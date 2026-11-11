@@ -2329,6 +2329,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		res, invokeErr = invokePrimaryAgent(ctx, invoker, inv,
 			primaryResumeDecision(fixupResume, selfRetryCount), &cfg, logSink)
 		phaseClock.beginGate()
+		// #5147: pin a timed-out / killed implement agent's uncommitted tree
+		// BEFORE anything can discard it. Every working_tree_restored defer
+		// (the #953 net, the fix-up and child-base defers,
+		// openPRAndShipArtifact's) fires at run() return, so this inline pin
+		// always precedes the force-checkout restore; the self-retry loop's next
+		// attempt starts from the same tree. Fail-open: a skip or failure logs
+		// and leaves the reason, category and exit unchanged.
+		checkpointKilledAgentTree(ctx, cfg, stageType, &res, invokeErr, logSink)
 
 		// Plan validation runs only if the agent itself succeeded —
 		// no point re-stating "your plan is malformed" when the

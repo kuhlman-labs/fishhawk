@@ -91,7 +91,8 @@ remaining scope).
   ticker cannot pin admissions shut (`backend/internal/opsmonitor/README.md`).
 - **Where it fires.** After every eligibility and dependency guard (dev mode,
   auth, runner_kind/executor, terminal run, wave order, post-deploy hold,
-  decomposed-parent acceptance) and the state switch, and BEFORE the bare CAS
+  decomposed-parent acceptance), the state switch and the superseded
+  merge-candidate pass refusal (#4811, below), and BEFORE the bare CAS
   or the concurrency slot admission. Only the two admissible arms reach it —
   `pending` (a first plan-stage spawn) and `awaiting_host_dispatch` — so it
   refuses EVERY new admission, and it commits nothing: no transition, no
@@ -112,6 +113,89 @@ remaining scope).
   `…_NilIsDefault`, `…_AlreadyDispatchedUntouched` (the hold is not even
   consulted) and `…_PrecedesSlotAdmission` (a grouped implement stage: a held
   hold never calls `concurrency.Store.Admit`; the not-held control does).
+
+## Superseded merge-candidate pass refusal (`host_dispatch.go`, [#4811](https://github.com/kuhlman-labs/fishhawk/issues/4811))
+
+The host-dispatch marker's arm of the stale-pass supersede
+(`merge_candidate_supersede.go`; the producer arm on a held / `not_queued`
+queue answer is in [merge-queue.md](merge-queue.md)). An ADR-090
+verify-only pass is triggered for head H1; when the run's head then moves to
+H2 while the pass is still undispatched, spawning it only burns a slot to
+record the runner's `head_moved` not_executed.
+
+- **Ledger rule.** `refuseSupersededMergeCandidatePass` reads the run's
+  implement stage (`implementStageStrict`) and its live
+  `stage_merge_candidate_verify_triggered` row. The pass is superseded when a
+  recorded head write (any `gateViewCurrentHeadSources` row, with
+  `gateViewCurrentHead`'s per-source rules) sequenced STRICTLY after the
+  trigger names a different head. A row before the trigger, or one naming the
+  trigger's own head, never supersedes it. The handler passes its own stage
+  ID, so a stage that is not the run's implement stage short-circuits before
+  any write. It is inert, with no reads, for a non-implement stage.
+- **Placement.** After the state switch (only the `pending` and
+  `awaiting_host_dispatch` arms reach it) and BEFORE the host memory hold,
+  the campaign hold and the CAS / slot admission, inside the held stage
+  admission lock. The core runs on a context marked as holding that fence,
+  so a nested acquisition on the stage stays re-entrant.
+- **Settle.** `settleMergeCandidatePassNotExecutedPinned`, the ADR-090/092
+  not_executed settle, PINNED to the checked trigger's sequence (a
+  compare-and-swap): `merge_candidate_verified{not_executed, "superseded:
+  ..."}`, then `run.FailStage` C, then `RestoreFixupStage` to the trigger's
+  prior gate. A replacement trigger appended since detection makes the
+  record refuse and write nothing (`trigger_replaced`). begin's PENDING
+  REPLACEMENT arm takes the same fence (bounded by `stageAdmissionTryWait`),
+  so in-process a replacement cannot land inside the record's own
+  read-to-append window. The process-local fence is the only thing closing
+  that window (one fishhawkd per database, as #1936 already assumes).
+- **Refusal.** `409 dispatch_not_admissible`, details `{stage_id, reason:
+  merge_candidate_pass_superseded, trigger_sequence, expected_head_sha,
+  superseding_head_sha, superseding_category, superseding_sequence,
+  settled}`, plus `settle_step` when not settled and `left_state` on
+  `before_restore_failed`. A settle that did not finish answers the same 409,
+  so the stale pass is never spawned. The stage is never `dispatched`; a
+  settled one is back at its prior gate.
+- **Advance.** On `settled` and on `restore_failed` (the producer arm's
+  condition, `mergeCandidateSupersedeAdvances`), `Orchestrator.Advance` is
+  queued on the handler's `postUnlock` hooks. They run after the admission
+  fence is released and after the 409 is written, on
+  `context.WithoutCancel`. No Orchestrator wired means no Advance.
+- **Fail-closed reads.** A stage-list read error (R2: never read as "no
+  implement stage"), an audit-chain read error during detection, and a
+  settle-time trigger read error each answer `500 dependency_check_failed`
+  with the stage untouched and nothing written, never 409 or an admit. This
+  is a behaviour change: a trigger read error used to reach concurrency
+  routing and be admitted as an implement (WARN-logged). That fallback now
+  covers only a malformed trigger and a missing audit repository
+  (`backend/internal/concurrency/README.md`,
+  `TestHostDispatch_UnreadableTriggerRoutesAsImplement`).
+- **Malformed trigger (R6).** A malformed or half-populated newest trigger
+  reads as no live pass, matching `resolveMergeCandidateVerifyTrigger`, so
+  the marker admits and the prompt serves no pass, as before. A dispatch
+  never loops on a 500.
+- **FailStage walk residual (R5).** `run.FailStage` walks
+  `awaiting_host_dispatch → dispatched → running → failed`. When a step of
+  that walk fails after the not_executed row landed (`before_restore_failed`),
+  the trigger is consumed and the stage is left EXACTLY where the walk
+  stopped (`running` or `dispatched`; a `pending` stage stays `pending`) with
+  no runner. Recover it with `fishhawk_reap_stage` (`POST
+  /v0/runs/{run_id}/stages/{stage_id}/reap-failure`); a stage left
+  `dispatched` is also failed by the dispatch watchdog when
+  `--enable-dispatch-watchdog` is set. The WARN names both.
+- **Dispatched arm (R3).** The idempotent `dispatched` arm is untouched: a
+  spawn attempt exists, and a dead runner's re-spawn still fetches the stale
+  pass. Its guard remains the runner's `head_moved` not_executed. Follow-up
+  [#5164](https://github.com/kuhlman-labs/fishhawk/issues/5164).
+- **Tests** (`host_dispatch_test.go`, fake-backed over `newSupFixture`):
+  `TestHostDispatch_SupersededMergeCandidatePass_RefusesAndSettles`,
+  `TestHostDispatch_CurrentMergeCandidatePass_Admits`,
+  `…_ReadErrorFailsClosed`, `…_StageListErrorFailsClosed` (`Sequence` 0 so
+  the resolver's list read is the only one), `…_SettleTimeReadErrorFailsClosed`,
+  `…_SettleRecordFails`, `…_AdvanceCondition`, `…_AdvancesAfterUnlock` (the
+  Advance seam probes the fence), `…_NoOrchestrator`,
+  `…_DispatchedArmUnchanged`, `…_NonImplementStageInert`,
+  `TestHostDispatch_MalformedMergeCandidateTrigger_Admits` and
+  `TestHostDispatch_ConcurrentReplacementStaysDispatchable`. The core's modes
+  are in `merge_candidate_supersede_test.go`.
 
 ## Decomposition wave-order host-dispatch guard (`decomposition_dispatch_guard.go`, E48.99 / #2546)
 
@@ -311,7 +395,7 @@ The fix-up prompt carries EVERY routed concern. Before #4284 the renderer packed
 
 - **One mapping (`prompt.go::fixupPromptConcerns`).** The prompt-serve resolver and the route-time check map `[]planreview.Concern` onto `[]prompt.FixupConcern` through the same helper: `Text = fixupConcernLine(c)`, `AcceptanceDerived` from the acceptance provenance, `Operator` for an `operator`-category concern that is not acceptance-derived (rendered first and never trimmed). The server's `selected` order and the audit `concerns` array are never reordered — the operator-first partition happens inside the renderer.
 - **Id pairing (`resolveFixupConcerns`).** The newest stage-bound `stage_fixup_triggered` payload's `concern_ids[i]` is stamped on `concerns[i]` ONLY when the two arrays have the same length — the rule `resolveRoutedFixupConcerns` already applies. The HTTP `concern_ids` path (with or without a minted operator concern) and auto-drive are length-matched, so each concern renders as `(concern <id>) [sev/cat] …`. The deferred-acceptance release (id-less acceptance concerns beside id'd review concerns), a degraded operator-concern mint, the positional path and merge-candidate are not, and render every concern id-less rather than under a misattributed id.
-- **Route-time fit (`fixup.go::fixupStageAs`, before `run.FixupStage`).** `fixupRouteFit` renders the pass's concerns with the REAL renderer (`prompt.FixupConcernsFit`), with `prompt.FixupConcernIDPlaceholder` (36 bytes) on every concern: the operator concern's id is minted only after the transition, and a block never shrinks as an id grows, so a set that fits here fits at serve time. When the trusted block cannot fit even at its minimum (every summary line, operator concerns in full), `fixupStageAs` returns `*fixupConcernsOverflowError`. Because the check precedes the transition, a refusal spends no pass, writes no `stage_fixup_triggered` entry, mints no operator concern and marks nothing `addressed_pending` — a concern the agent cannot see can no longer be recorded as routed. The HTTP handler maps it to **422 `fixup_concerns_overflow`** (details `bytes`, `max_bytes`, `overflow_bytes`, `concern_count`, `concern_ids` bounded at `maxOverflowDetailConcernIDs = 50`, `remedy`); the auto-drive `route_fixup` arm maps it to `DecisionRequired` / `DecisionState: "fixup_concerns_overflow"`, mirroring the #2091 budget/ceiling arms; merge-candidate logs the refusal like any other route refusal.
+- **Route-time fit (`fixup.go::fixupStageAs`, before the pre-flight and `run.FixupStage`).** `fixupRouteFit` renders the pass's concerns with the REAL renderer (`prompt.FixupConcernsFit`), with `prompt.FixupConcernIDPlaceholder` (36 bytes) on every concern: the operator concern's id is not minted yet (it is minted after this check, once `run.PreviewFixupStage` admits the pass and before the trigger append, #4815), and a block never shrinks as an id grows, so a set that fits here fits at serve time. When the trusted block cannot fit even at its minimum (every summary line, operator concerns in full), `fixupStageAs` returns `*fixupConcernsOverflowError`. Because the check precedes the pre-flight, the mint and the transition, a refusal spends no pass, writes no `stage_fixup_triggered` entry, mints no operator concern and marks nothing `addressed_pending` — a concern the agent cannot see can no longer be recorded as routed. The HTTP handler maps it to **422 `fixup_concerns_overflow`** (details `bytes`, `max_bytes`, `overflow_bytes`, `concern_count`, `concern_ids` bounded at `maxOverflowDetailConcernIDs = 50`, `remedy`); the auto-drive `route_fixup` arm maps it to `DecisionRequired` / `DecisionState: "fixup_concerns_overflow"`, mirroring the #2091 budget/ceiling arms; merge-candidate logs the refusal like any other route refusal.
 - **Acceptance exemption (#4284 C9).** Acceptance triage must not newly page. Acceptance-derived concerns are not measured for the refusal (the trusted-block fit excludes them), and an acceptance triage pass (`FixupOptions.AcceptanceStageID` set — `routeAcceptanceFixupPass`, both its immediate route and the deferred release that folds review concerns in) is never refused: the no-drop renderer lists every concern even past the budget.
 - **Truncation record (#4284 C4).** An ADMITTED pass whose note bodies the fit trimmed records `concern_bodies_truncated: true` and `truncated_concern_ids` on its `stage_fixup_triggered` entry (both keys absent otherwise, so other payloads stay byte-identical). The list comes from the same route-time fit over both blocks. It is a CONSERVATIVE SUPERSET: the fit renders with the longest id the serve-time render can carry, and when the routed ids do not pair with the concerns by position every caller-routed id is listed if any reviewer concern was trimmed (`fixupTruncatedConcernIDs`). It may be empty when only id-less (acceptance) concerns were trimmed. The minted operator id is never listed — an operator concern is never trimmed.
 - **Cap relationship.** `maxOperatorConcernBytes` (4000, the 400 cap on `operator_concern` / `operator_evidence`) no longer mirrors the renderer cap; it must stay AT MOST `prompt.MaxFixupConcernBytes` so a lone operator concern always fits — pinned by `TestFixupStage_OperatorConcernCapWithinRendererBudget`.
@@ -338,6 +422,18 @@ A fix-up trigger writes NO `implement_review_started` entry — the "round" it o
 - **Reconcile reporting reorder** (`review_reconcile.go`): the round's landed-terminal count now runs BEFORE the boot-marker gate, so `round_already_settled` takes precedence over `review_dispatched_by_this_process` and `landed_before` is real on every skip past the anchor checks (it always reported 0 on an in-flight skip, which the #3395 report read as "the round is genuinely empty"). Synthesis behaviour is unchanged; `TestReconcileRunReviews_Endpoint_RefusesLiveRound` is the pin.
 - **Gate view** (`gateview.go`): `stage_fixup_recovered` joins as a third fix-up outcome `recovered` so a delivered-nothing pass stops rendering `pending` forever; only the entry's sequence/stage are read (a malformed payload cannot hide it), and `earliestOutcomeAfter` still lets a `fixup_pushed` that precedes the recovery win as `pushed`.
 - Tests: `TestMaybeRecoverFixupFailure_DeliveredNothing_ReopensRoutedConcerns` / `_PushedPass_KeepsConcernsAddressedPending` / `_PushBeforeTriggerStillDeliveredNothing` / `_PushedReadError_OmitsDeliveredNothing` / `_NilConcernRepo_StillStampsDeliveredNothing` / `_ApplyResolutionError_ContinuesBestEffort` / `_NoRoutedConcerns_NoReopenError` (one per branch), `TestReconcileStageOrphanedReviews_SkipReasons` (the two after-boot rows), `TestGateView_FixupJoin_RecoveredOutcome`, and end to end over real Postgres + the real `fishhawk-mcp` binary `TestE2E_Fixup_FailedRedispatchRestoresReviewGate` / `TestE2E_Fixup_DeliveredNothingRecoveryReopensConcern` (`integration/mcp/fixup_test.go`).
+
+## Fix-up trigger ordering: append-then-reopen (#4815)
+
+`fixupStageAs` used to re-open the implement stage first and append `stage_fixup_triggered` after, logging a failed append. That left a re-opened stage with no trigger on the chain: no budget slot consumed, no routed concerns for the prompt, no review floor, and a dispatch that ran as a plain implement re-run. The fix-up now records the trigger BEFORE the re-open, for the reason the conflict-resolution pass's ORDERING comment gives (`conflictresolution_trigger.go`): a re-open cannot be walked back, so a trigger that cannot be recorded must refuse the pass with every stage untouched.
+
+- **Order (`fixup.go::triggerThenReopenFixup`).** Under the stage admission fence (`holdStageAdmission`, held for the helper's scope only): (1) `run.PreviewFixupStage`, the read-only pre-flight sharing `admitFixup` with `run.FixupStage`, so a deterministic refusal still mints, appends and spends nothing; (2) `mintOperatorConcern`; (3) the `stage_fixup_triggered` append, built from the preview's receipt fields (`fixupTriggerPayload` is byte-identical for the preview and the post-transition decision); (4) `run.FixupStage`, whose own admission re-decides the call. The fence is released before `fixupStageAs` continues, so `Advance` never runs under it. The four callers (HTTP handler, AutoDrive `route_fixup`, acceptance triage, the merge-candidate verdict route) hold no admission fence at the call site: acceptance's `appendAcceptanceOutcomeSerialized` releases its narrow hold before triage runs.
+- **Unrecorded trigger.** A failed append (or payload marshal) retires the minted operator concern and refuses with `fixupTriggerNotRecorded`: HTTP 500 `internal_error` whose message says the fix-up was refused, nothing was re-opened and no pass was spent; in-process callers see a non-sentinel error (AutoDrive propagates it, merge-candidate reports `routed=false` with the cause).
+- **Re-open failure after the trigger.** `settleUnopenedFixupTrigger` (on a cancellation-detached context) retires the minted concern and appends a `stage_fixup_recovered` void row: `delivered_nothing: true`, `source_failure_category: "C"`, `source_failure_reason` naming the failed re-open, and `restored_state` = the implement stage's ACTUAL state read back from the repository (no transition is made, so the row claims no restoration; only when that read fails does it record the preview's pre-trigger state, saying so in the reason and a WARN). The existing refund (`fixupRefundedPasses`), MCP review-floor void and gate-view `recovered` outcome readers honour it, so the settled trigger refunds its slot. Repeated settlements are still bounded by the absolute ceiling (`defaultFixupCeiling + maxCeilingRefundCredits`). The caller gets the re-open error verbatim, so every sentinel mapping is unchanged. No audit category was added.
+- **Retired operator concerns.** A minted-but-unrouted operator concern moves `raised → superseded` with a self-contained `state_reason` naming the refusal, so it does not wedge the open-concern gate. The row stays in the concern ledger and its history and can still be routed by id (`superseded` is routable). A failed retirement WARN-logs and the fix-up still refuses (fail-closed).
+- **Residuals.** (a) A process crash, or a failed settle append, between the append and the re-open leaves an unsettled trigger: one budget slot spent and the MCP review floor at that trigger until a later fix-up or review round; no agent pass runs. Reconciliation is deferred to [#5042](https://github.com/kuhlman-labs/fishhawk/issues/5042). (b) Pre-existing: on push_and_open_pr, `run.FixupStage` re-parks the review first, so a failure of the LATER implement re-open leaves the review `pending` with the implement stage at its gate; the settle row records the implement state truthfully and carries no `restored_review_*` keys. The change does not claim atomic multi-stage restoration; deferred to [#5043](https://github.com/kuhlman-labs/fishhawk/issues/5043). (c) Readers that floor on the newest trigger without the void rule see a settled trigger as they already see a #3395 delivered-nothing recovery. (d) The fence is single-process; a racing loser is settled via `run.FixupStage`'s re-admission. (e) Acceptance triage passes `MaxPasses` with no refund widening, so a settled trigger consumes that path's budget (unchanged policy).
+- **Sibling writers (audited, unchanged).** `startConflictResolutionPass` (`conflictresolution_trigger.go`) and `beginMergeCandidateVerifyPass` (`merge_candidate_verify.go`) already append before `run.FixupStage` and refuse on a failed append; the pending-replacement arm and `beginSupersededFixupPass` refuse and move no stage. Pinned by the conflict refusal table's `trigger append fails` case and `TestStartMergeCandidateVerifyPass_FailedAppendLeavesStageUntouched`. The `run.InfraParkHistory` `StagePushed` carve-out stays for chains written before this change.
+- Tests (`fixup_test.go`): `TestFixupStage_TriggerAppendFails_StageNeverReopened` (three shapes), `_RetiresMintedOperatorConcern`, `_RetireFailure_StillRefuses`, `TestFixupStage_ReopenFailsAfterTrigger_VoidsTriggerAndRefunds`, `_ReopenFails_SettleReadFails_RecordsPreTriggerState`, `_ReopenFails_SettleReadReturnsNoRow_RecordsPreTriggerState`, `_ReopenFailsAfterReviewRepark_RecordsActualState`, `_ReopenRefusedAfterTrigger_KeepsSentinel`, `_ReopenFails_SettleAppendFails_StillRefuses`, `_ReopenFails_SettleSurvivesCancelledRequest`, `_TriggerAppendedBeforeReopen`, `_TriggerPayloadMatchesPostTransitionDecision`, `_RepeatedSettlements_RespectsAbsoluteCeiling`, `TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen`; callers `TestAutoDriveRunGate_RouteFixupTriggerAppendFailurePropagates`, `TestRouteMergeCandidateFailure_TriggerAppendFails_NotRouted`; run-level `TestPreviewFixupStage_MatchesFixupStageAndMovesNothing`.
 
 ## Fix-up re-review backstop (#1932)
 

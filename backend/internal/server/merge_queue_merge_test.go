@@ -1029,6 +1029,81 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 			if _, ok := w.ledger.claimed[r.id]; ok != (tc.released == 0) {
 				t.Fatalf("claim present = %v, want %v", ok, tc.released == 0)
 			}
+			// #4876: the 409 readvance and the row-4 yield return the
+			// released entry to passed under the lock (the pump applies them
+			// with UnadmitPassed / YieldPassed); the ejection settle and the
+			// held arms leave it merging.
+			if tc.kind != mergeOnPassMerged {
+				want := mergequeue.PhaseMerging
+				if tc.kind == mergeOnPassReadvance || tc.kind == mergeOnPassYield {
+					want = mergequeue.PhasePassed
+				}
+				if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != want {
+					t.Fatalf("entry after the %s decision = %s/%s, want live/%s", tc.kind, e.State, e.Phase, want)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeOnPass_ReleasedToPassedFailureHolds (#4876, the reset's failure
+// mode, one row per call site): a typed refusal releases the claim (a 409, or
+// a 405 whose post-refusal snapshot reads REVIEW_REQUIRED, ADR-112 R3 row 4),
+// but the in-lock SetPhase(passed) fails (an mcqFaultStore override that fails
+// ONLY for PhasePassed). The decision must hold entry_changed naming the
+// outcome it lost, never readvance or yield: the claim is released, the entry
+// stays live and merging (the next pump's D8 resume redecides), and no
+// merge_queue_yielded row lands. Counterfactual: ignoring the reset's error
+// returns the readvance / row-4 yield, RED.
+func TestMergeOnPass_ReleasedToPassedFailureHolds(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		decision string
+		lost     string
+	}{
+		{name: "409 readvance", err: fmt.Errorf("pinned: %w", forge.ErrMergeConflict), lost: "before the readvance"},
+		{name: "405 row-4 yield", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable), decision: "REVIEW_REQUIRED",
+			lost: "before the forge_review_required yield"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req := w.ready("rtp", "h1", mcvUndelegatedSpecYAML)
+			w.merger.err = tc.err
+			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{ReviewDecision: tc.decision})
+			errPassed := errors.New("injected SetPhase(passed) failure")
+			var passedWrites int
+			fs := &mcqFaultStore{Store: w.store}
+			fs.setPhase = func(id uuid.UUID, phase mergequeue.Phase) (mergequeue.Entry, error) {
+				if phase == mergequeue.PhasePassed {
+					passedWrites++
+					return mergequeue.Entry{}, errPassed
+				}
+				return w.store.SetPhase(context.Background(), id, req.Entry.AdmissionEpoch, phase)
+			}
+			w.srv.cfg.MergeQueue = fs
+
+			out := w.decide(req)
+			requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonEntryChanged)
+			if !strings.Contains(out.Detail, "could not be returned to passed "+tc.lost) {
+				t.Fatalf("held detail = %q, want it to name the missed return to passed %s", out.Detail, tc.lost)
+			}
+			if passedWrites != 1 {
+				t.Fatalf("SetPhase(passed) attempts = %d, want 1 (the post-release reset)", passedWrites)
+			}
+			if len(w.ledger.released) != 1 {
+				t.Fatalf("releases = %v, want 1 (the typed refusal released the claim)", w.ledger.released)
+			}
+			if _, ok := w.ledger.claimed[r.id]; ok {
+				t.Fatal("the released claim is still present")
+			}
+			if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseMerging {
+				t.Fatalf("entry = %s/%s, want live/merging (no claim; the next pump's resume redecides)", e.State, e.Phase)
+			}
+			if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 {
+				t.Fatalf("merge_queue_yielded rows = %d, want 0", n)
+			}
 		})
 	}
 }
@@ -1890,7 +1965,9 @@ func TestMergeQueueMergeOnPass_OrphanedQueueClaimReleasedThenMerges(t *testing.T
 // writes one. (e) a zero claimed_at (the fake ledger's claim): CF delete
 // mergeQueueClaimCrashLeft's IsZero return → the fake releases and merges.
 // (f) an unapproved fold returns await_approval at step 6b, so step 8 never
-// runs: the claim holds the head until approval arrives (ADR-109 A1 point 2).
+// runs. Since ADR-109 A2 (#4862) these rows are BACKSTOP coverage: they drive
+// step 8 directly on a passed entry (an orphan stranded before A2); a
+// merging entry's orphan is released by the restart resume before the fold.
 func TestMergeQueueMergeOnPass_OrphanReleaseGuards(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1974,11 +2051,15 @@ func (q mqmReclaimErrQueue) ClaimMergeDispatch(ctx context.Context, runID uuid.U
 // conflicts and the decision holds merge_already_dispatched instead, RED on
 // the REASON only); (c) the fresh claim after a release fails → transient,
 // no claim row, and the next decision claims and merges (coverage of the
-// re-claim error path). (a) and (b) then drive TWO pump ticks: each tick's
-// resume hands the merging entry back (ONE merge_queue_resumed redecide row
-// per tick) and its merge-on-pass fails the release again, leaving phase
-// merging (approval condition 4).
+// re-claim error path). (a) and (b) drive step 8 directly (the A1 backstop,
+// keeping orphaned_claim_release_failed for BOTH failures there), then TWO
+// pump ticks: since ADR-109 A2 (#4862) each tick's RESUME writes ONE
+// merge_queue_resumed redecide row and fails the release itself ((a):
+// resume_unrecorded, (b): orphaned_claim_release_failed after its row),
+// leaving phase merging with the claim standing (approval condition 4).
 func TestMergeQueueMergeOnPass_OrphanReleaseFailsClosed(t *testing.T) {
+	// ticks drives two pump ticks; each tick's restart resume (not
+	// merge-on-pass, ADR-109 A2) fails the release.
 	ticks := func(t *testing.T, w *mqmWorld, a *mcqRun, want mergequeue.DispatchClaim, releasedPerTick int) {
 		t.Helper()
 		w.srv.mergeInFlight.clear(a.id) // the pump clears the decision's own mark

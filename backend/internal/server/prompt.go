@@ -2090,6 +2090,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Run-context verify rule (#5148): resolved before Build so the implement
+	// prompt states whether a runner gate runs after the agent. A
+	// conflict-resolution pass is forced to the fail-closed arm because its
+	// runner path runs no project verify.
+	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	trigger.VerifyGateConfigured = verifyGateConfigured(verifyCmd) && conflictResolution == nil
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		s.writePromptBuildError(w, r, string(stage.Type), err)
@@ -2112,7 +2118,6 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	s.recordCrewMessagesDelivered(r.Context(), runRow.ID, stage.ID, stage.Type, string(stage.Type), crewDeliveries.Sequences)
 
 	hash := signing.ComputeMessage([]byte(text))
-	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
@@ -2917,6 +2922,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Run-context verify rule (#5148), resolved exactly as
+	// handleGetStagePrompt resolves it so the preview matches the signed serve.
+	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	trigger.VerifyGateConfigured = verifyGateConfigured(verifyCmd) && conflictResolution == nil
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		s.writePromptBuildError(w, r, string(stage.Type), err)
@@ -2924,7 +2933,6 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
-	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
@@ -3929,6 +3937,16 @@ func (s *Server) resolveImplementTimeout(ctx context.Context, runRow *run.Run, s
 		slog.String("winner", winner),
 	)
 	return candidate
+}
+
+// verifyGateConfigured reports whether a resolved verify command means the
+// runner runs a verify gate after the implement agent finishes (#5148). The
+// command comes from resolveVerifyConfig, which reads the run's own
+// workflow-spec snapshot and yields "" on any parse or lookup failure, so an
+// unresolvable spec selects the prompt's fail-closed arm. Callers also force
+// false on a conflict-resolution pass, which runs no project verify.
+func verifyGateConfigured(verifyCmd string) bool {
+	return verifyCmd != ""
 }
 
 // resolveVerifyConfig returns the verify command, timeout (in seconds),
@@ -5090,7 +5108,8 @@ func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uu
 // therefore advanced through the CLEAN branch_rebased / branch_reset rows
 // recorded AFTER it (advanceFixupHeadThroughBaseMerges). A rebase alone never
 // invents a head: with no seed the field stays "". The acceptance resolvers
-// keep the un-advanced seed.
+// walk the same rows through acceptanceHeadAsOf (#4874), with a sequence-ordered
+// seed and a fail-closed read; this fix-up seed keeps its timestamp ordering.
 func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
 	seed, seedSHA := s.newestReportedHead(ctx, runID, stageID, "fixup_expected_head_sha")
 	if seed == nil {
@@ -5141,56 +5160,67 @@ func (s *Server) resolveConsolidatedFanInHeadSHA(ctx context.Context, runID uuid
 		)
 		return "", false
 	}
-	var newest *audit.Entry
-	var newestSHA string
-	for _, e := range entries {
-		if bounded && e.Sequence > maxSeq {
-			continue
-		}
-		var payload struct {
-			MergeSHA string `json:"merge_sha"`
-		}
-		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.MergeSHA == "" {
-			continue
-		}
-		if newest == nil || e.Sequence > newest.Sequence {
-			newest = e
-			newestSHA = payload.MergeSHA
-		}
+	if bounded {
+		entries = rowsAtOrBefore(entries, maxSeq)
 	}
+	newest, newestSHA := newestFanInHead(entries)
 	if newest == nil {
 		return "", false
 	}
 	return newestSHA, true
 }
 
-// acceptanceHeadForRun resolves ONE run's acceptance merge-candidate head:
-// the run's own reported-head ledger FIRST (returned verbatim when non-empty,
-// so every non-decomposed run's value is byte-identical to before #3091), and
-// only when that resolves "" the consolidated fan-in fallback. The fallback is
-// strictly SUBORDINATE — it never overrides a reported head — and deliberately
-// does NOT widen lineageLedgerCategories / auditcomplete.HeadReportCategoriesByPrecedence,
-// which are shared with the audit-check publisher and the branch-lineage guard.
+// acceptanceHeadForRun resolves ONE run's acceptance merge-candidate head
+// through acceptanceHeadAsOf, unbounded (#4874): the newest row by CHAIN
+// SEQUENCE across the run's reported-head ledger rows and its consolidated
+// fan-in integration_commit_recorded rows, advanced through the clean recorded
+// base merges after it. A late integration row newer than a reported head
+// therefore wins, and a reported head newer than every integration row wins;
+// neither set is subordinate. The integration category is read beside
+// lineageLedgerCategories and does NOT widen it or
+// auditcomplete.HeadReportCategoriesByPrecedence, which are shared with the
+// audit-check publisher and the branch-lineage guard.
+//
+// When the chosen seed is an integration row it logs the existing INFO line
+// naming the walked head. A read error WARNs and answers "" (the dispatch gates
+// then refuse acceptance_expected_head_unresolved); no seed keeps the existing
+// "no reported-head audit entry found" WARN.
 func (s *Server) acceptanceHeadForRun(ctx context.Context, runID, stageID uuid.UUID) string {
-	if sha := s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "acceptance_expected_head_sha"); sha != "" {
-		return sha
+	res, err := s.acceptanceHeadResolved(ctx, runID, 0, false)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: resolve acceptance head failed; omitting field",
+			slog.String("field", "acceptance_expected_head_sha"),
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return ""
 	}
-	if sha, ok := s.resolveConsolidatedFanInHeadSHA(ctx, runID, 0, false); ok {
+	if res.head == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: no reported-head audit entry found; omitting field",
+			slog.String("field", "acceptance_expected_head_sha"),
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return ""
+	}
+	if res.fanInSeed {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"prompt: acceptance head resolved from the consolidated fan-in ledger",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
-			slog.String("head_sha", sha),
+			slog.String("head_sha", res.head),
 		)
-		return sha
 	}
-	return ""
+	return res.head
 }
 
 // resolveAcceptanceExpectedHeadSHA returns the run's merge-candidate
-// identity — the newest-reported-head walk resolveFixupExpectedHeadSHA
-// performs, with the #3091 consolidated fan-in fallback for a decomposed
-// parent whose own reported-head ledger is empty — advertised on acceptance
+// identity — acceptanceHeadForRun's sequence-ordered seed across the
+// reported-head and consolidated fan-in rows, walked through clean recorded
+// base merges (#4874) — advertised on acceptance
 // dispatches as `acceptance_expected_head_sha` (E31.18 / #1569) so the
 // runner's pre-spawn target-identity gate can verify the declared acceptance
 // target serves the merge candidate (its /healthz git_sha) rather than a
@@ -6301,6 +6331,19 @@ func (s *Server) recordAcceptanceRetirementsUnserved(ctx context.Context, runID,
 // unconfigured AuditRepo, no entry, or any read error — WARN-and-omit, so a
 // degraded read makes the runner skip persistence (and report the drop)
 // rather than push to a guessed branch.
+//
+// DECOMPOSED PARENT (#4874). A parent's own chain carries no reported-head row
+// unless a fix-up ran, so when the ledger names no branch and the run has an
+// integration_commit_recorded row, the branch is the server-derived
+// consolidated branch (acceptanceFanInBranch). The orchestrator sets the
+// consolidated PR through SetRunPullRequestURL and writes no
+// pull_request_opened row, so a KNOWN branch with an unresolved PR number reads
+// the run row's URL (acceptanceRunPRNumber). That lookup is scoped: a run whose
+// ledger resolved both fields, or neither ledger nor fan-in rows, never reaches
+// RunRepo. A lookup failure WARNs and omits both fields on the derived
+// fan-in branch, and keeps today's (branch, 0) for a ledger branch, so the new
+// read can never regress a ledger-resolved branch. A run with no URL answers
+// (branch, 0) with no WARN.
 func (s *Server) resolveAcceptanceRunBranchAndPR(ctx context.Context, runID, stageID uuid.UUID) (string, int) {
 	if s.cfg.AuditRepo == nil {
 		return "", 0
@@ -6338,7 +6381,37 @@ func (s *Server) resolveAcceptanceRunBranchAndPR(ctx context.Context, runID, sta
 			}
 		}
 	}
-	return branch, prNumber
+	derived := false
+	if branch == "" {
+		fanBranch, err := s.acceptanceFanInBranch(ctx, runID)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: list integration audit entries failed; omitting acceptance run branch",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+			return "", 0
+		}
+		if fanBranch != "" {
+			branch, derived = fanBranch, true
+		}
+	}
+	if branch == "" || prNumber > 0 {
+		return branch, prNumber
+	}
+	n, err := s.acceptanceRunPRNumber(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: resolve acceptance pull request number from the run failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		if derived {
+			return "", 0
+		}
+		return branch, 0
+	}
+	return branch, n
 }
 
 // resolveFixupExpectedHeadSHA and resolveAcceptanceExpectedHeadSHA: the newest

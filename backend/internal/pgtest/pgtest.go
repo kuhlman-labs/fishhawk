@@ -53,6 +53,29 @@
 // helpers Fatalf with the runner-side remedy instead of attempting a
 // testcontainers start that cannot succeed. FISHHAWK_SKIP_INTEGRATION keeps
 // precedence over both.
+//
+// Connect diagnostics (#5116). NewPool times the clone (base connect, CREATE
+// DATABASE ... TEMPLATE, 55006 retries) and watches the postgres.Connect that
+// follows. If that connect is still pending after probeAfter (2 s) it starts
+// ONE live probe; if it fails with no live probe it runs one post-failure
+// probe. A probe opens at most two phase-timed connections, to the per-test
+// and the base database concurrently, recording lookup, dial, first server
+// byte, ready (ReadyForQuery) and ping, and takes a read-only server snapshot
+// (slots against max_connections, per-test backends, a top-5 wait-event
+// histogram, per-test and template database counts, checkpoint counters,
+// uptime) on the base connection. A stalled probe names the furthest phase
+// reached: stalled-at-lookup, stalled-at-dial, stalled-awaiting-server (dialed,
+// no server byte), stalled-in-startup (server bytes, no ReadyForQuery) or
+// stalled-at-ping; otherwise ok or connect-error:<class>. The connect error's
+// shape is classified as acquire-wait (a bare context deadline from
+// pgxpool.Ping: puddle gave up on a NEW connection still being built inside
+// postgres.Connect's fixed 5 s window), query-timeout (an established
+// connection stalled), connect-error:<class>, server-error:sqlstate=<code> or
+// other. A failure still routes to Fatalf, never Skip: the message keeps the
+// ORIGINAL error unchanged as its prefix and appends one `pgtest diagnostics:`
+// suffix capped at maxDiagBytes that never carries a DSN, password, user,
+// database name, host:port or query text. A slow connect that succeeds is
+// logged with the same suffix.
 package pgtest
 
 import (
@@ -143,23 +166,40 @@ func NewURL(t *testing.T) string {
 // cloned from the named template.
 func newURLFrom(t *testing.T, baseURL, tmpl string) string {
 	t.Helper()
+	dbURL, _ := newURLTimed(t, baseURL, tmpl)
+	return dbURL
+}
+
+// newURLTimed is newURLFrom that also reports how long the clone took, for
+// NewPool's connect diagnostics (#5116).
+func newURLTimed(t *testing.T, baseURL, tmpl string) (string, cloneTiming) {
+	t.Helper()
+	var clone cloneTiming
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	connStart := time.Now()
 	conn, err := pgx.Connect(ctx, baseURL)
+	clone.baseConnect = time.Since(connStart)
 	if err != nil {
 		t.Fatalf("connect base db: %v", err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
 	dbName := "fh_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	attempts := 0
 	create := func() error {
+		attempts++
 		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s TEMPLATE %s",
 			pgx.Identifier{dbName}.Sanitize(),
 			pgx.Identifier{tmpl}.Sanitize()))
 		return err
 	}
-	if err := createWithContentionRetry(contentionAttempts, contentionDelay, create); err != nil {
+	createStart := time.Now()
+	err = createWithContentionRetry(contentionAttempts, contentionDelay, create)
+	clone.create = time.Since(createStart)
+	clone.contentionRetries = max(attempts-1, 0)
+	if err != nil {
 		t.Fatalf("create per-test db: %v", err)
 	}
 
@@ -174,23 +214,138 @@ func newURLFrom(t *testing.T, baseURL, tmpl string) string {
 		_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{dbName}.Sanitize()+" WITH (FORCE)")
 	})
 
-	return replaceDBName(baseURL, dbName)
+	return replaceDBName(baseURL, dbName), clone
 }
 
 // NewPool returns a connected pgxpool against a freshly-migrated per-test
 // database. The pool is closed (before the database is dropped) via
-// t.Cleanup. Skips the test if Docker is unavailable.
+// t.Cleanup. Skips the test if Docker is unavailable. A connect failure
+// carries the connect diagnostics suffix (see the package doc).
 func NewPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dbURL := NewURL(t)
-	pool, err := postgres.Connect(context.Background(), dbURL)
+	base := sharedBaseURL(t)
+	tmpl, err := embeddedTemplateName()
 	if err != nil {
-		t.Fatalf("connect per-test pool: %v", err)
+		t.Fatalf("resolve template name: %v", err)
 	}
-	// Registered AFTER NewURL's drop cleanup, so it runs FIRST (LIFO):
-	// the pool must close before the database can be dropped.
-	t.Cleanup(pool.Close)
-	return pool
+	dbURL, clone := newURLTimed(t, base, tmpl)
+	return newPoolWith(t, poolOpen{
+		url:       dbURL,
+		baseURL:   base,
+		perTestDB: dbNameOf(dbURL),
+		clone:     clone,
+		connect:   postgres.Connect,
+		probe: func(ctx context.Context, baseURL, perTestURL, perTestDB, when string) diagReport {
+			return runConnectProbe(ctx, baseURL, perTestURL, perTestDB, when, probeHooks{})
+		},
+		after: time.After,
+	})
+}
+
+// Connect-diagnostics timing (#5116). These are deliberately NOT
+// timescale-scaled: they compete with postgres.Connect's fixed, unscaled 5 s
+// ping window, and a scaled trigger (5x under CI) would never fire before the
+// failure.
+const (
+	probeAfter             = 2 * time.Second
+	liveProbeBudget        = 3 * time.Second
+	postFailureProbeBudget = 5 * time.Second
+)
+
+// poolTB is the subset of *testing.T newPoolWith needs. It embeds fataler so
+// the fail-closed routing is unit-testable with a fake.
+type poolTB interface {
+	fataler
+	Logf(format string, args ...any)
+	Cleanup(func())
+}
+
+// poolOpen carries one per-test pool open and its injectable seams.
+type poolOpen struct {
+	url       string
+	baseURL   string
+	perTestDB string
+	clone     cloneTiming
+	connect   func(context.Context, string) (*pgxpool.Pool, error)
+	probe     func(ctx context.Context, baseURL, perTestURL, perTestDB, when string) diagReport
+	after     func(time.Duration) <-chan time.Time
+}
+
+// newPoolWith opens the pool, starting ONE live probe if the connect is still
+// pending after probeAfter. On success after a live probe it cancels and joins
+// the probe and logs the report. On failure it joins the live probe (bounded
+// by liveProbeBudget) or runs one post-failure probe, then Fatalf's with the
+// original error as an unchanged prefix — never Skip. The fake poolTB returns
+// from Fatalf, so the terminal call is followed by an explicit return.
+func newPoolWith(tb poolTB, o poolOpen) *pgxpool.Pool {
+	tb.Helper()
+	type connected struct {
+		pool *pgxpool.Pool
+		err  error
+	}
+	start := time.Now()
+	done := make(chan connected, 1)
+	go func() {
+		pool, err := o.connect(context.Background(), o.url)
+		done <- connected{pool, err}
+	}()
+
+	var (
+		res        connected
+		liveRep    diagReport
+		liveDone   chan struct{}
+		liveCancel context.CancelFunc
+	)
+	select {
+	case res = <-done:
+	case <-o.after(probeAfter):
+		var liveCtx context.Context
+		liveCtx, liveCancel = context.WithTimeout(context.Background(), liveProbeBudget)
+		defer liveCancel()
+		liveDone = make(chan struct{})
+		go func() {
+			defer close(liveDone)
+			liveRep = o.probe(liveCtx, o.baseURL, o.url, o.perTestDB, "live")
+		}()
+		res = <-done
+	}
+	elapsed := time.Since(start)
+
+	if res.err == nil {
+		if liveDone != nil {
+			liveCancel()
+			<-liveDone
+			tb.Logf("pgtest: slow per-test pool connect %s; %s", elapsed.Round(time.Millisecond),
+				renderDiag(classifyConnectErr(nil), o.clone, elapsed, &liveRep))
+		}
+		// Registered AFTER newURLTimed's drop cleanup, so it runs FIRST
+		// (LIFO): the pool must close before the database can be dropped.
+		tb.Cleanup(res.pool.Close)
+		return res.pool
+	}
+
+	var rep diagReport
+	if liveDone != nil {
+		<-liveDone // the live probe's own ctx bounds this by liveProbeBudget
+		rep = liveRep
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), postFailureProbeBudget)
+		rep = o.probe(ctx, o.baseURL, o.url, o.perTestDB, "post-failure")
+		cancel()
+	}
+	err := res.err
+	report := renderDiag(classifyConnectErr(err), o.clone, elapsed, &rep)
+	tb.Fatalf("connect per-test pool: %v; %s", err, report)
+	return nil
+}
+
+// dbNameOf is the database name of a Postgres URL, or "" when unparseable.
+func dbNameOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(u.Path, "/")
 }
 
 // sharedBaseURL returns the base (admin) connection URL of the shared

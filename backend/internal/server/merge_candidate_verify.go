@@ -33,12 +33,18 @@ import (
 //   - refuseMergeCandidatePassToIncapableRunner settles a pass a stale
 //     runner fetched without the merge-candidate-verify capability (#4183);
 //   - mergeCandidateVerifyState is the ONE predicate the merge gate, the
-//     rebase producer and the decomposed-parent hold read (D2, D4);
+//     rebase producer and the decomposed-parent hold read (D2, D4); ADR-142
+//     amends D2 so an acceptance scenario-corpus commit keeps a recorded
+//     requirement and needs exact-head evidence (scenarioCommitObligation);
 //   - routeMergeCandidateFailure applies D6 to a red result;
 //   - voidFailedMergeCandidateVerdict voids a failed head's verdict for the
 //     operator's verify-only re-run (#4391), making it re-triggerable; the
 //     in-place conversion of a queued D6 fix-up lives in
-//     merge_candidate_rerun.go.
+//     merge_candidate_rerun.go;
+//   - merge_candidate_supersede.go settles a STALE undispatched pass (its
+//     trigger's head superseded by a later recorded head write) as
+//     not_executed, pinned to the exact trigger it checked (#4811), for the
+//     queue's held / not_queued answers and the host-dispatch marker.
 
 // CategoryStageMergeCandidateVerifyTriggered is the durable trigger that
 // re-opens the implement stage for a verify-only merge-candidate pass (ADR-090
@@ -120,7 +126,19 @@ var (
 	errMergeCandidateInvalidResult  = errors.New("merge_candidate_result must be one of passed, failed, not_executed")
 	errMergeCandidateNoLiveTrigger  = errors.New("no live merge-candidate verify trigger for this stage")
 	errMergeCandidateTriggerPayload = errors.New("the live merge-candidate verify trigger payload is malformed or half-populated")
+	// errMergeCandidateTriggerReplaced is the pinned record's refusal (#4811
+	// R1): the stage's newest trigger is no longer the one the caller checked,
+	// so nothing is written and the replacement stays live.
+	errMergeCandidateTriggerReplaced = errors.New("the stage's newest merge-candidate verify trigger is no longer the one checked; a replacement is live")
 )
+
+// mergeCandidateChainReadError marks a chain READ failure inside a PINNED
+// record (#4811, approval condition D3), so a settle can tell an unreadable
+// chain from a failed append. Error and Unwrap are the underlying error's.
+type mergeCandidateChainReadError struct{ err error }
+
+func (e *mergeCandidateChainReadError) Error() string { return e.err.Error() }
+func (e *mergeCandidateChainReadError) Unwrap() error { return e.err }
 
 // mergeCandidateVerifyTrigger is the stage_merge_candidate_verify_triggered
 // payload: everything the runner needs (branch, base ref, expected head, the
@@ -289,6 +307,14 @@ type mergeCandidateVerifyRefusal struct {
 // queue (serializeMergeCandidateVerifyPass, merge_candidate_queue.go) instead
 // of starting at once; fan_in and an unwired queue take the direct start
 // below unchanged.
+//
+// #4811: a held or not_queued queue answer starts nothing, but it first
+// settles an older UNDISPATCHED pass whose head the run has since moved past
+// (answerQueuedWithoutPass, merge_candidate_supersede.go), so the slot waiter
+// cannot dispatch it stale; an unreadable stage list or chain turns that
+// answer into a refusal. Begin's PENDING REPLACEMENT arm still re-targets a
+// pending pass when the run holds the line, now under the implement stage's
+// admission fence.
 func (s *Server) startMergeCandidateVerifyPass(ctx context.Context, runID uuid.UUID,
 	p mergeCandidateVerifyParams, actor mergeCandidateActor) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
 	if s.mergeCandidateQueueRoutes(p, actor) {
@@ -354,6 +380,25 @@ func (s *Server) beginMergeCandidateVerifyPass(ctx context.Context, runID uuid.U
 	// local-verify group. A dispatched or running pass keeps the refusal
 	// below: its runner already holds the old trigger.
 	if live != nil && (impl.State == run.StageStatePending || impl.State == run.StageStateAwaitingHostDispatch) {
+		// R1 FENCE (#4811). The supersede settle (merge_candidate_supersede.go)
+		// holds this stage's admission fence across detect, record, FailStage
+		// and restore, so the replacement takes the same fence: in-process, no
+		// replacement lands inside the settle record's read-to-append window.
+		// Every read is redone under the fence by re-entering begin on the
+		// marked context (depth 1). LOCK ORDER: as holdStageAdmission's — the
+		// acquisition is bounded by stageAdmissionTryWait, and a miss is a
+		// Transient refusal the queue admission un-admits back to held
+		// (approval condition D1), the beginSupersededFixupPass precedent.
+		if !stageAdmissionHeldBy(ctx, impl.ID) && s.cfg.Orchestrator != nil {
+			fctx, unlock, acquired := s.tryHoldStageAdmission(ctx, impl.ID, stageAdmissionTryWait)
+			if !acquired {
+				return nil, &mergeCandidateVerifyRefusal{Transient: true, Reason: fmt.Sprintf(
+					"the implement stage %s's admission fence is busy (a host dispatch or a stale-pass settle holds it), so the pending pass was not re-targeted and still targets %s; nothing was written; re-invoke fishhawk_rebase_run_branch",
+					impl.ID, live.payload.ExpectedHeadSHA)}
+			}
+			defer unlock()
+			return s.beginMergeCandidateVerifyPass(fctx, runID, p, actor)
+		}
 		replacement := mergeCandidateVerifyTrigger{
 			Branch:                p.Branch,
 			BaseRef:               p.BaseRef,
@@ -563,6 +608,24 @@ func (s *Server) recordMergeCandidateVerified(ctx context.Context, runID, stageI
 // piece of the untrusted evidence is re-bounded before it is stored.
 func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID, stageID uuid.UUID,
 	result, reason string, ev mergeCandidateOutputEvidence, actorKind audit.ActorKind, actorSubject string) (*mergeCandidateVerifiedRecord, error) {
+	return s.recordMergeCandidateVerifiedEvidenceAt(ctx, runID, stageID, 0, result, reason, ev, actorKind, actorSubject)
+}
+
+// recordMergeCandidateVerifiedEvidenceAt is recordMergeCandidateVerifiedEvidence
+// with an optional PIN (#4811 R1): a non-zero pin is the chain sequence of the
+// trigger the caller checked, and the record refuses with
+// errMergeCandidateTriggerReplaced — writing nothing — when the stage's newest
+// trigger is not that one. It is the ONLY pin check. With a pin, a chain read
+// failure is wrapped as mergeCandidateChainReadError. Pin 0 is the unpinned
+// record, byte-identical for every existing caller.
+func (s *Server) recordMergeCandidateVerifiedEvidenceAt(ctx context.Context, runID, stageID uuid.UUID, pin int64,
+	result, reason string, ev mergeCandidateOutputEvidence, actorKind audit.ActorKind, actorSubject string) (*mergeCandidateVerifiedRecord, error) {
+	readErr := func(err error) error {
+		if pin != 0 {
+			return &mergeCandidateChainReadError{err: err}
+		}
+		return err
+	}
 	if !validMergeCandidateResult(result) {
 		return nil, errMergeCandidateInvalidResult
 	}
@@ -571,19 +634,22 @@ func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID
 	}
 	triggers, err := s.stageEntriesStrict(ctx, runID, stageID, CategoryStageMergeCandidateVerifyTriggered)
 	if err != nil {
-		return nil, err
+		return nil, readErr(err)
 	}
 	if len(triggers) == 0 {
 		return nil, errMergeCandidateNoLiveTrigger
 	}
 	newest := triggers[len(triggers)-1]
+	if pin != 0 && newest.Sequence != pin {
+		return nil, errMergeCandidateTriggerReplaced
+	}
 	var trigger mergeCandidateVerifyTrigger
 	if err := json.Unmarshal(newest.Payload, &trigger); err != nil || !trigger.populated() {
 		return nil, errMergeCandidateTriggerPayload
 	}
 	verified, err := s.stageEntriesStrict(ctx, runID, stageID, CategoryMergeCandidateVerified)
 	if err != nil {
-		return nil, err
+		return nil, readErr(err)
 	}
 	if len(verified) > 0 && verified[len(verified)-1].Sequence >= newest.Sequence {
 		var prior mergeCandidateVerifiedPayload
@@ -753,6 +819,14 @@ const (
 	mergeCandidateSettleRestoreFailed
 	// mergeCandidateSettled: the row landed and the pre-pass gate is restored.
 	mergeCandidateSettled
+	// mergeCandidateSettleTriggerReplaced (PINNED settle only, #4811 R1): the
+	// pinned trigger is no longer the stage's newest. Nothing written, no
+	// FailStage, no restore; the replacement stays live.
+	mergeCandidateSettleTriggerReplaced
+	// mergeCandidateSettleReadFailed (PINNED settle only, approval condition
+	// D3): the settle's own chain read failed, so it is told apart from
+	// no_live_trigger. Nothing written.
+	mergeCandidateSettleReadFailed
 )
 
 // settleMergeCandidatePassNotExecuted settles the stage's live merge-candidate
@@ -774,7 +848,31 @@ const (
 // error. It does not log or notify; callers do, so each keeps its own lines.
 func (s *Server) settleMergeCandidatePassNotExecuted(ctx context.Context, runID, stageID uuid.UUID,
 	reason string, beforeRestore func() error) (mergeCandidateSettleStep, error) {
-	trigger := s.resolveMergeCandidateVerifyTrigger(ctx, runID, stageID)
+	return s.settleMergeCandidatePassNotExecutedPinned(ctx, runID, stageID, 0, reason, beforeRestore)
+}
+
+// settleMergeCandidatePassNotExecutedPinned is settleMergeCandidatePassNotExecuted
+// with an optional PIN (#4811 R1): a non-zero pin is the sequence of the
+// trigger the caller checked. With a pin it resolves the live trigger
+// STRICTLY (a read error answers mergeCandidateSettleReadFailed, never
+// no_live_trigger; a malformed newest trigger is no live trigger, R6) and
+// records through recordMergeCandidateVerifiedEvidenceAt, so a replaced
+// trigger answers mergeCandidateSettleTriggerReplaced with NOTHING written and
+// no beforeRestore or restore run. Pin 0 is the unpinned settle, unchanged.
+func (s *Server) settleMergeCandidatePassNotExecutedPinned(ctx context.Context, runID, stageID uuid.UUID, pin int64,
+	reason string, beforeRestore func() error) (mergeCandidateSettleStep, error) {
+	var trigger *mergeCandidateVerifyTrigger
+	if pin == 0 {
+		trigger = s.resolveMergeCandidateVerifyTrigger(ctx, runID, stageID)
+	} else {
+		live, err := s.liveMergeCandidateTrigger(ctx, runID, stageID)
+		if err != nil && !errors.Is(err, errMergeCandidateTriggerPayload) {
+			return mergeCandidateSettleReadFailed, err
+		}
+		if live != nil {
+			trigger = &live.payload
+		}
+	}
 	if trigger == nil {
 		return mergeCandidateSettleNoLiveTrigger, nil
 	}
@@ -786,8 +884,15 @@ func (s *Server) settleMergeCandidatePassNotExecuted(ctx context.Context, runID,
 		}
 		reviewStageID = &rid
 	}
-	if _, err := s.recordMergeCandidateVerified(ctx, runID, stageID, mergeCandidateResultNotExecuted,
-		reason, "", audit.ActorSystem, mergeCandidateSystemSubject); err != nil {
+	if _, err := s.recordMergeCandidateVerifiedEvidenceAt(ctx, runID, stageID, pin, mergeCandidateResultNotExecuted,
+		reason, mergeCandidateOutputEvidence{}, audit.ActorSystem, mergeCandidateSystemSubject); err != nil {
+		var rerr *mergeCandidateChainReadError
+		switch {
+		case errors.Is(err, errMergeCandidateTriggerReplaced):
+			return mergeCandidateSettleTriggerReplaced, nil
+		case errors.As(err, &rerr):
+			return mergeCandidateSettleReadFailed, err
+		}
 		return mergeCandidateSettleRecordFailed, err
 	}
 	if beforeRestore != nil {
@@ -923,12 +1028,20 @@ var mergeCandidateRunnerGatedCategories = []string{"pull_request_opened", "fixup
 //  5. a decomposed parent (fan-in integration rows on its chain) → fan_in;
 //  6. anything else → not_required.
 //
+// Between rules 4 and 5, rule 4a (ADR-142, scenarioCommitObligation) gives an
+// acceptance scenario-corpus commit the cause ADR-142 assigns: a recorded
+// ADR-090 D2 requirement the commit does not discharge, the isolated
+// vouched-terminal ladder, or the conservative base_advance for an unresolved
+// chain on a probeable run; an empty answer falls through to rules 5 and 6.
+//
 // The rebase verb attributes its own merge commit with an
 // operator_commit_vouched row, which is why 1 and 2 precede 4: a vouch must
-// not exempt a base-advance head. A classified head is passed or failed only
-// by a verdict for EXACTLY that SHA; otherwise in_flight while a live trigger
-// names it, else unverified. Every audit read error is returned, never read as
-// "no requirement".
+// not exempt a base-advance head. Rule 4 precedes 4a, so an operator vouch of
+// exact live head keeps its D8 Amendment 1 answer. A classified head is passed
+// or failed only by a verdict for EXACTLY that SHA (ADR-142 D5: no result at a
+// predecessor or an intermediate scenario commit is inherited); otherwise
+// in_flight while a live trigger names it, else unverified. Every audit read
+// error is returned, never read as "no requirement".
 func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run, headSHA string) (mergeCandidateState, error) {
 	command, _, _ := s.resolveVerifyConfig(ctx, runRow, run.StageTypeImplement)
 	if command == "" {
@@ -1013,6 +1126,17 @@ func (s *Server) classifyMergeCandidateHead(ctx context.Context, runRow *run.Run
 		return s.classifyVouchedHead(ctx, runRow, headSHA)
 	}
 
+	// Rule 4a (ADR-142): an acceptance scenario-corpus commit. An empty cause
+	// falls through, so a standalone run reads not_required and a decomposed
+	// parent keeps rule 5's fan_in.
+	cause, err := s.scenarioCommitObligation(ctx, runRow, headSHA)
+	if err != nil {
+		return "", err
+	}
+	if cause != "" {
+		return cause, nil
+	}
+
 	for _, category := range []string{auditcomplete.CategoryIntegrationCommitRecorded, auditcomplete.CategorySlicesIntegrated} {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
 		if err != nil {
@@ -1023,6 +1147,234 @@ func (s *Server) classifyMergeCandidateHead(ctx context.Context, runRow *run.Run
 		}
 	}
 	return "", nil
+}
+
+// scenarioCommitEdge is one acceptance scenario-corpus report as the
+// classifier reads it: the runner-reported predecessor (base_sha) of the
+// reported head, and the row's chain sequence. The fields are runner-reported,
+// not forge attestation; a base can add or confirm a requirement, never clear
+// a recorded one (ADR-142 D1).
+type scenarioCommitEdge struct {
+	base string
+	seq  int64
+}
+
+// scenarioCommitEdges reads every acceptance_scenarios_pushed row on the run's
+// chain, keyed by its reported head_sha. It decodes permissively, as
+// chainReportsHead does: an undecodable row or an empty head is skipped, and a
+// non-string base_sha reads empty. When two rows report one head, the edge
+// keeps the higher sequence. A read error is returned.
+func (s *Server) scenarioCommitEdges(ctx context.Context, runID uuid.UUID) (map[string]scenarioCommitEdge, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceScenariosPushed)
+	if err != nil {
+		return nil, err
+	}
+	edges := make(map[string]scenarioCommitEdge, len(entries))
+	for _, e := range entries {
+		var p map[string]any
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		head, _ := p["head_sha"].(string)
+		if head == "" {
+			continue
+		}
+		base, _ := p["base_sha"].(string)
+		if prev, seen := edges[head]; seen && prev.seq > e.Sequence {
+			continue
+		}
+		edges[head] = scenarioCommitEdge{base: base, seq: e.Sequence}
+	}
+	return edges, nil
+}
+
+// reportedScenarioTerminal follows reported base_sha edges from headSHA until
+// it reaches a SHA that no scenario row reports, returning (that sha, true).
+// An empty base, a self-reference or a cycle cannot be tied to anything and
+// answers ("", false): ADR-142 D3's unresolved chain.
+func reportedScenarioTerminal(edges map[string]scenarioCommitEdge, headSHA string) (string, bool) {
+	seen := map[string]bool{}
+	sha := headSHA
+	for {
+		edge, reported := edges[sha]
+		if !reported {
+			return sha, true
+		}
+		seen[sha] = true
+		if edge.base == "" || seen[edge.base] {
+			return "", false
+		}
+		sha = edge.base
+	}
+}
+
+// scenarioHeadWrite is one recorded write that can produce or attribute a run
+// head, as ADR-142 D1 orders them: a no-op rebase (noOp), an ADR-090 D2
+// producer (cause), or a runner-gated report (head, no cause).
+type scenarioHeadWrite struct {
+	seq   int64
+	noOp  bool
+	cause string
+	head  string
+}
+
+// newestScenarioHeadWrite picks the newest non-no-op write strictly before
+// beforeSeq (the scenario commit's own row). No-ops are skipped BEFORE any
+// selection, so no number of them can mask an earlier performed write. The
+// order is chain sequence only, never a timestamp.
+func newestScenarioHeadWrite(writes []scenarioHeadWrite, beforeSeq int64) (scenarioHeadWrite, bool) {
+	var newest scenarioHeadWrite
+	found := false
+	for _, w := range writes {
+		if w.noOp {
+			continue
+		}
+		if w.seq >= beforeSeq {
+			continue
+		}
+		if !found || w.seq > newest.seq {
+			newest, found = w, true
+		}
+	}
+	return newest, found
+}
+
+// scenarioHeadWrites builds one candidate per recorded head write on the
+// run's chain. A branch_rebased row is a no-op ONLY when it decodes and its
+// already_up_to_date is true; an undecodable row, a non-bool flag (which
+// fails the decode) and a row without the field are performed base advances,
+// because a malformed or missing flag does not prove no write occurred
+// (ADR-142 D1; this posture is scoped to the scenario classifier). A
+// conflict-resolution push and a fan-in integration count by presence. A
+// runner-gated row carries its head; an undecodable or empty one is skipped.
+// A branch_reset row is not a head write here: it discharges nothing. Every
+// read error is returned.
+func (s *Server) scenarioHeadWrites(ctx context.Context, runID uuid.UUID) ([]scenarioHeadWrite, error) {
+	var writes []scenarioHeadWrite
+	rebased, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryBranchRebased)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range rebased {
+		var p struct {
+			AlreadyUpToDate bool `json:"already_up_to_date"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && p.AlreadyUpToDate {
+			writes = append(writes, scenarioHeadWrite{seq: e.Sequence, noOp: true})
+			continue
+		}
+		writes = append(writes, scenarioHeadWrite{seq: e.Sequence, cause: mergeCandidateCauseBaseAdvance})
+	}
+	producers := []struct{ category, cause string }{
+		{CategoryConflictResolutionPushed, mergeCandidateCauseConflictResolution},
+		{auditcomplete.CategoryIntegrationCommitRecorded, mergeCandidateCauseFanIn},
+		{auditcomplete.CategorySlicesIntegrated, mergeCandidateCauseFanIn},
+	}
+	for _, pr := range producers {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, pr.category)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			writes = append(writes, scenarioHeadWrite{seq: e.Sequence, cause: pr.cause})
+		}
+	}
+	for _, category := range mergeCandidateRunnerGatedCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			var p struct {
+				HeadSHA string `json:"head_sha"`
+			}
+			if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA == "" {
+				continue
+			}
+			writes = append(writes, scenarioHeadWrite{seq: e.Sequence, head: p.HeadSHA})
+		}
+	}
+	return writes, nil
+}
+
+// scenarioCommitObligation is classifyMergeCandidateHead's rule 4a (ADR-142):
+// the verification cause for an acceptance scenario-corpus commit headSHA, or
+// "" when ADR-142 leaves the head to the later rules. In order:
+//
+//	(a) no scenario row reports headSHA → "" (every other head keeps today's
+//	    path);
+//	(b) the newest non-no-op recorded head write before headSHA's row is an
+//	    ADR-090 D2 producer → its cause (D1), consulting no reported base and
+//	    no probe, so neither a base nor inability to probe can clear it;
+//	(c) the reported chain resolves to that newest write's runner-gated head →
+//	    "" (D2's existing classification); a chain resolving to an
+//	    operator-vouched terminal takes the terminal's isolated ladder
+//	    (classifyScenarioTerminalVouch), read only for a RESOLVED terminal;
+//	(d) anything else is uncertain (D3): base_advance on a probeable run, the
+//	    ADR-090 D7 residual with a WARN where the deployment cannot probe.
+//
+// base_advance in (d) is a conservative requirement, not evidence that a base
+// merge occurred. Every audit and forge read error is returned (D4). It
+// performs NO writes.
+func (s *Server) scenarioCommitObligation(ctx context.Context, runRow *run.Run, headSHA string) (string, error) {
+	runID := runRow.ID
+	edges, err := s.scenarioCommitEdges(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	own, reported := edges[headSHA]
+	if !reported {
+		return "", nil
+	}
+
+	writes, err := s.scenarioHeadWrites(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	newest, _ := newestScenarioHeadWrite(writes, own.seq)
+	if newest.cause != "" {
+		return newest.cause, nil
+	}
+
+	terminal, ok := reportedScenarioTerminal(edges, headSHA)
+	if ok && terminal == newest.head {
+		return "", nil
+	}
+	if ok {
+		vouchedTerminal, err := s.chainReportsHead(ctx, runID, CategoryOperatorCommitVouched, "vouched_sha", terminal)
+		if err != nil {
+			return "", err
+		}
+		if vouchedTerminal {
+			return s.classifyScenarioTerminalVouch(ctx, runRow, terminal, edges)
+		}
+	}
+
+	if why := s.mergeCandidateCannotProbeReason(runRow); why != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: a scenario commit's reported chain is unresolved and the deployment cannot probe; keeping the inability-to-probe residual (ADR-090 D7, ADR-142 D3)",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", headSHA),
+			slog.String("why", why))
+		return "", nil
+	}
+	return mergeCandidateCauseBaseAdvance, nil // ADR-142 D3: conservative requirement
+}
+
+// classifyScenarioTerminalVouch runs Amendment 1's probe and determinability
+// ladder on a scenario chain's operator-vouched terminal with ADR-142 D2's
+// isolated reference: the newest verified head by chain sequence excluding the
+// terminal and every head any scenario-corpus row reports. The exclusion is by
+// SHA, so no result at the current head, an intermediate or a forked scenario
+// commit can serve as the reference and remove the cause (D5). Rule 4's direct
+// live-head vouch keeps newestVerifiedHead unchanged.
+func (s *Server) classifyScenarioTerminalVouch(ctx context.Context, runRow *run.Run, terminal string, edges map[string]scenarioCommitEdge) (string, error) {
+	return s.vouchedHeadProbe(ctx, runRow, terminal, func(ctx context.Context) (string, error) {
+		return s.newestVerifiedHeadExcept(ctx, runRow.ID, func(sha string) bool {
+			_, scenarioHead := edges[sha]
+			return scenarioHead || sha == terminal
+		})
+	})
 }
 
 // chainReportsHead reports whether any of the run's entries in category carry

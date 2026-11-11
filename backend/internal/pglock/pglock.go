@@ -44,7 +44,9 @@
 // lock (pg_try_advisory_lock). A held lock releases both the slot and the
 // connection and the call re-tries every Poll, so a waiter holds nothing
 // between tries; the wait is bounded only by the caller's ctx, and a canceled
-// ctx returns its error with fn never run.
+// ctx returns its error with fn never run. A ctx that ends mid-query returns
+// its error even when pgx reports the interrupted write as a net timeout
+// (both are wrapped).
 //
 // # fn deadline, unlock, lapse
 //
@@ -65,6 +67,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"runtime"
 	"sync"
 	"time"
@@ -248,12 +251,31 @@ func attempt(ctx context.Context, pool *pgxpool.Pool, b *Budget, key int64, opts
 		// The lock may have been granted before the error: never return a
 		// possibly lock-holding session to the pool.
 		_ = conn.Conn().Close(context.Background())
-		return false, fmt.Errorf("%s: %w", opts.Name, err)
+		return false, fmt.Errorf("%s: %w", opts.Name, ctxTimeoutErr(ctx, err))
 	}
 	if !got {
 		return false, nil
 	}
 	return true, runLocked(ctx, conn, key, opts, fn)
+}
+
+// ctxTimeoutErr returns err, or, when ctx has ended and err is a net timeout
+// that does not already carry ctx's error, an error wrapping BOTH ctx.Err()
+// and err. pgconn reports a deadline that interrupts a read as the ctx error,
+// but one that interrupts a write (its context watcher sets the net.Conn
+// deadline) as "write failed: ... i/o timeout" (#5159), which
+// errors.Is(err, context.DeadlineExceeded) would miss. Both stay reachable
+// through errors.Is and errors.As. The guard keys on net.Error, and
+// context.DeadlineExceeded is itself one, so an error carrying a DeadlineExceeded
+// from a different ctx would also be relabelled with a canceled ctx's error;
+// this helper's one caller runs the query on the same ctx it passes here.
+func ctxTimeoutErr(ctx context.Context, err error) error {
+	cerr := ctx.Err()
+	var nerr net.Error
+	if cerr == nil || errors.Is(err, cerr) || !errors.As(err, &nerr) || !nerr.Timeout() {
+		return err
+	}
+	return fmt.Errorf("%w (%w)", cerr, err)
 }
 
 // runLocked runs fn on its bounded, marked context and unlocks in a defer, so

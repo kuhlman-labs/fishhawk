@@ -8904,6 +8904,8 @@ func TestBuild_ImplementReview_GateEvidence_RendersFixupSelfReportDivergence(t *
 		"CLAIMED the verify gate `passed`",
 		"committed-tree verify gate `failed`",
 		"ADVISORY signal",
+		// #5148: the claim now covers the checks the agent ran.
+		"can be an honest gap in those checks",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("divergence render missing %q:\n%s", w, got)
@@ -12043,6 +12045,8 @@ func TestBuild_Acceptance_OperatorAddedCriterion_RendersAdvisoryBlock(t *testing
 		"They did NOT pass plan review",
 		"MUST validate and report each one",
 		"does not condemn the change",
+		"can neither escalate nor certify the verdict",
+		"a pass on one of them does not validate it",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
@@ -17799,6 +17803,179 @@ func TestBuild_ConcurrentVerifyRule_StaysRepoAgnostic(t *testing.T) {
 		if strings.Contains(section, leaked) {
 			t.Errorf("the concurrent-verify block leaks the repo-specific token %q:\n%s", leaked, section)
 		}
+	}
+}
+
+// Run-context verify rule sentinels (#5148). Each is a load-bearing CLAUSE of
+// one arm of the "### Concurrent verify" block, not a heading: the configured
+// arm's prohibition and its "plan step is met by the gate" clause, and the
+// fail-closed arm's "no gate" statement and its instruction to run the full
+// verify. retiredSoftClause is the pre-#5148 wording that the configured arm
+// replaced; it must not come back.
+const (
+	runContextVerifySentinel    = "do NOT run the project's full verify gate yourself"
+	runContextSatisfiedSentinel = "satisfied by the runner's gate inside this run"
+	noGateSentinel              = "this stage has no runner verify gate configured"
+	noGateRunFullSentinel       = "run the project's full verify yourself before you finish"
+	retiredSoftClause           = "you do not need to run the full gate yourself"
+)
+
+// promptSection extracts the "### <heading>" section of a rendered prompt, up
+// to the next "### " heading (modelled on the repo-agnostic test's extraction).
+func promptSection(t *testing.T, got, heading string) string {
+	t.Helper()
+	start := strings.Index(got, heading)
+	if start < 0 {
+		t.Fatalf("section %q absent\n---\n%s", heading, got)
+	}
+	section := got[start:]
+	if end := strings.Index(section[len(heading):], "\n### "); end >= 0 {
+		section = section[:len(heading)+end]
+	}
+	return section
+}
+
+func assertConfiguredRunContextArm(t *testing.T, label, got string) {
+	t.Helper()
+	section := promptSection(t, got, "### Concurrent verify")
+	for _, want := range []string{runContextVerifySentinel, runContextSatisfiedSentinel, concurrentVerifyPollSentinel} {
+		if !strings.Contains(section, want) {
+			t.Errorf("%s: configured-gate concurrent-verify section missing %q\n---\n%s", label, want, section)
+		}
+	}
+	for _, unwanted := range []string{noGateSentinel, noGateRunFullSentinel} {
+		if strings.Contains(section, unwanted) {
+			t.Errorf("%s: configured-gate section carries the fail-closed clause %q\n---\n%s", label, unwanted, section)
+		}
+	}
+	for _, retired := range []string{retiredSoftClause, "nothing is skipped"} {
+		if strings.Contains(got, retired) {
+			t.Errorf("%s: prompt carries the retired clause %q", label, retired)
+		}
+	}
+	for _, leaked := range []string{"scripts/test", "FISHHAWK_VERIFY_PACKAGES", "FISHHAWK_VERIFY_LOCK_OWNER", "golangci-lint"} {
+		if strings.Contains(section, leaked) {
+			t.Errorf("%s: configured-gate section leaks the repo-specific token %q\n---\n%s", label, leaked, section)
+		}
+	}
+}
+
+func assertUnconfiguredRunContextArm(t *testing.T, label, got string) {
+	t.Helper()
+	section := promptSection(t, got, "### Concurrent verify")
+	for _, want := range []string{noGateSentinel, noGateRunFullSentinel, concurrentVerifyPollSentinel} {
+		if !strings.Contains(section, want) {
+			t.Errorf("%s: fail-closed concurrent-verify section missing %q\n---\n%s", label, want, section)
+		}
+	}
+	for _, unwanted := range []string{runContextVerifySentinel, runContextSatisfiedSentinel} {
+		if strings.Contains(section, unwanted) {
+			t.Errorf("%s: fail-closed section carries the configured-gate clause %q\n---\n%s", label, unwanted, section)
+		}
+	}
+}
+
+func fixupTriggerForRunContext(gate bool) Trigger {
+	return Trigger{
+		Repo:                 "o/r",
+		IssueNumber:          5148,
+		ApprovedPlan:         fixturePlan(),
+		FixupConcerns:        []FixupConcern{{Text: "[medium] tighten the bound check"}},
+		ImplementRunID:       "11112222333344445555666677778888",
+		ImplementStageID:     "99990000aaaabbbbccccddddeeeeffff",
+		VerifyGateConfigured: gate,
+	}
+}
+
+// TestBuild_Implement_RunContextVerifyRule_GateConfigured: the full implement
+// path, with and without a plan, renders the configured-gate arm (#5148).
+func TestBuild_Implement_RunContextVerifyRule_GateConfigured(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		trig Trigger
+	}{
+		{"with-plan", Trigger{Repo: "o/r", IssueNumber: 5148, ApprovedPlan: fixturePlan(), VerifyGateConfigured: true}},
+		{"no-plan", Trigger{Repo: "o/r", IssueNumber: 5148, VerifyGateConfigured: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Build("implement", tc.trig)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			assertConfiguredRunContextArm(t, "full implement "+tc.name, got)
+		})
+	}
+}
+
+// TestBuild_ImplementFixup_RunContextVerifyRule_GateConfigured: the slim fix-up
+// path, production-shaped (concerns and run/stage ids set), renders the
+// configured-gate arm.
+func TestBuild_ImplementFixup_RunContextVerifyRule_GateConfigured(t *testing.T) {
+	got, err := Build("implement", fixupTriggerForRunContext(true))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	assertConfiguredRunContextArm(t, "slim fix-up", got)
+}
+
+// TestBuild_Implement_RunContextVerifyRule_GateUnconfigured: with the zero
+// value the full implement path FAILS CLOSED to the run-the-full-verify arm.
+func TestBuild_Implement_RunContextVerifyRule_GateUnconfigured(t *testing.T) {
+	got, err := Build("implement", Trigger{Repo: "o/r", IssueNumber: 5148, ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	assertUnconfiguredRunContextArm(t, "full implement", got)
+}
+
+// TestBuild_ImplementFixup_RunContextVerifyRule_GateUnconfigured: the slim
+// fix-up path fails closed the same way.
+func TestBuild_ImplementFixup_RunContextVerifyRule_GateUnconfigured(t *testing.T) {
+	got, err := Build("implement", fixupTriggerForRunContext(false))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	assertUnconfiguredRunContextArm(t, "slim fix-up", got)
+}
+
+// TestBuild_ImplementFixup_SelfReport_GateConfigured_ProductionShaped: under a
+// configured gate the self-report asks for the checks the agent actually ran,
+// and nothing in the whole prompt tells the agent to run the full gate, which
+// would contradict the run-context rule.
+func TestBuild_ImplementFixup_SelfReport_GateConfigured_ProductionShaped(t *testing.T) {
+	got, err := Build("implement", fixupTriggerForRunContext(true))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	section := promptSection(t, got, "### Report your verify outcome")
+	for _, want := range []string{"the focused or scoped checks you actually ran", "The runner's gate remains the full verify of your change"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("configured self-report missing %q\n---\n%s", want, section)
+		}
+	}
+	for _, unwanted := range []string{"run the project's verify gate and report the outcome", noGateRunFullSentinel} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("configured fix-up prompt carries a full-gate instruction %q", unwanted)
+		}
+	}
+	if !strings.Contains(got, runContextVerifySentinel) {
+		t.Errorf("configured fix-up prompt lacks the run-context prohibition %q", runContextVerifySentinel)
+	}
+}
+
+// TestBuild_ImplementFixup_SelfReport_GateUnconfigured: with no gate the
+// self-report asks for the full verify the agent ran.
+func TestBuild_ImplementFixup_SelfReport_GateUnconfigured(t *testing.T) {
+	got, err := Build("implement", fixupTriggerForRunContext(false))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	section := promptSection(t, got, "### Report your verify outcome")
+	if !strings.Contains(section, "report the outcome of the full verify you ran") {
+		t.Errorf("fail-closed self-report missing the full-verify claim\n---\n%s", section)
+	}
+	if strings.Contains(section, "The runner's gate remains the full verify") {
+		t.Errorf("fail-closed self-report carries the configured-gate clause\n---\n%s", section)
 	}
 }
 

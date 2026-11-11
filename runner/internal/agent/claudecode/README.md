@@ -59,6 +59,14 @@ The arm sits **after** the thinking-block, external-API 5xx and session-resume-m
 
 The peer sentinel `agent.ErrAgentQuotaUnavailable` does **not** wrap `ErrAgentFailed`; `classifyErr` in `runner/cmd/fishhawk-runner/main.go` maps it to the `agent_quota_unavailable` err_class, but `Result.FailureCategory` stays `"A"`. It is **not retried in-driver** (a retry against an unreset cap fails identically), and the stable failure-reason phrase `could not obtain model quota` is what the backend's `implementFailedNextActions` (`backend/cmd/fishhawk-mcp/next_actions.go`) reads to steer the operator to wait for the cap to reset rather than burn retry budget — a best-effort string contract across the two go.work modules (same #1548 limitation as external-API).
 
+## Result wins over a lingering CLI (#5147)
+
+A CLI that emits its terminal `result.success` but never exits (a lingering background task keeps it alive) used to run to the stage deadline and classify `agent timeout`, losing finished work. The first non-error terminal success (`isTerminalSuccess`: kind `result.success` without `is_error: true`) arms a grace window (`defaultResultExitGrace`, 30s; `Invoker.ResultExitGrace` is the test seam). When it expires, the runner kills the CLI's process group. The terminal switch then settles on the captured result (`case settleOnResult:`, after the budget and loop arms, before the deadline arm) only when OUR kill ended the process: the grace kill fired or the deadline did, AND `Wait` reports an exit by signal or a clean exit. A CLI that exits non-zero on its own after a success result keeps the `waitErr` arms, and a deadline with no captured success, or with an `is_error: true` result, stays `ErrTimeout`. A settle appends an `agent_result_exit_grace_kill` event (`cause` `grace_expired` or `deadline`, `grace_seconds`). The timer is stopped as soon as the scan loop ends, before the drains and `Wait`, so it never signals a reaped pid. Settling changes classification only: the committed-tree verify and policy gates still run.
+
+The CLI runs in its own process group (`Setpgid`), and `cmd.Cancel` (the deadline) plus the grace, loop and budget kills all go through `killProcessTree` (a group `SIGKILL`, falling back to the direct child), so a grandchild holding stdout cannot keep the scan loop or `Wait` blocked. A background task that detaches into its own session is not reached; the #3663 orphan sweep (`runner/internal/procsweep`) is the backstop.
+
+Tests: `TestInvoke_ResultSuccessThenHang_GraceKillSettlesOnResult`, `TestInvoke_ResultSuccessThenHang_DeadlineSettlesOnResult`, `TestInvoke_ResultSuccessIsErrorThenHang_StaysTimeout`, `TestInvoke_ResultSuccessThenHang_KillsProcessGroup`, `TestInvoke_ResultSuccessThenSelfExit1_TakesWaitErrArm`, `TestInvoke_BudgetKill_KillsProcessGroup`, `TestIsTerminalSuccess`.
+
 ## Out-of-tree write detection (#611)
 
 `claudecode.go` surfaces (does not block) agent writes outside the working tree.

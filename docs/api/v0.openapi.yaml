@@ -3064,10 +3064,12 @@ components:
         dispatch_claim_orphan:
           allOf: [{ $ref: '#/components/schemas/MergeQueueDispatchClaimOrphan' }]
           description: |
-            A LIVE entry's crash-left queue dispatch claim (ADR-109 A1, #4711),
-            the label the merge-queue read's `dispatch_claim.orphan` carries;
-            `note` then adds a constant-shape clause (the conditional release
-            for `orphaned`, the operator re-arm for `orphaned_by_restart`).
+            A LIVE entry's crash-left queue dispatch claim (ADR-109 A1/A2,
+            #4711/#4862), the label the merge-queue read's
+            `dispatch_claim.orphan` carries; `note` then adds a constant-shape
+            clause (for `orphaned`, the resume's release before the fold on a
+            `merging` entry, else the conditional release; the operator re-arm
+            for `orphaned_by_restart`).
             Omitted for a held entry, with no or an unlabelled claim, and when
             the claim or clock read fails (the read still answers 200).
 
@@ -4098,17 +4100,21 @@ components:
       enum: [orphaned, orphaned_by_restart]
       description: |
         A DERIVED label on a crash-left QUEUE-path merge-dispatch claim (ADR-109
-        Amendment A1, #4711); never stored, and inline or delegated claims are
-        never labelled.
+        Amendments A1/A2, #4711/#4862); never stored, and inline or delegated
+        claims are never labelled.
         `orphaned` — the claim is still `dispatched` and its `claimed_at` is
         older than the crash-left window (150 s), judged on the DATABASE clock;
-        omitted when that clock cannot be read. The next merge-on-pass decision
-        whose forge-approval fold APPROVES releases it (a
-        `merge_dispatch_settled` row, outcome `released`, reason
-        `released_orphaned_claim`) and merges through the ordinary path. While
-        the fold does not approve, the pull request still needs a qualifying
-        approval and the claim holds the head until it arrives: a claimed
-        entry never yields.
+        omitted when that clock cannot be read. On a `merging` entry the next
+        restart resume releases it when the pull request reads open and
+        unmerged, BEFORE the forge-approval fold (a `merge_dispatch_settled`
+        row, outcome `released`, reason `released_orphaned_claim`); ordinary
+        merge-on-pass then waits, yields or merges with no claim standing. A
+        claim on any other phase (left before A2) still follows the
+        conditional step-8 release: the next merge-on-pass decision whose fold
+        APPROVES releases it (the same row) and merges through the ordinary
+        path; while that fold does not approve, the pull request still needs a
+        qualifying approval and the claim holds the head until it arrives: a
+        claimed entry never yields.
         `orphaned_by_restart` — the restart resume could not read the pull
         request and moved the claim to `dispatch_failed`; it holds the line for
         the operator re-arm (confirm on the forge the pull request did not
@@ -6331,21 +6337,29 @@ components:
           description: True when the tracker was read this poll.
         skipped_reason:
           type: string
-          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates]
+          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates, insufficient_scope]
           description: |
             Why no read happened: another refresh of this campaign is in flight;
             one finished (successfully or on a tracker error) under 30 s ago;
             the caller's account does not own the campaign; the caller cannot
-            see the repo; or no item is unstarted.
+            see the repo; no item is unstarted; or the caller lacks
+            `write:campaigns` (`insufficient_scope`: a read-scoped token, any
+            run-bound `mcp:run` token even one holding the scope, or an
+            anonymous caller). An `insufficient_scope` poll makes no tracker
+            read and no write, serves the persisted DAG, and neither stamps the
+            30 s interval nor reads, carries or clears an unrecorded hold.
         committed:
           type: boolean
           description: |
             False when observed additions could NOT be persisted (audit row or
             write failure). The additions are then HELD in `items`/`rollup`/
             `next_action` and listed under `added`, and `warnings` names the
-            cause. Every later status read (one the 30 s interval skips, or one
-            whose tracker read fails) keeps that hold and warning until a
-            refresh records the additions; the hold is process-local.
+            cause. Every later status read by a caller the refresh admits (one
+            the 30 s interval skips, or one whose tracker read fails) keeps that
+            hold and warning until a refresh records the additions; the hold is
+            process-local. A caller the refresh does not admit (for example one
+            without `write:campaigns`) is served the persisted DAG and carries
+            no hold.
         added:
           type: array
           items:
@@ -8165,19 +8179,30 @@ components:
             the rows with a total precedence ladder: any `failed` row →
             `failed`; else any `undecidable` row → `undecidable` (including an
             all-undecidable set, where nothing was verified); else if every
-            non-retired row is `skipped`, or no rows were itemized at all, or
-            every itemized row was retired →
+            laddered row (neither retired nor operator-added) is `skipped`, or
+            no rows were itemized at all, or every itemized row was retired,
+            or every itemized row was operator-added or retired →
             `not_validated` (bases `all-skip-observed` / `no-rows-observed` /
-            `all-retired-observed`, #3397 — the validator ran but verified
-            nothing); else `passed`. The
+            `all-retired-observed`, #3397; `added-only-observed`, #3682 — the
+            validator ran but verified no reviewed criterion in force); else
+            `passed`. An operator-added row never feeds the ladder, so it
+            cannot move a shipped `passed`. The
             recorded verdict is resolved severity-monotone as
             `max(shipped, derived)` over `passed < not_validated < undecidable <
             failed`, so a shipped `failed` is never softened (a shipped `failed`
             with an all-skip/empty set stays `failed`) and a row set containing
-            an undecidable row can never be recorded as `passed`. When the
+            an undecidable row can never be recorded as `passed`. The one
+            bounded exception (#3682 R1): a shipped `failed` with
+            `failure_mode` `assertion_fail` whose itemized rows are all
+            operator-added or retired, with at least one added row, at least
+            one failed row, and every reviewed criterion in force itemized,
+            records `not_validated` (`added-only-observed`) and routes no
+            triage. When the
             recorded verdict differs from the shipped one, the
             `acceptance_outcome_recorded` payload carries `verdict_reported`
-            with what the agent said.
+            with what the agent said. It also carries `added_criteria_failed`
+            (#3682) naming every operator-added id reported `failed`, whatever
+            the recorded verdict, and omits it when none failed.
         failure_mode:
           type: string
           enum: [error, assertion_fail]
@@ -8481,7 +8506,8 @@ components:
             #2512 (a shipped `passed` carrying an undecidable/failed row records
             `undecidable`/`failed`) and #3091 (an unbound head clamps to
             `undecidable`); #3397 adds `not_validated` (a shipped `passed` whose
-            non-retired rows are all skipped, or that itemized no rows). The
+            laddered rows are all skipped, or that itemized no rows, or, #3682,
+            only operator-added or retired rows). The
             original #2581 case is one instance: a `failed` verdict NEUTRALIZED
             because every failure named an acceptance criterion the operator
             RETIRED at the plan-approval gate (`amend_acceptance_criteria`)
@@ -8490,7 +8516,8 @@ components:
             untouched; the governance `acceptance_outcome_recorded` entry records
             this value as its `verdict` alongside `verdict_reported` (and, per
             origin, `downgrade_basis` + `retired_criterion_ids`,
-            `undecidable_basis`, or `basis`). Omitted when the recorded verdict
+            `undecidable_basis`, or `basis`; `added_criteria_failed` is
+            additive and descriptive). Omitted when the recorded verdict
             IS the shipped one — additive either way, since the runner decodes
             this body without `DisallowUnknownFields`.
             On an IDEMPOTENT replay (`idempotent: true`) this field ECHOES the
@@ -16213,7 +16240,9 @@ paths:
         re-invoke the merge; without the seam, re-invoke once the entry's pass
         is green. An INELIGIBLE or undeterminable run keeps
         the 409 above, byte-for-byte, plus the additive
-        `details.merge_queue_ineligible` reason codes, with nothing written.
+        `details.merge_queue_ineligible` reason codes, with no verdict, intent
+        or queue row written (the eligibility predicate's concern leg may
+        idempotently import child-slice concerns into the parent ledger).
         `merge_candidate_verify_failed` and `merge_candidate_check_failed`
         are never enqueued. Eligibility also refuses `changes_requested` (a
         reviewer's latest non-comment review is CHANGES_REQUESTED), and the
@@ -16586,8 +16615,9 @@ paths:
             `merge_queue_ineligible` array of reason codes — `not_approved`,
             `review_pending`, `review_coverage_incomplete`,
             `acceptance_not_eligible`, `acceptance_stale`, `checks_not_green`,
-            `checks_red`, `blocking_concern_open`, `undeterminable` (a read
-            failed: fail closed) — and nothing is written.
+            `checks_red`, `blocking_concern_open`, `undeterminable` (a read or
+            the concern leg's child-slice reconcile failed: fail closed) — and
+            no verdict, intent or queue row is written.
             (12) The merge overlap guard (#4119) refused, checked after case
             (4) and before case (7a), with NO new verdict row, nothing
             dispatched or enqueued. `overlapping_implement_in_flight`:
@@ -18696,6 +18726,19 @@ paths:
         `stage_concurrency_queued` (once per queue episode) and
         `stage_concurrency_admitted` (every grouped admission).
 
+        **Superseded merge-candidate pass (#4811).** An `implement` stage in
+        the `pending` or `awaiting_host_dispatch` arm whose live verify-only
+        pass (ADR-090) was triggered for a head that a recorded head write
+        sequenced after the trigger has since replaced is not spawned: the
+        pass is settled `not_executed` (pinned to the checked trigger, so a
+        replacement trigger appended since stays live) and the stage is
+        restored to its pre-pass gate, then the call answers 409
+        `dispatch_not_admissible` with `details.reason`
+        `merge_candidate_pass_superseded`. It fires after the state switch
+        and BEFORE the host memory hold and the CAS, so it never takes a
+        slot. A malformed newest trigger reads as no pass and the stage is
+        admitted. The idempotent already-`dispatched` arm is not checked.
+
         **Interim host memory hold (E85.11 / #4330).** Optional and default
         off; INTERIM, absorbed later by ADR-100's adaptive concurrency
         controller. With `fishhawkd serve --enable-ops-monitor
@@ -18816,6 +18859,23 @@ paths:
               `earlier_stage_failed`, `details.failed_stage_id`,
               `details.failed_stage_type` and `details.failure_category`,
               BEFORE the state CAS; retry or cancel the failed stage first.
+              Also the superseded merge-candidate pass refusal (#4811): an
+              `implement` stage in either admissible arm whose live
+              verify-only pass was triggered for a head the run has since
+              moved past is refused with `details.reason`
+              `merge_candidate_pass_superseded`, plus `details.stage_id`,
+              `details.trigger_sequence`, `details.expected_head_sha`,
+              `details.superseding_head_sha`, `details.superseding_category`,
+              `details.superseding_sequence` and `details.settled`. The stage
+              is SETTLED, not left in its state: when `settled` is `true` the
+              pass is recorded `not_executed` and the stage is back at its
+              pre-pass gate, so nothing is left to re-dispatch for that head.
+              When `settled` is `false`, `details.settle_step` names where the
+              settle stopped (`record_failed` leaves the stage and its trigger
+              untouched; `restore_failed` leaves it `failed`), and
+              `details.left_state` names the stage's state on
+              `before_restore_failed` (recover a stage left `running` or
+              `dispatched` with `fishhawk_reap_stage`). Never spawn on it.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not
@@ -18895,10 +18955,15 @@ paths:
               carries `campaign_id`, `hotfix_item_id`, `hotfix_issue_ref`,
               `expires_at`, `stage_id` and `item_id`. An ancestry that cannot be
               resolved (a missing parent, a cycle, or the depth bound) could
-              belong to any campaign, so while ANY campaign holds dispatches
-              (due holds are released first) it is held FAIL-CLOSED with
-              `details.reason: campaign_ancestry_unresolved` and
-              `details.unresolved`; with no hold anywhere it is admitted.
+              belong to any campaign the stage can see, so, on the stage's
+              repository, while a campaign in the stage's own account or a
+              legacy untenanted (NULL-account) campaign holds dispatches (due
+              holds in that scope are released first) it is held FAIL-CLOSED
+              with `details.reason: campaign_ancestry_unresolved` and
+              `details.unresolved`, and admitted when none does. A stage with
+              no account sees only untenanted campaigns' holds; a hold on a
+              campaign stamped with another account, or on another
+              repository, neither holds it nor is released by it (#4586).
               Expedited items and their decomposed
               children, non-implement stages, runs in no campaign and the
               idempotent already-`dispatched` arm are never held. A
@@ -18924,8 +18989,11 @@ paths:
             acceptance gate could not list the parent's decomposition children
             or read its `slices_integrated` history (#4080), or the campaign
             dispatch hold (#4234) could not resolve the stage's campaign
-            membership, its campaign, or the hold.
-            Retryable: all five fail closed on a read error rather than
+            membership, its campaign, or the hold, or the superseded
+            merge-candidate pass refusal (#4811) could not list the run's
+            stages or read its merge-candidate chain, including the settle's
+            own trigger read (the stage is untouched and nothing is written).
+            Retryable: all six fail closed on a read error rather than
             admitting out of order, on an unverified base, behind an
             unchecked deploy, or onto an unproven consolidated tree, and
             commit no state. `internal_error` — the state
@@ -23191,16 +23259,22 @@ paths:
         Dependency refresh (E86.47 / #4358): after the reconcile, the read
         re-reads tracker dependencies for unstarted items and ADDS newly
         observed edges (never removes one) — see `CampaignDependencyRefresh`.
-        It runs only for a caller whose account owns the campaign (or it is
-        untenanted) and who can see the repo, at most once per 30 s per
-        campaign (single-flight), and never fails the read: a tracker error or
-        an unrecordable change is reported in `dependency_refresh.warnings`,
-        and an observed blocker that could not be persisted still HOLDS its
-        item in this and every later status read until a refresh records it.
+        It runs only for a caller holding `write:campaigns` (a cookie session
+        passes, as on the write routes; a run-bound `mcp:run` token never does,
+        even one holding the scope; a caller without it gets
+        `dependency_refresh.skipped_reason: insufficient_scope` and the
+        persisted DAG, with no tracker read and no write), whose account owns
+        the campaign (or it is untenanted) and who can see the repo, at most
+        once per 30 s per campaign (single-flight), and never fails the read: a
+        tracker error or an unrecordable change is reported in
+        `dependency_refresh.warnings`, and an observed blocker that could not be
+        persisted still HOLDS its item in this and every later status read by a
+        caller the refresh admits until a refresh records it.
 
         Dispatch hold (E83.100 / #4234): an active hotfix hold is reported as
-        `dispatch_hold`. For a caller passing the same ownership + visibility
-        predicate, a DUE hold (hotfix item or its run terminal, or past
+        `dispatch_hold`. For a caller whose account owns the campaign (or it is
+        untenanted) and who can see the repo (that access predicate alone; the
+        refresh's `write:campaigns` gate does not apply), a DUE hold (hotfix item or its run terminal, or past
         `expires_at`) is released first and recorded as a system-actor
         `campaign_hold_released` row with `trigger: status_read`; any other
         caller never triggers a release. Expedited items carry `expedited`,
@@ -25399,17 +25473,25 @@ paths:
                   acceptance_expected_head_sha:
                     type: string
                     description: |
-                      The run's merge-candidate identity — the newest
-                      `head_sha` across the run's reported-head ledger
-                      entries (`pull_request_opened` / `child_pushed` /
-                      `fixup_pushed` / `acceptance_scenarios_pushed`, the same
-                      ADR-035 lineage source as
-                      `fixup_expected_head_sha`), falling back to the newest
-                      `integration_commit_recorded` `merge_sha` on the run's
-                      own chain when that ledger is empty (#3091), which is
-                      how a DECOMPOSED PARENT — whose children report their
-                      pushes on their own chains — resolves its consolidated
-                      branch tip. Served ONLY on acceptance stages
+                      The run's merge-candidate identity, resolved by
+                      acceptanceHeadAsOf (#4874): the seed is the
+                      highest-chain-sequence row across the run's
+                      reported-head ledger (`pull_request_opened` /
+                      `child_pushed` / `fixup_pushed` /
+                      `acceptance_scenarios_pushed` /
+                      `conflict_resolution_pushed`) and its own
+                      `integration_commit_recorded` `merge_sha` rows, with
+                      no timestamp read (a reported row wins only an
+                      equal-sequence tie), so a DECOMPOSED PARENT, whose
+                      children report their pushes on their own chains,
+                      resolves its consolidated branch tip. The seed then
+                      advances through each CLEAN `branch_rebased` row
+                      recorded after it (a reset to a head on that walked
+                      chain moves there), so after a Fishhawk rebase the
+                      field names the merge commit. A read error on either
+                      seed set or on the base-merge rows fails closed.
+                      `fixup_expected_head_sha` keeps its own timestamp
+                      seed and is unchanged. Served ONLY on acceptance stages
                       (E31.18 / #1569). The runner's pre-spawn
                       target-identity gate compares the declared acceptance
                       target's `/healthz` `git_sha` against it before
@@ -25439,7 +25521,11 @@ paths:
                     description: |
                       The run branch the acceptance runner pushes its
                       scenario-corpus commit to (E72.4 / #3328): the branch of
-                      the run's newest reported-head ledger entry. Served ONLY
+                      the run's newest reported-head ledger entry or, for a
+                      decomposed parent with no ledger branch but an
+                      `integration_commit_recorded` row, the server-derived
+                      `fishhawk/run-<first 8 of the run id>-consolidated`
+                      (#4874), never taken from a report. Served ONLY
                       on acceptance stages; absent when unresolvable, in which
                       case the runner skips persistence
                       (`persist_skipped` / `no_run_branch`) and reports
@@ -26032,14 +26118,14 @@ paths:
                     description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
                   acceptance_expected_head_sha:
                     type: string
-                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
+                    description: The run's merge-candidate identity resolved by acceptanceHeadAsOf (#4874) — the highest-chain-sequence row across the run's reported-head ledger and its own `integration_commit_recorded` `merge_sha` rows (no timestamp read; a reported row wins only an equal-sequence tie), advanced through each later CLEAN `branch_rebased` row, so after a Fishhawk rebase it names the merge commit; a read error fails closed, and `fixup_expected_head_sha` keeps its own timestamp seed; served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
                   forge_writes:
                     type: string
                     enum: [deny]
                     description: The backend's forge-write policy for this stage (E72.13 / #3500) — `deny` when this fishhawkd is in dev mode (a dev-only surface is mounted, `scripts/dev preview`); the runner's pre-spawn forge-writes gate refuses the stage on it (`runner_failed` reason `forge_writes_denied`, category C) before any agent spawn, push or pull-request open. Stamped on every stage type; omitted on a production daemon.
                   acceptance_run_branch:
                     type: string
-                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328); acceptance stages only, absent when unresolvable.
+                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328) — the newest reported-head ledger entry's branch or, for a decomposed parent with only `integration_commit_recorded` rows, the server-derived `fishhawk/run-<first 8>-consolidated` (#4874); acceptance stages only, absent when unresolvable.
                   acceptance_pull_request_number:
                     type: integer
                     description: The run's PR number from its newest `pull_request_opened` ledger entry, recorded as each persisted scenario's `origin.pr` (E72.4 / #3328); acceptance stages only, absent (0) when unresolvable — never the issue number.
@@ -26778,9 +26864,20 @@ paths:
                     served in `acceptance_criteria` and
                     `acceptance_criteria_ids`, and rendered under an
                     operator-authored block telling the validator it did NOT
-                    pass plan review. It is advisory: a failed verdict naming
-                    ONLY operator-added criteria is recorded `passed` with
-                    `downgrade_basis` `added_criteria_only`. Refused `400
+                    pass plan review. It is advisory: it can neither escalate
+                    nor certify a verdict. An added row never feeds the
+                    precedence ladder, so it cannot move a shipped `passed`
+                    (#3682). Residual shipped-`failed` shapes: a failed verdict
+                    naming ONLY operator-added criteria is recorded `passed`
+                    with `downgrade_basis` `added_criteria_only` when A1-A4
+                    hold; it stays `failed` on `failure_mode` `error` (A1) or a
+                    surviving blocking reviewed row reported `skipped` without
+                    a plan basis, or `undecidable` (A4); when only
+                    added/retired rows were itemized (A3) it records
+                    `not_validated` (`added-only-observed`) only for an
+                    `assertion_fail` with a failed row and every reviewed
+                    criterion in force itemized, else `failed` + triage. A
+                    failed live reviewed row always records `failed`. Refused `400
                     validation_failed` with `details.rule` one of
                     `criterion_id_exists`, `invalid_criterion_id`,
                     `statement_required`, `reason_required`, `duplicate_id`,
@@ -27999,8 +28096,9 @@ paths:
         settles the stage from the plan alone, so it produces no per-criterion
         rows (bases `empty_criteria` / `all_skip_with_basis`). The ship endpoint
         can ALSO record `not_validated` POST-RUN (#3397, bases
-        `all-skip-observed` / `no-rows-observed` / `all-retired-observed`) when a
-        validator ran but verified nothing. Both origins stay disjoint from the `undecidable`
+        `all-skip-observed` / `no-rows-observed` / `all-retired-observed`; #3682
+        `added-only-observed`) when a validator ran but verified no reviewed
+        criterion in force. Both origins stay disjoint from the `undecidable`
         verdict (#2512) and its `acceptance_undecidable` gate state by a single
         severity ladder (`passed < not_validated < undecidable < failed`): a run
         with any undecidable row records `undecidable`. All are merge-eligible;

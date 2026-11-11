@@ -9641,12 +9641,15 @@ func TestGetStagePrompt_Acceptance_NoEgressSpec_HostsOmitted(t *testing.T) {
 func TestGetStagePrompt_Acceptance_ServesExpectedHeadSHA(t *testing.T) {
 	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
 	au := s.cfg.AuditRepo.(*auditFake)
-	au.seeded = append(au.seeded,
-		makeReportedHeadEntry(runID, acceptanceStageID, "pull_request_opened",
-			"aaaa000000000000000000000000000000000000", time.Now().Add(-2*time.Hour)),
-		makeReportedHeadEntry(runID, acceptanceStageID, "fixup_pushed",
-			"bbbb111111111111111111111111111111111111", time.Now().Add(-1*time.Hour)),
-	)
+	// Explicit sequences in production append order (#4874): the acceptance
+	// head seeds by chain sequence, so two sequence-0 rows would tie.
+	prOpened := makeReportedHeadEntry(runID, acceptanceStageID, "pull_request_opened",
+		"aaaa000000000000000000000000000000000000", time.Now().Add(-2*time.Hour))
+	prOpened.Sequence = 1
+	fixup := makeReportedHeadEntry(runID, acceptanceStageID, "fixup_pushed",
+		"bbbb111111111111111111111111111111111111", time.Now().Add(-1*time.Hour))
+	fixup.Sequence = 2
+	au.seeded = append(au.seeded, prOpened, fixup)
 	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
@@ -14304,22 +14307,26 @@ func TestResolveAcceptanceExpectedHeadSHA_ConsolidatedFanIn(t *testing.T) {
 	}
 }
 
-// TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins pins that the #3091
-// fallback is strictly SUBORDINATE: a run carrying BOTH a reported head and an
-// integration entry resolves the REPORTED head, so every non-decomposed run's
-// value is byte-identical to before the change.
+// TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins pins that a NEWER
+// reported head wins: a run carrying BOTH a reported head at sequence 100 and
+// an integration entry at sequence 99 resolves the REPORTED head. Since #4874
+// the seed is the newest by chain sequence across both sets, so the inverse —
+// a late integration row newer than a reported head wins — is pinned by
+// TestGetStagePrompt_Acceptance_LateIntegrationBeatsOlderReportedHead.
 func TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	const reported = "abc1234def567890abc1234def567890abc12345"
 	const merge = "2222222aaaabbbbccccddddeeeeffff000022223"
+	reportedRow := makeReportedHeadEntry(runID, stageID, "pull_request_opened", reported, time.Now().UTC())
+	reportedRow.Sequence = 100
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
 		runID: {
-			makeReportedHeadEntry(runID, stageID, "pull_request_opened", reported, time.Now().UTC()),
+			reportedRow,
 			makeIntegrationCommitEntry(runID, 99, merge),
 		},
 	}}})
 	if got := s.resolveAcceptanceExpectedHeadSHA(context.Background(), runID, stageID); got != reported {
-		t.Errorf("= %q, want the REPORTED head %q — the fan-in fallback must never override it", got, reported)
+		t.Errorf("= %q, want the NEWER reported head %q", got, reported)
 	}
 }
 
@@ -17936,4 +17943,337 @@ func TestReviewObligation_RepeatedResumeFailures_RetainThroughBackend(t *testing
 	if got := f.discardReasons(t); len(got) != 0 {
 		t.Errorf("no resume here was declined, got %v", got)
 	}
+}
+
+// TestGetStagePrompt_Acceptance_LateIntegrationBeatsOlderReportedHead reads the
+// REST prompt (#4874): a reported head at sequence 20 and a LATER integration
+// row at 30 serve the integration head; a reported head at 40 serves itself.
+func TestGetStagePrompt_Acceptance_LateIntegrationBeatsOlderReportedHead(t *testing.T) {
+	const reported = "c000000000000000000000000000000000000020"
+	const lateMerge = "2f00000000000000000000000000000000000030"
+	const newerReported = "c000000000000000000000000000000000000040"
+	for _, tc := range []struct {
+		name string
+		rows func(runID, stageID uuid.UUID) []*audit.Entry
+		want string
+	}{
+		{"a late integration row beats an older reported head", func(runID, stageID uuid.UUID) []*audit.Entry {
+			r := makeReportedHeadEntry(runID, stageID, "acceptance_scenarios_pushed", reported, time.Now().Add(time.Hour))
+			r.Sequence = 20
+			return []*audit.Entry{r, makeIntegrationCommitEntry(runID, 30, lateMerge)}
+		}, lateMerge},
+		{"a newer reported head beats the integration row", func(runID, stageID uuid.UUID) []*audit.Entry {
+			r := makeReportedHeadEntry(runID, stageID, "acceptance_scenarios_pushed", newerReported, time.Now().Add(-time.Hour))
+			r.Sequence = 40
+			return []*audit.Entry{makeIntegrationCommitEntry(runID, 30, lateMerge), r}
+		}, newerReported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+			au := s.cfg.AuditRepo.(*auditFake)
+			au.seeded = append(au.seeded, tc.rows(runID, acceptanceStageID)...)
+			w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if resp.AcceptanceExpectedHeadSHA != tc.want {
+				t.Errorf("acceptance_expected_head_sha = %q, want %q", resp.AcceptanceExpectedHeadSHA, tc.want)
+			}
+		})
+	}
+}
+
+// branchPRRunRepo wraps promptRunRepo, counting GetRun calls and optionally
+// answering (nil, nil) or a transport error, so the PR-number fallback's
+// lookup scope and nil-safety are observable.
+type branchPRRunRepo struct {
+	*promptRunRepo
+	calls     int
+	answerNil bool
+	err       error
+}
+
+func (r *branchPRRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.answerNil {
+		return nil, nil
+	}
+	return r.promptRunRepo.GetRun(ctx, id)
+}
+
+// TestResolveAcceptanceRunBranchAndPR_DecomposedParent pins the decomposed
+// parent's consolidated branch and PR number (#4874), the lookup scope and
+// every failure answer. Each call goes through a recover helper so a nil
+// dereference is a reached assertion, not a dead test binary.
+func TestResolveAcceptanceRunBranchAndPR_DecomposedParent(t *testing.T) {
+	const ledgerBranch = "fishhawk/run-ledger01"
+	prURL := func(n int) *string { u := fmt.Sprintf("https://github.com/acme/widgets/pull/%d", n); return &u }
+	integration := func(runID uuid.UUID) *audit.Entry {
+		return makeIntegrationCommitEntry(runID, 10, "2f00000000000000000000000000000000000010")
+	}
+	ledgerRow := func(runID uuid.UUID, cat string, seq int64, fields map[string]any) *audit.Entry {
+		p, _ := json.Marshal(fields)
+		rid := runID
+		return &audit.Entry{ID: uuid.New(), RunID: &rid, Category: cat, Sequence: seq, Timestamp: time.Now().UTC(), Payload: p}
+	}
+	type fixture struct {
+		rows      func(runID uuid.UUID) []*audit.Entry
+		noRunRepo bool
+		runURL    *string
+		missing   bool // run absent -> run.ErrNotFound
+		answerNil bool
+		getErr    error
+		intErr    bool
+	}
+	cases := []struct {
+		name       string
+		fx         fixture
+		wantBranch func(runID uuid.UUID) string
+		wantPR     int
+		wantCalls  int
+		wantWarn   bool
+	}{
+		{"fan-in rows and a real PR URL", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }, runURL: prURL(4242)},
+			orchestrator.ConsolidatedBranch, 4242, 1, false},
+		{"an integration read error omits both", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }, runURL: prURL(4242), intErr: true},
+			func(uuid.UUID) string { return "" }, 0, 0, true},
+		{"no ledger and no fan-in rows never reach RunRepo", fixture{rows: func(uuid.UUID) []*audit.Entry { return nil }, runURL: prURL(4242)},
+			func(uuid.UUID) string { return "" }, 0, 0, false},
+		{"fan-in rows with no RunRepo", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }, noRunRepo: true},
+			func(uuid.UUID) string { return "" }, 0, 0, true},
+		{"fan-in rows with a missing run", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }, missing: true},
+			func(uuid.UUID) string { return "" }, 0, 1, true},
+		{"fan-in rows with GetRun answering (nil, nil)", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }, answerNil: true},
+			func(uuid.UUID) string { return "" }, 0, 1, true},
+		{"fan-in rows with a GetRun transport error", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }, getErr: errors.New("run store down")},
+			func(uuid.UUID) string { return "" }, 0, 1, true},
+		{"fan-in rows and a run with no URL (the fixture's shape)", fixture{rows: func(r uuid.UUID) []*audit.Entry { return []*audit.Entry{integration(r)} }},
+			orchestrator.ConsolidatedBranch, 0, 1, false},
+		{"ledger branch and ledger PR never reach RunRepo", fixture{rows: func(r uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{ledgerRow(r, "pull_request_opened", 5, map[string]any{"head_sha": "h", "branch": ledgerBranch, "pr_number": 7})}
+		}, runURL: prURL(4242)},
+			func(uuid.UUID) string { return ledgerBranch }, 7, 0, false},
+		{"ledger branch and ledger PR with no RunRepo", fixture{rows: func(r uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{ledgerRow(r, "pull_request_opened", 5, map[string]any{"head_sha": "h", "branch": ledgerBranch, "pr_number": 7})}
+		}, noRunRepo: true},
+			func(uuid.UUID) string { return ledgerBranch }, 7, 0, false},
+		{"ledger branch with no PR row reads the run URL (parent after a fix-up)", fixture{rows: func(r uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{ledgerRow(r, "fixup_pushed", 5, map[string]any{"head_sha": "h", "branch": ledgerBranch})}
+		}, runURL: prURL(4242)},
+			func(uuid.UUID) string { return ledgerBranch }, 4242, 1, false},
+		{"ledger branch with no PR row and no RunRepo keeps today's answer", fixture{rows: func(r uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{ledgerRow(r, "fixup_pushed", 5, map[string]any{"head_sha": "h", "branch": ledgerBranch})}
+		}, noRunRepo: true},
+			func(uuid.UUID) string { return ledgerBranch }, 0, 0, true},
+		{"ledger branch with no PR row and a read error keeps today's answer", fixture{rows: func(r uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{ledgerRow(r, "fixup_pushed", 5, map[string]any{"head_sha": "h", "branch": ledgerBranch})}
+		}, getErr: errors.New("run store down")},
+			func(uuid.UUID) string { return ledgerBranch }, 0, 1, true},
+		{"ledger branch with no PR row and (nil, nil) keeps today's answer", fixture{rows: func(r uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{ledgerRow(r, "fixup_pushed", 5, map[string]any{"head_sha": "h", "branch": ledgerBranch})}
+		}, answerNil: true},
+			func(uuid.UUID) string { return ledgerBranch }, 0, 1, true},
+	}
+	const warnMsg = "prompt: resolve acceptance pull request number from the run failed"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			au := newAuditFake()
+			au.seeded = append(au.seeded, tc.fx.rows(runID)...)
+			if tc.fx.intErr {
+				au.listByCategoryErrCategory = lineageIntegrationCommitCategory
+			}
+			inner := newPromptRunRepo()
+			if !tc.fx.missing {
+				inner.getRuns[runID] = &run.Run{ID: runID, PullRequestURL: tc.fx.runURL}
+			}
+			rr := &branchPRRunRepo{promptRunRepo: inner, answerNil: tc.fx.answerNil, err: tc.fx.getErr}
+			cfg := Config{Addr: "127.0.0.1:0", AuditRepo: au}
+			if !tc.fx.noRunRepo {
+				cfg.RunRepo = rr
+			}
+			s := New(cfg)
+			buf := captureLogger(s)
+			branch, pr, panicked := func() (b string, n int, p any) {
+				defer func() { p = recover() }()
+				b, n = s.resolveAcceptanceRunBranchAndPR(context.Background(), runID, stageID)
+				return b, n, nil
+			}()
+			if panicked != nil {
+				t.Fatalf("resolveAcceptanceRunBranchAndPR panicked (a nil dereference reached): %v", panicked)
+			}
+			if want := tc.wantBranch(runID); branch != want || pr != tc.wantPR {
+				t.Errorf("= (%q, %d), want (%q, %d)", branch, pr, want, tc.wantPR)
+			}
+			if rr.calls != tc.wantCalls {
+				t.Errorf("GetRun calls = %d, want %d", rr.calls, tc.wantCalls)
+			}
+			logs := buf.String()
+			gotWarn := strings.Contains(logs, warnMsg) || strings.Contains(logs, "prompt: list integration audit entries failed; omitting acceptance run branch")
+			if gotWarn != tc.wantWarn {
+				t.Errorf("WARN logged = %v, want %v:\n%s", gotWarn, tc.wantWarn, logs)
+			}
+			if tc.wantWarn && strings.Contains(logs, warnMsg) {
+				for _, attr := range []string{"run_id=" + runID.String(), "stage_id=" + stageID.String(), "error="} {
+					if !strings.Contains(logs, attr) {
+						t.Errorf("PR-number WARN missing %q:\n%s", attr, logs)
+					}
+				}
+			}
+		})
+	}
+	// The consolidated branch by literal, not only by helper.
+	runID := uuid.New()
+	if got, want := orchestrator.ConsolidatedBranch(runID), "fishhawk/run-"+runID.String()[:8]+"-consolidated"; got != want {
+		t.Errorf("ConsolidatedBranch = %q, want the literal %q", got, want)
+	}
+}
+
+// Run-context verify rule sentinels (#5148). The handler tests below pin the
+// cross-boundary seam: workflow spec → resolveVerifyConfig → handler →
+// Trigger.VerifyGateConfigured → rendered implement prompt.
+const (
+	runContextGateSentinel   = "do NOT run the project's full verify gate yourself"
+	runContextNoGateSentinel = "this stage has no runner verify gate configured"
+)
+
+// renderPromptForSpec drives the unsigned /prompt-render handler for an
+// implement stage whose run snapshot carries spec, and returns the prompt.
+func renderPromptForSpec(t *testing.T, spec string) string {
+	t.Helper()
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	rr.runRow = &run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(spec),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp.Prompt
+}
+
+// TestGetStagePromptRender_RunContextVerifyRule_GateConfigured: a spec
+// declaring executor.verify.command renders the configured-gate arm on the
+// unsigned preview.
+func TestGetStagePromptRender_RunContextVerifyRule_GateConfigured(t *testing.T) {
+	p := renderPromptForSpec(t, specWithVerifyYAML)
+	if !strings.Contains(p, runContextGateSentinel) {
+		t.Errorf("prompt-render with executor.verify lacks %q", runContextGateSentinel)
+	}
+	if strings.Contains(p, runContextNoGateSentinel) {
+		t.Errorf("prompt-render with executor.verify carries the fail-closed arm %q", runContextNoGateSentinel)
+	}
+}
+
+// TestGetStagePromptRender_RunContextVerifyRule_NoGate: a spec with no
+// executor.verify renders the fail-closed arm.
+func TestGetStagePromptRender_RunContextVerifyRule_NoGate(t *testing.T) {
+	p := renderPromptForSpec(t, planStageSpecYAML30m)
+	if !strings.Contains(p, runContextNoGateSentinel) {
+		t.Errorf("prompt-render without executor.verify lacks the fail-closed arm %q", runContextNoGateSentinel)
+	}
+	if strings.Contains(p, runContextGateSentinel) {
+		t.Errorf("prompt-render without executor.verify carries the configured-gate arm %q", runContextGateSentinel)
+	}
+}
+
+// TestGetStagePrompt_RunContextVerifyRule_SignedGateConfigured: the signed
+// /prompt endpoint the runner consumes renders the configured-gate arm.
+func TestGetStagePrompt_RunContextVerifyRule_SignedGateConfigured(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	rr.runRow = &run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(specWithVerifyYAML),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, runContextGateSentinel) {
+		t.Errorf("signed prompt with executor.verify lacks %q", runContextGateSentinel)
+	}
+}
+
+// TestGetStagePrompt_RunContextVerifyRule_ConflictResolutionFailsClosed (H1):
+// the runner routes an implement stage carrying a conflict-resolution
+// instruction to runConflictResolutionStage, which returns before every
+// verify gate. So even with executor.verify declared, both prompt endpoints
+// must render the fail-closed arm for such a pass. The fixture is identical to
+// the GateConfigured tests except for the live conflict trigger, so the
+// conflict override is the only thing that selects the fail-closed arm.
+func TestGetStagePrompt_RunContextVerifyRule_ConflictResolutionFailsClosed(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+	runID := uuid.New()
+	implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}},
+	}
+	rr.getRuns[runID] = &run.Run{
+		ID: runID, Repo: "o/r", WorkflowID: "feature_change",
+		WorkflowSpec: []byte(specWithVerifyYAML),
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: {
+			conflictTriggerEntry(runID, implStageID, 1, "fishhawk/run-1", "main", "head1"),
+		}}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	check := func(name string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200:\n%s", name, w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: decode: %v", name, err)
+		}
+		if !resp.ConflictResolution {
+			t.Fatalf("%s: conflict_resolution = false; fixture must carry a live trigger", name)
+		}
+		if resp.VerifyCommand == "" {
+			t.Fatalf("%s: verify_command empty; fixture must declare executor.verify", name)
+		}
+		if !strings.Contains(resp.Prompt, runContextNoGateSentinel) {
+			t.Errorf("%s: conflict-resolution pass lacks the fail-closed arm %q", name, runContextNoGateSentinel)
+		}
+		if strings.Contains(resp.Prompt, runContextGateSentinel) {
+			t.Errorf("%s: conflict-resolution pass carries the configured-gate arm %q", name, runContextGateSentinel)
+		}
+	}
+	check("signed /prompt", promptRequest(t, s, runID, implStageID, priv, ""))
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+implStageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	check("unsigned /prompt-render", w)
 }

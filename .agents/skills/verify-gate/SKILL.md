@@ -33,8 +33,9 @@ git status --short
 
 | Situation | Command |
 |---|---|
-| Before a PR / final check | `scripts/verify-change` |
-| Iterating on known packages | `scripts/test verify --packages backend/internal/foo,runner/internal/bar` (repo-relative). It skips patch coverage, so finish with a full run |
+| Before a PR / final check (outside a run) | `scripts/verify-change` |
+| Inside a Fishhawk run (`scripts/is-run-agent` prints `run-agent`, i.e. `FISHHAWK_RUN_AGENT` is set) whose stage configures a verify gate | Focused `scripts/test single` plus a scoped `scripts/test verify --packages …` only. The runner's committed-tree gate runs the full verify on the passing SHA; don't spend the agent budget repeating it (#5148). The marker only selects this workflow and never replaces the gate: with no configured gate, run the full verify yourself |
+| Iterating on known packages | `scripts/test verify --packages backend/internal/foo,runner/internal/bar` (repo-relative). It skips patch coverage, so finish with a full run, which inside a run is the runner's gate |
 | One test | `scripts/test single -run TestName ./backend/internal/foo/` |
 | Lint only | `scripts/test lint` |
 

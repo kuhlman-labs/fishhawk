@@ -529,6 +529,18 @@ const (
 	// exempted by auditcomplete's trace rule — a runner spawned, so the trace is
 	// owed.
 	AcceptanceBasisAllRetiredObserved = "all-retired-observed"
+	// AcceptanceBasisAddedOnlyObserved is the FOURTH POST-RUN basis for the
+	// empty-ladder-set door (#3181, #3682): the validator RAN and itemized rows,
+	// but every row names an OPERATOR-ADDED or RETIRED criterion and at least one
+	// is added, so the set the precedence ladder runs over is empty once added
+	// and retired ids are excluded. No reviewed criterion in force was evidenced,
+	// so nothing reviewed was verified. Reachable from a shipped `passed`, from a
+	// #2581-downgraded `failed` (a retired failed row beside an added row) and
+	// from the #3682 R1 advisory-only shipped `failed`. It is distinct from
+	// no-rows-observed (rows WERE recorded) and from all-retired-observed (not
+	// every row was retired). Like its siblings it is NOT exempted by
+	// auditcomplete's trace rule — a runner spawned, so the trace is owed.
+	AcceptanceBasisAddedOnlyObserved = "added-only-observed"
 )
 
 // Acceptance short-circuit verdict vocabulary (#2347). The pre-spawn
@@ -1634,13 +1646,14 @@ func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
 // in both directions through a test-only import, so a name added on either
 // side without the other fails in-loop.
 var seedScenarioNames = map[string]bool{
-	"acceptance-dispatched": true,
-	"grooming-confirm-gate": true,
-	"implement-running":     true,
-	"plan-gate-criteria":    true,
-	"plan-gate-parked":      true,
-	"split-parent-linked":   true,
-	"trace-upload-target":   true,
+	"acceptance-dispatched":   true,
+	"acceptance-rebased-head": true,
+	"grooming-confirm-gate":   true,
+	"implement-running":       true,
+	"plan-gate-criteria":      true,
+	"plan-gate-parked":        true,
+	"split-parent-linked":     true,
+	"trace-upload-target":     true,
 }
 
 // stubForgeRoutePrefix is the dev-only stub-forge control surface the

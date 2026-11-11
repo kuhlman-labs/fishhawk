@@ -134,11 +134,13 @@ type Deps struct {
 	ExternalURL string
 
 	// Audit, when set, lets findHeadSHA prefer the run's newest fixup_pushed
-	// head over the stale PR-open artifact head (#1682) — resolved through the
-	// SAME auditcomplete.LatestReportedHeadSHA ordering the server-side
-	// resolver uses, so audit_complete publishing and acceptance/retry head
-	// binding cannot diverge. Nil (legacy / dev posture) falls back to the
-	// artifact head, preserving the pre-#1682 behavior.
+	// head over the stale PR-open artifact head (#1682) — resolved through
+	// auditcomplete.LatestReportedHeadSHA's category precedence, shared with
+	// server.latestRunHeadSHA's remaining callers. Acceptance and Option C no
+	// longer share it: they read server.acceptanceHeadAsOf (#4874), which walks
+	// clean rebases, so after a clean rebase this check can target the
+	// pre-rebase ledger head (#5087). Nil (legacy / dev posture) falls back to
+	// the artifact head, preserving the pre-#1682 behavior.
 	Audit AuditReader
 
 	// OnDegraded, when non-nil, is invoked exactly once per failure
@@ -614,9 +616,13 @@ func (p *Publisher) detailsURL(runID uuid.UUID) string {
 // (fixup_pushed > child_pushed > pull_request_opened, via the shared
 // auditcomplete.LatestReportedHeadSHA), so a fix-up push retargets the check
 // onto the new commit instead of leaving it pinned to the stale PR-open head.
-// This is the SAME ordering server.latestRunHeadSHA uses, so audit_complete
-// publishing and the acceptance/retry head binding cannot resolve divergent
-// heads for the same audit history. When the audit reader is not wired (nil
+// This is the SAME category precedence server.latestRunHeadSHA's remaining
+// callers use. The acceptance head binding and Option C no longer do: they read
+// server.acceptanceHeadAsOf (#4874), which seeds by chain sequence and walks
+// clean branch_rebased rows, so after a clean rebase the Check Run can target
+// the pre-rebase ledger head while acceptance validates the merge commit. That
+// residual is tracked by #5087; this resolver is unchanged. When the audit
+// reader is not wired (nil
 // Audit dep) or records no head, it falls back to the pull_request artifact
 // head — the pre-#1682 behavior.
 //

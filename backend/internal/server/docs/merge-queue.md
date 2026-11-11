@@ -20,7 +20,8 @@ settle carries.
   declared verify command → `not_required`, nothing queued; otherwise Enqueue
   (new → held at the tail; same base → re-anchored in place) and pump the
   base, then answer from the run's entry. HELD → start state `held` with its
-  position and the live run (no trigger, no re-open, no slot). Admitted by
+  position and the live run (no trigger, no re-open, no slot; an older stale
+  undispatched pass is settled first, see the #4811 bullet). Admitted by
   this pump → the admission's answer. Already live → the pass is started for
   the new head directly. `fan_in` is NOT serialized (it gates the
   consolidated review that precedes approval); it still routes through
@@ -32,7 +33,35 @@ settle carries.
   `pending`/`awaiting_host_dispatch` is replaced by appending a trigger for
   the new head carrying the old `prior_state`/`reparked_review_stage_id`;
   no second re-open. A dispatched/running pass keeps the "stage is in state"
-  refusal.
+  refusal. Since #4811 the arm runs under the implement stage's admission
+  fence when an Orchestrator is wired (`tryHoldStageAdmission`, bounded by
+  `stageAdmissionTryWait`, re-entrant on a fence-marked context): a fence it
+  cannot take answers a
+  `Transient` refusal naming the busy fence, so admission `Unadmit`s the entry
+  back to held rather than ejecting it `pass_not_startable`.
+- **Stale pending pass on held/not_queued (#4811).** The `held` and
+  `not_queued` answers return before `beginMergeCandidateVerifyPass`, so the
+  replacement arm above never runs on them. Both now return through
+  `answerQueuedWithoutPass` (`merge_candidate_supersede.go`): under the
+  implement stage's admission fence it settles an UNDISPATCHED pass
+  (`pending`/`awaiting_host_dispatch`) whose trigger names a head the run has
+  moved past — a recorded head write sequenced after the trigger, or the
+  producer's new head — as `merge_candidate_verified{not_executed}` with a
+  `superseded:` reason, restores the stage to the trigger's prior gate and
+  re-parks the review, so the slot waiter cannot dispatch the old pass on the
+  new branch. The settle is pinned to the checked trigger's sequence: a
+  replacement appended since detection stays live (`trigger_replaced`, nothing
+  written). A dispatched or running pass is left to its runner's `head_moved`
+  not_executed (#5164). A busy fence is a WARN with no settle (the
+  host-dispatch marker check is the backstop). Advance runs after the fence
+  is released, and only when the settle step is `settled` or
+  `restore_failed` (so the failure path stays in force), the caller did not
+  already hold the fence, and an Orchestrator is wired. An unreadable stage
+  list or merge-candidate chain turns the `held`/`not_queued` answer into a
+  refusal (nothing started; re-invoke
+  `fishhawk_rebase_run_branch`). Residual: the window between the record's
+  trigger read and its append is closed only by the process-local fence (one
+  fishhawkd per database).
 - **Pump + admission.** `pumpMergeCandidateQueue(base)` loops: a live entry
   whose run is terminal is dropped `run_terminal`; otherwise `AdmitNext`.
   `admitMergeCandidateEntry` re-reads the run and PR: run terminal → dropped
@@ -43,7 +72,8 @@ settle carries.
   (`fishhawk_rebase_run_branch` resolves and re-queues); then re-anchor and
   act on `mergeCandidateVerifyState`: unverified → start (refusal → ejected
   `pass_not_startable`, except a `Transient` refusal — begin's
-  superseded-fix-up arm missing its bounded admission fence, #4391 — which
+  superseded-fix-up arm, #4391, or its fenced pending-replacement arm, #4811,
+  missing its bounded admission fence — which
   `Unadmit`s like the transient failures below), in_flight → phase `verifying`, passed/not_required →
   phase `passed`, failed → ejected `verify_failed`. A TRANSIENT failure (run
   or PR unreadable, behind-probe error, non-conflict advance refusal,
@@ -176,7 +206,104 @@ settle carries.
   `AdmissionBranches` (already failed / in_flight / passed at admission, an
   unresolved post-merge head, a re-anchor error, no installation, and a
   pending-replacement trigger-append failure, which TODAY ejects
-  `pass_not_startable`).
+  `pass_not_startable`). #4811 adds the stale-pass producer arm through the
+  real rebase handler, each asserting the superseded row and the restored
+  stage BEFORE any host-dispatch marker POST:
+  `HeldRebaseSupersedesStalePendingTrigger`,
+  `NotQueuedRebaseSupersedesStalePendingTrigger` and
+  `HeldRebaseLeavesDispatchedPassToRunner` (the fixture wires no Orchestrator,
+  so the fence and Advance are pinned fake-backed in
+  `merge_candidate_supersede_test.go`).
+
+### Scenario commits: exact-head classification ([ADR-142](../../../../docs/adr/142-merge-verification-after-scenario-commits.md), #4874)
+
+An acceptance scenario-corpus commit C (an `acceptance_scenarios_pushed` row)
+is classified by rule 4a of `mergeCandidateVerifyState`
+(`scenarioCommitObligation`, `merge_candidate_verify.go`), AFTER rule 4 (an
+operator-vouched live head) and BEFORE rule 5 (the decomposed-parent
+`fan_in`). Applicability: every requirement below holds only with a declared
+verify command (ADR-090 D4: none → `not_required` first, no arm runs), and is
+ENFORCED at merge only where the existing forge probe works. Rule 4 still
+decides an operator vouch of exact live C, with its existing reference.
+
+- **A recorded D2 obligation survives the commit (D1).** When the newest
+  non-no-op recorded head write before C is a performed `branch_rebased`, a
+  `conflict_resolution_pushed` or a fan-in integration, C needs passing
+  evidence at EXACTLY C, with that producer's cause (`base_advance`,
+  `conflict_resolution`, `fan_in`). The scenario commit is not a fourth
+  producer: it PRESERVES an obligation recorded by an ADR-090 D2 producer, and
+  a runner-gated root keeps today's answer. A report's `base_sha` can never
+  clear a recorded obligation. A `branch_rebased` whose `already_up_to_date`
+  decodes true is a no-op and is skipped before selection (the rebase verb's
+  up-to-date arm records one each time); an undecodable row or a missing flag
+  reads as performed. A `branch_reset` does not discharge it (one extra pass,
+  never a wedge).
+- **Runner-gated terminal (D2).** A chain whose reported terminal is the
+  newest runner-gated head, with no later recorded producer, falls through:
+  `not_required` on a standalone run and the existing `fan_in` on a parent.
+- **Vouched terminal (D2), the isolated reference.** When the walk resolves to
+  an operator-vouched terminal and D1 does not already decide, the vouch
+  ladder runs on the terminal with ONE change to its reference: the newest
+  verified head by chain sequence EXCLUDING the terminal and EVERY head an
+  `acceptance_scenarios_pushed` row on the chain reports
+  (`classifyScenarioTerminalVouch`). So no head a scenario row reports, C or
+  any intermediate or forked scenario commit, can remove the cause, whatever
+  its result or its position relative to the vouch. A nonempty cause is
+  returned; an EMPTY cause falls through, so a standalone run reads
+  `not_required` and a parent keeps its `fan_in`. A directly vouched live
+  head (rule 4) keeps its existing reference, which can be a passed scenario
+  commit, and so can read `not_required` where a scenario commit on the same
+  chain reads `unverified`: that difference is deliberate, and this amendment
+  hardens no direct vouch.
+- **Unresolved chain (D3).** A missing, malformed, empty, self-referencing,
+  cyclic or unrelated base with no recorded requirement answers `base_advance`
+  on a probeable run: a CONSERVATIVE requirement, not evidence that a base
+  merge occurred (the 409 wording residual is #5090). A deployment that
+  cannot probe keeps the ADR-090 D7 residual (`not_required` with a WARN),
+  but only when no requirement is already recorded.
+- **Exact-head evidence (D5).** Passed or failed comes only from a verdict at
+  exactly C; a result at M, an intermediate C1 or a predecessor neither clears
+  nor fails C, no verdict is inherited and no transfer row is fabricated
+  (transfer modes unchanged; a shadow or off transfer is not evidence).
+- **D7 gate reach.** `mergeCandidateGate` returns ungated with its WARN
+  BEFORE reading any state on a deployment that cannot probe. There a state
+  reader (the rebase up-to-date arm, the gate view) can report a recorded
+  requirement as `unverified`, but the merge is not refused: `unverified`
+  does not mean blocked on such a deployment.
+- **A parent's pass at C.** With a declared verify command on a probeable
+  deployment, a decomposed parent whose acceptance writes C generally owes
+  one pass at exactly C under the EXISTING classification: `fan_in` by the
+  direct route when the integration write is the newest head write before C
+  (ADR-092 D1, not serialized), and the newer producer's own cause and queue
+  route when a rebase or conflict push is newer.
+- **Recovery** is the existing route and promises no immediate pass. The gate
+  answers 409 `merge_candidate_unverified` naming `fishhawk_rebase_run_branch`
+  (unless `mergeQueueEnqueueArm` takes the run first: `fishhawk_merge_run`
+  then answers 202 with merge intent, and merge-on-pass still needs the pass
+  at C). The rebase verb's already-up-to-date arm reads `unverified` at C and
+  calls `startMergeCandidateVerifyPass` for C. `base_advance` and
+  `conflict_resolution` go through the ADR-092 queue: with no active entry
+  only a merge-queue-eligible run is admitted, otherwise the answer is
+  `not_queued` naming the reasons (for example `not_approved`,
+  `acceptance_not_eligible`), with no entry, no trigger and nothing
+  re-opened. Because C moves the head, a dismiss-stale repository drops the
+  forge approval, so the operator re-approves at C before the verb can queue
+  the pass, and on ANY repository merge-on-pass's fold needs an approval
+  covering exactly C (a scenario commit is not a clean base advance). An
+  eligible run behind another run's live pass answers `held`: a queue hold
+  is NOT a dispatched pass. A failed verdict at C refuses
+  `merge_candidate_verify_failed` with the existing fix-up and re-run routes.
+
+Pinned by `TestMergeCandidateVerifyState_ScenarioCommit`,
+`TestMergeCandidateVerifyState_ScenarioTerminalVouch`,
+`TestMergeCandidateScenarioCommit_GateRefusesThenRebaseStartsExactHeadPass`,
+`TestMergeCandidateScenarioTerminalVouch_GateRefusesFinalHeadThenRebaseStartsPass`,
+`TestMergeCandidateGate_CannotProbeStaysUngatedWithScenarioObligation` and
+`TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC`
+(`merge_candidate_verify_test.go`), with the isolated-reference seam in
+`TestVouchedHeadProbe_ReferenceExclusion` and the unchanged direct path in
+`TestClassifyVouchedHead_DirectKeepsScenarioEvidence`
+(`merge_candidate_vouch_reference_test.go`).
 
 ## Merge queue (ADR-093 slice 1, E87.4 / [#4295](https://github.com/kuhlman-labs/fishhawk/issues/4295))
 
@@ -187,8 +314,10 @@ README). Merge-on-pass is slice 2 (§ "Merge-on-pass (ADR-093 D3/D6)"
 below); eject/promote and durability are slices 3-4.
 
 - **Eligibility (`merge_queue_eligibility.go`, D1).** One predicate decides
-  queue ADMISSION, not only the merge. It never writes; every read error is
-  `undeterminable`, which is NOT eligible. Four legs, each on the existing
+  queue ADMISSION, not only the merge. It writes no verdict, intent or queue
+  row; its one write is leg (d)'s idempotent child-slice concern reconcile
+  (below). Every read error, and a failed reconcile, is `undeterminable`,
+  which is NOT eligible. Four legs, each on the existing
   single-source helper: (a) review gate approved — the LATEST implement
   review round (`implementReviewRound`, read-only) has a TERMINAL entry for
   every configured agent reviewer (no started round, fewer terminals than
@@ -228,7 +357,43 @@ below); eject/promote and durability are slices 3-4.
   (`"first_officer"`) or whose severity is `planreview.SeverityHigh`
   (`"high"`); medium/low stay advisory (ADR-027). No requirement-arbitration
   concern CATEGORY exists (`requirement_arbitration` is a page event), so the
-  leg matches none. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
+  leg matches none. **Child-slice reconcile (#4823).** Before the leg reads
+  the run's open concerns it re-runs the idempotent import
+  (`reconcileSliceConcerns`, `concern_rollup.go`) for the run's SUCCEEDED
+  decomposition children, so a late child review whose best-effort import
+  was lost (WARN `concern_late_import_failed`, site `child_review`) reaches
+  the parent ledger and blocks here (`blocking_concern_open`) instead of
+  being missed. The call is skipped for a terminal run (a copy on a merged
+  parent would be a false open row) and returns before any parent stage read
+  when no child has succeeded; a running or failed child is never imported
+  (the fan-in's child set). A copy inserted by the pass is audited as one
+  `concern_rolled_up` row with site `merge_reconcile`. A child-list,
+  stage-list, concern-read or import failure WARN-logs under the same key
+  (site `merge_reconcile`) and fails the leg closed: `undeterminable`, so
+  enqueue, admission, merge-on-pass and the re-probe all hold. This is the
+  predicate's ONE write, and it is idempotent: a closed child source is not
+  imported and the unique index never re-mints a closed copy, so a repeat
+  evaluation inserts nothing and writes no second audit row. Cost and
+  locking: every evaluation adds one indexed child listing
+  (`runs_decomposed_from_idx`); a decomposed parent whose succeeded children
+  hold open HIGH/MEDIUM concerns adds one parent stage list, one
+  open-concern read per succeeded child and one `ImportRolledUp`
+  transaction, which takes the child-source row locks (`FOR NO KEY UPDATE`).
+  The reconcile takes no lock of its own. The lock order is the merge-intent
+  lock first, then the concern store's row locks, never the reverse: a
+  merge-variant evaluation that runs under the merge-intent lock nests the
+  row locks inside it and inherits its `fn` deadline. Today's callers
+  (the enqueue arm, re-entry and merge-on-pass) evaluate BEFORE they take
+  that lock, and admission and the re-probe run on detached pump or tick
+  contexts, so none nests the import today. Every caller is a POST or pump path
+  (the enqueue arm, re-entry, admission, merge-on-pass, the yield re-probe,
+  rebase); no GET evaluates the predicate, so no GET writes. A parent copy
+  and its child source resolve independently except for retry-sweep
+  supersession (the concern README, § "Child-slice rollup"). **Residual
+  (#5045):** the inline admitted merge (`handleMergeRun` when
+  `mergeCandidateGate` admits) never evaluates this predicate, so it runs no
+  leg (d) at all; this reconcile does not make an open HIGH block every
+  merge path. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
   `review_coverage_incomplete`, `acceptance_not_eligible`,
   `acceptance_stale`, `checks_not_green`, `checks_red`,
   `blocking_concern_open`, `undeterminable`. The ADMISSION variant differs
@@ -258,8 +423,9 @@ below); eject/promote and durability are slices 3-4.
   its order; `merge_candidate_verify_failed` / `merge_candidate_check_failed`
   are never enqueued; an up-to-date verified (or ADR-096 transferred) head
   merges inline as before. An ineligible or undeterminable run gets today's
-  refusal plus the additive `details.merge_queue_ineligible` codes, with
-  nothing written.
+  refusal plus the additive `details.merge_queue_ineligible` codes, with no
+  verdict, intent or queue row written (the concern leg's reconcile may still
+  insert child-slice concern copies).
 - **Record before commit.** The chained `merge_queue_entered` row (operator
   actor; payload `run_id`, `repo`, `base_ref`, `anchored_head_sha`,
   `gate_code`, the verdict prose slice 2's merge-on-pass reads, `pr_url`)
@@ -393,14 +559,16 @@ deadline): `backend/internal/mergequeue/README.md`.
   run's ONE dispatch on the D1 ledger (path `queue`; an existing claim →
   hold `merge_already_dispatched`, forge never called, except a crash-left
   QUEUE claim still `dispatched`, which ADR-109 A1 releases and claims afresh
-  here: § "Merge-queue durability (ADR-093 D8)"); the pinned merge
+  here as the backstop, since A2's restart resume releases a merging entry's
+  orphan before the fold: § "Merge-queue durability (ADR-093 D8)"); the pinned merge
   `MergePullRequestAtHead(head)`.
 - **Classification.** nil → settle merged `merged_by_queue` INSIDE the lock
   (approval condition D3: a later inline caller reads the PR merged and
   answers `already_merged`, never 409) and append `merge_queue_merged`; a
   failed append after the forge accepted still settles merged and logs at
   ERROR. `ErrMergeConflict` (409 head mismatch) → re-read: merged → merged,
-  else readvance, no `merge_queue_merged` row. 405 / 422 →
+  else readvance, no `merge_queue_merged` row (after the in-lock return to
+  `passed` below). 405 / 422 →
   re-read: merged → merged, else ONE fresh review snapshot (no permission
   reads): reviewDecision `REVIEW_REQUIRED` / `CHANGES_REQUESTED` or
   mergeStateStatus `BLOCKED` → YIELD `forge_review_required` (ADR-112 R3 row
@@ -420,7 +588,21 @@ deadline): `backend/internal/mergequeue/README.md`.
   head (`mergeDispatchClaimNamesHead`: an inline or delegated claim recorded
   at head `unresolved`, an empty gate head, names ANY merged head, #4617),
   else holds `merged_claim_head_mismatch` (an unreadable claim holds
-  `merged_claim_unread`, #4748 M1). A `dispatch_failed` claim it reconciles
+  `merged_claim_unread`, #4748 M1). **Released claim → `passed`
+  ([#4876](https://github.com/kuhlman-labs/fishhawk/issues/4876)).** After a
+  RELEASED claim, the 409 readvance and the row-4 `forge_review_required`
+  yield first return the entry from `merging` to `passed` at its epoch,
+  under the lock (`mergeOnPassReleasedToPassed`, `SetPhase(passed)`),
+  because the pump applies both outside the lock with the phase-guarded
+  `UnadmitPassed` / `YieldPassed` (§ "Outcomes the pump applies"). It is the
+  rule ADR-109 A2 applies on the resume path (back to `passed` only once no
+  claim stands), applied at a second site. A missed write holds
+  `entry_changed` naming the lost outcome: the entry stays `merging` with no
+  claim and the next pump's D8 resume returns it to `passed` (`no_claim`,
+  `redecide`), so a persistent `SetPhase(passed)` failure costs at most one
+  refused forge PUT per pump cycle. The ejection settle (`SettleAt` is
+  phase-agnostic) and the uncertain arm (`dispatch_failed`, the claim
+  stands) keep `merging`. A `dispatch_failed` claim it reconciles
   appends ONE `merge_dispatch_settled` `reconciled_merged` row per run
   (`appendReconciledMergedOnce`, deduped on (run, outcome); a re-decide after
   a `SettleAt` CAS conflict appends no second row). A lock never taken → hold; a lapse after fn → WARN, its
@@ -443,20 +625,32 @@ deadline): `backend/internal/mergequeue/README.md`.
   decision's mark while its forge call is in flight. The pre-lock check stays
   `passed`-only: the pump routes a `merging`/`settling` entry to the restart
   resume (§ "Merge-queue durability (ADR-093 D8)"), skipping it while this
-  process's mark is set.
+  process's mark is set. A `passed`, intent-bearing entry is skipped the
+  same way while the mark is set (#4876): after a released claim the
+  decision returns the entry to `passed` under the lock, and the mark,
+  cleared only after the apply, keeps a concurrent same-process pump from
+  claiming or PUTting before this decision's outcome lands.
 - **Outcomes the pump applies.** `merged` → continue; `settle` → `SettleAt`
-  (epoch CAS; a conflict stops the pump); `readvance` → `Unadmit(epoch)`,
-  the only post-Unadmit continue, capped at `mergeQueueMaxReadvancesPerPump`
+  (epoch CAS; a conflict stops the pump); `readvance` → `UnadmitPassed(epoch)`,
+  the only post-readvance continue, capped at `mergeQueueMaxReadvancesPerPump`
   (3); `held` → stop; `await_approval` → `ApprovalWait(epoch, window)`
   OUTSIDE the merge-intent lock: not expired → hold and stop, expired →
-  `Yield` + `merge_queue_yielded` and continue; `yield` → `Yield` +
+  `YieldPassed` + `merge_queue_yielded` and continue; `yield` → `YieldPassed` +
   `merge_queue_yielded` and continue (a yield does not count against the
-  readvance cap); `expired_yielded` → continue (the expired-wait
+  readvance cap). The readvance and both yields are applied outside the lock,
+  so they compare-and-swap on phase `passed` as well as the epoch
+  ([#4876](https://github.com/kuhlman-labs/fishhawk/issues/4876)):
+  `SetPhase(merging)` keeps the epoch, and `merging` is stamped under the
+  lock before every queue claim, so a stale outcome landing after another
+  pump claimed the dispatch is refused (the pump stops) instead of returning
+  a claimed entry to held. An already-merging entry whose stale-read decision
+  returns a readvance or yield is therefore refused too and converges on the
+  next pump's D8 redecide (a one-pump delay). `expired_yielded` → continue (the expired-wait
   enforcement, which runs between the decision and this apply, already
   yielded a readvance or transient hold of an anchored entry under the
   run's merge-intent lock, #4748). Otherwise the pump continues only after a settle, a
   live admission or an admission yield (`stop := res.outcome != admitSettled
-  && res.outcome != admitLive && res.outcome != admitYielded`). Admission-owned writes (`Unadmit`, `SetPhase`, `ReanchorAt`,
+  && res.outcome != admitLive && res.outcome != admitYielded`). Admission-owned writes (`Unadmit`, `UnadmitPassed`, `SetPhase`, `ReanchorAt`,
   `SettleAt`) are compare-and-swaps on the entry's `admission_epoch`, so a
   stale decision changes nothing. A passed verdict pumps the base detached.
 - **Ownership and the three dispatch paths (approval conditions D1/D2).**
@@ -655,7 +849,11 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   transferred, merge_candidate_verdict_transferred_sequence,
   transferred_from, root_head}`, and `not_required` appears ONLY on a head
   that predicate determined needs no verify (no verify command, a
-  runner-gated or otherwise unclassified head). Any other state (unverified,
+  runner-gated or otherwise unclassified head, or a scenario commit ADR-142
+  leaves with no cause: a chain resolving to the newest runner-gated head with
+  no later recorded producer, an empty terminal-vouch cause on a standalone
+  run, or the D7 inability-to-probe residual with no recorded requirement;
+  § "Scenario commits"). Any other state (unverified,
   in_flight, failed, a transfer ignored in off/shadow mode) fails closed
   before any append, refused exactly like an evidence-read error.
 - **Unresolvable veto names `dismiss_review` (#4764).** Every
@@ -859,15 +1057,23 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   merge-intent lock: the anchor `approval_wait_started_at` is persisted
   once per episode (never reset by a readvance, `Unadmit` or a
   re-admission) and expiry is judged on the database clock. Not expired →
-  the entry holds and the pump stops; expired → `Store.Yield` (one
+  the entry holds and the pump stops; expired → `Store.YieldPassed` (one
   transaction: held, marker stamped, `enqueued_at` and the anchor kept,
-  under the `admission_epoch` CAS) and the pump CONTINUES. Window:
+  under the `admission_epoch` CAS and phase `passed`, #4876: a stale
+  out-of-lock yield never moves an entry another pump stamped `merging`) and
+  the pump CONTINUES. Window:
   `Config.MergeQueueApprovalWait` (zero = 30m), fishhawkd
   `--merge-queue-approval-wait` / `FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT` (a
   non-positive or unparseable value refuses startup). Row 4 (a typed RELEASE
   refusal whose fresh snapshot reads REVIEW_REQUIRED, CHANGES_REQUESTED or
   BLOCKED; a null reviewDecision is row 5's eject) yields
-  `forge_review_required` with the claim released.
+  `forge_review_required` with the claim released. The 409 readvance and
+  this row-4 yield first return the released entry to `passed` under the
+  lock (§ "Merge-on-pass (ADR-093 D3/D6)", released claim → `passed`), so
+  the pump's out-of-lock `YieldPassed` / `UnadmitPassed` can land. The
+  expired-wait and merge-gate enforcements yield with plain `Store.Yield`
+  inside the lock, after their pre-yield refusal re-read phase `passed`, the
+  in-flight registry and the D1 claim.
 - **Expired-wait enforcement (#4748, `mergeOnPassEnforceExpiredWait`).**
   Once an approval wait is OPEN in this admission epoch
   (`approval_wait_started_at` set AND `approval_wait_open`, docs/adr/112
@@ -947,8 +1153,8 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `yielded`, `yield_reason`) is appended first, then the queue write and
   `merge_queue_yielded` (site `merge_run`); 202 `queued` names the yield and
   the next step. A same-base LIVE entry is never marked; any other
-  ineligibility keeps the 409 with nothing written; the inline path still
-  refuses and writes nothing. A yielded entry's intent blocks the inline
+  ineligibility keeps the 409 with no verdict, intent or queue row written;
+  the inline path still refuses and writes nothing. A yielded entry's intent blocks the inline
   `merge_run` (ADR-109) until a qualifying approval clears the yield, the run
   is cancelled, or the operator withdraws the intent (§ "Withdraw intent
   (ADR-112 R3, #4685)").
@@ -1692,22 +1898,30 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
 | `merging` / `settling`, PR merged at the QUEUE claim's head | `settle_merged` row (`merge_actor_verified:false`, C6b), the deduped `merge_dispatch_settled` `reconciled_merged` (`appendReconciledMergedOnce`) for a `dispatch_failed` claim — a row already on the chain is success, not a hold (#4617) — then the merged tail with `Resume=true` (`merge_queue_merged` only when no row names the entry; a failed dedup read or append holds `resume_unrecorded`). A DECLARED approval gate with no `merge_queue_authorized` row (path `queue`, claim head) holds `authorization_unrecorded` (C6a) |
 | `merging` / `settling`, PR merged, no claim or another path's claim | `settle_pr_merged`, settled merged `pr_merged`, claim untouched. An inline or delegated claim at head `unresolved` counts as another path's claim at the merged head (`mergeDispatchClaimNamesHead`, #4617). Asymmetry: this resume writes NO `reconciled_merged` row and leaves an unresolved `dispatch_failed` non-queue claim unchanged; that claim heals on the next inline `merge_run` (`claimInlineMergeDispatch`'s deduped `reconciled_merged`), whereas merge-on-pass appends the deduped row |
 | PR merged at a head the claim does not name | hold `merged_claim_head_mismatch` |
-| `merging`, PR OPEN and unmerged, QUEUE claim still `dispatched` and crash-left (C2) | ADR-109 Amendment A1 ([#4711](https://github.com/kuhlman-labs/fishhawk/issues/4711)): one `merge_queue_resumed` {`redecide`, `orphaned_claim_open`, next_step `passed`, claim fields} row, then back to `passed` at the epoch (a CAS miss holds `entry_changed`), NO ledger write; ordinary merge-on-pass then releases the claim in step 8 (below) and merges through the ordinary path. A failing release writes ONE `redecide` row per pump tick (each tick's resume hands the re-stamped `merging` entry back; its merge-on-pass holds `orphaned_claim_release_failed` again), plus one `released_orphaned_claim` row per tick when the row landed and the CAS failed |
+| `merging`, PR OPEN and unmerged, QUEUE claim still `dispatched` and crash-left (C2) | ADR-109 Amendment A2 ([#4862](https://github.com/kuhlman-labs/fishhawk/issues/4862)): one `merge_queue_resumed` {`redecide`, `orphaned_claim_open`, next_step `passed`, claim fields} row, then the resume RELEASES the claim through merge-on-pass's own release body (`mergeOnPassReleaseOrphanedClaim`: a strict `merge_dispatch_settled` {`released`, `released_orphaned_claim`} row, then the exact-claim CAS DELETE), then back to `passed` at the epoch, then `redecide`: ordinary merge-on-pass decides with NO claim standing, so the claim never reaches the ADR-112 fold (an unapproved fold waits and yields like any other entry). Failures, each in phase `merging`: the redecide or settled row's append holds `resume_unrecorded` (nothing changed); the DELETE failing holds `orphaned_claim_release_failed` after the row (the claim's state unknown; the next resume re-judges it, releasing again or taking the no-claim arm); the helper's re-judgement unable to re-confirm the age (a clock read failing the second time) holds `merge_dispatch_in_progress` after the redecide row; the phase write failing holds `entry_changed` with the claim already released (the next resume takes the no-claim arm). A failing release writes ONE `redecide` row per pump tick, plus one `released_orphaned_claim` row per tick when the row landed and the DELETE failed |
 | `merging`, PR UNREADABLE (indeterminate), QUEUE claim still `dispatched` and crash-left (C2) | strict `merge_dispatch_settled` {`dispatch_failed`, `orphaned_by_restart`}, then the EXISTING `MarkMergeDispatchFailed(orphaned_by_restart)` (C3), then a hold row {`merge_dispatch_uncertain`, next_step `operator_rearm`, remedy}: confirm on the forge nothing merged, DELETE the `dispatch_failed` claim (mergequeue README operator re-arm); the queue-path re-arm needs NO `fishhawk_merge_run` re-invocation, the next pump re-decides from scratch (C8a). PR closed: the same transition, then `drop_pr_closed` |
 | the same claim younger than the crash-left age | hold `merge_dispatch_in_progress`, nothing written; a later tick re-decides |
 | `settling`, PR open (queue claim `dispatched`) or unreadable | hold `settling_unconfirmed`, no ledger write (an unreadable PR never orphans a settling claim: the step recorded that the forge accepted); depends on the forge converging: once it shows the PR merged, `fishhawk_reconcile_merge` or `fishhawk_record_merge_observation` (or the next pump) settles it; otherwise the forge must converge (C8b) |
 | an inline/delegated claim, a GitLab claim, or a non-orphaned `dispatch_failed` claim | hold `merge_already_dispatched`, no ledger write (C1: only a `queue`-path claim is ever reconciled) |
 | `merging`, no claim | `redecide`: back to `passed` at the epoch, ordinary merge-on-pass decides from scratch with the fold and veto in-lock; no dispatch was ever handed to the forge, so this is not a retry |
 
-- **ADR-109 governs the ledger.** The resume adds NO ledger transition and
-  dispatches NO merge: it makes ONE forge re-read (`merged := pr.Merged //
-  ADR-093 D8: the resume re-read`) under the run's merge-intent lock, and
-  its only claim write is the existing `MarkMergeDispatchFailed` the
-  uncertain classification already uses. Amendment A1's step-8 release
-  (below) is the SOLE added automatic ledger transition, and it is
-  merge-on-pass's, not the resume's.
-- **Step-8 orphan release (ADR-109 A1, #4711,
-  `mergeOnPassReleaseOrphanedClaim`).** In `mergeOnPassLocked` step 8, when
+- **ADR-109 governs the ledger.** The resume dispatches NO merge: it makes
+  ONE forge re-read (`merged := pr.Merged // ADR-093 D8: the resume re-read`)
+  under the run's merge-intent lock. It makes exactly two ledger writes, both
+  on a crash-left QUEUE claim still `dispatched` (Amendment A2 point 4): the
+  existing `MarkMergeDispatchFailed(orphaned_by_restart)` on the closed or
+  indeterminate arm, and the release of an open-PR orphan on the
+  `orphaned_claim_open` arm, through the same body (and the same
+  `released_orphaned_claim` row) as merge-on-pass step 8. No schema change
+  and no new audit category. A resume whose merge-intent lock lapses after
+  its judgement ran logs one WARN and keeps its outcome (its writes stand).
+- **Step-8 orphan release, the backstop (ADR-109 A1, #4711,
+  `mergeOnPassReleaseOrphanedClaim`).** Since A2 the resume releases a
+  merging entry's orphan before the fold, so step 8 acts only on (a) an
+  orphan stranded on a non-merging entry before A2 (a passed, held or
+  yielded entry still carrying an aged `dispatched` queue claim) and (b)
+  step 1's in-lock acceptance of a merging entry after a stale pre-lock
+  read. In `mergeOnPassLocked` step 8, when
   `ClaimMergeDispatch` answers claimed=false, AFTER steps 1-7 of THE SAME
   decision re-read the entry and an open, unmerged PR and re-ran the head,
   base, ADR-112 fold, R4 `merge_queue_authorized` row and verdict under the
@@ -1718,18 +1932,23 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
   age; a zero `claimed_at` fails closed). Order: a strict
   `merge_dispatch_settled` {`released`, `released_orphaned_claim`} row
   FIRST (record before action), then `ReleaseMergeDispatch` (the exact-claim
-  CAS DELETE on `state = 'dispatched'`); either failing holds
+  CAS DELETE on `state = 'dispatched'`); at step 8 either failing holds
   `orphaned_claim_release_failed` (not transient: no approval-wait
-  ExpiryYield) with the claim standing. On a release the decision claims
+  ExpiryYield; the resume holds `resume_unrecorded` for the append instead,
+  through the helper's `unrecordedReason` parameter). On a release the decision claims
   ONCE more (an error holds `transient`; a lost race holds
   `merge_already_dispatched`) and makes the ordinary step-9 pinned merge, so
-  a restart costs at most one extra pinned merge call. The release is
-  CONDITIONAL on that decision's fold approving: an unapproved fold returns
-  `await_approval` at step 6b, before step 8, so the PR still needs a
-  qualifying approval and the orphaned claim holds the head until it
-  arrives or the operator acts; `mergeOnPassPreYieldRefusal` still refuses
-  to yield a claimed entry (ADR-109: a claimed dispatch is held, never
-  yielded). Visibility: `dispatch_claim.orphan` on the merge-queue read and
+  a restart costs at most one extra pinned merge call. This backstop release
+  is CONDITIONAL on that decision's fold approving: an unapproved fold
+  returns `await_approval` at step 6b, before step 8, so for a pre-A2 orphan
+  the PR still needs a qualifying approval and the claim holds the head until
+  it arrives or the operator acts; `mergeOnPassPreYieldRefusal` still
+  refuses to yield a claimed entry (ADR-109: a claimed dispatch is held,
+  never yielded). Transition: an orphan already stranded on a non-merging
+  entry when A2 deploys keeps this conditional path. Residual: a late PUT
+  from the crashed process after the resume's release merges the PR; the
+  next pump settles it merged `pr_merged` with no PUT of its own (the merged
+  reconcile finds no claim). Visibility: `dispatch_claim.orphan` on the merge-queue read and
   `merge_candidate_queue.dispatch_claim_orphan` on the run read label
   `orphaned` / `orphaned_by_restart`; a released claim is deleted, so its
   record is the audit row.
@@ -1742,10 +1961,12 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
   boot-time cutoff. An unreadable clock holds.
 - **R2 note (binds any follow-up).** Any later automatic retry of a
   crash-left merge MUST re-run the ADR-112 forge-approval fold and veto
-  in-lock, failing closed, before calling the forge. A1's open-PR release
-  does exactly that (it sits after the fold in step 8); the retry-once and
-  the moved head/base release are not implemented, and the resume itself
-  dispatches no merge PUT.
+  in-lock, failing closed, before calling the forge. A2's open-PR release
+  does: the resume only releases the claim and dispatches no merge PUT, and
+  the next merge is ordinary merge-on-pass, whose fold and veto run in-lock
+  before its claim (step 8's backstop release likewise sits after the
+  fold); the retry-once and the moved head/base release are not
+  implemented.
 - **`merge_queue_resumed` (INTERNAL audit category).** Payload `{entry_id,
   base_ref, step, action, reason?, head_sha, admission_epoch, next_step?,
   remedy?, claim_state?, claim_path?, claim_head_sha?}`; every id is the

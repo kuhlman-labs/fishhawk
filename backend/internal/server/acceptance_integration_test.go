@@ -1785,3 +1785,283 @@ func TestAcceptanceReplayRoundTrip(t *testing.T) {
 		t.Errorf("scenarios_pushed entry lost the retirement reason")
 	}
 }
+
+// TestAcceptanceE2E_RebaseThenRedispatch_BindsNewHead drives the REAL run,
+// audit and handler flow across the #4874 boundary: a verdict at S through the
+// real ship; Option C refuses at S; the REAL rebase handler records a clean
+// branch_rebased S -> M; Option C now admits and re-opens; the host-dispatch
+// marker writes a new anchor; the REST prompt serves M; a real verdict binds M;
+// Option C at M refuses again. Nothing re-opens without the operator retry.
+func TestAcceptanceE2E_RebaseThenRedispatch_BindsNewHead(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	// Strip the implement verify stanza so the rebase records no merge-candidate
+	// trigger (which would re-open implement); fail loudly if it is not there.
+	const verifyStanza = "          verify:\n            command: \"scripts/test verify\"\n            timeout: \"15m\"\n            max_iterations: 1\n"
+	stripped := strings.Replace(string(exampleBytes), verifyStanza, "", 1)
+	if stripped == string(exampleBytes) {
+		t.Fatal("precondition: the committed example's implement verify stanza was not found")
+	}
+	if _, err := spec.ParseBytes([]byte(stripped)); err != nil {
+		t.Fatalf("precondition: the stripped example does not parse: %v", err)
+	}
+	seam := buildLocalAcceptanceSeam(t, []byte(stripped))
+	prURL := rebasePRURL
+	seam.rr.getRuns[seam.runID].PullRequestURL = &prURL
+	seam.rr.getRuns[seam.runID].InstallationID = instID(99)
+	seam.s.cfg.GitHub = newRebaseGitHubClient(t, cleanRebaseStub())
+	seam.s.postMergeHeadReadBackoff = testPostMergeHeadReadBackoff()
+	ctx := context.Background()
+
+	// 1) PR opened at S; Advance parks acceptance; the marker writes anchor #1.
+	seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": rebasePriorHeadSHA})
+	o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+	if _, err := o.Advance(ctx, seam.runID); err != nil {
+		t.Fatalf("orchestrator advance to acceptance: %v", err)
+	}
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("first host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 2) A signed verdict at S through the real ship.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "first episode"), ""); w.Code != 201 {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != rebasePriorHeadSHA {
+		t.Fatalf("first verdict head_sha = %v, want S %q", got, rebasePriorHeadSHA)
+	}
+
+	// 3) Option C at S: the verdict is current, so the retry refuses.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("retry at S status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+
+	// 4) The REAL rebase handler records a clean branch_rebased S -> M.
+	if w := postRebaseBranch(t, seam.s, seam.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator); w.Code != http.StatusOK {
+		t.Fatalf("rebase status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rebased := seam.au.snapshot(seam.runID, CategoryBranchRebased)
+	if len(rebased) != 1 {
+		t.Fatalf("branch_rebased rows = %d, want 1", len(rebased))
+	}
+	var adv branchRebasedAdvance
+	if err := json.Unmarshal(rebased[0].Payload, &adv); err != nil || !isCleanAdvance(adv) || adv.MergeCommitSHA != rebaseNewHeadSHA {
+		t.Fatalf("precondition: branch_rebased = %+v (err %v), want a clean advance to %s", adv, err, rebaseNewHeadSHA)
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Fatalf("precondition: merge-candidate triggers = %d, want 0 (no pass may re-open implement)", n)
+	}
+	if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStateSucceeded {
+		t.Fatalf("acceptance state after the rebase = %q, want succeeded (a rebase alone re-opens nothing)", got)
+	}
+
+	// 5) Option C now admits: the verdict at S is stale against M.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusOK {
+		t.Fatalf("retry after the rebase status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceReopened)); n != 1 {
+		t.Fatalf("acceptance_reopened rows = %d, want 1", n)
+	}
+
+	// 6) The real host-dispatch marker writes a new anchor above the rebase.
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("re-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 7) The REST prompt serves M.
+	w := promptRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	if resp.AcceptanceExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("acceptance_expected_head_sha = %q, want the merge commit %q", resp.AcceptanceExpectedHeadSHA, rebaseNewHeadSHA)
+	}
+
+	// 8) A real signed verdict binds M.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "second episode, post rebase"), ""); w.Code != 201 {
+		t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != rebaseNewHeadSHA {
+		t.Errorf("second verdict head_sha = %v, want the merge commit %q", got, rebaseNewHeadSHA)
+	}
+
+	// 9) Option C at M refuses.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("retry at M status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestAcceptanceE2E_ScenarioCommitThenFixup_SecondVerdictBindsFixupHead is the
+// #4673 cross-layer regression: acceptance -> the stage's own scenario-corpus
+// commit S1 -> a fix-up F -> acceptance again. It runs on ONE sequenced audit
+// store across orchestrator Advance, the host-dispatch marker (dispatch
+// anchors), the REAL acceptance_scenarios_pushed report handler, the
+// production fix-up reopen, the REST prompt (the served
+// acceptance_expected_head_sha), the signed ship handler (the persisted
+// verdict head_sha) and the merge-readiness predicates (acceptanceStaleRefusal
+// and acceptanceGateState).
+//
+// The ordering S1 < F < anchor #2 is the precondition that makes the binder
+// observable: a resolver that ranks acceptance_scenarios_pushed above
+// fixup_pushed (the pre-#5155 auditcomplete.LatestReportedHeadSHA precedence)
+// answers S1, while the chain-sequence seed answers F. Without the fix-up leg,
+// or with S1 after F, both orderings agree and the test would pass vacuously.
+// The head assertions use t.Errorf so a counterfactual reports the wrong head.
+//
+// COVERAGE LIMITS. The fixup_pushed row and the re-open are seeded, not driven
+// through the report handler: the real succeedFixupPushStage needs an implement
+// stage running under a guarded-edge repo, review-obligation rows and a fix-up
+// trigger, none of which this seam models. The fix-up leg therefore seeds
+// fixup_pushed F and calls reopenAcceptanceOnFixupPush, the same production
+// reopen the handler calls at pullrequest.go:1812. The handler-to-reopen call
+// site (pullrequest.go:1791-1812) is NOT covered by this test. The scenario
+// pushes ARE the real report handler, with no GitHub client wired so the
+// ADR-141 report verifier admits, as TestAcceptanceReplayRoundTrip does.
+//
+// Counterfactual: making newestReportedHeadBySequence rank
+// acceptance_scenarios_pushed rows above every other category goes RED on the
+// served-head and second-verdict head assertions, naming S1.
+func TestAcceptanceE2E_ScenarioCommitThenFixup_SecondVerdictBindsFixupHead(t *testing.T) {
+	const (
+		headH  = "1a00000000000000000000000000000000000001" // the implement (PR-open) head
+		headS1 = "5100000000000000000000000000000000000051" // the first episode's corpus commit
+		headF  = "f100000000000000000000000000000000000f01" // the fix-up head
+		headS2 = "5200000000000000000000000000000000000052" // the second episode's corpus commit
+		branch = "fishhawk/run-x/stage-y"
+	)
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildLocalAcceptanceSeam(t, exampleBytes)
+	ctx := context.Background()
+	scenarioPush := func(head, base string) []byte {
+		return []byte(`{"outcome":"acceptance_scenarios_pushed","branch":"` + branch + `","head_sha":"` + head +
+			`","base_sha":"` + base + `","scenario_ids":["scenario:issue-101/crit-a"]}`)
+	}
+	staleRefusal := func() *mergeReadinessRefusal {
+		t.Helper()
+		ref, err := seam.s.acceptanceStaleRefusal(ctx, seam.rr.getRuns[seam.runID], seam.rr.stagesByRunID[seam.runID])
+		if err != nil {
+			t.Fatalf("acceptanceStaleRefusal: %v", err)
+		}
+		return ref
+	}
+
+	// 1) The PR opened at H; Advance parks acceptance; the marker writes anchor #1.
+	seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": headH, "branch": branch})
+	o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+	if _, err := o.Advance(ctx, seam.runID); err != nil {
+		t.Fatalf("orchestrator advance to acceptance: %v", err)
+	}
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("first host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 2) Verdict #1 binds H.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "first episode"), ""); w.Code != 201 {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != headH {
+		t.Fatalf("first verdict head_sha = %v, want the PR-open head %q", got, headH)
+	}
+
+	// 3) The stage's own corpus commit S1 through the REAL report handler: a
+	//    post-verdict lineage row, no re-open, verdict #1 still bound to H.
+	if w := shipPRRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, scenarioPush(headS1, headH), ""); w.Code != http.StatusOK {
+		t.Fatalf("first scenarios-pushed status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceReopened)); n != 0 {
+		t.Errorf("acceptance_reopened rows after the corpus commit = %d, want 0 (the stage's own corpus commit never re-opens acceptance)", n)
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != headH {
+		t.Errorf("verdict #1 head_sha after the corpus commit = %v, want it still bound to %q", got, headH)
+	}
+	if ref := staleRefusal(); ref != nil {
+		t.Errorf("acceptanceStaleRefusal after the corpus commit = %q, want nil (admit)", ref.Code)
+	}
+
+	// 4) A fix-up lands F after S1, and the production reopen invalidates verdict #1.
+	seam.au.seedEntry(seam.runID, "fixup_pushed", map[string]any{"head_sha": headF, "branch": branch})
+	seam.s.reopenAcceptanceOnFixupPush(ctx, seam.runID, headF)
+	if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStatePending {
+		t.Fatalf("acceptance stage state after the fix-up reopen = %q, want pending", got)
+	}
+
+	// 5) Between the fix-up and the re-run, merge readiness refuses acceptance_stale.
+	ref := staleRefusal()
+	if ref == nil {
+		t.Fatal("acceptanceStaleRefusal after the fix-up = nil, want acceptance_stale")
+	}
+	if ref.Code != mergeCodeAcceptanceStale || ref.Details["verified_head_sha"] != headH || ref.Details["current_head_sha"] != headF {
+		t.Errorf("refusal = %s verified %v current %v, want %s verified %s current %s",
+			ref.Code, ref.Details["verified_head_sha"], ref.Details["current_head_sha"], mergeCodeAcceptanceStale, headH, headF)
+	}
+
+	// 6) Re-dispatch (anchor #2, above F). The ordering S1 < F < anchor #2 is
+	//    the precondition that distinguishes the binders.
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("re-dispatch host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	scen := seam.au.snapshot(seam.runID, CategoryAcceptanceScenariosPushed)
+	fix := seam.au.snapshot(seam.runID, "fixup_pushed")
+	anchors := seam.au.snapshot(seam.runID, CategoryAcceptanceDispatched)
+	if len(scen) != 1 || len(fix) != 1 || len(anchors) != 2 {
+		t.Fatalf("precondition: scenario/fix-up/anchor rows = %d/%d/%d, want 1/1/2", len(scen), len(fix), len(anchors))
+	}
+	if scen[0].Sequence >= fix[0].Sequence || fix[0].Sequence >= anchors[1].Sequence {
+		t.Fatalf("precondition: sequences S1 %d, F %d, anchor #2 %d must ascend", scen[0].Sequence, fix[0].Sequence, anchors[1].Sequence)
+	}
+
+	// The REST prompt serves F: the tree the runner checks out (criterion 1).
+	w := promptRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	if resp.AcceptanceExpectedHeadSHA != headF {
+		t.Errorf("acceptance_expected_head_sha = %q, want the fix-up head %q, not the prior episode's corpus commit %q",
+			resp.AcceptanceExpectedHeadSHA, headF, headS1)
+	}
+
+	// 7) Verdict #2 binds F, never S1.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "second episode, post fix-up"), ""); w.Code != 201 {
+		t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != headF {
+		t.Errorf("second verdict head_sha = %v, want the fix-up head %q it verified, not the prior episode's corpus commit %q", got, headF, headS1)
+	}
+
+	// 8) The second episode's own corpus commit S2 is a post-verdict descendant:
+	//    verdict #2 stays bound to F and the gate admits.
+	if w := shipPRRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, scenarioPush(headS2, headF), ""); w.Code != http.StatusOK {
+		t.Fatalf("second scenarios-pushed status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != headF {
+		t.Errorf("verdict #2 head_sha after its own corpus commit = %v, want it still bound to %q", got, headF)
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceReopened)); n != 1 {
+		t.Errorf("acceptance_reopened rows = %d, want 1 (only the fix-up's; the corpus commits re-open nothing)", n)
+	}
+	if ref := staleRefusal(); ref != nil {
+		t.Errorf("acceptanceStaleRefusal after verdict #2 and S2 = %q, want nil (admit)", ref.Code)
+	}
+	state, err := seam.s.acceptanceGateState(ctx, seam.rr.getRuns[seam.runID], seam.rr.stagesByRunID[seam.runID])
+	if err != nil {
+		t.Fatalf("acceptanceGateState: %v", err)
+	}
+	if state != acceptanceGatePassed {
+		t.Errorf("acceptanceGateState = %q, want %q", state, acceptanceGatePassed)
+	}
+}

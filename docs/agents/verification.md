@@ -6,15 +6,18 @@ preconditions and failure semantics; [testing rules](testing.md) cover fixtures.
 
 ## Gates and scope
 
-The repository implement stages run `scripts/verify-change`: path-aware frontend
-checks followed by the full Go/schema gate. See scripts/README § Workflow
+The runner's verify gate for this repository's implement stages runs
+`scripts/verify-change`: path-aware frontend checks followed by the full
+Go/schema gate. See scripts/README § Workflow
 verification for offline dependencies and infrastructure exit 75.
 
 - `scripts/test` runs `go test -race` in every registered module; `coverage`
   also checks aggregate coverage. `verify` adds lint, document/schema gates and
   gate harnesses before tests, folding patch coverage into that same test loop.
   `verify --no-tests` omits tests and patch coverage. Do not report it as full verify.
-- Full verify is required before push/open PR. Scoped verify restricts only the
+- Full verify is required before push/open PR from an operator checkout or
+  shell, and in a run stage with no configured runner gate; inside a run with
+  one, see [Run-context rule](#run-context-rule). Scoped verify restricts only the
   test loop, skips patch coverage with a reason, and widens to full on unknown
   packages. The runner performs full verification of the passing SHA; its
   outside-only failure absorption is narrowly defined in
@@ -31,6 +34,25 @@ verification for offline dependencies and infrastructure exit 75.
   floor; untracked Go files count. Its pre-test snapshot prevents tree rewrites
   from converting a real failure into a skip. Never use dev bypass knobs to
   claim a passing gate. See scripts/README for precondition versus integrity failures.
+
+### Run-context rule
+
+This is the canonical statement of how a Fishhawk run agent verifies its change
+(#5148). The runner stamps `FISHHAWK_RUN_AGENT` on every agent it spawns
+(`RunAgentEnvVar` in `runner/internal/agent/agent.go`); `scripts/is-run-agent`
+checks it (scripts/README § `is-run-agent`). The marker is not
+`FISHHAWK_RUN_ID`. It only selects the agent's verification workflow and never
+substitutes for the gate.
+
+When the implement prompt states that the stage has a configured runner verify
+gate (`executor.verify.command`), the run agent runs focused `scripts/test
+single` plus a scoped `scripts/test verify --packages ...` only. It does not run
+`scripts/verify-change` or a full `scripts/test verify`, even when a plan step
+names one. The runner's gate runs the configured command on the finished change
+under its own budget; on red it fails the stage or routes a bounded verify-fix
+iteration (runner/cmd/fishhawk-runner/README.md § Committed-tree verify-fix
+loop). When the prompt says no gate is configured, or outside a run (an operator
+checkout or shell), the full verify before push/open PR still applies.
 
 ## Toolchain and execution environment
 

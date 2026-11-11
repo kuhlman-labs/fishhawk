@@ -19,7 +19,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -92,7 +91,9 @@ const (
 	// acceptance/scenarios/retired.yaml on the run branch. It is a reported-head
 	// ledger category (auditcomplete.HeadReportCategoriesByPrecedence and
 	// lineageLedgerCategories both admit it) so the scenario commit attributes
-	// as run lineage without re-opening the settled acceptance verdict.
+	// as run lineage without re-opening the settled acceptance verdict. Those
+	// lists decide membership and attribution; the head acceptance validates
+	// and binds its verdict to is decided by acceptanceHeadAsOf (#4874).
 	CategoryAcceptanceScenariosPushed = "acceptance_scenarios_pushed"
 	// CategoryAcceptanceScenarioRetirementDropped records that an APPROVED
 	// scenario retirement served to the acceptance runner was NOT persisted to
@@ -232,7 +233,8 @@ const (
 	// the dispositions are decided by ONE total ladder over the row set
 	// (acceptanceVerdictSeverity: passed < not_validated < undecidable < failed).
 	// not_validated is reached PRE-SPAWN from the plan (no rows) OR POST-RUN when
-	// every non-retired row is skipped / no rows shipped (#3397); undecidable is
+	// every laddered row (neither retired nor operator-added) is skipped, no rows
+	// shipped (#3397), or only retired/added rows were itemized (#3682); undecidable is
 	// reached POST-RUN when ≥1 row is undecidable and none failed; failed outranks
 	// both. Because one ladder decides, the recorded verdicts stay mutually
 	// exclusive even though not_validated can now carry all-skipped rows.
@@ -806,7 +808,8 @@ func acceptanceCriteriaTally(criteria []acceptanceCriterionResult) (passed, fail
 // answer unreachable; TestAggregateAcceptanceResults_EmptyRowSet pins the
 // behaviour so a caller that drops the guard cannot claim surprise, and the
 // empty-set door itself is closed at the seam (binding condition 1, #3397): the
-// call site ladders an empty non-retired set against not_validated directly.
+// call site ladders an empty laddered set (no row neither retired nor
+// operator-added) against not_validated directly.
 //
 // A row set containing an undecidable row can NEVER aggregate to passed: a green
 // light over an unevaluated criterion is the dangerous direction, because nobody
@@ -1172,24 +1175,35 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	//
 	// #2512 orders the two rewrites at this ONE seam and the order is
 	// load-bearing: (1) the #2581 downgrade runs FIRST over the retired-id set;
-	// (2) the precedence ladder then runs over the NON-RETIRED rows only, so a
-	// retired criterion's undecidable row cannot pin the run to undecidable
-	// forever and the operator's retirement keeps its effect; (3) the recorded
+	// (2) the precedence ladder then runs over the rows that are neither
+	// RETIRED nor OPERATOR-ADDED, so a retired criterion's undecidable row cannot
+	// pin the run to undecidable forever and the operator's retirement keeps its
+	// effect, and an advisory added row can neither escalate nor certify the
+	// verdict (#3682); (3) the recorded
 	// verdict is acceptanceVerdictAtLeast(post-downgrade, derived) — a
 	// severity-monotone lower bound that never softens below either source.
 	//
-	// The retired-id set is resolved for EVERY verdict now (not just failed),
-	// because step (2) needs it regardless of what the agent shipped. Both
-	// degrade branches leave the set EMPTY, which makes the ladder run over all
-	// rows — the conservative direction, since a retired row can then only raise
-	// severity, never lower it.
+	// The retired-id AND added-id sets are resolved for EVERY verdict (not just
+	// failed), because step (2) needs them regardless of what the agent shipped.
+	// Both degrade branches leave both sets EMPTY, which makes the ladder run over
+	// all rows — the conservative direction, since a retired or added row can then
+	// only raise severity, never lower it.
 	downgradedVerdict, downgradeRetiredIDs, downgradeBasis := "", []string(nil), ""
 	downgradeAddedIDs := []string(nil)
 	retiredIDs := map[string]struct{}{}
+	// ladderAddedIDs is the operator-added criterion id set (#3181), resolved for
+	// every verdict (#3682) so an added row never feeds the ladder.
+	ladderAddedIDs := map[string]struct{}{}
+	// reviewedLiveIDs are the REVIEWED criteria still in force: live, not
+	// retired and not operator-added. The #3682 R1 advisory-only rule below reads
+	// it (approval condition C1): a shipped failed is softened only when every one
+	// of them was itemized. A degrade branch leaves it empty AND ladderAddedIDs
+	// empty, so R1's itemizedAdded conjunct is false and it cannot fire.
+	var reviewedLiveIDs []string
 	// ladderExcluded is the set of row ids the precedence ladder skips: the
-	// retired ids always, plus the operator-added ids when the #3181 added-only
-	// downgrade fired (their failures were neutralized, so re-deriving `failed`
-	// from them would undo it).
+	// retired ids and the operator-added ids, ALWAYS (#3682). An added row is
+	// advisory: it never passed plan review, so it can neither escalate nor
+	// certify the recorded verdict.
 	ladderExcluded := map[string]struct{}{}
 	{
 		approvedPlan, perr := s.loadApprovedPlanForRun(r.Context(), runID)
@@ -1208,6 +1222,12 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 					slog.String("run_id", runID.String()), slog.String("error", eerr.Error()))
 			} else {
 				retiredIDs = eff.retiredIDSet()
+				ladderAddedIDs = eff.addedIDSet()
+				for _, c := range eff.Live {
+					if _, added := ladderAddedIDs[c.ID]; !added {
+						reviewedLiveIDs = append(reviewedLiveIDs, c.ID)
+					}
+				}
 				if down, ids, basis := acceptanceDowngrade(acc, eff); down {
 					downgradedVerdict = acceptanceVerdictPassed
 					downgradeRetiredIDs = ids
@@ -1223,9 +1243,6 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 					downgradeAddedIDs = added
 					downgradeRetiredIDs = retiredFailed
 					downgradeBasis = acceptanceDowngradeBasisAddedOnly
-					for id := range eff.addedIDSet() {
-						ladderExcluded[id] = struct{}{}
-					}
 					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
 						"acceptance: failed verdict neutralized — every failure named an operator-added (advisory) criterion",
 						slog.String("run_id", runID.String()),
@@ -1235,10 +1252,35 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step (2)+(3): derive from the non-retired rows (and, when the #3181
-	// added-only downgrade fired, the non-added rows) and take the severity max.
-	// So an added-only neutralization over a surviving set that is all skipped
-	// records not_validated, never passed.
+	// addedFailedIDs (#3682 R6) are the operator-added ids reported failed, in
+	// row order, deduplicated. Descriptive only: nothing reads it to decide a
+	// verdict. It keeps a failed ADVISORY row visible on the payload now that an
+	// added row never feeds the ladder.
+	var addedFailedIDs []string
+	{
+		seen := map[string]struct{}{}
+		for _, c := range acc.normalizedCriteria {
+			if c.Result != acceptanceResultFailed {
+				continue
+			}
+			if _, added := ladderAddedIDs[c.ID]; !added {
+				continue
+			}
+			if _, dup := seen[c.ID]; dup {
+				continue
+			}
+			seen[c.ID] = struct{}{}
+			addedFailedIDs = append(addedFailedIDs, c.ID)
+		}
+	}
+
+	// Step (2)+(3): derive from the LADDERED rows — neither retired nor
+	// operator-added (#3682) — and take the severity max. An added row is
+	// excluded for every verdict, so it cannot move a shipped passed in either
+	// direction: an added undecidable/failed row cannot escalate it and an added
+	// passed row cannot lift an all-skipped reviewed set to passed. So an
+	// added-only neutralization over a surviving set that is all skipped records
+	// not_validated, never passed.
 	// The len(rows) > 0 guard is aggregateAcceptanceResults' documented
 	// PRECONDITION — without it an empty row set would answer `passed` and
 	// soften a shipped failed verdict into a pass, which is the exact hazard
@@ -1256,42 +1298,101 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	for id := range retiredIDs {
 		ladderExcluded[id] = struct{}{}
 	}
-	nonRetired := make([]acceptanceCriterionResult, 0, len(acc.normalizedCriteria))
+	// #3682: added rows are ADVISORY and never feed the ladder, so an added row
+	// cannot move a shipped passed in either direction.
+	for id := range ladderAddedIDs {
+		ladderExcluded[id] = struct{}{}
+	}
+	laddered := make([]acceptanceCriterionResult, 0, len(acc.normalizedCriteria))
 	for _, c := range acc.normalizedCriteria {
 		if _, excluded := ladderExcluded[c.ID]; !excluded {
-			nonRetired = append(nonRetired, c)
+			laddered = append(laddered, c)
 		}
 	}
 	observedBasis := ""
-	if len(nonRetired) > 0 {
-		derived := aggregateAcceptanceResults(nonRetired)
+	// advisoryOnlyFailure is the #3682 R1 shape: a shipped failed whose
+	// itemization evidences no reviewed criterion in force. It records
+	// not_validated and routes NO triage (see the triage branch below).
+	advisoryOnlyFailure := false
+	if len(laddered) > 0 {
+		derived := aggregateAcceptanceResults(laddered)
 		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, derived)
 		if derived == acceptanceVerdictNotValidated {
-			// Every non-retired row was skipped: the validator ran and verified
+			// Every laddered row was skipped: the validator ran and verified
 			// nothing (#3397).
 			observedBasis = plan.AcceptanceBasisAllSkipObserved
 		}
 	} else {
-		// THE NEIGHBOURING DOOR (binding condition 1, #3397): an empty non-retired
+		// THE NEIGHBOURING DOOR (binding condition 1, #3397): an empty laddered
 		// row set — the validator shipped a verdict itemizing zero drivable rows
-		// (e.g. {"verdict":"passed"} with no criteria) — verified nothing exactly
-		// as an all-skip set does. Ladder against not_validated so a shipped
-		// `passed` becomes not_validated while a shipped `failed` with an empty set
-		// stays failed (severity-monotone, so the guard's anti-softening purpose is
-		// intact). A separate basis keeps the verified-nothing origins tellable
-		// apart.
-		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, acceptanceVerdictNotValidated)
-		// NAME THE ORIGIN HONESTLY (fix-up, medium/untested-path): an empty
-		// non-retired set has TWO distinct origins, which must not share one
-		// operator-facing sentence. If the validator itemized rows but the operator
-		// retired EVERY one (the #2581 all-rows-retired path), record
-		// all-retired-observed — rows WERE recorded, so the no-rows wording
-		// ("recorded no criteria") would be inaccurate. Only a truly empty
-		// itemization records no-rows-observed.
-		if len(acc.normalizedCriteria) > 0 {
-			observedBasis = plan.AcceptanceBasisAllRetiredObserved
+		// (e.g. {"verdict":"passed"} with no criteria), or only retired/added rows
+		// — verified no reviewed criterion in force exactly as an all-skip set
+		// does. Ladder against not_validated so a shipped `passed` becomes
+		// not_validated while a shipped `failed` with an empty set stays failed
+		// (severity-monotone, so the guard's anti-softening purpose is intact),
+		// with the ONE bounded exception below. A separate basis keeps the
+		// verified-nothing origins tellable apart.
+		itemizedAdded := false
+		failedRows := 0
+		itemized := make(map[string]struct{}, len(acc.normalizedCriteria))
+		for _, c := range acc.normalizedCriteria {
+			itemized[c.ID] = struct{}{}
+			if _, added := ladderAddedIDs[c.ID]; added {
+				itemizedAdded = true
+			}
+			if c.Result == acceptanceResultFailed {
+				failedRows++
+			}
+		}
+		// Approval condition C1 (#3682): R1 applies ONLY when every reviewed
+		// criterion in force was itemized. A verdict that omits a live reviewed
+		// criterion keeps today's path (failed + triage), so a validator cannot
+		// earn a merge-eligible not_validated by leaving the reviewed contract out
+		// of its itemization. Inside this door no reviewed live row is laddered,
+		// so the conjunct holds only when no reviewed criterion is in force —
+		// every reviewed criterion was retired. The approval gate's R12
+		// (acceptance_criteria_all_operator_authored) refuses such a chain beside
+		// an add, so on any chain the gate admits R1 does not fire; it stays as
+		// the bounded rule for a chain recorded without that gate.
+		reviewedLiveItemized := true
+		for _, id := range reviewedLiveIDs {
+			if _, ok := itemized[id]; !ok {
+				reviewedLiveItemized = false
+				break
+			}
+		}
+		// #3682 R1: every itemized row is advisory (added) or superseded
+		// (retired), at least one is added, at least one failed, and the
+		// failure is an assertion failure. validate() admits failure_mode only
+		// on a shipped failed, so the assertion_fail conjunct also means
+		// "shipped failed". No reviewed live criterion was validated, so neither
+		// passed nor failed is honest: record not_validated. This is the ONE
+		// deliberate softening of a shipped failed at this seam. A pure-retired
+		// itemization (itemizedAdded false), failure_mode error, a shipped failed
+		// itemizing no failed row, and a verdict omitting a live reviewed
+		// criterion all keep failed. On a #2581-downgraded verdict (recorded is
+		// already passed) the rewrite equals the else branch.
+		advisoryOnlyFailure = itemizedAdded && failedRows > 0 && acc.FailureMode == acceptanceFailureAssertionFail && reviewedLiveItemized
+		if advisoryOnlyFailure {
+			recordedVerdict = acceptanceVerdictNotValidated
 		} else {
+			recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, acceptanceVerdictNotValidated)
+		}
+		// NAME THE ORIGIN HONESTLY (fix-up, medium/untested-path): an empty
+		// laddered set has THREE distinct origins, which must not share one
+		// operator-facing sentence. Only a truly empty itemization records
+		// no-rows-observed. If any itemized row is operator-added (#3682), record
+		// added-only-observed. Otherwise the operator retired EVERY itemized row
+		// (the #2581 all-rows-retired path): record all-retired-observed — rows
+		// WERE recorded, so the no-rows wording ("recorded no criteria") would be
+		// inaccurate.
+		switch {
+		case len(acc.normalizedCriteria) == 0:
 			observedBasis = plan.AcceptanceBasisNoRowsObserved
+		case itemizedAdded:
+			observedBasis = plan.AcceptanceBasisAddedOnlyObserved
+		default:
+			observedBasis = plan.AcceptanceBasisAllRetiredObserved
 		}
 	}
 	// Step (4), UNBOUND-HEAD CLAMP (#3091). A verdict whose validated head could
@@ -1392,6 +1493,16 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 				fields["added_criterion_ids"] = downgradeAddedIDs
 			}
 		}
+		// added_criteria_failed (#3682 R6) is an additive, descriptive key
+		// emitted whatever the recorded verdict, so a failed ADVISORY row on a
+		// recorded passed or not_validated stays visible without feeding the
+		// ladder. Nothing reads it to decide a verdict. It is distinct from
+		// added_criterion_ids, which stays the added-only downgrade's attribution
+		// and is gated on that downgrade firing. A payload with no failed added
+		// row marshals byte-identically to before.
+		if len(addedFailedIDs) > 0 {
+			fields["added_criteria_failed"] = addedFailedIDs
+		}
 		// undecidable_basis is the #3091 clamp's own key, DISTINCT from
 		// downgrade_basis (which keeps its #2581 retirement meaning). It is
 		// emitted only when the clamp actually fired, so an outcome with a
@@ -1400,7 +1511,8 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			fields["undecidable_basis"] = undecidableBasis
 		}
 		// basis (#3397) names WHY a POST-RUN not_validated verdict was derived —
-		// all-skip-observed or no-rows-observed. Emitted ONLY when the recorded
+		// all-skip-observed, no-rows-observed, all-retired-observed or
+		// added-only-observed. Emitted ONLY when the recorded
 		// verdict is not_validated: a clamp that raised it to undecidable carries
 		// undecidable_basis + verdict_reported and NO basis, and every other
 		// outcome marshals byte-identically to before. The value is distinct from
@@ -1546,12 +1658,16 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// rather than through a classifier fed an empty mode. An `undecidable`
 	// recorded verdict routes NO triage at all: an undecidable row is not a
 	// defect, so there is nothing to fix up or retry. A #3397 not_validated
-	// recorded verdict likewise routes no triage — it can only arise from a
-	// shipped `passed` (acc.Verdict != failed), so this branch is not entered;
-	// a shipped `failed` whose rows are all-skip stays recorded `failed` and
-	// still routes class-5 triage exactly as before.
+	// recorded verdict likewise routes no triage. It arises from a shipped
+	// `passed` (acc.Verdict != failed, so this branch is not entered), from a
+	// #2581/#3181-downgraded failed (downgradedVerdict set), or from the #3682
+	// R1 advisory-only shipped failed: every itemized row is added or retired,
+	// so there is no reviewed failure to fix up or retry (advisoryOnlyFailure).
+	// Every other shipped `failed` — a failed live reviewed row, failure_mode
+	// error, no failed row, an omitted live reviewed criterion, or an all-skip
+	// set — stays recorded `failed` and routes triage exactly as before.
 	paged := false
-	if acc.Verdict == acceptanceVerdictFailed && downgradedVerdict == "" {
+	if acc.Verdict == acceptanceVerdictFailed && downgradedVerdict == "" && !advisoryOnlyFailure {
 		disposition := s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
 		paged = acceptanceDispositionPages(disposition)
 	}
@@ -1588,9 +1704,19 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 // acceptance_outcome_recorded verdict, it re-opens the stage (succeeded →
 // pending) via run.ReopenAcceptanceStage and appends an acceptance_reopened
 // invalidation audit entry — the SAME kind the operator-gated #1567 re-open
-// uses (no new issue-comment surface). next_actions then routes to
-// acceptance_pending so the operator re-dispatches acceptance against the final
-// commit.
+// uses (no new issue-comment surface).
+//
+// It never calls Advance itself. Its one production caller, succeedFixupPushStage,
+// fires the orchestrator advance AFTER it (#4804), so a stage re-opened behind a
+// gateless implement edge is re-armed: parked at awaiting_host_dispatch on a local
+// run, dispatched on github_actions, or, when Orchestrator.Artifacts is wired and
+// the approved plan is empty-criteria or all-skip-with-basis, re-short-circuited
+// straight to succeeded with a fresh not_validated verdict, opening the review
+// gate with no park. A stage left pending (a gated implement edge, or a report
+// that found the implement stage already out of running and took no edge) is
+// what next_actions' acceptance dispatch lead covers, so the operator
+// re-dispatches acceptance against the final commit (docs/acceptance.md §
+// "Verdict head binding").
 //
 // No-op (everything untouched) when: the run has no acceptance stage; the
 // acceptance stage is not succeeded (a PRE-acceptance fix-up must not reopen
@@ -1733,8 +1859,9 @@ const (
 	// not_validated verdict. Two origins reach it: the orchestrator
 	// short-circuited PRE-SPAWN (zero acceptance criteria, or every criterion
 	// skip_expected with an expectation_basis), OR (since #3397) the stage RAN
-	// and shipped a verdict whose every non-retired row was skipped / no rows at
-	// all. Either way ZERO criteria were verified.
+	// and shipped a verdict whose every laddered row (neither retired nor
+	// operator-added) was skipped, no rows at all, or only retired/added rows
+	// (#3682). Either way ZERO reviewed criteria in force were verified.
 	//
 	// It is merge-ELIGIBLE on purpose: a change with no live target must not be
 	// stranded, and blocking here would trade a dishonest pass for a wedge. The
@@ -2290,20 +2417,21 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 }
 
 // acceptanceValidatedHeadSHA resolves the head the acceptance stage actually
-// validated (#1682, binding condition 2): the run's newest recorded head at
-// the moment the stage was DISPATCHED. Head-report entries with sequence
-// at-or-before the latest acceptance_dispatched entry for THIS stage are the
-// candidates; the precedence winner among them (via the shared
-// auditcomplete.LatestReportedHeadSHA) is the validated head. Anchoring on the
-// dispatch sequence excludes a fixup_pushed / child_pushed that lands AFTER
-// dispatch, so the verdict binds to the commit the validator checked out —
-// never a later commit that has not been validated.
+// validated (#1682, binding condition 2): the run's acceptance head at the
+// moment the stage was DISPATCHED, resolved by the SAME acceptanceHeadAsOf the
+// prompt serves, bounded by the latest acceptance_dispatched entry for THIS
+// stage (#4874). Every candidate — reported-head rows, the consolidated fan-in
+// integration_commit_recorded rows and the clean recorded base merges the seed
+// is walked through — is cut to sequence at-or-before that anchor before any
+// selection, so a fixup_pushed, scenario commit, integration merge or rebase
+// that lands AFTER dispatch never re-binds the verdict to a commit the
+// validator did not check out. The seed is the newest by CHAIN SEQUENCE
+// across both sets, never a timestamp and no longer category precedence.
 //
-// A decomposed PARENT writes no reported-head entry on its own chain at all
-// (see resolveConsolidatedFanInHeadSHA), so when the reported-head walk finds
-// nothing the resolver falls back to the parent's own incremental fan-in
-// ledger (integration_commit_recorded.merge_sha), BOUNDED by the same dispatch
-// anchor (#3091).
+// A decomposed PARENT's integration rows are an ordinary seed set here, not a
+// subordinate fallback: an integration row newer than a reported head at or
+// before the anchor binds the verdict to the integration-walked head (#3091,
+// #4874).
 //
 // A re-opened acceptance stage carries more than one acceptance_dispatched
 // entry; the highest-sequence one is the current validation episode.
@@ -2424,28 +2552,19 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 	if sha, applies := s.resolvePostDeployExpectedSHA(ctx, runID, stageID); applies {
 		return sha, sha != ""
 	}
-	var candidates []*audit.Entry
-	for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {
-		es, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
-		if err != nil {
-			return "", false
-		}
-		for _, e := range es {
-			if e.Sequence <= dispatchSeq {
-				candidates = append(candidates, e)
-			}
-		}
+	// One resolver for the served head and the validated head (#4874), bounded
+	// by the dispatch anchor. A read error or no head answers ("", false), which
+	// the #3091 clamp records as undecidable(head_unresolved).
+	sha, err := s.acceptanceHeadAsOf(ctx, runID, dispatchSeq, true)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance: validated head unreadable — treating it as unresolvable",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return "", false
 	}
-	if sha, ok := auditcomplete.LatestReportedHeadSHA(candidates); ok {
-		return sha, true
-	}
-	// Consolidated fan-in fallback (#3091), strictly SUBORDINATE to the
-	// reported-head walk above and BOUNDED by the same dispatch anchor: a
-	// decomposed parent's own chain carries no reported head at all, so the
-	// verdict would otherwise bind to nothing. Bounding on dispatchSeq is what
-	// stops a fan-in merge recorded AFTER the acceptance dispatch re-binding
-	// the verdict to a tree the stage never validated.
-	return s.resolveConsolidatedFanInHeadSHA(ctx, runID, dispatchSeq, true)
+	return sha, sha != ""
 }
 
 // latestAcceptanceDispatchSeq returns the highest audit sequence among the

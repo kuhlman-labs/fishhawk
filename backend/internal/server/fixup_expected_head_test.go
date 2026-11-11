@@ -158,7 +158,8 @@ func rebaseWithRecordedFixupHead(t *testing.T, stub *rebaseGitHub) (*rebaseSeed,
 // seam (writeBranchRebasedAudit's payload keys -> walkRecordedBaseMerges) is
 // pinned, not a hand-built row: after a clean rebase of the recorded fix-up
 // head the fix-up expectation is the merge commit (the run 3fa73698 incident).
-// The acceptance expectation is deliberately unchanged.
+// Since #4874 the acceptance expectation walks the same clean rebase, so it
+// names the merge commit too.
 func TestResolveFixupExpectedHeadSHA_AdvancesThroughRecordedRebase(t *testing.T) {
 	sd, stageID, resp := rebaseWithRecordedFixupHead(t, cleanRebaseStub())
 	if resp.NewHeadSHA != rebaseNewHeadSHA {
@@ -174,9 +175,9 @@ func TestResolveFixupExpectedHeadSHA_AdvancesThroughRecordedRebase(t *testing.T)
 		t.Errorf("fixup_expected_head_sha = %q, want the recorded merge commit %q (a fix-up after a clean rebase must not fail fixup_base_mismatch)",
 			got, rebaseNewHeadSHA)
 	}
-	if got := sd.s.resolveNewestReportedHeadSHA(ctx, sd.runID, stageID, "acceptance_expected_head_sha"); got != rebasePriorHeadSHA {
-		t.Errorf("acceptance expected head = %q, want the un-advanced recorded head %q (acceptance is out of scope)",
-			got, rebasePriorHeadSHA)
+	if got := sd.s.acceptanceHeadForRun(ctx, sd.runID, stageID); got != rebaseNewHeadSHA {
+		t.Errorf("acceptance expected head = %q, want the recorded merge commit %q (#4874)",
+			got, rebaseNewHeadSHA)
 	}
 }
 
@@ -252,5 +253,25 @@ func TestResolveFixupExpectedHeadSHA_NoRecordedHeadStaysEmpty(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
 	if got := s.resolveFixupExpectedHeadSHA(context.Background(), runID, uuid.New()); got != "" {
 		t.Errorf("fixup_expected_head_sha = %q, want empty with no recorded head", got)
+	}
+}
+
+// TestResolveFixupExpectedHeadSHA_SeedKeepsTimestampOrdering feeds a clock-
+// inverted chain to BOTH resolvers (#4874): F at seq 10 with a later timestamp
+// and S at seq 11 with an earlier one. The fix-up seed keeps its timestamp
+// ordering and answers F; the acceptance head orders by chain sequence and
+// answers S, so nothing was smuggled into fix-up.
+func TestResolveFixupExpectedHeadSHA_SeedKeepsTimestampOrdering(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _ := ahServer(
+		ahHead(runID, "fixup_pushed", 10, 5, ahF),
+		ahHead(runID, "pull_request_opened", 11, 0, ahS),
+	)
+	ctx := context.Background()
+	if got := s.resolveFixupExpectedHeadSHA(ctx, runID, stageID); got != ahF {
+		t.Errorf("fixup_expected_head_sha = %q, want %q (timestamp-then-sequence, unchanged)", got, ahF)
+	}
+	if got, err := s.acceptanceHeadAsOf(ctx, runID, 0, false); err != nil || got != ahS {
+		t.Errorf("acceptanceHeadAsOf = (%q, %v), want (%q, nil) (chain sequence)", got, err, ahS)
 	}
 }

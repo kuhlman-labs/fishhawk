@@ -2024,3 +2024,106 @@ func TestRetryStage_NoRecordedTree_WritesNoDiscardRow(t *testing.T) {
 		t.Errorf("no recorded verified tree means no discard row, got %+v", rows)
 	}
 }
+
+// retryRebaseRow is a clean branch_rebased row prior -> merge (#4874).
+func retryRebaseRow(seq int64, prior, merge string) *audit.Entry {
+	e := fixupWalkCleanRow(seq, prior, merge)
+	e.ID = uuid.New()
+	return e
+}
+
+// TestRetryStage_AcceptanceReopen_RebasedAfterVerdict_Admits: a verdict at S,
+// then a clean rebase S -> M. The current head is the acceptance head M, so
+// the verdict is stale and the operator retry admits (#4874).
+func TestRetryStage_AcceptanceReopen_RebasedAfterVerdict_Admits(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "S1reportedhead")},
+		"pull_request_opened":             {headReportEntry("pull_request_opened", "S1reportedhead", 1)},
+		CategoryBranchRebased:             {retryRebaseRow(3, "S1reportedhead", "M1mergecommit")},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a verdict recorded before a clean rebase is stale):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
+// TestRetryStage_AcceptanceReopen_VerdictAtRebasedHead_Refuses is the reverse
+// pair: a verdict at the merge commit M is current, so the retry keeps the 422.
+// The old ledger read (latestRunHeadSHA) would compare M to S and admit.
+func TestRetryStage_AcceptanceReopen_VerdictAtRebasedHead_Refuses(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "M1mergecommit")},
+		"pull_request_opened":             {headReportEntry("pull_request_opened", "S1reportedhead", 1)},
+		CategoryBranchRebased:             {retryRebaseRow(3, "S1reportedhead", "M1mergecommit")},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (the verdict is at the current acceptance head):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422", au.appended)
+	}
+}
+
+// TestRetryStage_AcceptanceReopen_BaseMergeReadError_500: a read error on
+// branch_rebased resolving the current head answers 500, never an admit.
+func TestRetryStage_AcceptanceReopen_BaseMergeReadError_500(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "H1oldhead")},
+		"fixup_pushed":                    {headReportEntry("fixup_pushed", "H2newhead", 5)},
+	}
+	au.catErr = map[string]error{CategoryBranchRebased: errors.New("base-merge read down")}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (base-merge read error):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 500", au.appended)
+	}
+}
+
+// TestRetryStage_AcceptanceReopen_LateIntegrationSeed: a reported head C at
+// 20 and a later integration row F2 at 30 make F2 current, so a verdict at C
+// admits and a verdict at F2 refuses.
+func TestRetryStage_AcceptanceReopen_LateIntegrationSeed(t *testing.T) {
+	integrationRow := func(seq int64, sha string) *audit.Entry {
+		payload, _ := json.Marshal(map[string]any{"merge_sha": sha})
+		return &audit.Entry{ID: uuid.New(), Category: lineageIntegrationCommitCategory, Payload: payload, Sequence: seq}
+	}
+	for _, tc := range []struct {
+		name     string
+		verdict  string
+		wantCode int
+	}{
+		{"a verdict at the older reported head admits", "C1reportedhead", http.StatusOK},
+		{"a verdict at the late integration head refuses", "F2integration", http.StatusUnprocessableEntity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au := reopenRetryServer(t)
+			stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+			au.byCategory = map[string][]*audit.Entry{
+				CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, tc.verdict)},
+				"acceptance_scenarios_pushed":     {headReportEntry("acceptance_scenarios_pushed", "C1reportedhead", 20)},
+				lineageIntegrationCommitCategory:  {integrationRow(30, "F2integration")},
+			}
+			if w := postRetry(t, s, stage.ID); w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
+			}
+		})
+	}
+}

@@ -1676,14 +1676,42 @@ its reason as `rationale`, `skip_expected: false` (always drivable) and
 (so `acceptance_criteria_ids` — now served from the seam — admits a verdict row
 for it) and to `Added`. The acceptance prompt names it under an
 "Operator-authored at approval" block: it did NOT pass plan review, it must be
-validated, and a failure on it alone does not condemn the change. It is
-ADVISORY by construction, not only by the `blocking` flag (which
-`aggregateAcceptanceResults` never reads): a failed verdict whose failures name
-ONLY operator-added criteria is neutralized at ingest under downgrade basis
-`added_criteria_only`, and the orchestrator's acceptance short-circuit evaluates
-the EFFECTIVE verification (via the nil-safe `EffectiveAcceptance` hook), so an
-add on an all-skip-with-basis plan is actually driven instead of settling
-`not_validated`.
+validated, a failure on it alone does not condemn the change, and a pass on it
+does not validate the change. It is ADVISORY by construction, not only by the
+`blocking` flag (which `aggregateAcceptanceResults` never reads): an added
+criterion can neither escalate nor certify a verdict. The orchestrator's
+acceptance short-circuit evaluates the EFFECTIVE verification (via the nil-safe
+`EffectiveAcceptance` hook), so an add on an all-skip-with-basis plan is still
+driven, but the verdict stays `not_validated`, because the add did not pass plan
+review (`TestShipAcceptance_AddedRowPassed_AllSkipReviewed_RecordsNotValidated`).
+
+An added row never feeds the precedence ladder, so it cannot move a shipped
+`passed` (#3682): an added `undecidable` or `failed` row beside a passing reviewed
+contract records `passed`, and the failure stays visible in `criteria_failed`
+and the additive `added_criteria_failed` key
+(`TestShipAcceptance_AddedRowUndecidable_PassingContract_RecordsPassed`,
+`TestShipAcceptance_AddedRowFailed_ShippedPassed_RecordsPassed`, which also pins
+the merge gate at `acceptance_passed`; the skipped-row sibling
+`TestShipAcceptance_AddedRowSkipped_PassingContract_RecordsPassed` is a
+regression pin — that shape never escalated). The residual shipped-`failed`
+shapes are named, not claimed away:
+
+- A shipped `failed` whose failures name only added criteria is neutralized
+  under downgrade basis `added_criteria_only` when A1-A4 hold.
+- The unchanged conjuncts leave it `failed` when `failure_mode` is `error` (A1),
+  or when a surviving blocking reviewed row was reported `skipped` without a
+  plan-declared basis, or `undecidable` (A4).
+- When only added/retired rows were itemized (A3), the #3682 R1 rule records
+  `not_validated` under basis `added-only-observed`, provided the verdict is
+  `assertion_fail`, at least one row failed, at least one itemized row is
+  added, and EVERY reviewed criterion in force was itemized (approval condition
+  C1). A verdict that omits a live reviewed criterion keeps `failed` and routes
+  triage (`TestShipAcceptance_OnlyAddedRows_ShippedFailed_OmitsLiveReviewed_StaysFailed`).
+  Inside the empty-ladder door the C1 conjunct holds only when every reviewed
+  criterion was retired, a chain the approval gate's R12 refuses beside an add,
+  so on any chain the gate admits this shape records `failed`.
+- A failed live reviewed row always records `failed`
+  (`TestAddedOnlyDowngrade_BlockingConjuncts` case A2).
 
 **2. Contested context in the acceptance prompt.** The acceptance prompt renders
 the binding approval conditions AND the paths the operator dropped via
@@ -1820,7 +1848,7 @@ a single total question: *was there evidence, and what did it say?*
 
 | | decided | evidence | outcome |
 |---|---|---|---|
-| `not_validated` (#2347, #3397) | PRE-SPAWN from the plan (no rows), OR POST-RUN when every non-retired row is `skipped` / no rows were itemized / every itemized row was retired | verified nothing — pre-spawn: no runner/preview (bases `empty-criteria` / `all-skip-with-basis`); post-run: the stage RAN but observed nothing (bases `all-skip-observed` / `no-rows-observed` / `all-retired-observed`) | merge-eligible |
+| `not_validated` (#2347, #3397, #3682) | PRE-SPAWN from the plan (no rows), OR POST-RUN when every laddered row (neither retired nor operator-added) is `skipped` / no rows were itemized / every itemized row was retired / every itemized row was operator-added or retired | verified nothing reviewed — pre-spawn: no runner/preview (bases `empty-criteria` / `all-skip-with-basis`); post-run: the stage RAN but observed no reviewed criterion in force (bases `all-skip-observed` / `no-rows-observed` / `all-retired-observed` / `added-only-observed`) | merge-eligible |
 | `undecidable` (#2512) | POST-RUN, from the agent's own rows | the stage ran and drove the preview; at least one row could not be decided | merge-eligible |
 | `failed` → `acceptance_triage` (#2474) | POST-RUN, from the agent's own rows | a criterion genuinely failed | blocked until arbitrated |
 
@@ -1849,16 +1877,45 @@ all, exactly the case an operator most needs described correctly. A row set
 containing an undecidable row can NEVER be recorded as `passed`, and an all-skip
 set can never be `passed` either: a green light over an unevaluated criterion is
 the dangerous direction, because nobody looks behind it. The seam layers the
-empty-row-set door on top (binding condition 1, #3397): an empty non-retired set
-is laddered against `not_validated` directly, so a shipped `passed` that itemized
-no rows records `not_validated` while a shipped `failed` with no rows stays
-`failed`. The empty non-retired set has TWO distinct origins, recorded under
-distinct bases so they stay tellable apart: `no-rows-observed` (the validator
-itemized nothing) and `all-retired-observed` (rows WERE itemized but the operator
-retired every one). The `all-retired-observed` origin is reachable only from a
-shipped `passed` — the #2581 downgrade's D3 precondition requires a surviving
-non-retired row, so an all-retired shipped `failed` never downgrades and the
-severity ladder leaves it `failed`.
+empty-row-set door on top (binding condition 1, #3397): an empty laddered set
+(no row that is neither retired nor operator-added) is laddered against
+`not_validated` directly, so a shipped `passed` that itemized no rows records
+`not_validated` while a shipped `failed` with no rows stays `failed`. The empty
+laddered set has THREE distinct origins, recorded under distinct bases so they
+stay tellable apart: `no-rows-observed` (the validator itemized nothing),
+`all-retired-observed` (rows WERE itemized but the operator retired every one)
+and `added-only-observed` (#3682: every itemized row was operator-added or
+retired, at least one added). The `all-retired-observed` origin is reachable only
+from a shipped `passed` — the #2581 downgrade's D3 precondition requires a
+surviving non-retired row, so an all-retired shipped `failed` never downgrades
+and the severity ladder leaves it `failed`. The `added-only-observed` origin is
+reachable from a shipped `passed`
+(`TestShipAcceptance_OnlyAddedRows_ShippedPassed_RecordsAddedOnlyBasis`,
+`TestShipAcceptance_OnlyAddedRows_WithRetired_RecordsAddedOnlyBasis`), from a
+#2581-downgraded `failed` whose surviving row was the added one
+(`TestShipAcceptance_RetiredFailedAddedPassed_ShippedFailed_RecordsNotValidated`),
+and from the #3682 R1 advisory-only shipped `failed`.
+
+**The #3682 R1 rule is the ONE deliberate softening of a shipped `failed` at this
+door.** A shipped `failed` whose itemized rows are all added or retired records
+`not_validated` (`added-only-observed`) and routes NO triage when all four
+conjuncts hold: at least one itemized added row, at least one failed row,
+`failure_mode` `assertion_fail`, and every reviewed criterion in force itemized
+(approval condition C1). Pinned by
+`TestShipAcceptance_OnlyAddedRows_ShippedFailed_RecordsNotValidated` and
+`TestShipAcceptance_RetiredFailedAddedFailed_ShippedFailed_RecordsNotValidated`.
+Every other shape keeps `failed`: `failure_mode` `error`
+(`TestShipAcceptance_OnlyAddedRows_ShippedFailedError_StaysFailed`), no failed
+row (`TestShipAcceptance_OnlyAddedRows_ShippedFailedNoFailedRow_StaysFailed`), a
+pure-retired itemization
+(`TestShipAcceptance_OnlyRetiredRows_EveryReviewedRetired_ShippedFailed_StaysFailed`,
+`TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed`), and an omitted
+live reviewed criterion
+(`TestShipAcceptance_OnlyAddedRows_ShippedFailed_OmitsLiveReviewed_StaysFailed`).
+Inside this door no reviewed row is laddered, so C1 holds only when every
+reviewed criterion was retired; the approval gate's R12
+(`acceptance_criteria_all_operator_authored`) refuses that chain beside an add,
+so on any gate-admitted chain R1 does not fire.
 
 The shipped-verdict/derived-verdict mismatch resolves SEVERITY-MONOTONE as a
 lower bound on the total order `passed < not_validated < undecidable < failed`:
@@ -1869,16 +1926,22 @@ recorded `passed` before #2512 and records `failed` now. That is a behaviour
 change on a pre-existing wire shape carrying no undecidable data, and it is
 deliberate — recording a pass over a row the agent itself reported failed was the
 dishonest direction. Pinned by
-`TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed`.
+`TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed`. Operator-added
+rows are carved out (#3682): they never feed the ladder, so a shipped `passed`
+whose only failed row is operator-added records `passed`
+(`TestShipAcceptance_AddedRowFailed_ShippedPassed_RecordsPassed`).
 
 `aggregateAcceptanceResults` is TOTAL and answers an EMPTY row set with `passed`.
 That answer is never taken as-is: its single call site guards on `len(rows) > 0`
-and, on an empty non-retired set, ladders the shipped verdict against
+and, on an empty laddered set, ladders the shipped verdict against
 `not_validated` DIRECTLY (#3397, binding condition 1) rather than calling the
 function — so a shipped `passed` with no rows records `not_validated`
 (`no-rows-observed`), a shipped `passed` whose every itemized row was retired
-records `not_validated` (`all-retired-observed`), and a shipped `failed` with no
-rows (or all rows retired) stays `failed`. The
+records `not_validated` (`all-retired-observed`), a shipped `passed` whose
+itemized rows are all operator-added or retired records `not_validated`
+(`added-only-observed`), and a shipped `failed` with no rows (or all rows
+retired) stays `failed`, except for the bounded #3682 R1 advisory-only shape
+above. The
 function's empty-set answer is pinned openly by
 `TestAggregateAcceptanceResults/EMPTY-row-set-answers-passed-the-documented-hazard`;
 the shipped-`failed`-with-no-rows anti-softening property by
@@ -1891,14 +1954,19 @@ all-retired origin (both directions) by
 
 **Ordering at the ingest seam is load-bearing.** The #2581 retired-criterion
 downgrade runs FIRST over the retired-id set; the ladder then runs over the
-NON-RETIRED rows only. If the ladder ran over all rows, a retired criterion's
+rows that are neither RETIRED nor OPERATOR-ADDED (#3682: the added-id set is
+resolved for every verdict, not only when the added-only downgrade fires). If the ladder ran over all rows, a retired criterion's
 undecidable row would pin the run to `undecidable` forever and the operator's
 retirement would have no effect
 (`TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun`, with its paired
 positive `TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable`).
 `verdict_reported` is the ONE "what the agent said vs what was recorded" field
 and is present whenever the two differ, for either reason; `downgrade_basis` and
-`retired_criterion_ids` stay gated on an actual retirement.
+`retired_criterion_ids` stay gated on an actual retirement, and
+`added_criterion_ids` on an actual added-only downgrade. `added_criteria_failed`
+(#3682) is an additive, descriptive key naming every operator-added id reported
+`failed`, emitted whatever the recorded verdict and absent when no added row
+failed; nothing reads it to decide a verdict.
 
 ### Head binding: the consolidated fan-in fallback and the unbound-head clamp (#3091)
 
@@ -1927,24 +1995,71 @@ appended before the pass's slice rows, so the last slice merge stays newest). Or
 not timestamp — the fan-in writes these within one pass, and the dispatch-anchored
 caller compares against a sequence anchor.
 
-Three properties are deliberate:
+Since #4874 the fallback is no longer subordinate: acceptance resolves its head
+through ONE resolver, `acceptanceHeadAsOf` (`acceptance_head.go`), and the
+expected head, the verdict's validated head and Option C's current head all
+read it. Its properties:
 
-- **Strictly SUBORDINATE.** `acceptanceHeadForRun` returns the reported head
-  verbatim whenever one resolves; the fallback fires only on `""`. A
-  non-decomposed run's answer is byte-identical to before
-  (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`).
-- **ACCEPTANCE-ONLY.** `lineageLedgerCategories` and
-  `auditcomplete.HeadReportCategoriesByPrecedence` are NOT widened — they are
-  shared with the branch-lineage guard and the audit-check publisher, and
-  widening them would silently change head resolution for surfaces this has
-  nothing to do with. `resolveFixupExpectedHeadSHA` is unaffected
-  (`TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry`).
+- **Seed by CHAIN SEQUENCE across both sets.** It ALWAYS reads the five
+  `lineageLedgerCategories` rows and the run's own `integration_commit_recorded`
+  rows, and picks the highest-sequence candidate across them; a reported row
+  wins only an equal-sequence tie, which only a test fake produces. No
+  timestamp is read, so a late integration row newer than a reported head now
+  wins (`TestAcceptanceHeadAsOf_SeedOrderedByChainSequence`,
+  `TestGetStagePrompt_Acceptance_LateIntegrationBeatsOlderReportedHead`). The
+  reverse is pinned too: a NEWER reported head wins
+  (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`). Correctness rests on
+  the chain's sequence being unique and assigned in serialized append order,
+  not on clocks.
+- **Walked through clean base advances.** The seed then advances through every
+  CLEAN `branch_rebased` row recorded after it, through the same
+  `walkRecordedBaseMerges` and `isCleanAdvance` the fix-up walk uses, so after a
+  Fishhawk rebase acceptance validates the merge commit rather than the
+  pre-rebase head.
+- **Fail-closed reads.** A read error on either seed set or on the base-merge
+  rows returns an error and resolves no head (an empty head makes the dispatch
+  verb and the runner refuse with `acceptance_expected_head_unresolved`), unlike
+  the fix-up path's deliberate seed fallback
+  (`TestAcceptanceHeadAsOf_LedgerReadErrorReturned`,
+  `TestAcceptanceHeadAsOf_BaseMergeReadErrorFailsClosed`).
+- **ACCEPTANCE-ONLY.** `lineageLedgerCategories` (now an alias of
+  `auditcomplete.ReportedHeadLedgerCategories`, membership unchanged) and
+  `auditcomplete.HeadReportCategoriesByPrecedence` are NOT widened: the
+  integration category is read beside the list, never added to it.
+  `resolveFixupExpectedHeadSHA` keeps its timestamp-then-sequence seed, so the
+  two can disagree on a clock-inverted chain
+  (`TestResolveFixupExpectedHeadSHA_SeedKeepsTimestampOrdering`).
 - **DISPATCH-SEQUENCE-BOUNDED on the validated-head path.**
-  `acceptanceValidatedHeadSHA` applies the fallback with `bounded=true` against
-  the same `dispatchSeq` anchor its reported-head walk uses, so a fan-in merge
-  recorded AFTER the acceptance dispatch can never re-bind the verdict to a tree
-  the stage did not validate
-  (`TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`).
+  `acceptanceValidatedHeadSHA` reads `acceptanceHeadAsOf` with `bounded=true`
+  at the `dispatchSeq` anchor: both seed sets and the base-merge rows are cut at
+  the anchor BEFORE selection, so a rebase, scenario commit or fan-in merge
+  recorded AFTER the dispatch can never re-bind the verdict to a tree the stage
+  did not validate (`TestShipAcceptance_PostDispatchRebaseDoesNotBind`,
+  `TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`). An error or an
+  empty answer returns `("", false)`, which the clamp below records as
+  `undecidable(head_unresolved)`.
+
+Residuals, none of them fixed here. The `fishhawk_audit_complete` Check Run's
+publisher still resolves `auditcomplete.LatestReportedHeadSHA`'s category
+precedence, so after a clean rebase it can target the pre-rebase ledger head;
+that is a source-read contract gap tracked by
+[#5087](https://github.com/kuhlman-labs/fishhawk/issues/5087), not a reproduced
+incident. The prompt resolves unbounded while the verdict binds at the anchor,
+so a head recorded between dispatch and prompt fetch can be served while the
+verdict names the older head
+([#5082](https://github.com/kuhlman-labs/fishhawk/issues/5082)). A
+plan-stageless recovery child resolves its head from an ancestor while its
+verdict reads only its own chain
+([#5083](https://github.com/kuhlman-labs/fishhawk/issues/5083); reachability
+UNVERIFIED). A vouched or unrecorded commit still does not advance the
+acceptance head (the Captain-held #4856 vouch half).
+
+The #4673 corpus-commit contract (a verdict binds the pre-corpus head, and after a
+fix-up the fix-up head, never the prior episode's scenario commit), its
+determination, why merge readiness runs no ancestor-or-equal check, and the
+residuals it added ([#5160](https://github.com/kuhlman-labs/fishhawk/issues/5160),
+[#5161](https://github.com/kuhlman-labs/fishhawk/issues/5161)) are in
+[acceptance.md § "Verdict head binding"](acceptance.md#verdict-head-binding-1682-4874-4673).
 
 **Anchor provenance and the retained sequence bound (E64.53 / #3174).** The
 `acceptance_dispatched` anchor is written by `Advance` for a backend-triggered
@@ -2338,7 +2453,7 @@ Two gate states that used to be HIDDEN — a merge that queued and then timed ou
 
 All three are 409s returned BEFORE the `merge_verdict_recorded` append, so none records a verdict nor dispatches a merge. `mergeReadinessRefusal{Code, Message, Details}` never writes HTTP: `handleMergeRun` renders it (adding `run_id` / `pr_url`) and the gate view reuses the same value, so the two surfaces cannot drift.
 
-- **`acceptance_stale` — FAIL-CLOSED, audit chain only.** `acceptanceStaleRefusal` refuses when the run's acceptance stage carries a stage-scoped `acceptance_reopened` entry NEWER than the newest `acceptance_outcome_recorded` — the state `reopenAcceptanceOnFixupPush` (and the #1567 operator re-open) leaves, where `acceptanceGateState` still reads the stale `passed` outcome and admits. It keys on the chain's own invalidation record, NEVER a head compare: a vouch commit or an ADR-090 rebase moves the head without re-opening acceptance, by design, and a head compare would block merges no verb could clear. Details: `verified_head_sha` (the outcome's `head_sha`, "" when unrecorded), `current_head_sha` (the re-open's), both sequences, the stage id/state, and `next_step` (`fishhawk_dispatch_stage` pending / `fishhawk_await_stage` dispatched or running / `fishhawk_retry_stage` settled without a newer verdict). An audit read error is returned, and the endpoint maps it to `500 internal_error` with nothing recorded — the evidence lives on Fishhawk's own chain, like `acceptanceGateState`. Placed after the acceptance gate and BEFORE the `GateMerger` nil check, so it needs no merge seam.
+- **`acceptance_stale` — FAIL-CLOSED, audit chain only.** `acceptanceStaleRefusal` refuses when the run's acceptance stage carries a stage-scoped `acceptance_reopened` entry NEWER than the newest `acceptance_outcome_recorded` — the state `reopenAcceptanceOnFixupPush` (and the #1567 operator re-open) leaves, where `acceptanceGateState` still reads the stale `passed` outcome and admits. It keys on the chain's own invalidation record, NEVER a head compare: a vouch commit or an ADR-090 rebase moves the head without re-opening acceptance, by design, and a head compare would block merges no verb could clear. A head compare could not have caught #4673 either: the wrong recorded head #4673 reports is the prior episode's corpus commit, an ANCESTOR of the fix-up head, so an ancestor-or-equal check passes it. The fix-up's `acceptance_reopened` row is written only when `reopenAcceptanceOnFixupPush` finds a succeeded acceptance stage with a recorded verdict, and a refused re-open or a failed append only WARN-logs; see [acceptance.md § "Verdict head binding"](acceptance.md#verdict-head-binding-1682-4874-4673) for the contract and those residuals. Details: `verified_head_sha` (the outcome's `head_sha`, "" when unrecorded), `current_head_sha` (the re-open's), both sequences, the stage id/state, and `next_step` (`fishhawk_dispatch_stage` pending / `fishhawk_await_stage` dispatched or running / `fishhawk_retry_stage` settled without a newer verdict). An audit read error is returned, and the endpoint maps it to `500 internal_error` with nothing recorded — the evidence lives on Fishhawk's own chain, like `acceptanceGateState`. Placed after the acceptance gate and BEFORE the `GateMerger` nil check, so it needs no merge seam.
 - **`approval_dismissed` — GATE VIEW ONLY, advisory, BEST-EFFORT, FAIL-OPEN, forge.** Since ADR-112 (#4619) the merge endpoint no longer runs `approvalDismissedCheck`: its approval refusal is the forge-approval fold's 409 `forge_approval_required` (§ "ADR-112 forge-approval fold"), so the gate view's `merge_readiness` and the merge endpoint deliberately differ on this leg. The gate view still reports it: it flags only when GitHub reports `mergeable_state=blocked`, no reviewer's LATEST review (COMMENTED / PENDING ignored) is `APPROVED`, and at least one is `DISMISSED`. Every uncertainty is reported as undetermined, never a blocker — no GitHub client, no installation, an unparseable repo, no PR number, a PR read error, a merged PR, any other `mergeable_state`, a reviews read error, a truncated listing. A dismissed review loses its earlier state, so a dismissed CHANGES_REQUESTED looks like a dismissed approval; re-approving is the remedy either way. `dismissing_commit` is the live head; `dismissing_cause` comes from the chain: `vouch_commit`, `fixup_push`, `push`, or `unknown` on an audit read error.
 
 - **`review_coverage_incomplete` — FAIL-CLOSED, audit chain only (#4219).** `reviewCoverageRefusal` (`review_coverage.go`) holds a decomposed parent until every SUCCEEDED slice child is covered by a SUCCESSFUL agent review: the parent's latest implement-review round carries an `implement_reviewed` verdict (a consolidated or fix-up round compares the whole parent diff, so it covers every slice), or each slice's own latest round does. A round whose reviewers all failed or were skipped covers nothing — the d3b1d915 hole; a reject verdict counts. Not applicable to a non-parent, a child run, zero configured agent reviewers, or no wired reviewer backend. Details: `uncovered_slices[]` (`child_run_id`, `slice_index`, `round_sequence`, `reason` `no_review_round` | `review_round_in_flight` | `review_round_no_verdict`), `parent_round`, and `next_step` (`fishhawk_rerun_review` when the parent round settled with no verdict, or when the parent has NO round and its consolidated PR is open — the verb then starts the first consolidated round, #4282; `fishhawk_await_review` while a round is in flight, before the PR opens, and for a GATING parent with no round, whose message names `fishhawk_fixup_stage` because the verb refuses it `gating_authority`). Placed right after `acceptance_stale` and BEFORE the `GateMerger` nil check; a read error is `500 internal_error`. The same predicate feeds the gate view, the drive observer (`drive.RuleReviewCoverageIncomplete`, stamped instead of `checks_green_awaiting_merge`) and the delegated `may_merge` arm (observe-only on the hold), so the four cannot drift. The recovery is the re-run verb (§ "Operator re-run"), including for a parent whose consolidated dispatch never started a round; no merge-time override ships.

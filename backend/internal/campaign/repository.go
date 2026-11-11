@@ -465,12 +465,21 @@ type Repository interface {
 	// caller decides due-ness with HoldReleaseReason against its own clock.
 	GetDispatchHold(ctx context.Context, campaignID uuid.UUID) (*DispatchHold, error)
 
-	// ListDispatchHolds returns every campaign's dispatch hold row, across
-	// campaigns and accounts, ordered by held_at then campaign_id (#4234). It
-	// is a plain read like GetDispatchHold (a hold past its expires_at is still
-	// listed). The host-dispatch guard reads it only when a stage's campaign
-	// ancestry is unresolvable, to decide whether ANY hold could apply.
-	ListDispatchHolds(ctx context.Context) ([]*DispatchHold, error)
+	// ListDispatchHolds returns the dispatch hold rows of the campaigns in s's
+	// account window on s.Repo, ordered by held_at then campaign_id (#4234,
+	// #4586): campaigns stamped with s.AccountID plus legacy untenanted
+	// (NULL-account) campaigns, and for an empty s.AccountID the NULL-account
+	// campaigns only — never every account. A hold on another account's
+	// campaign, or on another repository, is not listed. It is a plain read
+	// like GetDispatchHold (a hold past its expires_at is still listed),
+	// executed inside a transaction scoped to s.AccountID so the campaigns
+	// tenant policy cannot hide the stage's own campaign. An invalid scope
+	// (ValidateDispatchHoldScope) is refused ErrExpediteInvalid before any
+	// read, and a read error is returned, never "no holds", so the caller
+	// fails closed. The host-dispatch guard reads it only when a stage's
+	// campaign ancestry is unresolvable, to decide whether a hold that could
+	// be the stage's own still applies.
+	ListDispatchHolds(ctx context.Context, s DispatchHoldScope) ([]*DispatchHold, error)
 
 	// ReleaseDispatchHold deletes the campaign's dispatch hold, RECORDED
 	// BEFORE COMMIT (#4234). Lock order is the package-wide one: the campaign

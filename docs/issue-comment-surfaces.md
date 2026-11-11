@@ -1491,19 +1491,22 @@ Notes:
   status comment through `activityCategories` + `renderActivityLine` in
   `status_template.go`. Its sole writer is `server/concern_rollup.go`: on a
   decomposed parent's fan-in (every `integrateSlices` pass, immediately before
-  `slices_integrated`) or a child review landing after the child succeeded, it
+  `slices_integrated`), a child review landing after the child succeeded, or
+  the merge-queue eligibility predicate's concern leg (the merge-gate
+  reconcile of the parent's succeeded children), it
   copies the children's OPEN HIGH/MEDIUM concerns into the parent's concern
   ledger and, when at least one copy was inserted, appends ONE row on the
   parent and its implement stage, payload `{site, parent_stage_id, count,
   high, medium, concerns:[{concern_id, rolled_up_from, child_run_id,
   child_stage_id, slice_index, severity, category, reviewer_model,
   reviewer_role, origin_review_sequence}]}` (`site` ∈ `fan_in` |
-  `child_review`; no reviewer note prose). The line is count-only, with no
+  `child_review` | `merge_reconcile`; no reviewer note prose). The line is count-only, with no
   actor, no ids and no @-mention: `Child-slice concerns imported into the
   parent: <count> (<high> high, <medium> medium)`, or the bare phrase on a
   payload without a positive count. A re-run imports nothing and writes no
   row; an append failure leaves the durable copies without a row (ERROR
-  `concern_rolled_up_audit_lost`). Contract:
+  `concern_rolled_up_audit_lost`); a failed late or merge-gate import logs
+  WARN `concern_late_import_failed`. Contract:
   `backend/internal/concern/README.md` § "Child-slice rollup + the outcome
   column".
 - The implement-model resolution audit kind — `model_resolved` (#1013) — is
@@ -1651,13 +1654,20 @@ Notes:
   RAN and shipped a verdict the ingest ladder recorded as `not_validated`, keyed
   by `basis` — `all-skip-observed` renders "Acceptance not validated —
   `<passed>`/`<total>` criteria verified (the validator skipped every
-  criterion)"; `no-rows-observed` renders "Acceptance not validated — the
+  reviewed criterion in force)" — scoped to reviewed criteria in force because a
+  passed operator-added or retired row is counted in `<passed>` but never feeds
+  the ladder (#3682); `no-rows-observed` renders "Acceptance not validated — the
   validator recorded no criteria (verified nothing)"; `all-retired-observed`
   (rows WERE itemized but the operator retired every one, so nothing non-retired
   remained) renders "Acceptance not validated — all `<total>` recorded criteria
   were retired (verified nothing)" — a DISTINCT sentence from `no-rows-observed`
   because criteria WERE recorded here, so claiming the validator "recorded no
-  criteria" would be inaccurate. Because the POST-RUN stage
+  criteria" would be inaccurate; `added-only-observed` (#3682: every itemized row
+  named an operator-added or retired criterion, at least one added) renders
+  "Acceptance not validated — no reviewed criterion in force was recorded (all
+  `<total>` recorded were operator-added or retired)", falling back to "Acceptance
+  not validated — no reviewed criterion in force was recorded (only
+  operator-added or retired ones)" when the total is zero. Because the POST-RUN stage
   actually ran, both observed rows ALSO append the transcript clause (below),
   which the pre-spawn row never carries. Neither shape reuses the "Acceptance
   recorded — `<outcome>` (`<passed>`/`<total>` criteria passed)" certification
@@ -1695,7 +1705,7 @@ Notes:
   headline. A PRE-SPAWN `not_validated` branch is untouched by construction
   (that verdict is minted pre-spawn and never carries a transcript); a POST-RUN
   `not_validated` (basis `all-skip-observed` / `no-rows-observed` /
-  `all-retired-observed`, #3397) DID run, so its observed row appends the
+  `all-retired-observed`, #3397; `added-only-observed`, #3682) DID run, so its observed row appends the
   transcript clause too. A payload with
   no transcript, or `transcript: null`, renders byte-identically to before.
   No `@`-mention is added, so `notifier.go` stays uninvolved (same exemption as
@@ -1716,9 +1726,11 @@ Notes:
   verdict is now bound to a stale commit, so the stage is re-opened to
   re-validate the final commit (payload `{stage_id, prior_state, head_sha,
   reason}`). This kind is REUSED for the #1682 invalidation rather than adding a
-  new issue-comment surface. Both sites have no page-class ping of their own —
-  the status refresh rides the `notifyStatusUpdate` hook (like the PR-upload
-  handler), not a dedicated comment. Listed here so a future reader grepping the
+  new issue-comment surface. Since #4804 the fix-up push handler fires the
+  orchestrator advance only after this re-open, so the re-opened stage is
+  re-armed; that adds no audit kind or comment. Both sites have no page-class
+  ping of their own — the status refresh rides the `notifyStatusUpdate` hook
+  (like the PR-upload handler), not a dedicated comment. Listed here so a future reader grepping the
   acceptance audit categories doesn't mistake it for a comment surface.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT

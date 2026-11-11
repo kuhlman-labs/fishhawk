@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // ADR-093 D8 (E87.7 / #4298), slice 2: the merging/settling restart resume,
@@ -229,9 +230,10 @@ func TestMergeQueueResume_IndeterminateRead_HeldRemedyNamed(t *testing.T) {
 
 // C2: a queue claim seeded just INSIDE the crash-left window (relative to the
 // database clock) holds with nothing written; the same claim aged past the
-// window, its PR open and unmerged, is handed to merge-on-pass (ADR-109 A1:
-// redecide orphaned_claim_open) with NO resume ledger write. CF: re-add a
-// MarkMergeDispatchFailed on the hand-over arm → RED on the read-back.
+// window, its PR open and unmerged, is RELEASED by the resume (ADR-109 A2:
+// redecide orphaned_claim_open, one merge_dispatch_settled {released,
+// released_orphaned_claim} row, the claim row gone). CF: restore the pre-A2
+// arm with no release call → the claim row still stands, RED.
 func TestMergeQueueResume_YoungQueueClaimHolds(t *testing.T) {
 	w := newMQMWorld(t)
 	a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
@@ -249,13 +251,11 @@ func TestMergeQueueResume_YoungQueueClaimHolds(t *testing.T) {
 		t.Fatalf("rows written for a young claim: settled=%d resumed=%d", n, len(w.mqrResumed(a)))
 	}
 	w.exec(`UPDATE merge_dispatch_claims SET claimed_at = `+mqrAged+` WHERE run_id = $1`, a.id)
-	aged := w.mqrClaim(a)
+	releasedBefore := w.mqmReleasedRows(a)
 	requireOutcome(t, w.srv.mergeQueueResumeMerge(context.Background(), w.active(a)), mergeOnPassRedecide, mergeQueueResumeReasonOrphanedClaimOpen)
-	if c := w.mqrClaim(a); c.State != mergequeue.DispatchDispatched || c.FailureCause != "" || !c.ClaimedAt.Equal(aged.ClaimedAt) {
-		t.Fatalf("aged claim = %+v, want still dispatched and unchanged (the resume makes no ledger write)", c)
-	}
-	if n := len(w.rows(a, categoryMergeDispatchSettled)); n != settledBefore {
-		t.Fatalf("merge_dispatch_settled rows = %d, want %d (no resume ledger write)", n, settledBefore)
+	w.requireClaim(a, "")
+	if n := w.mqmReleasedRows(a); n != releasedBefore+1 {
+		t.Fatalf("released merge_dispatch_settled rows = %d, want %d (the resume releases the aged orphan, ADR-109 A2)", n, releasedBefore+1)
 	}
 }
 
@@ -342,9 +342,12 @@ func TestMergeQueueResume_MergeArms(t *testing.T) {
 				t.Fatalf("merge_dispatch_settled outcomes = %v, want a final reconciled_merged", got)
 			}
 		}},
-		{name: "open unmerged, aged queue claim (ADR-109 A1 hand-over)", setup: func(*mqmWorld, *mcqRun) {},
+		{name: "open unmerged, aged queue claim (ADR-109 A2 release)", setup: func(*mqmWorld, *mcqRun) {},
 			kind: mergeOnPassRedecide, reason: mergeQueueResumeReasonOrphanedClaimOpen, check: func(t *testing.T, w *mqmWorld, a *mcqRun) {
-				claimState(mergequeue.DispatchDispatched)(t, w, a)
+				w.requireClaim(a, "")
+				if n := w.mqmReleasedRows(a); n != 1 {
+					t.Fatalf("released merge_dispatch_settled rows = %d, want 1", n)
+				}
 				if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
 					t.Fatalf("entry = %s/%s, want live passed", e.State, e.Phase)
 				}
@@ -479,16 +482,18 @@ func TestMergeQueueResume_MergingNoClaimRedecides(t *testing.T) {
 	}
 }
 
-// ADR-109 Amendment A1 (#4711), end to end through a restart: a crash-left
+// ADR-109 Amendment A2 (#4862), end to end through a restart: a crash-left
 // queue claim still 'dispatched' whose PR reads open and unmerged → the
-// resume hands the entry back (ONE merge_queue_resumed {redecide,
-// orphaned_claim_open} row), merge-on-pass re-runs steps 1-7 (a fresh
-// merge_queue_authorized row), releases the claim (merge_dispatch_settled
-// {released, released_orphaned_claim}, AFTER the redecide row), claims afresh
-// and merges ONCE at h1; B is admitted after A, and a second restart writes
-// nothing. CF-A: route the open arm back to mergeQueueResumeOrphan → the
-// claim is dispatch_failed with zero merges, RED. CF-B: the release body
-// returns (false, "", "") → hold merge_already_dispatched, zero merges, RED.
+// resume writes ONE merge_queue_resumed {redecide, orphaned_claim_open} row,
+// RELEASES the claim (merge_dispatch_settled {released,
+// released_orphaned_claim}, AFTER the redecide row and BEFORE the fresh
+// merge_queue_authorized row: the release precedes the fold), returns the
+// entry to passed, and ordinary merge-on-pass claims and merges ONCE at h1;
+// B is admitted after A, and a second restart writes nothing. CF-A: route
+// the open arm back to mergeQueueResumeOrphan → the claim is dispatch_failed
+// with zero merges, RED. CF-B: the resume's release call answers
+// (true, "", "") without releasing → step 8's backstop releases after the
+// fold, so the released row follows the fresh R4 row, RED.
 func TestMergeQueueResume_OrphanedOpenClaimReleasedThenMergesOnce(t *testing.T) {
 	w := newMQMWorld(t)
 	a := w.seed("a", "h1", []byte(mqeSpecYAML))
@@ -523,8 +528,12 @@ func TestMergeQueueResume_OrphanedOpenClaimReleasedThenMergesOnce(t *testing.T) 
 	if released == nil || released.Sequence <= res[0].Sequence {
 		t.Fatalf("released row = %v, want one after the redecide row %d", released, res[0].Sequence)
 	}
-	if n := len(w.rows(a, CategoryMergeQueueAuthorized)); n != authBefore+1 {
-		t.Fatalf("merge_queue_authorized rows = %d, want %d (a fresh R4 row)", n, authBefore+1)
+	auth := w.rows(a, CategoryMergeQueueAuthorized)
+	if len(auth) != authBefore+1 {
+		t.Fatalf("merge_queue_authorized rows = %d, want %d (a fresh R4 row)", len(auth), authBefore+1)
+	}
+	if fresh := auth[len(auth)-1]; released.Sequence >= fresh.Sequence {
+		t.Fatalf("released row %d is not before the fresh merge_queue_authorized row %d (ADR-109 A2 releases before the fold)", released.Sequence, fresh.Sequence)
 	}
 	if e := w.storeEntry(b); e.State != mergequeue.StateLive && e.State != mergequeue.StateMerged {
 		t.Fatalf("B = %s, want admitted after A settled", e.State)
@@ -573,7 +582,9 @@ func TestMergeQueueResume_AppendFailuresHoldUnchanged(t *testing.T) {
 		hold string
 	}{
 		{"merge_queue_resumed", CategoryMergeQueueResumed, true, false, mergequeue.DispatchDispatched, ""},
-		{"merge_dispatch_settled", categoryMergeDispatchSettled, false, false, mergequeue.DispatchDispatched, ""},
+		// ADR-109 A2: the resume's own release row fails, so the open arm
+		// holds resume_unrecorded with the claim standing.
+		{"merge_dispatch_settled", categoryMergeDispatchSettled, false, false, mergequeue.DispatchDispatched, mergeQueueResumeReasonUnrecorded},
 		{"merge_queue_merged", CategoryMergeQueueMerged, true, false, mergequeue.DispatchDispatched, ""},
 		// The hold row after the crash-left transition on the INDETERMINATE
 		// arm (ADR-109 A1 moved the open PR off it): the settled row and the
@@ -832,25 +843,105 @@ func TestMergeQueueResume_ReclaimNoAdvanceWhileStageLive(t *testing.T) {
 }
 
 // Ruling R8c (counterfactual B8): the in-flight mark is cleared AFTER the
-// pump applied the outcome: at Unadmit time (a 409 readvance) it is still
-// set, and after the pump returns it is gone.
+// pump applied the outcome: at UnadmitPassed time (a 409 readvance, #4876) it
+// is still set, and after the pump returns it is gone.
 func TestMergeQueueMergeInFlight_ClearedAfterOutcomeApplied(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("ifl", "h1", mcvUndelegatedSpecYAML)
 	w.merger.err = fmt.Errorf("pinned: %w", forge.ErrMergeConflict)
 	var atUnadmit []bool
 	fs := &mcqFaultStore{Store: w.store}
-	fs.unadmitAt = func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
+	fs.unadmitPassedAt = func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
 		atUnadmit = append(atUnadmit, w.srv.mergeInFlight.has(r.id))
-		return w.store.Unadmit(ctx, id, epoch)
+		return w.store.UnadmitPassed(ctx, id, epoch)
 	}
 	w.srv.cfg.MergeQueue = fs
 	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
 	if len(atUnadmit) == 0 || !atUnadmit[0] {
-		t.Fatalf("in-flight at Unadmit = %v, want true (cleared only after the outcome applied)", atUnadmit)
+		t.Fatalf("in-flight at UnadmitPassed = %v, want true (cleared only after the outcome applied)", atUnadmit)
 	}
 	if w.srv.mergeInFlight.has(r.id) {
 		t.Fatal("in-flight mark survived the pump")
+	}
+}
+
+// #4876 approval condition C1 (ruling R8c kept after the in-lock return to
+// passed): pump A's decision claims, its pinned PUT is refused 409, the claim
+// is released and the entry returned to passed under the lock, and A parks in
+// its readvance UnadmitPassed with its in-flight mark still set. A second
+// SAME-process pump then finds the entry live, passed and intent-bearing, and
+// must skip it (the mark): NO dispatch claim and NO PUT before A applies its
+// outcome. Counterfactual: deleting the pump's in-flight skip on the passed
+// arm lets the second pump claim and PUT, RED.
+func TestMergeQueueMergeInFlight_SameProcessPumpSkipsReleasedPassedEntry(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("ifs", "h1", mcvUndelegatedSpecYAML)
+	w.merger.err = fmt.Errorf("pinned: %w", forge.ErrMergeConflict)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	fs := &mcqFaultStore{Store: w.store}
+	fs.unadmitPassedAt = func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			close(entered)
+			<-release
+		}
+		return w.store.UnadmitPassed(ctx, id, epoch)
+	}
+	w.srv.cfg.MergeQueue = fs
+	var releaseOnce sync.Once
+	releaseA := func() { releaseOnce.Do(func() { close(release) }) }
+	aDone := make(chan struct{})
+	go func() {
+		defer close(aDone)
+		w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+	}()
+	t.Cleanup(func() {
+		releaseA()
+		select {
+		case <-aDone:
+		case <-time.After(timescale.D(30 * time.Second)):
+		}
+	})
+	select {
+	case <-entered:
+	case <-aDone:
+		t.Fatal("fixture: pump A returned without reaching its readvance UnadmitPassed")
+	case <-time.After(timescale.D(30 * time.Second)):
+		t.Fatal("fixture: pump A never reached its readvance UnadmitPassed")
+	}
+	if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("fixture: entry at A's apply = %s/%s, want live/passed (the released claim returned it to passed)", e.State, e.Phase)
+	}
+	if !w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("fixture: A's in-flight mark is gone before its outcome applied")
+	}
+	claims, puts := fs.called("ClaimMergeDispatch"), len(w.merger.calls())
+	if claims != 1 || puts != 1 {
+		t.Fatalf("fixture: A made %d claims and %d PUTs, want 1 and 1", claims, puts)
+	}
+
+	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+
+	if n := fs.called("ClaimMergeDispatch"); n != claims {
+		t.Fatalf("the second same-process pump claimed the dispatch (%d claims, want %d) while A's outcome was unapplied: %v", n, claims, fs.names())
+	}
+	if n := len(w.merger.calls()); n != puts {
+		t.Fatalf("the second same-process pump PUT the merge (%d PUTs, want %d) while A's outcome was unapplied", n, puts)
+	}
+	if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("entry after the second pump = %s/%s, want live/passed (untouched)", e.State, e.Phase)
+	}
+	w.merger.err = nil
+	releaseA()
+	select {
+	case <-aDone:
+	case <-time.After(timescale.D(30 * time.Second)):
+		t.Fatal("pump A did not return after its UnadmitPassed was released")
+	}
+	if w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("in-flight mark survived pump A")
 	}
 }
 
@@ -860,11 +951,22 @@ func TestMergeQueueMergeInFlight_ClearedAfterOutcomeApplied(t *testing.T) {
 // read fails, so it never marked) leaves that mark set, and a pump whose
 // decision marked and merged clears only its own count (the refcount).
 // Restoring the unconditional clear reddens the first check; a set in place
-// of the refcount reddens the second.
+// of the refcount reddens the second. Since #4876 (approval condition C1) the
+// pump skips a passed entry whose run is ALREADY marked, so the overlapping
+// mark lands after the pump's skip check, during the decision's first forge
+// read (the proxy's onResponse seam): the race window the refcount covers.
 func TestMergeQueueMergeInFlight_OverlappingDecisionKeepsMark(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("ifo", "h1", mcvUndelegatedSpecYAML)
-	w.srv.mergeInFlight.mark(r.id) // the overlapping decision, mid forge call
+	// overlapOnce marks the run (the overlapping decision, mid forge call) on
+	// the decision's first forge response.
+	overlapOnce := func() {
+		var once sync.Once
+		w.mu.Lock()
+		w.onResponse = func(string) { once.Do(func() { w.srv.mergeInFlight.mark(r.id) }) }
+		w.mu.Unlock()
+	}
+	overlapOnce()
 	w.mu.Lock()
 	w.prReadFail = true
 	w.mu.Unlock()
@@ -875,6 +977,11 @@ func TestMergeQueueMergeInFlight_OverlappingDecisionKeepsMark(t *testing.T) {
 	if !w.srv.mergeInFlight.has(r.id) {
 		t.Fatal("a decision that never marked cleared the overlapping decision's in-flight mark")
 	}
+	w.srv.mergeInFlight.clear(r.id) // that overlapping decision applied its outcome
+	if w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("fixture: the first overlapping mark survived its own clear")
+	}
+	overlapOnce()
 	w.mu.Lock()
 	w.prReadFail = false
 	w.mu.Unlock()

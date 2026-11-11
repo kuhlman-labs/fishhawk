@@ -27,6 +27,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
@@ -76,6 +78,16 @@ const defaultHeartbeatInterval = 15 * time.Second
 // HANG is NOT a cap — so it is set generously (well past the few-second
 // real-world observation) rather than tight. See isQuotaUnavailable.
 const quotaUnavailableMaxWall = 30 * time.Second
+
+// defaultResultExitGrace bounds how long the CLI may linger AFTER it emitted a
+// non-error terminal `result.success` line (#5147). The incident: an implement
+// agent finished its work, emitted result.success, and a lingering background
+// task (a backgrounded Bash child) kept the CLI alive until the stage deadline,
+// so the terminal switch classified the finished invocation `agent timeout`
+// and the runner discarded the tree. Once the window expires the runner kills
+// the CLI's process group and settles on the captured result. A deadline that
+// fires after a captured success settles on it too. See Invoker.ResultExitGrace.
+const defaultResultExitGrace = 30 * time.Second
 
 // Invoker is the agent.Invoker implementation for Claude Code.
 type Invoker struct {
@@ -143,6 +155,70 @@ type Invoker struct {
 	// error through the real adapter into the real classifier — orthogonal to
 	// TraceLineMaxBytes.
 	TraceStream func(io.Reader) io.Reader
+
+	// ResultExitGrace is how long the CLI may keep running after it emitted a
+	// non-error terminal result.success line before the runner kills its
+	// process group and settles on that result (#5147). Zero means
+	// defaultResultExitGrace. A TEST seam, a peer of HeartbeatInterval.
+	ResultExitGrace time.Duration
+}
+
+// resultExitGrace applies the ResultExitGrace seam, defaulting a non-positive
+// value to defaultResultExitGrace.
+func (i *Invoker) resultExitGrace() time.Duration {
+	if i.ResultExitGrace > 0 {
+		return i.ResultExitGrace
+	}
+	return defaultResultExitGrace
+}
+
+// isTerminalSuccess reports whether a parsed trace line is the CLI's non-error
+// terminal result: kind result.success whose line does not carry
+// `is_error: true` (#5147). An API-error termination can arrive as subtype
+// success with is_error:true; that must never settle a lingering CLI as OK.
+// A line that does not parse is not a terminal success.
+func isTerminalSuccess(kind string, line []byte) bool {
+	if kind != "result.success" {
+		return false
+	}
+	var meta struct {
+		IsError bool `json:"is_error"`
+	}
+	if err := json.Unmarshal(line, &meta); err != nil {
+		return false
+	}
+	return !meta.IsError
+}
+
+// killProcessTree sends SIGKILL to the process group led by p (Setpgid at
+// spawn makes p the group leader, so its pid is the pgid), reaching
+// grandchildren that hold the stdout pipe open. If the group signal fails
+// (no group, e.g. a test builder that cleared SysProcAttr) it falls back to
+// killing the direct child. A nil process is a no-op. Mirrors codex.go's
+// killProcessGroup.
+func killProcessTree(p *os.Process) error {
+	if p == nil {
+		return nil
+	}
+	if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err != nil {
+		return p.Kill()
+	}
+	return nil
+}
+
+// exitedBySignalOrClean reports whether Wait's error is consistent with OUR
+// kill having ended the process: a nil error, or an exit by signal. A CLI that
+// exited non-zero on its own returns false so it keeps the waitErr arms (#5147).
+func exitedBySignalOrClean(waitErr error) bool {
+	if waitErr == nil {
+		return true
+	}
+	var ee *exec.ExitError
+	if !errors.As(waitErr, &ee) {
+		return false
+	}
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled()
 }
 
 // traceStream applies the TraceStream seam, defaulting to the identity so a
@@ -397,6 +473,18 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	spawnName, spawnArgs := agent.WrapArgv(inv.ExecWrapper, binary, args)
 	cmd := cmdFn(ctx, spawnName, spawnArgs...)
 	cmd.Dir = inv.WorkingDir
+	// Own process group (#5147): a grace, loop, budget or deadline kill must
+	// reach grandchildren (a lingering background task) that hold stdout open,
+	// or the scan loop and cmd.Wait stay blocked on the pipe.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// exec.CommandContext installs a default Cancel that kills only the direct
+	// child; replace it with the group kill. Guarded on non-nil because a
+	// non-nil Cancel on a Cmd not built with CommandContext makes Start fail.
+	if cmd.Cancel != nil {
+		cmd.Cancel = func() error {
+			return killProcessTree(cmd.Process)
+		}
+	}
 	// Compose env so a Cmd builder (e.g. tests) can pre-set
 	// vars on cmd.Env and we layer the API key on top. nil means
 	// "child will inherit our env", so seed with os.Environ() in
@@ -520,6 +608,27 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// invocation carried a --json-schema (#1325). nil when absent — the
 	// documented fallback trigger.
 	var structuredOutput []byte
+	// Result-wins state (#5147). successResult latches on the first non-error
+	// terminal result.success line and arms graceTimer; graceKilled records
+	// that the timer's process-group kill fired. stopGrace (called as soon as
+	// the scan loop ends, BEFORE the stderr drain and cmd.Wait) guarantees the
+	// callback never signals a reaped pid: graceMu serializes it with the stop.
+	successResult := false
+	var (
+		graceTimer   *time.Timer
+		graceKilled  atomic.Bool
+		graceMu      sync.Mutex
+		graceStopped bool
+	)
+	stopGrace := func() {
+		graceMu.Lock()
+		graceStopped = true
+		graceMu.Unlock()
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}
+	defer stopGrace()
 
 	// Progress heartbeat state (#580). The scan loop below writes
 	// turns / tokensUsed / lastKind; the heartbeat goroutine reads
@@ -635,6 +744,21 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
 			resultPayload = append([]byte(nil), ev.Payload...)
 		}
+		// Result wins (#5147): a non-error terminal success arms the bounded
+		// grace window once. The scan keeps reading to EOF as before; a CLI
+		// that exits promptly never lets the timer fire.
+		if !successResult && isTerminalSuccess(ev.Kind, line) {
+			successResult = true
+			graceTimer = time.AfterFunc(i.resultExitGrace(), func() {
+				graceMu.Lock()
+				defer graceMu.Unlock()
+				if graceStopped {
+					return
+				}
+				graceKilled.Store(true)
+				_ = killProcessTree(cmd.Process)
+			})
+		}
 		// Capture the schema-guaranteed structured_output object whenever a
 		// line surfaces one (it rides on the terminal result event). The
 		// latest non-empty wins.
@@ -698,7 +822,7 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 						"stage":     inv.Stage,
 					}),
 				})
-				_ = cmd.Process.Kill()
+				_ = killProcessTree(cmd.Process)
 				break
 			}
 		}
@@ -727,12 +851,15 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		if ok {
 			if inv.Budget.MaxTokens > 0 && tokensUsed > inv.Budget.MaxTokens {
 				budgetHit = true
-				_ = cmd.Process.Kill()
+				_ = killProcessTree(cmd.Process)
 				break
 			}
 		}
 	}
 	readErr := reader.Err()
+	// Stop the grace timer now the scan loop has ended, before the drains and
+	// cmd.Wait reap the pid (#5147).
+	stopGrace()
 
 	// Stop the heartbeat goroutine now the scan loop has finished —
 	// covers both the EOF path and the budget-hit early break, so the
@@ -782,6 +909,12 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// session_resume_failed arm below reads it, and that arm is gated on a
 	// resumed spawn itself.
 	resumeMiss := resumeNotFoundMarker(resultPayload, stderrBuf.String())
+	// settleOnResult (#5147): the CLI emitted a non-error terminal success and
+	// OUR kill ended it — the grace kill fired or the deadline Cancel did — and
+	// Wait is consistent with that kill (signal or clean exit). A CLI that exited
+	// non-zero on its own after a success result keeps the waitErr arms.
+	deadlineHit := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	settleOnResult := successResult && (graceKilled.Load() || deadlineHit) && exitedBySignalOrClean(waitErr)
 
 	switch {
 	case budgetHit:
@@ -808,6 +941,25 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 				loopCount, kind, truncateSignature(loopSig)),
 			"loop_detected",
 		), false, agent.ErrLoopDetected
+
+	case settleOnResult:
+		// Settle on the captured terminal result: fall out of the switch to the
+		// ordinary success tail. The settled invocation still faces the
+		// committed-tree verify and policy gates downstream.
+		cause := "grace_expired"
+		if !graceKilled.Load() {
+			cause = "deadline"
+		}
+		res.Events = append(res.Events, agent.Event{
+			Kind:      "agent_result_exit_grace_kill",
+			Timestamp: now(),
+			Payload: agent.MakePayload(map[string]any{
+				"cause":         cause,
+				"grace_seconds": i.resultExitGrace().Seconds(),
+				"run_id":        inv.RunID,
+				"stage":         inv.Stage,
+			}),
+		})
 
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return failureResult(res, now(), "A",

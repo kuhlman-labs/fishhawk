@@ -329,13 +329,14 @@ type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo f
 // head, which wins over the pull_request_opened (PR-open) head. Within a
 // category the winner is the highest-sequence entry.
 //
-// This single ordering is the shared enabler consumed by BOTH the server-side
-// resolver (server.latestRunHeadSHA — acceptance head binding + Option C's
-// head-aware retry) AND the audit-check publisher (auditcheckpublisher's
-// findHeadSHA — the fishhawk_audit_complete Check Run target). Divergent head
-// resolution between the acceptance/retry path and audit_complete publishing is
-// exactly the failure this centralization prevents: both import this package so
-// they cannot drift.
+// This ordering is shared by the server-side resolver server.latestRunHeadSHA
+// (its remaining pull-request reopen and in-flight upkeep callers) and the
+// audit-check publisher (auditcheckpublisher's findHeadSHA — the
+// fishhawk_audit_complete Check Run target). Acceptance head binding and Option
+// C's head-aware retry no longer read it: since #4874 they read the server's
+// acceptanceHeadAsOf, which seeds by chain sequence and walks clean recorded
+// base merges, so after a clean rebase this ordering can name the pre-rebase
+// head while acceptance names the merge commit.
 //
 // conflict_resolution_pushed is deliberately NOT a member (#3673), even though
 // its entries carry a head_sha the two ledger readers now honor. This slice is a
@@ -349,6 +350,17 @@ type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo f
 // head), so the category is admitted to the two membership readers only —
 // see CategoryConflictResolutionPushed.
 var HeadReportCategoriesByPrecedence = []string{"acceptance_scenarios_pushed", "fixup_pushed", "child_pushed", "pull_request_opened"}
+
+// ReportedHeadLedgerCategories is the run's own-chain reported-head ledger
+// MEMBERSHIP list (#4874): the five categories whose head_sha names a
+// run-authored commit. It is the source of server.lineageLedgerCategories
+// (an alias, membership and order unchanged) and of the MCP acceptance
+// preview mirror, so the two cannot drift. It is a membership list, not a
+// precedence ordering: see HeadReportCategoriesByPrecedence for that, and
+// CategoryConflictResolutionPushed for why that category is a member here
+// and absent there.
+var ReportedHeadLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed", "acceptance_scenarios_pushed",
+	CategoryConflictResolutionPushed}
 
 // CategoryConflictResolutionPushed is the audit category the runner's
 // SUCCESSFUL conflict-resolution pass is recorded under (E64.62 / #3202), and
@@ -521,6 +533,7 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	// not_validated bases #3397 added — "all-skip-observed", "no-rows-observed"
 	// and "all-retired-observed" (plan.AcceptanceBasisAllSkipObserved /
 	// plan.AcceptanceBasisNoRowsObserved / plan.AcceptanceBasisAllRetiredObserved) —
+	// and the #3682 "added-only-observed" (plan.AcceptanceBasisAddedOnlyObserved)
 	// are DELIBERATELY not exempted: a runner DID spawn for those, so the stage
 	// owes its trace exactly like a normally-dispatched one, which is pinned by a
 	// non-exempt regression row. A normal validator-recorded verdict never sets

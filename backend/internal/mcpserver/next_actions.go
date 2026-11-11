@@ -424,13 +424,16 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 //     queue's next pump re-decides), so it is INSERTED before the first
 //     fishhawk_merge_run, else APPENDED.
 //   - orphaned (still dispatched past the crash-left window): APPENDS
-//     fishhawk_get_merge_queue. The release is CONDITIONAL on the
-//     forge-approval fold: merge-on-pass step 8 releases the claim only in a
-//     decision whose fold approved, and a claimed entry never yields
-//     (ADR-109), so with the approval-wait anchor set the reason says the
-//     pull request still needs a qualifying approval and the claim holds the
-//     head until then; without it the reason states both outcomes. It never
-//     says there is nothing to do.
+//     fishhawk_get_merge_queue. On a MERGING entry (phase merging) the next
+//     restart resume releases the claim when the pull request reads open and
+//     unmerged, before the forge-approval fold (ADR-109 A2, #4862), and the
+//     reason says so. On any other phase (an orphan left before A2) the
+//     release is CONDITIONAL on the fold: merge-on-pass step 8, the backstop,
+//     releases the claim only in a decision whose fold approved, and a
+//     claimed entry never yields (ADR-109), so with the approval-wait anchor
+//     set the reason says the pull request still needs a qualifying approval
+//     and the claim holds the head until then; without it the reason states
+//     both outcomes. It never says there is nothing to do.
 //
 // Every string is built from constants and the run's own id, repo and base
 // ref. Idempotent (an identical action already present is left alone). A
@@ -458,7 +461,11 @@ func foldMergeQueueOrphanedClaim(run *Run, na *NextActions) {
 	case "orphaned":
 		why := "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A1): the next merge-on-pass decision whose forge-approval fold approves releases it and merges through the ordinary path. " +
 			"If the pull request still needs a qualifying forge approval, the claim holds the head until that approval arrives (a claimed entry never yields); read the line to watch it"
-		if q.ApprovalWaitStartedAt != nil {
+		switch {
+		case q.Phase == "merging":
+			why = "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A2) on a merging entry: the next restart resume releases it when the pull request reads open and unmerged, before the forge-approval fold; " +
+				"ordinary merge-on-pass then waits for approval, yields or merges through the ordinary path. Read the line to watch it"
+		case q.ApprovalWaitStartedAt != nil:
 			why = "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A1) and the pull request still needs a qualifying forge approval at its current head: " +
 				"the claim holds the head until that approval arrives (a claimed entry never yields). Approve the pull request under a write-or-higher identity the review gate admits; the next merge-on-pass decision then releases the claim and merges through the ordinary path"
 		}

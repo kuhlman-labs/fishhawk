@@ -185,7 +185,9 @@ type mergeRunResponse struct {
 //     YIELDED (ADR-112 R3, #4632: held with its intent and a marker the queue
 //     skips until a re-probe clears it). Any other ineligible or an
 //     undeterminable run keeps the 409 with an additive
-//     merge_queue_ineligible detail and nothing written.
+//     merge_queue_ineligible detail and no verdict, intent or queue row
+//     written (the predicate's concern leg may idempotently reconcile child
+//     slice concerns into the ledger).
 //   - 409 forge_approval_required (ADR-112 / #4619), INSIDE the merge-intent
 //     lock after the ownership check and BEFORE the overlap-override record,
 //     the verdict append, the observe, the republish and the claim: when the
@@ -536,8 +538,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// as behind / unverified / held is ENQUEUED (202 queued) instead, and
 		// one failing ONLY the approval leg is enqueued YIELDED (ADR-112 R3);
 		// any other ineligible one keeps today's refusal, plus the reason
-		// codes, with nothing written. An overlap override is recorded before the
-		// merge-intent append (recordOverlapOverride as the pre-commit step).
+		// codes, with no verdict, intent or queue row written (the predicate's
+		// concern leg may idempotently reconcile child-slice concerns). An
+		// overlap override is recorded before the merge-intent append
+		// (recordOverlapOverride as the pre-commit step).
 		handled, ineligible := s.mergeQueueEnqueueArm(w, r, runRow, prURL, verdict, id.Subject, gate, recordOverlapOverride)
 		if handled {
 			return

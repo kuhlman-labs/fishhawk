@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	campaigndb "github.com/kuhlman-labs/fishhawk/backend/internal/campaign/db"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 )
 
 // attachExpedites sets Item.Expedite on every item carrying a
@@ -118,24 +119,45 @@ func (r *postgresRepo) GetDispatchHold(ctx context.Context, campaignID uuid.UUID
 	return h, nil
 }
 
-// ListDispatchHolds returns every hold row, oldest first.
-func (r *postgresRepo) ListDispatchHolds(ctx context.Context) ([]*DispatchHold, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+dispatchHoldColumns+` FROM campaign_dispatch_holds ORDER BY held_at, campaign_id`)
-	if err != nil {
-		return nil, fmt.Errorf("list campaign dispatch holds: %w", err)
+// ListDispatchHolds returns the holds of the campaigns in s's account window
+// on s.Repo, oldest first (see the Repository doc). The semi-join keeps the
+// account comparison and the NULL-account branch grouped together, with the
+// repository test applied to both. An empty s.AccountID binds NULL through
+// accountIDArg, so the equality branch can never match and only NULL-account
+// campaigns are selected: there is deliberately no ListCampaignsFilter-style
+// NULL-argument wildcard here. The read runs inside a transaction scoped to
+// s.AccountID because campaign_dispatch_holds has no tenant policy but
+// campaigns does: once the runtime leaves its superuser role, an unscoped
+// subquery would hide the stage's own tenanted campaign behind the unset GUC
+// and answer an empty, fail-OPEN list. No index is needed: the holds table
+// carries one row per active hold, deleted on release.
+func (r *postgresRepo) ListDispatchHolds(ctx context.Context, s DispatchHoldScope) ([]*DispatchHold, error) {
+	if err := ValidateDispatchHoldScope(s); err != nil {
+		return nil, err
 	}
-	defer rows.Close()
 	var out []*DispatchHold
-	for rows.Next() {
-		h, err := scanDispatchHold(rows)
+	err := postgres.WithTenant(ctx, r.pool, s.AccountID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT `+dispatchHoldColumns+` FROM campaign_dispatch_holds WHERE campaign_id IN (SELECT id FROM campaigns WHERE (account_id = $1 OR account_id IS NULL) AND repo = $2) ORDER BY held_at, campaign_id`,
+			accountIDArg(s.AccountID), s.Repo)
 		if err != nil {
-			return nil, fmt.Errorf("scan campaign dispatch hold: %w", err)
+			return fmt.Errorf("list campaign dispatch holds: %w", err)
 		}
-		out = append(out, h)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list campaign dispatch holds: %w", err)
+		defer rows.Close()
+		for rows.Next() {
+			h, err := scanDispatchHold(rows)
+			if err != nil {
+				return fmt.Errorf("scan campaign dispatch hold: %w", err)
+			}
+			out = append(out, h)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list campaign dispatch holds: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

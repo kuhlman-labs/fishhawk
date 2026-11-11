@@ -992,6 +992,15 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 				err.Error(), overflow.details())
 			return
 		}
+		// #4815: the stage_fixup_triggered append failed, so the fix-up was
+		// REFUSED before any stage moved. Still a 500 internal_error (the cause
+		// is an audit-store failure, logged as the internal cause), but the
+		// message tells the operator nothing was re-opened or spent.
+		if errors.Is(err, errFixupTriggerNotRecorded) {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				fixupTriggerNotRecordedMessage, map[string]any{"error": err.Error()})
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"fixup failed", map[string]any{"error": err.Error()})
 		return
@@ -1094,16 +1103,18 @@ type fixupActionParams struct {
 }
 
 // fixupStageAs performs the gate-action core of POST /v0/stages/{id}/fixup
-// under the given identity: the route-time concern fit check (#4284),
-// run.FixupStage, the stage_fixup_triggered audit write, the durable-concern
-// addressed_pending marking, the orchestrator handoff, the drive re-park
-// stamp, and the status notify. It is
+// under the given identity: the route-time concern fit check (#4284), the
+// append-then-reopen sequence (triggerThenReopenFixup, #4815: pre-flight,
+// operator-concern mint, stage_fixup_triggered append, run.FixupStage), the
+// durable-concern addressed_pending marking, the orchestrator handoff, the
+// drive re-park stamp, and the status notify. It is
 // identity-parameterised so the HTTP handler and the in-process campaign
 // auto-driver (E25.6 / ADR-047) drive the identical path and stamp identical
-// audit. run.FixupStage's sentinel errors are returned verbatim for the
-// caller to map (HTTP status with budget/ceiling detail in the handler);
-// every post-transition step is best-effort exactly as in the prior inline
-// handler.
+// audit. run.FixupStage's sentinel errors (from the pre-flight or the re-open)
+// are returned verbatim for the caller to map (HTTP status with budget/ceiling
+// detail in the handler); an unrecorded trigger is a non-sentinel refusal
+// (fixupTriggerNotRecorded). Every post-re-open step is best-effort exactly as
+// in the prior inline handler.
 func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionParams) (*run.FixupDecision, []fixupPRBodyObligation, error) {
 	// Enforce the fixup gate's write scope on the acting identity (write:stages
 	// OR write:fixups, matching the handler's inline check). A no-op on the HTTP
@@ -1112,7 +1123,7 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	if !identityHasGateScope(id, "write:stages", "write:fixups") {
 		return nil, nil, &gateActionScopeError{scope: "write:stages or write:fixups"}
 	}
-	// Route-time concern fit (#4284), BEFORE the transition: a pass whose
+	// Route-time concern fit (#4284), BEFORE the pre-flight: a pass whose
 	// concerns cannot all be listed in the fix-up prompt is refused here, so it
 	// spends no budget, writes no audit entry, mints no operator concern, and
 	// marks no concern addressed_pending — a concern the agent would not see
@@ -1133,36 +1144,18 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 			ConcernIDs:    ids,
 		}
 	}
-	dec, err := run.FixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
+	// Append-then-reopen (#4815): the trigger is recorded BEFORE the implement
+	// stage is re-opened, under the stage admission fence, for the reason the
+	// conflict-resolution pass's ORDERING comment gives
+	// (conflictresolution_trigger.go): a re-open cannot be walked back, so a
+	// trigger that cannot be recorded must refuse the pass with every stage
+	// untouched. triggerThenReopenFixup releases the fence before it returns,
+	// so nothing below (in particular Advance) runs under it. Every step below
+	// runs only after a successful re-open and stays best-effort.
+	dec, routedIDs, err := s.triggerThenReopenFixup(ctx, id, p, fullFit)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// Mint the free-text operator instruction into the durable concern store
-	// (#2623), AFTER run.FixupStage's transition has committed so a
-	// budget/ceiling/not-applicable refusal can never leave an orphan open
-	// concern row on the run (there is no delete verb to unwind one). The minted
-	// id folds into the routed-id set below so it inherits addressed_pending,
-	// delta-verification resolution, and the gate-view fixups[] join for free.
-	operatorConcernID, minted := s.mintOperatorConcern(ctx, dec.Stage.RunID, dec.Stage.ID, p.OperatorConcern)
-	// Clone the routed-id set before appending: `routedIDs := p.ConcernIDs` would
-	// ALIAS the caller's backing array and write the minted id through into it
-	// whenever cap exceeds len — and fixupActionParams is shared with the
-	// non-HTTP auto-drive and acceptance-triage callers. slices.Clone makes the
-	// non-mutation guarantee true regardless of the caller slice's capacity.
-	routedIDs := slices.Clone(p.ConcernIDs)
-	if minted {
-		routedIDs = append(routedIDs, operatorConcernID)
-	}
-
-	// Audit first so the fix-up intent (and the selected concerns the
-	// prompt renderer reads back) is recorded even if the orchestrator
-	// handoff below fails. Same posture as the retry handler. The routed-id set
-	// (now including any minted operator-concern id) rides `concern_ids`; the
-	// minted id is ALSO recorded on its own `operator_concern_id` key so the
-	// gate-view fixups[] join attributes the pass to the operator concern.
-	truncatedIDs := fixupTruncatedConcernIDs(fullFit, p.Selected, routedIDs, p.ConcernIDs)
-	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence, fullFit.BodiesTruncated, truncatedIDs, p.Targets)
 
 	// PR-body-unsatisfiable signal (#2782): a routed instruction whose router
 	// TARGETED the PR body (E83.37 / #4022 — the declared target, never the
@@ -1172,18 +1165,18 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// and the review-time join share via buildFixupObligationSources + Detect),
 	// record the advisory audit entry on every routing path, and RETURN the set
 	// so the HTTP handler can put it on the response for the MCP verb to warn
-	// FROM. AFTER writeFixupAudit so the trigger entry stays the durable record;
-	// best-effort and fail-open, and it never unwinds the committed transition
-	// or changes the HTTP status. Deliberately NOT gated on a zero-concern skip:
+	// FROM. AFTER the trigger append and the re-open so the trigger entry stays
+	// the durable record; best-effort and fail-open, and it never unwinds the
+	// committed re-open or changes the HTTP status. Deliberately NOT gated on a zero-concern skip:
 	// an operator_concern-only pass whose instruction targets the PR body is
 	// unsatisfiable either way.
 	prBodyObligations := s.recordFixupPRBodyUnsatisfiable(ctx, dec, p.Selected, p.OperatorConcern, p.Reason, p.Targets)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's fix-up reason as state_reason. AFTER the
-	// audit append so the trigger entry is the durable record; best-effort like
-	// the append — a failure warn-logs and never unwinds the committed
-	// transition. The guard keys on the WIDENED routedIDs (relaxed from
+	// trigger append and the re-open, so a refused pass marks nothing;
+	// best-effort — a failure warn-logs and never unwinds the committed
+	// re-open. The guard keys on the WIDENED routedIDs (relaxed from
 	// p.ConcernIDs, #2623), so an operator-concern-only pass whose sole routed id
 	// is the freshly minted one still transitions it raised -> addressed_pending.
 	// The state_reason is deliberately p.Reason (the operator's fix-up `reason`),
@@ -1244,6 +1237,166 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	s.notifyStatusUpdate(ctx, dec.Stage.RunID, "stage_fixup")
 
 	return dec, prBodyObligations, nil
+}
+
+// triggerThenReopenFixup is fixupStageAs' append-then-reopen core (#4815). It
+// holds the stage admission fence for its own scope only — the fence and its
+// context marker end at this function's return, so the caller's Advance never
+// runs under it — and performs, in order:
+//
+//  1. run.PreviewFixupStage: the read-only pre-flight. A refusal (sentinel or
+//     read failure) is returned verbatim with nothing minted or appended, so a
+//     deterministic refusal still spends no pass.
+//  2. mintOperatorConcern, folding the minted id into the routed-id set.
+//  3. The stage_fixup_triggered append, built from the preview's receipt
+//     fields. A failed append retires the minted concern
+//     (retireUnroutedOperatorConcern) and refuses with
+//     fixupTriggerNotRecorded: no stage was re-opened and no pass was spent.
+//  4. run.FixupStage. Its own admission re-decides the call, so a state change
+//     that landed after the preview refuses here. Any error settles the
+//     already-recorded trigger (settleUnopenedFixupTrigger) and is returned
+//     verbatim, so every caller's errors.Is sentinel mapping still works.
+//
+// Lock order: no fixupStageAs caller holds a stage admission fence (the HTTP
+// handler, AutoDrive's route_fixup arm, acceptance triage — whose outcome
+// append releases its own narrow hold before triage — and the merge-candidate
+// verdict route), so the blocking acquisition here waits with no other fence
+// held, as holdStageAdmission's contract requires.
+func (s *Server) triggerThenReopenFixup(ctx context.Context, id Identity, p fixupActionParams, fullFit prompt.FixupConcernFit) (*run.FixupDecision, []uuid.UUID, error) {
+	ctx, unlock := s.holdStageAdmission(ctx, p.StageID)
+	defer unlock()
+
+	preview, err := run.PreviewFixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Mint the free-text operator instruction into the durable concern store
+	// (#2623) AFTER the pre-flight admitted the pass, so a budget/ceiling/
+	// not-applicable refusal never mints a row (there is no delete verb to
+	// unwind one). The minted id folds into the routed-id set below so it
+	// inherits addressed_pending, delta-verification resolution, and the
+	// gate-view fixups[] join for free. A later refusal (unrecorded trigger or
+	// failed re-open) retires it to superseded.
+	operatorConcernID, minted := s.mintOperatorConcern(ctx, preview.Stage.RunID, preview.Stage.ID, p.OperatorConcern)
+	// Clone the routed-id set before appending: `routedIDs := p.ConcernIDs` would
+	// ALIAS the caller's backing array and write the minted id through into it
+	// whenever cap exceeds len — and fixupActionParams is shared with the
+	// non-HTTP auto-drive and acceptance-triage callers. slices.Clone makes the
+	// non-mutation guarantee true regardless of the caller slice's capacity.
+	routedIDs := slices.Clone(p.ConcernIDs)
+	if minted {
+		routedIDs = append(routedIDs, operatorConcernID)
+	}
+
+	// The trigger is the durable record of the pass: the routed-id set (now
+	// including any minted operator-concern id) rides `concern_ids`, and the
+	// minted id is ALSO recorded on its own `operator_concern_id` key so the
+	// gate-view fixups[] join attributes the pass to the operator concern.
+	truncatedIDs := fixupTruncatedConcernIDs(fullFit, p.Selected, routedIDs, p.ConcernIDs)
+	if aerr := s.writeFixupAudit(ctx, id, preview, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence, fullFit.BodiesTruncated, truncatedIDs, p.Targets); aerr != nil {
+		s.retireUnroutedOperatorConcern(context.WithoutCancel(ctx), operatorConcernID,
+			"fix-up refused before any stage was re-opened: its stage_fixup_triggered audit entry could not be recorded, so this operator concern was never routed to a pass; re-invoke the fix-up to route the instruction")
+		return nil, nil, fixupTriggerNotRecorded(aerr)
+	}
+
+	dec, ferr := run.FixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
+	if ferr != nil {
+		s.settleUnopenedFixupTrigger(ctx, preview, operatorConcernID, ferr)
+		return nil, nil, ferr
+	}
+	return dec, routedIDs, nil
+}
+
+// errFixupTriggerNotRecorded marks fixupTriggerNotRecorded's refusal so the
+// HTTP handler can name it on the 500 (#4815).
+var errFixupTriggerNotRecorded = errors.New("fix-up trigger not recorded")
+
+// fixupTriggerNotRecordedMessage is the refusal's operator-facing text, used
+// both in the wrapped error and as the 500's message.
+const fixupTriggerNotRecordedMessage = "fix-up REFUSED: the stage_fixup_triggered audit entry could not be recorded, so the implement stage was not re-opened and no fix-up pass was spent; re-invoke the fix-up once the audit store is healthy"
+
+// fixupTriggerNotRecorded is the refusal when the stage_fixup_triggered append
+// fails (#4815). It wraps the cause with %w and carries no run sentinel, so the
+// HTTP handler maps it to a 500 naming the refusal and the in-process callers
+// see a genuine (non-sentinel) error.
+func fixupTriggerNotRecorded(cause error) error {
+	return fmt.Errorf("%s: %w", fixupTriggerNotRecordedMessage, errors.Join(errFixupTriggerNotRecorded, cause))
+}
+
+// settleUnopenedFixupTrigger settles a stage_fixup_triggered entry whose
+// re-open then failed (#4815): the trigger is on the chain but no pass will
+// run. It retires any minted operator concern and appends a
+// stage_fixup_recovered row with delivered_nothing:true and
+// source_failure_category C, which the refund (fixupRefundedPasses), the MCP
+// review-floor void and the gate-view outcome readers already honour, so the
+// trigger refunds its budget slot and voids its review floor.
+//
+// The row records the implement stage's ACTUAL state: restored_state is read
+// back from the repository, because a failed re-open moved nothing it can be
+// trusted to name (and a concurrent writer may have moved the stage). Only
+// when that read fails does it fall back to the preview's pre-trigger state,
+// saying so in source_failure_reason and a WARN log. No transition is made
+// here, so the row claims no restoration; on the push_and_open_pr flow a
+// review stage FixupStage re-parked before the implement re-open failed stays
+// pending and the row carries no restored_review_* keys (residual, #5043).
+//
+// It runs on a context detached from cancellation, so a request that ended
+// mid-flight still settles. A failed settle append is the existing WARN log in
+// writeFixupRecoveredAudit; the caller still returns the re-open error. A
+// process death before the settle leaves an unsettled trigger (residual,
+// #5042).
+func (s *Server) settleUnopenedFixupTrigger(ctx context.Context, preview *run.FixupDecision, operatorConcernID uuid.UUID, ferr error) {
+	settleCtx := context.WithoutCancel(ctx)
+	cause := stripFixupSentinel(ferr)
+	s.retireUnroutedOperatorConcern(settleCtx, operatorConcernID,
+		"fix-up refused: its stage_fixup_triggered audit entry was recorded but the implement stage could not be re-opened ("+cause+"), so this operator concern was never routed to a pass; re-invoke the fix-up to route the instruction")
+
+	reason := "fix-up re-open failed after its stage_fixup_triggered entry was recorded; no pass ran: " + cause
+	var settled run.Stage
+	if cur, gerr := s.cfg.RunRepo.GetStage(settleCtx, preview.Stage.ID); gerr == nil && cur != nil {
+		settled = *cur
+	} else {
+		// A COPY of the preview row: a fake repository may alias the stored row,
+		// and the settle must never mutate it.
+		settled = *preview.Stage
+		settled.State = preview.PriorState
+		readErr := "no row returned"
+		if gerr != nil {
+			readErr = gerr.Error()
+		}
+		reason += "; the implement stage could not be re-read (" + readErr + "), so restored_state records its pre-trigger state, not an observed one"
+		s.cfg.Logger.LogAttrs(settleCtx, slog.LevelWarn,
+			"fixup: settle unopened trigger: implement stage re-read failed; recording the pre-trigger state",
+			slog.String("run_id", preview.Stage.RunID.String()),
+			slog.String("stage_id", preview.Stage.ID.String()),
+			slog.String("error", readErr))
+	}
+	category := run.FailureC
+	deliveredNothing := true
+	s.writeFixupRecoveredAudit(settleCtx, preview.Stage.RunID, &run.FixupRecovery{
+		Stage:                &settled,
+		PriorFailureCategory: &category,
+		PriorFailureReason:   &reason,
+	}, fixupRoundClosure{DeliveredNothing: &deliveredNothing})
+}
+
+// retireUnroutedOperatorConcern moves an operator concern minted for a fix-up
+// that was then refused raised -> superseded (#4815), so the refused pass
+// leaves no OPEN row wedging the open-concern gate (there is no delete verb).
+// The row stays in the concern ledger and its history and can still be routed
+// by id. A no-op on uuid.Nil (nothing minted) or a nil ConcernRepo; a failure
+// WARN-logs and the caller still refuses.
+func (s *Server) retireUnroutedOperatorConcern(ctx context.Context, concernID uuid.UUID, reason string) {
+	if concernID == uuid.Nil || s.cfg.ConcernRepo == nil {
+		return
+	}
+	if _, rerr := s.cfg.ConcernRepo.ApplyResolution(ctx, concernID, concern.StateSuperseded, reason); rerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup: retire unrouted operator concern failed — the row stays raised",
+			slog.String("concern_id", concernID.String()),
+			slog.String("error", rerr.Error()))
+	}
 }
 
 // buildFixupObligationSources assembles the ordered fixupobligation.Source
@@ -1365,9 +1518,12 @@ func (s *Server) recordFixupPRBodyUnsatisfiable(ctx context.Context, dec *run.Fi
 // Returns (uuid.Nil, false) when there is nothing to mint (empty text) or no
 // store is wired (nil ConcernRepo). Best-effort like persistReviewConcerns: an
 // insert error (or an empty/nil result row) warn-logs and returns false, so the
-// fix-up — whose transition run.FixupStage has already committed — degrades to
-// exactly the pre-#2623 untracked delivery rather than failing. The concern
-// store is a derived index over the authoritative audit payload.
+// fix-up — which run.PreviewFixupStage has already admitted — degrades to
+// exactly the pre-#2623 untracked delivery rather than failing. The mint runs
+// AFTER that pre-flight and BEFORE the trigger append and the re-open (#4815);
+// if either then fails, triggerThenReopenFixup retires the minted row to
+// superseded. The concern store is a derived index over the authoritative audit
+// payload.
 func (s *Server) mintOperatorConcern(ctx context.Context, runID, stageID uuid.UUID, text string) (uuid.UUID, bool) {
 	if text == "" || s.cfg.ConcernRepo == nil {
 		return uuid.Nil, false
@@ -1901,15 +2057,46 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // as concern_targets (aligned with `concerns`) / operator_concern_target /
 // reason_target, each omitted when every target is code — the prompt-serve and
 // review-time re-derivation read them back, so routing, serve and review agree
-// on which obligation is unsatisfiable. Best-effort: the transition is already
-// committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string, bodiesTruncated bool, truncatedConcernIDs []string, targets fixupInstructionTargets) {
+// on which obligation is unsatisfiable.
+//
+// FAIL-CLOSED since #4815: the append runs BEFORE the implement stage is
+// re-opened (triggerThenReopenFixup), so dec is the run.PreviewFixupStage
+// decision and only its Stage ids, PriorState, RemainingBudget,
+// RemainingCeilingSlots, Forced and ReparkedReview id are read — the fields a
+// preview shares with the post-transition decision. A marshal or append error
+// is RETURNED, and the caller refuses the fix-up with no stage re-opened.
+func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string, bodiesTruncated bool, truncatedConcernIDs []string, targets fixupInstructionTargets) error {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
 	}
 	actorKind := actorKindForSubject(subject)
 
+	payload, err := fixupTriggerPayload(id, dec, selected, concernIDs, indices, reason, allowCreate, priorPasses, refundedPasses, delegatedRule, pinModel, operatorConcern, operatorConcernID, operatorEvidence, bodiesTruncated, truncatedConcernIDs, targets)
+	if err != nil {
+		return err
+	}
+
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        dec.Stage.RunID,
+		StageID:      &dec.Stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryStageFixupTriggered,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		return fmt.Errorf("append %s: %w", CategoryStageFixupTriggered, err)
+	}
+	return nil
+}
+
+// fixupTriggerPayload builds the stage_fixup_triggered payload writeFixupAudit
+// appends (see its doc for every key). It reads only the decision fields a
+// run.PreviewFixupStage decision shares with the post-transition one (#4815),
+// so the payload built from either is byte-identical. The only error is a
+// json.Marshal failure, which the payload's static types cannot produce.
+func fixupTriggerPayload(id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string, bodiesTruncated bool, truncatedConcernIDs []string, targets fixupInstructionTargets) ([]byte, error) {
 	passOrdinal := priorPasses + 1
 	admissibilityReason := fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",
 		passOrdinal, defaultMaxFixupPasses, len(selected), fixupScopeUsed(id))
@@ -2041,23 +2228,11 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 		}
 	}
 
-	payload, _ := json.Marshal(fields)
-
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:        dec.Stage.RunID,
-		StageID:      &dec.Stage.ID,
-		Timestamp:    time.Now().UTC(),
-		Category:     CategoryStageFixupTriggered,
-		ActorKind:    &actorKind,
-		ActorSubject: &subject,
-		Payload:      payload,
-	}); err != nil {
-		s.cfg.Logger.Error("audit append failed for fixup",
-			"run_id", dec.Stage.RunID,
-			"stage_id", dec.Stage.ID,
-			"error", err.Error(),
-		)
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s payload: %w", CategoryStageFixupTriggered, err)
 	}
+	return payload, nil
 }
 
 // maybeRecoverFixupFailure detects a failed fix-up re-dispatch and, when
@@ -2380,8 +2555,11 @@ func (s *Server) reopenRoutedConcernsAfterDeliveredNothing(ctx context.Context, 
 // and (#3395) the round-closure outcome: delivered_nothing (present only
 // when the fixup_pushed read succeeded), reopened_concern_ids (present only
 // when non-empty) and concern_reopen_error (present only when the reopen
-// could not be attempted or partially failed). Best-effort: the recovery
-// transition is already committed, so a failure here logs but doesn't unwind.
+// could not be attempted or partially failed). Best-effort: on the #788
+// recovery the restore transition is already committed, and on the #4815
+// settle of an unopened trigger (settleUnopenedFixupTrigger) no transition was
+// made and the caller is already returning its re-open error, so a failure
+// here logs but doesn't unwind.
 func (s *Server) writeFixupRecoveredAudit(ctx context.Context, runID uuid.UUID, rec *run.FixupRecovery, closure fixupRoundClosure) {
 	fields := map[string]any{
 		"stage_id":       rec.Stage.ID.String(),

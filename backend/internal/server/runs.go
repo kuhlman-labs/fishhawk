@@ -498,12 +498,19 @@ type runMergeCandidateQueuePayload struct {
 	DispatchClaimOrphan string `json:"dispatch_claim_orphan,omitempty"`
 }
 
-// The live-entry note's dispatch-claim orphan clauses (ADR-109 A1, #4711),
-// constant-shape. The orphaned clauses are CONDITIONAL on the forge-approval
-// fold: step 8 releases the claim only in a decision whose fold approved, and
-// a claimed entry never yields (ADR-109), so while the pull request lacks a
-// qualifying approval the claim holds the head.
+// The live-entry note's dispatch-claim orphan clauses (ADR-109, #4711/#4862),
+// constant-shape. On a MERGING entry the next restart resume releases the
+// claim when the PR reads open and unmerged, BEFORE the forge-approval fold
+// (Amendment A2), so the merging clause is unconditional on approval. On any
+// other phase (an orphan left on a non-merging entry before A2) the clauses
+// stay CONDITIONAL on the fold: step 8, the backstop, releases the claim only
+// in a decision whose fold approved, and a claimed entry never yields
+// (ADR-109), so while the pull request lacks a qualifying approval the claim
+// holds the head.
 const (
+	// mergeQueueNoteOrphanedMerging: orphaned on a merging entry (A2).
+	mergeQueueNoteOrphanedMerging = "; its queue dispatch claim is orphaned (crash-left, ADR-109 A2) on a merging entry: the next restart resume releases it when the pull request reads open and unmerged, before the forge-approval fold, " +
+		"then ordinary merge-on-pass waits for approval, yields or merges through the ordinary path"
 	// mergeQueueNoteOrphanedAwaitingApproval: orphaned, and the entry's
 	// approval-wait anchor is set (the fold did not approve).
 	mergeQueueNoteOrphanedAwaitingApproval = "; its queue dispatch claim is orphaned (crash-left, ADR-109 A1) and the pull request still needs a qualifying forge approval at its current head: " +
@@ -517,10 +524,14 @@ const (
 )
 
 // mergeQueueOrphanNoteClause is the live note's clause for label, keyed on
-// whether the approval-wait anchor is set; "" for no label.
-func mergeQueueOrphanNoteClause(label string, approvalWaiting bool) string {
+// the entry's phase (merging: the resume releases it, A2) and, on any other
+// phase, whether the approval-wait anchor is set; "" for no label.
+func mergeQueueOrphanNoteClause(label string, phase mergequeue.Phase, approvalWaiting bool) string {
 	switch label {
 	case mergeQueueClaimOrphaned:
+		if phase == mergequeue.PhaseMerging {
+			return mergeQueueNoteOrphanedMerging
+		}
 		if approvalWaiting {
 			return mergeQueueNoteOrphanedAwaitingApproval
 		}
@@ -638,7 +649,7 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 	}
 	out.DispatchClaimOrphan = s.mergeCandidateDispatchClaimOrphanFor(ctx, e)
 	out.Note = "live: this run holds the " + e.BaseRef + " merge-candidate line (ADR-092) until its pull request merges, its pass fails or the run ends; phase " + string(e.Phase) +
-		mergeQueueOrphanNoteClause(out.DispatchClaimOrphan, e.ApprovalWaitStartedAt != nil)
+		mergeQueueOrphanNoteClause(out.DispatchClaimOrphan, e.Phase, e.ApprovalWaitStartedAt != nil)
 	return out, nil
 }
 

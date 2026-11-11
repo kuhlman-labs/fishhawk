@@ -150,6 +150,20 @@ func TestCost_KnownTiers(t *testing.T) {
 			want:   10 + 50,
 		},
 		{
+			name:   "fable 5.2 reprices below the fable stem",
+			model:  "claude-fable-5-2",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   8 + 40, // $8 input + $40 output per 1M
+		},
+		{
+			name:   "mythos 5.2 reprices below the mythos 5 key",
+			model:  "claude-mythos-5-2",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   8 + 40,
+		},
+		{
 			name:   "sonnet 5 reprices below the sonnet stem",
 			model:  "claude-sonnet-5",
 			input:  1_000_000,
@@ -189,9 +203,10 @@ func TestCost_KnownTiers(t *testing.T) {
 // backend/cmd/fishhawkd/serve.go and backend/internal/server/modelpolicy.go
 // (claudecode=claude-opus-4-8,claude-sonnet-4-6; codex=gpt-5.5), AND the
 // models pinned in .fishhawk/workflows.yaml, which overrides the defaults
-// with claude-opus-5-5 (plan executor), claude-fable-5-1 (both claudecode
-// reviewers) and gpt-6-astra (both codex reviewers, since #3234).
-// claude-opus-5 and claude-fable-5 are the previous pins and
+// with claude-opus-5-5 (plan and implement executors), claude-fable-5-2
+// (every claudecode reviewer, since #5145) and gpt-6-astra (every codex
+// reviewer, since #3234). claude-opus-5, claude-fable-5 and
+// claude-fable-5-1 are the previous pins and
 // claude-sonnet-5-5 is the current Sonnet, so a swap to any of them
 // prices.
 // gpt-5.6-terra is retained as future-swap insurance — it was the codex
@@ -210,6 +225,8 @@ func TestCost_PricesLiveModelIDs(t *testing.T) {
 		"claude-opus-5-5",
 		"claude-fable-5",
 		"claude-fable-5-1",
+		"claude-fable-5-2",
+		"claude-mythos-5-2",
 		"claude-sonnet-4-6",
 		"claude-sonnet-5",
 		"claude-sonnet-5-5",
@@ -273,10 +290,12 @@ func TestCacheRates_Multipliers(t *testing.T) {
 		{family: "claude-sonnet-5", wantReadMultiplier: 0.1, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 2.5 / 1_000_000},
 		{family: "claude-mythos-5", wantReadMultiplier: 0.1, wantReadPerToken: 1.0 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
 		// The read-discount exceptions: Opus 5.5 reads at 0.05x, Fable 5.1 /
-		// Mythos 5.1 at 0.025x; write stays 1.25x input.
+		// Mythos 5.1 and Fable 5.2 / Mythos 5.2 at 0.025x; write stays 1.25x input.
 		{family: "claude-opus-5-5", wantReadMultiplier: 0.05, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
 		{family: "claude-fable-5-1", wantReadMultiplier: 0.025, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
 		{family: "claude-mythos-5-1", wantReadMultiplier: 0.025, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
+		{family: "claude-fable-5-2", wantReadMultiplier: 0.025, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 10.0 / 1_000_000},
+		{family: "claude-mythos-5-2", wantReadMultiplier: 0.025, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 10.0 / 1_000_000},
 		// gpt-5.5: read = $0.50/1M (0.1x input), write = input rate ($5/1M).
 		{family: "gpt-5.5", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
 		// gpt-5.6 tiers: read = 0.1x input, write = 1.25x input (the 5.6 premium).
@@ -306,7 +325,7 @@ func TestCacheRates_Multipliers(t *testing.T) {
 	// Anthropic write is 1.25x input; pin the multiplier directly too.
 	// The whole gpt-5.6 family and gpt-6-astra carry the same 1.25x write
 	// premium (unlike gpt-5.5).
-	for _, family := range []string{"claude-opus", "claude-opus-5-5", "claude-fable", "claude-fable-5-1", "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet", "claude-sonnet-5", "claude-haiku", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"} {
+	for _, family := range []string{"claude-opus", "claude-opus-5-5", "claude-fable", "claude-fable-5-1", "claude-fable-5-2", "claude-mythos-5", "claude-mythos-5-1", "claude-mythos-5-2", "claude-sonnet", "claude-sonnet-5", "claude-haiku", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"} {
 		r := familyRates[family]
 		approx(t, r.cacheWritePerToken, 1.25*r.inputPerToken)
 	}
@@ -317,7 +336,7 @@ func TestCacheRates_Multipliers(t *testing.T) {
 // for every live model id, so a non-cache-aware caller routed through the new
 // entry point is unaffected.
 func TestCostWithCache_ReducesToCost(t *testing.T) {
-	for _, model := range []string{"claude-opus-4-8", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-4-6", "claude-sonnet-5-5", "claude-haiku-4-5", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra"} {
+	for _, model := range []string{"claude-opus-4-8", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-fable-5-2", "claude-sonnet-4-6", "claude-sonnet-5-5", "claude-haiku-4-5", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra"} {
 		t.Run(model, func(t *testing.T) {
 			wantUSD, wantOK := Cost(model, 1_234_567, 89_012)
 			gotUSD, gotOK := CostWithCache(model, 1_234_567, 0, 0, 89_012)

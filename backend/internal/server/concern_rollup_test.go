@@ -31,6 +31,16 @@ import (
 type rollupRepo struct {
 	*orchestratorRepo
 	stagesErr error
+	// getRunErr fails GetRun for the named run ids only, so a test can break
+	// the child read or the parent read of the late hook independently.
+	getRunErr map[uuid.UUID]error
+}
+
+func (r *rollupRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if err, ok := r.getRunErr[id]; ok {
+		return nil, err
+	}
+	return r.orchestratorRepo.GetRun(ctx, id)
 }
 
 func (r *rollupRepo) ListStagesAwaitingChildren(context.Context) ([]*run.Stage, error) {
@@ -342,8 +352,10 @@ func TestSliceConcernRollup_ClosedChildConcernNotImported(t *testing.T) {
 
 // TestSliceConcernRollup_FanInImportBlocksMergeLeg: after the fan-in, the
 // parent's merge-eligibility leg blocks on the copied HIGH. The only HIGH
-// lives on the child and is seeded directly, so the parent leg blocks only if
-// the fan-in copied it.
+// lives on the child and is seeded directly. The copy is read BEFORE the leg
+// runs, so the test still discriminates a fan-in that copied nothing, even
+// though the leg's own reconcile would now import the HIGH if the fan-in had
+// not.
 func TestSliceConcernRollup_FanInImportBlocksMergeLeg(t *testing.T) {
 	f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
 	high := f.seedChildConcern(t, 0, "high", "refund path double-credits")
@@ -1007,4 +1019,271 @@ func TestSliceConcernRollup_SweepBetweenReadAndImportLeavesNoOpenCopy(t *testing
 	if len(entries) != 0 {
 		t.Errorf("concern_rolled_up rows = %d, want 0 (nothing was imported)", len(entries))
 	}
+}
+
+// warnLinesWith returns the WARN log lines that contain needle.
+func warnLinesWith(logs *bytes.Buffer, needle string) []string {
+	var out []string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, needle) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// TestSliceConcernRollup_LateImportFailureLogsStableKey pins the stable WARN
+// key on EVERY failure branch of the late hook (#4823), one subtest per branch,
+// each seeded by construction and driving importLateSliceConcerns directly.
+// The key is asserted as the LITERAL string, so changing its value goes RED.
+func TestSliceConcernRollup_LateImportFailureLogsStableKey(t *testing.T) {
+	cases := []struct {
+		name string
+		arm  func(f *rollupFixture)
+	}{
+		{"child read error", func(f *rollupFixture) {
+			f.rr.getRunErr = map[uuid.UUID]error{f.children[0].ID: errors.New("child unreadable")}
+		}},
+		{"parent read error", func(f *rollupFixture) {
+			f.rr.getRunErr = map[uuid.UUID]error{f.parent.ID: errors.New("parent unreadable")}
+		}},
+		{"parent stage list error", func(f *rollupFixture) { f.rr.stagesErr = errors.New("stages unreadable") }},
+		{"child concern list error", func(f *rollupFixture) { f.cr.listErr = errors.New("concern store down") }},
+		{"ImportRolledUp error", func(f *rollupFixture) { f.cr.importErr = errors.New("insert failed") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
+			f.seedChildConcern(t, 0, "high", "late high that must not be lost silently")
+			tc.arm(f)
+			f.s.importLateSliceConcerns(context.Background(), f.children[0].ID)
+			f.cr.listErr = nil // the copy count below reads the ledger
+
+			lines := warnLinesWith(f.logs, "event=concern_late_import_failed")
+			if len(lines) != 1 {
+				t.Fatalf("WARN lines keyed event=concern_late_import_failed = %d, want exactly 1; logs:\n%s", len(lines), f.logs.String())
+			}
+			for _, want := range []string{"level=WARN", "event=concern_late_import_failed", "run_id=" + f.children[0].ID.String(), "site=child_review"} {
+				if !strings.Contains(lines[0], want) {
+					t.Errorf("late-import WARN lacks %q: %s", want, lines[0])
+				}
+			}
+			if n := len(f.parentCopies(t)); n != 0 {
+				t.Errorf("parent copies = %d, want 0 (the import failed)", n)
+			}
+		})
+	}
+}
+
+// TestSliceConcernRollup_MergeLegReconcilesLostLateImport drives the PRODUCTION
+// verdict path on a succeeded child after its fan-in with the import failing,
+// then clears the fault: the merge leg's reconcile recovers the lost copy, so
+// the leg blocks on it (#4823). The only HIGH sits on the child with no parent
+// copy, so a leg that does not reconcile returns unblocked.
+func TestSliceConcernRollup_MergeLegReconcilesLostLateImport(t *testing.T) {
+	ctx := context.Background()
+	f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
+	if w := postConsolidate(t, f.s, f.parent.ID, withAuth); w.Code != http.StatusOK {
+		t.Fatalf("consolidate status = %d:\n%s", w.Code, w.Body.String())
+	}
+	const note = "late: stock never restored on cancel"
+	f.cr.importErr = errors.New("insert failed")
+	f.runChildReview(0, note, 0)
+
+	if lines := warnLinesWith(f.logs, "event=concern_late_import_failed"); len(lines) != 1 || !strings.Contains(lines[0], "site=child_review") {
+		t.Fatalf("want one WARN keyed concern_late_import_failed with site child_review after the lost import; logs:\n%s", f.logs.String())
+	}
+	if n := len(f.parentCopies(t)); n != 0 {
+		t.Fatalf("precondition: parent copies after the lost import = %d, want 0", n)
+	}
+	childRows, err := f.cr.ListByRun(ctx, f.children[0].ID)
+	if err != nil || len(childRows) != 1 || childRows[0].Note != note {
+		t.Fatalf("precondition: the child holds the late HIGH, got %v / %v", childRows, err)
+	}
+
+	f.cr.importErr = nil
+	reason, detail, err := f.s.mergeQueueConcernLeg(ctx, f.parent)
+	if err != nil {
+		t.Fatalf("mergeQueueConcernLeg: %v", err)
+	}
+	got := f.copiesWithNote(t, note)
+	if len(got) != 1 {
+		t.Fatalf("parent copies of the late HIGH after the leg = %d, want 1", len(got))
+	}
+	if reason != mergeQueueReasonBlockingConcernOpen || !strings.Contains(detail, got[0].ID.String()) {
+		t.Errorf("merge leg = %q / %q, want blocking_concern_open naming the recovered copy %s", reason, detail, got[0].ID)
+	}
+	rows := f.rolledUpRows(t)
+	if len(rows) != 1 || !strings.Contains(string(rows[0].Payload), `"site":"merge_reconcile"`) {
+		t.Errorf("concern_rolled_up rows = %d, want 1 with site merge_reconcile", len(rows))
+	}
+	if childRows[0].Outcome != concern.OutcomeCarried {
+		t.Errorf("child source outcome = %q, want carried", childRows[0].Outcome)
+	}
+}
+
+// TestSliceConcernRollup_MergeLegReconcileFailsClosed: every failure of the
+// reconcile is an ERROR from the leg (which the predicate maps to
+// undeterminable), a keyed WARN with site merge_reconcile, and no copy.
+func TestSliceConcernRollup_MergeLegReconcileFailsClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		arm  func(f *rollupFixture)
+	}{
+		{"child list error", func(f *rollupFixture) { f.rr.listRunsErr = errors.New("runs unreadable") }},
+		{"parent stage list error", func(f *rollupFixture) { f.rr.stagesErr = errors.New("stages unreadable") }},
+		{"child concern list error", func(f *rollupFixture) { f.cr.listErr = errors.New("concern store down") }},
+		{"ImportRolledUp error", func(f *rollupFixture) { f.cr.importErr = errors.New("insert failed") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
+			f.seedChildConcern(t, 0, "high", "uncopied high")
+			tc.arm(f)
+			reason, detail, err := f.s.mergeQueueConcernLeg(context.Background(), f.parent)
+			f.cr.listErr = nil // the copy count below reads the ledger
+			if err == nil || !strings.Contains(err.Error(), "reconcile child-slice concerns") {
+				t.Fatalf("leg = %q / %q / %v, want an error naming the child-slice reconcile (fail closed)", reason, detail, err)
+			}
+			lines := warnLinesWith(f.logs, "event=concern_late_import_failed")
+			if len(lines) != 1 || !strings.Contains(lines[0], "site=merge_reconcile") || !strings.Contains(lines[0], "run_id="+f.parent.ID.String()) {
+				t.Errorf("want one WARN keyed concern_late_import_failed with site merge_reconcile naming the parent; logs:\n%s", f.logs.String())
+			}
+			if n := len(f.parentCopies(t)); n != 0 {
+				t.Errorf("parent copies = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestSliceConcernRollup_MergeLegReconcileSkipsUnfinishedChildren: a running
+// and a failed child each hold an open HIGH; the reconcile imports only
+// SUCCEEDED children (the fan-in's set), so the leg stays unblocked.
+func TestSliceConcernRollup_MergeLegReconcileSkipsUnfinishedChildren(t *testing.T) {
+	f := newRollupFixture(t, []childSpec{{0, run.StateRunning}, {1, run.StateFailed}})
+	f.seedChildConcern(t, 0, "high", "running child high")
+	f.seedChildConcern(t, 1, "high", "failed child high")
+	reason, detail, err := f.s.mergeQueueConcernLeg(context.Background(), f.parent)
+	if err != nil || reason != "" {
+		t.Fatalf("leg = %q / %q / %v, want unblocked: an unfinished child's concerns are not imported", reason, detail, err)
+	}
+	if n := len(f.parentCopies(t)); n != 0 {
+		t.Errorf("parent copies = %d, want 0", n)
+	}
+}
+
+// TestSliceConcernRollup_MergeLegReconcileSkipsTerminalParent: a terminal
+// parent gets no copy (the late hook's rule: it would be a false open row),
+// even though a succeeded child holds an open HIGH.
+func TestSliceConcernRollup_MergeLegReconcileSkipsTerminalParent(t *testing.T) {
+	f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
+	f.seedChildConcern(t, 0, "high", "child high under a merged parent")
+	f.parent.State = run.StateSucceeded
+	reason, detail, err := f.s.mergeQueueConcernLeg(context.Background(), f.parent)
+	if err != nil || reason != "" {
+		t.Fatalf("leg = %q / %q / %v, want unblocked for a terminal parent", reason, detail, err)
+	}
+	if n := len(f.parentCopies(t)); n != 0 {
+		t.Errorf("parent copies = %d, want 0 for a terminal parent", n)
+	}
+	if n := len(f.rolledUpRows(t)); n != 0 {
+		t.Errorf("concern_rolled_up rows = %d, want 0", n)
+	}
+}
+
+// TestSliceConcernRollup_MergeLegNoChildrenReadsNoParentStages: a run with no
+// SUCCEEDED child returns before any parent stage read, so an unreadable stage
+// list cannot fail the leg of a run that has nothing to import.
+func TestSliceConcernRollup_MergeLegNoChildrenReadsNoParentStages(t *testing.T) {
+	for name, children := range map[string][]childSpec{
+		"no children":              {},
+		"only an unfinished child": {{0, run.StateRunning}},
+		"only a failed child":      {{0, run.StateFailed}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRollupFixture(t, children)
+			f.rr.stagesErr = errors.New("stages must not be read")
+			reason, detail, err := f.s.mergeQueueConcernLeg(context.Background(), f.parent)
+			if err != nil || reason != "" {
+				t.Fatalf("leg = %q / %q / %v, want unblocked with no parent stage read", reason, detail, err)
+			}
+		})
+	}
+}
+
+// TestSliceConcernRollup_MergeLegNilRunRepo: with no run repository the
+// reconcile imports nothing and does not dereference it.
+func TestSliceConcernRollup_MergeLegNilRunRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", ConcernRepo: newFakeConcernRepo()})
+	parent := &run.Run{ID: uuid.New(), State: run.StateRunning}
+	var (
+		reason string
+		err    error
+	)
+	if p := panicOf(func() { reason, _, err = s.mergeQueueConcernLeg(context.Background(), parent) }); p != nil {
+		t.Fatalf("leg with a nil RunRepo panicked (%v), want the reconcile to return before any read", p)
+	}
+	if err != nil || reason != "" {
+		t.Errorf("leg = %q / %v, want unblocked with no error", reason, err)
+	}
+}
+
+// TestSliceConcernRollup_CopyAndSourceResolveIndependently pins the README
+// rule in both directions through the merge-gate reconcile: a child-side
+// disposition does not clear the parent block, and dispositioning the parent
+// copy does not close the child source nor re-mint a copy on a later
+// evaluation.
+func TestSliceConcernRollup_CopyAndSourceResolveIndependently(t *testing.T) {
+	ctx := context.Background()
+	t.Run("waiving the child source leaves the copy blocking", func(t *testing.T) {
+		f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
+		high := f.seedChildConcern(t, 0, "high", "refund path double-credits")
+		if err := f.s.ImportSliceConcerns(ctx, f.parent.ID, []uuid.UUID{f.children[0].ID}); err != nil {
+			t.Fatal(err)
+		}
+		cp := copyOf(f.parentCopies(t), high)
+		if cp == nil {
+			t.Fatal("precondition: no parent copy")
+		}
+		if _, err := f.cr.ApplyResolution(ctx, high.ID, concern.StateWaived, "child-side waive"); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			reason, detail, err := f.s.mergeQueueConcernLeg(ctx, f.parent)
+			if err != nil || reason != mergeQueueReasonBlockingConcernOpen || !strings.Contains(detail, cp.ID.String()) {
+				t.Fatalf("evaluation %d: leg = %q / %q / %v, want blocking on the still-open copy %s", i, reason, detail, err, cp.ID)
+			}
+		}
+		if cp.State != concern.StateRaised {
+			t.Errorf("copy state = %s, want raised: a child-side waive does not close the parent copy", cp.State)
+		}
+	})
+	t.Run("waiving the parent copy leaves the source open and re-mints nothing", func(t *testing.T) {
+		f := newRollupFixture(t, []childSpec{{0, run.StateSucceeded}})
+		high := f.seedChildConcern(t, 0, "high", "refund path double-credits")
+		if err := f.s.ImportSliceConcerns(ctx, f.parent.ID, []uuid.UUID{f.children[0].ID}); err != nil {
+			t.Fatal(err)
+		}
+		cp := copyOf(f.parentCopies(t), high)
+		if cp == nil {
+			t.Fatal("precondition: no parent copy")
+		}
+		if _, err := f.cr.ApplyResolution(ctx, cp.ID, concern.StateWaived, "parent-side waive"); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			if reason, detail, err := f.s.mergeQueueConcernLeg(ctx, f.parent); err != nil || reason != "" {
+				t.Fatalf("evaluation %d: leg = %q / %q / %v, want unblocked once the copy is waived", i, reason, detail, err)
+			}
+		}
+		if !high.State.IsOpen() {
+			t.Errorf("child source state = %s, want it still open: waiving the copy does not close the source", high.State)
+		}
+		if n := len(f.parentCopies(t)); n != 1 {
+			t.Errorf("parent copies = %d, want 1 (the waived copy is never re-minted)", n)
+		}
+		if n := len(f.rolledUpRows(t)); n != 1 {
+			t.Errorf("concern_rolled_up rows = %d, want 1 (repeated evaluation writes no second row)", n)
+		}
+	})
 }

@@ -106,6 +106,39 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":529,"result":"Overloaded"}`)
 		fmt.Fprintln(os.Stderr, "API Error: 529 Overloaded")
 		helperExit(1)
+	case "success_then_hang", "success_iserror_then_hang":
+		// #5147: the CLI emits its terminal result then lingers (a background
+		// task keeps it alive) instead of exiting.
+		isErr := os.Getenv("HELPER_MODE") == "success_iserror_then_hang"
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":30,"output_tokens":12}}}`)
+		fmt.Printf(`{"type":"result","subtype":"success","is_error":%t,"usage":{"input_tokens":40,"output_tokens":20}}`+"\n", isErr)
+		time.Sleep(30 * time.Second)
+	case "success_then_hang_grandchild", "success_then_exit1_grandchild", "budget_grandchild":
+		// #5147: a grandchild holds the stdout pipe open. The hang variant
+		// lingers after its result; the exit1 variant exits non-zero ON ITS
+		// OWN right after it (F1), so the grandchild alone keeps the pipe open.
+		gc := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
+		gc.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=grandchild_sleep")
+		gc.Stdout = os.Stdout
+		if err := gc.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, "grandchild start:", err)
+			helperExit(2)
+		}
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		if os.Getenv("HELPER_MODE") == "budget_grandchild" {
+			// F5: trips a 100-token budget, then lingers with the grandchild.
+			fmt.Println(`{"type":"assistant","usage":{"input_tokens":80,"output_tokens":80}}`)
+			time.Sleep(30 * time.Second)
+		}
+		fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":30,"output_tokens":12}}}`)
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":40,"output_tokens":20}}`)
+		if os.Getenv("HELPER_MODE") == "success_then_exit1_grandchild" {
+			helperExit(1)
+		}
+		time.Sleep(30 * time.Second)
+	case "grandchild_sleep":
+		time.Sleep(6 * time.Second)
 	case "raw_line":
 		// Non-JSON output should not crash the harness; it must
 		// still appear in the trace as kind=raw.
@@ -978,6 +1011,162 @@ func TestInvoke_Timeout(t *testing.T) {
 	}
 	if res.FailureCategory != "A" {
 		t.Errorf("FailureCategory = %q, want A", res.FailureCategory)
+	}
+}
+
+// graceKillCause returns the cause of the agent_result_exit_grace_kill event,
+// or "" when the invocation emitted none.
+func graceKillCause(t *testing.T, res agent.Result) string {
+	t.Helper()
+	for _, ev := range res.Events {
+		if ev.Kind != "agent_result_exit_grace_kill" {
+			continue
+		}
+		var p struct {
+			Cause string `json:"cause"`
+		}
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			t.Fatalf("grace-kill payload: %v", err)
+		}
+		return p.Cause
+	}
+	return ""
+}
+
+// TestInvoke_ResultSuccessThenHang_GraceKillSettlesOnResult pins #5147's result
+// wins: a CLI that emits a non-error result.success then lingers is killed
+// after the grace window and settles OK, well before the 8s deadline.
+func TestInvoke_ResultSuccessThenHang_GraceKillSettlesOnResult(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("success_then_hang"), Now: frozenNow(), ResultExitGrace: 100 * time.Millisecond}
+	start := time.Now()
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Budget: agent.Budget{Timeout: 8 * time.Second}})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("err = %v, want nil (settled on the captured result)", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false, reason %q", res.FailureReason)
+	}
+	if got := graceKillCause(t, res); got != "grace_expired" {
+		t.Errorf("grace-kill cause = %q, want grace_expired", got)
+	}
+	if res.TokensUsed != 60 {
+		t.Errorf("TokensUsed = %d, want 60 (the result line's usage)", res.TokensUsed)
+	}
+	if elapsed >= 4*time.Second {
+		t.Errorf("elapsed = %s, want < 4s: the grace kill did not fire before the deadline", elapsed)
+	}
+}
+
+// TestInvoke_ResultSuccessThenHang_DeadlineSettlesOnResult: with the grace
+// window far away, the stage deadline kills the lingering CLI after a captured
+// success, and the invocation still settles OK rather than ErrTimeout.
+func TestInvoke_ResultSuccessThenHang_DeadlineSettlesOnResult(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("success_then_hang"), Now: frozenNow(), ResultExitGrace: time.Hour}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Budget: agent.Budget{Timeout: 2 * time.Second}})
+	if err != nil {
+		t.Fatalf("err = %v, want nil (deadline after a captured success settles on it)", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false, reason %q", res.FailureReason)
+	}
+	if got := graceKillCause(t, res); got != "deadline" {
+		t.Errorf("grace-kill cause = %q, want deadline", got)
+	}
+}
+
+// TestInvoke_ResultSuccessIsErrorThenHang_StaysTimeout: a result.success line
+// carrying is_error:true never settles; the deadline stays ErrTimeout.
+func TestInvoke_ResultSuccessIsErrorThenHang_StaysTimeout(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("success_iserror_then_hang"), Now: frozenNow(), ResultExitGrace: time.Hour}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Budget: agent.Budget{Timeout: 2 * time.Second}})
+	if !errors.Is(err, agent.ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout (an is_error result must not settle)", err)
+	}
+	if res.OK {
+		t.Error("OK = true for an is_error:true result")
+	}
+	captured := false
+	for _, ev := range res.Events {
+		if ev.Kind == "result.success" && strings.Contains(string(ev.Payload), `"is_error":true`) {
+			captured = true
+		}
+	}
+	if !captured {
+		t.Fatal("the is_error:true result.success event was not captured; the test would pass vacuously")
+	}
+}
+
+// TestInvoke_ResultSuccessThenHang_KillsProcessGroup: the grace kill reaches a
+// grandchild holding the stdout pipe (process-group kill), so the invocation
+// settles well before the grandchild's own 6s exit.
+func TestInvoke_ResultSuccessThenHang_KillsProcessGroup(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("success_then_hang_grandchild"), Now: frozenNow(), ResultExitGrace: 100 * time.Millisecond}
+	start := time.Now()
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Budget: agent.Budget{Timeout: 20 * time.Second}})
+	elapsed := time.Since(start)
+	if err != nil || !res.OK {
+		t.Fatalf("err = %v, OK = %v, reason %q; want a settled success", err, res.OK, res.FailureReason)
+	}
+	if elapsed >= 3*time.Second {
+		t.Errorf("elapsed = %s, want < 3s: the kill did not reach the grandchild holding stdout", elapsed)
+	}
+}
+
+// TestInvoke_ResultSuccessThenSelfExit1_TakesWaitErrArm pins F1: a CLI that
+// exits non-zero ON ITS OWN after a success result is not settled even though
+// the grace kill fired (to reap the grandchild holding stdout). Wait reports
+// exit status 1, not a signal, so the generic waitErr arm classifies it.
+func TestInvoke_ResultSuccessThenSelfExit1_TakesWaitErrArm(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("success_then_exit1_grandchild"), Now: frozenNow(), ResultExitGrace: 100 * time.Millisecond}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Budget: agent.Budget{Timeout: 20 * time.Second}})
+	if !errors.Is(err, agent.ErrAgentFailed) {
+		t.Fatalf("err = %v, want ErrAgentFailed (self-exit 1 takes the waitErr arm)", err)
+	}
+	if res.OK {
+		t.Error("OK = true for a CLI that exited 1 on its own")
+	}
+	if got := graceKillCause(t, res); got != "" {
+		t.Errorf("grace-kill cause = %q, want no settle event", got)
+	}
+}
+
+// TestInvoke_BudgetKill_KillsProcessGroup pins F5: the budget kill reaches a
+// grandchild holding stdout, so the post-kill stdout drain does not block
+// until the grandchild's own 6s exit.
+func TestInvoke_BudgetKill_KillsProcessGroup(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("budget_grandchild"), Now: frozenNow()}
+	start := time.Now()
+	_, err := inv.Invoke(context.Background(), agent.Invocation{Budget: agent.Budget{Timeout: 20 * time.Second, MaxTokens: 100}})
+	elapsed := time.Since(start)
+	if !errors.Is(err, agent.ErrBudgetExceeded) {
+		t.Fatalf("err = %v, want ErrBudgetExceeded", err)
+	}
+	if elapsed >= 3*time.Second {
+		t.Errorf("elapsed = %s, want < 3s: the budget kill did not reach the grandchild holding stdout", elapsed)
+	}
+}
+
+func TestIsTerminalSuccess(t *testing.T) {
+	cases := []struct {
+		name string
+		kind string
+		line string
+		want bool
+	}{
+		{"success without is_error", "result.success", `{"type":"result","subtype":"success"}`, true},
+		{"success is_error false", "result.success", `{"type":"result","subtype":"success","is_error":false}`, true},
+		{"success is_error true", "result.success", `{"type":"result","subtype":"success","is_error":true}`, false},
+		{"error_during_execution", "result.error_during_execution", `{"type":"result","subtype":"error_during_execution"}`, false},
+		{"bare result", "result", `{"type":"result"}`, false},
+		{"malformed json", "result.success", `{"type":"result",`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTerminalSuccess(tc.kind, []byte(tc.line)); got != tc.want {
+				t.Errorf("isTerminalSuccess(%q, %s) = %v, want %v", tc.kind, tc.line, got, tc.want)
+			}
+		})
 	}
 }
 
