@@ -1589,9 +1589,19 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 // acceptance_outcome_recorded verdict, it re-opens the stage (succeeded →
 // pending) via run.ReopenAcceptanceStage and appends an acceptance_reopened
 // invalidation audit entry — the SAME kind the operator-gated #1567 re-open
-// uses (no new issue-comment surface). next_actions then routes to
-// acceptance_pending so the operator re-dispatches acceptance against the final
-// commit.
+// uses (no new issue-comment surface).
+//
+// It never calls Advance itself. Its one production caller, succeedFixupPushStage,
+// fires the orchestrator advance AFTER it (#4804), so a stage re-opened behind a
+// gateless implement edge is re-armed: parked at awaiting_host_dispatch on a local
+// run, dispatched on github_actions, or, when Orchestrator.Artifacts is wired and
+// the approved plan is empty-criteria or all-skip-with-basis, re-short-circuited
+// straight to succeeded with a fresh not_validated verdict, opening the review
+// gate with no park. A stage left pending (a gated implement edge, or a report
+// that found the implement stage already out of running and took no edge) is
+// what next_actions' acceptance dispatch lead covers, so the operator
+// re-dispatches acceptance against the final commit (docs/acceptance.md §
+// "Verdict head binding").
 //
 // No-op (everything untouched) when: the run has no acceptance stage; the
 // acceptance stage is not succeeded (a PRE-acceptance fix-up must not reopen

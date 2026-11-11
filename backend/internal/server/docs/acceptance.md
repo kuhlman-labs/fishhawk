@@ -386,6 +386,46 @@ changes validated code, a fix-up push, records `acceptance_reopened` through
 and reset-branch paths. The refusal keys on the chain's own record, not a head
 compare.
 
+**Re-arm ordering (#4804).** `succeedFixupPushStage` runs edge → `fixup_pushed`
+row → `reopenAcceptanceOnFixupPush` → orchestrator advance.
+`decideVariantStageAfterReport` decides and commits the ADR-140 variant edge
+first, so a refused claim writes no row and re-opens nothing, and returns the
+gateless advance instead of firing it. The handler fires it only after the
+re-open. The walk then reaches the re-opened acceptance as the next pending
+stage, with three outcomes. A local run parks it at `awaiting_host_dispatch`
+and writes no `acceptance_dispatched` anchor (the host-dispatch marker writes
+it at the spawn). A github_actions run dispatches it as a first-time
+acceptance, and the anchor lands above `fixup_pushed`, so the re-run verdict
+binds the fix-up head. When `Orchestrator.Artifacts` is wired and the approved
+plan is empty-criteria or all-skip-with-basis, the walk re-short-circuits it
+straight to `succeeded` with a fresh `not_validated` verdict and opens the
+review gate, with no park. That verdict carries no `head_sha`: it binds the
+fix-up head by sitting above the `acceptance_reopened` row, so
+`acceptance_stale` admits. A gated implement edge takes no advance, and the
+acceptance stays `pending` behind the gate. Before #4804 the advance ran first.
+In feature_change it walked the review (re-parked `pending` by the classic
+fix-up) to `awaiting_approval` past the still-`succeeded` acceptance, and the
+re-open then stranded the acceptance `pending` (the #4801 stall). Pinned by
+`pullrequest_test.go`'s `TestShipPullRequest_FixupPushAfterSettledAcceptance_*`:
+`ParksReopenedAcceptance`, `GitHubActions_AnchorAfterFixupPushed`,
+`AllSkipPlan_ReShortCircuits` and `RefusedVariant_ReopensNothing`, plus two
+synthetic structural guards: `ReviewFirstOrder_OpensReviewGateAcceptanceWaits`,
+which is order-independent, and `GatedImplement_DoesNotAdvance`.
+
+Two operator-visible consequences follow in an acceptance-before-review
+workflow. (1) After a fix-up push, a follow-on classic fix-up is refused by
+`run.blockingAcceptanceStage` (`fixup_not_applicable`) until acceptance is
+re-dispatched and settles, so each fix-up round costs one acceptance re-run.
+(2) `next_actions` now takes `implement_concerns_open_acceptance_pending`
+(implement `succeeded`, acceptance `awaiting_host_dispatch`, review `pending`)
+and leads with the acceptance dispatch: see `mcpserver`
+`TestNextActions_StateTable/h_concerns_open_acceptance_pending_no_fixup` and
+`TestNextActions_GateClosedNeverOffersFixup`. The #4801 gate-open arms
+(`implement_concerns_open_acceptance_unsettled` and its
+`implement_concerns_open_acceptance_reopened` relabel), which need the review
+parked at `awaiting_approval`, are now reachable only on the residual paths
+below.
+
 **Known residuals, none fixed here.**
 
 - `reopenAcceptanceOnFixupPush` writes nothing when the acceptance stage is
@@ -396,6 +436,15 @@ compare.
   In each case no `acceptance_reopened` row exists, so `acceptanceStaleRefusal`
   has no record to key on and admits. The invalidation guarantee above holds only
   when that row is written.
+- A `fixup_pushed` report that finds the implement stage already out of
+  `running` takes no edge, so it fires no advance (#4804). A re-open on that path
+  still leaves acceptance `pending`, and the #4801 `next_actions` acceptance
+  dispatch lead is still the remedy.
+- The forced held-check republish inside `reopenAcceptanceOnFixupPush` computes
+  its title while the stage is still `pending`. The unforced republish after the
+  #4804 advance dedups on (head, state), so the title can name `pending` while
+  the stage is `awaiting_host_dispatch`. Both states are dispatchable, so the
+  "re-opened by a fix-up push, not re-dispatched" clause is still accurate.
 - Option C (`retry.go` `retryAcceptanceOutcomeUnknown`) compares the recorded
   head with the unbounded current head, so the stage's own post-verdict corpus
   commit reads as stale and an operator retry is admitted. Predates #5155;

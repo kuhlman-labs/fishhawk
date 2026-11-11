@@ -1379,6 +1379,397 @@ func TestReopenAcceptanceOnFixupPush_Idempotent(t *testing.T) {
 	}
 }
 
+// --- #4804: the fix-up push re-arms the acceptance it re-opens ---
+//
+// These drive the REAL signed POST /pull-request fixup_pushed handler
+// (succeedFixupPushStage) and a REAL orchestrator.Advance over ONE repository and
+// ONE sequence-stamping audit fake. The defect lives at that seam (handler →
+// variant edge → audit chain → re-open → orchestrator walk → host-dispatch park):
+// a test calling reopenAcceptanceOnFixupPush directly passes under either order.
+//
+// SETUP OBLIGATION (#4804 condition E3): the RunRepo MUST admit
+// run.ValidStageFixupTransition's succeeded → pending edge. The base
+// orchestratorRepo refuses it, so run.ReopenAcceptanceStage would be refused, the
+// re-open would silently no-op, and no arm here could go RED (control B — the
+// re-open staying behind the variant decision — least of all). The fixture wraps
+// newOrchestratorRepo in fixupReopenTransitioner (auditcheckpublish_test.go) and
+// uses that ONE wrapper as both Config.RunRepo and Orchestrator.Runs. The ADR-140
+// variant edge's run.GuardedStageTransitioner capability is NOT orchestratorRepo's:
+// it comes from the review_recovery_test.go init() seam (testGuardedEdge), which
+// serves any RunRepo that does not carry noGuardedEdgeMarker. Config.GitHub stays
+// nil, so the ADR-141 reported-head check and the lineage guard admit.
+
+const (
+	fixupRearmOldHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	fixupRearmNewHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
+// fixupRearmOpts selects one variable off the production feature_change shape.
+type fixupRearmOpts struct {
+	// reviewFirst orders review (seq 3) before acceptance (seq 4). SYNTHETIC
+	// structural fixture (#4804 condition E4): a classic fix-up cannot follow a
+	// settled acceptance in a review-first workflow, so this pins only that the
+	// reorder never dispatches past an earlier open gate.
+	reviewFirst bool
+	// gatedImplement sets implement RequiresApproval. SYNTHETIC structural fixture
+	// (E4): no shipped acceptance-before-review workflow gates implement; this
+	// pins only that the deferred advance stays keyed on a gateless edge.
+	gatedImplement bool
+	// githubActions makes the run non-local with Orchestrator.GitHub wired.
+	githubActions bool
+	// allSkipPlan wires Orchestrator.Artifacts with an approved plan whose every
+	// acceptance criterion is skip_expected with a basis (#4804 condition E1).
+	allSkipPlan bool
+}
+
+type fixupRearmSeam struct {
+	s              *Server
+	rr             *orchestratorRepo
+	au             *auditFake
+	priv           ed25519.PrivateKey
+	runRow         *run.Run
+	impl, acc, rev *run.Stage
+}
+
+// newFixupRearmSeam seeds the feature_change shape a classic fix-up push meets:
+// plan succeeded; implement running (the trace gate left it there); acceptance
+// SUCCEEDED with a recorded stage-scoped verdict at the PR-open head; review
+// pending (run.FixupStage's classic re-park, AcceptanceStageID nil, leaves it
+// there and the verdict-ful acceptance succeeded).
+func newFixupRearmSeam(t *testing.T, o fixupRearmOpts) *fixupRearmSeam {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	repo := &fixupReopenTransitioner{orchestratorRepo: rr}
+	au := newAuditFake()
+	au.stampSequence = true
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+
+	runRow := rr.seedRun()
+	prURL := "https://github.com/x/y/pull/7"
+	runRow.PullRequestURL = &prURL
+	runRow.RunnerKind = run.RunnerKindLocal
+	if o.githubActions {
+		runRow.RunnerKind = run.RunnerKindGitHubActions
+		runRow.InstallationID = ptrInt64(99)
+	}
+	runRow.RunnerKindResolved = true
+
+	planStage := rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
+	impl := rr.seedStage(runRow.ID, 2, run.StageStateRunning)
+	impl.Type = run.StageTypeImplement
+	impl.RequiresApproval = o.gatedImplement
+	// orchestratorRepo lists stages in seed order, so seed in sequence order.
+	seedAcc := func(seq int) *run.Stage {
+		st := rr.seedStage(runRow.ID, seq, run.StageStateSucceeded)
+		st.Type = run.StageTypeAcceptance
+		return st
+	}
+	seedRev := func(seq int) *run.Stage {
+		st := rr.seedStage(runRow.ID, seq, run.StageStatePending)
+		st.Type = run.StageTypeReview
+		st.ExecutorKind = run.ExecutorHuman
+		st.RequiresApproval = true
+		st.Gate = &run.Gate{Kind: run.GateKindApproval}
+		return st
+	}
+	var acc, rev *run.Stage
+	if o.reviewFirst {
+		rev = seedRev(3)
+		acc = seedAcc(4)
+	} else {
+		acc = seedAcc(3)
+		rev = seedRev(4)
+	}
+
+	if _, err := au.AppendChained(t.Context(), audit.ChainAppendParams{
+		RunID: runRow.ID, StageID: &acc.ID, Timestamp: time.Now().UTC(),
+		Category: CategoryAcceptanceOutcomeRecorded,
+		Payload:  recoveryPayload(t, map[string]any{"verdict": "passed", "head_sha": fixupRearmOldHead}),
+	}); err != nil {
+		t.Fatalf("setup: seed acceptance verdict: %v", err)
+	}
+
+	orch := &orchestrator.Orchestrator{Runs: repo, Audit: au}
+	if o.githubActions {
+		orch.GitHub = newConsolidateGitHub()
+	}
+	if o.allSkipPlan {
+		seedPlanArtifactContent(t, ar, planStage.ID, &plan.Plan{
+			PlanVersion: "standard_v1",
+			Verification: plan.Verification{AcceptanceCriteria: []plan.AcceptanceCriterion{
+				{ID: "c1", Statement: "webhook fires", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "covered by webhook_integration_test.go"},
+			}},
+		})
+		orch.Artifacts = ar
+	}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		RunRepo:      repo,
+		Orchestrator: orch,
+	})
+	priv, _ := sf.issue(t, runRow.ID)
+	return &fixupRearmSeam{s: s, rr: rr, au: au, priv: priv, runRow: runRow, impl: impl, acc: acc, rev: rev}
+}
+
+// postFixup posts a signed fixup_pushed report at the new head.
+func (f *fixupRearmSeam) postFixup(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"outcome": "fixup_pushed", "branch": "fishhawk/run/stage",
+		"head_sha": fixupRearmNewHead, "base_sha": variantReportBaseSHA, "files_changed_count": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return shipPRRequest(t, f.s, f.runRow.ID, f.impl.ID, f.priv, body, "")
+}
+
+func (f *fixupRearmSeam) state(t *testing.T, st *run.Stage) run.StageState {
+	t.Helper()
+	return stageStateOnOrchestratorRepo(t, f.rr, f.runRow.ID, st.ID)
+}
+
+// rows returns the run's entries of category in chain order.
+func (f *fixupRearmSeam) rows(t *testing.T, category string) []*audit.Entry {
+	t.Helper()
+	got, err := f.au.ListForRunByCategory(t.Context(), f.runRow.ID, category)
+	if err != nil {
+		t.Fatalf("list %s: %v", category, err)
+	}
+	return got
+}
+
+// assertFixupOK pins the 200 fixup_pushed answer and exactly one fixup_pushed row,
+// returning that row.
+func (f *fixupRearmSeam) assertFixupOK(t *testing.T, w *httptest.ResponseRecorder) *audit.Entry {
+	t.Helper()
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"outcome":"fixup_pushed"`) {
+		t.Fatalf("status = %d, want 200 outcome fixup_pushed:\n%s", w.Code, w.Body.String())
+	}
+	pushed := f.rows(t, "fixup_pushed")
+	if len(pushed) != 1 {
+		t.Fatalf("fixup_pushed rows = %d, want 1", len(pushed))
+	}
+	return pushed[0]
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_ParksReopenedAcceptance is
+// the #4804 done-means (control A). A classic fix-up push lands after a
+// verdict-ful acceptance settled in a local feature_change run. The deferred
+// advance fires after the re-open, so the walk reaches the re-opened acceptance
+// and parks it at awaiting_host_dispatch; the review stays pending behind it.
+// The resulting shape (implement succeeded, acceptance awaiting_host_dispatch,
+// review pending) is the one next_actions leads with the acceptance dispatch
+// (mcpserver TestNextActions_StateTable/h_concerns_open_acceptance_pending_no_fixup
+// and TestNextActions_GateClosedNeverOffersFixup).
+//
+// Counterfactual (a): restore the old order (advance before the re-open): the
+// advance walks the review to awaiting_approval past the still-succeeded
+// acceptance, and the re-open strands it pending. Counterfactual (b): delete the
+// post-re-open advance: acceptance and review both stay pending.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_ParksReopenedAcceptance(t *testing.T) {
+	f := newFixupRearmSeam(t, fixupRearmOpts{})
+	pushed := f.assertFixupOK(t, f.postFixup(t))
+
+	if got := f.state(t, f.impl); got != run.StageStateSucceeded {
+		t.Errorf("implement = %q, want succeeded (gateless edge)", got)
+	}
+	if got := f.state(t, f.acc); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("acceptance = %q, want awaiting_host_dispatch (the re-opened acceptance must be re-armed, not stranded pending)", got)
+	}
+	if got := f.state(t, f.rev); got != run.StageStatePending {
+		t.Errorf("review = %q, want pending (the walk must not open the review gate past the re-opened acceptance)", got)
+	}
+	reopened := f.rows(t, CategoryAcceptanceReopened)
+	if len(reopened) != 1 {
+		t.Fatalf("acceptance_reopened rows = %d, want 1", len(reopened))
+	}
+	if reopened[0].Sequence <= pushed.Sequence {
+		t.Errorf("acceptance_reopened seq %d is not above fixup_pushed seq %d", reopened[0].Sequence, pushed.Sequence)
+	}
+	if n := len(f.rows(t, CategoryAcceptanceDispatched)); n != 0 {
+		t.Errorf("acceptance_dispatched rows = %d, want 0 (a local park spawns nothing; the host-dispatch marker owns the anchor)", n)
+	}
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_ReviewFirstOrder_OpensReviewGateAcceptanceWaits
+// is a regression guard on a SYNTHETIC structural fixture (#4804 condition E4):
+// review seq 3 before acceptance seq 4. It is ORDER-INDEPENDENT (both orders open
+// the review gate and leave acceptance pending), so it is not a counterfactual
+// vehicle and is no evidence about a production-reachable flow. It pins only that
+// the reorder does not dispatch acceptance past an earlier open review gate.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_ReviewFirstOrder_OpensReviewGateAcceptanceWaits(t *testing.T) {
+	f := newFixupRearmSeam(t, fixupRearmOpts{reviewFirst: true})
+	f.assertFixupOK(t, f.postFixup(t))
+
+	if got := f.state(t, f.rev); got != run.StageStateAwaitingApproval {
+		t.Errorf("review = %q, want awaiting_approval (the earlier pending stage is the walk's next)", got)
+	}
+	if got := f.state(t, f.acc); got != run.StageStatePending {
+		t.Errorf("acceptance = %q, want pending (re-opened, behind the open review gate)", got)
+	}
+	if n := len(f.rows(t, CategoryAcceptanceReopened)); n != 1 {
+		t.Errorf("acceptance_reopened rows = %d, want 1", n)
+	}
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_GatedImplement_DoesNotAdvance
+// pins control C on a SYNTHETIC structural fixture (#4804 condition E4): the
+// deferred advance stays keyed on the gateless terminal. A gated implement lands
+// awaiting_approval and takes no advance, so the re-opened acceptance stays
+// pending. Counterfactual (d): an unconditional Orchestrator.Advance finds the
+// acceptance as the first pending stage behind the open implement gate and
+// parks it.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_GatedImplement_DoesNotAdvance(t *testing.T) {
+	f := newFixupRearmSeam(t, fixupRearmOpts{gatedImplement: true})
+	f.assertFixupOK(t, f.postFixup(t))
+
+	if got := f.state(t, f.impl); got != run.StageStateAwaitingApproval {
+		t.Errorf("implement = %q, want awaiting_approval", got)
+	}
+	if got := f.state(t, f.acc); got != run.StageStatePending {
+		t.Errorf("acceptance = %q, want pending (re-opened, not parked past the open implement gate)", got)
+	}
+	if got := f.state(t, f.rev); got != run.StageStatePending {
+		t.Errorf("review = %q, want pending (untouched)", got)
+	}
+	if n := len(f.rows(t, CategoryAcceptanceReopened)); n != 1 {
+		t.Errorf("acceptance_reopened rows = %d, want 1", n)
+	}
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_GitHubActions_AnchorAfterFixupPushed
+// pins control D: on a github_actions run the deferred advance dispatches the
+// re-opened acceptance as a first-time acceptance, and its acceptance_dispatched
+// anchor lands above the fixup_pushed row, so the re-run verdict binds the
+// fix-up head. Counterfactual (e): under the old order acceptance is never
+// dispatched (it stays pending) and no anchor is written.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_GitHubActions_AnchorAfterFixupPushed(t *testing.T) {
+	f := newFixupRearmSeam(t, fixupRearmOpts{githubActions: true})
+	pushed := f.assertFixupOK(t, f.postFixup(t))
+
+	if got := f.state(t, f.acc); got != run.StageStateDispatched {
+		t.Errorf("acceptance = %q, want dispatched (re-armed as a first-time acceptance)", got)
+	}
+	if got := f.state(t, f.rev); got != run.StageStatePending {
+		t.Errorf("review = %q, want pending", got)
+	}
+	anchors := f.rows(t, CategoryAcceptanceDispatched)
+	if len(anchors) != 1 {
+		t.Fatalf("acceptance_dispatched rows = %d, want 1", len(anchors))
+	}
+	if anchors[0].Sequence <= pushed.Sequence {
+		t.Errorf("acceptance_dispatched seq %d is not above fixup_pushed seq %d (the verdict would bind the pre-fix-up head)", anchors[0].Sequence, pushed.Sequence)
+	}
+	if head, ok := f.s.acceptanceValidatedHeadSHA(t.Context(), f.runRow.ID, f.acc.ID); !ok || head != fixupRearmNewHead {
+		t.Errorf("validated head = (%q, %v), want (%q, true)", head, ok, fixupRearmNewHead)
+	}
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_RefusedVariant_ReopensNothing
+// pins control B: the re-open stays behind the variant decision. A recorded
+// binding reject at another head for this implement stage (seeded as
+// TestShipPullRequest_VariantEdge_Modes/refused_409_no_row seeds it) refuses the
+// unproven fixup_pushed claim 409 review_obligation_missing, and nothing is
+// re-opened. Counterfactual (c): moving the re-open above the decision lands it
+// (the wrapper admits the edge): acceptance pending, one acceptance_reopened row.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_RefusedVariant_ReopensNothing(t *testing.T) {
+	f := newFixupRearmSeam(t, fixupRearmOpts{})
+	implID := f.impl.ID
+	if _, err := f.au.AppendChained(t.Context(), audit.ChainAppendParams{
+		RunID: f.runRow.ID, StageID: &implID, Timestamp: time.Now().UTC(),
+		Category: implementReviewedCategory,
+		Payload:  recoveryPayload(t, supplementalVerdict(prSeamOther, run.StageAttemptToken(f.impl.DispatchedAt), planreview.VerdictReject)),
+	}); err != nil {
+		t.Fatalf("setup: seed binding reject: %v", err)
+	}
+
+	w := f.postFixup(t)
+	assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+	if got := f.state(t, f.acc); got != run.StageStateSucceeded {
+		t.Errorf("acceptance = %q, want succeeded (a refused claim re-opens nothing)", got)
+	}
+	if n := len(f.rows(t, CategoryAcceptanceReopened)); n != 0 {
+		t.Errorf("acceptance_reopened rows = %d, want 0", n)
+	}
+	if n := len(f.rows(t, "fixup_pushed")); n != 0 {
+		t.Errorf("fixup_pushed rows = %d, want 0", n)
+	}
+	if got := f.state(t, f.impl); got != run.StageStateRunning {
+		t.Errorf("implement = %q, want running (no edge on a refused claim)", got)
+	}
+	if got := f.state(t, f.rev); got != run.StageStatePending {
+		t.Errorf("review = %q, want pending (no advance on a refused claim)", got)
+	}
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_AllSkipPlan_ReShortCircuits
+// pins the third re-arm outcome (#4804 condition E1). With Orchestrator.Artifacts
+// wired and an all-skip-with-basis plan, the deferred advance re-short-circuits
+// the re-opened acceptance straight to succeeded with a fresh not_validated
+// verdict and opens the review gate, with no park. The short-circuit verdict
+// carries no head_sha: it binds the fix-up head by chain position, sitting above
+// the acceptance_reopened row that names that head, which is what
+// acceptanceStaleRefusal reads. Under the old order no second verdict is written
+// and acceptance_stale refuses.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_AllSkipPlan_ReShortCircuits(t *testing.T) {
+	f := newFixupRearmSeam(t, fixupRearmOpts{allSkipPlan: true})
+	pushed := f.assertFixupOK(t, f.postFixup(t))
+
+	if got := f.state(t, f.acc); got != run.StageStateSucceeded {
+		t.Errorf("acceptance = %q, want succeeded (re-short-circuited, never parked)", got)
+	}
+	if got := f.state(t, f.rev); got != run.StageStateAwaitingApproval {
+		t.Errorf("review = %q, want awaiting_approval (the walk proceeds to the review gate)", got)
+	}
+	reopened := f.rows(t, CategoryAcceptanceReopened)
+	if len(reopened) != 1 {
+		t.Fatalf("acceptance_reopened rows = %d, want 1", len(reopened))
+	}
+	if got := auditPayloadString(reopened[0].Payload, "head_sha"); got != fixupRearmNewHead {
+		t.Errorf("acceptance_reopened head_sha = %q, want the fix-up head %q", got, fixupRearmNewHead)
+	}
+	// Errorf, not Fatalf: the acceptance_stale assertion below must still report.
+	outcomes := f.rows(t, CategoryAcceptanceOutcomeRecorded)
+	if len(outcomes) != 2 {
+		t.Errorf("acceptance_outcome_recorded rows = %d, want 2 (the seeded verdict plus the re-short-circuit's)", len(outcomes))
+	} else {
+		second := outcomes[1]
+		if second.StageID == nil || *second.StageID != f.acc.ID {
+			t.Errorf("second verdict stage = %v, want the acceptance stage %s", second.StageID, f.acc.ID)
+		}
+		if got := auditPayloadString(second.Payload, "verdict"); got != plan.AcceptanceVerdictNotValidated {
+			t.Errorf("second verdict = %q, want %q", got, plan.AcceptanceVerdictNotValidated)
+		}
+		if second.Sequence <= reopened[0].Sequence || second.Sequence <= pushed.Sequence {
+			t.Errorf("second verdict seq %d is not above acceptance_reopened seq %d and fixup_pushed seq %d (it would not bind the fix-up head)",
+				second.Sequence, reopened[0].Sequence, pushed.Sequence)
+		}
+	}
+	stages, err := f.rr.ListStagesForRun(t.Context(), f.runRow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRow, err := f.rr.GetRun(t.Context(), f.runRow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusal, err := f.s.acceptanceStaleRefusal(t.Context(), runRow, stages)
+	if err != nil {
+		t.Fatalf("acceptanceStaleRefusal: %v", err)
+	}
+	if refusal != nil {
+		t.Errorf("acceptance_stale refused: %s", refusal.Message)
+	}
+	if n := len(f.rows(t, CategoryAcceptanceDispatched)); n != 0 {
+		t.Errorf("acceptance_dispatched rows = %d, want 0 (a short-circuit spawns nothing)", n)
+	}
+}
+
 // TestShipPullRequest_FixupPushOutcome_RejectsMissingCoords pins the #794
 // validation: the fixup_pushed variant requires branch + head_sha + base_sha
 // (no new PR was opened, so those coordinates are the only record of what
