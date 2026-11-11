@@ -1634,13 +1634,14 @@ func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
 // in both directions through a test-only import, so a name added on either
 // side without the other fails in-loop.
 var seedScenarioNames = map[string]bool{
-	"acceptance-dispatched": true,
-	"grooming-confirm-gate": true,
-	"implement-running":     true,
-	"plan-gate-criteria":    true,
-	"plan-gate-parked":      true,
-	"split-parent-linked":   true,
-	"trace-upload-target":   true,
+	"acceptance-dispatched":   true,
+	"acceptance-rebased-head": true,
+	"grooming-confirm-gate":   true,
+	"implement-running":       true,
+	"plan-gate-criteria":      true,
+	"plan-gate-parked":        true,
+	"split-parent-linked":     true,
+	"trace-upload-target":     true,
 }
 
 // stubForgeRoutePrefix is the dev-only stub-forge control surface the

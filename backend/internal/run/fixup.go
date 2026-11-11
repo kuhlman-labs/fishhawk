@@ -150,7 +150,9 @@ type FixupDecision struct {
 	// entry records what was re-opened.
 	PriorState StageState
 
-	// Stage is the post-re-open implement stage row, in pending.
+	// Stage is the post-re-open implement stage row, in pending. On a
+	// PreviewFixupStage decision it is the PRE-transition row, valid for its
+	// ids only (#4815).
 	Stage *Stage
 
 	// ReparkedReview is the run's review stage after it was re-parked
@@ -300,27 +302,33 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 		return nil, fmt.Errorf("FixupStage: %s → pending: %w", adm.priorState, err)
 	}
 
-	remaining := opts.MaxPasses - (opts.PriorPassCount + 1)
-	if remaining < 0 {
-		remaining = 0
-	}
+	return adm.decision(opts, updated, reviewToRepark, reopenedAcceptance), nil
+}
 
-	// Ceiling slots surviving this admission (#3335), measured against the
-	// credited effective count: HardCeiling - (effective + 1), floored at 0.
-	remainingCeiling := opts.HardCeiling - (opts.PriorPassCount - adm.credit + 1)
-	if remainingCeiling < 0 {
-		remainingCeiling = 0
+// PreviewFixupStage returns the FixupDecision FixupStage would return for the
+// same call, WITHOUT performing it (#4815). It runs the same admitFixup, so a
+// refusal carries the same sentinel (ErrFixupNotApplicable,
+// ErrFixupCeilingReached, ErrFixupBudgetExhausted) and the byte-identical
+// message FixupStage returns, and it never calls TransitionStage.
+//
+// The receipt fields (PriorState, RemainingBudget, RemainingCeilingSlots,
+// Forced) equal the ones the following FixupStage reports against the same
+// repository state, because both derive them through fixupAdmission.decision.
+// Stage, ReparkedReview and ReopenedAcceptance are the PRE-transition rows:
+// they are valid for their ids (and Stage.RunID) only, never for their state.
+//
+// The intended caller must record a durable trigger BEFORE the re-open
+// (server.triggerThenReopenFixup): it builds the stage_fixup_triggered payload
+// from the preview, appends it, and only then calls FixupStage, so a failed
+// append refuses the fix-up with every stage untouched. Like FixupApplicable
+// the answer can go stale between this call and FixupStage; FixupStage's own
+// admission re-decides it.
+func PreviewFixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts FixupOptions) (*FixupDecision, error) {
+	adm, err := admitFixup(ctx, repo, stageID, opts)
+	if err != nil {
+		return nil, err
 	}
-
-	return &FixupDecision{
-		PriorState:            adm.priorState,
-		Stage:                 updated,
-		ReparkedReview:        reviewToRepark,
-		ReopenedAcceptance:    reopenedAcceptance,
-		RemainingBudget:       remaining,
-		RemainingCeilingSlots: remainingCeiling,
-		Forced:                adm.forced,
-	}, nil
+	return adm.decision(opts, adm.stage, adm.reviewToRepark, adm.acceptance), nil
 }
 
 // FixupApplicable reports whether FixupStage would ADMIT the same call,
@@ -364,6 +372,34 @@ type fixupAdmission struct {
 	credit int
 	// forced reports the admission ran past MaxPasses on the override.
 	forced bool
+}
+
+// decision builds the FixupDecision for an admitted call from the stage rows
+// it is handed: the post-transition rows on FixupStage, the pre-transition
+// rows on PreviewFixupStage (#4815). The receipt fields depend only on opts
+// and the admission, so the two callers report identical receipts.
+func (adm *fixupAdmission) decision(opts FixupOptions, stage, review, acceptance *Stage) *FixupDecision {
+	remaining := opts.MaxPasses - (opts.PriorPassCount + 1)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	// Ceiling slots surviving this admission (#3335), measured against the
+	// credited effective count: HardCeiling - (effective + 1), floored at 0.
+	remainingCeiling := opts.HardCeiling - (opts.PriorPassCount - adm.credit + 1)
+	if remainingCeiling < 0 {
+		remainingCeiling = 0
+	}
+
+	return &FixupDecision{
+		PriorState:            adm.priorState,
+		Stage:                 stage,
+		ReparkedReview:        review,
+		ReopenedAcceptance:    acceptance,
+		RemainingBudget:       remaining,
+		RemainingCeilingSlots: remainingCeiling,
+		Forced:                adm.forced,
+	}
 }
 
 // admitFixup is FixupStage's ADMISSION phase: every refusal FixupStage can

@@ -25403,17 +25403,25 @@ paths:
                   acceptance_expected_head_sha:
                     type: string
                     description: |
-                      The run's merge-candidate identity — the newest
-                      `head_sha` across the run's reported-head ledger
-                      entries (`pull_request_opened` / `child_pushed` /
-                      `fixup_pushed` / `acceptance_scenarios_pushed`, the same
-                      ADR-035 lineage source as
-                      `fixup_expected_head_sha`), falling back to the newest
-                      `integration_commit_recorded` `merge_sha` on the run's
-                      own chain when that ledger is empty (#3091), which is
-                      how a DECOMPOSED PARENT — whose children report their
-                      pushes on their own chains — resolves its consolidated
-                      branch tip. Served ONLY on acceptance stages
+                      The run's merge-candidate identity, resolved by
+                      acceptanceHeadAsOf (#4874): the seed is the
+                      highest-chain-sequence row across the run's
+                      reported-head ledger (`pull_request_opened` /
+                      `child_pushed` / `fixup_pushed` /
+                      `acceptance_scenarios_pushed` /
+                      `conflict_resolution_pushed`) and its own
+                      `integration_commit_recorded` `merge_sha` rows, with
+                      no timestamp read (a reported row wins only an
+                      equal-sequence tie), so a DECOMPOSED PARENT, whose
+                      children report their pushes on their own chains,
+                      resolves its consolidated branch tip. The seed then
+                      advances through each CLEAN `branch_rebased` row
+                      recorded after it (a reset to a head on that walked
+                      chain moves there), so after a Fishhawk rebase the
+                      field names the merge commit. A read error on either
+                      seed set or on the base-merge rows fails closed.
+                      `fixup_expected_head_sha` keeps its own timestamp
+                      seed and is unchanged. Served ONLY on acceptance stages
                       (E31.18 / #1569). The runner's pre-spawn
                       target-identity gate compares the declared acceptance
                       target's `/healthz` `git_sha` against it before
@@ -25443,7 +25451,11 @@ paths:
                     description: |
                       The run branch the acceptance runner pushes its
                       scenario-corpus commit to (E72.4 / #3328): the branch of
-                      the run's newest reported-head ledger entry. Served ONLY
+                      the run's newest reported-head ledger entry or, for a
+                      decomposed parent with no ledger branch but an
+                      `integration_commit_recorded` row, the server-derived
+                      `fishhawk/run-<first 8 of the run id>-consolidated`
+                      (#4874), never taken from a report. Served ONLY
                       on acceptance stages; absent when unresolvable, in which
                       case the runner skips persistence
                       (`persist_skipped` / `no_run_branch`) and reports
@@ -26036,14 +26048,14 @@ paths:
                     description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
                   acceptance_expected_head_sha:
                     type: string
-                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
+                    description: The run's merge-candidate identity resolved by acceptanceHeadAsOf (#4874) — the highest-chain-sequence row across the run's reported-head ledger and its own `integration_commit_recorded` `merge_sha` rows (no timestamp read; a reported row wins only an equal-sequence tie), advanced through each later CLEAN `branch_rebased` row, so after a Fishhawk rebase it names the merge commit; a read error fails closed, and `fixup_expected_head_sha` keeps its own timestamp seed; served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
                   forge_writes:
                     type: string
                     enum: [deny]
                     description: The backend's forge-write policy for this stage (E72.13 / #3500) — `deny` when this fishhawkd is in dev mode (a dev-only surface is mounted, `scripts/dev preview`); the runner's pre-spawn forge-writes gate refuses the stage on it (`runner_failed` reason `forge_writes_denied`, category C) before any agent spawn, push or pull-request open. Stamped on every stage type; omitted on a production daemon.
                   acceptance_run_branch:
                     type: string
-                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328); acceptance stages only, absent when unresolvable.
+                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328) — the newest reported-head ledger entry's branch or, for a decomposed parent with only `integration_commit_recorded` rows, the server-derived `fishhawk/run-<first 8>-consolidated` (#4874); acceptance stages only, absent when unresolvable.
                   acceptance_pull_request_number:
                     type: integer
                     description: The run's PR number from its newest `pull_request_opened` ledger entry, recorded as each persisted scenario's `origin.pr` (E72.4 / #3328); acceptance stages only, absent (0) when unresolvable — never the issue number.

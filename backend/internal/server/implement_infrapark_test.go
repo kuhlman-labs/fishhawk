@@ -139,8 +139,10 @@ func TestImplementInfraFailure_PullRequestFailureParksAndRetries(t *testing.T) {
 // seed a pass trigger whose re-parked review stage id names NO stage, so
 // RestoreFixupStage's review re-park fails before the implement stage is
 // un-failed. Row (c) seeds NO trigger row, only a prior pull_request_opened
-// scoped to the implement stage — the durable signal that survives a lost
-// stage_fixup_triggered append (#4815).
+// scoped to the implement stage — the durable signal the StagePushed carve-out
+// reads. Since #4815 the fix-up path refuses instead of re-opening on a failed
+// stage_fixup_triggered append, so this shape now comes only from chains
+// written before that change; the carve-out (and this row) stay.
 func TestImplementInfraFailure_PassRecoveryFallbackStillFailsRun(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -1272,3 +1272,182 @@ func TestFanInHoldOnStart_Answers(t *testing.T) {
 		})
 	}
 }
+
+// --- #4874: the D5 hold binds the live head; acceptance reads the ledger ---
+
+const (
+	fanInLedgerF       = "integF00" // the recorded integration merge, != fanInHead
+	fanInDivergenceMsg = "fan-in verify: the live consolidated head differs from the acceptance ledger head; the live-head answer stands"
+)
+
+// seedLedgerIntegration records integration_commit_recorded{merge_sha: F}.
+func (f *fanInFixture) seedLedgerIntegration() {
+	f.appendRow(nil, auditcomplete.CategoryIntegrationCommitRecorded, map[string]any{"merge_sha": fanInLedgerF})
+}
+
+// seedLedgerRebase records branch_rebased F -> fanInHead, clean or not.
+func (f *fanInFixture) seedLedgerRebase(clean bool) {
+	f.appendRow(nil, CategoryBranchRebased, map[string]any{
+		"prior_head_sha": fanInLedgerF, "new_head_sha": fanInHead, "merge_commit_sha": fanInHead,
+		"already_up_to_date": false, "clean_verified": clean, "base_tip_sha": "basetip1",
+	})
+}
+
+// seedVerdictOnly appends a merge_candidate_verified row for head with no
+// trigger, so it is exact-head evidence and nothing else.
+func (f *fanInFixture) seedVerdictOnly(head, result string) {
+	id := f.impl.ID
+	f.appendRow(&id, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+		HeadSHA: head, Cause: mergeCandidateCauseFanIn, VerifyCommand: "scripts/test verify",
+		Result: result, OutputTail: fanInTailSentinel, OutputUntrusted: true,
+	})
+}
+
+// Criterion fan-in-and-acceptance-agree-after-clean-advance: on a clean
+// recorded advance F -> fanInHead the D5 hold's live head and acceptance's
+// ledger head agree. A passed verdict at F cannot settle the gate; a passed
+// verdict at fanInHead settles it and releases acceptance, and the prompt's
+// resolver names fanInHead. No divergence WARN is logged.
+func TestFanInAcceptanceHold_RebasedHead_GatesAgree(t *testing.T) {
+	f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+	if fanInLedgerF == fanInHead {
+		t.Fatal("precondition: the recorded integration head must differ from the compare head")
+	}
+	f.seedLedgerIntegration()
+	f.seedLedgerRebase(true)
+	f.wireNotEligibleQueue()
+	buf := captureLogger(f.s)
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
+	f.rr.mu.Unlock()
+	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
+	f.s.cfg.Orchestrator = o
+	sf := newSigningFake()
+	f.s.cfg.SigningRepo = sf
+	priv, _ := sf.issue(t, f.parent.ID)
+	ctx := context.Background()
+
+	if got, err := f.s.acceptanceHeadAsOf(ctx, f.parent.ID, 0, false); err != nil || got != fanInHead {
+		t.Fatalf("acceptanceHeadAsOf = (%q, %v), want the compare head %q", got, err, fanInHead)
+	}
+	// A passed verdict at the OLD head F, recorded before the hold's pass so it
+	// consumes no trigger: it must not settle the gate.
+	f.seedVerdictOnly(fanInLedgerF, mergeCandidateResultPassed)
+	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || settled {
+		t.Fatalf("FanInVerifySettled with a pass only at F = %v, %v; want false (the old head cannot settle)", settled, err)
+	}
+	if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+		t.Fatalf("Advance #1: %v", err)
+	}
+	f.s.waitBackgroundReviews()
+	if got := f.state(acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance state = %q, want pending (held)", got)
+	}
+	f.assertOneFanInTrigger()
+
+	f.rr.mu.Lock()
+	f.impl.State = run.StageStateRunning
+	f.rr.mu.Unlock()
+	body, _ := json.Marshal(map[string]any{
+		"outcome": outcomeMergeCandidateVerified, "branch": f.branch, "head_sha": fanInHead,
+		"merge_candidate_result": "passed", "merge_candidate_reason": "",
+		"merge_candidate_output_tail": fanInTailSentinel,
+	})
+	if w := shipFanInReport(t, f, priv, body); w.Code != http.StatusOK {
+		t.Fatalf("report status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || !settled {
+		t.Errorf("FanInVerifySettled after the pass at fanInHead = %v, %v; want true", settled, err)
+	}
+	if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("acceptance state = %q, want awaiting_host_dispatch (released)", got)
+	}
+	if got := f.s.resolveAcceptanceExpectedHeadSHA(ctx, f.parent.ID, acc.ID); got != fanInHead {
+		t.Errorf("resolveAcceptanceExpectedHeadSHA = %q, want %q", got, fanInHead)
+	}
+	if strings.Contains(buf.String(), fanInDivergenceMsg) {
+		t.Errorf("divergence WARN logged on the agreeing head:\n%s", buf.String())
+	}
+}
+
+// TestFanInVerifySettled_DivergedHead_WarnsWithoutChangingAnswer: each named
+// divergence logs exactly one WARN naming both heads, and the settled answer
+// stays the LIVE head's; a ledger read error WARNs and changes nothing.
+func TestFanInVerifySettled_DivergedHead_WarnsWithoutChangingAnswer(t *testing.T) {
+	ctx := context.Background()
+	divergences := []struct {
+		name string
+		seed func(f *fanInFixture)
+	}{
+		{"unrecorded", func(*fanInFixture) {}},
+		{"unclean", func(f *fanInFixture) { f.seedLedgerRebase(false) }},
+		// This fixture has no PR number, so rule 4 reads D8 Amendment 1's
+		// cannot-probe answer: the row asserts the settled answer equals the
+		// live-head state rather than implying a probe ran.
+		{"vouched", func(f *fanInFixture) {
+			f.appendRow(nil, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": fanInHead})
+		}},
+	}
+	for _, d := range divergences {
+		for _, verdictAt := range []string{fanInHead, fanInLedgerF} {
+			t.Run(d.name+"/passed_at_"+verdictAt, func(t *testing.T) {
+				f := newFanInFixture(t, fanInVerifySpec)
+				f.seedLedgerIntegration()
+				d.seed(f)
+				f.seedVerdictOnly(verdictAt, mergeCandidateResultPassed)
+				if got, err := f.s.acceptanceHeadAsOf(ctx, f.parent.ID, 0, false); err != nil || got != fanInLedgerF {
+					t.Fatalf("precondition: ledger head = (%q, %v), want %q", got, err, fanInLedgerF)
+				}
+				state, err := f.s.mergeCandidateVerifyState(ctx, f.runRow(), fanInHead)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantSettled := state.State == mergeCandidateStateNotRequired || state.State == mergeCandidateStatePassed || state.State == mergeCandidateStateFailed
+				if d.name != "vouched" {
+					// The live head's own answer: settled only by a verdict AT it.
+					if want := verdictAt == fanInHead; wantSettled != want {
+						t.Fatalf("precondition: live-head state %+v, want settled=%v", state, want)
+					}
+				}
+				buf := captureLogger(f.s)
+				settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
+				if err != nil || settled != wantSettled {
+					t.Errorf("FanInVerifySettled = %v, %v; want %v (the live head's answer)", settled, err, wantSettled)
+				}
+				lines := linesContaining(buf.String(), fanInDivergenceMsg)
+				if len(lines) != 1 {
+					t.Fatalf("divergence WARN lines = %d, want exactly 1:\n%s", len(lines), buf.String())
+				}
+				for _, attr := range []string{"level=WARN", "live_head_sha=" + fanInHead, "ledger_head_sha=" + fanInLedgerF} {
+					if !strings.Contains(lines[0], attr) {
+						t.Errorf("divergence WARN missing %q: %s", attr, lines[0])
+					}
+				}
+			})
+		}
+	}
+	t.Run("a ledger read error WARNs and keeps the live answer", func(t *testing.T) {
+		f := newFanInFixture(t, fanInVerifySpec)
+		f.seedLedgerIntegration()
+		f.seedVerdictOnly(fanInHead, mergeCandidateResultPassed)
+		f.au.listByCategoryErrCategory = CategoryBranchReset // read by the ledger walk, not the classifier
+		state, err := f.s.mergeCandidateVerifyState(ctx, f.runRow(), fanInHead)
+		if err != nil || state.State != mergeCandidateStatePassed {
+			t.Fatalf("precondition: live-head state = %+v (err %v), want passed", state, err)
+		}
+		buf := captureLogger(f.s)
+		settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
+		if err != nil || !settled {
+			t.Errorf("FanInVerifySettled = %v, %v; want true, nil (a ledger read error changes nothing)", settled, err)
+		}
+		lines := linesContaining(buf.String(), "fan-in verify: acceptance ledger head unreadable; the live-head answer stands")
+		if len(lines) != 1 || !strings.Contains(lines[0], "level=WARN") {
+			t.Errorf("want exactly one read-error WARN, got:\n%s", buf.String())
+		}
+		if strings.Contains(buf.String(), fanInDivergenceMsg) {
+			t.Errorf("divergence WARN logged on a read error:\n%s", buf.String())
+		}
+	})
+}

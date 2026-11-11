@@ -17,7 +17,8 @@ import (
 // #4574), so a fix-up dispatched after fishhawk_rebase_run_branch advertises
 // the merge commit the branch tip now IS instead of failing the runner's
 // ADR-035 check with fixup_base_mismatch. The walk itself is
-// walkRecordedBaseMerges.
+// walkRecordedBaseMerges, which the acceptance head (acceptanceHeadAsOf) also
+// walks; only this fix-up read loop, WARN and seed fallback are fix-up-only.
 //
 // On ANY read error it WARNs and returns seedSHA — the un-advanced recorded
 // head, today's answer — and NEVER "": an empty expectation would switch the
@@ -53,7 +54,8 @@ func (s *Server) advanceFixupHeadThroughBaseMerges(ctx context.Context, runID, s
 	return advanced
 }
 
-// walkRecordedBaseMerges is the pure fix-up base walk (E89.6 / #4574). rows
+// walkRecordedBaseMerges is the pure recorded base walk shared by the fix-up
+// seed (E89.6 / #4574) and the acceptance head (acceptanceHeadAsOf, #4874). rows
 // are the run's branch_rebased and branch_reset entries (any other category
 // is ignored); only those recorded AFTER the seed (Sequence > seedSeq) take
 // part, walked in AUDIT-SEQUENCE order whatever order they are delivered in.

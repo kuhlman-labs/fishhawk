@@ -1289,3 +1289,91 @@ func TestRun_AcceptanceStage_ReplayCapBoundsServed(t *testing.T) {
 		t.Errorf("shipped replay header wrong: %s", fu.gotAcceptanceArgs.Body)
 	}
 }
+
+// consolidatedTestBranch is the newly reachable decomposed-parent run branch
+// shape (#4874): orchestrator.ConsolidatedBranch derives
+// fishhawk/run-<first 8 of the run id>-consolidated server-side, and
+// persistAcceptanceScenarios takes it as an opaque string.
+const consolidatedTestBranch = "fishhawk/run-abcd1234-consolidated"
+
+// TestPersist_ConsolidatedBranch_PushesCorpusOnlyCommit pins that a parent's
+// consolidated branch gets the same corpus-only, plain no-force push as a
+// standalone run branch (#4874 step 11): the bare origin's ref is the pushed
+// head, its first parent is the reported base, and every path the commit
+// touches is under acceptance/scenarios/. Runner guards only: no server-side
+// path-set enforcement exists or is claimed.
+func TestPersist_ConsolidatedBranch_PushesCorpusOnlyCommit(t *testing.T) {
+	_, tree, origin, head := persistRepo(t, nil)
+	var log strings.Builder
+	res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+		treeDir: tree, runBranch: consolidatedTestBranch, remoteURL: origin,
+		issue: 101, prNumber: 0, headSHA: head, runID: "abcd1234-0000-0000-0000-000000000000",
+		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "the parent run lists the acceptance stage", Drivable: true}},
+		verdict:  passedVerdictFor("crit-b"),
+		now:      func() time.Time { return time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC) },
+	}, &gitops.Pusher{}, &log)
+	if res.outcome != persistPushed {
+		t.Fatalf("outcome = %s (%s), want persist_pushed\n%s", res.outcome, res.reason, log.String())
+	}
+	if res.baseSHA != head || res.headSHA == head {
+		t.Fatalf("result = %+v, want a new head over base %s", res, head)
+	}
+	if got := tgit(t, origin, "rev-parse", "refs/heads/"+consolidatedTestBranch); got != res.headSHA {
+		t.Errorf("origin %s = %s, want the pushed head %s", consolidatedTestBranch, got, res.headSHA)
+	}
+	if got := tgit(t, origin, "rev-parse", res.headSHA+"^1"); got != res.baseSHA {
+		t.Errorf("pushed head's first parent = %s, want the reported base %s", got, res.baseSHA)
+	}
+	out := tgit(t, origin, "diff-tree", "--no-commit-id", "--name-only", "-r", res.headSHA)
+	if out == "" {
+		t.Fatal("pushed commit touches no path, want the recorded scenario")
+	}
+	for _, f := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(f, "acceptance/scenarios/") {
+			t.Errorf("pushed commit touches %s outside acceptance/scenarios/", f)
+		}
+	}
+}
+
+// TestPersist_ConsolidatedBranch_RefusesPlantedPaths pins the dirty-before-
+// write guard for the consolidated branch with EXACT reasons (#4874 step 11):
+// exact equality distinguishes the first guard from the later dirty_unwritten
+// guard, which would otherwise mask a deleted first guard. The origin ref is
+// read directly for the consolidated branch, because
+// assertPersistRefusedUntouched hard-codes fishhawk/run-r1 and would pass
+// vacuously here.
+func TestPersist_ConsolidatedBranch_RefusesPlantedPaths(t *testing.T) {
+	cases := []struct {
+		name, plantRel, wantReason string
+	}{
+		{"stray file outside the corpus", "stray.txt", "dirty_before_write: stray.txt"},
+		{"planted corpus file", "acceptance/scenarios/issue-101/planted.yaml", "dirty_before_write: acceptance/scenarios/issue-101/planted.yaml"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, tree, origin, head := persistRepo(t, nil)
+			plantFile(t, filepath.Join(tree, filepath.FromSlash(tc.plantRel)), "id: scenario:issue-101/planted\nstatement: exfil\n")
+			res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+				treeDir: tree, runBranch: consolidatedTestBranch, remoteURL: origin,
+				issue: 101, headSHA: head, runID: "abcd1234-0000-0000-0000-000000000000",
+				criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "s", Drivable: true}},
+				verdict:  passedVerdictFor("crit-b"),
+			}, &gitops.Pusher{}, &strings.Builder{})
+			if res.outcome != persistRefused || res.reason != tc.wantReason {
+				t.Fatalf("got outcome %s reason %q, want persist_refused with reason exactly %q", res.outcome, res.reason, tc.wantReason)
+			}
+			if got := tgit(t, tree, "rev-parse", "HEAD"); got != head {
+				t.Errorf("HEAD = %s, want unchanged %s", got, head)
+			}
+			if staged := tgit(t, tree, "diff", "--cached", "--name-only"); staged != "" {
+				t.Errorf("refused persist must stage nothing, staged: %s", staged)
+			}
+			if _, err := os.Stat(filepath.Join(tree, "acceptance", "scenarios", "issue-101", "crit-b.yaml")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("refusal must precede the scenario write, stat err = %v", err)
+			}
+			if out, err := exec.Command("git", "-C", origin, "rev-parse", "--verify", "refs/heads/"+consolidatedTestBranch).CombinedOutput(); err == nil {
+				t.Errorf("refused persist must push nothing, but origin has %s: %s", consolidatedTestBranch, out)
+			}
+		})
+	}
+}
