@@ -50,6 +50,59 @@ const (
 	auditCategoryPlanDecomposed            = "plan_decomposed"
 )
 
+// Server categories and values the #4816 reaped-live-merge-candidate-pass arm
+// reads. This package cannot import the server, so each is mirrored here and
+// bound to the server's own constant (and, for the trigger, to the server's
+// own populated()) by TestInfraParkReopenedPassCategoriesMatchServer in
+// backend/internal/server.
+const (
+	infraParkFixupTriggerCategory              = "stage_fixup_triggered"
+	infraParkConflictResolutionTriggerCategory = "stage_conflict_resolution_triggered"
+	// infraParkMergeCandidateTriggerCategory is the server's
+	// stage_merge_candidate_verify_triggered row: a verify-only pass re-opened
+	// the implement stage (ADR-090 D3).
+	infraParkMergeCandidateTriggerCategory = "stage_merge_candidate_verify_triggered"
+	// infraParkMergeCandidateVerifiedCategory is the server's
+	// merge_candidate_verified row. A same-stage row at or after the newest
+	// trigger consumes it (server liveMergeCandidateTrigger).
+	infraParkMergeCandidateVerifiedCategory = "merge_candidate_verified"
+	// infraParkOperatorReapCategory is the server's dispatch_reaper_failed row,
+	// written by the reap-failure endpoint. The dispatch watchdog's
+	// dispatch_watchdog_elapsed row is deliberately NOT mirrored or read: only
+	// an operator reap produces parking evidence (#4816 N1).
+	infraParkOperatorReapCategory = "dispatch_reaper_failed"
+)
+
+// infraParkMergeCandidateCauses mirrors the server's validMergeCandidateCause
+// enumeration. A trigger with any other cause is one the server would not
+// serve, so its retry replays a plain implement and must not park.
+var infraParkMergeCandidateCauses = []string{"base_advance", "conflict_resolution", "fan_in"}
+
+// InfraParkRunnerLostReason is the reap reason that marks a runner loss — the
+// only operator-reap reason that produces parking evidence (#4816 approval
+// condition C2). A manual fishhawk_reap_stage names it; the detached reaper's
+// synthesized or runner_failed-parsed reasons, the zero-exit strand reaper's
+// reason and the concurrency-slot spawn-failure compensation do not, so they
+// keep today's fail-the-run path.
+const InfraParkRunnerLostReason = "runner_lost"
+
+// InfraParkReopenedPassMergeCandidateVerify is the reopened_pass value the
+// orchestrator writes on a stage_infra_parked row when the parked failure is
+// an operator-reaped live merge-candidate verify-only pass (#4816). A
+// first-execution implement or acceptance park row carries no reopened_pass key.
+const InfraParkReopenedPassMergeCandidateVerify = "merge_candidate_verify"
+
+// InfraParkOperatorReapCategory returns the mirrored dispatch_reaper_failed
+// category ReadInfraParkHistory reads as an operator reap.
+func InfraParkOperatorReapCategory() string { return infraParkOperatorReapCategory }
+
+// InfraParkMergeCandidateVerifiedCategory returns the mirrored
+// merge_candidate_verified category ReadInfraParkHistory reads as the
+// consumption of a merge-candidate trigger.
+func InfraParkMergeCandidateVerifiedCategory() string {
+	return infraParkMergeCandidateVerifiedCategory
+}
+
 // infraParkReopenedPassCategories are the server's pass-trigger categories
 // (#4426 R4): a fix-up, conflict-resolution or merge-candidate-verify pass
 // re-opens a finished implement stage and writes one of these rows scoped to
@@ -57,9 +110,9 @@ const (
 // bound to the server constants by InfraParkReopenedPassCategories' mirror
 // test in backend/internal/server.
 var infraParkReopenedPassCategories = []string{
-	"stage_fixup_triggered",
-	"stage_conflict_resolution_triggered",
-	"stage_merge_candidate_verify_triggered",
+	infraParkFixupTriggerCategory,
+	infraParkConflictResolutionTriggerCategory,
+	infraParkMergeCandidateTriggerCategory,
 }
 
 // infraParkStagePushCategories are the server's head-producing categories
@@ -144,6 +197,22 @@ type InfraParkHistory struct {
 	// it is a re-opened pass whether or not a trigger row survived (#4426
 	// approval condition C1). It implies ReopenedPass.
 	StagePushed bool
+	// ReapedLiveMergeCandidatePass reports that the failure is an
+	// operator-reaped runner loss of a LIVE merge-candidate verify-only pass
+	// (#4816), whose retry replays the same pass. All of these hold for the
+	// failed stage:
+	//   - its newest stage_merge_candidate_verify_triggered row exists and is
+	//     populated exactly as the server's populated() requires;
+	//   - no same-stage merge_candidate_verified row at or after it (live);
+	//   - no same-stage stage_fixup_triggered or
+	//     stage_conflict_resolution_triggered row after it (newest pass);
+	//   - a same-stage dispatch_reaper_failed row carrying NO reported_by (an
+	//     operator reap, not a run-bound runner self-report), reason
+	//     InfraParkRunnerLostReason, and the stage's CURRENT failure episode
+	//     (failed_at + retry_ordinal, InfraParkEpisode) stamped by the reap.
+	// It overrides ReopenedPass and StagePushed in the implement guard without
+	// redefining them.
+	ReapedLiveMergeCandidatePass bool
 }
 
 // InfraParkEpisode returns the identity of the stage's current failure
@@ -169,13 +238,107 @@ type infraParkEpisodePayload struct {
 	RetryOrdinal int    `json:"retry_ordinal"`
 }
 
+// infraParkMergeCandidateTrigger is the anchor subset of the server's
+// mergeCandidateVerifyTrigger, with the same JSON tags and field types, so a
+// payload decodes (or fails to decode) here exactly as it does on the server.
+type infraParkMergeCandidateTrigger struct {
+	Branch                         string `json:"branch"`
+	BaseRef                        string `json:"base_ref"`
+	ExpectedHeadSHA                string `json:"expected_head_sha"`
+	Cause                          string `json:"cause"`
+	VerifyCommand                  string `json:"verify_command"`
+	PriorState                     string `json:"prior_state,omitempty"`
+	ReparkedReviewStageID          string `json:"reparked_review_stage_id,omitempty"`
+	SupersedesFixupTriggerSequence int64  `json:"supersedes_fixup_trigger_sequence,omitempty"`
+}
+
+// infraParkMergeCandidateTriggerPopulated mirrors the server's
+// mergeCandidateVerifyTrigger.populated() EXACTLY, cause enumeration included.
+// A trigger the server would not serve replays as a plain implement, so it
+// must not park.
+func infraParkMergeCandidateTriggerPopulated(raw json.RawMessage) bool {
+	var t infraParkMergeCandidateTrigger
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return false
+	}
+	causeOK := false
+	for _, c := range infraParkMergeCandidateCauses {
+		if c == t.Cause {
+			causeOK = true
+		}
+	}
+	return t.Branch != "" && t.BaseRef != "" && t.ExpectedHeadSHA != "" && causeOK && t.VerifyCommand != ""
+}
+
+// infraParkOperatorReapPayload is the subset of a dispatch_reaper_failed
+// payload the #4816 arm reads.
+type infraParkOperatorReapPayload struct {
+	Reason       string `json:"reason"`
+	FailedAt     string `json:"failed_at"`
+	RetryOrdinal int    `json:"retry_ordinal"`
+	ReportedBy   string `json:"reported_by"`
+}
+
+// infraParkOperatorReapInEpisode reports whether a dispatch_reaper_failed
+// payload is an OPERATOR runner-loss reap of the stage's CURRENT failure
+// episode (curAt, curOrdinal). It refuses:
+//   - an undecodable payload;
+//   - a run-bound runner self-report (reported_by present, #3598): only an
+//     operator reap produces parking evidence (#4816 N1), even if a future
+//     change stamped the run-bound arm;
+//   - any reason other than InfraParkRunnerLostReason (#4816 approval
+//     condition C2): a category-C reap that is not a runner loss fails the run;
+//   - an unstamped row (written before the stamp, decoding as ("", 0)), and a
+//     row stamped for another episode. The episode is the stage's own
+//     (ended_at, self_retry_count) pair, which RetryStageState changes on
+//     every failed -> pending re-open, so it cannot be lost or reused.
+func infraParkOperatorReapInEpisode(raw json.RawMessage, curAt string, curOrdinal int) bool {
+	var p infraParkOperatorReapPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return false
+	}
+	if p.ReportedBy != "" {
+		return false
+	}
+	if p.Reason != InfraParkRunnerLostReason {
+		return false
+	}
+	return p.FailedAt != "" && p.FailedAt == curAt && p.RetryOrdinal == curOrdinal
+}
+
+// infraParkReapedLiveMergeCandidatePass derives
+// InfraParkHistory.ReapedLiveMergeCandidatePass from the newest same-stage
+// sequences ReadInfraParkHistory tracked (-1 when absent) and the newest
+// trigger's payload.
+func infraParkReapedLiveMergeCandidatePass(triggerSeq, verifiedSeq, otherPassSeq int64, trigger json.RawMessage, operatorReap bool) bool {
+	live := verifiedSeq < triggerSeq
+	newestPass := triggerSeq > otherPassSeq
+	return triggerSeq >= 0 && live && newestPass && operatorReap && infraParkMergeCandidateTriggerPopulated(trigger)
+}
+
 // ReadInfraParkHistory derives the park history for failed from the run's
 // audit entries (any order; ListForRun returns them ascending by sequence).
 // A park row whose payload does not decode is counted as an earlier episode,
 // so a malformed row can only tighten the budget, never loosen it. The
-// implement-only exclusions (DecomposedParent, ReopenedPass) are derived from
-// the same entries, so Advance and the stalesweep settled walk decide from
-// the same facts.
+// implement-only exclusions (DecomposedParent, ReopenedPass) and the #4816
+// override (ReapedLiveMergeCandidatePass) are derived from the same entries,
+// so Advance and the stalesweep settled walk decide from the same facts.
+//
+// Per-producer decision for a category-C implement failure of a re-opened
+// merge-candidate verify-only pass (#4816; the full table, with the pinning
+// test per row, is in backend/internal/run/README.md "Infrastructure park"):
+//   - PARK: an operator-scoped reap (fishhawk_reap_stage, or the reap-failure
+//     endpoint under an operator token or session, conditional or not) whose
+//     reason is runner_lost, of a live, newest, populated pass, whose row is
+//     stamped with the stage's current episode.
+//   - FAIL: the run-bound runner self-report (#3598) and the dispatch watchdog
+//     (neither produces parking evidence); an operator reap with any other
+//     reason (the detached reaper's non-zero-exit and zero-exit strand
+//     reasons, the concurrency-slot spawn-failure compensation); every
+//     producer's recovery fallback that writes no operator reap row; a reap
+//     after the trigger was consumed or superseded by a newer fix-up or
+//     conflict-resolution pass; a decomposed parent; and any failure whose
+//     only operator-reap row is from an earlier episode or unstamped.
 func ReadInfraParkHistory(entries []*audit.Entry, failed *Stage) InfraParkHistory {
 	var h InfraParkHistory
 	if failed == nil {
@@ -186,6 +349,14 @@ func ReadInfraParkHistory(entries []*audit.Entry, failed *Stage) InfraParkHistor
 	// consecutive count: parks before it belong to an episode chain that
 	// ended in an executed verdict.
 	var resetSeq int64 = -1
+	// #4816: the newest same-stage merge-candidate trigger (and its payload),
+	// merge_candidate_verified row and fix-up / conflict-resolution trigger,
+	// plus whether an operator runner-loss reap of the current episode exists.
+	// The episode match takes no sequence floor: its identity is the stage's
+	// own (ended_at, self_retry_count) pair.
+	var triggerSeq, verifiedSeq, otherPassSeq int64 = -1, -1, -1
+	var trigger json.RawMessage
+	operatorReap := false
 	for _, e := range entries {
 		if e == nil {
 			continue
@@ -198,6 +369,26 @@ func ReadInfraParkHistory(entries []*audit.Entry, failed *Stage) InfraParkHistor
 		}
 		if e.StageID != nil && *e.StageID == failed.ID && isInfraParkReopenedPassCategory(e.Category) {
 			h.ReopenedPass = true
+		}
+		if e.StageID != nil && *e.StageID == failed.ID {
+			switch e.Category {
+			case infraParkMergeCandidateTriggerCategory:
+				if e.Sequence > triggerSeq {
+					triggerSeq, trigger = e.Sequence, e.Payload
+				}
+			case infraParkMergeCandidateVerifiedCategory:
+				if e.Sequence > verifiedSeq {
+					verifiedSeq = e.Sequence
+				}
+			case infraParkFixupTriggerCategory, infraParkConflictResolutionTriggerCategory:
+				if e.Sequence > otherPassSeq {
+					otherPassSeq = e.Sequence
+				}
+			case infraParkOperatorReapCategory:
+				if infraParkOperatorReapInEpisode(e.Payload, curAt, curOrdinal) {
+					operatorReap = true
+				}
+			}
 		}
 		if e.StageID != nil && *e.StageID == failed.ID && isInfraParkStagePushCategory(e.Category) {
 			h.StagePushed = true
@@ -221,6 +412,7 @@ func ReadInfraParkHistory(entries []*audit.Entry, failed *Stage) InfraParkHistor
 		h.PriorParks++
 	}
 	h.ReopenedPass = h.ReopenedPass || h.StagePushed
+	h.ReapedLiveMergeCandidatePass = infraParkReapedLiveMergeCandidatePass(triggerSeq, verifiedSeq, otherPassSeq, trigger, operatorReap)
 	return h
 }
 
@@ -261,6 +453,15 @@ func InfraParkHistoryOnReadError(stages []*Stage, failed *Stage) (InfraParkHisto
 //     so parking it could leave a half-restored review stage or a consumed
 //     pass trigger a retry would replay as a plain implement.
 //
+// The one re-opened pass that parks (#4816) is ReapedLiveMergeCandidatePass:
+// an operator's runner-loss reap of a live, newest, populated merge-candidate
+// verify-only pass, stamped for the current episode. Its trigger is still
+// live, so the server's prompt resolves it first and exclusively (ADR-090 D3)
+// and a retry replays the same verify-only pass; the review stage was never
+// re-opened by a verify-only pass's recovery, so nothing is half-restored.
+// A decomposed parent still never parks. The per-producer decision table is
+// on ReadInfraParkHistory.
+//
 // The carve-out shared by both types is the POST-MERGE shape (#4356 approval
 // condition C2): the run's PR merge was observed (pr_merged), or a review
 // stage was resolved succeeded by the merge resolution
@@ -268,9 +469,12 @@ func InfraParkHistoryOnReadError(stages []*Stage, failed *Stage) (InfraParkHisto
 // run completes as today. A
 // post-deploy acceptance (a deploy stage sequenced before it) validates the
 // deployed environment after the merge and is never carved out. Every other
-// category-C acceptance, or first-execution non-decomposed-parent implement,
-// failure parks, whether or not another stage is open: a parked run still
-// terminalizes through retry or cancel.
+// category-C acceptance, first-execution non-decomposed-parent implement, or
+// #4816 operator-reaped live verify-pass implement failure parks, whether or
+// not another stage is open: a parked run still terminalizes through retry or
+// cancel. The category-C check, the C2 carve-out and the lifetime park budget
+// are shared with the #4816 arm, so an operator-reaped live verify pass parks
+// at most InfraFailureParkRetryBudget times.
 func ClassifyInfraFailurePark(stages []*Stage, failed *Stage, h InfraParkHistory) InfraParkDecision {
 	if failed == nil || failed.State != StageStateFailed {
 		return InfraParkNotApplicable
@@ -278,7 +482,7 @@ func ClassifyInfraFailurePark(stages []*Stage, failed *Stage, h InfraParkHistory
 	switch failed.Type {
 	case StageTypeAcceptance:
 	case StageTypeImplement:
-		if h.DecomposedParent || h.ReopenedPass {
+		if h.DecomposedParent || (h.ReopenedPass && !h.ReapedLiveMergeCandidatePass) {
 			return InfraParkNotApplicable
 		}
 	default:

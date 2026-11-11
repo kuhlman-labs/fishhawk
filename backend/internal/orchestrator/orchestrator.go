@@ -410,7 +410,9 @@ const (
 // retry-eligible — unless the merge already overtook it
 // (run.ClassifyInfraFailurePark's post-merge carve-out), the failed implement
 // stage is a decomposed parent's fan-in or a re-opened pass (the
-// implement-only exclusions), or the stage has spent
+// implement-only exclusions; the one re-opened pass that parks is an
+// operator's runner-loss reap of a live merge-candidate verify-only pass,
+// #4816), or the stage has spent
 // run.InfraFailureParkRetryBudget parks, in which case the run fails and a
 // stage_infra_park_budget_exhausted row says why.
 //
@@ -459,10 +461,11 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// pending one, the run is over — completing as failed (or
 	// cancelled) is correct, and dispatching downstream stages
 	// would be wrong because the upstream output they depended on
-	// never landed. The #4356 / #4426 exception: a category-C acceptance,
-	// or first-execution non-decomposed-parent implement, failure parks the
-	// run (see run.ClassifyInfraFailurePark) — nothing downstream is
-	// dispatched, the run just stays running.
+	// never landed. The #4356 / #4426 / #4816 exception: a category-C
+	// acceptance, first-execution non-decomposed-parent implement, or
+	// operator-reaped live merge-candidate verify-pass implement, failure
+	// parks the run (see run.ClassifyInfraFailurePark) — nothing downstream
+	// is dispatched, the run just stays running.
 	var next *run.Stage
 	var gated *run.Stage
 	for _, s := range stages {
@@ -3357,9 +3360,12 @@ func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, pare
 // Audit wired the park cannot be bounded, so the failure takes today's
 // completeRun path. A failed audit read on an IMPLEMENT failure counts as a
 // re-opened pass (run.InfraParkHistoryOnReadError, #4426 approval condition
-// C1), so the run fails as it did before #4426 — a failed read never parks.
-// On an ACCEPTANCE failure it surfaces as an error with NO transition: the
-// run stays as it is and the next Advance re-decides.
+// C1), so the run fails as it did before #4426 — a failed read never parks,
+// not even an operator-reaped live merge-candidate verify pass (#4816), whose
+// override is derived only from a successful read. On an ACCEPTANCE failure
+// it surfaces as an error with NO transition: the run stays as it is and the
+// next Advance re-decides. The empty-history pre-check admits every
+// category-C implement failure, so the #4816 arm needs no change here.
 func (o *Orchestrator) classifyInfraFailurePark(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage) (run.InfraParkDecision, run.InfraParkHistory, error) {
 	if run.ClassifyInfraFailurePark(stages, failed, run.InfraParkHistory{}) == run.InfraParkNotApplicable {
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
@@ -3400,10 +3406,13 @@ func (o *Orchestrator) completeRunInfraParkExhausted(ctx context.Context, r *run
 // emitInfraParked writes the stage-scoped stage_infra_parked row for one
 // parked failure episode (#4356) — the record the park budget counts.
 // Best-effort, mirroring emitAcceptanceDispatched: a lost row under-counts
-// the budget by one episode and never unwinds the park.
+// the budget by one episode and never unwinds the park. A park of an
+// operator-reaped live merge-candidate verify-only pass (#4816) adds
+// reopened_pass = run.InfraParkReopenedPassMergeCandidateVerify; every other
+// park row's key set is unchanged and carries no reopened_pass key.
 func (o *Orchestrator) emitInfraParked(ctx context.Context, r *run.Run, failed *run.Stage, history run.InfraParkHistory) {
 	failedAt, retryOrdinal := run.InfraParkEpisode(failed)
-	o.emitInfraParkRow(ctx, r, failed, run.CategoryStageInfraParked, map[string]any{
+	fields := map[string]any{
 		"run_id":           r.ID.String(),
 		"stage_id":         failed.ID.String(),
 		"stage_type":       string(failed.Type),
@@ -3414,7 +3423,11 @@ func (o *Orchestrator) emitInfraParked(ctx context.Context, r *run.Run, failed *
 		"park_ordinal":     history.PriorParks + 1,
 		"retry_budget":     run.InfraFailureParkRetryBudget,
 		"run_state":        string(run.StateRunning),
-	})
+	}
+	if history.ReapedLiveMergeCandidatePass {
+		fields["reopened_pass"] = run.InfraParkReopenedPassMergeCandidateVerify
+	}
+	o.emitInfraParkRow(ctx, r, failed, run.CategoryStageInfraParked, fields)
 }
 
 // emitInfraParkBudgetExhausted writes the stage-scoped
