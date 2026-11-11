@@ -535,16 +535,42 @@ func epochConflict(cur Entry, epoch int64) error {
 		ErrStateConflict, cur.ID, cur.State, cur.AdmissionEpoch, epoch)
 }
 
+// phaseConflict is a phase CAS refusal (#4876): the entry is live at the
+// epoch but has moved past the phase the caller's decision was made against.
+func phaseConflict(cur Entry, epoch int64, want Phase) error {
+	return fmt.Errorf("%w: entry %s is %s, phase %q at admission epoch %d, want live, phase %q at epoch %d",
+		ErrStateConflict, cur.ID, cur.State, cur.Phase, cur.AdmissionEpoch, want, epoch)
+}
+
 // Unadmit returns a live entry to held at its ORIGINAL place (enqueued_at is
-// kept), clearing its phase and admitted_at — for a transient admission
-// failure or a merge-on-pass readvance. It is a compare-and-swap on the
-// admission epoch: an entry that is not live, or was re-admitted since epoch,
-// is ErrStateConflict and is not touched.
+// kept), clearing its phase and admitted_at, for a transient admission
+// failure. It is a compare-and-swap on the admission epoch: an entry that is
+// not live, or was re-admitted since epoch, is ErrStateConflict and is not
+// touched.
 func (s *PostgresStore) Unadmit(ctx context.Context, entryID uuid.UUID, epoch int64) (Entry, error) {
+	return s.unadmit(ctx, entryID, epoch, "")
+}
+
+// UnadmitPassed is Unadmit with one more compare-and-swap condition: the
+// entry's phase is passed (#4876), for a merge-on-pass readvance applied
+// outside the run's merge-intent lock. SetPhase keeps the admission epoch, so
+// the epoch check alone cannot see a concurrent pump that stamped merging (or
+// settling) and claimed the dispatch; a phase other than passed is
+// ErrStateConflict and writes nothing.
+func (s *PostgresStore) UnadmitPassed(ctx context.Context, entryID uuid.UUID, epoch int64) (Entry, error) {
+	return s.unadmit(ctx, entryID, epoch, PhasePassed)
+}
+
+// unadmit is Unadmit and UnadmitPassed: phase, when non-empty, is the phase
+// the live entry must also be in; empty accepts any phase.
+func (s *PostgresStore) unadmit(ctx context.Context, entryID uuid.UUID, epoch int64, phase Phase) (Entry, error) {
 	var out Entry
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
 		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // Unadmit admission-epoch CAS
 			return epochConflict(cur, epoch)
+		}
+		if phase != "" && cur.Phase != phase { // UnadmitPassed phase CAS (#4876)
+			return phaseConflict(cur, epoch, phase)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
 SET state = 'held', phase = NULL, admitted_at = NULL
@@ -883,6 +909,22 @@ FROM merge_candidate_queue_entries WHERE id = $1`, cur.ID, window.Microseconds()
 // is ErrStateConflict and is not touched. An empty reason is
 // ErrInvalidRequest.
 func (s *PostgresStore) Yield(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error) {
+	return s.yield(ctx, entryID, epoch, "", marker)
+}
+
+// YieldPassed is Yield with one more compare-and-swap condition: the entry's
+// phase is passed (#4876), for a merge-on-pass yield applied outside the
+// run's merge-intent lock. SetPhase keeps the admission epoch, so the epoch
+// check alone cannot see a concurrent pump that stamped merging (or settling)
+// and claimed the dispatch; a phase other than passed is ErrStateConflict and
+// writes nothing (no marker, yield_revision unchanged).
+func (s *PostgresStore) YieldPassed(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error) {
+	return s.yield(ctx, entryID, epoch, PhasePassed, marker)
+}
+
+// yield is Yield and YieldPassed: phase, when non-empty, is the phase the
+// live entry must also be in; empty accepts any phase.
+func (s *PostgresStore) yield(ctx context.Context, entryID uuid.UUID, epoch int64, phase Phase, marker YieldMarker) (Entry, error) {
 	if err := marker.validate(); err != nil {
 		return Entry{}, err
 	}
@@ -890,6 +932,9 @@ func (s *PostgresStore) Yield(ctx context.Context, entryID uuid.UUID, epoch int6
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
 		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // Yield admission-epoch CAS
 			return epochConflict(cur, epoch)
+		}
+		if phase != "" && cur.Phase != phase { // YieldPassed phase CAS (#4876)
+			return phaseConflict(cur, epoch, phase)
 		}
 		contAt, contBase := marker.continueArgs()
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
