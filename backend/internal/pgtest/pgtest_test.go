@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // --- pure classifier unit tests (no container) ---
@@ -822,4 +824,75 @@ func TestBootstrap_DistinctMigrationSetsCoexist(t *testing.T) {
 	}
 	check("older template", olderName, map[string]bool{"a_only": true, "b_only": false}, 1)
 	check("newer template", newerName, map[string]bool{"a_only": true, "b_only": true}, 2)
+}
+
+// --- connect diagnostics against the shared server (#5116) ---
+
+// TestServerSnapshot_SharedServer reads the snapshot from a real server over a
+// base connection while a NewPool holds a connection to its per-test
+// database, pinning the PG16 catalog path.
+func TestServerSnapshot_SharedServer(t *testing.T) {
+	p := NewPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(10*time.Second))
+	defer cancel()
+	conn, err := pgconn.Connect(ctx, sharedBaseURL(t))
+	if err != nil {
+		t.Fatalf("connect base: %v", err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	s := takeSnapshot(ctx, conn, p.Config().ConnConfig.Database)
+	if s.err != "" {
+		t.Fatalf("snapshot err = %q", s.err)
+	}
+	if s.maxConnections <= 0 || s.perTestBackends < 1 || s.fhDatabases < 1 || s.templateDatabases < 1 || s.uptimeSeconds < 0 {
+		t.Errorf("snapshot = %+v, want max>0, per-test>=1, fh>=1, tmpl>=1, uptime>=0", s)
+	}
+	if s.backends < s.clientBackends || s.clientBackends < 1 {
+		t.Errorf("backends=%d client=%d, want backends >= client >= 1", s.backends, s.clientBackends)
+	}
+	if len(s.waits) == 0 || len(s.waits) > 5 {
+		t.Errorf("waits = %v, want 1..5 buckets", s.waits)
+	}
+	numOrNA := regexp.MustCompile(`^(\d+|n/a)$`)
+	for name, v := range map[string]string{"checkpoints_req": s.checkpointsReq, "checkpoints_timed": s.checkpointsTimed} {
+		if !numOrNA.MatchString(v) {
+			t.Errorf("%s = %q, want a number or n/a", name, v)
+		}
+	}
+}
+
+// TestProbe_SharedServerHealthy runs the full probe against the real shared
+// server and asserts both targets are ok, the snapshot was taken through the
+// base probe, and the rendered line carries none of the REAL credentials.
+func TestProbe_SharedServerHealthy(t *testing.T) {
+	base := sharedBaseURL(t)
+	perTest := NewURL(t)
+	perTestDB := dbNameOf(perTest)
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(liveProbeBudget))
+	defer cancel()
+
+	rep := runConnectProbe(ctx, base, perTest, perTestDB, "live", probeHooks{})
+	for _, r := range []probeResult{rep.perTest, rep.base} {
+		if r.outcome != "ok" {
+			t.Errorf("%s probe outcome = %q, want ok (%+v)", r.target, r.outcome, r)
+		}
+		if r.ready < 0 || r.ready > r.readyLimit {
+			t.Errorf("%s probe ready = %v, want within the probe budget %v", r.target, r.ready, r.readyLimit)
+		}
+	}
+	if rep.server == nil || rep.server.err != "" || rep.server.maxConnections <= 0 {
+		t.Fatalf("server snapshot = %+v, want one taken on the base probe", rep.server)
+	}
+
+	cfg, err := pgconn.ParseConfig(base)
+	if err != nil {
+		t.Fatalf("parse base: %v", err)
+	}
+	line := renderDiag("ok", cloneTiming{}, time.Second, &rep)
+	forbidden := []string{cfg.User, cfg.Password, cfg.Database, perTestDB, cfg.Host, fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)}
+	if u, err := url.Parse(base); err == nil && u.Host != "" {
+		forbidden = append(forbidden, u.Host)
+	}
+	assertNoSecrets(t, "renderDiag", line, forbidden...)
 }

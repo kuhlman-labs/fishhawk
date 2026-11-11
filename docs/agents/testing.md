@@ -12,6 +12,9 @@ rules condense the former AGENTS.md test traps; linked package docs own details.
   use the runner-provided `FISHHAWK_TEST_PG_URL`; missing/broken service is a
   failure, never a skip. Raw migration fixtures use throwaway databases there.
   See [the shared-container contract](../../scripts/README.md).
+- Read a `connect per-test pool:` failure's `pgtest diagnostics:` shape and probe
+  phase before attributing it to the diff; do not raise timeouts or retries to
+  silence it (#5116).
 - `t.Parallel()` cannot coexist with `t.Setenv` or `t.Chdir`. Parallel Postgres
   and integration/MCP test files need separate non-parallel files for such tests.
 - `WithWaitStrategy` replaces defaults; use `WithAdditionalWaitStrategy` and
