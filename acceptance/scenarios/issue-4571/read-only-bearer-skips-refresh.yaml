@@ -1,0 +1,14 @@
+id: scenario:issue-4571/read-only-bearer-skips-refresh
+statement: GET /v0/campaigns/{campaign_id}/status with a bearer token lacking write:campaigns returns 200 with dependency_refresh.skipped_reason = insufficient_scope, dependency_refresh.performed = false and no dependency_refresh.added.
+verify_hint: 'HTTP: GET /v0/campaigns/{campaign_id}/status with a read:runs-only bearer and read dependency_refresh from the body. Decided in-suite by TestStatus_RefreshScopeGate_ThroughRealMux (read-only row) in backend/internal/server/campaign_dependency_refresh_test.go when the preview cannot seed a campaign.'
+steps: 'The live target cannot hold a campaign: GET /v0/campaigns -> items=[], no fixture seeds one, and the sandbox refuses POST /v0/campaigns. So, per the verify_hint (Posture B), in the sanctioned checkout I ran cd backend && go test ./internal/server/ -count=1 -v -run ''TestStatus_|Refresh''. TestStatus_RefreshScopeGate_ThroughRealMux/read_only_bearer sends GET /v0/campaigns/{id}/status through s.Handler() with Authorization: Bearer <read:runs-only API token> on an untenanted campaign with pending items in a fresh refresh harness. I also read refreshCampaignDependenciesForStatus (campaign_dependency_refresh.go:276-277).'
+assertions:
+    expected: 200, skipped_reason=insufficient_scope, performed=false, no added
+    observed_at_record: 'PASS. The row asserts 200 and dependency_refresh.skipped_reason=insufficient_scope, with 0 resolver calls, 0 AppendCampaignItems calls and 0 campaign_dependencies_refreshed audit rows. The denied path returns &dependencyRefreshResult{SkippedReason: insufficient_scope}, so performed is false (zero value) and added is omitted (omitempty). TestStatus_RefreshRequiresWriteCampaignsScope/read_only_token also PASS.'
+    repro_handle: cd backend && go test ./internal/server/ -count=1 -v -run TestStatus_RefreshScopeGate_ThroughRealMux
+origin:
+    issue: 4571
+    pr: 5153
+    run_id: 2dd8bcf1-f514-4276-9deb-2d339fc756d4
+    head_sha: 27c32e505fb5fc1a6e2e3f51105ac12ee49ee281
+    recorded_at: 2026-11-11T03:53:14Z
