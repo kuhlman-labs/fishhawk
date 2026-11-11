@@ -5546,3 +5546,80 @@ func TestAcceptanceGateState_FailedStageNeverAdmits(t *testing.T) {
 		t.Fatalf("acceptanceGateAdmitsMerge(%q) = true, want false", got)
 	}
 }
+
+// seedCleanRebase seeds a clean branch_rebased row prior -> merge (#4874).
+func seedCleanRebase(au *auditFake, runID uuid.UUID, seq int64, prior, merge string) {
+	seedHeadEntry(au, runID, nil, CategoryBranchRebased, seq, map[string]any{
+		"prior_head_sha": prior, "new_head_sha": merge, "merge_commit_sha": merge,
+		"already_up_to_date": false, "clean_verified": true, "base_tip_sha": "baseba5e",
+	})
+}
+
+// TestShipAcceptance_RebaseBeforeDispatchBindsMerge: a clean rebase recorded
+// before the anchor binds the shipped verdict to the merge commit (#4874).
+func TestShipAcceptance_RebaseBeforeDispatchBindsMerge(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 5, map[string]any{"head_sha": "prhead"})
+	seedCleanRebase(au, runID, 7, "prhead", "mergehead")
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["head_sha"]; got != "mergehead" {
+		t.Errorf("head_sha = %v, want the pre-dispatch rebase's merge commit", got)
+	}
+}
+
+// TestShipAcceptance_PostDispatchRebaseDoesNotBind: a clean rebase recorded
+// AFTER the dispatch anchor never re-binds the verdict.
+func TestShipAcceptance_PostDispatchRebaseDoesNotBind(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 5, map[string]any{"head_sha": "prhead"})
+	const anchor = 10
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, anchor, map[string]any{"stage_id": stageID.String()})
+	seedCleanRebase(au, runID, 20, "prhead", "postdispatchmerge") // ABOVE the anchor
+	if anchor <= 0 || anchor >= 20 {
+		t.Fatalf("precondition: the anchor must sit above 0 and below the rebase row")
+	}
+	if got, err := s.acceptanceHeadAsOf(context.Background(), runID, 0, false); err != nil || got != "postdispatchmerge" {
+		t.Fatalf("precondition: the unbounded head = (%q, %v), want the post-dispatch merge", got, err)
+	}
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["head_sha"]; got != "prhead" {
+		t.Errorf("head_sha = %v, want the dispatch-anchored head prhead (a post-dispatch rebase must not re-bind)", got)
+	}
+}
+
+// TestShipAcceptance_BaseMergeReadErrorClamps: a base-merge read error at ship
+// leaves the validated head unresolved, so a passed verdict is clamped to
+// undecidable(head_unresolved), never bound to the stale seed.
+func TestShipAcceptance_BaseMergeReadErrorClamps(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 5, map[string]any{"head_sha": "prhead"})
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+	au.listByCategoryErrCategory = CategoryBranchRebased
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	for key, want := range map[string]any{
+		"verdict":           acceptanceVerdictUndecidable,
+		"undecidable_basis": acceptanceUndecidableBasisHeadUnresolved,
+		"head_sha":          "",
+	} {
+		if got := payload[key]; got != want {
+			t.Errorf("%s = %v, want %v (payload: %v)", key, got, want, payload)
+		}
+	}
+}

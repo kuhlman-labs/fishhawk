@@ -19,7 +19,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -92,7 +91,9 @@ const (
 	// acceptance/scenarios/retired.yaml on the run branch. It is a reported-head
 	// ledger category (auditcomplete.HeadReportCategoriesByPrecedence and
 	// lineageLedgerCategories both admit it) so the scenario commit attributes
-	// as run lineage without re-opening the settled acceptance verdict.
+	// as run lineage without re-opening the settled acceptance verdict. Those
+	// lists decide membership and attribution; the head acceptance validates
+	// and binds its verdict to is decided by acceptanceHeadAsOf (#4874).
 	CategoryAcceptanceScenariosPushed = "acceptance_scenarios_pushed"
 	// CategoryAcceptanceScenarioRetirementDropped records that an APPROVED
 	// scenario retirement served to the acceptance runner was NOT persisted to
@@ -2290,20 +2291,21 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 }
 
 // acceptanceValidatedHeadSHA resolves the head the acceptance stage actually
-// validated (#1682, binding condition 2): the run's newest recorded head at
-// the moment the stage was DISPATCHED. Head-report entries with sequence
-// at-or-before the latest acceptance_dispatched entry for THIS stage are the
-// candidates; the precedence winner among them (via the shared
-// auditcomplete.LatestReportedHeadSHA) is the validated head. Anchoring on the
-// dispatch sequence excludes a fixup_pushed / child_pushed that lands AFTER
-// dispatch, so the verdict binds to the commit the validator checked out —
-// never a later commit that has not been validated.
+// validated (#1682, binding condition 2): the run's acceptance head at the
+// moment the stage was DISPATCHED, resolved by the SAME acceptanceHeadAsOf the
+// prompt serves, bounded by the latest acceptance_dispatched entry for THIS
+// stage (#4874). Every candidate — reported-head rows, the consolidated fan-in
+// integration_commit_recorded rows and the clean recorded base merges the seed
+// is walked through — is cut to sequence at-or-before that anchor before any
+// selection, so a fixup_pushed, scenario commit, integration merge or rebase
+// that lands AFTER dispatch never re-binds the verdict to a commit the
+// validator did not check out. The seed is the newest by CHAIN SEQUENCE
+// across both sets, never a timestamp and no longer category precedence.
 //
-// A decomposed PARENT writes no reported-head entry on its own chain at all
-// (see resolveConsolidatedFanInHeadSHA), so when the reported-head walk finds
-// nothing the resolver falls back to the parent's own incremental fan-in
-// ledger (integration_commit_recorded.merge_sha), BOUNDED by the same dispatch
-// anchor (#3091).
+// A decomposed PARENT's integration rows are an ordinary seed set here, not a
+// subordinate fallback: an integration row newer than a reported head at or
+// before the anchor binds the verdict to the integration-walked head (#3091,
+// #4874).
 //
 // A re-opened acceptance stage carries more than one acceptance_dispatched
 // entry; the highest-sequence one is the current validation episode.
@@ -2424,28 +2426,19 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 	if sha, applies := s.resolvePostDeployExpectedSHA(ctx, runID, stageID); applies {
 		return sha, sha != ""
 	}
-	var candidates []*audit.Entry
-	for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {
-		es, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
-		if err != nil {
-			return "", false
-		}
-		for _, e := range es {
-			if e.Sequence <= dispatchSeq {
-				candidates = append(candidates, e)
-			}
-		}
+	// One resolver for the served head and the validated head (#4874), bounded
+	// by the dispatch anchor. A read error or no head answers ("", false), which
+	// the #3091 clamp records as undecidable(head_unresolved).
+	sha, err := s.acceptanceHeadAsOf(ctx, runID, dispatchSeq, true)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance: validated head unreadable — treating it as unresolvable",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return "", false
 	}
-	if sha, ok := auditcomplete.LatestReportedHeadSHA(candidates); ok {
-		return sha, true
-	}
-	// Consolidated fan-in fallback (#3091), strictly SUBORDINATE to the
-	// reported-head walk above and BOUNDED by the same dispatch anchor: a
-	// decomposed parent's own chain carries no reported head at all, so the
-	// verdict would otherwise bind to nothing. Bounding on dispatchSeq is what
-	// stops a fan-in merge recorded AFTER the acceptance dispatch re-binding
-	// the verdict to a tree the stage never validated.
-	return s.resolveConsolidatedFanInHeadSHA(ctx, runID, dispatchSeq, true)
+	return sha, sha != ""
 }
 
 // latestAcceptanceDispatchSeq returns the highest audit sequence among the

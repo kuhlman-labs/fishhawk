@@ -1785,3 +1785,115 @@ func TestAcceptanceReplayRoundTrip(t *testing.T) {
 		t.Errorf("scenarios_pushed entry lost the retirement reason")
 	}
 }
+
+// TestAcceptanceE2E_RebaseThenRedispatch_BindsNewHead drives the REAL run,
+// audit and handler flow across the #4874 boundary: a verdict at S through the
+// real ship; Option C refuses at S; the REAL rebase handler records a clean
+// branch_rebased S -> M; Option C now admits and re-opens; the host-dispatch
+// marker writes a new anchor; the REST prompt serves M; a real verdict binds M;
+// Option C at M refuses again. Nothing re-opens without the operator retry.
+func TestAcceptanceE2E_RebaseThenRedispatch_BindsNewHead(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	// Strip the implement verify stanza so the rebase records no merge-candidate
+	// trigger (which would re-open implement); fail loudly if it is not there.
+	const verifyStanza = "          verify:\n            command: \"scripts/test verify\"\n            timeout: \"15m\"\n            max_iterations: 1\n"
+	stripped := strings.Replace(string(exampleBytes), verifyStanza, "", 1)
+	if stripped == string(exampleBytes) {
+		t.Fatal("precondition: the committed example's implement verify stanza was not found")
+	}
+	if _, err := spec.ParseBytes([]byte(stripped)); err != nil {
+		t.Fatalf("precondition: the stripped example does not parse: %v", err)
+	}
+	seam := buildLocalAcceptanceSeam(t, []byte(stripped))
+	prURL := rebasePRURL
+	seam.rr.getRuns[seam.runID].PullRequestURL = &prURL
+	seam.rr.getRuns[seam.runID].InstallationID = instID(99)
+	seam.s.cfg.GitHub = newRebaseGitHubClient(t, cleanRebaseStub())
+	seam.s.postMergeHeadReadBackoff = testPostMergeHeadReadBackoff()
+	ctx := context.Background()
+
+	// 1) PR opened at S; Advance parks acceptance; the marker writes anchor #1.
+	seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": rebasePriorHeadSHA})
+	o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+	if _, err := o.Advance(ctx, seam.runID); err != nil {
+		t.Fatalf("orchestrator advance to acceptance: %v", err)
+	}
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("first host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 2) A signed verdict at S through the real ship.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "first episode"), ""); w.Code != 201 {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != rebasePriorHeadSHA {
+		t.Fatalf("first verdict head_sha = %v, want S %q", got, rebasePriorHeadSHA)
+	}
+
+	// 3) Option C at S: the verdict is current, so the retry refuses.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("retry at S status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+
+	// 4) The REAL rebase handler records a clean branch_rebased S -> M.
+	if w := postRebaseBranch(t, seam.s, seam.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator); w.Code != http.StatusOK {
+		t.Fatalf("rebase status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rebased := seam.au.snapshot(seam.runID, CategoryBranchRebased)
+	if len(rebased) != 1 {
+		t.Fatalf("branch_rebased rows = %d, want 1", len(rebased))
+	}
+	var adv branchRebasedAdvance
+	if err := json.Unmarshal(rebased[0].Payload, &adv); err != nil || !isCleanAdvance(adv) || adv.MergeCommitSHA != rebaseNewHeadSHA {
+		t.Fatalf("precondition: branch_rebased = %+v (err %v), want a clean advance to %s", adv, err, rebaseNewHeadSHA)
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Fatalf("precondition: merge-candidate triggers = %d, want 0 (no pass may re-open implement)", n)
+	}
+	if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStateSucceeded {
+		t.Fatalf("acceptance state after the rebase = %q, want succeeded (a rebase alone re-opens nothing)", got)
+	}
+
+	// 5) Option C now admits: the verdict at S is stale against M.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusOK {
+		t.Fatalf("retry after the rebase status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceReopened)); n != 1 {
+		t.Fatalf("acceptance_reopened rows = %d, want 1", n)
+	}
+
+	// 6) The real host-dispatch marker writes a new anchor above the rebase.
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("re-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 7) The REST prompt serves M.
+	w := promptRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	if resp.AcceptanceExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("acceptance_expected_head_sha = %q, want the merge commit %q", resp.AcceptanceExpectedHeadSHA, rebaseNewHeadSHA)
+	}
+
+	// 8) A real signed verdict binds M.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "second episode, post rebase"), ""); w.Code != 201 {
+		t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != rebaseNewHeadSHA {
+		t.Errorf("second verdict head_sha = %v, want the merge commit %q", got, rebaseNewHeadSHA)
+	}
+
+	// 9) Option C at M refuses.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("retry at M status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+}

@@ -238,6 +238,25 @@ func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, 
 	if err != nil {
 		return false, fmt.Errorf("fan-in verify: compare patch: %w", err)
 	}
+	// LOG-ONLY divergence (#4874). The D5 hold and every parent gate bind the
+	// LIVE head; acceptance reads the ledger head (acceptanceHeadAsOf). They
+	// agree on every clean Fishhawk-recorded advance. A vouched, unrecorded or
+	// unclean head can still diverge: that is WARN-logged here and changes no
+	// answer, and no audit row records it (#4856 holds the vouch half).
+	ledgerHead, ledgerErr := s.acceptanceHeadAsOf(ctx, runID, 0, false)
+	if ledgerErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fan-in verify: acceptance ledger head unreadable; the live-head answer stands",
+			slog.String("run_id", runID.String()),
+			slog.String("live_head_sha", cmp.HeadSHA),
+			slog.String("error", ledgerErr.Error()))
+	} else if ledgerHead != "" && cmp.HeadSHA != "" && ledgerHead != cmp.HeadSHA {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fan-in verify: the live consolidated head differs from the acceptance ledger head; the live-head answer stands",
+			slog.String("run_id", runID.String()),
+			slog.String("live_head_sha", cmp.HeadSHA),
+			slog.String("ledger_head_sha", ledgerHead))
+	}
 	state, err := s.mergeCandidateVerifyState(ctx, runRow, cmp.HeadSHA)
 	if err != nil {
 		return false, fmt.Errorf("fan-in verify: merge-candidate verify state: %w", err)
