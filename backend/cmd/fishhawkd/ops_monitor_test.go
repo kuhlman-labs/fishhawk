@@ -986,11 +986,17 @@ func TestServe_OpsMonitorDispatchHoldWiring(t *testing.T) {
 	t.Cleanup(func() { serveOpsMonitorSeams = orig })
 
 	t.Run("flag on, local: shared hold turns held", func(t *testing.T) {
+		// heldReason is recorded inside the same Held call that satisfies the
+		// wait. serveUntil calls ready inline on this goroutine, so no lock.
+		var heldReason string
 		code, log, hold := serveCapturingHold(t, func(h server.HostAdmissionHold) bool {
 			if h == nil {
 				return false
 			}
-			held, _ := h.Held(time.Now())
+			held, reason := h.Held(time.Now())
+			if held {
+				heldReason = reason
+			}
 			return held
 		}, "--enable-ops-monitor", "--ops-monitor-dispatch-hold", "--ops-monitor-interval", "10ms",
 			"--ops-monitor-deployment", "local", "--ops-monitor-disk-path", t.TempDir())
@@ -1000,8 +1006,11 @@ func TestServe_OpsMonitorDispatchHoldWiring(t *testing.T) {
 		if _, ok := hold.(*opsmonitor.AdmissionHold); !ok {
 			t.Fatalf("cfg.HostAdmissionHold = %T, want *opsmonitor.AdmissionHold", hold)
 		}
-		if _, reason := hold.Held(time.Now()); !strings.Contains(reason, "critical") {
-			t.Errorf("hold reason = %q, want the critical-pressure reason", reason)
+		// The hold goes stale 3 x interval after the ticker stops, so a Held
+		// read after serve exits is timing-dependent (#4590). Assert on the
+		// reason from the same snapshot the wait observed, not a second read.
+		if !strings.Contains(heldReason, "critical") {
+			t.Errorf("hold reason captured when held = %q, want the critical-pressure reason", heldReason)
 		}
 		if !strings.Contains(log, `"dispatch_hold":true`) {
 			t.Errorf("'ops monitor started' does not report dispatch_hold:true:\n%s", log)
