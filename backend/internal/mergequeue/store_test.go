@@ -1815,9 +1815,9 @@ func (f *fixture) approvalWait(id uuid.UUID, epoch int64, window time.Duration) 
 
 // TestApprovalWait_AnchorSurvivesUnadmitAndReadmission (CF1 vehicle): one
 // row's wait anchor is stamped by the first ApprovalWait and survives an
-// Unadmit (merge-on-pass readvance), the re-admission and a stale re-claim,
-// so every later ApprovalWait returns the SAME start; expiry is judged in SQL
-// against that anchor. With the anchor reset by Unadmit, or stamped without
+// Unadmit (whose UPDATE the merge-on-pass readvance's UnadmitPassed shares),
+// the re-admission and a stale re-claim, so every later ApprovalWait returns
+// the SAME start; expiry is judged in SQL against that anchor. With the anchor reset by Unadmit, or stamped without
 // COALESCE, the second start is a later database instant: RED.
 func TestApprovalWait_AnchorSurvivesUnadmitAndReadmission(t *testing.T) {
 	f := newFixture(t)
@@ -4261,5 +4261,163 @@ func TestWithdrawIntent_SuppressesAutoReentry(t *testing.T) {
 	}
 	if latest, _, err := f.store.LatestForRun(ctx, w); err != nil || latest.ID != wEntry.ID || latest.State != StateDropped || latest.EjectReason != ReasonIntentWithdrawn {
 		t.Fatalf("W newest row = %+v (%v), want its withdrawn row still dropped %s", latest, err, ReasonIntentWithdrawn)
+	}
+}
+
+// phaseGuardEntry enqueues and admits a fresh entry on its own base (so every
+// table row is isolated), stamps phase with SetPhase at the admission epoch
+// (the merge-on-pass step-8 shape: the epoch is KEPT, so only a phase check
+// can tell the rows apart), and returns the committed row and its epoch. An
+// empty phase leaves the entry held (never admitted, epoch 0).
+func (f *fixture) phaseGuardEntry(baseRef string, phase Phase) (Entry, int64) {
+	f.t.Helper()
+	e := f.enqueue(f.run(), baseRef, "h-"+baseRef).Entry
+	if phase == "" {
+		return f.entry(e.ID), e.AdmissionEpoch
+	}
+	epoch := f.admitAt2(Base{Repo: testRepo, BaseRef: baseRef}, e.ID)
+	if _, err := f.store.SetPhase(context.Background(), e.ID, epoch, phase); err != nil {
+		f.t.Fatalf("SetPhase(%s, %d, %s): %v", e.ID, epoch, phase, err)
+	}
+	got := f.entry(e.ID)
+	if got.State != StateLive || got.Phase != phase || got.AdmissionEpoch != epoch {
+		f.t.Fatalf("seeded entry = %+v, want live, phase %s, epoch %d", got, phase, epoch)
+	}
+	return got, epoch
+}
+
+// requireUntouched fails unless the committed row after a refused call is
+// the row before it: state, phase, epoch, admitted_at, marker, yield revision
+// and updated_at (a refusal writes nothing).
+func requireUntouched(t *testing.T, before, after Entry) {
+	t.Helper()
+	sameTime := func(a, b *time.Time) bool { return (a == nil) == (b == nil) && (a == nil || a.Equal(*b)) }
+	if after.State != before.State || after.Phase != before.Phase || after.AdmissionEpoch != before.AdmissionEpoch ||
+		!sameTime(after.AdmittedAt, before.AdmittedAt) || after.Yielded() != before.Yielded() || after.YieldReason != before.YieldReason ||
+		after.YieldRevision != before.YieldRevision || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("committed row after a refusal = %+v, want untouched %+v", after, before)
+	}
+}
+
+// TestUnadmitPassed_PhaseGuard (#4876, the `// UnadmitPassed phase CAS`
+// counterfactual vehicle): UnadmitPassed lands only on a live entry in phase
+// passed at the epoch. A merging, settling or verifying entry at the SAME
+// epoch (stamped by SetPhase, which keeps the epoch) is ErrStateConflict and
+// the committed row is unchanged; with the phase guard set to `if false` the
+// read-back shows those rows moved to held: RED. Plain Unadmit keeps its
+// any-phase contract (the transient admission failure).
+func TestUnadmitPassed_PhaseGuard(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	landsHeld := func(t *testing.T, before, after Entry) {
+		t.Helper()
+		if after.State != StateHeld || after.Phase != "" || after.AdmittedAt != nil || !after.EnqueuedAt.Equal(before.EnqueuedAt) {
+			t.Fatalf("committed row = %+v, want held, phase and admitted_at cleared, enqueued_at %v kept", after, before.EnqueuedAt)
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		phase      Phase // "" = a held row, never admitted
+		epochDelta int64
+		plain      bool // plain Unadmit instead of UnadmitPassed
+		wantErr    error
+	}{
+		{name: "passed_lands_held", phase: PhasePassed},
+		{name: "merging_refused", phase: PhaseMerging, wantErr: ErrStateConflict},
+		{name: "settling_refused", phase: PhaseSettling, wantErr: ErrStateConflict},
+		{name: "verifying_refused", phase: PhaseVerifying, wantErr: ErrStateConflict},
+		{name: "passed_other_epoch_refused", phase: PhasePassed, epochDelta: 1, wantErr: ErrStateConflict},
+		{name: "held_refused", wantErr: ErrStateConflict},
+		{name: "plain_unadmit_merging_lands", phase: PhaseMerging, plain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, epoch := f.phaseGuardEntry("u-"+tc.name, tc.phase)
+			call := f.store.UnadmitPassed
+			if tc.plain {
+				call = f.store.Unadmit
+			}
+			_, err := call(ctx, before.ID, epoch+tc.epochDelta)
+			after := f.entry(before.ID)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				landsHeld(t, before, after)
+				return
+			}
+			// The committed row first: a refusal is judged by what it wrote,
+			// never by the error identity alone.
+			requireUntouched(t, before, after)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestYieldPassed_PhaseGuard (#4876, the `// YieldPassed phase CAS`
+// counterfactual vehicle): YieldPassed lands only on a live entry in phase
+// passed at the epoch, stamping the marker, bumping yield_revision and
+// keeping the approval-wait anchor. A merging or settling entry at the SAME
+// epoch is ErrStateConflict with no marker, yield_revision unchanged and the
+// row still live (read back); with the phase guard set to `if false` those
+// rows read back held and yielded: RED. Plain Yield keeps its any-phase
+// contract (the admission-site yield).
+func TestYieldPassed_PhaseGuard(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	marker := YieldMarker{Reason: "forge_approval_absent", Detail: "no qualifying approval"}
+	landsYielded := func(t *testing.T, before, after Entry) {
+		t.Helper()
+		if after.State != StateHeld || after.Phase != "" || after.AdmittedAt != nil || !after.EnqueuedAt.Equal(before.EnqueuedAt) ||
+			after.YieldReason != marker.Reason || after.YieldDetail != marker.Detail || after.YieldedAt == nil ||
+			after.YieldRevision != before.YieldRevision+1 ||
+			after.ApprovalWaitStartedAt == nil || !after.ApprovalWaitStartedAt.Equal(*before.ApprovalWaitStartedAt) {
+			t.Fatalf("committed row = %+v, want held and yielded %q, yield_revision %d, wait anchor %v kept",
+				after, marker.Reason, before.YieldRevision+1, before.ApprovalWaitStartedAt)
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		phase      Phase
+		epochDelta int64
+		marker     YieldMarker
+		plain      bool // plain Yield instead of YieldPassed
+		wantErr    error
+	}{
+		{name: "passed_lands_yielded", phase: PhasePassed, marker: marker},
+		{name: "merging_refused", phase: PhaseMerging, marker: marker, wantErr: ErrStateConflict},
+		{name: "settling_refused", phase: PhaseSettling, marker: marker, wantErr: ErrStateConflict},
+		{name: "passed_other_epoch_refused", phase: PhasePassed, epochDelta: 1, marker: marker, wantErr: ErrStateConflict},
+		{name: "empty_reason_invalid", phase: PhasePassed, wantErr: ErrInvalidRequest},
+		{name: "plain_yield_merging_lands", phase: PhaseMerging, marker: marker, plain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seeded, epoch := f.phaseGuardEntry("y-"+tc.name, tc.phase)
+			f.approvalWait(seeded.ID, epoch, time.Hour)
+			before := f.entry(seeded.ID)
+			call := f.store.YieldPassed
+			if tc.plain {
+				call = f.store.Yield
+			}
+			_, err := call(ctx, before.ID, epoch+tc.epochDelta, tc.marker)
+			after := f.entry(before.ID)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				landsYielded(t, before, after)
+				return
+			}
+			// The committed row first: a refusal is judged by what it wrote,
+			// never by the error identity alone.
+			if after.State != StateLive || after.Yielded() {
+				t.Fatalf("committed row = %+v, want still live and unmarked", after)
+			}
+			requireUntouched(t, before, after)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }

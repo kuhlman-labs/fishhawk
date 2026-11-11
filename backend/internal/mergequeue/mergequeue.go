@@ -195,8 +195,8 @@ type Entry struct {
 	// never overwritten; 0 for NULL (no intent, or one recorded before 0108).
 	MergeIntentSequence int64
 	// AdmissionEpoch is bumped by every admission (AdmitNext's admit and its
-	// stale re-claim, 0108; AdmitNextReclaiming's boot re-claim). The admission-owned writes (Unadmit, SetPhase,
-	// ReanchorAt, SettleAt, ApprovalWait, GateWait, Yield) are compare-and-swaps on it.
+	// stale re-claim, 0108; AdmitNextReclaiming's boot re-claim). The admission-owned writes (Unadmit, UnadmitPassed, SetPhase,
+	// ReanchorAt, SettleAt, ApprovalWait, GateWait, Yield, YieldPassed) are compare-and-swaps on it.
 	AdmissionEpoch int64
 	// YieldReason and YieldDetail are the yield marker (0109, ADR-112 R3):
 	// "" for NULL. YieldReason is the server's closed vocabulary;
@@ -653,6 +653,11 @@ type Store interface {
 	Enqueue(ctx context.Context, req EnqueueRequest) (EnqueueResult, error)
 	AdmitNext(ctx context.Context, base Base) (Admission, error)
 	Unadmit(ctx context.Context, entryID uuid.UUID, epoch int64) (Entry, error)
+	// UnadmitPassed is Unadmit with one more compare-and-swap condition, phase
+	// passed (#4876): a readvance applied outside the run's merge-intent lock
+	// never returns a merging or settling entry, which may hold a claimed
+	// dispatch, to held. A refusal is ErrStateConflict and writes nothing.
+	UnadmitPassed(ctx context.Context, entryID uuid.UUID, epoch int64) (Entry, error)
 	SetPhase(ctx context.Context, entryID uuid.UUID, epoch int64, phase Phase) (Entry, error)
 	Reanchor(ctx context.Context, entryID uuid.UUID, headSHA, baseSHA string) (Entry, error)
 	ReanchorAt(ctx context.Context, entryID uuid.UUID, epoch int64, headSHA, baseSHA string) (Entry, error)
@@ -670,6 +675,10 @@ type Store interface {
 	// Yield moves a live entry at epoch to held with the marker, in one
 	// statement (README.md § "Yield").
 	Yield(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error)
+	// YieldPassed is Yield with one more compare-and-swap condition, phase
+	// passed (#4876), for a merge-on-pass yield applied outside the run's
+	// merge-intent lock. A refusal is ErrStateConflict and writes nothing.
+	YieldPassed(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error)
 	// GateWait opens (once per admission epoch, spending one hold token) or
 	// continues the merge-gate window of a live entry at epoch and judges
 	// window's expiry on the database clock; it never touches the approval

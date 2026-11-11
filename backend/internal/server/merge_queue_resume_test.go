@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // ADR-093 D8 (E87.7 / #4298), slice 2: the merging/settling restart resume,
@@ -842,25 +843,105 @@ func TestMergeQueueResume_ReclaimNoAdvanceWhileStageLive(t *testing.T) {
 }
 
 // Ruling R8c (counterfactual B8): the in-flight mark is cleared AFTER the
-// pump applied the outcome: at Unadmit time (a 409 readvance) it is still
-// set, and after the pump returns it is gone.
+// pump applied the outcome: at UnadmitPassed time (a 409 readvance, #4876) it
+// is still set, and after the pump returns it is gone.
 func TestMergeQueueMergeInFlight_ClearedAfterOutcomeApplied(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("ifl", "h1", mcvUndelegatedSpecYAML)
 	w.merger.err = fmt.Errorf("pinned: %w", forge.ErrMergeConflict)
 	var atUnadmit []bool
 	fs := &mcqFaultStore{Store: w.store}
-	fs.unadmitAt = func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
+	fs.unadmitPassedAt = func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
 		atUnadmit = append(atUnadmit, w.srv.mergeInFlight.has(r.id))
-		return w.store.Unadmit(ctx, id, epoch)
+		return w.store.UnadmitPassed(ctx, id, epoch)
 	}
 	w.srv.cfg.MergeQueue = fs
 	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
 	if len(atUnadmit) == 0 || !atUnadmit[0] {
-		t.Fatalf("in-flight at Unadmit = %v, want true (cleared only after the outcome applied)", atUnadmit)
+		t.Fatalf("in-flight at UnadmitPassed = %v, want true (cleared only after the outcome applied)", atUnadmit)
 	}
 	if w.srv.mergeInFlight.has(r.id) {
 		t.Fatal("in-flight mark survived the pump")
+	}
+}
+
+// #4876 approval condition C1 (ruling R8c kept after the in-lock return to
+// passed): pump A's decision claims, its pinned PUT is refused 409, the claim
+// is released and the entry returned to passed under the lock, and A parks in
+// its readvance UnadmitPassed with its in-flight mark still set. A second
+// SAME-process pump then finds the entry live, passed and intent-bearing, and
+// must skip it (the mark): NO dispatch claim and NO PUT before A applies its
+// outcome. Counterfactual: deleting the pump's in-flight skip on the passed
+// arm lets the second pump claim and PUT, RED.
+func TestMergeQueueMergeInFlight_SameProcessPumpSkipsReleasedPassedEntry(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("ifs", "h1", mcvUndelegatedSpecYAML)
+	w.merger.err = fmt.Errorf("pinned: %w", forge.ErrMergeConflict)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	fs := &mcqFaultStore{Store: w.store}
+	fs.unadmitPassedAt = func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			close(entered)
+			<-release
+		}
+		return w.store.UnadmitPassed(ctx, id, epoch)
+	}
+	w.srv.cfg.MergeQueue = fs
+	var releaseOnce sync.Once
+	releaseA := func() { releaseOnce.Do(func() { close(release) }) }
+	aDone := make(chan struct{})
+	go func() {
+		defer close(aDone)
+		w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+	}()
+	t.Cleanup(func() {
+		releaseA()
+		select {
+		case <-aDone:
+		case <-time.After(timescale.D(30 * time.Second)):
+		}
+	})
+	select {
+	case <-entered:
+	case <-aDone:
+		t.Fatal("fixture: pump A returned without reaching its readvance UnadmitPassed")
+	case <-time.After(timescale.D(30 * time.Second)):
+		t.Fatal("fixture: pump A never reached its readvance UnadmitPassed")
+	}
+	if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("fixture: entry at A's apply = %s/%s, want live/passed (the released claim returned it to passed)", e.State, e.Phase)
+	}
+	if !w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("fixture: A's in-flight mark is gone before its outcome applied")
+	}
+	claims, puts := fs.called("ClaimMergeDispatch"), len(w.merger.calls())
+	if claims != 1 || puts != 1 {
+		t.Fatalf("fixture: A made %d claims and %d PUTs, want 1 and 1", claims, puts)
+	}
+
+	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+
+	if n := fs.called("ClaimMergeDispatch"); n != claims {
+		t.Fatalf("the second same-process pump claimed the dispatch (%d claims, want %d) while A's outcome was unapplied: %v", n, claims, fs.names())
+	}
+	if n := len(w.merger.calls()); n != puts {
+		t.Fatalf("the second same-process pump PUT the merge (%d PUTs, want %d) while A's outcome was unapplied", n, puts)
+	}
+	if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("entry after the second pump = %s/%s, want live/passed (untouched)", e.State, e.Phase)
+	}
+	w.merger.err = nil
+	releaseA()
+	select {
+	case <-aDone:
+	case <-time.After(timescale.D(30 * time.Second)):
+		t.Fatal("pump A did not return after its UnadmitPassed was released")
+	}
+	if w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("in-flight mark survived pump A")
 	}
 }
 
@@ -870,11 +951,22 @@ func TestMergeQueueMergeInFlight_ClearedAfterOutcomeApplied(t *testing.T) {
 // read fails, so it never marked) leaves that mark set, and a pump whose
 // decision marked and merged clears only its own count (the refcount).
 // Restoring the unconditional clear reddens the first check; a set in place
-// of the refcount reddens the second.
+// of the refcount reddens the second. Since #4876 (approval condition C1) the
+// pump skips a passed entry whose run is ALREADY marked, so the overlapping
+// mark lands after the pump's skip check, during the decision's first forge
+// read (the proxy's onResponse seam): the race window the refcount covers.
 func TestMergeQueueMergeInFlight_OverlappingDecisionKeepsMark(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("ifo", "h1", mcvUndelegatedSpecYAML)
-	w.srv.mergeInFlight.mark(r.id) // the overlapping decision, mid forge call
+	// overlapOnce marks the run (the overlapping decision, mid forge call) on
+	// the decision's first forge response.
+	overlapOnce := func() {
+		var once sync.Once
+		w.mu.Lock()
+		w.onResponse = func(string) { once.Do(func() { w.srv.mergeInFlight.mark(r.id) }) }
+		w.mu.Unlock()
+	}
+	overlapOnce()
 	w.mu.Lock()
 	w.prReadFail = true
 	w.mu.Unlock()
@@ -885,6 +977,11 @@ func TestMergeQueueMergeInFlight_OverlappingDecisionKeepsMark(t *testing.T) {
 	if !w.srv.mergeInFlight.has(r.id) {
 		t.Fatal("a decision that never marked cleared the overlapping decision's in-flight mark")
 	}
+	w.srv.mergeInFlight.clear(r.id) // that overlapping decision applied its outcome
+	if w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("fixture: the first overlapping mark survived its own clear")
+	}
+	overlapOnce()
 	w.mu.Lock()
 	w.prReadFail = false
 	w.mu.Unlock()
