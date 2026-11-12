@@ -215,6 +215,18 @@ Four tools carry a `scope_overlap` block naming the OTHER non-terminal runs (sta
 
 Unit tests: `TestGetPlan_ScopeOverlap_*` (`tools_test.go`), `TestGetGateView_ScopeOverlapPassThrough` (`gate_view_test.go`), `TestGetCampaignStatus_ScopeOverlap_*` (`campaign_test.go`) and `TestMergeRun_ScopeOverlap_*` (`merge_run_test.go`). Deletion counterfactuals were run by hand and each went RED: dropping the `get_plan` read, the campaign `decomposed_from` arm, the `run_id` arm, either own-run guard, the in-flight state filter, the read cap, the `read_failures` append, the nil-when-idle return, and the merge wrapper's assignment.
 
+## `fishhawk_verify_run`: complete per-run chain ([#5065](https://github.com/kuhlman-labs/fishhawk/issues/5065))
+
+**The read.** `verifyRun` pages `GET /v0/runs/{run_id}/audit?chain=true` (`ListRunAuditFilter.Chain`, 200 rows per page) — the server's complete `ChainsByParent` read, which skips `withholdDelegationShadow` and `withholdScopeOverlapFromRunBound`. The ordinary feed withholds rows (every human plan approval stamps a `delegation_shadow_evaluated` row), and each hidden row breaks the next recomputed `prev_hash` link, so walking it reported a false `chain_broken`. The tool never falls back to the ordinary feed. `Chain: false` omits the param, so every other `ListRunAudit` caller's request is unchanged.
+
+**Selection.** The complete read also returns the run's CI-retry descendants, interleaved by global sequence. Each descendant is an independently rooted chain (genesis `prev_hash` nil), so the tool walks ONLY rows whose `run_id` equals the requested run. Rows from other runs are counted in `descendant_entries_excluded` and their ids listed, sorted and unique, in `descendant_run_ids`. **Those rows are NOT verified by this call: verify each id in `descendant_run_ids` separately, with its own `run_id`.** `chain_length` and `category_counts` cover only the requested run's rows. A row whose `run_id` does not parse fails closed as `verified:false` with `hash_input_error`.
+
+**Checks.** Over the run's own rows in sequence order: sequence monotonicity (`sequence_not_monotonic`), entry hash (`hash_mismatch`), genesis (`first_entry_has_prev_hash`: the first row carries no `prev_hash`, the standalone verifier's rule, which catches a read truncated at the head) and chain link (`chain_broken`).
+
+**Refusal.** The server refuses `chain=true` to a run-bound (`mcp:run:`) subject with `403 run_token_forbidden` (E83.60 / #4118). `completeReadRefused` turns that into a tool error containing `audit chain was NOT verified`, never a `verified:false` result: it is an authorization refusal, not an integrity failure. The remedy is an operator-token verify, or `fishhawk export --run <id>` plus the standalone `fishhawk-verify`. Every other list error keeps the `list run audit: …` wrap.
+
+Tests: `verify_run_test.go` (fake backend: the chain param, truncated head, tampered payload, sequence order, descendant exclusion, unparseable `run_id`, and the omitted param on an ordinary read) and `verify_run_seam_test.go`, which runs the REAL `server.Handler` and the REAL `apiClient` against an in-memory chain repo (shadow rows straddling the 200-row page boundary with a positive control that the ordinary feed withholds them, descendant not spliced, stored-row tamper, run-bound refusal) and against real Postgres (`TestVerifyRun_CrossLayer_Postgres_CompleteChainAndDescendant`, the recursive-CTE `ChainsByParent` SQL; skips without Docker).
+
 ## In-band onboarding (server `instructions` + `fishhawk://runbook`, [#1356](https://github.com/kuhlman-labs/fishhawk/issues/1356))
 
 A connecting client whose agent holds no operator memory gets enough to drive a run without a CLI alt-tab, delivered over the protocol itself:

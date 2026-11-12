@@ -6882,6 +6882,14 @@ type ListRunAuditFilter struct {
 	// calls are not re-rejected by the endpoint. False omits the param and
 	// stays byte-identical to the prior request.
 	AllowUnknown bool
+	// Chain sets chain=true on the request (#5065), asking for the COMPLETE
+	// read: the server's ChainsByParent, covering the run and its CI-retry
+	// descendants, with no withholding (no delegation_shadow_evaluated or
+	// run-bound scope-overlap filtering). It is operator-only: the server
+	// refuses it 403 run_token_forbidden for a run-bound subject (E83.60 /
+	// #4118). fishhawk_verify_run sets it. False omits the param, so every
+	// other caller's request stays byte-identical.
+	Chain bool
 }
 
 // ListRunAudit calls GET /v0/runs/{run_id}/audit with optional
@@ -6909,6 +6917,9 @@ func (c *apiClient) ListRunAudit(ctx context.Context, runID uuid.UUID, f ListRun
 	}
 	if f.AllowUnknown {
 		q.Set("allow_unknown", "true")
+	}
+	if f.Chain {
+		q.Set("chain", "true")
 	}
 	path := "/v0/runs/" + runID.String() + "/audit"
 	if encoded := q.Encode(); encoded != "" {

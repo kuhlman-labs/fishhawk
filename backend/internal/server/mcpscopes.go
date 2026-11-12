@@ -103,6 +103,9 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// gates a run-bound token on mcp:read (which such a token always holds)
 	// while letting an operator bearer through unscoped
 	// (run_stage_wait.go, scope_amendment.go handleListScopeAmendments).
+	// Authentication-only here is the HTTP-layer gate, not the whole answer:
+	// fishhawk_verify_run's chain=true read is refused inside reads.go for a
+	// run-bound subject (#5065), so that tool always errors for one.
 	"fishhawk_get_active_run":      mcpScopeAuthenticatedOnly,
 	"fishhawk_get_plan":            mcpScopeAuthenticatedOnly,
 	"fishhawk_get_run_status":      mcpScopeAuthenticatedOnly,
@@ -129,7 +132,7 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_await_audit":           mcpScopeAuthenticatedOnly,
 	"fishhawk_await_children":        mcpScopeAuthenticatedOnly,
 	"fishhawk_await_review":          mcpScopeAuthenticatedOnly,
-	"fishhawk_verify_run":            mcpScopeAuthenticatedOnly,
+	"fishhawk_verify_run":            mcpScopeAuthenticatedOnly, // chain=true read: run-bound subjects always get a not-verified error (#5065)
 	"fishhawk_get_campaign_status":   mcpScopeAuthenticatedOnly,
 	"fishhawk_list_scope_amendments": mcpScopeAuthenticatedOnly,
 
