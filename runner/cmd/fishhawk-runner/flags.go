@@ -235,6 +235,13 @@ type config struct {
 	// fan-in commit. run() then records fixupIncrementBaseSHA below.
 	fixupPolicyIncrement bool
 
+	// planRevision is set at runtime (not a flag) from the fetched prompt's
+	// plan_revision (#4867): true ONLY on a plan dispatch of a run that holds a
+	// durable plan_revised constraint. run() then fast-forwards the reused
+	// lineage worktree to the declared base before capturing the plan seed
+	// (planRevisionBaseAdvanceEligible). Always false on the --prompt-file path.
+	planRevision bool
+
 	// fixupIncrementBaseSHA is set at runtime (not a flag) by run()'s fix-up
 	// block when fixupPolicyIncrement is true (#4391): the consolidated tip
 	// checkoutFixupBase fetched (verified against fixup_expected_head_sha when

@@ -457,7 +457,10 @@ func verifySeedCommit(ctx context.Context, repoDir, tip string) error {
 // logged lineage_seed_fallback (#3973). The reuse path is exempt: a
 // mid-lineage worktree's HEAD is legitimately the run branch, and its seed was
 // chosen at first provision. Plan and implement stages share this call site,
-// so both get the declared-base seed.
+// so both get the declared-base seed. Provisioning NEVER moves a reused
+// worktree's HEAD: the pre-agent advances in lineagebase.go do, after this
+// returns — the standalone implement advance (#3454) and the plan-revision
+// advance on a revised run's plan dispatch (#4867).
 func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string, logSink io.Writer) (string, error) {
 	if repoDir == "" {
 		repoDir = "."

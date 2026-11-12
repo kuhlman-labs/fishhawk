@@ -25530,6 +25530,21 @@ paths:
                       decomposed child's fix-up, a non-fix-up dispatch and a
                       verify-only merge-candidate pass (and on a probe error),
                       which keeps the cumulative diff.
+                  plan_revision:
+                    type: boolean
+                    description: |
+                      True ONLY on a plan stage dispatch of a run that holds a
+                      durable `plan_revised` constraint (#4867) — the same
+                      source the prompt's "Revision constraint" section renders
+                      from. The runner then fast-forwards the reused lineage
+                      worktree to the declared base before it captures the plan
+                      seed, so the revised planner, `plan_generated.seed_sha`
+                      and the plan review's exported tree name the current base
+                      rather than the admission commit. Durable: once a revise
+                      recorded a constraint, every later plan dispatch of the
+                      run (a clarification resume, a retry, a scope retry)
+                      carries it. Absent on a first-pass plan and on every
+                      non-plan stage.
                   egress_target_hosts:
                     type: array
                     items: { type: string }
@@ -26193,6 +26208,9 @@ paths:
                   fixup_policy_increment:
                     type: boolean
                     description: True ONLY on a decomposed PARENT's fix-up (#4391) — the parent analogue of #765's per-child increment base. The runner measures both `git_diff` emitters against the fetched consolidated tip (no-fetch merge-base, falling back to the cumulative diff on failure), so the in-band constraint check and the backend's `reEvaluatePolicy` see only the fix-up's own increment. Absent on an ordinary run's fix-up, a decomposed child's fix-up, a non-fix-up dispatch and a verify-only merge-candidate pass.
+                  plan_revision:
+                    type: boolean
+                    description: True ONLY on a plan stage dispatch of a run that holds a durable `plan_revised` constraint (#4867), the same source the prompt's "Revision constraint" section renders from. The runner fast-forwards the reused lineage worktree to the declared base before capturing the plan seed, so a revised plan is planned and reviewed on the current base. Durable once a revise recorded a constraint; absent on a first-pass plan and on every non-plan stage.
                   egress_target_hosts:
                     type: array
                     items: { type: string }

@@ -66,11 +66,53 @@ import (
 //     requires decomposedFromRunID != "", this one requires it empty — so the
 //     new block and the existing one can never both fire on one dispatch.
 //
-// Every non-implement stage type is excluded because there is no agent-visible
-// base to advance: a plan/review/acceptance stage does not cut a commit onto
-// the declared base.
+// Every non-implement stage type is excluded here because none of them cuts a
+// commit onto the declared base, so none needs the stage-lifetime base pin
+// this block records. A PLAN stage that re-dispatches after a plan-gate revise
+// is advanced by a SEPARATE predicate, planRevisionBaseAdvanceEligible below
+// (#4867), which reuses advanceLineageWorktreeToBase but records no pin; a
+// review/acceptance stage is never advanced.
 func standaloneBaseAdvanceEligible(stageType string, cfg config) bool {
 	return stageType == "implement" && !cfg.fixup && cfg.decomposedFromRunID == ""
+}
+
+// planRevisionBaseAdvanceEligible reports whether this dispatch is a PLAN stage
+// of a run that holds a durable plan_revised constraint (#4867), the shape that
+// fast-forwards the reused lineage worktree to the declared base before the
+// plan seed is captured. Without it a revise re-dispatch reused the worktree at
+// the admission commit, so the revised planner, plan_generated.seed_sha and the
+// plan review's exported tree all named a stale base.
+//
+// Each arm exists for a structural reason:
+//
+//   - stageType == "plan": only a plan stage re-dispatches on a revise; the
+//     implement advance is standaloneBaseAdvanceEligible's job, unchanged.
+//   - cfg.planRevision: the runner has ONLY the backend's plan_revision signal
+//     to tell a revised plan dispatch from any other. The backend serves it
+//     whenever the run holds a durable plan_revised constraint, so a first
+//     pass keeps today's HEAD, and so does a clarification resume, an ordinary
+//     retry or a plan_scope_retry re-dispatch ONLY while no plan_revised
+//     constraint exists. Once a revise recorded one, the signal is durable and
+//     every subsequent plan dispatch of the run advances too; each captures
+//     its seed after the advance, so the review still names the tree that pass
+//     read.
+//   - cfg.decomposedFromRunID == "": a decomposed child's lineage worktree is
+//     shared with its siblings and is based on its wave base, so it is never
+//     advanced here.
+//
+// There is no pin (pinBase): a plan stage cuts no commit, and the implement
+// stage that follows takes its own pin from its own advance.
+func planRevisionBaseAdvanceEligible(stageType string, cfg config) bool {
+	return stageType == "plan" && cfg.planRevision && cfg.decomposedFromRunID == ""
+}
+
+// baseAdvanceRepoDir is the worktree a base advance operates on: the
+// configured --working-dir, or the process cwd when none was given.
+func baseAdvanceRepoDir(cfg config) string {
+	if cfg.workingDir == "" {
+		return "."
+	}
+	return cfg.workingDir
 }
 
 // lineageBaseAdvanceRefusal is the typed PRE-AGENT refusal the base advance

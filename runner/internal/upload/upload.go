@@ -900,6 +900,19 @@ type FetchedPrompt struct {
 	// stay byte-identical to the backend's promptResponse.FixupPolicyIncrement
 	// (backend/internal/server/prompt.go).
 	FixupPolicyIncrement bool `json:"fixup_policy_increment,omitempty"`
+	// PlanRevision is true ONLY on a PLAN stage dispatch of a run that holds a
+	// durable plan_revised constraint (#4867). The runner then fast-forwards
+	// the reused lineage worktree to the current declared base before it
+	// captures the plan seed (planRevisionBaseAdvanceEligible), so a revised
+	// planner reads the base as it stands now. Once a revise recorded a
+	// constraint, every later plan dispatch of the run carries it too.
+	// False/absent on a first-pass plan, on every non-plan stage and from an
+	// older backend, which keeps today's no-advance plan dispatch.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (plan_revision) MUST stay
+	// byte-identical to the backend's promptResponse.PlanRevision
+	// (backend/internal/server/prompt.go).
+	PlanRevision bool `json:"plan_revision,omitempty"`
 	// FixupApplyPatches is the near-deterministic apply-list (#1165): one
 	// reviewer-emitted unified diff per routed concern, in routing order.
 	// Non-empty ONLY on a fix-up dispatch whose routed concerns EVERY carry a
