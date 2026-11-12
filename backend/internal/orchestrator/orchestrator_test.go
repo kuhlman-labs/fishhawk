@@ -4041,6 +4041,11 @@ func TestAdvance_AcceptanceShortCircuitEmptyCriteria(t *testing.T) {
 				t.Errorf("acceptance_outcome_recorded payload contains %s — a short-circuit that verified ZERO criteria must not record a pass (#2347): %s", forbidden, verdict.Payload)
 			}
 		}
+		// #4846: head_sha rides only a decomposed parent's verdict; an ordinary
+		// run's payload carries no head_sha key.
+		if strings.Contains(string(verdict.Payload), `"head_sha"`) {
+			t.Errorf("ordinary short-circuit verdict carries head_sha (#4846 binds it to decomposed parents only): %s", verdict.Payload)
+		}
 	})
 
 	// Defensive branch: a nil Audit is best-effort — the short-circuit still
@@ -4132,6 +4137,11 @@ func TestAdvance_AcceptanceShortCircuitAllSkipWithBasis(t *testing.T) {
 			if strings.Contains(string(verdict.Payload), forbidden) {
 				t.Errorf("acceptance_outcome_recorded payload contains %s — a short-circuit that verified ZERO criteria must not record a pass (#2347): %s", forbidden, verdict.Payload)
 			}
+		}
+		// #4846: head_sha rides only a decomposed parent's verdict; an ordinary
+		// run's payload carries no head_sha key.
+		if strings.Contains(string(verdict.Payload), `"head_sha"`) {
+			t.Errorf("ordinary short-circuit verdict carries head_sha (#4846 binds it to decomposed parents only): %s", verdict.Payload)
 		}
 	})
 
@@ -4286,6 +4296,12 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		}
 		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {
 			t.Errorf("acceptance_outcome_recorded = %d, want 1", n)
+		}
+		// #4846: an ordinary run's admission verdict carries no head_sha key.
+		for _, e := range ra.appended {
+			if e.Category == "acceptance_outcome_recorded" && strings.Contains(string(e.Payload), `"head_sha"`) {
+				t.Errorf("ordinary admission verdict carries head_sha (#4846 binds it to decomposed parents only): %s", e.Payload)
+			}
 		}
 	})
 

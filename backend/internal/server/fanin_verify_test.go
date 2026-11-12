@@ -11,13 +11,16 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -667,13 +670,17 @@ func TestFanInVerifySettled_Arms(t *testing.T) {
 		// own repo string.
 		wantDetailPrefix string
 		wantErr          bool
+		// wantHead is the consolidated head the answer judged (#4846): set on
+		// every compare-derived answer, settled or not, and empty on every arm
+		// that compared nothing (child, no children, fail-open).
+		wantHead string
 	}{
-		{name: "passed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultPassed) }, want: true},
-		{name: "not_required", spec: specImplementGatingReviewers, want: true},
-		{name: "failed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultFailed) }, want: true},
-		{name: "unverified", spec: fanInVerifySpec, want: false},
-		{name: "not_executed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultNotExecuted) }, want: false},
-		{name: "in_flight", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedTrigger(fanInHead) }, want: false},
+		{name: "passed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultPassed) }, want: true, wantHead: fanInHead},
+		{name: "not_required", spec: specImplementGatingReviewers, want: true, wantHead: fanInHead},
+		{name: "failed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultFailed) }, want: true, wantHead: fanInHead},
+		{name: "unverified", spec: fanInVerifySpec, want: false, wantHead: fanInHead},
+		{name: "not_executed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultNotExecuted) }, want: false, wantHead: fanInHead},
+		{name: "in_flight", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedTrigger(fanInHead) }, want: false, wantHead: fanInHead},
 		{name: "state_read_error", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
 			f.au.listByCategoryErrCategory = CategoryMergeCandidateVerified
 		}, wantErr: true},
@@ -746,6 +753,9 @@ func TestFanInVerifySettled_Arms(t *testing.T) {
 			} else if got.UnavailableDetail != tc.wantDetail {
 				t.Errorf("FanInVerifySettled.UnavailableDetail = %q, want %q", got.UnavailableDetail, tc.wantDetail)
 			}
+			if got.HeadSHA != tc.wantHead {
+				t.Errorf("FanInVerifySettled.HeadSHA = %q, want %q", got.HeadSHA, tc.wantHead)
+			}
 			// The hook is READ-ONLY: it never starts a pass.
 			if n := len(mcvTriggerRows(f.au)); tc.name == "unverified" && n != 0 {
 				t.Errorf("trigger rows = %d, want 0 (the hook starts nothing)", n)
@@ -762,8 +772,8 @@ func TestFanInVerifySettled_Arms(t *testing.T) {
 	t.Run("no_run_repo", func(t *testing.T) {
 		s := &Server{}
 		got, err := s.FanInVerifySettled(ctx, uuid.New(), "main", "b")
-		if err != nil || !got.Settled || got.UnavailableReason != orchestrator.FanInVerifyUnavailableNoRunRepo {
-			t.Errorf("FanInVerifySettled with no run repo = %+v, %v; want settled with reason no_run_repo", got, err)
+		if err != nil || !got.Settled || got.UnavailableReason != orchestrator.FanInVerifyUnavailableNoRunRepo || got.HeadSHA != "" {
+			t.Errorf("FanInVerifySettled with no run repo = %+v, %v; want settled with reason no_run_repo and no head", got, err)
 		}
 	})
 }
@@ -924,6 +934,164 @@ func TestFanInAcceptanceHold_EndToEnd(t *testing.T) {
 	}
 	if n := len(mcvTriggerRows(f.au)); n != 1 {
 		t.Errorf("trigger rows = %d, want still 1", n)
+	}
+}
+
+// --- #4846: the hold runs BEFORE the acceptance short-circuit ------------------
+
+// setFanInPlanBytes replaces the content of the fixture's approved plan
+// artifact (seedConsolidatedParent's plan stage), so a test can choose the
+// plan's verification block.
+func setFanInPlanBytes(t *testing.T, f *fanInFixture, planBytes json.RawMessage) {
+	t.Helper()
+	art, ok := f.s.cfg.ArtifactRepo.(*fakeArtifactRepo)
+	if !ok {
+		t.Fatalf("ArtifactRepo = %T, want *fakeArtifactRepo", f.s.cfg.ArtifactRepo)
+	}
+	art.mu.Lock()
+	defer art.mu.Unlock()
+	for _, a := range art.all {
+		if a.Kind == artifact.KindPlan {
+			a.Content = planBytes
+			return
+		}
+	}
+	t.Fatal("no plan artifact seeded")
+}
+
+// auditFeedItem is the slice of a GET /v0/runs/{id}/audit item the #4846
+// cross-layer test reads.
+type auditFeedItem struct {
+	Sequence int64           `json:"sequence"`
+	Category string          `json:"category"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+// getAuditFeed GETs the real audit feed filtered to category.
+func getAuditFeed(t *testing.T, s *Server, runID uuid.UUID, category string) []auditFeedItem {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String()+"/audit?category="+category, nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET audit feed (%s) status = %d:\n%s", category, w.Code, w.Body.String())
+	}
+	var page struct {
+		Items []auditFeedItem `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode audit feed: %v", err)
+	}
+	return page.Items
+}
+
+// (f) TestFanInAcceptanceHold_AllSkipShortCircuit_EndToEnd is the #4846
+// cross-layer test: the real *Server as FanInVerify and ConsolidatedReview,
+// the real Orchestrator with an approved all-skip-with-basis plan, the audit
+// chain fake, the real REST handlers and the real issuecomment renderer.
+// Advance #1 holds the parent's acceptance with ZERO verdict rows on the feed;
+// a signed merge_candidate_verified passed report for the consolidated head
+// releases it through the real report handler; the feed then carries exactly
+// one not_validated verdict bound to that head, sequenced after the verify; and
+// the PR status comment renders it as covering, not validating, that head (R8).
+// MECHANISM: the head is unverified at Advance #1, so under the old ordering
+// (short-circuit before the hold) the verdict is already on the feed there.
+func TestFanInAcceptanceHold_AllSkipShortCircuit_EndToEnd(t *testing.T) {
+	f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+	setFanInPlanBytes(t, f, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
+	f.rr.mu.Unlock()
+	o := &orchestrator.Orchestrator{Runs: f.rr, Audit: f.au, Artifacts: f.s.cfg.ArtifactRepo,
+		ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
+	f.s.cfg.Orchestrator = o
+	sf := newSigningFake()
+	f.s.cfg.SigningRepo = sf
+	priv, _ := sf.issue(t, f.parent.ID)
+	ctx := context.Background()
+
+	// 1. Advance reaches the pending acceptance with the head unverified: held,
+	// the verify-only pass started, and NO verdict on the feed.
+	if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+		t.Fatalf("Advance #1: %v", err)
+	}
+	f.s.waitBackgroundReviews()
+	if got := f.state(acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance state = %q, want pending (held until the fan-in verify settles)", got)
+	}
+	if n := len(mcvTriggerRows(f.au)); n != 1 {
+		t.Fatalf("merge-candidate trigger rows = %d, want 1", n)
+	}
+	if items := getAuditFeed(t, f.s, f.parent.ID, CategoryAcceptanceOutcomeRecorded); len(items) != 0 {
+		t.Fatalf("acceptance_outcome_recorded feed items = %d, want 0 before the consolidated head is verified: %+v", len(items), items)
+	}
+
+	// 2. The runner reports passed for exactly the consolidated head.
+	f.rr.mu.Lock()
+	f.impl.State = run.StageStateRunning
+	f.rr.mu.Unlock()
+	body, _ := json.Marshal(map[string]any{
+		"outcome": outcomeMergeCandidateVerified, "branch": f.branch, "head_sha": fanInHead,
+		"merge_candidate_result": "passed", "merge_candidate_reason": "",
+		"merge_candidate_output_tail": fanInTailSentinel,
+	})
+	w := shipFanInReport(t, f, priv, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+
+	// 3. The release short-circuited acceptance with ONE verdict bound to the
+	// verified head, after the verify row, and the review gate opened.
+	if got := f.state(acc.ID); got != run.StageStateSucceeded {
+		t.Fatalf("acceptance state = %q, want succeeded (short-circuited on release)", got)
+	}
+	verdicts := getAuditFeed(t, f.s, f.parent.ID, CategoryAcceptanceOutcomeRecorded)
+	if len(verdicts) != 1 {
+		t.Fatalf("acceptance_outcome_recorded feed items = %d, want exactly 1: %+v", len(verdicts), verdicts)
+	}
+	var verdict struct {
+		Verdict string `json:"verdict"`
+		Basis   string `json:"basis"`
+		HeadSHA string `json:"head_sha"`
+	}
+	if err := json.Unmarshal(verdicts[0].Payload, &verdict); err != nil {
+		t.Fatalf("decode verdict payload %s: %v", verdicts[0].Payload, err)
+	}
+	if verdict.Verdict != "not_validated" || verdict.Basis != "all-skip-with-basis" {
+		t.Errorf("verdict = %q basis %q, want not_validated / all-skip-with-basis", verdict.Verdict, verdict.Basis)
+	}
+	if verdict.HeadSHA != fanInHead {
+		t.Errorf("verdict head_sha = %q, want the hook-judged consolidated head %q", verdict.HeadSHA, fanInHead)
+	}
+	verified := getAuditFeed(t, f.s, f.parent.ID, CategoryMergeCandidateVerified)
+	if len(verified) != 1 {
+		t.Fatalf("merge_candidate_verified feed items = %d, want 1", len(verified))
+	}
+	if verdicts[0].Sequence <= verified[0].Sequence {
+		t.Errorf("verdict sequence %d <= merge_candidate_verified sequence %d, want the verdict AFTER the verify settled",
+			verdicts[0].Sequence, verified[0].Sequence)
+	}
+	if got := f.state(f.review.ID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval", got)
+	}
+
+	// 4. R8 consumer: the chain rows as written render the verdict as covering
+	// the head, never as having validated it.
+	entries, err := f.au.ListForRun(ctx, f.parent.ID)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	for i, e := range entries {
+		e.Sequence = int64(i + 1)
+	}
+	comment := issuecomment.RenderPRStatusBody(issuecomment.PRStatusInput{Run: f.runRow(), Audit: entries, Now: time.Now().UTC()})
+	if want := "Covers head: `" + fanInHead + "` (not validated)"; !strings.Contains(comment, want) {
+		t.Errorf("PR status comment missing %q:\n%s", want, comment)
+	}
+	if strings.Contains(comment, "Validated head") {
+		t.Errorf("PR status comment certifies the short-circuited head as validated:\n%s", comment)
 	}
 }
 

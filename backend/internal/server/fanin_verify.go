@@ -220,6 +220,10 @@ var _ orchestrator.FanInVerifyGate = (*Server)(nil)
 //     unknown state: not settled (false);
 //   - a run, children, compare or state read error: the error (the caller
 //     keeps acceptance pending and the next Advance retries).
+//
+// HeadSHA (#4846) is the compared consolidated head on every compare-derived
+// answer (settled or not), and empty on every arm that compared nothing (no run
+// repository, a child, no children, a forge that is not wired).
 func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (orchestrator.FanInVerifyAnswer, error) {
 	if s.cfg.RunRepo == nil {
 		return orchestrator.FanInVerifyAnswer{Settled: true, UnavailableReason: orchestrator.FanInVerifyUnavailableNoRunRepo}, nil
@@ -269,11 +273,14 @@ func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, 
 	if err != nil {
 		return orchestrator.FanInVerifyAnswer{}, fmt.Errorf("fan-in verify: merge-candidate verify state: %w", err)
 	}
+	// Every compare-derived answer carries the head it judged (#4846), so the
+	// orchestrator binds the hold and the short-circuit verdict to the same
+	// consolidated head the D5 hold reads.
 	switch state.State {
 	case mergeCandidateStateNotRequired, mergeCandidateStatePassed, mergeCandidateStateFailed:
-		return orchestrator.FanInVerifyAnswer{Settled: true}, nil
+		return orchestrator.FanInVerifyAnswer{Settled: true, HeadSHA: cmp.HeadSHA}, nil
 	default:
-		return orchestrator.FanInVerifyAnswer{}, nil
+		return orchestrator.FanInVerifyAnswer{HeadSHA: cmp.HeadSHA}, nil
 	}
 }
 

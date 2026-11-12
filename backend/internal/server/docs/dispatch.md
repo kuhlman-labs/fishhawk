@@ -91,7 +91,8 @@ remaining scope).
   ticker cannot pin admissions shut (`backend/internal/opsmonitor/README.md`).
 - **Where it fires.** After every eligibility and dependency guard (dev mode,
   auth, runner_kind/executor, terminal run, wave order, post-deploy hold,
-  decomposed-parent acceptance), the state switch and the superseded
+  decomposed-parent acceptance), the state switch, the decomposed-parent
+  fan-in verify hold refusal (#4846, below) and the superseded
   merge-candidate pass refusal (#4811, below), and BEFORE the bare CAS
   or the concurrency slot admission. Only the two admissible arms reach it —
   `pending` (a first plan-stage spawn) and `awaiting_host_dispatch` — so it
@@ -196,6 +197,112 @@ record the runner's `head_moved` not_executed.
   `TestHostDispatch_MalformedMergeCandidateTrigger_Admits` and
   `TestHostDispatch_ConcurrentReplacementStaysDispatchable`. The core's modes
   are in `merge_candidate_supersede_test.go`.
+
+## Decomposed-parent fan-in verify hold refusal (`host_dispatch.go`, [#4846](https://github.com/kuhlman-labs/fishhawk/issues/4846))
+
+A top-level decomposed parent's acceptance stage must not spawn before its
+consolidated head's fan-in merge-candidate verify settles (the #4785 hold).
+`Orchestrator.Advance` holds it `pending`; before #4846 a direct
+host-dispatch of that `pending` stage bypassed the hold. The marker now
+consults the same read-only predicate Advance uses
+(`orchestrator.DecomposedParentFanInHold`, which shares
+`decideFanInAcceptance` with Advance) and refuses a held stage
+(`refuseFanInVerifyPending`).
+
+- **Placement.** The `pending` arm of an ACCEPTANCE stage only, after the state
+  switch and BEFORE the #4811 superseded-pass refusal, the host memory hold,
+  the campaign dispatch hold and the CAS / slot admission. It reuses the
+  post-deploy hold's stage list when that block ran (one read otherwise; a
+  read error answers 500 `dependency_check_failed`). A child run is never
+  held and costs no read.
+- **Refusal.** `409 dispatch_not_admissible`, details `{stage_id, reason:
+  fan_in_verify_pending, hold_cause, consolidated_branch, head_sha,
+  implement_stage_id, implement_state}`. `hold_cause` is
+  `fan_in_verify_unsettled` (the head the hook judged is in `head_sha`) or
+  `consolidated_pr_not_opened` (no consolidated PR yet and the open would not
+  skip gracefully; `head_sha` empty). The implement fields come from the same
+  stage list, with no extra read. The message names the remedy for the
+  implement state (below).
+- **Read-only (R7).** The refusal appends NO audit row, performs NO CAS,
+  queues NO `Orchestrator.Advance` and fires NO `DispatchConsolidatedReview`.
+  Its only reads are the stage list, the children read and the hook's
+  read-only forge compare, which runs synchronously under the per-stage
+  admission lock (the #4080 guard's posture). Two concurrent refusals are two
+  identical reads that change nothing, so they need no bound. Release is owned
+  by the event-driven paths: the children settle and Advance starts the
+  `fan_in` pass through the D5 hold; the pass's `merge_candidate_verified`
+  report runs the post-verify Advance, which releases the hold. The #4811
+  superseded-pass `postUnlock` Advance is unrelated and unchanged.
+- **Fail-closed reads (approval condition C5).** With the Orchestrator wired, a
+  children-read (`ListRuns`) error or a hook error answers 500
+  `dependency_check_failed` and mutates nothing. The hook-error message names
+  the remedy: fix the forge cause, then dispatch the pending acceptance stage
+  again.
+- **Release record timing (approval condition C3).** A released answer lets
+  the admit proceed. A fail-open release (`UnavailableReason` set, #4792) is
+  recorded by `Orchestrator.RecordFanInHoldRelease` only AFTER the CAS has
+  admitted the stage, so a request the #4811 refusal, the host memory hold, the
+  campaign dispatch hold or a concurrency-slot queue refuses or queues appends
+  no `fan_in_verify_unavailable` row. A concurrency-slot waiter's ~5s re-POSTs
+  repeat the read-only hold evaluation (children read plus forge compare) and
+  record nothing until one is admitted. The row is deduplicated per (stage,
+  reason).
+- **Remedies, one per case where the hold cannot release** (the full list is in
+  `backend/internal/orchestrator/README.md` § "Consolidation before
+  acceptance"):
+  1. *Implement re-opened* (`pending` or `awaiting_host_dispatch`): the
+     verify-only pass is queued. Dispatch the IMPLEMENT stage
+     (`fishhawk_dispatch_stage`), not acceptance. *Implement `dispatched` or
+     `running`*: the pass is running; wait for its report.
+  2. *No pass in flight* (implement settled, no trigger row for the head): run
+     `fishhawk_rebase_run_branch` with `confirm: true` on the up-to-date
+     consolidated branch; its already-up-to-date arm classifies the head
+     `fan_in` and starts the pass directly, re-opening implement. The
+     non-mutating alternative is `fishhawk_rerun_review`, whose first
+     consolidated round runs the D5 hold that starts the `fan_in` pass. If the
+     rebase verb instead merged an advanced base and the queue answered
+     `not_queued`, use `fishhawk_rerun_review` (the D5 hold forces cause
+     `fan_in`). Cancel with `fishhawk_cancel_run` only where `rerun_review` is
+     ineligible (`firstRoundIneligibleSlug`: gating reviewer authority, no
+     agent reviewers, no PR).
+  3. *A persistent hook or compare error* (500): fix the forge cause the error
+     names (GitHub App installation, permissions, repository access). On an
+     unverified head, then re-drive as in (2). On a head whose verify already
+     settled, dispatch the pending acceptance stage
+     (`fishhawk_dispatch_stage`): once the hook reads settled the marker admits
+     `pending` and the admission walk short-circuits. Cancel only where the
+     hook can never read settled.
+  4. *`consolidated_pr_not_opened`*: the open is retried only by Advance, and
+     both `fishhawk_rebase_run_branch` and `fishhawk_rerun_review` need the PR.
+     Fix the cause the Advance error names (`open consolidated pr`:
+     installation id, App permission, default-branch read); if the open keeps
+     failing, cancel with `fishhawk_cancel_run` and start a fresh run.
+- **The `awaiting_host_dispatch` carve-out (R1).** An `awaiting_host_dispatch`
+  acceptance is admitted without consulting the hook: Advance parks it there
+  only after the hold released, and the operator re-open path that could leave
+  a held parent there is blocked upstream, because `run.FixupStage`'s
+  `TolerateUndispatchedAcceptance` admits past a `pending` acceptance only.
+  Dispatching acceptance therefore stays the recovery for a parent already past
+  the hold (run 819c130f). The idempotent `dispatched` arm is untouched.
+- **No Orchestrator wired.** The marker reads the children (Limit 1) and, for a
+  decomposed parent, WARN-logs `host-dispatch: decomposed parent acceptance
+  admitted with no fan-in verify hold: no orchestrator wired` with `run_id`,
+  `stage_id` and the #4792 record-not-hold posture, then admits; a read error
+  WARNs and admits. Production never takes this arm: fishhawkd always wires
+  the Orchestrator.
+- **Tests** (`host_dispatch_test.go`):
+  `TestHostDispatch_DecomposedParentAcceptance_FanInVerifyPending` (the 409
+  details and remedy per implement state, `consolidated_pr_not_opened`, the
+  `awaiting_host_dispatch` carve-out, settled and fail-open admits, a release a
+  later hold refuses recording nothing, hook and children-read errors failing
+  closed, the dispatched arm, a non-parent and a non-acceptance stage never
+  consulting the hook, and both nil-Orchestrator arms),
+  `…_RefusalReadOnly_EndToEnd` (the real `*Server` as both hooks: zero new
+  audit rows and no trigger) and `…_ConcurrentRefusalsReadOnly` (N = 3
+  barrier-synchronised refusals: every stage byte-equal to its snapshot,
+  exactly N hook calls, zero consolidated-review calls, zero appends). The
+  remedy is pinned by `rebase_branch_test.go`'s
+  `TestRebaseRunBranch_UpToDateStartsHeldDecomposedParentFanInPass`.
 
 ## Decomposition wave-order host-dispatch guard (`decomposition_dispatch_guard.go`, E48.99 / #2546)
 

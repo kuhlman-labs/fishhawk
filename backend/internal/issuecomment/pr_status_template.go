@@ -267,6 +267,11 @@ type prAcceptanceView struct {
 	// agent could not DECIDE (#2512); zero on every pre-#2512 outcome and on
 	// every outcome whose rows all decided.
 	criteriaUndecidable int
+	// criteriaFailed carries the outcome payload's criteria_failed tally
+	// (#4846): with criteriaPassed it tells whether an undecidable outcome
+	// decided any criterion against the head. Tolerant: an absent key decodes
+	// to zero.
+	criteriaFailed int
 }
 
 // prAcceptanceCriterion mirrors the server package's acceptanceCriterionResult
@@ -311,7 +316,7 @@ func buildPRAcceptance(entries []*audit.Entry, artifactBody []byte) *prAcceptanc
 		criteriaLiveValidation: a.criteriaLiveValidation,
 		criteriaUndecidable:    a.criteriaUndecidable,
 	}
-	v.targetURL, v.headSHA = decodePRAcceptanceOutcome(outcome.Payload)
+	v.targetURL, v.headSHA, v.criteriaFailed = decodePRAcceptanceOutcome(outcome.Payload)
 	if triage != nil {
 		t := decodeAcceptanceActivity(triage.Payload)
 		v.triageClass = t.class
@@ -402,13 +407,26 @@ func renderPRAcceptanceHeadline(v *prAcceptanceView) string {
 
 // renderPRAcceptanceMeta renders the validated target URL, head SHA, and triage
 // disposition as bullet lines. Each is omitted when absent.
+//
+// The head line names what the verdict says about that head (#4846). It reads
+// "Validated head" only when acceptanceHeadValidated holds: a validator decided
+// criteria against that head. Every other outcome that still records a head
+// (not_validated, which the decomposed-parent short-circuit verdict now carries
+// with head_sha; an undecidable outcome with no decided criterion; an empty or
+// unknown outcome) renders "Covers head: `<sha>` (not validated)", so the
+// verdict names the head it covers without certifying it. The wording lives
+// here, in the renderer, and not in a channel-specific path (ADR-015).
 func renderPRAcceptanceMeta(v *prAcceptanceView) string {
 	var b strings.Builder
 	if v.targetURL != "" {
 		fmt.Fprintf(&b, "- Target: %s\n", v.targetURL)
 	}
 	if v.headSHA != "" {
-		fmt.Fprintf(&b, "- Validated head: `%s`\n", shortSHA(v.headSHA))
+		if acceptanceHeadValidated(v) {
+			fmt.Fprintf(&b, "- Validated head: `%s`\n", shortSHA(v.headSHA))
+		} else {
+			fmt.Fprintf(&b, "- Covers head: `%s` (not validated)\n", shortSHA(v.headSHA))
+		}
 	}
 	switch {
 	case v.triageClass != "" && v.triageDisposition != "":
@@ -419,6 +437,23 @@ func renderPRAcceptanceMeta(v *prAcceptanceView) string {
 		fmt.Fprintf(&b, "- Triage — class-%s\n", v.triageClass)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// acceptanceHeadValidated reports whether the recorded outcome VALIDATED its
+// head (#4846): a validator ran against that head and decided criteria. True for
+// accepted and rejected, and for undecidable only when at least one criterion
+// was decided (criteria_passed + criteria_failed >= 1). False for not_validated
+// (zero criteria verified, including every short-circuit verdict),
+// skipped_out_of_scope, an empty outcome and any unknown outcome: the
+// conservative answer for a value this renderer does not recognise.
+func acceptanceHeadValidated(v *prAcceptanceView) bool {
+	switch v.outcome {
+	case "accepted", "rejected":
+		return true
+	case acceptanceOutcomeUndecidable:
+		return v.criteriaPassed+v.criteriaFailed >= 1
+	}
+	return false
 }
 
 // renderPRCriteriaTable renders the per-criterion evidence as a markdown table
@@ -465,21 +500,24 @@ func prTableCell(s string) string {
 	return strings.ReplaceAll(oneLine(s), "|", "\\|")
 }
 
-// decodePRAcceptanceOutcome reads target_url + head_sha out of an
-// acceptance_outcome_recorded payload (server/acceptance.go buildOutcomePayload).
-// These are NOT in the artifact body. Empty strings on any decode failure.
-func decodePRAcceptanceOutcome(payload []byte) (targetURL, headSHA string) {
+// decodePRAcceptanceOutcome reads target_url, head_sha and criteria_failed out
+// of an acceptance_outcome_recorded payload (server/acceptance.go
+// buildOutcomePayload; the orchestrator's short-circuit verdict). The URL and
+// head are NOT in the artifact body. Tolerant: zero values on any decode
+// failure, and an absent criteria_failed decodes to zero.
+func decodePRAcceptanceOutcome(payload []byte) (targetURL, headSHA string, criteriaFailed int) {
 	if len(payload) == 0 {
-		return "", ""
+		return "", "", 0
 	}
 	var p struct {
-		TargetURL string `json:"target_url"`
-		HeadSHA   string `json:"head_sha"`
+		TargetURL      string `json:"target_url"`
+		HeadSHA        string `json:"head_sha"`
+		CriteriaFailed int    `json:"criteria_failed"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
-		return "", ""
+		return "", "", 0
 	}
-	return p.TargetURL, p.HeadSHA
+	return p.TargetURL, p.HeadSHA, p.CriteriaFailed
 }
 
 // decodePRAcceptanceCriteria tolerantly decodes the per-criterion results from

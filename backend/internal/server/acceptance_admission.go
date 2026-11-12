@@ -14,8 +14,10 @@ import (
 
 // acceptanceAdmissionWalkTimeout bounds the context-cancellable part of the
 // pre-mutation phase of the short-circuit walk — the orchestrator's
-// admissibility reads (GetRun / ListStagesForRun), which run under this deadline
-// (#1936, binding condition 1). It does NOT bound the per-stage lock acquisition
+// admissibility reads (GetRun / ListStagesForRun) and, for a top-level
+// decomposed parent's PENDING acceptance stage, the fan-in verify hold's
+// children read and the hook's forge compare of the consolidated head (#4846),
+// all of which run under this deadline (#1936, binding condition 1). It does NOT bound the per-stage lock acquisition
 // that precedes those reads: LockStageAdmission blocks on a plain, non-context-
 // aware sync.Mutex.Lock(), so a goroutine parked behind a long-held lock waits
 // past this deadline. The design still degrades safely — once the lock is
@@ -84,12 +86,33 @@ type acceptanceAdmissionResponse struct {
 // never settle acceptance against a partial consolidated tree. A guard read
 // error is 500 internal_error.
 //
+// Decomposed-parent fan-in verify hold (#4846): for a top-level decomposed
+// parent's PENDING acceptance stage, TryShortCircuitAcceptance first consults
+// the shared read-only hold (orchestrator.DecomposedParentFanInHold, the same
+// arms Advance evaluates) under the stage admission lock and before any
+// mutation. A HELD stage (the consolidated head's fan-in verify is unsettled,
+// or the consolidated PR is not opened yet) is the normal short_circuited:false
+// no-op: nothing is written, no PR is opened and no consolidated review fires.
+// A released stage short-circuits as before, and its verdict carries the judged
+// consolidated head as head_sha. A fail-open release (#4792: no fan-in verify
+// consulted) appends its fan_in_verify_unavailable row only when the walk
+// actually short-circuits, before the verdict; a plan that matches no
+// predicate records nothing here. An awaiting_host_dispatch stage skips the
+// hold: Advance parked it there only after the hold released. This endpoint
+// only declines to settle a held stage; the host-dispatch marker is the
+// authority that refuses its spawn (409 fan_in_verify_pending). A children-read
+// or hook error answers 500 internal_error with the stage untouched, like every
+// TryShortCircuitAcceptance error. The MCP dispatch verbs fail OPEN on a 5xx
+// admission answer and proceed to the marker, which still refuses an unsettled
+// parent's pending acceptance.
+//
 // Fail-open by design (the reconciliation binding condition): a non-admissible
-// stage state (already settled, mixed criteria, an un-wired orchestrator)
-// returns short_circuited:false with NO warning — it is the normal no-op path,
-// and the caller's own spawn path + guards handle everything else. Only a
-// transport error (which the caller sees as a non-200) is treated as an
-// admission-call error the caller fails open on with a warning.
+// stage state (already settled, mixed criteria, an un-wired orchestrator, a
+// held decomposed parent) returns short_circuited:false with NO warning — it is
+// the normal no-op path, and the caller's own spawn path + guards handle
+// everything else. Only a transport error or a 5xx (which the caller sees as a
+// non-200) is treated as an admission-call error the caller fails open on with
+// a warning.
 func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {

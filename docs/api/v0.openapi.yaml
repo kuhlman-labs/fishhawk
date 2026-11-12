@@ -18847,6 +18847,21 @@ paths:
         slot. A malformed newest trigger reads as no pass and the stage is
         admitted. The idempotent already-`dispatched` arm is not checked.
 
+        **Decomposed-parent fan-in verify hold (#4846).** A top-level
+        decomposed parent's `acceptance` stage on the `pending` arm ONLY is
+        refused 409 `dispatch_not_admissible` with `details.reason`
+        `fan_in_verify_pending` while its consolidated head's fan-in
+        merge-candidate verify has not settled, or while its consolidated PR
+        is not opened yet: the same read-only hold `orchestrator.Advance`
+        applies. It fires after the state switch and BEFORE the superseded
+        merge-candidate pass refusal, the host memory hold and the CAS. The
+        refusal is purely read-only: no audit row, no state change, no queued
+        advance and no consolidated review, so concurrent refusals change
+        nothing. A children-read or hook error answers 500
+        `dependency_check_failed`. An `awaiting_host_dispatch` acceptance is
+        admitted without the check, and the idempotent already-`dispatched`
+        arm is untouched.
+
         **Interim host memory hold (E85.11 / #4330).** Optional and default
         off; INTERIM, absorbed later by ADR-100's adaptive concurrency
         controller. With `fishhawkd serve --enable-ops-monitor
@@ -18984,6 +18999,20 @@ paths:
               `details.left_state` names the stage's state on
               `before_restore_failed` (recover a stage left `running` or
               `dispatched` with `fishhawk_reap_stage`). Never spawn on it.
+              Also the decomposed-parent fan-in verify hold (#4846): a
+              top-level decomposed parent's `acceptance` stage on the
+              `pending` arm only (never `awaiting_host_dispatch`) is refused
+              with `details.reason` `fan_in_verify_pending`, plus
+              `details.stage_id`, `details.hold_cause`
+              (`fan_in_verify_unsettled` or `consolidated_pr_not_opened`),
+              `details.consolidated_branch`, `details.head_sha` (the head the
+              hook judged; empty on `consolidated_pr_not_opened`),
+              `details.implement_stage_id` and `details.implement_state`. The
+              refusal is read-only (no audit row, no state change, nothing
+              queued); the message names the remedy for the implement state:
+              dispatch a re-opened implement stage, or start the verify pass
+              with `fishhawk_rebase_run_branch` / `fishhawk_rerun_review`.
+              Never spawn acceptance on it.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not
@@ -28270,9 +28299,25 @@ paths:
         id). The MCP dispatch verbs fail closed on any admission 4xx, so a
         refusal stops the spawn.
 
+        **Decomposed-parent fan-in verify hold (#4846).** For a top-level
+        decomposed parent's `pending` acceptance stage the server first
+        consults the same read-only fan-in verify hold
+        `orchestrator.Advance` applies. A HELD stage (the consolidated head's
+        fan-in merge-candidate verify is unsettled, or the consolidated PR is
+        not opened yet) returns `short_circuited: false` and writes nothing;
+        the host-dispatch spawn marker refuses its spawn with 409
+        `fan_in_verify_pending`. A released stage short-circuits as before,
+        and its verdict payload carries the judged consolidated head as
+        `head_sha`. A fail-open release (no fan-in verify consulted) appends
+        its `fan_in_verify_unavailable` audit row only when the walk
+        short-circuits, before the verdict. An `awaiting_host_dispatch` stage
+        skips the hold. A children-read or hook error answers 500
+        `internal_error` with the stage untouched; the MCP dispatch verbs fail
+        open on that 5xx and the marker still refuses an unsettled parent.
+
         **Fail-open by design.** A non-admissible stage state (already
         settled, a `dispatched` stage, mixed criteria, an unconfigured
-        orchestrator) returns `short_circuited: false` — the normal no-op
+        orchestrator, a held decomposed parent) returns `short_circuited: false` — the normal no-op
         path; the caller records spawn evidence and spawns a runner exactly
         as today. Admission is an evaluate-and-maybe-settle pre-step, so a
         degraded server never blocks a legitimate dispatch. The endpoint
