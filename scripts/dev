@@ -3174,6 +3174,20 @@ cmd_up() {
       --scheduler-runner-kind local)
   fi
   #
+  # --auto-start-runner-kind local (#4525): fishhawk.yml fires only on an
+  # explicit operator dispatch (Captain decision 2026-10-16), so a labeled
+  # issue or a /fishhawk run comment relayed to this stack mints a LOCAL run
+  # whose first stage parks at awaiting_host_dispatch until a host dispatches
+  # it (fishhawk_run_stage), instead of firing workflow_dispatch. The campaign
+  # driver, when enabled, starts local item runs bound to the campaign's
+  # working_dir under the same flag. FISHHAWK_DEV_AUTO_START_LOCAL=0 drops the
+  # flag (fishhawkd's default, github_actions). scripts/test-dev pins it.
+  local -a auto_start_flags
+  auto_start_flags=()
+  if [[ "${FISHHAWK_DEV_AUTO_START_LOCAL:-1}" != "0" ]]; then
+    auto_start_flags=(--auto-start-runner-kind local)
+  fi
+  #
   # --enable-merge-outcome-observer (E82.2 / #3779, ADR-085): records each
   # merged run's merge-commit CI conclusion, fixed at merged_at + 6h, as one
   # run_merge_ci_observed audit row. Per 10m tick it makes at most 20 forge
@@ -3186,7 +3200,7 @@ cmd_up() {
   if [[ "${FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER:-1}" != "0" ]]; then
     merge_outcome_flags=(--enable-merge-outcome-observer)
   fi
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${merge_outcome_flags[@]}" >> "$LOG_FILE" 2>&1 &
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${auto_start_flags[@]}" "${merge_outcome_flags[@]}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"

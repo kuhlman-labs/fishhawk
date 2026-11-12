@@ -1301,6 +1301,17 @@ type Dispatcher struct {
 	// that runs `fishhawk/runner`. Defaults to "fishhawk.yml".
 	ActionsWorkflowFile string
 
+	// RunnerKind is the runner_kind the GitHub intake (Handle: a labeled
+	// issue or a `/fishhawk run` comment) mints its runs with (#4525), wired
+	// from fishhawkd's --auto-start-runner-kind. Empty means github_actions,
+	// today's behaviour: workflow_dispatch fires and the first stage moves to
+	// dispatched. A host-dispatched kind (local, per the runnerbackend
+	// registry) fires NO workflow_dispatch: the first stage is parked
+	// pending -> awaiting_host_dispatch until an operator host dispatches it
+	// (fishhawk_run_stage / fishhawk_dispatch_stage). The GitLab intake and
+	// the CI-failure retry arm keep their own kinds and ignore this field.
+	RunnerKind string
+
 	// Now is the clock used for audit timestamps; defaults to
 	// time.Now. Overridable for deterministic tests.
 	Now func() time.Time
@@ -1629,6 +1640,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// admission gates so a refused trigger costs no forge read. Nil on every
 	// degrade, never a refusal.
 	documentBaseCommit := d.captureDocumentBaseCommit(ctx, ev.Repo)
+	runnerKind := d.runnerKind()
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
 		Repo:                   ev.Repo,
 		WorkflowID:             m.WorkflowID,
@@ -1646,12 +1658,11 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// Snapshot the CI-retry cap so the SPA can render
 		// "Retry N/M" without re-parsing the spec (#280).
 		MaxRetriesSnapshot: WorkflowMaxRetries(workflow),
-		// Dispatcher-created runs always come from the GHA
-		// workflow_dispatch path (ADR-022 / #388). Local-runner
-		// mode (Phase C of E22 / #389) takes a different code
-		// path through handleCreateRun and stamps `local`
-		// itself.
-		RunnerKind:         run.RunnerKindGitHubActions,
+		// The deployment's auto-start runner kind (#4525): github_actions
+		// by default (the GHA workflow_dispatch path, ADR-022 / #388), or
+		// local under --auto-start-runner-kind local, in which case step 6
+		// parks the first stage for a host dispatch instead.
+		RunnerKind:         runnerKind,
 		RequiresCharter:    &requiresCharter,
 		DocumentBaseCommit: documentBaseCommit,
 	})
@@ -1661,7 +1672,8 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 
 	// Step 5: create one Stage row per stage definition in the
 	// spec. All stages start in pending; the first transitions to
-	// dispatched when we fire workflow_dispatch below. Subsequent
+	// dispatched when we fire workflow_dispatch below (or parks at
+	// awaiting_host_dispatch for a host-dispatched kind). Subsequent
 	// stages move forward as the runner reports completion through
 	// the trace upload + state-machine endpoints.
 	stages, err := CreateStagesFromSpec(ctx, d.Runs, created.ID, workflow.Stages)
@@ -1669,46 +1681,65 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return fmt.Errorf("dispatcher: create stages: %w", err)
 	}
 
-	// Step 6: fire workflow_dispatch on the customer-side Actions
-	// workflow. Inputs carry run_id, stage_id, and workflow_id so
-	// the runner action can call /v0/runs/{run_id}/signing-key with
-	// a known identity AND the trace endpoint with a stage UUID.
-	actionsFile := d.ActionsWorkflowFile
-	if actionsFile == "" {
-		actionsFile = DefaultActionsWorkflowFile
-	}
+	// Step 6: the dispatch decision (#4525), a registry lookup on the minted
+	// run's runner kind exactly as the CI-failure retry arm makes it. It keys
+	// on the KIND, not runnerbackend.Resolver: a freshly minted run is
+	// runner_kind-unresolved and Resolve would route it to github_actions.
 	firstStage := stages[0]
-	dispatchErr := d.GitHub.DispatchWorkflow(ctx, scope, repo,
-		actionsFile, ref, githubclient.DispatchInputs{
-			"run_id":      created.ID.String(),
-			"stage_id":    firstStage.ID.String(),
-			"workflow_id": m.WorkflowID,
-			"stage":       firstStage.ExecutorRef, // workflow-spec stage name vs stage UUID
-		})
-
-	// Step 7: transition the first stage to dispatched once the
-	// dispatch call returned (regardless of success — we tried to
-	// move it, the audit row records the outcome). Skip on failure
-	// so the next dispatch attempt sees the stage in pending.
-	if dispatchErr == nil {
+	var dispatchErr error
+	parkedKind := ""
+	if b, ok := d.backends().Backend(runnerKind); ok && b.HostDispatched() {
+		// A host-dispatched kind (local) fires no workflow_dispatch: the
+		// first stage parks pending -> awaiting_host_dispatch until an
+		// operator host dispatches it. A park error is the dispatch outcome
+		// (dispatch_failed, no status comment or board sync); the stage stays
+		// pending, which the host-dispatch marker still admits.
+		parkedKind = runnerKind
 		if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
-			run.StageStateDispatched, nil); err != nil {
-			// Don't fail the request — the stage is already
-			// associated with the run, the runner will
-			// eventually pick it up.
-			d.logger().LogAttrs(ctx, slog.LevelWarn,
-				"transition stage to dispatched failed",
-				slog.String("delivery_id", ev.DeliveryID),
-				slog.String("stage_id", firstStage.ID.String()),
-				slog.String("error", err.Error()),
-			)
+			run.StageStateAwaitingHostDispatch, nil); err != nil {
+			dispatchErr = fmt.Errorf("park first stage awaiting host dispatch: %w", err)
+		}
+	} else {
+		// Fire workflow_dispatch on the customer-side Actions workflow.
+		// Inputs carry run_id, stage_id, and workflow_id so the runner
+		// action can call /v0/runs/{run_id}/signing-key with a known
+		// identity AND the trace endpoint with a stage UUID.
+		actionsFile := d.ActionsWorkflowFile
+		if actionsFile == "" {
+			actionsFile = DefaultActionsWorkflowFile
+		}
+		dispatchErr = d.GitHub.DispatchWorkflow(ctx, scope, repo,
+			actionsFile, ref, githubclient.DispatchInputs{
+				"run_id":      created.ID.String(),
+				"stage_id":    firstStage.ID.String(),
+				"workflow_id": m.WorkflowID,
+				"stage":       firstStage.ExecutorRef, // workflow-spec stage name vs stage UUID
+			})
+
+		// Step 7: transition the first stage to dispatched once the
+		// dispatch call returned (regardless of success — we tried to
+		// move it, the audit row records the outcome). Skip on failure
+		// so the next dispatch attempt sees the stage in pending.
+		if dispatchErr == nil {
+			if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
+				run.StageStateDispatched, nil); err != nil {
+				// Don't fail the request — the stage is already
+				// associated with the run, the runner will
+				// eventually pick it up.
+				d.logger().LogAttrs(ctx, slog.LevelWarn,
+					"transition stage to dispatched failed",
+					slog.String("delivery_id", ev.DeliveryID),
+					slog.String("stage_id", firstStage.ID.String()),
+					slog.String("error", err.Error()),
+				)
+			}
 		}
 	}
 
 	// Step 8: audit. Whether dispatch succeeded or not, this
 	// delivery produced a Run row, so the audit log gets an entry
 	// pinning it to the trigger.
-	d.writeDispatchAudit(ctx, ev, m, created, specFile.SHA, dispatchErr, now)
+	d.writeDispatchAuditOutcome(ctx, ev, m, created, specFile.SHA, dispatchErr, parkedKind, now)
 
 	// Step 8.5: seed the sticky status comment on the triggering
 	// issue (E20.4 / #330) — this is the "Fishhawk picked it up"
@@ -1758,6 +1789,19 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// is the record.
 		return nil
 	}
+	if parkedKind != "" {
+		d.logger().LogAttrs(ctx, slog.LevelInfo, "webhook run parked awaiting host dispatch",
+			slog.String("event", ev.Type),
+			slog.String("action", ev.Action),
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("workflow_id", m.WorkflowID),
+			slog.String("run_id", created.ID.String()),
+			slog.String("stage_id", firstStage.ID.String()),
+			slog.String("runner_kind", parkedKind),
+		)
+		return nil
+	}
 	d.logger().LogAttrs(ctx, slog.LevelInfo, "webhook dispatched",
 		slog.String("event", ev.Type),
 		slog.String("action", ev.Action),
@@ -1768,6 +1812,15 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		slog.String("stage_id", firstStage.ID.String()),
 	)
 	return nil
+}
+
+// runnerKind is the runner kind Handle mints a run with (#4525):
+// Dispatcher.RunnerKind, or github_actions when it is empty.
+func (d *Dispatcher) runnerKind() string {
+	if d.RunnerKind == "" {
+		return run.RunnerKindGitHubActions
+	}
+	return d.RunnerKind
 }
 
 // captureDocumentBaseCommit returns the run-admission document base commit
@@ -3070,9 +3123,23 @@ func (d *Dispatcher) refusedByBlockingBudget(ctx context.Context, ev Event, m Ma
 // so a future re-dispatch can be authorized against the audit log.
 func (d *Dispatcher) writeDispatchAudit(ctx context.Context, ev Event, m Match,
 	created *run.Run, specSHA string, dispatchErr error, now time.Time) {
+	d.writeDispatchAuditOutcome(ctx, ev, m, created, specSHA, dispatchErr, "", now)
+}
+
+// writeDispatchAuditOutcome is writeDispatchAudit with the host-dispatch park
+// (#4525): a non-empty parkedKind means Handle parked the first stage for a
+// host dispatch instead of firing workflow_dispatch, so the outcome reads
+// awaiting_host_dispatch (dispatch_failed when the park errored) and the
+// payload gains a runner_kind key. An empty parkedKind writes today's payload
+// byte-for-byte.
+func (d *Dispatcher) writeDispatchAuditOutcome(ctx context.Context, ev Event, m Match,
+	created *run.Run, specSHA string, dispatchErr error, parkedKind string, now time.Time) {
 	systemKind := audit.ActorKind("system")
 
 	outcome := "dispatched"
+	if parkedKind != "" {
+		outcome = "awaiting_host_dispatch"
+	}
 	if dispatchErr != nil {
 		outcome = "dispatch_failed"
 	}
@@ -3089,6 +3156,9 @@ func (d *Dispatcher) writeDispatchAudit(ctx context.Context, ev Event, m Match,
 	}
 	if dispatchErr != nil {
 		payload["error"] = dispatchErr.Error()
+	}
+	if parkedKind != "" {
+		payload["runner_kind"] = parkedKind
 	}
 	body, _ := json.Marshal(payload)
 

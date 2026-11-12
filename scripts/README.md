@@ -1609,6 +1609,26 @@ on Tuesdays at 09:00 UTC.
 - **Pins.** `scripts/test-dev` pins the three flags and pins that they reach
   the `serve` argv.
 
+They also pass `--auto-start-runner-kind local` (#4525), so `fishhawk.yml`
+fires only on an explicit operator dispatch (Captain decision 2026-10-16).
+
+- **Webhook intake parks.** A labeled issue or a `/fishhawk run` comment
+  relayed to the local stack mints a `local` run and fires no
+  `workflow_dispatch`. Its first stage parks at `awaiting_host_dispatch`
+  until a host dispatches it with `fishhawk_run_stage`, which also binds the
+  run's `working_dir`.
+- **Campaign driver.** When the driver is enabled, it auto-starts `local`
+  item runs bound to the campaign's `working_dir`. A campaign with no binding
+  is refused (`campaign_auto_start_refused`), and its status read reports the
+  remedy. A campaign's recorded `runner_kind` wins over the flag.
+- **Takes effect at reload.** The flag applies from the next `scripts/dev up`
+  or reload; runs already minted keep their kind.
+- **Opting out.** `FISHHAWK_DEV_AUTO_START_LOCAL=0` drops the flag, which
+  restores fishhawkd's default (`github_actions`, `workflow_dispatch` on
+  webhook intake).
+- **Pins.** `scripts/test-dev` pins the flag, the opt-out and that the flag
+  reaches the `serve` argv.
+
 They also pass `--enable-merge-outcome-observer`, which turns on the
 merge-outcome CI observer (E82.2 / #3779, ADR-085). It fixes each merged run's
 merge-commit CI conclusion once, at `merged_at` + 6h, as one
