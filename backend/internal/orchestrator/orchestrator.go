@@ -1105,8 +1105,12 @@ func (o *Orchestrator) openConsolidatedPRLocked(ctx context.Context, r *run.Run,
 	// reverse to created_at ASC to approximate the children's mint order so the
 	// per-slice bullet pairing lines up with the plan's sub_plans ordering.
 	childRunIDs := childRunIDsInMintOrder(childIDs)
+	// Each succeeded slice's own Test plan / Notes (#5192), read from its
+	// newest child_pushed row. Degrades per slice with a WARN; never fails the
+	// open, and adds no forge call.
+	slices := o.consolidatedSliceTexts(ctx, r, approvedPlan, childIDs)
 
-	title, body := consolidatedPRTitleBody(r, approvedPlan, implStageID, head, o.ExternalURL, childRunIDs)
+	title, body := consolidatedPRTitleBody(r, approvedPlan, implStageID, head, o.ExternalURL, childRunIDs, slices)
 
 	// Defence in depth (#4110): before creating, adopt an already-open PR for
 	// the consolidated head — a retry after a create-succeeded / stamp-failed
@@ -1426,12 +1430,21 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // `Refs #N` instead, so merging the consolidated PR does not close the issue; a
 // nil plan keeps `Closes #N`.
 //
+// SLICE SECTIONS (#5192). Between the summary bullets and the closing line,
+// renderSliceSections splices each succeeded slice's own `## Test plan` and
+// `## Notes` (slices, from consolidatedSliceTexts) under one heading per
+// section, one `### Slice N: <title> (run <short>)` per contributing slice. On
+// a full delivery each slice's bare own-issue closing line is dropped (the
+// parent writes the one closing line); on a partial delivery every slice text
+// is neutralized to `Refs` as its LAST step. nil or empty slices leave the
+// body byte-identical to the pre-#5192 rendering.
+//
 // Defensive by construction: nil/empty IssueContext, a nil plan, and a plan
 // lacking a summary or sub_plan titles each still yield a valid, run-id-stamped
 // PR — the open never fails on missing context. childIDs pairs positionally
 // with p.Decomposition.SubPlans; the pairing is descriptive metadata only, so a
 // length mismatch degrades to titles-only bullets rather than mispairing.
-func consolidatedPRTitleBody(r *run.Run, p *plan.Plan, implStageID uuid.UUID, head, baseURL string, childIDs []uuid.UUID) (title, body string) {
+func consolidatedPRTitleBody(r *run.Run, p *plan.Plan, implStageID uuid.UUID, head, baseURL string, childIDs []uuid.UUID, slices []sliceText) (title, body string) {
 	// Title: a Conventional Commits header. An issue title that already
 	// matches the header shape is used verbatim (no double prefix); a
 	// non-conventional title gets the `chore: ` prefix; no issue title falls
@@ -1470,6 +1483,12 @@ func consolidatedPRTitleBody(r *run.Run, p *plan.Plan, implStageID uuid.UUID, he
 			}
 		}
 	}
+
+	issueNumber := 0
+	if r.IssueContext != nil {
+		issueNumber = r.IssueContext.Number
+	}
+	b.WriteString(renderSliceSections(slices, baseURL, issueNumber, p.IsPartialDelivery(), r.Repo))
 
 	if r.IssueContext != nil && r.IssueContext.Number > 0 {
 		keyword := "Closes"

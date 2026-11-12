@@ -10,12 +10,14 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -2101,7 +2103,7 @@ func TestConsolidatedPRTitleBody(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			title, body := consolidatedPRTitleBody(tc.r, tc.p, implID, head, tc.baseURL, tc.childIDs)
+			title, body := consolidatedPRTitleBody(tc.r, tc.p, implID, head, tc.baseURL, tc.childIDs, nil)
 			if title != tc.wantTitle {
 				t.Errorf("title = %q, want %q", title, tc.wantTitle)
 			}
@@ -6180,5 +6182,586 @@ func TestIntegrateSlices_NilImporterUnchanged(t *testing.T) {
 	}
 	if n := countAuditCategory(au, "slices_integrated"); n != 1 {
 		t.Errorf("slices_integrated rows = %d, want 1", n)
+	}
+}
+
+// --- Consolidated-PR slice sections (#5192) ---
+
+// sliceTestRun is the issue-triggered parent the slice-section tests render
+// for: issue 714 in kuhlman-labs/fishhawk.
+func sliceTestRun() *run.Run {
+	return &run.Run{
+		ID:           uuid.MustParse("11111111-2222-3333-4444-555555555555"),
+		Repo:         "kuhlman-labs/fishhawk",
+		IssueContext: &run.IssueContext{Title: "Add widget", Number: 714},
+	}
+}
+
+func sliceTestPlan(partial bool) *plan.Plan {
+	p := &plan.Plan{
+		Summary: "Consolidate the slices.",
+		Decomposition: &plan.Decomposition{SubPlans: []plan.SubPlanSummary{
+			{Title: "Slice one: backend"}, {Title: "Slice two: runner"},
+		}},
+	}
+	if partial {
+		p.Delivery = plan.DeliveryPartial
+	}
+	return p
+}
+
+var (
+	sliceChild0 = uuid.MustParse("c0000000-0000-0000-0000-000000000000")
+	sliceChild1 = uuid.MustParse("c1111111-1111-1111-1111-111111111111")
+)
+
+func renderWithSlices(t *testing.T, partial bool, slices []sliceText) string {
+	t.Helper()
+	_, body := consolidatedPRTitleBody(sliceTestRun(), sliceTestPlan(partial), uuid.Nil,
+		"fishhawk/run-11111111-consolidated", "https://app.fishhawk.test", []uuid.UUID{sliceChild0, sliceChild1}, slices)
+	return body
+}
+
+// qualifiedClosingRefRe is the test's own reading of an active closing
+// reference in this repository's qualified own-issue form.
+var qualifiedClosingRefRe = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+kuhlman-labs/fishhawk#714\b`)
+
+// (l) TestExtractPRSections: one case per extraction branch.
+func TestExtractPRSections(t *testing.T) {
+	cases := map[string]struct {
+		in, wantTP, wantNotes string
+	}{
+		"test plan and notes": {
+			in:     "## Summary\nsum\n## Test plan\n- ran x\n## Notes\n- note",
+			wantTP: "- ran x", wantNotes: "- note",
+		},
+		"case-insensitive heading with colon": {
+			in:     "## Test Plan:\n- ran\n## NOTES\nn",
+			wantTP: "- ran", wantNotes: "n",
+		},
+		"summary and other sections excluded": {
+			in:     "## Summary\nS\n## Other\nO\n## Notes\nN",
+			wantTP: "", wantNotes: "N",
+		},
+		"backtick fence hides a heading": {
+			in:     "## Test plan\n```\n## Notes\nfenced\n```\nafter",
+			wantTP: "```\n## Notes\nfenced\n```\nafter", wantNotes: "",
+		},
+		"tilde fence hides a heading": {
+			in:     "## Notes\n~~~\n## Test plan\n~~~\nend",
+			wantTP: "", wantNotes: "~~~\n## Test plan\n~~~\nend",
+		},
+		"neither section": {
+			in:     "## Summary\nonly a summary",
+			wantTP: "", wantNotes: "",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tp, notes := extractPRSections(tc.in)
+			if tp != tc.wantTP || notes != tc.wantNotes {
+				t.Errorf("extractPRSections(%q) = (%q, %q), want (%q, %q)", tc.in, tp, notes, tc.wantTP, tc.wantNotes)
+			}
+		})
+	}
+}
+
+// (l2) TestCloseOpenFence.
+func TestCloseOpenFence(t *testing.T) {
+	cases := map[string]struct{ in, want string }{
+		"unterminated backticks":  {"a\n```go\ncode", "a\n```go\ncode\n```"},
+		"unterminated long tilde": {"~~~~\ncode\n", "~~~~\ncode\n~~~~"},
+		"balanced fence":          {"```\ncode\n```", "```\ncode\n```"},
+		"fence-free":              {"plain text", "plain text"},
+		"inner tilde not a close": {"```\n~~~\ncode", "```\n~~~\ncode\n```"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := closeOpenFence(tc.in); got != tc.want {
+				t.Errorf("closeOpenFence(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// (m) TestStripOwnIssueClosingLines (C4 narrowing): only an EXACT bare
+// closing directive for issue 714 is dropped; everything else survives.
+func TestStripOwnIssueClosingLines(t *testing.T) {
+	dropped := []string{
+		"Closes #714", "closes: #714", "FIXES #714", "Resolved #714",
+		"Fixes kuhlman-labs/fishhawk#714", "Fixes Kuhlman-Labs/Fishhawk#714",
+		"- Closes #714", "* Fixes #714", "+ Resolves #714", "1. Closes #714", "1) Closes #714",
+		"> Closes #714", "> > Fixes #714",
+		"**Closes** #714", "**Closes #714**", "_Fixes #714_",
+		"  Closes #714  ",
+	}
+	for _, line := range dropped {
+		t.Run("dropped/"+line, func(t *testing.T) {
+			in := "before\n" + line + "\nafter"
+			if got := stripOwnIssueClosingLines(in, 714, "kuhlman-labs/fishhawk"); got != "before\nafter" {
+				t.Errorf("stripOwnIssueClosingLines(%q) = %q, want the line dropped", in, got)
+			}
+		})
+	}
+	survive := []string{
+		"- Fixes #5121: disclosed X", "Closes #12", "Closes other/repo#714", "Closes #7140",
+		"Closes #714.", "Closes #714 (slice 1 of 2)", "Closes #714, #12", "Refs #714",
+		"this fixes #714 as well",
+	}
+	for _, line := range survive {
+		t.Run("survives/"+line, func(t *testing.T) {
+			in := "before\n" + line + "\nafter"
+			if got := stripOwnIssueClosingLines(in, 714, "kuhlman-labs/fishhawk"); got != in {
+				t.Errorf("stripOwnIssueClosingLines(%q) = %q, want byte-identical", in, got)
+			}
+		})
+	}
+	t.Run("survives/fenced", func(t *testing.T) {
+		in := "```\nCloses #714\n```"
+		if got := stripOwnIssueClosingLines(in, 714, "kuhlman-labs/fishhawk"); got != in {
+			t.Errorf("stripOwnIssueClosingLines(%q) = %q, want the fenced line kept", in, got)
+		}
+	})
+}
+
+// (m2) With no run issue number nothing is stripped; the `Closes #0` line
+// isolates the n <= 0 guard from the number-anchored matcher.
+func TestStripOwnIssueClosingLines_NoIssueNumberStripsNothing(t *testing.T) {
+	in := "Closes #714\n- Fixes #12\nCloses #0"
+	if got := stripOwnIssueClosingLines(in, 0, "kuhlman-labs/fishhawk"); got != in {
+		t.Errorf("stripOwnIssueClosingLines(n=0) = %q, want byte-identical %q", got, in)
+	}
+}
+
+// (n) Two slices with Test plan and Notes are spliced under one heading per
+// section, in Summary < Test plan < Notes < Closes < footer order.
+func TestConsolidatedPRTitleBody_SplicesSliceSections(t *testing.T) {
+	body := renderWithSlices(t, false, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, TestPlan: "- s0 ran", Notes: "- s0 note"},
+		{Index: 1, Title: "Slice two: runner", ChildRunID: sliceChild1, TestPlan: "- s1 ran", Notes: "- s1 note"},
+	})
+	for _, h := range []string{"\n## Test plan\n", "\n## Notes\n"} {
+		if n := strings.Count(body, h); n != 1 {
+			t.Errorf("count(%q) = %d, want 1:\n%s", h, n, body)
+		}
+	}
+	for _, want := range []string{
+		"\n### Slice 0: Slice one: backend (run c0000000)\n\n- s0 ran\n",
+		"\n### Slice 1: Slice two: runner (run c1111111)\n\n- s1 ran\n",
+		"\n### Slice 0: Slice one: backend (run c0000000)\n\n- s0 note\n",
+		"\n### Slice 1: Slice two: runner (run c1111111)\n\n- s1 note\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q:\n%s", want, body)
+		}
+	}
+	order := []string{"## Summary", "## Test plan", "## Notes", "Closes #714", "_Opened by [Fishhawk]"}
+	last := -1
+	for _, s := range order {
+		i := strings.Index(body, s)
+		if i <= last {
+			t.Fatalf("%q at %d, want after %d (order %v):\n%s", s, i, last, order, body)
+		}
+		last = i
+	}
+}
+
+// (o) Missing or emptied slice text is omitted with no heading or placeholder;
+// all-empty slices render byte-identically to nil slices.
+func TestConsolidatedPRTitleBody_MissingSliceBodyOmitted(t *testing.T) {
+	body := renderWithSlices(t, false, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: "- s0 note"},
+		{Index: 1, Title: "Slice two: runner", ChildRunID: sliceChild1},
+	})
+	if strings.Contains(body, "### Slice 1") || strings.Contains(body, "## Test plan") {
+		t.Errorf("empty slice / section rendered a heading:\n%s", body)
+	}
+	if !strings.Contains(body, "### Slice 0") {
+		t.Errorf("slice 0 notes missing:\n%s", body)
+	}
+	stripped := renderWithSlices(t, false, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: "\nCloses #714\n"},
+	})
+	if strings.Contains(stripped, "## Notes") {
+		t.Errorf("notes stripped to empty still rendered a heading:\n%s", stripped)
+	}
+	nilBody := renderWithSlices(t, false, nil)
+	if stripped != nilBody {
+		t.Errorf("all-empty slices body differs from nil-slices body:\n got %q\nwant %q", stripped, nilBody)
+	}
+	empty := renderWithSlices(t, false, []sliceText{{Index: 0, ChildRunID: sliceChild0, TestPlan: "  \n", Notes: ""}})
+	if empty != nilBody {
+		t.Errorf("whitespace-only slice body differs from nil-slices body:\n got %q\nwant %q", empty, nilBody)
+	}
+}
+
+// (p) A full delivery drops the slice's bare own-issue close, so the parent's
+// line is the only one.
+func TestConsolidatedPRTitleBody_FullDeliveryStripsOwnBareClose(t *testing.T) {
+	body := renderWithSlices(t, false, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: "- did a thing\n- Closes #714"},
+	})
+	if n := strings.Count(body, "Closes #714"); n != 1 {
+		t.Errorf("count(Closes #714) = %d, want 1 (the parent's):\n%s", n, body)
+	}
+	if !strings.Contains(body, "- did a thing") {
+		t.Errorf("surviving note missing:\n%s", body)
+	}
+}
+
+// (p4) A full delivery keeps other-issue evidence and non-bare own-issue lines.
+func TestConsolidatedPRTitleBody_FullDeliveryKeepsOtherIssueEvidence(t *testing.T) {
+	body := renderWithSlices(t, false, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: "- Fixes #5121: disclosed X\nCloses #714 (slice 1 of 2)"},
+	})
+	for _, want := range []string{"- Fixes #5121: disclosed X", "Closes #714 (slice 1 of 2)"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing evidence line %q:\n%s", want, body)
+		}
+	}
+}
+
+// (p2) A partial delivery neutralizes every active own-issue close in slice
+// text: inline, bulleted and quoted.
+func TestConsolidatedPRTitleBody_PartialDeliveryNeutralizesSliceText(t *testing.T) {
+	for name, notes := range map[string]string{
+		"inline":   "This fixes #714 by tightening the guard",
+		"bulleted": "- Closes #714",
+		"quoted":   "> Fixes #714",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := renderWithSlices(t, true, []sliceText{{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: notes}})
+			if HasClosingReference(body, 714) {
+				t.Errorf("partial-delivery body carries an active closing reference to #714:\n%s", body)
+			}
+			if !strings.Contains(body, "Refs #714") {
+				t.Errorf("body missing Refs #714:\n%s", body)
+			}
+		})
+	}
+}
+
+// (C3-qualified) A partial delivery also neutralizes this repository's
+// qualified own-issue form; no active close to #714 remains in either the
+// `#714` or the `kuhlman-labs/fishhawk#714` form, bulleted or inline.
+func TestConsolidatedPRTitleBody_PartialDeliveryNeutralizesQualifiedOwnIssue(t *testing.T) {
+	for name, notes := range map[string]string{
+		"bulleted qualified": "- Closes kuhlman-labs/fishhawk#714",
+		"inline qualified":   "This also fixes Kuhlman-Labs/Fishhawk#714 for good",
+		"mixed":              "- Fixes #714\nand resolves: kuhlman-labs/fishhawk#714 too",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := renderWithSlices(t, true, []sliceText{{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: notes}})
+			if HasClosingReference(body, 714) {
+				t.Errorf("active `#714` closing reference remains:\n%s", body)
+			}
+			if qualifiedClosingRefRe.MatchString(StripCodeContexts(body)) {
+				t.Errorf("active `kuhlman-labs/fishhawk#714` closing reference remains:\n%s", body)
+			}
+			if !strings.Contains(strings.ToLower(body), "refs kuhlman-labs/fishhawk#714") && name != "mixed" {
+				t.Errorf("qualified reference not rewritten to Refs:\n%s", body)
+			}
+		})
+	}
+	// The shared server-facing helper is unchanged: it does not rewrite the
+	// qualified form.
+	if got, n := NeutralizeClosingReferences("Closes kuhlman-labs/fishhawk#714", 714); n != 0 || got != "Closes kuhlman-labs/fishhawk#714" {
+		t.Errorf("NeutralizeClosingReferences rewrote the qualified form: (%q, %d)", got, n)
+	}
+}
+
+// (p5) C3 ordering: the budget cut lands inside a code span, after the
+// reference and before the closer, so the neutralize step must run AFTER the
+// cut or the now-unterminated span exposes an active `Closes #714`.
+func TestConsolidatedPRTitleBody_PartialDeliveryBudgetCutInsideCodeSpan(t *testing.T) {
+	filler := strings.Repeat("a", consolidatedSliceTextBudget-2048)
+	span := "`Closes #714 " + strings.Repeat("b", 4096) + "TAILTOKEN`"
+	body := renderWithSlices(t, true, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: filler},
+		{Index: 1, Title: "Slice two: runner", ChildRunID: sliceChild1, Notes: span},
+	})
+	// Fixture self-checks: a cut happened, and it removed the span's closer.
+	if !strings.Contains(body, "/v0/runs/"+sliceChild1.String()+"/audit") {
+		t.Fatalf("setup: slice 1 was not cut (no audit pointer)")
+	}
+	if strings.Contains(body, "TAILTOKEN") {
+		t.Fatalf("setup: the cut kept the span's closer")
+	}
+	if HasClosingReference(body, 714) {
+		t.Errorf("budget cut re-exposed an active closing reference to #714:\n%s", body[len(body)-3000:])
+	}
+	if !strings.Contains(body, "Refs #714") {
+		t.Errorf("body missing Refs #714")
+	}
+}
+
+// (p3) An unterminated slice fence is closed, so it cannot swallow the later
+// slice and the parent's closing line.
+func TestConsolidatedPRTitleBody_UnterminatedSliceFenceClosed(t *testing.T) {
+	body := renderWithSlices(t, false, []sliceText{
+		{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: "log:\n```\nunterminated"},
+		{Index: 1, Title: "Slice two: runner", ChildRunID: sliceChild1, Notes: "- s1 note"},
+	})
+	if !HasClosingReference(body, 714) {
+		t.Errorf("parent's Closes #714 swallowed by an open slice fence:\n%s", body)
+	}
+	if !strings.Contains(StripCodeContexts(body), "### Slice 1") {
+		t.Errorf("### Slice 1 sits inside a fence:\n%s", body)
+	}
+}
+
+// (q) The 40 KiB budget keeps the body under GitHub's 65,536 cap; the crossing
+// slice and every later one render the audit pointer.
+func TestConsolidatedPRTitleBody_SliceTextBudget(t *testing.T) {
+	line := strings.Repeat("x", 99) + "\n"
+	text := strings.Repeat(line, 80) // 8,000 bytes
+	var slices []sliceText
+	var ids []uuid.UUID
+	for i := 0; i < 8; i++ {
+		id := uuid.New()
+		ids = append(ids, id)
+		slices = append(slices, sliceText{Index: i, ChildRunID: id, TestPlan: text, Notes: text})
+	}
+	_, body := consolidatedPRTitleBody(sliceTestRun(), nil, uuid.Nil, "h", "https://app.fishhawk.test", nil, slices)
+	if len(body) >= 65536 {
+		t.Fatalf("len(body) = %d, want < 65536", len(body))
+	}
+	// Test plan: slices 0-4 fit (40,000 bytes); slice 5 crosses the budget.
+	pointer := func(id uuid.UUID) string { return "https://app.fishhawk.test/v0/runs/" + id.String() + "/audit" }
+	for i, id := range ids {
+		want := 1 // every Notes entry is past the budget
+		if i >= 5 {
+			want = 2 // and so is this slice's Test plan entry
+		}
+		if n := strings.Count(body, pointer(id)); n != want {
+			t.Errorf("slice %d pointer count = %d, want %d", i, n, want)
+		}
+	}
+}
+
+// C4 (cut site: the consolidated budget): a cut that would land inside
+// `Fixes #5121` never leaves `Fixes #51`, with or without a nearby newline.
+func TestRenderSliceSections_BudgetCutNeverMintsIssueRef(t *testing.T) {
+	for name, tail := range map[string]string{
+		"no newline in final 512 bytes": "",
+		"newline within 512 bytes":      "\n" + strings.Repeat("y", 100) + " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			prefix := strings.Repeat("z", consolidatedSliceTextBudget-400) + tail
+			// The budget cut lands exactly after `Fixes #51`.
+			pad := strings.Repeat("p", consolidatedSliceTextBudget-len(prefix)-len("Fixes #51"))
+			notes := prefix + pad + "Fixes #5121 trailing"
+			out := renderSliceSections([]sliceText{{Index: 0, ChildRunID: sliceChild0, Notes: notes}}, "", 0, false, "")
+			if !strings.Contains(out, "/v0/runs/") {
+				t.Fatalf("setup: no cut happened")
+			}
+			if strings.Contains(out, "#51\n") || strings.Contains(out, "#51 ") || strings.Contains(out, "#5\n") {
+				t.Errorf("budget cut left a partial issue reference:\n%q", out[len(out)-300:])
+			}
+		})
+	}
+}
+
+// C4 (cut site: ClampChildPushedPRBody) plus the clamp's bound, rune safety
+// and marker.
+func TestClampChildPushedPRBody(t *testing.T) {
+	if got := ClampChildPushedPRBody("short"); got != "short" {
+		t.Errorf("under-bound text changed: %q", got)
+	}
+	long := strings.Repeat("é", 6*1024) // 12 KiB, cut straddles a rune
+	got := ClampChildPushedPRBody(long)
+	if len(got) > MaxChildPushedPRBodyBytes || !utf8.ValidString(got) || !strings.HasSuffix(got, childPushedPRBodyTruncationMarker) {
+		t.Errorf("clamp = %d bytes, valid=%v, marker=%v", len(got), utf8.ValidString(got), strings.HasSuffix(got, childPushedPRBodyTruncationMarker))
+	}
+	limit := MaxChildPushedPRBodyBytes - len(childPushedPRBodyTruncationMarker)
+	for name, tail := range map[string]string{
+		"no newline in final 512 bytes": "",
+		"newline within 512 bytes":      "\n" + strings.Repeat("y", 100) + " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			prefix := strings.Repeat("z", limit-400) + tail
+			pad := strings.Repeat("p", limit-len(prefix)-len("Fixes #51"))
+			got := ClampChildPushedPRBody(prefix + pad + "Fixes #5121 and more text past the bound" + strings.Repeat("q", 1024))
+			cut := strings.TrimSuffix(got, childPushedPRBodyTruncationMarker)
+			if len(got) > MaxChildPushedPRBodyBytes || cut == got {
+				t.Fatalf("setup: clamp = %d bytes, marker present=%v", len(got), cut != got)
+			}
+			if strings.HasSuffix(cut, "#51") || strings.HasSuffix(cut, "#5") {
+				t.Errorf("clamp left a partial issue reference: %q", cut[len(cut)-40:])
+			}
+		})
+	}
+}
+
+// TestChildPushedPRBody covers the decoder's present / absent / undecodable
+// arms.
+func TestChildPushedPRBody(t *testing.T) {
+	for name, tc := range map[string]struct{ payload, want string }{
+		"present":       {`{"branch":"b","pr_body":"## Test plan\n- x"}`, "## Test plan\n- x"},
+		"absent":        {`{"branch":"b"}`, ""},
+		"undecodable":   {`{not json`, ""},
+		"non-string":    {`{"pr_body":7}`, ""},
+		"empty payload": {``, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ChildPushedPRBody([]byte(tc.payload)); got != tc.want {
+				t.Errorf("ChildPushedPRBody(%s) = %q, want %q", tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
+func childPushedPayload(t *testing.T, prBody *string) json.RawMessage {
+	t.Helper()
+	m := map[string]any{"branch": "b", "head_sha": "abc"}
+	if prBody != nil {
+		m[ChildPushedPRBodyKey] = *prBody
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// (r) TestConsolidatedSliceTexts: one case per selection or degrade mode.
+func TestConsolidatedSliceTexts(t *testing.T) {
+	strp := func(s string) *string { return &s }
+	idx := func(i int) *int { return &i }
+	parent := sliceTestRun()
+	p := sliceTestPlan(false)
+	newChild := func(i *int, st run.State) *run.Run {
+		return &run.Run{ID: uuid.New(), State: st, SliceIndex: i}
+	}
+	push := func(au *recordingAudit, c *run.Run, payload json.RawMessage) {
+		au.appended = append(au.appended, audit.ChainAppendParams{RunID: c.ID, Category: "child_pushed", Payload: payload})
+	}
+
+	t.Run("newest row wins", func(t *testing.T) {
+		au := &recordingAudit{}
+		c := newChild(idx(0), run.StateSucceeded)
+		push(au, c, childPushedPayload(t, strp("## Test plan\n- A")))
+		push(au, c, childPushedPayload(t, strp("## Test plan\n- B")))
+		got := (&Orchestrator{Audit: au}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{c})
+		if len(got) != 1 || got[0].TestPlan != "- B" {
+			t.Errorf("got %+v, want the newest row's text `- B`", got)
+		}
+	})
+	t.Run("newer row without pr_body omits the slice", func(t *testing.T) {
+		au := &recordingAudit{}
+		c := newChild(idx(0), run.StateSucceeded)
+		push(au, c, childPushedPayload(t, strp("## Test plan\n- A")))
+		push(au, c, childPushedPayload(t, nil))
+		if got := (&Orchestrator{Audit: au}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{c}); len(got) != 0 {
+			t.Errorf("got %+v, want the slice omitted", got)
+		}
+	})
+	t.Run("undecodable payload omits the slice", func(t *testing.T) {
+		au := &recordingAudit{}
+		c := newChild(idx(0), run.StateSucceeded)
+		push(au, c, json.RawMessage(`{bad`))
+		if got := (&Orchestrator{Audit: au}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{c}); len(got) != 0 {
+			t.Errorf("got %+v, want the slice omitted", got)
+		}
+	})
+	t.Run("no row omits the slice", func(t *testing.T) {
+		c := newChild(idx(0), run.StateSucceeded)
+		if got := (&Orchestrator{Audit: &recordingAudit{}}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{c}); len(got) != 0 {
+			t.Errorf("got %+v, want the slice omitted", got)
+		}
+	})
+	t.Run("nil Audit", func(t *testing.T) {
+		c := newChild(idx(0), run.StateSucceeded)
+		if got := (&Orchestrator{}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{c}); got != nil {
+			t.Errorf("got %+v, want nil", got)
+		}
+	})
+	t.Run("list error", func(t *testing.T) {
+		au := &recordingAudit{}
+		c := newChild(idx(0), run.StateSucceeded)
+		push(au, c, childPushedPayload(t, strp("## Test plan\n- A")))
+		if got := (&Orchestrator{Audit: &erroringCategoryAudit{recordingAudit: au}}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{c}); got != nil {
+			t.Errorf("got %+v, want nil", got)
+		}
+	})
+	t.Run("non-succeeded, nil index, out of range, ordering", func(t *testing.T) {
+		au := &recordingAudit{}
+		running := newChild(idx(0), run.StateRunning)
+		noIdx := newChild(nil, run.StateSucceeded)
+		s1 := newChild(idx(1), run.StateSucceeded)
+		s0 := newChild(idx(0), run.StateSucceeded)
+		s9 := newChild(idx(9), run.StateSucceeded)
+		for _, c := range []*run.Run{running, noIdx, s1, s0, s9} {
+			push(au, c, childPushedPayload(t, strp("## Notes\n- "+c.ID.String())))
+		}
+		// created_at DESC arrival order.
+		got := (&Orchestrator{Audit: au}).consolidatedSliceTexts(context.Background(), parent, p, []*run.Run{s9, s1, running, noIdx, s0})
+		if len(got) != 3 {
+			t.Fatalf("got %d slices, want 3 (succeeded with slice_index): %+v", len(got), got)
+		}
+		for i, want := range []struct {
+			id    uuid.UUID
+			index int
+			title string
+		}{{s0.ID, 0, "Slice one: backend"}, {s1.ID, 1, "Slice two: runner"}, {s9.ID, 9, ""}} {
+			if got[i].ChildRunID != want.id || got[i].Index != want.index || got[i].Title != want.title {
+				t.Errorf("slice[%d] = %+v, want id %s index %d title %q", i, got[i], want.id, want.index, want.title)
+			}
+		}
+		if body := renderSliceSections(got, "", 714, false, ""); !strings.Contains(body, "### Slice 9 (run "+shortRunID(s9.ID)+")") {
+			t.Errorf("out-of-range slice heading missing:\n%s", body)
+		}
+	})
+}
+
+// (t) Advance end-to-end: a child_pushed pr_body reaches the forge-created
+// consolidated PR body.
+func TestAdvance_DecomposedParent_OpensConsolidatedPR_SplicesSliceText(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultBranch = defaultbranch.Static("main")
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+	parent.IssueContext = &run.IssueContext{Title: "Add widget", Number: 714}
+	var child *run.Run
+	for _, r := range rs.runs {
+		if r.DecomposedFrom != nil && *r.DecomposedFrom == parent.ID {
+			child = r
+		}
+	}
+	if child == nil {
+		t.Fatal("setup: no decomposed child seeded")
+	}
+	zero := 0
+	child.SliceIndex = &zero
+	prBody := "## Test plan\n- hand-run RED: X"
+	au.appended = append(au.appended, audit.ChainAppendParams{RunID: child.ID, Category: "child_pushed", Payload: childPushedPayload(t, &prBody)})
+
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if len(gh.createPRCalls) != 1 {
+		t.Fatalf("CreatePullRequest calls = %d, want 1", len(gh.createPRCalls))
+	}
+	body := gh.createPRCalls[0].Body
+	for _, want := range []string{"## Test plan", "### Slice 0", "hand-run RED: X"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("consolidated body missing %q:\n%s", want, body)
+		}
+	}
+	if i, j := strings.Index(body, "hand-run RED: X"), strings.Index(body, "Closes #714"); j < i {
+		t.Errorf("Closes #714 at %d, want after the slice text at %d:\n%s", j, i, body)
+	}
+}
+
+// (w) The orchestrator exports are the moved implementations (the real pin is
+// the unchanged server suite reached through its delegates).
+func TestNeutralizeAndHasClosingReference_Exported(t *testing.T) {
+	if got, n := NeutralizeClosingReferences("Fixes: #7", 7); got != "Refs #7" || n != 1 {
+		t.Errorf("NeutralizeClosingReferences = (%q, %d), want (Refs #7, 1)", got, n)
+	}
+	if HasClosingReference("```\nCloses #7\n```", 7) {
+		t.Error("HasClosingReference read a fenced Closes #7 as active")
 	}
 }
