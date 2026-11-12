@@ -2939,6 +2939,69 @@ func TestMergeRun_AcceptanceStale_AfterFixupPush(t *testing.T) {
 	}
 }
 
+// TestMergeRun_AcceptanceStale_FixupDuringInFlightEpisode pins #5163 at the
+// HTTP layer: a fix-up push (h2) lands while the acceptance episode is running,
+// so the REAL reopenAcceptanceOnFixupPush writes no acceptance_reopened row,
+// and the episode then ships a `passed` verdict bound to its dispatch-anchored
+// head h1. The merge is refused 409 acceptance_stale on the fixup_in_episode
+// basis, naming fishhawk_retry_stage on the settled stage. Counterfactual:
+// replacing acceptanceStaleRefusal's final call to
+// acceptanceFixupInEpisodeRefusal with `return nil, nil` admits the merge (200
+// with merger.called==1, as TestMergeRun_AcceptanceStale_AfterFixupPush
+// documents for this harness) → RED.
+func TestMergeRun_AcceptanceStale_FixupDuringInFlightEpisode(t *testing.T) {
+	const h1, h2 = "aaaa000000000000000000000000000000000001", "bbbb000000000000000000000000000000000002"
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	au.stampSequence = true
+	stages := acceptanceMergeStages(runID, run.StageStateRunning)
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, []byte(autoDriveAcceptanceSpecYAML), stages)
+	accID := stages[2].ID
+	appendRow := func(stageID *uuid.UUID, category string, payload map[string]any) {
+		t.Helper()
+		raw, _ := json.Marshal(payload)
+		if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID: runID, StageID: stageID, Timestamp: time.Now().UTC(), Category: category, Payload: raw,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", category, err)
+		}
+	}
+	appendRow(&accID, CategoryAcceptanceDispatched, map[string]any{})
+	appendRow(&stages[1].ID, CategoryFixupPushed, map[string]any{"head_sha": h2})
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, h2)
+	if rows, err := au.ListForRunByCategory(context.Background(), runID, CategoryAcceptanceReopened); err != nil || len(rows) != 0 {
+		t.Fatalf("precondition: acceptance_reopened rows after the in-flight fix-up = %d (err %v), want 0", len(rows), err)
+	}
+	if st := stages[2].State; st != run.StageStateRunning {
+		t.Fatalf("precondition: acceptance stage state after the in-flight fix-up = %s, want running (untouched)", st)
+	}
+	stages[2].State = run.StageStateSucceeded
+	appendRow(&accID, CategoryAcceptanceOutcomeRecorded, map[string]any{"verdict": acceptanceVerdictPassed, "head_sha": h1})
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	env := decodeMergeErr(t, w)
+	if env.Error.Code != mergeCodeAcceptanceStale {
+		t.Errorf("code = %q, want acceptance_stale", env.Error.Code)
+	}
+	d := env.Error.Details
+	if d["stale_basis"] != staleBasisFixupInEpisode {
+		t.Errorf("stale_basis = %v, want %s", d["stale_basis"], staleBasisFixupInEpisode)
+	}
+	if d["verified_head_sha"] != h1 || d["current_head_sha"] != h2 {
+		t.Errorf("heads = %v / %v, want %s / %s", d["verified_head_sha"], d["current_head_sha"], h1, h2)
+	}
+	if d["next_step"] != "fishhawk_retry_stage" || d["acceptance_stage_id"] != accID.String() || d["pr_url"] != mergePR {
+		t.Errorf("details = %v, want next_step fishhawk_retry_stage on stage %s with pr_url", d, accID)
+	}
+	if merger.called != 0 || len(mergeVerdictRows(au)) != 0 {
+		t.Errorf("merger.called=%d rows=%d, want 0/0 (refused before the append and dispatch)", merger.called, len(mergeVerdictRows(au)))
+	}
+}
+
 // TestMergeRun_AcceptanceStale_ReadErrorFailsClosed: an acceptance_reopened
 // read error is a 500 with nothing recorded and nothing dispatched — never an
 // admit. The stage is pending with a `passed` outcome seeded by construction,

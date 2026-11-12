@@ -385,11 +385,51 @@ descendant of the verdict head by construction: the scenario commit, a clean
 ADR-090 rebase merge, a conflict-resolution merge commit and an operator vouch
 commit on top. The code those writes add is covered by the ADR-090 / ADR-142
 exact-head merge-candidate verification, not by re-acceptance. The one write that
-changes validated code, a fix-up push, records `acceptance_reopened` through
-`reopenAcceptanceOnFixupPush`, and `acceptanceStaleRefusal` refuses
-`acceptance_stale` on that record. Branch rewrites belong to the ADR-035 lineage
-and reset-branch paths. The refusal keys on the chain's own record, not a head
-compare.
+changes validated code, a fix-up push, is refused `acceptance_stale` by
+`acceptanceStaleRefusal` on one of two chain records. On a settled stage
+`reopenAcceptanceOnFixupPush` writes `acceptance_reopened`, and an outcome at or
+below it is stale (`stale_basis` `acceptance_reopened`). Otherwise the push's
+own `fixup_pushed` row above the dispatch anchor of the episode that produced
+the outcome makes it stale (`stale_basis` `fixup_in_episode`, #5163; see below).
+Branch rewrites belong to the ADR-035 lineage and reset-branch paths. Both bases
+key on the chain's own record, not a head compare.
+
+**Fix-up during an in-flight episode (#5163).** `reopenAcceptanceOnFixupPush`
+re-opens only a `succeeded` stage, so a fix-up that lands while an episode is
+`dispatched` or `running` writes no `acceptance_reopened` row, and that
+episode's verdict binds its dispatch-anchored PRE-fix-up head.
+`acceptanceFixupInEpisodeRefusal` refuses it. The outcome's anchor is the newest
+stage-scoped `acceptance_dispatched` below the outcome, and it counts only when
+it is above every stage-scoped `acceptance_reopened`: the live-anchor rule
+`acceptanceValidatedHeadSHA` binds with. The arm refuses when the outcome names a
+`head_sha` and a run-wide `fixup_pushed` row sits above that anchor. All
+comparisons are chain sequences. The details add `dispatch_sequence`,
+`fixup_sequence` and `stale_basis` `fixup_in_episode`. `current_head_sha` is the
+INVALIDATING fix-up head, which can differ from the live PR head after a later
+push. `next_step` is `fishhawk_retry_stage` on a settled stage, whose Option C
+arm admits because the recorded head differs from the fix-up head, and
+`fishhawk_await_stage` while the stage is `dispatched` or `running`. That
+message says to retry after awaiting, unless a stage-scoped
+`acceptance_dispatched` above both the outcome and the fix-up is in flight: that
+re-run binds the fix-up head (a triage re-open writes no `acceptance_reopened`
+row), so its verdict clears the refusal. Fishhawk's merge verbs refuse this
+basis; `fishhawk_audit_complete` does not hold it and may already be green. The
+arm also covers a verdict shipped before the stage report with a fix-up after
+it, and an anchored episode whose `acceptance_reopened` append failed or whose
+re-open was refused. The two bases never both hold: when the
+`acceptance_reopened` basis holds, the outcome's anchor sits below the reopen,
+so this arm admits. Pinned by `TestAcceptanceStaleRefusal` (the rows "fix-up inside
+the in-flight episode refuses" through "re-run after reopen admits"),
+`TestAcceptanceStaleRefusal_ReadErrorsFailClosed` (the `acceptance_dispatched`
+and `fixup_pushed` reads fail closed),
+`TestAcceptanceE2E_FixupDuringInFlightEpisode_VerdictStaleUntilReRun` (the
+refusal while the gate alone admits, Option C clearing it, and admission after
+the re-run binds the fix-up head) and
+`TestMergeRun_AcceptanceStale_FixupDuringInFlightEpisode` (409 at
+`POST /v0/runs/{id}/merge`). The gate view's `merge_readiness` and the ADR-093
+merge-queue eligibility leg call the same `acceptanceStaleRefusal` predicate, so
+they refuse on this basis transitively; no surface-specific test row pins the
+new basis there.
 
 **Re-arm ordering (#4804).** `succeedFixupPushStage` runs edge → `fixup_pushed`
 row → `reopenAcceptanceOnFixupPush` → orchestrator advance.
@@ -431,16 +471,21 @@ and leads with the acceptance dispatch: see `mcpserver`
 parked at `awaiting_approval`, are now reachable only on the residual paths
 below.
 
-**Known residuals, none fixed here.**
+**Known residuals.**
 
 - `reopenAcceptanceOnFixupPush` writes nothing when the acceptance stage is
   absent or not `succeeded`, or has no recorded verdict (the #1567 operator
   re-open owns an outcome-less stage). A refused `ReopenAcceptanceStage` (a
   concurrent or re-delivered re-open, a terminal run) or a failed
   `acceptance_reopened` append only WARN-logs and never unwinds the fix-up push.
-  In each case no `acceptance_reopened` row exists, so `acceptanceStaleRefusal`
-  has no record to key on and admits. The invalidation guarantee above holds only
-  when that row is written.
+  When the verdict came from an ANCHORED episode the `fixup_in_episode` basis
+  above still refuses. Still residual, where `acceptanceStaleRefusal` admits: a
+  dispatch-less verdict (a short-circuit, or a restart-stale anchor) with a later
+  fix-up and no `acceptance_reopened` row; a verdict without `head_sha`; a failed
+  `fixup_pushed` append; vouch and conflict-resolution commits, by design; and
+  the `fishhawk_audit_complete` Check Run, which the new basis does not hold, so
+  a forge-side merge outside Fishhawk's merge verbs is not refused (no change
+  from before #5163).
 - A `fixup_pushed` report that finds the implement stage already out of
   `running` takes no edge, so it fires no advance (#4804). A re-open on that path
   still leaves acceptance `pending`, and the #4801 `next_actions` acceptance

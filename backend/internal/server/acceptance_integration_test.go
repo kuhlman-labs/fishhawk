@@ -2068,3 +2068,147 @@ func TestAcceptanceE2E_ScenarioCommitThenFixup_SecondVerdictBindsFixupHead(t *te
 		t.Errorf("acceptanceGateState = %q, want %q", state, acceptanceGatePassed)
 	}
 }
+
+// TestAcceptanceE2E_FixupDuringInFlightEpisode_VerdictStaleUntilReRun is the
+// #5163 cross-layer regression: a fix-up F lands while the first acceptance
+// episode is in flight, so reopenAcceptanceOnFixupPush (which re-opens only a
+// SUCCEEDED stage) writes no acceptance_reopened row, and the episode's verdict
+// binds the dispatch-anchored pre-fix-up head H. It runs on ONE sequenced audit
+// store across orchestrator Advance, the REAL host-dispatch marker, the REAL
+// production reopenAcceptanceOnFixupPush, the signed ship handler, the REAL
+// retry handler (Option C), the REST prompt and the merge-readiness predicates
+// (acceptanceStaleRefusal and acceptanceGateState).
+//
+// The precondition that makes the refusal observable: at step 4 the gate alone
+// reads `passed` and NO acceptance_reopened row exists, so only the
+// fixup_in_episode basis can refuse. Counterfactual: replacing
+// acceptanceStaleRefusal's final `return s.acceptanceFixupInEpisodeRefusal(...)`
+// with `return nil, nil` goes RED at step 4.
+//
+// COVERAGE LIMIT, as in the sibling #4673 e2e: the fixup_pushed row is seeded
+// and the production reopen called directly; the pullrequest.go
+// handler-to-reopen call site is pinned by the
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_* tests.
+func TestAcceptanceE2E_FixupDuringInFlightEpisode_VerdictStaleUntilReRun(t *testing.T) {
+	const (
+		headH  = "1a00000000000000000000000000000000000001" // the implement (PR-open) head
+		headF  = "f100000000000000000000000000000000000f01" // the fix-up head
+		branch = "fishhawk/run-x/stage-y"
+	)
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildLocalAcceptanceSeam(t, exampleBytes)
+	ctx := context.Background()
+	staleRefusal := func() *mergeReadinessRefusal {
+		t.Helper()
+		ref, err := seam.s.acceptanceStaleRefusal(ctx, seam.rr.getRuns[seam.runID], seam.rr.stagesByRunID[seam.runID])
+		if err != nil {
+			t.Fatalf("acceptanceStaleRefusal: %v", err)
+		}
+		return ref
+	}
+	gateState := func() string {
+		t.Helper()
+		state, err := seam.s.acceptanceGateState(ctx, seam.rr.getRuns[seam.runID], seam.rr.stagesByRunID[seam.runID])
+		if err != nil {
+			t.Fatalf("acceptanceGateState: %v", err)
+		}
+		return state
+	}
+
+	// 1) The PR opened at H; Advance parks acceptance; the marker writes anchor #1.
+	seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": headH, "branch": branch})
+	o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+	if _, err := o.Advance(ctx, seam.runID); err != nil {
+		t.Fatalf("orchestrator advance to acceptance: %v", err)
+	}
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("first host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// 2) The fix-up lands F during the in-flight episode. The production reopen
+	//    no-ops on a not-yet-succeeded stage: the #5163 residual's precondition.
+	seam.au.seedEntry(seam.runID, "fixup_pushed", map[string]any{"head_sha": headF, "branch": branch})
+	seam.s.reopenAcceptanceOnFixupPush(ctx, seam.runID, headF)
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceReopened)); n != 0 {
+		t.Fatalf("precondition: acceptance_reopened rows after the in-flight fix-up = %d, want 0", n)
+	}
+	if got := seam.rr.getStages[seam.acceptanceID].State; got == run.StageStateSucceeded {
+		t.Fatalf("precondition: acceptance stage state after the in-flight fix-up = %q, want not succeeded", got)
+	}
+
+	// 3) Verdict #1 ships and binds H (anchor #1, below F): not clamped, but stale.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "first episode, fix-up landed mid-flight"), ""); w.Code != 201 {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != headH {
+		t.Fatalf("first verdict head_sha = %v, want the dispatch-anchored head %q", got, headH)
+	}
+
+	// 4) The gate alone admits, but merge readiness refuses on the
+	//    fixup_in_episode basis.
+	if state := gateState(); state != acceptanceGatePassed {
+		t.Errorf("acceptanceGateState after verdict #1 = %q, want %q (the gate alone admits)", state, acceptanceGatePassed)
+	}
+	ref := staleRefusal()
+	if ref == nil {
+		t.Fatal("acceptanceStaleRefusal after the in-flight fix-up = nil, want acceptance_stale (fixup_in_episode)")
+	}
+	if ref.Code != mergeCodeAcceptanceStale || ref.Details["stale_basis"] != staleBasisFixupInEpisode ||
+		ref.Details["verified_head_sha"] != headH || ref.Details["current_head_sha"] != headF ||
+		ref.Details["next_step"] != "fishhawk_retry_stage" {
+		t.Errorf("refusal = %s basis %v verified %v current %v next %v, want %s %s %s %s fishhawk_retry_stage",
+			ref.Code, ref.Details["stale_basis"], ref.Details["verified_head_sha"], ref.Details["current_head_sha"], ref.Details["next_step"],
+			mergeCodeAcceptanceStale, staleBasisFixupInEpisode, headH, headF)
+	}
+
+	// 5) The named clearing verb works: Option C admits (recorded H != current F)
+	//    and writes the re-open; the refusal now rests on that row.
+	if w := postRetry(t, seam.s, seam.acceptanceID); w.Code != http.StatusOK {
+		t.Fatalf("retry after the in-flight fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceReopened)); n != 1 {
+		t.Fatalf("acceptance_reopened rows after the retry = %d, want 1", n)
+	}
+	if ref := staleRefusal(); ref == nil || ref.Details["stale_basis"] != staleBasisAcceptanceReopened {
+		t.Errorf("acceptanceStaleRefusal after the retry = %+v, want acceptance_stale on the acceptance_reopened basis", ref)
+	}
+
+	// 6) Re-dispatch (anchor #2, above F); the REST prompt serves F.
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("re-dispatch host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	fix := seam.au.snapshot(seam.runID, "fixup_pushed")
+	anchors := seam.au.snapshot(seam.runID, CategoryAcceptanceDispatched)
+	if len(fix) != 1 || len(anchors) != 2 || fix[0].Sequence >= anchors[1].Sequence {
+		t.Fatalf("precondition: want one fix-up below anchor #2; fix-up rows %d, anchor rows %d", len(fix), len(anchors))
+	}
+	w := promptRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	if resp.AcceptanceExpectedHeadSHA != headF {
+		t.Errorf("acceptance_expected_head_sha = %q, want the fix-up head %q", resp.AcceptanceExpectedHeadSHA, headF)
+	}
+
+	// 7) Verdict #2 binds F; merge readiness and the gate admit.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "second episode, post fix-up"), ""); w.Code != 201 {
+		t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != headF {
+		t.Errorf("second verdict head_sha = %v, want the fix-up head %q", got, headF)
+	}
+	if ref := staleRefusal(); ref != nil {
+		t.Errorf("acceptanceStaleRefusal after verdict #2 = %q (%v), want nil (admit)", ref.Code, ref.Details["stale_basis"])
+	}
+	if state := gateState(); state != acceptanceGatePassed {
+		t.Errorf("acceptanceGateState after verdict #2 = %q, want %q", state, acceptanceGatePassed)
+	}
+}

@@ -97,7 +97,9 @@ const mergeOverlapReasonMaxBytes = 2000
 //     entry.
 //   - "acceptance_stale", "forge_approval_required" — merge-readiness
 //     refusals: the recorded acceptance verdict was invalidated by a later
-//     acceptance_reopened (a fix-up push) (#4086), or the ADR-112
+//     fix-up push or re-open (an acceptance_reopened row, #4086, or a
+//     fixup_pushed row above the verdict episode's dispatch anchor, #5163),
+//     or the ADR-112
 //     forge-approval fold did not answer approved at the verified head
 //     (#4619). IMMEDIATE returns (no poll, no verdict row) instead of a
 //     timeout; the Message is the server's verbatim and NextAction names the
@@ -334,13 +336,19 @@ Statuses:
                      fishhawk_fixup_stage (ADR-090 D6: a delegated workflow
                      already routed one bounded fix-up when the result was
                      recorded; otherwise route it yourself).
-  - "acceptance_stale" — the recorded acceptance verdict is stale: acceptance
-                     was re-opened (a fix-up push landed a new head) after the
-                     verdict was recorded, so fishhawk_audit_complete cannot
-                     clear and the merge would only time out. Immediate, no
-                     verdict row; the message names the verified and current
-                     heads. next_action names fishhawk_dispatch_stage (stage
-                     pending), fishhawk_await_stage (re-run in flight) or
+  - "acceptance_stale" — the recorded acceptance verdict is stale: it was
+                     invalidated by a later fix-up push or re-open. On
+                     stale_basis acceptance_reopened (acceptance was re-opened
+                     after the verdict) fishhawk_audit_complete cannot clear and
+                     the merge would only time out. On fixup_in_episode (a
+                     fix-up landed while the verdict's episode was in flight)
+                     the check does not hold the basis and may already be
+                     green; Fishhawk's merge verbs refuse it. Immediate, no
+                     verdict row; the message
+                     names the verified and invalidating heads and
+                     details.stale_basis names the basis. next_action names
+                     fishhawk_dispatch_stage (stage pending),
+                     fishhawk_await_stage (stage dispatched or running) or
                      fishhawk_retry_stage, with the acceptance stage_id.
   - "forge_approval_required" — the ADR-112 forge-approval fold did not
                      answer approved at the verified head: no write-or-higher
@@ -867,7 +875,7 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 		next = &SuggestedAction{
 			Action:       verb,
 			Params:       params,
-			Precondition: "the recorded acceptance verdict was invalidated by a later re-open (acceptance_stale)",
+			Precondition: "the recorded acceptance verdict was invalidated by a later fix-up push or re-open (acceptance_stale)",
 			Consumes:     consumes,
 			Reason:       "re-run acceptance against the current head and await its verdict, then re-invoke fishhawk_merge_run",
 		}

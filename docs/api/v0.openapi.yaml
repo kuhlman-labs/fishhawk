@@ -16233,8 +16233,10 @@ paths:
         when the acceptance gate does not admit a merge
         (`409 acceptance_gate_not_passed`), when the recorded acceptance
         verdict is stale because the acceptance stage was re-opened after it
-        (`409 acceptance_stale`, #4086; an audit read error here is
-        `500 internal_error`, fail-closed), when a decomposed parent has a
+        or a fix-up push landed above the dispatch anchor of the episode that
+        produced it (`409 acceptance_stale`, #4086 / #5163; an audit read
+        error here is `500 internal_error`, fail-closed), when a decomposed
+        parent has a
         slice no successful agent review covers
         (`409 review_coverage_incomplete`, #4219; a read error here is
         `500 internal_error`, fail-closed), when the pull request has a merge
@@ -16616,22 +16618,35 @@ paths:
             re-anchors and starts the pass — watch `merge_candidate_queue` on
             `GET /v0/runs/{run_id}`, dispatch and await the pass once admitted,
             then re-invoke. Records NO verdict row and dispatches nothing.
-            (8) The recorded acceptance verdict is STALE (`acceptance_stale`,
-            #4086): the run's acceptance stage carries a stage-scoped
-            `acceptance_reopened` entry NEWER than the newest
+            (8) The recorded acceptance verdict is STALE (`acceptance_stale`).
+            Two bases, named by `details.stale_basis`, which never both hold.
+            `acceptance_reopened` (#4086): the run's acceptance stage carries a
+            stage-scoped `acceptance_reopened` entry at or above the newest
             `acceptance_outcome_recorded` (a fix-up push or an operator
-            re-open), so the `fishhawk_audit_complete` check would never clear.
-            It keys on the chain's own invalidation record, never on comparing
-            heads, so a vouch commit or an ADR-090 rebase does not trigger it.
-            `details` carry `{run_id, pr_url, acceptance_stage_id,
-            acceptance_stage_state, verified_head_sha, current_head_sha,
-            outcome_sequence, reopened_sequence, next_step}` where
-            `verified_head_sha` is the outcome's `head_sha` (empty when
-            unrecorded), `current_head_sha` the re-open's, and `next_step` is
-            `fishhawk_dispatch_stage` (stage pending), `fishhawk_await_stage`
-            (dispatched/running) or `fishhawk_retry_stage` (settled without a
-            newer verdict). Checked BEFORE the merge seam, so it is reported
-            even where `merge_seam_unconfigured` would follow.
+            re-open), so the `fishhawk_audit_complete` check would never
+            clear. `fixup_in_episode` (#5163): the outcome names a
+            `head_sha` and a `fixup_pushed` entry sits above the dispatch
+            anchor of the episode that produced it (the newest stage-scoped
+            `acceptance_dispatched` below the outcome and above every
+            stage-scoped `acceptance_reopened`): a fix-up landed while that
+            episode was dispatched or running; `fishhawk_audit_complete` does
+            not hold this basis and may already be green, so Fishhawk's merge
+            verbs are what refuse it. Both key on the chain's own
+            records, never on comparing heads, so a vouch commit or an ADR-090
+            rebase does not trigger it. `details` carry `{run_id, pr_url,
+            acceptance_stage_id, acceptance_stage_state, verified_head_sha,
+            current_head_sha, outcome_sequence, stale_basis, next_step}`, plus
+            `reopened_sequence` on the `acceptance_reopened` basis only and
+            `dispatch_sequence` and `fixup_sequence` on the `fixup_in_episode`
+            basis only. `verified_head_sha` is the outcome's `head_sha` (empty
+            when unrecorded). `current_head_sha` is the re-open's head on the
+            `acceptance_reopened` basis; on `fixup_in_episode` it names the
+            INVALIDATING fix-up head, which may differ from the live PR head
+            after a later push. `next_step` is `fishhawk_dispatch_stage`
+            (stage pending), `fishhawk_await_stage` (dispatched/running) or
+            `fishhawk_retry_stage` (settled without a newer verdict). Checked
+            BEFORE the merge seam, so it is reported even where
+            `merge_seam_unconfigured` would follow.
             (9) No qualifying forge approval covers the verified head
             (`forge_approval_required`, ADR-112 / #4619; replaces the #4086
             `approval_dismissed` refusal, which this endpoint no longer
