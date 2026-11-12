@@ -1,6 +1,7 @@
 package run
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -787,4 +788,32 @@ type StageAttemptChangedError struct {
 
 func (e StageAttemptChangedError) Error() string {
 	return fmt.Sprintf("stage %s attempt changed: expected %q, got %q", e.StageID, e.Expected, e.Actual)
+}
+
+// SettleAwaitingChildrenStage is the ONE settle edge every decomposed-parent
+// fan-in settler uses (#4610): the event-driven
+// orchestrator.maybeAdvanceDecomposedParent, the childcompletion sweeper's
+// resolveParent, and the POST /v0/runs/{run_id}/consolidate handler. Each moves
+// the parent implement stage OUT of awaiting_children to `to` (succeeded, or
+// failed-B / failed-C) with this helper rather than the plain TransitionStage.
+//
+// Production postgres gets the row-locked compare-and-swap from
+// awaiting_children, so a concurrent settler that already moved the stage
+// surfaces as StageStateChangedError instead of the same-state no-op SUCCESS
+// transitionStageTx would otherwise return (a plain succeeded->succeeded is
+// accepted by ValidStageTransition, which is what let a race loser write a
+// second children_settled row and Advance concurrently with the winner). The
+// caller treats that error as "already settled by a concurrent settler":
+// it writes no audit row and does not Advance.
+//
+// An in-memory repo without the StageCASTransitioner capability degrades to
+// the plain table-validated TransitionStage (the casTransitionFromObserved /
+// FailStage convention); production always has the capability (the
+// compile-time assertion in postgres.go and the boot-time
+// runRepoCASWiringError refusal).
+func SettleAwaitingChildrenStage(ctx context.Context, repo Repository, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error) {
+	if cas, ok := repo.(StageCASTransitioner); ok {
+		return cas.TransitionStageFrom(ctx, id, StageStateAwaitingChildren, to, completion)
+	}
+	return repo.TransitionStage(ctx, id, to, completion)
 }

@@ -309,6 +309,18 @@ type Orchestrator struct {
 	// layer is run.ConsolidatedPROpenLocker, always taken SECOND.
 	consolidatedPROpenLocks sync.Map
 
+	// fanInSettleLocks is the IN-PROCESS per-parent fan-in settle mutex
+	// (#4610): parent run UUID -> *sync.Mutex, taken by LockFanInSettle around
+	// every decomposed-parent settle's re-read-stage -> IntegrateSlices ->
+	// awaiting_children CAS -> audit critical section, by all three settlers
+	// (maybeAdvanceDecomposedParent, the childcompletion sweeper, the
+	// /consolidate handler). Zero-value usable and DELIBERATELY NEVER EVICTS,
+	// for the same reason consolidatedPROpenLocks does not (an eviction racing
+	// a LoadOrStore could hand two callers different mutexes for one parent):
+	// one mutex per decomposed parent per process lifetime. The cross-process
+	// backstop is run.SettleAwaitingChildrenStage's compare-and-swap.
+	fanInSettleLocks sync.Map
+
 	// fanInHolds counts consecutive decomposed-parent acceptance holds per
 	// parent run (#4785), guarded by fanInHoldMu, so the hold log line carries
 	// a hold_attempt that tells a repeated hold (the verify-only pass never
@@ -324,6 +336,28 @@ type Orchestrator struct {
 // ctx-aware: a waiter parks until the holder's forge calls return.
 func (o *Orchestrator) lockConsolidatedPROpen(runID uuid.UUID) func() {
 	m, _ := o.consolidatedPROpenLocks.LoadOrStore(runID, &sync.Mutex{})
+	// LoadOrStore only ever stores a *sync.Mutex, so the assertion cannot fail.
+	mu, _ := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// LockFanInSettle acquires the in-process fan-in settle mutex for a decomposed
+// parent run and returns its unlock function (#4610). Every settler of a
+// decomposed parent's awaiting_children stage takes it — the event-driven
+// maybeAdvanceDecomposedParent, the childcompletion sweeper (through the
+// fishhawkd adapter) and the POST /v0/runs/{run_id}/consolidate handler — and
+// RE-READS the stage inside it, so a waiter that finds the parent already
+// settled does nothing. Caller MUST invoke the returned unlock exactly once.
+// Not reentrant, and not ctx-aware (the accepted #1936 posture shared with
+// lockConsolidatedPROpen): a waiter parks until the holder's IntegrateSlices
+// forge calls return.
+//
+// Lock order: it is taken FIRST and is NEVER held across Advance, so it never
+// nests with the consolidated-PR-open locks Advance takes. A settler releases
+// it after its settle transition and audit append and only then calls Advance.
+func (o *Orchestrator) LockFanInSettle(runID uuid.UUID) func() {
+	m, _ := o.fanInSettleLocks.LoadOrStore(runID, &sync.Mutex{})
 	// LoadOrStore only ever stores a *sync.Mutex, so the assertion cannot fail.
 	mu, _ := m.(*sync.Mutex)
 	mu.Lock()
@@ -3638,6 +3672,20 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		}
 	}
 
+	// #4610: serialize the settle with the sweeper and the /consolidate
+	// handler. The ListStagesForRun below is the IN-LOCK re-read, so a parent
+	// another settler already resolved has no awaiting_children stage and this
+	// call returns writing nothing. The lock is released (guarded, so every
+	// early return unlocks) after the settle transition + audit and BEFORE
+	// Advance — it is never held across Advance.
+	unlock := o.LockFanInSettle(parentRunID)
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+
 	stages, err := o.Runs.ListStagesForRun(ctx, parentRunID)
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list parent stages for children_settled failed",
@@ -3714,10 +3762,13 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		case conflict != nil:
 			cat := run.FailureB
 			reason := conflict.Detail
-			if _, terr := o.Runs.TransitionStage(ctx, awaitingStage.ID, run.StageStateFailed, &run.StageCompletion{
+			if _, terr := run.SettleAwaitingChildrenStage(ctx, o.Runs, awaitingStage.ID, run.StageStateFailed, &run.StageCompletion{
 				FailureCategory: &cat,
 				FailureReason:   &reason,
 			}); terr != nil {
+				if o.logSettleRaceLost(ctx, parentRunID, awaitingStage.ID, terr) {
+					return
+				}
 				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: transition awaiting_children to failed-B on slice conflict failed",
 					slog.String("parent_run_id", parentRunID.String()),
 					slog.String("stage_id", awaitingStage.ID.String()),
@@ -3730,7 +3781,10 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		}
 	}
 
-	if _, err := o.Runs.TransitionStage(ctx, awaitingStage.ID, target, completion); err != nil {
+	if _, err := run.SettleAwaitingChildrenStage(ctx, o.Runs, awaitingStage.ID, target, completion); err != nil {
+		if o.logSettleRaceLost(ctx, parentRunID, awaitingStage.ID, err) {
+			return
+		}
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: transition awaiting_children stage failed",
 			slog.String("parent_run_id", parentRunID.String()),
 			slog.String("stage_id", awaitingStage.ID.String()),
@@ -3741,12 +3795,35 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 
 	o.emitChildrenSettled(ctx, parentRunID, awaitingStage.ID, anyFailed)
 
+	// Release the settle lock BEFORE Advance (#4610 lock order): Advance takes
+	// the consolidated-PR-open locks, which must never nest inside it. Only
+	// the winning settler reaches here.
+	locked = false
+	unlock()
+
 	if _, err := o.Advance(ctx, parentRunID); err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: advance parent after children settled failed",
 			slog.String("parent_run_id", parentRunID.String()),
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// logSettleRaceLost reports whether err is the awaiting_children CAS refusal
+// (run.StageStateChangedError) a fan-in settler gets when a concurrent settler
+// already moved the parent stage (#4610). On true it logs at INFO; the caller
+// returns WITHOUT its audit row and WITHOUT Advance — the winner owns both.
+func (o *Orchestrator) logSettleRaceLost(ctx context.Context, parentRunID, stageID uuid.UUID, err error) bool {
+	var changed run.StageStateChangedError
+	if !errors.As(err, &changed) {
+		return false
+	}
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: parent already settled by a concurrent settler",
+		slog.String("parent_run_id", parentRunID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.String("actual_state", string(changed.Actual)),
+	)
+	return true
 }
 
 // categoryParentAwaitingChildScopeDecision is the parent-side signal for a

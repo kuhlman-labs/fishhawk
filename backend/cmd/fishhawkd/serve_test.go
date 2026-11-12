@@ -789,6 +789,40 @@ func TestNewChildCompletionSweeper_WiresDispatchBackstop(t *testing.T) {
 	if sw.WaveIntegrate == nil {
 		t.Error("sweeper WaveIntegrate is nil; a dependent wave would never be integrated between waves (#2363)")
 	}
+	if sw.SettleLock == nil {
+		t.Error("sweeper SettleLock is nil; the sweeper would settle a decomposed parent outside the per-parent fan-in settle lock the event-driven settle and /consolidate share (#4610)")
+	}
+}
+
+// TestChildCompletionAdvancer_LockFanInSettle_NilOrchestrator pins the
+// adapter's nil-safe posture (#4610): a nil-orchestrator adapter returns a
+// callable no-op unlock rather than panicking, and a wired one delegates to the
+// orchestrator's real per-parent lock (a second acquisition blocks until the
+// first unlock).
+func TestChildCompletionAdvancer_LockFanInSettle_NilOrchestrator(t *testing.T) {
+	unlock := childCompletionAdvancer{}.LockFanInSettle(uuid.New())
+	if unlock == nil {
+		t.Fatal("nil-orchestrator LockFanInSettle returned a nil unlock")
+	}
+	unlock()
+
+	parent := uuid.New()
+	a := childCompletionAdvancer{o: &orchestrator.Orchestrator{}}
+	first := a.LockFanInSettle(parent)
+	acquired := make(chan func(), 1)
+	go func() { acquired <- a.LockFanInSettle(parent) }()
+	select {
+	case <-acquired:
+		t.Fatal("second LockFanInSettle for the same parent acquired while the first was held; the adapter does not delegate to the orchestrator's lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	first()
+	select {
+	case second := <-acquired:
+		second()
+	case <-time.After(5 * time.Second):
+		t.Fatal("second LockFanInSettle did not acquire after the first unlock")
+	}
 }
 
 // TestCampaignDriverStartDecision is the binding-condition serve-level test

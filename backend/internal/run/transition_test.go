@@ -1,6 +1,7 @@
 package run
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -880,5 +881,122 @@ func TestStageAttemptToken_NilIsEmptyAndRenderingIsUTCNano(t *testing.T) {
 	at := time.Date(2026, 9, 22, 10, 11, 12, 123456000, time.FixedZone("x", 3600))
 	if got, want := StageAttemptToken(&at), "2026-09-22T09:11:12.123456Z"; got != want {
 		t.Errorf("StageAttemptToken(%v) = %q, want %q", at, got, want)
+	}
+}
+
+// settleFake is the run-package vehicle for SettleAwaitingChildrenStage
+// (#4610): one in-memory stage plus a write counter. plainSettleFake carries
+// only the plain TransitionStage (no StageCASTransitioner); casSettleFake adds
+// the row-locked TransitionStageFrom, mirroring postgresRepo's refusal. The
+// plain transition mirrors postgres transitionStageTx: a same-state move is a
+// no-op SUCCESS that writes nothing.
+type plainSettleFake struct {
+	BaseFake
+	stage       *Stage
+	writes      int
+	plainCalls  int
+	casAttempts int
+}
+
+func (f *plainSettleFake) TransitionStage(_ context.Context, _ uuid.UUID, to StageState, _ *StageCompletion) (*Stage, error) {
+	f.plainCalls++
+	if f.stage.State == to {
+		return f.stage, nil
+	}
+	if !ValidStageTransition(f.stage.State, to) {
+		return nil, InvalidTransitionError{Kind: "stage", From: string(f.stage.State), To: string(to)}
+	}
+	f.writes++
+	f.stage.State = to
+	return f.stage, nil
+}
+
+type casSettleFake struct {
+	plainSettleFake
+}
+
+func (f *casSettleFake) TransitionStageFrom(_ context.Context, id uuid.UUID, from, to StageState, _ *StageCompletion) (*Stage, error) {
+	f.casAttempts++
+	if f.stage.State != from {
+		return nil, StageStateChangedError{StageID: id, Expected: from, Actual: f.stage.State}
+	}
+	f.writes++
+	f.stage.State = to
+	return f.stage, nil
+}
+
+// TestSettleAwaitingChildrenStage_CASRefusesDrift is the #4610 root-cause
+// control: a concurrent settler already moved the stage to succeeded, so the
+// loser's settle must REFUSE with StageStateChangedError{awaiting_children,
+// succeeded} and write nothing. With the CAS branch removed the fallback plain
+// TransitionStage sees succeeded->succeeded and returns the same-state SUCCESS
+// postgres returns — the silent loser this closes.
+func TestSettleAwaitingChildrenStage_CASRefusesDrift(t *testing.T) {
+	id := uuid.New()
+	f := &casSettleFake{plainSettleFake{stage: &Stage{ID: id, State: StageStateSucceeded}}}
+	got, err := SettleAwaitingChildrenStage(context.Background(), f, id, StageStateSucceeded, nil)
+	var sce StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("SettleAwaitingChildrenStage on an already-settled stage = (%v, %v), want StageStateChangedError", got, err)
+	}
+	if sce.Expected != StageStateAwaitingChildren || sce.Actual != StageStateSucceeded || sce.StageID != id {
+		t.Errorf("StageStateChangedError = %+v, want {StageID:%s Expected:awaiting_children Actual:succeeded}", sce, id)
+	}
+	if f.writes != 0 || f.plainCalls != 0 {
+		t.Errorf("writes = %d, plain TransitionStage calls = %d; want 0/0 (the CAS must refuse without falling back)", f.writes, f.plainCalls)
+	}
+}
+
+// TestSettleAwaitingChildrenStage_CASTransitionsFromAwaiting pins the winning
+// settle: an awaiting_children stage moves to the target through the CAS.
+func TestSettleAwaitingChildrenStage_CASTransitionsFromAwaiting(t *testing.T) {
+	for _, to := range []StageState{StageStateSucceeded, StageStateFailed} {
+		t.Run(string(to), func(t *testing.T) {
+			id := uuid.New()
+			f := &casSettleFake{plainSettleFake{stage: &Stage{ID: id, State: StageStateAwaitingChildren}}}
+			got, err := SettleAwaitingChildrenStage(context.Background(), f, id, to, nil)
+			if err != nil {
+				t.Fatalf("SettleAwaitingChildrenStage: %v", err)
+			}
+			if got.State != to || f.stage.State != to {
+				t.Errorf("stage state = %s (returned %s), want %s", f.stage.State, got.State, to)
+			}
+			if f.casAttempts != 1 || f.plainCalls != 0 || f.writes != 1 {
+				t.Errorf("cas attempts = %d, plain calls = %d, writes = %d; want 1/0/1", f.casAttempts, f.plainCalls, f.writes)
+			}
+		})
+	}
+}
+
+// TestSettleAwaitingChildrenStage_NonCASRepoFallsBack pins the in-memory
+// degrade: a repo without TransitionStageFrom gets exactly one plain
+// TransitionStage call.
+func TestSettleAwaitingChildrenStage_NonCASRepoFallsBack(t *testing.T) {
+	id := uuid.New()
+	f := &plainSettleFake{stage: &Stage{ID: id, State: StageStateAwaitingChildren}}
+	var repo Repository = f
+	if _, ok := repo.(StageCASTransitioner); ok {
+		t.Fatal("plainSettleFake unexpectedly implements StageCASTransitioner; the fallback vehicle is vacuous")
+	}
+	if _, err := SettleAwaitingChildrenStage(context.Background(), repo, id, StageStateSucceeded, nil); err != nil {
+		t.Fatalf("SettleAwaitingChildrenStage: %v", err)
+	}
+	if f.plainCalls != 1 || f.writes != 1 || f.stage.State != StageStateSucceeded {
+		t.Errorf("plain calls = %d, writes = %d, state = %s; want 1/1/succeeded", f.plainCalls, f.writes, f.stage.State)
+	}
+}
+
+// TestNewPostgresRepository_SatisfiesStageCASTransitioner is the #4610 fail-open
+// guard (approval condition C3): SettleAwaitingChildrenStage silently degrades
+// to the plain same-state-success TransitionStage for a repo WITHOUT the CAS
+// capability, so the production constructor's RETURNED interface value — not
+// just the concrete *postgresRepo the compile-time assertion in postgres.go
+// covers — must carry StageCASTransitioner. A decorator wrapped inside
+// NewPostgresRepository that hides TransitionStageFrom fails here instead of
+// reopening the duplicate-settle race.
+func TestNewPostgresRepository_SatisfiesStageCASTransitioner(t *testing.T) {
+	repo := NewPostgresRepository(nil)
+	if _, ok := repo.(StageCASTransitioner); !ok {
+		t.Fatalf("NewPostgresRepository returned %T, which does not implement StageCASTransitioner; the fan-in settle CAS (#4610) would silently fall back to the plain TransitionStage", repo)
 	}
 }

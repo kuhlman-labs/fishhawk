@@ -14568,10 +14568,13 @@ paths:
         it (502 `slice_integration_error`).
 
         Mechanism: composes the existing orchestrator primitives
-        (`IntegrateSlices` → `TransitionStage` → `Advance`), mirroring the
-        sweeper's `resolveParent`, WITHOUT touching the hot event-driven /
-        sweeper paths. On a clean integration the parent implement stage
-        resolves `succeeded`, a `children_settled` audit entry is appended
+        (`IntegrateSlices` → settle transition → `Advance`), mirroring the
+        sweeper's `resolveParent`, and shares the per-parent fan-in settle
+        lock and the `awaiting_children` compare-and-swap with the
+        event-driven settle and the sweeper (#4610), so the fan-in settles
+        exactly once however the three race. On a clean integration the
+        parent implement stage resolves `succeeded`, a `children_settled`
+        audit entry is appended
         (payload byte-identical to the sweeper's), the consolidated PR opens,
         and the parent review gate dispatches. On a slice merge conflict the
         parent implement stage fails recoverable (category `B`) and a
@@ -14591,6 +14594,13 @@ paths:
         after the sweeper won the race) finds no `awaiting_children` stage and
         returns 409 `not_awaiting_children`; `IntegrateSlices`' own merges are
         idempotent no-ops, so a retry after a surfaced error re-enters cleanly.
+        A call that RACES the server's own settle waits on the settle lock,
+        re-reads the stage, and answers the same 409 `not_awaiting_children`,
+        writing no `slices_integrated` / `children_settled` row and never
+        advancing the parent; the compare-and-swap is the cross-process
+        backstop (a loser in another process can write one extra idempotent
+        `slices_integrated` row, but never `children_settled`). The 409 can
+        arrive while the winner is still opening the consolidated PR.
 
         **Authorization.** Requires `write:runs`. A run-bound MCP token
         (subject `mcp:run:<uuid>`) is refused 403 (`agent_token_forbidden`) —
@@ -14645,7 +14655,9 @@ paths:
         '409':
           description: |
             Fan-in not runnable. One of: `not_awaiting_children` (no implement
-            stage parked in awaiting_children), `children_in_flight` (a child is
+            stage parked in awaiting_children — including a call that lost the
+            settle race to the event-driven settle or the sweeper, #4610),
+            `children_in_flight` (a child is
             still non-terminal; `details.non_terminal_child_run_ids` names
             them), or `children_failed` (a child failed;
             `details.failed_child_run_ids` names them).

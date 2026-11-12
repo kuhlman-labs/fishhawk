@@ -4344,6 +4344,18 @@ func (a childCompletionAdvancer) DispatchChildren(ctx context.Context, parentRun
 	return a.o.DispatchDecomposedChildren(ctx, parentRunID)
 }
 
+// LockFanInSettle satisfies childcompletion.FanInSettleLocker by delegating to
+// the orchestrator's per-parent fan-in settle lock (#4610), so the sweeper
+// serializes its settle with the event-driven settle and the /consolidate
+// handler. A nil orchestrator returns a callable no-op unlock, matching the
+// other adapter methods' nil-safe posture.
+func (a childCompletionAdvancer) LockFanInSettle(parentRunID uuid.UUID) func() {
+	if a.o == nil {
+		return func() {}
+	}
+	return a.o.LockFanInSettle(parentRunID)
+}
+
 // newStageOrchestrator builds the stage orchestrator from cfg. Extracted
 // from runServe so the wiring is unit-testable: in particular the Drive
 // engine that emits the RuleChildrenDispatch run_auto_advanced trail for
@@ -4394,7 +4406,9 @@ func newStageOrchestrator(cfg server.Config, logger *slog.Logger) *orchestrator.
 // between-wave fan-in (#2363) must both be wired non-nil, so neither the
 // fail-closed concurrent-dispatch top-up nor the wave-boundary integration can
 // be silently omitted — a miswiring is invisible to the behavioral tests, which
-// inject those fields directly.
+// inject those fields directly. SettleLock (#4610) is wired for the same
+// reason: a nil one leaves the sweeper settling outside the per-parent fan-in
+// settle lock the event-driven settle and /consolidate share.
 func newChildCompletionSweeper(cfg server.Config, logger *slog.Logger, interval time.Duration) *childcompletion.Sweeper {
 	adapter := childCompletionAdvancer{cfg.Orchestrator}
 	return &childcompletion.Sweeper{
@@ -4404,6 +4418,7 @@ func newChildCompletionSweeper(cfg server.Config, logger *slog.Logger, interval 
 		Integrate:     adapter,
 		WaveIntegrate: adapter,
 		Dispatch:      adapter,
+		SettleLock:    adapter,
 		Logger:        logger,
 		Interval:      interval,
 	}
