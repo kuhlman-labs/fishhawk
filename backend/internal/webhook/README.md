@@ -28,6 +28,17 @@ Sub-topics, with full detail in [`docs/architecture/webhook-dispatcher.md`](../.
 - [In-Fishhawk approval prune](../../../docs/architecture/webhook-dispatcher.md#in-fishhawk-approval-prune) (ADR-018 / #313)
 - [SPA review-stage read-only summary](../../../docs/architecture/webhook-dispatcher.md#spa-review-stage-read-only-summary) (ADR-018 / #314)
 
+### Auto-start runner kind: the host-dispatch park (#4525)
+
+`Dispatcher.RunnerKind` (wired from fishhawkd's `--auto-start-runner-kind`; empty = `github_actions`) is the `runner_kind` `Handle` mints a labeled-issue or `/fishhawk run` run with. Step 6 decides dispatch by a `runnerbackend` registry lookup on that KIND, exactly as the CI-failure retry arm does (not `runnerbackend.Resolver`: a freshly minted run is `runner_kind`-unresolved, and `Resolve` would route it to `github_actions`).
+
+- **Host-dispatched kind (`local`).** No `workflow_dispatch` fires. The first stage transitions `pending -> awaiting_host_dispatch` and stays there until a host dispatches it (`fishhawk_run_stage` / `fishhawk_dispatch_stage`, which also bind the unbound run's `working_dir`). `run_dispatched` records `outcome: awaiting_host_dispatch` plus a `runner_kind` key; the log line is `webhook run parked awaiting host dispatch`. The status comment and board sync fire as for a dispatch.
+- **Park failure.** A `TransitionStage` error is the dispatch outcome: `outcome: dispatch_failed` with the error and `runner_kind`, on the run's chain (`run_id`); no status comment or board sync; `Handle` returns nil. The stage stays `pending`, which the host-dispatch marker still admits.
+- **Default (`github_actions`).** Byte-identical to before: `workflow_dispatch` fires, the first stage moves to `dispatched`, and the `run_dispatched` payload carries no `runner_kind` key.
+- **Out of scope.** The GitLab intake (`gitlab_ci`) and the CI-failure retry arms keep their own kinds and ignore the field; fishhawkd refuses `gitlab_ci` for the flag because this intake cannot fire a GitLab pipeline.
+
+Tests: `auto_start_runner_kind_test.go` (both triggers parked, the default unchanged, the park failure).
+
 ## workflow_run.failure → fail-C (#243)
 
 `webhook.matchWorkflowRun` recognizes `workflow_run.completed` events for `fishhawk.yml` (the configured `DefaultActionsWorkflowFile`) with a non-success conclusion (`failure`, `timed_out`, `cancelled`, `action_required`, `startup_failure`, `stale`). Tagged as `MatchActionRunnerActionFailed` carrying the workflow_run's id + conclusion.
