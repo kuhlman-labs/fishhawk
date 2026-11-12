@@ -20,6 +20,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
@@ -226,6 +227,84 @@ func TestPlanReviewSeed_ExportsSeedNotCheckoutHead(t *testing.T) {
 	started := planReviewStarted(t, au)
 	if started.SeedSHA != shaB || started.SeedUnresolved != "" {
 		t.Errorf("plan_review_started seed = (%q, %q), want (%q, \"\")", started.SeedSHA, started.SeedUnresolved, shaB)
+	}
+}
+
+// TestPlanReviewSeed_RevisedPlanExportsRevisedSeed is the backend half of
+// #4867: a plan-gate revise re-dispatches the plan stage, the runner advances
+// the reused lineage worktree and uploads the ADVANCED tip as the second
+// round's seed. It crosses the seed header → handleShipPlan → plan_generated →
+// resolvePlanReviewSeed → export on that revised second round and pins that
+// the newest round's seed wins with NO export change: round one ships seed A,
+// a REAL handleRevisePlan re-opens the stage, round two ships a changed plan
+// with seed B, and the newest plan_generated.seed_sha, the newest
+// plan_review_started.seed_sha and the exported tree (seeded.txt) all name B.
+func TestPlanReviewSeed_RevisedPlanExportsRevisedSeed(t *testing.T) {
+	repo, shaA, shaB := gitSeedFixture(t)
+	s, sf, au, reviewer, runID, stageID, _ := seedRoundServer(t, repo)
+	priv, _ := sf.issue(t, runID)
+	rr, ok := s.cfg.RunRepo.(*promptRunRepo)
+	if !ok {
+		t.Fatalf("fixture precondition: RunRepo is %T, want *promptRunRepo", s.cfg.RunRepo)
+	}
+
+	// Round one: the first-pass plan at the admission commit A.
+	if w := shipPlanRequestWithSeed(t, s, runID, stageID, priv, validPlanBytes(t), shaA); w.Code != http.StatusCreated {
+		t.Fatalf("round one status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	// The operator revises at the plan gate (a REAL handleRevisePlan). Round
+	// one's background review has drained (waitBackgroundReviews above), so
+	// parking the fixture's stage at the gate races nothing.
+	rr.getStages[stageID].Type = run.StageTypePlan
+	rr.getStages[stageID].State = run.StageStateAwaitingApproval
+	if w := revisePlan(t, s, stageID, `{"constraint":"re-plan on the current base"}`); w.Code != http.StatusOK {
+		t.Fatalf("revise status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Round two: the revised plan, uploaded with the advanced tip B as its seed.
+	var doc map[string]any
+	if err := json.Unmarshal(validPlanBytes(t), &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["summary"] = "revised plan after the plan-gate revise"
+	revised, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPlanRequestWithSeed(t, s, runID, stageID, priv, revised, shaB); w.Code != http.StatusCreated {
+		t.Fatalf("round two status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	gen := planGeneratedPayloads(t, au)
+	if len(gen) != 2 || gen[0]["seed_sha"] != shaA || gen[1]["seed_sha"] != shaB {
+		t.Fatalf("plan_generated = %v, want two rows seeded (%s, %s)", gen, shaA, shaB)
+	}
+	started := auditFakeEntries(au, "plan_review_started")
+	if len(started) != 2 {
+		t.Fatalf("plan_review_started entries = %d, want 2 (one per round)", len(started))
+	}
+	var newest planreview.ReviewStartedPayload
+	if err := json.Unmarshal(started[len(started)-1].Payload, &newest); err != nil {
+		t.Fatalf("decode newest plan_review_started: %v", err)
+	}
+	if newest.SeedSHA != shaB || newest.SeedUnresolved != "" {
+		t.Errorf("newest plan_review_started seed = (%q, %q), want (%q, \"\")", newest.SeedSHA, newest.SeedUnresolved, shaB)
+	}
+	reviewer.mu.Lock()
+	got, files := reviewer.prompt, reviewer.treeFiles
+	reviewer.mu.Unlock()
+	seededPresent := false
+	for _, f := range files {
+		seededPresent = seededPresent || f == "seeded.txt"
+	}
+	if !seededPresent {
+		t.Errorf("revised round's export %v lacks seeded.txt — it exported the first round's seed A, not B", files)
+	}
+	if !strings.Contains(got, treeCommitLine(shaB)) {
+		t.Errorf("revised round's REPOSITORY ACCESS must name the advanced seed %s:\n%s", shaB[:12], got)
 	}
 }
 

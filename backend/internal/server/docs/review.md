@@ -664,6 +664,10 @@ the planner read, and reviewers grounded on it rejected current plans for citing
   it in full. Both keys are plan-only: `implement_review_started` stays byte-identical.
 - **Stale runner.** A runner built before #4436 sends no header, so every plan review runs diff-only
   (`seed_not_recorded`) until `bin/fishhawk-runner` is rebuilt (`scripts/dev post-merge`).
+- **Revised rounds (#4867).** A plan-gate revise re-dispatches the plan stage with `plan_revision`, and the runner
+  fast-forwards the reused lineage worktree to the declared base before capturing the seed, so a revised round's
+  seed is the advanced tip. Newest-row resolution then exports that tip with no export change
+  (`TestPlanReviewSeed_RevisedPlanExportsRevisedSeed`).
 - Tests: `plan_review_seed_test.go` (`TestPlanReviewSeed_*`, `TestPlanSeedHeader_MatchesSharedWireFixture`).
 
 ## Plan-gate scope/constraint pre-check (#658)

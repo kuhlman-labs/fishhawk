@@ -696,7 +696,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, promptHeldCommitReviewObligation, promptSupportsReviewObligationResume, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, promptHeldCommitReviewObligation, promptSupportsReviewObligationResume, promptPlanRevision, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -794,6 +794,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
 		cfg.fixupPolicyIncrement = promptFixupPolicyIncrement
+		cfg.planRevision = promptPlanRevision
 		exemptOpenPR = openPRFromHeldCommit
 		exemptHeldSHA = heldCommitSHA
 		exemptHeldBranch = heldCommitBranch
@@ -2108,6 +2109,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		pinBase(&cfg, advanceBaseRef, advanceTip, baseSourceStandaloneAdvance, logSink)
 	}
 
+	// Plan-revision base advance (#4867). A plan-gate revise re-dispatches the
+	// plan stage onto the lineage worktree it already provisioned, and the
+	// reuse path never moves HEAD, so without this block the revised planner
+	// sat on the admission commit. When the backend serves plan_revision (the
+	// run holds a durable plan_revised constraint) the worktree is
+	// fast-forwarded to the declared base with the SAME advance, refusals and
+	// token custody the standalone implement block above uses. PLACEMENT is
+	// load-bearing: it runs BEFORE capturePlanSeed below, so the shipped seed
+	// (plan_generated.seed_sha, and so the plan review's exported tree) is the
+	// advanced tip the agent reads. No pinBase: a plan stage cuts no commit and
+	// the implement stage takes its own pin. No restore defer: the worktree
+	// stays on the advanced tip for the agent and the later implement stage.
+	// cfg.planRevision is only ever true on the --fetch-prompt path, where
+	// cfg.workingDir already points into the lineage worktree under the lineage
+	// lock, so the operator checkout never moves.
+	if planRevisionBaseAdvanceEligible(stageType, cfg) {
+		planAdvanceToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
+		_, _, planAdvErr := advanceLineageWorktreeToBase(ctx, baseAdvanceRepoDir(cfg), resolveImplementBaseRef(cfg), planAdvanceToken, logSink)
+		if planAdvErr != nil {
+			_, _ = fmt.Fprintf(logSink, `{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", lineageBaseAdvanceFailureReason(planAdvErr), planAdvErr.Error())
+			return exitFailure
+		}
+	}
+
 	// Child wave-base establishment (#1302, supersedes the dormant #1036 /
 	// ADR-041 slice-branch keying): a dependent (wave-N) decomposition slice
 	// must run against its predecessors' INTEGRATED tree, not the operator's
@@ -2259,7 +2284,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 	// Plan seed (#4436): the commit the plan agent's tree sits at as it starts
 	// — after the lineage-worktree relocation of cfg.workingDir and every
-	// pre-agent HEAD move (none of which apply to a plan stage). Gated on the
+	// pre-agent HEAD move. The only one that applies to a plan stage is the
+	// #4867 plan-revision advance above, so a revised plan's seed is the
+	// advanced tip and a first pass's is the provisioned HEAD. Gated on the
 	// predicate the post-invoke plan upload uses, which ships it so the plan
 	// review grounds there. Captured BEFORE the watcher goroutine below starts:
 	// that closure reads cfg, so a later write would race it.
@@ -4174,16 +4201,19 @@ type reasoningEffort struct {
 // heldCommitReviewObligation and supportsReviewObligationResume (ADR-140 (#5047)
 // D9) are the required review a held-commit resume retains and the backend half
 // of its capability handshake; nil and false against a backend predating them.
+// planRevision (#4867) is true only on a plan dispatch of a run holding a
+// durable plan_revised constraint: run() then fast-forwards the reused lineage
+// worktree to the declared base before capturing the plan seed.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, heldCommitReviewObligation *upload.ReviewObligation, supportsReviewObligationResume bool, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, heldCommitReviewObligation *upload.ReviewObligation, supportsReviewObligationResume bool, planRevision bool, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -4198,20 +4228,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, got.HeldCommitReviewObligation, got.SupportsReviewObligationResume, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, got.HeldCommitReviewObligation, got.SupportsReviewObligationResume, got.PlanRevision, nil
 }
 
 func logStartup(w io.Writer, cfg config) {

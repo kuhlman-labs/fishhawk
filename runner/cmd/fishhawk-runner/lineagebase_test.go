@@ -149,6 +149,46 @@ func TestStandaloneBaseAdvanceEligible_Table(t *testing.T) {
 	}
 }
 
+// TestPlanRevisionBaseAdvanceEligible_Table pins the #4867 predicate: ONLY a
+// plan stage served plan_revision, outside a decomposition, advances. The
+// standalone table above stays unmodified as proof the implement predicate did
+// not widen.
+func TestPlanRevisionBaseAdvanceEligible_Table(t *testing.T) {
+	const parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	for _, tc := range []struct {
+		name      string
+		stageType string
+		cfg       config
+		want      bool
+	}{
+		{"revised plan", "plan", config{planRevision: true}, true},
+		{"first-pass plan", "plan", config{}, false},
+		{"decomposed child revised plan", "plan", config{planRevision: true, decomposedFromRunID: parent}, false},
+		{"implement with the signal", "implement", config{planRevision: true}, false},
+		{"plan_review with the signal", "plan_review", config{planRevision: true}, false},
+		{"acceptance with the signal", "acceptance", config{planRevision: true}, false},
+		{"plain implement", "implement", config{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planRevisionBaseAdvanceEligible(tc.stageType, tc.cfg); got != tc.want {
+				t.Errorf("planRevisionBaseAdvanceEligible(%q, %+v) = %v, want %v",
+					tc.stageType, tc.cfg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBaseAdvanceRepoDir pins the worktree a base advance targets: the
+// configured working dir, or the process cwd when none was given.
+func TestBaseAdvanceRepoDir(t *testing.T) {
+	if got := baseAdvanceRepoDir(config{}); got != "." {
+		t.Errorf("baseAdvanceRepoDir(no working dir) = %q, want %q", got, ".")
+	}
+	if got := baseAdvanceRepoDir(config{workingDir: "/tmp/lineage"}); got != "/tmp/lineage" {
+		t.Errorf("baseAdvanceRepoDir(working dir) = %q, want %q", got, "/tmp/lineage")
+	}
+}
+
 // TestLineageBaseAdvanceFailureReason_Table pins the reason mapping: the typed
 // pre-agent refusal gets its own self-diagnosing token, everything else the
 // generic one.

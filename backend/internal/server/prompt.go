@@ -229,6 +229,23 @@ type promptResponse struct {
 	// (runner/internal/upload/upload.go). A tag drift silently restores the
 	// cumulative diff and the parent fix-up fails category B again.
 	FixupPolicyIncrement bool `json:"fixup_policy_increment,omitempty"`
+	// PlanRevision is true ONLY on a PLAN stage dispatch of a run that holds a
+	// durable plan_revised constraint (#4867) — the same loadRevisionConstraint
+	// source the prompt's "Revision constraint" section renders from, so the
+	// section and this signal can never disagree. The runner uses it to
+	// fast-forward the reused lineage worktree to the current declared base
+	// before it captures the plan seed, so a revised planner reads the base as
+	// it stands now instead of the admission commit. The signal is durable:
+	// once a revise recorded a constraint, every later plan dispatch of the run
+	// (a clarification resume, a retry, a plan_scope_retry re-dispatch) carries
+	// it too. Omitted on a first-pass plan and on every non-plan stage
+	// (trigger.RevisionConstraint is loaded only inside the plan branch).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (plan_revision) MUST stay
+	// byte-identical to the runner's upload.FetchedPrompt
+	// (runner/internal/upload/upload.go). A tag drift silently restores the
+	// stale-tree revise and the revised planner reads the admission commit.
+	PlanRevision bool `json:"plan_revision,omitempty"`
 	// FixupApplyPatches is the near-deterministic apply-list (#1165): one
 	// reviewer-emitted unified diff per routed concern, in routing order.
 	// Populated ONLY when Fixup is true AND every routed concern carries a
@@ -2148,6 +2165,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 		FixupPolicyIncrement: fixupPolicyIncrement,
 		FixupApplyPatches:    fixupApplyPatches,
+		PlanRevision:         planRevisionDispatch(trigger.RevisionConstraint),
 	}
 	// Conflict-resolution instruction (#3202). Served as a UNIT: the resolver
 	// already refused a half-populated trigger, so a non-nil value here carries
@@ -2963,6 +2981,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 		FixupPolicyIncrement: fixupPolicyIncrement,
 		FixupApplyPatches:    fixupApplyPatches,
+		PlanRevision:         planRevisionDispatch(trigger.RevisionConstraint),
 	}
 	// Conflict-resolution instruction (#3202). Served as a UNIT: the resolver
 	// already refused a half-populated trigger, so a non-nil value here carries
@@ -7079,6 +7098,16 @@ func (s *Server) appendClarificationAnswersTruncatedAudit(ctx context.Context, r
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// planRevisionDispatch reports whether a prompt serve is a plan-revision
+// dispatch (#4867): the plan branch of each prompt handler loaded a durable
+// plan_revised constraint into trigger.RevisionConstraint. It is the single
+// source of promptResponse.PlanRevision on BOTH prompt endpoints, so the
+// signed prompt and prompt-render can never disagree, and it shares
+// loadRevisionConstraint with the prompt's "Revision constraint" section.
+func planRevisionDispatch(revisionConstraint *string) bool {
+	return revisionConstraint != nil
 }
 
 // loadRevisionConstraint scans the run's plan_revised audit entries

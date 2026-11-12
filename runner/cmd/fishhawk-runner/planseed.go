@@ -14,9 +14,12 @@ import (
 // merge.
 //
 // On a FRESH lineage provision the worktree is `git worktree add --detach
-// <path> <seedSHA>` and no pre-agent step moves HEAD for a plan stage, so this
-// equals lineage_worktree_seeded.seed_sha. On a reused worktree or the
-// --prompt-file path it is still exactly the tree the planner reads.
+// <path> <seedSHA>`, so on a first-pass plan this equals
+// lineage_worktree_seeded.seed_sha. On a plan dispatch of a revised run
+// (plan_revision, #4867) run() first fast-forwards the worktree to the
+// declared base, so the seed is the advanced tip (lineage_worktree_advanced.to,
+// or the base_current head). On a reused worktree or the --prompt-file path it
+// is still exactly the tree the planner reads.
 //
 // repoDir "" means "." (the agent's default CWD). It logs plan_seed_resolved,
 // or on error plan_seed_unresolved and returns "" — it never fails the stage;
