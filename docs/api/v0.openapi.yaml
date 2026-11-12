@@ -6324,6 +6324,60 @@ components:
             `mcp:run:<uuid>` token, or a token without `read:audit`), or the
             read failed (logged; the status read never fails on it). PRESENT
             with `items: []` means computed, none pending.
+        auto_start_refusal:
+          $ref: '#/components/schemas/CampaignAutoStartRefusal'
+          description: |
+            Why the server-side campaign driver cannot auto-start this
+            campaign (E88.1 / #4525). Present only when the driver runs on
+            this deployment, the campaign is `running` and it resolves to a
+            refusal; absent otherwise. Derived on each read from the
+            deployment's auto-start runner kind and the campaign row, never
+            persisted.
+
+    CampaignAutoStartRefusal:
+      type: object
+      description: |
+        A campaign-level auto-start refusal (E88.1 / #4525). The campaign
+        driver resolves an item run's runner kind from the campaign's recorded
+        `runner_kind`, else the deployment's `--auto-start-runner-kind`
+        (default `github_actions`); a `local` resolution inherits the
+        campaign's `working_dir`. While the campaign resolves to a refusal the
+        driver starts none of its items and records one
+        `campaign_auto_start_refused` audit row per campaign and reason.
+        `detail` and `remedy` are server-authored text: they never echo the
+        campaign's `working_dir` or recorded runner kind.
+      required: [reason, runner_kind_source, detail, remedy]
+      properties:
+        reason:
+          type: string
+          enum: [working_dir_unbound, working_dir_not_absolute, campaign_runner_kind_invalid]
+          description: |
+            `working_dir_unbound`: the resolved kind is `local` and the
+            campaign binds no `working_dir`. `working_dir_not_absolute`: the
+            bound `working_dir` is relative. `campaign_runner_kind_invalid`:
+            the recorded `runner_kind` is not a valid runner kind.
+        runner_kind:
+          type: string
+          enum: [github_actions, gitlab_ci, local]
+          description: The resolved runner kind; omitted for `campaign_runner_kind_invalid`.
+        runner_kind_source:
+          type: string
+          enum: [campaign, auto_start_flag]
+          description: |
+            `campaign`: the campaign's recorded `runner_kind` won.
+            `auto_start_flag`: the campaign recorded none, so the deployment's
+            `--auto-start-runner-kind` applied.
+        detail:
+          type: string
+          description: Human-readable explanation of the refusal.
+        remedy:
+          type: string
+          description: |
+            The operator path forward: start each item with
+            `POST /v0/campaigns/{campaign_id}/runs` (the
+            `fishhawk_start_campaign_item_run` tool) passing an absolute
+            `working_dir`, and, where it applies, the `--auto-start-runner-kind`
+            setting.
 
     CampaignPendingAmendments:
       type: object
