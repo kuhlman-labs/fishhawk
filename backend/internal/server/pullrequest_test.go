@@ -21,11 +21,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -921,6 +924,15 @@ func TestShipPullRequest_ChildPushOutcome_DrivesChildTerminal(t *testing.T) {
 	if payload.FilesChangedCount != 3 {
 		t.Errorf("child_pushed audit files_changed_count = %d, want 3 (the reported count must be persisted)", payload.FilesChangedCount)
 	}
+	// #5192 (k): a pushed report with no body leaves pr_body ABSENT from the
+	// row — not null and not "" — so "no slice text" stays a distinct state.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(childPushed.Payload, &fields); err != nil {
+		t.Fatalf("unmarshal child_pushed payload map: %v", err)
+	}
+	if raw, ok := fields[orchestrator.ChildPushedPRBodyKey]; ok {
+		t.Errorf("child_pushed payload carries %s = %s on a body-less report, want the key absent", orchestrator.ChildPushedPRBodyKey, raw)
+	}
 }
 
 // TestShipPullRequest_ChildPushOutcome_IsIdempotent pins the #776 guard: a
@@ -1013,6 +1025,347 @@ func TestShipPullRequest_ChildPushOutcome_RejectsMissingCoords(t *testing.T) {
 		if !strings.Contains(w.Body.String(), "pull_request_invalid") {
 			t.Errorf("body %s: missing pull_request_invalid:\n%s", body, w.Body.String())
 		}
+	}
+}
+
+// childPushedPayloads returns the decoded payloads of every child_pushed row
+// the handler appended for runID, in append order.
+func childPushedPayloads(t *testing.T, au *auditFake, runID uuid.UUID) []json.RawMessage {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []json.RawMessage
+	for _, e := range au.appended {
+		if e.RunID == runID && e.Category == "child_pushed" {
+			out = append(out, e.Payload)
+		}
+	}
+	return out
+}
+
+// TestShipPullRequest_ChildPushOutcome_PersistsPRBody is #5192 (i): a pushed
+// report's optional body survives wire decode (DisallowUnknownFields) and the
+// handler, lands on the child_pushed row as pr_body, and reads back through the
+// orchestrator's own decoder — the key is shared by construction.
+func TestShipPullRequest_ChildPushOutcome_PersistsPRBody(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	const prBody = "## Test plan\n- ran"
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "pushed",
+		"branch":              "fishhawk/run-aaaaaaaa",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 1,
+		"body":                prBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := childPushedPayloads(t, au, runRow.ID)
+	if len(rows) != 1 {
+		t.Fatalf("child_pushed rows = %d, want 1", len(rows))
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(rows[0], &fields); err != nil {
+		t.Fatalf("unmarshal child_pushed payload: %v", err)
+	}
+	if got := fields[orchestrator.ChildPushedPRBodyKey]; got != prBody {
+		t.Errorf("child_pushed %s = %#v, want %q", orchestrator.ChildPushedPRBodyKey, got, prBody)
+	}
+	if got := orchestrator.ChildPushedPRBody(rows[0]); got != prBody {
+		t.Errorf("orchestrator.ChildPushedPRBody(payload) = %q, want %q", got, prBody)
+	}
+}
+
+// TestShipPullRequest_ChildPushOutcome_ClampsPRBody is #5192 (j): a body over
+// MaxChildPushedPRBodyBytes (12 KiB of the two-byte rune é, under the request
+// cap) persists bounded and still valid UTF-8, so the cut never splits a rune.
+func TestShipPullRequest_ChildPushOutcome_ClampsPRBody(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	long := strings.Repeat("é", 6*1024) // 12 KiB, two bytes per rune
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":  "pushed",
+		"branch":   "fishhawk/run-aaaaaaaa",
+		"head_sha": "head-abc",
+		"base_sha": "base-def",
+		"body":     long,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := childPushedPayloads(t, au, runRow.ID)
+	if len(rows) != 1 {
+		t.Fatalf("child_pushed rows = %d, want 1", len(rows))
+	}
+	got := orchestrator.ChildPushedPRBody(rows[0])
+	if len(got) > orchestrator.MaxChildPushedPRBodyBytes {
+		t.Errorf("persisted pr_body = %d bytes, want <= %d", len(got), orchestrator.MaxChildPushedPRBodyBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Error("persisted pr_body is not valid UTF-8 (the clamp split a rune)")
+	}
+	if got == "" {
+		t.Error("persisted pr_body is empty, want the clamped text")
+	}
+}
+
+// prBodyCapturingGitHub records the body of every consolidated PR the
+// orchestrator opens over the consolidate fan-in fake.
+type prBodyCapturingGitHub struct {
+	*consolidateGitHub
+	bodyMu sync.Mutex
+	bodies []string
+}
+
+func (g *prBodyCapturingGitHub) CreatePullRequest(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error) {
+	g.bodyMu.Lock()
+	g.bodies = append(g.bodies, body)
+	g.bodyMu.Unlock()
+	return g.consolidateGitHub.CreatePullRequest(ctx, scope, repo, head, base, title, body)
+}
+
+func (g *prBodyCapturingGitHub) capturedBodies() []string {
+	g.bodyMu.Lock()
+	defer g.bodyMu.Unlock()
+	return append([]string(nil), g.bodies...)
+}
+
+// TestShipPullRequest_ChildPushOutcome_FinalChildBodyReachesConsolidatedPR is
+// the #5192 R1 cross-boundary test (u). The LAST slice's signed pushed report
+// drives succeedChildPushStage → child Advance → maybeAdvanceDecomposedParent
+// → slice integration → parent Advance → openConsolidatedPRLocked → audit read
+// → render → forge create, and the consolidated PR body must carry that slice's
+// own Test plan and Notes. It holds only because the child_pushed row is
+// appended BEFORE the advance fires: advancing first opens the PR while slice 1
+// has no row, so its text is omitted. Slice 0's pre-seeded text renders either
+// way, isolating the ordering as the only cause.
+func TestShipPullRequest_ChildPushOutcome_FinalChildBodyReachesConsolidatedPR(t *testing.T) {
+	gh := &prBodyCapturingGitHub{consolidateGitHub: newConsolidateGitHub()}
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	sf := newSigningFake()
+
+	parent := rr.seedRun()
+	inst := int64(42)
+	parent.InstallationID = &inst
+	rr.seedStage(parent.ID, 0, run.StageStateSucceeded).Type = run.StageTypePlan
+	rr.seedStage(parent.ID, 1, run.StageStateAwaitingChildren).Type = run.StageTypeImplement
+	review := rr.seedStage(parent.ID, 2, run.StageStatePending)
+	review.Type = run.StageTypeReview
+	review.ExecutorKind = run.ExecutorHuman
+
+	seedChild := func(idx int, state run.State) *run.Run {
+		c := rr.seedRun()
+		c.Repo = parent.Repo
+		c.DecomposedFrom = &parent.ID
+		c.SliceIndex = &idx
+		c.State = state
+		return c
+	}
+	slice0 := seedChild(0, run.StateSucceeded)
+	slice0Impl := rr.seedStage(slice0.ID, 0, run.StageStateSucceeded)
+	slice0Impl.Type = run.StageTypeImplement
+	seed0, _ := json.Marshal(map[string]any{
+		"run_id":                          slice0.ID.String(),
+		"stage_id":                        slice0Impl.ID.String(),
+		"head_sha":                        "head-slice-0",
+		orchestrator.ChildPushedPRBodyKey: "## Test plan\n- slice-0 ran",
+	})
+	if _, err := au.AppendChained(t.Context(), audit.ChainAppendParams{
+		RunID: slice0.ID, StageID: &slice0Impl.ID, Timestamp: time.Now().UTC(),
+		Category: "child_pushed", Payload: seed0,
+	}); err != nil {
+		t.Fatalf("seed slice 0 child_pushed: %v", err)
+	}
+
+	slice1 := seedChild(1, run.StateRunning)
+	slice1Impl := rr.seedStage(slice1.ID, 0, run.StageStateRunning)
+	slice1Impl.Type = run.StageTypeImplement
+	slice1Impl.RequiresApproval = false // gateless: the report's edge fires the advance
+
+	arts := newFakeArtifactRepo()
+	o := &orchestrator.Orchestrator{Runs: rr, GitHub: gh, Audit: au, Artifacts: arts, DefaultBranch: defaultbranch.Static("main")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: arts, SigningRepo: sf, Orchestrator: o})
+	o.ConsolidatedReview = nil // out of scope; would otherwise run during Advance
+
+	priv, _ := sf.issue(t, slice1.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "pushed",
+		"branch":              "fishhawk/run-" + parent.ID.String()[:8] + "/slice-1",
+		"head_sha":            "head-slice-1",
+		"base_sha":            "basesha",
+		"files_changed_count": 2,
+		"body":                "## Test plan\n- slice-1 hand-run RED: X\n\n## Notes\n- slice-1 note",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, slice1.ID, slice1Impl.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	bodies := gh.capturedBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("CreatePullRequest calls = %d, want exactly 1 (the final child's report must cascade into the consolidated PR open)", len(bodies))
+	}
+	for _, want := range []string{"### Slice 1", "slice-1 hand-run RED: X", "slice-1 note", "### Slice 0", "slice-0 ran"} {
+		if !strings.Contains(bodies[0], want) {
+			t.Errorf("consolidated PR body missing %q (the final child's child_pushed row must exist before the cascade):\n%s", want, bodies[0])
+		}
+	}
+
+	// Slice 1's child_pushed row precedes the parent's consolidated_pr_opened row.
+	au.mu.Lock()
+	childAt, openedAt := -1, -1
+	for i, e := range au.appended {
+		switch {
+		case e.RunID == slice1.ID && e.Category == "child_pushed" && childAt < 0:
+			childAt = i
+		case e.RunID == parent.ID && e.Category == "consolidated_pr_opened" && openedAt < 0:
+			openedAt = i
+		}
+	}
+	au.mu.Unlock()
+	if childAt < 0 || openedAt < 0 || childAt > openedAt {
+		t.Errorf("audit order: slice 1 child_pushed at %d, parent consolidated_pr_opened at %d; want the child row first", childAt, openedAt)
+	}
+}
+
+// seedAppendFailureChild seeds a decomposed child (DecomposedFrom set, so the
+// variant edge takes its isChild branch) whose gateless implement stage is its
+// only stage, under a parent whose other slice is still running, so the child's
+// completion cascade parks the parent and opens no PR.
+func seedAppendFailureChild(rr *orchestratorRepo) (child *run.Run, impl *run.Stage) {
+	parent := rr.seedRun()
+	rr.seedStage(parent.ID, 0, run.StageStateAwaitingChildren).Type = run.StageTypeImplement
+	other := rr.seedRun()
+	other.DecomposedFrom = &parent.ID
+	otherIdx := 0
+	other.SliceIndex = &otherIdx
+	child = rr.seedRun()
+	child.DecomposedFrom = &parent.ID
+	idx := 1
+	child.SliceIndex = &idx
+	impl = rr.seedStage(child.ID, 0, run.StageStateRunning)
+	impl.Type = run.StageTypeImplement
+	impl.RequiresApproval = false
+	return child, impl
+}
+
+func childPushBodyWithText(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/slice-1",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 1,
+		"body":                "## Test plan\n- ran",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestShipPullRequest_ChildPushOutcome_AppendFailureStillAdvances is #5192 (v):
+// with the advance deferred past the child_pushed append, an append failure
+// must still fire the advance — the edge is already committed — so the child
+// stage AND the child run settle instead of stranding in running.
+func TestShipPullRequest_ChildPushOutcome_AppendFailureStillAdvances(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	child, impl := seedAppendFailureChild(rr)
+	au.appendErrCategory = "child_pushed"
+
+	priv, _ := sf.issue(t, child.ID)
+	if w := shipPRRequest(t, s, child.ID, impl.ID, priv, childPushBodyWithText(t), ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(childPushedPayloads(t, au, child.ID)); n != 0 {
+		t.Fatalf("child_pushed rows = %d, want 0 (the injected append failure must drop the row)", n)
+	}
+	gotStage, err := rr.GetStage(t.Context(), impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if gotStage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", gotStage.State)
+	}
+	gotRun, err := rr.GetRun(t.Context(), child.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State != run.StateSucceeded {
+		t.Errorf("child run.State = %q, want succeeded (the advance must fire even when the child_pushed append fails)", gotRun.State)
+	}
+}
+
+// TestShipPullRequest_ChildPushOutcome_RedeliveryAfterAppendFailure is #5192
+// (v2). It pins the EXISTING re-delivery path, not a new control: after (v),
+// an identical re-delivery finds no child_pushed row, takes
+// decideVariantStageAfterReport's settled-stage branch (no second edge, a no-op
+// advance), and backfills the missing row with its pr_body.
+func TestShipPullRequest_ChildPushOutcome_RedeliveryAfterAppendFailure(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	child, impl := seedAppendFailureChild(rr)
+	au.appendErrCategory = "child_pushed"
+
+	priv, _ := sf.issue(t, child.ID)
+	body := childPushBodyWithText(t)
+	if w := shipPRRequest(t, s, child.ID, impl.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("first delivery: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	firstStage, err := rr.GetStage(t.Context(), impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	firstRun, err := rr.GetRun(t.Context(), child.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+
+	au.appendErrCategory = ""
+	if w := shipPRRequest(t, s, child.ID, impl.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("re-delivery: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := childPushedPayloads(t, au, child.ID)
+	if len(rows) != 1 {
+		t.Fatalf("child_pushed rows after re-delivery = %d, want exactly 1 (the re-delivery backfills the row)", len(rows))
+	}
+	if got := orchestrator.ChildPushedPRBody(rows[0]); got != "## Test plan\n- ran" {
+		t.Errorf("backfilled pr_body = %q, want the re-delivered body", got)
+	}
+	gotStage, err := rr.GetStage(t.Context(), impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if gotStage.State != firstStage.State || !gotStage.UpdatedAt.Equal(firstStage.UpdatedAt) {
+		t.Errorf("stage after re-delivery = %q (updated %v), want unchanged %q (updated %v): no second transition", gotStage.State, gotStage.UpdatedAt, firstStage.State, firstStage.UpdatedAt)
+	}
+	gotRun, err := rr.GetRun(t.Context(), child.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State != firstRun.State || !gotRun.UpdatedAt.Equal(firstRun.UpdatedAt) {
+		t.Errorf("child run after re-delivery = %q (updated %v), want unchanged %q (updated %v)", gotRun.State, gotRun.UpdatedAt, firstRun.State, firstRun.UpdatedAt)
 	}
 }
 

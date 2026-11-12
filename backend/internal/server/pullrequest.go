@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -163,7 +164,12 @@ type pullRequestBody struct {
 	// all children settle, per ADR-032). The PR fields (pr_number/pr_url) are
 	// absent; branch/head_sha/base_sha carry the pushed commit. The handler
 	// drives the child stage's terminal transition its push_to_shared_branch
-	// trace gate left in `running` without creating a PR artifact.
+	// trace gate left in `running` without creating a PR artifact. It may
+	// carry the optional Body (#5192): the slice agent's footer-free PR text,
+	// persisted (bounded to orchestrator.MaxChildPushedPRBodyBytes) as pr_body
+	// on the child_pushed entry and spliced into the consolidated PR body.
+	// Absent stays absent; no validate() rule, since a 400 would strand the
+	// child stage in `running` over optional text.
 	//
 	// When Outcome=="fixup_pushed" the body is a fix-up re-dispatch
 	// push-success report (#794): the fix-up committed + pushed onto the
@@ -1613,12 +1619,25 @@ func (s *Server) variantRefusedOnSettledStage(ctx context.Context, runID uuid.UU
 // succeedChildPushStage handles the child-push success variant (#771): a
 // decomposed child committed + pushed onto the shared parent branch (no PR)
 // after the trace gate left the child implement stage in `running`. It drives
-// the running → terminal transition via advanceVariantStageAfterReport (a no-op
+// the running → terminal transition via decideVariantStageAfterReport (a no-op
 // if the stage already advanced — e.g. an older runner that never gated),
-// writes a child_pushed audit entry pinning the shared-branch commit into the
-// chain, fires the sticky status comment, and responds 200. No PR artifact,
-// no pull_request_url backfill — the parent run opens the consolidated PR
-// after all children settle.
+// writes a child_pushed audit entry pinning the shared-branch commit (and the
+// slice agent's PR text, #5192) into the chain, fires the sticky status
+// comment, and responds 200. No PR artifact, no pull_request_url backfill — the
+// parent run opens the consolidated PR after all children settle.
+//
+// Order (#5192, the #4804 split succeedFixupPushStage uses): idempotency guard
+// → lineage guard → edge → child_pushed row → orchestrator advance → notify →
+// respond. The edge is decided and committed first, so a refused claim writes
+// no row and fires no advance. Only the advance is deferred past the row: the
+// last-settling child's synchronous Advance cascades through
+// maybeAdvanceDecomposedParent into the parent's consolidated-PR open, which
+// reads this row's pr_body, so advancing first would open the consolidated PR
+// without this slice's Test plan and Notes. An append failure WARNs and the
+// advance still fires — the edge is already committed, and a stranded child
+// is worse than a consolidated PR missing one slice's text. A re-delivery after
+// such a failure finds no row, takes decideVariantStageAfterReport's
+// settled-stage branch (no second edge, a no-op advance) and backfills the row.
 func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
@@ -1664,11 +1683,12 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	if !s.advanceVariantStageAfterReport(w, r, runID, stage, pr, respondPushed) {
+	proceed, advance := s.decideVariantStageAfterReport(w, r, runID, stage, pr, respondPushed)
+	if !proceed {
 		return
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	auditFields := map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
 		"branch":              pr.Branch,
@@ -1676,7 +1696,14 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 		"base_sha":            pr.BaseSHA,
 		"files_changed_count": pr.FilesChangedCount,
 		"auth_method":         authMethod,
-	})
+	}
+	// #5192: the slice agent's footer-free PR text, bounded for the chain and
+	// spliced into the parent's consolidated PR body. Only a non-empty body is
+	// written, so "no text" stays an ABSENT key rather than an empty string.
+	if pr.Body != "" {
+		auditFields[orchestrator.ChildPushedPRBodyKey] = orchestrator.ClampChildPushedPRBody(pr.Body)
+	}
+	auditPayload, _ := json.Marshal(auditFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,
@@ -1692,6 +1719,12 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	}
+
+	// #5192: the deferred advance fires only AFTER the row, so the cascade into
+	// the parent's consolidated-PR open reads this slice's pr_body. Fired
+	// unconditionally: the edge is already committed, so an append failure must
+	// not strand the child. A no-op unless this report won a gateless edge.
+	advance()
 
 	s.notifyStatusUpdate(r.Context(), runID, "child_pushed")
 
