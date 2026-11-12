@@ -510,6 +510,44 @@ unnecessary.
   `acceptanceBody.validate` still rejects any wire verdict other than
   `passed`/`failed`, so a validator cannot forge it, and an already-recorded
   `passed` keeps its exact prior meaning (no migration, no in-flight breakage).
+- **Decomposed-parent fan-in verify hold (#4846).** For a top-level decomposed
+  parent's PENDING acceptance stage, `TryShortCircuitAcceptance` consults the
+  shared read-only `orchestrator.DecomposedParentFanInHold` (the arms Advance
+  evaluates, through `decideFanInAcceptance`) under the admission lock and
+  before any mutation. A HELD stage (the consolidated head's fan-in verify is
+  unsettled, or the consolidated PR is not opened yet) is the normal
+  `short_circuited: false` no-op: nothing is written, no PR is opened and no
+  consolidated review fires. A released stage short-circuits as before, and its
+  verdict carries the judged consolidated head as `head_sha`. An
+  `awaiting_host_dispatch` stage skips the hold, because Advance parked it there
+  only after the hold released. The host-dispatch marker, not this walk, is the
+  authority that refuses the spawn (`409 fan_in_verify_pending`, see
+  [dispatch.md](dispatch.md) § "Decomposed-parent fan-in verify hold refusal").
+  - **Record-only-on-short-circuit order (R3/R9).** A fail-open release (#4792:
+    no fan-in verify consulted) appends its `fan_in_verify_unavailable` row
+    through a before-settle callback the core runs only inside a matched
+    predicate, before the walk's first transition and so before the verdict. A
+    plan that matches no predicate records nothing here; the marker records
+    that release when it admits the spawn. "Row before verdict" holds only when
+    the append succeeds: `recordFanInVerifyUnavailable` WARN-logs and swallows
+    an append failure (the #4792 posture) and the verdict is still recorded.
+  - **Errors (approval condition C4).** A children-read or hook error answers
+    `500 internal_error` with the stage untouched, like every
+    `TryShortCircuitAcceptance` error; the admission path never answers
+    `dependency_check_failed`.
+  - **Forge compare under the walk timeout (approval condition C7).** Admission
+    now makes the hook's forge compare inside `acceptanceAdmissionWalkTimeout`
+    (the children read and the compare run on the pre-mutation context). The MCP
+    dispatch verbs fail OPEN on a 5xx admission answer and proceed to the
+    host-dispatch marker, which still refuses an unsettled parent's pending
+    acceptance, so a compare outage cannot spawn a held stage.
+  - **Option C sees a recorded head.** A decomposed parent's short-circuit
+    verdict now carries `head_sha` (the live consolidated head the hook
+    compared). Option C's head-aware retry (`latestAcceptanceVerdictHead`) reads
+    it like any validator verdict's head; where it differs from the acceptance
+    ledger head (a vouched advance, which `FanInVerifySettled` WARN-logs, #4874)
+    the retry treats the verdict as stale and admits an operator re-open, which
+    is benign. Ordinary short-circuit payloads carry no `head_sha`, unchanged.
 - **Admission ↔ host-dispatch fence (#1936):** the whole read → admissibility-check
   → walk in `TryShortCircuitAcceptance` runs under a per-stage in-process mutex
   (`orchestrator.LockStageAdmission`) that `host_dispatch.go::handleHostDispatchStage`

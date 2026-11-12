@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -2945,5 +2948,546 @@ func TestHostDispatch_SupersededMergeCandidatePass_NonImplementStageInert(t *tes
 	}
 	if live := f.live(t); live == nil || live.sequence != f.seqA {
 		t.Errorf("live = %+v, want the implement stage's trigger A untouched", live)
+	}
+}
+
+// --- Decomposed-parent fan-in verify hold refusal (#4846) --------------------
+
+// fivpHook is a test-local FanInVerifyGate: it answers a scripted answer or
+// error and counts its calls. When inHook is set, its FIRST call signals it
+// and blocks on release (the (g3) barrier).
+type fivpHook struct {
+	mu      sync.Mutex
+	calls   int
+	answer  orchestrator.FanInVerifyAnswer
+	err     error
+	inHook  chan struct{}
+	release chan struct{}
+}
+
+func (h *fivpHook) FanInVerifySettled(context.Context, uuid.UUID, string, string) (orchestrator.FanInVerifyAnswer, error) {
+	h.mu.Lock()
+	h.calls++
+	first := h.calls == 1
+	h.mu.Unlock()
+	if first && h.inHook != nil {
+		close(h.inHook)
+		<-h.release
+	}
+	return h.answer, h.err
+}
+
+func (h *fivpHook) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls
+}
+
+// fivpReview counts DispatchConsolidatedReview calls; the refusal must fire
+// none (R7).
+type fivpReview struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *fivpReview) DispatchConsolidatedReview(context.Context, uuid.UUID, string, string) {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+}
+
+func (c *fivpReview) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// limitOneListRunsErrRepo fails only the Limit-1 children read (the hold's
+// decomposedParentForAcceptance and the nil-Orchestrator arm), so the #4080
+// guard's paginated children read before it still succeeds and the fixture
+// isolates the fan-in hold's read error.
+type limitOneListRunsErrRepo struct {
+	*orchestratorRepo
+	err error
+}
+
+func (r *limitOneListRunsErrRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	if f.Limit == 1 {
+		return nil, r.err
+	}
+	return r.orchestratorRepo.ListRuns(ctx, f)
+}
+
+// fivpFixture is the (g) fixture: the #4080 accDispatchFixture (a local
+// top-level decomposed parent with two succeeded children, a GitHub client
+// and an installation id) with a newest slices_integrated covering EVERY
+// child so #4080 admits, a stamped consolidated PR, no deploy or failed stage
+// ahead, and test-local hook and consolidated-review fakes on a real
+// Orchestrator. With the #4846 refusal absent, a pending acceptance stage is
+// CAS'd to dispatched.
+type fivpFixture struct {
+	*accDispatchFixture
+	o      *orchestrator.Orchestrator
+	hook   *fivpHook
+	review *fivpReview
+	impl   *run.Stage
+}
+
+func seedFanInVerifyPendingFixture(t *testing.T, accState run.StageState, answer orchestrator.FanInVerifyAnswer) *fivpFixture {
+	t.Helper()
+	f := seedAccDispatchFixture(t, accState)
+	seedSlicesIntegrated(t, f.au, f.parent.ID, waveConsolidatedBranch, []string{f.a.ID.String(), f.b.ID.String()})
+	prURL := "https://github.com/x/y/pull/7"
+	f.rr.mu.Lock()
+	f.parent.PullRequestURL = &prURL
+	f.parent.RunnerKind = run.RunnerKindLocal
+	f.parent.RunnerKindResolved = true
+	f.rr.mu.Unlock()
+	o := f.s.cfg.Orchestrator
+	hook := &fivpHook{answer: answer}
+	review := &fivpReview{}
+	o.FanInVerify = hook
+	o.ConsolidatedReview = review
+	o.DefaultBranch = defaultbranch.Static("main")
+	var impl *run.Stage
+	for _, st := range f.rr.stagesByRunID[f.parent.ID] {
+		if st.Type == run.StageTypeImplement {
+			impl = st
+		}
+	}
+	if impl == nil {
+		t.Fatal("fixture has no implement stage")
+	}
+	return &fivpFixture{accDispatchFixture: f, o: o, hook: hook, review: review, impl: impl}
+}
+
+func (f *fivpFixture) appends() int {
+	f.au.mu.Lock()
+	defer f.au.mu.Unlock()
+	return len(f.au.entries)
+}
+
+func (f *fivpFixture) unavailableRows(t *testing.T) int {
+	t.Helper()
+	rows, err := f.au.ListForRunByCategory(context.Background(), f.parent.ID, orchestrator.CategoryFanInVerifyUnavailable)
+	if err != nil {
+		t.Fatalf("list fan_in_verify_unavailable: %v", err)
+	}
+	return len(rows)
+}
+
+func (f *fivpFixture) state(t *testing.T, id uuid.UUID) run.StageState {
+	t.Helper()
+	st, err := f.rr.GetStage(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	return st.State
+}
+
+func (f *fivpFixture) setImplState(st run.StageState) {
+	f.rr.mu.Lock()
+	f.impl.State = st
+	f.rr.mu.Unlock()
+}
+
+// fivpError decodes a 4xx/5xx envelope's code, message and details.
+func fivpError(t *testing.T, w *httptest.ResponseRecorder) (code, message string, details map[string]any) {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope %s: %v", w.Body.String(), err)
+	}
+	return env.Error.Code, env.Error.Message, env.Error.Details
+}
+
+const fivpHead = "consolhead4846"
+
+// TestHostDispatch_DecomposedParentAcceptance_FanInVerifyPending is (g): the
+// marker refuses a held PENDING decomposed-parent acceptance stage with 409
+// fan_in_verify_pending, read-only, and admits every release.
+//
+// MECHANISM: the fixture clears every earlier guard (#4080 coverage, no deploy
+// or failed stage ahead, the pending arm), so with the refusal absent the
+// unsettled rows answer 200 and dispatch the stage (CF3). Widening the guard to
+// awaiting_host_dispatch turns the awaiting row into a 409 (CF7).
+func TestHostDispatch_DecomposedParentAcceptance_FanInVerifyPending(t *testing.T) {
+	unsettled := orchestrator.FanInVerifyAnswer{HeadSHA: fivpHead}
+
+	t.Run("pending_unsettled_implement_succeeded", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		before, accBefore := f.appends(), *f.acc
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409 fan_in_verify_pending:\n%s", w.Code, w.Body.String())
+		}
+		code, msg, details := fivpError(t, w)
+		if code != "dispatch_not_admissible" || details["reason"] != hostDispatchReasonFanInVerifyPending {
+			t.Errorf("code/reason = %q/%v, want dispatch_not_admissible/fan_in_verify_pending", code, details["reason"])
+		}
+		want := map[string]any{
+			"stage_id": f.acc.ID.String(), "hold_cause": orchestrator.FanInHoldCauseUnsettled,
+			"consolidated_branch": "fishhawk/run-" + f.parent.ID.String()[:8] + "-consolidated", "head_sha": fivpHead,
+			"implement_stage_id": f.impl.ID.String(), "implement_state": string(run.StageStateSucceeded),
+		}
+		for k, v := range want {
+			if details[k] != v {
+				t.Errorf("details[%s] = %v, want %v", k, details[k], v)
+			}
+		}
+		for _, verb := range []string{"fishhawk_rebase_run_branch", "fishhawk_rerun_review", "not_queued"} {
+			if !strings.Contains(msg, verb) {
+				t.Errorf("message must name %q: %q", verb, msg)
+			}
+		}
+		st, _ := f.rr.GetStage(context.Background(), f.acc.ID)
+		if !reflect.DeepEqual(*st, accBefore) {
+			t.Errorf("acceptance stage changed under a refusal (no CAS allowed):\n got %+v\nwant %+v", *st, accBefore)
+		}
+		if n := f.appends() - before; n != 0 {
+			t.Errorf("audit appends = %d, want 0 (the refusal records nothing)", n)
+		}
+		if n := f.review.count(); n != 0 {
+			t.Errorf("DispatchConsolidatedReview calls = %d, want 0", n)
+		}
+		if n := f.hook.count(); n != 1 {
+			t.Errorf("hook calls = %d, want exactly 1", n)
+		}
+	})
+
+	t.Run("pending_unsettled_implement_reopened", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		f.setImplState(run.StageStatePending)
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		_, msg, details := fivpError(t, w)
+		if details["implement_state"] != string(run.StageStatePending) || !strings.Contains(msg, "dispatch the IMPLEMENT stage") {
+			t.Errorf("implement_state %v / message %q, want pending and the implement-dispatch remedy", details["implement_state"], msg)
+		}
+		if got := f.state(t, f.impl.ID); got != run.StageStatePending {
+			t.Errorf("implement state = %q, want pending (never parked by the refusal)", got)
+		}
+		if n := f.review.count(); n != 0 {
+			t.Errorf("DispatchConsolidatedReview calls = %d, want 0", n)
+		}
+	})
+
+	t.Run("pending_consolidated_pr_not_opened", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		f.rr.mu.Lock()
+		f.parent.PullRequestURL = nil
+		f.rr.mu.Unlock()
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		_, msg, details := fivpError(t, w)
+		if details["hold_cause"] != orchestrator.FanInHoldCauseConsolidatedPRNotOpened || !strings.Contains(msg, "fishhawk_cancel_run") {
+			t.Errorf("hold_cause %v / message %q, want consolidated_pr_not_opened naming fishhawk_cancel_run", details["hold_cause"], msg)
+		}
+		if n := f.hook.count(); n != 0 {
+			t.Errorf("hook calls = %d, want 0 (the PR-not-opened hold consults no hook)", n)
+		}
+	})
+
+	t.Run("awaiting_host_dispatch_unsettled_admitted", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStateAwaitingHostDispatch, unsettled)
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (awaiting_host_dispatch is the R1 carve-out):\n%s", w.Code, w.Body.String())
+		}
+		if resp := decodeHostDispatch(t, w); !resp.Transitioned {
+			t.Error("transitioned = false, want true")
+		}
+		if n := f.hook.count(); n != 0 {
+			t.Errorf("hook calls = %d, want 0 on the awaiting_host_dispatch arm", n)
+		}
+	})
+
+	t.Run("pending_settled_admitted", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, orchestrator.FanInVerifyAnswer{Settled: true, HeadSHA: fivpHead})
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if got := f.state(t, f.acc.ID); got != run.StageStateDispatched {
+			t.Errorf("acceptance state = %q, want dispatched", got)
+		}
+		if n := f.unavailableRows(t); n != 0 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want 0 on a verified release", n)
+		}
+	})
+
+	forgeNotWired := orchestrator.FanInVerifyAnswer{Settled: true,
+		UnavailableReason: orchestrator.FanInVerifyUnavailableForgeNotWired, UnavailableDetail: "github client not wired"}
+
+	t.Run("pending_forge_not_wired_records_on_admit", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, forgeNotWired)
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if n := f.unavailableRows(t); n != 1 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want exactly 1 on the admitted fail-open release", n)
+		}
+	})
+
+	t.Run("released_then_refused_by_later_hold_records_nothing", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, forgeNotWired)
+		f.s.cfg.HostAdmissionHold = &fakeAdmissionHold{held: true, reason: "memory critical"}
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusConflict || decodeError(t, w) != "host_memory_pressure" {
+			t.Fatalf("status = %d, want 409 host_memory_pressure:\n%s", w.Code, w.Body.String())
+		}
+		if n := f.unavailableRows(t); n != 0 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want 0: a request a later hold refuses was never admitted (C3)", n)
+		}
+		if got := f.state(t, f.acc.ID); got != run.StageStatePending {
+			t.Errorf("acceptance state = %q, want pending", got)
+		}
+	})
+
+	t.Run("hook_error_fails_closed", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, orchestrator.FanInVerifyAnswer{})
+		f.hook.err = errors.New("compare boom")
+		before := f.appends()
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		code, msg, _ := fivpError(t, w)
+		if code != "dependency_check_failed" || !strings.Contains(msg, "fishhawk_dispatch_stage") {
+			t.Errorf("code %q / message %q, want dependency_check_failed naming the dispatch remedy (C2)", code, msg)
+		}
+		if got := f.state(t, f.acc.ID); got != run.StageStatePending {
+			t.Errorf("acceptance state = %q, want pending", got)
+		}
+		if n := f.appends() - before; n != 0 {
+			t.Errorf("audit appends = %d, want 0", n)
+		}
+	})
+
+	t.Run("children_read_error_fails_closed", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		f.o.Runs = &limitOneListRunsErrRepo{orchestratorRepo: f.rr, err: errors.New("children read boom")}
+		before := f.appends()
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusInternalServerError || decodeError(t, w) != "dependency_check_failed" {
+			t.Fatalf("status = %d, want 500 dependency_check_failed (C5):\n%s", w.Code, w.Body.String())
+		}
+		if got := f.state(t, f.acc.ID); got != run.StageStatePending {
+			t.Errorf("acceptance state = %q, want pending", got)
+		}
+		if n := f.appends() - before; n != 0 || f.hook.count() != 0 {
+			t.Errorf("audit appends = %d, hook calls = %d, want 0 and 0", n, f.hook.count())
+		}
+	})
+
+	t.Run("dispatched_arm_never_consults_hook", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStateDispatched, unsettled)
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK || f.hook.count() != 0 {
+			t.Errorf("status = %d, hook calls = %d, want 200 idempotent and 0", w.Code, f.hook.count())
+		}
+	})
+
+	t.Run("non_parent_never_consults_hook", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		f.rr.mu.Lock()
+		f.a.DecomposedFrom, f.b.DecomposedFrom = nil, nil
+		f.rr.mu.Unlock()
+		w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK || f.hook.count() != 0 {
+			t.Errorf("status = %d, hook calls = %d, want 200 and 0", w.Code, f.hook.count())
+		}
+	})
+
+	t.Run("non_acceptance_stage_never_consults_hook", func(t *testing.T) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		f.setImplState(run.StageStatePending)
+		w := postHostDispatch(t, f.s, f.parent.ID, f.impl.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK || f.hook.count() != 0 {
+			t.Errorf("status = %d, hook calls = %d, want 200 and 0:\n%s", w.Code, f.hook.count(), w.Body.String())
+		}
+	})
+
+	nilOrch := func(t *testing.T, repoErr error) (*fivpFixture, *bytes.Buffer, *httptest.ResponseRecorder) {
+		f := seedFanInVerifyPendingFixture(t, run.StageStatePending, unsettled)
+		f.s.cfg.Orchestrator = nil
+		if repoErr != nil {
+			f.s.cfg.RunRepo = &limitOneListRunsErrRepo{orchestratorRepo: f.rr, err: repoErr}
+		}
+		var buf bytes.Buffer
+		f.s.cfg.Logger = slog.New(slog.NewJSONHandler(&lockedWriter{w: &buf, mu: &sync.Mutex{}}, nil))
+		return f, &buf, postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+	}
+
+	t.Run("nil_orchestrator_warns_and_admits", func(t *testing.T) {
+		f, buf, w := nilOrch(t, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(buf.String(), "decomposed parent acceptance admitted with no fan-in verify hold: no orchestrator wired") ||
+			!strings.Contains(buf.String(), f.acc.ID.String()) {
+			t.Errorf("log = %s, want the no-orchestrator WARN naming the stage", buf.String())
+		}
+		if f.hook.count() != 0 {
+			t.Errorf("hook calls = %d, want 0", f.hook.count())
+		}
+	})
+
+	t.Run("nil_orchestrator_children_read_error_warns_and_admits", func(t *testing.T) {
+		_, buf, w := nilOrch(t, errors.New("children read boom"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (the nil-Orchestrator arm is WARN-and-admit):\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(buf.String(), "children read boom") {
+			t.Errorf("log = %s, want the read-error WARN", buf.String())
+		}
+	})
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_RefusalReadOnly_EndToEnd is (g2):
+// the REAL *Server as both hooks (no fakes) on a stamped-PR parent whose
+// consolidated head is unverified. The marker answers 409 fan_in_verify_pending
+// and changes nothing: no audit row, no merge-candidate trigger, implement
+// still succeeded, acceptance and review still pending, no review round.
+func TestHostDispatch_DecomposedParentAcceptance_RefusalReadOnly_EndToEnd(t *testing.T) {
+	f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
+	f.rr.mu.Unlock()
+	f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.rr, Audit: f.au, Artifacts: f.s.cfg.ArtifactRepo,
+		ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
+	before := len(f.au.appended)
+
+	w := postHostDispatch(t, f.s, f.parent.ID, acc.ID, withHostDispatchOperator)
+	f.s.waitBackgroundReviews()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if _, _, details := fivpError(t, w); details["reason"] != hostDispatchReasonFanInVerifyPending || details["head_sha"] != fanInHead {
+		t.Errorf("details = %+v, want reason fan_in_verify_pending for head %s", details, fanInHead)
+	}
+	f.au.mu.Lock()
+	after := len(f.au.appended)
+	f.au.mu.Unlock()
+	if after != before {
+		t.Errorf("audit rows %d -> %d, want no new row (R7 read-only refusal)", before, after)
+	}
+	if n := len(mcvTriggerRows(f.au)); n != 0 {
+		t.Errorf("stage_merge_candidate_verify_triggered rows = %d, want 0", n)
+	}
+	if got := f.state(f.impl.ID); got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded", got)
+	}
+	if a, r := f.state(acc.ID), f.state(f.review.ID); a != run.StageStatePending || r != run.StageStatePending {
+		t.Errorf("acceptance/review = %q/%q, want pending/pending", a, r)
+	}
+	if n := f.count("implement_review_started"); n != 0 {
+		t.Errorf("implement_review_started = %d, want 0", n)
+	}
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_ConcurrentRefusalsReadOnly is
+// (g3, R7): N concurrent refusals through the real handler are N identical
+// reads that change nothing. DETERMINISTIC BARRIER: the wrapping handler
+// signals each arrival before delegating, the hook's first call parks inside
+// the admission lock until release, and the test releases only after all N
+// requests are in flight.
+//
+// MECHANISM: re-adding a queued Advance after the refusal (CF8) makes each
+// refusal's post-unlock Advance reach consolidateBeforeAcceptance. In
+// acceptance_next that fires the counting ConsolidatedReview fake; in
+// implement_reopened Advance parks the pending implement stage at
+// awaiting_host_dispatch on the local runner.
+func TestHostDispatch_DecomposedParentAcceptance_ConcurrentRefusalsReadOnly(t *testing.T) {
+	const n = 3
+	for _, tc := range []struct {
+		name      string
+		implState run.StageState
+	}{
+		{"acceptance_next", run.StageStateSucceeded},
+		{"implement_reopened", run.StageStatePending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := seedFanInVerifyPendingFixture(t, run.StageStatePending, orchestrator.FanInVerifyAnswer{HeadSHA: fivpHead})
+			f.setImplState(tc.implState)
+			f.hook.inHook = make(chan struct{})
+			f.hook.release = make(chan struct{})
+			snapshot := map[uuid.UUID]run.Stage{}
+			f.rr.mu.Lock()
+			for _, st := range f.rr.stagesByRunID[f.parent.ID] {
+				snapshot[st.ID] = *st
+			}
+			f.rr.mu.Unlock()
+			before := f.appends()
+
+			arrived := make(chan struct{}, n)
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				arrived <- struct{}{}
+				f.s.handleHostDispatchStage(w, withHostDispatchOperator(r))
+			})
+			start := make(chan struct{})
+			codes := make([]int, n)
+			bodies := make([]string, n)
+			var wg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					req := httptest.NewRequest(http.MethodPost,
+						"/v0/runs/"+f.parent.ID.String()+"/stages/"+f.acc.ID.String()+"/host-dispatch", nil)
+					req.SetPathValue("run_id", f.parent.ID.String())
+					req.SetPathValue("stage_id", f.acc.ID.String())
+					w := httptest.NewRecorder()
+					h.ServeHTTP(w, req)
+					codes[i], bodies[i] = w.Code, w.Body.String()
+				}(i)
+			}
+			close(start)
+			for i := 0; i < n; i++ {
+				<-arrived
+			}
+			<-f.hook.inHook
+			close(f.hook.release)
+			wg.Wait()
+			f.s.waitBackgroundReviews()
+
+			for i := 0; i < n; i++ {
+				if codes[i] != http.StatusConflict || !strings.Contains(bodies[i], hostDispatchReasonFanInVerifyPending) {
+					t.Errorf("request %d: status %d body %s, want 409 fan_in_verify_pending", i, codes[i], bodies[i])
+				}
+			}
+			f.rr.mu.Lock()
+			for _, st := range f.rr.stagesByRunID[f.parent.ID] {
+				if !reflect.DeepEqual(*st, snapshot[st.ID]) {
+					t.Errorf("stage %s (%s) changed: got state %q, want %q", st.ID, st.Type, st.State, snapshot[st.ID].State)
+				}
+				if st.State == run.StageStateAwaitingHostDispatch || st.State == run.StageStateDispatched {
+					t.Errorf("stage %s (%s) is %q, want no stage parked or dispatched", st.ID, st.Type, st.State)
+				}
+			}
+			f.rr.mu.Unlock()
+			if c := f.hook.count(); c != n {
+				t.Errorf("hook calls = %d, want exactly %d (one read per refusal)", c, n)
+			}
+			if c := f.review.count(); c != 0 {
+				t.Errorf("DispatchConsolidatedReview calls = %d, want 0", c)
+			}
+			if c := f.appends() - before; c != 0 {
+				t.Errorf("audit appends = %d, want 0", c)
+			}
+		})
 	}
 }

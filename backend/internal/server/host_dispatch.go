@@ -35,6 +35,12 @@ const hostDispatchReasonDeployNotSucceeded = "deploy_not_succeeded"
 // comes first.
 const hostDispatchReasonEarlierStageFailed = "earlier_stage_failed"
 
+// hostDispatchReasonFanInVerifyPending is the `reason` detail on the
+// decomposed-parent fan-in verify hold's 409 dispatch_not_admissible (#4846):
+// a top-level decomposed parent's PENDING acceptance stage is held until its
+// consolidated head's fan-in merge-candidate verify settles.
+const hostDispatchReasonFanInVerifyPending = "fan_in_verify_pending"
+
 // HostAdmissionHold is the interim host-dispatch admission hold (E85.11 /
 // #4330; Config.HostAdmissionHold). Held reports whether NEW admissions are
 // held at now and a human-readable reason. Production is
@@ -152,6 +158,25 @@ type hostDispatchResponse struct {
 // no pass (admitted); a stage-list or chain read error answers 500
 // dependency_check_failed. The idempotent `dispatched` arm is untouched (a
 // declared residual, #5164). See refuseSupersededMergeCandidatePass.
+//
+// Decomposed-parent fan-in verify hold (#4846): a top-level decomposed
+// parent's acceptance stage on the PENDING arm only is refused 409
+// dispatch_not_admissible with reason fan_in_verify_pending while the shared
+// read-only orchestrator.DecomposedParentFanInHold predicate holds it (the
+// consolidated head's fan-in merge-candidate verify has not settled, or the
+// consolidated PR is not opened yet). It sits after the state switch and
+// BEFORE the #4811 superseded-pass refusal. The refusal is PURELY READ-ONLY:
+// no audit row, no CAS, no queued Advance and no DispatchConsolidatedReview;
+// its only reads are the stage list, the children read and the hook's
+// read-only forge compare, so two concurrent refusals are two identical reads
+// that change nothing and need no bound. Release stays with the event-driven
+// paths (children settle, then Advance starts the fan_in pass; the
+// merge_candidate_verified report settles, then Advance). A wired children-read
+// or hook error answers 500 dependency_check_failed, nothing written; a
+// fail-open release's fan_in_verify_unavailable row is recorded only once
+// the CAS has admitted the stage. awaiting_host_dispatch and dispatched are
+// untouched (an operator re-open, run.FixupStage, tolerates only pending). See
+// refuseFanInVerifyPending.
 //
 // Host memory hold (E85.11 / #4330, INTERIM until ADR-100's adaptive
 // concurrency controller): with Config.HostAdmissionHold wired and held, a
@@ -451,8 +476,12 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// dead runner.
 	// Sequence 0 has nothing ahead of it, so it skips the read. Fail-CLOSED on a
 	// stage-list read error (retryable 500), the wave-order guard's posture.
+	// The list is hoisted into runStages so the #4846 fan-in verify hold below
+	// reuses it rather than reading it again.
+	var runStages []*run.Stage
 	if (stage.State == run.StageStatePending || stage.State == run.StageStateAwaitingHostDispatch) && stage.Sequence > 0 {
-		runStages, lerr := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
+		var lerr error
+		runStages, lerr = s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 		if lerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
 				"could not list the run's stages to check for an unsucceeded deploy stage or a failed stage ahead of this one",
@@ -507,6 +536,20 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 			"stage is not in a host-dispatchable state",
 			map[string]any{"stage_id": stageID.String(), "state": string(stage.State)})
 		return
+	}
+
+	// Decomposed-parent fan-in verify hold (#4846): a top-level decomposed
+	// parent's PENDING acceptance stage is refused while the shared read-only
+	// hold predicate holds it. Read-only (R7): the refusal writes nothing and
+	// queues nothing. A fail-open release is recorded only after the CAS below
+	// admits the stage (fanInRelease), so a request a later hold refuses or
+	// queues records nothing. awaiting_host_dispatch is deliberately not
+	// checked (an operator re-open's recovery path, #4846 R1).
+	var fanInRelease orchestrator.FanInHold
+	if stage.Type == run.StageTypeAcceptance && stage.State == run.StageStatePending {
+		if s.refuseFanInVerifyPending(w, r, runRow, stage, runStages, &fanInRelease) {
+			return
+		}
 	}
 
 	// Superseded merge-candidate pass (#4811): an implement stage whose live
@@ -622,6 +665,13 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 			"could not mark the stage dispatched",
 			map[string]any{"stage_id": stageID.String(), "state": string(from), "error": err.Error()})
 		return
+	}
+
+	// The CAS admitted the stage, so a fail-open fan-in release (#4846) is now
+	// certain: record its fan_in_verify_unavailable row (deduplicated per
+	// stage and reason; a no-op for a zero, held or verified answer).
+	if s.cfg.Orchestrator != nil {
+		s.cfg.Orchestrator.RecordFanInHoldRelease(context.WithoutCancel(r.Context()), runRow, stage, fanInRelease)
 	}
 
 	// Acceptance spawn anchor (E64.53 / #3174). THIS is the site that marks a
@@ -825,6 +875,129 @@ func (s *Server) refuseSupersededMergeCandidatePass(w http.ResponseWriter, r *ht
 		"the stage's merge-candidate verify pass was triggered for a head the run has since moved past; it was settled not_executed instead of spending a slot",
 		details)
 	return true
+}
+
+// refuseFanInVerifyPending is the host-dispatch marker's arm of the #4846
+// decomposed-parent fan-in verify hold. It reports whether it wrote a
+// response. The handler calls it only for an ACCEPTANCE stage on the PENDING
+// arm, after the state switch and before the #4811 superseded-pass refusal.
+//
+// It is PURELY READ-ONLY (R7): it appends no audit row, performs no CAS,
+// queues no Orchestrator.Advance and fires no DispatchConsolidatedReview. Its
+// only reads are the run's stage list (reused from the deploy hold when that
+// block ran), the children read and the hook's read-only forge compare, so N
+// concurrent refusals are N identical reads that change nothing and need no
+// bound. Release is owned by the event-driven paths: the children settle and
+// Advance starts the fan_in pass through the D5 hold, and the pass's
+// merge_candidate_verified report runs the post-verify Advance.
+//
+//   - A child run answers false with no reads.
+//   - No Orchestrator wired: it reads the children (Limit 1) and, for a
+//     decomposed parent, WARN-logs the admit with no hold (the #4792
+//     record-not-hold posture); a read error WARNs and admits. Either way it
+//     answers false. Production never takes this arm: fishhawkd always wires
+//     the Orchestrator.
+//   - A stage-list, children-read or hook error answers 500
+//     dependency_check_failed, nothing written (fail-closed).
+//   - Held answers 409 dispatch_not_admissible, reason fan_in_verify_pending,
+//     with hold_cause, consolidated_branch, head_sha, implement_stage_id and
+//     implement_state, and a message naming the remedy for that state.
+//   - Released answers false and stores the answer in *release; the handler
+//     records a fail-open release (RecordFanInHoldRelease) only once its CAS
+//     has admitted the stage.
+func (s *Server) refuseFanInVerifyPending(w http.ResponseWriter, r *http.Request, runRow *run.Run,
+	stage *run.Stage, runStages []*run.Stage, release *orchestrator.FanInHold) bool {
+	if runRow.DecomposedFrom != nil {
+		return false
+	}
+	ctx := r.Context()
+	if s.cfg.Orchestrator == nil {
+		children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: &runRow.ID, Limit: 1})
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"host-dispatch: could not read decomposed children with no orchestrator wired; acceptance admitted with no fan-in verify hold (#4792 record-not-hold posture)",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+			return false
+		}
+		if len(children) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"host-dispatch: decomposed parent acceptance admitted with no fan-in verify hold: no orchestrator wired",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("posture", "#4792 record-not-hold"))
+		}
+		return false
+	}
+	if runStages == nil {
+		var err error
+		runStages, err = s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+				"could not list the run's stages to check the decomposed parent's fan-in verify hold",
+				map[string]any{"run_id": runRow.ID.String(), "stage_id": stage.ID.String(), "error": err.Error()})
+			return true
+		}
+	}
+	fanIn, ferr := s.cfg.Orchestrator.DecomposedParentFanInHold(ctx, runRow, runStages)
+	if ferr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+			"could not evaluate the decomposed parent's fan-in verify hold; fix the forge or store cause the error names (GitHub App installation, permissions, repository access), then dispatch this pending acceptance stage again (fishhawk_dispatch_stage): a settled head is admitted, and an unsettled one answers 409 fan_in_verify_pending naming the verify-pass remedy",
+			map[string]any{"run_id": runRow.ID.String(), "stage_id": stage.ID.String(), "error": ferr.Error()})
+		return true
+	}
+	if fanIn.Held {
+		impl := consolidatedImplementStage(runStages)
+		implID, implState := "", ""
+		if impl != nil {
+			implID, implState = impl.ID.String(), string(impl.State)
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"host-dispatch: decomposed parent acceptance refused: held by the fan-in verify hold",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("hold_cause", fanIn.HoldCause),
+			slog.String("consolidated_branch", fanIn.ConsolidatedBranch),
+			slog.String("head_sha", fanIn.HeadSHA),
+			slog.String("implement_state", implState))
+		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+			fanInVerifyPendingMessage(fanIn, impl),
+			map[string]any{
+				"stage_id":            stage.ID.String(),
+				"reason":              hostDispatchReasonFanInVerifyPending,
+				"hold_cause":          fanIn.HoldCause,
+				"consolidated_branch": fanIn.ConsolidatedBranch,
+				"head_sha":            fanIn.HeadSHA,
+				"implement_stage_id":  implID,
+				"implement_state":     implState,
+			})
+		return true
+	}
+	*release = fanIn
+	return false
+}
+
+// fanInVerifyPendingMessage is the fan_in_verify_pending 409's message: the
+// concrete remedy for the hold cause and the parent implement stage's state
+// (#4846 R10, approval conditions C1 and C2). backend/internal/orchestrator
+// README.md § "Consolidation before acceptance" carries the full list.
+func fanInVerifyPendingMessage(h orchestrator.FanInHold, impl *run.Stage) string {
+	const prefix = "decomposed parent acceptance is held until the consolidated head's fan-in merge-candidate verify settles; "
+	if h.HoldCause == orchestrator.FanInHoldCauseConsolidatedPRNotOpened {
+		return prefix + "the consolidated PR is not opened yet and the next orchestrator Advance opens it. If that open keeps failing, fix the cause its error names (installation id, App permission, default-branch read); fishhawk_rebase_run_branch and fishhawk_rerun_review both need the PR, so then cancel with fishhawk_cancel_run and start a fresh run (see backend/internal/orchestrator/README.md, Consolidation before acceptance)"
+	}
+	state := run.StageState("")
+	if impl != nil {
+		state = impl.State
+	}
+	switch state {
+	case run.StageStatePending, run.StageStateAwaitingHostDispatch:
+		return prefix + "the verify-only pass is queued on the re-opened implement stage, so dispatch the IMPLEMENT stage (fishhawk_dispatch_stage), not acceptance; its merge_candidate_verified report releases the hold"
+	case run.StageStateDispatched, run.StageStateRunning:
+		return prefix + "the verify-only pass is running on the implement stage; its merge_candidate_verified report releases the hold, so wait for it rather than dispatching acceptance"
+	}
+	return prefix + "no verify pass is in flight. Start it with fishhawk_rebase_run_branch (confirm:true) on the up-to-date consolidated branch, whose already-up-to-date arm starts the fan_in pass directly, or, without moving the branch, with fishhawk_rerun_review, whose first consolidated round runs the D5 hold that starts the pass; then dispatch the re-opened implement stage. If the rebase merged an advanced base and answered not_queued, use fishhawk_rerun_review. Cancel (fishhawk_cancel_run) only where rerun_review is ineligible: gating reviewer authority, no agent reviewers, or no PR"
 }
 
 // failedStageAhead returns the lowest-sequence stage of stages that is
