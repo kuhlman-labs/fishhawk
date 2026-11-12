@@ -1700,7 +1700,10 @@ func localSeamAcceptanceBody(t *testing.T, notes string) []byte {
 // reason) reaches the acceptance prompt as a FULL entry with pr filled from the
 // pull_request_opened ledger (742); the SHARED replay golden ships through the
 // real ingest and records a regression attributed to PR #742 (never issue
-// 101), routed class 1; the runner's acceptance_scenarios_pushed report then
+// 101). The golden's only failed row is the scenario, so since #4873 triage
+// pages it class 4; this harness's acceptance stage is still running and it
+// has no implement stage, so the page records unsettled_paged. The runner's
+// acceptance_scenarios_pushed report then
 // lands as a reported-head ledger row, so LatestReportedHeadSHA moves to the
 // scenario head while acceptance_outcome_recorded.head_sha stays the
 // pre-scenario head, the acceptance stage is not reopened, and the run stays
@@ -1759,8 +1762,8 @@ func TestAcceptanceReplayRoundTrip(t *testing.T) {
 		t.Errorf("regression origin_pr = %v, want 742", rp["origin_pr"])
 	}
 	triage := findAppendedByCategory(t, au, CategoryAcceptanceTriageDecided)
-	if !strings.Contains(string(triage.Payload), `"class":"1"`) {
-		t.Errorf("triage payload = %s, want class 1", triage.Payload)
+	if !strings.Contains(string(triage.Payload), `"class":"4"`) || !strings.Contains(string(triage.Payload), `"disposition":"unsettled_paged"`) {
+		t.Errorf("triage payload = %s, want class 4 / unsettled_paged (a scenario-only failure pages, #4873)", triage.Payload)
 	}
 
 	// 3. The runner's scenario-corpus push report lands as a ledger row.

@@ -22,7 +22,11 @@ import (
 // declaration modeled on merge_verdict_recorded / operator_commit_vouched: the
 // payload names the run, the acceptance stage, the operator's reason, and — load
 // bearing — the outcome_sequence of the acceptance_outcome_recorded entry it
-// discharges.
+// discharges. When the discharged outcome recorded failed replayed scenarios
+// (acceptance_outcome_recorded.failed_scenario_ids, #4873) the entry copies
+// them as failed_scenario_ids, so a scenario-only class-4 page discharged on
+// the reason alone stays auditable; the key is ABSENT otherwise (a legacy
+// outcome, or no failed scenario).
 //
 // The sequence binding IS the invalidation mechanism: acceptanceGateState only
 // honours an arbitration whose outcome_sequence EQUALS the newest recorded
@@ -103,7 +107,8 @@ type acceptanceArbitrationResponse struct {
 //     skip a fix-up the loop already dispatched. An ABSENT or undecodable
 //     disposition is refused too (fail-closed on unknown evidence);
 //  6. 409 acceptance_arbitration_requires_acknowledgement when the outcome
-//     carries criteria_failed > 0 and acknowledge_failed_criteria is not true;
+//     carries criteria_failed > 0 and acknowledge_failed_criteria is not true
+//     (a scenario-only class-4 page carries criteria_failed 0, #4873);
 //  7. 409 acceptance_outcome_superseded when a concurrent acceptance re-run
 //     landed a NEWER outcome between the guards and the append (WRITE-SIDE
 //     REVALIDATION). Since #2536 this guard runs INSIDE the append transaction,
@@ -325,7 +330,11 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 	// Guard 6: a verdict carrying genuinely FAILED criteria needs the operator's
 	// deliberate, separately-stated acknowledgement — the reason alone is not it.
 	// A class-5 all-skip verdict (criteria_failed == 0) is arbitrable on the
-	// reason alone: nothing failed, the criteria were unvalidatable.
+	// reason alone: nothing failed, the criteria were unvalidatable. So is a
+	// scenario-only class-4 page (#4873): criteria_failed tallies plan-criterion
+	// rows only, so it is 0 there too. The failed_scenario_ids copied onto the
+	// arbitration entry below are what keep that reason-only discharge
+	// auditable; tightening this guard on scenarios is tracked in #5198.
 	if outcome.CriteriaFailed > 0 && !reqBody.AcknowledgeFailedCriteria {
 		s.writeError(w, r, http.StatusConflict, "acceptance_arbitration_requires_acknowledgement",
 			"this acceptance verdict carries failed criteria; set acknowledge_failed_criteria:true to state deliberately that you are merging despite them",
@@ -356,6 +365,9 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 	}
 	if outcome.StageID != nil {
 		payloadMap["stage_id"] = outcome.StageID.String()
+	}
+	if len(outcome.FailedScenarioIDs) > 0 {
+		payloadMap["failed_scenario_ids"] = outcome.FailedScenarioIDs
 	}
 	payload, _ := json.Marshal(payloadMap)
 	params := audit.ChainAppendParams{

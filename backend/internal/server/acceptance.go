@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -139,14 +140,21 @@ const (
 // Acceptance triage class values (E31.8). Strings, matching
 // renderAcceptanceTriageLine's "class-%s" contract:
 //   - class 1: the code attempts the behavior and objectively fails
-//     (failure_mode=error, or assertion_fail where every failed criterion is
-//     explicit-source) → bounded fix-up pass.
+//     (failure_mode=error; assertion_fail where every failed criterion is
+//     explicit-source; or a replayed-scenario regression ACCOMPANIED by a failed
+//     criterion) → bounded fix-up pass.
 //   - class 2: assertion_fail where no criterion failed but ≥1 was skipped —
 //     validation could not complete (environment/flake) → re-open + re-run.
 //   - class 3: a failed criterion is inferred-source or unresolvable against
 //     the plan (bad/ambiguous criterion) → page the human, no transition.
 //   - class 4: unitemized or provenance-ungroundable failure (works-as-planned,
-//     disputed) → page the human, no transition.
+//     disputed) → page the human, no transition. Also a SCENARIO-ONLY replay
+//     regression (#4873): an assertion_fail whose only failed rows are replayed
+//     corpus scenarios cannot be told apart from an expectation superseded on
+//     the base, so it pages, keyed on the failed scenario ids, instead of
+//     auto-routing a fix-up. It is arbitrable (criteria_failed == 0); a manual
+//     fishhawk_fixup_stage with operator_concern is admitted only while the
+//     review stage is parked at awaiting_approval.
 //   - class 5: all-skip / externally-unvalidatable — every skipped criterion is
 //     a posture-A can't-exhibit skip carrying expectation_basis; the trigger
 //     requires an external event the default-deny egress sandbox cannot produce,
@@ -1526,6 +1534,16 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		if len(undecidableCauses) > 0 {
 			fields[plan.UndecidableCausesKey] = undecidableCauses
 		}
+		// failed_scenario_ids (#4873 R4) names the FAILED replayed-scenario rows —
+		// the same rows triage keys a scenario-only class-4 page on and
+		// recordAcceptanceScenarioRegressions iterates — so an arbitration that
+		// discharges such a page on a reason alone stays auditable (the
+		// arbitration entry copies it). Bounded by boundFailedScenarioIDs
+		// (approval condition 3). Emitted ONLY when a scenario row failed, so
+		// every other outcome marshals byte-identically to before.
+		if failedScenarioIDs := boundFailedScenarioIDs(failedCriterionIDs(acc.scenarioRows), acc.Replay); len(failedScenarioIDs) > 0 {
+			fields["failed_scenario_ids"] = failedScenarioIDs
+		}
 		// Replay evidence (E72.4 / #3328): the runner-injected cap header copied
 		// VERBATIM plus the scenario-row tallies counted here. Absent body.replay
 		// records replay:null so a consumer can tell "no corpus replayed" from a
@@ -1993,6 +2011,12 @@ type acceptanceOutcome struct {
 	// the payload carries null, no block, or an undecodable one. The producer
 	// symbol the implement-review gate-evidence stamping consumes.
 	Transcript *acceptanceTranscriptSummary
+	// FailedScenarioIDs is the decoded additive failed_scenario_ids key (#4873
+	// R4): the failed replayed-scenario rows the outcome recorded. nil when the
+	// key is absent (a legacy outcome, or no scenario row failed) or
+	// undecodable — the decode is tolerant, so a malformed key never turns a
+	// readable outcome into the recorded-but-unreadable hole.
+	FailedScenarioIDs []string
 }
 
 // latestAcceptanceOutcome returns the newest (highest-Sequence)
@@ -2031,6 +2055,9 @@ func (s *Server) latestAcceptanceOutcome(ctx context.Context, runID uuid.UUID) (
 		CriteriaFailed  int             `json:"criteria_failed"`
 		CriteriaSkipped int             `json:"criteria_skipped"`
 		Transcript      json.RawMessage `json:"transcript"`
+		// Captured raw and decoded SEPARATELY below (#4873 approval condition
+		// 2): a non-array value must not fail this decode and blank the verdict.
+		FailedScenarioIDs json.RawMessage `json:"failed_scenario_ids"`
 	}
 	if uerr := json.Unmarshal(latest.Payload, &p); uerr != nil {
 		// A malformed outcome payload is a recorded-but-unreadable verdict:
@@ -2042,7 +2069,24 @@ func (s *Server) latestAcceptanceOutcome(ctx context.Context, runID uuid.UUID) (
 	out.CriteriaFailed = p.CriteriaFailed
 	out.CriteriaSkipped = p.CriteriaSkipped
 	out.Transcript = decodeAcceptanceTranscriptSummary(p.Transcript)
+	out.FailedScenarioIDs = decodeFailedScenarioIDs(p.FailedScenarioIDs)
 	return out, nil
+}
+
+// decodeFailedScenarioIDs is the tolerant decode of the additive
+// acceptance_outcome_recorded.failed_scenario_ids key (#4873): nil for an
+// absent, null, empty or non-array value. It mirrors
+// decodeAcceptanceTranscriptSummary — a malformed additive key degrades to
+// "no ids", never to an unreadable outcome.
+func decodeFailedScenarioIDs(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal(raw, &ids); err != nil || len(ids) == 0 {
+		return nil
+	}
+	return ids
 }
 
 // latestAcceptanceVerdict is the thin verdict-axis wrapper over
@@ -2747,7 +2791,9 @@ func acceptanceCriteriaIDsFromPlan(p *plan.Plan) []string {
 // classifyAcceptanceFailure is the pure triage classifier (E31.8 / #1536): it
 // maps a failed verdict's failure_mode plus per-criterion results, resolved
 // against the approved plan's acceptance-criteria provenance (explicit vs
-// inferred), onto one of four classes. criteria is the approved plan's
+// inferred), onto one of five classes. A failed replayed-scenario row routes
+// class 1 only when a plan criterion also failed; a scenario-only regression
+// pages class 4 (#4873, scenarioOnlyRegression). criteria is the approved plan's
 // acceptance_criteria (nil/empty when the plan predates the typed contract or
 // could not be loaded — provenance cannot be grounded). Returns the class,
 // the criterion ids that key the disposition (the E31.11 per-criterion join
@@ -2768,13 +2814,22 @@ func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCri
 	}
 
 	// Replayed-scenario regression (E72.4 / #3328): a FAILED scenario row is a
-	// prior run's recorded behaviour objectively broken by this head — class 1,
-	// a bounded fix-up pass, keyed on the scenario ids (plus any failed criterion
-	// ids so the disposition names everything that failed). Scenario rows never
+	// prior run's recorded behaviour failing on this head. Scenario rows never
 	// enter the skip partition below: a skipped or undecidable replay is a
 	// replay-budget signal, not an environment flake, so it can never route
-	// class 2 / class 5 on its own.
+	// class 2 / class 5 on its own — which is why this branch stays ABOVE the
+	// skip partition.
+	//
+	// A scenario-only failure (no plan criterion failed, #4873) pages class 4,
+	// keyed on the scenario ids: it cannot be told apart from an expectation a
+	// later ruling superseded on the base, so it must not spend a fix-up pass.
+	// A scenario failure ACCOMPANIED by a failed plan criterion keeps class 1, a
+	// bounded fix-up pass keyed on the scenario ids plus the failed criterion ids
+	// so the disposition names everything that failed.
 	if regressed := failedCriterionIDs(acc.scenarioRows); len(regressed) > 0 {
+		if scenarioOnlyRegression(acc) {
+			return acceptanceClass4, regressed, acceptanceScenarioOnlyRegressionReason
+		}
 		ids := append(regressed, failedCriterionIDs(acc.normalizedCriteria)...)
 		return acceptanceClass1, ids,
 			"assertion_fail: a replayed scenario regressed; the code objectively breaks behaviour a prior run recorded — routing to a bounded fix-up pass"
@@ -2951,6 +3006,61 @@ func failedCriterionIDs(criteria []acceptanceCriterionResult) []string {
 		}
 	}
 	return ids
+}
+
+// scenarioOnlyRegression reports whether a failed verdict's ONLY failed rows
+// are replayed corpus scenarios: at least one scenario row failed and no plan
+// criterion of this change did (#4873). classifyAcceptanceFailure pages that
+// shape as ADR-049 D2 class 4 instead of auto-routing a class-1 fix-up, because
+// a scenario-only failure cannot be told apart from an expectation superseded
+// on the base by a later ruling. A scenario failure accompanied by a failed
+// criterion is NOT scenario-only and keeps class 1.
+func scenarioOnlyRegression(acc acceptanceBody) bool {
+	return len(failedCriterionIDs(acc.scenarioRows)) > 0 && len(failedCriterionIDs(acc.normalizedCriteria)) == 0
+}
+
+// acceptanceScenarioOnlyRegressionReason is the class-4 triage reason for a
+// scenarioOnlyRegression verdict (#4873). It names both operator routes and the
+// manual fix-up's review-gate precondition (run.FixupStage admits an operator
+// fix-up of a succeeded implement stage only while the review stage is parked
+// at awaiting_approval).
+const acceptanceScenarioOnlyRegressionReason = "assertion_fail: only replayed corpus scenario(s) failed and no plan criterion of this change failed; a scenario-only failure cannot be told apart from an expectation superseded on the base (#4873), so the human is paged instead of auto-routing a fix-up. If the expectation is stale, arbitrate (fishhawk_arbitrate_acceptance) and retire the scenario in acceptance/scenarios/retired.yaml on the default branch. If it is a genuine regression, route fishhawk_fixup_stage with operator_concern on the implement stage; that pass is admitted only while the review stage is parked at awaiting_approval, refused once the review stage succeeded or is terminal, and refused with a re-poll remedy while the review gate has not opened."
+
+// maxFailedScenarioIDBytes bounds each id recorded on
+// acceptance_outcome_recorded.failed_scenario_ids (#4873 approval condition 3).
+// Runner scenario ids are corpus-path derived and far shorter; the bound only
+// keeps a malformed row from inflating the chained audit payload.
+const maxFailedScenarioIDBytes = 256
+
+// boundFailedScenarioIDs applies the producer bounds to the failed scenario ids
+// recorded on acceptance_outcome_recorded.failed_scenario_ids (#4873 approval
+// condition 3): at most the replay's served scenario count is kept (a verdict
+// with no runner replay header served none, so it records none), and each id
+// is truncated to maxFailedScenarioIDBytes on a UTF-8 rune boundary. Telling an
+// unreadable key apart from an absent one is deferred to #5198.
+func boundFailedScenarioIDs(ids []string, replay *acceptanceReplay) []string {
+	served := 0
+	if replay != nil && replay.Served > 0 {
+		served = replay.Served
+	}
+	if len(ids) > served {
+		ids = ids[:served]
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if len(id) > maxFailedScenarioIDBytes {
+			cut := maxFailedScenarioIDBytes
+			for cut > 0 && !utf8.RuneStart(id[cut]) {
+				cut--
+			}
+			id = id[:cut]
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // allSkipsCarryExpectationBasis reports whether every skipped criterion in the
