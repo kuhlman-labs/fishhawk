@@ -399,8 +399,10 @@ Where judgment is load-bearing here, it is **not** the agent's:
 - The **non-convergent and ambiguous classes always page the human**: class 3 (a
   failed *inferred*-source criterion — the acceptance signal disagrees with what
   the plan inferred, so the miss belongs to plan review, recorded as a
-  `plan_review_miss`) and class 4 (an unitemized failure) route to a human with
-  no auto-transition.
+  `plan_review_miss`) and class 4 (an unitemized failure, or a scenario-only
+  replay regression — a replayed corpus scenario failed while none of the
+  change's own criteria did, which cannot be told apart from an expectation
+  superseded on the base, #4873) route to a human with no auto-transition.
 - The **merge gate stays with the human/operator**. `acceptance_passed` is an
   operator-loop `next_actions` condition, not a delegated `may_merge`: the
   acceptance agent's verdict informs the merge decision but never makes it.
