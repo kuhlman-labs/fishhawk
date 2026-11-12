@@ -3250,3 +3250,71 @@ func TestReanchorOnTransfer_KeepsMergingPhase(t *testing.T) {
 		})
 	}
 }
+
+// TestRebaseRunBranch_UpToDateStartsHeldDecomposedParentFanInPass pins the
+// #4846 R7 remedy on the REAL startMergeCandidateVerifyPass: a decomposed
+// parent held at acceptance whose fan-in verify pass never started (implement
+// succeeded, acceptance and review pending, no trigger row) is recovered by
+// fishhawk_rebase_run_branch on the up-to-date consolidated branch. The
+// already-up-to-date arm classifies the head fan_in (rule 5: a slices_integrated
+// row) and starts the verify-only pass directly, re-opening implement while
+// acceptance stays pending (TolerateUndispatchedAcceptance). The negative
+// subtest drops the slices_integrated row: the head reads not_required and no
+// pass starts, so rule 5 is the only source of the fan_in cause here.
+func TestRebaseRunBranch_UpToDateStartsHeldDecomposedParentFanInPass(t *testing.T) {
+	seed := func(t *testing.T, integrated bool) (*rebaseSeed, *run.Stage, *run.Stage) {
+		t.Helper()
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		impl := crImplementStage(t, sd)
+		child := &run.Run{ID: uuid.New(), Repo: "x/y", State: run.StateSucceeded, DecomposedFrom: &sd.runID}
+		sd.rr.getRuns[child.ID] = child
+		acc := &run.Stage{ID: uuid.New(), RunID: sd.runID, Type: run.StageTypeAcceptance,
+			ExecutorKind: run.ExecutorAgent, State: run.StageStatePending, Sequence: 1}
+		sd.rr.getStages[acc.ID] = acc
+		sd.review.State = run.StageStatePending
+		sd.rr.stagesByRunID[sd.runID] = []*run.Stage{impl, acc, sd.review}
+		if integrated {
+			seedMCVRow(sd, nil, "slices_integrated", map[string]any{
+				"consolidated_branch": rebaseBranchName, "child_run_ids": []string{child.ID.String()},
+			})
+		}
+		return sd, impl, acc
+	}
+
+	t.Run("slices_integrated_starts_fan_in_pass", func(t *testing.T) {
+		sd, impl, acc := seed(t, true)
+		resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+			rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+		if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyState != mergeCandidateStateInFlight {
+			t.Errorf("response triggered/state = %v/%q, want true/in_flight", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyState)
+		}
+		triggers := mcvTriggerPayloads(t, sd.au)
+		if len(triggers) != 1 {
+			t.Fatalf("stage_merge_candidate_verify_triggered rows = %d, want exactly 1", len(triggers))
+		}
+		if triggers[0].Cause != mergeCandidateCauseFanIn || triggers[0].ExpectedHeadSHA != rebaseNewHeadSHA {
+			t.Errorf("trigger = %+v, want cause fan_in for the live head %s", triggers[0], rebaseNewHeadSHA)
+		}
+		if impl.State != run.StageStatePending {
+			t.Errorf("implement state = %q, want pending (re-opened for the verify-only pass)", impl.State)
+		}
+		if acc.State != run.StageStatePending || sd.review.State != run.StageStatePending {
+			t.Errorf("acceptance/review = %q/%q, want pending/pending", acc.State, sd.review.State)
+		}
+	})
+
+	t.Run("no_slices_integrated_starts_nothing", func(t *testing.T) {
+		sd, impl, _ := seed(t, false)
+		resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+			rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+		if resp.MergeCandidateVerifyTriggered {
+			t.Error("merge_candidate_verify_triggered = true, want false without rule 5's slices_integrated row")
+		}
+		if n := len(mcvTriggerPayloads(t, sd.au)); n != 0 {
+			t.Errorf("trigger rows = %d, want 0", n)
+		}
+		if impl.State != run.StageStateSucceeded {
+			t.Errorf("implement state = %q, want succeeded (not re-opened)", impl.State)
+		}
+	})
+}
