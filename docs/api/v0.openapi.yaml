@@ -787,7 +787,7 @@ components:
         description:
           type: string
           maxLength: 4000
-          description: Required unless `category=security`; refused (422) on a security escape, even empty.
+          description: 'Required unless `category=security`; refused (422) on a security escape, even empty. Never vulnerability detail (use `category=security`): the row is append-only.'
         files:
           type: array
           minItems: 1
@@ -819,7 +819,13 @@ components:
           description: Required iff `category=security`. Interim vocabulary; closes when #4774 defines the class list (#4783).
         advisory_id:
           type: string
-          description: Required iff `category=security`. A GHSA id (`^GHSA(-[0-9a-z]{4}){3}$`) on a GitHub run; an opaque bounded token on any other forge.
+          description: |
+            Required iff `category=security`. A GHSA id (`^GHSA(-[0-9a-z]{4}){3}$`) on a
+            GitHub run; on any other forge a bare reference to a confidential issue in
+            the run's own project (`^#[1-9][0-9]{0,11}$`). A path-qualified or prose
+            value is refused `400 validation_failed` (`details.field: advisory_id`),
+            and the message never echoes the submitted value. Never put vulnerability
+            detail here: the row is append-only.
         delegated:
           type: boolean
           description: ADR-040 delegated-action marker (caller-asserted); makes the birth `pending_judgement` (`agent_recorded`).
@@ -29823,7 +29829,14 @@ paths:
         (for `later_reviewer`) the projected `reviewed_head`. `description`,
         `files` and `introducing_commits` are refused 422, and so is a closure
         `attestation.note`. There is no `security_finding_id` field (ADR-126
-        D7 deferred to E96 / #4774).
+        D7 deferred to E96 / #4774). `advisory_id` is a GHSA id on a GitHub
+        run and a same-project `#<iid>` confidential-issue reference on any
+        other forge; the check applies at RECORD only (a closure copies the
+        birth verbatim). **Vulnerability detail never goes in a record, on any
+        category:** the row is append-only and readable by every token that can
+        read the run's audit (run-bound tokens excepted). A reproduction,
+        payload or exploit chain stays in the forge's confidential object (a
+        draft advisory on GitHub, a confidential issue elsewhere).
 
         **Closure (A1.2 / A1.3).** Attestation is HUMAN-ONLY and needs a
         forge-verified credential: an agent subject or `delegated: true` is

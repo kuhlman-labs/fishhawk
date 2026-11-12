@@ -1626,7 +1626,7 @@ One tool, two shapes — `supersedes_sequence` makes the call a CLOSE:
 
 - **Who.** `write:runs` (`server/mcpscopes.go`, no run-bound allowance): the backend refuses every `mcp:run:` subject `run_token_forbidden`. Recording is open to agents (an agent-recorded birth is `pending_judgement`); a CLOSE is human-only and needs a forge-verified credential (`escape_attestation_requires_human` / `escape_attestation_requires_forge_credential`).
 - **`delegated`** follows `drive_run.go`'s `DriveStep.Delegated` (the ADR-040 marker). It is caller-asserted: on a RECORD it makes the birth pending, and a delegated CLOSE is refused.
-- **Security.** `category=security` for any vulnerability; only the class slug and the forge advisory id travel, the `idempotency_key` is a canonical UUID, and there is no `security_finding_id` field (ADR-126 D7 deferred).
+- **Security.** `category=security` for any vulnerability; only the class slug and the forge advisory reference travel (a GHSA id on GitHub, a same-project `#<iid>` confidential-issue reference elsewhere, `^#[1-9][0-9]{0,11}$`), the `idempotency_key` is a canonical UUID, and there is no `security_finding_id` field (ADR-126 D7 deferred). The tool description and input schema state that vulnerability detail never goes in a record on any category (`TestRecordEscape_DescriptionForbidsVulnerabilityDetail`); the field rules themselves stay server-side.
 - **Keys.** A `later_reviewer` escape dedupes on `concern:<concern_uuid>` and carries its concern round's `reviewed_head`; other sources dedupe on `idempotency_key:<key>`.
 - **Local pre-flight** (before the HTTP hop, zero requests): a non-UUID `run_id`, a CLOSE without `attestation`, a CLOSE carrying RECORD fields, and `attestation` without `supersedes_sequence`.
 

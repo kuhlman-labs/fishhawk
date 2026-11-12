@@ -24,14 +24,14 @@ type recordEscapeInput struct {
 	Source             string   `json:"source,omitempty" jsonschema:"RECORD: later_reviewer | follow_up_bug | operator_battery | human_finding | ci_red_on_main"`
 	Severity           string   `json:"severity,omitempty" jsonschema:"RECORD: high | medium | low"`
 	Category           string   `json:"category,omitempty" jsonschema:"RECORD (closed enum): correctness | security | reliability | concurrency | performance | data_integrity | test_coverage | documentation | other. Use security for ANY vulnerability"`
-	Description        string   `json:"description,omitempty" jsonschema:"RECORD: what escaped, at most 4000 characters; required unless category=security, and REFUSED on a security escape"`
+	Description        string   `json:"description,omitempty" jsonschema:"RECORD: what escaped, at most 4000 characters; NEVER vulnerability detail (use category=security); required unless category=security, and REFUSED on a security escape"`
 	Files              []string `json:"files,omitempty" jsonschema:"RECORD: 1..200 clean repo-relative paths the defect lives in; required unless category=security, and REFUSED on a security escape"`
 	HeadSHA            string   `json:"head_sha,omitempty" jsonschema:"RECORD: the 40/64-char lowercase hex commit the defect shipped in; required when the run's PR is not observably merged"`
 	IntroducingCommits []string `json:"introducing_commits,omitempty" jsonschema:"RECORD: at most 20 commit shas that introduced the defect (recorded as operator_supplied); REFUSED on a security escape"`
 	ConcernID          string   `json:"concern_id,omitempty" jsonschema:"RECORD, later_reviewer only (required there): the stable concern UUID the later review raised. The escape dedupes on concern:<uuid> and carries that concern's review-round reviewed_head"`
-	IdempotencyKey     string   `json:"idempotency_key,omitempty" jsonschema:"RECORD, every source EXCEPT later_reviewer (required there, refused on later_reviewer): ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$; on category=security it must be a canonical lowercase UUID. A replay with the same key is refused escape_already_recorded"`
+	IdempotencyKey     string   `json:"idempotency_key,omitempty" jsonschema:"RECORD, every source EXCEPT later_reviewer (required there, refused on later_reviewer): ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$; on category=security it must be a canonical lowercase UUID. A replay with the same key is refused escape_already_recorded. The key is an identifier, never a description of the defect"`
 	SecurityClass      string   `json:"security_class,omitempty" jsonschema:"RECORD, category=security only (required there): an interim slug ^[a-z0-9][a-z0-9_]{0,63}$"`
-	AdvisoryID         string   `json:"advisory_id,omitempty" jsonschema:"RECORD, category=security only (required there): the forge's draft-advisory id (a GHSA-xxxx-xxxx-xxxx id on a GitHub run)"`
+	AdvisoryID         string   `json:"advisory_id,omitempty" jsonschema:"RECORD, category=security only (required there): the forge's advisory reference, never vulnerability detail. On a GitHub run a GHSA id matching ^GHSA(-[0-9a-z]{4}){3}$; on any other forge a #<iid> reference to a confidential issue in the run's OWN project matching ^#[1-9][0-9]{0,11}$ (a path-qualified or prose value is refused)"`
 
 	// CLOSE fields.
 	SupersedesSequence int64                    `json:"supersedes_sequence,omitempty" jsonschema:"CLOSE: the audit_sequence of the pending_judgement birth to close. Its presence makes the call a CLOSE"`
@@ -145,9 +145,18 @@ refused escape_attestation_requires_human, and a credential that is not
 forge-verified is refused escape_attestation_requires_forge_credential.
 Recording stays open to agents; closing does not.
 
+VULNERABILITY DETAIL NEVER GOES IN A RECORD, on any category. The row is
+append-only and readable by every token that can read this run's audit
+(run-bound tokens excepted). A reproduction, payload or exploit chain stays in
+the forge's confidential object (a draft advisory on GitHub, a confidential
+issue elsewhere); never put it in description, files, idempotency_key,
+security_class or advisory_id, and never file a vulnerability under another
+category to keep a description.
+
 SECURITY: use category=security for ANY vulnerability. A security escape
-carries ONLY its class (security_class slug) and the forge's advisory id
-(advisory_id; a GHSA id on GitHub) — description, files and
+carries ONLY its class (security_class slug) and the forge's advisory
+reference (advisory_id: a GHSA id on GitHub, a #<iid> confidential-issue
+reference in the run's own project elsewhere) — description, files and
 introducing_commits are refused, and so is a closure note. Its
 idempotency_key must be a canonical UUID. There is no security_finding_id
 field (ADR-126 D7 deferred).

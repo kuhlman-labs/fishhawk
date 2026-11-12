@@ -1,0 +1,13 @@
+id: scenario:issue-4819/local-stdio-security-description
+statement: Launch the repository-local fishhawk-mcp stdio server with an explicitly fictional FISHHAWK_API_TOKEN, without loading any stored credential or making an authenticated backend request. MCP tools/list for fishhawk_record_escape states VULNERABILITY DETAIL NEVER GOES IN A RECORD on any category, and inputSchema.properties.description forbids vulnerability detail. Observe the actual wire result.
+steps: Built fishhawk-mcp from the sanctioned tree (cd backend && go build -o /tmp/fhacc4819/fishhawk-mcp ./cmd/fishhawk-mcp). Ran it over stdio with env -i, PATH, a fresh empty HOME, FISHHAWK_API_TOKEN=fictional-acceptance-token-not-real and FISHHAWK_BACKEND_URL=http://127.0.0.1:9 (closed port, so no backend call is possible). Sent initialize, notifications/initialized and tools/list as JSON-RPC lines, then extracted the fishhawk_record_escape tool. This observes the local tool description only; it does not validate backend writes.
+assertions:
+    expected: tools/list fishhawk_record_escape states VULNERABILITY DETAIL NEVER GOES IN A RECORD on any category, and inputSchema.properties.description forbids vulnerability detail
+    observed_at_record: 'The description contains ''VULNERABILITY DETAIL NEVER GOES IN A RECORD, on any category.'' It also says detail must ''never put it in description, files, idempotency_key, security_class or advisory_id, and never file a vulnerability under another category''. inputSchema.properties.description reads ''RECORD: what escaped, at most 4000 characters; NEVER vulnerability detail (use category=security)...''. The advisory_id property names GHSA on GitHub and ^#[1-9][0-9]{0,11}$ on other forges. The server exited 0 with no stderr error.'
+    repro_handle: printf initialize/initialized/tools/list | env -i PATH=$PATH HOME=$(mktemp -d) FISHHAWK_API_TOKEN=fictional FISHHAWK_BACKEND_URL=http://127.0.0.1:9 ./fishhawk-mcp; tool JSON sha256:0aa43d54140c913c11842d939981cf34e3da14b14739d60c28688ed8f89203c0
+origin:
+    issue: 4819
+    pr: 5199
+    run_id: 79b57a71-0fdb-4742-9805-81391f361224
+    head_sha: b5f1046b26bda91499418f05ae6c74a19b752576
+    recorded_at: 2026-11-12T09:54:50Z

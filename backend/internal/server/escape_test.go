@@ -821,24 +821,66 @@ func TestRecordEscape_SecurityClassOnly(t *testing.T) {
 	})
 }
 
+// TestRecordEscape_SecurityAdvisoryValidation pins the per-forge advisory_id
+// shape (#4819). A GitHub run takes a GHSA id; every other forge takes ONLY a
+// same-project confidential-issue reference, so a path or prose token that
+// would be a free-text channel into the append-only row is refused. Each
+// refusal asserts 400 validation_failed, details.field advisory_id, zero rows
+// (wantRefused) and that the message never echoes the submitted value.
 func TestRecordEscape_SecurityAdvisoryValidation(t *testing.T) {
+	const (
+		prose   = "sql-injection-in-login"
+		wantGH  = "github"
+		wantNon = "non_github"
+	)
 	cases := []struct {
-		name, runnerRef, advisory string
-		ok                        bool
+		name, runnerRef, runnerKind, advisory string
+		ok                                    bool
+		// shape names which forge arm's refusal message is expected.
+		shape string
 	}{
-		{"github_real_ghsa", "", escapeAdvisory, true},
-		{"github_lowercase_prefix", "", "ghsa-jfh8-c2jp-5v3q", false},
-		{"github_cve_refused", "", "CVE-2026-0001", false},
-		{"github_short_group", "", "GHSA-jfh8-c2jp-5v3", false},
-		{"gitlab_opaque_accepted", "gitlab:5", "acme/widgets#12", true},
-		{"gitlab_space_refused", "gitlab:5", "bad id", false},
+		// GitHub arm: every existing GHSA case is retained.
+		{name: "github_real_ghsa", advisory: escapeAdvisory, ok: true},
+		{name: "github_lowercase_prefix", advisory: "ghsa-jfh8-c2jp-5v3q", shape: wantGH},
+		{name: "github_cve_refused", advisory: "CVE-2026-0001", shape: wantGH},
+		{name: "github_short_group", advisory: "GHSA-jfh8-c2jp-5v3", shape: wantGH},
+		{name: "github_issue_ref_refused", advisory: "#12", shape: wantGH},
+		{name: "github_empty_refused", advisory: "", shape: wantGH},
+
+		// Non-GitHub arm, accepted: a same-project reference and its bound.
+		{name: "gitlab_issue_ref_accepted", runnerRef: "gitlab:5", advisory: "#12", ok: true},
+		{name: "gitlab_issue_ref_12_digit_bound", runnerRef: "gitlab:5", advisory: "#123456789012", ok: true},
+
+		// Non-GitHub arm, refused: one case per refusal mode.
+		{name: "gitlab_path_qualified_refused", runnerRef: "gitlab:5", advisory: "acme/widgets#12", shape: wantNon},
+		{name: "gitlab_prose_slug_refused", runnerRef: "gitlab:5", advisory: prose, shape: wantNon},
+		{name: "gitlab_bare_digits_refused", runnerRef: "gitlab:5", advisory: "12", shape: wantNon},
+		{name: "gitlab_zero_refused", runnerRef: "gitlab:5", advisory: "#0", shape: wantNon},
+		{name: "gitlab_leading_zero_refused", runnerRef: "gitlab:5", advisory: "#012", shape: wantNon},
+		{name: "gitlab_13_digits_refused", runnerRef: "gitlab:5", advisory: "#1234567890123", shape: wantNon},
+		{name: "gitlab_trailing_newline_refused", runnerRef: "gitlab:5", advisory: "#12\n", shape: wantNon},
+		{name: "gitlab_non_ascii_digits_refused", runnerRef: "gitlab:5", advisory: "#\u0661\u0662", shape: wantNon},
+		{name: "gitlab_space_refused", runnerRef: "gitlab:5", advisory: "bad id", shape: wantNon},
+		{name: "gitlab_ghsa_refused", runnerRef: "gitlab:5", advisory: escapeAdvisory, shape: wantNon},
+		{name: "gitlab_empty_refused", runnerRef: "gitlab:5", advisory: "", shape: wantNon},
+
+		// Other routes into the non-GitHub arm: a gitlab_ci run with no
+		// installation_ref (runForge reads the runner kind first) and an
+		// unrecognised forge scheme.
+		{name: "gitlab_ci_nil_ref_accepted", runnerKind: run.RunnerKindGitLabCI, advisory: "#12", ok: true},
+		{name: "gitlab_ci_nil_ref_prose_refused", runnerKind: run.RunnerKindGitLabCI, advisory: prose, shape: wantNon},
+		{name: "bitbucket_accepted", runnerRef: "bitbucket:9", advisory: "#12", ok: true},
+		{name: "bitbucket_prose_refused", runnerRef: "bitbucket:9", advisory: prose, shape: wantNon},
 	}
-	for i, tc := range cases {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newEscapeFixture(t)
 			if tc.runnerRef != "" {
 				ref := tc.runnerRef
 				fx.run.InstallationRef = &ref
+			}
+			if tc.runnerKind != "" {
+				fx.run.RunnerKind = tc.runnerKind
 			}
 			body := securityBody()
 			body["advisory_id"] = tc.advisory
@@ -846,13 +888,105 @@ func TestRecordEscape_SecurityAdvisoryValidation(t *testing.T) {
 			rec := fx.post(t, escapeSessionID(), body)
 			if tc.ok {
 				decodeEscapeResponse(t, rec)
+				sec := escObj(t, lastEscapePayload(t, fx))["security"].(map[string]any)
+				if sec["advisory_id"] != tc.advisory {
+					t.Errorf("stored security.advisory_id = %v, want %q", sec["advisory_id"], tc.advisory)
+				}
 				return
 			}
 			eb := wantRefused(t, fx, rec, 0, http.StatusBadRequest, "validation_failed")
 			if eb.Details["field"] != "advisory_id" {
-				t.Errorf("case %d details.field = %v, want advisory_id", i, eb.Details["field"])
+				t.Errorf("details.field = %v, want advisory_id", eb.Details["field"])
+			}
+			// The refused token may itself be the vulnerability detail: it is
+			// never echoed in the message or the details.
+			if tc.advisory != "" {
+				details, _ := json.Marshal(eb.Details)
+				if strings.Contains(eb.Message, tc.advisory) || strings.Contains(string(details), tc.advisory) {
+					t.Errorf("refusal echoes the submitted advisory_id %q: message %q details %s", tc.advisory, eb.Message, details)
+				}
+			}
+			// The message names the shape the caller must use. The empty-id
+			// refusal cannot know the forge, so it names both.
+			ghsa, issueRef := escapeGHSARE.String(), escapeIssueRefAdvisoryRE.String()
+			switch {
+			case tc.advisory == "":
+				if !strings.Contains(eb.Message, ghsa) || !strings.Contains(eb.Message, issueRef) {
+					t.Errorf("empty-id message %q must name both %q and %q", eb.Message, ghsa, issueRef)
+				}
+			case tc.shape == wantGH:
+				if !strings.Contains(eb.Message, ghsa) || strings.Contains(eb.Message, issueRef) {
+					t.Errorf("github message %q must name only %q", eb.Message, ghsa)
+				}
+			default:
+				if !strings.Contains(eb.Message, issueRef) || strings.Contains(eb.Message, ghsa) {
+					t.Errorf("non-github message %q must name only %q", eb.Message, issueRef)
+				}
+			}
+			if !strings.Contains(eb.Message, "never in a record") {
+				t.Errorf("message %q must say vulnerability detail never goes in a record", eb.Message)
 			}
 		})
+	}
+}
+
+// TestRecordEscape_LegacyAdvisoryBirthStillClosable pins the RECORD-only claim:
+// a pending security birth stored under the older, wider advisory shape (the
+// API now refuses it) is still closable, and the closure copies its escape
+// verbatim. CLOSE never re-validates advisory_id.
+func TestRecordEscape_LegacyAdvisoryBirthStillClosable(t *testing.T) {
+	fx := newEscapeFixture(t)
+	ref := "gitlab:5"
+	fx.run.InstallationRef = &ref
+	const legacy = "acme/widgets#12"
+
+	// The current API refuses the legacy shape, so seed the birth directly.
+	body := securityBody()
+	body["advisory_id"] = legacy
+	wantRefused(t, fx, fx.post(t, escapeSessionID(), body), 0, http.StatusBadRequest, "validation_failed")
+
+	escapeJSON := json.RawMessage(`{"source":"human_finding","severity":"high","category":"security",` +
+		`"security":{"class":"authz_bypass","advisory_id":"` + legacy + `"},"subject":{"head_sha":"` + escapeHeadSHA + `"}}`)
+	birth, err := json.Marshal(map[string]any{
+		"escape_version": escapeVersion, "record_kind": escapeRecordKindBirth, "run_id": fx.run.ID.String(),
+		"state": escapeStatePendingJudgement, "judgement_basis": escapeBasisAwaitingAttestation,
+		"source_event_key": escapeUUIDKey, "escape": escapeJSON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rid := fx.run.ID
+	const birthSeq = 7
+	fx.audit.seeded = append(fx.audit.seeded, &audit.Entry{
+		RunID: &rid, Sequence: birthSeq, Category: CategoryEscapeRecorded, Payload: birth,
+	})
+
+	resp := decodeEscapeResponse(t, fx.post(t, escapeSessionID(), closeBody(birthSeq, "defect")))
+	if resp.RecordKind != escapeRecordKindClosure {
+		t.Fatalf("record_kind = %q, want closure", resp.RecordKind)
+	}
+	rows := fx.audit.escapeRows()
+	if len(rows) != 1 {
+		t.Fatalf("escape rows appended = %d, want exactly the one closure", len(rows))
+	}
+	var closure struct {
+		Escape json.RawMessage `json:"escape"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &closure); err != nil {
+		t.Fatalf("decode closure: %v", err)
+	}
+	var got, want any
+	if err := json.Unmarshal(closure.Escape, &got); err != nil {
+		t.Fatalf("decode copied escape: %v", err)
+	}
+	if err := json.Unmarshal(escapeJSON, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("closure escape = %s, want the birth's escape %s byte-for-byte as JSON", closure.Escape, escapeJSON)
+	}
+	if sec, _ := got.(map[string]any)["security"].(map[string]any); sec["advisory_id"] != legacy {
+		t.Errorf("copied security.advisory_id = %v, want the legacy %q", sec["advisory_id"], legacy)
 	}
 }
 

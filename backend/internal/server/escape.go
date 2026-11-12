@@ -112,7 +112,9 @@ var (
 	// the vocabulary closes when #4774 defines the class list (#4783).
 	escapeSecurityClassRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_]{0,63}$`)
 	escapeGHSARE          = regexp.MustCompile(`^GHSA(-[0-9a-z]{4}){3}$`)
-	escapeOpaqueAdvisory  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:#/-]{0,127}$`)
+	// escapeIssueRefAdvisoryRE is the non-GitHub advisory shape: a bare
+	// same-project confidential-issue reference (#<iid>), never a path.
+	escapeIssueRefAdvisoryRE = regexp.MustCompile(`^#[1-9][0-9]{0,11}$`)
 
 	// escapeSecurityReviewedHeadKeys is the ONLY reviewed_head projection a
 	// security escape carries (approval condition C3): the scalar identity
@@ -430,12 +432,36 @@ func escapeValidRepoPath(p string) bool {
 }
 
 // escapeValidAdvisoryID validates a security advisory id by the run's forge:
-// a GitHub run carries a GHSA id, any other forge an opaque bounded token.
+// a GitHub run carries a GHSA id; any other forge names a confidential issue
+// in the run's OWN project (ADR-103 D6), so the id is a bare #<iid> reference.
+// A path-qualified reference is refused because its free path segments are a
+// prose channel into an append-only row (#4819). The check runs at RECORD
+// only: CLOSE copies a birth's escape verbatim and never re-validates it, so a
+// row recorded under the older, wider shape stays closable.
 func escapeValidAdvisoryID(forge, id string) bool {
 	if forge == "github" {
 		return escapeGHSARE.MatchString(id)
 	}
-	return escapeOpaqueAdvisory.MatchString(id)
+	return escapeIssueRefAdvisoryRE.MatchString(id)
+}
+
+// escapeAdvisoryShapes names both advisory shapes, one per forge arm, for a
+// message that cannot know the run's forge (the empty-id refusal).
+func escapeAdvisoryShapes() string {
+	return "a GHSA id matching " + escapeGHSARE.String() + " on a GitHub run, or a confidential-issue reference in the run's own project matching " +
+		escapeIssueRefAdvisoryRE.String() + " on any other forge"
+}
+
+// escapeAdvisoryMessage is the forge-specific refusal for a malformed
+// advisory_id. It NEVER echoes the caller's value: a refused token may itself
+// be the vulnerability detail the shape exists to keep out of the record.
+func escapeAdvisoryMessage(forge string) string {
+	if forge == "github" {
+		return "advisory_id must be a GHSA id matching " + escapeGHSARE.String() +
+			"; vulnerability detail belongs in the draft advisory, never in a record"
+	}
+	return "advisory_id must be a confidential-issue reference in this run's own project matching " + escapeIssueRefAdvisoryRE.String() +
+		"; vulnerability detail belongs in that confidential issue, never in a record"
 }
 
 // escapeValidateRecord applies the RECORD field rules that need no store
@@ -456,7 +482,8 @@ func escapeValidateRecord(req escapeRecordRequest) (string, string) {
 			return "security_class", "a security escape requires security_class matching ^[a-z0-9][a-z0-9_]{0,63}$"
 		}
 		if req.AdvisoryID == "" {
-			return "advisory_id", "a security escape requires advisory_id (the forge's draft-advisory id)"
+			return "advisory_id", "a security escape requires advisory_id: " + escapeAdvisoryShapes() +
+				"; vulnerability detail belongs in the forge's confidential object, never in a record"
 		}
 	} else {
 		if req.SecurityClass != "" {
@@ -560,7 +587,7 @@ func (s *Server) escapeRecord(w http.ResponseWriter, r *http.Request, id Identit
 		return
 	}
 	if security && !escapeValidAdvisoryID(runForge(rn), req.AdvisoryID) {
-		escapeValidation(s, w, r, "advisory_id", "advisory_id is not a valid advisory id for this run's forge")
+		escapeValidation(s, w, r, "advisory_id", escapeAdvisoryMessage(runForge(rn)))
 		return
 	}
 

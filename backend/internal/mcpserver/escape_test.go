@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // recordEscapeStub answers POST /v0/runs/{run_id}/escapes with status/body,
@@ -192,5 +193,85 @@ func TestRecordEscape_BackendRefusalsTyped(t *testing.T) {
 				t.Fatalf("err = %v (%#v), want *apiError %d %s", err, ae, tc.status, tc.code)
 			}
 		})
+	}
+}
+
+// TestRecordEscape_DescriptionForbidsVulnerabilityDetail pins the wire-visible
+// "vulnerability detail never goes in a record" contract (#4819) over a real
+// ListTools round trip: the tool description AND the input-schema properties a
+// driving agent reads. The field rules themselves stay server-side; this is the
+// only place an agent is told not to put detail in the free fields.
+func TestRecordEscape_DescriptionForbidsVulnerabilityDetail(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "fishhawk_record_escape" {
+			tool = tl
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatal("fishhawk_record_escape not visible over ListTools")
+	}
+
+	if !strings.Contains(tool.Description, "VULNERABILITY DETAIL NEVER GOES IN A RECORD") {
+		t.Errorf("tool description lacks the never-in-a-record rule:\n%s", tool.Description)
+	}
+	for _, field := range []string{"description", "files", "idempotency_key", "security_class", "advisory_id"} {
+		if !strings.Contains(tool.Description, field) {
+			t.Errorf("tool description does not name %q as a field that never carries vulnerability detail:\n%s", field, tool.Description)
+		}
+	}
+	if !strings.Contains(tool.Description, "#<iid>") {
+		t.Errorf("tool description does not name the non-GitHub #<iid> advisory form:\n%s", tool.Description)
+	}
+
+	// The wire-level InputSchema is opaque (any): decode it as a client would.
+	rawSchema, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(rawSchema, &schema); err != nil {
+		t.Fatalf("decode input schema: %v (%s)", err, rawSchema)
+	}
+	for _, tc := range []struct{ prop, want string }{
+		{"description", "NEVER vulnerability detail (use category=security)"},
+		{"advisory_id", "^#[1-9][0-9]{0,11}$"},
+		{"advisory_id", "^GHSA(-[0-9a-z]{4}){3}$"},
+		{"idempotency_key", "never a description of the defect"},
+	} {
+		got, ok := schema.Properties[tc.prop]
+		if !ok {
+			t.Fatalf("input schema has no %q property: %s", tc.prop, rawSchema)
+		}
+		if !strings.Contains(got.Description, tc.want) {
+			t.Errorf("%s input-schema description lacks %q:\n%s", tc.prop, tc.want, got.Description)
+		}
 	}
 }
