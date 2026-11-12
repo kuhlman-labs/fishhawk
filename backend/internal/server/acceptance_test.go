@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -4791,7 +4792,9 @@ func TestShipAcceptance_AbsentReplay_RecordsNull(t *testing.T) {
 
 // TestShipAcceptance_FailedScenarioRow_RecordsRegressionFromReplayScenarios: the
 // regression entry's origin_pr is the replay entry's 742 — NOT the issue 101 —
-// and its class-1 concern note names PR #742.
+// and the concern note names PR #742. The golden's only failed row is the
+// scenario (crit-a passed), so since #4873 it classifies as a scenario-only
+// class-4 page keyed on the scenario id rather than a class-1 fix-up.
 func TestShipAcceptance_FailedScenarioRow_RecordsRegressionFromReplayScenarios(t *testing.T) {
 	payload, au, acc := shipReplayGolden(t, wireGoldenAcceptanceReplayBytes(t))
 	_ = payload
@@ -4821,10 +4824,10 @@ func TestShipAcceptance_FailedScenarioRow_RecordsRegressionFromReplayScenarios(t
 	if reg["expected"] != "the run row lists the acceptance stage" || reg["repro_handle"] == "" {
 		t.Errorf("observed/expected/repro not carried: %v", reg)
 	}
-	// Class 1 with a note naming the recording PR.
+	// Scenario-only class 4 (#4873) with a note naming the recording PR.
 	class, ids, _ := classifyAcceptanceFailure(acc, nil)
-	if class != acceptanceClass1 || len(ids) != 1 || ids[0] != "scenario:issue-101/crit-b" {
-		t.Errorf("classify = %s %v, want class 1 keyed on the scenario id", class, ids)
+	if class != acceptanceClass4 || len(ids) != 1 || ids[0] != "scenario:issue-101/crit-b" {
+		t.Errorf("classify = %s %v, want class 4 keyed on the scenario id", class, ids)
 	}
 	concerns := synthesizeAcceptanceConcerns(acc, nil, ids, "r")
 	if len(concerns) != 1 || !strings.Contains(concerns[0].Note, "PR #742") {
@@ -6029,4 +6032,212 @@ func TestShipAcceptance_BaseMergeReadErrorClamps(t *testing.T) {
 			t.Errorf("%s = %v, want %v (payload: %v)", key, got, want, payload)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// #4873: a scenario-only replay regression pages class 4; the outcome records
+// failed_scenario_ids.
+// ---------------------------------------------------------------------------
+
+// scenarioClassifyBody builds a failed verdict body from criterion + scenario
+// rows and runs it through validate(), so scenarioRows is partitioned exactly
+// as on ingest (partitionScenarioRows keys only on the scenario: prefix).
+func scenarioClassifyBody(t *testing.T, failureMode string, rows []acceptanceCriterionResult, replay *acceptanceReplay) acceptanceBody {
+	t.Helper()
+	raw, err := json.Marshal(acceptanceBody{
+		Verdict: acceptanceVerdictFailed, FailureMode: failureMode,
+		Criteria: critRaw(rows...), TargetURL: "http://127.0.0.1:8080", Replay: replay,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acc acceptanceBody
+	if err := json.Unmarshal(raw, &acc); err != nil {
+		t.Fatal(err)
+	}
+	if err := acc.validate(context.Background(), nil); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	return acc
+}
+
+// staleScenarioID is the corpus scenario a later ruling superseded in run
+// d9862ab0 (outcome seq 152809, triage seq 152816).
+const staleScenarioID = "scenario:issue-3722/accepted-requires-acceptance-statement"
+
+// shape152809Rows reproduces the 152809 verdict's rows: 1 passed + 6 skipped
+// plan criteria (every skip carrying expectation_basis, so the criterion
+// partition alone would route class 5) and 25 scenario rows — 16 passed, 8
+// skipped, 1 failed (the stale scenario).
+func shape152809Rows() []acceptanceCriterionResult {
+	rows := []acceptanceCriterionResult{{ID: "crit-1", Result: acceptanceResultPassed}}
+	for i := 2; i <= 7; i++ {
+		rows = append(rows, acceptanceCriterionResult{ID: fmt.Sprintf("crit-%d", i), Result: acceptanceResultSkipped,
+			ExpectationBasis: "the external trigger cannot be produced in the egress sandbox"})
+	}
+	for i := 0; i < 16; i++ {
+		rows = append(rows, acceptanceCriterionResult{ID: fmt.Sprintf("scenario:issue-%d/passed", 3000+i), Result: acceptanceResultPassed})
+	}
+	for i := 0; i < 8; i++ {
+		rows = append(rows, acceptanceCriterionResult{ID: fmt.Sprintf("scenario:issue-%d/skipped", 3100+i), Result: acceptanceResultSkipped,
+			ExpectationBasis: "replay_budget_exhausted"})
+	}
+	return append(rows, acceptanceCriterionResult{ID: staleScenarioID, Result: acceptanceResultFailed,
+		Observed: "the run was accepted without an acceptance statement", Expected: "acceptance requires an acceptance statement"})
+}
+
+// TestClassifyAcceptanceFailure_ScenarioOnlyRegression_PagesClass4: an
+// assertion_fail whose ONLY failed rows are replayed scenarios pages class 4
+// keyed on the scenario ids with the #4873 reason — never class 1 (a fix-up)
+// and, for the 152809 shape whose criterion skips all carry expectation_basis,
+// never class 5 (the scenario branch runs above the skip partition).
+func TestClassifyAcceptanceFailure_ScenarioOnlyRegression_PagesClass4(t *testing.T) {
+	explicit := plan.CriterionSourceExplicit
+	var planCriteria []plan.AcceptanceCriterion
+	for i := 1; i <= 7; i++ {
+		planCriteria = append(planCriteria, plan.AcceptanceCriterion{ID: fmt.Sprintf("crit-%d", i), Statement: "s", Source: explicit})
+	}
+	failedScenario := acceptanceCriterionResult{ID: staleScenarioID, Result: acceptanceResultFailed}
+	for _, tc := range []struct {
+		name string
+		rows []acceptanceCriterionResult
+	}{
+		{"152809 shape", shape152809Rows()},
+		{"all criteria passed", []acceptanceCriterionResult{
+			{ID: "crit-1", Result: acceptanceResultPassed}, {ID: "crit-2", Result: acceptanceResultPassed}, failedScenario}},
+		{"no criterion rows", []acceptanceCriterionResult{failedScenario}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			acc := scenarioClassifyBody(t, acceptanceFailureAssertionFail, tc.rows, nil)
+			if len(acc.scenarioRows) == 0 {
+				t.Fatal("fixture: validate() partitioned no scenario rows")
+			}
+			class, ids, reason := classifyAcceptanceFailure(acc, planCriteria)
+			if class != acceptanceClass4 {
+				t.Fatalf("class = %s, want 4 (a scenario-only failure pages; class 1 would spend a fix-up, class 5 would hide the failure)", class)
+			}
+			if len(ids) != 1 || ids[0] != staleScenarioID {
+				t.Errorf("criterion_ids = %v, want [%s]", ids, staleScenarioID)
+			}
+			if reason != acceptanceScenarioOnlyRegressionReason {
+				t.Errorf("reason = %q, want the #4873 scenario-only reason", reason)
+			}
+		})
+	}
+}
+
+// TestClassifyAcceptanceFailure_ScenarioPlusCriterionFailure_StaysClass1: a
+// failed scenario ACCOMPANIED by a failed plan criterion (explicit, or inferred)
+// is not scenario-only — it keeps the class-1 fix-up, keyed on the scenario ids
+// plus the criterion ids, with the unchanged scenario reason.
+func TestClassifyAcceptanceFailure_ScenarioPlusCriterionFailure_StaysClass1(t *testing.T) {
+	planCriteria := []plan.AcceptanceCriterion{
+		{ID: "crit-explicit", Statement: "s", Source: plan.CriterionSourceExplicit},
+		{ID: "crit-inferred", Statement: "s", Source: plan.CriterionSourceInferred},
+	}
+	const class1ScenarioReason = "assertion_fail: a replayed scenario regressed; the code objectively breaks behaviour a prior run recorded — routing to a bounded fix-up pass"
+	for _, critID := range []string{"crit-explicit", "crit-inferred"} {
+		t.Run(critID, func(t *testing.T) {
+			acc := scenarioClassifyBody(t, acceptanceFailureAssertionFail, []acceptanceCriterionResult{
+				{ID: critID, Result: acceptanceResultFailed},
+				{ID: staleScenarioID, Result: acceptanceResultFailed},
+			}, nil)
+			class, ids, reason := classifyAcceptanceFailure(acc, planCriteria)
+			if class != acceptanceClass1 {
+				t.Fatalf("class = %s, want 1 (a scenario failure with a failed criterion keeps the fix-up)", class)
+			}
+			if len(ids) != 2 || ids[0] != staleScenarioID || ids[1] != critID {
+				t.Errorf("criterion_ids = %v, want [%s %s]", ids, staleScenarioID, critID)
+			}
+			if reason != class1ScenarioReason {
+				t.Errorf("reason = %q, want the unchanged class-1 scenario reason", reason)
+			}
+		})
+	}
+}
+
+// TestClassifyAcceptanceFailure_ErrorModeScenarioFailure_StaysClass1: the
+// failure_mode=error branch runs FIRST, so a scenario-only failure shipped as
+// error still routes class 1.
+func TestClassifyAcceptanceFailure_ErrorModeScenarioFailure_StaysClass1(t *testing.T) {
+	acc := scenarioClassifyBody(t, acceptanceFailureError, []acceptanceCriterionResult{
+		{ID: "crit-1", Result: acceptanceResultPassed},
+		{ID: staleScenarioID, Result: acceptanceResultFailed},
+	}, nil)
+	class, _, reason := classifyAcceptanceFailure(acc, nil)
+	if class != acceptanceClass1 || !strings.HasPrefix(reason, "failure_mode=error") {
+		t.Errorf("class/reason = %s/%q, want class 1 on the failure_mode=error branch", class, reason)
+	}
+}
+
+// TestShipAcceptance_FailedScenarioRow_RecordsFailedScenarioIDs (#4873 R4): the
+// shared replay golden's failed scenario row is recorded on
+// acceptance_outcome_recorded.failed_scenario_ids; a body with no failed
+// scenario row records the key ABSENT (not [] and not null), so every other
+// outcome marshals as before.
+func TestShipAcceptance_FailedScenarioRow_RecordsFailedScenarioIDs(t *testing.T) {
+	t.Run("failed scenario row", func(t *testing.T) {
+		payload, _, _ := shipReplayGolden(t, wireGoldenAcceptanceReplayBytes(t))
+		got, _ := payload["failed_scenario_ids"].([]any)
+		if len(got) != 1 || got[0] != "scenario:issue-101/crit-b" {
+			t.Errorf("failed_scenario_ids = %v, want [scenario:issue-101/crit-b]", payload["failed_scenario_ids"])
+		}
+	})
+	t.Run("no failed scenario row", func(t *testing.T) {
+		payload, _, _ := shipReplayGolden(t, validAcceptanceBytes(t))
+		if v, present := payload["failed_scenario_ids"]; present {
+			t.Errorf("failed_scenario_ids = %v, want the key ABSENT", v)
+		}
+	})
+}
+
+// TestShipAcceptance_FailedScenarioIDs_Bounded (#4873 approval condition 3):
+// the producer keeps at most the replay's served scenario count of failed ids,
+// records none for a verdict with no runner replay header (nothing was served),
+// and truncates each id to maxFailedScenarioIDBytes.
+func TestShipAcceptance_FailedScenarioIDs_Bounded(t *testing.T) {
+	golden := func(t *testing.T) map[string]any {
+		var m map[string]any
+		if err := json.Unmarshal(wireGoldenAcceptanceReplayBytes(t), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	shipIDs := func(t *testing.T, m map[string]any) []any {
+		body, _ := json.Marshal(m)
+		payload, _, _ := shipReplayGolden(t, body)
+		got, _ := payload["failed_scenario_ids"].([]any)
+		return got
+	}
+	t.Run("capped at served", func(t *testing.T) {
+		m := golden(t)
+		// served stays 1 while TWO scenario rows fail.
+		m["criteria"] = append(m["criteria"].([]any), map[string]any{"id": "scenario:issue-102/extra", "result": "failed"})
+		got := shipIDs(t, m)
+		if len(got) != 1 || got[0] != "scenario:issue-101/crit-b" {
+			t.Errorf("failed_scenario_ids = %v, want capped to served=1: [scenario:issue-101/crit-b]", got)
+		}
+	})
+	t.Run("no replay header records none", func(t *testing.T) {
+		m := golden(t)
+		delete(m, "replay")
+		body, _ := json.Marshal(m)
+		payload, _, _ := shipReplayGolden(t, body)
+		if v, present := payload["failed_scenario_ids"]; present {
+			t.Errorf("failed_scenario_ids = %v, want ABSENT when no scenario was served", v)
+		}
+	})
+	t.Run("long id truncated", func(t *testing.T) {
+		m := golden(t)
+		long := "scenario:" + strings.Repeat("é", 200) // 409 bytes, 2-byte runes
+		m["criteria"].([]any)[1].(map[string]any)["id"] = long
+		got := shipIDs(t, m)
+		if len(got) != 1 {
+			t.Fatalf("failed_scenario_ids = %v, want one truncated id", got)
+		}
+		id, _ := got[0].(string)
+		if len(id) > maxFailedScenarioIDBytes || !utf8.ValidString(id) || !strings.HasPrefix(long, id) || len(id) < maxFailedScenarioIDBytes-1 {
+			t.Errorf("truncated id len=%d valid=%v, want a valid UTF-8 prefix of at most %d bytes", len(id), utf8.ValidString(id), maxFailedScenarioIDBytes)
+		}
+	})
 }

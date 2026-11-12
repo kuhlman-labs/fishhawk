@@ -46,11 +46,21 @@ Use this when fishhawk_merge_run refuses with 409 acceptance_gate_not_passed on
 an acceptance_triage / acceptance_triage_paged run — typically a class-5
 externally_unvalidatable_paged verdict (every criterion skipped because the
 default-deny sandbox cannot produce the trigger), a class-3 bad/ambiguous
-criterion, or a class-1/2 whose fix-up or retry route was unavailable and paged
-instead. It writes an acceptance_triage_arbitrated audit entry carrying your
-reason and BOUND by sequence to the acceptance_outcome_recorded verdict it
-discharges, after which the acceptance gate reads acceptance_arbitrated and
-fishhawk_merge_run works — so your merge verdict still lands on the chain.
+criterion, a class-1/2 whose fix-up or retry route was unavailable and paged
+instead, or a class-4 scenario-only replay regression (a replayed corpus
+scenario failed while none of the change's own criteria did — typically an
+expectation superseded on the base, #4873). It writes an
+acceptance_triage_arbitrated audit entry carrying your reason and BOUND by
+sequence to the acceptance_outcome_recorded verdict it discharges, after which
+the acceptance gate reads acceptance_arbitrated and fishhawk_merge_run works —
+so your merge verdict still lands on the chain. When the discharged verdict
+recorded failed replayed scenarios, the entry also records them as
+failed_scenario_ids, so a scenario-only page discharged on the reason alone
+stays auditable; retire a stale scenario in acceptance/scenarios/retired.yaml on
+the default branch. For a GENUINE scenario-only regression the alternative is
+fishhawk_fixup_stage with operator_concern on the implement stage, admitted only
+while the review stage is awaiting_approval (refused once review succeeded or is
+terminal, and before the review gate opens).
 
 What it is NOT:
   - NOT a way past an AUTO-ROUTED disposition. A class-1/2 verdict that routed
@@ -71,7 +81,10 @@ Inputs:
   - run_id                     : the parked run.
   - reason                     : required operator rationale, recorded verbatim.
   - acknowledge_failed_criteria: required true when the verdict carries
-                                 genuinely FAILED criteria.
+                                 genuinely FAILED criteria; unnecessary for a
+                                 class-5 all-skip or a class-4 scenario-only
+                                 verdict (criteria_failed counts plan criteria
+                                 only).
 
 Returns the recorded discharge (run_id, acceptance_gate_state, outcome_sequence,
 arbitration_sequence, already_recorded). Tool errors:

@@ -1,0 +1,14 @@
+id: scenario:issue-4873/scenario-plus-criterion-failure-stays-class-1
+statement: When a failed acceptance verdict carries BOTH a failed replayed scenario row and a failed plan criterion row, the run's audit log carries an acceptance_triage_decided entry with class "1" whose criterion_ids name both the scenario id and the criterion id.
+verify_hint: Same dev-fixture flow as scenario-only-regression-pages-class-4, with one fixture criterion row also failed. GET /v0/runs/{run_id}/audit and read acceptance_triage_decided.class and criterion_ids.
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"}; take run_id and stages.acceptance from the 201 body. 2) Build a verdict JSON {verdict:failed, failure_mode:assertion_fail, target_url, criteria:[run-readable FAILED, stages-listed skipped, scenario:issue-3722/accepted-requires-acceptance-statement failed], replay:{cap:25,corpus_size:246,served:25,sampled_out:221,retired_excluded:0,seed:<run_id>,scenarios:[{scenario_id:'scenario:issue-3722/accepted-requires-acceptance-statement',origin_pr:3917,origin_issue:3722,origin_run_id:<uuid>,path:'acceptance/scenarios/issue-3722/accepted-requires-acceptance-statement.yaml'}]}}. 3) POST /v0/runs/{run}/signing-key {} -> private_key; POST /v0/dev/sign with header X-Fishhawk-Dev-Private-Key over the raw body bytes -> signature. 4) POST /v0/runs/{run}/acceptance?stage_id={acceptance} with X-Fishhawk-Signature -> 201. 5) GET /v0/runs/{run}/audit.
+assertions:
+    expected: class 1 with criterion_ids naming both the scenario id and the criterion id
+    observed_at_record: 'ship 201. acceptance_triage_decided: class ''1'', disposition unsettled_paged (stage not settled), criterion_ids [''scenario:issue-3722/accepted-requires-acceptance-statement'',''run-readable'']'
+    repro_handle: POST /v0/runs/{run}/acceptance?stage_id={acc} then GET /v0/runs/{run}/audit
+origin:
+    issue: 4873
+    pr: 5204
+    run_id: 5899c718-28dd-4e80-a3b3-6c2fa38b8124
+    head_sha: 7426aeab371458244ef310db1de2c0b335835b6f
+    recorded_at: 2026-11-12T15:24:21Z
