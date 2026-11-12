@@ -6270,10 +6270,17 @@ func TestExtractPRSections(t *testing.T) {
 func TestCloseOpenFence(t *testing.T) {
 	cases := map[string]struct{ in, want string }{
 		"unterminated backticks":  {"a\n```go\ncode", "a\n```go\ncode\n```"},
-		"unterminated long tilde": {"~~~~\ncode\n", "~~~~\ncode\n~~~~"},
+		"unterminated long tilde": {"~~~~\ncode\n", "~~~\ncode\n~~~"},
 		"balanced fence":          {"```\ncode\n```", "```\ncode\n```"},
 		"fence-free":              {"plain text", "plain text"},
 		"inner tilde not a close": {"```\n~~~\ncode", "```\n~~~\ncode\n```"},
+		// The closer is the shortest that closes the fence for its content;
+		// the opener is shortened to match, never mirrored.
+		"over-long opener shortened": {"x\n" + strings.Repeat("`", 20) + "go\ncode", "x\n```go\ncode\n```"},
+		"inner bare run sets closer": {"  `````\n```\ncode", "  ````\n```\ncode\n````"},
+		"other-char and info-string lines do not count": {
+			"`````\n~~~~~~\n````go\ncode", "```\n~~~~~~\n````go\ncode\n```",
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -6424,18 +6431,20 @@ func TestConsolidatedPRTitleBody_FullDeliveryKeepsOtherIssueEvidence(t *testing.
 // (p2) A partial delivery neutralizes every active own-issue close in slice
 // text: inline, bulleted and quoted.
 func TestConsolidatedPRTitleBody_PartialDeliveryNeutralizesSliceText(t *testing.T) {
-	for name, notes := range map[string]string{
-		"inline":   "This fixes #714 by tightening the guard",
-		"bulleted": "- Closes #714",
-		"quoted":   "> Fixes #714",
+	for name, tc := range map[string]struct{ notes, want string }{
+		"inline":   {"This fixes #714 by tightening the guard", "This Refs #714 by tightening the guard"},
+		"bulleted": {"- Closes #714", "- Refs #714"},
+		"quoted":   {"> Fixes #714", "> Refs #714"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			body := renderWithSlices(t, true, []sliceText{{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: notes}})
+			body := renderWithSlices(t, true, []sliceText{{Index: 0, Title: "Slice one: backend", ChildRunID: sliceChild0, Notes: tc.notes}})
 			if HasClosingReference(body, 714) {
 				t.Errorf("partial-delivery body carries an active closing reference to #714:\n%s", body)
 			}
-			if !strings.Contains(body, "Refs #714") {
-				t.Errorf("body missing Refs #714:\n%s", body)
+			// The rewritten slice line itself, under its slice heading: the
+			// parent writes its own `Refs #714` line on a partial plan anyway.
+			if want := "\n### Slice 0: Slice one: backend (run c0000000)\n\n" + tc.want + "\n"; !strings.Contains(body, want) {
+				t.Errorf("body missing rewritten slice line %q:\n%s", want, body)
 			}
 		})
 	}
@@ -6490,8 +6499,9 @@ func TestConsolidatedPRTitleBody_PartialDeliveryBudgetCutInsideCodeSpan(t *testi
 	if HasClosingReference(body, 714) {
 		t.Errorf("budget cut re-exposed an active closing reference to #714:\n%s", body[len(body)-3000:])
 	}
-	if !strings.Contains(body, "Refs #714") {
-		t.Errorf("body missing Refs #714")
+	// The cut slice's own text is rewritten, under its slice heading.
+	if want := "\n### Slice 1: Slice two: runner (run c1111111)\n\n`Refs #714 b"; !strings.Contains(body, want) {
+		t.Errorf("body missing the rewritten cut slice line %q", want)
 	}
 }
 
@@ -6539,24 +6549,134 @@ func TestConsolidatedPRTitleBody_SliceTextBudget(t *testing.T) {
 	}
 }
 
+// renderedSliceTexts returns each slice's text as renderSliceSections spliced
+// it into out (heading, audit pointer and separators removed), for a
+// Notes-only render.
+func renderedSliceTexts(out string) []string {
+	var texts []string
+	for _, blk := range strings.Split(out, "\n### Slice ")[1:] {
+		_, text, _ := strings.Cut(blk, ")\n\n")
+		text = strings.TrimSuffix(text, "\n")
+		if i := strings.Index(text, "_Slice text truncated"); i >= 0 {
+			text = strings.TrimSuffix(text[:i], "\n\n")
+		}
+		texts = append(texts, text)
+	}
+	return texts
+}
+
+// (da0e187d) The FO regression: six sub-8-KiB slices, each `## Notes` plus an
+// ~8,100-backtick fence opener plus `x`. The body stays under GitHub's 65,536
+// cap, every slice fence is closed, and the over-long opener is shortened
+// rather than mirrored, so no slice doubles.
+func TestConsolidatedPRTitleBody_OverlongFenceOpenerStaysBounded(t *testing.T) {
+	prBody := "## Notes\n" + strings.Repeat("`", 8100) + "\nx"
+	if len(prBody) >= MaxChildPushedPRBodyBytes {
+		t.Fatalf("setup: pr_body is %d bytes, want under 8 KiB", len(prBody))
+	}
+	var slices []sliceText
+	for i := 0; i < 6; i++ {
+		st := sliceText{Index: i, ChildRunID: uuid.New()}
+		st.TestPlan, st.Notes = extractPRSections(prBody)
+		slices = append(slices, st)
+	}
+	body := renderWithSlices(t, false, slices)
+	if len(body) >= 65536 {
+		t.Fatalf("len(body) = %d, want < 65536", len(body))
+	}
+	if got := closeOpenFence(body); got != body {
+		t.Errorf("body ends inside an open fence")
+	}
+	active := StripCodeContexts(body)
+	for i := 0; i < 6; i++ {
+		if !strings.Contains(active, fmt.Sprintf("\n### Slice %d (run ", i)) {
+			t.Errorf("### Slice %d sits inside an unclosed fence", i)
+		}
+	}
+	if !HasClosingReference(body, 714) {
+		t.Errorf("parent's Closes #714 swallowed by an open slice fence")
+	}
+	if n := strings.Count(body, ")\n\n```\nx\n```\n"); n != 6 {
+		t.Errorf("count(shortened closed fence) = %d, want 6 (len(body) = %d)", n, len(body))
+	}
+}
+
+// (da0e187d) The budget counts each slice text AS RENDERED: the spliced text
+// never exceeds consolidatedSliceTextBudget, whether the fence closer or the
+// partial-delivery `fix` → `Refs` rewrite grows it, and every fence is closed.
+func TestRenderSliceSections_RenderedTextWithinBudget(t *testing.T) {
+	notes := func(texts ...string) []sliceText {
+		var out []sliceText
+		for i, s := range texts {
+			out = append(out, sliceText{Index: i, ChildRunID: uuid.New(), Notes: s})
+		}
+		return out
+	}
+	six := func(s string) []sliceText { return notes(s, s, s, s, s, s) }
+	// A fence whose content holds a bare run one shorter than the opener: the
+	// closer must stay long, so closing grows each text by half.
+	innerRun := strings.Repeat("`", 2731) + "\n" + strings.Repeat("`", 2730) + "\nx"
+	for name, tc := range map[string]struct {
+		slices  []sliceText
+		partial bool
+	}{
+		// Non-cut path: the closer is counted. Eight slices cross the budget
+		// whether or not it is.
+		"fence closer counted": {slices: notes(innerRun, innerRun, innerRun, innerRun, innerRun, innerRun, innerRun, innerRun)},
+		// Cut path: the cut lands inside a fence with no newline to back off
+		// to, so the closer must be reserved before cutting.
+		"cut reserves the fence closer": {slices: notes(strings.Repeat("a", consolidatedSliceTextBudget-1000), "```\n"+strings.Repeat("c", 3000))},
+		// Partial delivery: every `fix #714` grows a byte as `Refs #714`.
+		"cut reserves the fix rewrite": {slices: six(strings.Repeat("fix #714\n", 888)), partial: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := renderSliceSections(tc.slices, "", 714, tc.partial, "kuhlman-labs/fishhawk")
+			if !strings.Contains(out, "/v0/runs/") {
+				t.Fatalf("setup: the budget was never crossed")
+			}
+			total := 0
+			for i, text := range renderedSliceTexts(out) {
+				total += len(text)
+				if closeOpenFence(text) != text {
+					t.Errorf("slice %d text ends inside an open fence", i)
+				}
+			}
+			if total > consolidatedSliceTextBudget {
+				t.Errorf("rendered slice text = %d bytes, want <= consolidatedSliceTextBudget (%d)", total, consolidatedSliceTextBudget)
+			}
+			if tc.partial && HasClosingReference(out, 714) {
+				t.Errorf("partial-delivery render carries an active closing reference to #714")
+			}
+		})
+	}
+}
+
 // C4 (cut site: the consolidated budget): a cut that would land inside
 // `Fixes #5121` never leaves `Fixes #51`, with or without a nearby newline.
 func TestRenderSliceSections_BudgetCutNeverMintsIssueRef(t *testing.T) {
-	for name, tail := range map[string]string{
-		"no newline in final 512 bytes": "",
-		"newline within 512 bytes":      "\n" + strings.Repeat("y", 100) + " ",
+	zs := strings.Repeat("z", consolidatedSliceTextBudget-400)
+	pad := func(prefix string) string {
+		// The budget cut lands exactly after `Fixes #51`.
+		return strings.Repeat("p", consolidatedSliceTextBudget-len(prefix)-len("Fixes #51"))
+	}
+	newlineTail := zs + "\n" + strings.Repeat("y", 100) + " "
+	for name, tc := range map[string]struct{ prefix, want string }{
+		// No newline to back off to: the trailing `#51` is stripped.
+		"no newline in final 512 bytes": {zs, zs + pad(zs) + "Fixes"},
+		// The newline branch: the cut ends on the last newline.
+		"newline within 512 bytes": {newlineTail, zs},
 	} {
 		t.Run(name, func(t *testing.T) {
-			prefix := strings.Repeat("z", consolidatedSliceTextBudget-400) + tail
-			// The budget cut lands exactly after `Fixes #51`.
-			pad := strings.Repeat("p", consolidatedSliceTextBudget-len(prefix)-len("Fixes #51"))
-			notes := prefix + pad + "Fixes #5121 trailing"
+			notes := tc.prefix + pad(tc.prefix) + "Fixes #5121 trailing"
 			out := renderSliceSections([]sliceText{{Index: 0, ChildRunID: sliceChild0, Notes: notes}}, "", 0, false, "")
 			if !strings.Contains(out, "/v0/runs/") {
 				t.Fatalf("setup: no cut happened")
 			}
 			if strings.Contains(out, "#51\n") || strings.Contains(out, "#51 ") || strings.Contains(out, "#5\n") {
 				t.Errorf("budget cut left a partial issue reference:\n%q", out[len(out)-300:])
+			}
+			if want := "(run c0000000)\n\n" + tc.want + "\n\n_Slice text truncated"; !strings.Contains(out, want) {
+				t.Errorf("cut prefix is not exactly the expected %d bytes ending %q:\n%q", len(tc.want), tc.want[len(tc.want)-20:], out[len(out)-400:])
 			}
 		})
 	}
@@ -6574,20 +6694,26 @@ func TestClampChildPushedPRBody(t *testing.T) {
 		t.Errorf("clamp = %d bytes, valid=%v, marker=%v", len(got), utf8.ValidString(got), strings.HasSuffix(got, childPushedPRBodyTruncationMarker))
 	}
 	limit := MaxChildPushedPRBodyBytes - len(childPushedPRBodyTruncationMarker)
-	for name, tail := range map[string]string{
-		"no newline in final 512 bytes": "",
-		"newline within 512 bytes":      "\n" + strings.Repeat("y", 100) + " ",
+	zs := strings.Repeat("z", limit-400)
+	pad := func(prefix string) string { return strings.Repeat("p", limit-len(prefix)-len("Fixes #51")) }
+	newlineTail := zs + "\n" + strings.Repeat("y", 100) + " "
+	for name, tc := range map[string]struct{ prefix, want string }{
+		// No newline to back off to: the trailing `#51` is stripped.
+		"no newline in final 512 bytes": {zs, zs + pad(zs) + "Fixes "},
+		// The newline branch: the cut ends on the last newline.
+		"newline within 512 bytes": {newlineTail, zs},
 	} {
 		t.Run(name, func(t *testing.T) {
-			prefix := strings.Repeat("z", limit-400) + tail
-			pad := strings.Repeat("p", limit-len(prefix)-len("Fixes #51"))
-			got := ClampChildPushedPRBody(prefix + pad + "Fixes #5121 and more text past the bound" + strings.Repeat("q", 1024))
+			got := ClampChildPushedPRBody(tc.prefix + pad(tc.prefix) + "Fixes #5121 and more text past the bound" + strings.Repeat("q", 1024))
 			cut := strings.TrimSuffix(got, childPushedPRBodyTruncationMarker)
 			if len(got) > MaxChildPushedPRBodyBytes || cut == got {
 				t.Fatalf("setup: clamp = %d bytes, marker present=%v", len(got), cut != got)
 			}
 			if strings.HasSuffix(cut, "#51") || strings.HasSuffix(cut, "#5") {
 				t.Errorf("clamp left a partial issue reference: %q", cut[len(cut)-40:])
+			}
+			if cut != tc.want {
+				t.Errorf("clamp cut = %d bytes ending %q, want exactly %d bytes ending %q", len(cut), cut[len(cut)-20:], len(tc.want), tc.want[len(tc.want)-20:])
 			}
 		})
 	}

@@ -341,8 +341,9 @@ const MaxChildPushedPRBodyBytes = 8 * 1024
 const childPushedPRBodyTruncationMarker = "\n\n_[truncated by Fishhawk to fit the child_pushed audit bound]_"
 
 // consolidatedSliceTextBudget bounds the total slice text spliced into one
-// consolidated PR body, keeping it well inside GitHub's 65,536-character body
-// limit alongside the summary, bullets and footer.
+// consolidated PR body, counted as rendered (renderSliceSections), keeping it
+// well inside GitHub's 65,536-character body limit alongside the summary,
+// bullets and footer.
 const consolidatedSliceTextBudget = 40 * 1024
 
 // safeCutTail is how far back a size cut looks for a newline to end on.
@@ -515,32 +516,69 @@ func extractPRSections(body string) (testPlan, notes string) {
 	return strings.Join(tp, "\n"), strings.Join(nt, "\n")
 }
 
-// closeOpenFence appends a matching closing fence line when s ends inside an
-// open ``` or ~~~ fence, so a slice's unterminated (or cut) fence cannot
-// swallow the later slices, the parent's closing line and the footer.
+// closeOpenFence appends a closing fence line when s ends inside an open ```
+// or ~~~ fence, so a slice's unterminated (or cut) fence cannot swallow the
+// later slices, the parent's closing line and the footer. The closer is the
+// SHORTEST one that closes the fence for its content: one longer than the
+// longest bare fence-character line inside it, and at least three. The
+// opener's run is shortened to match, so no content line closes it early and
+// an over-long opener (8,100 backticks) is never mirrored: the closer is at
+// most one byte longer than a line already in the fence, plus its newline.
 func closeOpenFence(s string) string {
+	lines := strings.Split(s, "\n")
 	inFence := false
 	var fenceChar byte
-	fenceLen := 0
-	for _, line := range strings.Split(s, "\n") {
+	fenceLen, opener, inner := 0, 0, 0
+	for i, line := range lines {
 		c, n, rest, ok := fenceDelimiter(strings.TrimLeft(line, " \t"))
 		if !ok {
 			continue
 		}
+		bare := strings.TrimSpace(rest) == ""
 		switch {
 		case !inFence:
-			inFence, fenceChar, fenceLen = true, c, n
-		case c == fenceChar && n >= fenceLen && strings.TrimSpace(rest) == "":
+			inFence, fenceChar, fenceLen, opener, inner = true, c, n, i, 0
+		case c == fenceChar && n >= fenceLen && bare:
 			inFence, fenceChar, fenceLen = false, 0, 0
+		case c == fenceChar && bare && n > inner:
+			inner = n
 		}
 	}
 	if !inFence {
 		return s
 	}
+	if run := max(3, inner+1); run < fenceLen {
+		line := lines[opener]
+		at := len(line) - len(strings.TrimLeft(line, " \t"))
+		lines[opener] = line[:at] + line[at+fenceLen-run:]
+		s, fenceLen = strings.Join(lines, "\n"), run
+	}
 	if !strings.HasSuffix(s, "\n") {
 		s += "\n"
 	}
 	return s + strings.Repeat(string(fenceChar), fenceLen)
+}
+
+// bareFixRe matches the one closing keyword shorter than its `Refs`
+// replacement: a bare `fix` followed by whitespace.
+var bareFixRe = regexp.MustCompile(`(?i)\bfix\s`)
+
+// sliceTextReserve bounds what renderSliceSections' finish step
+// (closeOpenFence, then the partial-delivery rewrite) can add to any cut of s:
+// a fence closer (its newline plus a run no longer than the longest fence run
+// in s, since closeOpenFence never lengthens an opener) and, when rewrite is
+// set, one byte per bare `fix` the rewrite can turn into `Refs`.
+func sliceTextReserve(s string, rewrite bool) int {
+	r := 0
+	for _, line := range strings.Split(s, "\n") {
+		if _, n, _, ok := fenceDelimiter(strings.TrimLeft(line, " \t")); ok && n+1 > r {
+			r = n + 1
+		}
+	}
+	if rewrite {
+		r += len(bareFixRe.FindAllStringIndex(s, -1))
+	}
+	return r
 }
 
 // closingKeywords is GitHub's closing keyword set as a bare regexp
@@ -655,13 +693,14 @@ func trimBlankLines(s string) string {
 // through, IN THIS ORDER: (1) extraction (done by consolidatedSliceTexts);
 // (2) on a FULL delivery with issue > 0, stripOwnIssueClosingLines; (3) trim,
 // omitting a text left empty (no heading, no placeholder); (4) the
-// consolidatedSliceTextBudget cut — the slice that crosses it is cut (safeCut)
-// and it and every later slice render a pointer to the child's audit log;
-// (5) closeOpenFence; (6) LAST, only on a partial-delivery parent with
-// issue > 0, the qualified own-issue pre-pass and then
-// NeutralizeClosingReferences, so no later step can cut the text and re-expose
-// a reference the rewrite skipped. A section heading is written only when at
-// least one slice contributes; nil or empty slices render "".
+// consolidatedSliceTextBudget cut — the slice that crosses it is cut (safeCut,
+// first reserving sliceTextReserve) and it and every later slice render a
+// pointer to the child's audit log; the budget counts each text as rendered,
+// after steps 5 and 6; (5) closeOpenFence; (6) LAST, only on a
+// partial-delivery parent with issue > 0, the qualified own-issue pre-pass and
+// then NeutralizeClosingReferences, so no later step can cut the text and
+// re-expose a reference the rewrite skipped. A section heading is written only
+// when at least one slice contributes; nil or empty slices render "".
 func renderSliceSections(slices []sliceText, baseURL string, issue int, partial bool, repo string) string {
 	type entry struct {
 		s         sliceText
@@ -680,25 +719,34 @@ func renderSliceSections(slices []sliceText, baseURL string, issue int, partial 
 			}
 		}
 	}
+	rewrite := partial && issue > 0
+	finish := func(text string) string {
+		text = closeOpenFence(text)
+		if rewrite {
+			text = neutralizeQualifiedOwnIssueRefs(text, issue, repo)
+			text, _ = NeutralizeClosingReferences(text, issue)
+		}
+		return text
+	}
+	// The budget counts each text AS RENDERED (fence closer and rewrite
+	// included), so the spliced slice text never exceeds it.
 	used := 0
 	for i := range sections {
 		for j := range sections[i] {
 			e := &sections[i][j]
-			switch {
-			case used >= consolidatedSliceTextBudget:
+			room := consolidatedSliceTextBudget - used
+			if room <= 0 {
 				e.text, e.truncated = "", true
-			case used+len(e.text) > consolidatedSliceTextBudget:
-				e.text = trimBlankLines(safeCut(e.text, consolidatedSliceTextBudget-used))
-				e.truncated = true
-				used = consolidatedSliceTextBudget
-			default:
-				used += len(e.text)
+				continue
 			}
-			e.text = closeOpenFence(e.text)
-			if partial && issue > 0 {
-				e.text = neutralizeQualifiedOwnIssueRefs(e.text, issue, repo)
-				e.text, _ = NeutralizeClosingReferences(e.text, issue)
+			if text := finish(e.text); len(text) <= room {
+				e.text = text
+				used += len(text)
+				continue
 			}
+			e.text = finish(trimBlankLines(safeCut(e.text, room-sliceTextReserve(e.text, rewrite))))
+			e.truncated = true
+			used = consolidatedSliceTextBudget
 		}
 	}
 	var b strings.Builder
