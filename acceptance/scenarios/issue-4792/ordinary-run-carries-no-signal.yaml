@@ -1,0 +1,14 @@
+id: scenario:issue-4792/ordinary-run-carries-no-signal
+statement: For an ordinary non-decomposed run on the preview, GET /v0/runs/{run_id} returns 200 with no fan_in_verify_unavailable key in the body, and GET /v0/runs/{run_id}/audit carries no entry of category fan_in_verify_unavailable.
+verify_hint: GET /v0/runs/{run_id} and GET /v0/runs/{run_id}/audit against the localhost preview.
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"} -> run c8de2096-e898-477e-a131-4a5ce1dc848a, a non-decomposed feature_change run. 2) GET /v0/runs/c8de2096-e898-477e-a131-4a5ce1dc848a. 3) GET /v0/runs/c8de2096-e898-477e-a131-4a5ce1dc848a/audit. 4) GET /v0/runs/c8de2096-e898-477e-a131-4a5ce1dc848a/audit?category=fan_in_verify_unavailable. 5) Additionally, on a fresh parked implement-running run, called MCP fishhawk_get_run_status.
+assertions:
+    expected: 200 with no fan_in_verify_unavailable key; no audit entry of category fan_in_verify_unavailable
+    observed_at_record: The GET run returned 200, and the body has no 'fan_in_verify_unavailable' substring (sha256:84e8c396...). The full audit holds only pull_request_opened and acceptance_dispatched. The category-filtered audit returned 200 {"items":[],"next_cursor":""}. The MCP next_actions on the ordinary parked run carried no fan_in_verify_unavailable advisory.
+    repro_handle: curl -s http://localhost:8090/v0/runs/{run_id} | grep fan_in_verify_unavailable; curl -s 'http://localhost:8090/v0/runs/{run_id}/audit?category=fan_in_verify_unavailable'
+origin:
+    issue: 4792
+    pr: 5197
+    run_id: 8c0b7594-52ab-4641-b20b-ad6dc1a1b0da
+    head_sha: ee94c4e4900f5547b08b17b40ade096d7646cda8
+    recorded_at: 2026-11-12T08:38:39Z

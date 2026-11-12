@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -30,7 +31,7 @@ import (
 //   - FanInVerifySettled (#4785) is the orchestrator's read-only
 //     FanInVerifyGate: in a workflow that orders acceptance BEFORE review
 //     (feature_change), Advance holds the parent's never-dispatched acceptance
-//     stage `pending` while it answers false, and fires
+//     stage `pending` while it answers unsettled, and fires
 //     DispatchConsolidatedReview (whose hold below starts the pass).
 //
 // RELEASE needs no code here. The pass re-opened the parent implement stage and
@@ -200,9 +201,16 @@ var _ orchestrator.FanInVerifyGate = (*Server)(nil)
 // branch) runConsolidatedReviewRound uses, so this read and the D5 hold bind to
 // the identical head. Answers:
 //
-//   - a child run, a run with no decomposed children, or a forge that is not
-//     wired: settled (true) — DispatchConsolidatedReview skips those too, so
-//     holding would wedge acceptance with nothing to release it;
+//   - a child run or a run with no decomposed children: settled (true) with NO
+//     reason — no verify is owed there;
+//   - a nil RunRepo or a forge that is not wired: settled (true), because
+//     DispatchConsolidatedReview skips those too and holding would wedge
+//     acceptance with nothing to release it. Unlike the two arms above, these
+//     are FAIL-OPEN releases, so the answer carries an UnavailableReason
+//     (no_run_repo, forge_not_wired with forgeCompareFor's own text as the
+//     detail, #4792) for the orchestrator to log and record. The reason and
+//     detail are closed vocabulary or server-built text: never a wrapped
+//     upstream error and never the installation-ref tail;
 //   - passed, not_required and FAILED: settled. FAILED counts as settled ON
 //     PURPOSE: holding acceptance on a failed head would deadlock, because the
 //     operator fix-up's #3116 admission still refuses while acceptance is
@@ -212,31 +220,31 @@ var _ orchestrator.FanInVerifyGate = (*Server)(nil)
 //     unknown state: not settled (false);
 //   - a run, children, compare or state read error: the error (the caller
 //     keeps acceptance pending and the next Advance retries).
-func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (bool, error) {
+func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (orchestrator.FanInVerifyAnswer, error) {
 	if s.cfg.RunRepo == nil {
-		return true, nil
+		return orchestrator.FanInVerifyAnswer{Settled: true, UnavailableReason: orchestrator.FanInVerifyUnavailableNoRunRepo}, nil
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
-		return false, fmt.Errorf("fan-in verify: get run: %w", err)
+		return orchestrator.FanInVerifyAnswer{}, fmt.Errorf("fan-in verify: get run: %w", err)
 	}
 	if runRow.DecomposedFrom != nil {
-		return true, nil
+		return orchestrator.FanInVerifyAnswer{Settled: true}, nil
 	}
 	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: &runID, Limit: 1})
 	if err != nil {
-		return false, fmt.Errorf("fan-in verify: list children: %w", err)
+		return orchestrator.FanInVerifyAnswer{}, fmt.Errorf("fan-in verify: list children: %w", err)
 	}
 	if len(children) == 0 {
-		return true, nil
+		return orchestrator.FanInVerifyAnswer{Settled: true}, nil
 	}
 	comparer, scope, repo, reason := s.forgeCompareFor(runRow)
 	if reason != "" {
-		return true, nil
+		return orchestrator.FanInVerifyAnswer{Settled: true, UnavailableReason: orchestrator.FanInVerifyUnavailableForgeNotWired, UnavailableDetail: reason}, nil
 	}
 	cmp, err := comparer.ComparePatch(ctx, scope, repo, base, branch)
 	if err != nil {
-		return false, fmt.Errorf("fan-in verify: compare patch: %w", err)
+		return orchestrator.FanInVerifyAnswer{}, fmt.Errorf("fan-in verify: compare patch: %w", err)
 	}
 	// LOG-ONLY divergence (#4874). The D5 hold and every parent gate bind the
 	// LIVE head; acceptance reads the ledger head (acceptanceHeadAsOf). They
@@ -259,13 +267,64 @@ func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, 
 	}
 	state, err := s.mergeCandidateVerifyState(ctx, runRow, cmp.HeadSHA)
 	if err != nil {
-		return false, fmt.Errorf("fan-in verify: merge-candidate verify state: %w", err)
+		return orchestrator.FanInVerifyAnswer{}, fmt.Errorf("fan-in verify: merge-candidate verify state: %w", err)
 	}
 	switch state.State {
 	case mergeCandidateStateNotRequired, mergeCandidateStatePassed, mergeCandidateStateFailed:
-		return true, nil
+		return orchestrator.FanInVerifyAnswer{Settled: true}, nil
 	default:
-		return false, nil
+		return orchestrator.FanInVerifyAnswer{}, nil
+	}
+}
+
+// runFanInVerifyUnavailablePayload is the run-status block distilled from the
+// newest fan_in_verify_unavailable audit row (#4792): a decomposed parent's
+// acceptance stage was RELEASED with no consolidated fan-in verify consulted.
+// Reason is one of the orchestrator.FanInVerifyUnavailable* constants and
+// Detail its bounded, server-built text (base-resolution detail is
+// defaultbranch.ReasonOf's closed vocabulary; forge lookup detail is
+// forgeCompareFor's constant text, which omits wrapped upstream errors and
+// installation-ref tails; parse-repo detail carries only the run's own repo).
+// Note is server-built advisory text; it is display-only and never a gate input.
+type runFanInVerifyUnavailablePayload struct {
+	Reason            string `json:"reason"`
+	Detail            string `json:"detail,omitempty"`
+	AcceptanceStageID string `json:"acceptance_stage_id"`
+	Note              string `json:"note"`
+}
+
+// fanInVerifyUnavailableForRun distills the newest fan_in_verify_unavailable
+// audit row for the run into the run-status block (#4792), mirroring
+// reviewHeadMismatchForRun's best-effort posture: nil AuditRepo -> nil, list
+// error -> WARN + nil, no row -> nil, undecodable newest row -> WARN + nil. The
+// newest row wins (ListForRunByCategory is sequence-ascending). It never fails
+// the read.
+func (s *Server) fanInVerifyUnavailableForRun(ctx context.Context, runID uuid.UUID) *runFanInVerifyUnavailablePayload {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, orchestrator.CategoryFanInVerifyUnavailable)
+	if err != nil {
+		s.cfg.Logger.Warn("run status: list fan_in_verify_unavailable failed; omitting fan_in_verify_unavailable block",
+			"run_id", runID.String(), "error", err.Error())
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	newest := entries[len(entries)-1]
+	var p orchestrator.FanInVerifyUnavailablePayload
+	if uerr := json.Unmarshal(newest.Payload, &p); uerr != nil {
+		s.cfg.Logger.Warn("run status: decode fan_in_verify_unavailable payload failed; omitting fan_in_verify_unavailable block",
+			"run_id", runID.String(), "error", uerr.Error())
+		return nil
+	}
+	return &runFanInVerifyUnavailablePayload{
+		Reason:            p.Reason,
+		Detail:            p.Detail,
+		AcceptanceStageID: p.AcceptanceStageID,
+		Note: "Acceptance was released on an unverified consolidated head (" + p.Reason +
+			"): no consolidated fan-in verify was consulted. The ADR-090 merge gate still applies to the consolidated head.",
 	}
 }
 

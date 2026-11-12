@@ -5951,6 +5951,143 @@ func TestNextActions_ReviewHeadMismatchAdvisory(t *testing.T) {
 	})
 }
 
+// TestFoldFanInVerifyUnavailableAdvisory (#4792): a run carrying the
+// fan_in_verify_unavailable block gets a display-only advisory APPENDED on
+// every nextActionsFor return path (general, ci_failed, ci_cancelled,
+// review_coverage_incomplete), consuming nothing, while every pre-existing
+// action stays present, in order and untouched. An absent block leaves the
+// actions byte-identical and a terminal run adds nothing (the block stays on
+// the run as history). COUNTERFACTUAL: delete the fold call from a sequence →
+// that arm's subtest goes RED; remove the terminal-run guard → the terminal
+// subtests go RED.
+func TestFoldFanInVerifyUnavailableAdvisory(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	block := &runFanInVerifyUnavailable{
+		Reason: "forge_not_wired", Detail: "github client not wired",
+		AcceptanceStageID: "stage-acc", Note: "acceptance was released on an unverified consolidated head",
+	}
+	mkRun := func(state string, b *runFanInVerifyUnavailable) *Run {
+		r := naRun(state)
+		r.PullRequestURL = &prURL
+		r.FanInVerifyUnavailable = b
+		return r
+	}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implComplete := naReviewStatus("implement", "complete")
+
+	// appended asserts with == without + exactly one trailing advisory.
+	appended := func(t *testing.T, runID string, without, with *NextActions) SuggestedAction {
+		t.Helper()
+		if len(with.Actions) != len(without.Actions)+1 {
+			t.Fatalf("actions = %v, want the advisory appended to %v", actionNames(with), actionNames(without))
+		}
+		if !reflect.DeepEqual(with.Actions[:len(without.Actions)], without.Actions) {
+			t.Fatalf("actions = %v, want the pre-existing actions %v unchanged and in order", actionNames(with), actionNames(without))
+		}
+		act := with.Actions[len(with.Actions)-1]
+		if act.Action != "fan_in_verify_unavailable" {
+			t.Fatalf("last action = %q, want fan_in_verify_unavailable (%v)", act.Action, actionNames(with))
+		}
+		if act.Consumes != consumesNone {
+			t.Errorf("consumes = %q, want none (display-only advisory)", act.Consumes)
+		}
+		for k, v := range map[string]string{
+			"run_id": runID, "reason": "forge_not_wired",
+			"stage_id": "stage-acc", "detail": "github client not wired",
+		} {
+			if act.Params[k] != v {
+				t.Errorf("params[%s] = %q, want %q", k, act.Params[k], v)
+			}
+		}
+		for _, want := range []string{"forge_not_wired", "github client not wired", "merge gate"} {
+			if !strings.Contains(act.Reason, want) {
+				t.Errorf("reason %q does not name %q", act.Reason, want)
+			}
+		}
+		return act
+	}
+
+	// withBlock copies a run row so the with/without reads share one run id.
+	withBlock := func(r *Run, b *runFanInVerifyUnavailable) *Run {
+		c := *r
+		c.FanInVerifyUnavailable = b
+		return &c
+	}
+	arms := []struct {
+		name  string
+		drive *DriveStatus
+		run   *Run
+	}{
+		{name: "general", run: mkRun("running", nil)},
+		{name: "ci_failed", drive: &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}, run: mkRun("running", nil)},
+		{name: "ci_cancelled", drive: naCICancelledDrive(true), run: naCICancelledRun(false, "", "")},
+		{name: "review_coverage_incomplete", drive: &DriveStatus{Drive: true, DerivedStatus: stateReviewCoverageIncomplete}, run: mkRun("running", nil)},
+	}
+	for _, arm := range arms {
+		t.Run("appends on the "+arm.name+" arm", func(t *testing.T) {
+			without := nextActionsFor(withBlock(arm.run, nil), stages, nil, implComplete, nil, arm.drive, false, false, false, "", "", releaseSignals{})
+			with := nextActionsFor(withBlock(arm.run, block), stages, nil, implComplete, nil, arm.drive, false, false, false, "", "", releaseSignals{})
+			if len(without.Actions) == 0 {
+				t.Fatalf("fixture must produce pre-existing actions on the %s arm", arm.name)
+			}
+			if arm.name == "general" && !strings.Contains(strings.Join(actionNames(without), ","), "fishhawk_merge_run") {
+				t.Fatalf("fixture must produce the merge ritual; got %v", actionNames(without))
+			}
+			appended(t, arm.run.ID, without, with)
+			// An absent block (or an older backend) is byte-identical.
+			if again := nextActionsFor(withBlock(arm.run, nil), stages, nil, implComplete, nil, arm.drive, false, false, false, "", "", releaseSignals{}); !reflect.DeepEqual(without, again) {
+				t.Errorf("an absent block changed the actions: %v vs %v", actionNames(without), actionNames(again))
+			}
+		})
+	}
+	for _, state := range []string{"succeeded", "failed", "cancelled"} {
+		t.Run("terminal "+state+" run adds nothing", func(t *testing.T) {
+			base := mkRun(state, nil)
+			without := nextActionsFor(base, stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+			with := nextActionsFor(withBlock(base, block), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+			if !reflect.DeepEqual(without, with) {
+				t.Errorf("terminal run actions = %v, want %v unchanged (the block stays as history)", actionNames(with), actionNames(without))
+			}
+		})
+	}
+	t.Run("hook_not_wired reads as expected and empty detail is omitted", func(t *testing.T) {
+		b := &runFanInVerifyUnavailable{Reason: "hook_not_wired", AcceptanceStageID: "stage-acc"}
+		na := &NextActions{State: "x"}
+		foldFanInVerifyUnavailableAdvisory(mkRun("running", b), na)
+		if len(na.Actions) != 1 {
+			t.Fatalf("actions = %v, want exactly the advisory", actionNames(na))
+		}
+		act := na.Actions[0]
+		if _, ok := act.Params["detail"]; ok {
+			t.Errorf("params[detail] present for an empty detail, want the key omitted")
+		}
+		for _, want := range []string{"CLI/dev posture", "merge gate", "needs no remediation"} {
+			if !strings.Contains(act.Reason, want) {
+				t.Errorf("reason %q does not say %q", act.Reason, want)
+			}
+		}
+	})
+	t.Run("empty stage id is omitted", func(t *testing.T) {
+		na := &NextActions{State: "x"}
+		foldFanInVerifyUnavailableAdvisory(mkRun("running", &runFanInVerifyUnavailable{Reason: "no_run_repo"}), na)
+		if len(na.Actions) != 1 {
+			t.Fatalf("actions = %v, want exactly the advisory", actionNames(na))
+		}
+		if _, ok := na.Actions[0].Params["stage_id"]; ok {
+			t.Errorf("params[stage_id] present for an empty stage id, want the key omitted")
+		}
+	})
+	t.Run("nil guards", func(t *testing.T) {
+		foldFanInVerifyUnavailableAdvisory(mkRun("running", block), nil)
+		na := &NextActions{State: "x"}
+		foldFanInVerifyUnavailableAdvisory(nil, na)
+		foldFanInVerifyUnavailableAdvisory(mkRun("running", nil), na)
+		if len(na.Actions) != 0 {
+			t.Errorf("nil run or block folded %v, want nothing", na.Actions)
+		}
+	})
+}
+
 // --- E35.3 / #1600: post-deploy rollback offer --------------------------------
 
 // naRollbackTriageEntry is a rollback_offered acceptance_triage_decided entry

@@ -319,6 +319,16 @@ type runResponse struct {
 	// handleGetRun ONLY (same posture as LiveValidation); omitted (nil) when no
 	// un-superseded mismatch was recorded or the read fails.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+	// FanInVerifyUnavailable is the run's fail-open acceptance-hold signal
+	// (#4792): a decomposed parent's acceptance stage was RELEASED with no
+	// consolidated fan-in verify consulted (no_run_repo, forge_not_wired,
+	// default_branch_unresolved, hook_not_wired or no_consolidated_pr). Distilled
+	// from the newest fan_in_verify_unavailable audit row by
+	// fanInVerifyUnavailableForRun. Populated by handleGetRun ONLY (same
+	// posture as ReviewHeadMismatch) so the list endpoint stays free of the
+	// extra read; omitted (nil) when no row was recorded or the read fails. It
+	// is a signal, never a hold: the ADR-090 merge gate still applies.
+	FanInVerifyUnavailable *runFanInVerifyUnavailablePayload `json:"fan_in_verify_unavailable,omitempty"`
 	// ReviewAuthority is the per-stage resolved review authority (E53.2 /
 	// #2225): for each stage of the run's workflow that declares a reviewers
 	// block, the resolved mode (advisory | gating | gateless) and its
@@ -2565,6 +2575,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// Stale-review surface (#3655): single-run read ONLY, same best-effort
 	// posture — nil (field omitted) when no un-superseded mismatch exists.
 	resp.ReviewHeadMismatch = s.reviewHeadMismatchForRun(r.Context(), runID)
+	resp.FanInVerifyUnavailable = s.fanInVerifyUnavailableForRun(r.Context(), runID)
 	// Review-authority surface (E53.2 / #2225): single-run read ONLY (same
 	// posture as Concerns / Delegation — no per-row spec parse on the list
 	// endpoint). A pure projection of the run's cached workflow spec; nil

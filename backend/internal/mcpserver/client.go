@@ -333,6 +333,15 @@ type Run struct {
 	// renders nothing — the mixed-version degrade. The json tag MUST byte-match
 	// the backend's runResponse field or it silently decodes to nil.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty" jsonschema:"present when the open implement-review round judged a tree the PR does not carry (reviewed_tree_sha != pushed_tree_sha): the review verdicts describe a stale tree, so force a fresh round (fishhawk_fixup_stage) before merging. Omitted when no such mismatch is recorded"`
+	// FanInVerifyUnavailable mirrors the backend run-status surface (#4792): a
+	// decomposed parent's acceptance stage was RELEASED with no consolidated
+	// fan-in verify consulted. next_actions folds a display-only advisory from
+	// it. The backend emits it on the single-run read only (handleGetRun);
+	// omitted (nil) when no fan_in_verify_unavailable row was recorded. An OLDER
+	// backend omits it entirely, so it decodes to nil and next_actions renders
+	// nothing — the mixed-version degrade. The json tag MUST byte-match the
+	// backend's runResponse field or it silently decodes to nil.
+	FanInVerifyUnavailable *runFanInVerifyUnavailable `json:"fan_in_verify_unavailable,omitempty" jsonschema:"present when a decomposed parent's acceptance was released with NO consolidated fan-in verify consulted (reason: no_run_repo, forge_not_wired, default_branch_unresolved, hook_not_wired or no_consolidated_pr). A signal, never a hold: the merge gate still applies. Omitted when no release was recorded"`
 	// Precedent mirrors the backend runResponse.precedent (E75.4 / #3732): the
 	// bounded precedent block for the run's open human gate. The backend emits
 	// it on the SINGLE-run read only (handleGetRun); nil when no human gate is
@@ -642,6 +651,23 @@ type RunLiveValidation struct {
 	// #371-class trap this file's WireShape test pins). Empty when the walk was
 	// not durably filed or on the companion arm (no per-run section).
 	ChecklistAnchor string `json:"checklist_anchor,omitempty" jsonschema:"this run's checklist section anchor (run-<run_id>) inside the rolling per-epic walk; empty when the walk carries no per-run section"`
+}
+
+// runFanInVerifyUnavailable mirrors the backend's runFanInVerifyUnavailablePayload
+// (#4792): the newest fan_in_verify_unavailable audit row, distilled onto the
+// run-status payload. The json tags MUST byte-match the backend or each field
+// silently decodes to its zero value (the #371-class hand-maintained-wire-mirror
+// trap); TestFanInVerifyUnavailable_WireShape pins them against raw
+// server-shaped bytes. Reason is the closed set no_run_repo | forge_not_wired |
+// default_branch_unresolved | hook_not_wired | no_consolidated_pr. Deliberately
+// UNEXPORTED — same rationale as gateViewReviewHeadMismatch: the field on Run is
+// the only consumer, and an exported identifier would widen the package's
+// export-surface baseline (TestExportedSurfaceMatchesBaseline).
+type runFanInVerifyUnavailable struct {
+	Reason            string `json:"reason" jsonschema:"why no fan-in verify was consulted: no_run_repo, forge_not_wired, default_branch_unresolved, hook_not_wired (expected in the CLI/dev posture) or no_consolidated_pr"`
+	Detail            string `json:"detail,omitempty" jsonschema:"bounded server-built detail for the reason (never a wrapped upstream error)"`
+	AcceptanceStageID string `json:"acceptance_stage_id" jsonschema:"the acceptance stage that was released"`
+	Note              string `json:"note" jsonschema:"server-built advisory: acceptance was released on an unverified consolidated head and the merge gate still applies"`
 }
 
 // RunConcerns mirrors the backend's run-status concerns block (#964):

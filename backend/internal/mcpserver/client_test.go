@@ -2022,6 +2022,53 @@ func TestReviewHeadMismatch_WireShape(t *testing.T) {
 	})
 }
 
+// TestFanInVerifyUnavailable_WireShape (#4792) pins the hand-maintained MCP wire
+// mirror for the run-status fan_in_verify_unavailable block, driven from raw
+// server-shaped bytes (the keys backend/internal/server pins in
+// TestFanInVerifyUnavailable_EndToEnd), not the Go struct, so a mistyped json tag
+// fails loudly instead of silently decoding nil (the #371-class trap). An
+// old-backend body that omits the key decodes nil (the mixed-version degrade).
+func TestFanInVerifyUnavailable_WireShape(t *testing.T) {
+	runID := uuid.New()
+	const block = `{"reason":"forge_not_wired","detail":"github client not wired",` +
+		`"acceptance_stage_id":"stage-acc","note":"acceptance was released on an unverified consolidated head"}`
+	want := runFanInVerifyUnavailable{
+		Reason: "forge_not_wired", Detail: "github client not wired",
+		AcceptanceStageID: "stage-acc", Note: "acceptance was released on an unverified consolidated head",
+	}
+	serve := func(t *testing.T, body string) *apiClient {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(ts.Close)
+		return newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	}
+	runBody := func(extra string) string {
+		return `{"id":"` + runID.String() + `","state":"running","workflow_id":"feature_change"` + extra + `}`
+	}
+
+	t.Run("run populated", func(t *testing.T) {
+		r, err := serve(t, runBody(`,"fan_in_verify_unavailable":`+block)).GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if r.FanInVerifyUnavailable == nil || *r.FanInVerifyUnavailable != want {
+			t.Fatalf("Run.FanInVerifyUnavailable = %+v, want %+v (a tag does not byte-match the backend)", r.FanInVerifyUnavailable, want)
+		}
+	})
+	t.Run("run old backend -> nil", func(t *testing.T) {
+		r, err := serve(t, runBody("")).GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if r.FanInVerifyUnavailable != nil {
+			t.Errorf("Run.FanInVerifyUnavailable = %+v, want nil", r.FanInVerifyUnavailable)
+		}
+	})
+}
+
 // --- W1: the WHOLE MCP wire, gh subprocess → request body (#2226) ---
 //
 // The gap the operator named: issue_fetch_test.go ends at the decode and the

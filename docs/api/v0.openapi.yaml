@@ -2749,6 +2749,8 @@ components:
           $ref: '#/components/schemas/LiveValidation'
         review_head_mismatch:
           $ref: '#/components/schemas/GateViewReviewHeadMismatch'
+        fan_in_verify_unavailable:
+          $ref: '#/components/schemas/FanInVerifyUnavailable'
         review_authority:
           type: array
           description: |
@@ -4779,6 +4781,64 @@ components:
         pushed_head_sha:
           type: string
           description: The PR head SHA the runner pushed.
+
+    FanInVerifyUnavailable:
+      type: object
+      description: |
+        Present when a decomposed parent's acceptance stage was RELEASED with
+        NO consolidated fan-in verify consulted (#4792): the hold that keeps
+        acceptance `pending` until the consolidated head's merge-candidate verify
+        settles (#4785, ADR-090 D5) could not look, so acceptance dispatched
+        anyway. A SIGNAL, never a hold and never a gate input: the release
+        itself is unchanged, and the ADR-090 merge gate still applies to the
+        unverified consolidated head.
+
+        Distilled from the newest `fan_in_verify_unavailable` audit row (system
+        actor, anchored on the acceptance stage), which the orchestrator appends
+        best-effort on every such release, deduplicated per (acceptance stage,
+        reason). Emitted by `GET /v0/runs/{run_id}` ONLY (a single audit read,
+        same posture as `review_head_mismatch`); omitted on the list endpoint,
+        when no release was recorded, or when the read fails. A server with no
+        run repository cannot serve this read at all, so `no_run_repo` is
+        recorded on the audit chain and in the server log but is unreachable
+        here from that server. Authorization is the run read's own
+        (`read:runs`); the underlying audit row is read through
+        `GET /v0/runs/{run_id}/audit?category=fan_in_verify_unavailable`, which
+        carries its own `read:audit` scope, so the two scopes are not
+        interchangeable.
+
+        `detail` is closed vocabulary or server-built text: the
+        `default_branch_unresolved` detail is the default-branch resolver's
+        closed reason vocabulary; the `forge_not_wired` detail is the forge
+        compare lookup's constant text (`github client not wired`,
+        `no installation id`, `forge <family> unresolved`, or `parse repo: ...`
+        naming only the repo the run already exposes) and never a wrapped
+        upstream error or an installation-ref tail.
+      required: [reason, acceptance_stage_id, note]
+      properties:
+        reason:
+          type: string
+          enum: [no_run_repo, forge_not_wired, default_branch_unresolved, hook_not_wired, no_consolidated_pr]
+          description: |
+            Why no fan-in verify was consulted. `no_run_repo`: the verify hook
+            has no run repository. `forge_not_wired`: the forge compare cannot be
+            built (no client, no installation id, an unparseable repo or an
+            unresolved forge family; `detail` carries which). `default_branch_unresolved`:
+            the fan-in base could not be read, so the hook was never consulted.
+            `hook_not_wired`: the verify hook or the consolidated-review
+            dispatcher is not wired. That is the EXPECTED CLI/dev posture, so its
+            signal alone needs no operator remediation. `no_consolidated_pr`: the
+            consolidated PR open skipped gracefully (no GitHub client or no
+            installation id), leaving the parent PR-less.
+        detail:
+          type: string
+          description: Bounded, server-built detail for `reason`. Omitted when the reason carries none.
+        acceptance_stage_id:
+          type: string
+          description: The acceptance stage that was released.
+        note:
+          type: string
+          description: Server-built advisory text naming the reason and stating that the merge gate still applies.
 
     GateViewConcern:
       type: object
