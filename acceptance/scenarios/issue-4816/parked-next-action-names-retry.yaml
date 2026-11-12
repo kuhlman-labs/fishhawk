@@ -1,0 +1,14 @@
+id: scenario:issue-4816/parked-next-action-names-retry
+statement: For the parked run from the first-execution scenario, the run status's next actions classify the run as implement_failed. The first offered action is fishhawk_retry_stage for the implement stage, and its precondition names the park budget (up to 3 parks per stage).
+verify_hint: 'MCP fishhawk_get_run_status (or GET /v0/runs/{run_id}) next_actions: state implement_failed, actions[0].action fishhawk_retry_stage with params.stage_id = the implement stage, precondition containing ''up to 3 parks per stage''.'
+steps: On the parked run from a fresh implement-running seed with a signed category-C pull-request failure, minted an fhm_ token (signing-key, dev sign '{}', POST /v0/runs/{run}/mcp-token). Called POST /mcp tools/call fishhawk_get_run_status {run_id} with the Mcp-Name header.
+assertions:
+    expected: state implement_failed, actions[0] fishhawk_retry_stage for implement, precondition containing 'up to 3 parks per stage'
+    observed_at_record: next_actions.state=implement_failed. actions[0].action=fishhawk_retry_stage with params.stage_id = the implement stage. The precondition names the first-execution park (#4426) and the operator-reaped live merge-candidate verify-only pass (#4816), and says 'up to 3 parks per stage'.
+    repro_handle: MCP tools/call fishhawk_get_run_status
+origin:
+    issue: 4816
+    pr: 5191
+    run_id: 644ccbaf-abb8-41ef-b338-5fe1f4355c00
+    head_sha: 9c17ffb7b04b5ec7a12151a5bccc4ab6588834f7
+    recorded_at: 2026-11-12T02:17:09Z
