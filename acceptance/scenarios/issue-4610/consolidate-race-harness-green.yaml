@@ -1,0 +1,13 @@
+id: scenario:issue-4610/consolidate-race-harness-green
+statement: 'The hermetic race harness passes in the acceptance sandbox: `scripts/test single -race -run ''TestConsolidateRun_(RacesEventDrivenSettle|LosesSettleRace|WaitsOnFanInSettleLock)'' ./backend/internal/server/` exits 0 at the merge-candidate head, and the loser of the race answers 409 not_awaiting_children with exactly one children_settled and one slices_integrated row.'
+steps: 'In the sanctioned acceptance tree at merge-candidate HEAD 307d73ca77259955a86e3864ae24cf5cf814b330 (equal to the preview git_sha), ran: scripts/test single -race -count=1 -v -run ''TestConsolidateRun_(RacesEventDrivenSettle|LosesSettleRace|WaitsOnFanInSettleLock)'' ./backend/internal/server/ with GOFLAGS=-buildvcs=false GOPROXY=off.'
+assertions:
+    expected: exit 0; loser 409 not_awaiting_children; exactly one children_settled and one slices_integrated
+    observed_at_record: EXIT=0, and all three tests PASS. The RacesEventDrivenSettle_SettlesOnce test asserts the loser gets 409 not_awaiting_children with exactly one children_settled and one slices_integrated row.
+    repro_handle: scripts/test single -race -run 'TestConsolidateRun_(RacesEventDrivenSettle|LosesSettleRace|WaitsOnFanInSettleLock)' ./backend/internal/server/
+origin:
+    issue: 4610
+    pr: 5201
+    run_id: e3175e39-47c5-4243-b485-29ddfe12da7a
+    head_sha: 307d73ca77259955a86e3864ae24cf5cf814b330
+    recorded_at: 2026-11-12T13:15:26Z
