@@ -1,0 +1,14 @@
+id: scenario:issue-4816/first-execution-park-unchanged
+statement: A first-execution category-C implement failure still parks the run. After the implement-running scenario's signed category-C pull-request failure report, the run reads running and its implement stage reads failed with category C. The run's audit log carries exactly one stage_infra_parked entry scoped to the implement stage, and its payload has no reopened_pass key.
+verify_hint: GET /v0/runs/{run_id} (state running, implement stage failed / failure_category C) and GET /v0/runs/{run_id}/audit (one stage_infra_parked entry scoped to the implement stage, payload without reopened_pass).
+steps: '1) POST /v0/dev/fixtures {"scenario":"implement-running"}. 2) POST /v0/runs/{run}/signing-key {}. 3) POST /v0/dev/sign over {"outcome":"failed","category":"C","reason":"open PR: 503 from the forge"}. 4) POST /v0/runs/{run}/pull-request?stage_id={implement} with X-Fishhawk-Signature returned 200. 5) GET /v0/runs/{run}, GET /v0/runs/{run}/stages, GET /v0/runs/{run}/audit.'
+assertions:
+    expected: run running; implement failed C; one stage_infra_parked for implement without reopened_pass
+    observed_at_record: Run state running. The implement stage is failed with failure_category C. The audit log has exactly one stage_infra_parked row, scoped to the implement stage. Its payload keys are run_id, stage_id, failed_at, run_state, stage_type, park_ordinal=1, retry_budget=3, retry_ordinal=0, failure_reason and failure_category, with no reopened_pass. The row is followed by pull_request_failed.
+    repro_handle: POST /v0/runs/{run}/pull-request?stage_id={impl} (signed category-C failure), then GET /v0/runs/{run}/audit
+origin:
+    issue: 4816
+    pr: 5191
+    run_id: 644ccbaf-abb8-41ef-b338-5fe1f4355c00
+    head_sha: 9c17ffb7b04b5ec7a12151a5bccc4ab6588834f7
+    recorded_at: 2026-11-12T02:17:09Z

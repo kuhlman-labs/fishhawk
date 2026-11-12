@@ -1867,12 +1867,19 @@ func TestRetryStage_ConcernSupersedeBestEffort(t *testing.T) {
 // ListForRunByCategory ERRORS (which is why every pre-#3621 retry test — the
 // #3593 supersede control included — sees checkpointNone and supersedes exactly
 // as before); this shadows it for the tests that need a checkpoint.
+//
+// listErrCategory (#4816), when set, makes ListForRunByCategory ERROR for that
+// one category, so a test can drive the retry gate's read-failure arm.
 type checkpointRetryAudit struct {
 	*approvalAuditFake
-	entries []*audit.Entry
+	entries         []*audit.Entry
+	listErrCategory string
 }
 
 func (a *checkpointRetryAudit) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.listErrCategory != "" && category == a.listErrCategory {
+		return nil, errors.New("audit read down for " + category)
+	}
 	var out []*audit.Entry
 	for _, e := range a.entries {
 		if e.Category == category {
@@ -2125,5 +2132,241 @@ func TestRetryStage_AcceptanceReopen_LateIntegrationSeed(t *testing.T) {
 				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
 			}
 		})
+	}
+}
+
+// --- #4816: a retry that replays a live merge-candidate verify-only pass ----
+
+// mcRetryTriggerPayload is a populated stage_merge_candidate_verify_triggered
+// payload naming headSHA, with the given fields blanked.
+func mcRetryTriggerPayload(t *testing.T, headSHA string, blank ...string) string {
+	t.Helper()
+	tr := mergeCandidateVerifyTrigger{
+		Branch: "fishhawk/run-4816", BaseRef: "main", ExpectedHeadSHA: headSHA,
+		Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: "scripts/test verify", PriorState: "succeeded",
+	}
+	for _, f := range blank {
+		switch f {
+		case "verify_command":
+			tr.VerifyCommand = ""
+		default:
+			t.Fatalf("unknown blank field %q", f)
+		}
+	}
+	b, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// triggerRetryResult is what retryWithTriggerState returns: the concern state
+// READ BACK after the call, every appended audit entry, the server (so the
+// test can resolve the trigger the prompt would serve) and the retried stage.
+type triggerRetryResult struct {
+	state    concern.State
+	appended []audit.ChainAppendParams
+	s        *Server
+	stage    *run.Stage
+}
+
+// retryWithTriggerState is retryWithCheckpointState's #4816 sibling: the same
+// failed implement stage with one open implement-review concern, retried
+// through the REAL POST /v0/stages/{stage_id}/retry handler (or, with
+// override, through retryStageAs as a category-B override), with the given
+// chain and an optional ListForRunByCategory failure.
+func retryWithTriggerState(t *testing.T, override bool, listErrCategory string, entries func(stageID uuid.UUID) []*audit.Entry) triggerRetryResult {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	implement.SelfRetryCount = 1
+	cat := run.FailureC
+	reason := "runner_lost"
+	if override {
+		cat = run.FailureB
+		reason = "policy gate refused the diff"
+	}
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	cr := newFakeConcernRepo()
+	c := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern")
+
+	base := newApprovalAuditFake()
+	au := &checkpointRetryAudit{approvalAuditFake: base, entries: entries(implement.ID), listErrCategory: listErrCategory}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+
+	if override {
+		id := Identity{Subject: "operator@example.test", TokenID: "tok-4816", Scopes: []string{"write:stages"}}
+		got, err := s.retryStageAs(context.Background(), id, retryActionParams{
+			StageID: implement.ID, Override: true, OverrideReason: "the gate refusal was a policy misfire",
+		})
+		if err != nil {
+			t.Fatalf("retryStageAs override: %v", err)
+		}
+		if got == nil || got.State != run.StageStatePending {
+			t.Fatalf("override retry re-opened to %+v, want pending", got)
+		}
+	} else if w := postRetry(t, s, implement.ID); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	base.mu.Lock()
+	appended := append([]audit.ChainAppendParams(nil), base.appended...)
+	base.mu.Unlock()
+	return triggerRetryResult{state: concernState(t, cr, c.ID), appended: appended, s: s, stage: implement}
+}
+
+// retryReceipt decodes the single appended receipt row of category.
+func retryReceipt(t *testing.T, appended []audit.ChainAppendParams, category string) map[string]any {
+	t.Helper()
+	var rows []audit.ChainAppendParams
+	for _, e := range appended {
+		if e.Category == category {
+			rows = append(rows, e)
+		}
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one %s receipt, got %d (%+v)", category, len(rows), appended)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestRetryStage_LiveMergeCandidateTrigger_KeepsImplementConcerns (#4816 H1,
+// N5): a retry whose stage still carries a LIVE merge-candidate verify trigger
+// replays the same verify-only pass, so it keeps the prior round's concerns
+// raised, writes no verified_tree_discarded row, records
+// replay_kept_reviewed_tree: true on its stage_retried receipt, and leaves the
+// trigger resolvable for the prompt. A consumed, half-populated or unreadable
+// trigger keeps today's supersede with the key ABSENT. Every row carries
+// explicit distinct sequences; the concern is READ BACK after the handler
+// returns.
+func TestRetryStage_LiveMergeCandidateTrigger_KeepsImplementConcerns(t *testing.T) {
+	const head = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	cases := []struct {
+		name            string
+		listErrCategory string
+		entries         func(t *testing.T, sid uuid.UUID) []*audit.Entry
+		wantKept        bool
+		wantDiscardRows int
+	}{
+		{name: "(i) live trigger, no push checkpoint -> kept", wantKept: true,
+			entries: func(t *testing.T, sid uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{retryCheckpointEntry(sid, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, head))}
+			}},
+		{name: "(ii) live trigger + an invalidated recorded tree -> kept, no discard row", wantKept: true,
+			entries: func(t *testing.T, sid uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{
+					retryCheckpointEntry(sid, "pull_request_failed", 3,
+						`{"push_checkpoint":{"branch":"b","head_sha":"h","base_sha":"base","verified_tree_sha":"tree4816"}}`),
+					retryCheckpointEntry(sid, "pull_request_opened", 4, `{}`),
+					retryCheckpointEntry(sid, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, head)),
+				}
+			}},
+		{name: "(iii) trigger consumed by merge_candidate_verified -> superseded", wantKept: false,
+			entries: func(t *testing.T, sid uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{
+					retryCheckpointEntry(sid, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, head)),
+					retryCheckpointEntry(sid, CategoryMergeCandidateVerified, 8, `{"result":"passed"}`),
+				}
+			}},
+		{name: "(iv) half-populated newest trigger -> superseded (fail-safe)", wantKept: false,
+			entries: func(t *testing.T, sid uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{retryCheckpointEntry(sid, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, head, "verify_command"))}
+			}},
+		{name: "(v) trigger read error -> superseded (fail-safe)", wantKept: false, listErrCategory: CategoryStageMergeCandidateVerifyTriggered,
+			entries: func(t *testing.T, sid uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{retryCheckpointEntry(sid, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, head))}
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := retryWithTriggerState(t, false, tc.listErrCategory, func(sid uuid.UUID) []*audit.Entry { return tc.entries(t, sid) })
+			receipt := retryReceipt(t, res.appended, CategoryStageRetried)
+			discard := retryDiscardRows(res.appended)
+			if tc.wantKept {
+				if res.state != concern.StateRaised {
+					t.Errorf("concern state = %q, want raised (a verify-only replay keeps the reviewed tree)", res.state)
+				}
+				if len(discard) != 0 {
+					t.Errorf("a verify-only replay discards nothing, so it must write no verified_tree_discarded row, got %+v", discard)
+				}
+				if receipt["replay_kept_reviewed_tree"] != true {
+					t.Errorf("stage_retried receipt = %v, want replay_kept_reviewed_tree true", receipt)
+				}
+				tr := res.s.resolveMergeCandidateVerifyTrigger(context.Background(), res.stage.RunID, res.stage.ID)
+				if tr == nil || tr.ExpectedHeadSHA != head {
+					t.Errorf("resolveMergeCandidateVerifyTrigger = %+v, want the live trigger naming %s (the replay is still served)", tr, head)
+				}
+				return
+			}
+			if res.state != concern.StateSuperseded {
+				t.Errorf("concern state = %q, want superseded (no live pass: a plain re-implement)", res.state)
+			}
+			if _, ok := receipt["replay_kept_reviewed_tree"]; ok {
+				t.Errorf("stage_retried receipt = %v, want NO replay_kept_reviewed_tree key", receipt)
+			}
+		})
+	}
+}
+
+// TestRetryStage_OverrideRetry_LiveMergeCandidateTrigger_KeepsConcerns
+// (#4816): the gate keys on the live trigger, not the retry kind, so an
+// audited category-B override retry of a live pass keeps the concerns too and
+// records the decision on its stage_override_retried receipt.
+func TestRetryStage_OverrideRetry_LiveMergeCandidateTrigger_KeepsConcerns(t *testing.T) {
+	const head = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+	res := retryWithTriggerState(t, true, "", func(sid uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{retryCheckpointEntry(sid, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, head))}
+	})
+	if res.state != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (an override replay of a live pass keeps the reviewed tree)", res.state)
+	}
+	if rows := retryDiscardRows(res.appended); len(rows) != 0 {
+		t.Errorf("want no verified_tree_discarded row, got %+v", rows)
+	}
+	receipt := retryReceipt(t, res.appended, CategoryStageOverrideRetried)
+	if receipt["replay_kept_reviewed_tree"] != true {
+		t.Errorf("stage_override_retried receipt = %v, want replay_kept_reviewed_tree true", receipt)
+	}
+}
+
+// TestRetryReplaysLiveMergeCandidatePass_Preconditions pins the gate's guard
+// (#4816): with the SAME live trigger on the chain, only an implement stage
+// re-opened to pending replays the pass; a nil stage, another stage type, a
+// non-pending re-open (the D-timeout awaiting_approval arm) and an unwired
+// AuditRepo answer false.
+func TestRetryReplaysLiveMergeCandidatePass_Preconditions(t *testing.T) {
+	stageID, runID := uuid.New(), uuid.New()
+	au := &checkpointRetryAudit{approvalAuditFake: newApprovalAuditFake(), entries: []*audit.Entry{
+		retryCheckpointEntry(stageID, CategoryStageMergeCandidateVerifyTriggered, 7, mcRetryTriggerPayload(t, "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3")),
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newOrchestratorRepo(), AuditRepo: au})
+	stage := func(typ run.StageType, state run.StageState) *run.Stage {
+		return &run.Stage{ID: stageID, RunID: runID, Type: typ, State: state}
+	}
+	if !s.retryReplaysLiveMergeCandidatePass(context.Background(), stage(run.StageTypeImplement, run.StageStatePending)) {
+		t.Fatal("implement re-opened to pending with a live trigger: want true")
+	}
+	for name, st := range map[string]*run.Stage{
+		"nil stage":                     nil,
+		"acceptance pending":            stage(run.StageTypeAcceptance, run.StageStatePending),
+		"implement awaiting_approval":   stage(run.StageTypeImplement, run.StageStateAwaitingApproval),
+		"implement awaiting_children":   stage(run.StageTypeImplement, run.StageStateAwaitingChildren),
+		"review pending (another type)": stage(run.StageTypeReview, run.StageStatePending),
+	} {
+		if s.retryReplaysLiveMergeCandidatePass(context.Background(), st) {
+			t.Errorf("%s: want false", name)
+		}
+	}
+	unwired := New(Config{Addr: "127.0.0.1:0", RunRepo: newOrchestratorRepo()})
+	if unwired.retryReplaysLiveMergeCandidatePass(context.Background(), stage(run.StageTypeImplement, run.StageStatePending)) {
+		t.Error("nil AuditRepo: want false")
 	}
 }

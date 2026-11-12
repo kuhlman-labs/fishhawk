@@ -2009,8 +2009,10 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 			Consumes:     consumesNone,
 			Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
 		}
-		// #4426: a category-C implement failure on a NON-terminal run is the
-		// server's infrastructure park — the run stays running and the stage
+		// #4426 / #4816: a category-C implement failure on a NON-terminal run is
+		// the server's infrastructure park (a first-execution failure, or an
+		// operator-reaped live merge-candidate verify-only pass whose retry
+		// replays the pass) — the run stays running and the stage
 		// stays retry-eligible, so fishhawk_revive_run (which needs a
 		// terminal-failed run) is not offered and the retry names the park. A
 		// terminal run, a category-D failure, and the A and B arms keep the
@@ -2023,7 +2025,7 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 					{
 						Action:       "fishhawk_retry_stage",
 						Params:       map[string]string{"stage_id": impl.ID},
-						Precondition: fmt.Sprintf("the implement stage FAILED category C while the run stays non-terminal: the server parks a first-execution category-C implement failure instead of failing the run, up to %d parks per stage (#4426)", runpkg.InfraFailureParkRetryBudget),
+						Precondition: fmt.Sprintf("the implement stage FAILED category C while the run stays non-terminal: the server parks a first-execution category-C implement failure (#4426) or an operator-reaped live merge-candidate verify-only pass whose retry replays the pass (#4816) instead of failing the run, up to %d parks per stage", runpkg.InfraFailureParkRetryBudget),
 						Consumes:     consumesRetryBudget,
 						Reason:       "retry the parked implement stage in place after reading the failure reason: on runner_kind local the retry parks it at awaiting_host_dispatch, and a decomposition child is then re-spawned by fishhawk_run_children (a parent's fishhawk_await_children releases children_dispatchable for it); past the park budget the next category-C failure fails the run",
 					},

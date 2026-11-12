@@ -1149,6 +1149,48 @@ func TestFind_ImplementInfraFailureParked(t *testing.T) {
 			}
 		}},
 	}
+	// #4816: a live merge-candidate verify-only pass. The failed stage carries
+	// an ended_at, so the operator reap row can be stamped with its episode.
+	endedAt := stale.Add(time.Minute).UTC()
+	livePass := func(a *memAudit, between string, reapCategory string) func(*run.Run, *run.Stage) {
+		return func(r *run.Run, impl *run.Stage) {
+			impl.EndedAt = &endedAt
+			impl.SelfRetryCount = 1
+			at, ordinal := run.InfraParkEpisode(impl)
+			scopedRow(a, r, &impl.ID, 1, "stage_merge_candidate_verify_triggered", map[string]any{
+				"branch": "fishhawk/run-x", "base_ref": "main", "expected_head_sha": strings.Repeat("a", 40),
+				"cause": "base_advance", "verify_command": "scripts/verify",
+			})
+			if between != "" {
+				scopedRow(a, r, &impl.ID, 2, between, map[string]any{"result": "passed"})
+			}
+			scopedRow(a, r, &impl.ID, 3, reapCategory, map[string]any{
+				"failure_category": "C", "reason": run.InfraParkRunnerLostReason, "failed_at": at, "retry_ordinal": ordinal,
+			})
+		}
+	}
+	t.Run("#4816 operator-reaped live verify pass: parked, not settled", func(t *testing.T) {
+		m, a := newMemRuns(), newMemAudit()
+		r := seed(m, a, livePass(a, "", run.InfraParkOperatorReapCategory()))
+		cands, _ := sweep(t, m, a, noRunners, testOpts())
+		if c := candidateFor(t, cands, r.ID); c.Class != ClassAbandoned {
+			t.Fatalf("candidate = %s/%s, want abandoned (Advance parks an operator-reaped live verify pass)", c.Class, c.Action)
+		}
+	})
+	settledCases = append(settledCases,
+		struct {
+			name  string
+			extra func(a *memAudit) func(r *run.Run, impl *run.Stage)
+		}{"#4816 trigger consumed by merge_candidate_verified before the reap", func(a *memAudit) func(*run.Run, *run.Stage) {
+			return livePass(a, run.InfraParkMergeCandidateVerifiedCategory(), run.InfraParkOperatorReapCategory())
+		}},
+		struct {
+			name  string
+			extra func(a *memAudit) func(r *run.Run, impl *run.Stage)
+		}{"#4816 dispatch_watchdog_elapsed instead of an operator reap", func(a *memAudit) func(*run.Run, *run.Stage) {
+			return livePass(a, "", "dispatch_watchdog_elapsed")
+		}},
+	)
 	for _, tc := range settledCases {
 		t.Run(tc.name+": settled failed", func(t *testing.T) {
 			m, a := newMemRuns(), newMemAudit()

@@ -3536,7 +3536,10 @@ components:
             longer exists — but that drops `open_implement` to 0, so the open
             set ALONE reads the discard as a settle. A NON-ZERO value means
             those concerns were never ANSWERED by the tree at this gate, only
-            discarded.
+            discarded. A retry that replays a live merge-candidate
+            verify-only pass (#4816), or resumes a held commit (#3621), keeps
+            the concerns and adds nothing here; the replay records
+            `replay_kept_reviewed_tree` on its retry receipt.
 
             Only the count is here. Each discarded concern's full row (id,
             `reviewer_model`, severity, category, note, `state_reason`) is
@@ -18317,7 +18320,15 @@ paths:
         `failed` (category `C`), the audit trail names the reason, and
         `retry_stage` is applicable. Unlike `run.FailStage`, the reap path
         will NOT collapse a park that lands mid-flight (#2630) and REQUIRES a
-        CAS-capable run repository rather than degrading to it (#2672).
+        CAS-capable run repository rather than degrading to it (#2672). An
+        OPERATOR-scoped reap (a `write:runs` token or a session) that performs
+        the transition also stamps its `dispatch_reaper_failed` entry with
+        `failed_at` and `retry_ordinal`, the failed stage's failure episode
+        read from the transitioned row (never a request field); a run-bound
+        self-report gets no stamp (#4816). An operator reap with reason
+        `runner_lost` of a live merge-candidate verify-only implement pass
+        then parks the run (stage `failed`/`C`, run `running`) instead of
+        failing it.
 
         **Idempotent.** A report against an already-terminal stage (a
         double-report, or a race with the dispatch watchdog reaping the same
@@ -18332,7 +18343,7 @@ paths:
         verdict ship failed after the stage settled (the 413 `body_too_large`
         strand). Instead of the bare no-op the handler appends ONE chained,
         stage-scoped `acceptance_verdict_unshipped` audit entry (actor
-        `system`; payload is the `dispatch_reaper_failed` key set — `run_id`,
+        `system`; payload is the shared reap key set — `run_id`,
         `stage_id`, `failure_category`, `reason`, `detail`, `exit_code`,
         `reported_at`, `auth_method`) and answers 200 `{transitioned: false,
         acceptance_verdict_unshipped_recorded: true}`. Still no transition
@@ -18658,8 +18669,9 @@ paths:
         `details.failed_stage_type` and `details.failure_category`), the same
         rule the orchestrator applies when it walks a run: it never dispatches
         past a failed stage. A category-C infrastructure failure of an
-        acceptance (#4356) or first-execution implement (#4426) stage parks the
-        run `running` instead of failing it, so the terminal-run refusal does
+        acceptance (#4356), first-execution implement (#4426), or
+        operator-reaped live merge-candidate verify-only implement pass
+        (#4816) stage parks the run `running` instead of failing it, so the terminal-run refusal does
         not cover the stages after it; retry or cancel the failed stage first.
         A failed `deploy` ahead answers `deploy_not_succeeded` instead. The
         refusal fires BEFORE the state CAS, so the stage keeps its state, and
@@ -27953,6 +27965,16 @@ paths:
         prior category B), kept separate from the ordinary `stage_retried`
         receipt. Without an override the body may be omitted entirely and
         default per-category semantics apply, writing `stage_retried`.
+
+        **Concerns on an implement retry (#3618 / #3621 / #4816).** A retry
+        that re-opens an implement stage normally supersedes the prior
+        attempt's open implement-review concerns. A retry (ordinary or
+        override) that replays a live merge-candidate verify-only pass
+        (#4816), or resumes a held commit (#3621), keeps them instead, and
+        the replay case records `replay_kept_reviewed_tree: true` on the
+        `stage_retried` / `stage_override_retried` receipt (the key is
+        present only when true). An unreadable, malformed or consumed
+        trigger falls back to the supersede.
 
         **Acceptance-reopen arm (E31.16 / #1567).** A failed acceptance
         VERDICT leaves the acceptance STAGE `succeeded` (E31.7), so a

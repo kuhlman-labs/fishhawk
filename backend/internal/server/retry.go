@@ -517,15 +517,20 @@ func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionPar
 			slog.String("error", fetchErr.Error()))
 	}
 
+	// #4816: decide BEFORE the receipt whether this retry replays a live
+	// merge-candidate verify-only pass, so the receipt records the decision
+	// (replay_kept_reviewed_tree) and the supersede below honours it.
+	keepReviewedTree := s.retryReplaysLiveMergeCandidatePass(ctx, dec.Stage)
+
 	// Audit first so the retry intent is recorded even if the
 	// orchestrator handoff below fails. Same posture as the
 	// approvals handler (E7.4 / approvals.go). A category-B override
 	// gets the distinct stage_override_retried entry (who/why) instead
 	// of the ordinary stage_retried receipt.
 	if dec.Overridden {
-		s.writeOverrideRetryAudit(ctx, id, dec, p.OverrideReason)
+		s.writeOverrideRetryAudit(ctx, id, dec, p.OverrideReason, keepReviewedTree)
 	} else {
-		s.writeRetryAudit(ctx, id, dec, runRow, p.DelegatedRule)
+		s.writeRetryAudit(ctx, id, dec, runRow, p.DelegatedRule, keepReviewedTree)
 	}
 
 	// Supersede the prior attempt's OPEN implement-review concerns (#3593),
@@ -558,7 +563,28 @@ func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionPar
 	//
 	// Every undecidable state maps to checkpointNone, so the fail-safe direction
 	// is today's behavior: supersede.
-	if dec.Stage.Type == run.StageTypeImplement && dec.Stage.State == run.StageStatePending {
+	//
+	// #4816 GATES IT AGAIN, AHEAD OF #3621. When the re-opened stage still
+	// carries a LIVE merge-candidate verify trigger (retryReplaysLiveMergeCandidatePass),
+	// the next prompt resolves that trigger first and exclusively (ADR-090 D3),
+	// so the runner replays the same verify-only pass on the same expected
+	// head: no agent re-runs, no tree is discarded, and the concerns still
+	// describe the reviewed tree the pass verifies. Superseding them, or
+	// writing verified_tree_discarded, would misrecord a tree that is kept.
+	// The gate keys on the live trigger alone — not on the retry kind (an
+	// override retry of a live pass keeps the concerns too) and not on a park
+	// row (a retry of a run the server FAILED with a live trigger replays the
+	// pass as well). The decision is recorded on the retry receipt as
+	// replay_kept_reviewed_tree: true. An unreadable, malformed,
+	// half-populated or consumed trigger answers false, keeping today's
+	// supersede — the prompt also serves no pass on those states, so that
+	// retry IS a plain re-implement.
+	if keepReviewedTree {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"retry replays a live merge-candidate verify-only pass; keeping the prior round's implement-review concerns",
+			slog.String("run_id", dec.Stage.RunID.String()),
+			slog.String("stage_id", dec.Stage.ID.String()))
+	} else if dec.Stage.Type == run.StageTypeImplement && dec.Stage.State == run.StageStatePending {
 		cp, verdict := s.newestPushCheckpoint(ctx, dec.Stage.RunID, dec.Stage.ID)
 		if verdict == checkpointResumable {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
@@ -717,13 +743,47 @@ func (s *Server) recordDriveRetryStage(ctx context.Context, stageType run.StageT
 	s.drive.Record(ctx, runID, &stageID, adv)
 }
 
+// retryReplaysLiveMergeCandidatePass reports whether a just-retried stage
+// will replay a LIVE merge-candidate verify-only pass (#4816): an implement
+// stage re-opened to pending whose newest stage_merge_candidate_verify_triggered
+// row is populated and not consumed by a same-stage merge_candidate_verified
+// row (liveMergeCandidateTrigger, the resolver the prompt serves from).
+// Fail-safe: any read error or a malformed / half-populated newest trigger
+// answers false (logged), so the retry keeps today's supersede.
+func (s *Server) retryReplaysLiveMergeCandidatePass(ctx context.Context, stage *run.Stage) bool {
+	if stage == nil || stage.Type != run.StageTypeImplement || stage.State != run.StageStatePending || s.cfg.AuditRepo == nil {
+		return false
+	}
+	live, err := s.liveMergeCandidateTrigger(ctx, stage.RunID, stage.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"retry: merge-candidate trigger unresolvable; treating the retry as a re-implement",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	return live != nil
+}
+
+// markRetryReplayKeptReviewedTree records on a retry receipt that the retry
+// replays a live merge-candidate verify-only pass and keeps the reviewed tree
+// (#4816). The key is written ONLY when kept, so every other stage_retried /
+// stage_override_retried payload keeps its key set.
+func markRetryReplayKeptReviewedTree(fields map[string]any, kept bool) {
+	if kept {
+		fields["replay_kept_reviewed_tree"] = true
+	}
+}
+
 // writeRetryAudit appends a stage_retried entry capturing the
 // prior failure category + reason, the retry receipt fields, and
 // the actor that triggered the retry. When delegatedRule is non-empty
 // the retry landed via the ADR-040 delegated path (#1026) and the
-// payload records `delegated: "<rule>"`. Best-effort — the transition
+// payload records `delegated: "<rule>"`. keptReviewedTree adds
+// replay_kept_reviewed_tree: true (#4816). Best-effort — the transition
 // is already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeRetryAudit(ctx context.Context, id Identity, dec *run.RetryDecision, runRow *run.Run, delegatedRule string) {
+func (s *Server) writeRetryAudit(ctx context.Context, id Identity, dec *run.RetryDecision, runRow *run.Run, delegatedRule string, keptReviewedTree bool) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -754,6 +814,7 @@ func (s *Server) writeRetryAudit(ctx context.Context, id Identity, dec *run.Retr
 	if delegatedRule != "" {
 		fields["delegated"] = delegatedRule
 	}
+	markRetryReplayKeptReviewedTree(fields, keptReviewedTree)
 
 	payload, _ := json.Marshal(fields)
 
@@ -780,10 +841,10 @@ func (s *Server) writeRetryAudit(ctx context.Context, id Identity, dec *run.Retr
 // required justification. The framing is explicit per the approval
 // condition: the override re-opens the stage to pending so the agent
 // re-runs and the policy gate re-evaluates the new diff — it does NOT
-// accept the B-violating diff or bypass the gate. Best-effort: the
-// transition is already committed, so a failure here logs but doesn't
-// unwind.
-func (s *Server) writeOverrideRetryAudit(ctx context.Context, id Identity, dec *run.RetryDecision, reason string) {
+// accept the B-violating diff or bypass the gate. keptReviewedTree adds
+// replay_kept_reviewed_tree: true (#4816). Best-effort: the transition is
+// already committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeOverrideRetryAudit(ctx context.Context, id Identity, dec *run.RetryDecision, reason string, keptReviewedTree bool) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -806,6 +867,7 @@ func (s *Server) writeOverrideRetryAudit(ctx context.Context, id Identity, dec *
 			dec.PriorCategory.Description(),
 			scopeUsed(id)),
 	}
+	markRetryReplayKeptReviewedTree(fields, keptReviewedTree)
 
 	payload, _ := json.Marshal(fields)
 

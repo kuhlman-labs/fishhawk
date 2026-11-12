@@ -1086,7 +1086,7 @@ func TestNextActions_ImplementFailedCategoryC_ParkedRun(t *testing.T) {
 			t.Fatalf("actions = %v, want fishhawk_retry_stage {stage_id: %s} first", actionNames(na), impl.ID)
 		}
 		pre := na.Actions[0].Precondition
-		for _, want := range []string{"FAILED category C", "non-terminal", "parks", fmt.Sprintf("up to %d parks per stage", runmodel.InfraFailureParkRetryBudget), "#4426"} {
+		for _, want := range []string{"FAILED category C", "non-terminal", "parks", fmt.Sprintf("up to %d parks per stage", runmodel.InfraFailureParkRetryBudget), "#4426", "#4816", "operator-reaped"} {
 			if !strings.Contains(pre, want) {
 				t.Errorf("retry precondition %q missing %q", pre, want)
 			}

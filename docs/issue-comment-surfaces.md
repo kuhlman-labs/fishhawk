@@ -1786,7 +1786,11 @@ Notes:
   `operator-agent/<role-spec-version>` token — ADR-040 D4, #1027) and payload
   `{stage_id, prior_category (always B), prior_reason,
   prior_failure_class, override_reason, retry_ordinal, override_effect,
-  admissibility_reason}`. It is kept DISTINCT from the ordinary `stage_retried`
+  admissibility_reason}`, plus `replay_kept_reviewed_tree: true` (present only
+  when true, #4816) when the retry replays a live merge-candidate verify-only
+  pass and therefore kept the prior round's implement-review concerns. The
+  ordinary `stage_retried` receipt carries the same optional key under the same
+  rule. It is kept DISTINCT from the ordinary `stage_retried`
   receipt so the explicit operator escape hatch (who/why) stays separable in
   audit analysis from both a normal retry and #692's automatic empty-diff → C
   reclassification. The override re-opens the category-B stage to `pending`: the
@@ -2334,8 +2338,10 @@ Notes:
   `acceptance_dispatched` / `acceptance_reopened` anchor — the runner's verdict
   ship failed (a 413 `body_too_large`) after the trace upload had already
   settled the stage. The actor is `system`, the entry is stage-scoped, and the
-  payload is the `dispatch_reaper_failed` key set `{run_id, stage_id,
-  failure_category, reason, detail, exit_code, reported_at, auth_method}`. It
+  payload is the shared reap key set `{run_id, stage_id,
+  failure_category, reason, detail, exit_code, reported_at, auth_method}` (the
+  operator `dispatch_reaper_failed` row adds the #4816 episode keys `failed_at`
+  + `retry_ordinal` on top; the marker does not). It
   transitions nothing and never Advances. It is READ by the acceptance gate
   (`acceptanceVerdictUnshippedLive`: live iff newer than the stage's anchor and
   than any stage-scoped outcome → gate state `acceptance_verdict_unshipped`,
