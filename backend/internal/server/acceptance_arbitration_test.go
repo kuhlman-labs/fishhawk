@@ -1048,3 +1048,144 @@ func TestAcceptanceArbitration_ConcurrentLoserRescanErrorIs500(t *testing.T) {
 		t.Errorf("appended arbitration rows = %d, want 0 (a read failure must never write)", len(rows))
 	}
 }
+
+// --- #4873: scenario-only class-4 page --------------------------------------
+
+// scenarioOnlyFailedID is the stale corpus scenario that failed in run d9862ab0
+// (outcome seq 152809).
+const scenarioOnlyFailedID = "scenario:issue-3722/accepted-requires-acceptance-statement"
+
+// seedPagedTriageRunWithOutcomeExtra is seedPagedTriageRun with additional
+// raw keys merged into the seeded acceptance_outcome_recorded payload (e.g.
+// failed_scenario_ids), so a consumer test can seed the producer's additive
+// key — or a malformed one — by construction.
+func seedPagedTriageRunWithOutcomeExtra(t *testing.T, repo *autoDriveRepo, au *auditFake, runID uuid.UUID,
+	class, disposition string, criteriaFailed, criteriaSkipped int, extra map[string]any) uuid.UUID {
+	t.Helper()
+	stages := acceptanceMergeStages(runID, run.StageStateSucceeded)
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, []byte(autoDriveAcceptanceSpecYAML), stages)
+	accID := stages[2].ID
+	fields := map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         accID.String(),
+		"verdict":          acceptanceVerdictFailed,
+		"criteria_failed":  criteriaFailed,
+		"criteria_skipped": criteriaSkipped,
+	}
+	for k, v := range extra {
+		fields[k] = v
+	}
+	p, _ := json.Marshal(fields)
+	rid, sid := runID, accID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryAcceptanceOutcomeRecorded,
+		Sequence: arbitrationOutcomeSeq, Payload: p,
+	})
+	au.mu.Unlock()
+	seedAcceptanceTriageDecision(au, runID, accID, arbitrationTriageSeq, class, disposition)
+	return accID
+}
+
+// TestAcceptanceArbitration_ScenarioOnlyPage_RecordsFailedScenarioIDs (#4873
+// R4): a scenario-only class-4 page carries criteria_failed 0, so guard 6 admits
+// a reason-only discharge — and the appended acceptance_triage_arbitrated entry
+// copies the discharged outcome's failed_scenario_ids so that discharge stays
+// auditable. An outcome with no key (legacy, or no failed scenario) records NO
+// key on the arbitration — absent, never [] or null.
+func TestAcceptanceArbitration_ScenarioOnlyPage_RecordsFailedScenarioIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		extra   map[string]any
+		wantIDs []string
+	}{
+		{"outcome carries failed_scenario_ids",
+			map[string]any{"failed_scenario_ids": []string{scenarioOnlyFailedID}},
+			[]string{scenarioOnlyFailedID}},
+		{"legacy outcome without the key", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au := newAutoDriveMergeServer(t, &fakeMerger{})
+			runID := uuid.New()
+			seedPagedTriageRunWithOutcomeExtra(t, repo, au, runID,
+				acceptanceClass4, acceptanceDispositionPaged, 0, 6, tc.extra)
+
+			w := postArbitration(t, s, runID, acceptanceArbitrationRequest{
+				Reason: "the scenario expectation was superseded on the base; retiring it",
+			}, withMergeOperator)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (a scenario-only page is arbitrable on the reason alone):\n%s", w.Code, w.Body.String())
+			}
+			rows := arbitrationRows(au)
+			if len(rows) != 1 {
+				t.Fatalf("arbitration rows = %d, want 1", len(rows))
+			}
+			var p map[string]any
+			if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+				t.Fatalf("unmarshal payload: %v", err)
+			}
+			if p["triage_class"] != acceptanceClass4 || p["triage_disposition"] != acceptanceDispositionPaged {
+				t.Errorf("triage class/disposition = %v/%v, want 4/paged", p["triage_class"], p["triage_disposition"])
+			}
+			if p["criteria_failed"] != float64(0) || p["acknowledged_failed_criteria"] != false {
+				t.Errorf("criteria_failed/acknowledged = %v/%v, want 0/false", p["criteria_failed"], p["acknowledged_failed_criteria"])
+			}
+			raw, present := p["failed_scenario_ids"]
+			if tc.wantIDs == nil {
+				if present {
+					t.Errorf("failed_scenario_ids = %v, want the key ABSENT for an outcome that recorded none", raw)
+				}
+				return
+			}
+			got, _ := raw.([]any)
+			if len(got) != len(tc.wantIDs) {
+				t.Fatalf("failed_scenario_ids = %v (present=%v), want %v", raw, present, tc.wantIDs)
+			}
+			for i, want := range tc.wantIDs {
+				if got[i] != want {
+					t.Errorf("failed_scenario_ids[%d] = %v, want %q", i, got[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestLatestAcceptanceOutcome_MalformedFailedScenarioIDsTolerated (#4873
+// approval condition 2): a non-array failed_scenario_ids must never turn a
+// readable outcome into the recorded-but-unreadable hole. Verdict and
+// CriteriaFailed still decode; FailedScenarioIDs is empty. Each row is the
+// malformed key paired with ITSELF (no clean comparison value), so only the
+// tolerant decode separates the rows from the hole.
+func TestLatestAcceptanceOutcome_MalformedFailedScenarioIDsTolerated(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  any
+	}{
+		{"string", "scenario:issue-3722/accepted-requires-acceptance-statement"},
+		{"number", 7},
+		{"object", map[string]any{"id": "scenario:x"}},
+		{"array of non-strings", []any{1, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au := newAutoDriveMergeServer(t, &fakeMerger{})
+			runID := uuid.New()
+			seedPagedTriageRunWithOutcomeExtra(t, repo, au, runID,
+				acceptanceClass4, acceptanceDispositionPaged, 2, 1,
+				map[string]any{"failed_scenario_ids": tc.raw})
+
+			out, err := s.latestAcceptanceOutcome(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("latestAcceptanceOutcome: %v", err)
+			}
+			if !out.Recorded || out.Verdict != acceptanceVerdictFailed {
+				t.Errorf("recorded/verdict = %v/%q, want true/failed (a malformed additive key must not blank the verdict)", out.Recorded, out.Verdict)
+			}
+			if out.CriteriaFailed != 2 || out.CriteriaSkipped != 1 {
+				t.Errorf("criteria_failed/skipped = %d/%d, want 2/1", out.CriteriaFailed, out.CriteriaSkipped)
+			}
+			if len(out.FailedScenarioIDs) != 0 {
+				t.Errorf("FailedScenarioIDs = %v, want empty for a malformed key", out.FailedScenarioIDs)
+			}
+		})
+	}
+}
