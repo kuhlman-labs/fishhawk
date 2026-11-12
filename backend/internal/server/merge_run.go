@@ -122,12 +122,16 @@ type mergeRunResponse struct {
 //   - 409 when the run is failed or cancelled (terminal-not-succeeded);
 //   - 409 when the acceptance gate does not admit a merge (pending / failed /
 //     settled-outcome-unknown / read error — ADR-049 decision #6);
-//   - 409 acceptance_stale (#4086) when the acceptance stage carries a
-//     stage-scoped acceptance_reopened entry newer than the newest recorded
-//     outcome — the gate above still reads that stale outcome as merge-eligible.
-//     It names the verified and current heads and the re-run verb, and an
-//     audit read error is a 500 with nothing recorded (fail-closed). It runs
-//     BEFORE the GateMerger guard because it needs no merge seam;
+//   - 409 acceptance_stale (#4086, #5163) when the newest recorded outcome is
+//     stale on either basis: the acceptance stage carries a stage-scoped
+//     acceptance_reopened entry at or above it (stale_basis
+//     acceptance_reopened), or the outcome came from an anchored episode with a
+//     fixup_pushed entry above its dispatch anchor (stale_basis
+//     fixup_in_episode) — the gate above still reads that stale outcome as
+//     merge-eligible. It names the verified and invalidating heads and the
+//     re-run verb, and an audit read error is a 500 with nothing recorded
+//     (fail-closed). It runs BEFORE the GateMerger guard because it needs no
+//     merge seam;
 //   - 409 review_coverage_incomplete (#4219) when the run is a decomposed
 //     parent with a succeeded slice no SUCCESSFUL agent review covers (see
 //     reviewCoverageRefusal). It names the uncovered slices and the verb that
@@ -393,17 +397,22 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stale-acceptance guard (#4086): the acceptance gate above reads the
-	// NEWEST recorded outcome, so after a fix-up push re-opened the stage it
-	// still admits on the stale `passed` verdict and the merge then times out
-	// behind a pending fishhawk_audit_complete. Refuse fast instead, naming
-	// both heads and the re-run verb. Placed BEFORE the GateMerger guard: it
-	// needs no merge seam, and both refusals record nothing. FAIL-CLOSED on an
-	// audit read error (500, nothing recorded), like the acceptance gate.
+	// Stale-acceptance guard (#4086, #5163): the acceptance gate above reads
+	// the NEWEST recorded outcome, so it still admits on a stale `passed`
+	// verdict on either basis: a fix-up push re-opened the stage after the
+	// verdict (acceptance_reopened), or a fix-up landed above the dispatch
+	// anchor of the episode that produced it, while that episode was in flight
+	// (fixup_in_episode). On the reopen basis the merge then times out behind
+	// a pending fishhawk_audit_complete; on fixup_in_episode that check may
+	// already be green, so this guard is what refuses it. Refuse fast, naming
+	// both heads and the re-run verb. Placed BEFORE the GateMerger guard: it needs no merge seam,
+	// and both refusals record nothing. FAIL-CLOSED on any of its audit reads
+	// (re-open, dispatch and fix-up history: 500, nothing recorded), like the
+	// acceptance gate.
 	stale, serr := s.acceptanceStaleRefusal(r.Context(), runRow, stages)
 	if serr != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"read acceptance re-open history failed", map[string]any{"error": serr.Error()})
+			"read acceptance staleness history failed (re-open, dispatch or fix-up records)", map[string]any{"error": serr.Error()})
 		return
 	}
 	if stale != nil {
