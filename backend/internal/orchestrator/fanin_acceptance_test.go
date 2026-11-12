@@ -9,12 +9,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -46,6 +49,10 @@ type recordingFanInVerify struct {
 	// hook's UnavailableReason / UnavailableDetail (#4792): a scripted
 	// fail-open release.
 	reason, detail string
+
+	// head, when set, rides every answer as the judged consolidated head
+	// (#4846), settled or not.
+	head string
 
 	// observe, when set, snapshots the repo state at call time.
 	runs       *stubRuns
@@ -79,9 +86,9 @@ func (f *recordingFanInVerify) FanInVerifySettled(_ context.Context, runID uuid.
 		settled = f.answers[i]
 	}
 	if !settled {
-		return FanInVerifyAnswer{}, nil
+		return FanInVerifyAnswer{HeadSHA: f.head}, nil
 	}
-	return FanInVerifyAnswer{Settled: true, UnavailableReason: f.reason, UnavailableDetail: f.detail}, nil
+	return FanInVerifyAnswer{Settled: true, HeadSHA: f.head, UnavailableReason: f.reason, UnavailableDetail: f.detail}, nil
 }
 
 func (f *recordingFanInVerify) callCount() int {
@@ -824,4 +831,683 @@ func TestRecordFanInVerifyUnavailable_NilAuditLogsOnly(t *testing.T) {
 	}
 	assertReleased(t, p)
 	assertUnavailableWarn(t, logs, p, FanInVerifyUnavailableHookNotWired)
+}
+
+// --- #4846: the hold runs BEFORE the acceptance short-circuit --------------
+
+// fanInAllSkipCriteria is an approved plan's acceptance criteria where every
+// criterion is skip_expected with a basis, so the all-skip-with-basis
+// short-circuit predicate matches.
+func fanInAllSkipCriteria() []map[string]any {
+	return []map[string]any{
+		{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake"},
+		{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+	}
+}
+
+// fanInDrivableCriteria is one drivable criterion: no short-circuit predicate
+// matches, so the stage needs a live target.
+func fanInDrivableCriteria() []map[string]any {
+	return []map[string]any{{"id": "ac-1", "statement": "POST returns 201", "source": "explicit", "source_ref": "#1", "blocking": true}}
+}
+
+// seedPlannedAcceptanceAheadParent seeds a feature_change-shaped decomposed
+// parent with a succeeded plan stage carrying an approved standard_v1 plan
+// (planBytes), then implement (succeeded), acceptance (acceptanceState) and
+// review (pending), one succeeded child, and no PR URL. It wires o.Artifacts.
+func seedPlannedAcceptanceAheadParent(t *testing.T, o *Orchestrator, rs *stubRuns, planBytes []byte, acceptanceState run.StageState) acceptanceAheadParent {
+	t.Helper()
+	parent, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: acceptanceState},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	parent.RunnerKind = run.RunnerKindLocal
+	parent.RunnerKindResolved = true
+	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	schemaV := "standard_v1"
+	o.Artifacts = &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		stages[0].ID: {{
+			ID:            uuid.New(),
+			StageID:       stages[0].ID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &schemaV,
+			Content:       planBytes,
+			CreatedAt:     time.Now().UTC(),
+		}},
+	}}
+	return acceptanceAheadParent{run: parent, implement: stages[1], acceptance: stages[2], review: stages[3]}
+}
+
+// stampPR gives the parent a consolidated PR URL, so the read-only predicate
+// reaches the hook instead of holding consolidated_pr_not_opened.
+func stampPR(p acceptanceAheadParent) {
+	pr := "https://github.com/kuhlman-labs/fishhawk/pull/9"
+	p.run.PullRequestURL = &pr
+}
+
+// appendIndex returns the index of the first append of category, or -1.
+func appendIndex(au *recordingAudit, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i, e := range au.appended {
+		if e.Category == category {
+			return i
+		}
+	}
+	return -1
+}
+
+// acceptanceRows returns every acceptance verdict and out-of-scope marker
+// append, with the index each landed at.
+func acceptanceRows(au *recordingAudit) (idx []int, rows []audit.ChainAppendParams) {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i, e := range au.appended {
+		if e.Category == "acceptance_outcome_recorded" || e.Category == "acceptance_skipped_out_of_scope" {
+			idx = append(idx, i)
+			rows = append(rows, e)
+		}
+	}
+	return idx, rows
+}
+
+func decodePayload(t *testing.T, row audit.ChainAppendParams) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(row.Payload, &m); err != nil {
+		t.Fatalf("decode %s payload %s: %v", row.Category, row.Payload, err)
+	}
+	return m
+}
+
+// (a) An approved plan that satisfies a short-circuit predicate no longer
+// records its verdict before the fan-in verify settles: Advance #1 holds with
+// zero verdict rows, and Advance #2 (settled) records exactly one, after the
+// consolidated PR opened, carrying the judged head. MECHANISM: under the old
+// ordering Advance #1 wrote the verdict before consulting the hook (run
+// 9e17e66a, sequence 150794).
+func TestAdvance_DecomposedParentAcceptance_ShortCircuitHeldUntilFanInSettles(t *testing.T) {
+	cases := []struct {
+		name         string
+		outOfScope   []string
+		criteria     []map[string]any
+		wantCategory string
+		wantBasis    string
+	}{
+		{name: "all_skip_with_basis", criteria: fanInAllSkipCriteria(), wantCategory: "acceptance_outcome_recorded", wantBasis: plan.AcceptanceBasisAllSkipWithBasis},
+		{name: "empty_criteria", wantCategory: "acceptance_outcome_recorded", wantBasis: plan.AcceptanceBasisEmptyCriteria},
+		{name: "out_of_scope_skip", outOfScope: []string{"deploy deferred"}, wantCategory: "acceptance_skipped_out_of_scope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, _, au, rec, hook := newFanInAcceptanceOrchestrator(t, false, true)
+			hook.head = "consolhead"
+			p := seedPlannedAcceptanceAheadParent(t, o, rs, acceptanceSkipPlanBytes(t, tc.outOfScope, tc.criteria), run.StageStatePending)
+
+			out, err := o.Advance(context.Background(), p.run.ID)
+			if err != nil {
+				t.Fatalf("Advance #1: %v", err)
+			}
+			if out != OutcomeNoOp {
+				t.Errorf("Advance #1 outcome = %q, want no-op (held)", out)
+			}
+			if p.acceptance.State != run.StageStatePending {
+				t.Errorf("acceptance after Advance #1 = %q, want pending (held until the fan-in verify settles)", p.acceptance.State)
+			}
+			if idx, _ := acceptanceRows(au); len(idx) != 0 {
+				t.Fatalf("acceptance verdict/marker rows after the held Advance #1 = %d, want 0 (the short-circuit ran before the fan-in hold)", len(idx))
+			}
+			if !auditHasCategory(au, "consolidated_pr_opened") {
+				t.Error("consolidated_pr_opened not recorded on Advance #1")
+			}
+			if hook.callCount() != 1 {
+				t.Errorf("hook calls after Advance #1 = %d, want 1", hook.callCount())
+			}
+			if len(rec.calls) != 1 {
+				t.Errorf("DispatchConsolidatedReview calls after Advance #1 = %d, want 1 (the verify-pass start)", len(rec.calls))
+			}
+
+			if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+				t.Fatalf("Advance #2: %v", err)
+			}
+			if p.acceptance.State != run.StageStateSucceeded {
+				t.Errorf("acceptance after Advance #2 = %q, want succeeded (short-circuited once released)", p.acceptance.State)
+			}
+			idx, rows := acceptanceRows(au)
+			if len(rows) != 1 {
+				t.Fatalf("acceptance verdict/marker rows after Advance #2 = %d, want exactly 1", len(rows))
+			}
+			if prIdx := appendIndex(au, "consolidated_pr_opened"); idx[0] < prIdx {
+				t.Errorf("acceptance row at append %d precedes consolidated_pr_opened at %d", idx[0], prIdx)
+			}
+			if rows[0].Category != tc.wantCategory {
+				t.Fatalf("row category = %q, want %q", rows[0].Category, tc.wantCategory)
+			}
+			got := decodePayload(t, rows[0])
+			if tc.wantCategory == "acceptance_skipped_out_of_scope" {
+				if _, ok := got["head_sha"]; ok {
+					t.Errorf("out-of-scope marker carries head_sha: %s", rows[0].Payload)
+				}
+				return
+			}
+			if got["verdict"] != plan.AcceptanceVerdictNotValidated || got[plan.AcceptanceBasisKey] != tc.wantBasis {
+				t.Errorf("verdict payload = %s, want verdict %s basis %s", rows[0].Payload, plan.AcceptanceVerdictNotValidated, tc.wantBasis)
+			}
+			if got["head_sha"] != "consolhead" {
+				t.Errorf("verdict head_sha = %v, want consolhead (the hook-judged consolidated head): %s", got["head_sha"], rows[0].Payload)
+			}
+		})
+	}
+}
+
+// (b) A fail-open release (nil hook) short-circuits on the first Advance: the
+// verdict has no head_sha key, and the hook_not_wired row precedes it.
+func TestAdvance_DecomposedParentAcceptance_ShortCircuitFailOpenRelease(t *testing.T) {
+	o, rs, _, au, _, _ := newFanInAcceptanceOrchestrator(t)
+	o.FanInVerify = nil
+	p := seedPlannedAcceptanceAheadParent(t, o, rs, acceptanceSkipPlanBytes(t, nil, fanInAllSkipCriteria()), run.StageStatePending)
+
+	if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if p.acceptance.State != run.StageStateSucceeded {
+		t.Errorf("acceptance = %q, want succeeded (fail-open release short-circuits)", p.acceptance.State)
+	}
+	assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+	idx, rows := acceptanceRows(au)
+	if len(rows) != 1 || rows[0].Category != "acceptance_outcome_recorded" {
+		t.Fatalf("acceptance rows = %+v, want exactly one acceptance_outcome_recorded", rows)
+	}
+	if u := appendIndex(au, CategoryFanInVerifyUnavailable); u < 0 || u > idx[0] {
+		t.Errorf("fan_in_verify_unavailable at append %d, verdict at %d: want the row BEFORE the verdict", u, idx[0])
+	}
+	if _, ok := decodePayload(t, rows[0])["head_sha"]; ok {
+		t.Errorf("fail-open verdict carries head_sha: %s", rows[0].Payload)
+	}
+}
+
+// (c) The read-only predicate's arms, one row each. Every row also asserts
+// ZERO audit appends, ZERO PR creates and ZERO consolidated-review fires: the
+// predicate decides and never acts.
+func TestDecomposedParentFanInHold_Arms(t *testing.T) {
+	branchOf := func(p acceptanceAheadParent) string { return consolidatedBranch(p.run.ID) }
+	cases := []struct {
+		name      string
+		answers   []bool
+		setup     func(o *Orchestrator, rs *stubRuns, hook *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent
+		want      func(p acceptanceAheadParent) FanInHold
+		wantErr   string
+		wantCalls int
+	}{
+		{
+			name: "child run",
+			setup: func(_ *Orchestrator, rs *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				other := uuid.New()
+				p.run.DecomposedFrom = &other
+				rs.listRunsErr = errors.New("ListRuns must not be called for a child")
+				return p
+			},
+			want: func(acceptanceAheadParent) FanInHold { return FanInHold{} },
+		},
+		{
+			name: "no implement stage",
+			setup: func(_ *Orchestrator, rs *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				r, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+					{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+				})
+				rs.listRunsErr = errors.New("ListRuns must not be called without an implement stage")
+				return acceptanceAheadParent{run: r, acceptance: stages[0]}
+			},
+			want: func(acceptanceAheadParent) FanInHold { return FanInHold{} },
+		},
+		{
+			name: "no children",
+			setup: func(_ *Orchestrator, rs *stubRuns, _ *recordingFanInVerify, _ acceptanceAheadParent) acceptanceAheadParent {
+				r, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+					{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+					{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+				})
+				return acceptanceAheadParent{run: r, implement: stages[0], acceptance: stages[1]}
+			},
+			want: func(acceptanceAheadParent) FanInHold { return FanInHold{} },
+		},
+		{
+			name: "children-list error",
+			setup: func(_ *Orchestrator, rs *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				rs.listRunsErr = errors.New("list boom")
+				return p
+			},
+			wantErr: "list boom",
+		},
+		{
+			name: "nil FanInVerify",
+			setup: func(o *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				o.FanInVerify = nil
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableHookNotWired, UnavailableDetail: "FanInVerify not wired"}
+			},
+		},
+		{
+			name: "nil ConsolidatedReview",
+			setup: func(o *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				o.ConsolidatedReview = nil
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableHookNotWired, UnavailableDetail: "ConsolidatedReview not wired"}
+			},
+		},
+		{
+			name: "both nil",
+			setup: func(o *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				o.FanInVerify, o.ConsolidatedReview = nil, nil
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableHookNotWired, UnavailableDetail: "FanInVerify and ConsolidatedReview not wired"}
+			},
+		},
+		{
+			name: "nil URL, nil GitHub",
+			setup: func(o *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				o.GitHub = nil
+				p.run.PullRequestURL = nil
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableNoConsolidatedPR, UnavailableDetail: "github client not wired"}
+			},
+		},
+		{
+			name: "empty URL, nil installation id",
+			setup: func(_ *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				empty := ""
+				p.run.PullRequestURL = &empty
+				p.run.InstallationID = nil
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableNoConsolidatedPR, UnavailableDetail: "no installation id"}
+			},
+		},
+		{
+			name: "empty URL, zero installation id",
+			setup: func(_ *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				empty := ""
+				p.run.PullRequestURL = &empty
+				p.run.InstallationID = int64Ptr(0)
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableNoConsolidatedPR, UnavailableDetail: "no installation id"}
+			},
+		},
+		{
+			name: "openable PR-less parent, nil URL",
+			setup: func(_ *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				p.run.PullRequestURL = nil
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, Held: true, HoldCause: FanInHoldCauseConsolidatedPRNotOpened, ConsolidatedBranch: branchOf(p)}
+			},
+		},
+		{
+			name: "openable PR-less parent, empty URL",
+			setup: func(_ *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				empty := ""
+				p.run.PullRequestURL = &empty
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, Held: true, HoldCause: FanInHoldCauseConsolidatedPRNotOpened, ConsolidatedBranch: branchOf(p)}
+			},
+		},
+		{
+			name: "unresolved default branch",
+			setup: func(o *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				o.DefaultBranch = defaultbranch.New(&countingRepoGetter{err: forge.ErrNotFound})
+				stampPR(p)
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableDefaultBranchUnresolved, UnavailableDetail: string(defaultbranch.ReasonRepositoryNotVisible)}
+			},
+		},
+		{
+			name: "hook error",
+			setup: func(_ *Orchestrator, _ *stubRuns, hook *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				hook.err = errors.New("compare boom")
+				stampPR(p)
+				return p
+			},
+			wantErr:   "compare boom",
+			wantCalls: 1,
+		},
+		{
+			name: "no_run_repo",
+			setup: func(_ *Orchestrator, _ *stubRuns, hook *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				hook.reason = FanInVerifyUnavailableNoRunRepo
+				stampPR(p)
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableNoRunRepo}
+			},
+			wantCalls: 1,
+		},
+		{
+			name: "forge_not_wired",
+			setup: func(_ *Orchestrator, _ *stubRuns, hook *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				hook.reason, hook.detail = FanInVerifyUnavailableForgeNotWired, "github client not wired"
+				stampPR(p)
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, ConsolidatedBranch: branchOf(p), UnavailableReason: FanInVerifyUnavailableForgeNotWired, UnavailableDetail: "github client not wired"}
+			},
+			wantCalls: 1,
+		},
+		{
+			name:    "unsettled",
+			answers: []bool{false},
+			setup: func(_ *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				stampPR(p)
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, Held: true, HoldCause: FanInHoldCauseUnsettled, HeadSHA: "consolhead", ConsolidatedBranch: branchOf(p)}
+			},
+			wantCalls: 1,
+		},
+		{
+			name:    "settled",
+			answers: []bool{true},
+			setup: func(_ *Orchestrator, _ *stubRuns, _ *recordingFanInVerify, p acceptanceAheadParent) acceptanceAheadParent {
+				stampPR(p)
+				return p
+			},
+			want: func(p acceptanceAheadParent) FanInHold {
+				return FanInHold{Parent: true, HeadSHA: "consolhead", ConsolidatedBranch: branchOf(p)}
+			},
+			wantCalls: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh, au, rec, hook := newFanInAcceptanceOrchestrator(t, tc.answers...)
+			hook.head = "consolhead"
+			p := tc.setup(o, rs, hook, seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded))
+			rs.mu.Lock()
+			stages := append([]*run.Stage(nil), rs.stages[p.run.ID]...)
+			rs.mu.Unlock()
+
+			got, err := o.DecomposedParentFanInHold(context.Background(), p.run, stages)
+			switch {
+			case tc.wantErr != "":
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want one naming %q", err, tc.wantErr)
+				}
+				if got != (FanInHold{}) {
+					t.Errorf("answer on error = %+v, want the zero value", got)
+				}
+			case err != nil:
+				t.Fatalf("DecomposedParentFanInHold: %v", err)
+			default:
+				if want := tc.want(p); got != want {
+					t.Errorf("answer = %+v, want %+v", got, want)
+				}
+			}
+			if hook.callCount() != tc.wantCalls {
+				t.Errorf("hook calls = %d, want %d", hook.callCount(), tc.wantCalls)
+			}
+			au.mu.Lock()
+			appends := len(au.appended)
+			au.mu.Unlock()
+			if appends != 0 {
+				t.Errorf("audit appends = %d, want 0 (the predicate is read-only)", appends)
+			}
+			if len(gh.createPRCalls) != 0 {
+				t.Errorf("CreatePullRequest calls = %d, want 0 (the predicate never opens the PR)", len(gh.createPRCalls))
+			}
+			if len(rec.calls) != 0 {
+				t.Errorf("DispatchConsolidatedReview calls = %d, want 0 (the predicate fires nothing)", len(rec.calls))
+			}
+			if _, ok := o.fanInHolds[p.run.ID]; ok {
+				t.Error("hold counter touched by the read-only predicate")
+			}
+		})
+	}
+}
+
+// RecordFanInHoldRelease records only a parent's fail-open release: a held
+// answer, a verified release and a non-parent append nothing.
+func TestRecordFanInHoldRelease_RecordsOnlyFailOpenRelease(t *testing.T) {
+	cases := []struct {
+		name     string
+		hold     FanInHold
+		wantRows int
+	}{
+		{name: "fail-open release", hold: FanInHold{Parent: true, UnavailableReason: FanInVerifyUnavailableHookNotWired, UnavailableDetail: "FanInVerify not wired"}, wantRows: 1},
+		{name: "not a parent", hold: FanInHold{UnavailableReason: FanInVerifyUnavailableHookNotWired}},
+		{name: "held", hold: FanInHold{Parent: true, Held: true, HoldCause: FanInHoldCauseUnsettled, UnavailableReason: FanInVerifyUnavailableHookNotWired}},
+		{name: "verified release", hold: FanInHold{Parent: true, HeadSHA: "consolhead"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, p, au, _ := newRecorderFixture(t)
+			o.RecordFanInHoldRelease(context.Background(), p.run, p.acceptance, tc.hold)
+			if tc.wantRows == 1 {
+				assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+				return
+			}
+			if n := len(unavailableRows(au)); n != 0 {
+				t.Errorf("rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// (d) The admission walk consults the shared predicate on a PENDING stage: an
+// unsettled hook leaves it pending with no verdict, a settled one
+// short-circuits with the judged head, a hook error mutates nothing, and an
+// awaiting_host_dispatch stage skips the predicate (R1). MECHANISM: the plan is
+// all-skip, so without the hold check the walk settles the pending stage while
+// the hook answers unsettled.
+func TestTryShortCircuitAcceptance_DecomposedParentFanInHold(t *testing.T) {
+	allSkip := func(t *testing.T) []byte { return acceptanceSkipPlanBytes(t, nil, fanInAllSkipCriteria()) }
+
+	t.Run("pending + unsettled holds", func(t *testing.T) {
+		o, rs, _, au, _, hook := newFanInAcceptanceOrchestrator(t, false)
+		hook.head = "consolhead"
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, allSkip(t), run.StageStatePending)
+		stampPR(p)
+
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err != nil || sc != nil || liveReq {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v, %v), want (nil, false, nil) while held", sc, liveReq, err)
+		}
+		if p.acceptance.State != run.StageStatePending {
+			t.Errorf("acceptance = %q, want pending (held)", p.acceptance.State)
+		}
+		if idx, _ := acceptanceRows(au); len(idx) != 0 {
+			t.Errorf("acceptance rows = %d, want 0 while held", len(idx))
+		}
+		if hook.callCount() != 1 {
+			t.Errorf("hook calls = %d, want 1", hook.callCount())
+		}
+	})
+
+	t.Run("pending + settled short-circuits with head_sha", func(t *testing.T) {
+		o, rs, _, au, _, hook := newFanInAcceptanceOrchestrator(t, true)
+		hook.head = "consolhead"
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, allSkip(t), run.StageStatePending)
+		stampPR(p)
+
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err != nil || sc == nil {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v), want a short-circuit", sc, err)
+		}
+		if p.acceptance.State != run.StageStateSucceeded {
+			t.Errorf("acceptance = %q, want succeeded", p.acceptance.State)
+		}
+		_, rows := acceptanceRows(au)
+		if len(rows) != 1 {
+			t.Fatalf("acceptance rows = %d, want 1", len(rows))
+		}
+		if got := decodePayload(t, rows[0])["head_sha"]; got != "consolhead" {
+			t.Errorf("verdict head_sha = %v, want consolhead: %s", got, rows[0].Payload)
+		}
+		assertNoUnavailableRows(t, au)
+	})
+
+	t.Run("hook error mutates nothing", func(t *testing.T) {
+		o, rs, _, au, _, hook := newFanInAcceptanceOrchestrator(t)
+		hook.err = errors.New("compare boom")
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, allSkip(t), run.StageStatePending)
+		stampPR(p)
+
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err == nil || !strings.Contains(err.Error(), "compare boom") || sc != nil {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v), want the hook error", sc, err)
+		}
+		if p.acceptance.State != run.StageStatePending {
+			t.Errorf("acceptance = %q, want pending (untouched)", p.acceptance.State)
+		}
+		for _, tr := range rs.stageTransitions {
+			if tr.StageID == p.acceptance.ID {
+				t.Errorf("acceptance transitioned to %q on a hook error", tr.To)
+			}
+		}
+		au.mu.Lock()
+		appends := len(au.appended)
+		au.mu.Unlock()
+		if appends != 0 {
+			t.Errorf("audit appends = %d, want 0 on a hook error", appends)
+		}
+	})
+
+	t.Run("awaiting_host_dispatch skips the predicate (R1)", func(t *testing.T) {
+		o, rs, _, au, _, hook := newFanInAcceptanceOrchestrator(t, false)
+		hook.head = "consolhead"
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, allSkip(t), run.StageStateAwaitingHostDispatch)
+		stampPR(p)
+
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err != nil || sc == nil {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v), want a short-circuit from awaiting_host_dispatch", sc, err)
+		}
+		if hook.callCount() != 0 {
+			t.Errorf("hook calls = %d, want 0 (awaiting_host_dispatch skips the predicate)", hook.callCount())
+		}
+		_, rows := acceptanceRows(au)
+		if len(rows) != 1 {
+			t.Fatalf("acceptance rows = %d, want 1", len(rows))
+		}
+		if _, ok := decodePayload(t, rows[0])["head_sha"]; ok {
+			t.Errorf("verdict carries head_sha without the predicate: %s", rows[0].Payload)
+		}
+	})
+}
+
+// failingCategoryAudit is a recordingAudit whose AppendChained fails for ONE
+// category only, so the fan_in_verify_unavailable append can fail while the
+// verdict still lands.
+type failingCategoryAudit struct {
+	*recordingAudit
+	failCategory string
+}
+
+func (f *failingCategoryAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == f.failCategory {
+		return nil, errors.New("append boom")
+	}
+	return f.recordingAudit.AppendChained(ctx, p)
+}
+
+// (d2) The admission walk records a fail-open release only when a predicate
+// matched, before the verdict (R3/R9). MECHANISM: the re-entry Advance finds
+// acceptance terminal and skips consolidateBeforeAcceptance, so without the
+// admission-side record no unavailable row exists at all; the non_skippable
+// fixture matches no predicate, so an unconditional record would append a row.
+func TestTryShortCircuitAcceptance_DecomposedParentFailOpen_RecordsUnavailableBeforeVerdict(t *testing.T) {
+	t.Run("skippable", func(t *testing.T) {
+		o, rs, _, au, _, _ := newFanInAcceptanceOrchestrator(t)
+		o.FanInVerify = nil
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, acceptanceSkipPlanBytes(t, nil, fanInAllSkipCriteria()), run.StageStatePending)
+
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err != nil || sc == nil {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v), want a short-circuit", sc, err)
+		}
+		assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+		idx, rows := acceptanceRows(au)
+		if len(rows) != 1 || rows[0].Category != "acceptance_outcome_recorded" {
+			t.Fatalf("acceptance rows = %+v, want one acceptance_outcome_recorded", rows)
+		}
+		if u := appendIndex(au, CategoryFanInVerifyUnavailable); u < 0 || u > idx[0] {
+			t.Errorf("fan_in_verify_unavailable at append %d, verdict at %d: want the row BEFORE the verdict", u, idx[0])
+		}
+		if _, ok := decodePayload(t, rows[0])["head_sha"]; ok {
+			t.Errorf("fail-open verdict carries head_sha: %s", rows[0].Payload)
+		}
+
+		if _, _, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID); err != nil {
+			t.Fatalf("second TryShortCircuitAcceptance: %v", err)
+		}
+		if n := len(unavailableRows(au)); n != 1 {
+			t.Errorf("rows after a second call = %d, want still 1", n)
+		}
+	})
+
+	t.Run("non_skippable (R9)", func(t *testing.T) {
+		o, rs, _, au, _, _ := newFanInAcceptanceOrchestrator(t)
+		o.FanInVerify = nil
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, acceptanceSkipPlanBytes(t, nil, fanInDrivableCriteria()), run.StageStatePending)
+
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err != nil || sc != nil || !liveReq {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v, %v), want (nil, true, nil)", sc, liveReq, err)
+		}
+		if p.acceptance.State != run.StageStatePending {
+			t.Errorf("acceptance = %q, want pending", p.acceptance.State)
+		}
+		if n := len(unavailableRows(au)); n != 0 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want 0 (no predicate matched, so nothing was released here)", n)
+		}
+		if idx, _ := acceptanceRows(au); len(idx) != 0 {
+			t.Errorf("acceptance rows = %d, want 0", len(idx))
+		}
+	})
+
+	// C6: the row-before-verdict order holds only when the append succeeds. A
+	// failed append WARNs and is swallowed (#4792); the verdict still lands.
+	t.Run("unavailable append fails", func(t *testing.T) {
+		o, rs, _, au, _, _ := newFanInAcceptanceOrchestrator(t)
+		o.FanInVerify = nil
+		o.Audit = &failingCategoryAudit{recordingAudit: au, failCategory: CategoryFanInVerifyUnavailable}
+		logs := jsonLogger(o)
+		p := seedPlannedAcceptanceAheadParent(t, o, rs, acceptanceSkipPlanBytes(t, nil, fanInAllSkipCriteria()), run.StageStatePending)
+
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), p.run.ID, p.acceptance.ID)
+		if err != nil || sc == nil {
+			t.Fatalf("TryShortCircuitAcceptance = (%+v, %v), want a short-circuit despite the failed append", sc, err)
+		}
+		if p.acceptance.State != run.StageStateSucceeded {
+			t.Errorf("acceptance = %q, want succeeded", p.acceptance.State)
+		}
+		if n := countAcceptanceCategory(au, "acceptance_outcome_recorded"); n != 1 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 1 (the verdict is still recorded)", n)
+		}
+		if n := len(unavailableRows(au)); n != 0 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want 0 (the append failed)", n)
+		}
+		if !strings.Contains(logs.String(), "append fan_in_verify_unavailable failed") {
+			t.Errorf("no WARN for the failed append; logs:\n%s", logs.String())
+		}
+	})
 }

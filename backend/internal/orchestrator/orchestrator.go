@@ -128,8 +128,15 @@ type FanInVerifyGate interface {
 // read-only and writes no audit row; the orchestrator, the only layer that sees
 // every fail-open arm, logs and records the reason. UnavailableDetail is a
 // bounded, server-built string (never a wrapped upstream error).
+//
+// HeadSHA (#4846) is the consolidated head the answer judged: set on every
+// compare-derived answer (settled or not) and empty on every arm that compared
+// nothing (no run repository, a child, no children, a forge that is not wired).
+// Advance carries it onto a decomposed parent's acceptance short-circuit verdict
+// as head_sha, so the verdict names the head it covers.
 type FanInVerifyAnswer struct {
 	Settled           bool
+	HeadSHA           string
 	UnavailableReason string
 	UnavailableDetail string
 }
@@ -621,6 +628,33 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		return OutcomeDispatched, nil
 	}
 
+	// #4785 / #4846: a workflow that orders acceptance BEFORE review
+	// (feature_change) reaches a decomposed parent's acceptance stage first, and
+	// the ADR-032 review-gate block below never fires there. So the
+	// consolidation tail runs here instead: open the consolidated PR, hold
+	// acceptance `pending` until the consolidated head's fan-in verify settles,
+	// then dispatch it and fire the consolidated review (below). Placed BEFORE
+	// the acceptance short-circuit (#4846): a parent whose approved plan
+	// satisfies a short-circuit predicate must not record its acceptance verdict
+	// before the consolidated head exists or is verified. A released parent's
+	// short-circuit verdict carries the judged head (fanInHead) as head_sha, and
+	// its re-entered Advance reaches the review gate, which fires the
+	// consolidated review as before.
+	isParentAcceptance := false
+	fanInHead := ""
+	if next.Type == run.StageTypeAcceptance && r.DecomposedFrom == nil {
+		updated, gate, err := o.consolidateBeforeAcceptance(ctx, r, stages, next)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: consolidate before acceptance: %w", err)
+		}
+		r = updated
+		isParentAcceptance = gate.isParent
+		fanInHead = gate.headSHA
+		if gate.held {
+			return OutcomeNoOp, nil
+		}
+	}
+
 	// E38.3 (#1657): auto-terminate a degenerate acceptance stage. When the
 	// approved plan declares verification.out_of_scope with ZERO
 	// acceptance_criteria, the acceptance stage has no observable criterion to
@@ -633,9 +667,10 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// acceptance stage lets the run reach completeRun → succeeded in the SAME call.
 	// Guarded by o.Artifacts != nil (a harness without the artifact repo takes the
 	// unchanged dispatch path — decomposition children have no plan stage anyway,
-	// so loadApprovedPlan returns nil for them and this never fires). Placed BEFORE
-	// the decomposition / consolidated-PR / dispatch block so no workflow_dispatch
-	// can fire for the skipped stage. A load error surfaces (do NOT silently
+	// so loadApprovedPlan returns nil for them and this never fires). Placed AFTER
+	// the decomposed-parent fan-in hold above (#4846) and BEFORE the
+	// decomposition / review-gate consolidated-PR / dispatch block so no
+	// workflow_dispatch can fire for the skipped stage. A load error surfaces (do NOT silently
 	// dispatch); a nil plan or a false predicate falls through to the unchanged
 	// operator-dispatched acceptance path.
 	//
@@ -651,7 +686,9 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// disjoint by construction (E38.3 requires out_of_scope>0; #1728 requires
 	// out_of_scope==0), so at most one fires.
 	if next.Type == run.StageTypeAcceptance && o.Artifacts != nil {
-		sc, _, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, next)
+		// Advance passes no before-settle callback: consolidateBeforeAcceptance
+		// has already recorded any fail-open release above.
+		sc, _, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, next, fanInHead, nil)
 		if err != nil {
 			return OutcomeNoOp, err
 		}
@@ -678,27 +715,6 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		}
 		if decomposed {
 			return OutcomeDecomposed, nil
-		}
-	}
-
-	// #4785: a workflow that orders acceptance BEFORE review (feature_change)
-	// reaches a decomposed parent's acceptance stage first, and the ADR-032
-	// review-gate block below never fires there. So the consolidation tail
-	// runs here instead: open the consolidated PR, hold acceptance `pending`
-	// until the consolidated head's fan-in verify settles, then dispatch it
-	// and fire the consolidated review (below). Placed AFTER the acceptance
-	// short-circuit, so a short-circuited acceptance re-enters Advance and
-	// the review gate opens the tail as before.
-	isParentAcceptance := false
-	if next.Type == run.StageTypeAcceptance && r.DecomposedFrom == nil {
-		updated, isParent, held, err := o.consolidateBeforeAcceptance(ctx, r, stages, next)
-		if err != nil {
-			return OutcomeNoOp, fmt.Errorf("orchestrator: consolidate before acceptance: %w", err)
-		}
-		r = updated
-		isParentAcceptance = isParent
-		if held {
-			return OutcomeNoOp, nil
 		}
 	}
 
@@ -891,53 +907,38 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 }
 
 // consolidateBeforeAcceptance runs a decomposed parent's consolidation tail
-// ahead of its acceptance stage (#4785), returning (updated run, isParent,
-// held, err).
+// ahead of its acceptance stage (#4785), returning (updated run, gate, err).
 //
 //	(a) A run with no implement stage, or no decomposed children, is
-//	    untouched: (r, false, false, nil).
+//	    untouched: (r, fanInGate{}, nil).
 //	(b) The consolidated PR is opened when the run carries no URL yet, anchored
 //	    on the run's review-type stage (falling back to next) so
 //	    consolidated_pr_opened keeps its review-stage anchor. An open error is
 //	    returned so the next Advance retries — the review-gate posture.
-//	(c) With FanInVerify and ConsolidatedReview wired and the PR present, the
-//	    read-only FanInVerify hook decides. Unsettled: fire
+//	(c) decideFanInAcceptance (shared with DecomposedParentFanInHold, #4846)
+//	    decides. Held (the read-only FanInVerify hook answered unsettled): fire
 //	    DispatchConsolidatedReview (which starts the verify-only pass on an
 //	    unverified head and holds otherwise), log, and report held — acceptance
 //	    stays `pending`. A hook error is returned (acceptance stays pending).
 //	    The hook's base is the resolved default branch (#4660); an
 //	    unresolved one is WARN-logged with its reason and consults no hook.
-//	(d) Otherwise not held: the caller dispatches acceptance and fires the
-//	    consolidated review. Every release with no fan-in verify consulted (a
-//	    nil hook, no consolidated PR, an unresolved base, or a hook answer
-//	    carrying an UnavailableReason) is logged and recorded as
-//	    fan_in_verify_unavailable (#4792); it is a signal, never a hold.
+//	(d) Otherwise not held: the caller short-circuits or dispatches acceptance
+//	    and fires the consolidated review. Every release with no fan-in verify
+//	    consulted (a nil hook, no consolidated PR, an unresolved base, or a hook
+//	    answer carrying an UnavailableReason) is logged and recorded as
+//	    fan_in_verify_unavailable (#4792); it is a signal, never a hold. A
+//	    verified release carries the judged head in gate.headSHA.
 //
 // holdAttempts counts consecutive holds per parent in-process so a repeated
 // hold with no trigger row (the pass could not start) is distinguishable in
 // the log from the first one.
-func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.Run, stages []*run.Stage, next *run.Stage) (*run.Run, bool, bool, error) {
-	// Only an implement stage fans out (ADR-025 D4), so a run with none can
-	// never be a decomposed parent: skip the children lookup entirely.
-	hasImplement := false
-	for _, s := range stages {
-		if s.Type == run.StageTypeImplement {
-			hasImplement = true
-			break
-		}
-	}
-	if !hasImplement {
-		return r, false, false, nil
-	}
-	children, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
-		DecomposedFrom: &r.ID,
-		Limit:          1,
-	})
+func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.Run, stages []*run.Stage, next *run.Stage) (*run.Run, fanInGate, error) {
+	isParent, err := o.decomposedParentForAcceptance(ctx, r, stages)
 	if err != nil {
-		return r, false, false, fmt.Errorf("list decomposed children: %w", err)
+		return r, fanInGate{}, err
 	}
-	if len(children) == 0 {
-		return r, false, false, nil
+	if !isParent {
+		return r, fanInGate{}, nil
 	}
 
 	if r.PullRequestURL == nil || *r.PullRequestURL == "" {
@@ -950,57 +951,43 @@ func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.R
 		}
 		updated, err := o.maybeOpenConsolidatedPR(ctx, r, reviewStage)
 		if err != nil {
-			return r, true, false, fmt.Errorf("open consolidated pr: %w", err)
+			return r, fanInGate{isParent: true}, fmt.Errorf("open consolidated pr: %w", err)
 		}
 		r = updated
 	}
 
+	// The PR open above already ran, so prOpenPending is false: a PR-less run
+	// here is one whose open skipped gracefully.
+	d, err := o.decideFanInAcceptance(ctx, r, false)
+	if err != nil {
+		return r, fanInGate{isParent: true}, err
+	}
+	if d.held {
+		o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, d.base, consolidatedBranch(r.ID))
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: decomposed parent acceptance held until the consolidated fan-in verify settles; release it by dispatching the parent's re-opened IMPLEMENT stage (the verify-only pass), not the acceptance stage",
+			slog.String("run_id", r.ID.String()),
+			slog.String("acceptance_stage_id", next.ID.String()),
+			slog.String("consolidated_branch", consolidatedBranch(r.ID)),
+			slog.String("head_sha", d.headSHA),
+			slog.Int("hold_attempt", o.noteFanInAcceptanceHold(r.ID)),
+		)
+		return r, fanInGate{isParent: true, held: true, headSHA: d.headSHA}, nil
+	}
 	// Every skip of the hold names itself (#4792): a release with no fan-in
 	// verify consulted is logged and recorded as fan_in_verify_unavailable,
 	// never held and never silent.
-	switch {
-	case o.FanInVerify == nil || o.ConsolidatedReview == nil:
-		o.recordFanInVerifyUnavailable(ctx, r, next, FanInVerifyUnavailableHookNotWired, o.fanInHookMissing())
-	case r.PullRequestURL == nil || *r.PullRequestURL == "":
-		o.recordFanInVerifyUnavailable(ctx, r, next, FanInVerifyUnavailableNoConsolidatedPR, o.noConsolidatedPRDetail(r))
-	default:
-		// The fan-in base is the repository's resolved default branch
-		// (#4660), never a literal. An unresolved read applies NO hold:
-		// acceptance dispatches as before (the merge gate still blocks on
-		// the unverified head) and the consolidated-review fire after the
-		// dispatch skips with its own WARN.
-		base, berr := o.runBaseBranch(ctx, r)
-		if berr != nil {
-			reason, _ := defaultbranch.ReasonOf(berr)
-			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed parent acceptance hold not applied: default branch unresolved",
-				slog.String("run_id", r.ID.String()),
-				slog.String("acceptance_stage_id", next.ID.String()),
-				slog.String("reason", string(reason)),
-				slog.String("error", berr.Error()))
-			o.recordFanInVerifyUnavailable(ctx, r, next, FanInVerifyUnavailableDefaultBranchUnresolved, string(reason))
-			o.clearFanInAcceptanceHold(r.ID)
-			return r, true, false, nil
-		}
-		answer, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
-		if err != nil {
-			return r, true, false, fmt.Errorf("fan-in verify state: %w", err)
-		}
-		if !answer.Settled {
-			o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
-			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: decomposed parent acceptance held until the consolidated fan-in verify settles; release it by dispatching the parent's re-opened IMPLEMENT stage (the verify-only pass), not the acceptance stage",
-				slog.String("run_id", r.ID.String()),
-				slog.String("acceptance_stage_id", next.ID.String()),
-				slog.String("consolidated_branch", consolidatedBranch(r.ID)),
-				slog.Int("hold_attempt", o.noteFanInAcceptanceHold(r.ID)),
-			)
-			return r, true, true, nil
-		}
-		if answer.UnavailableReason != "" {
-			o.recordFanInVerifyUnavailable(ctx, r, next, answer.UnavailableReason, answer.UnavailableDetail)
-		}
+	if d.baseErr != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed parent acceptance hold not applied: default branch unresolved",
+			slog.String("run_id", r.ID.String()),
+			slog.String("acceptance_stage_id", next.ID.String()),
+			slog.String("reason", d.unavailableDetail),
+			slog.String("error", d.baseErr.Error()))
+	}
+	if d.unavailableReason != "" {
+		o.recordFanInVerifyUnavailable(ctx, r, next, d.unavailableReason, d.unavailableDetail)
 	}
 	o.clearFanInAcceptanceHold(r.ID)
-	return r, true, false, nil
+	return r, fanInGate{isParent: true, headSHA: d.headSHA}, nil
 }
 
 // noteFanInAcceptanceHold increments and returns the in-process consecutive
@@ -1111,7 +1098,9 @@ func (o *Orchestrator) openConsolidatedPRLocked(ctx context.Context, r *run.Run,
 
 	// (d) Graceful-skip when GitHub can't be reached (no client / no
 	// installation). The parent stays PR-less — same posture as
-	// fireDispatch.
+	// fireDispatch. consolidatedPROpenSkips (fanin_hold.go, #4846) MIRRORS these
+	// two conditions for the read-only fan-in hold predicate; change both
+	// together.
 	if o.GitHub == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping consolidated PR",
 			slog.String("run_id", r.ID.String()))
@@ -1755,7 +1744,12 @@ func (o *Orchestrator) emitAcceptanceSkippedOutOfScope(ctx context.Context, runI
 // (auditcomplete keys on BASIS, not on the verdict, so the exemption is
 // unaffected by the verdict change). Appended with AppendChained (ActorKind
 // system) so Rule 4 chain-verify stays intact.
-func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, runID, stageID uuid.UUID, sequence int, basis string, criteriaTotal, liveValidationCount int) {
+//
+// headSHA (#4846) is the consolidated head a decomposed parent's fan-in verify
+// hold judged before releasing; a non-empty one is recorded as head_sha so the
+// verdict names the head it covers. Every other caller passes "" and the key is
+// omitted, so an ordinary run's payload is byte-identical to the pre-#4846 one.
+func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, runID, stageID uuid.UUID, sequence int, basis string, criteriaTotal, liveValidationCount int, headSHA string) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping acceptance_outcome_recorded short-circuit entry",
 			slog.String("run_id", runID.String()))
@@ -1765,7 +1759,7 @@ func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, ru
 	if basis == plan.AcceptanceBasisAllSkipWithBasis {
 		reason = "approved plan's acceptance criteria are all skip_expected with an expectation_basis; acceptance stage short-circuited to a NOT-VALIDATED verdict with no runner spawn and no preview — zero criteria were verified"
 	}
-	payload, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"stage_id":                               stageID.String(),
 		"sequence":                               sequence,
 		"verdict":                                plan.AcceptanceVerdictNotValidated,
@@ -1777,7 +1771,11 @@ func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, ru
 		plan.AcceptanceCriteriaLiveValidationKey: liveValidationCount,
 		plan.AcceptanceBasisKey:                  basis,
 		"reason":                                 reason,
-	})
+	}
+	if headSHA != "" {
+		fields["head_sha"] = headSHA
+	}
+	payload, err := json.Marshal(fields)
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal acceptance_outcome_recorded short-circuit payload failed",
 			slog.String("error", err.Error()))
@@ -1903,7 +1901,15 @@ func (o *Orchestrator) walkAcceptanceToSucceededFrom(ctx context.Context, stageI
 // side; no live target is needed). The admission endpoint reads it to report
 // needs_target so a dispatch verb probes the target BEFORE spawning a runner
 // doomed to fail category-C acceptance_target_unreachable.
-func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run.Run, stages []*run.Stage, target *run.Stage) (*AcceptanceShortCircuit, bool, error) {
+//
+// headSHA (#4846) is the decomposed parent's fan-in-judged consolidated head,
+// carried onto the two verdict-recording predicates' payload as head_sha (the
+// out-of-scope marker carries none); "" omits it. beforeSettle (#4846 R9), when
+// non-nil, runs inside a MATCHED predicate case only, before the walk's first
+// transition: the admission walk records a fail-open release there, so the row
+// precedes the verdict and a non-matching plan records nothing. The no-plan,
+// nil-Artifacts, non-acceptance and no-predicate-matched paths never call it.
+func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run.Run, stages []*run.Stage, target *run.Stage, headSHA string, beforeSettle func(context.Context)) (*AcceptanceShortCircuit, bool, error) {
 	if target.Type != run.StageTypeAcceptance || o.Artifacts == nil {
 		return nil, false, nil
 	}
@@ -1926,6 +1932,7 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 	v := o.effectiveAcceptanceVerification(ctx, r.ID, approvedPlan)
 	switch {
 	case plan.AcceptanceSkippableOutOfScope(v):
+		runBeforeSettle(ctx, beforeSettle)
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "out-of-scope skip"); err != nil {
 			return nil, false, err
 		}
@@ -1938,11 +1945,12 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 		)
 		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitOutOfScope, CriteriaTotal: 0}, false, nil
 	case plan.AcceptanceSkippableEmptyCriteria(v):
+		runBeforeSettle(ctx, beforeSettle)
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "empty-criteria short-circuit"); err != nil {
 			return nil, false, err
 		}
 		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisEmptyCriteria, 0,
-			plan.LiveValidationCriteriaCount(v))
+			plan.LiveValidationCriteriaCount(v), headSHA)
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (zero acceptance_criteria, zero out_of_scope) to a NOT-VALIDATED verdict",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
@@ -1951,12 +1959,13 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 		)
 		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitEmptyCriteria, Basis: plan.AcceptanceBasisEmptyCriteria, CriteriaTotal: 0}, false, nil
 	case plan.AcceptanceSkippableAllSkipWithBasis(v):
+		runBeforeSettle(ctx, beforeSettle)
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "all-skip-with-basis short-circuit"); err != nil {
 			return nil, false, err
 		}
 		total := len(v.AcceptanceCriteria)
 		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisAllSkipWithBasis, total,
-			plan.LiveValidationCriteriaCount(v))
+			plan.LiveValidationCriteriaCount(v), headSHA)
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (every acceptance criterion skip_expected with basis) to a NOT-VALIDATED verdict",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
@@ -1970,6 +1979,14 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 	// acceptance criterion needs a live target. No state change here — the
 	// admission endpoint reports needs_target and the dispatch verb probes.
 	return nil, true, nil
+}
+
+// runBeforeSettle invokes a short-circuit before-settle callback when one is
+// set (#4846 R9). Nil-safe so Advance can pass nil.
+func runBeforeSettle(ctx context.Context, f func(context.Context)) {
+	if f != nil {
+		f(ctx)
+	}
 }
 
 // effectiveAcceptanceVerification returns the verification the acceptance
@@ -2046,6 +2063,16 @@ func (o *Orchestrator) effectiveAcceptanceVerification(ctx context.Context, runI
 // plan, an un-wired orchestrator — and false alongside a fired short-circuit. The
 // admission endpoint reads it to add needs_target + the target hosts / expected head
 // SHA to its short_circuited:false response.
+//
+// FAN-IN VERIFY HOLD (#4846): on a PENDING target the walk first consults the
+// read-only DecomposedParentFanInHold predicate Advance shares. A held top-level
+// decomposed parent returns (nil, false, nil) with nothing mutated, and a
+// predicate error returns with nothing mutated. A released parent's verdict
+// carries the judged head as head_sha. A fail-open release is recorded through
+// the before-settle callback only when a short-circuit predicate matched, so its
+// fan_in_verify_unavailable row precedes the verdict (when the best-effort append
+// succeeds) and a non-matching plan records nothing here. An awaiting_host_dispatch
+// target skips the predicate: Advance parked it there only after the hold released.
 func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, stageID uuid.UUID) (*AcceptanceShortCircuit, bool, error) {
 	if o.Runs == nil {
 		return nil, false, errors.New("orchestrator: Runs is nil")
@@ -2096,6 +2123,31 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 		return nil, false, nil
 	}
 
+	// #4846: a top-level decomposed parent's PENDING acceptance is held until
+	// its consolidated head's fan-in verify settles, exactly as Advance holds it
+	// (the shared read-only predicate), so the admission walk cannot settle it
+	// behind Advance's back. Evaluated under the admission lock and before any
+	// mutation; an error returns with nothing mutated. An awaiting_host_dispatch
+	// target skips the predicate (R1): Advance parked it there only after the
+	// hold released, and run.FixupStage tolerates only a pending acceptance.
+	var hold FanInHold
+	if target.State == run.StageStatePending {
+		hold, err = o.DecomposedParentFanInHold(ctx, r, stages)
+		if err != nil {
+			return nil, false, fmt.Errorf("orchestrator: fan-in verify hold for acceptance admission: %w", err)
+		}
+		if hold.Held {
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: acceptance admission held: decomposed parent acceptance waits for the consolidated fan-in verify to settle; see the orchestrator README (Consolidation before acceptance) for the remedy",
+				slog.String("run_id", r.ID.String()),
+				slog.String("stage_id", target.ID.String()),
+				slog.String("hold_cause", hold.HoldCause),
+				slog.String("consolidated_branch", hold.ConsolidatedBranch),
+				slog.String("head_sha", hold.HeadSHA),
+			)
+			return nil, false, nil
+		}
+	}
+
 	// POINT OF NO RETURN (binding condition 1, #1936): from here the walk may
 	// mutate stage state, so it runs on a context that a client disconnect or the
 	// handler's own timeout can no longer cancel. context.WithoutCancel keeps the
@@ -2103,7 +2155,14 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 	// starts its walk always runs to completion — settle + audit + Advance — rather
 	// than wedging the stage at an intermediate state.
 	mutationCtx := context.WithoutCancel(ctx)
-	sc, liveValidationRequired, err := o.tryShortCircuitAcceptanceCore(mutationCtx, r, stages, target)
+	// A fail-open release (#4792) is recorded only when a predicate matched,
+	// before the walk's first transition and so before the verdict (R3/R9). A
+	// non-matching plan records nothing here; the marker or Advance records it
+	// when it actually releases the spawn.
+	recordRelease := func(c context.Context) {
+		o.RecordFanInHoldRelease(c, r, target, hold)
+	}
+	sc, liveValidationRequired, err := o.tryShortCircuitAcceptanceCore(mutationCtx, r, stages, target, hold.HeadSHA, recordRelease)
 	if err != nil {
 		return nil, false, err
 	}
