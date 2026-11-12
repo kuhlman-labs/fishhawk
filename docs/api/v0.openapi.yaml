@@ -2611,7 +2611,7 @@ components:
             no open concerns.
         derived_status:
           type: string
-          enum: [awaiting_merge, ci_failed, review_coverage_incomplete]
+          enum: [awaiting_merge, ci_failed, ci_cancelled, review_coverage_incomplete]
           description: |
             Presentation-only drive-mode status (#1023):
             `awaiting_merge` while a non-terminal drive run with an
@@ -2631,6 +2631,21 @@ components:
             remains at the latest observed rows. `ci_recovered` is a
             rule value, NOT a `derived_status` (the field goes absent
             while the remaining required checks conclude).
+            `ci_cancelled` (#4706) is a non-terminal drive run with an
+            open PR whose latest auto-advance is `ci_cancelled`: no
+            required check carries a red verdict, but one concluded
+            `cancelled`/`stale` AT the run's current recorded head — the
+            audit-ledger head report Fishhawk last recorded, not a forge
+            read — so no newer push will re-run it. Detection only: it
+            parks with `next_action` `retrigger_ci` and never offers a
+            merge. A red verdict outranks it (`ci_failed`), a
+            cancellation at an older recorded head stays ignored, a
+            later `ci_recovered` (a newer recorded head landed) or
+            `checks_green_awaiting_merge` supersedes it, and an
+            unresolvable current head holds it. The recorded head can lag
+            the forge (an exhausted push report, or a post-fix-up head
+            whose check rows were not ingested), so a cancellation at an
+            unrecorded newer head does not park.
             `review_coverage_incomplete` (#4219) is stamped INSTEAD of
             `awaiting_merge` on a decomposed parent whose review evidence
             settled with a succeeded slice no successful agent review
@@ -5193,7 +5208,13 @@ components:
         latest observed rows: the parking conclusion was `cancelled`/
         `stale`, a head superseded by a newer push, so the run returns
         to awaiting its remaining checks rather than the `ci_failed`
-        dead end), `review_coverage_incomplete` (#4219 — stamped instead of
+        dead end; it also lifts a `ci_cancelled` park once the
+        cancellation is no longer at the current recorded head),
+        `ci_cancelled` (#4706 — a required PR check concluded
+        `cancelled`/`stale` at the run's current recorded head with no
+        red verdict present; detection only, it parks with
+        `next_action` `retrigger_ci` and never advances),
+        `review_coverage_incomplete` (#4219 — stamped instead of
         `checks_green_awaiting_merge` on a decomposed parent with a
         succeeded slice no successful agent review covers; detection only,
         it parks and never advances).
@@ -8161,19 +8182,30 @@ components:
             the rows with a total precedence ladder: any `failed` row →
             `failed`; else any `undecidable` row → `undecidable` (including an
             all-undecidable set, where nothing was verified); else if every
-            non-retired row is `skipped`, or no rows were itemized at all, or
-            every itemized row was retired →
+            laddered row (neither retired nor operator-added) is `skipped`, or
+            no rows were itemized at all, or every itemized row was retired,
+            or every itemized row was operator-added or retired →
             `not_validated` (bases `all-skip-observed` / `no-rows-observed` /
-            `all-retired-observed`, #3397 — the validator ran but verified
-            nothing); else `passed`. The
+            `all-retired-observed`, #3397; `added-only-observed`, #3682 — the
+            validator ran but verified no reviewed criterion in force); else
+            `passed`. An operator-added row never feeds the ladder, so it
+            cannot move a shipped `passed`. The
             recorded verdict is resolved severity-monotone as
             `max(shipped, derived)` over `passed < not_validated < undecidable <
             failed`, so a shipped `failed` is never softened (a shipped `failed`
             with an all-skip/empty set stays `failed`) and a row set containing
-            an undecidable row can never be recorded as `passed`. When the
+            an undecidable row can never be recorded as `passed`. The one
+            bounded exception (#3682 R1): a shipped `failed` with
+            `failure_mode` `assertion_fail` whose itemized rows are all
+            operator-added or retired, with at least one added row, at least
+            one failed row, and every reviewed criterion in force itemized,
+            records `not_validated` (`added-only-observed`) and routes no
+            triage. When the
             recorded verdict differs from the shipped one, the
             `acceptance_outcome_recorded` payload carries `verdict_reported`
-            with what the agent said.
+            with what the agent said. It also carries `added_criteria_failed`
+            (#3682) naming every operator-added id reported `failed`, whatever
+            the recorded verdict, and omits it when none failed.
         failure_mode:
           type: string
           enum: [error, assertion_fail]
@@ -8477,7 +8509,8 @@ components:
             #2512 (a shipped `passed` carrying an undecidable/failed row records
             `undecidable`/`failed`) and #3091 (an unbound head clamps to
             `undecidable`); #3397 adds `not_validated` (a shipped `passed` whose
-            non-retired rows are all skipped, or that itemized no rows). The
+            laddered rows are all skipped, or that itemized no rows, or, #3682,
+            only operator-added or retired rows). The
             original #2581 case is one instance: a `failed` verdict NEUTRALIZED
             because every failure named an acceptance criterion the operator
             RETIRED at the plan-approval gate (`amend_acceptance_criteria`)
@@ -8486,7 +8519,8 @@ components:
             untouched; the governance `acceptance_outcome_recorded` entry records
             this value as its `verdict` alongside `verdict_reported` (and, per
             origin, `downgrade_basis` + `retired_criterion_ids`,
-            `undecidable_basis`, or `basis`). Omitted when the recorded verdict
+            `undecidable_basis`, or `basis`; `added_criteria_failed` is
+            additive and descriptive). Omitted when the recorded verdict
             IS the shipped one — additive either way, since the runner decodes
             this body without `DisallowUnknownFields`.
             On an IDEMPOTENT replay (`idempotent: true`) this field ECHOES the
@@ -26842,9 +26876,20 @@ paths:
                     served in `acceptance_criteria` and
                     `acceptance_criteria_ids`, and rendered under an
                     operator-authored block telling the validator it did NOT
-                    pass plan review. It is advisory: a failed verdict naming
-                    ONLY operator-added criteria is recorded `passed` with
-                    `downgrade_basis` `added_criteria_only`. Refused `400
+                    pass plan review. It is advisory: it can neither escalate
+                    nor certify a verdict. An added row never feeds the
+                    precedence ladder, so it cannot move a shipped `passed`
+                    (#3682). Residual shipped-`failed` shapes: a failed verdict
+                    naming ONLY operator-added criteria is recorded `passed`
+                    with `downgrade_basis` `added_criteria_only` when A1-A4
+                    hold; it stays `failed` on `failure_mode` `error` (A1) or a
+                    surviving blocking reviewed row reported `skipped` without
+                    a plan basis, or `undecidable` (A4); when only
+                    added/retired rows were itemized (A3) it records
+                    `not_validated` (`added-only-observed`) only for an
+                    `assertion_fail` with a failed row and every reviewed
+                    criterion in force itemized, else `failed` + triage. A
+                    failed live reviewed row always records `failed`. Refused `400
                     validation_failed` with `details.rule` one of
                     `criterion_id_exists`, `invalid_criterion_id`,
                     `statement_required`, `reason_required`, `duplicate_id`,
@@ -28073,8 +28118,9 @@ paths:
         settles the stage from the plan alone, so it produces no per-criterion
         rows (bases `empty_criteria` / `all_skip_with_basis`). The ship endpoint
         can ALSO record `not_validated` POST-RUN (#3397, bases
-        `all-skip-observed` / `no-rows-observed` / `all-retired-observed`) when a
-        validator ran but verified nothing. Both origins stay disjoint from the `undecidable`
+        `all-skip-observed` / `no-rows-observed` / `all-retired-observed`; #3682
+        `added-only-observed`) when a validator ran but verified no reviewed
+        criterion in force. Both origins stay disjoint from the `undecidable`
         verdict (#2512) and its `acceptance_undecidable` gate state by a single
         severity ladder (`passed < not_validated < undecidable < failed`): a run
         with any undecidable row records `undecidable`. All are merge-eligible;

@@ -16793,7 +16793,8 @@ func TestApprovePlan_AddCriterionAdvertised(t *testing.T) {
 	}
 	desc := f.Tag.Get("jsonschema")
 	for _, want := range []string{"'add'", "FRESH lowercase slug", "NEVER blocking", "added_criteria_only",
-		"criterion_id_exists", "invalid_criterion_id", "acceptance_criteria_all_operator_authored"} {
+		"criterion_id_exists", "invalid_criterion_id", "acceptance_criteria_all_operator_authored",
+		"neither escalate nor certify", "added-only-observed"} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("amend_acceptance_criteria description missing %q", want)
 		}

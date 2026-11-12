@@ -3993,6 +3993,91 @@ func TestRunStage_NextActions_AcceptanceBlockerFold(t *testing.T) {
 	}
 }
 
+// TestRunStage_NextActions_CICancelledConflictSignalKeepsFinalState (C2,
+// #4706) is the run_stage.go call-site pin for the ci_cancelled arm's
+// conflict-fold composition: it drives the REAL runStage handler — the SECOND
+// foldConflictResolutionAdvisory call site, after nextActionsFor — for an
+// acceptance stage, with drive derived_status ci_cancelled and the recent-audit
+// slice carrying an OLDER conflict-resolution entry (sequence 10) and the LATER
+// run_auto_advanced ci_cancelled stamp (sequence 20). Every ci_cancelled row
+// keeps the FINAL state ci_cancelled with I1-I5 and its appended conflict
+// action; the sibling ci_failed + pushed row is relabeled exactly as today.
+// run_stage.go itself is not edited — this proves the relabel guard inside the
+// shared fold reaches this call site. Counterfactual 6 run against it: the
+// signal rows go RED on I1 and the sibling row stays GREEN.
+func TestRunStage_NextActions_CICancelledConflictSignalKeepsFinalState(t *testing.T) {
+	type row struct {
+		name, signal     string
+		mismatch         bool
+		yield            naYieldRow
+		derived          string
+		wantSiblingState string
+	}
+	var rows []row
+	for _, signal := range []string{"triggered", "failed", "pushed"} {
+		for _, mismatch := range []bool{false, true} {
+			rows = append(rows, row{name: fmt.Sprintf("%s/mismatch=%t", signal, mismatch), signal: signal, mismatch: mismatch, derived: stateCICancelled})
+		}
+	}
+	rows = append(rows,
+		row{name: "pushed/retry_after_merge_checks_pending", signal: "pushed",
+			yield: naYieldRow{"retry_after_merge_checks_pending", "merge_checks_pending", "retry_after", "fishhawk_get_merge_queue"}, derived: stateCICancelled},
+		row{name: "no_signal", derived: stateCICancelled},
+		row{name: "sibling_ci_failed_pushed", signal: "pushed", derived: "ci_failed", wantSiblingState: "conflict_resolution_pass_succeeded"},
+	)
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			captureArgv(t)
+
+			runID := uuid.New()
+			acceptanceID := uuid.New()
+			seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+			// The fixture carries the ci_cancelled run's surfaces (open PR,
+			// optional mismatch and yield); the seeded row keeps its id, repo and
+			// the settled four-stage list the acceptance call-site needs.
+			fixture := naCICancelledRun(tc.mismatch, tc.yield.reason, tc.yield.next)
+			fixture.ID = runID.String()
+			conflictStageID := uuid.NewString()
+			fb.mu.Lock()
+			seededRow := fb.getRunByID[runID]
+			seededRow.PullRequestURL = fixture.PullRequestURL
+			seededRow.ReviewHeadMismatch = fixture.ReviewHeadMismatch
+			seededRow.MergeCandidateQueue = fixture.MergeCandidateQueue
+			fb.getRunByID[runID] = seededRow
+			fb.getRunExtraByID[runID] = map[string]any{
+				"drive":          true,
+				"derived_status": tc.derived,
+				"next_action": map[string]any{
+					"action": driveNextActionRetriggerCI,
+					"detail": naCICancelledDetail,
+					"pr_url": "https://github.com/x/y/pull/7",
+				},
+			}
+			fb.auditByRun[runID] = naCICancelledRecent(tc.signal, conflictStageID)
+			fb.mu.Unlock()
+			// The invariant helpers read the run the classifier saw.
+			view := seededRow
+
+			out := runAcceptanceStage(t, r, runID, acceptanceID)
+			na := out.NextActions
+			if tc.wantSiblingState != "" {
+				if na.State != tc.wantSiblingState {
+					t.Errorf("sibling: final state = %s, want %s (relabeled exactly as today)", na.State, tc.wantSiblingState)
+				}
+				assertConflictAction(t, &view, na, tc.signal, conflictStageID, -1)
+				return
+			}
+			k := assertCICancelledInvariants(t, &view, na, naCICancelledDetail)
+			if tc.yield.next != "" {
+				assertYieldRemedy(t, na, tc.yield, k)
+			}
+			assertConflictAction(t, &view, na, tc.signal, conflictStageID, k)
+		})
+	}
+}
+
 // TestRunStage_AcceptanceParkNamesDefaultPreviewCommand closes the SECOND WIRE
 // (#3321 operator condition 1). foldAcceptancePreviewAdvisory is wired at BOTH
 // nextActionsFor call sites — tools.go's getRunStatus and this one, run_stage's

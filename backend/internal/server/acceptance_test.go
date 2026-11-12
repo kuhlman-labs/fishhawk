@@ -5502,36 +5502,418 @@ func TestShipAcceptance_AddedOnly_ComposesWithRetirement(t *testing.T) {
 }
 
 // TestAddedOnlyDowngrade_BlockingConjuncts is one case per conjunct that BLOCKS
-// the added-only downgrade: each records the reported failure unchanged.
+// the added-only downgrade. Every case asserts no downgrade_basis, since the
+// downgrade is unchanged by #3682. A1 (failure_mode error), A2 (a failed LIVE
+// reviewed row — the pin for "a failed live reviewed row still records
+// failed") and A4 (a surviving blocking skip/undecidable) record the reported
+// failure unchanged. A3 (no surviving non-added row) on the default plan, where
+// crit-1..3 stay live but are not itemized, is the approval-condition C1
+// OMISSION case and still records failed. Only the A3 variant whose every
+// reviewed criterion was retired satisfies the #3682 R1 rule and records
+// not_validated.
 func TestAddedOnlyDowngrade_BlockingConjuncts(t *testing.T) {
 	cases := []struct {
-		name    string
-		mode    string
-		results []acceptanceCriterionResult
+		name        string
+		mode        string
+		amendments  []acceptanceCriteriaAmendment
+		results     []acceptanceCriterionResult
+		wantVerdict string
 	}{
-		{"A1 error failure mode", "error", []acceptanceCriterionResult{
-			{ID: "crit-1", Result: "passed"}, {ID: "crit-op", Result: "failed"}}},
-		{"A2 failed non-added id", "assertion_fail", []acceptanceCriterionResult{
-			{ID: "crit-1", Result: "failed"}, {ID: "crit-op", Result: "failed"}}},
-		{"A3 no surviving non-added row", "assertion_fail", []acceptanceCriterionResult{
-			{ID: "crit-op", Result: "failed"}}},
-		{"A4 surviving blocking undecidable", "assertion_fail", []acceptanceCriterionResult{
+		{"A1 error failure mode", "error", addCritOp(), []acceptanceCriterionResult{
+			{ID: "crit-1", Result: "passed"}, {ID: "crit-op", Result: "failed"}}, acceptanceVerdictFailed},
+		{"A2 failed non-added id", "assertion_fail", addCritOp(), []acceptanceCriterionResult{
+			{ID: "crit-1", Result: "failed"}, {ID: "crit-op", Result: "failed"}}, acceptanceVerdictFailed},
+		{"A3 no surviving non-added row, live reviewed criteria omitted", "assertion_fail", addCritOp(), []acceptanceCriterionResult{
+			{ID: "crit-op", Result: "failed"}}, acceptanceVerdictFailed},
+		{"A3 no surviving non-added row, every reviewed criterion retired", "assertion_fail", retireEveryReviewedAddCritOp(), []acceptanceCriterionResult{
+			{ID: "crit-op", Result: "failed"}}, acceptanceVerdictNotValidated},
+		{"A4 surviving blocking undecidable", "assertion_fail", addCritOp(), []acceptanceCriterionResult{
 			{ID: "crit-1", Result: "undecidable", UndecidableReason: json.RawMessage(`"target flaked"`)},
-			{ID: "crit-2", Result: "passed"}, {ID: "crit-op", Result: "failed"}}},
-		{"A4 surviving blocking skip without plan basis", "assertion_fail", []acceptanceCriterionResult{
+			{ID: "crit-2", Result: "passed"}, {ID: "crit-op", Result: "failed"}}, acceptanceVerdictFailed},
+		{"A4 surviving blocking skip without plan basis", "assertion_fail", addCritOp(), []acceptanceCriterionResult{
 			{ID: "crit-1", Result: "skipped", ExpectationBasis: "target unavailable"},
-			{ID: "crit-2", Result: "passed"}, {ID: "crit-op", Result: "failed"}}},
+			{ID: "crit-2", Result: "passed"}, {ID: "crit-op", Result: "failed"}}, acceptanceVerdictFailed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			payload := shipAddedFixture(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "failed", tc.mode, tc.results...))
-			if payload["verdict"] != "failed" {
-				t.Errorf("recorded verdict = %v, want failed (no added-only downgrade)", payload["verdict"])
+			payload := shipAddedFixture(t, amendIngestCriteria(), tc.amendments, acceptanceVerdictBytes(t, "failed", tc.mode, tc.results...))
+			if payload["verdict"] != tc.wantVerdict {
+				t.Errorf("recorded verdict = %v, want %s", payload["verdict"], tc.wantVerdict)
 			}
 			if _, present := payload["downgrade_basis"]; present {
 				t.Errorf("downgrade_basis present on a blocked downgrade: %v", payload)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3682: an operator-added criterion never feeds the precedence ladder.
+// ---------------------------------------------------------------------------
+
+// retireEveryReviewedAddCritOp retires EVERY reviewed criterion of
+// amendIngestCriteria and adds crit-op. It is seeded BY CONSTRUCTION — the
+// approval gate's R12 (acceptance_criteria_all_operator_authored) refuses this
+// chain — because it is the only chain on which the #3682 R1 rule's approval
+// condition C1 conjunct (every reviewed criterion in force itemized) can hold
+// inside the empty-ladder door: no reviewed criterion is in force.
+func retireEveryReviewedAddCritOp() []acceptanceCriteriaAmendment {
+	return append([]acceptanceCriteriaAmendment{
+		{ID: "crit-1", Action: "retire", Reason: "criterion superseded at the approval gate"},
+		{ID: "crit-2", Action: "retire", Reason: "approval condition 1 replaced the server-budget surface"},
+		{ID: "crit-3", Action: "retire", Reason: "the advisory surface was dropped"},
+	}, addCritOp()...)
+}
+
+// shipAddedInline is shipAddedFixture for the tests that also read the audit
+// fake (triage entries, the rendered status body) or the merge-gate state.
+func shipAddedInline(t *testing.T, criteria []plan.AcceptanceCriterion, amendments []acceptanceCriteriaAmendment, body []byte) (*Server, *auditFake, uuid.UUID, map[string]any) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedAmendedPlanFixture(t, ar, au, rr, runID, criteria, amendments)
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	return s, au, runID, decodeAcceptanceOutcome(t, au)
+}
+
+// shippedGateState reads the merge-gate state over a succeeded acceptance stage.
+func shippedGateState(t *testing.T, s *Server, runID uuid.UUID) string {
+	t.Helper()
+	state, err := s.acceptanceGateState(context.Background(),
+		acceptanceGateRun(runID, specWithAcceptanceStage),
+		[]*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)})
+	if err != nil {
+		t.Fatalf("acceptanceGateState: %v", err)
+	}
+	return state
+}
+
+// TestShipAcceptance_AddedRowUndecidable_PassingContract_RecordsPassed is the
+// #3682 done-means: an operator-added row reported undecidable on an otherwise
+// fully-passing reviewed contract records passed. The raw tally still counts it
+// (the agent's evidence), and no added_criteria_failed key is emitted (R6
+// absence: nothing added failed).
+func TestShipAcceptance_AddedRowUndecidable_PassingContract_RecordsPassed(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "undecidable", UndecidableReason: json.RawMessage(`"target flaked"`)},
+	))
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed (an added row cannot escalate)", payload["verdict"])
+	}
+	for _, key := range []string{"verdict_reported", plan.AcceptanceBasisKey, "downgrade_basis", "added_criteria_failed"} {
+		if v, present := payload[key]; present {
+			t.Errorf("%s = %v present, want absent", key, v)
+		}
+	}
+	if payload["criteria_undecidable"] != float64(1) {
+		t.Errorf("criteria_undecidable = %v, want 1 (raw tallies are the agent's evidence)", payload["criteria_undecidable"])
+	}
+}
+
+// TestShipAcceptance_AddedRowSkipped_PassingContract_RecordsPassed is a
+// REGRESSION PIN (FO revision R5), not evidence of a fixed defect: an added row
+// reported skipped beside a passing reviewed contract never escalated, because
+// aggregateAcceptanceResults yields not_validated only when EVERY row is
+// skipped. It stays green with the added-id exclusion removed.
+func TestShipAcceptance_AddedRowSkipped_PassingContract_RecordsPassed(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "skipped", ExpectationBasis: "the operator path has no preview route"},
+	))
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed", payload["verdict"])
+	}
+	if payload["criteria_skipped"] != float64(1) {
+		t.Errorf("criteria_skipped = %v, want 1", payload["criteria_skipped"])
+	}
+}
+
+// TestShipAcceptance_AddedRowFailed_ShippedPassed_RecordsPassed: a shipped
+// passed whose only failed row is operator-added records passed (it used to
+// record failed under #2512's mismatch rule), and the merge gate reads
+// acceptance_passed, not acceptance_triage (R4). The failure stays visible in
+// criteria_failed and added_criteria_failed (R6). Ingest triage keys on the
+// SHIPPED verdict, so no triage-entry assertion is meaningful here.
+func TestShipAcceptance_AddedRowFailed_ShippedPassed_RecordsPassed(t *testing.T) {
+	s, _, runID, payload := shipAddedInline(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "path 404s"},
+	))
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed (an added failure cannot escalate a shipped pass)", payload["verdict"])
+	}
+	if v, present := payload["verdict_reported"]; present {
+		t.Errorf("verdict_reported = %v present on an unchanged verdict", v)
+	}
+	if payload["criteria_failed"] != float64(1) {
+		t.Errorf("criteria_failed = %v, want 1", payload["criteria_failed"])
+	}
+	if got := toStringSlice(payload["added_criteria_failed"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criteria_failed = %v, want [crit-op]", got)
+	}
+	if state := shippedGateState(t, s, runID); state != acceptanceGatePassed {
+		t.Errorf("gate state = %q, want %q (never %q)", state, acceptanceGatePassed, acceptanceGateTriage)
+	}
+}
+
+// TestShipAcceptance_AddedRowPassed_AllSkipReviewed_RecordsNotValidated is R2:
+// a passing add never certifies. The run 0aad7486 contract (every reviewed
+// criterion skip_expected with a basis, all skipped) plus a PASSED crit-op used
+// to record passed; it now records not_validated under all-skip-observed.
+func TestShipAcceptance_AddedRowPassed_AllSkipReviewed_RecordsNotValidated(t *testing.T) {
+	criteria := []plan.AcceptanceCriterion{
+		{ID: "crit-a", Statement: "webhook fires", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "covered by webhook_integration_test.go"},
+		{ID: "crit-b", Statement: "issue closes", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "covered by closer_e2e_test.go"},
+	}
+	payload := shipAddedFixture(t, criteria, addCritOp(), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-a", Result: "skipped", ExpectationBasis: "covered by webhook_integration_test.go"},
+		acceptanceCriterionResult{ID: "crit-b", Result: "skipped", ExpectationBasis: "covered by closer_e2e_test.go"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "passed"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s (a passing add never certifies)", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAllSkipObserved {
+		t.Errorf("basis = %v, want %s", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAllSkipObserved)
+	}
+	if payload["verdict_reported"] != acceptanceVerdictPassed {
+		t.Errorf("verdict_reported = %v, want passed", payload["verdict_reported"])
+	}
+}
+
+// TestShipAcceptance_OnlyAddedRows_ShippedPassed_RecordsAddedOnlyBasis: a
+// shipped passed itemizing only an operator-added row leaves the ladder set
+// empty, so it records not_validated under its own added-only-observed basis.
+func TestShipAcceptance_OnlyAddedRows_ShippedPassed_RecordsAddedOnlyBasis(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-op", Result: "passed"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAddedOnlyObserved {
+		t.Errorf("basis = %v, want %s", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAddedOnlyObserved)
+	}
+	if payload["criteria_total"] != float64(1) {
+		t.Errorf("criteria_total = %v, want 1", payload["criteria_total"])
+	}
+}
+
+// TestShipAcceptance_OnlyAddedRows_WithRetired_RecordsAddedOnlyBasis: retired
+// plus added rows only — the basis names the added origin, never
+// all-retired-observed (not every row was retired).
+func TestShipAcceptance_OnlyAddedRows_WithRetired_RecordsAddedOnlyBasis(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), append(retireCrit2(), addCritOp()...), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "passed"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAddedOnlyObserved {
+		t.Errorf("basis = %v, want %s (not %s)", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAddedOnlyObserved, plan.AcceptanceBasisAllRetiredObserved)
+	}
+}
+
+// TestShipAcceptance_OnlyAddedRows_ShippedFailed_RecordsNotValidated is the
+// #3682 R1 rule: a shipped failed/assertion_fail whose only itemized row is a
+// failed operator-added criterion, on a chain where every reviewed criterion
+// was retired (so every reviewed criterion in force — none — was itemized, C1),
+// records not_validated, routes NO triage, and gates not_validated. Neither
+// downgrade fires: D1-D3 find no retired failure and A3 sees no surviving row.
+func TestShipAcceptance_OnlyAddedRows_ShippedFailed_RecordsNotValidated(t *testing.T) {
+	s, au, runID, payload := shipAddedInline(t, amendIngestCriteria(), retireEveryReviewedAddCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "path 404s"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload["verdict_reported"] != acceptanceVerdictFailed {
+		t.Errorf("verdict_reported = %v, want failed", payload["verdict_reported"])
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAddedOnlyObserved {
+		t.Errorf("basis = %v, want %s", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAddedOnlyObserved)
+	}
+	if v, present := payload["downgrade_basis"]; present {
+		t.Errorf("downgrade_basis = %v present, want absent (neither downgrade fires)", v)
+	}
+	if got := toStringSlice(payload["added_criteria_failed"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criteria_failed = %v, want [crit-op]", got)
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 0 (no reviewed failure to route)", n)
+	}
+	if state := shippedGateState(t, s, runID); state != acceptanceGateNotValidated {
+		t.Errorf("gate state = %q, want %q", state, acceptanceGateNotValidated)
+	}
+}
+
+// TestShipAcceptance_OnlyAddedRows_ShippedFailed_OmitsLiveReviewed_StaysFailed
+// is approval condition C1's omission pin: the same failed-added-only verdict
+// on a chain where crit-1..3 stay LIVE but are not itemized keeps today's path —
+// recorded failed with exactly one triage entry and the triage gate. Without
+// the coverage conjunct a validator could earn a merge-eligible not_validated
+// by leaving the reviewed contract out of its itemization.
+func TestShipAcceptance_OnlyAddedRows_ShippedFailed_OmitsLiveReviewed_StaysFailed(t *testing.T) {
+	s, au, runID, payload := shipAddedInline(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "path 404s"},
+	))
+	if payload["verdict"] != acceptanceVerdictFailed {
+		t.Errorf("recorded verdict = %v, want failed (a live reviewed criterion was omitted)", payload["verdict"])
+	}
+	if v, present := payload[plan.AcceptanceBasisKey]; present {
+		t.Errorf("basis = %v present on a recorded failed", v)
+	}
+	if got := toStringSlice(payload["added_criteria_failed"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criteria_failed = %v, want [crit-op]", got)
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 1 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 1 (today's failed + triage path)", n)
+	}
+	if state := shippedGateState(t, s, runID); state != acceptanceGateTriage {
+		t.Errorf("gate state = %q, want %q", state, acceptanceGateTriage)
+	}
+}
+
+// TestShipAcceptance_AddedOnlyBasis_RendersOnStatusComment crosses request body
+// -> audit payload -> issue-comment render: the T5 verdict shipped through the
+// ingest handler renders the added-only sentence on the status comment.
+func TestShipAcceptance_AddedOnlyBasis_RendersOnStatusComment(t *testing.T) {
+	_, au, runID, _ := shipAddedInline(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-op", Result: "passed"},
+	))
+	entries, err := au.ListForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	rendered := issuecomment.RenderStatusBody(acceptanceGateRun(runID, specWithAcceptanceStage),
+		[]*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}, entries, "https://x", time.Now())
+	if want := "no reviewed criterion in force was recorded (all 1 recorded were operator-added or retired)"; !strings.Contains(rendered, want) {
+		t.Errorf("status body missing %q:\n%s", want, rendered)
+	}
+}
+
+// TestShipAcceptance_RetiredFailedAddedPassed_ShippedFailed_RecordsNotValidated
+// is the exact R1 composition: retired crit-2 failed plus added crit-op passed
+// on a shipped failed. The #2581 downgrade fires (crit-op is its survivor) and
+// the added-id exclusion then empties the ladder, so the recorded verdict is
+// not_validated — never passed and never failed — with no triage routed.
+func TestShipAcceptance_RetiredFailedAddedPassed_ShippedFailed_RecordsNotValidated(t *testing.T) {
+	s, au, runID, payload := shipAddedInline(t, amendIngestCriteria(), append(retireCrit2(), addCritOp()...), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "no budget line"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "passed"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload["verdict_reported"] != acceptanceVerdictFailed {
+		t.Errorf("verdict_reported = %v, want failed", payload["verdict_reported"])
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAddedOnlyObserved {
+		t.Errorf("basis = %v, want %s", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAddedOnlyObserved)
+	}
+	if payload["downgrade_basis"] != acceptanceDowngradeBasisRetiredOnly {
+		t.Errorf("downgrade_basis = %v, want %q", payload["downgrade_basis"], acceptanceDowngradeBasisRetiredOnly)
+	}
+	if got := toStringSlice(payload["retired_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-2"}) {
+		t.Errorf("retired_criterion_ids = %v, want [crit-2]", got)
+	}
+	if v, present := payload["added_criteria_failed"]; present {
+		t.Errorf("added_criteria_failed = %v present, want absent (the added row passed)", v)
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 0", n)
+	}
+	if state := shippedGateState(t, s, runID); state != acceptanceGateNotValidated {
+		t.Errorf("gate state = %q, want %q", state, acceptanceGateNotValidated)
+	}
+}
+
+// TestShipAcceptance_RetiredFailedAddedFailed_ShippedFailed_RecordsNotValidated:
+// a retired and an added row both failed, every reviewed criterion retired (C1
+// holds). Neither downgrade fires — D2 refuses the added failure and A3 has no
+// survivor — so R1 records not_validated.
+func TestShipAcceptance_RetiredFailedAddedFailed_ShippedFailed_RecordsNotValidated(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), retireEveryReviewedAddCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "no budget line"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "path 404s"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAddedOnlyObserved {
+		t.Errorf("basis = %v, want %s", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAddedOnlyObserved)
+	}
+	if v, present := payload["downgrade_basis"]; present {
+		t.Errorf("downgrade_basis = %v present, want absent", v)
+	}
+	if got := toStringSlice(payload["added_criteria_failed"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criteria_failed = %v, want [crit-op]", got)
+	}
+}
+
+// TestShipAcceptance_OnlyAddedRows_ShippedFailedError_StaysFailed is an R1
+// residual: failure_mode error keeps failed on the otherwise-R1 fixture, and
+// writes EXACTLY ONE triage entry — the baseline that makes the zero-count in
+// TestShipAcceptance_OnlyAddedRows_ShippedFailed_RecordsNotValidated non-vacuous.
+func TestShipAcceptance_OnlyAddedRows_ShippedFailedError_StaysFailed(t *testing.T) {
+	_, au, _, payload := shipAddedInline(t, amendIngestCriteria(), retireEveryReviewedAddCritOp(), acceptanceVerdictBytes(t, "failed", "error",
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "runner crashed"},
+	))
+	if payload["verdict"] != acceptanceVerdictFailed {
+		t.Errorf("recorded verdict = %v, want failed (failure_mode error is never softened)", payload["verdict"])
+	}
+	if v, present := payload[plan.AcceptanceBasisKey]; present {
+		t.Errorf("basis = %v present on a recorded failed", v)
+	}
+	if got := toStringSlice(payload["added_criteria_failed"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criteria_failed = %v, want [crit-op]", got)
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 1 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 1", n)
+	}
+}
+
+// TestShipAcceptance_OnlyAddedRows_ShippedFailedNoFailedRow_StaysFailed is an
+// R1 residual: a shipped failed itemizing no failed row (only a passed added
+// row) keeps failed — the failure is attributable to no itemized row.
+func TestShipAcceptance_OnlyAddedRows_ShippedFailedNoFailedRow_StaysFailed(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), retireEveryReviewedAddCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-op", Result: "passed"},
+	))
+	if payload["verdict"] != acceptanceVerdictFailed {
+		t.Errorf("recorded verdict = %v, want failed", payload["verdict"])
+	}
+	if v, present := payload[plan.AcceptanceBasisKey]; present {
+		t.Errorf("basis = %v present on a recorded failed", v)
+	}
+}
+
+// TestShipAcceptance_OnlyRetiredRows_EveryReviewedRetired_ShippedFailed_StaysFailed
+// pins R1's itemizedAdded conjunct on a fixture that ISOLATES it: every
+// reviewed criterion is retired (so C1's coverage conjunct holds) and the
+// verdict itemizes only failed RETIRED rows. A pure-retired itemization keeps
+// its #2581/#3397 behaviour — failed, no basis.
+func TestShipAcceptance_OnlyRetiredRows_EveryReviewedRetired_ShippedFailed_StaysFailed(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), retireEveryReviewedAddCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "failed", Observed: "still broken"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "still broken"},
+	))
+	if payload["verdict"] != acceptanceVerdictFailed {
+		t.Errorf("recorded verdict = %v, want failed (a pure-retired itemization never softens)", payload["verdict"])
+	}
+	if v, present := payload[plan.AcceptanceBasisKey]; present {
+		t.Errorf("basis = %v present on a recorded failed", v)
 	}
 }
 

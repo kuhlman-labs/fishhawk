@@ -60,6 +60,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleChecksGreenAwaitingMerge,
 		RuleCIFailed,
 		RuleCIRecovered,
+		RuleCICancelled,
 		RuleAcceptancePending,
 		RuleAcceptanceOutcomeUnknown,
 		RuleAcceptanceTriage,
@@ -76,6 +77,15 @@ func TestMechanical_RuleTable(t *testing.T) {
 	// applyDriveSurfaces; pin the literal so a rename is a caught break.
 	if RuleCIRecovered != "ci_recovered" {
 		t.Errorf("RuleCIRecovered = %q, want ci_recovered", RuleCIRecovered)
+	}
+	// #4706: ci_cancelled byte-matches the derived_status and the MCP
+	// next_actions.state; retrigger_ci is the stamped next-action verb the
+	// MCP arm renders as fishhawk_retrigger_ci.
+	if RuleCICancelled != "ci_cancelled" {
+		t.Errorf("RuleCICancelled = %q, want ci_cancelled", RuleCICancelled)
+	}
+	if NextActionRetriggerCI != "retrigger_ci" {
+		t.Errorf("NextActionRetriggerCI = %q, want retrigger_ci", NextActionRetriggerCI)
 	}
 	// The acceptance-gate rules (E31.17 / #1568) must byte-match the MCP
 	// next_actions.state strings so the two surfaces cannot diverge; the failed

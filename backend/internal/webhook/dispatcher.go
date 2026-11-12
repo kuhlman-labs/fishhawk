@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
@@ -21,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // FishhawkLabel is the issue / PR label that triggers a default
@@ -2054,6 +2056,18 @@ const (
 	// is a fan-in PR" from "the repository could not say" — the second is worth
 	// re-driving.
 	ciRetrySkipChildrenLookupFailed = "decomposition_children_lookup_failed"
+	// ciRetrySkipSupersededHead refuses a CI-failure retry for a cancelled or
+	// stale check_run whose head is PROVEN older than the run's current
+	// recorded head (#4706): both heads are known and they differ. A newer push
+	// superseded that check, so it carries no verdict about the code and a
+	// retry child would burn an attempt (and possibly the cap) on nothing.
+	ciRetrySkipSupersededHead = "check_superseded_by_newer_head"
+	// ciRetrySkipHeadLookupFailed is the FAIL-CLOSED sibling: the audit-ledger
+	// read for the current recorded head errored, so Fishhawk could not learn
+	// whether the cancelled/stale check was superseded. Distinct from a CLEAN
+	// miss (no recorded head at all), which proves nothing and keeps today's
+	// retry.
+	ciRetrySkipHeadLookupFailed = "current_head_lookup_failed"
 )
 
 // decomposedParentSkipReason reports why a CI-failure retry must NOT mint a
@@ -2083,6 +2097,67 @@ func (d *Dispatcher) decomposedParentSkipReason(ctx context.Context, r *run.Run)
 	return ""
 }
 
+// currentRunHeadSHA returns the run's CURRENT RECORDED head (#4706): the head
+// auditcomplete.LatestReportedHeadSHA resolves over the run's head-report
+// categories (auditcomplete.HeadReportCategoriesByPrecedence), the same
+// resolver and membership server.latestRunHeadSHA reads. It is Fishhawk's
+// audit-ledger head, NOT a forge read: when the ledger lags the forge (an
+// exhausted push report, ADR-141 D5; the post-fix-up ingest gap, #5122) a
+// check at an unrecorded newer head reads as not-current.
+//
+// Two outcomes are deliberately distinct. A ledger READ ERROR is returned as
+// an error so the caller can fail closed. A CLEAN MISS (no head-report entry
+// carries a head) falls back to runHeadSHA, the implement-stage pull_request
+// artifact head, and returns "" when that is absent too — an unknown head,
+// never an error. Nil-tolerant: an unwired Audit is a clean miss.
+func (d *Dispatcher) currentRunHeadSHA(ctx context.Context, runID uuid.UUID) (string, error) {
+	if d.Audit != nil {
+		var entries []*audit.Entry
+		for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {
+			es, err := d.Audit.ListForRunByCategory(ctx, runID, cat)
+			if err != nil {
+				return "", err
+			}
+			entries = append(entries, es...)
+		}
+		if sha, ok := auditcomplete.LatestReportedHeadSHA(entries); ok {
+			return sha, nil
+		}
+	}
+	return d.runHeadSHA(ctx, runID)
+}
+
+// supersededCheckSkipReason reports why a CI-failure retry must NOT mint a
+// child for ref because the check was superseded by a newer recorded head
+// (#4706), or "" when the retry may proceed. A non-empty result is one of
+// ciRetrySkipSupersededHead or ciRetrySkipHeadLookupFailed.
+//
+// The order is load-bearing. The OUTER conclusion gate comes first, so a
+// non-supersession conclusion (failure, timed_out, ...) never reaches the
+// head lookup and a ledger fault can never refuse a real red verdict's retry.
+// A lookup ERROR then refuses FAIL CLOSED, mirroring decomposedParentSkipReason
+// (#4813). Only then is supersession tested, and it must be PROVEN: both the
+// check's head and the current recorded head are non-empty and differ
+// (stagecheck.SupersededByHead). A clean miss leaves the current head unknown,
+// proves nothing, and keeps today's retry.
+func (d *Dispatcher) supersededCheckSkipReason(ctx context.Context, r *run.Run, ref *CheckRunRef) string {
+	if !stagecheck.ConclusionSuperseded(&ref.Conclusion) {
+		return ""
+	}
+	current, err := d.currentRunHeadSHA(ctx, r.ID)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: current recorded head lookup failed; refusing retry",
+			slog.String("run_id", r.ID.String()),
+			slog.String("error", err.Error()))
+		return ciRetrySkipHeadLookupFailed
+	}
+	if stagecheck.SupersededByHead(&ref.Conclusion, ref.HeadSHA, current) {
+		return ciRetrySkipSupersededHead
+	}
+	return ""
+}
+
 // handleCIFailureRetry creates a follow-up implement run when a
 // required CI check fails on a Fishhawk-managed PR (#279 / E16).
 // Best-effort throughout — every skip path emits a structured log
@@ -2107,6 +2182,19 @@ func (d *Dispatcher) decomposedParentSkipReason(ctx context.Context, r *run.Run)
 //     no row) or the parent is at its cap (step 5 would report ci_retry_exhausted
 //     instead of the real reason). See decomposedParentSkipReason and
 //     backend/internal/webhook/README.md ("Decomposed-parent refusal").
+//
+//     Step 2b (#4706): refuse, with an audited ci_retry_skipped row, a
+//     cancelled/stale check whose supersession is PROVEN — the check's head
+//     and the run's current recorded head are both non-empty and differ
+//     (check_superseded_by_newer_head). The current head is Fishhawk's
+//     audit-ledger head (auditcomplete precedence), not forge authority; no
+//     artifact or payload cross-check is made. Two cases stay separate: a
+//     CLEAN MISS (no ledger head and no pull_request artifact head) leaves the
+//     head unknown, proves nothing, and the retry proceeds as before; a ledger
+//     READ ERROR refuses FAIL CLOSED (current_head_lookup_failed). Any other
+//     conclusion never reaches the lookup. Placed after step 2a and BEFORE
+//     step 3 and step 5 for the same reasons. See supersededCheckSkipReason and
+//     backend/internal/webhook/README.md ("Superseded-head refusal").
 //
 //  3. Skip if a Fishhawk run already has this head_sha (defence in depth).
 //     The runner's fresh commit produces a new head_sha each retry, so an
@@ -2192,6 +2280,16 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 	// be swallowed by the dedup with no record, and a capped parent would report
 	// ci_retry_exhausted instead of the real reason.
 	if reason := d.decomposedParentSkipReason(ctx, parent); reason != "" {
+		d.writeCIRetrySkippedAudit(ctx, ev, parent, ref, reason, now)
+		return nil
+	}
+
+	// Step 2b: refuse a cancelled/stale check PROVEN superseded by a newer
+	// recorded head (#4706). Same placement contract as step 2a: after the
+	// required-check filter, and before the head_sha dedup and the retry cap so
+	// the refusal is recorded under its real reason. A ledger read error
+	// refuses fail closed; a clean miss returns "" and the retry proceeds.
+	if reason := d.supersededCheckSkipReason(ctx, parent, ref); reason != "" {
 		d.writeCIRetrySkippedAudit(ctx, ev, parent, ref, reason, now)
 		return nil
 	}

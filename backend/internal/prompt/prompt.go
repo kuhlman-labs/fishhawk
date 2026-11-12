@@ -4882,7 +4882,9 @@ type OperatorAddedAcceptanceCriterion struct {
 // APPENDED at the approval gate (#3181), each with its recorded reason. They
 // are live — they appear in the checklist above and must be validated — but
 // they never passed plan review, so the block says so and tells the validator
-// a failure on one alone does not condemn the change. Like the retired block it
+// an added criterion can neither escalate nor certify the verdict (#3682): a
+// failure on one alone does not condemn the change and a pass on one does not
+// validate it. Like the retired block it
 // renders BEFORE the "### Output contract" section and reuses only the
 // already-enumerated result / expectation_basis / notes fields. Renders nothing
 // when nothing was added, so an unamended prompt is byte-identical.
@@ -4895,9 +4897,11 @@ func writeAcceptanceOperatorAddedCriteria(b *strings.Builder, t Trigger) {
 		"the reason recorded on the approval audit entry. They did NOT pass plan review: no " +
 		"planner wrote them and no reviewer checked them. They appear in the checklist above " +
 		"and you MUST validate and report each one like any other criterion (`result`, " +
-		"`expectation_basis`, `notes`). They are advisory, not blocking: a failure on one of " +
-		"them ALONE does not condemn the change — report it honestly as `result`=`failed` " +
-		"rather than marking it skipped to protect the change.\n\n")
+		"`expectation_basis`, `notes`). They are advisory: an operator-added criterion can " +
+		"neither escalate nor certify the verdict. A failure on one of them ALONE does not " +
+		"condemn the change, and a pass on one of them does not validate it — report each " +
+		"honestly, as `result`=`failed` when it fails, rather than marking it skipped to " +
+		"protect the change.\n\n")
 	for _, ac := range t.AcceptanceCriteriaOperatorAdded {
 		fmt.Fprintf(b, "- [%s] added by the operator: %s\n", ac.ID, ac.Reason)
 	}

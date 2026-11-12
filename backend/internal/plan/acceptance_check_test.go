@@ -401,19 +401,21 @@ func TestAcceptanceNotValidatedVocabulary(t *testing.T) {
 // TestAcceptanceObservedBases pins the #3397 POST-RUN basis constants: each is
 // non-empty, they differ from each other, and all differ from the two
 // PRE-SPAWN bases auditcomplete's trace exemption honors — the distinction that
-// keeps an observed all-skip / no-rows / all-retired verdict owing its trace.
+// keeps an observed all-skip / no-rows / all-retired / added-only verdict
+// owing its trace.
 func TestAcceptanceObservedBases(t *testing.T) {
 	observed := []string{
 		AcceptanceBasisAllSkipObserved,
 		AcceptanceBasisNoRowsObserved,
 		AcceptanceBasisAllRetiredObserved,
+		AcceptanceBasisAddedOnlyObserved,
 	}
 	for _, o := range observed {
 		if o == "" {
 			t.Fatal("observed basis constants must be non-empty")
 		}
 	}
-	// Every observed basis must be distinct from every other — the three
+	// Every observed basis must be distinct from every other — the four
 	// verified-nothing origins must stay tellable apart on the recorded payload.
 	seen := map[string]struct{}{}
 	for _, o := range observed {
