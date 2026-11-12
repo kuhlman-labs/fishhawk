@@ -1,0 +1,14 @@
+id: scenario:issue-4873/scenario-only-regression-pages-class-4
+statement: 'When a failed assertion_fail acceptance verdict is shipped whose only failed row is a replayed corpus scenario (an id with the scenario: prefix) and no plan criterion row failed, the run''s audit log carries an acceptance_triage_decided entry with class "4", a paged disposition (paged, or unsettled_paged when the acceptance stage had not yet settled), and criterion_ids naming that scenario id. No fixup_dispatched disposition and no stage_fixup_triggered entry are recorded.'
+verify_hint: Materialize the acceptance-dispatched dev fixture (POST /v0/dev/fixtures). Sign a failed/assertion_fail verdict body via POST /v0/dev/sign, carrying the fixture's criterion ids (passed or skipped) plus one failed scenario:issue-3722/accepted-requires-acceptance-statement row, and ship it to POST /v0/runs/{run_id}/acceptance?stage_id=<acceptance stage>. Then GET /v0/runs/{run_id}/audit and read the acceptance_triage_decided class, disposition and criterion_ids (class "1" before this change).
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"}; take run_id and stages.acceptance from the 201 body. 2) Build a verdict JSON {verdict:failed, failure_mode:assertion_fail, target_url, criteria:[run-readable passed, stages-listed skipped, scenario:issue-3722/accepted-requires-acceptance-statement failed], replay:{cap:25,corpus_size:246,served:25,sampled_out:221,retired_excluded:0,seed:<run_id>,scenarios:[{scenario_id:'scenario:issue-3722/accepted-requires-acceptance-statement',origin_pr:3917,origin_issue:3722,origin_run_id:<uuid>,path:'acceptance/scenarios/issue-3722/accepted-requires-acceptance-statement.yaml'}]}}. 3) POST /v0/runs/{run}/signing-key {} -> private_key; POST /v0/dev/sign with header X-Fishhawk-Dev-Private-Key over the raw body bytes -> signature. 4) POST /v0/runs/{run}/acceptance?stage_id={acceptance} with X-Fishhawk-Signature -> 201. 5) GET /v0/runs/{run}/audit. Read the acceptance_triage_decided entry and look for any stage_fixup_triggered or fixup_dispatched entry.
+assertions:
+    expected: class 4, paged/unsettled_paged, criterion_ids naming the scenario id; no fixup_dispatched, no stage_fixup_triggered
+    observed_at_record: 'ship 201. acceptance_triage_decided: class ''4'', disposition ''unsettled_paged'' (the acceptance stage was still dispatched), criterion_ids [''scenario:issue-3722/accepted-requires-acceptance-statement'']. Audit categories: pull_request_opened, acceptance_dispatched, acceptance_outcome_recorded, acceptance_scenario_regression, acceptance_triage_decided. No stage_fixup_triggered and no fixup_dispatched disposition.'
+    repro_handle: POST /v0/runs/{run}/acceptance?stage_id={acc} then GET /v0/runs/{run}/audit
+origin:
+    issue: 4873
+    pr: 5204
+    run_id: 5899c718-28dd-4e80-a3b3-6c2fa38b8124
+    head_sha: 7426aeab371458244ef310db1de2c0b335835b6f
+    recorded_at: 2026-11-12T15:24:21Z

@@ -1,0 +1,14 @@
+id: scenario:issue-4873/outcome-records-failed-scenario-ids
+statement: When a shipped acceptance verdict carries a failed replayed scenario row, the run's acceptance_outcome_recorded audit entry carries a failed_scenario_ids array naming that scenario id. An outcome with no failed scenario row carries no failed_scenario_ids key.
+verify_hint: Same dev-fixture flow as scenario-only-regression-pages-class-4, with a replay header on the signed body. GET /v0/runs/{run_id}/audit and read acceptance_outcome_recorded.failed_scenario_ids. Then ship a second fixture run's verdict whose rows are all criteria and confirm the key is absent.
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"}; take run_id and stages.acceptance from the 201 body. 2) Build a verdict JSON {verdict:failed, failure_mode:assertion_fail, target_url, criteria:[run-readable passed, stages-listed skipped, scenario:issue-3722/accepted-requires-acceptance-statement failed], replay:{cap:25,corpus_size:246,served:25,sampled_out:221,retired_excluded:0,seed:<run_id>,scenarios:[{scenario_id:'scenario:issue-3722/accepted-requires-acceptance-statement',origin_pr:3917,origin_issue:3722,origin_run_id:<uuid>,path:'acceptance/scenarios/issue-3722/accepted-requires-acceptance-statement.yaml'}]}}. 3) POST /v0/runs/{run}/signing-key {} -> private_key; POST /v0/dev/sign over the raw body bytes -> signature. 4) POST /v0/runs/{run}/acceptance?stage_id={acceptance} with X-Fishhawk-Signature -> 201. 5) GET /v0/runs/{run}/audit and read acceptance_outcome_recorded. 6) Seed a SECOND acceptance-dispatched run and ship a signed failed/assertion_fail verdict whose rows are only criteria (run-readable failed, stages-listed skipped), with no replay object. GET its audit and read acceptance_outcome_recorded.
+assertions:
+    expected: failed_scenario_ids names the scenario; the key is absent when no scenario row failed
+    observed_at_record: 'Run 1: acceptance_outcome_recorded.failed_scenario_ids = [''scenario:issue-3722/accepted-requires-acceptance-statement''] (replay.scenarios_failed 1). Run 2 (criteria-only): acceptance_outcome_recorded has no failed_scenario_ids key (replay null).'
+    repro_handle: GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded
+origin:
+    issue: 4873
+    pr: 5204
+    run_id: 5899c718-28dd-4e80-a3b3-6c2fa38b8124
+    head_sha: 7426aeab371458244ef310db1de2c0b335835b6f
+    recorded_at: 2026-11-12T15:24:21Z
