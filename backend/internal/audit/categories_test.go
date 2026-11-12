@@ -225,6 +225,17 @@ func TestKnownCategories_StagePermissionsDeclared(t *testing.T) {
 // unpriced_model_alert mislabel it replaces — and
 // categories_completeness_test.go's AST sweep would fail the build on the
 // emit site in trace.go.
+// TestKnownCategories_CampaignAutoStartRefused pins the E88.1 / #4525
+// category the campaign driver records when a running campaign cannot be
+// auto-started: an unregistered category is un-awaitable through
+// fishhawk_await_audit, and categories_completeness_test.go's AST sweep fails
+// the build on the driver's emit site.
+func TestKnownCategories_CampaignAutoStartRefused(t *testing.T) {
+	if !IsKnownCategory("campaign_auto_start_refused") {
+		t.Fatal("campaign_auto_start_refused is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 func TestKnownCategories_AgentRequestFailedAlert(t *testing.T) {
 	if !IsKnownCategory("agent_request_failed_alert") {
 		t.Fatal("agent_request_failed_alert is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")

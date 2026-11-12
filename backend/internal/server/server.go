@@ -142,6 +142,15 @@ type Config struct {
 	// serve.go sets it true.
 	CampaignDependencyRefresh bool
 
+	// CampaignAutoStartRunnerKind is the runner kind the campaign driver
+	// auto-starts item runs with (#4525). serve.go sets it to the
+	// --auto-start-runner-kind value ONLY when the campaign driver actually
+	// starts, and leaves it empty otherwise. Non-empty, it lets GET
+	// /v0/campaigns/{id}/status report an auto_start_refusal block for a
+	// running campaign ResolveCampaignAutoStart refuses; empty (driver off,
+	// and every fake-backed test) omits the block.
+	CampaignAutoStartRunnerKind string
+
 	// SigningRepo issues + persists per-run Ed25519 keys for the
 	// trace bundle signing flow. Wired by the
 	// /v0/runs/{id}/signing-key handler; nil leaves it 503.

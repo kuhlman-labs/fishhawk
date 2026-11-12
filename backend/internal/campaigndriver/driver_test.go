@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -1386,5 +1387,224 @@ func TestCampaignAccountID_Branches(t *testing.T) {
 				t.Fatalf("got %v, want %s", got, *tc.want)
 			}
 		})
+	}
+}
+
+// --- campaign-level start refusal (#4525) -----------------------------------
+
+// refusingStarter returns its refusal (or err) while set, counting every call,
+// and otherwise starts a pending run like fakeStarter.
+type refusingStarter struct {
+	mu      sync.Mutex
+	calls   int
+	refusal *StartRefusal
+	err     error
+	reader  *fakeRunReader
+}
+
+func (f *refusingStarter) StartCampaignRun(_ context.Context, _ *campaign.Item, _ *campaign.Campaign) (*run.Run, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.refusal != nil {
+		return nil, f.refusal
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	r := &run.Run{ID: uuid.New(), State: run.StatePending}
+	if f.reader != nil {
+		f.reader.runs[r.ID] = r
+	}
+	return r, nil
+}
+
+func (f *refusingStarter) set(refusal *StartRefusal) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refusal = refusal
+}
+
+func (f *refusingStarter) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func unboundRefusal() *StartRefusal {
+	return &StartRefusal{
+		Reason:           "working_dir_unbound",
+		RunnerKind:       run.RunnerKindLocal,
+		RunnerKindSource: "auto_start_flag",
+		Detail:           "the campaign binds no working_dir",
+	}
+}
+
+func TestTick_StartRefusal_StartsNothingRecordsOnce(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	first := store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	second := store.seedItem(c, "issue:2", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &refusingStarter{refusal: unboundRefusal(), reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	if got := starter.callCount(); got != 1 {
+		t.Fatalf("Starter calls = %d, want 1 (a refusal ends the campaign's START pass)", got)
+	}
+	if len(store.links) != 0 || len(store.itemTransitions) != 0 {
+		t.Fatalf("a refused campaign linked %d / transitioned %d items, want 0 / 0", len(store.links), len(store.itemTransitions))
+	}
+	refused := au.byCategory(categoryCampaignAutoStartRefused)
+	if len(refused) != 1 {
+		t.Fatalf("campaign_auto_start_refused entries = %d, want 1", len(refused))
+	}
+	want := map[string]any{
+		"campaign_id":        c.ID.String(),
+		"issue_ref":          "issue:1",
+		"reason":             "working_dir_unbound",
+		"runner_kind":        run.RunnerKindLocal,
+		"runner_kind_source": "auto_start_flag",
+		"detail":             "the campaign binds no working_dir",
+	}
+	if len(refused[0].payload) != len(want) {
+		t.Errorf("payload keys = %v, want exactly %v", refused[0].payload, want)
+	}
+	for k, v := range want {
+		if refused[0].payload[k] != v {
+			t.Errorf("payload[%q] = %v, want %v", k, refused[0].payload[k], v)
+		}
+	}
+	if au.count() != 1 {
+		t.Fatalf("total audit entries = %d, want 1", au.count())
+	}
+
+	// A second tick over the same standing refusal records nothing new.
+	tk.Tick(context.Background())
+	if got := len(au.byCategory(categoryCampaignAutoStartRefused)); got != 1 {
+		t.Fatalf("after a second tick, refused entries = %d, want 1 (deduped)", got)
+	}
+
+	// The starter recovers: the next tick starts items and forgets the refusal.
+	starter.set(nil)
+	tk.Tick(context.Background())
+	if first.RunID == nil || second.RunID == nil {
+		t.Fatalf("after recovery, items linked = %v / %v, want both", first.RunID, second.RunID)
+	}
+	if got := len(au.byCategory(categoryCampaignIssueStarted)); got != 2 {
+		t.Fatalf("campaign_issue_started entries = %d, want 2", got)
+	}
+
+	// A later refusal for a new eligible item records again.
+	store.seedItem(c, "issue:3", campaign.ItemStatePending, nil, nil)
+	starter.set(unboundRefusal())
+	tk.Tick(context.Background())
+	if got := len(au.byCategory(categoryCampaignAutoStartRefused)); got != 2 {
+		t.Fatalf("a refusal after a successful start: refused entries = %d, want 2", got)
+	}
+}
+
+// TestTick_StartRefusal_AppendErrorRetriesNextTick pins that the dedup key is
+// marked only after the campaign_auto_start_refused append succeeds (C8).
+func TestTick_StartRefusal_AppendErrorRetriesNextTick(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &refusingStarter{refusal: unboundRefusal(), reader: reader}
+	au := &fakeAudit{appendErr: errors.New("audit down")}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+	if au.count() != 0 {
+		t.Fatalf("audit entries with a failing append = %d, want 0", au.count())
+	}
+
+	au.mu.Lock()
+	au.appendErr = nil
+	au.mu.Unlock()
+	tk.Tick(context.Background())
+	if got := len(au.byCategory(categoryCampaignAutoStartRefused)); got != 1 {
+		t.Fatalf("after the append recovers, refused entries = %d, want 1 (retried)", got)
+	}
+}
+
+// TestTick_StartRefusal_ClearedWhenCampaignLeavesRunning pins that a campaign
+// no longer listed running loses its recorded refusals (C8), so a resumed
+// campaign records its standing refusal again.
+func TestTick_StartRefusal_ClearedWhenCampaignLeavesRunning(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &refusingStarter{refusal: unboundRefusal(), reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	store.mu.Lock()
+	c.State = campaign.StatePaused
+	store.mu.Unlock()
+	tk.Tick(context.Background())
+	tk.refusedMu.Lock()
+	tracked := len(tk.refused)
+	tk.refusedMu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("refusal map tracks %d campaigns after the campaign paused, want 0", tracked)
+	}
+
+	store.mu.Lock()
+	c.State = campaign.StateRunning
+	store.mu.Unlock()
+	tk.Tick(context.Background())
+	if got := len(au.byCategory(categoryCampaignAutoStartRefused)); got != 2 {
+		t.Fatalf("after resume, refused entries = %d, want 2", got)
+	}
+}
+
+// TestTick_StartRefusal_WrappedIsRecognised pins errors.As: a wrapped
+// StartRefusal is still a campaign-level refusal.
+func TestTick_StartRefusal_WrappedIsRecognised(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.seedItem(c, "issue:2", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &refusingStarter{err: fmt.Errorf("start: %w", unboundRefusal()), reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+	if got := starter.callCount(); got != 1 {
+		t.Fatalf("Starter calls = %d, want 1", got)
+	}
+	if got := len(au.byCategory(categoryCampaignAutoStartRefused)); got != 1 {
+		t.Fatalf("refused entries = %d, want 1", got)
+	}
+}
+
+// TestTick_PlainStarterError_KeepsWarnAndContinue pins that a non-refusal
+// starter error keeps today's per-item posture: every eligible item is
+// attempted and nothing is recorded.
+func TestTick_PlainStarterError_KeepsWarnAndContinue(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.seedItem(c, "issue:2", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &refusingStarter{err: errors.New("forge down"), reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+	if got := starter.callCount(); got != 2 {
+		t.Fatalf("Starter calls = %d, want 2 (warn-and-continue)", got)
+	}
+	if au.count() != 0 {
+		t.Fatalf("audit entries = %d, want 0", au.count())
 	}
 }

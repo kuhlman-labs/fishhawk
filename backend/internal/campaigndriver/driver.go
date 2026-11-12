@@ -18,7 +18,10 @@
 //     (campaign.NextEligible) are started — bounded by a concurrency cap
 //     counting currently-running items — via the RunStarter seam, linked to
 //     their item (SetCampaignItemRun), transitioned to running, and recorded
-//     with a campaign_issue_started entry.
+//     with a campaign_issue_started entry. A RunStarter that returns a
+//     *StartRefusal (#4525) ends the campaign's START pass for the tick: no
+//     item of it starts, and one campaign_auto_start_refused entry is recorded
+//     per (campaign, reason).
 //
 // ADVANCE runs BEFORE START within a tick and re-reads the items in between,
 // so a predecessor that reached terminal this tick settles AND its now-eligible
@@ -53,6 +56,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -98,7 +102,41 @@ const (
 	// actor wrote is the page trigger; this marker records the pause action on
 	// the campaign side.
 	categoryCampaignPaused = "campaign_paused"
+	// categoryCampaignAutoStartRefused is the campaign-level marker the
+	// driver records on the GLOBAL chain when the RunStarter returned a
+	// *StartRefusal (#4525): the campaign cannot be auto-started (for example
+	// it resolves to a local run with no working_dir binding), so the driver
+	// starts no item of it. Recorded once per (campaign, reason) while the
+	// campaign stays running, not every tick.
+	categoryCampaignAutoStartRefused = "campaign_auto_start_refused"
 )
+
+// StartRefusal is the error a RunStarter returns when a CAMPAIGN cannot be
+// auto-started at all (#4525), as opposed to a transient per-item failure.
+// On a StartRefusal the driver ends the campaign's START pass for the tick, so
+// no item of that campaign is started, linked or transitioned, and records one
+// campaign_auto_start_refused entry per (campaign, reason). Every field is a
+// server constant or enum value: the serve.go adapter fills them from
+// server.ResolveCampaignAutoStart, which never echoes the campaign's
+// working_dir or any issue or campaign text.
+type StartRefusal struct {
+	// Reason is a stable machine-readable token (working_dir_unbound,
+	// working_dir_not_absolute, campaign_runner_kind_invalid).
+	Reason string
+	// RunnerKind is the resolved runner kind, or "" when the campaign's
+	// recorded kind is invalid.
+	RunnerKind string
+	// RunnerKindSource names the ladder rung that chose the kind (campaign or
+	// auto_start_flag).
+	RunnerKindSource string
+	// Detail is a short human-readable explanation.
+	Detail string
+}
+
+// Error implements error.
+func (e *StartRefusal) Error() string {
+	return "campaign auto-start refused: " + e.Reason
+}
 
 // CampaignStore is the slice of campaign.Repository the driver uses: list the
 // running campaigns and their items, link an item to its run, and apply
@@ -238,6 +276,15 @@ type Ticker struct {
 
 	// Now sources the current time for audit timestamps. nil → time.Now.
 	Now func() time.Time
+
+	// refusedMu guards refused: the (campaign, reason) pairs whose
+	// campaign_auto_start_refused entry was recorded (#4525). A key is set only
+	// after the append succeeds, cleared when a later start for the campaign
+	// succeeds, and pruned for every campaign no longer listed running, so the
+	// map is bounded by the running-campaign set. In-memory per process: a
+	// restart records each standing refusal once more.
+	refusedMu sync.Mutex
+	refused   map[uuid.UUID]map[string]struct{}
 }
 
 // Run drives the ticker until ctx is cancelled. Per-campaign and per-item
@@ -287,6 +334,7 @@ func (t *Ticker) Tick(ctx context.Context) {
 			slog.String("error", err.Error()))
 		return
 	}
+	t.pruneStartRefusals(campaigns)
 	for _, c := range campaigns {
 		if c.State != campaign.StateRunning {
 			// Defense-in-depth: the filter already constrains to running. A
@@ -567,7 +615,9 @@ func (t *Ticker) deriveAndTransition(ctx context.Context, logger *slog.Logger, c
 // (effective max minus currently-running items), starting each via the
 // RunStarter seam, linking it to its item, transitioning it to running, and
 // emitting a campaign_issue_started entry. Idempotent: an item that already
-// has a run, or is no longer in a startable state, is skipped.
+// has a run, or is no longer in a startable state, is skipped. A *StartRefusal
+// from the starter ends the pass for the whole campaign (recordStartRefusal);
+// any other starter error is per-item and the next eligible item is tried.
 func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, items []*campaign.Item) {
 	elig := campaign.NextEligible(items)
 	budget := t.effectiveMaxParallel() - len(elig.Running)
@@ -597,6 +647,14 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 
 		runRow, err := t.Starter.StartCampaignRun(ctx, it, c)
 		if err != nil {
+			// A campaign-level refusal (#4525) is not transient and applies to
+			// every item of the campaign: record it (once per campaign+reason)
+			// and end the START pass so no further item is attempted.
+			var refusal *StartRefusal
+			if errors.As(err, &refusal) {
+				t.recordStartRefusal(ctx, logger, c, it, refusal)
+				return
+			}
 			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: start run for item failed; will retry next tick",
 				slog.String("campaign_id", c.ID.String()),
 				slog.String("item_id", it.ID.String()),
@@ -610,6 +668,9 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 				slog.String("item_id", it.ID.String()))
 			continue
 		}
+		// The campaign starts again, so a later refusal is news: forget the
+		// recorded ones.
+		t.clearStartRefusals(c.ID)
 
 		if _, err := t.Campaigns.SetCampaignItemRun(ctx, it.ID, &runRow.ID); err != nil {
 			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: link item to run failed",
@@ -653,17 +714,90 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 	}
 }
 
+// recordStartRefusal records a campaign-level StartRefusal (#4525) as one
+// campaign_auto_start_refused entry per (campaign, reason). The dedup key is
+// marked only after the append succeeds, so a failed append is retried on the
+// next tick rather than silently lost; the WARN log fires only when recording.
+func (t *Ticker) recordStartRefusal(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, refusal *StartRefusal) {
+	if t.startRefusalRecorded(c.ID, refusal.Reason) {
+		return
+	}
+	logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: campaign auto-start refused; no item of the campaign is started",
+		slog.String("campaign_id", c.ID.String()),
+		slog.String("reason", refusal.Reason),
+		slog.String("runner_kind", refusal.RunnerKind),
+		slog.String("runner_kind_source", refusal.RunnerKindSource))
+	if !t.emit(ctx, logger, c.ID, categoryCampaignAutoStartRefused, map[string]any{
+		"campaign_id":        c.ID.String(),
+		"issue_ref":          it.IssueRef,
+		"reason":             refusal.Reason,
+		"runner_kind":        refusal.RunnerKind,
+		"runner_kind_source": refusal.RunnerKindSource,
+		"detail":             refusal.Detail,
+	}) {
+		return
+	}
+	t.refusedMu.Lock()
+	defer t.refusedMu.Unlock()
+	if t.refused == nil {
+		t.refused = map[uuid.UUID]map[string]struct{}{}
+	}
+	if t.refused[c.ID] == nil {
+		t.refused[c.ID] = map[string]struct{}{}
+	}
+	t.refused[c.ID][refusal.Reason] = struct{}{}
+}
+
+// startRefusalRecorded reports whether (campaignID, reason) was recorded.
+func (t *Ticker) startRefusalRecorded(campaignID uuid.UUID, reason string) bool {
+	t.refusedMu.Lock()
+	defer t.refusedMu.Unlock()
+	_, ok := t.refused[campaignID][reason]
+	return ok
+}
+
+// clearStartRefusals forgets every recorded refusal for campaignID.
+func (t *Ticker) clearStartRefusals(campaignID uuid.UUID) {
+	t.refusedMu.Lock()
+	defer t.refusedMu.Unlock()
+	delete(t.refused, campaignID)
+}
+
+// pruneStartRefusals forgets the recorded refusals of every campaign not in
+// the running listing, so a campaign that left running and later resumes
+// records a standing refusal again, and the map never outgrows the running set.
+func (t *Ticker) pruneStartRefusals(running []*campaign.Campaign) {
+	t.refusedMu.Lock()
+	defer t.refusedMu.Unlock()
+	if len(t.refused) == 0 {
+		return
+	}
+	keep := make(map[uuid.UUID]struct{}, len(running))
+	for _, c := range running {
+		if c.State == campaign.StateRunning {
+			keep[c.ID] = struct{}{}
+		}
+	}
+	for id := range t.refused {
+		if _, ok := keep[id]; !ok {
+			delete(t.refused, id)
+		}
+	}
+}
+
 // emit appends one campaign-level audit entry on the global chain, stamped
 // with the owning campaign's tenant account partition (ADR-057 / #1828).
 // Best-effort: a marshal or append error WARN-logs and never unwinds the
-// transition it records, mirroring the sweeper/reconciler audit posture.
-func (t *Ticker) emit(ctx context.Context, logger *slog.Logger, campaignID uuid.UUID, category string, payload map[string]any) {
+// transition it records, mirroring the sweeper/reconciler audit posture. It
+// reports whether the entry was appended, for a caller (recordStartRefusal)
+// that must not mark an unrecorded entry as recorded.
+func (t *Ticker) emit(ctx context.Context, logger *slog.Logger, campaignID uuid.UUID, category string, payload map[string]any) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: marshal audit payload failed",
 			slog.String("category", category),
 			slog.String("error", err.Error()))
-		return
+		return false
 	}
 	systemKind := audit.ActorSystem
 	if _, err := t.Audit.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
@@ -676,7 +810,9 @@ func (t *Ticker) emit(ctx context.Context, logger *slog.Logger, campaignID uuid.
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: append audit entry failed",
 			slog.String("category", category),
 			slog.String("error", err.Error()))
+		return false
 	}
+	return true
 }
 
 // campaignAccountID resolves the campaign's owning tenant account — the
