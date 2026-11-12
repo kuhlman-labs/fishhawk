@@ -114,6 +114,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldMergeQueueYield(run, na)
 		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
+		foldFanInVerifyUnavailableAdvisory(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -136,6 +137,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldMergeQueueYield(run, na)
 		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
+		foldFanInVerifyUnavailableAdvisory(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -156,6 +158,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldMergeQueueYield(run, na)
 		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
+		foldFanInVerifyUnavailableAdvisory(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -188,6 +191,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldMergeQueueYield(run, na)
 	foldMergeQueueOrphanedClaim(run, na)
 	foldMergeCandidateRerunAlternative(run, na)
+	foldFanInVerifyUnavailableAdvisory(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
 	return na
@@ -950,6 +954,54 @@ func foldReviewHeadMismatchAdvisory(run *Run, na *NextActions) {
 			m.ReviewedTreeSHA, orUnknown(m.ReviewedHeadSHA), m.PushedTreeSHA, orUnknown(m.PushedHeadSHA)),
 	}
 	na.Actions = append([]SuggestedAction{advisory}, na.Actions...)
+}
+
+// foldFanInVerifyUnavailableAdvisory APPENDS a DISPLAY-ONLY advisory when the run
+// carries a fan_in_verify_unavailable block (#4792): a decomposed parent's
+// acceptance stage was released with NO consolidated fan-in verify consulted.
+// It is a signal, never a hold: the advisory consumes nothing, only INSERTS at
+// the end (every existing action, the merge ritual included, stays present and
+// in its original relative order), and it states that the ADR-090 merge gate
+// still applies to the unverified head. hook_not_wired is the expected CLI/dev
+// posture, so its text says no remediation is needed on its own; the other
+// reasons point at the forge/repo configuration. A TERMINAL run adds nothing:
+// the block stays on the run as history. An absent block, including an older
+// backend that omits the field, appends nothing and leaves every surface
+// byte-identical. na is mutated in place; a nil run or na is a no-op.
+func foldFanInVerifyUnavailableAdvisory(run *Run, na *NextActions) {
+	if na == nil || run == nil || run.FanInVerifyUnavailable == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	b := run.FanInVerifyUnavailable
+	params := map[string]string{
+		"run_id": run.ID,
+		"reason": b.Reason,
+	}
+	if b.AcceptanceStageID != "" {
+		params["stage_id"] = b.AcceptanceStageID
+	}
+	if b.Detail != "" {
+		params["detail"] = b.Detail
+	}
+	remedy := "check the forge/repository configuration named by the reason; the merge gate (ADR-090) still blocks an unverified consolidated head, so nothing merges on this release alone"
+	if b.Reason == "hook_not_wired" {
+		remedy = "hook_not_wired is the expected CLI/dev posture (no server-side fan-in verify hook is wired), so this signal alone needs no remediation; the merge gate (ADR-090) still applies to the consolidated head"
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "fan_in_verify_unavailable",
+		Params:       params,
+		Precondition: "a decomposed parent's acceptance stage was released with no consolidated fan-in verify consulted",
+		Consumes:     consumesNone,
+		Reason:       fmt.Sprintf("acceptance was released on an unverified consolidated head (%s%s): %s", b.Reason, detailSuffix(b.Detail), remedy),
+	})
+}
+
+// detailSuffix renders ": <detail>" for a non-empty detail, else nothing.
+func detailSuffix(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return ": " + detail
 }
 
 // orUnknown renders an empty SHA coordinate as "unknown" rather than a blank.

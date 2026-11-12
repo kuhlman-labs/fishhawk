@@ -677,6 +677,7 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.issue_context", Tier: "T8", Class: classOversizedCapable, Surfaces: restRun, Unbounded: unboundedRun},
 	{Path: "run.live_validation", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_head_mismatch", Tier: "T9", Class: classStored, Surfaces: restRun},
+	{Path: "run.fan_in_verify_unavailable", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_authority", Tier: "T9", Class: classStored, Surfaces: restRun},
 	// merge_candidate_queue (ADR-092 / #4200) is one constant-shape entry (no
 	// lists): kept through every tier and itemised at the diagnosis skeleton,
@@ -1063,6 +1064,11 @@ func tierResidualBounded(out *GetRunStatusOutput, runID string, led *elisionLedg
 		out.Run.ReviewHeadMismatch = nil
 		led.add(classified("run.review_head_mismatch", runID,
 			"the stale-review signal is stored on the audit chain (review_head_mismatch) and returned by the gate view; next_actions already carries its advisory", 0))
+	}
+	if out.Run.FanInVerifyUnavailable != nil {
+		out.Run.FanInVerifyUnavailable = nil
+		led.add(classified("run.fan_in_verify_unavailable", runID,
+			"the fail-open acceptance-release signal is stored on the audit chain (fan_in_verify_unavailable) and returned by GET /v0/runs/{id}; next_actions already carries its advisory", 0))
 	}
 	if out.DriveStatus != nil && len(out.DriveStatus.AutoAdvanced) > 0 {
 		n := len(out.DriveStatus.AutoAdvanced)

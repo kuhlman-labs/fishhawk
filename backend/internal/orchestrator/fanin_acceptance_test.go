@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -40,12 +42,17 @@ type recordingFanInVerify struct {
 	err     error
 	calls   []fanInVerifyCall
 
+	// reason and detail, when set, ride every Settled=true answer as the
+	// hook's UnavailableReason / UnavailableDetail (#4792): a scripted
+	// fail-open release.
+	reason, detail string
+
 	// observe, when set, snapshots the repo state at call time.
 	runs       *stubRuns
 	acceptance *run.Stage
 }
 
-func (f *recordingFanInVerify) FanInVerifySettled(_ context.Context, runID uuid.UUID, base, branch string) (bool, error) {
+func (f *recordingFanInVerify) FanInVerifySettled(_ context.Context, runID uuid.UUID, base, branch string) (FanInVerifyAnswer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := fanInVerifyCall{runID: runID, base: base, branch: branch}
@@ -61,16 +68,20 @@ func (f *recordingFanInVerify) FanInVerifySettled(_ context.Context, runID uuid.
 	}
 	f.calls = append(f.calls, c)
 	if f.err != nil {
-		return false, f.err
+		return FanInVerifyAnswer{}, f.err
 	}
-	if len(f.answers) == 0 {
-		return true, nil
+	settled := true
+	if len(f.answers) > 0 {
+		i := len(f.calls) - 1
+		if i >= len(f.answers) {
+			i = len(f.answers) - 1
+		}
+		settled = f.answers[i]
 	}
-	i := len(f.calls) - 1
-	if i >= len(f.answers) {
-		i = len(f.answers) - 1
+	if !settled {
+		return FanInVerifyAnswer{}, nil
 	}
-	return f.answers[i], nil
+	return FanInVerifyAnswer{Settled: true, UnavailableReason: f.reason, UnavailableDetail: f.detail}, nil
 }
 
 func (f *recordingFanInVerify) callCount() int {
@@ -129,6 +140,89 @@ func prURL(rs *stubRuns, id uuid.UUID) string {
 	return ""
 }
 
+// unavailableRows returns every fan_in_verify_unavailable append (#4792).
+func unavailableRows(au *recordingAudit) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, e := range au.appended {
+		if e.Category == CategoryFanInVerifyUnavailable {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// assertNoUnavailableRows pins a healthy path: no fail-open signal is recorded.
+func assertNoUnavailableRows(t *testing.T, au *recordingAudit) {
+	t.Helper()
+	if rows := unavailableRows(au); len(rows) != 0 {
+		t.Errorf("fan_in_verify_unavailable rows = %d, want 0 on a healthy path: %+v", len(rows), rows)
+	}
+}
+
+// assertOneUnavailableRow pins EXACTLY one fan_in_verify_unavailable row with
+// the reason, detail and the acceptance stage anchor.
+func assertOneUnavailableRow(t *testing.T, au *recordingAudit, p acceptanceAheadParent, reason, detail string) {
+	t.Helper()
+	rows := unavailableRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("fan_in_verify_unavailable rows = %d, want exactly 1: %+v", len(rows), rows)
+	}
+	row := rows[0]
+	if row.StageID == nil || *row.StageID != p.acceptance.ID {
+		t.Errorf("row stage anchor = %v, want the acceptance stage %s", row.StageID, p.acceptance.ID)
+	}
+	if row.ActorKind == nil || *row.ActorKind != audit.ActorSystem {
+		t.Errorf("row actor = %v, want the system actor", row.ActorKind)
+	}
+	var got FanInVerifyUnavailablePayload
+	if err := json.Unmarshal(row.Payload, &got); err != nil {
+		t.Fatalf("decode payload %s: %v", row.Payload, err)
+	}
+	want := FanInVerifyUnavailablePayload{
+		Reason:             reason,
+		Detail:             detail,
+		AcceptanceStageID:  p.acceptance.ID.String(),
+		ConsolidatedBranch: consolidatedBranch(p.run.ID),
+	}
+	if got != want {
+		t.Errorf("payload = %+v, want %+v", got, want)
+	}
+}
+
+// jsonLogger routes the orchestrator's logger to a JSON handler so a test can
+// assert on the WARN message and its attrs.
+func jsonLogger(o *Orchestrator) *bytes.Buffer {
+	buf := &bytes.Buffer{}
+	o.Logger = slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return buf
+}
+
+// assertUnavailableWarn pins the WARN naming fan_in_verify_unavailable with the
+// reason, run id and acceptance stage id.
+func assertUnavailableWarn(t *testing.T, logs *bytes.Buffer, p acceptanceAheadParent, reason string) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.Contains(line, `"level":"WARN"`) &&
+			strings.Contains(line, "fan_in_verify_unavailable") &&
+			strings.Contains(line, `"reason":"`+reason+`"`) &&
+			strings.Contains(line, `"run_id":"`+p.run.ID.String()+`"`) &&
+			strings.Contains(line, `"acceptance_stage_id":"`+p.acceptance.ID.String()+`"`) {
+			return
+		}
+	}
+	t.Errorf("no WARN naming fan_in_verify_unavailable, reason %q, run and acceptance stage; logs:\n%s", reason, logs.String())
+}
+
+// assertReleased pins that acceptance left pending on the local runner.
+func assertReleased(t *testing.T, p acceptanceAheadParent) {
+	t.Helper()
+	if p.acceptance.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("acceptance state = %q, want awaiting_host_dispatch (released: a signal, never a hold)", p.acceptance.State)
+	}
+}
+
 // RELEASE case (hook reports SETTLED): the consolidated PR is opened BEFORE
 // acceptance leaves pending, acceptance is then dispatched (parked at
 // awaiting_host_dispatch on the local runner) and the consolidated review
@@ -142,6 +236,7 @@ func TestAdvance_DecomposedParentAcceptance_OpensPRBeforeDispatch(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
+	assertNoUnavailableRows(t, au)
 	if out != OutcomeDispatched {
 		t.Errorf("Outcome = %q, want dispatched", out)
 	}
@@ -197,13 +292,14 @@ func TestAdvance_DecomposedParentAcceptance_OpensPRBeforeDispatch(t *testing.T) 
 func TestAdvance_DecomposedParentAcceptance_HeldWhileFanInUnsettled(t *testing.T) {
 	for _, implState := range []run.StageState{run.StageStateSucceeded, run.StageStateRunning} {
 		t.Run(string(implState), func(t *testing.T) {
-			o, rs, gh, _, rec, hook := newFanInAcceptanceOrchestrator(t, false)
+			o, rs, gh, au, rec, hook := newFanInAcceptanceOrchestrator(t, false)
 			p := seedAcceptanceAheadParent(t, rs, implState)
 
 			out, err := o.Advance(context.Background(), p.run.ID)
 			if err != nil {
 				t.Fatalf("Advance: %v", err)
 			}
+			assertNoUnavailableRows(t, au)
 			if out != OutcomeNoOp {
 				t.Errorf("Outcome = %q, want no-op (held)", out)
 			}
@@ -289,7 +385,7 @@ func TestAdvance_DecomposedParentAcceptance_ListChildrenErrorHolds(t *testing.T)
 // dispatched, the PR is not re-opened, and the hold counter counted the
 // repeated hold and is cleared on release.
 func TestAdvance_DecomposedParentAcceptance_ReleaseAfterSettled(t *testing.T) {
-	o, rs, gh, _, rec, _ := newFanInAcceptanceOrchestrator(t, false, false, true)
+	o, rs, gh, au, rec, _ := newFanInAcceptanceOrchestrator(t, false, false, true)
 	p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
 
 	for i := 0; i < 2; i++ {
@@ -323,26 +419,129 @@ func TestAdvance_DecomposedParentAcceptance_ReleaseAfterSettled(t *testing.T) {
 	if _, ok := o.fanInHolds[p.run.ID]; ok {
 		t.Error("hold attempt count not cleared on release")
 	}
+	assertNoUnavailableRows(t, au)
 }
 
 // A nil hook (CLI/dev posture) still opens the consolidated PR before
-// acceptance, dispatches acceptance and fires the consolidated review.
+// acceptance, dispatches acceptance and fires the consolidated review, and the
+// release is RECORDED as hook_not_wired (#4792): the CLI/dev posture expects
+// it, so the row is a signal and not a fault. A nil ConsolidatedReview or both
+// nil name themselves in the detail.
 func TestAdvance_DecomposedParentAcceptance_NilHook_DispatchesWithPR(t *testing.T) {
-	o, rs, gh, _, rec, _ := newFanInAcceptanceOrchestrator(t)
-	o.FanInVerify = nil
-	p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+	cases := []struct {
+		name       string
+		nilHook    bool
+		nilReview  bool
+		wantDetail string
+		wantFires  int
+	}{
+		{name: "nil FanInVerify", nilHook: true, wantDetail: "FanInVerify not wired", wantFires: 1},
+		{name: "nil ConsolidatedReview", nilReview: true, wantDetail: "ConsolidatedReview not wired"},
+		{name: "both nil", nilHook: true, nilReview: true, wantDetail: "FanInVerify and ConsolidatedReview not wired"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh, au, rec, hook := newFanInAcceptanceOrchestrator(t)
+			logs := jsonLogger(o)
+			if tc.nilHook {
+				o.FanInVerify = nil
+			}
+			if tc.nilReview {
+				o.ConsolidatedReview = nil
+			}
+			p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
 
-	if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
-		t.Fatalf("Advance: %v", err)
+			if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if len(gh.createPRCalls) != 1 {
+				t.Errorf("CreatePullRequest calls = %d, want 1", len(gh.createPRCalls))
+			}
+			assertReleased(t, p)
+			if len(rec.calls) != tc.wantFires {
+				t.Errorf("DispatchConsolidatedReview calls = %d, want %d", len(rec.calls), tc.wantFires)
+			}
+			if !tc.nilHook && hook.callCount() != 0 {
+				t.Errorf("FanInVerifySettled calls = %d, want 0 (the review dispatcher is not wired)", hook.callCount())
+			}
+			assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableHookNotWired, tc.wantDetail)
+			assertUnavailableWarn(t, logs, p, FanInVerifyUnavailableHookNotWired)
+		})
 	}
-	if len(gh.createPRCalls) != 1 {
-		t.Errorf("CreatePullRequest calls = %d, want 1", len(gh.createPRCalls))
+}
+
+// The graceful PR-open skip (o.GitHub nil, or no installation id) leaves the
+// parent PR-less, so the hook is skipped altogether. That is the most common
+// real fail-open posture (#4792): it records no_consolidated_pr, names which
+// skip fired, consults no hook and still releases acceptance.
+func TestAdvance_DecomposedParentAcceptance_NoConsolidatedPR_RecordsUnavailable(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      func(o *Orchestrator, p acceptanceAheadParent)
+		wantDetail string
+	}{
+		{name: "github client nil", setup: func(o *Orchestrator, _ acceptanceAheadParent) { o.GitHub = nil }, wantDetail: "github client not wired"},
+		{name: "nil installation id", setup: func(_ *Orchestrator, p acceptanceAheadParent) { p.run.InstallationID = nil }, wantDetail: "no installation id"},
 	}
-	if p.acceptance.State != run.StageStateAwaitingHostDispatch {
-		t.Errorf("acceptance state = %q, want awaiting_host_dispatch", p.acceptance.State)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh, au, rec, hook := newFanInAcceptanceOrchestrator(t, false)
+			logs := jsonLogger(o)
+			p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+			tc.setup(o, p)
+
+			if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if prURL(rs, p.run.ID) != "" {
+				t.Errorf("pull_request_url = %q, want empty (the open skipped gracefully)", prURL(rs, p.run.ID))
+			}
+			if len(gh.createPRCalls) != 0 {
+				t.Errorf("CreatePullRequest calls = %d, want 0", len(gh.createPRCalls))
+			}
+			if hook.callCount() != 0 {
+				t.Errorf("FanInVerifySettled calls = %d, want 0 with no consolidated PR", hook.callCount())
+			}
+			if len(rec.calls) != 0 {
+				t.Errorf("DispatchConsolidatedReview calls = %d, want 0 with no consolidated PR", len(rec.calls))
+			}
+			assertReleased(t, p)
+			assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableNoConsolidatedPR, tc.wantDetail)
+			assertUnavailableWarn(t, logs, p, FanInVerifyUnavailableNoConsolidatedPR)
+		})
 	}
-	if len(rec.calls) != 1 {
-		t.Errorf("DispatchConsolidatedReview calls = %d, want 1", len(rec.calls))
+}
+
+// The hook's own fail-open answer (Settled=true plus an UnavailableReason) is
+// recorded verbatim: the release still happens and the consolidated review
+// still fires, but the reason and detail reach the chain and the log (#4792).
+func TestAdvance_DecomposedParentAcceptance_HookUnavailable_RecordsReason(t *testing.T) {
+	cases := []struct {
+		name, reason, detail string
+	}{
+		{name: "no_run_repo", reason: FanInVerifyUnavailableNoRunRepo},
+		{name: "forge_not_wired", reason: FanInVerifyUnavailableForgeNotWired, detail: "github client not wired"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, _, au, rec, hook := newFanInAcceptanceOrchestrator(t, true)
+			hook.reason, hook.detail = tc.reason, tc.detail
+			logs := jsonLogger(o)
+			p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+
+			if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if hook.callCount() != 1 {
+				t.Errorf("FanInVerifySettled calls = %d, want 1", hook.callCount())
+			}
+			assertReleased(t, p)
+			if len(rec.calls) != 1 {
+				t.Errorf("DispatchConsolidatedReview calls = %d, want 1 (the release fire is unchanged)", len(rec.calls))
+			}
+			assertOneUnavailableRow(t, au, p, tc.reason, tc.detail)
+			assertUnavailableWarn(t, logs, p, tc.reason)
+		})
 	}
 }
 
@@ -351,7 +550,7 @@ func TestAdvance_DecomposedParentAcceptance_NilHook_DispatchesWithPR(t *testing.
 // literal. The hook is not consulted, acceptance dispatches as before, the
 // consolidated-review fire skips, and a WARN names the reason with the run id.
 func TestAdvance_DecomposedParentAcceptance_UnresolvedDefaultBranchDispatchesWithoutHold(t *testing.T) {
-	o, rs, gh, _, rec, hook := newFanInAcceptanceOrchestrator(t, false)
+	o, rs, gh, au, rec, hook := newFanInAcceptanceOrchestrator(t, false)
 	o.DefaultBranch = defaultbranch.New(&countingRepoGetter{err: forge.ErrNotFound})
 	var logBuf bytes.Buffer
 	o.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -390,12 +589,16 @@ func TestAdvance_DecomposedParentAcceptance_UnresolvedDefaultBranchDispatchesWit
 	if !warned {
 		t.Errorf("no WARN naming the unresolved reason and run_id; logs:\n%s", logBuf.String())
 	}
+	// #4792: the release is also recorded, with the resolver's closed-vocabulary
+	// reason as the detail.
+	assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableDefaultBranchUnresolved, string(defaultbranch.ReasonRepositoryNotVisible))
+	assertUnavailableWarn(t, &logBuf, p, FanInVerifyUnavailableDefaultBranchUnresolved)
 }
 
 // An ordinary (non-decomposed) run's acceptance is untouched: no PR, no hook,
 // no consolidated review, acceptance dispatched as before.
 func TestAdvance_DecomposedParentAcceptance_NonDecomposedRunUntouched(t *testing.T) {
-	o, rs, gh, _, rec, hook := newFanInAcceptanceOrchestrator(t, false)
+	o, rs, gh, au, rec, hook := newFanInAcceptanceOrchestrator(t, false)
 	r, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
 		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
 		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
@@ -419,6 +622,7 @@ func TestAdvance_DecomposedParentAcceptance_NonDecomposedRunUntouched(t *testing
 	if stages[1].State != run.StageStateAwaitingHostDispatch {
 		t.Errorf("acceptance state = %q, want awaiting_host_dispatch (dispatched as before)", stages[1].State)
 	}
+	assertNoUnavailableRows(t, au)
 }
 
 // A run with no implement stage can never be a decomposed parent (only an
@@ -509,4 +713,115 @@ func TestMaybeAdvanceDecomposedParent_RedriveSettle_OpensPRBeforeAcceptance(t *t
 	if len(rec.calls) != 1 {
 		t.Errorf("DispatchConsolidatedReview calls = %d, want 1", len(rec.calls))
 	}
+}
+
+// --- #4792: the recorder's failure modes ------------------------------------
+
+func newRecorderFixture(t *testing.T) (*Orchestrator, acceptanceAheadParent, *recordingAudit, *bytes.Buffer) {
+	t.Helper()
+	o, rs, _, au, _, _ := newFanInAcceptanceOrchestrator(t)
+	logs := jsonLogger(o)
+	p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+	return o, p, au, logs
+}
+
+// A repeat of the same (acceptance stage, reason) adds no row, a different
+// reason adds one, and an undecodable existing row never suppresses the append.
+func TestRecordFanInVerifyUnavailable_Dedupes(t *testing.T) {
+	ctx := context.Background()
+	o, p, au, _ := newRecorderFixture(t)
+
+	o.recordFanInVerifyUnavailable(ctx, p.run, p.acceptance, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+	o.recordFanInVerifyUnavailable(ctx, p.run, p.acceptance, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+	if n := len(unavailableRows(au)); n != 1 {
+		t.Fatalf("rows after a repeat of the same stage and reason = %d, want 1", n)
+	}
+
+	o.recordFanInVerifyUnavailable(ctx, p.run, p.acceptance, FanInVerifyUnavailableNoConsolidatedPR, "github client not wired")
+	if n := len(unavailableRows(au)); n != 2 {
+		t.Fatalf("rows after a different reason = %d, want 2", n)
+	}
+
+	// The same reason on a DIFFERENT acceptance stage is not a repeat.
+	other := *p.acceptance
+	other.ID = uuid.New()
+	o.recordFanInVerifyUnavailable(ctx, p.run, &other, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+	if n := len(unavailableRows(au)); n != 3 {
+		t.Fatalf("rows after the same reason on another stage = %d, want 3", n)
+	}
+
+	// An undecodable existing row is no match. The malformed payload names the
+	// SAME stage and reason but carries a wrong-typed detail: encoding/json
+	// still fills reason and acceptance_stage_id while reporting the type error,
+	// so only the decode-error guard (not the stage/reason comparison) keeps this
+	// row from suppressing the append.
+	for name, payload := range map[string]func(stageID uuid.UUID) string{
+		"truncated json": func(uuid.UUID) string { return `{"reason":"hook_not_wired"` },
+		"wrong-typed field": func(id uuid.UUID) string {
+			return `{"reason":"hook_not_wired","acceptance_stage_id":"` + id.String() + `","detail":5}`
+		},
+		"not json at all": func(uuid.UUID) string { return "not json" },
+	} {
+		t.Run("undecodable existing row does not suppress: "+name, func(t *testing.T) {
+			o, p, au, _ := newRecorderFixture(t)
+			stageID := p.acceptance.ID
+			au.appended = append(au.appended, audit.ChainAppendParams{
+				RunID: p.run.ID, StageID: &stageID, Category: CategoryFanInVerifyUnavailable, Payload: []byte(payload(stageID)),
+			})
+			o.recordFanInVerifyUnavailable(ctx, p.run, p.acceptance, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+			if n := len(unavailableRows(au)); n != 2 {
+				t.Errorf("rows = %d, want 2 (the malformed row plus the new one)", n)
+			}
+		})
+	}
+}
+
+// A dedupe read failure WARNs and still appends: a read failure never loses the
+// signal.
+func TestRecordFanInVerifyUnavailable_ListErrorStillAppends(t *testing.T) {
+	o, p, au, logs := newRecorderFixture(t)
+	o.Audit = &erroringCategoryAudit{recordingAudit: au}
+
+	o.recordFanInVerifyUnavailable(context.Background(), p.run, p.acceptance, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+
+	assertOneUnavailableRow(t, au, p, FanInVerifyUnavailableHookNotWired, "FanInVerify not wired")
+	if !strings.Contains(logs.String(), "list fan_in_verify_unavailable rows failed") {
+		t.Errorf("no WARN for the failed dedupe read; logs:\n%s", logs.String())
+	}
+}
+
+// An append failure WARNs and never unwinds the release.
+func TestRecordFanInVerifyUnavailable_AppendErrorDoesNotBlockRelease(t *testing.T) {
+	o, rs, _, au, _, _ := newFanInAcceptanceOrchestrator(t)
+	o.FanInVerify = nil
+	o.Audit = &failingAppendAudit{recordingAudit: au}
+	logs := jsonLogger(o)
+	p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+
+	if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+		t.Fatalf("Advance: %v (a failed append must not fail the release)", err)
+	}
+	assertReleased(t, p)
+	if rows := unavailableRows(au); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 (the append failed)", len(rows))
+	}
+	if !strings.Contains(logs.String(), "append fan_in_verify_unavailable failed") {
+		t.Errorf("no WARN for the failed append; logs:\n%s", logs.String())
+	}
+	assertUnavailableWarn(t, logs, p, FanInVerifyUnavailableHookNotWired)
+}
+
+// A nil Audit logs the WARN only: no panic, and the release is unchanged.
+func TestRecordFanInVerifyUnavailable_NilAuditLogsOnly(t *testing.T) {
+	o, rs, _, _, _, _ := newFanInAcceptanceOrchestrator(t)
+	o.FanInVerify = nil
+	o.Audit = nil
+	logs := jsonLogger(o)
+	p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+
+	if _, err := o.Advance(context.Background(), p.run.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	assertReleased(t, p)
+	assertUnavailableWarn(t, logs, p, FanInVerifyUnavailableHookNotWired)
 }

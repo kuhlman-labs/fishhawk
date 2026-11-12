@@ -70,6 +70,11 @@ func maximalRunStatusOutput(runID string) GetRunStatusOutput {
 				StageID: "s1", ReviewedTreeSHA: strings.Repeat("1", 40), PushedTreeSHA: strings.Repeat("2", 40),
 				ReviewRoundSequence: 7, ReviewedHeadSHA: strings.Repeat("a", 40), PushedHeadSHA: strings.Repeat("b", 40),
 			},
+			// #4792: the fail-open acceptance-release signal rides T9 too.
+			FanInVerifyUnavailable: &runFanInVerifyUnavailable{
+				Reason: "forge_not_wired", Detail: "github client not wired",
+				AcceptanceStageID: "s2", Note: strings.Repeat("acceptance was released on an unverified head ", 4),
+			},
 			WorkingDir: "/tmp/checkout",
 			CreatedAt:  now, UpdatedAt: now,
 		},
@@ -941,7 +946,7 @@ func TestSkeleton_ItemisesNestedOmissions(t *testing.T) {
 	// its own class and pointer, never one opaque line.
 	for _, path := range []string{
 		"run.issue_context", "run.concerns.items", "run.review_authority",
-		"run.live_validation", "run.review_head_mismatch", "stages[].executor", "next_actions.actions",
+		"run.live_validation", "run.review_head_mismatch", "run.fan_in_verify_unavailable", "stages[].executor", "next_actions.actions",
 	} {
 		f, ok := byField[path]
 		if !ok {
@@ -1779,5 +1784,32 @@ func TestTierResidualBounded_ElidesReviewHeadMismatch(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("T9 recorded no run.review_head_mismatch ledger entry; entries = %+v", led.entries)
+	}
+}
+
+// TestTierResidualBounded_ElidesFanInVerifyUnavailable (#4792): the T9 residual
+// tier drops run.fan_in_verify_unavailable AND records its own ledger entry, so
+// the fail-open signal can never vanish from a bounded response silently.
+// COUNTERFACTUAL: delete the fan_in_verify_unavailable arm of tierResidualBounded
+// → the block survives T9 and no ledger entry is recorded, RED.
+func TestTierResidualBounded_ElidesFanInVerifyUnavailable(t *testing.T) {
+	runID := uuid.NewString()
+	out := maximalRunStatusOutput(runID)
+	if out.Run.FanInVerifyUnavailable == nil {
+		t.Fatal("fixture must carry run.fan_in_verify_unavailable")
+	}
+	led := &elisionLedger{}
+	tierResidualBounded(&out, runID, led)
+	if out.Run.FanInVerifyUnavailable != nil {
+		t.Errorf("run.fan_in_verify_unavailable survived T9: %+v", out.Run.FanInVerifyUnavailable)
+	}
+	found := false
+	for _, e := range led.entries {
+		if e.field == "run.fan_in_verify_unavailable" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("T9 recorded no run.fan_in_verify_unavailable ledger entry; entries = %+v", led.entries)
 	}
 }

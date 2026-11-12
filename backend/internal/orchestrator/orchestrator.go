@@ -117,7 +117,21 @@ type ConsolidatedReviewDispatcher interface {
 // starting the verify-only pass stays inside DispatchConsolidatedReview's
 // detached goroutine, so Advance can never re-enter itself through it.
 type FanInVerifyGate interface {
-	FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (bool, error)
+	FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (FanInVerifyAnswer, error)
+}
+
+// FanInVerifyAnswer is the FanInVerifyGate's answer (#4792). Settled false
+// holds acceptance. Settled true releases it, and a non-empty UnavailableReason
+// (one of the FanInVerifyUnavailable* constants) only ever accompanies
+// Settled=true: acceptance was released with NO verify consulted because the
+// hook could not look (no run repository, no forge compare). The hook stays
+// read-only and writes no audit row; the orchestrator, the only layer that sees
+// every fail-open arm, logs and records the reason. UnavailableDetail is a
+// bounded, server-built string (never a wrapped upstream error).
+type FanInVerifyAnswer struct {
+	Settled           bool
+	UnavailableReason string
+	UnavailableDetail string
 }
 
 // RunCancelledObserver is notified AFTER completeRun resolves a run to the
@@ -860,7 +874,10 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 //	    The hook's base is the resolved default branch (#4660); an
 //	    unresolved one is WARN-logged with its reason and consults no hook.
 //	(d) Otherwise not held: the caller dispatches acceptance and fires the
-//	    consolidated review.
+//	    consolidated review. Every release with no fan-in verify consulted (a
+//	    nil hook, no consolidated PR, an unresolved base, or a hook answer
+//	    carrying an UnavailableReason) is logged and recorded as
+//	    fan_in_verify_unavailable (#4792); it is a signal, never a hold.
 //
 // holdAttempts counts consecutive holds per parent in-process so a repeated
 // hold with no trigger row (the pass could not start) is distinguishable in
@@ -904,8 +921,15 @@ func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.R
 		r = updated
 	}
 
-	if o.FanInVerify != nil && o.ConsolidatedReview != nil &&
-		r.PullRequestURL != nil && *r.PullRequestURL != "" {
+	// Every skip of the hold names itself (#4792): a release with no fan-in
+	// verify consulted is logged and recorded as fan_in_verify_unavailable,
+	// never held and never silent.
+	switch {
+	case o.FanInVerify == nil || o.ConsolidatedReview == nil:
+		o.recordFanInVerifyUnavailable(ctx, r, next, FanInVerifyUnavailableHookNotWired, o.fanInHookMissing())
+	case r.PullRequestURL == nil || *r.PullRequestURL == "":
+		o.recordFanInVerifyUnavailable(ctx, r, next, FanInVerifyUnavailableNoConsolidatedPR, o.noConsolidatedPRDetail(r))
+	default:
 		// The fan-in base is the repository's resolved default branch
 		// (#4660), never a literal. An unresolved read applies NO hold:
 		// acceptance dispatches as before (the merge gate still blocks on
@@ -919,14 +943,15 @@ func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.R
 				slog.String("acceptance_stage_id", next.ID.String()),
 				slog.String("reason", string(reason)),
 				slog.String("error", berr.Error()))
+			o.recordFanInVerifyUnavailable(ctx, r, next, FanInVerifyUnavailableDefaultBranchUnresolved, string(reason))
 			o.clearFanInAcceptanceHold(r.ID)
 			return r, true, false, nil
 		}
-		fanInSettled, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
+		answer, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
 		if err != nil {
 			return r, true, false, fmt.Errorf("fan-in verify state: %w", err)
 		}
-		if !fanInSettled {
+		if !answer.Settled {
 			o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
 			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: decomposed parent acceptance held until the consolidated fan-in verify settles; release it by dispatching the parent's re-opened IMPLEMENT stage (the verify-only pass), not the acceptance stage",
 				slog.String("run_id", r.ID.String()),
@@ -935,6 +960,9 @@ func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.R
 				slog.Int("hold_attempt", o.noteFanInAcceptanceHold(r.ID)),
 			)
 			return r, true, true, nil
+		}
+		if answer.UnavailableReason != "" {
+			o.recordFanInVerifyUnavailable(ctx, r, next, answer.UnavailableReason, answer.UnavailableDetail)
 		}
 	}
 	o.clearFanInAcceptanceHold(r.ID)

@@ -1054,6 +1054,17 @@ Notes:
   Best-effort — never blocks the ship.
   Listed here so the non-surface choice is a reviewable decision, not an
   omission.
+- The fail-open acceptance-release audit kind — `fan_in_verify_unavailable`
+  (#4792), written by `orchestrator.recordFanInVerifyUnavailable` when a
+  decomposed parent's acceptance stage is RELEASED with no consolidated fan-in
+  verify consulted — is an **internal audit kind, not an issue-comment surface**,
+  and is DELIBERATELY absent from `issuecomment`'s `activityCategories`: it is a
+  signal for the operator reading run status (`fan_in_verify_unavailable` on
+  `GET /v0/runs/{run_id}` and a display-only `next_actions` advisory), not run
+  activity to narrate on the issue thread. Payload `{reason, detail?,
+  acceptance_stage_id, consolidated_branch}`, deduplicated per (acceptance stage,
+  reason), best-effort — never blocks the release. Listed here so the non-surface
+  choice is a reviewable decision, not an omission.
 - The routed-concern not-attempted audit kind — `fixup_concern_unattempted`
   (#2896), written by the implement-review assembly path
   (`trace.go::runImplementReviews`) before any reviewer verdict — is an

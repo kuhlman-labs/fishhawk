@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -654,12 +655,18 @@ func newFanInAcceptanceAheadFixture(t *testing.T, spec []byte) (f *fanInFixture,
 
 func TestFanInVerifySettled_Arms(t *testing.T) {
 	ctx := context.Background()
+	gitlabRef := "gitlab:42"
 	cases := []struct {
-		name    string
-		spec    []byte
-		setup   func(f *fanInFixture)
-		want    bool
-		wantErr bool
+		name       string
+		spec       []byte
+		setup      func(f *fanInFixture)
+		want       bool
+		wantReason string
+		wantDetail string
+		// wantDetailPrefix replaces wantDetail when the detail embeds the run's
+		// own repo string.
+		wantDetailPrefix string
+		wantErr          bool
 	}{
 		{name: "passed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultPassed) }, want: true},
 		{name: "not_required", spec: specImplementGatingReviewers, want: true},
@@ -688,7 +695,26 @@ func TestFanInVerifySettled_Arms(t *testing.T) {
 		{name: "list_children_error", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
 			f.rr.listRunsErr = errors.New("db unavailable")
 		}, wantErr: true},
-		{name: "forge_not_wired", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.s.cfg.GitHub = nil }, want: true},
+		// The fail-open arms (#4792): Settled stays true, and the answer names why
+		// no verify was consulted.
+		{name: "forge_not_wired", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.s.cfg.GitHub = nil },
+			want: true, wantReason: orchestrator.FanInVerifyUnavailableForgeNotWired, wantDetail: "github client not wired"},
+		{name: "forge_no_installation_id", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.rr.mu.Lock()
+			f.rr.runs[f.parent.ID].InstallationID = nil
+			f.rr.mu.Unlock()
+		}, want: true, wantReason: orchestrator.FanInVerifyUnavailableForgeNotWired, wantDetail: "no installation id"},
+		{name: "forge_parse_failure", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.rr.mu.Lock()
+			f.rr.runs[f.parent.ID].Repo = "noslash"
+			f.rr.mu.Unlock()
+		}, want: true, wantReason: orchestrator.FanInVerifyUnavailableForgeNotWired, wantDetailPrefix: "parse repo"},
+		{name: "forge_unresolved_family", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.rr.mu.Lock()
+			f.rr.runs[f.parent.ID].InstallationRef = &gitlabRef
+			f.rr.mu.Unlock()
+			f.s.cfg.ForgeResolver = func(string) (forge.Forge, error) { return nil, errors.New("registry down") }
+		}, want: true, wantReason: orchestrator.FanInVerifyUnavailableForgeNotWired, wantDetail: "forge gitlab unresolved"},
 		{name: "compare_error", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.s.cfg.GitHub = erroringComparePatchClient(t) }, wantErr: true},
 	}
 	for _, tc := range cases {
@@ -700,15 +726,25 @@ func TestFanInVerifySettled_Arms(t *testing.T) {
 			got, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("FanInVerifySettled = %v, nil; want an error", got)
+					t.Fatalf("FanInVerifySettled = %+v, nil; want an error", got)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("FanInVerifySettled: %v", err)
 			}
-			if got != tc.want {
-				t.Errorf("FanInVerifySettled = %v, want %v", got, tc.want)
+			if got.Settled != tc.want {
+				t.Errorf("FanInVerifySettled.Settled = %v, want %v", got.Settled, tc.want)
+			}
+			if got.UnavailableReason != tc.wantReason {
+				t.Errorf("FanInVerifySettled.UnavailableReason = %q, want %q", got.UnavailableReason, tc.wantReason)
+			}
+			if tc.wantDetailPrefix != "" {
+				if !strings.HasPrefix(got.UnavailableDetail, tc.wantDetailPrefix) {
+					t.Errorf("FanInVerifySettled.UnavailableDetail = %q, want prefix %q", got.UnavailableDetail, tc.wantDetailPrefix)
+				}
+			} else if got.UnavailableDetail != tc.wantDetail {
+				t.Errorf("FanInVerifySettled.UnavailableDetail = %q, want %q", got.UnavailableDetail, tc.wantDetail)
 			}
 			// The hook is READ-ONLY: it never starts a pass.
 			if n := len(mcvTriggerRows(f.au)); tc.name == "unverified" && n != 0 {
@@ -725,8 +761,9 @@ func TestFanInVerifySettled_Arms(t *testing.T) {
 	})
 	t.Run("no_run_repo", func(t *testing.T) {
 		s := &Server{}
-		if got, err := s.FanInVerifySettled(ctx, uuid.New(), "main", "b"); err != nil || !got {
-			t.Errorf("FanInVerifySettled with no run repo = %v, %v; want true, nil", got, err)
+		got, err := s.FanInVerifySettled(ctx, uuid.New(), "main", "b")
+		if err != nil || !got.Settled || got.UnavailableReason != orchestrator.FanInVerifyUnavailableNoRunRepo {
+			t.Errorf("FanInVerifySettled with no run repo = %+v, %v; want settled with reason no_run_repo", got, err)
 		}
 	})
 }
@@ -888,6 +925,315 @@ func TestFanInAcceptanceHold_EndToEnd(t *testing.T) {
 	if n := len(mcvTriggerRows(f.au)); n != 1 {
 		t.Errorf("trigger rows = %d, want still 1", n)
 	}
+}
+
+// --- #4792: the fail-open acceptance release is observable --------------------
+
+// failOpenParent is the feature_change-shaped decomposed parent (#4785) with a
+// stamped consolidated PR and NO forge wired (cfg.GitHub nil), driven by a REAL
+// orchestrator whose Audit is the fixture's audit fake and whose FanInVerify and
+// ConsolidatedReview are the real *Server: the producer of the
+// fan_in_verify_unavailable signal, un-mocked end to end.
+func failOpenParent(t *testing.T) (*fanInFixture, *run.Stage, *orchestrator.Orchestrator) {
+	t.Helper()
+	f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
+	f.rr.mu.Unlock()
+	f.s.cfg.GitHub = nil
+	o := &orchestrator.Orchestrator{Runs: f.rr, Audit: f.au, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
+	f.s.cfg.Orchestrator = o
+	return f, acc, o
+}
+
+// getRunBody GETs /v0/runs/{id} through the real handler and decodes the body.
+func getRunBody(t *testing.T, s *Server, runID uuid.UUID) (map[string]json.RawMessage, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String(), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /v0/runs/%s status = %d:\n%s", runID, w.Code, w.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode run body: %v", err)
+	}
+	return body, w.Body.String()
+}
+
+// fanInUnavailableFeedItem is the slice of a fan_in_verify_unavailable audit
+// feed item the integration tests read.
+type fanInUnavailableFeedItem struct {
+	Category string          `json:"category"`
+	StageID  string          `json:"stage_id"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+// getUnavailableFeed GETs the real audit feed filtered to the category.
+func getUnavailableFeed(t *testing.T, s *Server, runID uuid.UUID) ([]fanInUnavailableFeedItem, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/runs/"+runID.String()+"/audit?category="+orchestrator.CategoryFanInVerifyUnavailable, nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET audit feed status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var page struct {
+		Items []fanInUnavailableFeedItem `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode audit feed: %v", err)
+	}
+	return page.Items, w.Body.String()
+}
+
+// TestFanInVerifyUnavailable_EndToEnd (#4792) crosses every layer of the signal:
+// the real server hook, the real orchestrator, the audit chain and the REST
+// handlers. A decomposed parent with a stamped PR and no forge wired is
+// RELEASED (never held), exactly one fan_in_verify_unavailable row lands on the
+// chain, and the real GET /v0/runs/{id} body and the real audit feed both carry
+// it. The healthy arm (a passed verdict) records nothing and omits the key.
+// COUNTERFACTUAL: delete the handleGetRun line → the body assertions go RED
+// while the row stays (the wiring, not the emit); delete the orchestrator's
+// hook-answer record → no row, RED.
+func TestFanInVerifyUnavailable_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	t.Run("fail-open release is recorded and surfaced", func(t *testing.T) {
+		f, acc, o := failOpenParent(t)
+		if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		f.s.waitBackgroundReviews()
+		if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
+			t.Fatalf("acceptance state = %q, want awaiting_host_dispatch (released: a signal, never a hold)", got)
+		}
+		if n := f.count(orchestrator.CategoryFanInVerifyUnavailable); n != 1 {
+			t.Fatalf("fan_in_verify_unavailable rows = %d, want exactly 1", n)
+		}
+
+		body, _ := getRunBody(t, f.s, f.parent.ID)
+		raw, ok := body["fan_in_verify_unavailable"]
+		if !ok {
+			t.Fatalf("run body has no fan_in_verify_unavailable key; keys: %v", func() []string {
+				var ks []string
+				for k := range body {
+					ks = append(ks, k)
+				}
+				return ks
+			}())
+		}
+		var block struct {
+			Reason            string `json:"reason"`
+			Detail            string `json:"detail"`
+			AcceptanceStageID string `json:"acceptance_stage_id"`
+			Note              string `json:"note"`
+		}
+		if err := json.Unmarshal(raw, &block); err != nil {
+			t.Fatalf("decode block %s: %v", raw, err)
+		}
+		if block.Reason != orchestrator.FanInVerifyUnavailableForgeNotWired || block.Detail != "github client not wired" ||
+			block.AcceptanceStageID != acc.ID.String() {
+			t.Errorf("block = %+v, want forge_not_wired / github client not wired / %s", block, acc.ID)
+		}
+		if !strings.Contains(block.Note, orchestrator.FanInVerifyUnavailableForgeNotWired) || !strings.Contains(block.Note, "merge gate") {
+			t.Errorf("note %q must name the reason and say the merge gate still applies", block.Note)
+		}
+
+		// The list endpoint stays free of the extra audit read: it carries the
+		// parent but never the block.
+		listReq := httptest.NewRequest(http.MethodGet, "/v0/runs", nil)
+		listW := httptest.NewRecorder()
+		f.s.Handler().ServeHTTP(listW, listReq)
+		if listW.Code != http.StatusOK {
+			t.Fatalf("GET /v0/runs status = %d:\n%s", listW.Code, listW.Body.String())
+		}
+		var list struct {
+			Items []map[string]json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal(listW.Body.Bytes(), &list); err != nil {
+			t.Fatalf("decode run list: %v", err)
+		}
+		listed := false
+		for _, it := range list.Items {
+			if strings.Contains(string(it["id"]), f.parent.ID.String()) {
+				listed = true
+				if _, has := it["fan_in_verify_unavailable"]; has {
+					t.Errorf("the list endpoint carries fan_in_verify_unavailable: %s", it["fan_in_verify_unavailable"])
+				}
+			}
+		}
+		if !listed {
+			t.Fatalf("the parent run is absent from the list response: %s", listW.Body.String())
+		}
+
+		items, _ := getUnavailableFeed(t, f.s, f.parent.ID)
+		if len(items) != 1 {
+			t.Fatalf("audit feed items = %d, want 1", len(items))
+		}
+		if items[0].Category != orchestrator.CategoryFanInVerifyUnavailable || items[0].StageID != acc.ID.String() {
+			t.Errorf("feed item = %+v, want the category anchored on the acceptance stage %s", items[0], acc.ID)
+		}
+		var payload orchestrator.FanInVerifyUnavailablePayload
+		if err := json.Unmarshal(items[0].Payload, &payload); err != nil {
+			t.Fatalf("decode feed payload %s: %v", items[0].Payload, err)
+		}
+		if payload.Reason != orchestrator.FanInVerifyUnavailableForgeNotWired || payload.AcceptanceStageID != acc.ID.String() {
+			t.Errorf("feed payload = %+v, want reason forge_not_wired on the acceptance stage", payload)
+		}
+	})
+
+	t.Run("healthy release records nothing and omits the key", func(t *testing.T) {
+		f, acc, o := failOpenParent(t)
+		f.s.cfg.GitHub = cannedComparePatchClient(t, cannedCompareOneFile)
+		f.seedVerdict(fanInHead, mergeCandidateResultPassed)
+		if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		f.s.waitBackgroundReviews()
+		if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
+			t.Fatalf("acceptance state = %q, want awaiting_host_dispatch", got)
+		}
+		if n := f.count(orchestrator.CategoryFanInVerifyUnavailable); n != 0 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want 0 on a healthy release", n)
+		}
+		if body, _ := getRunBody(t, f.s, f.parent.ID); body["fan_in_verify_unavailable"] != nil {
+			t.Errorf("run body carries fan_in_verify_unavailable %s on a healthy release, want the key omitted", body["fan_in_verify_unavailable"])
+		}
+	})
+}
+
+// TestFanInVerifyUnavailable_DetailOmitsUpstreamErrorAndRefTail (#4792, approval
+// condition C5) traces the persisted detail to its producer with a SYNTHETIC
+// installation-ref tail and resolver error: the forge lookup detail is
+// forgeCompareFor's constant "forge <family> unresolved", so neither the
+// ref tail (after the colon) nor the wrapped upstream error reaches the
+// run-status block, the audit row or the audit feed.
+func TestFanInVerifyUnavailable_DetailOmitsUpstreamErrorAndRefTail(t *testing.T) {
+	const (
+		refTail  = "SECRET-INSTALLATION-REF-TAIL-7f3a"
+		upstream = "UPSTREAM-ERROR-DSN-postgres://u:p@internal-host"
+	)
+	f, acc, o := failOpenParent(t)
+	ref := "gitlab:" + refTail
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].InstallationRef = &ref
+	f.rr.mu.Unlock()
+	f.s.cfg.ForgeResolver = func(string) (forge.Forge, error) { return nil, errors.New(upstream) }
+
+	if _, err := o.Advance(context.Background(), f.parent.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	f.s.waitBackgroundReviews()
+	if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("acceptance state = %q, want awaiting_host_dispatch", got)
+	}
+
+	rows := auditEntries(f.au, orchestrator.CategoryFanInVerifyUnavailable)
+	if len(rows) != 1 {
+		t.Fatalf("fan_in_verify_unavailable rows = %d, want 1", len(rows))
+	}
+	var payload orchestrator.FanInVerifyUnavailablePayload
+	if err := json.Unmarshal(rows[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Reason != orchestrator.FanInVerifyUnavailableForgeNotWired || payload.Detail != "forge gitlab unresolved" {
+		t.Errorf("payload = %+v, want forge_not_wired / %q", payload, "forge gitlab unresolved")
+	}
+	body, rawBody := getRunBody(t, f.s, f.parent.ID)
+	_, rawFeed := getUnavailableFeed(t, f.s, f.parent.ID)
+	for label, surface := range map[string]string{
+		"audit row payload": string(rows[0].Payload),
+		"run-status block":  string(body["fan_in_verify_unavailable"]),
+		"audit feed":        rawFeed,
+		"run-status body":   rawBody,
+	} {
+		for _, leaked := range []string{refTail, upstream} {
+			if strings.Contains(surface, leaked) {
+				t.Errorf("%s leaks %q:\n%s", label, leaked, surface)
+			}
+		}
+	}
+	if !strings.Contains(string(body["fan_in_verify_unavailable"]), "forge gitlab unresolved") {
+		t.Errorf("run-status block lacks the constant detail: %s", body["fan_in_verify_unavailable"])
+	}
+}
+
+// appendUnavailableRow seeds one fan_in_verify_unavailable row on the audit fake.
+func appendUnavailableRow(au *auditFake, runID, stageID uuid.UUID, reason string) {
+	raw, _ := json.Marshal(orchestrator.FanInVerifyUnavailablePayload{
+		Reason: reason, AcceptanceStageID: stageID.String(), ConsolidatedBranch: "fishhawk/run-x",
+	})
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	au.appended = append(au.appended, audit.ChainAppendParams{
+		RunID: runID, StageID: &stageID, Category: orchestrator.CategoryFanInVerifyUnavailable, Payload: raw,
+	})
+}
+
+// The run-status distiller is best-effort and never fails the read: nil
+// AuditRepo -> nil, list error -> WARN + nil, no row -> nil, undecodable newest
+// row -> WARN + nil, and the NEWEST of several rows wins.
+func TestFanInVerifyUnavailableForRun_Arms(t *testing.T) {
+	ctx := context.Background()
+	runID, stageID := uuid.New(), uuid.New()
+
+	t.Run("nil AuditRepo", func(t *testing.T) {
+		s := New(Config{})
+		if got := s.fanInVerifyUnavailableForRun(ctx, runID); got != nil {
+			t.Errorf("block = %+v, want nil", got)
+		}
+	})
+	t.Run("list error WARNs", func(t *testing.T) {
+		au := newAuditFake()
+		au.listByCategoryErr = errors.New("audit unavailable")
+		s := New(Config{AuditRepo: au})
+		buf := captureLogger(s)
+		if got := s.fanInVerifyUnavailableForRun(ctx, runID); got != nil {
+			t.Errorf("block = %+v, want nil on a list error", got)
+		}
+		if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "list fan_in_verify_unavailable failed") {
+			t.Errorf("no WARN for the list error; logs:\n%s", buf.String())
+		}
+	})
+	t.Run("no row", func(t *testing.T) {
+		s := New(Config{AuditRepo: newAuditFake()})
+		if got := s.fanInVerifyUnavailableForRun(ctx, runID); got != nil {
+			t.Errorf("block = %+v, want nil with no row", got)
+		}
+	})
+	t.Run("undecodable newest row WARNs", func(t *testing.T) {
+		au := newAuditFake()
+		au.stampSequence = true
+		appendUnavailableRow(au, runID, stageID, orchestrator.FanInVerifyUnavailableNoRunRepo)
+		au.appended = append(au.appended, audit.ChainAppendParams{
+			RunID: runID, StageID: &stageID, Category: orchestrator.CategoryFanInVerifyUnavailable, Payload: []byte("not json"),
+		})
+		s := New(Config{AuditRepo: au})
+		buf := captureLogger(s)
+		if got := s.fanInVerifyUnavailableForRun(ctx, runID); got != nil {
+			t.Errorf("block = %+v, want nil for an undecodable newest row", got)
+		}
+		if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "decode fan_in_verify_unavailable payload failed") {
+			t.Errorf("no WARN for the undecodable row; logs:\n%s", buf.String())
+		}
+	})
+	t.Run("newest of two rows wins", func(t *testing.T) {
+		au := newAuditFake()
+		au.stampSequence = true
+		appendUnavailableRow(au, runID, stageID, orchestrator.FanInVerifyUnavailableNoConsolidatedPR)
+		appendUnavailableRow(au, runID, stageID, orchestrator.FanInVerifyUnavailableHookNotWired)
+		s := New(Config{AuditRepo: au})
+		got := s.fanInVerifyUnavailableForRun(ctx, runID)
+		if got == nil || got.Reason != orchestrator.FanInVerifyUnavailableHookNotWired || got.AcceptanceStageID != stageID.String() {
+			t.Fatalf("block = %+v, want the newest row (hook_not_wired) on stage %s", got, stageID)
+		}
+		if !strings.Contains(got.Note, "hook_not_wired") || !strings.Contains(got.Note, "merge gate") {
+			t.Errorf("note %q must name the reason and say the merge gate still applies", got.Note)
+		}
+	})
 }
 
 // --- #4812: a base-advanced consolidated head ------------------------------------
@@ -1106,8 +1452,8 @@ func TestFanInAcceptanceHold_BaseAdvanceHead_EndToEnd(t *testing.T) {
 		t.Fatalf("acceptance state = %q, want pending (held)", got)
 	}
 	f.assertHeld()
-	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || settled {
-		t.Fatalf("FanInVerifySettled before the pass = %v, %v; want false", settled, err)
+	if ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || ans.Settled {
+		t.Fatalf("FanInVerifySettled before the pass = %+v, %v; want unsettled", ans, err)
 	}
 
 	f.rr.mu.Lock()
@@ -1124,8 +1470,8 @@ func TestFanInAcceptanceHold_BaseAdvanceHead_EndToEnd(t *testing.T) {
 	}
 	f.s.waitBackgroundReviews()
 
-	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || !settled {
-		t.Errorf("FanInVerifySettled after the pass = %v, %v; want true", settled, err)
+	if ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || !ans.Settled {
+		t.Errorf("FanInVerifySettled after the pass = %+v, %v; want settled", ans, err)
 	}
 	verdicts := auditEntries(f.au, CategoryMergeCandidateVerified)
 	if len(verdicts) != 1 {
@@ -1334,8 +1680,8 @@ func TestFanInAcceptanceHold_RebasedHead_GatesAgree(t *testing.T) {
 	// A passed verdict at the OLD head F, recorded before the hold's pass so it
 	// consumes no trigger: it must not settle the gate.
 	f.seedVerdictOnly(fanInLedgerF, mergeCandidateResultPassed)
-	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || settled {
-		t.Fatalf("FanInVerifySettled with a pass only at F = %v, %v; want false (the old head cannot settle)", settled, err)
+	if ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || ans.Settled {
+		t.Fatalf("FanInVerifySettled with a pass only at F = %+v, %v; want unsettled (the old head cannot settle)", ans, err)
 	}
 	if _, err := o.Advance(ctx, f.parent.ID); err != nil {
 		t.Fatalf("Advance #1: %v", err)
@@ -1358,8 +1704,8 @@ func TestFanInAcceptanceHold_RebasedHead_GatesAgree(t *testing.T) {
 		t.Fatalf("report status = %d:\n%s", w.Code, w.Body.String())
 	}
 	f.s.waitBackgroundReviews()
-	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || !settled {
-		t.Errorf("FanInVerifySettled after the pass at fanInHead = %v, %v; want true", settled, err)
+	if ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || !ans.Settled {
+		t.Errorf("FanInVerifySettled after the pass at fanInHead = %+v, %v; want settled", ans, err)
 	}
 	if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
 		t.Fatalf("acceptance state = %q, want awaiting_host_dispatch (released)", got)
@@ -1412,9 +1758,9 @@ func TestFanInVerifySettled_DivergedHead_WarnsWithoutChangingAnswer(t *testing.T
 					}
 				}
 				buf := captureLogger(f.s)
-				settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
-				if err != nil || settled != wantSettled {
-					t.Errorf("FanInVerifySettled = %v, %v; want %v (the live head's answer)", settled, err, wantSettled)
+				ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
+				if err != nil || ans.Settled != wantSettled || ans.UnavailableReason != "" {
+					t.Errorf("FanInVerifySettled = %+v, %v; want settled=%v with no reason (the live head's answer)", ans, err, wantSettled)
 				}
 				lines := linesContaining(buf.String(), fanInDivergenceMsg)
 				if len(lines) != 1 {
@@ -1438,9 +1784,9 @@ func TestFanInVerifySettled_DivergedHead_WarnsWithoutChangingAnswer(t *testing.T
 			t.Fatalf("precondition: live-head state = %+v (err %v), want passed", state, err)
 		}
 		buf := captureLogger(f.s)
-		settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
-		if err != nil || !settled {
-			t.Errorf("FanInVerifySettled = %v, %v; want true, nil (a ledger read error changes nothing)", settled, err)
+		ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
+		if err != nil || !ans.Settled {
+			t.Errorf("FanInVerifySettled = %+v, %v; want settled, nil (a ledger read error changes nothing)", ans, err)
 		}
 		lines := linesContaining(buf.String(), "fan-in verify: acceptance ledger head unreadable; the live-head answer stands")
 		if len(lines) != 1 || !strings.Contains(lines[0], "level=WARN") {
