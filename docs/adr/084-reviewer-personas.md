@@ -70,3 +70,16 @@ Adopt the Recommendation as binding: D1 (b) a persona is a separate reviewer inv
 - **Cost** lands only where a persona is attached: statically on plan review for the architect, and on escalated paths for security.
 - **Out of scope:** binding reviewer authority, new stage types, model preselection of documents, and replacing SAST/SCA products.
 - **Reversal:** remove the persona declarations. The standard reviewers were never changed, so there is nothing to restore.
+
+## Amendment A1: server-check concerns are refused on agent-drivable channels (ratified by the Captain 2026-11-12)
+
+**Context.** Rule 5 says a server-synthesized concern is never waivable by an agent. The guard that enforces it (E80.3, #3760) decides "agent" from the credential: it refuses an operator-agent, run-bound or first-officer-seat subject, and a request that declares itself delegated. A credential's subject does not say who is using it. An MCP server configured with a human-bound credential and driven by an agent session presents a human subject, so the guard admits it. This was found on this repository's own deployment on 2026-11-12 (#5228).
+
+**Options.**
+- **A.** Leave the guard as it is and rely on each deployment to give its agent sessions an operator-agent credential.
+- **B.** Enforce rule 5 by channel as well as by identity.
+- **C.** Add a recorded grant under which an agent may clear such a concern. That weakens rule 5 and is not taken.
+
+**Decision.** Option B. A request to clear a server-synthesized concern is refused when it arrives over an agent-drivable channel (any MCP transport), regardless of the subject its credential carries; a human clears it through the Web UI session or the CLI. The existing subject and delegated tests stay. Rule 5 is otherwise unchanged, and no agent path is added.
+
+**Consequences.** Implemented in #5228 for the waive, bulk-waive and defer verbs. A human keeps a cheap path through propose-and-confirm (#5229). This amendment does not decide whether the same test applies to other human-only actions, what makes a CLI call human, or whether a deployment that gives an agent session a human-bound credential is supported; ADR-143 (#5231) proposes those. No reviewer saw this text before ratification.
