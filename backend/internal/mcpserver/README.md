@@ -1803,8 +1803,10 @@ Outcomes (200):
 A non-conflict failure returns `slice_integration_error` (502); as a 5xx the cause is redacted from the body and retained in the operator log keyed by `error_ref` (E67.15 / #2587), which the tool surfaces so the operator can correlate — the diagnosability the event-driven fan-in path lacks.
 
 Implementation: `backend/internal/server/consolidate.go::handleConsolidateRun`, registered as the MCP verb in `tools.go`.
-It composes the **exported** orchestrator primitives `IntegrateSlices` → `TransitionStage` → `Advance`, mirroring
-`childcompletion.resolveParent`'s all-succeeded arm, WITHOUT touching the hot event-driven/sweeper paths. The
+It composes the **exported** orchestrator primitives `IntegrateSlices` → `run.SettleAwaitingChildrenStage` → `Advance`,
+mirroring `childcompletion.resolveParent`'s all-succeeded arm, and shares the per-parent fan-in settle lock
+(`Orchestrator.LockFanInSettle`) and the `awaiting_children` compare-and-swap with the event-driven and sweeper
+settles (#4610), so a call racing either answers 409 `not_awaiting_children` and writes no settle row. The
 `children_settled` and `slice_integration_conflict` audit payloads are byte-identical to the sweeper's, so the
 `children_status` integration-phase classifier reports correctly whichever path settled the parent. Where the
 event-driven `maybeAdvanceDecomposedParent` WARN-swallows a non-conflict `IntegrateSlices` error (leaving a silent

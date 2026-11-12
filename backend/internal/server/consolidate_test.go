@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -43,6 +44,14 @@ type consolidateGitHub struct {
 	// sliceDeltaFiles for one whose BASE is it (the slice since main).
 	baseDeltaFiles  []string
 	sliceDeltaFiles []string
+
+	// onForgeWrite, when set, runs at the top of every CreateRef and
+	// MergeBranch BEFORE g.mu is taken (#4610), so a racer it blocks cannot
+	// deadlock the other racer's forge calls. onOpenPR runs at the top of
+	// CreatePullRequest — reached only from Advance's consolidated-PR open.
+	onForgeWrite func()
+	onOpenPR     func()
+	prCalls      int // CreatePullRequest calls, under mu
 }
 
 func newConsolidateGitHub() *consolidateGitHub {
@@ -60,6 +69,9 @@ func (g *consolidateGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialSc
 }
 
 func (g *consolidateGitHub) CreateRef(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch, sha string) error {
+	if g.onForgeWrite != nil {
+		g.onForgeWrite()
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.createdRefs = append(g.createdRefs, branch)
@@ -68,6 +80,9 @@ func (g *consolidateGitHub) CreateRef(_ context.Context, _ forge.CredentialScope
 }
 
 func (g *consolidateGitHub) MergeBranch(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, head, _ string) (string, error) {
+	if g.onForgeWrite != nil {
+		g.onForgeWrite()
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.mergeHeads = append(g.mergeHeads, head)
@@ -81,7 +96,25 @@ func (g *consolidateGitHub) MergeBranch(_ context.Context, _ forge.CredentialSco
 }
 
 func (g *consolidateGitHub) CreatePullRequest(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, _, _, _ string) (*githubclient.PullRequest, error) {
+	if g.onOpenPR != nil {
+		g.onOpenPR()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.prCalls++
 	return &githubclient.PullRequest{HTMLURL: g.prURL}, nil
+}
+
+func (g *consolidateGitHub) prCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.prCalls
+}
+
+func (g *consolidateGitHub) forgeWriteCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.createdRefs) + len(g.mergeHeads)
 }
 
 func (g *consolidateGitHub) ListOpenPullRequestsByHead(context.Context, forge.CredentialScope, githubclient.RepoRef, string, string) ([]githubclient.PullRequest, error) {
@@ -1053,5 +1086,328 @@ func TestConsolidateRun_RunBoundTokenForbidden(t *testing.T) {
 	}
 	if code := decodeError(t, w); code != "agent_token_forbidden" {
 		t.Errorf("error = %q, want agent_token_forbidden", code)
+	}
+}
+
+// settleRaceRepo wraps the CAS-capable orchestratorRepo with a one-shot
+// "concurrent winner" hook (#4610): on the FIRST transition attempt of
+// hookStageID — through EITHER TransitionStage or TransitionStageFrom — it
+// first sets that stage to winnerState (what the server's own settle
+// committed), then evaluates the attempt. orchestratorRepo's plain
+// TransitionStage accepts a same-state move as success exactly as postgres
+// does, so a settler that bypasses the CAS is observably a silent loser.
+type settleRaceRepo struct {
+	*orchestratorRepo
+	hookStageID uuid.UUID
+	winnerState run.StageState
+	fired       bool
+}
+
+func (r *settleRaceRepo) fireWinner(id uuid.UUID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fired || id != r.hookStageID {
+		return
+	}
+	r.fired = true
+	if st, ok := r.stagesByID[id]; ok {
+		st.State = r.winnerState
+	}
+}
+
+func (r *settleRaceRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.fireWinner(id)
+	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+}
+
+func (r *settleRaceRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.fireWinner(id)
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+// rewireWithWinner rebuilds the fixture's server + orchestrator over a
+// settleRaceRepo whose winner hook is armed on the parent implement stage.
+func rewireWithWinner(f *consolidateFixture, winner run.StageState) *settleRaceRepo {
+	wr := &settleRaceRepo{orchestratorRepo: f.rr, hookStageID: f.impl.ID, winnerState: winner}
+	o := &orchestrator.Orchestrator{Runs: wr, GitHub: f.gh, Audit: f.au, Artifacts: f.arts, DefaultBranch: defaultbranch.Static("main")}
+	f.s = New(Config{RunRepo: wr, AuditRepo: f.au, ArtifactRepo: f.arts, Orchestrator: o})
+	o.ConsolidatedReview = nil
+	return wr
+}
+
+func (f *consolidateFixture) stageState(st *run.Stage) run.StageState {
+	f.rr.mu.Lock()
+	defer f.rr.mu.Unlock()
+	return st.State
+}
+
+func (f *consolidateFixture) reviewStage(t *testing.T) *run.Stage {
+	t.Helper()
+	stages, _ := f.rr.ListStagesForRun(context.Background(), f.parent.ID)
+	for _, st := range stages {
+		if st.Type == run.StageTypeReview {
+			return st
+		}
+	}
+	t.Fatal("no review stage seeded")
+	return nil
+}
+
+// TestConsolidateRun_LosesSettleRace_Returns409 is the handler's clean-arm CAS
+// control (#4610): the server's own settle committed succeeded while this call
+// integrated, so the succeeded CAS refuses and the call answers 409
+// not_awaiting_children with no children_settled row and no Advance. With the
+// CAS removed, the plain TransitionStage sees succeeded->succeeded as a
+// same-state success, so the loser writes children_settled, Advances (opening
+// the consolidated PR) and answers 200.
+func TestConsolidateRun_LosesSettleRace_Returns409(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateSucceeded},
+	})
+	wr := rewireWithWinner(f, run.StageStateSucceeded)
+
+	w := postConsolidate(t, f.s, f.parent.ID, withAuth)
+
+	if !wr.fired {
+		t.Fatal("the concurrent-winner hook never fired; the settle transition was not attempted")
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "not_awaiting_children" {
+		t.Errorf("error = %q, want not_awaiting_children", code)
+	}
+	if n := consolidateAuditCount(t, f.au, f.parent.ID, "children_settled"); n != 0 {
+		t.Errorf("children_settled entries = %d, want 0 (the race loser must not write the winner's settle row)", n)
+	}
+	if n := gh.prCount(); n != 0 {
+		t.Errorf("CreatePullRequest calls = %d, want 0 (the race loser must not Advance)", n)
+	}
+	if st := f.stageState(f.reviewStage(t)); st != run.StageStatePending {
+		t.Errorf("review stage = %q, want pending", st)
+	}
+}
+
+// TestConsolidateRun_SliceConflictLosesSettleRace_Returns409 is the handler's
+// conflict-arm CAS control: the winner committed failed, so the failed-B CAS
+// refuses — 409 not_awaiting_children and no slice_integration_conflict row.
+func TestConsolidateRun_SliceConflictLosesSettleRace_Returns409(t *testing.T) {
+	gh := newConsolidateGitHub()
+	gh.conflictOnHeadSuffix = "/slice-1"
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateSucceeded},
+	})
+	wr := rewireWithWinner(f, run.StageStateFailed)
+
+	w := postConsolidate(t, f.s, f.parent.ID, withAuth)
+
+	if !wr.fired {
+		t.Fatal("the concurrent-winner hook never fired; the failed-B transition was not attempted")
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "not_awaiting_children" {
+		t.Errorf("error = %q, want not_awaiting_children", code)
+	}
+	if n := consolidateAuditCount(t, f.au, f.parent.ID, "slice_integration_conflict"); n != 0 {
+		t.Errorf("slice_integration_conflict entries = %d, want 0 (the race loser must not write the winner's conflict row)", n)
+	}
+}
+
+// TestConsolidateRun_WaitsOnFanInSettleLock_ReReadsStage pins the handler's
+// settle lock and in-lock re-read (#4610). The test holds
+// LockFanInSettle(parent) — standing in for a concurrent settler — while the
+// POST runs; the handler must not reach the forge. The test then commits what
+// the holder would have (implement succeeded) and unlocks: the handler
+// re-reads and answers 409 without integrating. Deleting the handler's lock →
+// it integrates immediately (an entry signal within the wait). Deleting only
+// the re-read → after unlock it integrates (slices_integrated == 1) before the
+// CAS refuses.
+func TestConsolidateRun_WaitsOnFanInSettleLock_ReReadsStage(t *testing.T) {
+	gh := newConsolidateGitHub()
+	entered := make(chan struct{}, 1)
+	gh.onForgeWrite = func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateSucceeded},
+	})
+
+	unlock := f.s.cfg.Orchestrator.LockFanInSettle(f.parent.ID)
+	respCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() { respCh <- postConsolidate(t, f.s, f.parent.ID, withAuth) }()
+
+	select {
+	case <-entered:
+		t.Error("the handler reached the forge while another settler held the fan-in settle lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	f.rr.mu.Lock()
+	f.impl.State = run.StageStateSucceeded
+	f.rr.mu.Unlock()
+	unlock()
+
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-respCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the consolidate call did not return after the settle lock was released")
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "not_awaiting_children" {
+		t.Errorf("error = %q, want not_awaiting_children", code)
+	}
+	if n := gh.forgeWriteCount(); n != 0 {
+		t.Errorf("CreateRef+MergeBranch calls = %d, want 0", n)
+	}
+	if n := consolidateAuditCount(t, f.au, f.parent.ID, "slices_integrated"); n != 0 {
+		t.Errorf("slices_integrated entries = %d, want 0 (the waiter must re-read the settled stage and skip the fan-in)", n)
+	}
+}
+
+// TestConsolidateRun_RacesEventDrivenSettle_SettlesOnce is the issue's
+// cross-boundary repro (#4610) under -race: racer A is the REAL event-driven
+// settle — o.Advance(lastChild) -> completeRun -> maybeAdvanceDecomposedParent
+// — blocked at its first forge write while holding the settle lock; racer B is
+// POST /consolidate. B must answer 409 not_awaiting_children (never 500 or
+// 200) and the fan-in must settle exactly once: one slices_integrated, one
+// children_settled, one CreatePullRequest. With the handler's lock deleted, B
+// runs its whole fan-in while A is blocked and answers 200, then A resumes and
+// writes a SECOND slices_integrated.
+func TestConsolidateRun_RacesEventDrivenSettle_SettlesOnce(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+	})
+	// The last child: running, with one succeeded implement stage, so
+	// Advance(child) completes it and fires the event-driven parent settle.
+	last := f.rr.seedRun()
+	last.Repo = f.parent.Repo
+	last.DecomposedFrom = &f.parent.ID
+	idx := 1
+	last.SliceIndex = &idx
+	last.State = run.StateRunning
+	lastImpl := f.rr.seedStage(last.ID, 0, run.StageStateSucceeded)
+	lastImpl.Type = run.StageTypeImplement
+
+	aEntered := make(chan struct{})
+	release := make(chan struct{})
+	var first sync.Once
+	gh.onForgeWrite = func() {
+		blocked := false
+		first.Do(func() { blocked = true })
+		if blocked {
+			close(aEntered)
+			<-release
+		}
+	}
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := f.s.cfg.Orchestrator.Advance(context.Background(), last.ID)
+		aDone <- err
+	}()
+	select {
+	case <-aEntered:
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("the event-driven settle never reached the fan-in's first forge write")
+	}
+
+	bResp := make(chan *httptest.ResponseRecorder, 1)
+	go func() { bResp <- postConsolidate(t, f.s, f.parent.ID, withAuth) }()
+
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-bResp:
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(release)
+	if err := <-aDone; err != nil {
+		t.Errorf("racer A Advance(last child): %v", err)
+	}
+	if w == nil {
+		select {
+		case w = <-bResp:
+		case <-time.After(10 * time.Second):
+			t.Fatal("racer B (POST /consolidate) never returned")
+		}
+	}
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("racer B status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "not_awaiting_children" {
+		t.Errorf("racer B error = %q, want not_awaiting_children", code)
+	}
+	if n := consolidateAuditCount(t, f.au, f.parent.ID, "slices_integrated"); n != 1 {
+		t.Errorf("slices_integrated entries = %d, want exactly 1", n)
+	}
+	if n := consolidateAuditCount(t, f.au, f.parent.ID, "children_settled"); n != 1 {
+		t.Errorf("children_settled entries = %d, want exactly 1", n)
+	}
+	if n := gh.prCount(); n != 1 {
+		t.Errorf("CreatePullRequest calls = %d, want exactly 1", n)
+	}
+	if st := f.stageState(f.impl); st != run.StageStateSucceeded {
+		t.Errorf("parent implement state = %q, want succeeded", st)
+	}
+}
+
+// TestConsolidateRun_SettleLockNotHeldAcrossAdvance pins the handler's lock
+// order (#4610, approval condition C2): the CreatePullRequest fake — reached
+// only from Advance — tries LockFanInSettle(parent) with a bounded wait.
+// Holding the lock across Advance makes it time out (RED) without deadlocking
+// the suite: the probe goroutine acquires and releases after the handler
+// returns.
+func TestConsolidateRun_SettleLockNotHeldAcrossAdvance(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+	})
+	var probed, acquired bool
+	probeDone := make(chan struct{})
+	gh.onOpenPR = func() {
+		probed = true
+		got := make(chan struct{})
+		go func() {
+			defer close(probeDone)
+			u := f.s.cfg.Orchestrator.LockFanInSettle(f.parent.ID)
+			close(got)
+			u()
+		}()
+		select {
+		case <-got:
+			acquired = true
+		case <-time.After(time.Second):
+		}
+	}
+
+	w := postConsolidate(t, f.s, f.parent.ID, withAuth)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if !probed {
+		t.Fatal("CreatePullRequest was never reached; Advance did not open the consolidated PR")
+	}
+	if !acquired {
+		t.Error("LockFanInSettle(parent) blocked inside Advance's CreatePullRequest; the handler holds the settle lock across Advance")
+	}
+	select {
+	case <-probeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lock probe never acquired after the handler returned")
 	}
 }

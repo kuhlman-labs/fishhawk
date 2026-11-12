@@ -48,9 +48,12 @@ type consolidateResponse struct {
 // slice_integration_error) so the operator can diagnose it.
 //
 // It composes the existing EXPORTED orchestrator primitives
-// (IntegrateSlices -> TransitionStage -> Advance), mirroring
-// childcompletion.resolveParent, WITHOUT touching the hot event-driven /
-// sweeper paths. The children_settled and slice_integration_conflict audit
+// (IntegrateSlices -> run.SettleAwaitingChildrenStage -> Advance), mirroring
+// childcompletion.resolveParent, and shares the per-parent fan-in settle lock
+// and the awaiting_children compare-and-swap with them (#4610): the
+// event-driven maybeAdvanceDecomposedParent and the sweeper take the same
+// Orchestrator.LockFanInSettle, so the fan-in settles exactly once however the
+// three race. The children_settled and slice_integration_conflict audit
 // payloads are byte-identical to the sweeper's so the children_status
 // integration-phase classifier reports correctly after the verb runs.
 //
@@ -131,7 +134,11 @@ func (s *Server) handleConsolidateRun(w http.ResponseWriter, r *http.Request) {
 	// means the parent was already resolved (or never decomposed), so the
 	// fan-in is a no-op — 409 keeps the verb idempotent-friendly (a second
 	// call after a successful consolidate, or after the sweeper won the race,
-	// reports not_awaiting_children rather than re-resolving).
+	// reports not_awaiting_children rather than re-resolving). This is the
+	// cheap PRE-lock check; a call that RACES the server's own settle (#4610)
+	// passes it, then waits on the settle lock in runConsolidation, re-reads
+	// the settled stage and answers the same 409 — the race loser writes no
+	// slices_integrated / children_settled row and never Advances.
 	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -146,9 +153,7 @@ func (s *Server) handleConsolidateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if parentStage == nil {
-		s.writeError(w, r, http.StatusConflict, "not_awaiting_children",
-			"the parent has no implement stage parked in awaiting_children; it is already resolved or not a decomposition",
-			map[string]any{"run_id": runID.String()})
+		s.writeNotAwaitingChildren(w, r, runID)
 		return
 	}
 
@@ -359,7 +364,36 @@ func (s *Server) listAllDecomposedChildren(ctx context.Context, parentRunID uuid
 // runConsolidation runs the fan-in by composing the exported orchestrator
 // primitives, mirroring childcompletion.resolveParent's all-succeeded arm.
 // Split out so the precondition checks above stay readable.
+//
+// It runs under the per-parent fan-in settle lock it shares with the
+// event-driven settle and the sweeper (#4610), and RE-READS the parent stage
+// inside it: a call that waited on a concurrent settler finds the stage no
+// longer awaiting_children and answers 409 not_awaiting_children without
+// integrating. Both settle transitions go through the awaiting_children
+// compare-and-swap (run.SettleAwaitingChildrenStage), so a cross-process loser
+// maps to the same 409 and writes no slice_integration_conflict /
+// children_settled row. The lock is released before Advance, which only the
+// winning call reaches.
 func (s *Server) runConsolidation(w http.ResponseWriter, r *http.Request, runID uuid.UUID, parentStage *run.Stage) {
+	unlock := s.cfg.Orchestrator.LockFanInSettle(runID)
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
+
+	fresh, err := s.cfg.RunRepo.GetStage(r.Context(), parentStage.ID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get parent stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+	if fresh.State != run.StageStateAwaitingChildren {
+		s.writeNotAwaitingChildren(w, r, runID)
+		return
+	}
+
 	conflict, err := s.cfg.Orchestrator.IntegrateSlices(r.Context(), runID)
 	switch {
 	case err != nil:
@@ -379,10 +413,14 @@ func (s *Server) runConsolidation(w http.ResponseWriter, r *http.Request, runID 
 		// so the children_status classifier reports integration_conflict.
 		cat := run.FailureB
 		reason := conflict.Detail
-		if _, terr := s.cfg.RunRepo.TransitionStage(r.Context(), parentStage.ID, run.StageStateFailed, &run.StageCompletion{
+		if _, terr := run.SettleAwaitingChildrenStage(r.Context(), s.cfg.RunRepo, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
 			FailureCategory: &cat,
 			FailureReason:   &reason,
 		}); terr != nil {
+			if isSettleRaceLost(terr) {
+				s.writeNotAwaitingChildren(w, r, runID)
+				return
+			}
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"transition parent stage to failed-B on slice conflict failed",
 				map[string]any{"error": terr.Error()})
@@ -405,12 +443,21 @@ func (s *Server) runConsolidation(w http.ResponseWriter, r *http.Request, runID 
 	// children_settled audit (byte-identical to the sweeper's), then advance
 	// the parent so maybeOpenConsolidatedPR opens the consolidated PR and the
 	// parent review gate dispatches.
-	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), parentStage.ID, run.StageStateSucceeded, nil); err != nil {
+	if _, err := run.SettleAwaitingChildrenStage(r.Context(), s.cfg.RunRepo, parentStage.ID, run.StageStateSucceeded, nil); err != nil {
+		if isSettleRaceLost(err) {
+			s.writeNotAwaitingChildren(w, r, runID)
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"transition parent stage to succeeded failed", map[string]any{"error": err.Error()})
 		return
 	}
 	s.emitChildrenSettled(r.Context(), runID, parentStage.ID)
+
+	// Release the settle lock BEFORE Advance (#4610 lock order): Advance takes
+	// the consolidated-PR-open locks, which must never nest inside it.
+	locked = false
+	unlock()
 
 	if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -432,6 +479,23 @@ func (s *Server) runConsolidation(w http.ResponseWriter, r *http.Request, runID 
 		resp.PullRequestURL = *updated.PullRequestURL
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// writeNotAwaitingChildren writes the 409 not_awaiting_children refusal: the
+// parent has no implement stage parked in awaiting_children. One body for the
+// pre-lock check, the in-lock re-read and a lost settle CAS (#4610), so a race
+// loser is indistinguishable from a later call.
+func (s *Server) writeNotAwaitingChildren(w http.ResponseWriter, r *http.Request, runID uuid.UUID) {
+	s.writeError(w, r, http.StatusConflict, "not_awaiting_children",
+		"the parent has no implement stage parked in awaiting_children; it is already resolved or not a decomposition",
+		map[string]any{"run_id": runID.String()})
+}
+
+// isSettleRaceLost reports whether err is the awaiting_children CAS refusal a
+// settle gets when a concurrent settler already moved the parent stage (#4610).
+func isSettleRaceLost(err error) bool {
+	var changed run.StageStateChangedError
+	return errors.As(err, &changed)
 }
 
 // emitChildrenSettled writes a children_settled audit entry whose payload is

@@ -30,6 +30,15 @@ On the all-succeeded path, `resolveParent` calls the nil-safe `Sweeper.Integrate
 - A `*SliceHeadMissingError` parks the parent WITHOUT counting toward the bounded-retry give-up — see "Missing slice head" below.
 - A nil `Integrate` (dev posture / pre-#1142) skips integration entirely, preserving the prior resolve behavior.
 
+## Settle serialization (#4610)
+
+Three settlers can move a decomposed parent's implement stage out of `awaiting_children`: this sweeper's `resolveParent`, the event-driven `orchestrator.maybeAdvanceDecomposedParent`, and `POST /v0/runs/{run_id}/consolidate`. Before #4610 a race loser's plain `TransitionStage` was a same-state no-op SUCCESS (postgres `transitionStageTx` short-circuits `from == to`), so it wrote a second `slices_integrated` and `children_settled` and called `Advance` alongside the winner.
+
+- **`SettleLock`** (a `FanInSettleLocker`; serve.go's `childCompletionAdvancer` delegates to `Orchestrator.LockFanInSettle`) is the per-parent in-process mutex all three share. After the recoverable-park return and before `Integrate`, `resolveParent` takes it and RE-READS the stage with `GetStage`; a parent no longer `awaiting_children` (another settler resolved it while this tick waited on the lock) is skipped at DEBUG. The lock is released before `Advance`, never held across it. Nil-safe: a nil `SettleLock` skips the lock and the re-read.
+- **CAS arms.** The give-up failed-B, slice-conflict failed-B and shared target transitions all go through `run.SettleAwaitingChildrenStage`, a compare-and-swap from `awaiting_children`. A `run.StageStateChangedError` logs INFO, still clears that arm's counter and dedup keys, and returns nil without the arm's audit row (`slice_integration_failed` / `slice_integration_conflict` / `children_settled`) and without `Advance` — the winner owns both.
+- **Cross-process residual.** The mutex covers one process (Helm split mode runs the sweeper on the worker pod). The CAS still makes exactly one settler write `children_settled` and `Advance`, but a cross-process loser can write one extra idempotent `slices_integrated` (`already_contained`) before its CAS refuses.
+- **Pinned by** `TestTick_LosesSettleRace_NoChildrenSettledNoAdvance`, `TestTick_SliceConflictLosesSettleRace_NoConflictRow`, `TestTick_GiveUpLosesSettleRace_NoFailedRow`, `TestTick_FailedChildLosesSettleRace_NoChildrenSettled`, `TestTick_SettleLockReReadsStage_SkipsSettledParent`, and serve.go's `TestNewChildCompletionSweeper_WiresDispatchBackstop` (the `SettleLock` wiring).
+
 ## Between-wave fan-in (#2363)
 
 The fan-in above is the SETTLING one: it runs only once every child is terminal. A decomposition with `depends_on` also needs a fan-in at each WAVE boundary, because a dependent child must spawn against a base carrying its predecessors' commits. That re-base used to be the blocking `fishhawk_run_children` driver's job (a client-side `POST /integrate-wave` between waves), so a fan-out with no client alive never advanced past a wave boundary.

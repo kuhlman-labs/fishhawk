@@ -1922,3 +1922,226 @@ func TestTick_InfraParkedChildKeepsParentAwaiting(t *testing.T) {
 		t.Errorf("Advance calls = %v, want [%s]", ad.advanced, parentRun)
 	}
 }
+
+// casRaceRunRepo wraps fakeRunRepo with the StageCASTransitioner capability
+// production postgres carries, standing in for a concurrent settler that
+// already moved the parent stage (#4610): its TransitionStageFrom refuses with
+// StageStateChangedError{Actual: winner} and records nothing. Under the
+// CAS-removed mutation the sweeper falls back to fakeRunRepo's plain
+// TransitionStage, which records a success — the stand-in for postgres'
+// same-state no-op success that made the race loser silent. GetStage answers
+// the in-lock re-read with getStageState (default awaiting_children).
+type casRaceRunRepo struct {
+	*fakeRunRepo
+	winner        run.StageState
+	casAttempts   int
+	getStageState run.StageState
+}
+
+func (r *casRaceRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, from, _ run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.casAttempts++
+	return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: r.winner}
+}
+
+func (r *casRaceRunRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.getStageState
+	if state == "" {
+		state = run.StageStateAwaitingChildren
+	}
+	return &run.Stage{ID: id, State: state}, nil
+}
+
+var _ run.StageCASTransitioner = (*casRaceRunRepo)(nil)
+
+func (r *casRaceRunRepo) attempts() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.casAttempts
+}
+
+func countAppended(au *fakeAudit, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+func advanceCount(ad *recordingAdvancer) int {
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
+	return len(ad.advanced)
+}
+
+func newCASRaceSweeper(children []*run.Run, stagesByRun map[uuid.UUID][]*run.Stage, winner run.StageState) (*Sweeper, *casRaceRunRepo, *fakeAudit, *recordingAdvancer) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &casRaceRunRepo{
+		fakeRunRepo: &fakeRunRepo{
+			awaitingChildren: []*run.Stage{parentStage},
+			childrenByParent: map[uuid.UUID][]*run.Run{parentRun: children},
+			stagesByRun:      stagesByRun,
+		},
+		winner: winner,
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	return &Sweeper{Runs: rs, Audit: au, Advance: ad, Logger: slog.Default()}, rs, au, ad
+}
+
+// TestTick_LosesSettleRace_NoChildrenSettledNoAdvance is the sweeper's clean
+// CAS arm (#4610): a concurrent settler already resolved the parent, so the
+// shared settle transition's CAS refuses and the tick writes no
+// children_settled row and never Advances.
+func TestTick_LosesSettleRace_NoChildrenSettledNoAdvance(t *testing.T) {
+	s, rs, au, ad := newCASRaceSweeper([]*run.Run{mkChild(uuid.New(), run.StateSucceeded)}, nil, run.StageStateSucceeded)
+	s.Integrate = &recordingIntegrator{}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if rs.attempts() != 1 {
+		t.Errorf("CAS attempts = %d, want 1 (the settle must go through TransitionStageFrom)", rs.attempts())
+	}
+	if n := countAppended(au, "children_settled"); n != 0 {
+		t.Errorf("children_settled rows = %d, want 0 (the race loser must not write the winner's settle row)", n)
+	}
+	if n := advanceCount(ad); n != 0 {
+		t.Errorf("Advance calls = %d, want 0 (the race loser must not Advance)", n)
+	}
+}
+
+// TestTick_SliceConflictLosesSettleRace_NoConflictRow is the slice-conflict CAS
+// arm: the failed-B CAS refuses, so no slice_integration_conflict row and no
+// Advance.
+func TestTick_SliceConflictLosesSettleRace_NoConflictRow(t *testing.T) {
+	child := uuid.New()
+	s, rs, au, ad := newCASRaceSweeper([]*run.Run{mkChild(child, run.StateSucceeded)}, nil, run.StageStateFailed)
+	s.Integrate = &recordingIntegrator{conflict: &SliceConflict{SliceIndex: 0, ChildRunID: child, Detail: "slice integration conflict: slice-0"}}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if rs.attempts() != 1 {
+		t.Errorf("CAS attempts = %d, want 1", rs.attempts())
+	}
+	if n := countAppended(au, "slice_integration_conflict"); n != 0 {
+		t.Errorf("slice_integration_conflict rows = %d, want 0 (the race loser must not write the winner's conflict row)", n)
+	}
+	if n := advanceCount(ad); n != 0 {
+		t.Errorf("Advance calls = %d, want 0", n)
+	}
+}
+
+// TestTick_GiveUpLosesSettleRace_NoFailedRow is the bounded-retry give-up CAS
+// arm: IntegrateSlices errors for maxIntegrationAttempts ticks and the cap
+// tick's failed-B CAS refuses — no slice_integration_failed row, and the
+// per-parent counter is still cleared (a further failing tick does not
+// immediately re-attempt the give-up).
+func TestTick_GiveUpLosesSettleRace_NoFailedRow(t *testing.T) {
+	s, rs, au, ad := newCASRaceSweeper([]*run.Run{mkChild(uuid.New(), run.StateSucceeded)}, nil, run.StageStateFailed)
+	s.Integrate = &recordingIntegrator{returnErr: errors.New("consolidated branch D/F conflict")}
+
+	for i := 1; i <= maxIntegrationAttempts; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+	if rs.attempts() != 1 {
+		t.Errorf("CAS attempts = %d, want 1 (the cap tick's give-up transition)", rs.attempts())
+	}
+	if n := countAppended(au, "slice_integration_failed"); n != 0 {
+		t.Errorf("slice_integration_failed rows = %d, want 0 (the race loser must not write a give-up row)", n)
+	}
+	if n := advanceCount(ad); n != 0 {
+		t.Errorf("Advance calls = %d, want 0", n)
+	}
+	s.mu.Lock()
+	_, stillCounted := s.integrationErrs[s.Runs.(*casRaceRunRepo).awaitingChildren[0].RunID]
+	s.mu.Unlock()
+	if stillCounted {
+		t.Error("integration-error counter was not cleared after the lost give-up settle")
+	}
+}
+
+// TestTick_FailedChildLosesSettleRace_NoChildrenSettled is the anyFailed CAS
+// arm: a NON-recoverable failed child resolves the parent failed-C, the CAS
+// refuses, so no children_settled row and no Advance.
+func TestTick_FailedChildLosesSettleRace_NoChildrenSettled(t *testing.T) {
+	failedChild := uuid.New()
+	s, rs, au, ad := newCASRaceSweeper(
+		[]*run.Run{mkChild(failedChild, run.StateFailed)},
+		map[uuid.UUID][]*run.Stage{failedChild: {mkFailedImplement(failedChild, run.FailureD, "gate rejected by approver")}},
+		run.StageStateFailed,
+	)
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if rs.attempts() != 1 {
+		t.Errorf("CAS attempts = %d, want 1 (was the parent parked?)", rs.attempts())
+	}
+	if n := countAppended(au, "children_settled"); n != 0 {
+		t.Errorf("children_settled rows = %d, want 0", n)
+	}
+	if n := advanceCount(ad); n != 0 {
+		t.Errorf("Advance calls = %d, want 0", n)
+	}
+}
+
+// flippingSettleLock is a FanInSettleLocker standing in for a concurrent
+// settler that held the lock while this tick waited: acquiring it flips the
+// repo's GetStage answer to succeeded (what the holder committed).
+type flippingSettleLock struct {
+	repo     *casRaceRunRepo
+	acquired int
+}
+
+func (l *flippingSettleLock) LockFanInSettle(uuid.UUID) func() {
+	l.acquired++
+	l.repo.mu.Lock()
+	l.repo.getStageState = run.StageStateSucceeded
+	l.repo.mu.Unlock()
+	return func() {}
+}
+
+// TestTick_SettleLockReReadsStage_SkipsSettledParent pins the sweeper's settle
+// lock + in-lock re-read (#4610): the tick's ListStagesAwaitingChildren
+// snapshot is stale by the time it holds the lock, and the re-read must skip
+// the settled parent — no Integrate, no children_settled, no Advance. Deleting
+// the re-read → Integrate runs; replacing the acquisition with a no-op → the
+// flip never happens and Integrate runs.
+func TestTick_SettleLockReReadsStage_SkipsSettledParent(t *testing.T) {
+	s, rs, au, ad := newCASRaceSweeper([]*run.Run{mkChild(uuid.New(), run.StateSucceeded)}, nil, run.StageStateSucceeded)
+	integ := &recordingIntegrator{}
+	s.Integrate = integ
+	lock := &flippingSettleLock{repo: rs}
+	s.SettleLock = lock
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if lock.acquired != 1 {
+		t.Errorf("settle lock acquisitions = %d, want 1", lock.acquired)
+	}
+	integ.mu.Lock()
+	calls := len(integ.called)
+	integ.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("IntegrateSlices calls = %d, want 0 (the in-lock re-read must skip a parent another settler resolved)", calls)
+	}
+	if n := countAppended(au, "children_settled"); n != 0 {
+		t.Errorf("children_settled rows = %d, want 0", n)
+	}
+	if n := advanceCount(ad); n != 0 {
+		t.Errorf("Advance calls = %d, want 0", n)
+	}
+}

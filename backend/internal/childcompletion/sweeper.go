@@ -126,6 +126,17 @@ type ChildDispatcher interface {
 	DispatchChildren(ctx context.Context, parentRunID uuid.UUID) (int, error)
 }
 
+// FanInSettleLocker is the slice of orchestrator.Orchestrator the sweeper
+// takes around a decomposed parent's settle (#4610): the per-parent in-process
+// fan-in settle mutex the event-driven settle and the /consolidate handler
+// share, so the three settlers serialize and a waiter re-reads the stage
+// inside it. LockFanInSettle blocks until the lock is held and returns its
+// unlock. Extracted as an interface for the same import-graph reason as
+// Advancer/Integrator — childcompletion never imports orchestrator.
+type FanInSettleLocker interface {
+	LockFanInSettle(parentRunID uuid.UUID) func()
+}
+
 // Sweeper periodically resolves awaiting_children parent stages.
 // All dependencies are required; a nil Repository, Audit, or
 // Advancer is a configuration error rather than a graceful skip
@@ -162,6 +173,16 @@ type Sweeper struct {
 	// one tick. Nil-safe: a nil Dispatch disables the backstop, preserving
 	// the pre-#1143 posture for dev and existing tests.
 	Dispatch ChildDispatcher
+
+	// SettleLock is the per-parent fan-in settle lock shared with the
+	// event-driven settle and the /consolidate handler (#4610). When set,
+	// resolveParent takes it before integrating and RE-READS the parent stage
+	// inside it, so a parent another settler resolved while this tick waited
+	// is skipped. Nil-safe: a nil SettleLock skips the lock and the re-read,
+	// preserving the pre-#4610 posture for existing tests; the
+	// awaiting_children compare-and-swap on every settle transition applies
+	// either way.
+	SettleLock FanInSettleLocker
 
 	// mu guards integrationErrs. Tick runs serially from a single Run
 	// goroutine, but the exported Tick is also called directly (and
@@ -362,6 +383,34 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		return nil
 	}
 
+	// #4610: serialize the settle with the event-driven settle and the
+	// /consolidate handler, then RE-READ the stage inside the lock — the
+	// ListStagesAwaitingChildren snapshot this tick started from may be stale
+	// if another settler held the lock while we waited. Released (guarded, so
+	// every early return unlocks) before Advance; never held across it.
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	if s.SettleLock != nil {
+		unlock := s.SettleLock.LockFanInSettle(parentRunID)
+		release = unlock
+		fresh, err := s.Runs.GetStage(ctx, parentStage.ID)
+		if err != nil {
+			return fmt.Errorf("re-read parent stage under settle lock: %w", err)
+		}
+		if fresh.State != run.StageStateAwaitingChildren {
+			s.logger().LogAttrs(ctx, slog.LevelDebug, "childcompletion: parent already settled by a concurrent settler",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("parent_stage_id", parentStage.ID.String()),
+				slog.String("actual_state", string(fresh.State)),
+			)
+			return nil
+		}
+	}
+
 	anyFailed := len(failedChildren) > 0
 	var (
 		target     run.StageState
@@ -420,11 +469,20 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 				// drift. The rendered bytes are unchanged and pinned by
 				// TestTick_Integrate_BoundedRetryGivesUpAtCap.
 				reason := fmt.Sprintf("%s %d attempts: %v", failuresig.AnchorSliceIntegrationGiveUp, attempts, err)
-				if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
+				if _, terr := run.SettleAwaitingChildrenStage(ctx, s.Runs, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
 					FailureCategory: &cat,
 					FailureReason:   &reason,
 				}); terr != nil {
-					return fmt.Errorf("transition parent stage to failed-B on integration give-up: %w", terr)
+					if !s.settleRaceLost(ctx, parentRunID, parentStage.ID, terr) {
+						return fmt.Errorf("transition parent stage to failed-B on integration give-up: %w", terr)
+					}
+					// Lost the settle race: the winner owns the audit row.
+					// Still clear this arm's counter + dedup keys — the
+					// parent is settled either way.
+					s.clearIntegrationError(parentRunID)
+					s.clearWaveConflict(parentRunID)
+					s.clearHeadMissing(parentRunID)
+					return nil
 				}
 				s.emitSliceIntegrationFailed(ctx, parentRunID, parentStage.ID, attempts, err)
 				s.clearIntegrationError(parentRunID)
@@ -462,10 +520,15 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 			s.clearHeadMissing(parentRunID)
 			cat := run.FailureB
 			reason := conflict.Detail
-			if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
+			if _, terr := run.SettleAwaitingChildrenStage(ctx, s.Runs, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
 				FailureCategory: &cat,
 				FailureReason:   &reason,
 			}); terr != nil {
+				if s.settleRaceLost(ctx, parentRunID, parentStage.ID, terr) {
+					// Lost the settle race: no slice_integration_conflict
+					// row (the counter + dedup keys were cleared above).
+					return nil
+				}
 				return fmt.Errorf("transition parent stage to failed-B on slice conflict: %w", terr)
 			}
 			s.emitSliceIntegrationConflict(ctx, parentRunID, parentStage.ID, conflict)
@@ -482,7 +545,15 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		s.clearHeadMissing(parentRunID)
 	}
 
-	if _, err := s.Runs.TransitionStage(ctx, parentStage.ID, target, completion); err != nil {
+	if _, err := run.SettleAwaitingChildrenStage(ctx, s.Runs, parentStage.ID, target, completion); err != nil {
+		if s.settleRaceLost(ctx, parentRunID, parentStage.ID, err) {
+			// Lost the settle race: clear the dedup keys (the parent is
+			// settled either way) but write no children_settled row and do
+			// not Advance — the winner owns both.
+			s.clearWaveConflict(parentRunID)
+			s.clearHeadMissing(parentRunID)
+			return nil
+		}
 		return fmt.Errorf("transition parent stage to %s: %w", target, err)
 	}
 	// Settling exit (#2695 item 5): this shared transition is reached by EVERY
@@ -498,6 +569,13 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 
 	s.emitChildrenSettled(ctx, parentRunID, parentStage.ID, children, target)
 
+	// Release the settle lock BEFORE Advance (#4610 lock order): Advance takes
+	// the consolidated-PR-open locks, which must never nest inside it.
+	if release != nil {
+		release()
+		release = nil
+	}
+
 	// Advance the parent to dispatch its next stage (review) or to
 	// complete the run. The orchestrator's Advance is idempotent —
 	// re-firing on a parent we've already advanced is a no-op.
@@ -511,6 +589,23 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		slog.Int("child_count", len(children)),
 	)
 	return nil
+}
+
+// settleRaceLost reports whether err is the awaiting_children CAS refusal
+// (run.StageStateChangedError) a settle gets when a concurrent settler already
+// moved the parent stage (#4610), logging it at INFO. On true the caller
+// returns nil without its arm's audit row and without Advance.
+func (s *Sweeper) settleRaceLost(ctx context.Context, parentRunID, parentStageID uuid.UUID, err error) bool {
+	var changed run.StageStateChangedError
+	if !errors.As(err, &changed) {
+		return false
+	}
+	s.logger().LogAttrs(ctx, slog.LevelInfo, "childcompletion: parent already settled by a concurrent settler",
+		slog.String("parent_run_id", parentRunID.String()),
+		slog.String("parent_stage_id", parentStageID.String()),
+		slog.String("actual_state", string(changed.Actual)),
+	)
+	return true
 }
 
 // integrateCompletedWave runs the between-wave fan-in for a parent whose
