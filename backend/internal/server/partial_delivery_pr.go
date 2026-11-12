@@ -3,16 +3,14 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
 
@@ -48,133 +46,11 @@ import (
 const categoryPartialDeliveryClosingReferenceNeutralized = "partial_delivery_closing_reference_neutralized"
 
 // neutralizeClosingReferences rewrites every ACTIVE GitHub closing reference to
-// issue n in body — a closing keyword (close/closes/closed, fix/fixes/fixed,
-// resolve/resolves/resolved), an optional `:`, whitespace, then `#n` with a real
-// word boundary — so it reads `Refs #n`, and returns the rewritten body plus the
-// number of references rewritten.
-//
-// "Active" is EXACTLY hasClosingReference's definition (#2570): the scan runs
-// over a code-masked view built with the same fence rules as stripCodeContexts
-// (fenceDelimiter; liberal open, strict close) and the same backtick-run rule as
-// stripInlineCode, so text inside an inline code span or a fenced block is
-// byte-preserved and `#n1` / `#nfoo` are untouched. The view keeps every byte
-// offset of body (a masked byte becomes a space in a fence, NUL in a code span —
-// the same regex behaviour as stripCodeContexts' empty line and single NUL), so
-// a match position in the view IS the position in body.
-//
-// Only the keyword (and its optional `:`) is replaced, so nothing outside the
-// directive moves: "Closes #7" → "Refs #7", "Fixes: #7" → "Refs #7". When the
-// span between the keyword and the colon crosses masked text, only the keyword
-// itself is replaced. Invariant: hasClosingReference(result, n) is false for
-// every input.
+// issue n in body as `Refs #n`. It delegates to the shared definition in
+// orchestrator.NeutralizeClosingReferences (#5192), which the consolidated
+// PR body applies too; invariant: hasClosingReference(result, n) is false.
 func neutralizeClosingReferences(body string, n int) (string, int) {
-	if n <= 0 || body == "" {
-		return body, 0
-	}
-	re := regexp.MustCompile(`(?i)\b((close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:\s*:)?)\s+#` + fmt.Sprint(n) + `\b`)
-	view := maskCodeContexts(body)
-	// `(?:\s*:)?\s+` matches exactly what hasClosingReference's `\s*:?\s+` does;
-	// it is spelled this way so group 1 swallows whitespace only up to a colon,
-	// and the rewrite never joins the lines a bare keyword was split across.
-	matches := re.FindAllStringSubmatchIndex(view, -1)
-	if len(matches) == 0 {
-		return body, 0
-	}
-	var out strings.Builder
-	last := 0
-	for _, m := range matches {
-		// m[2:4] is the keyword plus optional colon; m[4:6] the bare keyword.
-		start, end := m[2], m[3]
-		if view[start:end] != body[start:end] {
-			start, end = m[4], m[5]
-		}
-		out.WriteString(body[last:start])
-		out.WriteString("Refs")
-		last = end
-	}
-	out.WriteString(body[last:])
-	return out.String(), len(matches)
-}
-
-// maskCodeContexts is the offset-preserving sibling of stripCodeContexts: it
-// returns a string the same length as body in which every byte of a fence line
-// and of a fenced block's content becomes a space, and every byte of an inline
-// code span (backticks included) becomes codeSpanElision. Newlines are kept.
-// The fence and span recognition rules are stripCodeContexts' and
-// stripInlineCode's verbatim; only the elision preserves length so a regex match
-// over the view maps straight back onto body.
-func maskCodeContexts(body string) string {
-	var out strings.Builder
-	out.Grow(len(body))
-	inFence := false
-	var fenceChar byte
-	fenceLen := 0
-	for i, line := range strings.Split(body, "\n") {
-		if i > 0 {
-			out.WriteByte('\n')
-		}
-		trimmed := strings.TrimLeft(line, " \t")
-		if c, n, rest, ok := fenceDelimiter(trimmed); ok {
-			if !inFence {
-				inFence, fenceChar, fenceLen = true, c, n
-				out.WriteString(strings.Repeat(" ", len(line)))
-				continue
-			}
-			if c == fenceChar && n >= fenceLen && strings.TrimSpace(rest) == "" {
-				inFence, fenceChar, fenceLen = false, 0, 0
-				out.WriteString(strings.Repeat(" ", len(line)))
-				continue
-			}
-		}
-		if inFence {
-			out.WriteString(strings.Repeat(" ", len(line)))
-			continue
-		}
-		out.WriteString(maskInlineCode(line))
-	}
-	return out.String()
-}
-
-// maskInlineCode is stripInlineCode with a length-preserving elision: a run of
-// N backticks opens a span that the next run of EXACTLY N backticks closes, and
-// every byte of the span becomes codeSpanElision. An unmatched run is literal.
-func maskInlineCode(line string) string {
-	var out strings.Builder
-	i := 0
-	for i < len(line) {
-		if line[i] != '`' {
-			out.WriteByte(line[i])
-			i++
-			continue
-		}
-		j := i
-		for j < len(line) && line[j] == '`' {
-			j++
-		}
-		n := j - i
-		closed := false
-		for k := j; k < len(line); {
-			if line[k] != '`' {
-				k++
-				continue
-			}
-			m := k
-			for m < len(line) && line[m] == '`' {
-				m++
-			}
-			if m-k == n {
-				out.WriteString(strings.Repeat(codeSpanElision, m-i))
-				i, closed = m, true
-				break
-			}
-			k = m
-		}
-		if !closed {
-			out.WriteString(line[i:j])
-			i = j
-		}
-	}
-	return out.String()
+	return orchestrator.NeutralizeClosingReferences(body, n)
 }
 
 // partialDeliveryPlan loads the run's approved plan (loadApprovedPlanForRun,

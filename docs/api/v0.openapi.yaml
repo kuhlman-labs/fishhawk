@@ -7484,7 +7484,11 @@ components:
           child stage's terminal transition its push_to_shared_branch trace
           gate left in `running`, without creating a PR artifact — so a child
           whose push failed (reported via `outcome: failed`) never reaches
-          terminal succeeded with no code on the shared branch.
+          terminal succeeded with no code on the shared branch. It may carry
+          the optional `body` (#5192): the slice agent's footer-free PR
+          description, persisted (8 KiB bound) as `pr_body` on the child's
+          `child_pushed` audit entry and spliced into the parent's
+          consolidated PR body.
         - **Fix-up push** (`outcome: fixup_pushed`, #794): a fix-up
           re-dispatch committed + pushed onto the EXISTING PR branch but
           opened no new PR (the open PR already tracks the branch). `branch`,
@@ -7535,7 +7539,10 @@ components:
             `category` + `reason` required). `pushed` (#771) reports a
             decomposed child's successful push onto the shared parent branch
             (no PR opened; `branch` + `head_sha` + `base_sha` required,
-            `pr_number`/`pr_url`/`title` absent). `fixup_pushed` (#794) reports
+            `pr_number`/`pr_url`/`title` absent; the optional `body` (#5192)
+            is the slice agent's footer-free PR description, persisted (8 KiB
+            bound) as `pr_body` on the child's `child_pushed` audit entry and
+            spliced into the consolidated PR body). `fixup_pushed` (#794) reports
             a fix-up re-dispatch's successful push onto the EXISTING PR branch
             (no new PR; `branch` + `head_sha` + `base_sha` required,
             `pr_number`/`pr_url`/`title` absent). `fixup_no_changes` (#856)
@@ -30766,12 +30773,15 @@ paths:
           closing the zombie-run hole where a commit/push failure
           stranded the run at review with a null PR.
         - **Child push** (`{ outcome: "pushed", branch, head_sha,
-          base_sha, files_changed_count }`, #771): a decomposed child
+          base_sha, files_changed_count, body? }`, #771): a decomposed child
           pushed onto the shared parent branch without opening a PR. The
           handler drives the child stage's terminal transition its
           push_to_shared_branch trace gate left in `running`, without
           creating a PR artifact — the decomposition-child analogue of the
-          #742 zombie fix.
+          #742 zombie fix. The optional `body` (#5192) is the slice agent's
+          footer-free PR description, persisted (8 KiB bound) as `pr_body`
+          on the child's `child_pushed` audit entry and spliced into the
+          consolidated PR body.
 
         Two auth paths are accepted:
 
