@@ -44,6 +44,13 @@ Two predicates express that distinction WITHOUT touching `DeriveState`:
 
 **The drive `ci_failed` park keys on `RedVerdict`, not `StateFail`** (`server.go::reviewChecksFailed`), so a superseded cancelled/stale conclusion never trips `ci_failed`; the recovery lifecycle is in `backend/internal/drive/README.md`.
 
+**Head-aware supersession (#4706).** "Superseded" is a claim about heads, so two more predicates take the run's current head explicitly:
+
+- `(*Check).CancelledAtHead(currentHead)` — `StateFail`, a superseded conclusion, a non-empty `currentHead`, and `HeadSHA == currentHead`. A cancelled/stale check AT the current head was not superseded by anything, so nothing re-runs it; the drive surfaces it (`ci_cancelled`) instead of ignoring it.
+- `SupersededByHead(conclusion, checkHead, currentHead)` — a superseded conclusion whose check head and current head are BOTH non-empty and differ. Supersession must be proven: an unknown (empty) head never equals or differs from anything, so it returns false. The webhook CI-failure retry refuses only on this.
+
+The current head is Fishhawk's **recorded** head — the audit-ledger head `auditcomplete.LatestReportedHeadSHA` resolves — not a forge read. When the ledger lags the forge, a check at an unrecorded newer head reads as not-current; the ledger-trust and ingest limits are in `backend/internal/webhook/README.md` § "CI-failure retry: superseded-head refusal".
+
 ## Ingest and read paths
 
 - Ingest (GitHub): `backend/internal/server/checkrun.go::ingestCheckRun` parses the `check_run` event, walks `pull_requests[]`, asks the repo for matching stages via `(pr_number, head_sha, check_name)`, and appends a row per match.

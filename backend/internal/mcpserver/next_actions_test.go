@@ -7902,3 +7902,660 @@ func TestNextActions_MergeQueueOrphanedClaimOnEveryPath(t *testing.T) {
 		})
 	}
 }
+
+// --- #4706: the ci_cancelled arm ---------------------------------------------
+
+// naCICancelledDetail is the server-stamped ci_cancelled drive Detail shape
+// (backend/internal/server/server.go): bounded and neutralized at its source.
+const naCICancelledDetail = "required PR checks (lint) concluded cancelled/stale at the current recorded head abc123 and no newer push will re-run them; re-run them with fishhawk_retrigger_ci"
+
+// naCICancelledMergeVerbs is invariant I2's closed set: no action anywhere on
+// the ci_cancelled arm may carry one of these. The approve_pr, dismiss_review
+// and configure_identity_provider yield remedies are not merge verbs.
+var naCICancelledMergeVerbs = map[string]bool{"fishhawk_merge_run": true, "merge_pr": true, "merge_and_file_follow_up": true}
+
+// naCICancelledMismatch is a review_head_mismatch block for the I3 rows.
+func naCICancelledMismatch() *gateViewReviewHeadMismatch {
+	return &gateViewReviewHeadMismatch{
+		StageID: "stage-impl", ReviewedTreeSHA: strings.Repeat("1", 40), PushedTreeSHA: strings.Repeat("2", 40),
+		ReviewRoundSequence: 7, ReviewedHeadSHA: strings.Repeat("a", 40), PushedHeadSHA: strings.Repeat("b", 40),
+	}
+}
+
+// naCICancelledRun is the MERGE-OFFERING fixture: a running run with an open
+// PR whose classifier table arm (implement succeeded, settled approve review)
+// offers fishhawk_merge_run — so the ci_cancelled early return is the only
+// thing keeping the merge off the block. yieldReason/next empty means no
+// merge_candidate_queue yield.
+func naCICancelledRun(mismatch bool, yieldReason, next string) *Run {
+	r := naRun("running")
+	if yieldReason != "" {
+		r = naYieldedRun(yieldReason, next)
+	} else {
+		pr := "https://github.com/x/y/pull/7"
+		r.PullRequestURL = &pr
+	}
+	if mismatch {
+		r.ReviewHeadMismatch = naCICancelledMismatch()
+	}
+	return r
+}
+
+func naCICancelledStages() []Stage {
+	return []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+}
+
+func naCICancelledImplReview() *ReviewStatus {
+	rs := naReviewStatus("implement", "complete")
+	rs.Reviews = []PlanReview{{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve", ReviewerModel: "m"}}
+	return rs
+}
+
+// naCICancelledDrive is the drive read view for the ci_cancelled park; with
+// withNextAction false the stamp carries no next_action (the default-reason
+// row).
+func naCICancelledDrive(withNextAction bool) *DriveStatus {
+	ds := &DriveStatus{Drive: true, DerivedStatus: stateCICancelled}
+	if withNextAction {
+		ds.NextAction = &RunNextAction{Action: driveNextActionRetriggerCI, Detail: naCICancelledDetail, PRURL: "https://github.com/x/y/pull/7"}
+	}
+	return ds
+}
+
+// ciCancelledNA runs the FULL classifier for a ci_cancelled fixture.
+func ciCancelledNA(run *Run, drive *DriveStatus) *NextActions {
+	return nextActionsFor(run, naCICancelledStages(), nil, naCICancelledImplReview(), nil, drive, false, false, false, "", "", releaseSignals{})
+}
+
+// assertCICancelledInvariants checks I1-I5 on the FINAL next_actions block of
+// a ci_cancelled run and returns k, the index of the first
+// fishhawk_retrigger_ci. wantReason is the lead action's expected reason.
+func assertCICancelledInvariants(t *testing.T, run *Run, na *NextActions, wantReason string) int {
+	t.Helper()
+	if na == nil {
+		t.Fatal("next_actions = nil, want the ci_cancelled block")
+	}
+	// I1: the state stays ci_cancelled through every fold.
+	if na.State != stateCICancelled {
+		t.Errorf("I1: final state = %s, want ci_cancelled (actions %v)", na.State, actionNames(na))
+	}
+	// I2: no merge verb anywhere.
+	for i, a := range na.Actions {
+		if naCICancelledMergeVerbs[a.Action] {
+			t.Errorf("I2: actions[%d] = %s, a merge verb on the ci_cancelled arm (actions %v)", i, a.Action, actionNames(na))
+		}
+		if a.Action == driveNextActionRetriggerCI {
+			t.Errorf("I2: actions[%d] carries the raw drive verb %q; the arm must name fishhawk_retrigger_ci", i, a.Action)
+		}
+	}
+	// I3: retrigger leads, behind exactly one mismatch advisory when set.
+	k := -1
+	for i, a := range na.Actions {
+		if a.Action == "fishhawk_retrigger_ci" {
+			k = i
+			break
+		}
+	}
+	if k < 0 {
+		t.Fatalf("I3: no fishhawk_retrigger_ci in %v", actionNames(na))
+	}
+	mismatches := 0
+	for _, a := range na.Actions {
+		if a.Action == "review_head_mismatch" {
+			mismatches++
+		}
+	}
+	if run.ReviewHeadMismatch == nil {
+		if k != 0 || mismatches != 0 {
+			t.Errorf("I3: without a mismatch want fishhawk_retrigger_ci at 0 and no advisory; k = %d, actions %v", k, actionNames(na))
+		}
+	} else {
+		want := &NextActions{}
+		foldReviewHeadMismatchAdvisory(run, want)
+		if mismatches != 1 || na.Actions[0].Action != "review_head_mismatch" || !reflect.DeepEqual(na.Actions[0], want.Actions[0]) {
+			t.Errorf("I3: want exactly one review_head_mismatch at 0 deep-equal to the fold's advisory; actions %v", actionNames(na))
+		}
+		if k != 1 {
+			t.Errorf("I3: with a mismatch want fishhawk_retrigger_ci at 1; k = %d, actions %v", k, actionNames(na))
+		}
+	}
+	// I4: the lead action's shape, and page_human present.
+	lead := na.Actions[k]
+	if lead.Params["run_id"] != run.ID {
+		t.Errorf("I4: fishhawk_retrigger_ci params = %v, want run_id %s", lead.Params, run.ID)
+	}
+	for key := range lead.Params {
+		if key != "run_id" && key != "working_dir" {
+			t.Errorf("I4: fishhawk_retrigger_ci carries unexpected param %q (%v)", key, lead.Params)
+		}
+	}
+	if lead.Consumes != consumesNone {
+		t.Errorf("I4: fishhawk_retrigger_ci consumes = %q, want none", lead.Consumes)
+	}
+	if lead.Reason != wantReason {
+		t.Errorf("I4: fishhawk_retrigger_ci reason = %q, want %q", lead.Reason, wantReason)
+	}
+	pages := 0
+	for _, a := range na.Actions {
+		if a.Action == "page_human" {
+			pages++
+			if a.Params["run_id"] != run.ID {
+				t.Errorf("I4: page_human params = %v, want run_id %s", a.Params, run.ID)
+			}
+		}
+	}
+	if pages != 1 {
+		t.Errorf("I4: page_human count = %d, want 1 (actions %v)", pages, actionNames(na))
+	}
+	// I5: a retry_after yield remedy is fishhawk_get_merge_queue, names the
+	// yield_reason and never the merge verb.
+	if q := run.MergeCandidateQueue; q != nil && q.YieldedAt != nil && q.NextStep == "retry_after" {
+		got := 0
+		for i, a := range na.Actions {
+			if a.Action != "fishhawk_get_merge_queue" || !strings.Contains(a.Precondition, "yielded with next_step retry_after") {
+				continue
+			}
+			got++
+			if i <= k {
+				t.Errorf("I5: the yield's fishhawk_get_merge_queue sits at %d, want after the lead retrigger at %d", i, k)
+			}
+			if !strings.Contains(a.Precondition, q.YieldReason) {
+				t.Errorf("I5: precondition %q does not name yield_reason %s", a.Precondition, q.YieldReason)
+			}
+			if strings.Contains(a.Reason, "fishhawk_merge_run") {
+				t.Errorf("I5: the withheld-merge remedy names fishhawk_merge_run: %q", a.Reason)
+			}
+			if a.Params["repo"] != q.Repo || a.Params["base_ref"] != q.BaseRef || a.Consumes != consumesNone {
+				t.Errorf("I5: fishhawk_get_merge_queue params = %v consumes = %q, want repo %s base_ref %s consuming none", a.Params, a.Consumes, q.Repo, q.BaseRef)
+			}
+		}
+		if got != 1 {
+			t.Errorf("I5: retry_after yield remedies = %d, want exactly one fishhawk_get_merge_queue (actions %v)", got, actionNames(na))
+		}
+	}
+	return k
+}
+
+// naConflictSignals is the conflict-resolution signal set the fold reads; ""
+// is no signal.
+var naConflictSignals = []string{"", "triggered", "failed", "pushed"}
+
+const naConflictRefusal = "conflict_resolution_outside_hunk"
+
+// naCICancelledRecent is the recent-audit slice (newest first): the
+// run_auto_advanced ci_cancelled stamp at sequence 20, and — for a signal — an
+// OLDER conflict-resolution entry at sequence 10, so the cancellation park is
+// LATER than the conflict signal and the fold still reads it as Present.
+func naCICancelledRecent(signal, stageID string) []AuditEntry {
+	recent := []AuditEntry{{Category: "run_auto_advanced", Sequence: 20, Payload: map[string]any{
+		"rule": "ci_cancelled", "from": "review:awaiting_approval", "to": "ci_cancelled",
+	}}}
+	switch signal {
+	case "triggered":
+		recent = append(recent, crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil))
+	case "failed":
+		recent = append(recent, crAuditEntry(auditCategoryConflictResolutionFailed, 10, stageID, map[string]any{"reason": naConflictRefusal}))
+	case "pushed":
+		recent = append(recent, crAuditEntry(auditCategoryConflictResolutionPushed, 10, stageID, map[string]any{"head_sha": "deadbeef"}))
+	}
+	return recent
+}
+
+// assertConflictAction asserts the conflict-resolution fold's single action
+// for signal sits after index after (none: no conflict action at all).
+func assertConflictAction(t *testing.T, run *Run, na *NextActions, signal, stageID string, after int) {
+	t.Helper()
+	var idx []int
+	for i, a := range na.Actions {
+		if strings.Contains(a.Precondition, "conflict-resolution") {
+			idx = append(idx, i)
+		}
+	}
+	if signal == "" {
+		if len(idx) != 0 {
+			t.Errorf("no signal: conflict actions at %v, want none (actions %v)", idx, actionNames(na))
+		}
+		return
+	}
+	if len(idx) != 1 {
+		t.Fatalf("signal %s: conflict actions at %v, want exactly one (actions %v)", signal, idx, actionNames(na))
+	}
+	if idx[0] <= after {
+		t.Errorf("signal %s: conflict action at %d, want after %d", signal, idx[0], after)
+	}
+	a := na.Actions[idx[0]]
+	switch signal {
+	case "triggered":
+		if a.Action != "fishhawk_await_stage" || a.Params["run_id"] != run.ID || a.Params["stage_id"] != stageID {
+			t.Errorf("triggered: conflict action = %s %v, want fishhawk_await_stage {run_id, stage_id %s}", a.Action, a.Params, stageID)
+		}
+	case "failed":
+		if a.Action != "fishhawk_rebase_run_branch" || a.Params["run_id"] != run.ID || a.Params["confirm"] != "true" || !strings.Contains(a.Reason, naConflictRefusal) {
+			t.Errorf("failed: conflict action = %s %v reason %q, want fishhawk_rebase_run_branch {run_id, confirm} naming %s", a.Action, a.Params, a.Reason, naConflictRefusal)
+		}
+	case "pushed":
+		if a.Action != "fishhawk_rebase_run_branch" || a.Params["run_id"] != run.ID || a.Params["confirm"] != "true" || !strings.Contains(a.Reason, "SUCCEEDED") {
+			t.Errorf("pushed: conflict action = %s %v reason %q, want fishhawk_rebase_run_branch {run_id, confirm} naming SUCCEEDED", a.Action, a.Params, a.Reason)
+		}
+	}
+}
+
+// naConflictRelabel is the state the conflict fold relabels a sibling arm to.
+var naConflictRelabel = map[string]string{
+	"triggered": "conflict_resolution_pass_pending",
+	"failed":    "conflict_resolution_pass_failed",
+	"pushed":    "conflict_resolution_pass_succeeded",
+}
+
+// TestCICancelledLiterals pins the copied literals against the drive package:
+// the next_actions state and the stamped verb byte-match what the server
+// records (backend/internal/server/server.go, #4706).
+func TestCICancelledLiterals(t *testing.T) {
+	if stateCICancelled != string(drive.RuleCICancelled) {
+		t.Errorf("stateCICancelled = %q, want drive.RuleCICancelled %q", stateCICancelled, drive.RuleCICancelled)
+	}
+	if driveNextActionRetriggerCI != drive.NextActionRetriggerCI {
+		t.Errorf("driveNextActionRetriggerCI = %q, want drive.NextActionRetriggerCI %q", driveNextActionRetriggerCI, drive.NextActionRetriggerCI)
+	}
+}
+
+// TestNextActions_CICancelled_RetriggerLeadsAbsentAdvisory_NeverMerge (N1) runs
+// the FULL classifier on the merge-offering fixture: the table arm offers
+// fishhawk_merge_run, the ci_cancelled arm leads with fishhawk_retrigger_ci
+// (reason = the drive Detail, or the fixed default with no stamp), offers
+// page_human, never a merge verb, and never leaks the raw retrigger_ci verb.
+// Manual deletion: removing the ci_cancelled early return sends the run to the
+// table, whose arm offers fishhawk_merge_run, with the raw drive verb
+// prepended — I1 and I2 fail.
+func TestNextActions_CICancelled_RetriggerLeadsAbsentAdvisory_NeverMerge(t *testing.T) {
+	baseline := ciCancelledNA(naCICancelledRun(false, "", ""), nil)
+	if !naOffersMerge(baseline) {
+		t.Fatalf("fixture must offer fishhawk_merge_run without the drive park; got %s %v", baseline.State, actionNames(baseline))
+	}
+	for _, tc := range []struct {
+		name       string
+		nextAction bool
+		wantReason string
+	}{
+		{"drive_detail_present", true, naCICancelledDetail},
+		{"next_action_nil", false, ciCancelledDefaultReason},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naCICancelledRun(false, "", "")
+			na := ciCancelledNA(run, naCICancelledDrive(tc.nextAction))
+			assertCICancelledInvariants(t, run, na, tc.wantReason)
+			if got := actionNames(na); !slices.Equal(got, []string{"fishhawk_retrigger_ci", "page_human"}) {
+				t.Errorf("actions = %v, want exactly [fishhawk_retrigger_ci page_human]", got)
+			}
+			if _, ok := productIssueFilingStates[stateCICancelled]; ok {
+				t.Error("ci_cancelled must not be a product-issue filing state")
+			}
+		})
+	}
+}
+
+// naYieldRow is one merge-queue yield fixture: the yield reason and next step,
+// the remedy action the fold must add (empty = nothing), and whether the
+// remedy must sit after the lead retrigger.
+type naYieldRow struct {
+	name, reason, next, remedy string
+}
+
+var naCICancelledYieldRows = []naYieldRow{
+	{"r1_retry_after_forge_approval_undetermined", "forge_approval_undetermined", "retry_after", "fishhawk_get_merge_queue"},
+	{"r2_retry_after_merge_checks_pending", "merge_checks_pending", "retry_after", "fishhawk_get_merge_queue"},
+	{"r3_retry_after_merge_review_pending", "merge_review_pending", "retry_after", "fishhawk_get_merge_queue"},
+	{"r4_retrigger_ci_merge_checks_red", "merge_checks_red", "retrigger_ci", "fishhawk_retrigger_ci"},
+	{"r5_approve_pr_forge_approval_absent", "forge_approval_absent", "approve_pr", "approve_pr"},
+	{"r6_dismiss_review_forge_approval_vetoed", "forge_approval_vetoed", "dismiss_review", "dismiss_review"},
+	{"r7_configure_identity_provider", "forge_approval_identity_provider_unconfigured", "configure_identity_provider", "configure_identity_provider"},
+	{"r8_none_provider_unsupported", "forge_approval_provider_unsupported", "none", ""},
+}
+
+// assertYieldRemedy asserts the yield's remedy is present exactly once, after
+// k, carrying the yield precondition — or, for next_step none, that no
+// yield-shaped action was added.
+func assertYieldRemedy(t *testing.T, na *NextActions, row naYieldRow, k int) {
+	t.Helper()
+	marker := "yielded with next_step " + row.next
+	var at []int
+	for i, a := range na.Actions {
+		if strings.Contains(a.Precondition, marker) {
+			at = append(at, i)
+			if a.Action != row.remedy {
+				t.Errorf("%s: yield remedy = %s, want %s", row.name, a.Action, row.remedy)
+			}
+		}
+	}
+	if row.remedy == "" {
+		if len(at) != 0 {
+			t.Errorf("%s: next_step none added %v, want nothing", row.name, at)
+		}
+		return
+	}
+	if len(at) != 1 || at[0] <= k {
+		t.Errorf("%s: yield remedy at %v, want exactly one after the lead retrigger at %d (actions %v)", row.name, at, k, actionNames(na))
+	}
+}
+
+// TestNextActions_CICancelled_MergeQueueYieldNeverReintroducesMerge (N2): on
+// the ci_cancelled arm every merge-queue yield keeps the merge off the block.
+// retry_after (r1-r3, r9) — whose remedy elsewhere IS a synthesized
+// fishhawk_merge_run — names fishhawk_get_merge_queue with a withheld-merge
+// tail; retrigger_ci appends a second fishhawk_retrigger_ci carrying the yield
+// precondition; the approve_pr / dismiss_review / configure_identity_provider
+// remedies are unchanged; none adds nothing. r9 adds every merge-adjacent fold
+// and none is dropped. The UNAFFECTED-STATE contrasts pin the drive
+// awaiting_merge arm (one fishhawk_merge_run, rewritten in place) and the
+// ci_failed arm (still synthesizes one on retry_after — #5121, unchanged).
+// Counterfactual 5: disabling `if na.State == stateCICancelled {` sends r1, r2,
+// r3 and r9 to mergeRunAction, which appends a fishhawk_merge_run — I2 RED.
+func TestNextActions_CICancelled_MergeQueueYieldNeverReintroducesMerge(t *testing.T) {
+	for _, row := range naCICancelledYieldRows {
+		t.Run(row.name, func(t *testing.T) {
+			run := naCICancelledRun(false, row.reason, row.next)
+			na := ciCancelledNA(run, naCICancelledDrive(true))
+			k := assertCICancelledInvariants(t, run, na, naCICancelledDetail)
+			assertYieldRemedy(t, na, row, k)
+			if row.next == "retry_after" {
+				a := na.Actions[len(na.Actions)-1]
+				if a.Action != "fishhawk_get_merge_queue" || !strings.Contains(a.Reason, "merge is withheld") || !strings.Contains(a.Reason, row.reason) {
+					t.Errorf("retry_after remedy = %s %q, want an APPENDED fishhawk_get_merge_queue naming %s and the withheld merge", a.Action, a.Reason, row.reason)
+				}
+				if strings.Contains(a.Reason, naYieldHostileDetail) {
+					t.Errorf("retry_after remedy interpolates the untrusted yield_detail: %q", a.Reason)
+				}
+			}
+		})
+	}
+
+	t.Run("r9_retry_after_with_every_merge_adjacent_fold", func(t *testing.T) {
+		row := naYieldRow{"r9", "merge_checks_pending", "retry_after", "fishhawk_get_merge_queue"}
+		run := naCICancelledRun(false, row.reason, row.next)
+		behind := 3
+		run.MergeCandidateStaleness = &runMergeCandidateStaleness{State: "stale", HeadSHA: "h1", BaseRef: "main", BaseSHA: "b1", BehindBy: &behind}
+		run.MergeCandidateQueue.DispatchClaimOrphan = "orphaned_by_restart"
+		run.MergeCandidateRerun = &runMergeCandidateRerun{HeadSHA: "h1", Cause: "base_advance", FailedSequence: 41}
+		na := ciCancelledNA(run, naCICancelledDrive(true))
+		k := assertCICancelledInvariants(t, run, na, naCICancelledDetail)
+		assertYieldRemedy(t, na, row, k)
+		var rebase, rerun, rearm int
+		for _, a := range na.Actions {
+			switch {
+			case a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] == "true":
+				rerun++
+			case a.Action == "fishhawk_rebase_run_branch":
+				rebase++
+			case a.Action == "operator_rearm":
+				rearm++
+			}
+		}
+		if rebase != 1 || rerun != 1 || rearm != 1 {
+			t.Errorf("merge-adjacent folds: rebase=%d rerun=%d operator_rearm=%d, want one each (actions %v)", rebase, rerun, rearm, actionNames(na))
+		}
+	})
+
+	t.Run("retry_after_without_base_ref_omits_the_param", func(t *testing.T) {
+		run := naCICancelledRun(false, "merge_checks_pending", "retry_after")
+		run.MergeCandidateQueue.BaseRef = ""
+		na := ciCancelledNA(run, naCICancelledDrive(true))
+		assertCICancelledInvariants(t, run, na, naCICancelledDetail)
+		a := findAction(t, na, "fishhawk_get_merge_queue")
+		if _, ok := a.Params["base_ref"]; ok || a.Params["repo"] != "x/y" {
+			t.Errorf("params = %v, want repo only (base_ref omitted when unset)", a.Params)
+		}
+	})
+
+	t.Run("unaffected_drive_awaiting_merge_rewrites_in_place", func(t *testing.T) {
+		run := naCICancelledRun(false, "merge_checks_pending", "retry_after")
+		behind := 3
+		run.MergeCandidateStaleness = &runMergeCandidateStaleness{State: "stale", HeadSHA: "h1", BaseRef: "main", BaseSHA: "b1", BehindBy: &behind}
+		run.MergeCandidateQueue.DispatchClaimOrphan = "orphaned_by_restart"
+		ds := &DriveStatus{Drive: true, DerivedStatus: "awaiting_merge", NextAction: &RunNextAction{Action: driveNextActionMergePR, Detail: "checks green", PRURL: "https://github.com/x/y/pull/7"}}
+		na := ciCancelledNA(run, ds)
+		names := actionNames(na)
+		first := slices.Index(names, "fishhawk_merge_run")
+		if first < 0 {
+			t.Fatalf("awaiting_merge actions = %v, want a fishhawk_merge_run", names)
+		}
+		if !strings.Contains(na.Actions[first].Reason, "merge_checks_pending") || !strings.Contains(na.Actions[first].Precondition, "retry_after") {
+			t.Errorf("awaiting_merge: the first fishhawk_merge_run was not rewritten in place: %+v", na.Actions[first])
+		}
+		if slices.Contains(names, "fishhawk_get_merge_queue") {
+			t.Errorf("awaiting_merge actions = %v, want no ci_cancelled remedy off the ci_cancelled arm", names)
+		}
+		if r, o := slices.Index(names, "fishhawk_rebase_run_branch"), slices.Index(names, "operator_rearm"); r < 0 || o < 0 || r > first || o > first {
+			t.Errorf("awaiting_merge actions = %v, want staleness and operator_rearm before the merge", names)
+		}
+		baseline := ciCancelledNA(naCICancelledRun(false, "", ""), ds)
+		if got, want := countAction(na, "fishhawk_merge_run"), countAction(baseline, "fishhawk_merge_run"); got != want {
+			t.Errorf("awaiting_merge: fishhawk_merge_run count = %d with the yield, %d without — retry_after must rewrite, never add", got, want)
+		}
+	})
+
+	t.Run("unaffected_ci_failed_still_synthesizes_merge", func(t *testing.T) {
+		run := naCICancelledRun(false, "merge_checks_pending", "retry_after")
+		na := ciCancelledNA(run, &DriveStatus{Drive: true, DerivedStatus: "ci_failed"})
+		if !strings.HasPrefix(na.State, "ci_failed_") {
+			t.Fatalf("state = %q, want the ci_failed arm", na.State)
+		}
+		if countAction(na, "fishhawk_merge_run") != 1 || slices.Contains(actionNames(na), "fishhawk_get_merge_queue") {
+			t.Errorf("ci_failed actions = %v, want today's synthesized fishhawk_merge_run unchanged (#5121)", actionNames(na))
+		}
+	})
+}
+
+func countAction(na *NextActions, name string) int {
+	n := 0
+	for _, a := range na.Actions {
+		if a.Action == name {
+			n++
+		}
+	}
+	return n
+}
+
+// TestNextActions_CICancelled_ReviewHeadMismatchKeepsPriority (N3): a
+// review_head_mismatch advisory stays FIRST on the ci_cancelled arm, deep-equal
+// to the fold's own advisory, with fishhawk_retrigger_ci at 1 — alone and
+// under both yield remedies. Manual deletion: removing
+// foldReviewHeadMismatchAdvisory from the ci_cancelled branch makes
+// fishhawk_retrigger_ci actions[0] — I3 RED.
+func TestNextActions_CICancelled_ReviewHeadMismatchKeepsPriority(t *testing.T) {
+	for _, row := range []naYieldRow{
+		{"mismatch_only", "", "", ""},
+		{"mismatch_retry_after_merge_checks_pending", "merge_checks_pending", "retry_after", "fishhawk_get_merge_queue"},
+		{"mismatch_retrigger_ci_merge_checks_red", "merge_checks_red", "retrigger_ci", "fishhawk_retrigger_ci"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			run := naCICancelledRun(true, row.reason, row.next)
+			na := ciCancelledNA(run, naCICancelledDrive(true))
+			k := assertCICancelledInvariants(t, run, na, naCICancelledDetail)
+			if row.next != "" {
+				assertYieldRemedy(t, na, row, k)
+			}
+		})
+	}
+}
+
+// naYieldVariants is N4's yield axis.
+var naYieldVariants = []naYieldRow{
+	{"no_yield", "", "", ""},
+	{"retry_after_merge_checks_pending", "merge_checks_pending", "retry_after", "fishhawk_get_merge_queue"},
+	{"retry_after_forge_approval_undetermined", "forge_approval_undetermined", "retry_after", "fishhawk_get_merge_queue"},
+}
+
+// naApplyFinalSurfaceFolds runs getRunStatus's post-classifier folds in their
+// real order (tools.go) over na. gateAcceptanceOnIntegration's sole entry
+// condition is offersAcceptanceDispatch, asserted false so the gate is a no-op
+// on this arm.
+func naApplyFinalSurfaceFolds(t *testing.T, run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
+	t.Helper()
+	if offersAcceptanceDispatch(na) {
+		t.Fatalf("the ci_cancelled arm offers an acceptance dispatch (%v); gateAcceptanceOnIntegration would act", actionNames(na))
+	}
+	foldAcceptanceRedispatchAdvisory(run, stages, recent, na)
+	foldConflictResolutionAdvisory(run, recent, na)
+	previewCmd, _ := resolveAcceptancePreviewCmd(func(string) string { return "" }, false)
+	foldAcceptancePreviewAdvisory(run, previewCmd, latestReportedHeadSHA(recent), na)
+}
+
+// TestNextActions_CICancelled_FinalSurfaceFoldsNeverReintroduceMerge (N4, the
+// HIGH 1c22bab3 matrix): a ci_cancelled run with a NON-TERMINAL acceptance
+// stage and a working_dir binding, through nextActionsFor and the getRunStatus
+// post-folds in order, across signal {none, triggered, failed, pushed} ×
+// mismatch {absent, present} × yield {none, retry_after/merge_checks_pending,
+// retry_after/forge_approval_undetermined}. Every row keeps I1-I5 on the
+// FINAL block and carries the signal's conflict action after the lead
+// retrigger. The SIBLING sub-arm pins ci_failed, review_coverage_incomplete and
+// an ordinary succeeded_pr_open arm relabeled exactly as today.
+// Counterfactual 6: disabling `if na.State != stateCICancelled {` relabels
+// every signal row conflict_resolution_pass_* — I1 RED; the no-signal rows and
+// the sibling sub-arm stay GREEN (no signal / relabeled either way).
+func TestNextActions_CICancelled_FinalSurfaceFoldsNeverReintroduceMerge(t *testing.T) {
+	stageID := uuid.NewString()
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded"), naStage("acceptance", "pending")}
+	for _, signal := range naConflictSignals {
+		for _, mismatch := range []bool{false, true} {
+			for _, y := range naYieldVariants {
+				name := fmt.Sprintf("signal=%s/mismatch=%t/%s", naOrNone(signal), mismatch, y.name)
+				t.Run(name, func(t *testing.T) {
+					run := naCICancelledRun(mismatch, y.reason, y.next)
+					run.WorkingDir = "/tmp/fh-checkout"
+					recent := naCICancelledRecent(signal, stageID)
+					na := nextActionsFor(run, stages, nil, naCICancelledImplReview(), nil, naCICancelledDrive(true), false, false, false, "", "", releaseSignals{})
+					naApplyFinalSurfaceFolds(t, run, stages, recent, na)
+					k := assertCICancelledInvariants(t, run, na, naCICancelledDetail)
+					if y.next != "" {
+						assertYieldRemedy(t, na, y, k)
+					}
+					assertConflictAction(t, run, na, signal, stageID, k)
+				})
+			}
+		}
+	}
+
+	// SIBLING sub-arm: positive comparisons that must stay byte-identical to
+	// today — each arm is relabeled to the signal's state with the same action.
+	prURL := "https://github.com/x/y/pull/7"
+	siblings := []struct {
+		name   string
+		run    func() *Run
+		stages []Stage
+		drive  *DriveStatus
+		want   func(string) bool
+	}{
+		{"ci_failed", func() *Run { return naCICancelledRun(false, "", "") }, stages,
+			&DriveStatus{Drive: true, DerivedStatus: "ci_failed"}, func(s string) bool { return strings.HasPrefix(s, "ci_failed_") }},
+		{"review_coverage_incomplete", func() *Run { return naCICancelledRun(false, "", "") }, stages,
+			&DriveStatus{Drive: true, DerivedStatus: stateReviewCoverageIncomplete}, func(s string) bool { return s == stateReviewCoverageIncomplete }},
+		{"succeeded_pr_open", func() *Run {
+			r := naRun("succeeded")
+			r.PullRequestURL = &prURL
+			return r
+		}, naCICancelledStages(), nil, func(s string) bool { return s == "succeeded_pr_open" }},
+	}
+	for _, sib := range siblings {
+		for _, signal := range []string{"triggered", "failed", "pushed"} {
+			t.Run("sibling/"+sib.name+"/"+signal, func(t *testing.T) {
+				run := sib.run()
+				recent := naCICancelledRecent(signal, stageID)
+				na := nextActionsFor(run, sib.stages, nil, naCICancelledImplReview(), nil, sib.drive, false, false, false, "", "", releaseSignals{})
+				if !sib.want(na.State) {
+					t.Fatalf("fixture: pre-fold state = %q, want the %s arm", na.State, sib.name)
+				}
+				before := len(na.Actions)
+				foldAcceptanceRedispatchAdvisory(run, sib.stages, recent, na)
+				foldConflictResolutionAdvisory(run, recent, na)
+				if na.State != naConflictRelabel[signal] {
+					t.Errorf("sibling %s: final state = %s, want %s (relabeled exactly as today)", sib.name, na.State, naConflictRelabel[signal])
+				}
+				if len(na.Actions) < before+1 {
+					t.Errorf("sibling %s: actions %v, want the conflict action appended", sib.name, actionNames(na))
+				}
+				assertConflictAction(t, run, na, signal, stageID, -1)
+			})
+		}
+	}
+}
+
+// naOrNone returns s, or "none" when s is empty.
+func naOrNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// TestGetRunStatus_CICancelled_ConflictSignalKeepsFinalState (C1) drives the
+// REAL getRunStatus handler — the first foldConflictResolutionAdvisory call
+// site — over the fake backend: drive derived_status ci_cancelled, the older
+// conflict entry at 10 and the ci_cancelled stamp at 20. Every signal row keeps
+// the FINAL state ci_cancelled with I1-I5 and its conflict action; the sibling
+// ci_failed + pushed row relabels as today. Counterfactual 6 run against it:
+// the signal rows go RED on I1, the sibling row stays GREEN.
+func TestGetRunStatus_CICancelled_ConflictSignalKeepsFinalState(t *testing.T) {
+	type row struct {
+		name, signal     string
+		mismatch         bool
+		yield            naYieldRow
+		derived          string
+		wantSiblingState string
+	}
+	retry := naYieldRow{"retry_after_merge_checks_pending", "merge_checks_pending", "retry_after", "fishhawk_get_merge_queue"}
+	var rows []row
+	for _, signal := range []string{"triggered", "failed", "pushed"} {
+		for _, mismatch := range []bool{false, true} {
+			rows = append(rows, row{name: fmt.Sprintf("%s/mismatch=%t", signal, mismatch), signal: signal, mismatch: mismatch, yield: retry, derived: stateCICancelled})
+		}
+	}
+	rows = append(rows,
+		row{name: "pushed/retry_after_forge_approval_undetermined", signal: "pushed",
+			yield: naYieldRow{"undetermined", "forge_approval_undetermined", "retry_after", "fishhawk_get_merge_queue"}, derived: stateCICancelled},
+		row{name: "no_signal", derived: stateCICancelled},
+		row{name: "sibling_ci_failed_pushed", signal: "pushed", derived: "ci_failed", wantSiblingState: "conflict_resolution_pass_succeeded"},
+	)
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			fixture := naCICancelledRun(tc.mismatch, tc.yield.reason, tc.yield.next)
+			fixture.ID = runID.String()
+			fb.getRunByID[runID] = *fixture
+			fb.getRunExtraByID[runID] = map[string]any{
+				"drive":          true,
+				"derived_status": tc.derived,
+				"next_action": map[string]any{
+					"action": driveNextActionRetriggerCI,
+					"detail": naCICancelledDetail,
+					"pr_url": "https://github.com/x/y/pull/7",
+				},
+			}
+			stageID := uuid.NewString()
+			fb.stagesByRun[runID] = naCICancelledStages()
+			fb.auditByRun[runID] = naCICancelledRecent(tc.signal, stageID)
+
+			r := newResolver(srv, nil)
+			_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("getRunStatus: %v", err)
+			}
+			na := out.NextActions
+			if na == nil {
+				t.Fatal("next_actions = nil")
+			}
+			if tc.wantSiblingState != "" {
+				if na.State != tc.wantSiblingState {
+					t.Errorf("sibling: final state = %s, want %s (relabeled exactly as today)", na.State, tc.wantSiblingState)
+				}
+				assertConflictAction(t, fixture, na, tc.signal, stageID, -1)
+				return
+			}
+			k := assertCICancelledInvariants(t, fixture, na, naCICancelledDetail)
+			if tc.yield.next != "" {
+				assertYieldRemedy(t, na, tc.yield, k)
+			}
+			assertConflictAction(t, fixture, na, tc.signal, stageID, k)
+		})
+	}
+}

@@ -113,3 +113,73 @@ func TestCheckRedVerdict(t *testing.T) {
 		})
 	}
 }
+
+// TestCheck_CancelledAtHead pins the head-aware cancellation predicate the
+// drive ci_cancelled park keys on (#4706). It calls the predicate DIRECTLY:
+// the observer's headKnown gate never passes an empty head, so the
+// empty_check_head_and_empty_current_head row is the ONLY place the
+// `currentHead != ""` arm is isolatable — it is the one row whose check head
+// equals the (empty) current head, so dropping the arm turns it true. The
+// cancelled@abc / "" row fails the equality on its own and cannot carry that
+// credit.
+func TestCheck_CancelledAtHead(t *testing.T) {
+	cases := []struct {
+		name        string
+		state       stagecheck.State
+		conclusion  *string
+		checkHead   string
+		currentHead string
+		want        bool
+	}{
+		{"cancelled_at_current_head", stagecheck.StateFail, ptr("cancelled"), "abc", "abc", true},
+		{"stale_at_current_head", stagecheck.StateFail, ptr("stale"), "abc", "abc", true},
+		{"cancelled_at_older_head", stagecheck.StateFail, ptr("cancelled"), "abc", "def", false},
+		{"failure_at_current_head", stagecheck.StateFail, ptr("failure"), "abc", "abc", false},
+		{"pass_success", stagecheck.StatePass, ptr("success"), "abc", "abc", false},
+		{"fail_nil_conclusion", stagecheck.StateFail, nil, "abc", "abc", false},
+		{"pending_cancelled", stagecheck.StatePending, ptr("cancelled"), "abc", "abc", false},
+		{"cancelled_with_unknown_current_head", stagecheck.StateFail, ptr("cancelled"), "abc", "", false},
+		{"empty_check_head_and_empty_current_head", stagecheck.StateFail, ptr("cancelled"), "", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			check := &stagecheck.Check{State: c.state, Conclusion: c.conclusion, HeadSHA: c.checkHead}
+			if got := check.CancelledAtHead(c.currentHead); got != c.want {
+				t.Errorf("CancelledAtHead(%q) = %v, want %v (state=%q conclusion=%v head=%q)",
+					c.currentHead, got, c.want, c.state, c.conclusion, c.checkHead)
+			}
+		})
+	}
+}
+
+// TestSupersededByHead pins the PROVEN-supersession predicate the webhook
+// CI-failure retry refusal keys on (#4706): both heads known and different.
+// Each false row isolates one conjunct — the ""→def row is the only thing
+// between an empty check head and a refusal, the abc→"" row the same for an
+// empty current head, and the failure abc→def row (two different non-empty
+// heads) leaves the conclusion restriction as the only thing in the path.
+func TestSupersededByHead(t *testing.T) {
+	cases := []struct {
+		name        string
+		conclusion  *string
+		checkHead   string
+		currentHead string
+		want        bool
+	}{
+		{"cancelled_older_head", ptr("cancelled"), "abc", "def", true},
+		{"stale_older_head", ptr("stale"), "abc", "def", true},
+		{"cancelled_same_head", ptr("cancelled"), "abc", "abc", false},
+		{"failure_older_head", ptr("failure"), "abc", "def", false},
+		{"nil_conclusion", nil, "abc", "def", false},
+		{"cancelled_unknown_check_head", ptr("cancelled"), "", "def", false},
+		{"cancelled_unknown_current_head", ptr("cancelled"), "abc", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stagecheck.SupersededByHead(c.conclusion, c.checkHead, c.currentHead); got != c.want {
+				t.Errorf("SupersededByHead(%v, %q, %q) = %v, want %v",
+					c.conclusion, c.checkHead, c.currentHead, got, c.want)
+			}
+		})
+	}
+}

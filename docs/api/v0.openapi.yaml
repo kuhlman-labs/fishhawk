@@ -2611,7 +2611,7 @@ components:
             no open concerns.
         derived_status:
           type: string
-          enum: [awaiting_merge, ci_failed, review_coverage_incomplete]
+          enum: [awaiting_merge, ci_failed, ci_cancelled, review_coverage_incomplete]
           description: |
             Presentation-only drive-mode status (#1023):
             `awaiting_merge` while a non-terminal drive run with an
@@ -2631,6 +2631,21 @@ components:
             remains at the latest observed rows. `ci_recovered` is a
             rule value, NOT a `derived_status` (the field goes absent
             while the remaining required checks conclude).
+            `ci_cancelled` (#4706) is a non-terminal drive run with an
+            open PR whose latest auto-advance is `ci_cancelled`: no
+            required check carries a red verdict, but one concluded
+            `cancelled`/`stale` AT the run's current recorded head — the
+            audit-ledger head report Fishhawk last recorded, not a forge
+            read — so no newer push will re-run it. Detection only: it
+            parks with `next_action` `retrigger_ci` and never offers a
+            merge. A red verdict outranks it (`ci_failed`), a
+            cancellation at an older recorded head stays ignored, a
+            later `ci_recovered` (a newer recorded head landed) or
+            `checks_green_awaiting_merge` supersedes it, and an
+            unresolvable current head holds it. The recorded head can lag
+            the forge (an exhausted push report, or a post-fix-up head
+            whose check rows were not ingested), so a cancellation at an
+            unrecorded newer head does not park.
             `review_coverage_incomplete` (#4219) is stamped INSTEAD of
             `awaiting_merge` on a decomposed parent whose review evidence
             settled with a succeeded slice no successful agent review
@@ -5190,7 +5205,13 @@ components:
         latest observed rows: the parking conclusion was `cancelled`/
         `stale`, a head superseded by a newer push, so the run returns
         to awaiting its remaining checks rather than the `ci_failed`
-        dead end), `review_coverage_incomplete` (#4219 — stamped instead of
+        dead end; it also lifts a `ci_cancelled` park once the
+        cancellation is no longer at the current recorded head),
+        `ci_cancelled` (#4706 — a required PR check concluded
+        `cancelled`/`stale` at the run's current recorded head with no
+        red verdict present; detection only, it parks with
+        `next_action` `retrigger_ci` and never advances),
+        `review_coverage_incomplete` (#4219 — stamped instead of
         `checks_green_awaiting_merge` on a decomposed parent with a
         succeeded slice no successful agent review covers; detection only,
         it parks and never advances).

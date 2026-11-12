@@ -131,10 +131,26 @@ const (
 	// the latest rows and the checks are not yet green (pending / superseded),
 	// the observer stamps ci_recovered (From ci_failed, To
 	// review:awaiting_approval), which supersedes the derived ci_failed status
-	// so next_actions leaves the ci_failed_unroutable dead end. Detection only,
+	// so next_actions leaves the ci_failed_unroutable dead end. Since #4706 it
+	// also lifts a RuleCICancelled latest once no required check is cancelled
+	// at the current recorded head (From ci_cancelled). Detection only,
 	// like RuleCIFailed (ADR-040 bucket 1, zero judgment): it parks and never
 	// advances — the remaining required checks concluding is the real edge.
 	RuleCIRecovered Rule = "ci_recovered"
+	// RuleCICancelled covers a required PR check concluded cancelled/stale AT
+	// the run's current recorded head (#4706) — the one supersession
+	// conclusion nothing will re-run, because no newer push superseded it.
+	// The current head is Fishhawk's audit-ledger head
+	// (auditcomplete.LatestReportedHeadSHA), not a forge read; the same
+	// conclusion at an older recorded head stays ignored (#3414), and a red
+	// verdict outranks it (ci_failed parks first). The observer parks the run
+	// with a NextActionRetriggerCI next action, lifts it via RuleCIRecovered
+	// once a newer recorded head lands, and holds it while the head is
+	// unresolvable. Detection only (ADR-040 bucket 1, zero judgment): it parks
+	// and never advances — re-running CI stays the operator's call. This name
+	// MUST byte-match the derived_status and the MCP next_actions.state string
+	// "ci_cancelled" (the cross-module literal test pins it).
+	RuleCICancelled Rule = "ci_cancelled"
 	// RuleAcceptancePending covers a run whose workflow declares an
 	// acceptance stage where review evidence is terminal and required PR
 	// checks are green, but the acceptance stage has not yet settled a
@@ -253,6 +269,7 @@ var mechanical = map[Rule]bool{
 	RuleChecksGreenAwaitingMerge:   true,
 	RuleCIFailed:                   true,
 	RuleCIRecovered:                true,
+	RuleCICancelled:                true,
 	RuleAcceptancePending:          true,
 	RuleAcceptanceOutcomeUnknown:   true,
 	RuleAcceptanceTriage:           true,
@@ -279,6 +296,13 @@ type NextAction struct {
 	Detail string `json:"detail,omitempty"`
 	PRURL  string `json:"pr_url,omitempty"`
 }
+
+// NextActionRetriggerCI is the NextAction.Action verb the RuleCICancelled
+// park stamps (#4706): re-run the required checks cancelled at the current
+// recorded head. The MCP classifier renders it as fishhawk_retrigger_ci and
+// never surfaces this raw verb; its local copy is pinned against this
+// constant by the cross-module literal test.
+const NextActionRetriggerCI = "retrigger_ci"
 
 // Outcome is the engine's decision for one evaluated transition
 // point: Advance true means the mechanical transition was (or is

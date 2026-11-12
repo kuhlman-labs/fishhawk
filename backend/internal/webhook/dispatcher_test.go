@@ -1242,6 +1242,17 @@ type stubAudit struct {
 	appended       []audit.ChainAppendParams
 	globalAppended []audit.GlobalChainAppendParams
 	appendErr      error
+	// seeded is the run-chained ledger ListForRunByCategory reads (#4706):
+	// entries are matched on (RunID, Category).
+	seeded []*audit.Entry
+	// listByCategoryErrCategory injects a ListForRunByCategory error for
+	// EXACTLY this category — the same name and single-category semantics as
+	// the server package's auditFake field. It is never a global error, so
+	// AppendChained and every other consumer of this fake stays healthy.
+	listByCategoryErrCategory string
+	// listCalls counts ListForRunByCategory calls, so a test can prove the
+	// head lookup was (or was not) reached.
+	listCalls int
 }
 
 func (s *stubAudit) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
@@ -1290,8 +1301,20 @@ func (s *stubAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, erro
 func (s *stubAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
-func (s *stubAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
-	return nil, errors.New("not used")
+func (s *stubAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listCalls++
+	if s.listByCategoryErrCategory != "" && category == s.listByCategoryErrCategory {
+		return nil, fmt.Errorf("stubAudit: injected ListForRunByCategory(%s) failure", category)
+	}
+	var out []*audit.Entry
+	for _, e := range s.seeded {
+		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // validSpec is the canonical workflow YAML used in dispatcher
@@ -3149,6 +3172,32 @@ func checkRunFailedEvent(t *testing.T) Event {
 		"sender":       map[string]any{"login": "alice", "type": "User"},
 	})
 	ev, err := ParseEvent("check_run", "deliv-checkrun-1", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// checkRunEventWith is checkRunFailedEvent with the conclusion and head_sha
+// chosen by the caller (#4706): the same required check (ci/build) on PR 42.
+func checkRunEventWith(t *testing.T, conclusion, headSHA string) Event {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{
+		"action": "completed",
+		"check_run": map[string]any{
+			"name":       "ci/build",
+			"head_sha":   headSHA,
+			"conclusion": conclusion,
+			"status":     "completed",
+			"pull_requests": []map[string]any{
+				{"number": 42},
+			},
+		},
+		"repository":   map[string]any{"full_name": "kuhlman-labs/fishhawk"},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, err := ParseEvent("check_run", "deliv-checkrun-"+conclusion+"-"+headSHA, raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5212,5 +5261,312 @@ func TestDispatcher_PersistsGroomingDetermination(t *testing.T) {
 				t.Errorf("stored requires_charter = %v, want %v", *got, tc.want)
 			}
 		})
+	}
+}
+
+// seedSupersessionLedger seeds the parent's head-report ledger for the #4706
+// tests: pull_request_opened@abc000, then fixup_pushed@abc123, then
+// fixup_pushed@def456. auditcomplete.LatestReportedHeadSHA picks the newest
+// entry of the highest-precedence category present, so the current recorded
+// head is def456 and abc123 is a superseded head. No pull_request artifact
+// records abc123, so the step-3 head_sha dedup cannot swallow an event there.
+func seedSupersessionLedger(au *stubAudit, runID uuid.UUID) {
+	rid := runID
+	entry := func(seq int64, category, sha string) *audit.Entry {
+		return &audit.Entry{
+			ID:       uuid.New(),
+			Sequence: seq,
+			RunID:    &rid,
+			Category: category,
+			Payload:  []byte(fmt.Sprintf(`{"head_sha":%q}`, sha)),
+		}
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	au.seeded = append(au.seeded,
+		entry(10, "pull_request_opened", "abc000"),
+		entry(20, "fixup_pushed", "abc123"),
+		entry(30, "fixup_pushed", "def456"),
+	)
+}
+
+// TestHandle_CIFailureRetry_SupersededCancellation_RefusedBeforeRetryAccounting
+// is the done-means test for the webhook half of #4706: a cancelled or stale
+// required check at a head PROVEN older than the current recorded head (abc123
+// vs def456) consumes no retry. It mints nothing, dispatches nothing, and leaves
+// exactly one ci_retry_skipped row naming check_superseded_by_newer_head — and
+// it does so AHEAD of the retry cap, so the capped rows write no
+// ci_retry_exhausted. The reason is compared as a LITERAL.
+//
+// Counterfactual (CF3): disabling Step 2b's call-site condition lets the
+// uncapped rows mint a child and the capped rows write ci_retry_exhausted.
+// abc123 has no pull_request artifact, so the step-3 dedup cannot mask it.
+func TestHandle_CIFailureRetry_SupersededCancellation_RefusedBeforeRetryAccounting(t *testing.T) {
+	cases := []struct {
+		name         string
+		conclusion   string
+		retryAttempt int
+	}{
+		{"cancelled_uncapped", "cancelled", 0},
+		{"cancelled_capped", "cancelled", 1},
+		{"stale_uncapped", "stale", 0},
+		{"stale_capped", "stale", 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d, gh, runs, au := newDispatcherWithStubs(t)
+			d.Artifacts = &stubArtifacts{}
+			notifier := &stubIssueNotifier{}
+			d.IssueNotifier = notifier
+			// ciRetrySpec caps at max_retries: 1, so retry_attempt 1 is capped.
+			parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, c.retryAttempt)
+			seedSupersessionLedger(au, parent.ID)
+
+			if err := d.Handle(context.Background(), checkRunEventWith(t, c.conclusion, "abc123")); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 1 {
+				t.Errorf("runs.created = %d, want 1 (a superseded cancellation mints no retry child)", len(runs.created))
+			}
+			if gh.dispatchCalls != 0 {
+				t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+			}
+			if len(notifier.retryCalls) != 0 {
+				t.Errorf("NotifyCIRetry calls = %d, want 0", len(notifier.retryCalls))
+			}
+			for _, a := range au.appended {
+				if a.Category == "ci_retry_exhausted" {
+					t.Errorf("a superseded cancellation reported ci_retry_exhausted; want the real reason ahead of the cap (chained to %s)", a.RunID)
+				}
+				if a.Category == "ci_failure_retry_dispatched" {
+					t.Errorf("a ci_failure_retry_dispatched row was written for a superseded cancellation (chained to %s)", a.RunID)
+				}
+			}
+			rows, payloads := ciRetrySkippedRows(t, au)
+			if len(rows) != 1 {
+				t.Fatalf("ci_retry_skipped rows = %d, want exactly 1; audit categories: %v", len(rows), auditCategories(au))
+			}
+			if rows[0].RunID != parent.ID {
+				t.Errorf("row chained to %s, want the parent %s", rows[0].RunID, parent.ID)
+			}
+			if got, _ := payloads[0]["reason"].(string); got != "check_superseded_by_newer_head" {
+				t.Errorf("reason = %q, want %q", got, "check_superseded_by_newer_head")
+			}
+			if got, _ := payloads[0]["conclusion"].(string); got != c.conclusion {
+				t.Errorf("payload conclusion = %q, want %q", got, c.conclusion)
+			}
+			if got, _ := payloads[0]["head_sha"].(string); got != "abc123" {
+				t.Errorf("payload head_sha = %q, want abc123", got)
+			}
+		})
+	}
+}
+
+// TestHandle_CIFailureRetry_CurrentHeadCancellation_StillRetries is the
+// positive control for Step 2b: a cancellation AT the current recorded head
+// (def456) was superseded by nothing, so today's retry still runs.
+func TestHandle_CIFailureRetry_CurrentHeadCancellation_StillRetries(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	d.IssueNotifier = &stubIssueNotifier{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSupersessionLedger(au, parent.ID)
+
+	if err := d.Handle(context.Background(), checkRunEventWith(t, "cancelled", "def456")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + retry child for a current-head cancellation)", len(runs.created))
+	}
+	if child := runs.created[1]; child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Errorf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+	if rows, _ := ciRetrySkippedRows(t, au); len(rows) != 0 {
+		t.Errorf("ci_retry_skipped rows = %d, want 0 at the current head", len(rows))
+	}
+}
+
+// TestHandle_CIFailureRetry_FailureAtSupersededHead_StillRetries is a POSITIVE
+// observation: a real failure verdict at an older head still retries, with a
+// HEALTHY head lookup. It is an ADMITTED MASK, not a RED vehicle, for either
+// conclusion restriction alone: removing only the outer gate leaves it GREEN
+// (SupersededByHead's own conclusion check returns false for failure), and
+// removing only the inner one leaves it GREEN (the outer gate returns first).
+// Their isolated credits are TestHandle_CIFailureRetry_NonSupersessionFailure_
+// HeadLookupError_StillRetries and stagecheck's failure_older_head row.
+func TestHandle_CIFailureRetry_FailureAtSupersededHead_StillRetries(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	d.IssueNotifier = &stubIssueNotifier{}
+	seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSupersessionLedger(au, runs.created[0].ID)
+
+	if err := d.Handle(context.Background(), checkRunEventWith(t, "failure", "abc123")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (a failure verdict retries at any head)", len(runs.created))
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+	if rows, _ := ciRetrySkippedRows(t, au); len(rows) != 0 {
+		t.Errorf("ci_retry_skipped rows = %d, want 0 for a failure verdict", len(rows))
+	}
+}
+
+// TestHandle_CIFailureRetry_SupersededCheck_HeadLookupFailed_RefusesFailClosed
+// pins the READ-ERROR half: a cancelled check whose current recorded head
+// cannot be read refuses FAIL CLOSED with current_head_lookup_failed, mirroring
+// #4813. The fault is scoped to acceptance_scenarios_pushed, the first
+// category currentRunHeadSHA reads, so AppendChained stays healthy and the
+// refusal row is observable.
+//
+// Counterfactual (manual): making the lookup-error branch return "" fails open
+// — the head stays unknown, nothing is proven superseded, and a child is minted.
+func TestHandle_CIFailureRetry_SupersededCheck_HeadLookupFailed_RefusesFailClosed(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSupersessionLedger(au, parent.ID)
+	au.listByCategoryErrCategory = "acceptance_scenarios_pushed"
+
+	if err := d.Handle(context.Background(), checkRunEventWith(t, "cancelled", "abc123")); err != nil {
+		t.Fatalf("Handle: %v (a head lookup failure must refuse quietly, not 5xx)", err)
+	}
+	if len(runs.created) != 1 {
+		t.Errorf("runs.created = %d, want 1 (no child minted on a failed head lookup)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(notifier.retryCalls) != 0 {
+		t.Errorf("NotifyCIRetry calls = %d, want 0", len(notifier.retryCalls))
+	}
+	rows, payloads := ciRetrySkippedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1; audit categories: %v", len(rows), auditCategories(au))
+	}
+	if rows[0].RunID != parent.ID {
+		t.Errorf("row chained to %s, want the parent %s", rows[0].RunID, parent.ID)
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "current_head_lookup_failed" {
+		t.Errorf("reason = %q, want %q", got, "current_head_lookup_failed")
+	}
+}
+
+// TestHandle_CIFailureRetry_CancelledNoRecordedHead_StillRetries pins the
+// CLEAN-MISS half: no head-report ledger entry and no pull_request artifact
+// head, so the current head is unknown. An unknown head proves no
+// supersession, so today's retry runs. The check head (abc123) is non-empty,
+// which isolates SupersededByHead's currentHead arm at handler level. The
+// lookup DID run (one read per head-report category): this is a clean miss,
+// not an unreached lookup.
+func TestHandle_CIFailureRetry_CancelledNoRecordedHead_StillRetries(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	d.IssueNotifier = &stubIssueNotifier{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+
+	if err := d.Handle(context.Background(), checkRunEventWith(t, "cancelled", "abc123")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (a clean miss proves nothing and keeps the retry)", len(runs.created))
+	}
+	if child := runs.created[1]; child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Errorf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+	if rows, _ := ciRetrySkippedRows(t, au); len(rows) != 0 {
+		t.Errorf("ci_retry_skipped rows = %d, want 0 on a clean miss", len(rows))
+	}
+	au.mu.Lock()
+	calls := au.listCalls
+	au.mu.Unlock()
+	if calls != 4 {
+		t.Errorf("ListForRunByCategory calls = %d, want 4 (one per head-report category: the lookup ran and missed cleanly)", calls)
+	}
+}
+
+// TestHandle_CIFailureRetry_NonSupersessionFailure_HeadLookupError_StillRetries
+// isolates Step 2b's OUTER conclusion gate. A failure verdict carries a
+// category-scoped head-lookup fault (acceptance_scenarios_pushed), so the ONLY
+// thing between this delivery and a current_head_lookup_failed refusal is the
+// gate returning before the lookup. Healthy: one child, no refusal row, and the
+// faulted ledger is never read (listCalls == 0).
+//
+// Counterfactual (CF7): replacing the gate with `if ref == nil {` lets the
+// lookup run, hit the scoped fault and refuse — the child-count and
+// no-refusal assertions fail and listCalls becomes 1.
+func TestHandle_CIFailureRetry_NonSupersessionFailure_HeadLookupError_StillRetries(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	d.IssueNotifier = &stubIssueNotifier{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	au.listByCategoryErrCategory = "acceptance_scenarios_pushed"
+
+	if err := d.Handle(context.Background(), checkRunEventWith(t, "failure", "abc123")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 2 {
+		t.Errorf("runs.created = %d, want 2 (a failure verdict never reaches the head lookup, so its fault cannot refuse the retry)", len(runs.created))
+	} else if child := runs.created[1]; child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Errorf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+	if rows, payloads := ciRetrySkippedRows(t, au); len(rows) != 0 {
+		t.Errorf("ci_retry_skipped rows = %d (payloads %v), want 0 for a non-supersession failure", len(rows), payloads)
+	}
+	au.mu.Lock()
+	calls := au.listCalls
+	au.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("ListForRunByCategory calls = %d, want 0 (the outer conclusion gate must return before the head lookup)", calls)
+	}
+}
+
+// TestHandle_CIFailureRetry_SupersededCancellation_ArtifactHeadFallback_Refuses
+// pins currentRunHeadSHA's CLEAN-MISS fallback: with no head-report ledger
+// entry, the run's implement-stage pull_request artifact head (def456) is the
+// current head, so a cancellation at abc123 is still PROVEN superseded and
+// refused. The artifact records def456, not abc123, so the step-3 dedup cannot
+// swallow the event.
+//
+// Counterfactual (manual): replacing the fallback `return d.runHeadSHA(ctx,
+// runID)` with `return "", nil` leaves the head unknown, nothing is proven, and
+// a child is minted.
+func TestHandle_CIFailureRetry_SupersededCancellation_ArtifactHeadFallback_Refuses(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.IssueNotifier = &stubIssueNotifier{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	recordHeadSHA(t, runs, arts, parent.ID, "def456")
+
+	if err := d.Handle(context.Background(), checkRunEventWith(t, "cancelled", "abc123")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Errorf("runs.created = %d, want 1 (the artifact head proves supersession on a ledger miss)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	rows, payloads := ciRetrySkippedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1; audit categories: %v", len(rows), auditCategories(au))
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "check_superseded_by_newer_head" {
+		t.Errorf("reason = %q, want %q", got, "check_superseded_by_newer_head")
 	}
 }
