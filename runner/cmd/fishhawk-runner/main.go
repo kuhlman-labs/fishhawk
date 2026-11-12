@@ -9905,7 +9905,10 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 
 		// CHILD TAIL (#4079). The slice branch is published; report "pushed"
 		// exactly as the ordinary child arm does (branch/head/base + the diff
-		// size, no PR artifact) and stop — the parent integrates the slice. A
+		// size + the footer-free agent PR body, no PR artifact) and stop — the
+		// parent integrates the slice. servedPRBody is the body the #2570
+		// checkpoint preserved, so a resumed child still delivers its
+		// `## Test plan` / `## Notes` to the consolidated PR (#5192). A
 		// report failure re-arms as push (see fail above), so the next retry
 		// re-publishes idempotently and re-reports.
 		if isChildResume {
@@ -9919,6 +9922,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 				HeadSHA:           heldSHA,
 				BaseSHA:           heldBaseSHA,
 				FilesChangedCount: filesChanged,
+				PRBody:            servedPRBody,
 			}); err != nil {
 				return fail(heldCommitShipCategory(err), fmt.Sprintf("report child push from held commit: %v", err))
 			}
@@ -11714,11 +11718,15 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// running until the SLA watchdog reaps it, and a commit/push failure
 		// (reported via reportPullRequestFailure above) could never be
 		// distinguished from a still-pending push. No PR was opened, so the
-		// "pushed" outcome carries only branch/head_sha/base_sha + the diff
-		// size; the backend writes a child_pushed audit entry (no PR
-		// artifact). A report error is category-C (network) and is surfaced
-		// like the success ShipPullRequest error below so the failure path
-		// reports it.
+		// "pushed" outcome carries branch/head_sha/base_sha + the diff size,
+		// plus the agent's FOOTER-FREE PR body when it authored one (#5192):
+		// the backend persists it on the child_pushed audit entry (no PR
+		// artifact) and splices the slice's `## Test plan` / `## Notes` into
+		// the parent's consolidated PR. agentPRBody is empty when the agent
+		// wrote no handoff, keeping the report byte-identical. No title is
+		// sent — the consolidated heading uses the approved sub_plan title. A
+		// report error is category-C (network) and is surfaced like the
+		// success ShipPullRequest error below so the failure path reports it.
 		filesChanged := childPushFilesChanged(ctx, cap.BaseSHA, baseRef, repoDir, cfg.runID, cfg.stageID, logSink)
 		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 			RunID:             cfg.runID,
@@ -11729,6 +11737,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			HeadSHA:           cap.HeadSHA,
 			BaseSHA:           cap.BaseSHA,
 			FilesChangedCount: filesChanged,
+			PRBody:            agentPRBody,
 		}); err != nil {
 			return fmt.Errorf("report child push: %w", err)
 		}
