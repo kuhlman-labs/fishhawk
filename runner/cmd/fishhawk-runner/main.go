@@ -2962,6 +2962,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// changed differs from the git_diff the trace shipped, so it is not pinned,
 	// and with no pin the B/C report below arms no reverify checkpoint — the
 	// next retry is an ordinary agent pass.
+	//
+	// Nor is a head verify already judged RED when the fix loop then ended on a
+	// pre-verify plumbing failure (#5172, verifyHeadJudgedRedThenUnjudged): that
+	// category-C failure is about the NEXT tree, never judged, so arming a
+	// reverify on the red head would re-verify a known-red commit and drop
+	// the fix re-invoke's work. The retry re-runs the agent instead.
 	committedGateFailed := okBeforeCommittedGates && !res.OK && stageType == "implement" && !cfg.noPR
 	var verifyPin verifyHeadPin
 	verifyPinned := false
@@ -2970,7 +2976,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if repoDir == "" {
 			repoDir = "."
 		}
-		if why := verifyHeadNotAgentPass(ctx, repoDir, res.Events, len(cfg.scopeFiles) > scopeFilesAtAgentExit); why != "" {
+		why := verifyHeadNotAgentPass(ctx, repoDir, res.Events, len(cfg.scopeFiles) > scopeFilesAtAgentExit)
+		if why == "" && verifyHeadJudgedRedThenUnjudged(res.Events) {
+			why = verifyPinSkipRedHeadUnjudged
+		}
+		if why != "" {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_head_pin_skipped","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
 				cfg.runID, cfg.stageID, why)
@@ -5885,10 +5895,13 @@ func verifyFailureExcerpt(out string) string {
 // Failure handling splits on WHERE HEAD is when the failing op runs, symmetric
 // with runVerifyGateCommitted (#816):
 //
-//   - A PRE-commit infra error (StageScoped / commitVerifyWIP / commit produced
-//     nothing) left HEAD untouched, so it routes through the NON-BLOCKING skip
-//     path (verify_fix_skipped, nil return, outcome=skipped) — never invent a
-//     failure from gate plumbing; the real push runs its own #728/#800 gate.
+//   - A PRE-verify git plumbing error (StageScoped / commitVerifyWIP /
+//     rev-parse) reaches no verdict, so it FAILS CLOSED (#5172): it logs
+//     verify_fix_skipped, records outcome=skipped and demotes the stage to
+//     category C (res.OK=false, a verifyGateSkippedLead reason naming the
+//     step, nil return), the same as a refused / unavailable / timed-out
+//     gate. There is no in-place re-run. A commit that produced nothing is
+//     NOT a failure: the nothing-staged no-op still passes.
 //   - A fix RE-INVOKE that fails after every in-place attempt (#804, #3408) is
 //     also non-blocking (verify_fix_reinvoke_exhausted, nil return) — but the
 //     verify verdict on the committed tree WAS reached and was red, so the
@@ -5918,7 +5931,7 @@ func verifyFailureExcerpt(out string) string {
 // A passing verify whose tree cannot be resolved FAILS CLOSED
 // (ErrPushedTreeNotVerified, hard error → category-B at the call site) — an
 // empty tree would silently disable the invariant. Empty is returned only on
-// the no-verdict paths: nothing-staged pass, skip, and exhaustion.
+// the no-verdict paths: nothing-staged pass, failure, and exhaustion.
 //
 // cfg is a POINTER (#3434): the mid-loop re-fold writes approved amendment
 // paths into cfg.scopeFiles, and every post-loop consumer in run()
@@ -5979,7 +5992,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		attempts        int
 		lastOutput      string
 		verifiedTreeSHA string // set only on a passing iteration's real verify (#960)
-		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip (outcome=skipped)
+		lastIterErr     error  // non-nil only on a PRE-verify plumbing failure → category C (outcome=skipped, #5172)
 		reinvokeErr     error  // non-nil when every fix re-invoke attempt failed → non-blocking, outcome=failed (#3408)
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
 		refused         bool   // a gate-isolation refusal (ADR-063 / #2134) → category C, no fix re-invoke
@@ -6038,7 +6051,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 
 		// (a) Stage scope-only and make a throwaway commit so the verify
 		// command sees the drift-excluded committed tree, not the working tree.
-		if _, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles); err != nil {
+		if _, err := verifyGateStageScopedFn(ctx, repoDir, scopeFiles); err != nil {
 			if absorbing != nil {
 				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
 				break
@@ -6046,13 +6059,13 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			lastIterErr = fmt.Errorf("verify-fix: stage scoped: %w", err)
 			break
 		}
-		committed, err := commitVerifyWIP(ctx, *cfg, repoDir)
+		committed, err := verifyGateCommitWIPFn(ctx, *cfg, repoDir)
 		if err != nil {
 			if absorbing != nil {
 				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
 				break
 			}
-			lastIterErr = err
+			lastIterErr = fmt.Errorf("verify-fix: commit wip: %w", err)
 			break
 		}
 		if !committed && absorbing != nil {
@@ -6069,12 +6082,13 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 
 		// (b) Resolve the throwaway commit's SHA. HEAD has now moved, so any undo
 		// failure from here on is FATAL (see (d)).
-		headSHA, err := gitRevParseHEAD(ctx, repoDir)
+		headSHA, err := verifyGateRevParseHEADFn(ctx, repoDir)
 		if err != nil {
 			// rev-parse failed but the commit landed — undo it so the working
-			// tree is left as the real push expects, then non-blocking skip. A
-			// failed undo here is FATAL for the same reason as (d): HEAD is left
-			// on the throwaway commit and the real push would stack on top.
+			// tree is left as the real push expects, then fail category C
+			// (#5172). A failed undo here is FATAL for the same reason as (d):
+			// HEAD is left on the throwaway commit and the real push would
+			// stack on top.
 			if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
 				fatalErr = rerr
 				break
@@ -6083,7 +6097,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
 				break
 			}
-			lastIterErr = err
+			lastIterErr = fmt.Errorf("verify-fix: rev-parse: %w", err)
 			break
 		}
 
@@ -6212,7 +6226,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// next iteration's re-commit (fail+retry). A reset failure here is FATAL
 		// (#816): HEAD is left on the throwaway commit and the real push would
 		// stack on top, pushing the WIP commit into the PR. Do NOT swallow it to
-		// the non-blocking skip — abort the stage hard.
+		// the category-C plumbing demotion (#5172) — abort the stage hard.
 		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
 			fatalErr = rerr
 			break
@@ -6678,9 +6692,10 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	// Emit verify_summary EXACTLY ONCE on every exit path (#804 Gap 2, #816). The
 	// outcome must reflect the real exit: a POST-commit reset failure aborts the
 	// stage hard, so it is "failed" (carrying the abort detail) and returns a
-	// hard error; a PRE-commit infra abort short-circuits into the non-blocking
-	// skip below, so it is "skipped" (carrying the abort detail), NOT "failed" —
-	// the old `if !passed` form mislabelled the errored-exit path as failed. A
+	// hard error; a PRE-verify plumbing abort reached no verdict, so it is
+	// "skipped" (carrying the abort detail) and fails category C below (#5172),
+	// NOT "failed" — the old `if !passed` form mislabelled the errored-exit
+	// path as failed. A
 	// fix re-invoke exhausted after a red verify is "failed" WITH a detail
 	// naming the re-invoke error (#3408): the verdict was reached, so the
 	// review must not read it as the indeterminate "skipped".
@@ -6761,13 +6776,20 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	}
 
 	if lastIterErr != nil {
-		// A PRE-commit infra failure inside the loop (git/stage error) is a
-		// non-blocking skip — never invent a new failure source from gate
-		// plumbing. The stage proceeds to the real push, which runs its own
-		// #728/#800 gate.
+		// A PRE-verify git plumbing failure (stage / throwaway commit /
+		// rev-parse, #5172) means no verdict was reached on this pass's tree,
+		// possibly AFTER a fix re-invoke rewrote it. The real push's #728
+		// compile gate is Go-only and runs no tests, so proceeding would push
+		// an unverified tree. The stage fails category C instead, the same
+		// treatment as a refused / unavailable / timed-out gate; there is no
+		// in-place re-run (fishhawk_retry_stage re-runs it). run() never pins
+		// an earlier red head for this failure (verifyHeadJudgedRedThenUnjudged).
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, lastIterErr.Error())
+		res.OK = false
+		res.FailureCategory = "C"
+		res.FailureReason = verifyGateSkippedReason(cfg.verifyCmd, lastIterErr.Error())
 		return reinvoked, "", nil
 	}
 
@@ -6863,10 +6885,16 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 //
 // Failure handling splits on WHERE HEAD is when the failing op runs:
 //
-//   - A PRE-commit infra error (StageScoped / commitVerifyWIP / rev-parse) left
-//     HEAD untouched, so it is a NON-BLOCKING skip: emit a skipped verify_run +
-//     nil error — never invent a failure from gate plumbing. The real push runs
-//     its own #728/#800 gate.
+//   - A PRE-verify git plumbing error (StageScoped / commitVerifyWIP /
+//     rev-parse) means the gate never ran the verify command, so it FAILS
+//     CLOSED (#5172): emit the skipped verify_run and return
+//     verifyGatePlumbingFailure (gitops.ErrVerifyInfraFailure +
+//     errVerifyGateSkipped, the verifyGateSkippedLead reason first), which
+//     the call site classifies category C, retryable in place. There is no
+//     in-place re-run. The real push's #728 gate is Go-only `go vet` and runs
+//     no tests, so passing here would push an unverified tree. A rev-parse
+//     failure first undoes the throwaway commit (a failed undo is FATAL, as
+//     at (e)).
 //   - A non-zero verify exit whose output matches the testcontainers
 //     start-timeout signature (#972, isTestcontainersStartFlake) is re-run
 //     ONCE against the same throwaway headSHA before the reset; both
@@ -6915,7 +6943,8 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 // whose tree cannot be resolved is an inconsistent state and FAILS CLOSED
 // (ErrPushedTreeNotVerified, category-B): an empty tree would silently
 // disable the invariant. The empty-string/no-enforcement return is reserved
-// for the paths where no gate verdict exists (skip, nothing staged, failure).
+// for the paths where no gate verdict exists: the nothing-staged no-op (the
+// only nil-error empty return) and the failure paths.
 func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) ([]agent.Event, string, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
@@ -6928,17 +6957,18 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	}
 
 	// (a) Stage scope-only, capturing the drift list for the failure message.
-	// Pre-commit infra error — HEAD never moved; non-blocking skip.
-	drift, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles)
+	// Pre-commit infra error — HEAD never moved, but the gate never ran:
+	// category C (#5172).
+	drift, err := verifyGateStageScopedFn(ctx, repoDir, scopeFiles)
 	if err != nil {
-		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "stage_scoped: "+err.Error(), "skipped")}, "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "stage_scoped: "+err.Error(), "skipped")}, "", verifyGatePlumbingFailure(cfg.verifyCmd, "stage_scoped", err)
 	}
 
 	// (b) Throwaway commit to materialize a committed-HEAD SHA. Still pre-commit
-	// from HEAD's perspective on error (the commit failed) → non-blocking skip.
-	committed, err := commitVerifyWIP(ctx, cfg, repoDir)
+	// from HEAD's perspective on error (the commit failed) → category C (#5172).
+	committed, err := verifyGateCommitWIPFn(ctx, cfg, repoDir)
 	if err != nil {
-		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "commit_wip: "+err.Error(), "skipped")}, "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "commit_wip: "+err.Error(), "skipped")}, "", verifyGatePlumbingFailure(cfg.verifyCmd, "commit_wip", err)
 	}
 	if !committed {
 		// Nothing staged — no scope-only change to gate. The real push hits its
@@ -6948,15 +6978,15 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 
 	// (c) Resolve the throwaway commit's SHA. HEAD has now moved, so any undo
 	// failure from here on is FATAL (see (e)).
-	headSHA, err := gitRevParseHEAD(ctx, repoDir)
+	headSHA, err := verifyGateRevParseHEADFn(ctx, repoDir)
 	if err != nil {
 		// rev-parse failed but the commit landed — undo it so the working tree
-		// is left as the real push expects, then non-blocking skip. A failed
-		// undo here is FATAL for the same reason as (e).
+		// is left as the real push expects, then fail category C (#5172). A
+		// failed undo here is FATAL for the same reason as (e).
 		if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
 			return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "reset_after_revparse: "+rerr.Error(), "failed")}, "", rerr
 		}
-		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "rev_parse: "+err.Error(), "skipped")}, "", nil
+		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "rev_parse: "+err.Error(), "skipped")}, "", verifyGatePlumbingFailure(cfg.verifyCmd, "rev_parse", err)
 	}
 
 	// The gate's CHANGE IDENTITY (#3665), computed against the throwaway
@@ -8286,7 +8316,7 @@ func resolveDiffCoverageBaseRef(cfg config, dc *upload.DiffCoverageConfig) strin
 
 // verifyRunEvent builds the verify_run trace event for a committed-tree verify
 // run, carrying the committed head_sha and its tree_sha (#960 — the tree the
-// gate actually ran against; empty on the pre-commit skip paths) alongside the
+// gate actually ran against; empty on the pre-commit plumbing paths) alongside the
 // command/exit/output the working-tree gate (runVerifyGate) emits.
 func verifyRunEvent(command, headSHA, treeSHA string, exitCode int, output, outcome string) agent.Event {
 	return agent.Event{
@@ -8300,6 +8330,40 @@ func verifyRunEvent(command, headSHA, treeSHA string, exitCode int, output, outc
 			"outcome":   outcome,
 		}),
 	}
+}
+
+// verifyPinSkipRedHeadUnjudged is the verify_head_pin_skipped reason for a
+// head withheld by verifyHeadJudgedRedThenUnjudged (#5172).
+const verifyPinSkipRedHeadUnjudged = "plumbing_failure_after_red_verify"
+
+// verifyHeadJudgedRedThenUnjudged reports whether the verify-fix loop ended
+// without a verdict (its verify_summary outcome is "skipped") while the last
+// committed verify_run head, the one pinVerifyHead would pin, was judged RED
+// (outcome "failed"). That is the fix loop's pre-verify plumbing failure on an
+// iteration after a red one (#5172): the failure concerns a later, never-judged
+// tree, so the red head must never be armed as a reverify checkpoint. A gate
+// that never ran the command (#3983) leaves a "skipped" verify_run as the last
+// head, so it is unaffected. With no verify_summary (the single-shot gate) or no
+// headed verify_run this is false.
+func verifyHeadJudgedRedThenUnjudged(events []agent.Event) bool {
+	summary, headOutcome := "", ""
+	for i := len(events) - 1; i >= 0 && (summary == "" || headOutcome == ""); i-- {
+		var p struct {
+			Outcome string `json:"outcome"`
+			HeadSHA string `json:"head_sha"`
+		}
+		switch events[i].Kind {
+		case "verify_summary":
+			if summary == "" && json.Unmarshal(events[i].Payload, &p) == nil {
+				summary = p.Outcome
+			}
+		case "verify_run":
+			if headOutcome == "" && json.Unmarshal(events[i].Payload, &p) == nil && p.HeadSHA != "" {
+				headOutcome = p.Outcome
+			}
+		}
+	}
+	return summary == "skipped" && headOutcome == "failed"
 }
 
 // commitVerifyWIP stages nothing new (the caller already ran StageScoped) and
@@ -8330,6 +8394,20 @@ func commitVerifyWIP(ctx context.Context, cfg config, repoDir string) (committed
 	}
 	return true, nil
 }
+
+// The committed-tree gates' pre-verify plumbing seams (#5172), swapped only by
+// tests that seed a plumbing failure, following the materializeGateCheckoutFn
+// precedent. Only runVerifyGateCommitted and runVerifyFixLoop call them.
+var (
+	// verifyGateStageScopedFn stages the scope-only tree for a gate (#5172).
+	verifyGateStageScopedFn = func(ctx context.Context, repoDir string, paths []string) ([]string, error) {
+		return (&gitops.Pusher{}).StageScoped(ctx, repoDir, paths)
+	}
+	// verifyGateCommitWIPFn makes the gate's throwaway commit (#5172).
+	verifyGateCommitWIPFn = commitVerifyWIP
+	// verifyGateRevParseHEADFn resolves the throwaway commit's SHA (#5172).
+	verifyGateRevParseHEADFn = gitRevParseHEAD
+)
 
 // gitRevParseHEAD returns the current HEAD SHA of repoDir.
 func gitRevParseHEAD(ctx context.Context, repoDir string) (string, error) {

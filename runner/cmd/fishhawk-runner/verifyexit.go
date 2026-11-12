@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
 // The verify exit-code contract (#4022, docs/spec/workflow-v2.md § "Verify
@@ -82,8 +83,9 @@ var errVerifyTempFail = errors.New("verify infrastructure temporary failure")
 
 // errVerifyGateSkipped is wrapped (alongside gitops.ErrVerifyInfraFailure)
 // when the gate never ran the verify command (outcome "skipped": its
-// throwaway checkout could not be materialized) across its one re-run. An
-// unexecuted gate never passes (#3983).
+// throwaway checkout could not be materialized) across its one re-run, or
+// when a pre-verify git plumbing step failed (verifyGatePlumbingFailure,
+// #5172). An unexecuted gate never passes (#3983).
 var errVerifyGateSkipped = errors.New("verify gate skipped")
 
 // verifyTempFailLead / verifyGateSkippedLead lead the matching FailureReason /
@@ -105,6 +107,21 @@ func verifyTempFailReason(verifyCmd string, attempts int) string {
 func verifyGateSkippedReason(verifyCmd, detail string) string {
 	return fmt.Sprintf("%s: the committed-tree gate never ran %q (outcome skipped: %s); an unexecuted gate is not a pass. Retry the stage in place.",
 		verifyGateSkippedLead, verifyCmd, detail)
+}
+
+// verifyGatePlumbingFailure is the single-shot committed-tree gate's error for
+// a pre-verify git plumbing failure (#5172): StageScoped, the throwaway commit
+// or the rev-parse of its SHA failed, so the gate never ran the verify command.
+// An unexecuted gate is not a pass, so this is category C like every other
+// unexecuted gate (#3983): it wraps gitops.ErrVerifyInfraFailure +
+// errVerifyGateSkipped. The reason text LEADS (verifyGateSkippedLead) and the
+// sentinels follow it, so the stage's FailureReason names the cause first.
+// There is deliberately no in-place re-run: a stale index.lock or a similar
+// local git condition is cleared by the operator, and fishhawk_retry_stage
+// re-runs the gate. err is local git plumbing output only (C7, #5172).
+func verifyGatePlumbingFailure(verifyCmd, step string, err error) error {
+	return fmt.Errorf("%s [%w: %w]",
+		verifyGateSkippedReason(verifyCmd, step+": "+err.Error()), gitops.ErrVerifyInfraFailure, errVerifyGateSkipped)
 }
 
 // logVerifyTempFailRerun writes the verify_infra_tempfail_retry JSONL line a

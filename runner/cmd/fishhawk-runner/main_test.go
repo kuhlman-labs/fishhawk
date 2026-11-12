@@ -13079,7 +13079,7 @@ func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T
 	if !strings.Contains(stderr.String(), "verify_fix_reinvoke_exhausted") {
 		t.Errorf("expected verify_fix_reinvoke_exhausted log line:\n%s", stderr.String())
 	}
-	// The pre-commit infra skip is a DIFFERENT path (outcome=skipped); a red
+	// The pre-verify plumbing failure is a DIFFERENT path (outcome=skipped, category C since #5172); a red
 	// verify whose repair channel died must not be relabelled as it.
 	if strings.Contains(stderr.String(), "verify_fix_skipped") {
 		t.Errorf("re-invoke exhaustion must NOT emit verify_fix_skipped:\n%s", stderr.String())
@@ -13593,11 +13593,12 @@ func TestRun_VerifyGateCommitted_NothingStaged_NoOp(t *testing.T) {
 	}
 }
 
-// TestRunVerifyGateCommitted_InfraSkipNonBlocking: a PRE-commit infra error (here
-// a non-git working dir, so StageScoped fails) is a NON-BLOCKING skip — HEAD was
-// never moved, so the helper returns a skipped event + nil error and the real
-// push runs its own gate.
-func TestRunVerifyGateCommitted_InfraSkipNonBlocking(t *testing.T) {
+// TestRunVerifyGateCommitted_NonGitWorkingDirIsCategoryC: a PRE-verify plumbing
+// error (here a REAL one: a non-git working dir, so StageScoped fails) FAILS
+// CLOSED (#5172). HEAD never moved, but the gate never ran the verify command,
+// so the helper returns one skipped verify_run and a category-C error wrapping
+// gitops.ErrVerifyInfraFailure + errVerifyGateSkipped, never the old nil.
+func TestRunVerifyGateCommitted_NonGitWorkingDirIsCategoryC(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -13607,8 +13608,14 @@ func TestRunVerifyGateCommitted_InfraSkipNonBlocking(t *testing.T) {
 		scopeFiles: []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
 	}
 	evs, tree, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
-	if err != nil {
-		t.Fatalf("pre-commit infra error must be a non-blocking skip, got %v", err)
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errVerifyGateSkipped) {
+		t.Fatalf("pre-verify plumbing error must wrap ErrVerifyInfraFailure + errVerifyGateSkipped, got %v", err)
+	}
+	if got := committedGateFailureCategory(err); got != "C" {
+		t.Errorf("category = %q, want C (retryable in place)", got)
+	}
+	if !strings.HasPrefix(err.Error(), verifyGateSkippedLead+": ") || !strings.Contains(err.Error(), "stage_scoped") {
+		t.Errorf("error = %q, want a %s lead naming stage_scoped", err, verifyGateSkippedLead)
 	}
 	if len(evs) != 1 {
 		t.Fatalf("event count = %d, want 1 (skip path)", len(evs))
@@ -13626,8 +13633,8 @@ func TestRunVerifyGateCommitted_InfraSkipNonBlocking(t *testing.T) {
 // FATAL, not a skip. We force it by committing into a repo with no prior commit,
 // so the throwaway is the ROOT commit and `git reset --soft HEAD~1` fails (no
 // parent). In that state HEAD is left on the throwaway commit, so swallowing the
-// error would push the WIP commit into the PR. Distinct from the pre-commit
-// infra-skip case, which must stay non-blocking.
+// error would push the WIP commit into the PR. Distinct from the pre-verify
+// plumbing case, which fails category C (#5172), not fatal/uncategorized.
 func TestRunVerifyGateCommitted_PostCommitResetFailureFatal(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -16281,12 +16288,13 @@ func TestRunVerifyFixLoop_PromptTooLargeNotRetried(t *testing.T) {
 	}
 }
 
-// TestRunVerifyFixLoop_PreCommitInfraSkipStaysSkipped is the CONTROL that the
-// two non-blocking paths are distinct after #3408: a PRE-commit infra failure
-// (a non-git working dir, so StageScoped fails before any verify runs) still
+// TestRunVerifyFixLoop_PreCommitInfraFailureIsCategoryC: a PRE-verify plumbing
+// failure (a non-git working dir, so StageScoped fails before any verify runs)
 // records verify_summary outcome=skipped + verify_fix_skipped — no verdict was
-// reached — and never the re-invoke-exhausted outcome=failed path.
-func TestRunVerifyFixLoop_PreCommitInfraSkipStaysSkipped(t *testing.T) {
+// reached — never the re-invoke-exhausted outcome=failed path, and since #5172
+// it demotes the stage to category C with a verify_gate_skipped lead instead
+// of passing it unverified.
+func TestRunVerifyFixLoop_PreCommitInfraFailureIsCategoryC(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -16301,13 +16309,16 @@ func TestRunVerifyFixLoop_PreCommitInfraSkipStaysSkipped(t *testing.T) {
 	var logSink strings.Builder
 	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err != nil {
-		t.Fatalf("pre-commit infra error must be non-blocking, got %v\n%s", err, logSink.String())
+		t.Fatalf("pre-verify plumbing error must demote through res, not a hard error, got %v\n%s", err, logSink.String())
 	}
 	if reinvoked || invoker.callIdx != 0 || tree != "" {
 		t.Errorf("reinvoked=%t calls=%d tree=%q, want false/0/\"\" (no verify ran)", reinvoked, invoker.callIdx, tree)
 	}
-	if !res.OK || res.FailureCategory != "" {
-		t.Errorf("skip must not demote: OK=%t category=%q", res.OK, res.FailureCategory)
+	if res.OK || res.FailureCategory != "C" {
+		t.Errorf("plumbing failure must demote to C: OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+	if !strings.HasPrefix(res.FailureReason, verifyGateSkippedLead+": ") || !strings.Contains(res.FailureReason, "stage scoped") {
+		t.Errorf("FailureReason = %q, want a %s lead naming the stage-scoped step", res.FailureReason, verifyGateSkippedLead)
 	}
 	var summary map[string]any
 	for _, ev := range res.Events {
