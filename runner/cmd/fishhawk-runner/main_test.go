@@ -6206,6 +6206,79 @@ func TestRun_ImplementStage_DecomposedChild_SliceZero(t *testing.T) {
 		t.Errorf("child-push report must carry head_sha + base_sha; got head=%q base=%q",
 			fu.gotPRArgs.HeadSHA, fu.gotPRArgs.BaseSHA)
 	}
+	// #5192: no handoff was authored, so the pushed report carries no body and
+	// its signed bytes stay identical to the pre-#5192 shape.
+	if fu.gotPRArgs.PRBody != "" {
+		t.Errorf("child-push report PRBody = %q, want empty (no agent handoff)", fu.gotPRArgs.PRBody)
+	}
+}
+
+// TestRun_ImplementStage_DecomposedChild_ReportsAgentPRBody pins #5192 on the
+// ordinary decomposed-child return: the slice agent's FOOTER-FREE PR body rides
+// the "pushed" report so the parent's consolidated PR can splice its
+// `## Test plan` / `## Notes`. Counterfactual: delete `PRBody: agentPRBody` from
+// the isDecomposed ShipPullRequest call -> PRBody is "" -> RED.
+func TestRun_ImplementStage_DecomposedChild_ReportsAgentPRBody(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	runID := "11111111-2222-3333-4444-555555555555"
+	stageID := "22222222-3333-4444-5555-666666666666"
+	path := withPRDescriptionPath(t, runID, stageID)
+	wantBody := "## Summary\n\n- slice work\n\n## Test plan\n\n- [ ] hand-run RED: assertion text\n\n## Notes\n\n- slice note"
+	// The agent writes the handoff DURING invocation — after the pre-invoke
+	// sweep (#1777) removes any stale one — mirroring the real flow.
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			if werr := os.WriteFile(path, []byte("feat(runner): slice zero\n\n"+wantBody+"\n"), 0o600); werr != nil {
+				t.Errorf("write PR file in onInvoke: %v", werr)
+			}
+		},
+	})
+	withFakeRemoteBranchExists(t, false)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             stageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		DecomposedFromRunID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR called for decomposed child — should be suppressed")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (child-push report) not called")
+	}
+	if fu.gotPRArgs.Outcome != "pushed" {
+		t.Errorf("child-push report Outcome = %q, want \"pushed\"", fu.gotPRArgs.Outcome)
+	}
+	if fu.gotPRArgs.PRBody != wantBody {
+		t.Errorf("child-push report PRBody = %q, want the agent-authored body %q", fu.gotPRArgs.PRBody, wantBody)
+	}
+	if strings.Contains(fu.gotPRArgs.PRBody, "_Opened by [Fishhawk]") {
+		t.Errorf("child-push report PRBody carries the attribution footer; it must be footer-free:\n%s", fu.gotPRArgs.PRBody)
+	}
+	if fu.gotPRArgs.PRTitle != "" {
+		t.Errorf("child-push report PRTitle = %q, want empty (the consolidated heading uses the sub_plan title)", fu.gotPRArgs.PRTitle)
+	}
 }
 
 // TestRun_ImplementStage_DecomposedChild_SliceTwo verifies that a non-zero

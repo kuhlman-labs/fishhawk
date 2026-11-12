@@ -2553,6 +2553,10 @@ type ShipPullRequestArgs struct {
 	// it (see HeldCommitPRText). Both are clamped and budgeted against the
 	// backend's 32 KiB request cap before shipping; empty on every other outcome
 	// and on every pre-push failure, where the body stays byte-identical to today.
+	// The decomposed child's Outcome=="pushed" report (#5192) also carries
+	// PRBody (never PRTitle), bounded by fitChildPushPRBody, so the parent's
+	// consolidated PR can splice the slice's `## Test plan` / `## Notes`; the
+	// other push-shaped outcomes ignore it.
 	// ResumeKind is the CHECKPOINT DISCRIMINATOR on an Outcome=="failed" report
 	// (E45.86 / #3621). Empty — the legacy value — means the PR-OPEN checkpoint
 	// (#2169) or no checkpoint at all, and the marshalled body is then
@@ -3441,7 +3445,8 @@ func InjectTranscript(body []byte, ref AcceptanceTranscriptRef) ([]byte, error) 
 // pullRequestChildPushBody is the success-report wire shape ShipPullRequest
 // marshals when Args.Outcome == "pushed" (#771). A decomposed child pushes
 // onto the shared parent branch without opening a PR, so the body carries the
-// pushed commit's branch + SHAs + diff size rather than a PR number/URL. The
+// pushed commit's branch + SHAs + diff size rather than a PR number/URL, plus
+// the agent's optional footer-free PR body on "pushed" (#5192). The
 // backend decodes these optional fields from the same pullRequestBody as the
 // success and failure variants; kept here so the runner owns the bytes it
 // signs.
@@ -3455,6 +3460,104 @@ type pullRequestChildPushBody struct {
 	// "fixup_pushed" report. omitempty keeps the "pushed" child-push and
 	// "fixup_no_changes" bodies byte-identical when it is unset.
 	ApplyPath string `json:"apply_path,omitempty"`
+	// Body is the slice agent's FOOTER-FREE pull-request description (#5192),
+	// populated ONLY on the "pushed" child-push report and only when the agent
+	// authored one. The backend persists it on the child's child_pushed audit
+	// entry and splices its `## Test plan` / `## Notes` into the parent's
+	// consolidated PR. omitempty keeps every other outcome, and every pushed
+	// report without authored text, byte-identical. It is bounded by
+	// fitChildPushPRBody before marshalling. The `body` tag matches the
+	// backend's pullRequestBody.Body, so DisallowUnknownFields accepts it.
+	Body string `json:"body,omitempty"`
+}
+
+// childPushPRBodyCutBackoff is how far back a child-push body cut looks for a
+// newline to end on (#5192 C4).
+const childPushPRBodyCutBackoff = 512
+
+// cutChildPushPRBody cuts s to at most max bytes for the child-push report
+// (#5192 C4). It wraps clampRunes — which the park and failure paths share and
+// which stays unchanged — and BACKS THE CUT OFF so a size cut can never mint a
+// wrong closing reference: to the last newline when one lies within the final
+// childPushPRBodyCutBackoff bytes of the cut, otherwise past any trailing `#`
+// plus digit run, so `Fixes #5121` cut mid-number never leaves `Fixes #51`.
+// A string that already fits is returned unchanged.
+func cutChildPushPRBody(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := clampRunes(s, max)
+	if i := strings.LastIndexByte(cut, '\n'); i >= 0 && len(cut)-i <= childPushPRBodyCutBackoff {
+		return cut[:i]
+	}
+	end := len(cut)
+	for end > 0 && cut[end-1] >= '0' && cut[end-1] <= '9' {
+		end--
+	}
+	if end > 0 && cut[end-1] == '#' {
+		return cut[:end-1]
+	}
+	return cut
+}
+
+// fitChildPushPRBody bounds the agent PR body raw a "pushed" child-push report
+// carries (#5192) and returns the text to send in env.Body.
+//
+// TWO BOUNDS, ONE MARKER. The text is held to MaxHeldCommitPRBodyBytes (the
+// same 8 KiB the #2570 park carries) AND the MARSHALLED envelope to
+// MaxPullRequestReportBytes, because encoding/json's escape expansion (six
+// bytes per `<`) can push an 8 KiB body past the backend's 32 KiB cap. Whenever
+// EITHER bound cuts, the result is a cut prefix plus exactly one
+// heldCommitPRBodyTruncationMarker, and the cut reserves the marker's bytes, so
+// len(result) <= MaxHeldCommitPRBodyBytes on EVERY path — including a body of
+// 8 KiB or less that only the envelope fit cuts (#5192 C2). An uncut body is
+// returned verbatim with no marker.
+//
+// NOT shrinkHeldCommitPRBody (#5192 C5): that helper returns early and UNMARKED
+// whenever the text it is handed already fits, so handing it a pre-marker cut
+// ships zero markers exactly when the bare cut fits but the marked one does
+// not. Here every cut candidate carries the marker, and the largest fitting
+// one is found by binary search over measured marshalled bytes.
+//
+// DROP RATHER THAN 413. When not even MinHeldCommitPRBodyBytes of retained text
+// fits, the body is dropped (""): this report drives the child stage's terminal
+// transition and must never be refused over optional text.
+func fitChildPushPRBody(env pullRequestChildPushBody, raw string) string {
+	if raw == "" {
+		return ""
+	}
+	fits := func(body string) bool {
+		env.Body = body
+		over, ok := marshalOverflow(env, MaxPullRequestReportBytes)
+		return ok && over <= 0
+	}
+	if len(raw) <= MaxHeldCommitPRBodyBytes && fits(raw) {
+		return raw
+	}
+	// A cut happens: reserve the marker's bytes so the marked result stays
+	// within MaxHeldCommitPRBodyBytes, and never retain the whole raw text.
+	candidate := func(n int) string {
+		return cutChildPushPRBody(raw, n) + heldCommitPRBodyTruncationMarker
+	}
+	hi := min(len(raw)-1, MaxHeldCommitPRBodyBytes-len(heldCommitPRBodyTruncationMarker))
+	if hi >= MinHeldCommitPRBodyBytes && fits(candidate(hi)) {
+		return candidate(hi)
+	}
+	lo, hi := MinHeldCommitPRBodyBytes, hi-1
+	best := -1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if fits(candidate(mid)) {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	return candidate(best)
 }
 
 // HeldCommitPRText is the agent-authored pull-request title + body a park or
@@ -3621,14 +3724,21 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		// discriminator differs. For "fixup_no_changes" no new commit landed, so
 		// HeadSHA is empty and FilesChangedCount is 0 — branch + base_sha pin the
 		// unchanged tip for the audit entry.
-		marshalled, err := json.Marshal(pullRequestChildPushBody{
+		push := pullRequestChildPushBody{
 			Outcome:           args.Outcome,
 			Branch:            args.Branch,
 			HeadSHA:           args.HeadSHA,
 			BaseSHA:           args.BaseSHA,
 			FilesChangedCount: args.FilesChangedCount,
 			ApplyPath:         args.ApplyPath,
-		})
+		}
+		// #5192: only the decomposed child's "pushed" report carries the
+		// agent's PR body — every other outcome sharing this shape, and every
+		// pushed report without authored text, keeps today's signed bytes.
+		if args.Outcome == "pushed" && args.PRBody != "" {
+			push.Body = fitChildPushPRBody(push, args.PRBody)
+		}
+		marshalled, err := json.Marshal(push)
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request push body: %w", err)
 		}

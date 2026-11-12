@@ -510,11 +510,297 @@ func TestShipPullRequest_ChildPushOutcome_MarshalsPushBody(t *testing.T) {
 	if sent != want {
 		t.Errorf("sent body = %+v, want %+v", sent, want)
 	}
+	// #5192 byte identity: a pushed report without PRBody carries no `body` key.
+	if strings.Contains(string(pf.receivedBody), `"body"`) {
+		t.Errorf("pushed report without PRBody carries a body key: %s", pf.receivedBody)
+	}
 	// Signature must cover the marshalled push body, not the empty success Body.
 	digest := sha256.Sum256(pf.receivedBody)
 	wantSig := hex.EncodeToString(ed25519.Sign(priv, digest[:]))
 	if pf.receivedSig != wantSig {
 		t.Error("signature must cover the child-push body bytes")
+	}
+}
+
+// childPushTestArgs is the "pushed" child-push report the #5192 body tests ship.
+func childPushTestArgs(priv ed25519.PrivateKey, outcome, prBody string) ShipPullRequestArgs {
+	return ShipPullRequestArgs{
+		RunID:             "run-aaa",
+		StageID:           "stage-bbb",
+		PrivateKey:        priv,
+		Outcome:           outcome,
+		Branch:            "fishhawk/run-aaa/slice-0",
+		HeadSHA:           "head-abc",
+		BaseSHA:           "base-def",
+		FilesChangedCount: 3,
+		PRBody:            prBody,
+	}
+}
+
+// childPushEnvelopeSize is the marshalled size of the child-push envelope
+// childPushTestArgs ships carrying body, measured with encoding/json directly so
+// the #5192 fixtures are built independently of fitChildPushPRBody.
+func childPushEnvelopeSize(t *testing.T, body string) int {
+	t.Helper()
+	b, err := json.Marshal(pullRequestChildPushBody{
+		Outcome: "pushed", Branch: "fishhawk/run-aaa/slice-0",
+		HeadSHA: "head-abc", BaseSHA: "base-def", FilesChangedCount: 3, Body: body,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(b)
+}
+
+// shipChildPush ships a child-push report and returns the decoded received
+// body, failing the test unless the signature covers the received bytes and
+// the received bytes fit the backend's request cap.
+func shipChildPush(t *testing.T, outcome, prBody string) (pullRequestChildPushBody, []byte) {
+	t.Helper()
+	pf, srv := newPRFakeBackend(t)
+	pf.status = http.StatusOK
+	pf.body = `{"stage_id":"stage-bbb","outcome":"` + outcome + `","branch":"fishhawk/run-aaa/slice-0","head_sha":"head-abc"}`
+	priv := makePRKey(t)
+	if _, err := quickPRClient(srv).ShipPullRequest(context.Background(), childPushTestArgs(priv, outcome, prBody)); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if len(pf.receivedBody) > MaxPullRequestReportBytes {
+		t.Errorf("received %d bytes, over MaxPullRequestReportBytes %d (would 413)", len(pf.receivedBody), MaxPullRequestReportBytes)
+	}
+	digest := sha256.Sum256(pf.receivedBody)
+	if pf.receivedSig != hex.EncodeToString(ed25519.Sign(priv, digest[:])) {
+		t.Error("signature must cover the received child-push bytes")
+	}
+	var sent pullRequestChildPushBody
+	if err := json.Unmarshal(pf.receivedBody, &sent); err != nil {
+		t.Fatalf("unmarshal received body: %v", err)
+	}
+	if sent.Outcome != outcome || sent.Branch != "fishhawk/run-aaa/slice-0" || sent.HeadSHA != "head-abc" || sent.BaseSHA != "base-def" || sent.FilesChangedCount != 3 {
+		t.Errorf("push coordinates not intact: %+v", sent)
+	}
+	return sent, pf.receivedBody
+}
+
+// assertSingleTrailingMarker asserts body is a CUT: within the 8 KiB text
+// bound, ending with exactly one truncation marker (#5192 C2/C5).
+func assertSingleTrailingMarker(t *testing.T, body string) {
+	t.Helper()
+	if len(body) > MaxHeldCommitPRBodyBytes {
+		t.Errorf("body is %d bytes, over MaxHeldCommitPRBodyBytes %d", len(body), MaxHeldCommitPRBodyBytes)
+	}
+	if !strings.HasSuffix(body, heldCommitPRBodyTruncationMarker) {
+		t.Errorf("cut body does not end with the truncation marker; tail %q", body[max(0, len(body)-80):])
+	}
+	if n := strings.Count(body, heldCommitPRBodyTruncationMarker); n != 1 {
+		t.Errorf("truncation marker count = %d, want exactly 1", n)
+	}
+}
+
+// TestShipPullRequest_ChildPushOutcome_CarriesPRBody (#5192 (a)): a "pushed"
+// report with an agent PR body carries it verbatim under `body`.
+// Counterfactual: delete the populate line -> no body key -> RED.
+func TestShipPullRequest_ChildPushOutcome_CarriesPRBody(t *testing.T) {
+	const prBody = "## Summary\n\n- slice\n\n## Test plan\n\n- [ ] ran X\n\n## Notes\n\n- note"
+	sent, raw := shipChildPush(t, "pushed", prBody)
+	if sent.Body != prBody {
+		t.Errorf("sent body = %q, want %q", sent.Body, prBody)
+	}
+	if !strings.Contains(string(raw), `"body":`) {
+		t.Errorf("received bytes carry no body key: %s", raw)
+	}
+}
+
+// TestShipPullRequest_FixupPushedOutcome_NeverCarriesBody (#5192 (c)): every
+// other push-shaped outcome ignores PRBody even when it is SET, so the
+// Outcome=="pushed" gate is the only thing keeping it off.
+// Counterfactual: delete the `args.Outcome == "pushed"` gate -> body appears -> RED.
+func TestShipPullRequest_FixupPushedOutcome_NeverCarriesBody(t *testing.T) {
+	for _, outcome := range []string{"fixup_pushed", "fixup_no_changes", "conflict_resolution_pushed"} {
+		t.Run(outcome, func(t *testing.T) {
+			_, raw := shipChildPush(t, outcome, "## Test plan\n- must not ship")
+			if strings.Contains(string(raw), `"body"`) {
+				t.Errorf("%s report carries a body key: %s", outcome, raw)
+			}
+		})
+	}
+}
+
+// TestShipPullRequest_ChildPushOutcome_BodyClampedToHeldCommitCap (#5192 (d)):
+// 20 KiB of plain letters (no escape expansion, so the 32 KiB envelope never
+// binds) is clamped to the 8 KiB text bound with exactly one marker.
+// Counterfactual: delete the raw clamp -> 20 KiB sent -> RED on size.
+func TestShipPullRequest_ChildPushOutcome_BodyClampedToHeldCommitCap(t *testing.T) {
+	raw := strings.Repeat("abcdefghij", 2048)
+	if childPushEnvelopeSize(t, raw) > MaxPullRequestReportBytes {
+		t.Fatal("fixture: the letters-only body must fit the envelope so only the raw clamp cuts")
+	}
+	sent, _ := shipChildPush(t, "pushed", raw)
+	assertSingleTrailingMarker(t, sent.Body)
+}
+
+// TestShipPullRequest_ChildPushOutcome_SingleMarkerWhenClampStraddlesEnvelope
+// (#5192 C5 (d2)): a 12 KiB body whose raw-clamped text ALONE fits the envelope
+// but whose clamped text PLUS the marker does not. Built by construction:
+// k leading `<` (six marshalled bytes each) then letters, k chosen so the
+// marker's marshalled bytes straddle the cap.
+// Counterfactual: set the pre-marker cut and hand it to shrinkHeldCommitPRBody
+// (which returns early UNMARKED when the bare cut fits) -> zero markers -> RED.
+func TestShipPullRequest_ChildPushOutcome_SingleMarkerWhenClampStraddlesEnvelope(t *testing.T) {
+	budget := MaxHeldCommitPRBodyBytes - len(heldCommitPRBodyTruncationMarker)
+	var raw string
+	for k := 0; k <= budget; k += 5 {
+		cand := strings.Repeat("<", k) + strings.Repeat("a", 12*1024-k)
+		if childPushEnvelopeSize(t, cand[:budget]) <= MaxPullRequestReportBytes &&
+			childPushEnvelopeSize(t, cand[:budget]+heldCommitPRBodyTruncationMarker) > MaxPullRequestReportBytes {
+			raw = cand
+			break
+		}
+	}
+	if raw == "" {
+		t.Fatal("fixture: no k straddles the envelope cap")
+	}
+	if alone := childPushEnvelopeSize(t, raw[:budget]); alone > MaxPullRequestReportBytes {
+		t.Fatalf("fixture: clamped text alone marshals to %d, want <= %d", alone, MaxPullRequestReportBytes)
+	}
+	if marked := childPushEnvelopeSize(t, raw[:budget]+heldCommitPRBodyTruncationMarker); marked <= MaxPullRequestReportBytes {
+		t.Fatalf("fixture: clamped text + marker marshals to %d, want > %d", marked, MaxPullRequestReportBytes)
+	}
+	sent, _ := shipChildPush(t, "pushed", raw)
+	assertSingleTrailingMarker(t, sent.Body)
+}
+
+// TestShipPullRequest_ChildPushOutcome_EnvelopeCutReservesMarker (#5192 C2): an
+// EXACTLY-8192-byte body — so the raw clamp never fires — whose ESCAPE-HEAVY
+// tail makes the envelope barely overflow. The envelope fit is the only cut, and
+// it must still reserve the marker's bytes: the result is at most 8192 bytes
+// with exactly one trailing marker. Trailing `<` (six marshalled bytes each)
+// let a marker-sized cut fit the envelope while overrunning the text bound.
+// Counterfactual: search up to len(raw)-1 instead of reserving the marker ->
+// ~8236 bytes -> RED on size.
+func TestShipPullRequest_ChildPushOutcome_EnvelopeCutReservesMarker(t *testing.T) {
+	var raw string
+	for k := 0; k <= MaxHeldCommitPRBodyBytes; k++ {
+		cand := strings.Repeat("a", MaxHeldCommitPRBodyBytes-k) + strings.Repeat("<", k)
+		if childPushEnvelopeSize(t, cand) > MaxPullRequestReportBytes {
+			raw = cand
+			break
+		}
+	}
+	if len(raw) != MaxHeldCommitPRBodyBytes {
+		t.Fatalf("fixture: raw is %d bytes, want exactly %d", len(raw), MaxHeldCommitPRBodyBytes)
+	}
+	if over := childPushEnvelopeSize(t, raw) - MaxPullRequestReportBytes; over <= 0 || over > 6 {
+		t.Fatalf("fixture: envelope overflow = %d bytes, want a bare overflow in (0, 6]", over)
+	}
+	sent, _ := shipChildPush(t, "pushed", raw)
+	assertSingleTrailingMarker(t, sent.Body)
+}
+
+// TestShipPullRequest_ChildPushOutcome_BodyBudgetedToReportCap (#5192 (e)):
+// exactly 8 KiB of `<` — the raw clamp does not fire, but each `<` marshals to
+// a six-byte escape (~48 KiB) — is budgeted under the 32 KiB request cap with
+// exactly one marker. Counterfactual: return the uncut body without the
+// envelope search -> ~48 KiB -> RED on size.
+func TestShipPullRequest_ChildPushOutcome_BodyBudgetedToReportCap(t *testing.T) {
+	raw := strings.Repeat("<", MaxHeldCommitPRBodyBytes)
+	if childPushEnvelopeSize(t, raw) <= MaxPullRequestReportBytes {
+		t.Fatal("fixture: the escape-heavy body must overflow the envelope")
+	}
+	sent, _ := shipChildPush(t, "pushed", raw)
+	assertSingleTrailingMarker(t, sent.Body)
+}
+
+// TestShipPullRequest_ChildPushOutcome_CutNeverMintsWrongClose (#5192 C4): a
+// size cut that would land inside `Fixes #5121` backs off past the `#` plus
+// digit run, so it never leaves `Fixes #51`; a newline within the final 512
+// bytes is preferred as the cut point. One subtest per cut route through the
+// child-push fit: the raw 8 KiB clamp and the envelope fit.
+// Counterfactual: delete the `#`+digit back-off in cutChildPushPRBody -> the
+// body carries `Fixes #51` -> RED.
+func TestShipPullRequest_ChildPushOutcome_CutNeverMintsWrongClose(t *testing.T) {
+	budget := MaxHeldCommitPRBodyBytes - len(heldCommitPRBodyTruncationMarker)
+	const ref, partial = " Fixes #5121", " Fixes #51"
+
+	t.Run("raw_clamp", func(t *testing.T) {
+		prefix := strings.Repeat("a", budget-len(partial))
+		raw := prefix + ref + strings.Repeat("b", 4000)
+		sent, _ := shipChildPush(t, "pushed", raw)
+		assertSingleTrailingMarker(t, sent.Body)
+		if strings.Contains(sent.Body, "Fixes #5") {
+			t.Errorf("raw clamp minted a partial reference; tail %q", sent.Body[len(sent.Body)-80:])
+		}
+		if want := prefix + " Fixes " + heldCommitPRBodyTruncationMarker; sent.Body != want {
+			t.Errorf("raw clamp body tail = %q, want the cut backed off to before `#`", sent.Body[len(sent.Body)-80:])
+		}
+	})
+
+	t.Run("envelope_fit", func(t *testing.T) {
+		// After a `<` prefix every byte marshals to ONE byte, so the marked
+		// envelope grows by exactly one byte per retained byte past the prefix
+		// and the largest fitting retained length is computable by construction.
+		const k = 5100
+		lead := strings.Repeat("<", k)
+		perByteBase := childPushEnvelopeSize(t, lead+heldCommitPRBodyTruncationMarker) - k
+		maxN := MaxPullRequestReportBytes - perByteBase
+		m := maxN - k - len(partial)
+		if m <= 0 {
+			t.Fatalf("fixture: filler length %d, want > 0", m)
+		}
+		prefix := lead + strings.Repeat("a", m)
+		raw := prefix + ref + strings.Repeat("b", 200)
+		if len(raw) > MaxHeldCommitPRBodyBytes || maxN >= budget {
+			t.Fatalf("fixture: len(raw)=%d maxN=%d — the envelope fit must be the only cut", len(raw), maxN)
+		}
+		if childPushEnvelopeSize(t, raw) <= MaxPullRequestReportBytes {
+			t.Fatal("fixture: the body must overflow the envelope")
+		}
+		if childPushEnvelopeSize(t, raw[:maxN]+heldCommitPRBodyTruncationMarker) > MaxPullRequestReportBytes ||
+			childPushEnvelopeSize(t, raw[:maxN+1]+heldCommitPRBodyTruncationMarker) <= MaxPullRequestReportBytes {
+			t.Fatal("fixture: the unbacked-off cut must land exactly after `#51`")
+		}
+		sent, _ := shipChildPush(t, "pushed", raw)
+		assertSingleTrailingMarker(t, sent.Body)
+		if strings.Contains(sent.Body, "Fixes #5") {
+			t.Errorf("envelope fit minted a partial reference; tail %q", sent.Body[len(sent.Body)-80:])
+		}
+		if want := prefix + " Fixes " + heldCommitPRBodyTruncationMarker; sent.Body != want {
+			t.Errorf("envelope fit body tail = %q, want the cut backed off to before `#`", sent.Body[len(sent.Body)-80:])
+		}
+	})
+
+	t.Run("newline_within_backoff", func(t *testing.T) {
+		head := strings.Repeat("a", budget-300)
+		raw := head + "\n" + strings.Repeat("c", 290) + ref + strings.Repeat("b", 4000)
+		sent, _ := shipChildPush(t, "pushed", raw)
+		assertSingleTrailingMarker(t, sent.Body)
+		if want := head + heldCommitPRBodyTruncationMarker; sent.Body != want {
+			t.Errorf("cut did not back off to the newline; tail %q", sent.Body[len(sent.Body)-80:])
+		}
+	})
+
+	t.Run("newline_beyond_backoff_ignored", func(t *testing.T) {
+		raw := strings.Repeat("a", 100) + "\n" + strings.Repeat("c", budget+1000)
+		sent, _ := shipChildPush(t, "pushed", raw)
+		assertSingleTrailingMarker(t, sent.Body)
+		if want := raw[:budget] + heldCommitPRBodyTruncationMarker; sent.Body != want {
+			t.Errorf("a newline beyond the final %d bytes moved the cut; len %d", childPushPRBodyCutBackoff, len(sent.Body))
+		}
+	})
+}
+
+// TestShipPullRequest_ChildPushOutcome_UncutBodyHasNoMarker (#5192): a body
+// that fits both bounds ships verbatim with no marker, and one too
+// escape-heavy for even the floor to fit is dropped rather than risk a 413.
+func TestShipPullRequest_ChildPushOutcome_UncutBodyHasNoMarker(t *testing.T) {
+	const prBody = "## Test plan\n- Fixes #5121 evidence"
+	sent, _ := shipChildPush(t, "pushed", prBody)
+	if sent.Body != prBody || strings.Contains(sent.Body, heldCommitPRBodyTruncationMarker) {
+		t.Errorf("uncut body = %q, want verbatim %q", sent.Body, prBody)
+	}
+
+	env := pullRequestChildPushBody{Outcome: "pushed", Branch: strings.Repeat("x", MaxPullRequestReportBytes-300)}
+	if got := fitChildPushPRBody(env, strings.Repeat("<", 2000)); got != "" {
+		t.Errorf("an envelope with no room for the floor kept a body of %d bytes, want it dropped", len(got))
 	}
 }
 

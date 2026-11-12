@@ -436,6 +436,10 @@ func TestChildPushResume_PublishesAndReportsPushed(t *testing.T) {
 	if got.FilesChangedCount != 1 {
 		t.Errorf("files_changed_count = %d, want 1 (a.txt, held commit vs its base)", got.FilesChangedCount)
 	}
+	// #5192: no body was served, so the pushed report carries none.
+	if got.PRBody != "" {
+		t.Errorf("report PRBody = %q, want empty (none served)", got.PRBody)
+	}
 	for _, ref := range []string{checkpointRef(cfg.runID, cfg.stageID), checkpointStashRef(cfg.runID, cfg.stageID)} {
 		if _, ok := refTarget(repo, ref); ok {
 			t.Errorf("checkpoint ref %s survived a successful child resume", ref)
@@ -443,6 +447,46 @@ func TestChildPushResume_PublishesAndReportsPushed(t *testing.T) {
 	}
 	if !strings.Contains(logSink.String(), `"event":"push_resume_child_pushed"`) {
 		t.Errorf("missing push_resume_child_pushed:\n%s", logSink.String())
+	}
+}
+
+// TestChildPushResume_CarriesServedPRBody pins #5192 on the child push-resume
+// tail: the footer-free body the #2570 checkpoint preserved rides the "pushed"
+// report, so a resumed child still delivers its `## Test plan` to the parent's
+// consolidated PR. Counterfactual: delete `PRBody: servedPRBody` from the child
+// tail -> PRBody is "" -> RED.
+func TestChildPushResume_CarriesServedPRBody(t *testing.T) {
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	base := cprGit(t, repo, "rev-parse", "main")
+	cfg := childResumeCfg(repo)
+	pinBothCheckpointRefs(t, repo, cfg, headSHA)
+	withFakePusher(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const served = "## Test plan\n- x"
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), cfg, headSHA, branch, base, resumeKindPush, treeSHA, "feat: served title", served, &logSink, fu, issued); code != exitOK {
+		t.Fatalf("exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Fatalf("a child resume must NEVER open a pull request, got %+v", fpr.gotArgs)
+	}
+	if len(fu.gotPRCalls) != 1 {
+		t.Fatalf("pull-request reports = %d, want exactly the pushed report", len(fu.gotPRCalls))
+	}
+	got := fu.gotPRCalls[0]
+	if got.Outcome != "pushed" {
+		t.Errorf("report outcome = %q, want pushed", got.Outcome)
+	}
+	if got.PRBody != served {
+		t.Errorf("report PRBody = %q, want the served body %q", got.PRBody, served)
+	}
+	if got.PRTitle != "" {
+		t.Errorf("report PRTitle = %q, want empty (the consolidated heading uses the sub_plan title)", got.PRTitle)
 	}
 }
 
