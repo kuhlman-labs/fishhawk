@@ -95,6 +95,17 @@ func TestOpenAPI_EscapeRouteDocumented(t *testing.T) {
 			t.Errorf("docs/api/v0.openapi.yaml EscapeRecordRequest is missing %q (escapeRecordRequest)", field)
 		}
 	}
+	// advisory_id's documented shapes come from the handler's regexes, so the
+	// contract cannot drift from escape.go (#4819).
+	advisoryDesc, _ := escapeMapAt(t, schemas, "EscapeRecordRequest", "properties", "advisory_id")["description"].(string)
+	for _, re := range []string{escapeGHSARE.String(), escapeIssueRefAdvisoryRE.String()} {
+		if !strings.Contains(advisoryDesc, re) {
+			t.Errorf("docs/api/v0.openapi.yaml EscapeRecordRequest advisory_id description does not state %q (escape.go)", re)
+		}
+	}
+	if strings.Contains(advisoryDesc, "opaque") {
+		t.Errorf("docs/api/v0.openapi.yaml EscapeRecordRequest advisory_id description still says the non-GitHub shape is opaque: %s", advisoryDesc)
+	}
 	if escapeMapAt(t, schemas, "EscapeRecordRequest")["additionalProperties"] != false {
 		t.Error("docs/api/v0.openapi.yaml EscapeRecordRequest must set additionalProperties: false (strict decode)")
 	}
@@ -133,5 +144,21 @@ func TestV0Doc_EscapeRouteDocumented(t *testing.T) {
 		if !strings.Contains(md, "`"+code+"`") {
 			t.Errorf("docs/api/v0.md error table does not name `%s`", code)
 		}
+	}
+}
+
+// TestReviewDoc_EscapeAdvisoryShapesDocumented pins the § Security escapes
+// paragraph in backend/internal/server/docs/review.md to the handler's two
+// advisory regexes, so the doc cannot keep describing a shape the handler no
+// longer accepts (#4819).
+func TestReviewDoc_EscapeAdvisoryShapesDocumented(t *testing.T) {
+	md := readRepoDoc(t, "backend/internal/server/docs/review.md")
+	for _, re := range []string{escapeGHSARE.String(), escapeIssueRefAdvisoryRE.String()} {
+		if !strings.Contains(md, "`"+re+"`") {
+			t.Errorf("backend/internal/server/docs/review.md § Security escapes does not state the advisory_id shape `%s` (escape.go)", re)
+		}
+	}
+	if strings.Contains(md, "an opaque bounded token") {
+		t.Error("backend/internal/server/docs/review.md still describes the non-GitHub advisory_id as an opaque bounded token")
 	}
 }
