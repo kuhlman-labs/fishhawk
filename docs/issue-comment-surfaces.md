@@ -523,9 +523,12 @@ Notes:
     third kind, `acceptance_scenario_regression` `{scenario_id, origin_pr?,
     origin_issue, origin_run_id, path, origin_unresolved?, observed, expected,
     repro_handle}`, is written by `server/acceptance.go` per FAILED replayed
-    scenario row and reaches the operator through the class-1 triage route
-    (a synthesized concern naming `PR #<origin_pr>` or `(originating PR
-    unknown)`), not through its own comment.
+    scenario row and reaches the operator through triage, not through its
+    own comment: when a failed plan criterion accompanies it, the class-1
+    route (a synthesized concern naming `PR #<origin_pr>` or `(originating PR
+    unknown)`); when the scenario rows are the ONLY failed rows, a class-4
+    `paged` triage decision keyed on the failed scenario ids (#4873), which
+    the operator arbitrates or routes as a manual fix-up.
   - **Acceptance triage decision (E31.8, #1536)** — `acceptance_triage_decided`.
     A failed acceptance verdict was triaged (`server/acceptance.go::triageAcceptanceFailure`)
     and the disposition needs a human — the paged variants only (`paged`,

@@ -8516,9 +8516,14 @@ components:
         `acceptance_scenario_regression` audit entry whose `origin_pr` /
         `origin_issue` / `origin_run_id` / `path` come ONLY from the matching
         `scenarios[]` entry (no entry, or `origin_pr` 0 → `origin_pr` absent
-        and `origin_unresolved: true`, never the issue number) and routes
-        triage class 1; a skipped / undecidable scenario row never routes
-        class 2 / 5 and never clamps the run verdict.
+        and `origin_unresolved: true`, never the issue number). A failed
+        scenario row ACCOMPANIED by a failed plan-criterion row routes triage
+        class 1; an `assertion_fail` verdict whose ONLY failed rows are
+        scenarios pages triage class 4 instead (#4873: a scenario-only failure
+        cannot be told apart from an expectation superseded on the base), and
+        its ids are listed on `acceptance_outcome_recorded.failed_scenario_ids`
+        (absent when no scenario row failed). A skipped / undecidable scenario
+        row never routes class 2 / 5 and never clamps the run verdict.
       required: [cap, corpus_size, served, sampled_out, retired_excluded, seed, scenarios]
       properties:
         cap: { type: integer }
@@ -17522,7 +17527,10 @@ paths:
         It appends ONE chained `acceptance_triage_arbitrated` audit entry
         carrying the operator's `reason` and — load bearing — the
         `outcome_sequence` of the `acceptance_outcome_recorded` entry it
-        discharges. The acceptance gate then reads `acceptance_arbitrated`,
+        discharges. When that outcome recorded failed replayed scenarios
+        (`acceptance_outcome_recorded.failed_scenario_ids`, #4873) the entry
+        also carries them as `failed_scenario_ids`; the key is absent
+        otherwise. The acceptance gate then reads `acceptance_arbitrated`,
         which the operator merge endpoint, the delegated `may_merge` arm and
         the drive presentation all admit through one shared predicate.
 
@@ -17568,7 +17576,10 @@ paths:
         verdict must be one that PAGED (an auto-routed `fixup_dispatched` /
         `retry_dispatched` keeps its automatic route, and an absent or
         unreadable disposition is refused); a verdict carrying genuinely FAILED
-        criteria additionally requires `acknowledge_failed_criteria: true`; and
+        criteria additionally requires `acknowledge_failed_criteria: true`
+        (`criteria_failed` tallies plan-criterion rows only, so a scenario-only
+        class-4 page, #4873, is arbitrable on the reason alone and its recorded
+        `failed_scenario_ids` keep that discharge auditable); and
         the outcome is RE-READ inside the append's own transaction under a row
         lock, refusing `409 acceptance_outcome_superseded` if a concurrent
         acceptance re-run moved it in the meantime.
