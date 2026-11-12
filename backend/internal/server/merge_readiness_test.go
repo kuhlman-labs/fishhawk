@@ -38,10 +38,12 @@ func seedReadinessEntry(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, cate
 	au.mu.Unlock()
 }
 
-// TestAcceptanceStaleRefusal drives the staleness table. Counterfactuals: a
+// TestAcceptanceStaleRefusal drives the staleness table over both bases:
+// acceptance_reopened (#4086) and fixup_in_episode (#5163). Counterfactuals: a
 // body that always returns nil reddens every refusing row; flipping the
 // outcome-vs-reopen comparison makes "outcome newer than reopen" refuse and
-// the stale rows admit.
+// the stale rows admit. The fixup_in_episode rows each isolate one control of
+// acceptanceFixupInEpisodeRefusal (see the row comments).
 func TestAcceptanceStaleRefusal(t *testing.T) {
 	const h1, h2 = "aaaa000000000000000000000000000000000001", "bbbb000000000000000000000000000000000002"
 	type tc struct {
@@ -53,10 +55,28 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 		wantNext  string
 		wantVerif string
 		wantCur   string
+		// wantDetails are the row's own sequence / basis details. A key mapped
+		// to nil must be ABSENT from the refusal's details.
+		wantDetails map[string]any
+		// wantMsg is a substring the refusal message must carry (the
+		// basis-specific clearing sentence), when set.
+		wantMsg string
+	}
+	reopenDetails := map[string]any{
+		"outcome_sequence": int64(5), "reopened_sequence": int64(8),
+		"stale_basis": staleBasisAcceptanceReopened, "dispatch_sequence": nil, "fixup_sequence": nil,
 	}
 	staleSeed := func(au *auditFake, runID, accID uuid.UUID) {
 		seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
 		seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": h2})
+	}
+	// inEpisodeSeed is a1's chain: the fix-up lands inside the dispatched
+	// episode (dispatch@3 < fixup@4 < outcome@5), so no acceptance_reopened row
+	// exists and only the fixup_in_episode basis can refuse.
+	inEpisodeSeed := func(au *auditFake, runID, accID uuid.UUID) {
+		seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+		seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 4, map[string]any{"head_sha": h2})
+		seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
 	}
 	cases := []tc{
 		{name: "no acceptance stage row", noAccRow: true, seed: staleSeed},
@@ -80,19 +100,112 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": h2})
 			}},
 		{name: "pending stage refuses with dispatch", accState: run.StageStatePending, seed: staleSeed,
-			wantStale: true, wantNext: "fishhawk_dispatch_stage", wantVerif: h1, wantCur: h2},
+			wantStale: true, wantNext: "fishhawk_dispatch_stage", wantVerif: h1, wantCur: h2, wantDetails: reopenDetails},
 		{name: "dispatched stage refuses with await", accState: run.StageStateDispatched, seed: staleSeed,
-			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2},
+			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2, wantDetails: reopenDetails},
 		{name: "running stage refuses with await", accState: run.StageStateRunning, seed: staleSeed,
-			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2},
+			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2, wantDetails: reopenDetails},
 		{name: "failed re-run refuses with retry", accState: run.StageStateFailed, seed: staleSeed,
-			wantStale: true, wantNext: "fishhawk_retry_stage", wantVerif: h1, wantCur: h2},
+			wantStale: true, wantNext: "fishhawk_retry_stage", wantVerif: h1, wantCur: h2, wantDetails: reopenDetails},
 		{name: "outcome without head_sha still refuses", accState: run.StageStatePending,
 			seed: func(au *auditFake, runID, accID uuid.UUID) {
 				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed"})
 				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": h2})
 			},
-			wantStale: true, wantNext: "fishhawk_dispatch_stage", wantVerif: "", wantCur: h2},
+			wantStale: true, wantNext: "fishhawk_dispatch_stage", wantVerif: "", wantCur: h2, wantDetails: reopenDetails},
+
+		// --- fixup_in_episode basis (#5163) ---
+
+		// a1: with the new arm absent the function admits, because no
+		// acceptance_reopened row exists.
+		{name: "fix-up inside the in-flight episode refuses", accState: run.StageStateSucceeded, seed: inEpisodeSeed,
+			wantStale: true, wantNext: "fishhawk_retry_stage", wantVerif: h1, wantCur: h2,
+			wantDetails: map[string]any{
+				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(4),
+				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
+			},
+			wantMsg: "Re-open the acceptance stage with fishhawk_retry_stage and dispatch it against the current head"},
+		// a2: the verdict shipped before the stage report (the stage is still
+		// running, so reopenAcceptanceOnFixupPush no-ops) and the fix-up landed
+		// after it. Also the failed-reopen-append shape.
+		{name: "fix-up after the verdict, anchored episode, no reopen", accState: run.StageStateRunning,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 6, map[string]any{"head_sha": h2})
+			},
+			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2,
+			wantDetails: map[string]any{
+				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(6),
+				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
+			},
+			// Not acceptanceStaleNextStep's "re-run is in flight": no re-run is.
+			wantMsg: "The stale episode is still settling: await it with fishhawk_await_stage, then re-open it with fishhawk_retry_stage"},
+		// a3: isolates the anchor bound `e.Sequence <= anchor.Sequence`.
+		{name: "fix-up before the dispatch anchor admits", accState: run.StageStateSucceeded,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 2, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
+			}},
+		// a4: isolates the live-anchor guard. The only dispatch (@1) is at or
+		// below the reopen (@3), so the short-circuit verdict @6 has no live
+		// anchor; the reopen basis is silent (reopen@3 < outcome@6).
+		{name: "dispatch-less verdict after a reopen admits", accState: run.StageStateSucceeded,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 1, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 3, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 4, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 6, map[string]any{"verdict": "not_validated", "head_sha": h2})
+			}},
+		// a5: exactly a1 minus the outcome's head_sha; isolates the
+		// `verifiedHead == ""` admit.
+		{name: "anchored verdict without head_sha admits", accState: run.StageStateSucceeded,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 4, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed"})
+			}},
+		// a6: isolates `e.Sequence >= outcome.Sequence` in the anchor fold: the
+		// dispatch @7 above the outcome is a later episode's, not its anchor.
+		{name: "a dispatch above the outcome is not its anchor", accState: run.StageStateDispatched,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 6, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 7, map[string]any{})
+			},
+			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2,
+			wantDetails: map[string]any{
+				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(6),
+				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
+			}},
+		// a7: isolates the stage-scope skip in the anchor fold.
+		{name: "a dispatch scoped to another stage is ignored", accState: run.StageStateSucceeded,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				other := uuid.New()
+				seedReadinessEntry(au, runID, &other, CategoryAcceptanceDispatched, 3, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 4, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
+			}},
+		// a8: both bases hold; the reopen basis wins with its exact details.
+		{name: "reopen basis keeps precedence", accState: run.StageStatePending,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				inEpisodeSeed(au, runID, accID)
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": h2})
+			},
+			wantStale: true, wantNext: "fishhawk_dispatch_stage", wantVerif: h1, wantCur: h2, wantDetails: reopenDetails},
+		// a9: the re-run after the reopen dispatched above the fix-up and
+		// shipped a verdict on the fix-up head.
+		{name: "re-run after reopen admits", accState: run.StageStateSucceeded,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 1, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 2, map[string]any{"verdict": "passed", "head_sha": h1})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 3, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 4, map[string]any{"head_sha": h2})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 6, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 8, map[string]any{"verdict": "passed", "head_sha": h2})
+			}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -131,8 +244,20 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 			if d["acceptance_stage_id"] != accID.String() || d["acceptance_stage_state"] != string(c.accState) {
 				t.Errorf("stage details = %v / %v, want %s / %s", d["acceptance_stage_id"], d["acceptance_stage_state"], accID, c.accState)
 			}
-			if d["outcome_sequence"] != int64(5) || d["reopened_sequence"] != int64(8) {
-				t.Errorf("sequences = %v / %v, want 5 / 8", d["outcome_sequence"], d["reopened_sequence"])
+			for k, want := range c.wantDetails {
+				got, present := d[k]
+				if want == nil {
+					if present {
+						t.Errorf("details[%s] = %v, want absent", k, got)
+					}
+					continue
+				}
+				if got != want {
+					t.Errorf("details[%s] = %v (%T), want %v (%T)", k, got, got, want, want)
+				}
+			}
+			if c.wantMsg != "" && !strings.Contains(ref.Message, c.wantMsg) {
+				t.Errorf("message %q does not carry %q", ref.Message, c.wantMsg)
 			}
 			if c.wantCur != "" && !strings.Contains(ref.Message, c.wantCur) {
 				t.Errorf("message %q does not name the current head", ref.Message)
@@ -144,8 +269,8 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 	}
 }
 
-// TestAcceptanceStaleRefusal_ReadErrorsFailClosed pins that both audit reads
-// propagate their error (never resolve to admit), and that an unwired audit
+// TestAcceptanceStaleRefusal_ReadErrorsFailClosed pins that every audit read
+// propagates its error (never resolves to admit), and that an unwired audit
 // repo admits.
 func TestAcceptanceStaleRefusal_ReadErrorsFailClosed(t *testing.T) {
 	for _, cat := range []string{CategoryAcceptanceReopened, CategoryAcceptanceOutcomeRecorded} {
@@ -156,6 +281,28 @@ func TestAcceptanceStaleRefusal_ReadErrorsFailClosed(t *testing.T) {
 			stages := acceptanceMergeStages(runID, run.StageStatePending)
 			accID := stages[2].ID
 			seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": "h2"})
+			au.listByCategoryErrCategory = cat
+			ref, err := s.acceptanceStaleRefusal(context.Background(), &run.Run{ID: runID}, stages)
+			if err == nil {
+				t.Fatalf("err = nil (refusal %+v), want the %s read error propagated", ref, cat)
+			}
+			if ref != nil {
+				t.Errorf("refusal = %+v alongside an error, want nil", ref)
+			}
+		})
+	}
+	// The fixup_in_episode basis reads acceptance_dispatched and fixup_pushed
+	// only past the head_sha and live-anchor checks, so seed an anchored outcome
+	// (dispatch@3 below outcome@5, no reopen) to reach both reads.
+	for _, cat := range []string{CategoryAcceptanceDispatched, CategoryFixupPushed} {
+		t.Run(cat, func(t *testing.T) {
+			au := newAuditFake()
+			s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+			runID := uuid.New()
+			stages := acceptanceMergeStages(runID, run.StageStateSucceeded)
+			accID := stages[2].ID
+			seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+			seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": "h1"})
 			au.listByCategoryErrCategory = cat
 			ref, err := s.acceptanceStaleRefusal(context.Background(), &run.Run{ID: runID}, stages)
 			if err == nil {

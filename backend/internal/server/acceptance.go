@@ -1739,7 +1739,11 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 // No-op (everything untouched) when: the run has no acceptance stage; the
 // acceptance stage is not succeeded (a PRE-acceptance fix-up must not reopen
 // anything); or the succeeded stage has NO recorded verdict (that outcome-less
-// hole is the retry handler's #1567 operator-reopen path, not this one).
+// hole is the retry handler's #1567 operator-reopen path, not this one). A
+// fix-up landing while an acceptance episode is dispatched or running is NOT
+// re-opened here either (#5163): merge readiness's fixup_in_episode basis
+// (acceptanceFixupInEpisodeRefusal) reads this push's fixup_pushed row above
+// the episode's dispatch anchor and marks that episode's eventual verdict stale.
 // Idempotent against a re-delivered fixup_pushed: the caller's (stage_id,
 // head_sha) dedup short-circuits before this runs, and ReopenAcceptanceStage
 // refuses a non-succeeded (already-pending) stage, so a second delivery cannot
@@ -1765,7 +1769,9 @@ func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUI
 	}
 	// A pre-acceptance fix-up (no acceptance stage, or one not yet succeeded)
 	// leaves the gate alone — only a SETTLED acceptance stage can carry a stale
-	// verdict to invalidate.
+	// verdict to invalidate. A fix-up during a dispatched/running episode also
+	// returns here; acceptanceFixupInEpisodeRefusal (merge_readiness.go) marks
+	// that episode's eventual verdict stale from the fixup_pushed row (#5163).
 	if acceptance == nil || acceptance.State != run.StageStateSucceeded {
 		return
 	}

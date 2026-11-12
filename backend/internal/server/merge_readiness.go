@@ -43,16 +43,40 @@ type mergeReadinessRefusal struct {
 	Details map[string]any
 }
 
-// acceptanceStaleRefusal reports a STALE acceptance verdict (#4086): the run's
-// acceptance stage carries a stage-scoped acceptance_reopened entry NEWER than
-// the newest acceptance_outcome_recorded entry. That is the state
-// reopenAcceptanceOnFixupPush (and the #1567 operator re-open) leaves behind:
-// the stage is back to pending while acceptanceGateState still reads the stale
-// recorded outcome and admits the merge, which then sits behind a pending
-// fishhawk_audit_complete until the tool times out.
+// Values of the acceptance_stale refusal's stale_basis detail: which chain
+// record marks the recorded verdict stale.
+const (
+	staleBasisAcceptanceReopened = "acceptance_reopened"
+	staleBasisFixupInEpisode     = "fixup_in_episode"
+)
+
+// acceptanceStaleRefusal reports a STALE acceptance verdict (#4086, #5163). It
+// has two bases, both read from the run's own audit chain:
 //
-// It keys on the chain's OWN invalidation record, never on comparing the
-// outcome's head with the live PR head: a vouch commit or an ADR-090 rebase
+//   - acceptance_reopened (#4086): the acceptance stage carries a stage-scoped
+//     acceptance_reopened entry at or above the newest
+//     acceptance_outcome_recorded entry. That is the state
+//     reopenAcceptanceOnFixupPush (and the #1567 operator re-open) leaves
+//     behind: the stage is back to pending while acceptanceGateState still
+//     reads the stale recorded outcome and admits the merge, which then sits
+//     behind a pending fishhawk_audit_complete until the tool times out. This
+//     basis keeps precedence and its exact details.
+//   - fixup_in_episode (#5163, acceptanceFixupInEpisodeRefusal): the newest
+//     outcome came from an ANCHORED episode and a fixup_pushed entry sits above
+//     that episode's dispatch anchor. reopenAcceptanceOnFixupPush re-opens only
+//     a SUCCEEDED stage, so a fix-up landing while the episode is dispatched or
+//     running writes no acceptance_reopened row, and the episode's eventual
+//     verdict binds the dispatch-anchored PRE-fix-up head.
+//
+// The outcome's anchor follows the live-anchor rule acceptanceValidatedHeadSHA
+// binds with: the newest stage-scoped acceptance_dispatched entry BELOW the
+// outcome, provided it is ABOVE every stage-scoped acceptance_reopened entry. An
+// anchor at or below the newest reopen is a prior episode's (#3176), and a
+// verdict with no live anchor (a dispatch-less short-circuit) is not covered.
+//
+// Both bases key on the chain's OWN invalidation record, never on comparing the
+// outcome's head with the live PR head. A fixup_pushed row is Fishhawk's own
+// record of the push, not a head compare. A vouch commit or an ADR-090 rebase
 // changes the head without re-opening acceptance, by design, and a head compare
 // would block merges the server has no verb to clear.
 //
@@ -64,20 +88,17 @@ type mergeReadinessRefusal struct {
 // resolution merge, an operator vouch commit) is a descendant of the verdict
 // head by construction, and the code those add is covered by the ADR-090 /
 // ADR-142 merge-candidate verification. The one write that changes validated
-// code, a fix-up push, invalidates the verdict through the acceptance_reopened
-// record this function reads, but only under reopenAcceptanceOnFixupPush's
-// conditions: it writes nothing when the acceptance stage is not succeeded or
-// has no recorded verdict, and a refused ReopenAcceptanceStage or a failed
-// acceptance_reopened append only WARN-logs. In those cases no record exists and
-// this function admits (known residuals). See docs/acceptance.md § "Verdict
-// head binding".
+// code, a fix-up push, invalidates the verdict through one of the two records
+// this function reads. Known residuals (this function admits): a dispatch-less
+// verdict with a later fix-up and no reopen row; a fixup_in_episode candidate
+// whose outcome carries no head_sha; and a failed fixup_pushed append. See
+// docs/acceptance.md § "Verdict head binding".
 //
 // nil (admit) when: the audit repo is unwired; the run has no acceptance stage
-// row; no reopen is scoped to that stage; no outcome is recorded at all (the
-// acceptance gate's pending / outcome-unknown states already refuse that); or
-// the newest outcome is newer than the newest reopen (the re-run shipped its
-// verdict). FAIL-CLOSED: an audit read error is returned, never resolved to
-// admit — the evidence lives on Fishhawk's own chain, like acceptanceGateState.
+// row; no outcome is recorded at all (the acceptance gate's pending /
+// outcome-unknown states already refuse that); or neither basis holds.
+// FAIL-CLOSED: every audit read error is returned, never resolved to admit —
+// the evidence lives on Fishhawk's own chain, like acceptanceGateState.
 func (s *Server) acceptanceStaleRefusal(ctx context.Context, runRow *run.Run, stages []*run.Stage) (*mergeReadinessRefusal, error) {
 	if s.cfg.AuditRepo == nil {
 		return nil, nil
@@ -90,9 +111,6 @@ func (s *Server) acceptanceStaleRefusal(ctx context.Context, runRow *run.Run, st
 	if err != nil {
 		return nil, err
 	}
-	if reopen == nil {
-		return nil, nil
-	}
 	outcomes, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryAcceptanceOutcomeRecorded)
 	if err != nil {
 		return nil, fmt.Errorf("list %s audit entries: %w", CategoryAcceptanceOutcomeRecorded, err)
@@ -103,24 +121,100 @@ func (s *Server) acceptanceStaleRefusal(ctx context.Context, runRow *run.Run, st
 			outcome = e
 		}
 	}
-	if outcome == nil || outcome.Sequence > reopen.Sequence {
+	if outcome == nil {
 		return nil, nil
 	}
 
+	if reopen != nil && reopen.Sequence >= outcome.Sequence {
+		verifiedHead := auditPayloadString(outcome.Payload, "head_sha")
+		currentHead := auditPayloadString(reopen.Payload, "head_sha")
+		nextStep, how := acceptanceStaleNextStep(acc.State)
+		return &mergeReadinessRefusal{
+			Code: mergeCodeAcceptanceStale,
+			Message: fmt.Sprintf("the recorded acceptance verdict is stale: it validated head %s, and acceptance stage %s was re-opened afterwards at head %s (a fix-up push or an operator re-open), so the verdict no longer covers the pull request and the fishhawk_audit_complete check will not clear. The queued merge would only time out. %s, then re-invoke the merge. No merge verdict was recorded.",
+				shaOrUnrecorded(verifiedHead), acc.ID, shaOrUnrecorded(currentHead), how),
+			Details: map[string]any{
+				"acceptance_stage_id":    acc.ID.String(),
+				"acceptance_stage_state": string(acc.State),
+				"verified_head_sha":      verifiedHead,
+				"current_head_sha":       currentHead,
+				"outcome_sequence":       outcome.Sequence,
+				"reopened_sequence":      reopen.Sequence,
+				"stale_basis":            staleBasisAcceptanceReopened,
+				"next_step":              nextStep,
+			},
+		}, nil
+	}
+	return s.acceptanceFixupInEpisodeRefusal(ctx, runRow, acc, outcome, reopen)
+}
+
+// acceptanceFixupInEpisodeRefusal is acceptanceStaleRefusal's fixup_in_episode
+// basis (#5163). reopen is the newest stage-scoped acceptance_reopened entry,
+// nil or strictly below outcome. It refuses when outcome names a head_sha, its
+// live dispatch anchor exists (the newest stage-scoped acceptance_dispatched
+// below outcome, above reopen), and a run-wide fixup_pushed entry sits above
+// that anchor: the push landed after the episode bound its head, so the verdict
+// does not cover it. Pure chain-sequence comparisons, never timestamps (the
+// #3048 cross-clock trap). Both reads fail closed.
+//
+// An outcome without head_sha admits: #3091 already clamped that unbound
+// verdict to undecidable, it names no tree, and Option C (the only clearing
+// verb on a settled stage) fails closed on it, so refusing would wedge the
+// merge. A missing or restart-stale anchor admits, mirroring
+// acceptanceValidatedHeadSHA's `restartSeq >= dispatchSeq` guard.
+func (s *Server) acceptanceFixupInEpisodeRefusal(ctx context.Context, runRow *run.Run, acc *run.Stage, outcome, reopen *audit.Entry) (*mergeReadinessRefusal, error) {
 	verifiedHead := auditPayloadString(outcome.Payload, "head_sha")
-	currentHead := auditPayloadString(reopen.Payload, "head_sha")
-	nextStep, how := acceptanceStaleNextStep(acc.State)
+	if verifiedHead == "" {
+		return nil, nil
+	}
+	dispatches, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryAcceptanceDispatched)
+	if err != nil {
+		return nil, fmt.Errorf("list %s audit entries: %w", CategoryAcceptanceDispatched, err)
+	}
+	var anchor *audit.Entry
+	for _, e := range dispatches {
+		if e.StageID == nil || *e.StageID != acc.ID || e.Sequence >= outcome.Sequence {
+			continue
+		}
+		if anchor == nil || e.Sequence > anchor.Sequence {
+			anchor = e
+		}
+	}
+	if anchor == nil || (reopen != nil && reopen.Sequence >= anchor.Sequence) {
+		return nil, nil
+	}
+	fixups, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryFixupPushed)
+	if err != nil {
+		return nil, fmt.Errorf("list %s audit entries: %w", CategoryFixupPushed, err)
+	}
+	var fixup *audit.Entry
+	for _, e := range fixups {
+		if e.Sequence <= anchor.Sequence {
+			continue
+		}
+		if fixup == nil || e.Sequence > fixup.Sequence {
+			fixup = e
+		}
+	}
+	if fixup == nil {
+		return nil, nil
+	}
+
+	fixupHead := auditPayloadString(fixup.Payload, "head_sha")
+	nextStep, how := acceptanceFixupStaleNextStep(acc.State)
 	return &mergeReadinessRefusal{
 		Code: mergeCodeAcceptanceStale,
-		Message: fmt.Sprintf("the recorded acceptance verdict is stale: it validated head %s, and acceptance stage %s was re-opened afterwards at head %s (a fix-up push or an operator re-open), so the verdict no longer covers the pull request and the fishhawk_audit_complete check will not clear. The queued merge would only time out. %s, then re-invoke the merge. No merge verdict was recorded.",
-			shaOrUnrecorded(verifiedHead), acc.ID, shaOrUnrecorded(currentHead), how),
+		Message: fmt.Sprintf("the recorded acceptance verdict is stale: acceptance stage %s was dispatched at audit sequence %d and its verdict validated head %s, but a fix-up push landed head %s at sequence %d after that dispatch, so the verdict does not cover the fix-up and the fishhawk_audit_complete check will not clear. %s, then re-invoke the merge. No merge verdict was recorded.",
+			acc.ID, anchor.Sequence, verifiedHead, shaOrUnrecorded(fixupHead), fixup.Sequence, how),
 		Details: map[string]any{
 			"acceptance_stage_id":    acc.ID.String(),
 			"acceptance_stage_state": string(acc.State),
 			"verified_head_sha":      verifiedHead,
-			"current_head_sha":       currentHead,
+			"current_head_sha":       fixupHead,
 			"outcome_sequence":       outcome.Sequence,
-			"reopened_sequence":      reopen.Sequence,
+			"dispatch_sequence":      anchor.Sequence,
+			"fixup_sequence":         fixup.Sequence,
+			"stale_basis":            staleBasisFixupInEpisode,
 			"next_step":              nextStep,
 		},
 	}, nil
@@ -158,6 +252,19 @@ func acceptanceStaleNextStep(state run.StageState) (string, string) {
 		return "fishhawk_await_stage", "The acceptance re-run is in flight: await it with fishhawk_await_stage"
 	case run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled, run.StageStateSuperseded:
 		return "fishhawk_retry_stage", "The acceptance stage settled without a newer verdict: re-open it with fishhawk_retry_stage and dispatch it"
+	}
+	return "fishhawk_dispatch_stage", "Re-run acceptance against the current head with fishhawk_dispatch_stage and await its verdict"
+}
+
+// acceptanceFixupStaleNextStep is acceptanceStaleNextStep for the
+// fixup_in_episode basis. Its dispatched/running sentence differs: no re-run is
+// in flight there, the stale episode itself is still settling.
+func acceptanceFixupStaleNextStep(state run.StageState) (string, string) {
+	switch state {
+	case run.StageStateDispatched, run.StageStateRunning:
+		return "fishhawk_await_stage", "The stale episode is still settling: await it with fishhawk_await_stage, then re-open it with fishhawk_retry_stage and dispatch it"
+	case run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled, run.StageStateSuperseded:
+		return "fishhawk_retry_stage", "Re-open the acceptance stage with fishhawk_retry_stage and dispatch it against the current head"
 	}
 	return "fishhawk_dispatch_stage", "Re-run acceptance against the current head with fishhawk_dispatch_stage and await its verdict"
 }
