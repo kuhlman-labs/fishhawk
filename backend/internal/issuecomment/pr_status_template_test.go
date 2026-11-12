@@ -598,3 +598,65 @@ func TestRenderPRWhatNow_AcceptancePrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestRenderPRStatusBody_AcceptanceHeadLine pins the head-line rule (#4846 R8):
+// "Validated head" renders only for an outcome that decided criteria against
+// the head (accepted, rejected, undecidable with at least one decided
+// criterion). Every other outcome that records a head renders "Covers head:
+// `<sha>` (not validated)", including the decomposed-parent short-circuit
+// verdict (not_validated with basis all-skip-with-basis), which now carries
+// head_sha. An absent head_sha renders neither line.
+func TestRenderPRStatusBody_AcceptanceHeadLine(t *testing.T) {
+	const (
+		head      = "abcdef1234567890"
+		validated = "- Validated head: `abcdef123456`"
+		covers    = "- Covers head: `abcdef123456` (not validated)"
+	)
+	cases := []struct {
+		name    string
+		payload map[string]any
+		want    string // "" means neither head line renders
+	}{
+		{name: "accepted", payload: map[string]any{"outcome": "accepted", "criteria_passed": 2, "criteria_total": 2}, want: validated},
+		{name: "rejected", payload: map[string]any{"outcome": "rejected", "criteria_passed": 0, "criteria_failed": 1, "criteria_total": 1}, want: validated},
+		{name: "undecidable with one passed", payload: map[string]any{"outcome": "undecidable", "criteria_passed": 1, "criteria_undecidable": 1, "criteria_total": 2}, want: validated},
+		{name: "undecidable with one failed", payload: map[string]any{"outcome": "undecidable", "criteria_failed": 1, "criteria_undecidable": 1, "criteria_total": 2}, want: validated},
+		{name: "undecidable with zero decided", payload: map[string]any{"outcome": "undecidable", "criteria_undecidable": 2, "criteria_total": 2}, want: covers},
+		{name: "not_validated all-skip-with-basis", payload: map[string]any{"outcome": "not_validated", "verdict": "not_validated", "basis": "all-skip-with-basis", "criteria_passed": 0, "criteria_failed": 0, "criteria_total": 2}, want: covers},
+		{name: "skipped_out_of_scope", payload: map[string]any{"outcome": "skipped_out_of_scope"}, want: covers},
+		{name: "empty outcome", payload: map[string]any{}, want: covers},
+		{name: "unknown outcome", payload: map[string]any{"outcome": "something_new", "criteria_passed": 3}, want: covers},
+		{name: "absent head_sha", payload: map[string]any{"outcome": "accepted", "criteria_passed": 1, "criteria_total": 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]any{"stage_id": uuid.New().String()}
+			for k, v := range tc.payload {
+				payload[k] = v
+			}
+			if tc.name != "absent head_sha" {
+				payload["head_sha"] = head
+			}
+			body := RenderPRStatusBody(PRStatusInput{
+				Run:   prStatusRun(),
+				Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", payload)},
+				Now:   time.Unix(1000, 0).UTC(),
+			})
+			if !strings.Contains(body, "**Acceptance**") {
+				t.Fatalf("acceptance section missing (fixture defect):\n%s", body)
+			}
+			for _, line := range []string{validated, covers} {
+				has := strings.Contains(body, line)
+				if line == tc.want && !has {
+					t.Errorf("body missing %q:\n%s", line, body)
+				}
+				if line != tc.want && has {
+					t.Errorf("body must not contain %q:\n%s", line, body)
+				}
+			}
+			if tc.want != validated && strings.Contains(body, "Validated head") {
+				t.Errorf("body certifies an unvalidated head with 'Validated head':\n%s", body)
+			}
+		})
+	}
+}

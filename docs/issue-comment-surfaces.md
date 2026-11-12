@@ -237,7 +237,8 @@ Notes:
   merge-scoped "what now" line, the CURRENT-round `implement` review verdicts
   (reusing the anchor's `renderStageReviews` / current-round isolation), the
   acceptance outcome with a **per-criterion table** (id, pass/fail/skip, basis)
-  + validated target URL + head SHA + triage disposition, and fix-up history
+  + validated target URL + head SHA (see the head-line rule below) + triage
+  disposition, and fix-up history
   (one line per `fixup_pushed` pass). It carries **NO plan / scope / approach
   dump** — that material is issue-locus and stays on the anchor. Rendered by the
   pure `RenderPRStatusBody` (`pr_status_template.go`) and maintained by a
@@ -266,6 +267,19 @@ Notes:
     failing_request}` per transcript row — not the verdict's observed/expected
     prose). When the artifact is unretrievable the table degrades to the tally
     line.
+  - **Head line (#4846).** When the outcome payload carries `head_sha`, the
+    head line says what the verdict did with that head, decided in
+    `renderPRAcceptanceMeta` (`acceptanceHeadValidated`).
+    ``- Validated head: `<short>` `` renders only when a validator decided
+    criteria against the head: outcome `accepted` or `rejected`, or `undecidable` with at least one
+    decided criterion (`criteria_passed + criteria_failed >= 1`). Every other
+    outcome renders ``- Covers head: `<short>` (not validated)``:
+    `not_validated`, `undecidable` with no decided criterion,
+    `skipped_out_of_scope`, and an empty or unknown outcome. A decomposed
+    parent's short-circuit verdict (`not_validated`) now carries `head_sha`,
+    the consolidated head whose fan-in verify released the hold, so it names
+    the head it covers without certifying it. An absent `head_sha` renders
+    neither line. Pinned by `TestRenderPRStatusBody_AcceptanceHeadLine`.
   - **Body cap.** Capped at `MaxIssueCommentBodyBytes` by a degradation ladder
     that drops the acceptance criteria table detail first (collapsing to the
     tally line), then the fix-up history, always preserving the header, the

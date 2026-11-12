@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -1134,4 +1135,306 @@ func TestAcceptanceAdmission_ShortCircuitIsDisjointFromUndecidable(t *testing.T)
 	if !acceptanceGateAdmitsMerge(acceptanceGateNotValidated) || !acceptanceGateAdmitsMerge(acceptanceGateUndecidable) {
 		t.Error("both dispositions must be merge-eligible through acceptanceGateAdmitsMerge")
 	}
+}
+
+// --- #4846: the admission walk consults the fan-in verify hold ----------------
+
+// admissionFanInHook is a scripted FanInVerifyGate for the admission tests: it
+// answers settled (with head) or not, or an error, and counts its calls. Test
+// local to this file (C8).
+type admissionFanInHook struct {
+	mu      sync.Mutex
+	settled bool
+	head    string
+	err     error
+	calls   int
+}
+
+func (h *admissionFanInHook) FanInVerifySettled(context.Context, uuid.UUID, string, string) (orchestrator.FanInVerifyAnswer, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	if h.err != nil {
+		return orchestrator.FanInVerifyAnswer{}, h.err
+	}
+	return orchestrator.FanInVerifyAnswer{Settled: h.settled, HeadSHA: h.head}, nil
+}
+
+func (h *admissionFanInHook) callCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls
+}
+
+// admissionConsolidatedReview counts DispatchConsolidatedReview calls; the
+// admission walk must never fire one.
+type admissionConsolidatedReview struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *admissionConsolidatedReview) DispatchConsolidatedReview(context.Context, uuid.UUID, string, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+}
+
+func (c *admissionConsolidatedReview) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// buildFanInAdmissionSeam is a decomposed parent (#4080 full slice coverage, so
+// the integration gate admits) whose orchestrator is wired with the scripted
+// hook, a counting consolidated-review fake and a static default branch. The
+// parent carries a stamped consolidated PR unless stampPR is false.
+func buildFanInAdmissionSeam(t *testing.T, acceptanceState run.StageState, planBytes json.RawMessage, hook orchestrator.FanInVerifyGate, stampPR bool) (*admissionSeam, *admissionConsolidatedReview) {
+	t.Helper()
+	seam := buildAdmissionSeam(t, acceptanceState, planBytes)
+	a, b := decomposeAdmissionSeam(t, seam)
+	seedAdmissionSlicesIntegrated(t, seam, []string{a.ID.String(), b.ID.String()})
+	parent := seam.rr.runs[seam.runID]
+	parent.Repo = "kuhlman-labs/example"
+	if stampPR {
+		pr := "https://github.com/kuhlman-labs/example/pull/9"
+		parent.PullRequestURL = &pr
+	}
+	cr := &admissionConsolidatedReview{}
+	seam.o.ConsolidatedReview = cr
+	seam.o.FanInVerify = hook
+	seam.o.DefaultBranch = defaultbranch.Static("main")
+	return seam, cr
+}
+
+// decodeAdmission decodes a 200 admission body.
+func decodeAdmission(t *testing.T, w *httptest.ResponseRecorder) acceptanceAdmissionResponse {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceAdmissionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return resp
+}
+
+// outcomeHead returns the head_sha key of the single acceptance verdict, and
+// whether the key is present.
+func outcomeHead(t *testing.T, au *auditFake, runID uuid.UUID) (string, bool) {
+	t.Helper()
+	rows, err := au.ListForRunByCategory(context.Background(), runID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("acceptance_outcome_recorded rows = %d, want 1", len(rows))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("decode verdict %s: %v", rows[0].Payload, err)
+	}
+	head, ok := p["head_sha"].(string)
+	return head, ok
+}
+
+// (h) TestAcceptanceAdmission_DecomposedParentFanInHold: the admission walk
+// consults the shared read-only hold on a PENDING decomposed parent. A held
+// stage is the normal short_circuited:false no-op with nothing written; a
+// settled hook short-circuits with the judged head on the verdict; a hook error
+// answers 500 internal_error with the stage untouched (C4, C7); and an
+// awaiting_host_dispatch stage skips the hold (R1). MECHANISM: the plan is
+// all-skip-with-basis and the integration gate admits, so without the hold the
+// walk settles the pending stage while the hook answers unsettled
+// (TestAcceptanceAdmission_DecomposedParent_FullIntegration_ShortCircuits is
+// the unhooked control).
+func TestAcceptanceAdmission_DecomposedParentFanInHold(t *testing.T) {
+	allSkip := func(t *testing.T) json.RawMessage { return admissionPlanBytes(t, nil, allSkipWithBasisCriteria) }
+
+	assertUntouched := func(t *testing.T, seam *admissionSeam, cr *admissionConsolidatedReview, appendsBefore int) {
+		t.Helper()
+		if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", got)
+		}
+		if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
+		}
+		seam.au.mu.Lock()
+		appends := len(seam.au.appended)
+		seam.au.mu.Unlock()
+		if appends != appendsBefore {
+			t.Errorf("audit appends = %d, want %d (the held / failed walk writes nothing)", appends, appendsBefore)
+		}
+		if n := cr.callCount(); n != 0 {
+			t.Errorf("DispatchConsolidatedReview calls = %d, want 0 (admission fires nothing)", n)
+		}
+	}
+
+	t.Run("pending + unsettled: held no-op", func(t *testing.T) {
+		hook := &admissionFanInHook{head: "consolhead"}
+		seam, cr := buildFanInAdmissionSeam(t, run.StageStatePending, allSkip(t), hook, true)
+		before := len(seam.au.appended)
+
+		resp := decodeAdmission(t, postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity()))
+		if resp.ShortCircuited {
+			t.Error("short_circuited = true, want false (held until the fan-in verify settles)")
+		}
+		if n := hook.callCount(); n != 1 {
+			t.Errorf("hook calls = %d, want 1", n)
+		}
+		assertUntouched(t, seam, cr, before)
+	})
+
+	t.Run("pending + PR not opened: held without the hook", func(t *testing.T) {
+		hook := &admissionFanInHook{settled: true, head: "consolhead"}
+		seam, cr := buildFanInAdmissionSeam(t, run.StageStatePending, allSkip(t), hook, false)
+		gh := seam.o.GitHub.(*consolidateGitHub)
+		before := len(seam.au.appended)
+
+		resp := decodeAdmission(t, postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity()))
+		if resp.ShortCircuited {
+			t.Error("short_circuited = true, want false (consolidated_pr_not_opened holds)")
+		}
+		if n := hook.callCount(); n != 0 {
+			t.Errorf("hook calls = %d, want 0 (an unopened PR holds before the hook)", n)
+		}
+		gh.mu.Lock()
+		prCalls := gh.prCalls
+		gh.mu.Unlock()
+		if prCalls != 0 {
+			t.Errorf("CreatePullRequest calls = %d, want 0 (admission never opens the PR)", prCalls)
+		}
+		assertUntouched(t, seam, cr, before)
+	})
+
+	t.Run("pending + settled: short-circuits with head_sha", func(t *testing.T) {
+		hook := &admissionFanInHook{settled: true, head: "consolhead"}
+		seam, cr := buildFanInAdmissionSeam(t, run.StageStatePending, allSkip(t), hook, true)
+
+		resp := decodeAdmission(t, postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity()))
+		if !resp.ShortCircuited {
+			t.Fatalf("short_circuited = false, want true once the fan-in verify settled")
+		}
+		if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStateSucceeded {
+			t.Errorf("acceptance stage = %q, want succeeded", got)
+		}
+		if head, ok := outcomeHead(t, seam.au, seam.runID); !ok || head != "consolhead" {
+			t.Errorf("verdict head_sha = (%q, %v), want (consolhead, true)", head, ok)
+		}
+		if n := countByCategory(seam.au, orchestrator.CategoryFanInVerifyUnavailable); n != 0 {
+			t.Errorf("fan_in_verify_unavailable = %d, want 0 on a verified release", n)
+		}
+		if n := cr.callCount(); n != 0 {
+			t.Errorf("DispatchConsolidatedReview calls = %d, want 0 (admission fires nothing)", n)
+		}
+	})
+
+	t.Run("hook error: 500 internal_error, stage untouched", func(t *testing.T) {
+		hook := &admissionFanInHook{err: errors.New("compare boom")}
+		seam, cr := buildFanInAdmissionSeam(t, run.StageStatePending, allSkip(t), hook, true)
+		before := len(seam.au.appended)
+
+		w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		if code := decodeError(t, w); code != "internal_error" {
+			t.Errorf("code = %q, want internal_error (the admission error contract, C4)", code)
+		}
+		assertUntouched(t, seam, cr, before)
+	})
+
+	t.Run("awaiting_host_dispatch + unsettled: hold skipped (R1)", func(t *testing.T) {
+		hook := &admissionFanInHook{head: "consolhead"}
+		seam, _ := buildFanInAdmissionSeam(t, run.StageStateAwaitingHostDispatch, allSkip(t), hook, true)
+
+		resp := decodeAdmission(t, postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity()))
+		if !resp.ShortCircuited {
+			t.Fatal("short_circuited = false, want true (an awaiting_host_dispatch stage is past the hold)")
+		}
+		if n := hook.callCount(); n != 0 {
+			t.Errorf("hook calls = %d, want 0 (the hold is consulted on pending only)", n)
+		}
+		if _, ok := outcomeHead(t, seam.au, seam.runID); ok {
+			t.Error("verdict carries head_sha, want none when the hold was not consulted")
+		}
+	})
+}
+
+// (h2) TestAcceptanceAdmission_DecomposedParentFailOpen_UnavailableBeforeVerdict
+// drives the real admission endpoint on a decomposed parent with NO FanInVerify
+// wired (the hook_not_wired fail-open release, #4792). An all-skip plan
+// short-circuits and records the hook_not_wired row at a LOWER chain sequence
+// than the verdict (R3). A drivable-criterion plan matches no predicate, so the
+// walk records NOTHING and answers short_circuited:false (R9): the release is
+// recorded later, by the marker when it admits the spawn or by Advance.
+// MECHANISM: the re-entry Advance finds acceptance terminal and skips the
+// consolidation tail, so without the admission-side record no unavailable row
+// exists at all; an unconditional record would append one on the drivable plan.
+func TestAcceptanceAdmission_DecomposedParentFailOpen_UnavailableBeforeVerdict(t *testing.T) {
+	build := func(t *testing.T, planBytes json.RawMessage) *admissionSeam {
+		seam, _ := buildFanInAdmissionSeam(t, run.StageStatePending, planBytes, nil, true)
+		seam.o.FanInVerify = nil
+		seam.au.stampSequence = true
+		return seam
+	}
+	unavailableRows := func(t *testing.T, seam *admissionSeam) []*audit.Entry {
+		t.Helper()
+		rows, err := seam.au.ListForRunByCategory(context.Background(), seam.runID, orchestrator.CategoryFanInVerifyUnavailable)
+		if err != nil {
+			t.Fatalf("ListForRunByCategory: %v", err)
+		}
+		return rows
+	}
+
+	t.Run("all-skip parent: row before verdict", func(t *testing.T) {
+		seam := build(t, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+
+		resp := decodeAdmission(t, postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity()))
+		if !resp.ShortCircuited {
+			t.Fatal("short_circuited = false, want true (a fail-open release short-circuits)")
+		}
+		rows := unavailableRows(t, seam)
+		if len(rows) != 1 {
+			t.Fatalf("fan_in_verify_unavailable rows = %d, want exactly 1", len(rows))
+		}
+		var p orchestrator.FanInVerifyUnavailablePayload
+		if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+			t.Fatalf("decode %s: %v", rows[0].Payload, err)
+		}
+		if p.Reason != orchestrator.FanInVerifyUnavailableHookNotWired || p.AcceptanceStageID != seam.acceptanceID.String() {
+			t.Errorf("payload = %+v, want hook_not_wired on the acceptance stage", p)
+		}
+		verdicts, err := seam.au.ListForRunByCategory(context.Background(), seam.runID, CategoryAcceptanceOutcomeRecorded)
+		if err != nil || len(verdicts) != 1 {
+			t.Fatalf("acceptance_outcome_recorded rows = %d (%v), want 1", len(verdicts), err)
+		}
+		if rows[0].Sequence >= verdicts[0].Sequence {
+			t.Errorf("fan_in_verify_unavailable sequence %d >= verdict sequence %d, want the row BEFORE the verdict",
+				rows[0].Sequence, verdicts[0].Sequence)
+		}
+		if _, ok := outcomeHead(t, seam.au, seam.runID); ok {
+			t.Error("fail-open verdict carries head_sha, want none (no head was judged)")
+		}
+	})
+
+	t.Run("drivable-criterion parent: nothing recorded (R9)", func(t *testing.T) {
+		drivable := []map[string]any{{"id": "ac-1", "statement": "POST returns 201", "source": "explicit", "source_ref": "#1", "blocking": true}}
+		seam := build(t, admissionPlanBytes(t, nil, drivable))
+
+		resp := decodeAdmission(t, postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity()))
+		if resp.ShortCircuited {
+			t.Error("short_circuited = true, want false (a drivable criterion matches no predicate)")
+		}
+		if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending", got)
+		}
+		if rows := unavailableRows(t, seam); len(rows) != 0 {
+			t.Errorf("fan_in_verify_unavailable rows = %d, want 0 (recorded only when the walk short-circuits)", len(rows))
+		}
+		if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
+		}
+	})
 }
