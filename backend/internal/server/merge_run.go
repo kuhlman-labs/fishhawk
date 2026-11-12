@@ -402,9 +402,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// verdict on either basis: a fix-up push re-opened the stage after the
 	// verdict (acceptance_reopened), or a fix-up landed above the dispatch
 	// anchor of the episode that produced it, while that episode was in flight
-	// (fixup_in_episode). The merge then times out behind a pending
-	// fishhawk_audit_complete. Refuse fast instead, naming both heads and the
-	// re-run verb. Placed BEFORE the GateMerger guard: it needs no merge seam,
+	// (fixup_in_episode). On the reopen basis the merge then times out behind
+	// a pending fishhawk_audit_complete; on fixup_in_episode that check may
+	// already be green, so this guard is what refuses it. Refuse fast, naming
+	// both heads and the re-run verb. Placed BEFORE the GateMerger guard: it needs no merge seam,
 	// and both refusals record nothing. FAIL-CLOSED on any of its audit reads
 	// (re-open, dispatch and fix-up history: 500, nothing recorded), like the
 	// acceptance gate.

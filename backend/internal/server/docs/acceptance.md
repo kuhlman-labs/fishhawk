@@ -408,11 +408,17 @@ comparisons are chain sequences. The details add `dispatch_sequence`,
 INVALIDATING fix-up head, which can differ from the live PR head after a later
 push. `next_step` is `fishhawk_retry_stage` on a settled stage, whose Option C
 arm admits because the recorded head differs from the fix-up head, and
-`fishhawk_await_stage` while the stage is `dispatched` or `running`. The arm
-also covers a verdict shipped before the stage report with a fix-up after it,
-and an anchored episode whose `acceptance_reopened` append failed or whose
-re-open was refused. The `acceptance_reopened` basis keeps precedence and its
-exact details. Pinned by `TestAcceptanceStaleRefusal` (the rows "fix-up inside
+`fishhawk_await_stage` while the stage is `dispatched` or `running`. That
+message says to retry after awaiting, unless a stage-scoped
+`acceptance_dispatched` above both the outcome and the fix-up is in flight: that
+re-run binds the fix-up head (a triage re-open writes no `acceptance_reopened`
+row), so its verdict clears the refusal. Fishhawk's merge verbs refuse this
+basis; `fishhawk_audit_complete` does not hold it and may already be green. The
+arm also covers a verdict shipped before the stage report with a fix-up after
+it, and an anchored episode whose `acceptance_reopened` append failed or whose
+re-open was refused. The two bases never both hold: when the
+`acceptance_reopened` basis holds, the outcome's anchor sits below the reopen,
+so this arm admits. Pinned by `TestAcceptanceStaleRefusal` (the rows "fix-up inside
 the in-flight episode refuses" through "re-run after reopen admits"),
 `TestAcceptanceStaleRefusal_ReadErrorsFailClosed` (the `acceptance_dispatched`
 and `fixup_pushed` reads fail closed),

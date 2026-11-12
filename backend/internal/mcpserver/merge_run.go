@@ -337,11 +337,14 @@ Statuses:
                      already routed one bounded fix-up when the result was
                      recorded; otherwise route it yourself).
   - "acceptance_stale" — the recorded acceptance verdict is stale: it was
-                     invalidated by a later fix-up push or re-open (acceptance
-                     was re-opened after the verdict, or a fix-up landed while
-                     the verdict's episode was in flight), so
-                     fishhawk_audit_complete cannot clear and the merge would
-                     only time out. Immediate, no verdict row; the message
+                     invalidated by a later fix-up push or re-open. On
+                     stale_basis acceptance_reopened (acceptance was re-opened
+                     after the verdict) fishhawk_audit_complete cannot clear and
+                     the merge would only time out. On fixup_in_episode (a
+                     fix-up landed while the verdict's episode was in flight)
+                     the check does not hold the basis and may already be
+                     green; Fishhawk's merge verbs refuse it. Immediate, no
+                     verdict row; the message
                      names the verified and invalidating heads and
                      details.stale_basis names the basis. next_action names
                      fishhawk_dispatch_stage (stage pending),

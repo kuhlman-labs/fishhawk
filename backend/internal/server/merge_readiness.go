@@ -59,14 +59,18 @@ const (
 //     reopenAcceptanceOnFixupPush (and the #1567 operator re-open) leaves
 //     behind: the stage is back to pending while acceptanceGateState still
 //     reads the stale recorded outcome and admits the merge, which then sits
-//     behind a pending fishhawk_audit_complete until the tool times out. This
-//     basis keeps precedence and its exact details.
+//     behind a pending fishhawk_audit_complete until the tool times out. It is
+//     checked first, but the order is not observable: when it holds, the
+//     outcome's anchor sits below the reopen, so the fixup_in_episode basis
+//     admits on its own.
 //   - fixup_in_episode (#5163, acceptanceFixupInEpisodeRefusal): the newest
 //     outcome came from an ANCHORED episode and a fixup_pushed entry sits above
 //     that episode's dispatch anchor. reopenAcceptanceOnFixupPush re-opens only
 //     a SUCCEEDED stage, so a fix-up landing while the episode is dispatched or
 //     running writes no acceptance_reopened row, and the episode's eventual
-//     verdict binds the dispatch-anchored PRE-fix-up head.
+//     verdict binds the dispatch-anchored PRE-fix-up head. The
+//     fishhawk_audit_complete check does not hold this basis and may already
+//     be green, so Fishhawk's merge verbs are what refuse it.
 //
 // The outcome's anchor follows the live-anchor rule acceptanceValidatedHeadSHA
 // binds with: the newest stage-scoped acceptance_dispatched entry BELOW the
@@ -171,9 +175,17 @@ func (s *Server) acceptanceFixupInEpisodeRefusal(ctx context.Context, runRow *ru
 	if err != nil {
 		return nil, fmt.Errorf("list %s audit entries: %w", CategoryAcceptanceDispatched, err)
 	}
-	var anchor *audit.Entry
+	// rerun is the newest stage-scoped dispatch ABOVE the outcome: a later
+	// episode, which only picks the clearing sentence below.
+	var anchor, rerun *audit.Entry
 	for _, e := range dispatches {
-		if e.StageID == nil || *e.StageID != acc.ID || e.Sequence >= outcome.Sequence {
+		if e.StageID == nil || *e.StageID != acc.ID {
+			continue
+		}
+		if e.Sequence >= outcome.Sequence {
+			if rerun == nil || e.Sequence > rerun.Sequence {
+				rerun = e
+			}
 			continue
 		}
 		if anchor == nil || e.Sequence > anchor.Sequence {
@@ -201,10 +213,10 @@ func (s *Server) acceptanceFixupInEpisodeRefusal(ctx context.Context, runRow *ru
 	}
 
 	fixupHead := auditPayloadString(fixup.Payload, "head_sha")
-	nextStep, how := acceptanceFixupStaleNextStep(acc.State)
+	nextStep, how := acceptanceFixupStaleNextStep(acc.State, rerun != nil && rerun.Sequence > fixup.Sequence)
 	return &mergeReadinessRefusal{
 		Code: mergeCodeAcceptanceStale,
-		Message: fmt.Sprintf("the recorded acceptance verdict is stale: acceptance stage %s was dispatched at audit sequence %d and its verdict validated head %s, but a fix-up push landed head %s at sequence %d after that dispatch, so the verdict does not cover the fix-up and the fishhawk_audit_complete check will not clear. %s, then re-invoke the merge. No merge verdict was recorded.",
+		Message: fmt.Sprintf("the recorded acceptance verdict is stale: acceptance stage %s was dispatched at audit sequence %d and its verdict validated head %s, but a fix-up push landed head %s at sequence %d after that dispatch, so the verdict does not cover the fix-up. Fishhawk's merge verbs refuse it; the fishhawk_audit_complete check does not hold this basis and may already be green. %s, then re-invoke the merge. No merge verdict was recorded.",
 			acc.ID, anchor.Sequence, verifiedHead, shaOrUnrecorded(fixupHead), fixup.Sequence, how),
 		Details: map[string]any{
 			"acceptance_stage_id":    acc.ID.String(),
@@ -257,11 +269,19 @@ func acceptanceStaleNextStep(state run.StageState) (string, string) {
 }
 
 // acceptanceFixupStaleNextStep is acceptanceStaleNextStep for the
-// fixup_in_episode basis. Its dispatched/running sentence differs: no re-run is
-// in flight there, the stale episode itself is still settling.
-func acceptanceFixupStaleNextStep(state run.StageState) (string, string) {
+// fixup_in_episode basis. rerunCoversFixup reports a stage-scoped
+// acceptance_dispatched above both the outcome and the fix-up: that re-run binds
+// the fix-up head, so its verdict clears the refusal by itself and the
+// dispatched/running sentence is acceptanceStaleNextStep's "re-run is in
+// flight". Otherwise the in-flight episode is stale itself (the anchored
+// episode, or a re-run dispatched before the fix-up landed): await it, then
+// re-open it.
+func acceptanceFixupStaleNextStep(state run.StageState, rerunCoversFixup bool) (string, string) {
 	switch state {
 	case run.StageStateDispatched, run.StageStateRunning:
+		if rerunCoversFixup {
+			return acceptanceStaleNextStep(state)
+		}
 		return "fishhawk_await_stage", "The stale episode is still settling: await it with fishhawk_await_stage, then re-open it with fishhawk_retry_stage and dispatch it"
 	case run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled, run.StageStateSuperseded:
 		return "fishhawk_retry_stage", "Re-open the acceptance stage with fishhawk_retry_stage and dispatch it against the current head"

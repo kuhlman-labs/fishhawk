@@ -16618,18 +16618,20 @@ paths:
             re-anchors and starts the pass — watch `merge_candidate_queue` on
             `GET /v0/runs/{run_id}`, dispatch and await the pass once admitted,
             then re-invoke. Records NO verdict row and dispatches nothing.
-            (8) The recorded acceptance verdict is STALE (`acceptance_stale`),
-            so the `fishhawk_audit_complete` check would never clear. Two
-            bases, named by `details.stale_basis`. `acceptance_reopened`
-            (#4086, takes precedence): the run's acceptance stage carries a
+            (8) The recorded acceptance verdict is STALE (`acceptance_stale`).
+            Two bases, named by `details.stale_basis`, which never both hold.
+            `acceptance_reopened` (#4086): the run's acceptance stage carries a
             stage-scoped `acceptance_reopened` entry at or above the newest
             `acceptance_outcome_recorded` (a fix-up push or an operator
-            re-open). `fixup_in_episode` (#5163): the outcome names a
+            re-open), so the `fishhawk_audit_complete` check would never
+            clear. `fixup_in_episode` (#5163): the outcome names a
             `head_sha` and a `fixup_pushed` entry sits above the dispatch
             anchor of the episode that produced it (the newest stage-scoped
             `acceptance_dispatched` below the outcome and above every
             stage-scoped `acceptance_reopened`): a fix-up landed while that
-            episode was dispatched or running. Both key on the chain's own
+            episode was dispatched or running; `fishhawk_audit_complete` does
+            not hold this basis and may already be green, so Fishhawk's merge
+            verbs are what refuse it. Both key on the chain's own
             records, never on comparing heads, so a vouch commit or an ADR-090
             rebase does not trigger it. `details` carry `{run_id, pr_url,
             acceptance_stage_id, acceptance_stage_state, verified_head_sha,

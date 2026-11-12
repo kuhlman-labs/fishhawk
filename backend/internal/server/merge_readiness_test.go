@@ -168,6 +168,10 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 			}},
 		// a6: isolates `e.Sequence >= outcome.Sequence` in the anchor fold: the
 		// dispatch @7 above the outcome is a later episode's, not its anchor.
+		// That re-run (a triage re-open writes no acceptance_reopened row) is
+		// above the fix-up too, so it binds the fix-up head and its verdict
+		// clears the refusal: the message says the re-run is in flight, not
+		// "await, then re-open".
 		{name: "a dispatch above the outcome is not its anchor", accState: run.StageStateDispatched,
 			seed: func(au *auditFake, runID, accID uuid.UUID) {
 				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
@@ -179,7 +183,40 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 			wantDetails: map[string]any{
 				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(6),
 				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
-			}},
+			},
+			wantMsg: "The acceptance re-run is in flight: await it with fishhawk_await_stage, then re-invoke the merge"},
+		// a6b: a6 with the re-run dispatched BEFORE the fix-up landed
+		// (dispatch@6 < fixup@7); isolates `rerun.Sequence > fixup.Sequence`.
+		// That re-run bound the pre-fix-up head, so it is stale itself.
+		{name: "a re-run dispatched before the fix-up is still stale", accState: run.StageStateRunning,
+			seed: func(au *auditFake, runID, accID uuid.UUID) {
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 3, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
+				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceDispatched, 6, map[string]any{})
+				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 7, map[string]any{"head_sha": h2})
+			},
+			wantStale: true, wantNext: "fishhawk_await_stage", wantVerif: h1, wantCur: h2,
+			wantDetails: map[string]any{
+				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(7),
+				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
+			},
+			wantMsg: "The stale episode is still settling: await it with fishhawk_await_stage, then re-open it with fishhawk_retry_stage"},
+		// a6c / a6d: the remaining next_step arms on this basis. pending is the
+		// state a refused-reopen append or a row-less triage re-open leaves.
+		{name: "fix-up in episode, pending stage refuses with dispatch", accState: run.StageStatePending, seed: inEpisodeSeed,
+			wantStale: true, wantNext: "fishhawk_dispatch_stage", wantVerif: h1, wantCur: h2,
+			wantDetails: map[string]any{
+				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(4),
+				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
+			},
+			wantMsg: "Re-run acceptance against the current head with fishhawk_dispatch_stage"},
+		{name: "fix-up in episode, failed stage refuses with retry", accState: run.StageStateFailed, seed: inEpisodeSeed,
+			wantStale: true, wantNext: "fishhawk_retry_stage", wantVerif: h1, wantCur: h2,
+			wantDetails: map[string]any{
+				"outcome_sequence": int64(5), "dispatch_sequence": int64(3), "fixup_sequence": int64(4),
+				"stale_basis": staleBasisFixupInEpisode, "reopened_sequence": nil,
+			},
+			wantMsg: "Re-open the acceptance stage with fishhawk_retry_stage"},
 		// a7: isolates the stage-scope skip in the anchor fold.
 		{name: "a dispatch scoped to another stage is ignored", accState: run.StageStateSucceeded,
 			seed: func(au *auditFake, runID, accID uuid.UUID) {
@@ -188,8 +225,12 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 				seedReadinessEntry(au, runID, &accID, CategoryFixupPushed, 4, map[string]any{"head_sha": h2})
 				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
 			}},
-		// a8: both bases hold; the reopen basis wins with its exact details.
-		{name: "reopen basis keeps precedence", accState: run.StageStatePending,
+		// a8: a1's chain plus a reopen above the outcome; the refusal keeps the
+		// reopen basis's exact details. A details-shape regression row only: it
+		// does NOT pin arm order, because whenever the reopen basis holds the
+		// outcome's anchor sits below the reopen and the fixup_in_episode
+		// basis admits on its own.
+		{name: "reopen basis details with a fix-up in the episode", accState: run.StageStatePending,
 			seed: func(au *auditFake, runID, accID uuid.UUID) {
 				inEpisodeSeed(au, runID, accID)
 				seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": h2})
@@ -255,6 +296,12 @@ func TestAcceptanceStaleRefusal(t *testing.T) {
 				if got != want {
 					t.Errorf("details[%s] = %v (%T), want %v (%T)", k, got, got, want, want)
 				}
+			}
+			// Only the reopen basis holds fishhawk_audit_complete; the
+			// fixup_in_episode message must not claim the check stays red.
+			if d["stale_basis"] == staleBasisFixupInEpisode &&
+				(strings.Contains(ref.Message, "will not clear") || !strings.Contains(ref.Message, "may already be green")) {
+				t.Errorf("fixup_in_episode message %q claims fishhawk_audit_complete stays red", ref.Message)
 			}
 			if c.wantMsg != "" && !strings.Contains(ref.Message, c.wantMsg) {
 				t.Errorf("message %q does not carry %q", ref.Message, c.wantMsg)
