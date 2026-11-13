@@ -6,6 +6,7 @@ date: 2026-11-13
 issue: https://github.com/kuhlman-labs/fishhawk/issues/5239
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-145"]
 applies_to: []
 ---
 

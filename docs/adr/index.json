@@ -1702,6 +1702,21 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-145"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-145",
+      "title": "Recovery and the response to an unowned enrolment for the proof of presence (amends ADR-144)",
+      "path": "docs/adr/145-proof-of-presence-recovery.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-144"
+      ],
       "applies_to": []
     }
   ]
