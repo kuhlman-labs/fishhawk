@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -203,6 +204,11 @@ type recordAutoDriveActResponse struct {
 // operator-agent identity (delegated:true, the ADR-040 acting-identity
 // context). This is the SUPPLEMENTARY driver-attribution record; see
 // CategoryRunAutoDriven.
+//
+// A host-dispatcher/<host> subject (ADR-104 Q4, E88.2 / #4526) is admitted
+// under write:runs instead of write:approvals — its profile never carries
+// write:approvals — and must tag its row with source host_dispatcher. Every
+// other subject keeps the write:approvals rule unchanged.
 func (s *Server) handleAutoDriveRecordAct(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -210,7 +216,15 @@ func (s *Server) handleAutoDriveRecordAct(w http.ResponseWriter, r *http.Request
 			"an authenticated token is required", nil)
 		return
 	}
-	if id.TokenID != "" && !hasScope(id, "write:approvals") {
+	isDispatcher := hostdispatcher.IsSubject(id.Subject)
+	if isDispatcher {
+		if !hasScope(id, hostdispatcher.ScopeWriteRuns) {
+			s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+				"token is missing required scope: write:runs",
+				map[string]any{"required_scope": hostdispatcher.ScopeWriteRuns})
+			return
+		}
+	} else if id.TokenID != "" && !hasScope(id, "write:approvals") {
 		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
 			"token is missing required scope: write:approvals",
 			map[string]any{"required_scope": "write:approvals"})
@@ -264,6 +278,11 @@ func (s *Server) handleAutoDriveRecordAct(w http.ResponseWriter, r *http.Request
 	case source == "":
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"source is required", map[string]any{"field": "source"})
+		return
+	case isDispatcher && source != hostdispatcher.SourceTag:
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"a host-dispatcher subject must record source "+hostdispatcher.SourceTag,
+			map[string]any{"field": "source", "got": source, "want": hostdispatcher.SourceTag})
 		return
 	}
 

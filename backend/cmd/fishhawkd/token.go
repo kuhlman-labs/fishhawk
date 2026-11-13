@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tokenmigrate"
@@ -83,9 +84,9 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL")
 	subject := fs.String("subject", "",
-		"identity the token is bound to (e.g. \"github:42\", \"bootstrap\", or \"operator-agent/<role-spec-version>\" for an operator-agent role instance)")
+		"identity the token is bound to (e.g. \"github:42\", \"bootstrap\", \"operator-agent/<role-spec-version>\" for an operator-agent role instance, or \"host-dispatcher/<host>\" for an ADR-104 host dispatcher)")
 	scopesCSV := fs.String("scopes", "",
-		"comma-separated scope list (optional)")
+		"comma-separated scope list (optional; a host-dispatcher/<host> subject defaults to, and is limited to, read:runs,read:audit,write:runs,write:stages)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -105,10 +106,13 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 		return exitUsage
 	}
 
-	scopes := splitCSV(*scopesCSV)
-	if len(scopes) == 0 && !strings.HasPrefix(*subject, "mcp:") {
-		scopes = operatorDefaultScopes
-		_, _ = fmt.Fprintln(logSink, "fishhawkd token issue: applying default operator scope set")
+	scopes, note, err := resolveIssueScopes(*subject, splitCSV(*scopesCSV))
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink, "fishhawkd token issue: %v\n", err)
+		return exitUsage
+	}
+	if note != "" {
+		_, _ = fmt.Fprintln(logSink, "fishhawkd token issue: "+note)
 	}
 
 	pool, err := pgxpool.New(context.Background(), *dbURL)
@@ -136,6 +140,33 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 		"issued token id=%s subject=%s scopes=%v\n",
 		tok.ID, tok.Subject, tok.Scopes)
 	return exitOK
+}
+
+// resolveIssueScopes decides the scope set `fishhawkd token issue` mints for
+// subject. A host-dispatcher/<host> subject (ADR-104 Q4, E88.2 / #4526) must
+// carry a valid label, defaults to hostdispatcher.Scopes() when --scopes is
+// omitted, and may not request a scope outside that profile (the error names
+// it). Every other subject keeps the prior rule: an empty request defaults to
+// operatorDefaultScopes, except an mcp: subject. note is the log line to print
+// when a default was applied.
+func resolveIssueScopes(subject string, requested []string) (scopes []string, note string, err error) {
+	if hostdispatcher.IsSubject(subject) {
+		if verr := hostdispatcher.ValidateSubject(subject); verr != nil {
+			return nil, "", verr
+		}
+		if len(requested) == 0 {
+			return hostdispatcher.Scopes(), "applying the host-dispatcher scope profile", nil
+		}
+		if outside := hostdispatcher.OutsideProfile(requested); len(outside) > 0 {
+			return nil, "", fmt.Errorf("host-dispatcher subject %q may not hold scope(s) %s; the profile is %s",
+				subject, strings.Join(outside, ","), strings.Join(hostdispatcher.Scopes(), ","))
+		}
+		return requested, "", nil
+	}
+	if len(requested) == 0 && !strings.HasPrefix(subject, "mcp:") {
+		return operatorDefaultScopes, "applying default operator scope set", nil
+	}
+	return requested, "", nil
 }
 
 func runTokenMigrate(args []string, logSink io.Writer) int {

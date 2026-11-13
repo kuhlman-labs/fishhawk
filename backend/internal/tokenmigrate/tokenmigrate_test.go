@@ -3,11 +3,13 @@ package tokenmigrate
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 )
 
@@ -164,4 +166,44 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestMigrateScopes_SkipsHostDispatcherToken pins R3 (E88.2 / #4526): a
+// host-dispatcher token's profile is a strict subset of the operator default,
+// so without the skip `--apply` would promote it to the full operator set,
+// write:approvals included. Counterfactual run by hand: deleting the
+// hostdispatcher.IsSubject skip made --apply promote the row, RED.
+func TestMigrateScopes_SkipsHostDispatcherToken(t *testing.T) {
+	profile := hostdispatcher.Scopes()
+	// Precondition: the profile is a strict subset of the defaults, so the
+	// subset rule WOULD promote it.
+	if !isSubset(profile, testDefaults) || len(missingScopes(profile, testDefaults)) == 0 {
+		t.Fatalf("precondition: profile %v must be a strict subset of %v", profile, testDefaults)
+	}
+
+	pool := pgtest.NewPool(t)
+	idD := seedToken(t, pool, "host-dispatcher/devbox", profile)
+	idB := seedToken(t, pool, "operator:subset", []string{"read:runs", "read:audit"})
+
+	for _, dry := range []bool{true, false} {
+		var buf bytes.Buffer
+		summary, err := MigrateScopes(context.Background(), pool, testDefaults, dry, &buf)
+		if err != nil {
+			t.Fatalf("dry=%v: %v", dry, err)
+		}
+		if summary.Scanned != 2 || summary.Migrated != 1 || summary.Skipped != 1 {
+			t.Errorf("dry=%v summary = %+v, want Scanned=2 Migrated=1 Skipped=1", dry, summary)
+		}
+		if !strings.Contains(buf.String(), "skip  subject=host-dispatcher/devbox id="+idD+" (host-dispatcher profile)") {
+			t.Errorf("dry=%v output does not name the dispatcher skip:\n%s", dry, buf.String())
+		}
+		if got := queryScopes(t, pool, idD); !equalStringSlices(got, profile) {
+			t.Fatalf("dry=%v dispatcher token scopes = %v, want unchanged %v", dry, got, profile)
+		}
+	}
+	// The operator subset token is still promoted, so the skip is
+	// dispatcher-only.
+	if got := queryScopes(t, pool, idB); !equalStringSlices(got, testDefaults) {
+		t.Errorf("operator subset token = %v, want promoted to %v", got, testDefaults)
+	}
 }

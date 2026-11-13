@@ -5,6 +5,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 )
 
@@ -18,9 +19,11 @@ import (
 // these writers with the prefix, so they classify as user here and are
 // guarded by their own subject-binding checks upstream. A first-officer seat
 // subject (first_officer/..., E85.6 / #4148) is an agent too: seat-driven
-// rows record actor_kind agent.
+// rows record actor_kind agent. A host-dispatcher subject (host-dispatcher/...,
+// ADR-104 Q4, E88.2 / #4526) is an agent as well.
 func actorKindForSubject(subject string) audit.ActorKind {
-	if operatorrole.IsTokenSubject(subject) || firstofficer.IsSeatSubject(subject) {
+	if operatorrole.IsTokenSubject(subject) || firstofficer.IsSeatSubject(subject) ||
+		hostdispatcher.IsSubject(subject) {
 		return audit.ActorAgent
 	}
 	return audit.ActorUser
@@ -31,7 +34,9 @@ func actorKindForSubject(subject string) audit.ActorKind {
 // same prefix actorKindForSubject keys on), a run-bound mcp:run:<uuid>
 // subject, minted for the agent executing inside a run, or a first-officer
 // seat subject (firstofficer.IsSeatSubject, E85.6 / #4148 — a prefix match,
-// so a malformed seat subject is an agent too). Every other subject —
+// so a malformed seat subject is an agent too), or a host-dispatcher subject
+// (hostdispatcher.IsSubject, ADR-104 Q4 — also a prefix match). Every other
+// subject —
 // a human token, a GitHub login, a cookie session — is a human.
 //
 // It is the ONE classification shared by the captain verbs
@@ -42,5 +47,5 @@ func actorKindForSubject(subject string) audit.ActorKind {
 // indistinguishable from that human and is treated as one.
 func isAgentSubject(subject string) bool {
 	return operatorrole.IsTokenSubject(subject) || strings.HasPrefix(subject, "mcp:run:") ||
-		firstofficer.IsSeatSubject(subject)
+		firstofficer.IsSeatSubject(subject) || hostdispatcher.IsSubject(subject)
 }

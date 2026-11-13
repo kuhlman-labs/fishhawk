@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 )
 
@@ -100,5 +103,69 @@ func TestRunTokenIssue_DefaultsAuthMethodStatic(t *testing.T) {
 func TestOperatorDefaultScopes_ExcludeSpecialistJobAttestScope(t *testing.T) {
 	if containsScope(operatorDefaultScopes, "attest:specialist-jobs") {
 		t.Fatalf("operatorDefaultScopes must not contain attest:specialist-jobs; got %v", operatorDefaultScopes)
+	}
+}
+
+// TestResolveIssueScopes_HostDispatcherProfile pins the ADR-104 Q4 minting
+// rule (E88.2 / #4526): a host-dispatcher/<host> subject with no --scopes gets
+// exactly the dispatcher profile, never operatorDefaultScopes; a requested
+// scope outside the profile is refused naming it; a malformed label is
+// refused. Counterfactual run by hand: making the dispatcher branch fall
+// through to the operator default turned the default-profile row RED.
+func TestResolveIssueScopes_HostDispatcherProfile(t *testing.T) {
+	got, note, err := resolveIssueScopes("host-dispatcher/devbox", nil)
+	if err != nil {
+		t.Fatalf("default profile: %v", err)
+	}
+	if want := "read:runs,read:audit,write:runs,write:stages"; strings.Join(got, ",") != want {
+		t.Fatalf("default dispatcher scopes = %v, want %s", got, want)
+	}
+	if containsScope(got, "write:approvals") || !strings.Contains(note, "host-dispatcher") {
+		t.Fatalf("default dispatcher scopes %v / note %q", got, note)
+	}
+
+	got, _, err = resolveIssueScopes("host-dispatcher/devbox", []string{"read:runs", "write:stages"})
+	if err != nil || strings.Join(got, ",") != "read:runs,write:stages" {
+		t.Fatalf("in-profile request = %v, %v", got, err)
+	}
+
+	if _, _, err := resolveIssueScopes("host-dispatcher/devbox", []string{"read:runs", "write:approvals"}); err == nil ||
+		!strings.Contains(err.Error(), "write:approvals") {
+		t.Fatalf("out-of-profile request err = %v, want a refusal naming write:approvals", err)
+	}
+
+	for _, bad := range []string{"host-dispatcher/", "host-dispatcher/a/b", "host-dispatcher/has space"} {
+		if _, _, err := resolveIssueScopes(bad, nil); !errors.Is(err, hostdispatcher.ErrInvalidSubject) {
+			t.Errorf("resolveIssueScopes(%q) err = %v, want ErrInvalidSubject", bad, err)
+		}
+	}
+}
+
+// TestResolveIssueScopes_NonDispatcherUnchanged pins that the prior rule is
+// byte-identical for every other subject.
+func TestResolveIssueScopes_NonDispatcherUnchanged(t *testing.T) {
+	got, note, err := resolveIssueScopes("github:42", nil)
+	if err != nil || strings.Join(got, ",") != strings.Join(operatorDefaultScopes, ",") ||
+		note != "applying default operator scope set" {
+		t.Fatalf("operator default = %v, %q, %v", got, note, err)
+	}
+	got, _, err = resolveIssueScopes("github:42", []string{"write:approvals", "custom:scope"})
+	if err != nil || strings.Join(got, ",") != "write:approvals,custom:scope" {
+		t.Fatalf("explicit operator scopes = %v, %v", got, err)
+	}
+	got, note, err = resolveIssueScopes("mcp:run:x", nil)
+	if err != nil || len(got) != 0 || note != "" {
+		t.Fatalf("mcp subject = %v, %q, %v; want no default", got, note, err)
+	}
+}
+
+// TestRunTokenIssue_RefusesBadDispatcherBeforeDB: the refusal is a usage exit
+// raised before any database dial (the --db URL here is unreachable).
+func TestRunTokenIssue_RefusesBadDispatcherBeforeDB(t *testing.T) {
+	var logSink bytes.Buffer
+	code := runTokenIssue([]string{"--db", "postgres://127.0.0.1:1/none", "--subject", "host-dispatcher/devbox",
+		"--scopes", "read:runs,write:approvals"}, &logSink)
+	if code != exitUsage || !strings.Contains(logSink.String(), "write:approvals") {
+		t.Fatalf("exit = %d, log = %q; want usage exit naming write:approvals", code, logSink.String())
 	}
 }
