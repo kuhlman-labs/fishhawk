@@ -5103,6 +5103,22 @@ type CampaignStatus struct {
 	// backend, a read failure, or a caller without read:audit) — which is not
 	// the same claim as a present block with no items.
 	PendingAmendments *campaignPendingAmendments `json:"pending_amendments,omitempty"`
+	// AutoStartRefusal is the campaign driver's auto-start refusal (E88.1 /
+	// #4525); absent unless the driver runs, the campaign is running and it
+	// cannot be auto-started.
+	AutoStartRefusal *campaignAutoStartRefusal `json:"auto_start_refusal,omitempty"`
+}
+
+// campaignAutoStartRefusal mirrors the backend's
+// campaignAutoStartRefusalPayload (server/campaign_auto_start.go), carried by
+// the status read's auto_start_refusal block. Unexported, so the export
+// baseline is unchanged.
+type campaignAutoStartRefusal struct {
+	Reason           string `json:"reason"`
+	RunnerKind       string `json:"runner_kind,omitempty"`
+	RunnerKindSource string `json:"runner_kind_source"`
+	Detail           string `json:"detail"`
+	Remedy           string `json:"remedy"`
 }
 
 // campaignDispatchHold mirrors the backend's dispatchHoldPayload

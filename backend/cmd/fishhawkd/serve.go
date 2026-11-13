@@ -2054,6 +2054,9 @@ func runServe(args []string, logSink io.Writer) int {
 	schedulerRunnerKind := fs.String("scheduler-runner-kind",
 		envOr("FISHHAWKD_SCHEDULER_RUNNER_KIND", runpkg.RunnerKindGitHubActions),
 		"runner_kind every scheduled run is created with (a POST /v0/runs runner_kind; default github_actions). With local, a started run parks at awaiting_host_dispatch until a host dispatches it — the scheduler does not auto-dispatch. An unknown value fails startup.")
+	autoStartRunnerKind := fs.String("auto-start-runner-kind",
+		envOr("FISHHAWKD_AUTO_START_RUNNER_KIND", runpkg.RunnerKindGitHubActions),
+		"runner_kind both auto-start paths mint runs with (#4525): the GitHub webhook intake (a labeled issue or a /fishhawk run comment) and the campaign driver (--enable-campaign-driver). github_actions (the default) or local. With local, the webhook intake fires NO fishhawk.yml workflow_dispatch: the run's first stage parks at awaiting_host_dispatch until a host dispatches it (fishhawk_run_stage / fishhawk_dispatch_stage); the campaign driver starts local item runs bound to the campaign's working_dir and refuses (campaign_auto_start_refused) a campaign that binds none. A campaign's recorded runner_kind wins over this flag. gitlab_ci and any other value fail startup (the GitHub intake cannot fire a GitLab pipeline). --scheduler-runner-kind is separate.")
 	alertSourcesFile := fs.String("alert-sources-file",
 		envOr("FISHHAWKD_ALERT_SOURCES_FILE", ""),
 		"YAML file declaring the alert sources the HMAC-authenticated POST /v0/triggers/alert ingress accepts (E35.4 / #1601, ADR-053): per source an id, the env var holding its HMAC secret (>= 32 bytes; secrets never live in the file), the repo incidents are filed in, and auto_start (default false). Empty (the default) leaves the ingress off — the route answers 503. A malformed file, an unknown key, or a missing or short secret fails startup. Contract: backend/internal/alerttrigger/README.md.")
@@ -2329,6 +2332,13 @@ func runServe(args []string, logSink io.Writer) int {
 	// the scan.
 	if err := validateSchedulerRunnerKind(*schedulerRunnerKind); err != nil {
 		logger.Error("invalid --scheduler-runner-kind", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	// Auto-start runner kind (#4525), validated with the scheduler flags and
+	// for the same reason: a typo must fail startup, not silently mint runs
+	// on a kind nobody chose.
+	if err := validateAutoStartRunnerKind(*autoStartRunnerKind); err != nil {
+		logger.Error("invalid --auto-start-runner-kind", slog.String("error", err.Error()))
 		return exitFailure
 	}
 	schedRepos, err := parseSchedulerRepos(*schedulerRepos)
@@ -3101,6 +3111,11 @@ func runServe(args []string, logSink io.Writer) int {
 			Audit:     cfg.AuditRepo,
 			Artifacts: cfg.ArtifactRepo,
 			Logger:    logger,
+			// RunnerKind is the --auto-start-runner-kind (#4525): with
+			// local, a labeled issue or /fishhawk run comment mints a local
+			// run whose first stage parks awaiting a host dispatch instead
+			// of firing fishhawk.yml.
+			RunnerKind: *autoStartRunnerKind,
 			// Route the webhook surfaces through the Channel abstraction
 			// too (ADR-015 #79): the Router satisfies the dispatcher's
 			// narrower webhook.IssueNotifier subset and fans out to the v0
@@ -3655,6 +3670,12 @@ func runServe(args []string, logSink io.Writer) int {
 	// Pinned by TestServeGo_CapturesMergeQueueBootAtBeforeServing.
 	cfg.MergeQueueBootAt = captureMergeQueueBootAt(context.Background(), cfg.MergeQueue, logger)
 
+	// Campaign-driver start decision (#4525), computed ONCE before newServer
+	// copies cfg so the status read's auto_start_refusal block is reported
+	// only when the driver really runs, and reused at the ticker start site.
+	startCampaignDriver, campaignDriverSkipReason := campaignDriverStartDecision(*enableCampaignDriver, cfg)
+	cfg.CampaignAutoStartRunnerKind = campaignAutoStartStatusKind(startCampaignDriver, *autoStartRunnerKind)
+
 	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
@@ -4085,8 +4106,8 @@ func runServe(args []string, logSink io.Writer) int {
 	// through srv.StartRunForCampaignIssue, which needs the GitHub client to
 	// resolve the workflow spec). MECHANICAL advancement only — started runs
 	// park at their gates for the operator-agent until E25.6/E25.7 land.
-	if start, skipReason := campaignDriverStartDecision(*enableCampaignDriver, cfg); start {
-		ticker := newCampaignDriver(cfg, srv, logger, campaignNotifier, *campaignDriverInterval, *campaignDriverWorkflowID, *campaignDriverWorkflowRef)
+	if startCampaignDriver {
+		ticker := newCampaignDriver(cfg, srv, logger, campaignNotifier, *campaignDriverInterval, *campaignDriverWorkflowID, *campaignDriverWorkflowRef, *autoStartRunnerKind)
 		go func() {
 			if err := ticker.Run(ctx); err != nil {
 				logger.Error("campaign driver exited with error", slog.String("error", err.Error()))
@@ -4094,9 +4115,10 @@ func runServe(args []string, logSink io.Writer) int {
 		}()
 		logger.Info("campaign driver started",
 			slog.Duration("interval", *campaignDriverInterval),
-			slog.String("workflow_id", *campaignDriverWorkflowID))
+			slog.String("workflow_id", *campaignDriverWorkflowID),
+			slog.String("auto_start_runner_kind", *autoStartRunnerKind))
 	} else if *enableCampaignDriver {
-		logger.Warn(skipReason)
+		logger.Warn(campaignDriverSkipReason)
 	}
 
 	// Scheduler ticker (E79.1 / #3725), constructed before server.New above
@@ -4434,28 +4456,79 @@ type campaignRunStarter struct {
 	srv         *server.Server
 	workflowID  string
 	workflowRef string
+	// runnerKind is the --auto-start-runner-kind (#4525); empty means
+	// github_actions. server.ResolveCampaignAutoStart applies it only to a
+	// campaign that recorded no runner_kind.
+	runnerKind string
 }
 
+// StartCampaignRun starts item's run with the kind and checkout
+// server.ResolveCampaignAutoStart resolves for c (#4525): the campaign's
+// recorded runner_kind, else --auto-start-runner-kind. A github_actions start
+// stays unbound (E48.69 / #2498: the GHA auto-driver spawns no local runner,
+// and a bound value would be the daemon host's own directory); a local start
+// inherits the campaign's absolute working_dir binding. A refused resolution
+// (a local campaign with no or a relative working_dir, or an invalid recorded
+// kind) returns a *campaigndriver.StartRefusal BEFORE any forge call, so the
+// driver starts no item of that campaign.
 func (a campaignRunStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*runpkg.Run, error) {
-	// RunnerKind and WorkingDir are left zero: empty RunnerKind → the repo-layer
-	// github_actions default (the operator-driven local start passes "local"
-	// through handleStartCampaignItemRun), and empty WorkingDir → an unbound run
-	// (E48.69 / #2498) — the GHA auto-driver spawns no local runner, so it binds
-	// no checkout, and a bound value would be the daemon host's own directory.
+	if refusal := a.startRefusal(c); refusal != nil {
+		return nil, refusal
+	}
 	return a.srv.StartRunForCampaignIssue(ctx, a.startParams(item, c))
 }
 
-// startParams builds the run-start parameters for item. An EXPEDITED item
-// (the campaign hotfix verb, #4234) runs under the workflow its hotfix
-// recorded; every other item runs under --campaign-driver-workflow-id.
+// startRefusal maps a refused server.ResolveCampaignAutoStart onto the
+// driver's campaign-level *campaigndriver.StartRefusal, or returns nil when the
+// campaign may be auto-started. Every field is a server constant or enum value.
+func (a campaignRunStarter) startRefusal(c *campaign.Campaign) *campaigndriver.StartRefusal {
+	res := server.ResolveCampaignAutoStart(c, a.runnerKind)
+	if !res.Refused() {
+		return nil
+	}
+	return &campaigndriver.StartRefusal{
+		Reason:           res.RefusalReason,
+		RunnerKind:       res.RunnerKind,
+		RunnerKindSource: res.Source,
+		Detail:           res.Detail,
+	}
+}
+
+// startParams builds the run-start parameters for item; callers check
+// startRefusal first. An EXPEDITED item (the campaign hotfix verb, #4234) runs
+// under the workflow its hotfix recorded; every other item runs under
+// --campaign-driver-workflow-id. A github_actions resolution maps to an EMPTY
+// RunnerKind (the repo-layer default), so the default deployment's params are
+// byte-identical to the pre-#4525 starter; any other resolved kind is passed
+// through (a recorded gitlab_ci included, as handleStartCampaignItemRun
+// accepts it) with the WorkingDir the resolver bound (non-empty only for
+// local).
 func (a campaignRunStarter) startParams(item *campaign.Item, c *campaign.Campaign) server.StartRunForCampaignIssueParams {
 	workflowID := a.workflowID
 	if item.Expedite != nil && item.Expedite.Workflow != "" {
 		workflowID = item.Expedite.Workflow
 	}
-	return server.StartRunForCampaignIssueParams{
+	params := server.StartRunForCampaignIssueParams{
 		Repo: c.Repo, IssueRef: item.IssueRef, WorkflowID: workflowID, WorkflowRef: a.workflowRef,
 	}
+	res := server.ResolveCampaignAutoStart(c, a.runnerKind)
+	if !res.Refused() && res.RunnerKind != runpkg.RunnerKindGitHubActions {
+		params.RunnerKind = res.RunnerKind
+		params.WorkingDir = res.WorkingDir
+	}
+	return params
+}
+
+// campaignAutoStartStatusKind is the server.Config.CampaignAutoStartRunnerKind
+// value (#4525): the --auto-start-runner-kind when the campaign driver starts
+// (campaignDriverStartDecision), empty otherwise, so GET
+// /v0/campaigns/{id}/status reports auto_start_refusal only on a deployment
+// whose driver actually evaluates campaigns.
+func campaignAutoStartStatusKind(driverStarts bool, kind string) string {
+	if !driverStarts {
+		return ""
+	}
+	return kind
 }
 
 // campaignDriverStartDecision reports whether the campaign-driver ticker
@@ -4483,11 +4556,11 @@ func campaignDriverStartDecision(enabled bool, cfg server.Config) (start bool, s
 // newCampaignDriver builds the campaign-driver ticker from cfg + the server
 // (the run-starter adapter binds to it). Extracted from runServe so the wiring
 // is unit-testable. Callers must gate on campaignDriverStartDecision first.
-func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logger, notifier *issuecomment.Notifier, interval time.Duration, workflowID, workflowRef string) *campaigndriver.Ticker {
+func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logger, notifier *issuecomment.Notifier, interval time.Duration, workflowID, workflowRef, runnerKind string) *campaigndriver.Ticker {
 	t := &campaigndriver.Ticker{
 		Campaigns: cfg.CampaignRepo,
 		Runs:      cfg.RunRepo,
-		Starter:   campaignRunStarter{srv: srv, workflowID: workflowID, workflowRef: workflowRef},
+		Starter:   campaignRunStarter{srv: srv, workflowID: workflowID, workflowRef: workflowRef, runnerKind: runnerKind},
 		Audit:     cfg.AuditRepo,
 		GateActor: newCampaignGateActor(cfg, srv, logger),
 		Logger:    logger,
@@ -4542,6 +4615,22 @@ func validateSchedulerRunnerKind(kind string) error {
 	}
 	sort.Strings(names)
 	return fmt.Errorf("%q is not a runner kind; want one of %s", kind, strings.Join(names, ", "))
+}
+
+// autoStartRunnerKinds is the --auto-start-runner-kind accepted set (#4525):
+// stricter than run.ValidRunnerKinds, because the GitHub webhook intake cannot
+// fire a GitLab pipeline (the GitLab intake mints its own kind).
+var autoStartRunnerKinds = []string{runpkg.RunnerKindGitHubActions, runpkg.RunnerKindLocal}
+
+// validateAutoStartRunnerKind refuses an --auto-start-runner-kind outside
+// autoStartRunnerKinds, naming the accepted set.
+func validateAutoStartRunnerKind(kind string) error {
+	for _, ok := range autoStartRunnerKinds {
+		if kind == ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("%q is not an auto-start runner kind; want one of %s", kind, strings.Join(autoStartRunnerKinds, ", "))
 }
 
 // parseSchedulerRepos splits --scheduler-repos on commas, trims each entry,

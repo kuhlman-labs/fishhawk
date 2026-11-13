@@ -2182,6 +2182,12 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	if pending != nil {
 		body["pending_amendments"] = pending
 	}
+	// The campaign driver's auto-start refusal (#4525), derived from config
+	// and the POST-reconcile campaign row. Absent unless the driver runs, the
+	// campaign is running and ResolveCampaignAutoStart refuses it.
+	if refusal := s.campaignAutoStartRefusalForStatus(c); refusal != nil {
+		body["auto_start_refusal"] = refusal
+	}
 	s.writeJSON(w, r, http.StatusOK, body)
 }
 

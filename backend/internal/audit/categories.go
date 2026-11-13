@@ -394,6 +394,16 @@ import "sort"
 // untrusted forge text), so it is run-bound-readable under ADR-106 (no
 // ADR-106 registry flag exists yet) — INTERNAL, actor = the operator, not an
 // issue-comment surface.
+// E88.1 / #4525 added campaign_auto_start_refused, the campaign driver's
+// global-chain record that a running campaign cannot be auto-started (its
+// RunStarter returned a campaigndriver.StartRefusal, e.g. a local resolution
+// with no working_dir binding), written once per (campaign, reason) while the
+// campaign stays running (campaigndriver/driver.go). It is run-bound-readable
+// under ADR-106 (no ADR-106 registry flag exists yet): it is campaign-scoped
+// and names no run at all, carrying only the campaign id, the refused item's
+// issue ref and server-constant reason, runner kind and detail, never a
+// working_dir or other run's data — INTERNAL, actor system, not an
+// issue-comment surface.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -427,6 +437,7 @@ var KnownCategories = map[string]struct{}{
 	"budget_alert_sent":                       {},
 	"campaign_admission_screened":             {},
 	"campaign_advanced":                       {},
+	"campaign_auto_start_refused":             {},
 	"campaign_cancelled":                      {},
 	"campaign_dependencies_refreshed":         {}, // E86.47 / #4358: the monotone tracker-edge refresh added held depends_on edges (server/campaign_dependency_refresh.go) — INTERNAL
 	"campaign_gate_acted":                     {},

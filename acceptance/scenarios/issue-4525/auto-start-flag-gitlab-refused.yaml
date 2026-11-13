@@ -1,0 +1,14 @@
+id: scenario:issue-4525/auto-start-flag-gitlab-refused
+statement: Running fishhawkd serve with --auto-start-runner-kind gitlab_ci also exits non-zero naming the accepted set, because the GitHub webhook intake cannot fire a GitLab pipeline.
+verify_hint: 'CLI: `fishhawkd serve --auto-start-runner-kind gitlab_ci` exits non-zero and stderr names ''invalid --auto-start-runner-kind'' and github_actions, local.'
+steps: Posture B. Used the fishhawkd binary freshly built from the sanctioned tree (cd backend && go build ./cmd/fishhawkd). Ran env -i PATH=/usr/bin:/bin HOME=/tmp/fhacc4525 fishhawkd serve --auto-start-runner-kind gitlab_ci.
+assertions:
+    expected: non-zero exit naming the flag and the accepted set
+    observed_at_record: Exit 1; ERROR 'invalid --auto-start-runner-kind', error '"gitlab_ci" is not an auto-start runner kind; want one of github_actions, local'. sha256:e3a3d1fd07b1d02625b5bf140a68eb8fa6b336000018d9b761cf4954b1d808a5
+    repro_handle: fishhawkd serve --auto-start-runner-kind gitlab_ci; echo $?
+origin:
+    issue: 4525
+    pr: 5233
+    run_id: 2aeb32d1-c0f3-49b3-ba33-44c9db8daa59
+    head_sha: 6530b5113b726cf9e23a9be5f90a28abb5ce536f
+    recorded_at: 2026-11-12T23:31:17Z
