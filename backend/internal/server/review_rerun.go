@@ -734,17 +734,45 @@ func (s *Server) rerunRoundStarted(ctx context.Context, runID uuid.UUID, rerunOf
 // advanced_past_review, forge_compare_unavailable) and the slice-0
 // conflict_base_unresolved.
 const (
-	// rerunSlugConflictHeadMoved (E8): a head-moving row (branch_rebased,
-	// branch_reset or fixup_pushed) is sequenced after the conflict row C, so
-	// C's merge head is no longer the PR head and reviewing it would review a
-	// head the PR no longer carries.
+	// rerunSlugConflictHeadMoved (E8): the newest head-recording row
+	// sequenced after the conflict row C names a head other than C's, so C's
+	// merge head is no longer the PR head and reviewing it would review a head
+	// the PR no longer carries (conflictHeadMovedAfter).
 	rerunSlugConflictHeadMoved = "conflict_head_moved"
 )
 
-// conflictHeadMovingCategories are the run-wide rows that move the run
-// branch's head after a conflict-resolution push without starting an implement
-// round themselves (E8).
-var conflictHeadMovingCategories = []string{CategoryBranchRebased, CategoryBranchReset, CategoryFixupPushed}
+// conflictHeadMovedAfter is E8's rung: whether the run's newest recorded head
+// sequenced after cSeq differs from head. The head-recording rows are every
+// gateViewCurrentHeadSources row, read through newestRecordedHeadAfter (which
+// skips an already-up-to-date branch_rebased, a rebase check that moved no
+// head), plus branch_reset (its reset_to_sha). A later row naming C's own head,
+// such as a vouch of the merge head, does not move it; a newest branch_reset
+// whose target is unreadable does. Every read error is returned.
+func (s *Server) conflictHeadMovedAfter(ctx context.Context, runID uuid.UUID, cSeq int64, head string) (bool, error) {
+	newest, found, err := s.newestRecordedHeadAfter(ctx, runID, cSeq)
+	if err != nil {
+		return false, fmt.Errorf("read recorded heads for run %s: %w", runID, err)
+	}
+	seq, sha := int64(-1), ""
+	if found {
+		seq, sha = newest.sequence, newest.head
+	}
+	resets, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryBranchReset)
+	if err != nil {
+		return false, fmt.Errorf("list %s for run %s: %w", CategoryBranchReset, runID, err)
+	}
+	for _, e := range resets {
+		if e.Sequence <= cSeq || e.Sequence < seq {
+			continue
+		}
+		var p struct {
+			ResetToSHA string `json:"reset_to_sha"`
+		}
+		_ = json.Unmarshal(e.Payload, &p)
+		seq, sha = e.Sequence, p.ResetToSHA
+	}
+	return seq >= 0 && sha != head, nil
+}
 
 // newestConflictResolutionPushed returns C, the run's newest
 // conflict_resolution_pushed row bound to a stage and naming a head, with that
@@ -818,11 +846,11 @@ func (s *Server) conflictRoundStartedAfter(ctx context.Context, runID, stageID u
 // conflictArmIneligibleSlug is the conflict-head arm's ladder, each rung
 // decided before any write: reviewer_unwired, no_agent_reviewers,
 // gating_authority, superseded_by_fixup (a stage_fixup_triggered on C's stage
-// after C), conflict_head_moved (E8), implement_stage_terminal /
+// after C), conflict_head_moved (E8: conflictHeadMovedAfter), implement_stage_terminal /
 // advanced_past_review, conflict_base_unresolved and forge_compare_unavailable.
 // It deliberately ignores the docs_only class: the operator asked. It returns
 // the configured agent count and the compare base for the round.
-func (s *Server) conflictArmIneligibleSlug(ctx context.Context, runRow *run.Run, c *audit.Entry) (agents int, base, slug string, err error) {
+func (s *Server) conflictArmIneligibleSlug(ctx context.Context, runRow *run.Run, c *audit.Entry, head string) (agents int, base, slug string, err error) {
 	if s.defaultPlanReviewer() == nil {
 		return 0, "", redispatchSlugReviewerUnwired, nil
 	}
@@ -845,16 +873,12 @@ func (s *Server) conflictArmIneligibleSlug(ctx context.Context, runRow *run.Run,
 		}
 		return agents, "", slug, err
 	}
-	for _, cat := range conflictHeadMovingCategories {
-		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
-		if err != nil {
-			return agents, "", "", fmt.Errorf("list %s for run %s: %w", cat, runRow.ID, err)
+	moved, err := s.conflictHeadMovedAfter(ctx, runRow.ID, c.Sequence, head)
+	if err != nil || moved {
+		if moved {
+			slug = rerunSlugConflictHeadMoved
 		}
-		for _, e := range entries {
-			if e.Sequence > c.Sequence {
-				return agents, "", rerunSlugConflictHeadMoved, nil
-			}
-		}
+		return agents, "", slug, err
 	}
 	if slug, err := s.implementRoundStageSlug(ctx, runRow.ID, stageID); err != nil || slug != "" {
 		return agents, "", slug, err
@@ -919,7 +943,7 @@ func (s *Server) rerunConflictHead(w http.ResponseWriter, r *http.Request, id Id
 		"conflict_resolution_sequence": c.Sequence,
 		"head_sha":                     head,
 	}
-	agents, base, slug, err := s.conflictArmIneligibleSlug(ctx, runRow, c)
+	agents, base, slug, err := s.conflictArmIneligibleSlug(ctx, runRow, c, head)
 	if err != nil {
 		return false, err
 	}

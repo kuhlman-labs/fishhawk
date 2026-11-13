@@ -700,6 +700,9 @@ const (
 	// maxResolutionSummaryPaths caps the shipped resolved-path list; the
 	// backend applies the same cap.
 	maxResolutionSummaryPaths = 200
+	// maxResolutionSummaryPathBytes bounds one shipped resolved path; the
+	// backend refuses a longer one (shippableResolvedPath).
+	maxResolutionSummaryPathBytes = 512
 	// maxRemergePatchBytes caps the shipped remerge-diff patch (rune-safe).
 	maxRemergePatchBytes = 24 * 1024
 	// maxRemergeDetailBytes caps the remerge failure detail (rune-safe).
@@ -752,7 +755,22 @@ func remergeDiff(ctx context.Context, repoDir, head string) ([]byte, error) {
 // degrades to a reason; it never refuses the pass.
 func conflictResolutionSummary(ctx context.Context, repoDir, head string, conflicted map[string]conflictresolve.ConflictedFile) conflictResolutionSummaryResult {
 	var out conflictResolutionSummaryResult
-	out.ResolvedPaths = sortedStringKeys(conflicted)
+	// A path the backend would refuse (a newline, tab or other control byte,
+	// a backslash, over 512 bytes) is NOT shipped: one such path would turn the
+	// whole report into a 400 after the merge head is already pushed. The list
+	// is then marked truncated, since it no longer names every resolved path,
+	// which also keeps the backend from skipping review as docs-only. With no
+	// shippable path left, no summary ships at all (today's body).
+	for _, p := range sortedStringKeys(conflicted) {
+		if shippableResolvedPath(p) {
+			out.ResolvedPaths = append(out.ResolvedPaths, p)
+		} else {
+			out.ResolvedPathsTruncated = true
+		}
+	}
+	if len(out.ResolvedPaths) == 0 {
+		return conflictResolutionSummaryResult{}
+	}
 	if len(out.ResolvedPaths) > maxResolutionSummaryPaths {
 		out.ResolvedPaths = out.ResolvedPaths[:maxResolutionSummaryPaths]
 		out.ResolvedPathsTruncated = true
@@ -782,6 +800,27 @@ func conflictResolutionSummary(ctx context.Context, repoDir, head string, confli
 	}
 	out.Patch = text
 	return out
+}
+
+// shippableResolvedPath mirrors the backend's resolved-path wire rule
+// (validateResolvedPath in backend/internal/server/conflictresolution_review.go):
+// non-empty, at most 512 bytes, not absolute, no backslash, no `..` segment
+// and no control byte (below 0x20, or 0x7f).
+func shippableResolvedPath(p string) bool {
+	if p == "" || len(p) > maxResolutionSummaryPathBytes || strings.HasPrefix(p, "/") || strings.Contains(p, "\\") {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // configDefinesMergeDriver reports whether a `git config --list -z` stream

@@ -1159,7 +1159,12 @@ merge head can show the reviewer how the conflicts were resolved
   pre-#4795 shape, so either skew direction is safe.
 - **What ships.** Only after `verifyAuthorizedCommit` accepts the merge commit,
   `conflictResolutionSummary` ships `resolved_paths` (the sorted conflicted set,
-  capped at 200 with `resolved_paths_truncated`) and `resolution_patch`: the
+  capped at 200 with `resolved_paths_truncated`) and `resolution_patch`. A
+  conflicted path the backend's wire rule refuses (a control byte such as a
+  newline, a backslash, a `..` segment, over 512 bytes: `shippableResolvedPath`)
+  is omitted with `resolved_paths_truncated`, because one such path would make
+  the post-push report a 400; with no shippable path left, no summary ships.
+  The patch is the
   merge commit's `git -c merge.renormalize=false show --remerge-diff --format=
   --no-color --no-ext-diff --no-textconv <head>`, run through `gitOutRaw` (so
   `HardeningArgs` applies) and cut rune-safe at 24 KiB with

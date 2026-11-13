@@ -365,8 +365,11 @@ var reviewGoverningPrefixes = []string{"docs/review/", "docs/spec/", "docs/adr/"
 // isDocumentationPath reports whether p is documentation that governs no
 // review: a doc extension (case-sensitive), not an instruction path, no
 // .github / .fishhawk segment, no review-governing prefix, and not a declared
-// review-convention path.
+// review-convention path. The path is canonicalised (path.Clean) first, so a
+// `./`, `.` or empty segment validateResolvedPath admits cannot hide a
+// review-governing prefix.
 func isDocumentationPath(p string, declared []string) bool {
+	p = path.Clean(p)
 	ext := false
 	for _, e := range docExtensions {
 		if strings.HasSuffix(p, e) {
@@ -390,7 +393,7 @@ func isDocumentationPath(p string, declared []string) bool {
 		}
 	}
 	for _, d := range declared {
-		if strings.EqualFold(path.Clean(p), path.Clean(d)) {
+		if strings.EqualFold(p, path.Clean(d)) {
 			return false
 		}
 	}
@@ -447,7 +450,10 @@ func (s *Server) conflictResolutionCompareBase(ctx context.Context, runID, stage
 // compare's changed-file list for base...head is read and the classification
 // is re-run over the UNION of that list and the runner's paths. A failed or
 // truncated compare, or a listed path the runner did not claim, fails toward
-// review (false).
+// review (false). A rename's SOURCE is a listed path too (it vanished at
+// head), so moving a review-governing file out of its tree is never skipped
+// on the destination's claim alone; a rename whose source the forge did not
+// name fails toward review (permission_drift.go reads sources the same way).
 func (s *Server) docsOnlyConfirmedByCompare(ctx context.Context, runRow *run.Run, base, headSHA string, paths []string) bool {
 	if base == "" || runRow == nil {
 		return false
@@ -468,9 +474,15 @@ func (s *Server) docsOnlyConfirmedByCompare(ctx context.Context, runRow *run.Run
 		if !claimed[f.Path] {
 			return false
 		}
+		if f.Status == "renamed" && f.PreviousPath == "" {
+			return false
+		}
+		if f.PreviousPath != "" && !claimed[f.PreviousPath] {
+			return false
+		}
 	}
-	// Every compare path is claimed, so the union IS the runner's list, which
-	// the caller already classified docs_only.
+	// Every compare path, rename sources included, is claimed, so the union IS
+	// the runner's list, which the caller already classified docs_only.
 	return true
 }
 

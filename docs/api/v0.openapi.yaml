@@ -7804,14 +7804,15 @@ components:
             fishhawkd first.
         resolved_paths:
           type: array
-          maxItems: 200
           items: { type: string, maxLength: 512 }
           description: |
             #4795: conflict_resolution_pushed only. The conflicted paths the
             pass resolved (relative, no `..` segment, no backslash, no control
             byte; 400 `pull_request_invalid` otherwise). Required non-empty when
-            any other summary field is set. The server keeps the first 200 and
-            sets resolved_paths_truncated.
+            any other summary field is set. A longer list is admitted: the
+            server keeps the first 200 and sets resolved_paths_truncated. The
+            runner omits a path these rules refuse and sets
+            resolved_paths_truncated.
         resolved_paths_truncated: { type: boolean, description: "#4795: the runner or server cut resolved_paths." }
         resolution_patch:
           type: string
@@ -18368,8 +18369,10 @@ paths:
         `details.conflict_resolution_sequence` and `details.head_sha`:
         `reviewer_unwired`, `no_agent_reviewers`, `gating_authority`,
         `superseded_by_fixup` (a fix-up triggered on C's stage after C),
-        `conflict_head_moved` (a `branch_rebased`, `branch_reset` or
-        `fixup_pushed` after C: the PR no longer carries that head),
+        `conflict_head_moved` (the newest head-recording row after C, such
+        as a performed `branch_rebased`, a `branch_reset` or a
+        `fixup_pushed`, names another head: the PR no longer carries that
+        head; an already-up-to-date rebase moves nothing),
         `implement_stage_terminal`, `advanced_past_review`,
         `conflict_base_unresolved` (the conflict trigger's base branch is
         unreadable) and `forge_compare_unavailable`. The docs-only class is

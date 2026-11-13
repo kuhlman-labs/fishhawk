@@ -150,8 +150,9 @@ round_already_started true means the automatic dispatch won a race and this
 call joined its round. Its refusals (review_rerun_ineligible, details.reason
 plus details.conflict_resolution_sequence and head_sha): reviewer_unwired,
 no_agent_reviewers, gating_authority, superseded_by_fixup (a fix-up was
-triggered after the push), conflict_head_moved (a rebase, reset or fix-up push
-moved the head after it — the PR no longer carries that head),
+triggered after the push), conflict_head_moved (a later recorded head, such as
+a performed rebase, a reset or a fix-up push, differs from the merge head — the
+PR no longer carries that head),
 implement_stage_terminal, advanced_past_review, conflict_base_unresolved (the
 conflict trigger's base branch is unreadable) and forge_compare_unavailable.
 For conflict_base_unresolved and superseded_by_fixup, route

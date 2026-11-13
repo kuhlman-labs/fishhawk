@@ -1507,12 +1507,24 @@ func TestRerunReview_ConflictArmRefusals(t *testing.T) {
 		{name: "superseded by fixup", after: func(t *testing.T, f *redispatchFixture) {
 			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryStageFixupTriggered, map[string]any{"stage_id": f.implStage.ID.String()})
 		}, wantReason: redispatchSlugSupersededByFixup},
-		// E8: a head-moving row after C — the PR no longer carries C's head.
+		// E8: a head-recording row after C names another head — the PR no
+		// longer carries C's head.
 		{name: "E8 branch_rebased after C", after: func(t *testing.T, f *redispatchFixture) {
 			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{"new_head_sha": "rebasedhead"})
 		}, wantReason: rerunSlugConflictHeadMoved},
 		{name: "E8 branch_reset after C", after: func(t *testing.T, f *redispatchFixture) {
-			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchReset, map[string]any{"new_head_sha": "resethead"})
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchReset, map[string]any{"reset_to_sha": "resethead", "prior_head_sha": conflictArmMergeHead})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 acceptance_scenarios_pushed after C", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, "acceptance_scenarios_pushed", map[string]any{"head_sha": "scenariohead"})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 operator_commit_vouched after C", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": "vouchedhead"})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 moved after an up-to-date rebase", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{
+				"prior_head_sha": conflictArmMergeHead, "new_head_sha": conflictArmMergeHead, "already_up_to_date": true})
+			f.appendAt(t, f.implStage.ID, beforeBoot, "child_pushed", map[string]any{"head_sha": "childhead"})
 		}, wantReason: rerunSlugConflictHeadMoved},
 		{name: "implement stage terminal", opts: redispatchFixtureOpts{implStageState: run.StageStateFailed}, wantReason: redispatchSlugImplementStageTerminal},
 		{name: "advanced past review", opts: redispatchFixtureOpts{reviewStageState: run.StageStateSucceeded}, wantReason: redispatchSlugAdvancedPastReview},
@@ -1541,6 +1553,42 @@ func TestRerunReview_ConflictArmRefusals(t *testing.T) {
 			assertNothingRerun(t, f, 0)
 			if p := paths(); len(p) != 0 {
 				t.Errorf("compare calls = %v, want none", p)
+			}
+		})
+	}
+}
+
+// TestRerunReview_ConflictArmHeadUnmovedRowsStillFire (E8): a head-recording
+// row after C that still names C's head moves nothing, so the arm starts the
+// round. An already-up-to-date rebase check keeps new_head_sha equal to the
+// prior head; a vouch of the merge head records the same head.
+//
+// COUNTERFACTUAL: refuse on ANY head-recording row after C (the category-only
+// rung) → 409 conflict_head_moved → RED.
+func TestRerunReview_ConflictArmHeadUnmovedRowsStillFire(t *testing.T) {
+	cases := map[string]func(t *testing.T, f *redispatchFixture){
+		"already up-to-date rebase": func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{
+				"prior_head_sha": conflictArmMergeHead, "new_head_sha": conflictArmMergeHead, "already_up_to_date": true})
+		},
+		"vouch of the merge head": func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": conflictArmMergeHead})
+		},
+		"reset back to the merge head": func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{"new_head_sha": "rebasedhead"})
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchReset, map[string]any{"reset_to_sha": conflictArmMergeHead, "prior_head_sha": "rebasedhead"})
+		},
+	}
+	for name, after := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+			seedConflictArmTrigger(t, f)
+			seedConflictArmPushed(t, f, nil)
+			after(t, f)
+			rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+			f.s.waitBackgroundReviews()
+			if resp := decodeRerunOK(t, rec); resp.RoundOrigin != reviewRoundOriginConflictResolution || resp.HeadSHA != conflictArmMergeHead {
+				t.Errorf("response = %+v, want a conflict_resolution round at %s", resp, conflictArmMergeHead)
 			}
 		})
 	}

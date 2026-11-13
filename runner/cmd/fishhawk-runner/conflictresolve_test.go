@@ -2885,6 +2885,37 @@ func TestConflictResolutionSummary_CapsPathsAndPatch(t *testing.T) {
 	}
 }
 
+// TestConflictResolutionSummary_DropsPathsTheBackendRefuses: a conflicted
+// path the backend's wire rule refuses (git supports newline-bearing names) is
+// dropped from resolved_paths with the truncated flag, so the report the
+// runner sends after its push is never a 400; with no shippable path left, no
+// summary ships and the remerge-diff is not run.
+func TestConflictResolutionSummary_DropsPathsTheBackendRefuses(t *testing.T) {
+	crSummarySeams(t, nil)
+	readGitConfigFn = func(context.Context, string) (string, error) { return "", nil }
+	remergeCalls := new(int)
+	remergeDiffFn = func(context.Context, string, string) ([]byte, error) { *remergeCalls++; return []byte("PATCH"), nil }
+	bad := []string{"new\nline.go", "tab\t.go", "cr\r.go", "del\x7f.go", "back\\slash.go", "a/../b.go",
+		strings.Repeat("p", maxResolutionSummaryPathBytes+1)}
+	conflicted := map[string]conflictresolve.ConflictedFile{"ok.go": {}, strings.Repeat("q", maxResolutionSummaryPathBytes): {}}
+	for _, p := range bad {
+		conflicted[p] = conflictresolve.ConflictedFile{}
+	}
+	got := conflictResolutionSummary(context.Background(), t.TempDir(), "HEAD", conflicted)
+	if len(got.ResolvedPaths) != 2 || got.ResolvedPaths[0] != "ok.go" || !got.ResolvedPathsTruncated || got.Patch != "PATCH" {
+		t.Errorf("summary = %d paths %q (truncated %t, patch %q), want ok.go and the 512-byte path, truncated, with the patch",
+			len(got.ResolvedPaths), got.ResolvedPaths, got.ResolvedPathsTruncated, got.Patch)
+	}
+	*remergeCalls = 0
+	only := map[string]conflictresolve.ConflictedFile{}
+	for _, p := range bad {
+		only[p] = conflictresolve.ConflictedFile{}
+	}
+	if got := conflictResolutionSummary(context.Background(), t.TempDir(), "HEAD", only); fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", conflictResolutionSummaryResult{}) || *remergeCalls != 0 {
+		t.Errorf("all-unshippable summary = %+v (remerge calls %d), want the zero summary and no remerge-diff", got, *remergeCalls)
+	}
+}
+
 // TestConfigDefinesMergeDriver is the D8 key matcher over `git config --list
 // -z` records: section merge (any case), a subsection (which may contain dots),
 // variable driver (any case).
