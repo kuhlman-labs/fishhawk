@@ -9175,3 +9175,57 @@ VALUES ($1, 'o/r', 'main', 'held', 'h3', 'forge_review_required', now()), ($2, '
 			row4Flag, redFlag, plainFlag)
 	}
 }
+
+// TestMigrateDown_RunsAutoDispatchReversal pins 0116 (E88.2 / #4526, the
+// ADR-104 Q3 host-dispatcher mark) in BOTH directions: runs.auto_dispatch
+// EXISTS after MigrateUp as a NOT NULL boolean defaulting false, and is GONE
+// after rolling back through 0116 while the runs table survives.
+func TestMigrateDown_RunsAutoDispatchReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	type column struct {
+		count      int
+		nullable   string
+		defaultSQL string
+	}
+	autoDispatchColumn := func() column {
+		var c column
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*), coalesce(max(is_nullable), ''), coalesce(max(column_default), '')
+			   FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'auto_dispatch'`).Scan(&c.count, &c.nullable, &c.defaultSQL); err != nil {
+			t.Fatalf("query runs.auto_dispatch: %v", err)
+		}
+		return c
+	}
+
+	c := autoDispatchColumn()
+	if c.count != 1 {
+		t.Fatalf("runs.auto_dispatch count after MigrateUp = %d, want 1 (0116 added it)", c.count)
+	}
+	if c.nullable != "NO" || c.defaultSQL != "false" {
+		t.Errorf("runs.auto_dispatch is_nullable=%q default=%q, want NO / false (every legacy row reads unmarked)", c.nullable, c.defaultSQL)
+	}
+
+	downThrough(t, url, "0116")
+	if c := autoDispatchColumn(); c.count != 0 {
+		t.Errorf("runs.auto_dispatch count after MigrateDown = %d, want 0 (0116 reverted)", c.count)
+	}
+	var runsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'`).Scan(&runsTable); err != nil {
+		t.Fatalf("query runs table: %v", err)
+	}
+	if runsTable != 1 {
+		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0116 is an ALTER)", runsTable)
+	}
+}

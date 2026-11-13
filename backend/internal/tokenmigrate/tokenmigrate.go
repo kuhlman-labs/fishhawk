@@ -11,6 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 )
 
 // DB narrows pgxpool.Pool to the methods MigrateScopes needs so tests
@@ -27,16 +29,18 @@ type Summary struct {
 	// Migrated is the number of tokens whose scopes were (or would be)
 	// promoted to the operator default.
 	Migrated int
-	// Skipped is the number of tokens left unchanged: either already at
-	// the full default set, or carrying a scope outside the default set
-	// (treated as intentional — operator must re-issue manually).
+	// Skipped is the number of tokens left unchanged: already at the full
+	// default set, carrying a scope outside the default set (treated as
+	// intentional — operator must re-issue manually), or a host-dispatcher
+	// token, whose fixed profile is never promoted.
 	Skipped int
 }
 
 // MigrateScopes scans active non-MCP tokens and promotes any whose
 // scope set is a strict subset of operatorScopes to the full default.
 // Tokens that contain a scope not in operatorScopes are left untouched;
-// tokens already carrying the full default are counted as Skipped.
+// tokens already carrying the full default are counted as Skipped, and so
+// are host-dispatcher/<host> tokens, which are never promoted.
 //
 // When dryRun is true, the function reports what it would do but writes
 // nothing to the database. Output lines describing each candidate are
@@ -79,6 +83,18 @@ func MigrateScopes(ctx context.Context, db DB, operatorScopes []string, dryRun b
 
 	for _, tok := range tokens {
 		summary.Scanned++
+
+		// A host-dispatcher token (ADR-104 Q4, E88.2 / #4526) holds a
+		// deliberate profile that is a strict SUBSET of the operator
+		// default, so the subset rule below would promote it to the full
+		// operator set (write:approvals included). Skip it first, and name
+		// it, so the dry-run inventory shows it was left alone.
+		if hostdispatcher.IsSubject(tok.subject) {
+			_, _ = fmt.Fprintf(w, "skip  subject=%s id=%s (host-dispatcher profile)\n",
+				tok.subject, tok.id)
+			summary.Skipped++
+			continue
+		}
 
 		if !isSubset(tok.scopes, operatorScopes) {
 			_, _ = fmt.Fprintf(w, "skip  subject=%s id=%s (has non-default scope)\n",

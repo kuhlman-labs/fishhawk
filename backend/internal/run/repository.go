@@ -135,6 +135,12 @@ type CreateRunParams struct {
 	// CreateRun returns an error rather than persisting a mutable ref (see
 	// Run.DocumentBaseCommit for the full contract).
 	DocumentBaseCommit *string
+	// AutoDispatch is the ADR-104 Q3 starter-stamped host-dispatcher mark to
+	// persist (migration 0116, E88.2 / #4526); see Run.AutoDispatch. A root
+	// mint site sets it from its starter (campaign driver true, operator
+	// opt-in, webhook never); a child mint inherits the parent's value via
+	// ChildParamsFrom.
+	AutoDispatch bool
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

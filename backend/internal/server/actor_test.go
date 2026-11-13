@@ -57,6 +57,30 @@ func TestActorKindForSubject(t *testing.T) {
 	}
 }
 
+// TestActorKindForSubject_HostDispatcherIsAgent pins ADR-104 Q4 (E88.2 /
+// #4526): dispatcher-driven rows record actor_kind agent, including for a
+// malformed host-dispatcher/ subject. Counterfactual run by hand: deleting the
+// hostdispatcher.IsSubject disjunct from actorKindForSubject turned every
+// dispatcher row RED (user).
+func TestActorKindForSubject_HostDispatcherIsAgent(t *testing.T) {
+	cases := []struct {
+		name    string
+		subject string
+		want    audit.ActorKind
+	}{
+		{"host dispatcher is agent", "host-dispatcher/devbox", audit.ActorAgent},
+		{"malformed host dispatcher is agent", "host-dispatcher/bad/label", audit.ActorAgent},
+		{"bare prefix without slash is user", "host-dispatcher", audit.ActorUser},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := actorKindForSubject(tc.subject); got != tc.want {
+				t.Errorf("actorKindForSubject(%q) = %q, want %q", tc.subject, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestIsAgentSubject_FirstOfficerSeat pins the seat rows of the shared agent
 // classification (E85.6 / #4148): the captain verbs, the human-only
 // server-check clearing guard and the re-run refusal all treat a seat as an
@@ -72,6 +96,28 @@ func TestIsAgentSubject_FirstOfficerSeat(t *testing.T) {
 		{"first_officer/not-a-valid-seat", true},
 		{"github:first_officer", false},
 		{"first_officer", false},
+	}
+	for _, tc := range cases {
+		if got := isAgentSubject(tc.subject); got != tc.want {
+			t.Errorf("isAgentSubject(%q) = %v, want %v", tc.subject, got, tc.want)
+		}
+	}
+}
+
+// TestIsAgentSubject_HostDispatcher pins the dispatcher rows of the shared
+// agent classification: every human-only consumer (captain verbs, the
+// server-check clearing guard, the re-run refusal) refuses a dispatcher.
+// Counterfactual run by hand: removing the hostdispatcher.IsSubject term from
+// isAgentSubject turned the dispatcher rows RED.
+func TestIsAgentSubject_HostDispatcher(t *testing.T) {
+	cases := []struct {
+		subject string
+		want    bool
+	}{
+		{"host-dispatcher/devbox", true},
+		{"host-dispatcher/", true},
+		{"github:host-dispatcher", false},
+		{"host-dispatcher", false},
 	}
 	for _, tc := range cases {
 		if got := isAgentSubject(tc.subject); got != tc.want {
