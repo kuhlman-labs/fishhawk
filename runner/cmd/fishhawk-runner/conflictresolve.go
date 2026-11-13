@@ -189,10 +189,23 @@ type conflictResolutionResult struct {
 	Recovered bool
 	// RecoveryDetail names what recovery could not restore, when it could not.
 	RecoveryDetail string
+	// Category is the terminal-report category of a refusal. Empty means the
+	// historical B (the pass reached a decision and the decision was no); C
+	// when the host could not provide operator-required signal confinement
+	// (#4858) — environment, not judgement.
+	Category string
 }
 
 // refused reports whether the pass refused.
 func (r conflictResolutionResult) refused() bool { return r.Reason != "" }
+
+// category is the refusal's terminal-report category: Category, or B.
+func (r conflictResolutionResult) category() string {
+	if r.Category == "" {
+		return "B"
+	}
+	return r.Category
+}
 
 // conflictRecoveryTimeout bounds the detached recovery context. A var so tests
 // can shrink it.
@@ -575,6 +588,15 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 
 	// (4) Invoke the agent under a working-tree-edits-only contract.
 	if err := invoke(ctx); err != nil {
+		// The invoker refused BEFORE any spawn because the host cannot provide
+		// operator-required signal confinement (#4858, R1): category C under its
+		// own named reason. refuse() still aborts the merge.
+		var sbx *implementSignalSandboxRefusal
+		if errors.As(err, &sbx) {
+			r := refuse(sbx.Reason, sbx.Detail, nil)
+			r.Category = "C"
+			return r
+		}
 		return refuse(reasonAgentFailed, err.Error(), nil)
 	}
 
@@ -1199,6 +1221,15 @@ func logEvent(logSink io.Writer, event string, fields map[string]string) {
 // selects the configured coding agent and invokes it on the fetched prompt;
 // tests substitute a stub that edits the working tree (or fails, or cancels).
 var conflictResolutionAgentInvoker = func(ctx context.Context, cfg config, logSink io.Writer) error {
+	// Signal confinement (#4858) is decided FIRST — before the prompt read,
+	// selectInvoker or any spawn — so a require+unavailable host refuses with
+	// zero agent spawns and a typed refusal the pass maps to category C. This
+	// stage returns from run() before the implement-stage configuration, so
+	// this is its one configuration.
+	sbx, failReason, failDetail := configureImplementSignalSandbox(ctx, os.Getenv, probeImplementSignalSandbox, logSink)
+	if failReason != "" {
+		return &implementSignalSandboxRefusal{Reason: failReason, Detail: failDetail}
+	}
 	promptText, err := os.ReadFile(cfg.promptFile)
 	if err != nil {
 		return fmt.Errorf("read prompt: %w", err)
@@ -1221,6 +1252,8 @@ var conflictResolutionAgentInvoker = func(ctx context.Context, cfg config, logSi
 		BaseEnv:      agentBaseEnv,
 		Env:          map[string]string{},
 		ProgressSink: logSink,
+		// nil (unwrapped) unless the host enforces the signal profile.
+		ExecWrapper: sbx.wrapper,
 	})
 	if err != nil {
 		return err
@@ -1428,7 +1461,7 @@ func runConflictResolutionStage(ctx context.Context, cfg config, req conflictRes
 			logEvent(logSink, "conflict_resolution_report_failed", map[string]string{"error": err.Error()})
 			return exitFailure
 		}
-		logEvent(logSink, "runner_failed", map[string]string{"reason": refusal.Reason, "detail": refusal.Detail})
+		logEvent(logSink, "runner_failed", map[string]string{"reason": refusal.Reason, "detail": refusal.Detail, "category": refusal.Category})
 		return exitFailure
 	}
 	// Registered BEFORE the pass so every return path tears the tree down.
@@ -1471,14 +1504,16 @@ func runConflictResolutionStage(ctx context.Context, cfg config, req conflictRes
 			Outcome:    "failed",
 			// Category B: the pass reached a decision and the decision was no.
 			// A retry against the same repository state would refuse
-			// identically, so this is not the retryable class.
-			Category: "B",
+			// identically, so this is not the retryable class. Category C when
+			// the host could not provide operator-required signal confinement
+			// (#4858): environment, not judgement.
+			Category: res.category(),
 			Reason:   reason,
 		}); err != nil {
 			logEvent(logSink, "conflict_resolution_report_failed", map[string]string{"error": err.Error()})
 			return exitFailure
 		}
-		logEvent(logSink, "runner_failed", map[string]string{"reason": res.Reason, "detail": res.Detail})
+		logEvent(logSink, "runner_failed", map[string]string{"reason": res.Reason, "detail": res.Detail, "category": res.category()})
 		return exitFailure
 	}
 
