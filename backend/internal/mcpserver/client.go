@@ -5142,6 +5142,35 @@ type CampaignItem struct {
 	ExpediteReason string    `json:"expedite_reason,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+	// Awaiting mirrors the backend's status-only per-item awaiting block
+	// (E88.4 / #4528), passed through verbatim. omitempty, so a list read, an
+	// older backend, or an unstarted, terminal or run-terminal item carries no
+	// key.
+	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read)"`
+}
+
+// campaignItemAwaiting mirrors the backend's `CampaignItemAwaiting` schema
+// (campaignItemAwaitingPayload). stage_* are absent for no_active_stage.
+type campaignItemAwaiting struct {
+	Kind                string                        `json:"kind"`
+	Reason              string                        `json:"reason"`
+	RunID               string                        `json:"run_id"`
+	StageID             string                        `json:"stage_id,omitempty"`
+	StageType           string                        `json:"stage_type,omitempty"`
+	StageState          string                        `json:"stage_state,omitempty"`
+	NextStep            string                        `json:"next_step"`
+	Decision            *campaignItemAwaitingDecision `json:"decision,omitempty"`
+	DecisionWithheld    bool                          `json:"decision_withheld,omitempty"`
+	DecisionUnavailable bool                          `json:"decision_unavailable,omitempty"`
+}
+
+// campaignItemAwaitingDecision is the current (uncleared) decision marker:
+// gate is a stage id or "run".
+type campaignItemAwaitingDecision struct {
+	DecisionState string    `json:"decision_state"`
+	Action        string    `json:"action"`
+	Gate          string    `json:"gate"`
+	RecordedAt    time.Time `json:"recorded_at"`
 }
 
 // CampaignRollup mirrors the backend's `CampaignRollup` wire schema

@@ -306,6 +306,11 @@ type campaignItemResponse struct {
 	ExpediteReason string    `json:"expedite_reason,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+	// Awaiting is what a running item with a non-terminal linked run waits on
+	// (E88.4 / #4528, campaign_item_awaiting.go). Set ONLY by the status read;
+	// omitempty, so the items-list route and unstarted, terminal and
+	// run-terminal items keep their exact wire shape.
+	Awaiting *campaignItemAwaitingPayload `json:"awaiting,omitempty"`
 }
 
 // campaignRollupPayload is the engine's readiness partition over a
@@ -2154,9 +2159,15 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	pending := s.campaignPendingAmendmentsForStatus(r.Context(), c, items)
 
 	elig := campaign.NextEligible(items)
+	// The per-item awaiting block (E88.4 / #4528): stage-state classification
+	// for every caller; the decision sources gated by the same predicate as
+	// pending_amendments, computed once per read.
+	readable := campaignAmendmentsReadable(IdentityFrom(r.Context()))
 	out := make([]campaignItemResponse, 0, len(items))
 	for _, it := range items {
-		out = append(out, toCampaignItemResponse(it))
+		resp := toCampaignItemResponse(it)
+		resp.Awaiting = s.campaignItemAwaitingForStatus(r.Context(), c, it, readable, pending)
+		out = append(out, resp)
 	}
 	body := map[string]any{
 		"campaign": toCampaignResponse(c),
