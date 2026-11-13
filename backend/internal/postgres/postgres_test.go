@@ -4976,10 +4976,10 @@ func TestMigrateDown_ArtifactCommsReportReversal(t *testing.T) {
 	}
 }
 
-// TestMigrateDown_ArtifactConflictResolutionDiffReversal pins 0116 (#4795) in
+// TestMigrateDown_ArtifactConflictResolutionDiffReversal pins 0117 (#4795) in
 // BOTH directions, mirroring the 0098 test above: after MigrateUp the
 // artifacts kind CHECK ADMITS a 'conflict_resolution_diff' row, and after
-// rolling back through 0116 it REFUSES one (SQLSTATE 23514 naming
+// rolling back through 0117 it REFUSES one (SQLSTATE 23514 naming
 // artifacts_kind_check) while every prior kind — 0098's 'comms_report'
 // included — still inserts. The test removes its own row before rolling back,
 // so the down migration's restored CHECK is the only thing deciding the second
@@ -5020,13 +5020,13 @@ func TestMigrateDown_ArtifactConflictResolutionDiffReversal(t *testing.T) {
 	}
 
 	if err := insertArtifact("conflict_resolution_diff"); err != nil {
-		t.Fatalf("insert kind='conflict_resolution_diff' after MigrateUp: %v — 0116 must make the row insertable", err)
+		t.Fatalf("insert kind='conflict_resolution_diff' after MigrateUp: %v — 0117 must make the row insertable", err)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM artifacts WHERE kind = 'conflict_resolution_diff'`); err != nil {
 		t.Fatalf("clear conflict_resolution_diff artifacts before rollback: %v", err)
 	}
 
-	downThrough(t, url, "0116")
+	downThrough(t, url, "0117")
 
 	var checkErr *pgconn.PgError
 	if err := insertArtifact("conflict_resolution_diff"); !errors.As(err, &checkErr) || checkErr.Code != "23514" {
@@ -5037,7 +5037,7 @@ func TestMigrateDown_ArtifactConflictResolutionDiffReversal(t *testing.T) {
 	}
 	for _, kind := range []string{"plan", "pull_request", "deployment", "acceptance", "release_notes", "grooming_report", "acceptance_transcript", "upkeep_report", "comms_report"} {
 		if err := insertArtifact(kind); err != nil {
-			t.Errorf("insert kind=%q after 0116 rollback: %v — the rollback must disturb no earlier widening", kind, err)
+			t.Errorf("insert kind=%q after 0117 rollback: %v — the rollback must disturb no earlier widening", kind, err)
 		}
 	}
 }

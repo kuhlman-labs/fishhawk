@@ -558,7 +558,7 @@ func TestPostgres_ListForStage_OrderedByCreatedAt(t *testing.T) {
 
 // TestPostgres_ConflictResolutionDiff_RoundTripAndCrossCheck pins #4795 E4:
 // a conflict_resolution_diff artifact round-trips through Create, Get and
-// GetByHash on the real DB (migration 0116 admits the kind), and the loader's
+// GetByHash on the real DB (migration 0117 admits the kind), and the loader's
 // cross-check over the READ-BACK row decodes the patch and accepts the stored
 // hash even though JSONB normalised the content bytes.
 func TestPostgres_ConflictResolutionDiff_RoundTripAndCrossCheck(t *testing.T) {
@@ -580,7 +580,7 @@ func TestPostgres_ConflictResolutionDiff_RoundTripAndCrossCheck(t *testing.T) {
 		Content: body, ContentHash: hash,
 	})
 	if err != nil {
-		t.Fatalf("Create conflict_resolution_diff (migration 0116 must admit the kind): %v", err)
+		t.Fatalf("Create conflict_resolution_diff (migration 0117 must admit the kind): %v", err)
 	}
 	got, err := repo.Get(context.Background(), created.ID)
 	if err != nil {

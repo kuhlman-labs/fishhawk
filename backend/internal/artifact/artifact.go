@@ -30,7 +30,7 @@ type Artifact struct {
 
 // Kind enumerates the artifact kinds. Closed set per the schema's
 // CHECK constraint (migration 0002, widened by 0037, 0045, 0051, 0073, 0083,
-// 0095, 0098 and 0116): plan, pull_request, deployment, acceptance,
+// 0095, 0098 and 0117): plan, pull_request, deployment, acceptance,
 // release_notes, grooming_report, acceptance_transcript, upkeep_report,
 // comms_report, conflict_resolution_diff.
 type Kind string
@@ -108,7 +108,7 @@ const (
 	// handler on the implement stage the report arrived on, validated as
 	// conflict_resolution_diff_v1, and read back ONLY through the server's
 	// single framing loader, which renders it as an additional section of the
-	// conflict-resolution implement-review round. Admitted by migration 0116,
+	// conflict-resolution implement-review round. Admitted by migration 0117,
 	// which widens artifacts_kind_check; the constant and migration ship
 	// together (a Create with this kind fails SQLSTATE 23514 against the
 	// un-widened CHECK), exactly as 0098 paired with KindCommsReport.

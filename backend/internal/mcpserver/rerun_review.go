@@ -293,7 +293,7 @@ func rerunConflictArmHint(reason string) string {
 	case "superseded_by_fixup":
 		return "a fix-up was triggered after the conflict-resolution push, so its head supersedes the merge head; await the fix-up, or route fishhawk_fixup_stage on the implement stage: its pushed head is reviewed"
 	case "conflict_head_moved":
-		return "the run branch moved after the conflict-resolution push (rebase, reset or fix-up push), so the PR no longer carries that merge head; the new head's own review applies — read it with fishhawk_get_gate_view"
+		return "the run branch moved after the conflict-resolution push (a later recorded head such as a rebase, reset, fix-up push, vouched commit or acceptance-scenario push), so the PR no longer carries that merge head; the new head's own review applies — read it with fishhawk_get_gate_view"
 	}
 	return ""
 }
