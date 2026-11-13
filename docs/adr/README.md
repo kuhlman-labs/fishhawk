@@ -374,6 +374,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-084 is recorded with this batch because ADR-118 amends it. Its tracker body is transcribed after removing the automatically appended "Intake signals" section, as for ADR-113 and ADR-114.
 - ADR-112: `amends: [ADR-093]` ("it **amends ADR-093** (D4, D6, D7, and the mechanics of Q1(a)…)"; "It does not supersede either"); ADR-093 gains `amended_by: [ADR-112]`. Its in-body "Amendment A1" (2026-10-23) is part of the transcribed body, and adds no edge.
 - ADR-113: `amends: [ADR-055]` (Record metadata); ADR-055 `amended_by: [ADR-113]`.
+- ADR-084: no edge added. Its in-body "Amendment A1: server-check concerns are refused on agent-drivable channels" (2026-11-12) is part of the transcribed body.
 - ADR-114: no edge. Its in-body "Amendment A1: token callers" (2026-10-23) is part of the transcribed body.
 - ADR-115: `amends: [ADR-063, ADR-092, ADR-093, ADR-094, ADR-112]` (Record metadata). Each gains `amended_by: [ADR-115]`. ADR-092 keeps `superseded_by: [ADR-093]`, and ADR-094 keeps `amended_by` ADR-100.
 - ADR-116: `amends: [ADR-041, ADR-115]` ("It amends ADR-041 decision 4 … and ADR-115 D5"); both gain `amended_by: [ADR-116]`.
@@ -403,6 +404,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-140: `amends: [ADR-091]`; ADR-091 gains `amended_by: [ADR-140]`, retains ADR-095 and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
 - ADR-141: `amends: [ADR-035]`; ADR-035 gains `amended_by: [ADR-141]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
 - ADR-142: `amends: [ADR-090]`; ADR-090 gains `amended_by: [ADR-142]`, retains its `supersedes` and `superseded_by` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
+- ADR-143: `amends: [ADR-084]`; ADR-084 gains `amended_by: [ADR-143]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It narrows the CLI arm of ADR-084's in-body Amendment A1 until a proof of presence is adopted.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -611,6 +613,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-140](140-terminal-run-review-consumer-lifetime.md) | Bound terminal-run review recovery by consumer lifetime (amends ADR-091) | `accepted` | [#5047](https://github.com/kuhlman-labs/fishhawk/issues/5047) |
 | [ADR-141](141-forge-confirmed-push-reports.md) | Require forge-confirmed push reports and isolate their retries (amends ADR-035) | `accepted` | [#5053](https://github.com/kuhlman-labs/fishhawk/issues/5053) |
 | [ADR-142](142-merge-verification-after-scenario-commits.md) | Keep merge verification requirements across acceptance scenario commits | `accepted` | [#5088](https://github.com/kuhlman-labs/fishhawk/issues/5088) |
+| [ADR-143](143-human-only-actions-credential-kind.md) | Human-only actions are refused on agent-drivable channels (amends ADR-084) | `accepted` | [#5231](https://github.com/kuhlman-labs/fishhawk/issues/5231) |
 
 ## Status unknown — needs captain confirmation
 
