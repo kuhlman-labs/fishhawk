@@ -1238,7 +1238,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// It is assigned to the shared `inv` and therefore covers every derived
 	// invocation by value — the fix-up dispatch, the verify-fix re-invoke
 	// (fixInv := baseInv) and the base-rebase re-invoke (reinvokeInv := baseInv)
-	// — the same seam inv.Model above rides.
+	// — the same seam inv.Model above rides, and the implement-stage signal
+	// sandbox's inv.ExecWrapper (#4858, configured just before the primary
+	// agent loop) rides it too.
 	//
 	// Placed BEFORE the `if stageType == "acceptance"` block, whose acceptenv
 	// assignment overwrites BaseEnv, so the acceptance posture is unchanged by
@@ -2294,6 +2296,41 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.planSeedSHA = capturePlanSeed(ctx, cfg.workingDir, logSink)
 	}
 
+	// Implement-stage signal confinement (#4858, extending ADR-050 / #4855).
+	// Configured ONCE per stage, here: AFTER the #1165 deterministic apply
+	// decided appliedFixup (an applied fix-up spawns no agent, so the probe
+	// never runs and the trace says not_spawned — approval condition D4) and
+	// BEFORE the first agent spawn. Fix-up dispatches are implement stages
+	// (cfg.fixup). The wrapper is assigned to the shared inv, so every derived
+	// spawn inherits it by value — the same seam inv.Model and inv.BaseEnv
+	// ride: invokePrimaryAgent's fix-up resume (resumeInv := inv) and its
+	// resume-failed fresh fallback, the verify-fix re-invoke (fixInv :=
+	// baseInv) and the base-rebase re-invoke (reinvokeInv := baseInv). The
+	// conflict-resolution stage returned long before this (it is configured in
+	// conflictResolutionAgentInvoker), so no stage is configured twice. A
+	// local replay without --fetch-prompt has an empty stageType and stays
+	// unconfined. A failing branch (invalid mode, require+unavailable) fails
+	// category-C with NO agent spawn, the acceptance sandbox failure's shape —
+	// placed BEFORE the amendment watcher and orphan sweeper start, so the
+	// early return leaks neither.
+	var implementSignalTrace *agent.Event
+	if stageType == "implement" {
+		sbx := implementSignalNotSpawnedOutcome()
+		if !appliedFixup {
+			var failReason, failDetail string
+			sbx, failReason, failDetail = configureImplementSignalSandbox(ctx, os.Getenv, probeImplementSignalSandbox, logSink)
+			if failReason != "" {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":%q,"category":"C","detail":%q}`+"\n",
+					failReason, failDetail)
+				return exitFailure
+			}
+			inv.ExecWrapper = sbx.wrapper
+		}
+		ev := sbx.traceEvent()
+		implementSignalTrace = &ev
+	}
+
 	// Mid-stage scope-amendment watcher (#1035): for implement stages,
 	// emit an in-band scope_amendment_pending event the moment the agent
 	// files a request, so the fishhawk_run_stage relay surfaces the
@@ -2583,6 +2620,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				cfg.runID, cfg.stageID, retryErr.Error())
 		}
 		break
+	}
+	// R8 (#4858): the stage's ONE implement_signal_sandbox trace event, so the
+	// uploaded raw bundle shows a stage that ran unconfined under auto. Appended
+	// after the loop because every attempt reassigns res wholesale; on the
+	// applied fix-up path the loop never ran and res is the apply's result.
+	if implementSignalTrace != nil {
+		res.Events = append(res.Events, *implementSignalTrace)
 	}
 
 	// Stop the mid-stage scope-amendment watcher before the post-invoke
