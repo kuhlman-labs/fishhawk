@@ -1694,6 +1694,15 @@
         "ADR-084"
       ],
       "applies_to": []
+    },
+    {
+      "id": "ADR-144",
+      "title": "Proof of presence: a passkey step-up for decisions only a human may take",
+      "path": "docs/adr/144-proof-of-presence.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }
