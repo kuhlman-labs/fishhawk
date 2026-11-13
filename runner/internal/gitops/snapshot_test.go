@@ -306,6 +306,88 @@ func TestSnapshot_NothingToSave(t *testing.T) {
 	}
 }
 
+// snapRacyRepo returns a newSnapshotRepo whose a.txt carries a same-size
+// edit git's racy-clean check must catch (#5234), built BY CONSTRUCTION:
+// core.trustctime=false and core.checkStat=minimal limit the stat compare to
+// whole-second mtime plus size; a.txt's cached entry, the real index file and
+// the edited a.txt all carry the same past second T. The real index sees the
+// edit (its entry is racily clean, so git re-hashes it); a private copy with a
+// fresh file mtime would trust the stat match and miss it.
+func snapRacyRepo(t *testing.T) string {
+	t.Helper()
+	repo := newSnapshotRepo(t)
+	mustGit(t, repo, "config", "core.trustctime", "false")
+	mustGit(t, repo, "config", "core.checkStat", "minimal")
+	tick := time.Now().Add(-time.Hour).Truncate(time.Second)
+	stamp := func(rel string) {
+		t.Helper()
+		if err := os.Chtimes(filepath.Join(repo, rel), tick, tick); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The entry records mtime T; the index itself is written at now, so git
+	// does not smudge the entry and its cached size stays real.
+	stamp("a.txt")
+	mustGit(t, repo, "update-index", "-q", "--refresh")
+	stamp(".git/index") // the last real index write, in the entry's tick
+	snapWriteFile(t, repo, "a.txt", "A\n")
+	stamp("a.txt") // same size, same tick
+
+	// Fixture self-checks (never `git status`: it may rewrite and smudge the
+	// real index, erasing the racy shape).
+	if got := mustGitOut(t, repo, "--no-optional-locks", "diff-files", "--name-only"); got != "a.txt" {
+		t.Fatalf("fixture: real-index diff-files = %q, want a.txt (the real index must see the racy edit)", got)
+	}
+	info, err := os.Stat(filepath.Join(repo, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(tick) {
+		t.Fatalf("fixture: real index mtime = %v, want %v", info.ModTime(), tick)
+	}
+	return repo
+}
+
+// A same-size edit in the same timestamp tick as the last real index write is
+// saved (#5234). Without it the snapshot misses the edit and the revert, which
+// runs on the racy-protected real index, discards it: lost work.
+func TestSnapshot_RacySameSizeEditIsSaved(t *testing.T) {
+	ctx := context.Background()
+	p := &Pusher{}
+
+	t.Run("with untracked sibling", func(t *testing.T) {
+		repo := snapRacyRepo(t)
+		snapWriteFile(t, repo, "new.txt", "agent new file\n")
+		snap, created, err := p.SnapshotWorkTree(ctx, repo, "racy-1", nil)
+		if err != nil || !created {
+			t.Fatalf("SnapshotWorkTree = (%+v, %v, %v), want a created snapshot", snap, created, err)
+		}
+		if got := mustGitOut(t, repo, "show", snap.SHA+":a.txt"); got != "A" {
+			t.Errorf("W:a.txt = %q, want the racy edit %q", got, "A")
+		}
+		if got := snapReadFile(t, repo, "a.txt"); got != "a\n" {
+			t.Errorf("worktree a.txt after the revert = %q, want HEAD's %q", got, "a\n")
+		}
+		if err := p.RestoreSnapshot(ctx, repo, snap); err != nil {
+			t.Fatalf("RestoreSnapshot: %v", err)
+		}
+		if got := snapReadFile(t, repo, "a.txt"); got != "A\n" {
+			t.Errorf("a.txt after RestoreSnapshot = %q, want the racy edit %q", got, "A\n")
+		}
+	})
+
+	t.Run("racy edit alone", func(t *testing.T) {
+		repo := snapRacyRepo(t)
+		snap, created, err := p.SnapshotWorkTree(ctx, repo, "racy-2", nil)
+		if err != nil || !created {
+			t.Fatalf("SnapshotWorkTree = (%+v, %v, %v), want a created snapshot of the racy edit", snap, created, err)
+		}
+		if got := mustGitOut(t, repo, "show", snap.SHA+":a.txt"); got != "A" {
+			t.Errorf("W:a.txt = %q, want the racy edit %q", got, "A")
+		}
+	})
+}
+
 // snapConflicted snapshots a divergent edit to a.txt and then advances
 // HEAD over the same line, so restoring the snapshot conflicts.
 func snapConflicted(t *testing.T, p *Pusher) (repo string, snap Snapshot) {
@@ -722,6 +804,47 @@ func TestSnapshot_FailureModes(t *testing.T) {
 		})
 		if _, created, err := p.SnapshotWorkTree(ctx, repo, "k", nil); err == nil || created || !strings.Contains(err.Error(), "probe tracked changes") {
 			t.Fatalf("SnapshotWorkTree = (created %v, %v), want the probe error", created, err)
+		}
+	})
+}
+
+// TestSnapshot_CopyWorktreeIndexFailures pins the private index copy's
+// fail-closed paths (#5234): an index that opens but cannot be read, and a
+// copy whose mtime cannot be carried over, each refuse rather than hand the
+// snapshot a private index with the wrong content or a fresh stat view.
+func TestSnapshot_CopyWorktreeIndexFailures(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unreadable index", func(t *testing.T) {
+		repo := newSnapshotRepo(t)
+		// `--git-path objects` names a directory: it opens and stats, but a
+		// read fails, so only the read branch can report it.
+		p := snapSeamPusher(func(args []string) []string {
+			if len(args) == 3 && args[0] == "rev-parse" && args[1] == "--git-path" && args[2] == "index" {
+				return []string{"rev-parse", "--git-path", "objects"}
+			}
+			return nil
+		})
+		dst := filepath.Join(t.TempDir(), "index")
+		err := p.copyWorktreeIndex(ctx, repo, dst)
+		if err == nil || !strings.Contains(err.Error(), "read index") {
+			t.Fatalf("copyWorktreeIndex(directory index) = %v, want a read-index error", err)
+		}
+		if snapFileExists(filepath.Dir(dst), "index") {
+			t.Error("a private index was written although the source could not be read")
+		}
+	})
+
+	t.Run("mtime cannot be preserved", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root may set /dev/null's times, so the utimes refusal cannot be provoked")
+		}
+		repo := newSnapshotRepo(t)
+		// /dev/null accepts the write but refuses a non-owner's explicit
+		// utimes, so only the mtime-preserve branch can report it.
+		err := (&Pusher{}).copyWorktreeIndex(ctx, repo, os.DevNull)
+		if err == nil || !strings.Contains(err.Error(), "preserve private index mtime") {
+			t.Fatalf("copyWorktreeIndex(dst=%s) = %v, want a preserve-mtime error", os.DevNull, err)
 		}
 	})
 }

@@ -15,7 +15,8 @@ package main
 // The suffixes are LEAF siblings of -stash / -verify / -fixup-: a child path
 // <stage>/timeout-<n> would be a git directory/file conflict with the existing
 // <run>/<stage> held-commit leaf ref (#4079). The snapshot is built in a
-// private index, so the worktree and its real index are never written. The
+// private index seeded from HEAD by read-tree (#5234), so every path is hashed
+// and the worktree and its real index are never written. The
 // whole step is fail-open: a skip or a failure logs and never changes the
 // stage reason, category or exit.
 
@@ -100,18 +101,15 @@ func pinAgentKillCheckpoint(ctx context.Context, repoDir, runID, stageID, kind s
 	tmpIndex := filepath.Join(tmpDir, "index")
 	indexEnv := []string{"GIT_INDEX_FILE=" + tmpIndex}
 
-	realIndex, err := akGit(ctx, repoDir, nil, "rev-parse", "--git-path", "index")
-	if err != nil {
-		return agentKillPin{}, false, fmt.Errorf("locate index: %w", err)
-	}
-	if !filepath.IsAbs(realIndex) {
-		realIndex = filepath.Join(repoDir, realIndex)
-	}
-	if data, rerr := os.ReadFile(realIndex); rerr == nil {
-		if werr := os.WriteFile(tmpIndex, data, 0o600); werr != nil {
-			return agentKillPin{}, false, fmt.Errorf("copy index: %w", werr)
-		}
-	} else if _, err := akGit(ctx, repoDir, indexEnv, "read-tree", "HEAD"); err != nil {
+	// Seed the private index from HEAD, never from a copy of the real index
+	// (#5234). A copy keeps the real index's stat cache but gets a fresh file
+	// mtime, and git re-hashes a racily clean entry only when the entry's
+	// mtime is not older than the index file's: a same-size edit made in the
+	// same timestamp tick as the last real index write would be trusted as
+	// clean and pinned with its pre-edit bytes. A read-tree index has no stat
+	// data, so `add -A` hashes every path. The resolved head SHA (not the
+	// symbolic HEAD) keeps the seed and the commit parent from diverging.
+	if _, err := akGit(ctx, repoDir, indexEnv, "read-tree", head); err != nil {
 		return agentKillPin{}, false, fmt.Errorf("seed private index: %w", err)
 	}
 

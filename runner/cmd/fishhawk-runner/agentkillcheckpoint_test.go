@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
@@ -348,8 +350,8 @@ func TestPinAgentKillCheckpoint_UnbornHeadSkips(t *testing.T) {
 	}
 }
 
-// With no real index the private index is seeded from HEAD (read-tree), and
-// the real index is still never created.
+// The private index is ALWAYS seeded from HEAD (read-tree, #5234); with no
+// real index at all the pin still works and the real index is never created.
 func TestPinAgentKillCheckpoint_MissingRealIndexSeedsFromHead(t *testing.T) {
 	repo, head := agentKillRepo(t)
 	realIndex := filepath.Join(repo, ".git", "index")
@@ -374,6 +376,93 @@ func TestPinAgentKillCheckpoint_MissingRealIndexSeedsFromHead(t *testing.T) {
 	}
 	if _, err := os.Stat(realIndex); !os.IsNotExist(err) {
 		t.Errorf("real index stat err = %v; the pin must never write the real index", err)
+	}
+}
+
+// A same-size edit made in the same timestamp tick as the last real index
+// write is pinned (#5234). The fixture builds git's racy-clean shape BY
+// CONSTRUCTION: core.trustctime=false and core.checkStat=minimal limit the
+// stat compare to whole-second mtime plus size; a.txt's cached entry, the
+// real index file and the edited a.txt all carry the same past second T, and
+// the edit keeps the size. The REAL index sees the edit (its entry is racily
+// clean, so git re-hashes it); a private index COPIED from it would carry a
+// fresh file mtime, trust the stat match and pin the pre-edit bytes.
+func TestPinAgentKillCheckpoint_RacySameSizeEditIsPinned(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(), gitops.IdentityEnv("t", "t@e")...)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	stamp := func(rel string, at time.Time) {
+		t.Helper()
+		if err := os.Chtimes(filepath.Join(repo, rel), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tick := time.Now().Add(-time.Hour).Truncate(time.Second)
+	run("init", "-q", "--initial-branch=main")
+	run("config", "core.trustctime", "false")
+	run("config", "core.checkStat", "minimal")
+	akWrite(t, repo, "a.txt", "original\n")
+	// The entry's cached mtime is T; the index itself is written at now, so
+	// git does not smudge the entry and its cached size stays real.
+	stamp("a.txt", tick)
+	run("add", "-A")
+	run("commit", "-q", "--no-gpg-sign", "-m", "seed")
+	head := run("rev-parse", "HEAD")
+
+	realIndex := filepath.Join(repo, ".git", "index")
+	stamp(".git/index", tick) // the last real index write, in the entry's tick
+	akWrite(t, repo, "a.txt", "modified\n")
+	stamp("a.txt", tick) // same size, same tick
+
+	// Fixture self-checks (never `git status`: it may rewrite and smudge the
+	// real index, erasing the racy shape).
+	if got := run("--no-optional-locks", "diff-files", "--name-only"); got != "a.txt" {
+		t.Fatalf("fixture: real-index diff-files = %q, want a.txt (the real index must see the racy edit)", got)
+	}
+	before, err := os.ReadFile(realIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(realIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(tick) {
+		t.Fatalf("fixture: real index mtime = %v, want %v", info.ModTime(), tick)
+	}
+
+	pin, pinned, err := pinAgentKillCheckpoint(context.Background(), repo, akRunID, akStageID, "killed")
+	if err != nil || !pinned {
+		t.Fatalf("pin = %+v, pinned = %v, err = %v; want the racy same-size edit pinned", pin, pinned, err)
+	}
+	if got := cprGit(t, repo, "show", pin.ref+":a.txt"); got != "modified" {
+		t.Errorf("%s:a.txt = %q, want the edited bytes %q", pin.ref, got, "modified")
+	}
+	if pin.parentSHA != head {
+		t.Errorf("parent = %q, want HEAD %s", pin.parentSHA, head)
+	}
+	after, err := os.ReadFile(realIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("real index bytes changed; the pin must never write the real index")
+	}
+	if info, err := os.Stat(realIndex); err != nil {
+		t.Errorf("stat real index after pin: %v", err)
+	} else if !info.ModTime().Equal(tick) {
+		t.Errorf("real index mtime = %v, want %v unchanged", info.ModTime(), tick)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,8 @@ func SnapshotRef(key string) string { return snapshotRefPrefix + key }
 //   - H is HEAD;
 //   - I (parent H) records the index, written from a PRIVATE copy of the
 //     worktree's index file so the real index is only touched by the revert;
+//     the copy carries the real index's mtime, so git's racy-clean check
+//     still re-hashes a same-tick same-size edit (#5234);
 //   - U (no parent), present only when there are untracked files, records the
 //     `ls-files --others --exclude-standard` set under a fresh private index —
 //     untracked files are included and ignored ones are not;
@@ -152,8 +155,18 @@ func (p *Pusher) SnapshotWorkTree(ctx context.Context, repoDir, key string, path
 }
 
 // copyWorktreeIndex copies the worktree's own index file (per-worktree, at
-// `rev-parse --git-path index`) to dst. A worktree with no index file yet
-// leaves dst absent, which git reads as an empty index.
+// `rev-parse --git-path index`) to dst, carrying its mtime. A worktree with no
+// index file yet leaves dst absent, which git reads as an empty index.
+//
+// The copy must keep the real index's mtime (#5234): git re-hashes a racily
+// clean entry only when the entry's mtime is not older than the index file's,
+// so a copy with a fresh mtime would trust a same-size edit made in the same
+// timestamp tick as the last real index write, and the snapshot would miss it
+// while the revert (on the real, racy-protected index) still discarded it.
+// Keeping the mtime gives the snapshot the same stat view as the real index
+// the revert uses. Content and mtime come from ONE open fd: git replaces the
+// index by renaming index.lock, so the fd pins one consistent pair, where a
+// later stat could pair old content with a racing rewrite's newer mtime.
 func (p *Pusher) copyWorktreeIndex(ctx context.Context, repoDir, dst string) error {
 	out, err := p.runOut(ctx, repoDir, "rev-parse", "--git-path", "index")
 	if err != nil {
@@ -163,15 +176,27 @@ func (p *Pusher) copyWorktreeIndex(ctx context.Context, repoDir, dst string) err
 	if !filepath.IsAbs(src) {
 		src = filepath.Join(repoDir, src)
 	}
-	data, err := os.ReadFile(src)
+	f, err := os.Open(src)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("gitops: snapshot: read index: %w", err)
 	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("gitops: snapshot: stat index: %w", err)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("gitops: snapshot: read index: %w", err)
+	}
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return fmt.Errorf("gitops: snapshot: write private index: %w", err)
+	}
+	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
+		return fmt.Errorf("gitops: snapshot: preserve private index mtime: %w", err)
 	}
 	return nil
 }
