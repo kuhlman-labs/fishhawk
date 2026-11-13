@@ -7802,6 +7802,27 @@ components:
             routed fix-up concern (ADR-090 D6). Omitted when empty; a fishhawkd
             that predates the field rejects it (400, unknown field), so deploy
             fishhawkd first.
+        resolved_paths:
+          type: array
+          maxItems: 200
+          items: { type: string, maxLength: 512 }
+          description: |
+            #4795: conflict_resolution_pushed only. The conflicted paths the
+            pass resolved (relative, no `..` segment, no backslash, no control
+            byte; 400 `pull_request_invalid` otherwise). Required non-empty when
+            any other summary field is set. The server keeps the first 200 and
+            sets resolved_paths_truncated.
+        resolved_paths_truncated: { type: boolean, description: "#4795: the runner or server cut resolved_paths." }
+        resolution_patch:
+          type: string
+          description: |
+            #4795: the merge commit's remerge-diff. Secret-scanned raw, stored
+            REDACTED as a `conflict_resolution_diff` artifact, never recorded on
+            the audit row. Sent only when the implement prompt advertised
+            `conflict_resolution_summary: true`.
+        resolution_patch_truncated: { type: boolean, description: "#4795: requires a non-empty resolution_patch." }
+        resolution_patch_unavailable_reason: { type: string, maxLength: 64, description: "#4795: why the patch is absent; must be absent with a patch; mapped to a closed slug." }
+        resolution_patch_unavailable_detail: { type: string, maxLength: 1024, description: "#4795: redacted runner detail, no NUL, must be absent with a patch; stored cut to 256 bytes, never rendered." }
         merge_candidate_failure_summary:
           type: object
           additionalProperties: false
@@ -8689,7 +8710,7 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         kind:
           type: string
-          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript, upkeep_report, comms_report]
+          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript, upkeep_report, comms_report, conflict_resolution_diff]
         schema_version:
           type: [string, "null"]
           example: standard_v1

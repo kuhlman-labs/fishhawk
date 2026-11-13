@@ -334,6 +334,31 @@ type pullRequestBody struct {
 	MergeCandidateOutputTail     string                        `json:"merge_candidate_output_tail,omitempty"`
 	MergeCandidateFailures       string                        `json:"merge_candidate_failures,omitempty"`
 	MergeCandidateFailureSummary *mergeCandidateFailureSummary `json:"merge_candidate_failure_summary,omitempty"`
+
+	// The six conflict-resolution SUMMARY fields (#4795), present only on a
+	// conflict_resolution_pushed report from a runner the backend advertised
+	// conflict_resolution_summary to: the conflicted paths the pass resolved
+	// (capped server-side at 200, setting the truncated flag), the merge
+	// commit's remerge-diff, and a reason/detail when the patch is absent.
+	// validateConflictResolutionSummary bounds them; the patch is secret-scanned
+	// raw, stored REDACTED as a conflict_resolution_diff artifact, and never
+	// reaches the audit row or a log line. A pre-change runner sends none of
+	// them and is admitted exactly as before.
+	//
+	// CROSS-MODULE WIRE CONTRACT: each json tag MUST stay byte-identical to
+	// the runner's upload.pullRequestChildPushBody field of the same name (the
+	// ship_child_push pair in backend/internal/wirecontract).
+	ResolvedPaths []string `json:"resolved_paths,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolvedPathsTruncated bool `json:"resolved_paths_truncated,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatch string `json:"resolution_patch,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatchTruncated bool `json:"resolution_patch_truncated,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatchUnavailableReason string `json:"resolution_patch_unavailable_reason,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatchUnavailableDetail string `json:"resolution_patch_unavailable_detail,omitempty"`
 }
 
 // mergeCandidateFailureSummary is the structured failing-name summary of a
@@ -371,6 +396,11 @@ const outcomeMergeCandidateVerified = "merge_candidate_verified"
 // wrong shape — the operator's audit log will need to be reconciled
 // by hand.
 func (p *pullRequestBody) validate() error {
+	// The conflict-resolution summary fields (#4795) ride ONLY the
+	// conflict_resolution_pushed variant.
+	if p.Outcome != "conflict_resolution_pushed" && p.hasConflictResolutionSummaryField() {
+		return errors.New("resolved_paths and resolution_* fields are accepted only on a conflict_resolution_pushed outcome")
+	}
 	// Failure-report variant (#742): no PR was opened, so the PR fields are
 	// absent. Require the outcome marker, a valid failure category, and a
 	// reason; the PR-field checks below don't apply.
@@ -468,7 +498,7 @@ func (p *pullRequestBody) validate() error {
 		case p.BaseSHA == "":
 			return errors.New("base_sha is required for a conflict_resolution_pushed outcome")
 		}
-		return nil
+		return p.validateConflictResolutionSummary()
 	}
 	// Scenario-corpus push report (E72.4 / #3328): require the commit
 	// coordinates so the audit entry (a reported-head ledger row) pins what
@@ -2805,7 +2835,11 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 		return
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	// The resolution summary (#4795): secret-scanned raw, stored redacted as an
+	// artifact, and folded into the row as paths + artifact id/sha256/bytes
+	// only. A report with no summary adds no key.
+	summary := s.recordConflictResolutionSummary(r.Context(), runID, stage, pr)
+	rowPayload := map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
 		"branch":              pr.Branch,
@@ -2813,7 +2847,11 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 		"base_sha":            pr.BaseSHA,
 		"files_changed_count": pr.FilesChangedCount,
 		"auth_method":         authMethod,
-	})
+	}
+	for k, v := range summary.payload {
+		rowPayload[k] = v
+	}
+	auditPayload, _ := json.Marshal(rowPayload)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,
@@ -2831,6 +2869,11 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 	}
 
 	s.notifyStatusUpdate(r.Context(), runID, CategoryConflictResolutionPushed)
+
+	// The conflict-resolved head's implement review (#4795): a full-diff
+	// conflict_resolution round, or a named skip row. After the replay dedup,
+	// the forge check and the live-trigger guard, so a replay never re-fires it.
+	s.maybeDispatchConflictResolutionReview(r.Context(), runID, stage, pr, summary.secretGroups)
 
 	// Permission-drift check (E80.4 / #3761): a conflict-resolution merge
 	// commit is agent-authored, so it is checked like any other push. Its

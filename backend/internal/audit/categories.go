@@ -458,6 +458,7 @@ var KnownCategories = map[string]struct{}{
 	"captain_relinquished":                    {},
 	"child_pushed":                            {},
 	"conflict_resolution_pushed":              {},
+	"conflict_resolution_review_skipped":      {}, // #4795: the conflict-resolution report's automatic review did not start a round (reason resolution_docs_only | decomposed_parent); payload is this run's ids and SHAs, a closed reason slug, validated repo paths and a count, no free text, so it is run-bound-readable under ADR-106 (server/conflictresolution_review.go) — INTERNAL
 	"child_redriven":                          {},
 	"children_settled":                        {},
 	"ci_failure_retry_dispatched":             {},

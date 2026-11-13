@@ -36,6 +36,11 @@ const (
 	// reviewRoundOriginConsolidated: a decomposed parent's consolidated review,
 	// whose diff is ComparePatch(base, consolidated head).
 	reviewRoundOriginConsolidated = "consolidated"
+	// reviewRoundOriginConflictResolution: the review of a conflict-resolved
+	// head (#4795), whose diff is ComparePatch(base_ref, merge head), the full
+	// change as it will merge. It is an ordinary full-diff round in every
+	// respect except that it also renders the conflict-resolution framing.
+	reviewRoundOriginConflictResolution = "conflict_resolution"
 )
 
 // reviewRoundSource is where an implement-review round's diff came from.
@@ -68,8 +73,9 @@ type reviewRedispatch struct {
 // package can construct them, and no code inside it derives them from a
 // request.
 type (
-	reviewRoundSourceCtxKey struct{}
-	reviewRedispatchCtxKey  struct{}
+	reviewRoundSourceCtxKey         struct{}
+	reviewRedispatchCtxKey          struct{}
+	conflictResolutionFramingCtxKey struct{}
 )
 
 // withReviewRoundSource returns ctx carrying the implement round's source.
@@ -162,4 +168,21 @@ func reviewRedispatchFrom(ctx context.Context) (reviewRedispatch, bool) {
 		return reviewRedispatch{}, false
 	}
 	return rd, true
+}
+
+// withConflictResolutionFraming returns ctx carrying a conflict_resolution
+// round's framing (#4795). It rides the context for the reason the round source
+// does: it reaches runImplementReviewsForTree's Trigger build without touching
+// its call sites. Its only setter is startConflictResolutionRound, which reads
+// the framing through loadConflictResolutionFraming, so every round renders the
+// same redacted text.
+func withConflictResolutionFraming(ctx context.Context, fr conflictResolutionFraming) context.Context {
+	return context.WithValue(ctx, conflictResolutionFramingCtxKey{}, fr)
+}
+
+// conflictResolutionFramingFrom returns the framing ctx carries; ok=false when
+// it carries none.
+func conflictResolutionFramingFrom(ctx context.Context) (conflictResolutionFraming, bool) {
+	fr, ok := ctx.Value(conflictResolutionFramingCtxKey{}).(conflictResolutionFraming)
+	return fr, ok
 }

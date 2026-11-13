@@ -2229,7 +2229,7 @@ func productionReferrers(t *testing.T, names ...string) map[string][]string {
 func TestReviewWrappers_CallersOwnNoStageEdge(t *testing.T) {
 	allowed := map[string][]string{
 		"runPlanReviews":                               {"redispatchPlanRound"},
-		"runImplementReviews":                          {"redispatchImplementRound", "runConsolidatedReviewRound", "maybeBackstopFixupReReview"},
+		"runImplementReviews":                          {"redispatchImplementRound", "runConsolidatedReviewRound", "maybeBackstopFixupReReview", "startConflictResolutionRound"},
 		"runPlanReviewLoop":                            {},
 		"runPlanReviewLoopWithConventions":             {"runPlanReviewLoop"},
 		"runImplementReviewInvocations":                {},
@@ -2251,6 +2251,95 @@ func TestReviewWrappers_CallersOwnNoStageEdge(t *testing.T) {
 			if slices.Contains(referrers, edgeOwner) {
 				t.Errorf("edge owner %s calls bool wrapper %s", edgeOwner, wrapper)
 			}
+		}
+	}
+}
+
+// conflictRoundStageEdgeNames are the stage-edge owners
+// startConflictResolutionRound must never reference (#4795 D5).
+var conflictRoundStageEdgeNames = []string{
+	"TransitionStage", "TransitionRun", "transitionStageAtIdentity", "transitionStageAtAttempt",
+	"transitionStageAtAttemptGuarded", "failStageCategoryB", "advanceStage", "advanceStageAfterTrace",
+	"advanceVariantStageAfterReport",
+}
+
+// inspectConflictRoundBody reports every violation in fn's body: a referenced
+// stage-edge name, or a runImplementReviews call that is not a bare
+// expression statement (its outcome must be discarded), or not exactly one
+// such call.
+func inspectConflictRoundBody(fn *ast.FuncDecl) []string {
+	var out []string
+	exprCalls, allCalls := 0, 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.ExprStmt:
+			if call, ok := x.X.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "runImplementReviews" {
+					exprCalls++
+				}
+			}
+		case *ast.CallExpr:
+			if sel, ok := x.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "runImplementReviews" {
+				allCalls++
+			}
+		case *ast.Ident:
+			if slices.Contains(conflictRoundStageEdgeNames, x.Name) {
+				out = append(out, "references stage edge "+x.Name)
+			}
+		}
+		return true
+	})
+	if allCalls != 1 || exprCalls != 1 {
+		out = append(out, fmt.Sprintf("runImplementReviews calls = %d, as bare statements = %d; want exactly one discarded call", allCalls, exprCalls))
+	}
+	return out
+}
+
+func conflictRoundFuncDecl(t *testing.T, file *ast.File) *ast.FuncDecl {
+	t.Helper()
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "startConflictResolutionRound" && fn.Body != nil {
+			return fn
+		}
+	}
+	t.Fatal("startConflictResolutionRound not found")
+	return nil
+}
+
+// TestConflictResolutionRound_OwnsNoStageEdge pins #4795 D5: the
+// conflict-resolution round body owns no stage edge and discards the review
+// outcome. The self-checks plant two violating copies through the same
+// inspector, so a weakened inspector fails here.
+func TestConflictResolutionRound_OwnsNoStageEdge(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "conflictresolution_review.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if v := inspectConflictRoundBody(conflictRoundFuncDecl(t, file)); len(v) != 0 {
+		t.Fatalf("startConflictResolutionRound: %v", v)
+	}
+	planted := map[string]string{
+		"stage_edge": `package server
+func (s *Server) startConflictResolutionRound() string {
+	s.cfg.RunRepo.TransitionStage(nil)
+	s.runImplementReviews(nil)
+	return ""
+}`,
+		"outcome_read": `package server
+func (s *Server) startConflictResolutionRound() string {
+	out := s.runImplementReviews(nil)
+	_ = out
+	return ""
+}`,
+	}
+	for name, src := range planted {
+		pf, err := parser.ParseFile(fset, name+".go", src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse planted %s: %v", name, err)
+		}
+		if v := inspectConflictRoundBody(conflictRoundFuncDecl(t, pf)); len(v) == 0 {
+			t.Errorf("self-check %s: the inspector passed a violating body", name)
 		}
 	}
 }

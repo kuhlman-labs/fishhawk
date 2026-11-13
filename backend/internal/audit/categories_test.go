@@ -33,6 +33,8 @@ func TestIsKnownCategory(t *testing.T) {
 		"stage_conflict_resolution_triggered",
 		"stage_conflict_resolution_failed",
 		"conflict_resolution_pushed",
+		// #4795: the conflict-resolution report's automatic review skip row.
+		"conflict_resolution_review_skipped",
 		// #2292 push-notification claim + failure rows (travel together).
 		"push_notification_sent",
 		"push_notification_failed",

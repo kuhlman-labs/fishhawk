@@ -2091,7 +2091,15 @@ Notes:
   the EXISTING PR branch, and only after the ADR-141 forge check confirms (or skips)
   the head AND the stage carries a live trigger (#3806). The recorded row carries
   payload `{run_id, stage_id, branch, head_sha, base_sha, files_changed_count,
-  auth_method}`; a report with no live trigger answers `409
+  auth_method}`, plus, when the runner reported a resolution summary (#4795),
+  `resolved_paths`, `resolved_paths_truncated` and either
+  `resolution_diff_artifact_id` / `resolution_diff_sha256` / `resolution_diff_bytes`
+  (the redacted `conflict_resolution_diff` artifact) or
+  `resolution_diff_unavailable: resolution_diff_store_failed` — never patch text.
+  The report then starts a full-diff `conflict_resolution` implement-review round,
+  or appends the INTERNAL `conflict_resolution_review_skipped` row
+  `{run_id, stage_id, head_sha, base_sha, reason (resolution_docs_only |
+  decomposed_parent), resolved_paths, diff_secret_groups?}` (no issue comment); a report with no live trigger answers `409
   conflict_resolution_not_live` and writes NO audit row (WARN only). The recorded
   entry ALSO consumes the trigger, exactly as the failure entry does: either terminal outcome settles the pass, so a later ordinary
   fix-up on the stage is served `conflict_resolution=false` whether the pass was refused
