@@ -25,7 +25,7 @@ import (
 // of the per-run core (host_dispatcher.go), so every marker POST and spawn
 // passes the same campaign, cap and pause checks. The loop owns:
 //
-//   - the persisted 0600 ledger in a 0700, owner-checked, pid-locked state dir
+//   - the persisted 0600 ledger in a 0700, owner-checked, flock-locked state dir
 //     (daily spawn count, in-flight set, the once-per-marker-epoch stale
 //     re-spawn counter);
 //   - the caps (max in-flight, per tick, per UTC day) and the pause file,
@@ -199,7 +199,8 @@ func SetHostDispatcherPaused(stateDir string, paused bool) error {
 // RunHostDispatcher runs the dispatcher until ctx is cancelled. It ticks once
 // immediately and then every Interval; a cancel finishes the in-flight tick
 // before returning. It returns an error when the configuration or state dir is
-// refused at start, or when another dispatcher takes the state-dir lock.
+// refused at start, when another dispatcher holds the state-dir lock, or when
+// the lock file is replaced underneath it.
 func RunHostDispatcher(ctx context.Context, cfg HostDispatcherConfig) error {
 	cfg, err := cfg.withDefaults()
 	if err != nil {
@@ -208,11 +209,11 @@ func RunHostDispatcher(ctx context.Context, cfg HostDispatcherConfig) error {
 	if err := prepareHostDispatchStateDir(cfg.StateDir, fileOwnerUID); err != nil {
 		return err
 	}
-	unlock, err := acquireHostDispatchLock(cfg.StateDir)
+	lock, err := acquireHostDispatchLock(cfg.StateDir)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer lock.unlock()
 
 	r := &runResolver{
 		api:          newAPIClient(config{backendURL: cfg.BackendURL, apiToken: cfg.APIToken, hostLabel: processHostLabel}),
@@ -224,6 +225,7 @@ func RunHostDispatcher(ctx context.Context, cfg HostDispatcherConfig) error {
 		return err
 	}
 	l := newHostDispatchLoop(cfg, r, binary)
+	l.lockHeld = lock.held
 	return l.run(ctx)
 }
 
@@ -347,59 +349,68 @@ func writeHostDispatchFile(dir, name string, data []byte) error {
 	return os.Rename(tmpName, filepath.Join(dir, name))
 }
 
-// signalZero probes a pid without signalling it.
-var signalZero os.Signal = syscall.Signal(0)
+// hostDispatchLock is the state dir's exclusive lock (F7e): an flock(2) on
+// <dir>/lock, held for the dispatcher's whole lifetime, so every tick's ledger
+// work runs under it. The kernel releases it when the holder's file closes,
+// however the process ends, so a crashed dispatcher's lock is free at once and
+// no contender ever reads, judges or removes another's lock (the pid-file
+// takeover race). The file itself is never removed: removing it would let a
+// contender lock a fresh inode while the holder still holds the old one.
+type hostDispatchLock struct {
+	f    *os.File
+	path string
+}
 
-// hostDispatchPidAlive reports whether pid is a live process (an error other
-// than "process done", e.g. EPERM, counts as live: fail closed).
-var hostDispatchPidAlive = func(pid int) bool {
-	if pid <= 0 {
-		return false
+// acquireHostDispatchLock takes the lock without blocking. A held lock refuses
+// state_dir_locked, naming the pid the holder wrote (diagnostics only: the
+// flock, not the file content, is the lock).
+func acquireHostDispatchLock(dir string) (*hostDispatchLock, error) {
+	path := filepath.Join(dir, hostDispatchLockFile)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600) //nolint:gosec // operator state dir
+	if err != nil {
+		return nil, fmt.Errorf("%s: open %s: %w", hdStateDirLocked, path, err)
 	}
-	p, err := os.FindProcess(pid)
+	if ferr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); ferr != nil { //nolint:gosec // an fd fits an int
+		_ = f.Close()
+		if errors.Is(ferr, syscall.EWOULDBLOCK) {
+			holder := "unknown"
+			if pid, rerr := readHostDispatchLock(path); rerr == nil {
+				holder = strconv.Itoa(pid)
+			}
+			return nil, fmt.Errorf("%s: another dispatcher (pid %s) holds %s; stop it first", hdStateDirLocked, holder, path)
+		}
+		return nil, fmt.Errorf("%s: flock %s: %w", hdStateDirLocked, path, ferr)
+	}
+	l := &hostDispatchLock{f: f, path: path}
+	if !l.held() {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s: %s was replaced while it was being locked; retry", hdStateDirLocked, path)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s: chmod 0600 %s: %w", hdStateDirLocked, path, err)
+	}
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
+	}
+	return l, nil
+}
+
+// held reports whether <dir>/lock still names the inode this process holds
+// the flock on. Every tick checks it first, so a dispatcher whose lock file
+// was removed or replaced (another dispatcher could then lock the new file)
+// stops before any request.
+func (l *hostDispatchLock) held() bool {
+	fi, err := l.f.Stat()
 	if err != nil {
 		return false
 	}
-	return !errors.Is(p.Signal(signalZero), os.ErrProcessDone)
+	pi, err := os.Lstat(l.path)
+	return err == nil && os.SameFile(fi, pi)
 }
 
-// acquireHostDispatchLock takes the state dir's pid lock (F7e): an O_EXCL
-// create of <dir>/lock holding this pid. A lock held by a live pid refuses
-// (state_dir_locked); a dead holder's lock is taken over once. Every tick
-// re-reads the lock (hostDispatchLockHeld), so a dispatcher that lost a
-// takeover race stops at its next tick. unlock removes the file only while it
-// still names this pid.
-func acquireHostDispatchLock(dir string) (func(), error) {
-	path := filepath.Join(dir, hostDispatchLockFile)
-	pid := os.Getpid()
-	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) //nolint:gosec // operator state dir
-		if err == nil {
-			_, werr := f.WriteString(strconv.Itoa(pid))
-			cerr := f.Close()
-			if werr != nil || cerr != nil {
-				_ = os.Remove(path)
-				return nil, fmt.Errorf("%s: write lock: %v %v", hdStateDirLocked, werr, cerr)
-			}
-			return func() {
-				if holder, _ := readHostDispatchLock(path); holder == pid {
-					_ = os.Remove(path)
-				}
-			}, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("%s: %w", hdStateDirLocked, err)
-		}
-		holder, rerr := readHostDispatchLock(path)
-		if rerr == nil && hostDispatchPidAlive(holder) {
-			return nil, fmt.Errorf("%s: another dispatcher (pid %d) holds %s; stop it, or remove the file if that pid is not a dispatcher", hdStateDirLocked, holder, path)
-		}
-		if attempt == 0 {
-			_ = os.Remove(path)
-		}
-	}
-	return nil, fmt.Errorf("%s: could not take %s", hdStateDirLocked, path)
-}
+// unlock releases the flock. It leaves the file in place.
+func (l *hostDispatchLock) unlock() { _ = l.f.Close() }
 
 func readHostDispatchLock(path string) (int, error) {
 	raw, err := os.ReadFile(path) //nolint:gosec // operator state dir
@@ -470,7 +481,8 @@ type hostDispatchLoop struct {
 	// terminate reaps this process's detached runners for a run (default
 	// detachedRunners.terminateRunners).
 	terminate func(runID string) int
-	// lockHeld re-checks the state-dir lock each tick.
+	// lockHeld re-checks the state-dir lock each tick (hostDispatchLock.held;
+	// false until RunHostDispatcher wires the lock it took: fail closed).
 	lockHeld func() bool
 	// writeFile is the ledger/status write seam (fault injection).
 	writeFile func(dir, name string, data []byte) error
@@ -481,9 +493,11 @@ type hostDispatchLoop struct {
 
 	// queued maps run id -> the start of its live queue episode.
 	queued map[string]time.Time
-	// campaignRefused holds the runs whose latest read refused them for
-	// campaign state (moved last until a fresh read stops refusing).
-	campaignRefused map[string]bool
+	// deprioritised holds the runs whose latest evaluation was refused for
+	// campaign state (CampaignRefused) or after the gate admitted it (Held):
+	// moved last until a fresh evaluation stops refusing, so persistently held
+	// older runs cannot spend every tick's budget.
+	deprioritised map[string]bool
 	// ownRuns holds the runs this process spawned a runner for.
 	ownRuns map[string]bool
 	// gateCalls counts Admit calls (the per-tick budget reads it).
@@ -494,26 +508,21 @@ type hostDispatchLoop struct {
 
 func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string) *hostDispatchLoop {
 	l := &hostDispatchLoop{
-		cfg:             cfg,
-		api:             r.api,
-		now:             time.Now,
-		terminate:       func(runID string) int { n, _ := detachedRunners.terminateRunners(runID, nil); return n },
-		writeFile:       writeHostDispatchFile,
-		queued:          map[string]time.Time{},
-		campaignRefused: map[string]bool{},
-		ownRuns:         map[string]bool{},
+		cfg:           cfg,
+		api:           r.api,
+		now:           time.Now,
+		terminate:     func(runID string) int { n, _ := detachedRunners.terminateRunners(runID, nil); return n },
+		writeFile:     writeHostDispatchFile,
+		queued:        map[string]time.Time{},
+		deprioritised: map[string]bool{},
+		ownRuns:       map[string]bool{},
 	}
-	pid := os.Getpid()
-	lockPath := filepath.Join(cfg.StateDir, hostDispatchLockFile)
-	l.lockHeld = func() bool {
-		holder, err := readHostDispatchLock(lockPath)
-		return err == nil && holder == pid
-	}
+	l.lockHeld = func() bool { return false }
 	l.core = newHostDispatcher(r, binary, l, l)
 	l.core.staleAfter = cfg.StaleAfter
 	l.core.now = func() time.Time { return l.now() }
 	l.status = HostDispatcherStatus{
-		PID:             pid,
+		PID:             os.Getpid(),
 		Host:            r.api.hostLabelResolution().Label,
 		IntervalSeconds: cfg.Interval.Seconds(),
 	}
@@ -638,10 +647,11 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	}
 	l.order(candidates)
 
-	// A campaign-state refusal deprioritises the run until a fresh read of it
-	// stops refusing; a run this tick does not reach keeps its place.
-	refused := make(map[string]bool, len(l.campaignRefused))
-	for id := range l.campaignRefused {
+	// A campaign-state or held refusal deprioritises the run until a fresh
+	// evaluation of it stops refusing; a run this tick does not reach keeps
+	// its place.
+	refused := make(map[string]bool, len(l.deprioritised))
+	for id := range l.deprioritised {
 		refused[id] = true
 	}
 	attempts := 0
@@ -667,7 +677,7 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 			break
 		}
 	}
-	l.campaignRefused = refused
+	l.deprioritised = refused
 	return nil
 }
 
@@ -680,7 +690,7 @@ func (l *hostDispatchLoop) record(o hostDispatchOutcome, refused map[string]bool
 	} else {
 		delete(l.queued, o.RunID)
 	}
-	if o.CampaignRefused {
+	if o.CampaignRefused || o.Held {
 		refused[o.RunID] = true
 	} else {
 		delete(refused, o.RunID)
@@ -793,15 +803,15 @@ func (l *hostDispatchLoop) listCandidates(ctx context.Context) ([]Run, error) {
 }
 
 // order sorts candidates: live queue episodes first (oldest episode first),
-// then created_at and id, with runs whose latest read refused them for
-// campaign state moved last (deprioritised, never skipped without a fresh
-// read).
+// then created_at and id, with runs whose latest evaluation was refused for
+// campaign state or after the gate admitted it moved last (deprioritised,
+// never skipped without a fresh evaluation).
 func (l *hostDispatchLoop) order(runs []Run) {
 	rank := func(r Run) int {
 		if _, ok := l.queued[r.ID]; ok {
 			return 0
 		}
-		if l.campaignRefused[r.ID] {
+		if l.deprioritised[r.ID] {
 			return 2
 		}
 		return 1
@@ -885,6 +895,24 @@ func (l *hostDispatchLoop) Admit(_ context.Context, c hostDispatchCandidate) (fu
 // stale re-spawn for the same marker epoch (ADR-104 Q2).
 func (l *hostDispatchLoop) Allowed(stageID string, epoch time.Time) bool {
 	return l.ledger != nil && !l.ledger.Respawns[respawnKey(stageID, epoch)]
+}
+
+// Release returns a reservation whose attempt ended before a spawn. A persist
+// failure keeps the key (the epoch stays consumed: fail safe).
+func (l *hostDispatchLoop) Release(stageID string, epoch time.Time) error {
+	if l.ledger == nil {
+		return errors.New("no ledger loaded")
+	}
+	k := respawnKey(stageID, epoch)
+	if !l.ledger.Respawns[k] {
+		return nil
+	}
+	delete(l.ledger.Respawns, k)
+	if err := l.persistLedger(); err != nil {
+		l.ledger.Respawns[k] = true
+		return err
+	}
+	return nil
 }
 
 func (l *hostDispatchLoop) Reserve(stageID string, epoch time.Time) (bool, error) {

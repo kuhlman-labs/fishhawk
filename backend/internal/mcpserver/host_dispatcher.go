@@ -31,12 +31,15 @@ import (
 // a later tick (the queue record is ADR-094, amended by ADR-100 and ADR-115);
 // there is no asynchronous slot waiter.
 
-// Host-dispatcher refusal codes. Every refusal commits nothing the core owns:
-// the gate reservation is released, and no marker or spawn follows.
+// Host-dispatcher refusal codes. Every refusal releases the gate reservation
+// and any stale re-spawn reservation, and no spawn follows. A refusal before
+// the record act commits nothing; one after it (a queued or refused marker)
+// keeps that act's row, which covers the next attempt of the same dispatch.
 const (
 	hdRefuseNotLocal              = "runner_kind_not_local"
 	hdRefuseRunTerminal           = "run_terminal"
 	hdRefusePathOutside           = pathOutsideAllowedRootsCode
+	hdRefuseWorkingDirAbsent      = "working_dir_absent"
 	hdRefuseNotEligible           = "not_eligible"
 	hdRefuseParentUnreadable      = "parent_unreadable"
 	hdRefuseRunReadFailed         = "run_read_failed"
@@ -90,12 +93,16 @@ type hostDispatchGate interface {
 
 // hostDispatchRespawnCounter bounds the stale re-spawn to ONE per (stage id,
 // marker epoch) (ADR-104 Q2). Allowed is the read-only early check; Reserve
-// consumes the epoch's single re-spawn BEFORE the spawn and reports whether it
-// was still available. Slice 3 persists it in the ledger so a restart cannot
-// grant a second re-spawn.
+// consumes the epoch's single re-spawn BEFORE any POST and reports whether it
+// was still available. Release returns a reservation whose attempt ended
+// before a spawn was tried (a gate-later refusal, a record or marker failure),
+// so only an attempted spawn consumes the epoch; a Release error leaves the
+// epoch consumed (fail safe). Slice 3 persists it in the ledger so a restart
+// cannot grant a second re-spawn.
 type hostDispatchRespawnCounter interface {
 	Allowed(stageID string, epoch time.Time) bool
 	Reserve(stageID string, epoch time.Time) (bool, error)
+	Release(stageID string, epoch time.Time) error
 }
 
 // hostDispatchOutcome is one evaluation's result.
@@ -116,6 +123,12 @@ type hostDispatchOutcome struct {
 	// CampaignRefused marks a refusal for campaign state (the tick moves the
 	// run last next time; it never skips it without a fresh read).
 	CampaignRefused bool
+	// Held marks a refusal AFTER the gate admitted the attempt (the server's
+	// marker refused it, the record act failed, the acceptance target is
+	// missing): the stage stays parked and the refusal tends to persist, so
+	// the tick moves the run last next time, exactly as for CampaignRefused,
+	// and older held runs cannot spend every tick's budget.
+	Held bool
 	// StopMarkers is true on 409 host_memory_pressure: the tick stops POSTing
 	// markers for the rest of the round.
 	StopMarkers bool
@@ -147,10 +160,14 @@ type hostDispatcher struct {
 	// exit (the stage goes failed, which selection never re-picks), so the core
 	// never re-spawns a stage it is running itself.
 	running map[string]bool
-	// recorded holds the stage ids whose run_auto_driven row this process wrote
-	// for a still-live queue episode: a re-attempt re-POSTs the marker without
-	// a second row.
-	recorded map[string]bool
+	// recorded maps a stage id to the dispatch attempt (hostDispatchAttempt)
+	// its run_auto_driven row was written for. The row covers the whole held
+	// episode: a queued or refused marker leaves the stage untouched, so a
+	// re-attempt of the SAME attempt re-POSTs the marker without a second row.
+	// Only this process's admitted marker clears it. A stage dispatched by
+	// anyone in between carries a new dispatched_at, so its re-opened row no
+	// longer matches and the next dispatch records a fresh row first.
+	recorded map[string]string
 }
 
 func newHostDispatcher(r *runResolver, binary string, gate hostDispatchGate, respawns hostDispatchRespawnCounter) *hostDispatcher {
@@ -165,7 +182,7 @@ func newHostDispatcher(r *runResolver, binary string, gate hostDispatchGate, res
 		environ:    os.Environ,
 		staleAfter: defaultHostDispatchStaleAfter,
 		running:    map[string]bool{},
-		recorded:   map[string]bool{},
+		recorded:   map[string]string{},
 	}
 }
 
@@ -174,6 +191,27 @@ func newHostDispatcher(r *runResolver, binary string, gate hostDispatchGate, res
 // every other selected state (pending, awaiting_host_dispatch) is fresh.
 func hostDispatchSpawnable(st Stage) (fresh bool) {
 	return st.State != "dispatched"
+}
+
+// hostDispatchAttempt is the stage's dispatch-attempt identity: its
+// dispatched_at, which the database re-stamps on every transition INTO
+// 'dispatched' and never clears (migration 0072, run.StageAttemptToken). ""
+// for a stage that has never been dispatched.
+func hostDispatchAttempt(st Stage) string {
+	if st.DispatchedAt == nil {
+		return ""
+	}
+	return st.DispatchedAt.UTC().Format(time.RFC3339Nano)
+}
+
+// hostDispatchWorkingDirPresent reports whether workingDir exists on THIS
+// host as a directory. Confinement accepts a path that does not exist, and
+// nothing binds a marked run to the host that owns its checkout, so a
+// dispatcher whose roots merely cover the path string must not spawn a runner
+// against a missing checkout.
+func hostDispatchWorkingDirPresent(workingDir string) bool {
+	fi, err := os.Stat(workingDir)
+	return err == nil && fi.IsDir()
 }
 
 // hostDispatchConfined reports whether workingDir is non-empty, absolute and
@@ -289,7 +327,8 @@ func campaignPermits(link *runCampaignLink) (string, string) {
 }
 
 // evaluate decides one candidate run and walks the pre-marker sequence when it
-// is admissible. It is synchronous and commits nothing on a refusal.
+// is admissible. It is synchronous; a refusal commits at most the one
+// run_auto_driven row of the dispatch attempt it refused.
 func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDispatchOutcome {
 	o := hostDispatchOutcome{RunID: runID.String()}
 	view, err := h.r.fetchRunDriveView(ctx, runID)
@@ -305,6 +344,9 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 	}
 	if !hostDispatchConfined(run.WorkingDir, h.r.allowedRoots) {
 		return h.refuse(o, hdRefusePathOutside, fmt.Sprintf("working_dir %q is empty, relative or outside every allowed root", run.WorkingDir))
+	}
+	if !hostDispatchWorkingDirPresent(run.WorkingDir) {
+		return h.refuse(o, hdRefuseWorkingDirAbsent, fmt.Sprintf("working_dir %q is not a directory on this host; the run's checkout lives elsewhere", run.WorkingDir))
 	}
 	ok, why, eerr := h.eligible(ctx, run)
 	if eerr != nil {
@@ -421,10 +463,27 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 	if release == nil {
 		release = func() {}
 	}
+	// respawnHeld is true once this attempt holds the epoch's re-spawn. Every
+	// exit before the spawn returns it (releaseRespawn), so only an attempted
+	// spawn consumes the epoch.
+	respawnHeld := false
+	releaseRespawn := func(detail string) string {
+		if !respawnHeld {
+			return detail
+		}
+		respawnHeld = false
+		if err := h.respawns.Release(disp.ID, epoch); err != nil {
+			detail += "; returning the stale re-spawn reservation also failed, so this marker epoch stays consumed: " + err.Error()
+		}
+		return detail
+	}
+	// fail ends an admitted attempt with nothing spawned. It keeps
+	// h.recorded: the stage is untouched, so the row already written covers
+	// the next attempt of the same dispatch.
 	fail := func(code, detail string) hostDispatchOutcome {
 		release()
-		delete(h.recorded, disp.ID)
-		return h.refuse(o, code, detail)
+		o.Held = !o.StopMarkers
+		return h.refuse(o, code, releaseRespawn(detail))
 	}
 
 	if respawn {
@@ -435,6 +494,7 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		if !got {
 			return fail(hdRefuseStaleRespawnCap, "the stale re-spawn for this marker epoch was already used")
 		}
+		respawnHeld = true
 	}
 
 	// Acceptance admission and target check run after the campaign and pause
@@ -462,8 +522,10 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		}
 	}
 
-	// (3) Record run_auto_driven, fail closed — once per queue episode.
-	if !h.recorded[disp.ID] {
+	// (3) Record run_auto_driven, fail closed — once per dispatch attempt,
+	// however many ticks its marker is queued or refused.
+	attempt := hostDispatchAttempt(*disp)
+	if prev, ok := h.recorded[disp.ID]; !ok || prev != attempt {
 		note := ""
 		if respawn {
 			note = staleRedispatchNote
@@ -476,7 +538,7 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		}); rerr != nil {
 			return fail(hdRefuseRecordFailed, rerr.Error())
 		}
-		h.recorded[disp.ID] = true
+		h.recorded[disp.ID] = attempt
 	}
 
 	// (4) The host-dispatch marker.
@@ -485,7 +547,7 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		if _, queued := asConcurrencySlotQueued(hderr); queued {
 			release()
 			o.QueueEpisode = true
-			return h.refuse(o, hdRefuseSlotQueued, hderr.Error())
+			return h.refuse(o, hdRefuseSlotQueued, releaseRespawn(hderr.Error()))
 		}
 		if asHostMemoryPressure(hderr) {
 			o.StopMarkers = true

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 )
 
 // host_dispatcher_test.go drives the host-dispatcher core (E88.2 / #4526)
@@ -183,6 +185,7 @@ func (b *hdBackend) serve(w http.ResponseWriter, req *http.Request) {
 			code, resp := b.marker(parts[2], parts[4])
 			if code == 200 && strings.Contains(resp, `"transitioned":true`) {
 				b.setState(run, parts[4], "dispatched")
+				b.stampDispatched(run, parts[4])
 			}
 			writeJSON(w, code, resp)
 			return
@@ -192,6 +195,7 @@ func (b *hdBackend) serve(w http.ResponseWriter, req *http.Request) {
 				switch run.Stages[i].State {
 				case "pending", "awaiting_host_dispatch":
 					run.Stages[i].State = "dispatched"
+					b.stampDispatched(run, parts[4])
 					writeJSON(w, 200, `{"transitioned":true,"stage_state":"dispatched"}`)
 				default:
 					writeJSON(w, 200, fmt.Sprintf(`{"transitioned":false,"stage_state":%q}`, run.Stages[i].State))
@@ -213,6 +217,17 @@ func (b *hdBackend) setState(run *hdRun, stageID, state string) {
 	for i := range run.Stages {
 		if run.Stages[i].ID == stageID {
 			run.Stages[i].State = state
+		}
+	}
+}
+
+// stampDispatched models the migration-0072 trigger: every transition INTO
+// 'dispatched' re-stamps dispatched_at.
+func (b *hdBackend) stampDispatched(run *hdRun, stageID string) {
+	now := time.Now().UTC()
+	for i := range run.Stages {
+		if run.Stages[i].ID == stageID {
+			run.Stages[i].DispatchedAt = &now
 		}
 	}
 }
@@ -294,6 +309,10 @@ func (c *hdCounter) Reserve(stageID string, epoch time.Time) (bool, error) {
 	}
 	c.used[k] = true
 	return true, nil
+}
+func (c *hdCounter) Release(stageID string, epoch time.Time) error {
+	delete(c.used, c.key(stageID, epoch))
+	return nil
 }
 
 type hdHarness struct {
@@ -982,6 +1001,7 @@ type racingCounter struct{}
 
 func (racingCounter) Allowed(string, time.Time) bool          { return true }
 func (racingCounter) Reserve(string, time.Time) (bool, error) { return false, nil }
+func (racingCounter) Release(string, time.Time) error         { return nil }
 
 func TestHostDispatcher_StaleRespawnReserveIsBinding(t *testing.T) {
 	h := newHDHarness(t)
@@ -992,5 +1012,187 @@ func TestHostDispatcher_StaleRespawnReserveIsBinding(t *testing.T) {
 	}
 	if h.b.count(isRecordReq) != 0 || h.b.count(isMarkerReq) != 0 || h.gate.releases != 1 {
 		t.Fatalf("records=%d markers=%d releases=%d; want 0, 0, 1", h.b.count(isRecordReq), h.b.count(isMarkerReq), h.gate.releases)
+	}
+}
+
+// 8e9ca661: a marker refusal that leaves the stage parked (a later-wave
+// child's 409 dependency_not_satisfied, sustained 409 host_memory_pressure)
+// records ONE run_auto_driven row for the held dispatch, however many ticks
+// it is refused, and the admitted attempt adds none. The server's own code
+// is surfaced, and a held refusal is marked Held (memory pressure is not: it
+// is the host's state, not the run's). Counterfactual run by hand: restoring
+// `delete(h.recorded, disp.ID)` in fail() wrote 6 rows, RED.
+func TestHostDispatcher_HeldMarkerRecordsOncePerAttempt(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(nil)
+	answer := apiErrBody("dependency_not_satisfied", "wave 1 is not integrated")
+	h.b.marker = func(_, _ string) (int, string) {
+		if answer == "" {
+			return 200, `{"transitioned":true,"stage_state":"dispatched"}`
+		}
+		return 409, answer
+	}
+	for i := 0; i < 3; i++ {
+		o := h.eval(t, r)
+		if o.Spawned || o.Refusal != "dependency_not_satisfied" || !o.Held || o.StopMarkers {
+			t.Fatalf("held eval %d = %+v; want dependency_not_satisfied, Held", i, o)
+		}
+	}
+	answer = apiErrBody("host_memory_pressure", "host memory critical")
+	for i := 0; i < 2; i++ {
+		o := h.eval(t, r)
+		if o.Spawned || o.Refusal != hdRefuseMemoryPressure || o.Held || !o.StopMarkers {
+			t.Fatalf("memory-pressure eval %d = %+v; want host_memory_pressure, StopMarkers, not Held", i, o)
+		}
+	}
+	answer = ""
+	if o := h.eval(t, r); !o.Spawned {
+		t.Fatalf("admitted eval = %+v; want spawned", o)
+	}
+	if len(h.b.acts) != 1 || h.spawner.n() != 1 || h.gate.releases != 5 {
+		t.Fatalf("acts=%d spawns=%d releases=%d; want ONE row for the held dispatch, one spawn, 5 released reservations", len(h.b.acts), h.spawner.n(), h.gate.releases)
+	}
+	if n := h.b.count(isMarkerReq); n != 6 {
+		t.Fatalf("marker POSTs = %d; want 6 (every held attempt re-POSTs)", n)
+	}
+}
+
+// c85bb21d: the recorded mark is keyed on the stage's dispatch attempt
+// (dispatched_at). A stage queued here and then dispatched by someone else
+// (an operator's fishhawk_dispatch_stage) and re-opened by a fix-up is a NEW
+// attempt: its spawn is preceded by a fresh row. Counterfactual run by hand:
+// making hostDispatchAttempt return "" skipped the second row (acts=1), RED.
+func TestHostDispatcher_RecordedMarkFollowsDispatchAttempt(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(nil)
+	queued := true
+	h.b.marker = func(_, _ string) (int, string) {
+		if queued {
+			return 409, queuedBody()
+		}
+		return 200, `{"transitioned":true,"stage_state":"dispatched"}`
+	}
+	if o := h.eval(t, r); o.Refusal != hdRefuseSlotQueued || len(h.b.acts) != 1 {
+		t.Fatalf("queued = %+v acts=%d; want concurrency_slot_queued and one row", o, len(h.b.acts))
+	}
+	// The episode ends elsewhere: an operator dispatches the stage, its runner
+	// fails, and a fix-up re-opens the SAME stage row to pending. None of it is
+	// observed by this process between evaluations.
+	h.b.mu.Lock()
+	h.b.stampDispatched(r, r.Stages[0].ID)
+	r.Stages[0].State = "pending"
+	h.b.mu.Unlock()
+	queued = false
+	if o := h.eval(t, r); !o.Spawned {
+		t.Fatalf("re-opened stage = %+v; want spawned", o)
+	}
+	if len(h.b.acts) != 2 {
+		t.Fatalf("acts = %d; want a fresh row for the new dispatch attempt", len(h.b.acts))
+	}
+	h.b.mu.Lock()
+	lastRecord, lastMarker := -1, -1
+	for i, q := range h.b.reqs {
+		if isRecordReq(q) {
+			lastRecord = i
+		}
+		if isMarkerReq(q) {
+			lastMarker = i
+		}
+	}
+	h.b.mu.Unlock()
+	if lastRecord < 0 || lastRecord > lastMarker {
+		t.Fatalf("second row at request %d, admitting marker at %d; the row must precede the marker", lastRecord, lastMarker)
+	}
+}
+
+// d27d6170: a stale re-spawn whose attempt fails BEFORE the spawn (a
+// record-act 500, a marker refusal on the already-dispatched arm) returns the
+// epoch's reservation, so a later evaluation still gets the one re-spawn.
+// Only an attempted spawn consumes it. Counterfactual run by hand: replacing
+// the Release call with nothing returned stale_respawn_cap_reached on the
+// second evaluation, RED.
+func TestHostDispatcher_StaleRespawnReturnedOnPreSpawnFailure(t *testing.T) {
+	h := newHDHarness(t)
+	r := staleRun(h, time.Hour)
+	h.b.recordCode = 500
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseRecordFailed || !o.Respawn {
+		t.Fatalf("record 500 on the stale path = %+v; want record_act_failed", o)
+	}
+	h.b.recordCode = 0
+	refuse := true
+	h.b.marker = func(_, _ string) (int, string) {
+		if refuse {
+			return 409, apiErrBody("wave_not_integrated", "earlier wave not integrated")
+		}
+		return 200, `{"transitioned":false,"stage_state":"dispatched"}`
+	}
+	if o := h.eval(t, r); o.Spawned || o.Refusal != "wave_not_integrated" {
+		t.Fatalf("marker refusal on the stale path = %+v; want wave_not_integrated", o)
+	}
+	refuse = false
+	if o := h.eval(t, r); !o.Spawned || !o.Respawn {
+		t.Fatalf("after two pre-spawn failures = %+v; want the epoch's one re-spawn", o)
+	}
+	if len(h.b.acts) != 1 || h.spawner.n() != 1 {
+		t.Fatalf("acts=%d spawns=%d; want one row and one re-spawn", len(h.b.acts), h.spawner.n())
+	}
+	restarted := newHostDispatcher(h.d.r, h.d.binary, h.gate, h.d.respawns)
+	restarted.spawn, restarted.probe, restarted.environ = h.spawner.spawn, h.d.probe, h.d.environ
+	if o := restarted.evaluate(context.Background(), uuid.MustParse(r.ID)); o.Spawned || o.Refusal != hdRefuseStaleRespawnCap {
+		t.Fatalf("after the re-spawn = %+v; want stale_respawn_cap_reached (the spawn consumed the epoch)", o)
+	}
+}
+
+// 354e10dd: a working_dir inside an allowed root that does not exist on this
+// host (another host's checkout path) is refused before the campaign-link
+// read, with nothing recorded or POSTed. Counterfactual run by hand: making
+// hostDispatchWorkingDirPresent return true spawned against the missing
+// directory, RED.
+func TestHostDispatcher_WorkingDirAbsentRefused(t *testing.T) {
+	h := newHDHarness(t)
+	missing := h.addRun(func(r *hdRun) { r.WorkingDir = filepath.Join(h.root, "elsewhere") })
+	file := filepath.Join(h.root, "not-a-dir")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notDir := h.addRun(func(r *hdRun) { r.WorkingDir = file })
+	for _, r := range []*hdRun{missing, notDir} {
+		if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseWorkingDirAbsent {
+			t.Fatalf("working_dir %q = %+v; want working_dir_absent", r.WorkingDir, o)
+		}
+	}
+	if h.b.count(isLinkReq) != 0 || h.b.count(func(q hdRequest) bool { return q.Method == http.MethodPost }) != 0 || h.spawner.n() != 0 {
+		t.Fatal("an absent working_dir drew a campaign-link read, a POST or a spawn")
+	}
+}
+
+// 3fad0a0c / 939bae05 (FO ruling): the server refuses a host-dispatcher
+// subject every route outside hostdispatcher.Routes(). Every request the core
+// makes across its paths (spawn, acceptance admission, record act, marker,
+// category-C report, child parent read) must be on that allowlist, or the
+// dispatcher would be refused in production while these fakes answer.
+func TestHostDispatcher_RequestsStayOnServerAllowlist(t *testing.T) {
+	h := newHDHarness(t)
+	h.eval(t, h.addRun(nil))
+	h.eval(t, acceptanceRun(h))
+	zero := 0
+	parent := h.addRun(func(r *hdRun) { r.Stages = nil })
+	h.eval(t, h.addRun(func(r *hdRun) {
+		r.AutoDispatch, r.SliceIndex, r.DecomposedFrom = false, &zero, parent.ID
+		r.Stages = []Stage{{ID: uuid.NewString(), RunID: r.ID, Sequence: 1, Type: "implement", State: "awaiting_host_dispatch"}}
+	}))
+	h.eval(t, staleRun(h, time.Hour))
+	h.spawner.err = errors.New("exec: no such file")
+	h.eval(t, h.addRun(nil))
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	if len(h.b.reaps) != 1 {
+		t.Fatalf("reaps = %v; want the spawn-failure report exercised", h.b.reaps)
+	}
+	for _, q := range h.b.reqs {
+		path, _, _ := strings.Cut(q.Path, "?")
+		if !hostdispatcher.RouteAllowed(q.Method, path) {
+			t.Errorf("%s %s is not in hostdispatcher.Routes(); the server would answer 403 host_dispatcher_route_forbidden", q.Method, path)
+		}
 	}
 }

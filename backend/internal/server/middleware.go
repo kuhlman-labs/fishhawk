@@ -464,6 +464,20 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 			if hostdispatcher.IsSubject(id.Subject) && !fromTokenStore {
 				id = Identity{Subject: "anonymous"}
 			}
+			// Route allowlist (ADR-104 Q4 residual closed by the FO fix-up
+			// ruling on #4526): a host-dispatcher subject may call ONLY the
+			// routes the dispatcher uses (hostdispatcher.Routes()). Every
+			// other route — run-minting (POST /v0/runs, recover), gate
+			// decisions (scope amendments, crew escalations, scope
+			// completeness), cancel, concurrency promote — is refused here,
+			// before the handler and before any repository-configured check,
+			// so write:runs / write:stages never reach beyond the list.
+			if hostdispatcher.IsSubject(id.Subject) && !hostdispatcher.RouteAllowed(r.Method, r.URL.EscapedPath()) {
+				s.writeError(w, r, http.StatusForbidden, "host_dispatcher_route_forbidden",
+					"a host-dispatcher subject may call only the routes the host dispatcher uses; use an operator token for this route",
+					map[string]any{"method": r.Method, "path": r.URL.Path})
+				return
+			}
 
 			ctx := context.WithValue(r.Context(), ctxKeyIdentity, id)
 			next.ServeHTTP(w, r.WithContext(ctx))

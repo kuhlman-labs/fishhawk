@@ -1,8 +1,8 @@
 # hostdispatcher
 
-The ADR-104 host-dispatcher identity (E88.2 / #4526). Leaf package (strings
-only): the subject grammar, the ratified scope profile, the clamp and the
-record-act source tag. Server enforcement lives in
+The ADR-104 host-dispatcher identity (E88.2 / #4526). Leaf package (standard
+library only): the subject grammar, the ratified scope profile, the clamp, the route
+allowlist and the record-act source tag. Server enforcement lives in
 `backend/internal/server/middleware.go` (`bearerAuth`), `actor.go` and
 `autodrive_http.go`; minting in `backend/cmd/fishhawkd/token.go`; the migration
 exclusion in `backend/internal/tokenmigrate`. The dispatcher loop itself is
@@ -29,8 +29,8 @@ Withheld: `write:approvals` (the dispatcher never acts at a gate),
 ## Enforcement (server)
 
 1. **Clamp.** `bearerAuth`'s api-token branch clamps every dispatcher-subject
-   token to the profile. A hand-minted dispatcher token holding
-   `write:approvals` gets 403 `insufficient_scope` on approve.
+   token to the profile, so a hand-minted dispatcher token holding
+   `write:approvals` does not carry it to any handler.
 2. **Malformed subject.** A token-store record whose subject has the prefix but
    an invalid label is refused 401 `invalid_token_subject`.
 3. **Token store only.** After every credential branch has run, an identity
@@ -47,6 +47,10 @@ Withheld: `write:approvals` (the dispatcher never acts at a gate),
    subject under `write:runs` instead of `write:approvals`. The subject must
    send `source: host_dispatcher` (`SourceTag`), or it gets 400
    `validation_failed`. Every other subject keeps the `write:approvals` rule.
+6. **Route allowlist.** After the token-store guard, `bearerAuth` refuses a
+   dispatcher subject every route outside `Routes()` with 403
+   `host_dispatcher_route_forbidden`, before the handler and before any
+   repository-configured check (see below).
 
 ## Minting
 
@@ -67,40 +71,53 @@ subject first. It counts the row as Skipped and prints
 `skip  subject=host-dispatcher/<host> id=<id> (host-dispatcher profile)`, so
 the dry-run inventory names it.
 
-## Accepted residual: the profile's reach (ADR-104 Q4)
+## Route allowlist: the profile's reach (ADR-104 Q4)
 
-`write:runs` and `write:stages` are coarse operator scopes. Many routes check
-one of them and nothing more, so a dispatcher token passes their scope gate.
-The dispatcher's own code calls none of them except the record act and the
-host-dispatch marker. ADR-104 Q4 accepts this residual. There is no
-per-route dispatcher scope.
+`write:runs` and `write:stages` are coarse operator scopes: many routes check
+one of them and nothing more. ADR-104 Q4 accepted that reach as a residual; the
+FO's fix-up ruling on this delivery closes it with ONE server-side allowlist
+instead of per-handler refusals. A dispatcher subject may call only the routes
+`fishhawk-mcp host-dispatch` uses (`Routes()`):
 
-`TestHostDispatcherProfile_RouteReach`
-(`backend/internal/server/host_dispatcher_identity_test.go`) sends a request
-to every mutating route registered in `handlers.go` twice: once with a
-read-only control token, once with a dispatcher token hand-minted with the
-full operator set. It pins which routes let the dispatcher past the scope gate
-(`hdAdmittedRoutes`) and which refuse it (`hdRefusedRoutes`, for example
-approvals, merge, `auto-drive` gate acts, campaigns, captain verbs, concern
-resolve and deploy rollback). A route that changes class turns the test RED.
-When that happens, update the pinned list and this section together.
+| Route | Used for |
+|---|---|
+| `GET /v0/runs` | candidate list (`runner_kind=local`, `pending` / `running`) |
+| `GET /v0/runs/{run_id}` | drive view, forge target, parent read, `?include=campaign_link` (gate and reap) |
+| `GET /v0/runs/{run_id}/stages` | stage selection, in-flight refresh, the runner reaper's stage-state probe |
+| `POST /v0/runs/{run_id}/auto-drive/acts` | the `run_auto_driven` record act |
+| `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch` | the host-dispatch marker |
+| `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` | the category-C report for a failed spawn or a reaped runner |
+| `POST /v0/stages/{stage_id}/acceptance-admission` | acceptance admission before an acceptance spawn |
 
-Some admitted routes are reachable only past the scope gate. Their handlers may
-still refuse later, on run state, a subject check or validation. The table pins
-scope reach, not end-to-end success. `POST /v0/runs` is classified there but not
-pinned, because a sibling slice adds a 403 `host_dispatcher_cannot_start_runs`
-refusal with its own test.
+Every other route answers 403 `host_dispatcher_route_forbidden`, including
+the ones a dispatcher token's scopes would otherwise pass: run minting
+(`POST /v0/runs`, `POST /v0/runs/{run_id}/recover`, so a dispatcher cannot
+mint an inherited `auto_dispatch` child of a marked run), gate decisions
+(scope-amendment, crew-escalation and scope-completeness decisions),
+`cancel`, crew convert-to-concern, specialist admission, concurrency promote,
+stage progress, and every read outside the table. `handleCreateRun`'s own
+403 `host_dispatcher_cannot_start_runs` stays as defense in depth.
+`RouteAllowed` matches segments as `http.ServeMux` does and fails closed on a
+trailing slash, a dot or empty segment, an escaped slash or another method
+(HEAD is not GET).
 
-The admitted set at this delivery has 34 routes:
-concern defer/waive, release cut/notes/publish, run `auto-drive/acts`,
-`cancel`, `concerns/waive`, `consolidate`, divergence answer, `escapes`,
-`integrate-wave`, merge-queue promote/withdraw, `product-reports`,
-`rebase-branch`, `reconcile-merge`, `record-merge-observation`, `recover`,
-`redrive`, `reset-branch`, `retrigger-ci`, reviews reconcile/rerun, `revive`,
-scope-completeness decision, stage `host-dispatch` and `reap-failure`,
-`status-comment`, `vouch-commit`, stage `acceptance-admission`, `fixup` and
-`retry`, and `POST /v0/work-items`. The test's `hdAdmittedRoutes` is the
-authoritative list.
+Pins: `TestHostDispatcherProfile_RouteReach`
+(`backend/internal/server/host_dispatcher_identity_test.go`) drives every
+route registered in `handlers.go` with a dispatcher token hand-minted with the
+full operator set and asserts each one: an allowlisted route passes
+`bearerAuth` and its scope gate, every other route is 403
+`host_dispatcher_route_forbidden`. There is no unasserted bucket.
+`TestHostDispatcherAllowlist_RefusesBeforeHandler` reads committed state (a
+refused dispatcher `cancel` leaves the run running). On the client side,
+`TestHostDispatcher_RequestsStayOnServerAllowlist`
+(`backend/internal/mcpserver/host_dispatcher_test.go`) asserts every request
+the core makes is on the allowlist. Widening the list changes all three, and
+this table, together.
+
+Remaining reach (accepted): within the allowlist a stolen dispatcher token can
+record dispatch acts, post the marker for any run in its account, report a
+category-C stage failure, and run acceptance admission. It cannot approve,
+merge, mint, recover, cancel or decide a gate.
 
 ## Runner credential custody (narrower than ADR-104 Q4)
 

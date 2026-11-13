@@ -112,3 +112,47 @@ func TestParseSubject(t *testing.T) {
 		t.Errorf("SubjectFor(\"\") err = %v, want ErrInvalidSubject", err)
 	}
 }
+
+// TestRouteAllowed pins the allowlist matcher: every allowlisted pattern
+// matches its own concrete path, neighbours and malformed paths do not.
+// Counterfactual run by hand: making RouteAllowed return true for every
+// method turned the wrong-method rows RED.
+func TestRouteAllowed(t *testing.T) {
+	const id = "0b6a3b8e-0d2f-4a38-9a66-1f5bfb3c2d10"
+	for _, c := range []struct {
+		method, path string
+		want         bool
+	}{
+		{"GET", "/v0/runs", true},
+		{"GET", "/v0/runs/" + id, true},
+		{"GET", "/v0/runs/" + id + "/stages", true},
+		{"POST", "/v0/runs/" + id + "/auto-drive/acts", true},
+		{"POST", "/v0/runs/" + id + "/stages/" + id + "/host-dispatch", true},
+		{"POST", "/v0/runs/" + id + "/stages/" + id + "/reap-failure", true},
+		{"POST", "/v0/stages/" + id + "/acceptance-admission", true},
+		{"POST", "/v0/runs", false},
+		{"HEAD", "/v0/runs", false},
+		{"POST", "/v0/runs/" + id, false},
+		{"POST", "/v0/runs/" + id + "/recover", false},
+		{"POST", "/v0/runs/" + id + "/cancel", false},
+		{"POST", "/v0/runs/" + id + "/scope-amendments/" + id + "/decision", false},
+		{"POST", "/v0/crew-messages/1/escalation-decision", false},
+		{"GET", "/v0/runs/", false},
+		{"GET", "/v0/runs/" + id + "/", false},
+		{"GET", "//v0/runs", false},
+		{"GET", "/v0/runs/../tokens", false},
+		{"GET", "/v0/runs/" + id + "%2Fstages", false},
+		{"GET", "/v0/runs/%zz", false},
+		{"GET", "v0/runs", false},
+		{"GET", "/v0/runs/" + id + "/audit", false},
+	} {
+		if got := RouteAllowed(c.method, c.path); got != c.want {
+			t.Errorf("RouteAllowed(%s, %s) = %v, want %v", c.method, c.path, got, c.want)
+		}
+	}
+	r := Routes()
+	r[0] = "POST /v0/runs"
+	if RouteAllowed("POST", "/v0/runs") {
+		t.Fatal("Routes() returned the shared slice; a caller widened the allowlist")
+	}
+}

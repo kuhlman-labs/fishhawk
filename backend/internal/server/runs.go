@@ -1389,7 +1389,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// A host-dispatcher/<host> subject (ADR-104 Q4, E88.2 / #4526) holds
 	// write:runs to record its dispatch acts, but it is dispatch-only: it
 	// never STARTS a run (and so can never stamp its own auto_dispatch mark).
-	// Refused before the body is read, so a refused request writes nothing.
+	// bearerAuth's dispatcher route allowlist already refuses this route (and
+	// recover, the other run-minting route) 403 host_dispatcher_route_forbidden;
+	// this check is defense in depth for a caller that reaches the handler
+	// directly. Refused before the body is read, so a refused request writes
+	// nothing.
 	if hostdispatcher.IsSubject(IdentityFrom(r.Context()).Subject) {
 		s.writeError(w, r, http.StatusForbidden, "host_dispatcher_cannot_start_runs",
 			"a host-dispatcher subject is dispatch-only and cannot start runs; start the run with an operator token or the campaign driver",

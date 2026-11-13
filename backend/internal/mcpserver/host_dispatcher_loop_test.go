@@ -545,6 +545,48 @@ func TestTick_LedgerWriteFailureRefuses(t *testing.T) {
 	}
 }
 
+// d27d6170 (persisted counter): a stale re-spawn whose record act fails is
+// returned to the ledger, so the next tick still re-spawns once and a restart
+// then refuses; a Release whose ledger write fails keeps the key (the epoch
+// stays consumed, fail safe). Counterfactual run by hand: deleting the
+// re-add after the failed persist let Allowed answer true, RED.
+func TestTick_StaleRespawnReleasePersisted(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	old := lh.clock.Add(-2 * time.Hour)
+	r := lh.add(0, func(r *hdRun) { r.Stages[0].State = "dispatched"; r.Stages[0].UpdatedAt = old })
+	lh.b.recordCode = 500
+	a := lh.loop(nil)
+	lh.tick(a)
+	if o, _ := outcomeFor(a, r.ID); o.Refusal != hdRefuseRecordFailed || lh.spawner.n() != 0 {
+		t.Fatalf("tick 1 = %+v spawns=%d; want record_act_failed, no spawn", o, lh.spawner.n())
+	}
+	if len(a.ledger.Respawns) != 0 {
+		t.Fatalf("ledger respawns after a pre-spawn failure = %v; want the reservation returned", a.ledger.Respawns)
+	}
+	lh.b.recordCode = 0
+	lh.tick(a)
+	if lh.spawner.n() != 1 {
+		t.Fatalf("tick 2 spawns = %d; want the epoch's one re-spawn", lh.spawner.n())
+	}
+	b := lh.loop(nil)
+	lh.tick(b)
+	if o, _ := outcomeFor(b, r.ID); o.Refusal != hdRefuseStaleRespawnCap {
+		t.Fatalf("restart = %+v; want %s", o, hdRefuseStaleRespawnCap)
+	}
+
+	epoch := lh.clock.Add(-time.Hour)
+	if ok, err := b.Reserve("stage-x", epoch); !ok || err != nil {
+		t.Fatalf("Reserve = %v, %v", ok, err)
+	}
+	b.writeFile = func(string, string, []byte) error { return errors.New("disk full") }
+	if err := b.Release("stage-x", epoch); err == nil {
+		t.Fatal("Release with a failing ledger write returned nil")
+	}
+	if b.Allowed("stage-x", epoch) {
+		t.Fatal("a failed Release freed the epoch; it must stay consumed")
+	}
+}
+
 // A slot-queued answer releases the reservation (no spawn counted).
 func TestTick_QueuedReleasesReservation(t *testing.T) {
 	lh := newHDLoopHarness(t)
@@ -624,49 +666,177 @@ func mustStat(t *testing.T, p string) os.FileInfo {
 	return fi
 }
 
-// F7(e): the state-dir pid lock refuses a second dispatcher, takes over a
-// dead holder's lock, and a dispatcher whose lock was taken stops.
+// F7(e): the state-dir flock refuses a second dispatcher (naming the holder
+// pid), is released when the holder's file closes, and leaves the lock file in
+// place. Counterfactual run by hand: replacing the Flock call with a nil error
+// let the second acquire succeed, RED.
 func TestStateDirLock_SecondDispatcherRefused(t *testing.T) {
 	dir := t.TempDir()
-	unlock, err := acquireHostDispatchLock(dir)
+	a, err := acquireHostDispatchLock(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireHostDispatchLock(dir); err == nil || !strings.Contains(err.Error(), hdStateDirLocked) {
-		t.Fatalf("second lock: err = %v; want %s", err, hdStateDirLocked)
+	_, err = acquireHostDispatchLock(dir)
+	if err == nil || !strings.Contains(err.Error(), hdStateDirLocked) || !strings.Contains(err.Error(), "pid "+strconv.Itoa(os.Getpid())) {
+		t.Fatalf("second lock: err = %v; want %s naming pid %d", err, hdStateDirLocked, os.Getpid())
 	}
 	assertMode(t, filepath.Join(dir, hostDispatchLockFile), 0o600)
-	unlock()
-	if _, err := os.Stat(filepath.Join(dir, hostDispatchLockFile)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unlock left the lock file: %v", err)
+	a.unlock()
+	if _, err := os.Stat(filepath.Join(dir, hostDispatchLockFile)); err != nil {
+		t.Fatalf("unlock removed the lock file (a contender could lock a fresh inode): %v", err)
 	}
+	b, err := acquireHostDispatchLock(dir)
+	if err != nil {
+		t.Fatalf("lock not free after the holder released it: %v", err)
+	}
+	b.unlock()
+}
 
-	// A dead holder's lock is taken over.
+// hdContend starts n contenders at once over dir. Each winner holds the lock
+// for a while and records how many winners were inside together.
+func hdContend(t *testing.T, dir string, n int) (winners, maxInside int) {
+	t.Helper()
+	var (
+		mu     sync.Mutex
+		inside int
+		wg     sync.WaitGroup
+	)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			lock, err := acquireHostDispatchLock(dir)
+			if err != nil {
+				if !strings.Contains(err.Error(), hdStateDirLocked) {
+					t.Errorf("contender error = %v; want %s", err, hdStateDirLocked)
+				}
+				return
+			}
+			mu.Lock()
+			winners++
+			inside++
+			if inside > maxInside {
+				maxInside = inside
+			}
+			mu.Unlock()
+			time.Sleep(50 * time.Millisecond) // the protected tick work
+			if !lock.held() {
+				t.Error("a winner lost its lock mid-hold")
+			}
+			mu.Lock()
+			inside--
+			mu.Unlock()
+			lock.unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	return winners, maxInside
+}
+
+// 8c4a6c05: concurrent dispatcher starts over one state dir; at most one is
+// ever inside the protected work. Counterfactual run by hand: replacing the
+// Flock call with a nil error let every contender in together, RED.
+func TestStateDirLock_ConcurrentStartsExclusive(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		winners, maxInside := hdContend(t, t.TempDir(), 16)
+		if winners < 1 || maxInside != 1 {
+			t.Fatalf("round %d: winners=%d max inside together=%d; want >=1 and exactly 1", round, winners, maxInside)
+		}
+	}
+}
+
+// 8c4a6c05: a dead holder's lock (an old pid file, a crashed process whose
+// file the kernel closed) is taken over by exactly one of many concurrent
+// contenders; none of them removes another's lock. Counterfactual run by
+// hand: replacing the Flock call with a nil error let every contender take
+// it over together, RED.
+func TestStateDirLock_StaleTakeoverExclusive(t *testing.T) {
+	dir := t.TempDir()
+	// A pre-flock pid file naming a dead pid, then a holder that crashes: its
+	// file is closed without the unlock path (the kernel's release on exit).
 	if err := os.WriteFile(filepath.Join(dir, hostDispatchLockFile), []byte("2147483646"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	unlock, err = acquireHostDispatchLock(dir)
+	crashed, err := acquireHostDispatchLock(dir)
 	if err != nil {
-		t.Fatalf("stale lock not taken over: %v", err)
+		t.Fatalf("a stale pid file blocked the lock: %v", err)
 	}
-	defer unlock()
+	_ = crashed.f.Close()
+	for round := 0; round < 5; round++ {
+		winners, maxInside := hdContend(t, dir, 16)
+		if winners < 1 || maxInside != 1 {
+			t.Fatalf("round %d: winners=%d max inside together=%d; want >=1 and exactly 1", round, winners, maxInside)
+		}
+	}
+}
 
-	// A dispatcher whose lock now names another pid stops at its next tick.
+// A dispatcher whose lock file was removed and re-created (so another
+// dispatcher could lock the new file) stops at its next tick before any
+// request. Counterfactual run by hand: making held() return true let the
+// tick proceed with no lock-lost error, RED.
+func TestStateDirLock_ReplacedLockStopsTick(t *testing.T) {
 	lh := newHDLoopHarness(t)
-	lh.dir = dir
 	l := lh.loop(nil)
-	lockPath := filepath.Join(dir, hostDispatchLockFile)
-	pid := os.Getpid()
-	l.lockHeld = func() bool { h, err := readHostDispatchLock(lockPath); return err == nil && h == pid }
-	if err := os.WriteFile(lockPath, []byte(strconv.Itoa(pid+1)), 0o600); err != nil {
+	lock, err := acquireHostDispatchLock(lh.dir)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer lock.unlock()
+	l.lockHeld = lock.held
+	lockPath := filepath.Join(lh.dir, hostDispatchLockFile)
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	other, err := acquireHostDispatchLock(lh.dir)
+	if err != nil {
+		t.Fatalf("the replacement lock: %v", err)
+	}
+	defer other.unlock()
 	lh.add(0, nil)
 	if err := l.tick(context.Background()); err == nil || !strings.Contains(err.Error(), hdRefuseLockLost) {
-		t.Fatalf("tick with a lost lock: err = %v; want %s", err, hdRefuseLockLost)
+		t.Fatalf("tick with a replaced lock: err = %v; want %s", err, hdRefuseLockLost)
 	}
-	if lh.b.count(func(hdRequest) bool { return true }) != 0 {
+	if lh.b.count(func(hdRequest) bool { return true }) != 0 || len(lh.listQuery) != 0 {
 		t.Fatal("a dispatcher that lost its lock still made requests")
+	}
+}
+
+// 667525a3: older runs whose marker the server keeps refusing (later-wave
+// children held at 409 dependency_not_satisfied) cannot spend every tick's
+// budget: a held run moves last, so a newer admissible run is spawned on the
+// next tick, and each held dispatch records one row, not one per tick.
+// Counterfactual run by hand: dropping `|| o.Held` from record() left the
+// newer run unspawned after 3 ticks, RED.
+func TestTick_HeldOlderRunsDoNotStarveNewer(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	held := map[string]bool{}
+	for i := 0; i < hostDispatchDefaultPerTick; i++ {
+		r := lh.add(-time.Duration(10-i)*time.Hour, nil)
+		held[r.ID] = true
+	}
+	newer := lh.add(0, nil)
+	lh.b.marker = func(runID, _ string) (int, string) {
+		if held[runID] {
+			return 409, apiErrBody("dependency_not_satisfied", "wave 1 is not integrated")
+		}
+		return 200, `{"transitioned":true,"stage_state":"dispatched"}`
+	}
+	l := lh.loop(func(c *HostDispatcherConfig) { c.PerTickCap = hostDispatchDefaultPerTick })
+	lh.tick(l)
+	if markersFor(lh.b, newer.ID) != 0 {
+		t.Fatal("tick 1 reached the newer run; the fixture needs per-tick-cap held runs ahead of it")
+	}
+	for tick := 2; tick <= 3 && lh.spawner.n() == 0; tick++ {
+		lh.tick(l)
+	}
+	if lh.spawner.n() != 1 || lh.spawner.spawns[0].Run != newer.ID {
+		t.Fatalf("spawns = %+v; want the newer run spawned by tick 3", lh.spawner.spawns)
+	}
+	if len(lh.b.acts) != hostDispatchDefaultPerTick+1 {
+		t.Fatalf("run_auto_driven rows = %d; want one per held dispatch plus the spawn (%d)", len(lh.b.acts), hostDispatchDefaultPerTick+1)
 	}
 }
 
@@ -694,7 +864,9 @@ func TestRunHostDispatcher_ConfigRefusals(t *testing.T) {
 	if serr != nil || st.LastTickAt.IsZero() || st.LastRefusalCode != hdRefuseListFailed {
 		t.Fatalf("status after one tick = %+v, %v; want a tick with list_runs_failed", st, serr)
 	}
-	if _, err := os.Stat(filepath.Join(dir, hostDispatchLockFile)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("clean exit left the lock: %v", err)
+	lock, lerr := acquireHostDispatchLock(dir)
+	if lerr != nil {
+		t.Fatalf("clean exit did not release the lock: %v", lerr)
 	}
+	lock.unlock()
 }

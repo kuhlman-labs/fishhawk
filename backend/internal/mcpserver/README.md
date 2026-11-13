@@ -75,8 +75,10 @@ The host dispatcher is a long-lived loop that spawns the parked stages of
 acts at a gate: it holds no reference to `AutoDriveRunGate`, approval, merge or
 scope-amendment-decision methods. The identity contract (the
 `host-dispatcher/<host>` subject, its four-scope profile, the record-act
-admission, and the accepted `write:stages` residual) is
-`backend/internal/hostdispatcher/README.md`. Mint the credential with
+admission, and the server's route allowlist, which refuses a dispatcher token
+every route this loop does not call) is
+`backend/internal/hostdispatcher/README.md`. Every request the core makes is
+pinned to that allowlist by `TestHostDispatcher_RequestsStayOnServerAllowlist`. Mint the credential with
 `fishhawkd token issue --subject host-dispatcher/<host>`. The command takes it
 through the same `loadConfig` ladder as the server modes.
 
@@ -98,10 +100,12 @@ The scripts/dev wiring and its operator documentation are
 
 **Eligibility** (`host_dispatcher.go`). A run is a candidate when it is local,
 not terminal, has a `working_dir` that is non-empty, absolute and inside an
-allowed root (`path_outside_allowed_roots` otherwise), and either carries the
-mark or is a decomposition child whose parent carries it. A parent read error
-skips the child (fail closed). A verify-only re-open is eligible only through
-that same mark: an unmarked run is never spawned, whatever re-opened it. The
+allowed root (`path_outside_allowed_roots` otherwise) and that exists on this
+host as a directory (`working_dir_absent` otherwise, before the campaign-link
+read), and either carries the mark or is a decomposition child whose parent
+carries it. A parent read error skips the child (fail closed). A verify-only
+re-open is eligible only through that same mark: an unmarked run is never
+spawned, whatever re-opened it. The
 stage comes from `driveDispatchableStage`. A failed stage is never re-picked,
 so the dispatcher originates no retries.
 
@@ -114,22 +118,33 @@ ancestry is `campaign_link_unresolved`, both fail closed. Any other campaign
 state is `campaign_not_running`. (2) The loop's gate (`hostDispatchLoop.Admit`)
 checks the pause file, max in-flight and the daily cap, then reserves the
 ledger entry and persists it. (3) `run_auto_driven` is recorded with
-`source: host_dispatcher`, fail closed, once per queue episode. (4) The
-host-dispatch marker is POSTed. (5) The runner is spawned. Each refusal commits
-nothing: the reservation is released and no marker or spawn follows.
-A 409 `concurrency_slot_queued` leaves the stage at `awaiting_host_dispatch` for
-the next tick. There is no asynchronous slot waiter: the tick is the only
+`source: host_dispatcher`, fail closed, once per dispatch attempt. The attempt
+is the stage's `dispatched_at` (re-stamped on every transition into
+`dispatched`, never cleared), so a marker that is queued or refused for many
+ticks (a later-wave child's 409 `dependency_not_satisfied`, sustained
+`host_memory_pressure`) writes one row, and a stage someone else dispatched and
+a fix-up re-opened is a new attempt with a fresh row before its spawn. (4) The
+host-dispatch marker is POSTed. (5) The runner is spawned. Every refusal
+releases the reservation and no spawn follows; a refusal before (3) commits
+nothing, and one after it keeps that attempt's row. A refusal after the gate
+admitted the attempt (the marker refused it, the record act failed, the
+acceptance target is missing; not `host_memory_pressure`) marks the outcome
+held. A 409 `concurrency_slot_queued` leaves the stage at
+`awaiting_host_dispatch` for the next tick. There is no asynchronous slot waiter: the tick is the only
 admission path, and `concurrency_slot.go` is untouched. A 409
 `host_memory_pressure` stops markers for the rest of the tick. A
 `transitioned:false` answer is `marker_not_transitioned` with no spawn.
 
 **Refusal codes.** Per candidate: `runner_kind_not_local`, `run_terminal`,
-`path_outside_allowed_roots`, `not_eligible`, `parent_unreadable`,
+`path_outside_allowed_roots`, `working_dir_absent`, `not_eligible`,
+`parent_unreadable`,
 `nothing_dispatchable`, `in_flight`, `stale_runner_live`,
 `stale_runner_unknown`, `stale_respawn_cap_reached`, the three campaign codes,
 `paused`, `cap_reached:max_in_flight`, `cap_reached:daily`,
 `ledger_write_failed`, `record_act_failed`, `concurrency_slot_queued`,
-`host_memory_pressure`, `marker_not_transitioned`, `spawn_failed`. Per tick:
+`host_memory_pressure`, `marker_not_transitioned`, `spawn_failed`, and the
+server's own code for any other marker refusal (for example
+`dependency_not_satisfied`, `wave_not_integrated`, `campaign_dispatch_held`). Per tick:
 `cap_reached:per_tick`, `ledger_read_failed`, `list_runs_failed`,
 `state_dir_lock_lost`. The status file records the latest one that is not a
 routine skip.
@@ -144,9 +159,11 @@ ledger and rolls the UTC day. It reaps: a run this process spawned that is now
 only stages the server still reports `dispatched` or `running` (a read error
 keeps the entry, fail closed). It lists local `pending` and `running` runs
 (bounded pagination). It orders them: live queue episodes first, oldest
-episode first, then `created_at` and `id`. A run whose latest read refused it
-for campaign state moves last until a fresh read stops refusing it, and is
-never skipped without that read. Finally it evaluates candidates until the
+episode first, then `created_at` and `id`. A run whose latest evaluation was
+refused for campaign state, or held after the gate admitted it, moves last
+until a fresh evaluation stops refusing it, and is never skipped without that
+evaluation. Older held runs therefore cannot spend every tick's budget: a newer
+admissible run is reached on the next tick. Finally it evaluates candidates until the
 per-tick cap of candidates that reached the campaign-link read is spent. That
 cap therefore bounds both the campaign-link reads and the marker POSTs per tick.
 The daily count is persisted and rolls over at 00:00:00Z, so a restart does
@@ -167,8 +184,11 @@ that is past `--stale-after`, is probed. When the probe answers live or
 unknown, the stage is reported and never spawned. When it answers dead, the
 stage is re-spawned at most once per (stage id, marker epoch). The marker epoch
 is the later of the stage's `updated_at` and `started_at`. The counter is
-persisted in the ledger and reserved before the spawn, so a restart never
-grants a second re-spawn for the same epoch (ADR-104 Q2). When a runner this
+persisted in the ledger and reserved before any POST, so a restart never
+grants a second re-spawn for the same epoch (ADR-104 Q2). An attempt that ends
+before the spawn (a later refusal, a record or marker failure) returns the
+reservation, so only an attempted spawn consumes the epoch; if returning it
+fails to persist, the epoch stays consumed (fail safe). When a runner this
 process spawned exits early, its own detached reaper reports a failed stage,
 and selection never re-picks a failed stage. The single re-spawn therefore
 happens only after a dispatcher restart, or for a stage another process
@@ -180,11 +200,15 @@ owned by `os.Getuid()` (`state_dir_not_owned`). The owner is read from the
 `Uid` field of `FileInfo.Sys()` by reflection, and the check fails closed
 where that field is absent, for example on Windows. An existing dir is
 tightened to 0700. The ledger, status and pause files are 0600, written by
-temp file and rename. The `lock` file is a pid lock taken with `O_EXCL`: a
-live holder refuses a second dispatcher (`state_dir_locked`), and a dead
-holder's lock is taken over once. Every tick re-reads the lock, so if two
-dispatchers race a takeover, the loser stops at its next tick. Deleting the
-state dir resets the ledger.
+temp file and rename. The `lock` file carries an exclusive, non-blocking
+`flock(2)` held for the dispatcher's whole lifetime, so every tick's ledger
+work runs under it. A held lock refuses a second dispatcher
+(`state_dir_locked`, naming the holder's pid). The kernel releases the lock
+when the holder exits, however it exits, so a crashed dispatcher's lock is free
+at once and no contender ever reads, judges or removes another's lock. The file
+is never removed. Every tick checks that the path still names the locked
+inode: a dispatcher whose lock file was removed or replaced stops
+(`state_dir_lock_lost`). Deleting the state dir resets the ledger.
 
 **Env custody.** The spawned runner's environment is `os.Environ()` with every
 `FISHHAWK_API_TOKEN` entry removed, and every entry whose value equals the
@@ -194,8 +218,21 @@ receives a run-bound token that the runner mints. This fits ADR-104 Q1's "may
 be the forwarded token" and is narrower than ADR-104 Q4; it is a proposed
 amendment for Captain ratification.
 
+**Single-host assumption.** Nothing binds a marked run to the host that owns
+its checkout: candidates are filtered by `runner_kind=local`, the marker's
+`host` field is a concurrency-group label, and the `host-dispatcher/<host>`
+subject is never compared with the run. The dispatcher refuses a
+`working_dir` that does not exist on this host, but two dispatchers on
+different hosts whose allowed roots cover the same absolute path, both with a
+checkout there, could each spawn a run meant for the other. One dispatcher per
+backend account is the supported shape until eligibility binds to a host
+label (a run or campaign field, a follow-up).
+
 **Residuals (not in this delivery).** These remain open: the ADR-101 D4 kill
-switch for charter runs, a campaign's `max_in_flight`, the `fishhawk_doctor`
+switch for charter runs, the verify-only re-open of an UNMARKED local run
+(cut by F3: `rebaseOperatorActor` stamps `ActorUser` for any subject, so the
+re-open's actor is not decidable until the rebase and re-verify verbs record
+actor fidelity server-side), a campaign's `max_in_flight`, the `fishhawk_doctor`
 liveness/pause rung (it will read the status file), scheduler stamping of
 `auto_dispatch`, the `fishhawk_start_run` `auto_dispatch` flag, and the
 real-server end-to-end

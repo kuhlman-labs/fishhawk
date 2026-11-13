@@ -65,6 +65,17 @@ components:
         `api_tokens` table; revocation is immediate. Used by the CLI
         and any programmatic caller.
 
+        A token whose subject is `host-dispatcher/<host>` (ADR-104 Q4,
+        E88.2 / #4526) may call ONLY the routes `fishhawk-mcp
+        host-dispatch` uses: `GET /v0/runs`, `GET /v0/runs/{run_id}`,
+        `GET /v0/runs/{run_id}/stages`,
+        `POST /v0/runs/{run_id}/auto-drive/acts`,
+        `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`,
+        `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` and
+        `POST /v0/stages/{stage_id}/acceptance-admission`. Every other
+        route answers `403 host_dispatcher_route_forbidden` from the auth
+        middleware, before the handler runs, whatever the token's scopes.
+
     githubOIDC:
       type: http
       scheme: bearer
@@ -14522,11 +14533,13 @@ paths:
         '403':
           description: |
             The caller may not create runs: `insufficient_scope` (the
-            token lacks `write:runs`), or `host_dispatcher_cannot_start_runs`
-            — a `host-dispatcher/<host>` subject (ADR-104 Q4, E88.2 / #4526)
-            holds `write:runs` to record its dispatch acts but is
-            dispatch-only and never starts a run. The refusal fires before
-            the body is read; nothing is written.
+            token lacks `write:runs`), or, for a `host-dispatcher/<host>`
+            subject (ADR-104 Q4, E88.2 / #4526), which holds `write:runs`
+            to record its dispatch acts but is dispatch-only and never
+            starts a run, `host_dispatcher_route_forbidden` from the auth
+            middleware's dispatcher route allowlist (see `bearerToken`).
+            The handler's own `host_dispatcher_cannot_start_runs`, before
+            the body is read, is defense in depth. Nothing is written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

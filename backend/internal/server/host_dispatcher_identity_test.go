@@ -93,10 +93,13 @@ func hdErrCode(t *testing.T, w *httptest.ResponseRecorder) string {
 }
 
 // TestHostDispatcherToken_ClampDropsApprovals: a dispatcher token hand-minted
-// WITH write:approvals still cannot approve a plan — 403 insufficient_scope and
-// NO approval row. Counterfactual run by hand: deleting the ClampScopes call in
-// bearerAuth let the record's own write:approvals through and the approval row
-// landed, RED.
+// WITH write:approvals still cannot approve a plan — 403 and NO approval row.
+// The route allowlist refuses it first (host_dispatcher_route_forbidden); the
+// clamp behind it is pinned by TestHostDispatcherToken_ClampedIdentity.
+// Counterfactual run by hand: deleting the allowlist check AND the ClampScopes
+// call let the record's own write:approvals through (approve 200, the row
+// landed), RED; deleting only the allowlist check turned the code assertion
+// RED (insufficient_scope from the clamp).
 func TestHostDispatcherToken_ClampDropsApprovals(t *testing.T) {
 	tokens, ar, rr, aud := newFakeTokenRepo(), newFakeApprovalRepo(), newApprovalRunRepo(), &foAuditFake{}
 	s := New(Config{Addr: "127.0.0.1:0", APITokenRepo: tokens, ApprovalRepo: ar, RunRepo: rr, AuditRepo: aud,
@@ -112,8 +115,8 @@ func TestHostDispatcherToken_ClampDropsApprovals(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden || hdErrCode(t, w) != "insufficient_scope" {
-		t.Fatalf("approve with a dispatcher token = %d %s, want 403 insufficient_scope", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden || hdErrCode(t, w) != "host_dispatcher_route_forbidden" {
+		t.Fatalf("approve with a dispatcher token = %d %s, want 403 host_dispatcher_route_forbidden", w.Code, w.Body.String())
 	}
 	if n := len(ar.all); n != 0 {
 		t.Fatalf("a dispatcher recorded %d approval(s)", n)
@@ -125,7 +128,7 @@ func TestHostDispatcherToken_ClampDropsApprovals(t *testing.T) {
 func TestHostDispatcherToken_ClampedIdentity(t *testing.T) {
 	f := newHDFixture(t)
 	tok := f.mint(hdSubject, "write:approvals", "write:runs", "read:runs", "write:deploy", "write:stages", "read:audit")
-	id, status, body := driveBearerToken(f.s, f.tokens, nil, tok)
+	id, status, body := hdDriveBearerAt(f.s, tok, http.MethodGet, "/v0/runs")
 	if status != http.StatusOK || id.Subject != hdSubject {
 		t.Fatalf("dispatcher token refused: %d %s", status, body)
 	}
@@ -273,120 +276,69 @@ func TestBearerAuth_HostDispatcherSubjectOnlyViaTokenStore(t *testing.T) {
 	}
 }
 
-// --- F4: the profile's reach over every mutating route ---
+// hdDriveBearerAt runs bearerAuth alone for method + path and returns the
+// identity the next handler saw (empty when bearerAuth answered itself).
+func hdDriveBearerAt(s *Server, tok, method, path string) (Identity, int, string) {
+	var captured Identity
+	h := s.bearerAuth(s.cfg.APITokenRepo, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(method, path, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return captured, rec.Code, rec.Body.String()
+}
 
-// hdAdmittedRoutes is the ACCEPTED ADR-104 Q4 residual (documented in
-// backend/internal/hostdispatcher/README.md): the mutating routes whose scope
-// gate admits a host-dispatcher token holding the ratified profile
-// (read:runs, read:audit, write:runs, write:stages). A route here refuses a
-// read-only control token 403 insufficient_scope and lets the dispatcher past
-// that gate. Adding a route to this set (or a new write:runs / write:stages
-// route) turns TestHostDispatcherProfile_RouteReach RED: update this list AND
-// the README residual table together.
-var hdAdmittedRoutes = []string{
-	"POST /v0/concerns/{concern_id}/defer",
-	"POST /v0/concerns/{concern_id}/waive",
-	"POST /v0/releases/cut",
-	"POST /v0/releases/notes",
-	"POST /v0/releases/publish",
+// --- F4 + FO ruling: the dispatcher's reach is the route allowlist ---
+
+// hdWantAllowlist is the pinned host-dispatcher route allowlist
+// (hostdispatcher.Routes(), documented in backend/internal/hostdispatcher/
+// README.md): exactly the routes `fishhawk-mcp host-dispatch` calls. Widening
+// it turns TestHostDispatcherProfile_RouteReach RED: update this list, the
+// README and the dispatcher's request pin
+// (mcpserver TestHostDispatcher_RequestsStayOnServerAllowlist) together.
+var hdWantAllowlist = []string{
+	"GET /v0/runs",
+	"GET /v0/runs/{run_id}",
+	"GET /v0/runs/{run_id}/stages",
 	"POST /v0/runs/{run_id}/auto-drive/acts",
-	"POST /v0/runs/{run_id}/cancel",
-	"POST /v0/runs/{run_id}/concerns/waive",
-	"POST /v0/runs/{run_id}/consolidate",
-	"POST /v0/runs/{run_id}/divergence/{sequence}/answer",
-	"POST /v0/runs/{run_id}/escapes",
-	"POST /v0/runs/{run_id}/integrate-wave",
-	"POST /v0/runs/{run_id}/merge-queue/promote",
-	"POST /v0/runs/{run_id}/merge-queue/withdraw",
-	"POST /v0/runs/{run_id}/product-reports",
-	"POST /v0/runs/{run_id}/rebase-branch",
-	"POST /v0/runs/{run_id}/reconcile-merge",
-	"POST /v0/runs/{run_id}/record-merge-observation",
-	"POST /v0/runs/{run_id}/recover",
-	"POST /v0/runs/{run_id}/redrive",
-	"POST /v0/runs/{run_id}/reset-branch",
-	"POST /v0/runs/{run_id}/retrigger-ci",
-	"POST /v0/runs/{run_id}/reviews/reconcile",
-	"POST /v0/runs/{run_id}/reviews/rerun",
-	"POST /v0/runs/{run_id}/revive",
-	"POST /v0/runs/{run_id}/scope-completeness/decision",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure",
-	"POST /v0/runs/{run_id}/status-comment",
-	"POST /v0/runs/{run_id}/vouch-commit",
 	"POST /v0/stages/{stage_id}/acceptance-admission",
-	"POST /v0/stages/{stage_id}/fixup",
-	"POST /v0/stages/{stage_id}/retry",
-	"POST /v0/work-items",
 }
 
-// hdRefusedRoutes are the scope-gated mutating routes the dispatcher token is
-// refused on (403 insufficient_scope, or a named agent refusal).
-var hdRefusedRoutes = []string{
-	"PATCH /v0/refinement/sessions/{session_id}/draft",
-	"POST /v0/campaigns",
-	"POST /v0/campaigns/preview",
-	"POST /v0/captain/accept",
-	"POST /v0/captain/claim",
-	"POST /v0/captain/offer",
-	"POST /v0/captain/relinquish",
-	"POST /v0/captain/withdraw",
-	"POST /v0/concerns/{concern_id}/label",
-	"POST /v0/digest/mark-read",
-	"POST /v0/first-officer-seats",
-	"POST /v0/first-officer-seats/retire",
-	"POST /v0/refinement/sessions",
-	"POST /v0/refinement/sessions/{session_id}/decision",
-	"POST /v0/refinement/sessions/{session_id}/file",
-	"POST /v0/repos/{owner}/{name}/delegation/confirm",
-	"POST /v0/repos/{owner}/{name}/delegation/lower",
-	"POST /v0/runs/{run_id}/acceptance-arbitration",
-	"POST /v0/runs/{run_id}/auto-drive",
-	"POST /v0/runs/{run_id}/concerns/resolve",
-	"POST /v0/runs/{run_id}/deployment/rollback",
-	"POST /v0/runs/{run_id}/merge",
-	"POST /v0/stages/{stage_id}/approvals",
-	"POST /v0/stages/{stage_id}/clarification",
-	"POST /v0/stages/{stage_id}/revise",
-}
-
-// hdSiblingSliceRoutes are classified but NOT pinned here: slice 1 of the same
-// parent plan (E88.2 / #4526) refuses a host-dispatcher subject on POST
-// /v0/runs with 403 host_dispatcher_cannot_start_runs and pins that in
-// runs_create_test.go TestCreateRun_HostDispatcherSubjectRefused, so the route
-// moves from admitted to refused when that slice lands.
-var hdSiblingSliceRoutes = map[string]bool{"POST /v0/runs": true}
-
-var handleFuncRE = regexp.MustCompile(`mux\.HandleFunc\("((?:POST|PUT|PATCH|DELETE) [^"]+)"`)
+var handleFuncRE = regexp.MustCompile(`mux\.HandleFunc\("((?:GET|POST|PUT|PATCH|DELETE) [^"]+)"`)
 var pathParamRE = regexp.MustCompile(`\{([a-z_]+)\}`)
 
-// TestHostDispatcherProfile_RouteReach (F4) drives EVERY mutating route
-// registered in handlers.go with (a) a read-only control token and (b) a
-// host-dispatcher token hand-minted with the full operator set (so the clamp
-// is exercised on every route too), and pins which routes admit the
-// dispatcher. Classification per route:
-//
-//   - admitted: the control is refused 403 insufficient_scope and the
-//     dispatcher is not (it passed the scope gate);
-//   - refused: both are refused (403) — the route needs a scope or subject the
-//     profile withholds;
-//   - not scope-gated on this probe: the control is not refused by scope (the
-//     route has no scope gate, or validation answers first) — reported, not
-//     pinned, so a fixture change cannot silently move a route.
+// TestHostDispatcherProfile_RouteReach (F4, FO fix-up ruling on 3fad0a0c /
+// 939bae05) drives EVERY route registered in handlers.go, reads and writes,
+// with a host-dispatcher token hand-minted with the full operator set, and
+// asserts each one: an allowlisted route lets the dispatcher past bearerAuth
+// and its scope gate (no 401/403); every other route answers 403
+// host_dispatcher_route_forbidden. There is no unasserted bucket, so a new
+// route cannot sit unclassified, and recover, the scope-amendment and
+// crew-escalation decisions, convert-to-concern, specialist admission,
+// concurrency promote and cancel are all pinned refused. Counterfactual run
+// by hand: deleting the allowlist check in bearerAuth turned all 176
+// non-allowlisted rows RED (GET /healthz answered 200, cancel 200, ...).
 func TestHostDispatcherProfile_RouteReach(t *testing.T) {
 	src, err := os.ReadFile("handlers.go")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := hostdispatcher.Routes(); !slices.Equal(sortedCopy(got), sortedCopy(hdWantAllowlist)) {
+		t.Fatalf("hostdispatcher.Routes() changed; update hdWantAllowlist, the hostdispatcher README and the mcpserver request pin together.\n got %v\nwant %v", got, hdWantAllowlist)
+	}
 	f := newHDFixture(t)
-	control := f.mint("github:probe-control", "read:runs", "read:audit")
 	dispatcher := f.mint(hdSubject, operatorProbeScopes...)
 
-	var admitted, refused, ungated []string
 	seen := map[string]bool{}
+	var admitted []string
+	forbidden := 0
 	for _, m := range handleFuncRE.FindAllStringSubmatch(string(src), -1) {
 		route := m[1]
-		if seen[route] || hdSiblingSliceRoutes[route] {
+		if seen[route] {
 			continue
 		}
 		seen[route] = true
@@ -397,36 +349,77 @@ func TestHostDispatcherProfile_RouteReach(t *testing.T) {
 				if strings.HasPrefix(pattern, "/v0/runs/") {
 					return f.runID.String()
 				}
+			case "{sequence}":
+				return "1"
+			case "{owner}", "{name}":
+				return "probe"
 			}
 			return uuid.New().String()
 		})
 		path = strings.TrimSuffix(path, "{$}")
-		cw := f.do(method, path, control, `{}`)
-		dw := f.do(method, path, dispatcher, `{}`)
-		controlScopeRefused := cw.Code == http.StatusForbidden && hdErrCode(t, cw) == "insufficient_scope"
-		switch {
-		case !controlScopeRefused:
-			ungated = append(ungated, route)
-		case dw.Code == http.StatusForbidden || dw.Code == http.StatusUnauthorized:
-			refused = append(refused, route)
-		default:
+		w := f.do(method, path, dispatcher, `{}`)
+		if slices.Contains(hdWantAllowlist, route) {
 			admitted = append(admitted, route)
+			if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
+				t.Errorf("allowlisted %s refused the dispatcher: %d %s", route, w.Code, w.Body.String())
+			}
+			continue
 		}
+		if w.Code != http.StatusForbidden || hdErrCode(t, w) != "host_dispatcher_route_forbidden" {
+			t.Errorf("%s = %d %s; want 403 host_dispatcher_route_forbidden (not on the allowlist)", route, w.Code, w.Body.String())
+			continue
+		}
+		forbidden++
 	}
 	sort.Strings(admitted)
-	sort.Strings(refused)
-	sort.Strings(ungated)
-	t.Logf("not scope-gated on this probe (%d): %s", len(ungated), strings.Join(ungated, "\n  "))
-	if !slices.Equal(admitted, sortedCopy(hdAdmittedRoutes)) {
-		t.Errorf("routes admitting a host-dispatcher token changed; update hdAdmittedRoutes AND the hostdispatcher README residual.\n got (%d):\n  %s\nwant (%d):\n  %s",
-			len(admitted), strings.Join(admitted, "\n  "), len(hdAdmittedRoutes), strings.Join(sortedCopy(hdAdmittedRoutes), "\n  "))
+	if !slices.Equal(admitted, sortedCopy(hdWantAllowlist)) {
+		t.Errorf("allowlisted routes registered in handlers.go = %v; want every allowlist entry registered: %v", admitted, sortedCopy(hdWantAllowlist))
 	}
-	if !slices.Equal(refused, sortedCopy(hdRefusedRoutes)) {
-		t.Errorf("routes refusing a host-dispatcher token changed; update hdRefusedRoutes.\n got (%d):\n  %s\nwant (%d):\n  %s",
-			len(refused), strings.Join(refused, "\n  "), len(hdRefusedRoutes), strings.Join(sortedCopy(hdRefusedRoutes), "\n  "))
+	for _, must := range []string{
+		"POST /v0/runs",
+		"POST /v0/runs/{run_id}/recover",
+		"POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision",
+		"POST /v0/crew-messages/{sequence}/escalation-decision",
+		"POST /v0/crew-messages/{sequence}/convert-to-concern",
+		"POST /v0/specialist-jobs/{job_id}/admission",
+		"POST /v0/stages/{stage_id}/concurrency/promote",
+		"POST /v0/runs/{run_id}/stages/{stage_id}/progress",
+		"POST /v0/runs/{run_id}/cancel",
+	} {
+		if !seen[must] {
+			t.Errorf("%s is no longer registered in handlers.go; re-check this pin", must)
+		}
 	}
-	if !slices.Contains(admitted, "POST /v0/runs/{run_id}/auto-drive/acts") {
-		t.Errorf("record-act must admit the dispatcher (its one write:runs act)")
+	t.Logf("%d routes forbidden to the dispatcher, %d allowlisted", forbidden, len(admitted))
+}
+
+// TestHostDispatcherAllowlist_RefusesBeforeHandler reads committed state: a
+// dispatcher's POST /v0/runs/{id}/cancel (write:runs, which the profile holds)
+// leaves the run running, while an operator token with the same scope cancels
+// it. Counterfactual run by hand: deleting the allowlist check in bearerAuth
+// cancelled the run on the dispatcher's request, RED.
+func TestHostDispatcherAllowlist_RefusesBeforeHandler(t *testing.T) {
+	f := newHDFixture(t)
+	dispatcher := f.mint(hdSubject, hostdispatcher.Scopes()...)
+	path := "/v0/runs/" + f.runID.String() + "/cancel"
+	w := f.do(http.MethodPost, path, dispatcher, `{"reason":"probe"}`)
+	if w.Code != http.StatusForbidden || hdErrCode(t, w) != "host_dispatcher_route_forbidden" {
+		t.Fatalf("dispatcher cancel = %d %s; want 403 host_dispatcher_route_forbidden", w.Code, w.Body.String())
+	}
+	state := func() run.State {
+		f.runs.mu.Lock()
+		defer f.runs.mu.Unlock()
+		return f.runs.runs[f.runID].State
+	}
+	if got := state(); got != run.StateRunning {
+		t.Fatalf("run state after the refused dispatcher cancel = %s; want running", got)
+	}
+	op := f.mint("github:octocat", "write:runs", "read:runs")
+	if w := f.do(http.MethodPost, path, op, `{"reason":"probe"}`); w.Code >= 300 {
+		t.Fatalf("operator cancel = %d %s; want success (the refusal is subject-specific)", w.Code, w.Body.String())
+	}
+	if got := state(); got != run.StateCancelled {
+		t.Fatalf("run state after the operator cancel = %s; want cancelled", got)
 	}
 }
 

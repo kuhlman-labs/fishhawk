@@ -1,7 +1,8 @@
 // Package hostdispatcher defines the ADR-104 host-dispatcher identity (E88.2 /
 // #4526): the host-dispatcher/<host> token subject grammar, the ratified scope
-// profile (ADR-104 Q4) and the clamp the bearer middleware applies to every
-// dispatcher-subject token. It is a leaf package (strings only) so the server,
+// profile (ADR-104 Q4), the clamp the bearer middleware applies to every
+// dispatcher-subject token and the route allowlist it enforces. It is a leaf
+// package (standard library only) so the server,
 // `fishhawkd token issue`, `fishhawkd token migrate` and the dispatcher itself
 // share ONE definition of what a host dispatcher is. Long-form contract:
 // README.md.
@@ -10,6 +11,7 @@ package hostdispatcher
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -132,4 +134,84 @@ func OutsideProfile(requested []string) []string {
 		}
 	}
 	return out
+}
+
+// routes is the closed set of REST routes a host-dispatcher subject may call:
+// exactly the routes `fishhawk-mcp host-dispatch` uses
+// (backend/internal/mcpserver/host_dispatcher*.go and the shared helpers it
+// calls). The bearer middleware refuses every other route 403
+// host_dispatcher_route_forbidden before the handler and before any
+// repository-configured check, so no write:runs / write:stages route outside
+// this list (recover, scope-amendment and crew-escalation decisions, cancel,
+// concurrency promote, ...) is reachable with a dispatcher token. Widening it
+// is a contract change: update the README, the server's route-reach pin and
+// the dispatcher's request pin together.
+var routes = []string{
+	"GET /v0/runs",
+	"GET /v0/runs/{run_id}",
+	"GET /v0/runs/{run_id}/stages",
+	"POST /v0/runs/{run_id}/auto-drive/acts",
+	"POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch",
+	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure",
+	"POST /v0/stages/{stage_id}/acceptance-admission",
+}
+
+// Routes returns the allowlist as "METHOD /pattern" strings (a fresh slice per
+// call).
+func Routes() []string {
+	return append([]string(nil), routes...)
+}
+
+// RouteAllowed reports whether method and escapedPath (the request's
+// URL.EscapedPath(), no query) match an allowlisted route. Segments split on
+// "/" as http.ServeMux splits them: a {name} segment matches one non-empty
+// segment, a literal segment must equal the unescaped segment. A trailing
+// slash, an empty or dot segment, an escaped slash or an unparseable escape
+// never matches, and
+// the method must match exactly (HEAD is not GET): it fails closed.
+func RouteAllowed(method, escapedPath string) bool {
+	segs, ok := splitPath(escapedPath)
+	if !ok {
+		return false
+	}
+	for _, rt := range routes {
+		m, pattern, _ := strings.Cut(rt, " ")
+		if m != method {
+			continue
+		}
+		want, _ := splitPath(pattern)
+		if len(want) != len(segs) {
+			continue
+		}
+		match := true
+		for i, w := range want {
+			if strings.HasPrefix(w, "{") && strings.HasSuffix(w, "}") {
+				continue
+			}
+			if w != segs[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func splitPath(p string) ([]string, bool) {
+	if !strings.HasPrefix(p, "/") {
+		return nil, false
+	}
+	raw := strings.Split(p[1:], "/")
+	out := make([]string, 0, len(raw))
+	for _, seg := range raw {
+		u, err := url.PathUnescape(seg)
+		if err != nil || u == "" || u == "." || u == ".." || strings.Contains(u, "/") {
+			return nil, false
+		}
+		out = append(out, u)
+	}
+	return out, true
 }
