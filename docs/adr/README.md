@@ -405,6 +405,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-141: `amends: [ADR-035]`; ADR-035 gains `amended_by: [ADR-141]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
 - ADR-142: `amends: [ADR-090]`; ADR-090 gains `amended_by: [ADR-142]`, retains its `supersedes` and `superseded_by` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
 - ADR-143: `amends: [ADR-084]`; ADR-084 gains `amended_by: [ADR-143]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It narrows the CLI arm of ADR-084's in-body Amendment A1 until a proof of presence is adopted.
+- ADR-144: no edge. Its record-metadata line declares `amends: []`: it decides the proof-of-presence mechanism and adopts it for no action, so each later adoption is an amendment of the record that governs the action.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -614,6 +615,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-141](141-forge-confirmed-push-reports.md) | Require forge-confirmed push reports and isolate their retries (amends ADR-035) | `accepted` | [#5053](https://github.com/kuhlman-labs/fishhawk/issues/5053) |
 | [ADR-142](142-merge-verification-after-scenario-commits.md) | Keep merge verification requirements across acceptance scenario commits | `accepted` | [#5088](https://github.com/kuhlman-labs/fishhawk/issues/5088) |
 | [ADR-143](143-human-only-actions-credential-kind.md) | Human-only actions are refused on agent-drivable channels (amends ADR-084) | `accepted` | [#5231](https://github.com/kuhlman-labs/fishhawk/issues/5231) |
+| [ADR-144](144-proof-of-presence.md) | Proof of presence: a passkey step-up for decisions only a human may take | `accepted` | [#5239](https://github.com/kuhlman-labs/fishhawk/issues/5239) |
 
 ## Status unknown — needs captain confirmation
 
