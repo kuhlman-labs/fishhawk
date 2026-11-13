@@ -31,12 +31,22 @@
 // sandbox-exec instance. A `pkill`/`killall` by name from inside the sandbox
 // is refused with EPERM for every outside match.
 //
+// SignalProfile (#4858) renders the same signal section ALONE over `(allow
+// default)` — no network or credential rules — for the implement-stage
+// agents (implement, fix-up, conflict resolution), which need the network
+// and the toolchain but must not signal anything outside their own sandbox
+// instance. ProbeSignalConfinement proves the host enforces it
+// behaviourally: a `kill -0` of the runner's own pid from inside the
+// profile must be refused with EPERM. It extends the ADR-050 / #4855
+// containment; it is not a separate decision.
+//
 // The package is a stdlib-only leaf mirroring gateiso/sandbox.go's
 // probe/wrap shape. Long-form contract, the empirical matrix, and the
-// stated residuals (nested sandbox_apply refused, unix sockets outside the
-// credential denies open, Linux unavailable, a pre-existing hard link to a
-// credential file, a symlink re-pointed after the render): README.md next
-// to this file.
+// stated residuals (a nested DIFFERENT-profile sandbox_apply refused while
+// an identical one is a no-op, unix sockets outside the credential denies
+// open, Linux unavailable, a pre-existing hard link to a credential file, a
+// symlink re-pointed after the render, setuid /bin/ps refused): README.md
+// next to this file.
 package netsandbox
 
 import (
@@ -45,6 +55,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -128,6 +139,67 @@ func probe(ctx context.Context, goos string, lookPath func(string) (string, erro
 		return false, fmt.Sprintf("net-sandbox unavailable: sandbox-exec deny-all probe failed (%v)", err)
 	}
 	return true, ""
+}
+
+// UnavailableSignalNonDarwin is the reason ProbeSignalConfinement reports on
+// every non-darwin host (#4858). It names the Linux gap: Seatbelt is
+// macOS-only, a PID namespace (`unshare --pid --fork`) is the candidate
+// equivalent but needs its own probe and design, and until then an agent
+// shell on this OS can signal any process its user owns.
+const UnavailableSignalNonDarwin = "signal-sandbox unavailable: Seatbelt (sandbox-exec) is macOS-only; a PID namespace (unshare --pid --fork) is the candidate Linux equivalent and does not ship yet — agent shells on this OS can signal any same-user process"
+
+// SignalProfile (#4858) is the signal-only Seatbelt profile the implement,
+// fix-up and conflict-resolution agents run under: `(allow default)` plus
+// the signal section, and nothing else — no network, file or mach rules,
+// because those agents need the network and the toolchain. Its one allow is
+// exactly `(target same-sandbox)`.
+func SignalProfile() string {
+	return "(version 1)\n(allow default)\n" + signalClause
+}
+
+// ProbeSignalConfinement (#4858) reports whether this host ENFORCES
+// SignalProfile: darwin, sandbox-exec on PATH, the profile applies against
+// /usr/bin/true, and `/bin/kill -0 <this process's pid>` run under it is
+// refused with EPERM. Signal 0 delivers nothing, so the probe is harmless on
+// a host that does not enforce. The reason names what failed when
+// unavailable.
+func ProbeSignalConfinement(ctx context.Context) (available bool, reason string) {
+	return probeSignal(ctx, runtime.GOOS, exec.LookPath, probeExec, os.Getpid())
+}
+
+// probeSignal is ProbeSignalConfinement with its host probes injected. It
+// reuses probeExec, so the package adds no exec site.
+func probeSignal(ctx context.Context, goos string, lookPath func(string) (string, error), run func(context.Context, string, ...string) error, selfPID int) (bool, string) {
+	const pre = "signal-sandbox unavailable: "
+	if goos != "darwin" {
+		return false, UnavailableSignalNonDarwin
+	}
+	if _, err := lookPath(sandboxExec); err != nil {
+		return false, fmt.Sprintf(pre+"%s not on PATH (%v)", sandboxExec, err)
+	}
+	// Covers the exit-65 grammar rejection and the exit-71 nested
+	// `sandbox_apply: Operation not permitted` (this process already runs
+	// under a DIFFERENT profile).
+	argv := Wrap([]string{"/usr/bin/true"}, SignalProfile())
+	if err := run(ctx, argv[0], argv[1:]...); err != nil {
+		return false, fmt.Sprintf(pre+"sandbox-exec could not apply the signal profile (%v)", err)
+	}
+	argv = Wrap([]string{"/bin/kill", "-0", strconv.Itoa(selfPID)}, SignalProfile())
+	err := run(ctx, argv[0], argv[1:]...)
+	switch {
+	case err == nil:
+		return false, pre + "profile applied but kill -0 of the runner's own pid was not refused: the host does not enforce (target same-sandbox), or this process already runs inside an identical sandbox instance (a nested identical apply is a no-op)"
+	case !signalRefused(err):
+		return false, fmt.Sprintf(pre+"could not prove enforcement (%v)", err)
+	}
+	return true, ""
+}
+
+// signalRefused reports whether a probe error is the kernel's EPERM for the
+// signal — the only failure that proves enforcement. probeExec folds the
+// command's output into the error, so the text is kill's own message.
+func signalRefused(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Operation not permitted")
 }
 
 const (

@@ -91,8 +91,12 @@ func removeEnv(env []string, key string) []string {
 func TestProcsweepHelperNoop(t *testing.T) {}
 
 func TestSweep_ReapsOrphanedSetsidDescendant(t *testing.T) {
-	if _, err := exec.LookPath("ps"); err != nil {
-		t.Skip("ps not available on this host")
+	// A REAL exec probe, not LookPath: inside a signal-confined agent shell
+	// (#4858) sandbox-exec refuses the setuid /bin/ps (exit 71) while LookPath
+	// still finds it, and both processPPID and the sweep's real readTable
+	// (proctable_unix.go) exec ps.
+	if out, err := exec.Command("ps", "-o", "pid=", "-p", strconv.Itoa(os.Getpid())).CombinedOutput(); err != nil {
+		t.Skipf("ps cannot exec on this host (%v: %s) — e.g. a signal-confined agent shell (#4858) where setuid /bin/ps is refused; not a regression", err, strings.TrimSpace(string(out)))
 	}
 
 	// The stage-start floor is taken BEFORE the helper spawns, so the grandchild

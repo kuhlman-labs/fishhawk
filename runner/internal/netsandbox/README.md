@@ -1,6 +1,9 @@
 # runner/internal/netsandbox
 
-OS-level confinement of the acceptance agent's WHOLE process tree (E72 / [#3393](https://github.com/kuhlman-labs/fishhawk/issues/3393)). Stdlib-only leaf; mirrors `gateiso/sandbox.go`'s probe/wrap shape. Consumed at ONE site: `runner/cmd/fishhawk-runner/acceptancesandbox.go::configureAcceptanceNetSandbox`, wired into `main.go`'s acceptance block directly after `egressproxy.Start`, threaded to the adapters via `agent.Invocation.ExecWrapper`.
+OS-level confinement of an agent's WHOLE process tree (E72 / [#3393](https://github.com/kuhlman-labs/fishhawk/issues/3393)). Stdlib-only leaf; mirrors `gateiso/sandbox.go`'s probe/wrap shape. Two consumers, both threaded to the adapters via `agent.Invocation.ExecWrapper`:
+
+- `runner/cmd/fishhawk-runner/acceptancesandbox.go::configureAcceptanceNetSandbox` — the COMPOSED acceptance profile (`Profile` + `WithSignalConfinement` + `WithCredentialDeny`), wired into `main.go`'s acceptance block directly after `egressproxy.Start`.
+- `runner/cmd/fishhawk-runner/implementsandbox.go` — the signal-only `SignalProfile()` on every implement-stage agent spawn (implement, fix-up, conflict resolution; [#4858](https://github.com/kuhlman-labs/fishhawk/issues/4858)), § "Signal-only profile" below.
 
 ## Why an OS layer
 
@@ -35,6 +38,43 @@ Renders immediately after `(allow default)`, BEFORE the credential section and t
 ```
 
 A process under the profile can signal only processes in its OWN sandbox instance: everything it started (child, double-forked grandchild re-parented to launchd, a process group it created with `setpgid`) stays killable; the host `fishhawkd`, the acceptance preview, another stage's runner or agent, and a process under a SEPARATE `sandbox-exec` instance of the same profile are refused with `EPERM`. The allow is exactly the App Sandbox base profile's own (`/System/Library/Sandbox/Profiles/application.sb`) — no pid, process-name or path exception. Two rejected spellings: `(deny signal (target others))` did NOT deny an outside kill on Darwin 27.0.1 (the victim died, `kill` exited 0), and `(allow signal (target pgrp))` admitted an outside victim in the agent's process group. The runner applies this option on every applied acceptance profile; `Probe` carries the same clause, so a host that rejects the grammar reports `unavailable` (pre-spawn, loud) instead of failing `sandbox-exec` at agent spawn.
+
+### Signal-only profile: `SignalProfile()` (#4858)
+
+**Decision record.** This EXTENDS the accepted ADR-050 / [#4855](https://github.com/kuhlman-labs/fishhawk/issues/4855) acceptance containment to the implement-stage agents; the FO ruled it an extension, not a new ADR (campaign 6, [#4858](https://github.com/kuhlman-labs/fishhawk/issues/4858)). It is reversible at runtime with no rebuild: `FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX=off`.
+
+```
+(version 1)
+(allow default)
+(deny signal)
+(allow signal (target same-sandbox))
+```
+
+The same signal section as `WithSignalConfinement`, alone over `(allow default)`. There are NO network, file or mach rules: implement, fix-up and conflict-resolution agents need the network (model API, module proxies, the forge through their own credentials) and the whole toolchain, and their containment is the worktree and the workflow's path constraints, not egress. The only thing this profile takes away is signalling a process outside the agent's own sandbox instance — the #4855 incident shape (`pkill` by name stopping the host `fishhawkd`) on the stages that run most often. `TestSignalProfile_Golden` pins the four lines and the absence of `network`, `file-read` and `mach-lookup`.
+
+`ProbeSignalConfinement(ctx)` proves ENFORCEMENT, not just presence; it reuses the package's one probe exec (`probeExec`), so the runner's spawn ratchet sees no new exec site. Its reasons (`TestProbeSignalConfinement_Rows`, one row each), all prefixed `signal-sandbox unavailable:`:
+
+| Branch | Reason |
+|---|---|
+| non-darwin | `UnavailableSignalNonDarwin` (Seatbelt is macOS-only; a PID namespace, `unshare --pid --fork`, is the candidate) |
+| `sandbox-exec` not on PATH | `sandbox-exec not on PATH (<err>)` |
+| `sandbox-exec -p <SignalProfile> /usr/bin/true` fails | `sandbox-exec could not apply the signal profile (<err>)` — the exit-65 grammar rejection, and the exit-71 nested `sandbox_apply: Operation not permitted` when the runner already runs under a DIFFERENT profile |
+| `/bin/kill -0 <runner pid>` under the profile SUCCEEDS | `profile applied but kill -0 of the runner's own pid was not refused: the host does not enforce (target same-sandbox), or this process already runs inside an identical sandbox instance (a nested identical apply is a no-op)` |
+| the kill fails without `Operation not permitted` | `could not prove enforcement (<err>)` |
+| the kill fails with `Operation not permitted` | available |
+
+Signal 0 delivers nothing, so the probe is harmless on a host that does not enforce. The apply probe is load-bearing: without it, the exit-71 nested-apply text (which itself contains `Operation not permitted`) would read as a refused kill.
+
+**Policy: `FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX`** (runner-process config, dropped from the agent env by `agentenv`'s `FISHHAWK_` deny prefix):
+
+| Value | Behaviour | Event (exactly one per stage configuration) |
+|---|---|---|
+| `auto` (default, empty) | wrap when `ProbeSignalConfinement` says available; otherwise spawn unwrapped, LOUDLY, reason printed | `implement_signal_sandbox_applied {mode, mechanism:"seatbelt", signals_confined:true}` / `implement_signal_sandbox_unavailable {mode, reason, signals_confined:false}` |
+| `require` | unavailable fails the stage category-C BEFORE any spawn (the conflict-resolution stage too) | `implement_signal_sandbox_required {mode, reason}` → `runner_failed` |
+| `off` | never probe, never wrap — the kill switch | `implement_signal_sandbox_disabled {mode, signals_confined:false}` |
+| anything else | category-C pre-spawn | `implement_signal_sandbox_config {var, detail}` |
+
+The implement stage also carries ONE `implement_signal_sandbox` event (`outcome`, `mode`, `reason`, `signals_confined`) in its uploaded raw trace bundle, so an operator can see a stage that ran UNCONFINED under `auto`; the stderr events above reach only the local runner log. Event wiring, the spawns wrapped and the conflict-resolution path: `runner/README.md` § "Implement-stage signal confinement (#4858)".
 
 ### Credential denies: `Profile(proxyAddr, allowHosts, WithCredentialDeny(d))`
 
@@ -101,6 +141,25 @@ With `WithSignalConfinement` composed with the credential and network rules (Dar
 | the same kill / pkill / killall under the profile rendered WITHOUT the signal section (case `h`, in-test counterfactual) | victim dies |
 | real `claude -p` (2.1.314) and `codex exec` (0.153.4) each running one shell tool call under the composed profile, through the egress proxy (implement-stage smoke, #4855) | exit 0 |
 
+With `SignalProfile()` alone (Darwin 27.0.1, the `signal_only` arm of the same test; same victims, same assertions):
+
+| Under the signal-only profile | Result |
+|---|---|
+| cases `a`–`e` (outside kill, `kill -0`, `pkill`, `killall`, a separate instance) | refused; victim alive — identical to the composed arm |
+| own child, grandchild, own `setpgid` group (case `f`) | killed (exit 143) |
+| `curl` DIRECT to a loopback port the acceptance profile does not admit (case `g`) | 200 — the network is kept |
+| the same kills under `(version 1)(allow default)` (case `h`) | victim dies |
+| `ProbeSignalConfinement` on the same host | available |
+
+Real-CLI smoke under `SignalProfile()` (#4858 step 9; run by hand, not committed). Prompt: one shell call that starts `sleep 30 &`, kills it and echoes the wait status.
+
+| CLI (2026-11-12, macOS 27.0.1) | Runner flags | Own child killed | Session exit; EPERM text in stream | Direct parent-signal check |
+|---|---|---|---|---|
+| `claude` 2.1.323 | `--print --verbose --output-format stream-json --dangerously-skip-permissions` | `wait_status=143` | exit 0, result `success`; no `Operation not permitted` | UNOBSERVABLE |
+| `codex` 0.166.0 | `exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check` | `wait_status=143` | exit 0; no `Operation not permitted` | UNOBSERVABLE |
+
+Claude's first attempt never reached the sandbox: its own tool policy blocks a Bash command that STARTS with `sleep N`, so the recorded row used `true; /bin/sleep 30 & …`. The direct parent-signal check is UNOBSERVABLE, not "no parent signal": the calibration denial (`sandbox-exec -p <SignalProfile> /bin/kill -0 $$` → `Operation not permitted`) did not appear in `/usr/bin/log show --last 1m --style compact --predicate 'eventMessage CONTAINS "deny(1) signal"'`; the predicate's one match was `log`'s own argv line. (Use `/usr/bin/log`: zsh shadows the bare `log` with a builtin; `(deny signal (with report))` is rejected on a deny action.) The behavioural proxy is the normal, EPERM-free session exit above. The live walk's `verify_hint` names the adapter the operator verifies; the other adapter is intentionally unverified live, covered by this smoke and the darwin spawn e2e.
+
 The setuid `/bin/ps` cannot be exec'd under ANY `sandbox-exec` profile on this host (`execvp … Operation not permitted`, the network-only profile included) — pre-existing and unrelated to the signal section; `pgrep` works.
 
 Declared non-isolation: the `<home>/Library/Keychains` file-read clause is not behaviourally separable from the mach-lookup clause (each alone refused the read in planning probes); only the golden render (`TestProfile_CredentialDeny_Golden`) pins it.
@@ -121,7 +180,7 @@ A profile render error (`acceptance_net_sandbox_profile`) is also category-C: ne
 
 ## Residuals (stated, not closed here)
 
-1. **Nested `sandbox_apply` is refused inside the profile.** If the operator's Claude Code settings enable the built-in Bash sandbox, EVERY Bash tool call in the acceptance agent fails under this change. Set `FISHHAWK_ACCEPTANCE_NET_SANDBOX=off` on the runner env (no rebuild) or disable that setting. Probe command: `sandbox-exec -p '(version 1)(allow default)(deny network-outbound (remote ip "*:*"))' sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` exits 71.
+1. **A nested `sandbox_apply` of a DIFFERENT profile is refused inside the profile** (exit 71); a nested apply of the IDENTICAL profile exits 0 but is a no-op — it runs in the same sandbox instance (re-observed on Darwin 27.0.1 in #4858 planning). If the operator's Claude Code settings enable the built-in Bash sandbox, EVERY Bash tool call in the acceptance agent — and, under #4858, in the implement, fix-up and conflict-resolution agents — fails. Set `FISHHAWK_ACCEPTANCE_NET_SANDBOX=off` / `FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX=off` on the runner env (no rebuild) or disable that setting. Probe command: `sandbox-exec -p '(version 1)(allow default)(deny network-outbound (remote ip "*:*"))' sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` exits 71.
 2. **Unix-domain sockets are NOT denied outside the credential denies** — `(remote ip "*:*")` does not cover them. With `WithCredentialDeny`'s `SSHAgent`, sockets under the real home (Docker Desktop's `~/.docker/run/docker.sock`, gpg-agent, the 1Password agent), the runner's `SSH_AUTH_SOCK` and the launchd `Listeners` pattern ARE denied; a socket elsewhere (`/var/run/docker.sock`) stays reachable, and is an escape path (a container with network). Closing the rest needs an allow-list of the agent's own IPC sockets; follow-up. Behaviour change: an acceptance agent that relied on the home-dir docker socket breaks — the kill switch is `FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION=off`.
 3. **Linux is unavailable** (`UnavailableNonDarwin`): gateiso's `unshare -n` creates a namespace with NO route to the host loopback the proxy binds — the verify gate wants "no network at all", acceptance wants "host loopback only, everything else denied" — so the mechanism does not transfer and enforcement there stays env-only, reported by the loud `acceptance_net_sandbox_unavailable` event. A Linux equivalent (e.g. a per-process nftables/cgroup rule) is a follow-up.
 4. **`sandbox-exec(1)` is documented as deprecated by Apple** (`man sandbox-exec`) yet ships on current macOS and is the same mechanism Claude Code's own macOS sandbox uses (<https://github.com/anthropic-experimental/sandbox-runtime>). The darwin e2e fails if a future macOS removes or changes it; `Probe` then reports unavailable and `auto` degrades loudly.
@@ -130,7 +189,14 @@ A profile render error (`acceptance_net_sandbox_profile`) is also category-C: ne
 7. **A pre-existing hard link** to a credential file elsewhere is not covered (a hard link has no path relation to the denied one). An agent cannot MANUFACTURE one: `ln` and `cp` of a denied file fail `Operation not permitted`.
 8. **Symlinks are resolved once, at render.** A new alias the agent creates is covered (it resolves to a denied vnode path); a symlink the OPERATOR re-points mid-stage is not re-resolved.
 9. **Linux**: none of the credential denies apply (residual 3); the synthetic HOME is the only control there, and absolute-path reads, OpenSSH (which reads the passwd home, not `$HOME`) and Secret Service over D-Bus remain reachable.
-10. **Signal confinement is macOS-only.** On Linux (residual 3) an acceptance agent can still signal any same-user process, including the host `fishhawkd` and its preview; the only control there is the deferred prompt half of #4855. The macOS half covers the acceptance stage only — implement and fix-up shells are #4858.
+10. **Signal confinement is macOS-only.** On macOS it covers the acceptance stage (#4855) and, through `SignalProfile()`, the implement, fix-up and conflict-resolution shells (#4858). On Linux (residual 3) every one of those agents can still signal any same-user process, including the host `fishhawkd` and its preview; `UnavailableSignalNonDarwin` is printed on every Linux implement spawn. A PID namespace (`unshare --user --pid --fork --mount-proc`) is the candidate, but some distros restrict unprivileged user namespaces (Ubuntu 24.04's AppArmor restriction), so it needs its own probe and design; follow-up.
+
+Implement-stage residuals (#4858), each with the kill switch `FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX=off`:
+
+11. **`ps` cannot exec in a confined implement shell.** The setuid `/bin/ps` is refused (`execvp … Operation not permitted`, exit 71) while `pgrep` works. Tests that exec `ps` skip loudly on a REAL exec probe (procsweep, lockholder, the lineage-lock integration test); `scripts/dev`'s live-run scan fails closed and its port-owner diagnostics print `?`. List: `runner/README.md` § "Expected confined-shell failures".
+12. **Nested sandboxes** (residual 1): an operator-enabled Claude Code built-in Bash sandbox breaks, and the acceptance-profile e2es in this package Probe-skip inside a confined shell (a different profile cannot be applied), while a nested IDENTICAL apply is a no-op — so `ProbeSignalConfinement` reports the "not refused" reason there, never a false available.
+13. **Cross-invocation liveness in `scripts/dev` and `scripts/test` reads only `ESRCH` as dead**: a confined shell gets `EPERM` for every pid outside its sandbox, which must read live. Contract: `scripts/README.md`.
+14. **Signal confinement does not protect pid, lease or lock FILES** — the profile has no file rules, so a confined agent can still write them; it only stops the agent signalling the processes they name.
 
 ## Relationship to ADR-063
 
