@@ -1556,10 +1556,11 @@ in-loop rather than only when a human runs the harness.
 
 Every liveness read of a pid the reading shell did NOT spawn — the container
 lease and its lock and the verify lock in `scripts/test`, and in `scripts/dev`
-`cmd_up` (via `_dev_pid_running`), the `_relay_up` re-entrancy guard, every stop
-path (`_tls_down`, `_relay_down`, `cmd_down`, `_down_port_fallback`,
-`cmd_k8s_down` via `_k8s_pf_down`, `_preview_kill_tracked`) and
-`_preview_lock_owner` — goes through `_pid_alive`. Only ESRCH (`No such
+`cmd_up` (via `_dev_pid_running`), the `_relay_up` re-entrancy guard, the host
+dispatcher's `_host_dispatch_running` and its own-spawn readiness poll, every
+stop path (`_tls_down`, `_relay_down`, `_host_dispatch_quiesce`, `cmd_down`,
+`_down_port_fallback`, `cmd_k8s_down` via `_k8s_pf_down`,
+`_preview_kill_tracked`) and `_preview_lock_owner` — goes through `_pid_alive`. Only ESRCH (`No such
 process`) reads dead. EPERM reads LIVE, the fail-safe direction: a
 signal-confined implement or fix-up agent shell (#4858) gets EPERM for every pid
 outside its sandbox, so a bare `kill -0 <pid> 2>/dev/null` there would read
@@ -1598,7 +1599,8 @@ worktree's gitignored `.fishhawk/*.pid`, which is absent or the agent's own. The
 signal-only profile has no file rules, though, and the shared checkout is the
 worktree's ancestor, so a confined agent that runs `<shared
 checkout>/scripts/dev ...` by absolute path (or after a `cd`) acts on the LIVE
-stack's `.fishhawk/dev.pid`, `tls-proxy.pid` and `webhook-relay.pid`.
+stack's `.fishhawk/dev.pid`, `tls-proxy.pid`, `webhook-relay.pid` and
+`host-dispatch.pid`.
 `scripts/dev` has no run-agent refusal of its own; only the skills call
 `scripts/is-run-agent`. Before confinement such a `down` would have killed the
 live stack. Under confinement with a bare `kill -0`, `up` would have deleted
@@ -1626,7 +1628,7 @@ have reported "stopped" and deleted pid files of processes still running. With
 |---|---|
 | `fishhawkd` | rebuilt **and restarted** by `scripts/dev up`/`reload` |
 | `fishhawk-runner` | picked up automatically — spawned fresh from `bin/` on each `fishhawk_run_stage` |
-| `fishhawk-mcp` | **auto-swapped** by the registered [`fishhawk-mcp-shim`](../backend/cmd/fishhawk-mcp-shim/README.md) (ADR-060 / #1922) — the shim SHOULD hot-swap the rebuilt child, and `up`/`reload` print a one-line auto-swap note saying so. **That is an expectation, not an observation** (#2831): `scripts/dev` cannot probe the harness-owned shim, so CONFIRM with a version-returning tool call reflecting the new GitSHA. If it still reports the old SHA the swap did not happen — run `bin/fishhawk-mcp-shim --status` for the recorded reason (`deferred_in_flight` names the request holding it off; `deferred_no_initialize_recorded` means the session cannot be replayed at all), then `/mcp`. A manual `/mcp` reconnect is also the fallback when the shim is **not** registered (the Claude Code harness owns the MCP server process, so `scripts/dev` cannot restart it) |
+| `fishhawk-mcp` | **auto-swapped** by the registered [`fishhawk-mcp-shim`](../backend/cmd/fishhawk-mcp-shim/README.md) (ADR-060 / #1922) — the shim SHOULD hot-swap the rebuilt child, and `up`/`reload` print a one-line auto-swap note saying so. **That is an expectation, not an observation** (#2831): `scripts/dev` cannot probe the harness-owned shim, so CONFIRM with a version-returning tool call reflecting the new GitSHA. If it still reports the old SHA the swap did not happen — run `bin/fishhawk-mcp-shim --status` for the recorded reason (`deferred_in_flight` names the request holding it off; `deferred_no_initialize_recorded` means the session cannot be replayed at all), then `/mcp`. A manual `/mcp` reconnect is also the fallback when the shim is **not** registered (the Claude Code harness owns the MCP server process, so `scripts/dev` cannot restart it). The shim does NOT cover the `fishhawk-mcp host-dispatch` process: `scripts/dev` owns it, and the `up` at the end of every `reload` restarts it on the rebuilt binary (see "Host dispatcher" below) |
 | `fishhawk-mcp-shim` | rebuilt on disk but a **shim-binary** change needs a manual `/mcp` reconnect — the shim swaps its *child*, not itself, so the harness-owned shim process stays on the old code until you reconnect |
 
 ### The local `serve` flags
@@ -1680,8 +1682,9 @@ fires only on an explicit operator dispatch (Captain decision 2026-10-16).
   `workflow_dispatch`. Its first stage parks at `awaiting_host_dispatch`
   until a host dispatches it with `fishhawk_run_stage`, which also binds the
   run's `working_dir`.
-- **Campaign driver.** When the driver is enabled, it auto-starts `local`
-  item runs bound to the campaign's `working_dir`. A campaign with no binding
+- **Campaign driver.** The driver, which the local stack enables (see
+  `--enable-campaign-driver` below), auto-starts `local` item runs bound to
+  the campaign's `working_dir`. A campaign with no binding
   is refused (`campaign_auto_start_refused`), and its status read reports the
   remedy. A campaign's recorded `runner_kind` wins over the flag.
 - **Takes effect at reload.** The flag applies from the next `scripts/dev up`
@@ -1711,6 +1714,34 @@ merge-commit CI conclusion once, at `merged_at` + 6h, as one
 - **Pins.** `scripts/test-dev` pins the flag, the opt-out and that it reaches
   the `serve` argv.
 
+They also pass `--enable-campaign-driver` (E88.3 / #4527), which turns on the
+campaign driver (E25.5 / #1444). Each tick (60 s by default) advances every
+`running` campaign and starts the items whose dependencies have succeeded, up
+to the campaign's parallel budget.
+
+- **Local, marked item runs.** Under `--auto-start-runner-kind local` above,
+  each started item is a `local` run bound to the campaign's `working_dir`.
+  The driver stamps every run it starts with the ADR-104 `auto_dispatch`
+  mark. The run's first stage parks at `awaiting_host_dispatch` until the host
+  dispatcher spawns it (see "Host dispatcher" below). Without a dispatcher
+  (`FISHHAWK_DEV_HOST_DISPATCH_TOKEN` unset, or `FISHHAWK_DEV_HOST_DISPATCH=0`),
+  the run stays parked until an operator dispatches it.
+- **Gates stay with the operator.** The driver acts at a gate only under the
+  run's `operator_agent` delegation and a configured merge client, and the
+  dispatcher never acts at one. Contract:
+  `backend/internal/campaigndriver/README.md`.
+- **Hand-driven campaigns.** The driver starts eligible items of EVERY
+  `running` campaign. An operator who drives a campaign by hand with
+  `fishhawk_start_campaign_item_run` should set
+  `FISHHAWK_DEV_CAMPAIGN_DRIVER=0` first, so the driver does not start the
+  items they meant to start themselves.
+- **Takes effect at reload.** The flag applies from the next `scripts/dev up`
+  or reload.
+- **Opting out.** `FISHHAWK_DEV_CAMPAIGN_DRIVER=0` drops the flag; fishhawkd's
+  own default is off.
+- **Pins.** `scripts/test-dev` HD-f1 pins the flag, the opt-out and that the
+  flag reaches the `serve` argv.
+
 ### `post-merge` and `reload`
 
 `scripts/dev post-merge [<issue>] [--start-deps]` is the one-step full per-PR
@@ -1723,8 +1754,9 @@ build-cache bound" below), optionally confirms a given issue is
 `CLOSED` via `gh issue view` (warn-only, non-fatal), then runs `reload` LAST so
 reload's `/healthz` readiness gate (#628 — non-zero exit + log tail on failure)
 and MCP-reconnect verdict are inherited and the verdict is the command's final
-line. Since E68.7 / #2897 it REFUSES at its very top — before the git walk —
-while any `fishhawk-runner` process is live, and since E83.30 / #3974 also while
+line. Since E68.7 / #2897 it REFUSES at its top — after only the host
+dispatcher quiesce (E88.3 / #4527), before the git walk — while any
+`fishhawk-runner` process is live, and since E83.30 / #3974 also while
 fishhawkd reports a restart blocker (an undispatched decomposition child, which
 its `git pull` would strand, or a review round a restart would lose — one the
 next boot would not re-dispatch, #4077), or answers that check with an undecided
@@ -1744,6 +1776,316 @@ an undecided HTTP 503 (ADR-140 D7, #5047). `reload --when-quiet`
 (#4077) waits, bounded, until nothing is live instead of refusing. `reload`
 STRIPS its own `--force` / `--when-quiet` from the argv it forwards to
 `cmd_up`.
+
+Both commands stop the host dispatcher (E88.3 / #4527) BEFORE their live-run
+scan: pause, drain, stopped (ADR-104 Q5). A runner its last tick spawned is
+therefore caught by the scan instead of racing the teardown. A guard refusal
+restarts the dispatcher the command stopped, and the `up` at the end of every
+reload restarts it on the rebuilt `fishhawk-mcp`. See "Host dispatcher" below.
+
+### Host dispatcher (E88.3 / [#4527](https://github.com/kuhlman-labs/fishhawk/issues/4527), ADR-104)
+
+`fishhawk-mcp host-dispatch` (E88.2 / #4526) is the long-lived, dispatch-only
+loop that spawns the parked stages of `auto_dispatch`-marked local runs on this
+host. It never acts at a gate. The loop's contract (eligibility, caps, pause
+file, state dir, env custody) is `backend/internal/mcpserver/README.md`
+§ "Host dispatcher". Its identity (the `host-dispatcher/<host>` subject, the
+four-scope profile, the server's route allowlist) is
+`backend/internal/hostdispatcher/README.md`. On the local stack `scripts/dev`
+owns the process: `up` starts it, and `down`, `reload` and `post-merge` stop it
+before anything else. The helpers are the `_host_dispatch_*` block of
+`scripts/dev`.
+
+#### One-time setup: the dedicated token
+
+The dispatcher runs ONLY under its own `host-dispatcher/<host>` token, never the
+operator token or the credential store (ADR-104 Q4). Mint it with the `.env`
+database settings loaded, then put it in `.env`:
+
+```sh
+(set -a; source .env; bin/fishhawkd token issue --subject host-dispatcher/<host>)
+# .env:
+FISHHAWK_DEV_HOST_DISPATCH_TOKEN=<the printed token>
+```
+
+`<host>` is 1-64 characters of `[A-Za-z0-9._-]`. Without `--scopes` the token
+gets exactly the dispatcher profile (`read:runs`, `read:audit`, `write:runs`,
+`write:stages`; no `write:approvals`).
+
+#### Starting it (`up`)
+
+`cmd_up` calls `if ! _host_dispatch_up` after the fishhawkd readiness and
+identity checks, the TLS front end and the webhook relay, and before the MCP
+banner, which stays last. In order:
+
+| Condition | Result |
+|---|---|
+| `FISHHAWK_DEV_HOST_DISPATCH=0` | `host dispatcher disabled (FISHHAWK_DEV_HOST_DISPATCH=0)`, nothing started |
+| a live dispatcher already in the pid file | `host dispatcher already running (pid N)`, no second spawn (a second one would be refused `state_dir_locked` anyway) |
+| `FISHHAWK_DEV_HOST_DISPATCH_TOKEN` unset | one line naming the variable and the `token issue` command; the operator token is NEVER substituted |
+| `bin/fishhawk-mcp` not executable | one line saying to run `scripts/dev reload` |
+| the process exits during the readiness window | one line plus the last 15 lines of `logs/host-dispatch.log`; the pid file is removed |
+| alive, `status.json` names the spawned pid | `host dispatcher started (pid N) — logs: …; status: bin/fishhawk-mcp host-dispatch --status --state-dir …` |
+| alive, no matching `status.json` after 10 s (50 polls of 0.2 s) | a warning naming the `--status` command; the pid file is kept |
+
+Every failure is **degrade-not-abort**, like the webhook relay: `up` prints
+`host dispatcher not started (see reason above); continuing — scripts/dev up is
+unaffected` and carries on. `FISHHAWK_DEV_HOST_DISPATCH=0` opts out of STARTING
+it only. `down`, `reload` and `post-merge` still stop a dispatcher that is
+running.
+
+What it runs:
+
+- **Command.** `bin/fishhawk-mcp host-dispatch --allowed-roots <roots>
+  --state-dir <checkout>/.fishhawk/cache/host-dispatch`. `<roots>` is
+  `FISHHAWK_MCP_ALLOWED_ROOTS` when set, else the checkout root (the
+  `working_dir` local runs bind). The other flags keep their defaults
+  (`--interval` 30s, `--max-in-flight` 2, `--per-tick-cap` 4, `--daily-cap`
+  48).
+- **Scrubbed environment (approval condition G3).** It is spawned with an
+  explicit allowlist and nothing else: `_host_dispatch_exec_scrubbed`, in a
+  subshell, un-exports every exported variable, exports the allowlist and
+  execs the binary. The variables are never an argv (an `env -i NAME=value`
+  prefix would show the bearer to `ps` until `env` execs). The allowlist
+  carries `PATH`, `HOME`, `TMPDIR`, `FISHHAWK_API_TOKEN` (set from
+  `FISHHAWK_DEV_HOST_DISPATCH_TOKEN`, so an operator `FISHHAWK_API_TOKEN` in
+  `.env` never reaches it, and its presence also stops `fishhawk-mcp`'s
+  `loadConfig` before the credential-store rung) and `FISHHAWK_BACKEND_URL`
+  (`http://localhost:<port>`). When set, it also carries the names in
+  `_HD_ENV_PASSTHROUGH`:
+  - process basics: `USER`, `LOGNAME`, `SHELL`, `LANG`, `XDG_STATE_HOME`;
+  - the docker endpoint, `DOCKER_HOST` and `DOCKER_CONTEXT`. The gate's
+    isolation check (`runner/internal/gateiso`) resolves the endpoint from
+    them and refuses a non-local one, so dropping them would point the gate
+    at the wrong daemon;
+  - the runner's security-policy knobs: `FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION`,
+    `FISHHAWK_ACCEPTANCE_NET_SANDBOX`, `FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX` and
+    `FISHHAWK_FORGE_WRITES`, so an operator's `require`, `off` or `deny` holds
+    on this spawn path as on the MCP-verb one;
+  - env-carried model credentials and their config locators:
+    `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+    `CLAUDE_CONFIG_DIR`, `CODEX_HOME`. The acceptance synthetic HOME needs an
+    env-carried model credential (`runner/README.md`), so without these the
+    credential isolation would degrade on this path only;
+  - the other documented runner variables: `FISHHAWK_HOST_LABEL`,
+    `FISHHAWK_RUNNER_BIN`, `FISHHAWK_AGENT_BIN`, `FISHHAWK_CODEX_BIN`,
+    `FISHHAWK_DEPLOYMENT_PROFILE`, the `FISHHAWK_ACCEPTANCE_PREVIEW_*` and
+    `FISHHAWK_ACCEPTANCE_REPLAY_*` settings and the `FISHHAWK_GATE_*` variables;
+  - every `FISHHAWK_AGENT_ENV_*` and `FISHHAWK_ACCEPTANCE_ENV_*` variable, the
+    runner's own operator passthrough families.
+
+  `SSH_AUTH_SOCK` is NOT carried: it is a credential locator the runner already
+  refuses for untrusted execution, and no runner path needs it. Nothing else
+  from `.env` reaches it: not `FISHHAWKD_DATABASE_URL`, the webhook or OAuth
+  secrets, the App key file or the AWS trace-store keys. The runners it spawns
+  inherit this environment minus every `FISHHAWK_API_TOKEN`, so a runner
+  variable missing from the allowlist does not reach them either. Add it to
+  `_HD_ENV_PASSTHROUGH` with a test row.
+- **Files.** The pid file is `.fishhawk/host-dispatch.pid`, gitignored by
+  `.fishhawk/*.pid`. It is not space-prefixed, so `_clean_stray_pid_files`
+  leaves it alone. The log is `logs/host-dispatch.log`. The state dir is
+  `.fishhawk/cache/host-dispatch`, a gitignored RUNTIME directory (0700:
+  ledger, `status.json`, `pause`, `lock`) that only the dispatcher and its
+  `--status` / `--pause` / `--resume` commands read. It is never a diff target.
+- **Always resumed.** Before the spawn, `up` removes `<state>/pause` and
+  `<state>/status.json`. Removing the pause file clears an operator's manual
+  pause. Removing `status.json` means only the new process can satisfy the
+  identity proof below.
+
+#### Identity: no signal without it
+
+The fishhawkd start nonce round-trips through `/healthz`; the dispatcher has no
+listener. Its per-spawn proof is therefore `status.json` naming the spawned pid
+(the first tick runs at start and writes it), plus an exact argv check before
+any signal. The FO ratified this pair as the nonce substitute (approval
+condition G6).
+
+`_host_dispatch_running` reads the pid file. An absent file means not running. An
+ESRCH-dead pid prints `host dispatcher already stopped (removed the stale pid
+file …)`. A live pid is checked with `ps -ww -o args= -p <pid>` and
+`_host_dispatch_argv_matches`: the FIRST token's basename, any extension
+stripped, must EQUAL `fishhawk-mcp`, and the SECOND token must EQUAL
+`host-dispatch`. That is the exact-token rule of `_parse_live_runs`, never
+substring containment. A shebang script fails it on purpose (`ps` shows the
+interpreter first), and the rule is not loosened for one.
+
+- **Argv mismatch (a reused pid).** `pid N in … is not a host dispatcher (pid
+  reused?) — removing the stale pid file`, and the process is NEVER signalled.
+- **`ps` fails.** One degraded warning, and the pid is treated as the dispatcher
+  with its identity UNCONFIRMED. Leaving a live spawner across a teardown is the
+  worse failure, so it still gets SIGTERM. It never gets SIGKILL unless
+  `status.json` names it (approval condition G5, below).
+
+#### Stopping it: the ADR-104 Q5 quiesce
+
+`_host_dispatch_quiesce <force 0|1> <down|reload|post-merge>`. When no
+dispatcher is running it is silent and returns 0, so `down` after a reload's
+quiesce is a no-op. Otherwise:
+
+1. **Pause.** Create `<state>/pause` (umask 077) unless an entry of that name
+   exists; any entry, even a symlink, already counts. `scripts/dev` creates it
+   directly rather than through `--pause`, so a missing or not-yet-rebuilt
+   binary cannot block it. The in-flight tick re-checks the pause file before
+   every marker POST, so it POSTs no further marker.
+2. **Drain.** `kill -TERM`. The dispatcher finishes its in-flight tick (the tick
+   runs on a context detached from the cancel) and exits. `scripts/dev` polls
+   every 0.5 s for the exit, bounded by `FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT`
+   (seconds, default 120; a non-positive or non-numeric value falls back to
+   120). Set it in `.env` or the shell. The value used is the one the shell
+   would hold after the `.env` load, so a `.env` setting wins. `reload` and
+   `post-merge` quiesce before their own `.env` load, so the knob is read
+   through a subshell that sources `.env`. It NEVER sends SIGKILL inside that window: a kill mid-tick can leave a
+   POSTed marker with no runner behind it (#1912). A refused SIGTERM (EPERM) is
+   the #4858 `_stop_refused` error: the pid file is kept, and the quiesce
+   returns 1.
+3. **Stopped.** `host dispatcher drained and stopped (pid N)`. The pid file is
+   removed, and the command records that it stopped a dispatcher, for the
+   restore below.
+
+On a drain timeout:
+
+| Context | Result |
+|---|---|
+| `down`, or `--force` | a warning naming the pid, the possible POSTed marker without a runner and its remedy (`POST /v0/runs/{id}/stages/{id}/reap-failure`, `fishhawk_reap_stage`), then SIGKILL and the pid file removed. **G5:** SIGKILL is sent only when the identity is confirmed (the argv matched, or `status.json` names the pid). Otherwise it stops at SIGTERM: an error, the pid file kept, return 1 (`down` finishes its teardown and exits 1) |
+| `reload` / `post-merge` without `--force` | `error: refusing to <context>: the host dispatcher (pid N) did not drain within <T>s of SIGTERM (FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT).` and exit 1. The dispatcher stays paused and exits when its tick ends; re-run once it has exited, or pass `--force` |
+
+Where it runs:
+
+- **`down`**: first, before `_tls_down`, in the `down` context, so the spawner
+  stops before its backend.
+- **`reload`**: after the bounded registration probe (#4875) and BEFORE the
+  live-run and restart-blocker guards, with reload's `--force`. Why the order
+  is load-bearing: "Live-run guard for reload / post-merge" § "Wiring".
+- **`post-merge`**: BEFORE its first live-run guard, so before `git checkout
+  main` / `git pull`. The quiesce inside its later `cmd_reload` is then a no-op.
+- **`reload --when-quiet`**: the dispatcher is paused BEFORE the wait and stays
+  paused through every poll. On a timeout, `_host_dispatch_resume` removes the
+  pause file this command created; an operator's own pause is left alone. The
+  dispatcher keeps running.
+- **Restore on refusal.** Each guard refusal in `reload` and `post-merge` calls
+  `_host_dispatch_restore`. When this command stopped a dispatcher, the restore
+  re-sources `.env` and calls `_host_dispatch_up`. A failure is one line,
+  `host dispatcher not restored (see reason above) — the next 'scripts/dev
+  reload' starts it`. The "stopped one" flag persists from `post-merge` into its
+  `cmd_reload`, so a refusal in reload's post-pull guards restores it too.
+- **Restart on reload.** The `up` at the end of every reload starts the
+  dispatcher on the rebuilt `bin/fishhawk-mcp`. The MCP shim's auto-swap covers
+  only the MCP server child, never this process (ADR-104 Q1/Q5).
+
+Every call site is a tested context (`if ! …` or `|| down_rc=1`), so a
+deliberate refusal never fires the #631 `TRAPZERR` diagnostic.
+
+#### Interrupted waits (approval condition G4)
+
+An INT/TERM trap is armed around the `--when-quiet` wait, the registration
+probe that follows it, and the drain wait.
+Ctrl-C or SIGTERM there removes the pause file THIS command created, prints
+`interrupted: removed the host dispatcher pause file this command created`, and
+exits 130 or 143. An interrupted drain still ends with the dispatcher exiting,
+because it already has SIGTERM. The next `up` or reload starts it, and the
+stale pid file self-heals.
+
+A hard kill (SIGKILL) of `scripts/dev` cannot be trapped and can leave the
+pause file behind, with the dispatcher idling paused. Remedy:
+
+```sh
+bin/fishhawk-mcp host-dispatch --resume --state-dir .fishhawk/cache/host-dispatch
+```
+
+The next `scripts/dev up` or reload also clears it.
+
+#### Operating it
+
+- **Status.** `bin/fishhawk-mcp host-dispatch --status --state-dir
+  .fishhawk/cache/host-dispatch` prints one line, `state=<live|paused|stale>
+  pid=… host=… last_tick_at=… paused=… in_flight=… spawns_today=…`, plus the
+  latest refusal when there is one.
+  It exits 0 when live or paused, and 1 when the status is absent or stale.
+  Pass the `--state-dir`: the binary's default is
+  `$TMPDIR/fishhawk-host-dispatch`, not the `scripts/dev` one.
+- **Pause / resume by hand.** `--pause` / `--resume` with the same
+  `--state-dir`. A manual pause holds until the next `up` (including the one
+  that ends every reload), which always starts it resumed. Set
+  `FISHHAWK_DEV_HOST_DISPATCH=0` to keep it off across reloads.
+- **Manual stop** (for example with a reverted `scripts/dev`): pause it, then
+  `kill -TERM "$(cat .fishhawk/host-dispatch.pid)"` and wait for it to exit.
+
+#### Residuals, stated not hidden
+
+- A `post-merge` or reload that fails after the quiesce for another reason (a
+  diverged main under `--ff-only`, a build failure in `cmd_up`) leaves the
+  dispatcher stopped until the next successful reload.
+- A drain-timeout refusal leaves the dispatcher paused and exiting (it already
+  has SIGTERM). That refused command does not restore it; the next reload
+  starts it.
+- Plain `scripts/dev up` with fishhawkd already running returns before the
+  dispatcher start, so it does not start a stopped dispatcher. Use `reload`.
+- `up` clears an operator's manual pause (above).
+- One dispatcher per backend account: the single-host assumption in
+  `backend/internal/mcpserver/README.md`.
+- **Follow-up: a Go-side nonce (approval condition G6).** The identity proof is
+  the `status.json` pid plus the exact argv check. A per-spawn nonce that
+  `scripts/dev` passes and the dispatcher echoes in `status.json` would bind the
+  proof to the spawn rather than to a pid. It needs a Go change in
+  `fishhawk-mcp host-dispatch` and is a follow-up.
+- The change takes effect at the next reload. The first `post-merge` after it
+  lands runs the OLD `scripts/dev` for its own reload, so a second reload may
+  be needed. Once the campaign driver is on, campaign item runs park at
+  `awaiting_host_dispatch` until a dispatcher token is configured.
+
+#### Tests
+
+`scripts/test-dev` HD rows, run by `scripts/test verify` via
+`_verify_gate_harnesses`:
+
+- **Pure and body pins** (always run). HD-f1 pins the campaign-driver flag, its
+  opt-out and the `serve` argv. HD-s3c is the argv identity table, including a
+  rejected `/bin/zsh /x/fishhawk-mcp host-dispatch`. HD-s5 is the drain-timeout
+  knob, including a value set only in `.env`. HD-o pins the orderings: reload's quiesce after the probe and before
+  the scan, the pause before the `--when-quiet` wait, post-merge's quiesce
+  before its scan and `git checkout main`, `down`'s quiesce before `_tls_down`,
+  and both guard refusals restoring. HD-u7 pins the start after `_await_healthz`
+  and before the banner.
+- **Stub-backed rows.** A compiled Go stub is built into
+  `<tmp>/bin/fishhawk-mcp`, so the real argv rule matches it (approval
+  condition G2: a shebang script would not). The reload rows scan with real
+  `ps`, filtered to the row's temp dir. The rows SKIP, with a printed reason,
+  when `ps` cannot exec (#4858) or `go` is not on PATH.
+  - Start: HD-u1 (argv, the dedicated token and never the operator's, the
+    backend URL, the pause file and `status.json` cleared), HD-e1 (env custody:
+    seeded `.env`, AWS, `SSH_AUTH_SOCK` and operator-token sentinels never
+    reach the stub; a runner policy knob, a model credential, `DOCKER_HOST`
+    and a `FISHHAWK_AGENT_ENV_*` variable do; an `env` shim proves the bearer
+    is on no argv),
+    HD-u2 (opt-out), HD-u3 (token required), HD-u3b (missing binary), HD-u4
+    (exit at start), HD-u5 (alive without status), HD-u6 (re-entrancy).
+  - Stop: HD-s1, HD-s2 and HD-s3 (no pid file, dead pid, and a reused pid
+    never signalled), HD-s3b (`ps` fails: degraded, still stopped), HD-s3d (G5:
+    no unconfirmed SIGKILL), HD-s4 (drain timeout in each context), HD-s4e and
+    HD-s4k (a refused SIGTERM, a refused SIGKILL), HD-s6 (the #1912 drain
+    counterfactual: every POSTed marker has its runner, the pause preceded
+    SIGTERM, and the stop is recorded for the restore).
+  - Wiring: HD-r1 (the scan-ordering counterfactual: the runner the draining
+    tick spawns is caught, no teardown), HD-r2 (restore after a refusal, and
+    nothing started when none was running), HD-w1 and HD-w2 (`--when-quiet`
+    paused at every poll; resumed on a timeout), HD-p1 (post-merge refuses
+    before git and restores), HD-p2 (post-merge into the real `cmd_reload`,
+    whose post-pull scan refuses: the dispatcher post-merge stopped is
+    restored), HD-x1 (a restore without a token prints its failure line; a
+    token only in `.env` is sourced), HD-i1 to HD-i4 (G4: SIGTERM during
+    either wait, SIGINT during the `--when-quiet` wait, and SIGTERM during the
+    probe after it each remove the pause file).
+- **Row-dir guards.** HD-g1: a failed `mktemp` fails the row and leaves a
+  non-empty, missing dir, and `_hd_cleanup` signals and removes only a
+  `fishhawk-hd.*` dir directly under the temp root, so an empty dir can never
+  become a `pkill -KILL -f /`.
+- Every pre-existing row runs against a throwaway `HD_*` dir, so no row reaches
+  a live dispatcher.
+
+The Go loop's pause and SIGTERM semantics are pinned on the Go side by
+`backend/internal/mcpserver/host_dispatcher_loop_test.go` and
+`backend/cmd/fishhawk-mcp/host_dispatch_test.go`. The stub models that contract;
+it is not the binary.
 
 ### Rebuild detection and the `README.md` carve-out (#2403)
 
@@ -2214,27 +2556,43 @@ id could not be read reads `pid <pid> (run id unreadable)`.
   what it forwards to `cmd_up` (which scans only for `--all` / `--start-deps` and
   has no meaning for `--force`), then calls the guard **before `cmd_down`** — so
   the refusal is structurally ahead of the stop. Its full order is the
-  `--when-quiet` wait when requested, the bounded registration probe (#4875), a
-  fresh live-run guard, a fresh restart-blocker guard, then the teardown. The probe
+  `--when-quiet` wait when requested (the host dispatcher paused throughout),
+  the bounded registration probe (#4875), the host dispatcher quiesce, a fresh
+  live-run guard, a fresh restart-blocker guard, then the teardown. The probe
   runs first so a slow one cannot widen the window between the final scan and the
   teardown.
-- `cmd_post_merge` calls the guard at its **very top**, before `git checkout main`
-  / `git pull --ff-only` / `scripts/cleanup-merged`, so a refusal never leaves
-  local git state half-advanced. It does NOT strip `--force`: it forwards it to
-  `cmd_reload`, whose own re-scan is a cheap idempotent second check.
+- `cmd_post_merge` calls the guard at its top, after only the host dispatcher
+  quiesce and before `git checkout main` / `git pull --ff-only` /
+  `scripts/cleanup-merged`, so a refusal never leaves local git state
+  half-advanced. It does NOT strip `--force`: it forwards it to `cmd_reload`,
+  whose own re-scan is a cheap idempotent second check.
+- **The host dispatcher quiesce precedes the scan (E88.3 / #4527).** The
+  dispatcher is a runner SOURCE. Its in-flight tick re-checks the pause file
+  before every marker POST, but a tick already past that check still spawns
+  the runner for the marker it POSTed. Scanning first would let that runner
+  appear after a clean scan, a race with a live spawner behind it. Pause,
+  drain (wait for the process to exit) and only then scan, and the scan sees
+  every runner the dispatcher will start. `scripts/test-dev` HD-r1 is the
+  counterfactual: with the quiesce moved below the guards the scan is clean
+  and the teardown runs while the fixture runner starts. A guard refusal
+  after the quiesce restarts the dispatcher (`_host_dispatch_restore`).
 - Every call site is written `if ! _refuse_on_live_runs …`, a TESTED context, so a
   deliberate refusal never fires the #631 `TRAPZERR` diagnostic.
 - `up` and `down` are deliberately **NOT** guarded. `up` starts nothing and stops
   nothing, and `down` is the operator explicitly asking for a teardown — a guard
-  there would refuse the very command you reach for to clean up.
+  there would refuse the very command you reach for to clean up. `down` does
+  stop the host dispatcher first (a stop, not a guard), so the spawner stops
+  before its backend.
 
 ### Residuals, stated not hidden
 
 - **TOCTOU.** A runner that starts between the scan and the teardown is not
   caught. `cmd_reload` scans after its bounded registration probe, so the probe adds
   nothing to that window (#4875). `cmd_post_merge`'s second check via `cmd_reload`
-  narrows the window to roughly the git pull, but does not eliminate it. Eliminating
-  it needs a lock the
+  narrows the window to roughly the git pull, but does not eliminate it. The host
+  dispatcher is stopped before the scan, so it is not a source inside the window;
+  an operator verb (`fishhawk_dispatch_stage`, `fishhawk_drive_run`) still is.
+  Eliminating it needs a lock the
   runner participates in, out of proportion to the hazard: the guard turns a
   silent collision into a rare one.
 - **Fail-OPEN on a scan degrade.** No `ps`, or a non-zero `ps`, prints a one-line
@@ -2350,7 +2708,8 @@ the already-loaded old `scripts/dev`.
   caught — the same class as #2897. `post-merge`'s second check inside
   `cmd_reload` runs AFTER the pull, so a refusal there leaves main pulled.
   `--when-quiet` narrows the window (the order is the wait, the bounded registration
-  probe, then both guards fresh, then the teardown) but does not close it.
+  probe, the host dispatcher quiesce, then both guards fresh, then the teardown)
+  but does not close it.
 - **Undecided 503 (ADR-140 D7).** One unreadable candidate, another tenant's
   included, makes the whole request a generic 503, so it can temporarily refuse
   reload for all callers without disclosing which run it was. No authentication or
@@ -2374,11 +2733,18 @@ live poll; a quiet first poll prints nothing.
 | `FISHHAWK_RELOAD_QUIET_INTERVAL` | `15` | seconds between polls (the last sleep is clipped to the remaining budget) |
 | `FISHHAWK_RELOAD_QUIET_TIMEOUT` | `3600` | seconds of waiting before giving up |
 
-- **Quiet** → falls through to the bounded registration probe (#4875), then the
-  normal live-run and restart-blocker guards (a cheap fresh re-check, after the
-  probe so the probe cannot widen the window), then the teardown.
+- **Host dispatcher paused for the whole wait** (E88.3 / #4527). A running
+  dispatcher is paused before the first poll, so it cannot keep starting the
+  runners the wait is waiting out. An INT/TERM during the wait removes the
+  pause file this command created (see "Host dispatcher" in the
+  `scripts/dev` lifecycle section above).
+- **Quiet** → falls through to the bounded registration probe (#4875), the host
+  dispatcher quiesce, then the normal live-run and restart-blocker guards (a
+  cheap fresh re-check, after the probe so the probe cannot widen the window),
+  then the teardown.
 - **Timeout** → `error: reload --when-quiet gave up after <N>s … still live:
-  <what>`, exit 1, no teardown.
+  <what>`, exit 1, no teardown. The dispatcher is resumed: the pause file this
+  command created is removed, and it keeps running.
 - **Degrades count as quiet**: `ps` or curl unavailable, daemon unreachable, a
   non-200 other than 503 (404 = old daemon), a malformed body. The guards that run
   next print their own one-line degrade reasons.

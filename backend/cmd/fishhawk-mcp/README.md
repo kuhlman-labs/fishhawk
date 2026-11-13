@@ -130,6 +130,32 @@ The go-sdk's own DNS-rebinding protection (rejecting a non-loopback `Host` heade
 
 `--transport http` ALSO puts this binary in the CONFINING posture (E66.63 / [#3589](https://github.com/kuhlman-labs/fishhawk/issues/3589)): `working_dir` and `spec_file` must additionally resolve inside a root named by `--allowed-roots` / `FISHHAWK_MCP_ALLOWED_ROOTS`, or the call is refused `path_outside_allowed_roots` before any filesystem read — and with NO root configured every path-taking verb is refused (fail closed). Stdio is deliberately unconfined: the client spawned this process, so the caller already owns every path it can reach. See [mcpserver README — `working_dir` resolution](../../internal/mcpserver/README.md) and [path confinement over HTTP](../../internal/mcpserver/README.md).
 
+## Host dispatcher (`host-dispatch`)
+
+`fishhawk-mcp host-dispatch` (ADR-104, E88.2 / [#4526](https://github.com/kuhlman-labs/fishhawk/issues/4526)) is a second mode of this binary, not an MCP server. It is a long-lived loop that spawns the parked stages of `auto_dispatch`-marked local runs on this host. It only dispatches; it never acts at a gate. `host_dispatch.go` routes the subcommand before the transport flag parse, so every other invocation sees unchanged input. The contract is not repeated here:
+
+- the loop (eligibility, the pre-marker sequence, refusal codes, ticks and caps, the state dir and its lock, env custody, residuals): [`backend/internal/mcpserver/README.md`](../../internal/mcpserver/README.md) § "Host dispatcher";
+- the identity (the `host-dispatcher/<host>` subject, its four-scope profile, the server's route allowlist): [`backend/internal/hostdispatcher/README.md`](../../internal/hostdispatcher/README.md).
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--allowed-roots` | `FISHHAWK_MCP_ALLOWED_ROOTS` | OS path-list of absolute checkout roots a spawned run's `working_dir` must resolve inside. Both empty exits 2. |
+| `--state-dir` | `$TMPDIR/fishhawk-host-dispatch` | Ledger, `status.json`, `pause` and `lock`. 0700, owned by you, never a symlink. |
+| `--interval` | `30s` | Tick interval. Above `45s` exits 2, so a queued stage is re-POSTed inside the server's 60 s queue TTL. |
+| `--max-in-flight` | `2` | Stages this dispatcher keeps `dispatched` or `running` (ADR-104 Q6). |
+| `--per-tick-cap` | `4` | Candidates per tick that reach the campaign-link read; bounds reads and marker POSTs. |
+| `--daily-cap` | `48` | Spawns per UTC day, persisted, rolling over at 00:00:00Z. |
+| `--stale-after` | `0` (the `drive_run` default) | How long a `dispatched` stage this process is not running may sit before its runner's liveness is probed. |
+| `--runner-binary` | `FISHHAWK_RUNNER_BIN`, then beside this binary, then `PATH` | The `fishhawk-runner` to spawn. |
+| `--pause` / `--resume` | off | Create or remove `<state-dir>/pause` and exit. A running dispatcher re-checks the file before every marker POST; any entry under that name, even a symlink, counts as paused. |
+| `--status` | off | Print the status file as one line and exit: 0 when live or paused, 1 when absent or stale (the last tick is older than 3 intervals). |
+
+`--pause`, `--resume` and `--status` are mutually exclusive. A usage error exits 2 and a runtime failure exits 1. SIGINT or SIGTERM lets the in-flight tick finish, then the process exits.
+
+**Credential.** Mint a dedicated token with `fishhawkd token issue --subject host-dispatcher/<host>`; without `--scopes` it gets exactly the dispatcher profile. The mode reads it through the same [token-resolution ladder](#token-resolution-ladder-2389--adr-076) as the server modes, so set it as `FISHHAWK_API_TOKEN` for this process: an empty variable falls through to the operator's stored credential, which is the wrong identity for a dispatcher.
+
+**On the local stack.** `scripts/dev up` starts it under `FISHHAWK_DEV_HOST_DISPATCH_TOKEN` with a scrubbed environment, `--state-dir .fishhawk/cache/host-dispatch` and the checkout as the allowed root. `down`, `reload` and `post-merge` pause it, drain it with SIGTERM and wait for it to exit BEFORE their live-run scan. The `up` at the end of every reload restarts it on the rebuilt binary; the [`fishhawk-mcp-shim`](#surviving-rebuilds-fishhawk-mcp-shim) auto-swap does not cover this mode. Operator contract: [`scripts/README.md`](../../../scripts/README.md) § "Host dispatcher" (E88.3 / [#4527](https://github.com/kuhlman-labs/fishhawk/issues/4527)).
+
 ## Install (operators)
 
 Pre-built binaries ship with every `mcp/vX.Y.Z` GitHub Release: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Full install path including cosign verification and `claude mcp add` registration lives at [`docs/mcp/install.md`](../../../docs/mcp/install.md).

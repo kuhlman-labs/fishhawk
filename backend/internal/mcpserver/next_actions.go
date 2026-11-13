@@ -1175,7 +1175,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// implement settled path, so an open-concern hint arm cannot mask the retry.
 	// A TERMINAL failed run keeps the bare {State: failed} arm below.
 	if acceptance != nil && acceptance.State == "failed" && !runStateIsTerminal(run.State) {
-		return acceptanceStageFailedNextActions(run, acceptance)
+		return acceptanceStageFailedNextActions(run, acceptance, stages)
 	}
 
 	// A run cancelled by its PR closing without merge (#4082). Checked AHEAD
@@ -2360,7 +2360,9 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 	// recorded-verdict arm: an older recorded verdict — even a passed one — must
 	// never route a failed stage to the merge ritual. Mirrors the server gate.
 	if acceptance.State == "failed" {
-		return acceptanceStageFailedNextActions(run, acceptance)
+		// No stage list here: this terminal-section arm never offers the
+		// #5249 fix-up (classifyNextActions serves the non-terminal park).
+		return acceptanceStageFailedNextActions(run, acceptance, nil)
 	}
 
 	// E38.3 / #1877: a succeeded verdict-less acceptance stage that carries the
@@ -2514,7 +2516,13 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 // is byte-equal to drive.RuleAcceptanceOutcomeUnknown and to the server gate
 // state a failed acceptance stage reads, so the surfaces cannot diverge. NOT a
 // product-issue filing state: a parked infra failure is a recovery path.
-func acceptanceStageFailedNextActions(run *Run, acceptance *Stage) *NextActions {
+//
+// stages is the run's stage list, used ONLY to decide the #5249 fix-up action
+// (acceptanceParkFixupAction). Shared by fishhawk_get_run_status
+// (classifyNextActions passes its stages) and fishhawk_drive_run's
+// acceptance_stage_failed stop (drive_run passes its stages); a nil list
+// offers no fix-up. Order: retry, fix-up (when offered), cancel.
+func acceptanceStageFailedNextActions(run *Run, acceptance *Stage, stages []Stage) *NextActions {
 	category, reason := "", ""
 	if acceptance.FailureCategory != nil {
 		category = *acceptance.FailureCategory
@@ -2522,26 +2530,76 @@ func acceptanceStageFailedNextActions(run *Run, acceptance *Stage) *NextActions 
 	if acceptance.FailureReason != nil {
 		reason = *acceptance.FailureReason
 	}
-	return &NextActions{
-		State: "acceptance_settled_outcome_unknown",
-		Actions: []SuggestedAction{
-			{
-				Action: "fishhawk_retry_stage",
-				Params: map[string]string{"stage_id": acceptance.ID},
-				Precondition: fmt.Sprintf("the acceptance stage FAILED its own execution (failure_category %q, failure_reason %q) while the run stays non-terminal: the server parks a category-C acceptance failure instead of failing the run, up to %d parks per stage (#4356)",
-					category, reason, runpkg.InfraFailureParkRetryBudget),
-				Consumes: consumesRetryBudget,
-				Reason:   "the retry re-opens the acceptance stage failed -> pending; on the local runner follow with fishhawk_dispatch_stage for the acceptance stage. The run keeps its merge-candidate line entry while parked",
-			},
-			{
-				Action:       "fishhawk_cancel_run",
-				Params:       map[string]string{"run_id": run.ID},
-				Precondition: "you choose to abandon the run instead of retrying the acceptance stage",
-				Consumes:     consumesNone,
-				Reason:       "cancel this run (releases its merge-candidate line entry), then start a fresh one with fishhawk_start_run (consumes a new run)",
-			},
-		},
+	fixup := acceptanceParkFixupAction(acceptance, stages)
+	retryPrecondition := fmt.Sprintf("the acceptance stage FAILED its own execution (failure_category %q, failure_reason %q) while the run stays non-terminal: the server parks a category-C acceptance failure instead of failing the run, up to %d parks per stage (#4356)",
+		category, reason, runpkg.InfraFailureParkRetryBudget)
+	if fixup != nil {
+		retryPrecondition += ". Retry only when the failure is transient infrastructure; when the change itself breaks the preview a retry re-fails on the same head — route fishhawk_fixup_stage (the next action) instead (#5249)"
 	}
+	actions := []SuggestedAction{{
+		Action:       "fishhawk_retry_stage",
+		Params:       map[string]string{"stage_id": acceptance.ID},
+		Precondition: retryPrecondition,
+		Consumes:     consumesRetryBudget,
+		Reason:       "the retry re-opens the acceptance stage failed -> pending; on the local runner follow with fishhawk_dispatch_stage for the acceptance stage. The run keeps its merge-candidate line entry while parked",
+	}}
+	if fixup != nil {
+		actions = append(actions, *fixup)
+	}
+	actions = append(actions, SuggestedAction{
+		Action:       "fishhawk_cancel_run",
+		Params:       map[string]string{"run_id": run.ID},
+		Precondition: "you choose to abandon the run instead of retrying the acceptance stage",
+		Consumes:     consumesNone,
+		Reason:       "cancel this run (releases its merge-candidate line entry), then start a fresh one with fishhawk_start_run (consumes a new run)",
+	})
+	return &NextActions{State: "acceptance_settled_outcome_unknown", Actions: actions}
+}
+
+// acceptanceParkFixupAction returns the fishhawk_fixup_stage action for a
+// category-C acceptance park the change itself caused (#5249), or nil. It is
+// non-nil ONLY when the acceptance stage is failed with failure_category C,
+// the implement stage succeeded, and the review stage is exactly `pending`.
+//
+// KEEP-IN-SYNC: this mirrors branch (e) of run.findOpenReviewStage — the
+// predicate the OPERATOR HTTP fix-up route (server.handleFixupStage, the only
+// caller that sets run.FixupOptions.AdmitInfraParkedAcceptance) admits; no
+// other fix-up caller admits this shape. The same exemption is mirrored by
+// fixupGateOpen in review_action_hint.go, so the review_action_hint NOTE never
+// says the fix-up refuses where this action offers it. The cross-check is
+// TestE2E_Fixup_InfraParkedAcceptanceAdmitsFixup (backend/internal/integration/mcp):
+// it asserts this action, the review_action_hint message, and the server's
+// admit/refuse verdict agree on the C park and on a category-A park.
+func acceptanceParkFixupAction(acceptance *Stage, stages []Stage) *SuggestedAction {
+	if !acceptanceInfraParkFixupShape(acceptance, stages) {
+		return nil
+	}
+	impl := stageByType(stages, "implement")
+	return &SuggestedAction{
+		Action: "fishhawk_fixup_stage",
+		Params: map[string]string{
+			"stage_id":         impl.ID,
+			"operator_concern": "<what the change must fix so the acceptance preview boots>",
+		},
+		Precondition: "the acceptance stage is parked failed with failure_category C and the review stage is still pending — the shape where the change itself breaks the preview, so a retry re-fails on the same head. Operator route only: the fix-up re-parks acceptance failed -> pending and re-opens implement (#5249)",
+		Consumes:     consumesFixupBudget,
+		Reason:       "route the fix-up to the implement stage: it re-dispatches implement with your operator_concern, and the re-parked acceptance then re-runs against the fixed head before the review gate opens. On the local runner follow with fishhawk_dispatch_stage for the implement stage",
+	}
+}
+
+// acceptanceInfraParkFixupShape reports the #5249 shape: acceptance failed
+// with failure_category C, implement succeeded, review exactly pending. A nil
+// stages list never matches. Shared by acceptanceParkFixupAction and
+// fixupGateOpen so the two mirrors of run.findOpenReviewStage branch (e)
+// cannot drift.
+func acceptanceInfraParkFixupShape(acceptance *Stage, stages []Stage) bool {
+	if acceptance == nil || acceptance.State != "failed" || acceptance.FailureCategory == nil ||
+		*acceptance.FailureCategory != string(runpkg.FailureC) {
+		return false
+	}
+	impl := stageByType(stages, "implement")
+	review := stageByType(stages, "review")
+	return impl != nil && impl.State == "succeeded" && review != nil && review.State == "pending"
 }
 
 // acceptanceOutcomeUnknownActions is the defensive read arm for a settled

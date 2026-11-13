@@ -28816,7 +28816,17 @@ paths:
         stage is also re-parked `awaiting_approval → pending` so the
         re-dispatched implement flows back into a fresh review (the
         re-parked review stage id is recorded on the audit entry as
-        `reparked_review_stage_id`). The orchestrator then walks
+        `reparked_review_stage_id`).
+          - #5249: the operator route also admits a fix-up when implement
+            `succeeded`, the review stage is exactly `pending`, and the
+            acceptance stage is parked `failed` with `failure_category` C.
+            The acceptance stage is re-parked `failed → pending` (failure
+            metadata cleared) before implement re-opens, review stays
+            `pending`, and the trigger records `reparked_acceptance_stage_id`,
+            `acceptance_reparked_from: failed_c` and
+            `reparked_acceptance_failure_reason`. Category A/B/D failures keep
+            the `fixup_not_applicable` refusal.
+        The orchestrator then walks
         `pending → dispatched` and fires `workflow_dispatch`, and a
         `stage_fixup_triggered` audit entry is written carrying the routed
         stable concern IDs (`concern_ids`, #964) or the deprecated selected

@@ -81,7 +81,7 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-055": {nil, nil, nil, []string{"ADR-113", "ADR-132"}},
 	"ADR-063": {nil, nil, nil, []string{"ADR-115"}},
 	"ADR-068": {nil, nil, nil, []string{"ADR-118"}},
-	"ADR-084": {nil, nil, nil, []string{"ADR-118", "ADR-120", "ADR-139"}},
+	"ADR-084": {nil, nil, nil, []string{"ADR-118", "ADR-120", "ADR-139", "ADR-143"}},
 	"ADR-092": {[]string{"ADR-090"}, []string{"ADR-093"}, nil, []string{"ADR-115"}},
 	"ADR-112": {nil, nil, []string{"ADR-093"}, []string{"ADR-115", "ADR-121"}},
 	"ADR-113": {nil, nil, []string{"ADR-055"}, []string{"ADR-120", "ADR-123", "ADR-139"}},
@@ -118,6 +118,8 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-035": {nil, nil, nil, []string{"ADR-141"}},
 	// ADR-142, ratified 2026-11-06 (relations from its record-metadata line, ADR-113 D3).
 	"ADR-142": {nil, nil, []string{"ADR-090"}, nil},
+	// ADR-143, ratified 2026-11-12 (relations from its record-metadata line, ADR-113 D3).
+	"ADR-143": {nil, nil, []string{"ADR-084"}, nil},
 	"ADR-090": {[]string{"ADR-043"}, []string{"ADR-092", "ADR-093", "ADR-096"}, nil, []string{"ADR-142"}},
 	// The Captain's 2026-10-23 status rulings (ADR-041 amends ADR-032).
 	"ADR-032": {nil, nil, nil, []string{"ADR-041"}},
