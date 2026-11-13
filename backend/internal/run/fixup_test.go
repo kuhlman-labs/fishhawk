@@ -5,9 +5,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -31,7 +33,9 @@ type fixupRepo struct {
 }
 
 // RetryStage counts the call, then applies the stageRetryTransitions edge the
-// way postgresRepo does: failure_category, failure_reason and ended_at clear.
+// way postgresRepo does (RetryStageState): failure_category, failure_reason
+// and ended_at clear, and self_retry_count increments — the #4356 park
+// episode identity the #5249 restore cannot recover.
 func (r *fixupRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
 	r.retries++
 	if r.retryErr != nil {
@@ -50,6 +54,7 @@ func (r *fixupRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageStat
 	s.FailureCategory = nil
 	s.FailureReason = nil
 	s.EndedAt = nil
+	s.SelfRetryCount++
 	cp := *s
 	return &cp, nil
 }
@@ -1619,6 +1624,157 @@ func TestRestoreReparkedAcceptance(t *testing.T) {
 		t.Fatalf("err = %v, want ErrFixupRecoveryNotApplicable", err)
 	}
 	assertStatesUnchanged(t, repo2, before)
+}
+
+// TestRestoreReparkedAcceptance_RestoredParkIsFreshEpisode pins the #4356
+// park-budget arithmetic of the #5249 restore: the re-park's RetryStage bumps
+// self_retry_count and the restore stamps a fresh ended_at, so the original
+// stage_infra_parked row no longer matches the restored stage's episode and
+// counts as a PRIOR park. Below the boundary the restored failure parks again
+// (one more park spent); when the original park was the last one in budget
+// the restored failure is InfraParkBudgetExhausted — the run fails terminally
+// on the next Advance. run/README.md states both outcomes.
+func TestRestoreReparkedAcceptance_RestoredParkIsFreshEpisode(t *testing.T) {
+	cases := []struct {
+		name            string
+		earlierParks    int // park rows of episodes BEFORE the one the fix-up was admitted over
+		wantPriorParks  int
+		wantRestoredCls run.InfraParkDecision
+	}{
+		{"first park: restored failure parks again", 0, 1, run.InfraParkRetryable},
+		{"last park in budget: restored failure exhausts the budget", run.InfraFailureParkRetryBudget - 1, run.InfraFailureParkRetryBudget, run.InfraParkBudgetExhausted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo, impl, acc, _ := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+			// The parked episode: ended_at stamped, retry ordinal = earlier parks.
+			endedAt := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+			repo.mu.Lock()
+			repo.stages[acc.ID].EndedAt = &endedAt
+			repo.stages[acc.ID].SelfRetryCount = tc.earlierParks
+			repo.mu.Unlock()
+
+			var entries []*audit.Entry
+			for i := 0; i < tc.earlierParks; i++ {
+				entries = append(entries, parkEntry(t, int64(i+1), acc.ID, time.Date(2026, 10, 1+i, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano), i))
+			}
+			parked, _ := repo.GetStage(ctx, acc.ID)
+			origAt, origOrdinal := run.InfraParkEpisode(parked)
+			entries = append(entries, parkEntry(t, int64(tc.earlierParks+1), acc.ID, origAt, origOrdinal))
+
+			// Control: before the fix-up the original row IS the current episode.
+			if h := run.ReadInfraParkHistory(entries, parked); !h.CurrentEpisodeParked || h.PriorParks != tc.earlierParks {
+				t.Fatalf("pre-fix-up history = %+v, want CurrentEpisodeParked with PriorParks %d", h, tc.earlierParks)
+			}
+
+			// Fix-up admitted over the park, re-dispatch delivers nothing,
+			// recovery restores implement, then the acceptance park.
+			if _, err := run.FixupStage(ctx, repo, impl.ID, parkedOpts()); err != nil {
+				t.Fatalf("FixupStage: %v", err)
+			}
+			if _, err := repo.TransitionStage(ctx, impl.ID, run.StageStateFailed, nil); err != nil {
+				t.Fatalf("fail implement: %v", err)
+			}
+			if _, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateSucceeded, nil); err != nil {
+				t.Fatalf("RestoreFixupStage: %v", err)
+			}
+			restored, err := run.RestoreReparkedAcceptance(ctx, repo, acc.ID, parked.FailureReason)
+			if err != nil {
+				t.Fatalf("RestoreReparkedAcceptance: %v", err)
+			}
+
+			h := run.ReadInfraParkHistory(entries, restored)
+			if h.CurrentEpisodeParked {
+				t.Errorf("restored stage matched the original park row's episode; want a fresh episode")
+			}
+			if h.PriorParks != tc.wantPriorParks {
+				t.Errorf("PriorParks = %d, want %d (the original park row counts as prior)", h.PriorParks, tc.wantPriorParks)
+			}
+			if got := run.ClassifyInfraFailurePark(mustListStages(t, repo, restored.RunID), restored, h); got != tc.wantRestoredCls {
+				t.Errorf("ClassifyInfraFailurePark(restored) = %v, want %v", got, tc.wantRestoredCls)
+			}
+		})
+	}
+}
+
+func mustListStages(t *testing.T, repo *fixupRepo, runID uuid.UUID) []*run.Stage {
+	t.Helper()
+	stages, err := repo.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	return stages
+}
+
+// casFixupRepo gives fixupRepo the StageCASTransitioner capability, as the
+// production postgresRepo has. afterGetStage runs once GetStage has returned
+// its snapshot, letting a test land a dispatch between
+// RestoreReparkedAcceptance's read and its write — the window is modelled
+// OUTSIDE the CAS, so the plain TransitionStage fallback sees it too.
+type casFixupRepo struct {
+	*fixupRepo
+	afterGetStage func(id uuid.UUID)
+}
+
+func (m *casFixupRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	st, err := m.fixupRepo.GetStage(ctx, id)
+	if err == nil && m.afterGetStage != nil {
+		m.afterGetStage(id)
+	}
+	return st, err
+}
+
+func (m *casFixupRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	m.mu.Lock()
+	s, ok := m.stages[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, run.ErrNotFound
+	}
+	if s.State != from {
+		cur := s.State
+		m.mu.Unlock()
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: cur}
+	}
+	m.mu.Unlock()
+	return m.TransitionStage(ctx, id, to, c)
+}
+
+// TestRestoreReparkedAcceptance_CASRefusesMidFlightDispatch pins that the
+// "still pending" precondition is atomic on a CAS-capable repo: a dispatch
+// landing between the read and the write is refused with
+// StageStateChangedError and the dispatched acceptance stage is left alone,
+// not failed. Without the CAS the plain dispatched → failed edge would apply.
+func TestRestoreReparkedAcceptance_CASRefusesMidFlightDispatch(t *testing.T) {
+	ctx := context.Background()
+	reason := "preview did not boot"
+	base, _, _, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStatePending)
+	var landed bool
+	repo := &casFixupRepo{fixupRepo: base, afterGetStage: func(id uuid.UUID) {
+		if landed || id != acc.ID {
+			return
+		}
+		landed = true
+		base.mu.Lock()
+		base.stages[id].State = run.StageStateDispatched
+		base.mu.Unlock()
+	}}
+	_, err := run.RestoreReparkedAcceptance(ctx, repo, acc.ID, &reason)
+	if !landed {
+		t.Fatal("fixture: the mid-flight dispatch never landed")
+	}
+	// Committed state first: the dispatched stage must not have been failed.
+	base.mu.Lock()
+	got := *base.stages[acc.ID]
+	base.mu.Unlock()
+	if got.State != run.StageStateDispatched || got.FailureCategory != nil || got.FailureReason != nil {
+		t.Errorf("acceptance = %q cat=%v reason=%v, want dispatched with no failure metadata (left alone)", got.State, got.FailureCategory, got.FailureReason)
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) || sce.Expected != run.StageStatePending || sce.Actual != run.StageStateDispatched {
+		t.Errorf("err = %v, want StageStateChangedError{pending → dispatched}", err)
+	}
 }
 
 // TestPreviewFixupStage_InfraParkedAcceptance_MovesNothing pins that the

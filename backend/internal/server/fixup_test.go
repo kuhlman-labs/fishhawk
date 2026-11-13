@@ -2015,6 +2015,94 @@ func TestMaybeRecoverFixupFailure_RecoversAndEmits(t *testing.T) {
 	}
 }
 
+// TestMaybeRecoverFixupFailure_RestoresReparkedAcceptancePark pins the server
+// call site of the #5249 K3 delivered-nothing recovery: a stage_fixup_triggered
+// entry carrying reparked_acceptance_stage_id / reparked_acceptance_failure_reason
+// makes maybeRecoverFixupFailure put a still-pending acceptance stage back to
+// failed/category C with the ORIGINAL reason, and records the move on
+// stage_fixup_recovered. An acceptance that already left pending is left alone
+// (the restore refuses), the implement recovery still lands, and the refusal is
+// recorded as acceptance_restore_error.
+func TestMaybeRecoverFixupFailure_RestoresReparkedAcceptancePark(t *testing.T) {
+	cases := []struct {
+		name         string
+		accState     run.StageState
+		wantAccState run.StageState
+		wantRestored bool
+	}{
+		{"pending acceptance restored to failed/C", run.StageStatePending, run.StageStateFailed, true},
+		{"dispatched acceptance left alone", run.StageStateDispatched, run.StageStateDispatched, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+			au := newStoringAuditFake()
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+			ctx := context.Background()
+
+			runRow, impl, review := seedFailedFixupRun(rr)
+			acc := rr.seedStage(runRow.ID, 3, tc.accState)
+			rr.mu.Lock()
+			acc.Type = run.StageTypeAcceptance
+			rr.mu.Unlock()
+
+			fields := map[string]any{
+				"stage_id":                           impl.ID.String(),
+				"prior_state":                        string(run.StageStateSucceeded),
+				"reparked_acceptance_stage_id":       acc.ID.String(),
+				"acceptance_reparked_from":           run.AcceptanceReparkedFromFailedC,
+				"reparked_acceptance_failure_reason": "preview did not boot",
+			}
+			payload, _ := json.Marshal(fields)
+			kind := audit.ActorKind("user")
+			if _, err := au.AppendChained(ctx, audit.ChainAppendParams{
+				RunID: runRow.ID, StageID: &impl.ID, Category: CategoryStageFixupTriggered, ActorKind: &kind, Payload: payload,
+			}); err != nil {
+				t.Fatalf("seed stage_fixup_triggered: %v", err)
+			}
+
+			if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+				t.Fatal("maybeRecoverFixupFailure = false, want true (implement recovered)")
+			}
+			curImpl, _ := rr.GetStage(ctx, impl.ID)
+			curReview, _ := rr.GetStage(ctx, review.ID)
+			if curImpl.State != run.StageStateSucceeded || curReview.State != run.StageStatePending {
+				t.Errorf("implement=%q review=%q, want succeeded / pending", curImpl.State, curReview.State)
+			}
+			curAcc, _ := rr.GetStage(ctx, acc.ID)
+			if curAcc.State != tc.wantAccState {
+				t.Errorf("acceptance state = %q, want %q", curAcc.State, tc.wantAccState)
+			}
+			if tc.wantRestored {
+				if curAcc.FailureCategory == nil || *curAcc.FailureCategory != run.FailureC ||
+					curAcc.FailureReason == nil || *curAcc.FailureReason != "preview did not boot" {
+					t.Errorf("acceptance cat=%v reason=%v, want C / the original reason", curAcc.FailureCategory, curAcc.FailureReason)
+				}
+			} else if curAcc.FailureCategory != nil || curAcc.FailureReason != nil {
+				t.Errorf("left-alone acceptance stamped failure metadata: cat=%v reason=%v", curAcc.FailureCategory, curAcc.FailureReason)
+			}
+
+			entries, err := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageFixupRecovered)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("stage_fixup_recovered entries = %d (err %v), want 1", len(entries), err)
+			}
+			var rec map[string]any
+			if err := json.Unmarshal(entries[0].Payload, &rec); err != nil {
+				t.Fatalf("unmarshal stage_fixup_recovered: %v", err)
+			}
+			if rec["reparked_acceptance_stage_id"] != acc.ID.String() {
+				t.Errorf("recovered reparked_acceptance_stage_id = %v, want %s", rec["reparked_acceptance_stage_id"], acc.ID)
+			}
+			if rec["acceptance_restored"] != tc.wantRestored {
+				t.Errorf("recovered acceptance_restored = %v, want %v", rec["acceptance_restored"], tc.wantRestored)
+			}
+			if _, has := rec["acceptance_restore_error"]; has == tc.wantRestored {
+				t.Errorf("recovered acceptance_restore_error present = %v, want %v", has, !tc.wantRestored)
+			}
+		})
+	}
+}
+
 // --- #3395 delivered-nothing round closure ---
 
 // seedFixupTriggeredWithConcernsSeq seeds a stage_fixup_triggered entry at
@@ -6491,6 +6579,27 @@ func TestFixupStage_InfraParkedAcceptanceAdmittedAndAudited(t *testing.T) {
 				t.Errorf("admissibility_reason = %q, want the acceptance-park clause", r)
 			}
 		})
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_TriggerReasonBounded pins the bound on
+// the reparked_acceptance_failure_reason audit copy: an oversized parked
+// failure_reason (runner/agent-derived text) is truncated to
+// reparkedAcceptanceFailureReasonMax bytes plus the "..." marker, not copied
+// verbatim.
+func TestFixupStage_InfraParkedAcceptance_TriggerReasonBounded(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	impl, acc, _ := seedInfraParkedAcceptance(repo, run.FailureC)
+	long := strings.Repeat("x", reparkedAcceptanceFailureReasonMax+500)
+	acc.FailureReason = &long
+
+	w := postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: "fix the preview boot", Reason: "r"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, _ := latestFixupTriggeredPayload(t, au)["reparked_acceptance_failure_reason"].(string)
+	if want := long[:reparkedAcceptanceFailureReasonMax] + "..."; got != want {
+		t.Errorf("reparked_acceptance_failure_reason len = %d, want %d (bounded)", len(got), len(want))
 	}
 }
 

@@ -295,7 +295,9 @@ type FixupDecision struct {
 // re-open, and if the implement re-open then fails the acceptance stage is
 // put back to failed/category C with its original failure_reason
 // (RestoreReparkedAcceptance, best-effort) so the park — and its operator
-// exits — survive the refused pass.
+// exits — survive the refused pass, as a fresh #4356 park episode (terminal
+// when the original park was the last one in budget; see
+// RestoreReparkedAcceptance).
 //
 // The recorded approve_with_concerns verdict and the concern-index
 // validation are the handler's responsibility (they require the audit
@@ -358,7 +360,8 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 	if err != nil {
 		if reparkedAcceptance != nil {
 			// The pass never opened: put the acceptance park back (best-effort)
-			// so the run keeps its category-C park and its operator exits. A
+			// so the run keeps a category-C park and its operator exits (a fresh
+			// park episode; terminal at the #4356 budget boundary). A
 			// restore failure leaves acceptance pending at the old head (the
 			// #5043 residual class) and is joined onto the returned error.
 			if _, rerr := RestoreReparkedAcceptance(ctx, repo, reparkedAcceptance.ID, adm.parkedAcceptance.FailureReason); rerr != nil {
@@ -380,6 +383,22 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 // acceptance has moved on and is left alone). Best-effort for its callers:
 // FixupStage when the implement re-open fails, and the server's fix-up
 // failure recovery after RestoreFixupStage.
+//
+// The `pending` precondition is enforced ATOMICALLY when the repo carries the
+// StageCASTransitioner capability (production postgresRepo): the write is a
+// pending → failed compare-and-swap, so a dispatch that lands between the read
+// and the write is refused with StageStateChangedError and the dispatched
+// stage is left alone. A repo without the capability (in-memory fakes) falls
+// back to the read-then-TransitionStage walk RestoreFixupStage uses.
+//
+// The restored park is a NEW #4356 park episode, not the original one: the
+// re-park's RetryStage bumped self_retry_count and this write stamps a fresh
+// ended_at, so ReadInfraParkHistory counts the original stage_infra_parked row
+// as a PRIOR park. The next orchestrator Advance therefore either parks again
+// (spending one more park of InfraFailureParkRetryBudget) or, when the
+// original park was the last one in budget, fails the run terminally
+// (InfraParkBudgetExhausted) — the same arithmetic a re-dispatched acceptance
+// re-failing on the unchanged head produces.
 func RestoreReparkedAcceptance(ctx context.Context, repo Repository, acceptanceStageID uuid.UUID, failureReason *string) (*Stage, error) {
 	acc, err := repo.GetStage(ctx, acceptanceStageID)
 	if err != nil {
@@ -390,7 +409,13 @@ func RestoreReparkedAcceptance(ctx context.Context, repo Repository, acceptanceS
 			ErrFixupRecoveryNotApplicable, acc.ID, acc.Type, acc.State)
 	}
 	cat := FailureC
-	restored, err := repo.TransitionStage(ctx, acceptanceStageID, StageStateFailed, &StageCompletion{FailureCategory: &cat, FailureReason: failureReason})
+	completion := &StageCompletion{FailureCategory: &cat, FailureReason: failureReason}
+	var restored *Stage
+	if cas, ok := repo.(StageCASTransitioner); ok {
+		restored, err = cas.TransitionStageFrom(ctx, acceptanceStageID, StageStatePending, StageStateFailed, completion)
+	} else {
+		restored, err = repo.TransitionStage(ctx, acceptanceStageID, StageStateFailed, completion)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("RestoreReparkedAcceptance: pending → failed: %w", err)
 	}
