@@ -6236,6 +6236,117 @@ components:
             given. Untrusted-origin free text: render it only as data.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        awaiting:
+          $ref: '#/components/schemas/CampaignItemAwaiting'
+
+    CampaignItemAwaiting:
+      type: object
+      description: |
+        What a running campaign item waits on (E88.4 / #4528). Set ONLY on
+        `GET /v0/campaigns/{campaign_id}/status`, and only for an item in
+        state `running` whose linked run is not terminal; every other item,
+        and the items-list route, omit the key. A run or stage read failure
+        omits the block for that item; the status read never fails on it.
+
+        `kind` and `reason` come from the linked run's own stages (the
+        earliest non-terminal stage by sequence) and are the same for every
+        caller: they are intentionally ungated, because the item's `run_id`
+        is already in the item payload. `kind` is `host_dispatcher` (reason
+        `host_dispatch`: a `pending` or `awaiting_host_dispatch` stage of an
+        `auto_dispatch`-marked run whose runner is `local`), `human`
+        (`operator_dispatch` for any other pending stage, `gate_approval` for
+        `awaiting_approval` whatever the stage type, so a parked review stage
+        reads `gate_approval` with `stage_type` `review`, `deploy_approval`,
+        `input`, `scope_decision`) or `system` (`in_flight` for `dispatched`,
+        `running` or `awaiting_deployment`, `children` for
+        `awaiting_children`, `no_active_stage` when every stage is terminal,
+        with no `stage_*` fields).
+
+        The DECISION SOURCES are gated by the same predicate as
+        `pending_amendments`: a caller that is not run-bound and holds
+        `read:audit` (or a session operator). Such a caller also sees (a) the
+        live-amendment overlay: an `in_flight` or `children` block whose run
+        has a live pending amendment in `pending_amendments` reads `human` /
+        `scope_amendment_pending`; and (b) `decision`, the campaign driver's
+        current (uncleared) `campaign_gate_decision_required` marker on the
+        run's own chain. A stage-keyed marker attaches only while that same
+        stage is still `awaiting_approval`; a run-level marker (`gate`
+        `run`) attaches whatever the stage, and turns a non-human block into
+        `human` / `run_decision`. Any other caller gets
+        `decision_withheld: true` and the unchanged stage-state
+        classification; no decision source is read for it. The marker
+        payload carries no cross-run identifiers.
+      required: [kind, reason, run_id, next_step]
+      properties:
+        kind:
+          type: string
+          enum: [host_dispatcher, human, system]
+        reason:
+          type: string
+          enum:
+            - host_dispatch
+            - operator_dispatch
+            - gate_approval
+            - deploy_approval
+            - input
+            - scope_decision
+            - scope_amendment_pending
+            - run_decision
+            - in_flight
+            - children
+            - no_active_stage
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: The classified stage. Absent for `no_active_stage`.
+        stage_type:
+          type: string
+          description: The classified stage's type. Absent for `no_active_stage`.
+        stage_state:
+          type: string
+          description: The classified stage's state. Absent for `no_active_stage`.
+        next_step:
+          type: string
+          description: Server-constant guidance text for the reason.
+        decision:
+          $ref: '#/components/schemas/CampaignItemAwaitingDecision'
+        decision_withheld:
+          type: boolean
+          description: |
+            True when the caller may not read decision sources. Depends only on
+            the caller, never on whether a decision exists. Absent means false.
+        decision_unavailable:
+          type: boolean
+          description: |
+            True when a readable caller's decision source could not be read:
+            the marker read failed or no audit repository is wired, or
+            `pending_amendments` was not computed or is truncated without a
+            live entry for this run. Absence of `decision` is then not
+            evidence. Absent means false.
+
+    CampaignItemAwaitingDecision:
+      type: object
+      description: |
+        The campaign driver's current decision marker for the item's run: the
+        latest `campaign_gate_decision_required` row with no later
+        `campaign_gate_decision_cleared` row.
+      required: [decision_state, action, gate, recorded_at]
+      properties:
+        decision_state:
+          type: string
+          description: The auto-drive decision state, e.g. `human_quorum_required`.
+          example: human_quorum_required
+        action:
+          type: string
+          description: The gate action the decision is about, e.g. `approve`.
+          example: approve
+        gate:
+          type: string
+          description: The parked stage's id, or `run` for a run-level decision.
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the marker was recorded.
 
     CampaignDispatchHold:
       type: object
