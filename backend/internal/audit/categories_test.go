@@ -238,6 +238,23 @@ func TestKnownCategories_CampaignAutoStartRefused(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_CampaignGateDecisionRequired pins the E88.4 / #4528
+// run-chain marker the campaign driver appends once per DecisionRequired
+// occurrence; an unregistered category is un-awaitable.
+func TestKnownCategories_CampaignGateDecisionRequired(t *testing.T) {
+	if !IsKnownCategory("campaign_gate_decision_required") {
+		t.Fatal("campaign_gate_decision_required is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_CampaignGateDecisionCleared pins the E88.4 / #4528
+// run-chain row that clears a recorded decision marker.
+func TestKnownCategories_CampaignGateDecisionCleared(t *testing.T) {
+	if !IsKnownCategory("campaign_gate_decision_cleared") {
+		t.Fatal("campaign_gate_decision_cleared is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 func TestKnownCategories_AgentRequestFailedAlert(t *testing.T) {
 	if !IsKnownCategory("agent_request_failed_alert") {
 		t.Fatal("agent_request_failed_alert is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")

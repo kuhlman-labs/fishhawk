@@ -2964,6 +2964,28 @@ Notes:
     page-class `anchor_ping_posted` ping for this event (see the page-class ping
     list above). The `campaign_gate_paged` entry itself stays audit-only —
     `campaign_gate_acted` has no comment surface at all.
+- The campaign **decision-required marker** kinds —
+  `campaign_gate_decision_required` and `campaign_gate_decision_cleared`
+  (E88.4 / #4528) — are **system-actor RUN-chain audit kinds, NOT issue-comment
+  surfaces**. Nothing in `issuecomment` posts them and they have no Notifier
+  method. The campaign-driver ticker (`campaigndriver.Ticker.trackDecision`) is
+  the SOLE writer, on the item's linked run chain (`AppendChained`, `system`
+  actor, `StageID` = the parked gate stage or nil):
+  - `campaign_gate_decision_required` (payload `{campaign_id, issue_ref, run_id,
+    gate, decision_state, action}`) records once per occurrence key that the
+    gate actor (`server.Server.DriveCampaignRunGate`) returned a
+    DecisionRequired outcome; `gate` is the parked plan/implement stage id or
+    the literal `run`.
+  - `campaign_gate_decision_cleared` (the same payload plus `cleared_by`:
+    `acted`, `paged` or `no_decision`) records that a later non-decision
+    outcome whose stage read positively showed the gate no longer parked
+    cleared it. An indeterminate read never clears, and a run-level (`run`)
+    gate clears only on an acted or paged outcome.
+  Both are run-bound readable: the payload names only the run's own campaign,
+  issue, stage and closed-set tokens, never the actor's note. They are an
+  interim registration under ADR-106's existing audit-category mechanism and
+  take the mandatory run-bound flag via #4599 / E89 #4537. The operator-facing
+  surface is the per-item `awaiting` block on `GET /v0/campaigns/{id}/status`.
 - The release-publish audit kind — `release_published` (E33.3 / #1588, ADR-051
   option B publish half) — is an **internal, system-actor audit kind, NOT an
   issue-comment surface**. Nothing in `issuecomment` posts it and it has no

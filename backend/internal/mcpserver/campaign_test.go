@@ -20,7 +20,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -4331,6 +4333,135 @@ func TestGetCampaignStatus_AutoStartRefusal_ThroughRealServer(t *testing.T) {
 			}
 			if got.Detail == "" || !strings.Contains(got.Remedy, "fishhawk_start_campaign_item_run") {
 				t.Fatalf("auto_start_refusal detail/remedy = %q / %q", got.Detail, got.Remedy)
+			}
+		})
+	}
+}
+
+// awaitingStatusRunRepo serves one running run and its stages to the status
+// read's per-item awaiting block (E88.4 / #4528).
+type awaitingStatusRunRepo struct {
+	runpkg.BaseFake
+	r      *runpkg.Run
+	stages []*runpkg.Stage
+}
+
+func (f *awaitingStatusRunRepo) GetRun(_ context.Context, id uuid.UUID) (*runpkg.Run, error) {
+	if f.r == nil || id != f.r.ID {
+		return nil, runpkg.ErrNotFound
+	}
+	cp := *f.r
+	return &cp, nil
+}
+
+func (f *awaitingStatusRunRepo) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*runpkg.Stage, error) {
+	if f.r == nil || id != f.r.ID {
+		return nil, nil
+	}
+	return f.stages, nil
+}
+
+// awaitingStatusAudit serves one current decision marker on the run chain.
+type awaitingStatusAudit struct {
+	audit.BaseFake
+	runID uuid.UUID
+	entry *audit.Entry
+}
+
+func (a *awaitingStatusAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == a.runID && category == a.entry.Category {
+		return []*audit.Entry{a.entry}, nil
+	}
+	return nil, nil
+}
+
+// TestGetCampaignStatus_Awaiting_ThroughRealServer drives the REAL status
+// handler through the real MCP HTTP client: a running item parked at a plan
+// gate carries the awaiting block verbatim — the decision for a caller with
+// read:audit (decision_unavailable too, because no scope-amendment repository
+// is wired, so pending amendments were not computed), decision_withheld for a
+// caller without it — and an unstarted item carries no awaiting key.
+func TestGetCampaignStatus_Awaiting_ThroughRealServer(t *testing.T) {
+	now := time.Now().UTC()
+	c := &campaign.Campaign{
+		ID: uuid.New(), Repo: "acme/widgets", EpicRef: "issue:1",
+		State: campaign.StateRunning, PausePolicy: campaign.PausePolicyPauseCampaign,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	runRow := &runpkg.Run{ID: uuid.New(), Repo: "acme/widgets", State: runpkg.StateRunning,
+		AutoDispatch: true, RunnerKind: runpkg.RunnerKindLocal, CreatedAt: now, UpdatedAt: now}
+	plan := &runpkg.Stage{ID: uuid.New(), RunID: runRow.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		State: runpkg.StageStateAwaitingApproval, CreatedAt: now, UpdatedAt: now}
+	runID := runRow.ID
+	repo := &autoStartStatusRepo{c: c, items: []*campaign.Item{
+		{ID: uuid.New(), CampaignID: c.ID, IssueRef: "issue:2", State: campaign.ItemStateRunning, RunID: &runID, CreatedAt: now, UpdatedAt: now},
+		{ID: uuid.New(), CampaignID: c.ID, IssueRef: "issue:3", State: campaign.ItemStatePending, Position: 1, CreatedAt: now, UpdatedAt: now},
+	}}
+	body, _ := json.Marshal(map[string]any{
+		"campaign_id": c.ID.String(), "issue_ref": "issue:2", "run_id": runID.String(),
+		"gate": plan.ID.String(), "decision_state": "human_quorum_required", "action": "approve",
+	})
+	au := &awaitingStatusAudit{runID: runID, entry: &audit.Entry{
+		Sequence: 7, Category: campaigndriver.CategoryCampaignGateDecisionRequired, Timestamp: now, Payload: body,
+	}}
+	for _, tc := range []struct {
+		name         string
+		scopes       []string
+		wantDecision bool
+	}{
+		{"read:audit caller sees the decision", []string{"read:campaigns", "read:runs", "read:audit"}, true},
+		{"caller without read:audit is withheld", []string{"read:campaigns", "read:runs"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const bearer = "fhk_awaiting_status_e2e"
+			tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{ID: uuid.New(), Subject: "github:op", Scopes: tc.scopes, PlainText: bearer}}
+			s := server.New(server.Config{CampaignRepo: repo, RunRepo: &awaitingStatusRunRepo{r: runRow, stages: []*runpkg.Stage{plan}},
+				AuditRepo: au, APITokenRepo: tokRepo})
+			httpSrv := httptest.NewServer(s.Handler())
+			t.Cleanup(httpSrv.Close)
+			r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+
+			_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: c.ID.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus through the real server: %v", err)
+			}
+			if len(out.Items) != 2 {
+				t.Fatalf("items = %+v, want 2", out.Items)
+			}
+			var parked, unstarted *CampaignItem
+			for i := range out.Items {
+				switch out.Items[i].IssueRef {
+				case "issue:2":
+					parked = &out.Items[i]
+				case "issue:3":
+					unstarted = &out.Items[i]
+				}
+			}
+			if unstarted == nil || unstarted.Awaiting != nil {
+				t.Fatalf("unstarted item = %+v, want no awaiting block", unstarted)
+			}
+			blk := parked.Awaiting
+			if blk == nil || blk.Kind != "human" || blk.Reason != "gate_approval" || blk.RunID != runID.String() ||
+				blk.StageID != plan.ID.String() || blk.StageType != "plan" || blk.StageState != "awaiting_approval" || blk.NextStep == "" {
+				t.Fatalf("awaiting = %+v, want human/gate_approval on the plan stage", blk)
+			}
+			if !tc.wantDecision {
+				if !blk.DecisionWithheld || blk.Decision != nil || blk.DecisionUnavailable {
+					t.Fatalf("awaiting = %+v, want decision_withheld and no decision", blk)
+				}
+				return
+			}
+			if blk.DecisionWithheld || !blk.DecisionUnavailable {
+				t.Fatalf("withheld/unavailable = %v/%v, want false/true", blk.DecisionWithheld, blk.DecisionUnavailable)
+			}
+			d := blk.Decision
+			if d == nil || d.Gate != plan.ID.String() || d.DecisionState != "human_quorum_required" || d.Action != "approve" || d.RecordedAt.IsZero() {
+				t.Fatalf("decision = %+v, want the plan-gate marker", d)
+			}
+			// Re-emitting the item keeps the block verbatim (passthrough).
+			raw, _ := json.Marshal(parked)
+			if !strings.Contains(string(raw), `"awaiting":{"kind":"human","reason":"gate_approval"`) {
+				t.Fatalf("re-emitted item = %s, want the awaiting block", raw)
 			}
 		})
 	}

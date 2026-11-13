@@ -268,6 +268,7 @@ type fakeGateActor struct {
 	mu        sync.Mutex
 	calls     []uuid.UUID
 	overrides [][]byte // campaign operator_agent override bytes per call (E25.12)
+	hints     []*bool  // DecisionKeyHeld hint per call; nil when absent (E88.4)
 	err       error
 	drive     func(runRow *run.Run) (GateActionOutcome, error)
 }
@@ -281,11 +282,16 @@ func (f *fakeGateActor) DriveRunGate(ctx context.Context, runRow *run.Run) (Gate
 
 // DriveRunGateWithCampaign records the run and the campaign override bytes the
 // driver threaded, so a test can assert driveGate passed c.OperatorAgent.
-func (f *fakeGateActor) DriveRunGateWithCampaign(_ context.Context, runRow *run.Run, campaignOverride []byte) (GateActionOutcome, error) {
+func (f *fakeGateActor) DriveRunGateWithCampaign(ctx context.Context, runRow *run.Run, campaignOverride []byte) (GateActionOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, runRow.ID)
 	f.overrides = append(f.overrides, campaignOverride)
+	if held, ok := DecisionKeyHeld(ctx); ok {
+		f.hints = append(f.hints, &held)
+	} else {
+		f.hints = append(f.hints, nil)
+	}
 	if f.err != nil {
 		return GateActionOutcome{}, f.err
 	}
@@ -371,6 +377,79 @@ type fakeAudit struct {
 	mu        sync.Mutex
 	entries   []recordedAudit
 	appendErr error
+
+	// Run chain (E88.4 / #4528): seeded and appended rows, the Sequence
+	// counter, per-call AppendChained errors consumed in order (a nil slot
+	// succeeds), and a ListForRunByCategory error.
+	chain       []*audit.Entry
+	seq         int64
+	chainErrs   []error
+	listErr     error
+	listCalls   int
+	chainCalled int
+}
+
+func (f *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.chainCalled++
+	if len(f.chainErrs) > 0 {
+		err := f.chainErrs[0]
+		f.chainErrs = f.chainErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	f.seq++
+	rid := p.RunID
+	e := &audit.Entry{
+		ID: uuid.New(), Sequence: f.seq, RunID: &rid, StageID: p.StageID,
+		Timestamp: p.Timestamp, Category: p.Category, ActorKind: p.ActorKind,
+		ActorSubject: p.ActorSubject, Payload: p.Payload,
+	}
+	f.chain = append(f.chain, e)
+	return e, nil
+}
+
+func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []*audit.Entry
+	for _, e := range f.chain {
+		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// seedChain stores a pre-existing run-chain row, as a previous process wrote it.
+func (f *fakeAudit) seedChain(runID uuid.UUID, stageID *uuid.UUID, category string, payload []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seq++
+	rid := runID
+	f.chain = append(f.chain, &audit.Entry{
+		ID: uuid.New(), Sequence: f.seq, RunID: &rid, StageID: stageID,
+		Category: category, Payload: payload,
+	})
+}
+
+// chainRows returns the run-chain rows of category for runID, in order.
+func (f *fakeAudit) chainRows(runID uuid.UUID, category string) []*audit.Entry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*audit.Entry
+	for _, e := range f.chain {
+		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (f *fakeAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
@@ -1606,5 +1685,520 @@ func TestTick_PlainStarterError_KeepsWarnAndContinue(t *testing.T) {
 	}
 	if au.count() != 0 {
 		t.Fatalf("audit entries = %d, want 0", au.count())
+	}
+}
+
+// --- E88.4 / #4528: decision-required marker ---------------------------------
+
+// scriptStep is one scripted GateActor reply.
+type scriptStep struct {
+	out GateActionOutcome
+	err error
+}
+
+// scriptedActor replies with steps in order; the last step repeats.
+func scriptedActor(steps ...scriptStep) *fakeGateActor {
+	i := 0
+	return &fakeGateActor{drive: func(_ *run.Run) (GateActionOutcome, error) {
+		st := steps[len(steps)-1]
+		if i < len(steps) {
+			st = steps[i]
+		}
+		i++
+		return st.out, st.err
+	}}
+}
+
+// stageDecision is a human-quorum decision parked at plan stage S. The note
+// names another run so a test can prove it never reaches the payload.
+func stageDecision(s uuid.UUID) scriptStep {
+	return scriptStep{out: GateActionOutcome{
+		DecisionRequired: true, DecisionState: "human_quorum_required", Action: "approve",
+		GateKnown: true, GateStageID: &s, ParkedGateStageIDs: []uuid.UUID{s},
+		Note: "decision_required: see run " + uuid.NewString(),
+	}}
+}
+
+// runDecision is a run-level decision (no parked plan/implement stage);
+// parked lists the parked review stages, if any.
+func runDecision(state string, parked ...uuid.UUID) scriptStep {
+	return scriptStep{out: GateActionOutcome{
+		DecisionRequired: true, DecisionState: state, Action: "route_fixup",
+		GateKnown: true, ParkedGateStageIDs: parked, Note: "decision_required: " + state,
+	}}
+}
+
+// observeReleased is an observe-only outcome whose stage read shows nothing parked.
+func observeReleased() scriptStep {
+	return scriptStep{out: GateActionOutcome{GateKnown: true, Note: "observe-only"}}
+}
+
+// observeParked is an observe-only outcome whose stage read shows parked still parked.
+func observeParked(parked ...uuid.UUID) scriptStep {
+	return scriptStep{out: GateActionOutcome{GateKnown: true, ParkedGateStageIDs: parked, Note: "observe-only"}}
+}
+
+// observeUnknown is an observe-only outcome with no positive stage read.
+func observeUnknown() scriptStep {
+	return scriptStep{out: GateActionOutcome{Note: "observe-only (fail-closed)"}}
+}
+
+type decisionFixture struct {
+	tk     *Ticker
+	au     *fakeAudit
+	reader *fakeRunReader
+	store  *fakeCampaignStore
+	c      *campaign.Campaign
+	it     *campaign.Item
+	r      *run.Run
+	logs   *bytes.Buffer
+}
+
+func newDecisionFixture(t *testing.T, actor *fakeGateActor) *decisionFixture {
+	t.Helper()
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:4528", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+	logs := &bytes.Buffer{}
+	tk.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	return &decisionFixture{tk: tk, au: au, reader: reader, store: store, c: c, it: it, r: r, logs: logs}
+}
+
+func (f *decisionFixture) ticks(n int) {
+	for i := 0; i < n; i++ {
+		f.tk.Tick(context.Background())
+	}
+}
+
+func (f *decisionFixture) markers() []*audit.Entry {
+	return f.au.chainRows(f.r.ID, CategoryCampaignGateDecisionRequired)
+}
+
+func (f *decisionFixture) clears() []*audit.Entry {
+	return f.au.chainRows(f.r.ID, CategoryCampaignGateDecisionCleared)
+}
+
+// assertPayloadKeys checks the exact payload key set and returns the payload.
+func assertPayloadKeys(t *testing.T, e *audit.Entry, want ...string) map[string]any {
+	t.Helper()
+	var p map[string]any
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(p) != len(want) {
+		t.Fatalf("payload keys = %v, want exactly %v", p, want)
+	}
+	for _, k := range want {
+		if _, ok := p[k]; !ok {
+			t.Fatalf("payload %v missing key %q (want exactly %v)", p, k, want)
+		}
+	}
+	return p
+}
+
+var markerKeys = []string{"campaign_id", "issue_ref", "run_id", "gate", "decision_state", "action"}
+var clearedKeys = append(append([]string{}, markerKeys...), "cleared_by")
+
+func TestTick_DecisionRequired_RecordsMarkerOncePerOccurrence(t *testing.T) {
+	s := uuid.New()
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s)))
+	f.ticks(3)
+
+	m := f.markers()
+	if len(m) != 1 {
+		t.Fatalf("decision_required rows = %d over 3 identical decision ticks, want 1", len(m))
+	}
+	p := assertPayloadKeys(t, m[0], markerKeys...)
+	if p["gate"] != s.String() || p["decision_state"] != "human_quorum_required" || p["action"] != "approve" ||
+		p["run_id"] != f.r.ID.String() || p["campaign_id"] != f.c.ID.String() || p["issue_ref"] != "issue:4528" {
+		t.Fatalf("marker payload = %v", p)
+	}
+	if m[0].StageID == nil || *m[0].StageID != s {
+		t.Fatalf("marker StageID = %v, want %s", m[0].StageID, s)
+	}
+	if m[0].ActorKind == nil || *m[0].ActorKind != audit.ActorSystem {
+		t.Fatalf("marker actor = %v, want system", m[0].ActorKind)
+	}
+	if bytes.Contains(m[0].Payload, []byte("see run")) {
+		t.Fatalf("marker payload carries the actor note: %s", m[0].Payload)
+	}
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d, want 0", n)
+	}
+	if n := f.au.count(); n != 0 {
+		t.Fatalf("global-chain entries = %d, want 0 (the marker rides the run chain)", n)
+	}
+}
+
+func TestTick_DecisionRequired_RunLevelNilStageOncePerOccurrence(t *testing.T) {
+	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted")))
+	f.ticks(3)
+
+	m := f.markers()
+	if len(m) != 1 {
+		t.Fatalf("decision_required rows = %d, want 1", len(m))
+	}
+	p := assertPayloadKeys(t, m[0], markerKeys...)
+	if p["gate"] != GateRunLevel || p["decision_state"] != "fixup_budget_exhausted" {
+		t.Fatalf("marker payload = %v, want gate %q", p, GateRunLevel)
+	}
+	if m[0].StageID != nil {
+		t.Fatalf("run-level marker StageID = %v, want nil", m[0].StageID)
+	}
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d, want 0", n)
+	}
+}
+
+func TestTick_DecisionRequired_DecisionChangeRecordsNew(t *testing.T) {
+	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted"), runDecision("fixup_ceiling_reached")))
+	f.ticks(2)
+
+	m := f.markers()
+	if len(m) != 2 {
+		t.Fatalf("decision_required rows = %d, want 2 (a changed decision is a new occurrence)", len(m))
+	}
+	if p := assertPayloadKeys(t, m[1], markerKeys...); p["decision_state"] != "fixup_ceiling_reached" {
+		t.Fatalf("second marker = %v", p)
+	}
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d, want 0", n)
+	}
+}
+
+func TestTick_DecisionRequired_NonDecisionTickThenSameDecisionRecordsNew(t *testing.T) {
+	s := uuid.New()
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s), observeReleased(), stageDecision(s)))
+	f.ticks(3)
+
+	if n := len(f.markers()); n != 2 {
+		t.Fatalf("decision_required rows = %d, want 2", n)
+	}
+	cl := f.clears()
+	if len(cl) != 1 {
+		t.Fatalf("decision_cleared rows = %d, want 1", len(cl))
+	}
+	p := assertPayloadKeys(t, cl[0], clearedKeys...)
+	if p["cleared_by"] != clearedByNoDecision || p["gate"] != s.String() {
+		t.Fatalf("cleared payload = %v", p)
+	}
+	if cl[0].StageID == nil || *cl[0].StageID != s {
+		t.Fatalf("cleared StageID = %v, want %s", cl[0].StageID, s)
+	}
+}
+
+func TestTick_DecisionRequired_ActedAndPagedClear(t *testing.T) {
+	t.Run("acted", func(t *testing.T) {
+		s := uuid.New()
+		acted := scriptStep{out: GateActionOutcome{Acted: true, Action: "route_fixup", GateKnown: true, Note: "fix-up"}}
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s), acted, stageDecision(s)))
+		f.ticks(3)
+		if n := len(f.markers()); n != 2 {
+			t.Fatalf("decision_required rows = %d, want 2", n)
+		}
+		cl := f.clears()
+		if len(cl) != 1 {
+			t.Fatalf("decision_cleared rows = %d, want 1", len(cl))
+		}
+		if p := assertPayloadKeys(t, cl[0], clearedKeys...); p["cleared_by"] != clearedByActed {
+			t.Fatalf("cleared_by = %v, want acted", p["cleared_by"])
+		}
+		if n := len(f.au.byCategory(categoryCampaignGateActed)); n != 1 {
+			t.Fatalf("campaign_gate_acted rows = %d, want 1", n)
+		}
+	})
+	t.Run("paged", func(t *testing.T) {
+		s := uuid.New()
+		paged := scriptStep{out: GateActionOutcome{Paged: true, PageEvent: "reviewer_reject", GateKnown: true, Note: "page"}}
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s), paged))
+		f.ticks(2)
+		cl := f.clears()
+		if len(cl) != 1 {
+			t.Fatalf("decision_cleared rows = %d, want 1", len(cl))
+		}
+		if p := assertPayloadKeys(t, cl[0], clearedKeys...); p["cleared_by"] != clearedByPaged {
+			t.Fatalf("cleared_by = %v, want paged", p["cleared_by"])
+		}
+	})
+}
+
+// An actor error never appends and never clears, whatever outcome it carries:
+// the errored step returns a positive released read so only driveGate's error
+// return keeps it from clearing.
+func TestTick_DecisionRequired_ActorErrorKeepsKey(t *testing.T) {
+	s := uuid.New()
+	errStep := scriptStep{out: GateActionOutcome{GateKnown: true, Note: "partial"}, err: errors.New("dispatch failed")}
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s), errStep, stageDecision(s)))
+	f.ticks(3)
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows = %d, want 1", n)
+	}
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d, want 0", n)
+	}
+}
+
+func TestTick_DecisionRequired_GateUnknownDefers(t *testing.T) {
+	unknown := scriptStep{out: GateActionOutcome{DecisionRequired: true, DecisionState: "human_quorum_required", Action: "approve", Note: "gate unknown"}}
+	t.Run("between_known_ticks", func(t *testing.T) {
+		s := uuid.New()
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s), unknown, stageDecision(s)))
+		f.ticks(3)
+		if n := len(f.markers()); n != 1 {
+			t.Fatalf("decision_required rows = %d, want 1 (the unknown tick defers)", n)
+		}
+		if n := len(f.clears()); n != 0 {
+			t.Fatalf("decision_cleared rows = %d, want 0", n)
+		}
+	})
+	t.Run("first_tick", func(t *testing.T) {
+		f := newDecisionFixture(t, scriptedActor(unknown))
+		f.ticks(2)
+		if n := len(f.markers()); n != 0 {
+			t.Fatalf("decision_required rows = %d, want 0", n)
+		}
+		if !bytes.Contains(f.logs.Bytes(), []byte("campaigndriver: decision gate unknown; marker deferred")) {
+			t.Fatalf("no defer WARN; logs = %s", f.logs.String())
+		}
+	})
+}
+
+func TestTick_DecisionRequired_AppendFailureWarnsAndRetries(t *testing.T) {
+	t.Run("marker", func(t *testing.T) {
+		s := uuid.New()
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s)))
+		f.au.chainErrs = []error{errors.New("chain down")}
+		f.ticks(1)
+		if n := len(f.markers()); n != 0 {
+			t.Fatalf("decision_required rows after failed append = %d, want 0", n)
+		}
+		logs := f.logs.String()
+		if !bytes.Contains(f.logs.Bytes(), []byte("campaigndriver: decision marker append failed")) ||
+			!bytes.Contains(f.logs.Bytes(), []byte(f.r.ID.String())) {
+			t.Fatalf("no WARN with message and run_id; logs = %s", logs)
+		}
+		f.ticks(2)
+		if n := len(f.markers()); n != 1 {
+			t.Fatalf("decision_required rows after retry = %d, want 1", n)
+		}
+	})
+	t.Run("clear", func(t *testing.T) {
+		s := uuid.New()
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s), observeReleased()))
+		f.ticks(1)
+		f.au.chainErrs = []error{errors.New("chain down")}
+		f.ticks(1)
+		if n := len(f.clears()); n != 0 {
+			t.Fatalf("decision_cleared rows after failed append = %d, want 0", n)
+		}
+		if !bytes.Contains(f.logs.Bytes(), []byte("campaigndriver: decision clear append failed")) {
+			t.Fatalf("no clear WARN; logs = %s", f.logs.String())
+		}
+		f.ticks(2)
+		if n := len(f.clears()); n != 1 {
+			t.Fatalf("decision_cleared rows after retry = %d, want 1", n)
+		}
+	})
+}
+
+func TestTick_DecisionRequired_HydratesFromChain(t *testing.T) {
+	seedPayload := func(f *decisionFixture, s uuid.UUID) []byte {
+		b, _ := json.Marshal(map[string]any{
+			"campaign_id": f.c.ID.String(), "issue_ref": f.it.IssueRef, "run_id": f.r.ID.String(),
+			"gate": s.String(), "decision_state": "human_quorum_required", "action": "approve",
+		})
+		return b
+	}
+	t.Run("uncleared_marker_seeds_key", func(t *testing.T) {
+		s := uuid.New()
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s), observeReleased()))
+		f.au.seedChain(f.r.ID, &s, CategoryCampaignGateDecisionRequired, seedPayload(f, s))
+		f.ticks(1)
+		if n := len(f.markers()); n != 1 {
+			t.Fatalf("decision_required rows = %d, want 1 (the seeded row only; a restart must not duplicate)", n)
+		}
+		f.ticks(1)
+		if n := len(f.clears()); n != 1 {
+			t.Fatalf("decision_cleared rows = %d, want 1 (the hydrated key clears)", n)
+		}
+	})
+	t.Run("cleared_marker_seeds_nothing", func(t *testing.T) {
+		s := uuid.New()
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s)))
+		f.au.seedChain(f.r.ID, &s, CategoryCampaignGateDecisionRequired, seedPayload(f, s))
+		f.au.seedChain(f.r.ID, &s, CategoryCampaignGateDecisionCleared, seedPayload(f, s))
+		f.ticks(1)
+		if n := len(f.markers()); n != 2 {
+			t.Fatalf("decision_required rows = %d, want 2 (a new occurrence after the clear)", n)
+		}
+	})
+	t.Run("malformed_marker_seeds_nothing", func(t *testing.T) {
+		s := uuid.New()
+		f := newDecisionFixture(t, scriptedActor(stageDecision(s)))
+		f.au.seedChain(f.r.ID, &s, CategoryCampaignGateDecisionRequired, []byte("not json"))
+		f.ticks(2)
+		if n := len(f.markers()); n != 2 {
+			t.Fatalf("decision_required rows = %d, want 2 (the malformed row plus one fresh marker)", n)
+		}
+		if !bytes.Contains(f.logs.Bytes(), []byte("campaigndriver: decision marker payload unreadable; not seeded")) {
+			t.Fatalf("no unreadable-payload WARN; logs = %s", f.logs.String())
+		}
+	})
+}
+
+func TestTick_DecisionRequired_HydrationReadErrorDefers(t *testing.T) {
+	s := uuid.New()
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s)))
+	f.au.listErr = errors.New("audit read down")
+	f.ticks(2)
+	if f.au.chainCalled != 0 {
+		t.Fatalf("AppendChained calls = %d with the chain unreadable, want 0", f.au.chainCalled)
+	}
+	if !bytes.Contains(f.logs.Bytes(), []byte("campaigndriver: decision chain read failed; marker tracking deferred")) {
+		t.Fatalf("no hydration WARN; logs = %s", f.logs.String())
+	}
+	f.au.listErr = nil
+	f.ticks(1)
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows after recovery = %d, want 1", n)
+	}
+}
+
+func TestTick_DecisionRequired_UndrivenRunForgotten(t *testing.T) {
+	s := uuid.New()
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s)))
+	f.ticks(1)
+	if _, ok := f.tk.storedDecision(f.r.ID); !ok {
+		t.Fatal("no stored key after the decision tick")
+	}
+	f.reader.setState(f.r.ID, run.StateSucceeded)
+	f.ticks(1)
+	if _, ok := f.tk.storedDecision(f.r.ID); ok {
+		t.Fatal("stored key survived the run settling terminal")
+	}
+	f.tk.decisionMu.Lock()
+	_, hydrated := f.tk.decisionsHydrated[f.r.ID]
+	f.tk.decisionMu.Unlock()
+	if hydrated {
+		t.Fatal("hydration flag survived the run settling terminal")
+	}
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d, want 0 for a terminal run", n)
+	}
+}
+
+// C1 (a): an observe-only outcome while the keyed stage is still parked clears
+// nothing, and the same decision afterwards records no second marker.
+func TestTick_DecisionRequired_ObserveOnlyWhileStillParkedKeepsKey(t *testing.T) {
+	s := uuid.New()
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s), observeParked(s), observeParked(s), observeParked(s), stageDecision(s)))
+	f.ticks(5)
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d with the stage still awaiting_approval, want 0", n)
+	}
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows = %d, want 1", n)
+	}
+}
+
+// C1 (b): a stage-read error (GateKnown=false) never clears.
+func TestTick_DecisionRequired_StageReadErrorNoClear(t *testing.T) {
+	s := uuid.New()
+	f := newDecisionFixture(t, scriptedActor(stageDecision(s), observeUnknown(), observeUnknown(), stageDecision(s)))
+	f.ticks(4)
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d after indeterminate reads, want 0", n)
+	}
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows = %d, want 1", n)
+	}
+}
+
+// actedReleased is an acted outcome whose stage read shows nothing parked.
+func actedReleased() scriptStep {
+	return scriptStep{out: GateActionOutcome{Acted: true, Action: "merge", GateKnown: true, Note: "merged"}}
+}
+
+// C1 run-level: a run-level key clears only on a positive (acted or paged)
+// outcome whose stage read shows no parked plan, implement or review stage.
+func TestTick_DecisionRequired_RunLevelClearsOnlyWithNoParkedStage(t *testing.T) {
+	review := uuid.New()
+	acted := scriptStep{out: GateActionOutcome{Acted: true, Action: "merge", GateKnown: true, ParkedGateStageIDs: []uuid.UUID{review}, Note: "merged"}}
+	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted", review), observeParked(review), acted, actedReleased()))
+	f.ticks(3)
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d with the review stage parked, want 0", n)
+	}
+	f.ticks(1)
+	cl := f.clears()
+	if len(cl) != 1 {
+		t.Fatalf("decision_cleared rows = %d once nothing is parked, want 1", len(cl))
+	}
+	if cl[0].StageID != nil {
+		t.Fatalf("run-level cleared StageID = %v, want nil", cl[0].StageID)
+	}
+	if p := assertPayloadKeys(t, cl[0], clearedKeys...); p["cleared_by"] != clearedByActed {
+		t.Fatalf("cleared_by = %v, want acted", p["cleared_by"])
+	}
+}
+
+// C1 run-level, fail-closed: AutoDriveRunGate answers observe-only with a nil
+// error on its own fail-closed reads, and the translator's stage read then
+// succeeds with nothing parked (a merge-arm decision is reached only when no
+// stage is awaiting_approval). That outcome is indistinguishable from a
+// positive observe-only, so it must hold a run-level key: no clear row, and the
+// recurring decision records no second marker.
+func TestTick_DecisionRequired_RunLevelHeldThroughFailClosedObserveOnly(t *testing.T) {
+	merge := scriptStep{out: GateActionOutcome{
+		DecisionRequired: true, DecisionState: "first_officer_finding_open", Action: "merge",
+		GateKnown: true, Note: "decision_required: merge hold",
+	}}
+	f := newDecisionFixture(t, scriptedActor(merge, observeReleased(), observeReleased(), observeReleased(), merge))
+	f.ticks(5)
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d after fail-closed observe-only ticks, want 0", n)
+	}
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows = %d, want 1 (the held key dedupes the recurring decision)", n)
+	}
+}
+
+// C1 run-level: a paged outcome is positive and clears a run-level key.
+func TestTick_DecisionRequired_RunLevelPagedClears(t *testing.T) {
+	paged := scriptStep{out: GateActionOutcome{Paged: true, PageEvent: "reviewer_reject", GateKnown: true, Note: "page"}}
+	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted"), paged))
+	f.ticks(2)
+	cl := f.clears()
+	if len(cl) != 1 {
+		t.Fatalf("decision_cleared rows = %d, want 1", len(cl))
+	}
+	if p := assertPayloadKeys(t, cl[0], clearedKeys...); p["cleared_by"] != clearedByPaged {
+		t.Fatalf("cleared_by = %v, want paged", p["cleared_by"])
+	}
+}
+
+// C4 hint: the actor is told the driver may hold a key until the run is
+// hydrated with no key; a recorded decision flips it back.
+func TestTick_DecisionKeyHeldHint(t *testing.T) {
+	s := uuid.New()
+	actor := scriptedActor(observeReleased(), observeReleased(), stageDecision(s), observeParked(s))
+	f := newDecisionFixture(t, actor)
+	f.ticks(4)
+	want := []bool{true, false, false, true}
+	if len(actor.hints) != len(want) {
+		t.Fatalf("hints = %d, want %d", len(actor.hints), len(want))
+	}
+	for i, w := range want {
+		if actor.hints[i] == nil {
+			t.Fatalf("hint[%d] absent, want %v", i, w)
+		}
+		if *actor.hints[i] != w {
+			t.Fatalf("hint[%d] = %v, want %v", i, *actor.hints[i], w)
+		}
 	}
 }

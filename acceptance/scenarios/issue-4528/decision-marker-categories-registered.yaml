@@ -1,0 +1,15 @@
+id: scenario:issue-4528/decision-marker-categories-registered
+statement: GET /v0/runs/{run_id}/audit?category=campaign_gate_decision_required and GET /v0/runs/{run_id}/audit?category=campaign_gate_decision_cleared each return 200 with an entries list for an existing run. Neither returns 400 validation_failed naming an unknown category, so a fishhawk_await_audit wait can be armed on either marker.
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/audit?category=campaign_gate_decision_required and ?category=campaign_gate_decision_cleared on any run in the preview each return 200 (before this change both return 400 validation_failed with suggestions).'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} -> 201, run 463576f2-72fe-45ce-be4c-7c2d4d42dc18. 2) GET /v0/runs/{run}/audit?category=campaign_gate_decision_required. 3) GET /v0/runs/{run}/audit?category=campaign_gate_decision_cleared. 4) Control: GET /v0/runs/{run}/audit?category=bogus_category_xyz.'
+steps_carried_from: head 1485f612818ad165ed0dfd329e14e9a8d7cfd7f1 recorded_at 2026-11-13T14:44:30Z
+assertions:
+    expected: 200 with an entries list for both categories, not 400 validation_failed
+    observed_at_record: 'steps 2 and 3: 200 {"items":[],"next_cursor":""}; control 400 validation_failed ''category is not a known audit category'''
+    repro_handle: curl 'http://localhost:8090/v0/runs/<run>/audit?category=campaign_gate_decision_cleared'
+origin:
+    issue: 4528
+    pr: 5253
+    run_id: ca4e7ab8-3279-4e17-a0e7-53163fd2b604
+    head_sha: 68b1e62e8decb8f9815d57047d45124847202078
+    recorded_at: 2026-11-13T16:22:38Z
