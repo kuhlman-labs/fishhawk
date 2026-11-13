@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -278,6 +279,10 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := Identity{Subject: "anonymous"}
+			// fromTokenStore records that the api-token branch (fhk_) resolved
+			// id: the ONLY branch allowed to carry a host-dispatcher subject
+			// (ADR-104 Q4, E88.2 / #4526). See the post-resolution guard below.
+			fromTokenStore := false
 
 			// Cookie session first. Tied to a real forge user, so
 			// handlers that index on Subject get a stable
@@ -428,9 +433,50 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 								}
 								id = seat
 							}
+							// A host-dispatcher token (ADR-104 Q4, E88.2 /
+							// #4526) must carry a valid host-dispatcher/<host>
+							// subject and is ALWAYS clamped to the dispatcher
+							// profile, so a hand-minted dispatcher token holding
+							// write:approvals still cannot approve.
+							if hostdispatcher.IsSubject(rec.Subject) {
+								if verr := hostdispatcher.ValidateSubject(rec.Subject); verr != nil {
+									s.writeError(w, r, http.StatusUnauthorized, "invalid_token_subject",
+										"host-dispatcher token subject is malformed; re-issue it with `fishhawkd token issue --subject host-dispatcher/<host>`",
+										map[string]any{"error": verr.Error()})
+									return
+								}
+								id.Scopes = hostdispatcher.ClampScopes(id.Scopes)
+							}
+							fromTokenStore = true
 						}
 					}
 				}
+			}
+
+			// Post-resolution guard (ADR-104 Q4, E88.2 / #4526): the
+			// host-dispatcher profile is granted ONLY through the api-token
+			// store branch above, where the clamp runs. Any other branch that
+			// produced a host-dispatcher subject — an AS-issued fho_ token, a
+			// session, a run-bound fhm_ token — resets to anonymous. The fhm_
+			// subject is the fixed mcp:run:<id> and a session subject is
+			// <provider>:<login>, so today only the OAuth branch can reach this;
+			// the guard is branch-agnostic so a future branch cannot either.
+			if hostdispatcher.IsSubject(id.Subject) && !fromTokenStore {
+				id = Identity{Subject: "anonymous"}
+			}
+			// Route allowlist (ADR-104 Q4 residual closed by the FO fix-up
+			// ruling on #4526): a host-dispatcher subject may call ONLY the
+			// routes the dispatcher uses (hostdispatcher.Routes()). Every
+			// other route — run-minting (POST /v0/runs, recover), gate
+			// decisions (scope amendments, crew escalations, scope
+			// completeness), cancel, concurrency promote — is refused here,
+			// before the handler and before any repository-configured check,
+			// so write:runs / write:stages never reach beyond the list.
+			if hostdispatcher.IsSubject(id.Subject) && !hostdispatcher.RouteAllowed(r.Method, r.URL.EscapedPath()) {
+				s.writeError(w, r, http.StatusForbidden, "host_dispatcher_route_forbidden",
+					"a host-dispatcher subject may call only the routes the host dispatcher uses; use an operator token for this route",
+					map[string]any{"method": r.Method, "path": r.URL.Path})
+				return
 			}
 
 			ctx := context.WithValue(r.Context(), ctxKeyIdentity, id)

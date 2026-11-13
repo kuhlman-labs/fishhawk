@@ -81,6 +81,20 @@ Read the consequence honestly: a rollback RESTORES the spec-derived behaviour �
 
 **sqlc.** Hand-edited like `requires_charter`, not regenerated: every Run-returning query in `db/queries.sql.go` gained `document_base_commit` at the END of its SELECT/RETURNING list and `&i.DocumentBaseCommit` at the end of its scan block, `CreateRun`'s explicit column list gained it as `$24`, and `db.Run` / `db.CreateRunParams` gained `DocumentBaseCommit *string`.
 
+## `auto_dispatch` — the starter-stamped host-dispatcher mark (E88.2 / #4526)
+
+`runs.auto_dispatch` (migration `0116_runs_auto_dispatch`, `BOOLEAN NOT NULL DEFAULT false`) is the ADR-104 Q3 mark that makes a local run eligible for `fishhawk-mcp host-dispatch`. It is stamped ONCE, by the run's STARTER, and never changed afterwards: the campaign driver (`cmd/fishhawkd` `campaignRunStarter.startParams`) stamps every run it starts; an operator may opt in with `auto_dispatch: true` on `POST /v0/runs`; the operator campaign item-start path and every webhook-started run stay unmarked. A `host-dispatcher/<host>` subject can never mint (and so never mark) a run: the server's dispatcher route allowlist (`backend/internal/hostdispatcher/README.md`) answers 403 `host_dispatcher_route_forbidden` on every run-minting route, `POST /v0/runs` and `POST /v0/runs/{id}/recover` included, before the handler runs, and `POST /v0/runs` keeps its own 403 `host_dispatcher_cannot_start_runs` as defense in depth. Because the mark is inherited (below), the recover refusal is load-bearing: without it a dispatcher could mint a marked recovery child of a marked run and then spawn it. The mark makes a run DISPATCHABLE only; it grants no gate act.
+
+Threaded through `CreateRunParams.AutoDispatch` → `postgres.CreateRun` → `rowToRun` (the single shared mapper) and echoed on `GET /v0/runs/{id}` and the list route as `auto_dispatch` (omitted when false).
+
+**Inherited by child runs (F2 decision).** `childParamsInheritance` marks `AutoDispatch` `inherited`: a CI-retry or operator-recovery child of a campaign-driver run must stay dispatchable or the unattended campaign strands. The mark still comes from the starter of the PARENT, so this does not contradict ADR-104 Q3 (which concerns webhook-STARTED runs): a child of an unmarked webhook run stays unmarked. Pinned by `TestChildParamsFrom_InheritsAutoDispatch` (CI-retry and recovery shapes, marked and unmarked parent) and the reflection pins below.
+
+**Tests.** `TestCreateRun_AutoDispatchRoundTrip` round-trips both values across `CreateRun` / `GetRun` / `TransitionRun` / `ListRuns`; `TestMigrateDown_RunsAutoDispatchReversal` (`internal/postgres`) asserts NOT NULL / default false after `MigrateUp` and the column gone after rolling back through 0116 with `runs` intact.
+
+**Rollback.** `MigrateDown` through 0116 drops the column; every mark is lost, which only makes runs undispatchable by the host dispatcher (an operator can still dispatch them by hand).
+
+**sqlc.** Hand-edited like `document_base_commit`, not regenerated: every Run-returning query in `db/queries.sql.go` gained `auto_dispatch` at the END of its SELECT/RETURNING list and `&i.AutoDispatch` at the end of its scan block, `CreateRun`'s explicit column list gained it as `$25`, and `db.Run` / `db.CreateRunParams` gained `AutoDispatch bool`.
+
 ## `runs_retry_child_once_idx` — atomic CI-failure-retry dedup (E45.22 / #2043)
 
 The same migration creates `CREATE UNIQUE INDEX runs_retry_child_once_idx ON runs (parent_run_id, retry_attempt) WHERE parent_run_id IS NOT NULL AND retry_attempt > 0`. Both CI-failure retry paths (the pre-existing GitHub `check_run` path and the GitLab pipeline path) previously deduplicated with a read followed by a write and no atomicity between them, so two concurrent deliveries for one failure could both observe "no child yet" and both insert.
@@ -517,7 +531,7 @@ The other two non-test `CreateRunParams` literals — `server.(*Server).CreateRu
 
 `childParamsInheritance` in `childparams.go` carries one row per `CreateRunParams` field: a mode and a one-sentence reason. It is the decision record, and it is enforced.
 
-- **`inherited`** — copied verbatim from the parent row. `Repo`, `WorkflowID`, `WorkflowSHA`, `TriggerSource`, `TriggerRef`, `InstallationID`, `InstallationRef`, `RunnerKind`, `WorkflowSpec`, `WorkingDir`, `RequiredChecksSnapshot`, `MaxRetriesSnapshot`, `IssueContext`, `RequiresCharter` (verbatim INCLUDING `nil` — see the `requires_charter` section above), `DocumentBaseCommit` (verbatim INCLUDING `nil` — see the `document_base_commit` section above).
+- **`inherited`** — copied verbatim from the parent row. `Repo`, `WorkflowID`, `WorkflowSHA`, `TriggerSource`, `TriggerRef`, `InstallationID`, `InstallationRef`, `RunnerKind`, `WorkflowSpec`, `WorkingDir`, `RequiredChecksSnapshot`, `MaxRetriesSnapshot`, `IssueContext`, `RequiresCharter` (verbatim INCLUDING `nil` — see the `requires_charter` section above), `DocumentBaseCommit` (verbatim INCLUDING `nil` — see the `document_base_commit` section above), `AutoDispatch` (a child of a campaign-driver run stays dispatchable — see the `auto_dispatch` section above).
 - **`derived`** — computed from the parent, never copied. Today only `ParentRunID = &parent.ID`; a verbatim copy of `parent.ParentRunID` would point the child at its GRANDparent.
 - **`notInherited`** — deliberately left zero for the site to set. `RetryAttempt`, `DecomposedFrom`, `SliceIndex`, `IdempotencyKey`, `UpstreamRunID`, `Drive`.
 

@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 385 names are tool I/O request/response structs. The MCP
+// The bulk of these 390 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -236,6 +236,10 @@ var exportBaseline = []string{
 	"HandoverBriefOutput",
 	"HealthInfo",
 	"HostDispatchResult",
+	// E88.2 / #4526: the `fishhawk-mcp host-dispatch` entry points (ADR-104 host
+	// dispatcher) — the command's config, run loop, status file and pause verb.
+	"HostDispatcherConfig",
+	"HostDispatcherStatus",
 	"InitInput",
 	"InitOutput",
 	"Instructions",
@@ -351,6 +355,7 @@ var exportBaseline = []string{
 	"PromoteQueuedStageResult",
 	"ReadCrewMessagesInput",
 	"ReadCrewMessagesOutput",
+	"ReadHostDispatcherStatus", // E88.2 / #4526
 	"ReapFailureResult",
 	"ReapStageInput",
 	"ReapStageOutput",
@@ -463,6 +468,7 @@ var exportBaseline = []string{
 	"RunConcerns",
 	"RunCost",
 	"RunCostStage",
+	"RunHostDispatcher", // E88.2 / #4526
 	"RunLatency",
 	"RunLiveValidation",
 	"RunMergedPRCost",
@@ -494,6 +500,7 @@ var exportBaseline = []string{
 	"SecurityFinding",
 	"SendCrewMessageInput",
 	"SessionGuidance",
+	"SetHostDispatcherPaused", // E88.2 / #4526
 	// E85.9 / #4300: the client mirrors of the /v0/specialist-jobs job read
 	// shape (server specialistJobResponse). Exported because both specialist
 	// tools' outputs embed SpecialistJob, which embeds the requester and

@@ -66,6 +66,7 @@ func childParamsParentFixture(t *testing.T) *Run {
 		// &false pass the inherited-equality check for the wrong reason.
 		RequiresCharter:    &requiresCharter,
 		DocumentBaseCommit: &documentBaseCommit,
+		AutoDispatch:       true,
 	}
 }
 
@@ -313,6 +314,52 @@ func TestChildParamsFrom_InheritsDocumentBaseCommit(t *testing.T) {
 				t.Fatalf("child dropped the parent's DocumentBaseCommit (%q); its run-admission documents would be withheld", *tc.parent)
 			case tc.parent != nil && *child.DocumentBaseCommit != *tc.parent:
 				t.Errorf("child DocumentBaseCommit = %q, want the parent's admission commit %q", *child.DocumentBaseCommit, *tc.parent)
+			}
+		})
+	}
+}
+
+// TestChildParamsFrom_InheritsAutoDispatch pins the F2 mode decision for the
+// ADR-104 Q3 host-dispatcher mark (migration 0116, E88.2 / #4526): a CI-retry
+// child (webhook/dispatcher.go, webhook/gitlab_ciretry.go) and an
+// operator-recovery child (server/recover.go) both mint through
+// ChildParamsFrom, so a child of a MARKED parent carries auto_dispatch and
+// stays dispatchable, while a child of an UNMARKED parent stays unmarked. The
+// two child shapes differ only in the call-site-owned RetryAttempt, which the
+// cases set after the call exactly as those sites do.
+func TestChildParamsFrom_InheritsAutoDispatch(t *testing.T) {
+	cases := []struct {
+		name   string
+		marked bool
+		mint   func(p CreateRunParams, parent *Run) CreateRunParams
+	}{
+		{"CI-retry child of a marked run carries auto_dispatch", true,
+			func(p CreateRunParams, parent *Run) CreateRunParams {
+				p.RetryAttempt = parent.RetryAttempt + 1
+				return p
+			}},
+		{"recovery child of a marked run carries auto_dispatch", true,
+			func(p CreateRunParams, parent *Run) CreateRunParams { p.RetryAttempt = parent.RetryAttempt; return p }},
+		{"CI-retry child of an unmarked run stays unmarked", false,
+			func(p CreateRunParams, parent *Run) CreateRunParams {
+				p.RetryAttempt = parent.RetryAttempt + 1
+				return p
+			}},
+		{"recovery child of an unmarked run stays unmarked", false,
+			func(p CreateRunParams, parent *Run) CreateRunParams { p.RetryAttempt = parent.RetryAttempt; return p }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := &Run{
+				ID:           uuid.New(),
+				Repo:         "kuhlman-labs/fishhawk",
+				WorkflowID:   "feature_change",
+				RunnerKind:   RunnerKindLocal,
+				AutoDispatch: tc.marked,
+			}
+			child := tc.mint(ChildParamsFrom(parent), parent)
+			if child.AutoDispatch != tc.marked {
+				t.Errorf("child AutoDispatch = %v, want %v (the parent's starter-stamped mark)", child.AutoDispatch, tc.marked)
 			}
 		})
 	}

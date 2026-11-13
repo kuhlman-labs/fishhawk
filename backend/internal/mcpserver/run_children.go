@@ -548,38 +548,7 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		base = hdr.BaseBranch
 	}
 
-	argv := []string{
-		"--run-id", d.runID,
-		"--backend-url", r.api.baseURL,
-		"--workflow", p.in.Workflow,
-		"--stage", "implement",
-		stageIDArgFlag, d.stageID,
-		"--working-dir", p.workingDir,
-		"--fetch-prompt",
-		"--upload-trace",
-		"--github-repo", p.repo,
-	}
-	// `--forge gitlab --gitlab-base-url <url>` for a gitlab parent, nothing for
-	// github — the same runForgeTarget.argv() composeRunnerArgv appends, placed
-	// at the same position (right after --github-repo) so the two producers
-	// cannot drift (E45.46 / #3463).
-	argv = append(argv, p.forgeTarget.argv()...)
-	argv = append(argv, runnerAgentArgv(agent)...)
-	argv = append(argv,
-		// --base-branch / --check-base-ref drives BOTH halves of a dependent
-		// wave's basing on its predecessors' merged tree: (a) the runner's
-		// PRE-INVOKE working-tree checkout of this base into the child worktree,
-		// so the agent SEES its predecessors' integrated symbols and can compile
-		// (#1302); and (b) the commit-time branch cut from origin/<base> (the
-		// runner's freshFetchBase routing). freshFetchBase alone governs only
-		// (b) — the agent's working tree is established by (a).
-		"--base-branch", base,
-		"--check-base-ref", base,
-		// The load-bearing flag: each concurrent child keys its worktree on its
-		// OWN run id (run-<child>) instead of the shared parent root, so siblings
-		// get isolated checkouts (E24.4 / #1144).
-		"--parallel-isolate",
-	)
+	argv := childRunnerArgv(d.runID, d.stageID, r.api.baseURL, p.in.Workflow, p.workingDir, p.repo, p.forgeTarget, agent, base)
 
 	// The report + probe closures are built exactly as dispatch_stage.go builds
 	// them, bound to THIS child's (run, stage). report is BOTH the detached
@@ -663,6 +632,47 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		"spawn failed after the host-dispatch marker had already flipped the stage to 'dispatched' (%v), and the category-C failure report meant to make it retryable ALSO failed (%v), so this child's implement stage is STRANDED in 'dispatched' with no runner and no reaper. fishhawk_retry_stage will NOT clear it — it admits only a 'failed' stage. Recover with fishhawk_reap_stage(run_id:%q, stage_id:%q, category:\"C\"), then fishhawk_retry_stage, then re-invoke fishhawk_run_children. (Fallback for a client without that verb: POST %s/v0/runs/%s/stages/%s/reap-failure with {\"category\":\"C\",\"reason\":\"runner_spawn_failed\"}.)",
 		spawnErr, rerr, d.runID, d.stageID, r.api.baseURL, d.runID, d.stageID))
 	return res
+}
+
+// childRunnerArgv composes a decomposed child's implement-stage runner argv
+// (E88.2 / #4526 extracted it from dispatchOneChild byte-identically). It is
+// the ONE child argv producer: fishhawk_run_children and the host dispatcher
+// (host_dispatcher.go) both call it, so the two child spawns cannot drift —
+// the run_children argv tests pin its output.
+func childRunnerArgv(runID, stageID, backendURL, workflow, workingDir, repo string, forge runForgeTarget, agent, base string) []string {
+	argv := []string{
+		"--run-id", runID,
+		"--backend-url", backendURL,
+		"--workflow", workflow,
+		"--stage", "implement",
+		stageIDArgFlag, stageID,
+		"--working-dir", workingDir,
+		"--fetch-prompt",
+		"--upload-trace",
+		"--github-repo", repo,
+	}
+	// `--forge gitlab --gitlab-base-url <url>` for a gitlab parent, nothing for
+	// github — the same runForgeTarget.argv() composeRunnerArgv appends, placed
+	// at the same position (right after --github-repo) so the two producers
+	// cannot drift (E45.46 / #3463).
+	argv = append(argv, forge.argv()...)
+	argv = append(argv, runnerAgentArgv(agent)...)
+	argv = append(argv,
+		// --base-branch / --check-base-ref drives BOTH halves of a dependent
+		// wave's basing on its predecessors' merged tree: (a) the runner's
+		// PRE-INVOKE working-tree checkout of this base into the child worktree,
+		// so the agent SEES its predecessors' integrated symbols and can compile
+		// (#1302); and (b) the commit-time branch cut from origin/<base> (the
+		// runner's freshFetchBase routing). freshFetchBase alone governs only
+		// (b) — the agent's working tree is established by (a).
+		"--base-branch", base,
+		"--check-base-ref", base,
+		// The load-bearing flag: each concurrent child keys its worktree on its
+		// OWN run id (run-<child>) instead of the shared parent root, so siblings
+		// get isolated checkouts (E24.4 / #1144).
+		"--parallel-isolate",
+	)
+	return argv
 }
 
 // isWaveNotIntegrated reports whether a host-dispatch marker error is the

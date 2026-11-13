@@ -123,6 +123,12 @@ func parseFlags(args []string, stderr io.Writer) (transportFlags, error) {
 // process with exitFailure — MCP clients restart their server
 // processes, so a graceful exit on transport failure is correct.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	// `fishhawk-mcp host-dispatch ...` (ADR-104, E88.2 / #4526) is routed
+	// BEFORE the transport flag parse, so every server-mode invocation sees
+	// unchanged input.
+	if isHostDispatchInvocation(args) {
+		return runHostDispatch(ctx, args[2:], stdout, stderr, defaultHostDispatchDeps())
+	}
 	tf, err := parseFlags(args, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)

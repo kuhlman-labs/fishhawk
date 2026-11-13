@@ -79,6 +79,8 @@ var childParamsInheritance = map[string]childFieldDecision{
 		"A child executes the same workflow definition as its parent, so it carries the same grooming determination (migration 0082 / #2806) — verbatim, INCLUDING nil: a child of a parent with no persisted determination has none either, and the consumer's legacy branch derives it from the (shared) cached spec."},
 	"DocumentBaseCommit": {modeInherited,
 		"A retry, recovery or decomposition child resolves repo-declared run-admission documents against the SAME admission commit as its parent (migration 0091 / #3746) — verbatim, INCLUDING nil: a child of a parent with no recorded commit has its run-admission documents withheld too, never re-pinned to a newer head."},
+	"AutoDispatch": {modeInherited,
+		"A CI-retry or operator-recovery child of a campaign-driver run must stay dispatchable or the unattended campaign strands (ADR-104 Q3, E88.2 / #4526): the mark comes from the starter of the PARENT, so a child of an unmarked (e.g. webhook-started) run stays unmarked."},
 
 	// --- derived: computed from the parent, never copied.
 	"ParentRunID": {modeDerived,
@@ -135,6 +137,7 @@ func ChildParamsFrom(parent *Run) CreateRunParams {
 		IssueContext:           parent.IssueContext,
 		RequiresCharter:        parent.RequiresCharter,
 		DocumentBaseCommit:     parent.DocumentBaseCommit,
+		AutoDispatch:           parent.AutoDispatch,
 
 		// derived
 		ParentRunID: &parentID,
