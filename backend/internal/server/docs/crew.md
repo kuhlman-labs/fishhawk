@@ -563,7 +563,7 @@ ADR-085 rule 4: at every HUMAN action on a delegable class, record what delegati
 | Caller | Class | Why |
 |---|---|---|
 | `reads.go` `handleListRunAudit` (non-chain list) | withheld | the general per-run list feeds the frontend run view; the frontend reads this non-chain endpoint, so the reads filter covers it (`fishhawk_get_run_status` `recent_audit` reads `GET /v0/audit`, `ListAll`, withheld by the same slice) |
-| `reads.go` `handleListRunAudit` `chain=true` | integrity-exempt | hash-chain verification needs every row; the positive control pins the stamp is present here |
+| `reads.go` `handleListRunAudit` `chain=true` | integrity-exempt | hash-chain verification needs every row; the positive control pins the stamp is present here. This is the read `fishhawk_verify_run` consumes (#5065) |
 | `reads.go` `handleGetStatusComment` | internal-non-rendering | renders through `issuecomment.RenderStatusBody`, whose activity timeline is the `activityCategories` ALLOW-list — the stamp is not on it and must never be added |
 | `product_report.go` diagnostic bundle | withheld | the bundle is PUBLISHED into a forge issue, so it must not carry the category or its payload |
 | `diagnostics.go` `GET /v0/runs/{id}/diagnostics` | integrity-exempt | operator integrity/debug surface; stays complete by design, not a gate surface |

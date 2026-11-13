@@ -90,7 +90,7 @@ The agent should call `fishhawk_get_run_status` and return the Run row + ordered
 Two audiences with different scopes:
 
 - **Operator-side** (your terminal Claude Code with an `fhk_*` apitoken): full lifecycle. Read tools work with `read:runs,read:audit`; the write tools need `write:runs,write:approvals,write:stages,write:deploy,write:campaigns` per the table below.
-- **Runner-side** (the agent inside a Fishhawk runner with an `fhm_*` mcptoken, scope `mcp:read`): read-only. Per ADR-021 / [ADR-022's addendum](https://github.com/kuhlman-labs/fishhawk/issues/388) — runner identity is read-only across all runner backends. The agent never approves its own work.
+- **Runner-side** (the agent inside a Fishhawk runner with an `fhm_*` mcptoken, scope `mcp:read`): read-only. Per ADR-021 / [ADR-022's addendum](https://github.com/kuhlman-labs/fishhawk/issues/388) — runner identity is read-only across all runner backends. The agent never approves its own work. One read is operator-only: `fishhawk_verify_run` reads the complete `chain=true` audit feed, which the backend refuses to a run-bound (`mcp:run:`) token, so under an `fhm_*` token the tool always returns an explicit `audit chain was NOT verified` error ([#5065](https://github.com/kuhlman-labs/fishhawk/issues/5065)).
 
 ### Read tools
 
@@ -100,7 +100,7 @@ Two audiences with different scopes:
 | `fishhawk_get_plan` | Returns the approved standard_v1 plan; walks `parent_run_id` for CI-retry chains. |
 | `fishhawk_get_run_status` | Bundles Run + ordered stages + recent audit (time-descending) into one tool call. Compact by default ([#1727](https://github.com/kuhlman-labs/fishhawk/issues/1727)): the heavy `issue_context` (issue body + all comments) and reviewer free-text prose (`free_form` + concern notes) are omitted to stay within the tool-result token cap, while every operator-playbook field (`next_actions`, wait statuses, `run.concerns`, review verdicts/severities/concern keys) is retained; pass `include_issue_context: true` and/or `include_review_prose: true` to restore the full payload. |
 | `fishhawk_list_audit` | Filtered audit access (`category`, `stage_id`) with cursor pagination. |
-| `fishhawk_verify_run` | Verify audit chain integrity for a run — checks every entry hash and chain link. `verified=false` is a halt condition before opening a PR. |
+| `fishhawk_verify_run` | Verify a run's complete audit chain (the `chain=true` read) — checks sequence order, every entry hash, the genesis entry and every chain link over the run's own rows. CI-retry descendants are reported in `descendant_run_ids` but not mixed in or verified; verify each separately. Needs an operator token: a run-bound token gets an explicit not-verified error, not a result. `verified=false` is a halt condition before opening a PR. |
 
 ### Write tools (operator-side only)
 
@@ -143,7 +143,7 @@ The composition matches the CLI's `fishhawk run start --working-dir … --issue 
 2. Agent calls `fishhawk_run_stage --stage plan` (the MCP server spawns `fishhawk-runner` and streams events).
 3. Agent calls `fishhawk_approve_plan`.
 4. Agent calls `fishhawk_run_stage --stage implement`.
-5. Agent calls `fishhawk_verify_run` with the run id. A `verified=false` result is a halt — do not open a PR; file an incident.
+5. Agent calls `fishhawk_verify_run` with the run id under the operator token. A `verified=false` result is a halt — do not open a PR; file an incident. An `audit chain was NOT verified` error is different: the backend refused the complete read to a run-bound token. That is an authorization refusal, not an integrity failure — re-run the verify with an operator token, or `fishhawk export --run <id>` and check the bundle with `fishhawk-verify`.
 
 The `fishhawk_run_stage` tool requires the `fishhawk-runner` binary on the MCP server's host (`PATH` lookup, overridable via `FISHHAWK_RUNNER_BIN` env, a `fishhawk-runner` beside the server binary, or — on the stdio transport only — the tool's `runner_binary` input). Over the HTTP transport (`fishhawkd`'s `/mcp`, `fishhawk-mcp --transport http`) every runner-spawning tool refuses a supplied `runner_binary` with `runner_binary_not_allowed_over_http` and resolves the runner only from the serving daemon's own `FISHHAWK_RUNNER_BIN`, sibling or `PATH` (#4476). The MCP server runs locally on an operator's workstation today, so this is always satisfied; a future hosted MCP deployment will surface a clean tool error.
 
