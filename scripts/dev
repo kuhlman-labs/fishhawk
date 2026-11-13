@@ -55,6 +55,18 @@ TLS_LOG_FILE="${LOG_DIR}/tls-proxy.log"
 RELAY_PID_FILE="${REPO_ROOT}/.fishhawk/webhook-relay.pid"
 RELAY_LOG_FILE="${LOG_DIR}/webhook-relay.log"
 
+# Host dispatcher (E88.3 / #4527, ADR-104): `fishhawk-mcp host-dispatch`, the
+# long-lived process that spawns the parked stages of local runs. On by default
+# (FISHHAWK_DEV_HOST_DISPATCH=0 opts out of starting it) and started only with a
+# dedicated FISHHAWK_DEV_HOST_DISPATCH_TOKEN. The pid file is covered by the
+# .gitignore `.fishhawk/*.pid` glob and is NOT space-prefixed, so
+# _clean_stray_pid_files leaves it alone; the state dir (pause file,
+# status.json, lock) sits under the already-gitignored .fishhawk/cache/.
+HD_PID_FILE="${REPO_ROOT}/.fishhawk/host-dispatch.pid"
+HD_LOG_FILE="${LOG_DIR}/host-dispatch.log"
+HD_STATE_DIR="${REPO_ROOT}/.fishhawk/cache/host-dispatch"
+HD_BIN="${REPO_ROOT}/bin/fishhawk-mcp"
+
 cmd="${1:-}"
 
 _die() { print -u2 "error: $*"; exit 1 }
@@ -2911,6 +2923,371 @@ _relay_down() {
   return 0
 }
 
+# --- Host dispatcher (E88.3 / #4527, ADR-104) -------------------------------
+# `fishhawk-mcp host-dispatch` (E88.2 / #4526) spawns the parked stages of local
+# runs. `up` starts it under a DEDICATED host-dispatcher/<host> token; `down`,
+# `reload` and `post-merge` quiesce it in the ADR-104 Q5 order — pause, drain,
+# stopped — BEFORE the live-runner scan, so a runner its in-flight tick spawns
+# is caught by the scan instead of racing the teardown. Degrade-not-abort like
+# the webhook relay: a missing token or a failed start never fails `up`.
+# Long-form contract: scripts/README.md.
+
+typeset -g _HD_PID="" _HD_ARGV_CONFIRMED=0 _HD_RESTORE=0 _HD_PAUSE_CREATED=0
+
+# Prints `--enable-campaign-driver` unless FISHHAWK_DEV_CAMPAIGN_DRIVER=0.
+_campaign_driver_flags() {
+  if [[ "${FISHHAWK_DEV_CAMPAIGN_DRIVER:-1}" != "0" ]]; then
+    print -r -- "--enable-campaign-driver"
+  fi
+  return 0
+}
+
+# PURE. Arg: one `ps -o args=` line. True only when the FIRST token's basename,
+# with any extension stripped, EQUALS fishhawk-mcp AND the SECOND token EQUALS
+# host-dispatch — the exact-token rule of _parse_live_runs, never substring
+# containment. A shebang script fails it (ps shows the interpreter first) on
+# purpose: the rule is not loosened for an interpreter-plus-script argv.
+_host_dispatch_argv_matches() {
+  local -a tokens
+  tokens=(${=1})
+  if (( ${#tokens} < 2 )); then return 1; fi
+  local base="${tokens[1]:t}"
+  base="${base%%.*}"
+  [[ "$base" == "fishhawk-mcp" && "${tokens[2]}" == "host-dispatch" ]]
+}
+
+# IMPURE seam: one process's full argv. Non-zero when ps fails or prints nothing.
+_host_dispatch_ps_args() {
+  local out=""
+  if ! out="$(ps -ww -o args= -p "$1" 2>/dev/null)"; then return 1; fi
+  if [[ -z "$out" ]]; then return 1; fi
+  print -r -- "$out"
+}
+
+# FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT in seconds (default 120). A
+# non-positive or non-numeric value falls back to the default (the
+# relay-polls fail-safe precedent). The value is the one the shell would hold
+# after the .env load: reload and post-merge quiesce BEFORE any .env load of
+# their own, so .env is sourced here, in a subshell (the
+# _detect_shim_registered_with_env precedent), silenced and tested.
+_host_dispatch_drain_timeout() {
+  local v=""
+  v="$(
+    if [[ -f "${REPO_ROOT}/.env" ]]; then
+      { set -a; source "${REPO_ROOT}/.env"; set +a; } >/dev/null 2>&1 || true
+    fi
+    print -r -- "${FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT:-}"
+  )" || v=""
+  if [[ "$v" == <-> ]] && (( v > 0 )); then
+    print -r -- "$v"
+  else
+    print 120
+  fi
+}
+
+# Prints the integer `pid` field of <state_dir>/status.json (written by the
+# dispatcher's first tick); empty when the file is absent or unparseable.
+_host_dispatch_status_pid() {
+  local f="${1}/status.json" body=""
+  if [[ ! -f "$f" ]]; then return 0; fi
+  if ! body="$(cat -- "$f" 2>/dev/null)"; then return 0; fi
+  if [[ "$body" =~ '"pid"[[:space:]]*:[[:space:]]*([0-9]+)' ]]; then
+    print -r -- "${match[1]}"
+  fi
+  return 0
+}
+
+# The one sleep the dispatcher legs perform, stubbable like _reload_quiet_sleep.
+_host_dispatch_sleep() {
+  sleep "$1"
+}
+
+# The scrubbed child environment (approval condition G3), into the global array
+# _HD_ENV as NAME=value words. An explicit allowlist: the process basics, the
+# dispatcher's own bearer (from FISHHAWK_DEV_HOST_DISPATCH_TOKEN — never the
+# operator's FISHHAWK_API_TOKEN, and its presence also stops fishhawk-mcp's
+# loadConfig before the credential-store rung), the backend URL, and the
+# documented runner variables when set. The dispatcher hands each runner this
+# environment minus the bearer, so the allowlist is also every dispatcher-spawned
+# runner's environment: it carries the runner's security-policy knobs (an
+# operator's fail-closed `require` or `off` kill switch must hold on this spawn
+# path too), its env-carried model credentials and their config locators, and
+# the documented FISHHAWK_AGENT_ENV_* / FISHHAWK_ACCEPTANCE_ENV_* passthrough
+# families. DOCKER_HOST and DOCKER_CONTEXT stay: the gate's isolation check
+# (runner/internal/gateiso) resolves the docker endpoint from them and refuses
+# a non-local one, so dropping them would point the gate at the wrong daemon.
+# SSH_AUTH_SOCK is NOT carried: it is a credential locator the runner refuses
+# for untrusted execution (acceptenv), and no runner path needs it. Nothing
+# else from .env reaches it: not FISHHAWKD_DATABASE_URL, the webhook or OAuth
+# secrets, the App key file, or the AWS trace-store keys.
+typeset -ga _HD_ENV_PASSTHROUGH
+_HD_ENV_PASSTHROUGH=(USER LOGNAME SHELL LANG XDG_STATE_HOME DOCKER_HOST DOCKER_CONTEXT
+  FISHHAWK_HOST_LABEL FISHHAWK_RUNNER_BIN FISHHAWK_AGENT_BIN FISHHAWK_CODEX_BIN
+  FISHHAWK_DEPLOYMENT_PROFILE FISHHAWK_FORGE_WRITES
+  FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION FISHHAWK_ACCEPTANCE_NET_SANDBOX
+  FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX
+  ANTHROPIC_API_KEY OPENAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR CODEX_HOME
+  FISHHAWK_ACCEPTANCE_PREVIEW_CMD FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD
+  FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS FISHHAWK_ACCEPTANCE_PREVIEW_READY_TIMEOUT_SECS
+  FISHHAWK_ACCEPTANCE_REPLAY_MAX_SCENARIOS FISHHAWK_ACCEPTANCE_REPLAY_TIME_CAP_SECS
+  FISHHAWK_GATE_IMAGE FISHHAWK_GATE_IMAGE_ALLOWLIST FISHHAWK_GATE_CONTAINER
+  FISHHAWK_GATE_CACHE FISHHAWK_GATE_DOCKER_CONFIG FISHHAWK_GATE_SERVICES
+  FISHHAWK_GATE_BUILD FISHHAWK_GATE_ISOLATION FISHHAWK_GATE_POSTGRES_IMAGE)
+typeset -ga _HD_ENV
+_host_dispatch_env() {
+  local token="$1" name
+  _HD_ENV=(
+    "PATH=${PATH}"
+    "HOME=${HOME:-}"
+    "TMPDIR=${TMPDIR:-/tmp}"
+    "FISHHAWK_API_TOKEN=${token}"
+    "FISHHAWK_BACKEND_URL=http://localhost:$(_healthz_port)"
+  )
+  for name in "${_HD_ENV_PASSTHROUGH[@]}" \
+      ${parameters[(I)FISHHAWK_AGENT_ENV_*]} ${parameters[(I)FISHHAWK_ACCEPTANCE_ENV_*]}; do
+    if [[ -n "${(P)name:-}" ]]; then
+      _HD_ENV+=("${name}=${(P)name}")
+    fi
+  done
+  return 0
+}
+
+# Exec <cmd...> with EXACTLY the _HD_ENV words as its environment. Call it only
+# in a subshell: it un-exports every exported parameter, exports the _HD_ENV
+# words, then execs. The words never become an argv (an `env -i NAME=value`
+# prefix would show the bearer to `ps` until env execs), and the exec keeps the
+# subshell's pid, which _host_dispatch_up records.
+_host_dispatch_exec_scrubbed() {
+  local n w
+  for n in ${(k)parameters[(R)*export*]}; do
+    typeset -g +x -- "$n" 2>/dev/null
+  done
+  for w in "${_HD_ENV[@]}"; do
+    export -- "$w"
+  done
+  exec -- "$@"
+}
+
+# 0 when HD_PID_FILE names a live host dispatcher; sets _HD_PID (and prints it)
+# and _HD_ARGV_CONFIRMED. Returns 1, removing the pid file, when it is absent,
+# ESRCH-dead, or names a live process whose argv is NOT a host dispatcher
+# (pid reuse) — that process is never signalled. When ps fails it warns once
+# and treats the pid as the dispatcher with _HD_ARGV_CONFIRMED=0: the pid file
+# was written by scripts/dev, and leaving a live spawner across a teardown is
+# the worse failure; the quiesce then never SIGKILLs it unconfirmed (G5).
+_host_dispatch_running() {
+  local pid="" args=""
+  _HD_PID=""
+  _HD_ARGV_CONFIRMED=0
+  if [[ ! -f "$HD_PID_FILE" ]]; then return 1; fi
+  pid="$(cat "$HD_PID_FILE" 2>/dev/null)" || pid=""
+  if ! _pid_alive "$pid"; then
+    print -u2 -r -- "host dispatcher already stopped (removed the stale pid file ${HD_PID_FILE})"
+    rm -f "$HD_PID_FILE"
+    return 1
+  fi
+  if args="$(_host_dispatch_ps_args "$pid")"; then
+    if ! _host_dispatch_argv_matches "$args"; then
+      print -u2 -r -- "pid ${pid} in ${HD_PID_FILE} is not a host dispatcher (pid reused?) — removing the stale pid file"
+      rm -f "$HD_PID_FILE"
+      return 1
+    fi
+    _HD_ARGV_CONFIRMED=1
+  else
+    print -u2 -r -- "warning: could not read the argv of pid ${pid} (ps failed) — treating it as the host dispatcher named by ${HD_PID_FILE} (degraded)"
+  fi
+  _HD_PID="$pid"
+  print -r -- "$pid"
+  return 0
+}
+
+# Start the dispatcher. Degrade-not-abort like _relay_up: every failure prints
+# ONE actionable stderr line and returns non-zero (the caller wraps it in `if !`).
+_host_dispatch_up() {
+  if [[ "${FISHHAWK_DEV_HOST_DISPATCH:-1}" == "0" ]]; then
+    print "host dispatcher disabled (FISHHAWK_DEV_HOST_DISPATCH=0)"
+    return 0
+  fi
+  # A second dispatcher would be refused state_dir_locked anyway.
+  if _host_dispatch_running >/dev/null; then
+    print "host dispatcher already running (pid ${_HD_PID})"
+    return 0
+  fi
+  local token="${FISHHAWK_DEV_HOST_DISPATCH_TOKEN:-}"
+  if [[ -z "$token" ]]; then
+    print -u2 "host dispatcher not started: FISHHAWK_DEV_HOST_DISPATCH_TOKEN is unset — mint a dedicated token with 'bin/fishhawkd token issue --subject host-dispatcher/<host>' and set it in .env (the dispatcher never runs under the operator token or the credential store)"
+    return 1
+  fi
+  if [[ ! -x "$HD_BIN" ]]; then
+    print -u2 "host dispatcher not started: ${HD_BIN} is not executable — run 'scripts/dev reload' to build it"
+    return 1
+  fi
+  mkdir -p "$HD_STATE_DIR" "$LOG_DIR" "${HD_PID_FILE:h}"
+  chmod 0700 "$HD_STATE_DIR"
+  # An up always starts it resumed, and the identity proof below can only be
+  # satisfied by a status.json the NEW process writes.
+  rm -f "${HD_STATE_DIR}/pause" "${HD_STATE_DIR}/status.json"
+  _HD_PAUSE_CREATED=0
+  local roots="${FISHHAWK_MCP_ALLOWED_ROOTS:-$REPO_ROOT}"
+  _host_dispatch_env "$token"
+  ( _host_dispatch_exec_scrubbed "$HD_BIN" host-dispatch --allowed-roots "$roots" --state-dir "$HD_STATE_DIR" ) >> "$HD_LOG_FILE" 2>&1 &
+  local hd_pid=$!
+  # The relay's subshell-safe disown (see _relay_up).
+  local disown_err="${HD_LOG_FILE}.disown"
+  disown 2>"$disown_err" || true
+  if [[ -s "$disown_err" ]] && ! grep -q "no current job" "$disown_err"; then
+    print -u2 -- "$(cat "$disown_err")"
+  fi
+  rm -f "$disown_err"
+  print -r -- "$hd_pid" > "$HD_PID_FILE"
+
+  # Identity proof — the analogue of the fishhawkd start-nonce round-trip (the
+  # dispatcher has no listener): its first tick runs at start and writes
+  # status.json, which must name the pid this spawn produced.
+  local i=0 status_pid=""
+  while (( i < 50 )); do
+    if ! _pid_alive "$hd_pid"; then
+      print -u2 "host dispatcher exited at start (pid ${hd_pid}) — last ${HD_LOG_FILE} lines:"
+      tail -n 15 "$HD_LOG_FILE" >&2 || true
+      rm -f "$HD_PID_FILE"
+      return 1
+    fi
+    status_pid="$(_host_dispatch_status_pid "$HD_STATE_DIR")"
+    if [[ "$status_pid" == "$hd_pid" ]]; then
+      print "host dispatcher started (pid ${hd_pid}) — logs: ${HD_LOG_FILE}; status: bin/fishhawk-mcp host-dispatch --status --state-dir ${HD_STATE_DIR}"
+      return 0
+    fi
+    _host_dispatch_sleep 0.2
+    (( ++i ))
+  done
+  print -u2 "warning: host dispatcher (pid ${hd_pid}) is running but its status.json does not name it yet — check it with bin/fishhawk-mcp host-dispatch --status --state-dir ${HD_STATE_DIR}"
+  return 0
+}
+
+# Pause: when running, create <state>/pause unless an entry of that name exists
+# (any entry, even a symlink, already counts as paused). Created directly, not
+# via `fishhawk-mcp host-dispatch --pause`, so a missing or not-yet-rebuilt
+# binary cannot block it. _HD_PAUSE_CREATED marks a pause THIS invocation made.
+_host_dispatch_pause() {
+  if ! _host_dispatch_running >/dev/null; then return 0; fi
+  local f="${HD_STATE_DIR}/pause"
+  if [[ -e "$f" || -L "$f" ]]; then return 0; fi
+  if ( umask 077; print -n >| "$f" ) 2>/dev/null; then
+    _HD_PAUSE_CREATED=1
+  fi
+  return 0
+}
+
+# Resume: remove the pause file this invocation created; an operator's own
+# pause is left alone.
+_host_dispatch_resume() {
+  if (( _HD_PAUSE_CREATED )); then
+    rm -f "${HD_STATE_DIR}/pause"
+    _HD_PAUSE_CREATED=0
+  fi
+  return 0
+}
+
+# INT/TERM during the --when-quiet wait (and the registration probe after it)
+# or the drain wait (approval condition G4): remove the pause file this invocation created, then exit 128+signal. A
+# hard kill (SIGKILL) cannot be trapped; `fishhawk-mcp host-dispatch --resume`
+# is the remedy.
+_host_dispatch_interrupted() {
+  if (( _HD_PAUSE_CREATED )); then
+    rm -f "${HD_STATE_DIR}/pause"
+    _HD_PAUSE_CREATED=0
+    print -u2 "interrupted: removed the host dispatcher pause file this command created"
+  fi
+  exit "$1"
+}
+_host_dispatch_arm_interrupt_trap() {
+  trap '_host_dispatch_interrupted 130' INT
+  trap '_host_dispatch_interrupted 143' TERM
+}
+_host_dispatch_disarm_interrupt_trap() {
+  trap - INT TERM
+}
+
+# The ADR-104 Q5 quiesce. Args: <force 0|1> <context down|reload|post-merge>.
+# Not running -> silent, 0 (idempotent). Else PAUSE (the in-flight tick
+# re-checks the pause file before every marker POST), DRAIN (SIGTERM: the tick
+# finishes on a context detached from the cancel, then the process exits; we
+# wait, bounded by _host_dispatch_drain_timeout, and NEVER SIGKILL inside that
+# window — a kill mid-tick can leave a POSTed marker with no runner, #1912),
+# then STOPPED (pid file removed, _HD_RESTORE=1). On a drain timeout: down or
+# --force SIGKILLs (only an identity-confirmed pid, G5); reload/post-merge
+# refuse and leave it paused. Call it in a tested context (#631).
+_host_dispatch_quiesce() {
+  local force="${1:-0}" context="${2:-down}"
+  if ! _host_dispatch_running >/dev/null; then return 0; fi
+  local pid="$_HD_PID" confirmed="$_HD_ARGV_CONFIRMED" out=""
+  _host_dispatch_pause
+  if ! out="$(export LC_ALL=C; kill -TERM "$pid" 2>&1)"; then
+    if _pid_alive "$pid"; then
+      _stop_refused "host dispatcher" "$pid" "$HD_PID_FILE" "$out"
+      return 1
+    fi
+  fi
+  local timeout polls i=0
+  timeout="$(_host_dispatch_drain_timeout)"
+  polls=$(( timeout * 2 ))
+  _host_dispatch_arm_interrupt_trap
+  while _pid_alive "$pid" && (( i < polls )); do
+    _host_dispatch_sleep 0.5
+    (( ++i ))
+  done
+  _host_dispatch_disarm_interrupt_trap
+  if ! _pid_alive "$pid"; then
+    print "host dispatcher drained and stopped (pid ${pid})"
+    rm -f "$HD_PID_FILE"
+    _HD_RESTORE=1
+    return 0
+  fi
+  if [[ "$context" == down ]] || (( force )); then
+    if (( ! confirmed )) && [[ "$(_host_dispatch_status_pid "$HD_STATE_DIR")" != "$pid" ]]; then
+      print -u2 -r -- "error: host dispatcher pid ${pid} did not exit within ${timeout}s of SIGTERM and its identity is unconfirmed (ps failed, and ${HD_STATE_DIR}/status.json does not name it) — not sending SIGKILL; pid file kept: ${HD_PID_FILE}"
+      return 1
+    fi
+    print -u2 -r -- "warning: host dispatcher pid ${pid} did not drain within ${timeout}s (FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT) — sending SIGKILL; a marker its last tick POSTed may have no runner behind it: recover that stage with POST /v0/runs/{id}/stages/{id}/reap-failure"
+    if ! out="$(export LC_ALL=C; kill -KILL "$pid" 2>&1)"; then
+      if _pid_alive "$pid"; then
+        _stop_refused "host dispatcher" "$pid" "$HD_PID_FILE" "$out"
+        return 1
+      fi
+    fi
+    i=0
+    while _pid_alive "$pid" && (( i < 10 )); do
+      _host_dispatch_sleep 0.2
+      (( ++i ))
+    done
+    rm -f "$HD_PID_FILE"
+    _HD_RESTORE=1
+    return 0
+  fi
+  print -u2 ""
+  print -u2 -r -- "error: refusing to ${context}: the host dispatcher (pid ${pid}) did not drain within ${timeout}s of SIGTERM (FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT)."
+  print -u2 "  it stays paused and exits when its in-flight tick ends; re-run once it has exited, or pass --force"
+  print -u2 "  (a SIGKILL mid-tick can leave a POSTed marker with no runner behind it)."
+  return 1
+}
+
+# Restart a dispatcher this command stopped, after a guard refused the
+# teardown. Non-fatal, one line either way.
+_host_dispatch_restore() {
+  if (( ! _HD_RESTORE )); then return 0; fi
+  _HD_RESTORE=0
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  fi
+  if ! _host_dispatch_up; then
+    print -u2 "host dispatcher not restored (see reason above) — the next 'scripts/dev reload' starts it"
+  fi
+  return 0
+}
+
 # --- Local trace store wiring (E45.75 / #3600) -------------------------------
 # Without FISHHAWKD_S3_BUCKET fishhawkd has no trace store, POST
 # /v0/runs/{id}/trace answers 503, and every local run fails at upload AFTER the
@@ -3322,7 +3699,15 @@ cmd_up() {
   if [[ "${FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER:-1}" != "0" ]]; then
     merge_outcome_flags=(--enable-merge-outcome-observer)
   fi
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${auto_start_flags[@]}" "${merge_outcome_flags[@]}" >> "$LOG_FILE" 2>&1 &
+  #
+  # --enable-campaign-driver (E88.3 / #4527): the campaign driver starts the
+  # item runs of every running campaign. Under --auto-start-runner-kind local
+  # above they are LOCAL runs that park at awaiting_host_dispatch until the
+  # host dispatcher (started below) spawns them. FISHHAWK_DEV_CAMPAIGN_DRIVER=0
+  # drops the flag. scripts/test-dev pins it.
+  local -a campaign_driver_flags
+  campaign_driver_flags=(${(f)"$(_campaign_driver_flags)"})
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${auto_start_flags[@]}" "${merge_outcome_flags[@]}" "${campaign_driver_flags[@]}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"
@@ -3395,6 +3780,15 @@ cmd_up() {
     fi
   fi
 
+  # Host dispatcher (E88.3 / #4527, ADR-104). After the fishhawkd readiness and
+  # identity checks, so it has a backend to poll; before the MCP banner, which
+  # stays last. NON-fatal like the relay. Every reload ends in this `up`, so it
+  # also restarts the dispatcher on the rebuilt fishhawk-mcp, which the MCP
+  # auto-swap does not cover (ADR-104 Q1/Q5).
+  if ! _host_dispatch_up; then
+    print -u2 "host dispatcher not started (see reason above); continuing — scripts/dev up is unaffected"
+  fi
+
   # Last line(s): tell the operator what MCP-activation step (if any) this run
   # requires. The kind selects among the schema-major banner (#1422), its
   # registered-shim sibling that asks you to VERIFY rather than reconnect
@@ -3414,7 +3808,8 @@ cmd_down() {
     set +a
   fi
 
-  # Tear down the TLS front end FIRST, so the proxy stops before its upstream.
+  # Tear down the TLS front end before fishhawkd (after the host dispatcher
+  # quiesce below), so the proxy stops before its upstream.
   # CONDITION 2: unconditional (guarded on the pid file inside _tls_down, NEVER
   # on FISHHAWK_DEV_TLS) — an operator who disabled the flag between `up` and
   # `down`/`reload` must not orphan the proxy. Idempotent on an absent pid file.
@@ -3422,6 +3817,13 @@ cmd_down() {
   # (#4858); record it rather than letting `set -e` abort before the stray
   # sweep and the port fallback run, and exit 1 at the end.
   local down_rc=0
+
+  # Quiesce the host dispatcher (E88.3 / #4527) BEFORE everything else, so the
+  # spawner stops before its backend: pause, drain, stopped (ADR-104 Q5). In
+  # the down context a drain timeout escalates to SIGKILL with a warning. A
+  # no-op when reload/post-merge already quiesced it.
+  _host_dispatch_quiesce 1 down || down_rc=1
+
   _tls_down "$TLS_PID_FILE" || down_rc=1
 
   # Tear down the webhook relay UNCONDITIONALLY (guarded on the pid file inside
@@ -3992,7 +4394,16 @@ cmd_reload() {
     if ! _reload_quiet_knobs_valid "$q_interval" "$q_timeout"; then
       exit 2
     fi
+    # Keep the host dispatcher paused for the WHOLE wait (E88.3 / #4527), so
+    # it cannot keep starting runners the wait is waiting out. A timeout
+    # resumes it; an INT/TERM removes the pause this command created (G4).
+    # The trap stays armed through the registration probe below, and the
+    # quiesce re-arms it for the drain.
+    _host_dispatch_pause
+    _host_dispatch_arm_interrupt_trap
     if ! _reload_wait_until_quiet "$q_interval" "$q_timeout"; then
+      _host_dispatch_disarm_interrupt_trap
+      _host_dispatch_resume
       exit 1
     fi
   fi
@@ -4004,11 +4415,23 @@ cmd_reload() {
   local shim_state=""
   if ! shim_state="$(_detect_shim_registered_with_env)"; then shim_state=""; fi
   _SHIM_REGISTERED_PRECOMPUTED="$(_normalize_shim_state "$shim_state")"
+  if (( when_quiet )); then
+    _host_dispatch_disarm_interrupt_trap
+  fi
+
+  # Host dispatcher quiesce (E88.3 / #4527, ADR-104 Q5) BEFORE the live-run
+  # scan: a runner the draining tick spawns is then visible to the scan below
+  # instead of racing the teardown. A drain timeout refuses (the dispatcher
+  # stays paused); every guard refusal below restarts a dispatcher it stopped.
+  if ! _host_dispatch_quiesce "$force" reload; then
+    exit 1
+  fi
 
   # Live-run guard (#2897) BEFORE any teardown, so the refusal is structurally
   # ahead of the stop. Tested context: a deliberate refusal must not fire the
   # #631 ZERR trap.
   if ! _refuse_on_live_runs "$force"; then
+    _host_dispatch_restore
     exit 1
   fi
   # Restart-blocker guard (E83.30 / #3974), also BEFORE any teardown: the
@@ -4016,6 +4439,7 @@ cmd_reload() {
   # restart would lose. The RELOAD context ignores undispatched_child (#4077):
   # that hazard is post-merge's git pull, which reload never performs.
   if ! _refuse_on_restart_blockers "$force" "" reload; then
+    _host_dispatch_restore
     exit 1
   fi
 
@@ -4038,8 +4462,9 @@ cmd_reload() {
 cmd_post_merge() {
   print "post-merge: starting"
 
-  # Live-run guard (#2897) at the VERY TOP — before git checkout/pull and
-  # cleanup-merged — so a refusal never leaves local git state half-advanced.
+  # Live-run guard (#2897) at the top — after only the host dispatcher quiesce,
+  # before git checkout/pull and cleanup-merged — so a refusal never leaves
+  # local git state half-advanced.
   # --force is NOT stripped here: it is forwarded to cmd_reload (which strips
   # it), whose own re-scan is a cheap idempotent second check that also catches
   # a runner started during the pull.
@@ -4047,7 +4472,14 @@ cmd_post_merge() {
   for pm_arg in "$@"; do
     if [[ "$pm_arg" == "--force" ]]; then pm_force=1; fi
   done
+  # Host dispatcher quiesce (E88.3 / #4527) before the scan, as in cmd_reload.
+  # cmd_reload's own quiesce is then a no-op, and a refusal there restores the
+  # dispatcher through the persisted _HD_RESTORE.
+  if ! _host_dispatch_quiesce "$pm_force" post-merge; then
+    exit 1
+  fi
   if ! _refuse_on_live_runs "$pm_force"; then
+    _host_dispatch_restore
     exit 1
   fi
   # Restart-blocker guard (E83.30 / #3974), likewise before any git step, in
@@ -4056,6 +4488,7 @@ cmd_post_merge() {
   # after the pull in the reload context (a review blocker appearing in
   # between refuses THERE, with main already pulled — the TOCTOU residual).
   if ! _refuse_on_restart_blockers "$pm_force" "" post-merge; then
+    _host_dispatch_restore
     exit 1
   fi
 
@@ -5943,6 +6376,14 @@ _usage() {
   print -u2 "  would strand. Pass --force to tear down anyway, or reload --when-quiet"
   print -u2 "  to wait until nothing is live (FISHHAWK_RELOAD_QUIET_INTERVAL, default"
   print -u2 "  15 s; FISHHAWK_RELOAD_QUIET_TIMEOUT, default 3600 s; exit 1 on timeout)."
+  print -u2 ""
+  print -u2 "  up starts the host dispatcher (fishhawk-mcp host-dispatch, ADR-104) under"
+  print -u2 "  the dedicated FISHHAWK_DEV_HOST_DISPATCH_TOKEN (non-fatal when unset) and"
+  print -u2 "  passes --enable-campaign-driver to fishhawkd. down, reload and post-merge"
+  print -u2 "  pause, drain (SIGTERM, bounded by FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT,"
+  print -u2 "  default 120 s) and stop it BEFORE the live-run scan; a refused reload or"
+  print -u2 "  post-merge restarts it. reload --when-quiet keeps it paused while waiting."
+  print -u2 "  Opt-outs: FISHHAWK_DEV_HOST_DISPATCH=0, FISHHAWK_DEV_CAMPAIGN_DRIVER=0."
   print -u2 ""
   print -u2 "  preview builds fishhawkd from <sha-or-ref> (default \$FISHHAWK_PREVIEW_SHA) in"
   print -u2 "  a detached worktree, serves it on FISHHAWK_PREVIEW_ADDR (default"
