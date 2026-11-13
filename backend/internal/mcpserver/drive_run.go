@@ -713,7 +713,7 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		// Nothing is recorded or spawned on this path.
 		if acc := stageByType(stages, "acceptance"); acc != nil && acc.State == "failed" {
 			out.StoppedReason = stoppedAcceptanceStageFailed
-			out.NextActions = acceptanceStageFailedNextActions(runRow, acc)
+			out.NextActions = acceptanceStageFailedNextActions(runRow, acc, stages)
 			return nil, out, nil
 		}
 

@@ -7995,6 +7995,28 @@ components:
             routed fix-up concern (ADR-090 D6). Omitted when empty; a fishhawkd
             that predates the field rejects it (400, unknown field), so deploy
             fishhawkd first.
+        resolved_paths:
+          type: array
+          items: { type: string, maxLength: 512 }
+          description: |
+            #4795: conflict_resolution_pushed only. The conflicted paths the
+            pass resolved (relative, no `..` segment, no backslash, no control
+            byte; 400 `pull_request_invalid` otherwise). Required non-empty when
+            any other summary field is set. A longer list is admitted: the
+            server keeps the first 200 and sets resolved_paths_truncated. The
+            runner omits a path these rules refuse and sets
+            resolved_paths_truncated.
+        resolved_paths_truncated: { type: boolean, description: "#4795: the runner or server cut resolved_paths." }
+        resolution_patch:
+          type: string
+          description: |
+            #4795: the merge commit's remerge-diff. Secret-scanned raw, stored
+            REDACTED as a `conflict_resolution_diff` artifact, never recorded on
+            the audit row. Sent only when the implement prompt advertised
+            `conflict_resolution_summary: true`.
+        resolution_patch_truncated: { type: boolean, description: "#4795: requires a non-empty resolution_patch." }
+        resolution_patch_unavailable_reason: { type: string, maxLength: 64, description: "#4795: why the patch is absent; must be absent with a patch; mapped to a closed slug." }
+        resolution_patch_unavailable_detail: { type: string, maxLength: 1024, description: "#4795: redacted runner detail, no NUL, must be absent with a patch; stored cut to 256 bytes, never rendered." }
         merge_candidate_failure_summary:
           type: object
           additionalProperties: false
@@ -8882,7 +8904,7 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         kind:
           type: string
-          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript, upkeep_report, comms_report]
+          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript, upkeep_report, comms_report, conflict_resolution_diff]
         schema_version:
           type: [string, "null"]
           example: standard_v1
@@ -18599,9 +18621,42 @@ paths:
         round starts. The 200 carries `rerun_of_sequence: 0`; a recorded
         request that started no round is `502 review_rerun_not_started`.
 
+        **Conflict-resolved head (#4795).** After the in-flight refusals
+        (which apply only to an existing latest round) and before the
+        no-round and verdict checks, the handler reads C, the run's newest
+        `conflict_resolution_pushed` row. The conflict-head arm fires when C
+        exists, no `implement_review_started` at ANY head is sequenced after
+        C, and none exists at C's stage and merge head: it is reachable with
+        zero prior rounds, and fires even when the pre-merge round carries
+        verdicts. It does not fire on a decomposed parent (a parent with no
+        round takes the first-round path). Its refusals, each a write-free
+        `409 review_rerun_ineligible` carrying `details.reason`,
+        `details.conflict_resolution_sequence` and `details.head_sha`:
+        `reviewer_unwired`, `no_agent_reviewers`, `gating_authority`,
+        `superseded_by_fixup` (a fix-up triggered on C's stage after C),
+        `conflict_head_moved` (the newest head-recording row after C, such
+        as a performed `branch_rebased`, a `branch_reset` or a
+        `fixup_pushed`, names another head: the PR no longer carries that
+        head; an already-up-to-date rebase moves nothing),
+        `implement_stage_terminal`, `advanced_past_review`,
+        `conflict_base_unresolved` (the conflict trigger's base branch is
+        unreadable) and `forge_compare_unavailable`. The docs-only class is
+        ignored: the operator asked. It appends `review_round_rerun_requested`
+        with `rerun_of_sequence: 0`, `round_origin: conflict_resolution`,
+        `head_sha`, `conflict_resolution_sequence` and
+        `superseded_round_sequence` (the latest round, omitted with none),
+        then starts a full-diff round over the forge compare
+        `base_ref...merge-head` synchronously, with no re-run marker. The 200
+        carries `rerun_of_sequence: 0`, `round_origin`, `head_sha` and
+        `round_already_started` (true when the automatic dispatch started the
+        round between the check and the append, and this call joined it); a
+        recorded request that started no round is `502
+        review_rerun_not_started` naming the round's failure slug.
+
         **Refusals, in order, each decided before anything is written.**
-        `409 no_review_round` (no `implement_review_started` and not a
-        decomposed parent — a parent takes the first-round path above);
+        `409 no_review_round` (no `implement_review_started`, no unreviewed
+        conflict-resolution head, and not a decomposed parent — a parent
+        takes the first-round path above);
         `409 review_round_in_flight` on this route (`POST
         /v0/runs/{run_id}/pull-request` has its own `503` under the same code,
         see that route; `details.reason`: `rerun_pending` — a
@@ -18651,7 +18706,7 @@ paths:
                   rerun_of_sequence:
                     type: integer
                     format: int64
-                    description: Audit sequence of the verdict-less `implement_review_started` that was re-run; `0` when this call started a decomposed parent's FIRST consolidated round (#4282 — no earlier round existed).
+                    description: Audit sequence of the verdict-less `implement_review_started` that was re-run; `0` when this call started a decomposed parent's FIRST consolidated round (#4282 — no earlier round existed) or a conflict-head round (#4795, `round_origin` set).
                   new_round_sequence:
                     type: integer
                     format: int64
@@ -18659,6 +18714,16 @@ paths:
                   configured_agents:
                     type: integer
                     description: Agent reviewers the re-run round was dispatched with.
+                  round_origin:
+                    type: string
+                    enum: [conflict_resolution]
+                    description: Set by the conflict-head arm only (#4795); the round is a full-diff review of the merge head.
+                  head_sha:
+                    type: string
+                    description: The merge head the conflict-head arm's round reviews (#4795).
+                  round_already_started:
+                    type: boolean
+                    description: True when the automatic conflict-resolution dispatch started the round first and this call joined it (#4795).
         '400':
           description: '`run_id` is not a valid UUID (`validation_failed`).'
           content:
@@ -25900,6 +25965,16 @@ paths:
                       (older backend, or backend-side resolution failure)
                       means the runner proceeds with checkout only, skipping
                       the comparison.
+                  conflict_resolution_summary:
+                    type: boolean
+                    description: |
+                      #4795 capability advert: true ONLY on a conflict-resolution
+                      pass prompt (served together with the pass's other
+                      conflict-resolution anchors), telling the runner this
+                      backend accepts the `resolved_paths` / `resolution_*`
+                      fields on its `conflict_resolution_pushed` report. Absent
+                      on every other prompt, so a runner never ships the summary
+                      to a backend that cannot take it.
                   fixup_policy_increment:
                     type: boolean
                     description: |
@@ -26591,6 +26666,16 @@ paths:
                   fixup_expected_head_sha:
                     type: string
                     description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source — advanced through the clean Fishhawk-recorded base merges (`branch_rebased` rows recording a performed merge whose new head is the merge commit and whose parents were verified as [prior head, base tip]) recorded after it, so a fix-up after `fishhawk_rebase_run_branch` expects the merge commit (E89.6 / #4574); a concurrent push, an unverified advance or a reset off that chain leaves the recorded head. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
+                  conflict_resolution_summary:
+                    type: boolean
+                    description: |
+                      #4795 capability advert: true ONLY on a conflict-resolution
+                      pass prompt (served together with the pass's other
+                      conflict-resolution anchors), telling the runner this
+                      backend accepts the `resolved_paths` / `resolution_*`
+                      fields on its `conflict_resolution_pushed` report. Absent
+                      on every other prompt, so a runner never ships the summary
+                      to a backend that cannot take it.
                   fixup_policy_increment:
                     type: boolean
                     description: True ONLY on a decomposed PARENT's fix-up (#4391) — the parent analogue of #765's per-child increment base. The runner measures both `git_diff` emitters against the fetched consolidated tip (no-fetch merge-base, falling back to the cumulative diff on failure), so the in-band constraint check and the backend's `reEvaluatePolicy` see only the fix-up's own increment. Absent on an ordinary run's fix-up, a decomposed child's fix-up, a non-fix-up dispatch and a verify-only merge-candidate pass.
@@ -28847,7 +28932,17 @@ paths:
         stage is also re-parked `awaiting_approval → pending` so the
         re-dispatched implement flows back into a fresh review (the
         re-parked review stage id is recorded on the audit entry as
-        `reparked_review_stage_id`). The orchestrator then walks
+        `reparked_review_stage_id`).
+          - #5249: the operator route also admits a fix-up when implement
+            `succeeded`, the review stage is exactly `pending`, and the
+            acceptance stage is parked `failed` with `failure_category` C.
+            The acceptance stage is re-parked `failed → pending` (failure
+            metadata cleared) before implement re-opens, review stays
+            `pending`, and the trigger records `reparked_acceptance_stage_id`,
+            `acceptance_reparked_from: failed_c` and
+            `reparked_acceptance_failure_reason`. Category A/B/D failures keep
+            the `fixup_not_applicable` refusal.
+        The orchestrator then walks
         `pending → dispatched` and fires `workflow_dispatch`, and a
         `stage_fixup_triggered` audit entry is written carrying the routed
         stable concern IDs (`concern_ids`, #964) or the deprecated selected

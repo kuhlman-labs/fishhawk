@@ -21,6 +21,9 @@ import (
 // of the SAME head. On a decomposed parent whose consolidated dispatch never
 // started a round at all (the forge compare failed or was not wired), it starts
 // the parent's FIRST consolidated round instead (#4282; rerun_of_sequence 0).
+// When the run's newest conflict-resolution push has no review round (#4795),
+// it starts a full-diff conflict_resolution round on that merge head instead
+// (the conflict-head arm; round_origin conflict_resolution).
 // Every refusal, the audit row and the dedup bypass live server-side
 // (backend/internal/server/review_rerun.go); this tool validates the run id,
 // passes the result through and names the follow-up wait.
@@ -41,6 +44,11 @@ type RerunReviewResult struct {
 	RerunOfSequence  int64  `json:"rerun_of_sequence" jsonschema:"the audit sequence of the verdict-less implement_review_started round that was re-run; 0 when this call started a decomposed parent's FIRST consolidated round (no earlier round existed)"`
 	NewRoundSequence int64  `json:"new_round_sequence" jsonschema:"the audit sequence of the NEW implement_review_started round this call dispatched (its rerun_of names rerun_of_sequence; a first consolidated round carries no rerun_of)"`
 	ConfiguredAgents int    `json:"configured_agents" jsonschema:"how many agent reviewers the re-run round was dispatched with"`
+	// RoundOrigin, HeadSHA and RoundAlreadyStarted are set by the
+	// conflict-head arm (#4795) only.
+	RoundOrigin         string `json:"round_origin,omitempty" jsonschema:"conflict_resolution when the conflict-head arm started (or joined) a full-diff round on the merge head; absent otherwise"`
+	HeadSHA             string `json:"head_sha,omitempty" jsonschema:"the merge head the conflict-head arm's round reviews"`
+	RoundAlreadyStarted bool   `json:"round_already_started,omitempty" jsonschema:"true when the automatic conflict-resolution dispatch started the round first and this call joined it"`
 }
 
 // RerunReviewOutput is the tool response.
@@ -60,12 +68,16 @@ type RerunReviewOutput struct {
 //   - 403 run_token_forbidden, operator_agent_forbidden, insufficient_scope or
 //     account_forbidden
 //   - 404 run_not_found
-//   - 409 no_review_round (no round and not a decomposed parent),
+//   - 409 no_review_round (no round, no unreviewed conflict-resolution head,
+//     and not a decomposed parent),
 //     review_round_in_flight, review_round_has_verdict or
 //     review_rerun_ineligible (details.reason; the first-round path adds
 //     reviewer_unwired, no_agent_reviewers, gating_authority,
 //     consolidated_review_not_due, implement_stage_terminal,
-//     advanced_past_review and forge_compare_unavailable)
+//     advanced_past_review and forge_compare_unavailable; the conflict-head
+//     arm adds superseded_by_fixup, conflict_head_moved and
+//     conflict_base_unresolved, with details.conflict_resolution_sequence and
+//     details.head_sha)
 //   - 500 review_rerun_check_failed / review_rerun_audit_failed (nothing re-run)
 //   - 502 review_rerun_not_started (recorded, but no round started;
 //     details.reason — on the first-round path compare_failed,
@@ -122,6 +134,30 @@ head dispatches the review), consolidated_review_not_due (the consolidated PR
 is not open yet — await it), implement_stage_terminal, advanced_past_review,
 forge_compare_unavailable.
 
+CONFLICT-RESOLVED HEAD (#4795). A conflict-resolution pass pushes a merge
+head that the automatic dispatch normally reviews in full; when it did not
+(the dispatch failed, or skipped a docs-only resolution) this verb starts that
+review. It fires when the run's newest conflict_resolution_pushed row has no
+implement-review round at its merge head AND no implement round at any head
+started after it — even when the pre-merge round carries verdicts, and even
+with no prior round at all. It does not fire on a decomposed parent (that
+takes the first-round path). It records review_round_rerun_requested
+(rerun_of_sequence 0, round_origin conflict_resolution, head_sha,
+conflict_resolution_sequence) and starts a full-diff round over the forge
+compare base_ref...merge-head, with the resolution summary as an extra prompt
+section. The result carries round_origin conflict_resolution and head_sha;
+round_already_started true means the automatic dispatch won a race and this
+call joined its round. Its refusals (review_rerun_ineligible, details.reason
+plus details.conflict_resolution_sequence and head_sha): reviewer_unwired,
+no_agent_reviewers, gating_authority, superseded_by_fixup (a fix-up was
+triggered after the push), conflict_head_moved (a later recorded head, such as
+a performed rebase, a reset or a fix-up push, differs from the merge head — the
+PR no longer carries that head),
+implement_stage_terminal, advanced_past_review, conflict_base_unresolved (the
+conflict trigger's base branch is unreadable) and forge_compare_unavailable.
+For conflict_base_unresolved and superseded_by_fixup, route
+fishhawk_fixup_stage on the implement stage: its pushed head is reviewed.
+
 ELIGIBILITY (each refusal is decided before anything is written):
   - the run has an implement-review round, or is a decomposed parent that
     takes the first-round path above (no_review_round otherwise)
@@ -146,7 +182,8 @@ Input:
   - run_id (required) — the run UUID (for a decomposed parent, the PARENT).
 
 Response: {result{run_id, stage, stage_id, rerun_of_sequence,
-new_round_sequence, configured_agents}, message, next_action}.
+new_round_sequence, configured_agents, round_origin?, head_sha?,
+round_already_started?}, message, next_action}.
 
 Tool errors (the backend refusal verbatim, plus a remedy hint):
   - invalid UUID (caught before the HTTP hop)
@@ -177,7 +214,13 @@ func (r *runResolver) rerunReview(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) {
-			if hint := rerunReviewRefusalHint(ae.Code); hint != "" {
+			hint := rerunReviewRefusalHint(ae.Code)
+			if _, arm := ae.Details["conflict_resolution_sequence"]; arm {
+				if reason, _ := ae.Details["reason"].(string); rerunConflictArmHint(reason) != "" {
+					hint = rerunConflictArmHint(reason)
+				}
+			}
+			if hint != "" {
 				return nil, RerunReviewOutput{}, fmt.Errorf("rerun review: %w — %s", err, hint)
 			}
 		}
@@ -190,13 +233,24 @@ func (r *runResolver) rerunReview(ctx context.Context, _ *mcp.CallToolRequest, i
 	// existed, so the message must not claim a "round 0" was re-run.
 	started := "re-ran implement-review round " + strconv.FormatInt(res.RerunOfSequence, 10) + " as round "
 	precondition := "the re-run implement-review round was dispatched"
-	if res.RerunOfSequence == 0 {
+	switch {
+	case res.RoundOrigin == "conflict_resolution" && res.RoundAlreadyStarted:
+		started = "joined the conflict-resolution round already started on head " + res.HeadSHA + " (round "
+		precondition = "the conflict-resolution implement-review round was dispatched"
+	case res.RoundOrigin == "conflict_resolution":
+		started = "started a full-diff conflict-resolution implement-review round on merge head " + res.HeadSHA + " (round "
+		precondition = "the conflict-resolution implement-review round was dispatched"
+	case res.RerunOfSequence == 0:
 		started = "started the decomposed parent's FIRST consolidated implement-review round (no earlier round was dispatched) as round "
 		precondition = "the parent's first consolidated implement-review round was dispatched"
 	}
+	roundRef := strconv.FormatInt(res.NewRoundSequence, 10)
+	if res.RoundOrigin == "conflict_resolution" {
+		roundRef += ")"
+	}
 	return nil, RerunReviewOutput{
 		Result: *res,
-		Message: started + strconv.FormatInt(res.NewRoundSequence, 10) + " with " + strconv.Itoa(res.ConfiguredAgents) +
+		Message: started + roundRef + " with " + strconv.Itoa(res.ConfiguredAgents) +
 			" configured reviewer(s). Await its verdict with fishhawk_await_review (stage=implement); a recorded verdict clears a review_coverage_incomplete hold, a round whose reviewers fail again can be re-run again.",
 		NextAction: &SuggestedAction{
 			Action:       "fishhawk_await_review",
@@ -224,6 +278,22 @@ func rerunReviewRefusalHint(code string) string {
 		return "details.reason names why this round cannot be re-run; a superseded or advanced round is reviewed by its successor, not re-run; on a decomposed parent with no round, gating_authority is cleared by fishhawk_fixup_stage on the parent implement stage and consolidated_review_not_due by awaiting the consolidated review"
 	case "review_rerun_not_started":
 		return "the request was recorded (review_round_rerun_requested) but no round started; fix the cause named in details.reason and call fishhawk_rerun_review again — except fanin_verify_held, which is cleared by awaiting the in-flight merge-candidate verify pass (its report dispatches the round) or, when details.merge_candidate_state is failed, by fishhawk_fixup_stage on the parent implement stage"
+	}
+	return ""
+}
+
+// rerunConflictArmHint is the remedy for a conflict-head arm refusal (#4795),
+// keyed by details.reason; it replaces the generic review_rerun_ineligible
+// hint when the refusal carries details.conflict_resolution_sequence. Empty
+// for a reason with no arm-specific remedy. Pure so a table test pins it.
+func rerunConflictArmHint(reason string) string {
+	switch reason {
+	case "conflict_base_unresolved":
+		return "the conflict-resolution trigger's base branch could not be read, so the full base...merge-head compare has no base; route fishhawk_fixup_stage on the implement stage: its pushed head is reviewed"
+	case "superseded_by_fixup":
+		return "a fix-up was triggered after the conflict-resolution push, so its head supersedes the merge head; await the fix-up, or route fishhawk_fixup_stage on the implement stage: its pushed head is reviewed"
+	case "conflict_head_moved":
+		return "the run branch moved after the conflict-resolution push (a later recorded head such as a rebase, reset, fix-up push, vouched commit or acceptance-scenario push), so the PR no longer carries that merge head; the new head's own review applies — read it with fishhawk_get_gate_view"
 	}
 	return ""
 }

@@ -8696,3 +8696,73 @@ func TestGetRunStatus_CICancelled_ConflictSignalKeepsFinalState(t *testing.T) {
 		})
 	}
 }
+
+// TestNextActions_AcceptanceStageFailedParked_OffersFixup pins the #5249
+// mirror of run.findOpenReviewStage branch (e): a category-C acceptance park
+// with implement succeeded and review pending offers retry -> fixup -> cancel,
+// and every other shape offers no fix-up.
+func TestNextActions_AcceptanceStageFailedParked_OffersFixup(t *testing.T) {
+	build := func(cat, implState, reviewState string, withReview bool) (Stage, Stage, []Stage) {
+		acc := naStage("acceptance", "failed")
+		reason := "acceptance_preview_provision_failed"
+		c := cat
+		acc.FailureCategory, acc.FailureReason = &c, &reason
+		impl := naStage("implement", implState)
+		stages := []Stage{naStage("plan", "succeeded"), impl, acc}
+		if withReview {
+			stages = append(stages, naStage("review", reviewState))
+		}
+		return impl, acc, stages
+	}
+	hint := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 1}
+	run := naRun("running")
+
+	impl, acc, stages := build("C", "succeeded", "pending", true)
+	got := classifyNextActions(run, stages, nil, naReviewStatus("implement", "complete"), hint, false, false, false, "", "", releaseSignals{})
+	if len(got.Actions) != 3 {
+		t.Fatalf("actions = %+v, want retry, fixup, cancel", got.Actions)
+	}
+	if got.Actions[0].Action != "fishhawk_retry_stage" || got.Actions[0].Params["stage_id"] != acc.ID ||
+		!strings.Contains(got.Actions[0].Precondition, "route fishhawk_fixup_stage") {
+		t.Errorf("retry = %+v, want retry on acceptance naming the fix-up alternative", got.Actions[0])
+	}
+	fx := got.Actions[1]
+	if fx.Action != "fishhawk_fixup_stage" || fx.Params["stage_id"] != impl.ID || fx.Params["operator_concern"] == "" || fx.Consumes != consumesFixupBudget {
+		t.Errorf("fixup = %+v, want fishhawk_fixup_stage{stage_id: %s, operator_concern} consuming fixup_budget", fx, impl.ID)
+	}
+	if got.Actions[2].Action != "fishhawk_cancel_run" {
+		t.Errorf("third action = %+v, want fishhawk_cancel_run", got.Actions[2])
+	}
+
+	negatives := []struct {
+		name                        string
+		cat, implState, reviewState string
+		withReview                  bool
+	}{
+		{"category A", "A", "succeeded", "pending", true},
+		{"category D", "D", "succeeded", "pending", true},
+		{"implement awaiting_approval", "C", "awaiting_approval", "pending", true},
+		{"review awaiting_approval", "C", "succeeded", "awaiting_approval", true},
+		{"review succeeded", "C", "succeeded", "succeeded", true},
+		{"no review stage", "C", "succeeded", "", false},
+	}
+	for _, tc := range negatives {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, stages := build(tc.cat, tc.implState, tc.reviewState, tc.withReview)
+			got := classifyNextActions(run, stages, nil, naReviewStatus("implement", "complete"), hint, false, false, false, "", "", releaseSignals{})
+			for _, a := range got.Actions {
+				if a.Action == "fishhawk_fixup_stage" {
+					t.Fatalf("actions = %+v, want no fishhawk_fixup_stage", got.Actions)
+				}
+				if a.Action == "fishhawk_retry_stage" && strings.Contains(a.Precondition, "route fishhawk_fixup_stage") {
+					t.Fatalf("retry precondition names the fix-up where none is offered: %q", a.Precondition)
+				}
+			}
+		})
+	}
+
+	// A nil stage list (the terminal-section acceptance arm) offers no fix-up.
+	if a := acceptanceStageFailedNextActions(run, &acc, nil); len(a.Actions) != 2 {
+		t.Fatalf("nil stages actions = %+v, want retry + cancel only", a.Actions)
+	}
+}

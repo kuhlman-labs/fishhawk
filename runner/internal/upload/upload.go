@@ -955,6 +955,17 @@ type FetchedPrompt struct {
 	// anchored the trigger to. The runner refuses BEFORE mutating anything when
 	// the checked-out tip differs.
 	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
+	// ConflictResolutionSummary is the backend's capability advert (#4795): true
+	// only on a conflict-resolution prompt served by a fishhawkd that validates
+	// and stores the resolution summary (resolved_paths / resolution_*). The
+	// runner computes and ships the summary ONLY when this is true, so a newer
+	// runner talking to an older backend sends today's body unchanged.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to the
+	// backend's promptResponse.ConflictResolutionSummary
+	// (backend/internal/server/prompt.go); the prompt_response pair in
+	// backend/internal/wirecontract pins it.
+	ConflictResolutionSummary bool `json:"conflict_resolution_summary,omitempty"`
 
 	// MergeCandidateVerify is true when this implement stage is a VERIFY-ONLY
 	// merge-candidate pass (ADR-090 D3 / #4018): a Fishhawk write (base
@@ -2624,7 +2635,30 @@ type ShipPullRequestArgs struct {
 	// empty, so a passing report stays decodable by an older fishhawkd.
 	MergeCandidateFailures       string
 	MergeCandidateFailureSummary *MergeCandidateFailureSummary
+
+	// ResolvedPaths .. ResolutionPatchUnavailableDetail carry the OPTIONAL
+	// resolution summary of an Outcome=="conflict_resolution_pushed" report
+	// (#4795): the sorted conflicted paths the pass resolved (with a truncated
+	// flag), the `git show --remerge-diff` patch of the merge commit (with a
+	// truncated flag), or a reason and detail naming why no patch ships. The
+	// runner populates them only when the served prompt advertised
+	// FetchedPrompt.ConflictResolutionSummary; empty everywhere else, where the
+	// body stays byte-identical. ShipPullRequest budgets them against
+	// MaxPullRequestReportBytes (shrinkConflictResolutionSummary). Unused on
+	// every other outcome.
+	ResolvedPaths                    []string
+	ResolvedPathsTruncated           bool
+	ResolutionPatch                  string
+	ResolutionPatchTruncated         bool
+	ResolutionPatchUnavailableReason string
+	ResolutionPatchUnavailableDetail string
 }
+
+// ResolutionPatchExceedsReportCap is the resolution_patch_unavailable_reason a
+// conflict_resolution_pushed report carries when the remerge-diff patch was
+// dropped to fit MaxPullRequestReportBytes (#4795). It MIRRORS the backend's
+// closed slug of the same text (backend/internal/prompt).
+const ResolutionPatchExceedsReportCap = "resolution_patch_exceeds_report_cap"
 
 // MergeCandidateFailureSummary is the structured failing-name summary of a
 // non-passed merge-candidate pass (#4250 approval condition C2): the failing
@@ -3482,6 +3516,104 @@ type pullRequestChildPushBody struct {
 	// fitChildPushPRBody before marshalling. The `body` tag matches the
 	// backend's pullRequestBody.Body, so DisallowUnknownFields accepts it.
 	Body string `json:"body,omitempty"`
+
+	// ResolvedPaths .. ResolutionPatchUnavailableDetail are the OPTIONAL
+	// resolution summary of a "conflict_resolution_pushed" report (#4795),
+	// populated only when the backend advertised conflict_resolution_summary.
+	// omitempty keeps every other outcome, and every pre-#4795 report,
+	// byte-identical.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+	// backend's pullRequestBody (backend/internal/server/pullrequest.go); the
+	// ship_child_push pair in backend/internal/wirecontract pins them.
+	ResolvedPaths []string `json:"resolved_paths,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolvedPathsTruncated bool `json:"resolved_paths_truncated,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatch string `json:"resolution_patch,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatchTruncated bool `json:"resolution_patch_truncated,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatchUnavailableReason string `json:"resolution_patch_unavailable_reason,omitempty"`
+	// CROSS-MODULE WIRE CONTRACT: see ResolvedPaths.
+	ResolutionPatchUnavailableDetail string `json:"resolution_patch_unavailable_detail,omitempty"`
+}
+
+// shrinkConflictResolutionSummary budgets a conflict_resolution_pushed
+// report's resolution summary (#4795) so the MARSHALLED body fits maxBytes,
+// mirroring shrinkMergeCandidateBodyFields: JSON escapes `<`, `>`, `&` and
+// control bytes to six bytes each, so a raw-length budget can still encode
+// past the backend's cap and a 413 would lose the terminal report. The ladder:
+//
+//  1. truncate the patch, keeping its HEAD, rune-safe, and set
+//     resolution_patch_truncated;
+//  2. when not even one rune of patch fits, DROP the patch and ship reason
+//     resolution_patch_exceeds_report_cap with no detail;
+//  3. only then cut the path list to its largest fitting prefix (at least one
+//     path, because the backend requires a non-empty list beside any summary
+//     field) and set resolved_paths_truncated.
+//
+// It never touches the push coordinates. It returns false only when even one
+// path does not fit, in which case every summary field is cleared and the
+// legacy body ships.
+func shrinkConflictResolutionSummary(body *pullRequestChildPushBody, maxBytes int) bool {
+	fits := func() bool {
+		over, ok := marshalOverflow(body, maxBytes)
+		return ok && over <= 0
+	}
+	if fits() {
+		return true
+	}
+	if original := body.ResolutionPatch; original != "" {
+		body.ResolutionPatchTruncated = true
+		lo, hi := 0, len(original) // hi does not fit
+		for hi-lo > 1 {
+			mid := lo + (hi-lo)/2
+			body.ResolutionPatch = clampRunes(original, mid)
+			if fits() {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		if cut := clampRunes(original, lo); cut != "" {
+			body.ResolutionPatch = cut
+			if fits() {
+				return true
+			}
+		}
+		body.ResolutionPatch = ""
+		body.ResolutionPatchTruncated = false
+		body.ResolutionPatchUnavailableReason = ResolutionPatchExceedsReportCap
+		body.ResolutionPatchUnavailableDetail = ""
+		if fits() {
+			return true
+		}
+	}
+	if paths := body.ResolvedPaths; len(paths) > 1 {
+		body.ResolvedPathsTruncated = true
+		lo, hi := 1, len(paths) // hi does not fit
+		for hi-lo > 1 {
+			mid := lo + (hi-lo)/2
+			body.ResolvedPaths = paths[:mid]
+			if fits() {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		body.ResolvedPaths = paths[:lo]
+		if fits() {
+			return true
+		}
+	}
+	body.ResolvedPaths = nil
+	body.ResolvedPathsTruncated = false
+	body.ResolutionPatch = ""
+	body.ResolutionPatchTruncated = false
+	body.ResolutionPatchUnavailableReason = ""
+	body.ResolutionPatchUnavailableDetail = ""
+	return fits()
 }
 
 // childPushPRBodyCutBackoff is how far back a child-push body cut looks for a
@@ -3750,6 +3882,18 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		// pushed report without authored text, keeps today's signed bytes.
 		if args.Outcome == "pushed" && args.PRBody != "" {
 			push.Body = fitChildPushPRBody(push, args.PRBody)
+		}
+		// #4795: only the conflict-resolution report carries the resolution
+		// summary, and only when the caller populated it (the backend advertised
+		// the capability); every other report keeps today's signed bytes.
+		if args.Outcome == "conflict_resolution_pushed" && len(args.ResolvedPaths) > 0 {
+			push.ResolvedPaths = args.ResolvedPaths
+			push.ResolvedPathsTruncated = args.ResolvedPathsTruncated
+			push.ResolutionPatch = args.ResolutionPatch
+			push.ResolutionPatchTruncated = args.ResolutionPatchTruncated
+			push.ResolutionPatchUnavailableReason = args.ResolutionPatchUnavailableReason
+			push.ResolutionPatchUnavailableDetail = args.ResolutionPatchUnavailableDetail
+			_ = shrinkConflictResolutionSummary(&push, MaxPullRequestReportBytes)
 		}
 		marshalled, err := json.Marshal(push)
 		if err != nil {

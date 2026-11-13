@@ -5,9 +5,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -22,6 +24,39 @@ type fixupRepo struct {
 	// FixupApplicable's side-effect freedom by COUNTING writes rather than
 	// inferring it from read-back state (#4304).
 	transitions int
+	// retries counts every RetryStage call and retryErr injects a RetryStage
+	// failure (#5249): the acceptance re-park and the preview's side-effect
+	// freedom are asserted by COUNTING, and a re-park failure is modelled by
+	// error injection.
+	retries  int
+	retryErr error
+}
+
+// RetryStage counts the call, then applies the stageRetryTransitions edge the
+// way postgresRepo does (RetryStageState): failure_category, failure_reason
+// and ended_at clear, and self_retry_count increments — the #4356 park
+// episode identity the #5249 restore cannot recover.
+func (r *fixupRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	r.retries++
+	if r.retryErr != nil {
+		return nil, r.retryErr
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if !run.ValidStageRetryTransition(s.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
+	}
+	s.State = to
+	s.FailureCategory = nil
+	s.FailureReason = nil
+	s.EndedAt = nil
+	s.SelfRetryCount++
+	cp := *s
+	return &cp, nil
 }
 
 // TransitionStage counts the call, then delegates to memRepo.
@@ -1363,5 +1398,413 @@ func TestPreviewFixupStage_MatchesFixupStageAndMovesNothing(t *testing.T) {
 				t.Errorf("transitions = %d, want 0", repo.transitions)
 			}
 		})
+	}
+}
+
+// implementWithParkedAcceptance builds the #5249 shape: implement succeeded,
+// an acceptance stage FAILED with the given category (a #4356 park when C),
+// and a review stage in reviewState, ordered acceptance-before-review.
+func implementWithParkedAcceptance(t *testing.T, category run.FailureCategory, reviewState run.StageState) (*fixupRepo, *run.Stage, *run.Stage, *run.Stage) {
+	t.Helper()
+	runID := uuid.New()
+	impl := newStage(run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+	impl.RunID = runID
+	impl.Sequence = 1
+	acc := newStage(run.StageStateFailed)
+	acc.Type = run.StageTypeAcceptance
+	acc.RunID = runID
+	acc.Sequence = 2
+	cat := category
+	reason := "preview did not boot"
+	acc.FailureCategory = &cat
+	acc.FailureReason = &reason
+	review := newStage(reviewState)
+	review.Type = run.StageTypeReview
+	review.RunID = runID
+	review.Sequence = 3
+	return newFixupRepo(impl, acc, review), impl, acc, review
+}
+
+func parkedOpts() run.FixupOptions {
+	return run.FixupOptions{MaxPasses: 1, HardCeiling: 3, AdmitInfraParkedAcceptance: true}
+}
+
+// TestFixupStage_InfraParkedAcceptance_AdmitsAndReparks is the #5249
+// done-means: a fix-up over a category-C acceptance park with review pending
+// is ADMITTED, re-parks acceptance failed → pending (failure metadata
+// cleared), re-opens implement, and leaves review pending — read back from
+// the repository after the call.
+func TestFixupStage_InfraParkedAcceptance_AdmitsAndReparks(t *testing.T) {
+	repo, impl, acc, review := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, parkedOpts())
+	if err != nil {
+		t.Fatalf("FixupStage over a category-C acceptance park: %v (want admitted)", err)
+	}
+	gotImpl, _ := repo.GetStage(ctx, impl.ID)
+	gotAcc, _ := repo.GetStage(ctx, acc.ID)
+	gotReview, _ := repo.GetStage(ctx, review.ID)
+	if gotImpl.State != run.StageStatePending {
+		t.Errorf("implement = %q, want pending", gotImpl.State)
+	}
+	if gotAcc.State != run.StageStatePending || gotAcc.FailureCategory != nil || gotAcc.FailureReason != nil {
+		t.Errorf("acceptance = %q cat=%v reason=%v, want pending with failure metadata cleared", gotAcc.State, gotAcc.FailureCategory, gotAcc.FailureReason)
+	}
+	if gotReview.State != run.StageStatePending {
+		t.Errorf("review = %q, want pending (untouched)", gotReview.State)
+	}
+	if dec.ReparkedAcceptance == nil || dec.ReparkedAcceptance.ID != acc.ID || dec.ReparkedAcceptance.State != run.StageStatePending {
+		t.Errorf("decision.ReparkedAcceptance = %+v, want acceptance %s in pending", dec.ReparkedAcceptance, acc.ID)
+	}
+	if dec.ReparkedAcceptanceFailureReason == nil || *dec.ReparkedAcceptanceFailureReason != "preview did not boot" {
+		t.Errorf("decision.ReparkedAcceptanceFailureReason = %v, want the pre-re-park reason", dec.ReparkedAcceptanceFailureReason)
+	}
+	if dec.ReparkedReview != nil {
+		t.Errorf("decision.ReparkedReview = %+v, want nil (review left pending)", dec.ReparkedReview)
+	}
+	if repo.retries != 1 {
+		t.Errorf("RetryStage calls = %d, want 1", repo.retries)
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_NonCCategoryRefused pins that only a
+// category-C park admits: A/B/D keep today's (b) refusal and move nothing.
+func TestFixupStage_InfraParkedAcceptance_NonCCategoryRefused(t *testing.T) {
+	for _, cat := range []run.FailureCategory{run.FailureA, run.FailureB, run.FailureD} {
+		t.Run(string(cat), func(t *testing.T) {
+			repo, impl, _, _ := implementWithParkedAcceptance(t, cat, run.StageStatePending)
+			before := repo.stageStates()
+			_, err := run.FixupStage(context.Background(), repo, impl.ID, parkedOpts())
+			if !errors.Is(err, run.ErrFixupNotApplicable) || !strings.Contains(err.Error(), "review gate has not opened yet (review stage state") {
+				t.Fatalf("err = %v, want the (b) ErrFixupNotApplicable refusal", err)
+			}
+			assertStatesUnchanged(t, repo, before)
+		})
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_RequiresOptIn pins that the arm is
+// opt-in: the same C park WITHOUT AdmitInfraParkedAcceptance refuses (b).
+func TestFixupStage_InfraParkedAcceptance_RequiresOptIn(t *testing.T) {
+	repo, impl, _, _ := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+	before := repo.stageStates()
+	opts := parkedOpts()
+	opts.AdmitInfraParkedAcceptance = false
+	_, err := run.FixupStage(context.Background(), repo, impl.ID, opts)
+	if !errors.Is(err, run.ErrFixupNotApplicable) || !strings.Contains(err.Error(), "review gate has not opened yet (review stage state") {
+		t.Fatalf("err = %v, want the (b) refusal without the opt-in", err)
+	}
+	assertStatesUnchanged(t, repo, before)
+	if repo.retries != 0 {
+		t.Errorf("RetryStage calls = %d, want 0", repo.retries)
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_ReviewNotPendingRefused pins the
+// review-pending conjunct: a RUNNING review refuses (b) (only that conjunct
+// refuses there), a succeeded review refuses (c).
+func TestFixupStage_InfraParkedAcceptance_ReviewNotPendingRefused(t *testing.T) {
+	cases := []struct {
+		review run.StageState
+		want   string
+	}{
+		{run.StageStateRunning, "review gate has not opened yet (review stage state \"running\")"},
+		{run.StageStateSucceeded, "review stage is already resolved"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.review), func(t *testing.T) {
+			repo, impl, _, _ := implementWithParkedAcceptance(t, run.FailureC, tc.review)
+			before := repo.stageStates()
+			_, err := run.FixupStage(context.Background(), repo, impl.ID, parkedOpts())
+			if !errors.Is(err, run.ErrFixupNotApplicable) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want refusal containing %q", err, tc.want)
+			}
+			assertStatesUnchanged(t, repo, before)
+		})
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_UnsettledAcceptanceKeepsRefusal pins
+// that an unsettled acceptance keeps the (a) acceptance-blocker refusal even
+// with the opt-in set.
+func TestFixupStage_InfraParkedAcceptance_UnsettledAcceptanceKeepsRefusal(t *testing.T) {
+	for _, st := range []run.StageState{run.StageStatePending, run.StageStateDispatched} {
+		t.Run(string(st), func(t *testing.T) {
+			repo, impl, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, st)
+			before := repo.stageStates()
+			_, err := run.FixupStage(context.Background(), repo, impl.ID, parkedOpts())
+			if !errors.Is(err, run.ErrFixupNotApplicable) || !strings.Contains(err.Error(), "acceptance") {
+				t.Fatalf("err = %v, want the (a) acceptance-blocker refusal", err)
+			}
+			assertStatesUnchanged(t, repo, before)
+		})
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_ReparkFailureLeavesImplementSucceeded
+// pins the partial-failure ordering: a failed acceptance re-park returns
+// before implement is touched.
+func TestFixupStage_InfraParkedAcceptance_ReparkFailureLeavesImplementSucceeded(t *testing.T) {
+	repo, impl, acc, _ := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+	repo.retryErr = errors.New("db down")
+	before := repo.stageStates()
+	_, err := run.FixupStage(context.Background(), repo, impl.ID, parkedOpts())
+	if err == nil || !strings.Contains(err.Error(), "re-park acceptance") {
+		t.Fatalf("err = %v, want the re-park failure", err)
+	}
+	assertStatesUnchanged(t, repo, before)
+	if repo.transitions != 0 {
+		t.Errorf("TransitionStage calls = %d, want 0 (implement untouched)", repo.transitions)
+	}
+	_ = acc
+}
+
+// TestFixupStage_InfraParkedAcceptance_ImplementReopenFailureRestoresPark
+// pins the never-opened recovery (#5249 K3/K4): when the implement re-open
+// fails AFTER the acceptance re-park, the acceptance stage is put back to
+// failed/category C with its original failure_reason.
+func TestFixupStage_InfraParkedAcceptance_ImplementReopenFailureRestoresPark(t *testing.T) {
+	repo, impl, acc, review := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+	repo.failTransition(impl.ID, errors.New("implement write failed"))
+	ctx := context.Background()
+	_, err := run.FixupStage(ctx, repo, impl.ID, parkedOpts())
+	if err == nil {
+		t.Fatal("FixupStage succeeded, want the implement re-open failure")
+	}
+	gotAcc, _ := repo.GetStage(ctx, acc.ID)
+	if gotAcc.State != run.StageStateFailed || gotAcc.FailureCategory == nil || *gotAcc.FailureCategory != run.FailureC ||
+		gotAcc.FailureReason == nil || *gotAcc.FailureReason != "preview did not boot" {
+		t.Errorf("acceptance after failed re-open = %q cat=%v reason=%v, want failed/C with the original reason",
+			gotAcc.State, gotAcc.FailureCategory, gotAcc.FailureReason)
+	}
+	gotImpl, _ := repo.GetStage(ctx, impl.ID)
+	gotReview, _ := repo.GetStage(ctx, review.ID)
+	if gotImpl.State != run.StageStateSucceeded || gotReview.State != run.StageStatePending {
+		t.Errorf("implement=%q review=%q, want succeeded / pending", gotImpl.State, gotReview.State)
+	}
+}
+
+// TestRestoreReparkedAcceptance pins the delivered-nothing recovery the
+// server runs after RestoreFixupStage (#5249 K3): a pending acceptance goes
+// back to failed/C with the given reason; a non-pending one is left alone.
+func TestRestoreReparkedAcceptance(t *testing.T) {
+	ctx := context.Background()
+	reason := "preview did not boot"
+
+	repo, impl, acc, review := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+	if _, err := run.FixupStage(ctx, repo, impl.ID, parkedOpts()); err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	// The pass delivered nothing: implement failed, then recovered.
+	if _, err := repo.TransitionStage(ctx, impl.ID, run.StageStateFailed, nil); err != nil {
+		t.Fatalf("fail implement: %v", err)
+	}
+	if _, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateSucceeded, nil); err != nil {
+		t.Fatalf("RestoreFixupStage: %v", err)
+	}
+	got, err := run.RestoreReparkedAcceptance(ctx, repo, acc.ID, &reason)
+	if err != nil {
+		t.Fatalf("RestoreReparkedAcceptance: %v", err)
+	}
+	if got.State != run.StageStateFailed || got.FailureCategory == nil || *got.FailureCategory != run.FailureC || got.FailureReason == nil || *got.FailureReason != reason {
+		t.Errorf("acceptance = %q cat=%v reason=%v, want failed/C %q", got.State, got.FailureCategory, got.FailureReason, reason)
+	}
+	gotImpl, _ := repo.GetStage(ctx, impl.ID)
+	gotReview, _ := repo.GetStage(ctx, review.ID)
+	if gotImpl.State != run.StageStateSucceeded || gotReview.State != run.StageStatePending {
+		t.Errorf("post-recovery implement=%q review=%q, want succeeded / pending (the C park again)", gotImpl.State, gotReview.State)
+	}
+
+	// A dispatched acceptance has moved on: not applicable, nothing moves.
+	repo2, _, _, acc2 := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStateDispatched)
+	before := repo2.stageStates()
+	if _, err := run.RestoreReparkedAcceptance(ctx, repo2, acc2.ID, &reason); !errors.Is(err, run.ErrFixupRecoveryNotApplicable) {
+		t.Fatalf("err = %v, want ErrFixupRecoveryNotApplicable", err)
+	}
+	assertStatesUnchanged(t, repo2, before)
+}
+
+// TestRestoreReparkedAcceptance_RestoredParkIsFreshEpisode pins the #4356
+// park-budget arithmetic of the #5249 restore: the re-park's RetryStage bumps
+// self_retry_count and the restore stamps a fresh ended_at, so the original
+// stage_infra_parked row no longer matches the restored stage's episode and
+// counts as a PRIOR park. Below the boundary the restored failure parks again
+// (one more park spent); when the original park was the last one in budget
+// the restored failure is InfraParkBudgetExhausted — the run fails terminally
+// on the next Advance. run/README.md states both outcomes.
+func TestRestoreReparkedAcceptance_RestoredParkIsFreshEpisode(t *testing.T) {
+	cases := []struct {
+		name            string
+		earlierParks    int // park rows of episodes BEFORE the one the fix-up was admitted over
+		wantPriorParks  int
+		wantRestoredCls run.InfraParkDecision
+	}{
+		{"first park: restored failure parks again", 0, 1, run.InfraParkRetryable},
+		{"last park in budget: restored failure exhausts the budget", run.InfraFailureParkRetryBudget - 1, run.InfraFailureParkRetryBudget, run.InfraParkBudgetExhausted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo, impl, acc, _ := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+			// The parked episode: ended_at stamped, retry ordinal = earlier parks.
+			endedAt := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+			repo.mu.Lock()
+			repo.stages[acc.ID].EndedAt = &endedAt
+			repo.stages[acc.ID].SelfRetryCount = tc.earlierParks
+			repo.mu.Unlock()
+
+			var entries []*audit.Entry
+			for i := 0; i < tc.earlierParks; i++ {
+				entries = append(entries, parkEntry(t, int64(i+1), acc.ID, time.Date(2026, 10, 1+i, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano), i))
+			}
+			parked, _ := repo.GetStage(ctx, acc.ID)
+			origAt, origOrdinal := run.InfraParkEpisode(parked)
+			entries = append(entries, parkEntry(t, int64(tc.earlierParks+1), acc.ID, origAt, origOrdinal))
+
+			// Control: before the fix-up the original row IS the current episode.
+			if h := run.ReadInfraParkHistory(entries, parked); !h.CurrentEpisodeParked || h.PriorParks != tc.earlierParks {
+				t.Fatalf("pre-fix-up history = %+v, want CurrentEpisodeParked with PriorParks %d", h, tc.earlierParks)
+			}
+
+			// Fix-up admitted over the park, re-dispatch delivers nothing,
+			// recovery restores implement, then the acceptance park.
+			if _, err := run.FixupStage(ctx, repo, impl.ID, parkedOpts()); err != nil {
+				t.Fatalf("FixupStage: %v", err)
+			}
+			if _, err := repo.TransitionStage(ctx, impl.ID, run.StageStateFailed, nil); err != nil {
+				t.Fatalf("fail implement: %v", err)
+			}
+			if _, err := run.RestoreFixupStage(ctx, repo, impl.ID, run.StageStateSucceeded, nil); err != nil {
+				t.Fatalf("RestoreFixupStage: %v", err)
+			}
+			restored, err := run.RestoreReparkedAcceptance(ctx, repo, acc.ID, parked.FailureReason)
+			if err != nil {
+				t.Fatalf("RestoreReparkedAcceptance: %v", err)
+			}
+
+			h := run.ReadInfraParkHistory(entries, restored)
+			if h.CurrentEpisodeParked {
+				t.Errorf("restored stage matched the original park row's episode; want a fresh episode")
+			}
+			if h.PriorParks != tc.wantPriorParks {
+				t.Errorf("PriorParks = %d, want %d (the original park row counts as prior)", h.PriorParks, tc.wantPriorParks)
+			}
+			if got := run.ClassifyInfraFailurePark(mustListStages(t, repo, restored.RunID), restored, h); got != tc.wantRestoredCls {
+				t.Errorf("ClassifyInfraFailurePark(restored) = %v, want %v", got, tc.wantRestoredCls)
+			}
+		})
+	}
+}
+
+func mustListStages(t *testing.T, repo *fixupRepo, runID uuid.UUID) []*run.Stage {
+	t.Helper()
+	stages, err := repo.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	return stages
+}
+
+// casFixupRepo gives fixupRepo the StageCASTransitioner capability, as the
+// production postgresRepo has. afterGetStage runs once GetStage has returned
+// its snapshot, letting a test land a dispatch between
+// RestoreReparkedAcceptance's read and its write — the window is modelled
+// OUTSIDE the CAS, so the plain TransitionStage fallback sees it too.
+type casFixupRepo struct {
+	*fixupRepo
+	afterGetStage func(id uuid.UUID)
+}
+
+func (m *casFixupRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	st, err := m.fixupRepo.GetStage(ctx, id)
+	if err == nil && m.afterGetStage != nil {
+		m.afterGetStage(id)
+	}
+	return st, err
+}
+
+func (m *casFixupRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	m.mu.Lock()
+	s, ok := m.stages[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, run.ErrNotFound
+	}
+	if s.State != from {
+		cur := s.State
+		m.mu.Unlock()
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: cur}
+	}
+	m.mu.Unlock()
+	return m.TransitionStage(ctx, id, to, c)
+}
+
+// TestRestoreReparkedAcceptance_CASRefusesMidFlightDispatch pins that the
+// "still pending" precondition is atomic on a CAS-capable repo: a dispatch
+// landing between the read and the write is refused with
+// StageStateChangedError and the dispatched acceptance stage is left alone,
+// not failed. Without the CAS the plain dispatched → failed edge would apply.
+func TestRestoreReparkedAcceptance_CASRefusesMidFlightDispatch(t *testing.T) {
+	ctx := context.Background()
+	reason := "preview did not boot"
+	base, _, _, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStatePending)
+	var landed bool
+	repo := &casFixupRepo{fixupRepo: base, afterGetStage: func(id uuid.UUID) {
+		if landed || id != acc.ID {
+			return
+		}
+		landed = true
+		base.mu.Lock()
+		base.stages[id].State = run.StageStateDispatched
+		base.mu.Unlock()
+	}}
+	_, err := run.RestoreReparkedAcceptance(ctx, repo, acc.ID, &reason)
+	if !landed {
+		t.Fatal("fixture: the mid-flight dispatch never landed")
+	}
+	// Committed state first: the dispatched stage must not have been failed.
+	base.mu.Lock()
+	got := *base.stages[acc.ID]
+	base.mu.Unlock()
+	if got.State != run.StageStateDispatched || got.FailureCategory != nil || got.FailureReason != nil {
+		t.Errorf("acceptance = %q cat=%v reason=%v, want dispatched with no failure metadata (left alone)", got.State, got.FailureCategory, got.FailureReason)
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) || sce.Expected != run.StageStatePending || sce.Actual != run.StageStateDispatched {
+		t.Errorf("err = %v, want StageStateChangedError{pending → dispatched}", err)
+	}
+}
+
+// TestPreviewFixupStage_InfraParkedAcceptance_MovesNothing pins that the
+// preview admits the C park with the same receipt and moves no stage.
+func TestPreviewFixupStage_InfraParkedAcceptance_MovesNothing(t *testing.T) {
+	repo, impl, acc, _ := implementWithParkedAcceptance(t, run.FailureC, run.StageStatePending)
+	ctx := context.Background()
+	before := repo.stageStates()
+	dec, err := run.PreviewFixupStage(ctx, repo, impl.ID, parkedOpts())
+	if err != nil {
+		t.Fatalf("PreviewFixupStage: %v", err)
+	}
+	if dec.ReparkedAcceptance == nil || dec.ReparkedAcceptance.ID != acc.ID {
+		t.Errorf("preview ReparkedAcceptance = %+v, want acceptance %s", dec.ReparkedAcceptance, acc.ID)
+	}
+	if err := run.FixupApplicable(ctx, repo, impl.ID, parkedOpts()); err != nil {
+		t.Errorf("FixupApplicable = %v, want nil", err)
+	}
+	if repo.transitions != 0 || repo.retries != 0 {
+		t.Errorf("TransitionStage=%d RetryStage=%d, want 0/0", repo.transitions, repo.retries)
+	}
+	assertStatesUnchanged(t, repo, before)
+}
+
+func assertStatesUnchanged(t *testing.T, repo *fixupRepo, before map[uuid.UUID]run.StageState) {
+	t.Helper()
+	after := repo.stageStates()
+	for id, st := range before {
+		if after[id] != st {
+			t.Errorf("stage %s moved %q → %q on a refused/preview call", id, st, after[id])
+		}
 	}
 }

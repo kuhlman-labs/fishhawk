@@ -35,7 +35,9 @@ func reviewedHeadKindForOrigin(origin string) string {
 	switch origin {
 	case reviewRoundOriginTrace:
 		return planreview.ReviewedHeadKindWipTree
-	case reviewRoundOriginFixupPush:
+	case reviewRoundOriginFixupPush, reviewRoundOriginConflictResolution:
+		// A conflict_resolution round (#4795) reviews the pushed merge head,
+		// with base_sha = the compare base (the trigger's base_ref).
 		return planreview.ReviewedHeadKindPushedCommit
 	case reviewRoundOriginConsolidated:
 		return planreview.ReviewedHeadKindCompareHead
@@ -54,7 +56,8 @@ func reviewedHeadKindForOrigin(origin string) string {
 // AUTHORITATIVE verify head (bundle.ExtractVerifyHead) — never headSHA, which
 // is the #797 dedup key (the FIRST verify head); a fixup_push or consolidated
 // round's sha is headSHA, the compare head it was dispatched against, with
-// base_sha = src.BaseSHA. A round with no usable head records head_unknown
+// base_sha = src.BaseSHA (a conflict_resolution round's sha is the pushed
+// merge head, the same way). A round with no usable head records head_unknown
 // with a reason and an empty sha, and STILL records its rendered-diff sets.
 //
 // The rendered-diff sets are plain paths, deduplicated in ChangedFiles order,

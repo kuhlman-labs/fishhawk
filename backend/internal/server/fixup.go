@@ -120,6 +120,17 @@ const (
 // pins the relationship.
 const maxOperatorConcernBytes = 4000
 
+// reparkedAcceptanceFailureReasonMax bounds the parked acceptance stage's
+// failure_reason as copied onto stage_fixup_triggered
+// (reparked_acceptance_failure_reason, #5249). The text can derive from
+// runner or agent output, so the audit copy is byte-bounded (UTF-8-safe
+// truncate) rather than unbounded. It is NOT structure-neutralized: the
+// delivered-nothing recovery writes it back as the stage's failure_reason,
+// which must read as the text the stage carried before the re-park (the
+// stage_infra_parked row of that episode records the same text). A reason
+// past the bound is restored as its truncated prefix.
+const reparkedAcceptanceFailureReasonMax = 4000
+
 // fixupConcernsOverflowRemedy is the remedy every fixup_concerns_overflow
 // refusal names (#4284 C3).
 const fixupConcernsOverflowRemedy = "shorten operator_concern, split the concerns across more than one fix-up pass, or route fewer concern_ids"
@@ -903,6 +914,13 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			ForceAdditionalPass:   reqBody.ForceAdditionalPass,
 			HardCeiling:           defaultFixupCeiling,
 			CeilingRefundedPasses: ceilingCredits,
+			// #5249: the operator route ALONE admits a fix-up over an
+			// acceptance stage parked failed/category C with review pending
+			// (the change itself broke the preview; only a fix-up cures it).
+			// Route-keyed: every caller this handler admits (operator, a
+			// run-bound token on its own run, a delegated may_route_fixup
+			// caller) gets the arm, matching retry.go's category-C self-retry.
+			AdmitInfraParkedAcceptance: true,
 		},
 		Selected:         selected,
 		ConcernIDs:       concernIDs,
@@ -2123,6 +2141,10 @@ func fixupTriggerPayload(id Identity, dec *run.FixupDecision, selected []planrev
 		// because the operator forced it (#860).
 		admissibilityReason += "; operator-forced override"
 	}
+	if dec.ReparkedAcceptance != nil {
+		// #5249: the pass was admitted over a category-C acceptance park.
+		admissibilityReason += "; admitted over a category-C acceptance park (acceptance re-parked failed → pending)"
+	}
 	routedIDs := make([]string, 0, len(concernIDs))
 	for _, id := range concernIDs {
 		routedIDs = append(routedIDs, id.String())
@@ -2176,6 +2198,20 @@ func fixupTriggerPayload(id Identity, dec *run.FixupDecision, selected []planrev
 	// full state change (and downstream tooling can correlate the gate).
 	if dec.ReparkedReview != nil {
 		fields["reparked_review_stage_id"] = dec.ReparkedReview.ID.String()
+	}
+	// #5249: the acceptance stage re-parked failed/category C → pending, and
+	// its pre-re-park failure_reason, so a delivered-nothing recovery
+	// (maybeRecoverFixupFailure → run.RestoreReparkedAcceptance) can put the
+	// park back. Emitted ONLY on that arm; every other payload is unchanged.
+	// The keys ride THIS entry, which triggerThenReopenFixup appends BEFORE
+	// run.FixupStage moves any stage, so a failed append aborts the fix-up
+	// with acceptance still parked.
+	if dec.ReparkedAcceptance != nil {
+		fields["reparked_acceptance_stage_id"] = dec.ReparkedAcceptance.ID.String()
+		fields["acceptance_reparked_from"] = run.AcceptanceReparkedFromFailedC
+		if dec.ReparkedAcceptanceFailureReason != nil {
+			fields["reparked_acceptance_failure_reason"] = truncate(*dec.ReparkedAcceptanceFailureReason, reparkedAcceptanceFailureReasonMax)
+		}
 	}
 	if delegatedRule != "" {
 		fields["delegated"] = delegatedRule
@@ -2281,10 +2317,12 @@ func (s *Server) maybeRecoverFixupFailure(ctx context.Context, runID, stageID uu
 	}
 
 	var payload struct {
-		PriorState            string   `json:"prior_state"`
-		ReparkedReviewStageID string   `json:"reparked_review_stage_id"`
-		ConcernIDs            []string `json:"concern_ids"`
-		PassOrdinal           int      `json:"pass_ordinal"`
+		PriorState                      string   `json:"prior_state"`
+		ReparkedReviewStageID           string   `json:"reparked_review_stage_id"`
+		ConcernIDs                      []string `json:"concern_ids"`
+		PassOrdinal                     int      `json:"pass_ordinal"`
+		ReparkedAcceptanceStageID       string   `json:"reparked_acceptance_stage_id"`
+		ReparkedAcceptanceFailureReason *string  `json:"reparked_acceptance_failure_reason"`
 	}
 	if err := json.Unmarshal(triggered.Payload, &payload); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -2325,6 +2363,34 @@ func (s *Server) maybeRecoverFixupFailure(ctx context.Context, runID, stageID uu
 		return false
 	}
 
+	// #5249: the pass was admitted over a category-C acceptance park and
+	// re-parked acceptance to pending. Put the park back (failed/C with the
+	// original reason) so the run returns to a category-C park whose operator
+	// exits (retry / fix-up / cancel) next_actions offers. The restored park
+	// is a FRESH #4356 park episode (run.RestoreReparkedAcceptance): the next
+	// Advance spends one more park, or fails the run when the original park
+	// was the last one in budget. Best-effort: the implement restore already
+	// committed, so a failure here is a WARN and leaves acceptance pending
+	// (implement succeeded / acceptance pending / review pending — the
+	// documented operator exit in run/README.md). Either outcome is recorded
+	// on the stage_fixup_recovered entry below.
+	closure := fixupRoundClosure{}
+	if payload.ReparkedAcceptanceStageID != "" {
+		if aid, perr := uuid.Parse(payload.ReparkedAcceptanceStageID); perr == nil {
+			closure.ReparkedAcceptanceStageID = aid.String()
+			if _, rerr := run.RestoreReparkedAcceptance(ctx, s.cfg.RunRepo, aid, payload.ReparkedAcceptanceFailureReason); rerr != nil {
+				closure.AcceptanceRestoreError = rerr.Error()
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"fixup recovery: re-parked acceptance not restored to its category-C park",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", aid.String()),
+					slog.String("error", rerr.Error()))
+			} else {
+				closure.AcceptanceRestored = true
+			}
+		}
+	}
+
 	// #3395: close the round the fix-up opened. A fix-up trigger writes no
 	// implement_review_started entry — the "round" it opens is purely the
 	// floor the MCP status derivation applies at the trigger's sequence — so a
@@ -2338,7 +2404,6 @@ func (s *Server) maybeRecoverFixupFailure(ctx context.Context, runID, stageID uu
 	// open state `reopened`. Every step is best-effort and runs AFTER the
 	// restore committed, so the return value is unchanged: true iff the
 	// restore landed.
-	closure := fixupRoundClosure{}
 	deliveredNothing, known := s.fixupDeliveredNothing(ctx, runID, stageID, triggered.Sequence)
 	if known {
 		closure.DeliveredNothing = &deliveredNothing
@@ -2369,6 +2434,13 @@ type fixupRoundClosure struct {
 	DeliveredNothing   *bool
 	ReopenedConcernIDs []string
 	ReopenError        string
+	// #5249: the acceptance stage the trigger re-parked failed/C → pending
+	// (empty when the trigger carried none), whether the recovery put it
+	// back to failed/C, and the restore error when it did not. Recorded so an
+	// acceptance pending → failed move made by recovery is attributable.
+	ReparkedAcceptanceStageID string
+	AcceptanceRestored        bool
+	AcceptanceRestoreError    string
 }
 
 // fixupRecoveryCategoryLabel / fixupRecoveryReasonLabel render the source
@@ -2573,6 +2645,13 @@ func (s *Server) writeFixupRecoveredAudit(ctx context.Context, runID uuid.UUID, 
 	}
 	if closure.ReopenError != "" {
 		fields["concern_reopen_error"] = closure.ReopenError
+	}
+	if closure.ReparkedAcceptanceStageID != "" {
+		fields["reparked_acceptance_stage_id"] = closure.ReparkedAcceptanceStageID
+		fields["acceptance_restored"] = closure.AcceptanceRestored
+		if closure.AcceptanceRestoreError != "" {
+			fields["acceptance_restore_error"] = closure.AcceptanceRestoreError
+		}
 	}
 	if rec.RestoredReview != nil {
 		fields["restored_review_stage_id"] = rec.RestoredReview.ID.String()
