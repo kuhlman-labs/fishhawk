@@ -102,6 +102,13 @@ type reviewRoundRerunRequestedPayload struct {
 	// consolidated round (#4282): RerunOfSequence is then 0 and HeadSHA is
 	// absent (the compare resolves it after the row is recorded).
 	FirstRound bool `json:"first_round,omitempty"`
+	// ConflictResolutionSequence names the conflict_resolution_pushed row C
+	// whose merge head the conflict-head arm (#4795) reviews; RerunOfSequence
+	// is then 0 and RoundOrigin conflict_resolution.
+	ConflictResolutionSequence int64 `json:"conflict_resolution_sequence,omitempty"`
+	// SupersededRoundSequence is the latest pre-merge round the arm's
+	// merge-head round supersedes (absent with zero prior rounds).
+	SupersededRoundSequence int64 `json:"superseded_round_sequence,omitempty"`
 }
 
 // rerunReviewResponse is the 200 body of POST /v0/runs/{run_id}/reviews/rerun.
@@ -112,6 +119,13 @@ type rerunReviewResponse struct {
 	RerunOfSequence  int64  `json:"rerun_of_sequence"`
 	NewRoundSequence int64  `json:"new_round_sequence"`
 	ConfiguredAgents int    `json:"configured_agents"`
+	// RoundOrigin and HeadSHA are set by the conflict-head arm (#4795):
+	// conflict_resolution and the merge head it reviewed.
+	RoundOrigin string `json:"round_origin,omitempty"`
+	HeadSHA     string `json:"head_sha,omitempty"`
+	// RoundAlreadyStarted is true when the conflict-head arm JOINED a round
+	// the automatic dispatch started between its check and its append.
+	RoundAlreadyStarted bool `json:"round_already_started,omitempty"`
 }
 
 // pendingReruns is the process-local set of runs with a re-run between its
@@ -204,11 +218,16 @@ func (s *Server) rerunIneligibleSlug(ctx context.Context, runID uuid.UUID, lates
 // handleRerunReview re-runs the run's latest implement-review round when that
 // round settled with ZERO verdicts (#4219), or starts a decomposed parent's
 // FIRST consolidated round when it has none (#4282, rerunFirstConsolidatedRound,
-// whose own ladder is documented there). Refusals, in order, each decided
-// before anything is written:
+// whose own ladder is documented there), or — the conflict-head arm (#4795,
+// rerunConflictHead, ladder documented there) — starts a full-diff
+// conflict_resolution round on the newest conflict-resolved head when no round
+// reviews it. The arm runs after the in-flight refusals and before the no-round
+// and verdict checks. Refusals, in order, each decided before anything is
+// written:
 //
-//	409 no_review_round          — the run has no implement_review_started and
-//	                               is not a decomposed parent.
+//	409 no_review_round          — the run has no implement_review_started, no
+//	                               unreviewed conflict-resolution head, and is
+//	                               not a decomposed parent.
 //	409 review_round_in_flight   — a re-run of this run is pending in this
 //	                               process, the round is mid-handoff to a boot
 //	                               re-dispatch, or not every configured
@@ -300,30 +319,48 @@ func (s *Server) handleRerunReview(w http.ResponseWriter, r *http.Request) {
 		checkFailed(err)
 		return
 	}
-	if !ok {
-		s.rerunFirstConsolidatedRound(w, r, id, runRow, stage)
-		return
+	// The in-flight refusals apply only to an existing round, so they run
+	// ahead of the conflict-head arm (#4795): a round still landing is
+	// awaited, never superseded behind its reviewers' backs.
+	var round map[string]any
+	var landed int
+	if ok {
+		round = map[string]any{"run_id": runID.String(), "round_sequence": latest.Sequence}
+		if reviewRedispatchPending(runID, stage.label, latest.Sequence) {
+			round["reason"] = rerunInFlightRedispatching
+			s.writeError(w, r, http.StatusConflict, rerunCodeRoundInFlight,
+				"the latest implement-review round is being re-dispatched after a restart; await it instead", round)
+			return
+		}
+		landed, err = s.countLandedReviewTerminals(ctx, runID, stage, latest.Sequence)
+		if err != nil {
+			checkFailed(err)
+			return
+		}
+		// A payload with no configured count (pre-#600) cannot be in flight by
+		// this test; its missing round source refuses it below instead.
+		if payload.ConfiguredAgents > 0 && !planreview.Settled(payload.ConfiguredAgents, landed) {
+			round["reason"] = rerunInFlightUnsettled
+			round["configured_agents"] = payload.ConfiguredAgents
+			round["landed"] = landed
+			s.writeError(w, r, http.StatusConflict, rerunCodeRoundInFlight,
+				"the latest implement-review round has not settled; await it (or close an orphaned round with POST /v0/runs/{run_id}/reviews/reconcile) before re-running", round)
+			return
+		}
 	}
-	round := map[string]any{"run_id": runID.String(), "round_sequence": latest.Sequence}
-	if reviewRedispatchPending(runID, stage.label, latest.Sequence) {
-		round["reason"] = rerunInFlightRedispatching
-		s.writeError(w, r, http.StatusConflict, rerunCodeRoundInFlight,
-			"the latest implement-review round is being re-dispatched after a restart; await it instead", round)
-		return
-	}
-	landed, err := s.countLandedReviewTerminals(ctx, runID, stage, latest.Sequence)
+	// The conflict-head arm (#4795) sits BEFORE the !ok branch (so it is
+	// reachable with zero prior rounds) and before the verdict check (so a
+	// pre-merge round's verdicts do not refuse a review of the merge head).
+	handled, err := s.rerunConflictHead(w, r, id, runRow, stage, latest)
 	if err != nil {
 		checkFailed(err)
 		return
 	}
-	// A payload with no configured count (pre-#600) cannot be in flight by
-	// this test; its missing round source refuses it below instead.
-	if payload.ConfiguredAgents > 0 && !planreview.Settled(payload.ConfiguredAgents, landed) {
-		round["reason"] = rerunInFlightUnsettled
-		round["configured_agents"] = payload.ConfiguredAgents
-		round["landed"] = landed
-		s.writeError(w, r, http.StatusConflict, rerunCodeRoundInFlight,
-			"the latest implement-review round has not settled; await it (or close an orphaned round with POST /v0/runs/{run_id}/reviews/reconcile) before re-running", round)
+	if handled {
+		return
+	}
+	if !ok {
+		s.rerunFirstConsolidatedRound(w, r, id, runRow, stage)
 		return
 	}
 	verdicts, err := s.countReviewVerdictsAfter(ctx, runID, latest.Sequence)
@@ -688,4 +725,269 @@ func (s *Server) rerunRoundStarted(ctx context.Context, runID uuid.UUID, rerunOf
 		}
 	}
 	return found, nil
+}
+
+// Conflict-head arm refusal reasons (#4795), carried in details.reason of a
+// write-free 409 review_rerun_ineligible. The rest of the arm's ladder reuses
+// the re-dispatch and first-round slugs (reviewer_unwired, no_agent_reviewers,
+// gating_authority, superseded_by_fixup, implement_stage_terminal,
+// advanced_past_review, forge_compare_unavailable) and the slice-0
+// conflict_base_unresolved.
+const (
+	// rerunSlugConflictHeadMoved (E8): a head-moving row (branch_rebased,
+	// branch_reset or fixup_pushed) is sequenced after the conflict row C, so
+	// C's merge head is no longer the PR head and reviewing it would review a
+	// head the PR no longer carries.
+	rerunSlugConflictHeadMoved = "conflict_head_moved"
+)
+
+// conflictHeadMovingCategories are the run-wide rows that move the run
+// branch's head after a conflict-resolution push without starting an implement
+// round themselves (E8).
+var conflictHeadMovingCategories = []string{CategoryBranchRebased, CategoryBranchReset, CategoryFixupPushed}
+
+// newestConflictResolutionPushed returns C, the run's newest
+// conflict_resolution_pushed row bound to a stage and naming a head, with that
+// head; nil when there is none.
+func (s *Server) newestConflictResolutionPushed(ctx context.Context, runID uuid.UUID) (*audit.Entry, string, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryConflictResolutionPushed)
+	if err != nil {
+		return nil, "", fmt.Errorf("list %s for run %s: %w", CategoryConflictResolutionPushed, runID, err)
+	}
+	var c *audit.Entry
+	var head string
+	for _, e := range entries {
+		if e.StageID == nil || (c != nil && e.Sequence < c.Sequence) {
+			continue
+		}
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA == "" {
+			continue
+		}
+		c, head = e, p.HeadSHA
+	}
+	return c, head, nil
+}
+
+// conflictArmFires is the arm's firing rule over the run's
+// implement_review_started rows: no round at ANY head is sequenced after C, and
+// no round exists at (C.stage, C.head) at all.
+func conflictArmFires(started []*audit.Entry, c *audit.Entry, head string) bool {
+	for _, e := range started {
+		if e.Sequence > c.Sequence {
+			return false
+		}
+		if e.StageID == nil || *e.StageID != *c.StageID {
+			continue
+		}
+		var p planreview.ReviewStartedPayload
+		if json.Unmarshal(e.Payload, &p) == nil && p.HeadSHA == head {
+			return false
+		}
+	}
+	return true
+}
+
+// conflictRoundStartedAfter returns the newest implement_review_started at
+// (stageID, head) sequenced after cSeq, or 0. It is bounded by C, NOT by the
+// request row, so a round the automatic dispatch started between the arm's
+// check and its append is found and joined.
+func (s *Server) conflictRoundStartedAfter(ctx context.Context, runID, stageID uuid.UUID, head string, cSeq int64) (int64, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if err != nil {
+		return 0, fmt.Errorf("list implement_review_started for run %s: %w", runID, err)
+	}
+	var found int64
+	for _, e := range entries {
+		if e.Sequence <= cSeq || e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var p planreview.ReviewStartedPayload
+		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA != head {
+			continue
+		}
+		if e.Sequence > found {
+			found = e.Sequence
+		}
+	}
+	return found, nil
+}
+
+// conflictArmIneligibleSlug is the conflict-head arm's ladder, each rung
+// decided before any write: reviewer_unwired, no_agent_reviewers,
+// gating_authority, superseded_by_fixup (a stage_fixup_triggered on C's stage
+// after C), conflict_head_moved (E8), implement_stage_terminal /
+// advanced_past_review, conflict_base_unresolved and forge_compare_unavailable.
+// It deliberately ignores the docs_only class: the operator asked. It returns
+// the configured agent count and the compare base for the round.
+func (s *Server) conflictArmIneligibleSlug(ctx context.Context, runRow *run.Run, c *audit.Entry) (agents int, base, slug string, err error) {
+	if s.defaultPlanReviewer() == nil {
+		return 0, "", redispatchSlugReviewerUnwired, nil
+	}
+	authority := planreview.AuthorityGateless
+	if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg != nil {
+		agents = cfg.AgentCount()
+		authority = planreview.ResolveAuthority(*cfg)
+	}
+	if agents == 0 {
+		return 0, "", rerunSlugNoAgentReviewers, nil
+	}
+	if authority == planreview.AuthorityGating {
+		return agents, "", redispatchSlugGatingAuthority, nil
+	}
+	stageID := *c.StageID
+	newer, err := s.stageEntryAfter(ctx, runRow.ID, CategoryStageFixupTriggered, stageID, c.Sequence)
+	if err != nil || newer {
+		if newer {
+			slug = redispatchSlugSupersededByFixup
+		}
+		return agents, "", slug, err
+	}
+	for _, cat := range conflictHeadMovingCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
+		if err != nil {
+			return agents, "", "", fmt.Errorf("list %s for run %s: %w", cat, runRow.ID, err)
+		}
+		for _, e := range entries {
+			if e.Sequence > c.Sequence {
+				return agents, "", rerunSlugConflictHeadMoved, nil
+			}
+		}
+	}
+	if slug, err := s.implementRoundStageSlug(ctx, runRow.ID, stageID); err != nil || slug != "" {
+		return agents, "", slug, err
+	}
+	base = s.conflictResolutionCompareBase(ctx, runRow.ID, stageID)
+	if base == "" {
+		return agents, "", conflictResolutionSlugBaseUnknown, nil
+	}
+	if _, _, _, reason := s.forgeCompareFor(runRow); reason != "" {
+		return agents, "", redispatchSlugForgeCompareUnavail, nil
+	}
+	return agents, base, "", nil
+}
+
+// rerunConflictHead is handleRerunReview's CONFLICT-HEAD arm (#4795). It fires
+// when the run's newest conflict_resolution_pushed row C exists, no
+// implement_review_started at ANY head is sequenced after C, and no round
+// exists at (C.stage, C.head). It does not fire on a decomposed parent (E7:
+// the automatic dispatch records decomposed_parent and starts no conflict
+// round there, and a parent with zero rounds yields to
+// rerunFirstConsolidatedRound). handled false means the arm did not fire and
+// today's ladder runs unchanged.
+//
+// When it fires, conflictArmIneligibleSlug's ladder answers a write-free 409
+// review_rerun_ineligible carrying details.reason, conflict_resolution_sequence
+// and head_sha. Otherwise it appends review_round_rerun_requested
+// (rerun_of_sequence 0, round_origin conflict_resolution, head_sha,
+// conflict_resolution_sequence, superseded_round_sequence), runs
+// startConflictResolutionRound SYNCHRONOUSLY on a context detached from the
+// request with NO re-run marker (a first dispatch of the head, kept single by
+// the #797 same-head dedup), and re-reads the newest round at (C.stage, C.head)
+// sequenced after C: found → 200 (round_already_started when it predates the
+// request row: the automatic dispatch won the race); none → 502
+// review_rerun_not_started naming the round's failure slug.
+func (s *Server) rerunConflictHead(w http.ResponseWriter, r *http.Request, id Identity, runRow *run.Run, stage orphanedReviewStageKind, latest *audit.Entry) (bool, error) {
+	ctx := r.Context()
+	runID := runRow.ID
+	c, head, err := s.newestConflictResolutionPushed(ctx, runID)
+	if err != nil || c == nil {
+		return false, err
+	}
+	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if err != nil {
+		return false, fmt.Errorf("list implement_review_started for run %s: %w", runID, err)
+	}
+	if !conflictArmFires(started, c, head) {
+		return false, nil
+	}
+	if runRow.DecomposedFrom == nil {
+		children, err := s.listAllDecomposedChildren(ctx, runID)
+		if err != nil {
+			return false, err
+		}
+		if len(children) > 0 {
+			return false, nil
+		}
+	}
+	stageID := *c.StageID
+	details := map[string]any{
+		"run_id":                       runID.String(),
+		"stage_id":                     stageID.String(),
+		"conflict_resolution_sequence": c.Sequence,
+		"head_sha":                     head,
+	}
+	agents, base, slug, err := s.conflictArmIneligibleSlug(ctx, runRow, c)
+	if err != nil {
+		return false, err
+	}
+	if slug != "" {
+		details["reason"] = slug
+		s.writeError(w, r, http.StatusConflict, rerunCodeIneligible,
+			"the run's conflict-resolved head has no implement-review round and one cannot be started: "+slug, details)
+		return true, nil
+	}
+	row := reviewRoundRerunRequestedPayload{
+		Stage:                      stage.label,
+		StageID:                    stageID.String(),
+		RerunOfSequence:            0,
+		ConfiguredAgents:           agents,
+		Authority:                  planreview.AuthorityAdvisory,
+		RoundOrigin:                reviewRoundOriginConflictResolution,
+		HeadSHA:                    head,
+		ConflictResolutionSequence: c.Sequence,
+	}
+	if latest != nil {
+		row.SupersededRoundSequence = latest.Sequence
+	}
+	body, _ := json.Marshal(row)
+	actorKind := actorKindForSubject(id.Subject)
+	subject := id.Subject
+	req, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     categoryReviewRoundRerunRequested,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      body,
+	})
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, rerunCodeAuditFailed,
+			"could not record the review re-run request; nothing was started",
+			map[string]any{internalCauseKey: err.Error()})
+		return true, nil
+	}
+
+	// Detached from the request so a client disconnect mid-compare cannot
+	// cancel a round the audit row already announced. NO re-run marker.
+	failSlug := s.startConflictResolutionRound(context.WithoutCancel(ctx), runID, stageID, base, head)
+
+	newSeq, err := s.conflictRoundStartedAfter(ctx, runID, stageID, head, c.Sequence)
+	if err != nil {
+		return false, err
+	}
+	if newSeq == 0 {
+		if failSlug == "" {
+			failSlug = redispatchSlugRoundNotStarted
+		}
+		details["reason"] = failSlug
+		s.writeError(w, r, http.StatusBadGateway, rerunCodeNotStarted,
+			"the conflict-head review was recorded but started no round: "+failSlug, details)
+		return true, nil
+	}
+	s.writeJSON(w, r, http.StatusOK, rerunReviewResponse{
+		RunID:               runID.String(),
+		Stage:               stage.label,
+		StageID:             stageID.String(),
+		RerunOfSequence:     0,
+		NewRoundSequence:    newSeq,
+		ConfiguredAgents:    agents,
+		RoundOrigin:         reviewRoundOriginConflictResolution,
+		HeadSHA:             head,
+		RoundAlreadyStarted: req != nil && newSeq < req.Sequence,
+	})
+	return true, nil
 }

@@ -285,6 +285,16 @@ type promptResponse struct {
 	// ConflictResolutionExpectedHeadSHA is the run-branch tip the trigger was
 	// anchored to; the runner refuses BEFORE mutating anything on a mismatch.
 	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
+	// ConflictResolutionSummary is the #4795 capability advert: served true
+	// ONLY alongside ConflictResolution, it tells the runner this backend
+	// accepts the resolved_paths / resolution_* report fields, so the runner
+	// runs its remerge-diff summary step and ships them. Absent on every other
+	// prompt, so a runner talking to a pre-#4795 backend sends nothing new.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to
+	// the runner's upload.FetchedPrompt.ConflictResolutionSummary (the
+	// prompt_response pair in backend/internal/wirecontract).
+	ConflictResolutionSummary bool `json:"conflict_resolution_summary,omitempty"`
 
 	// Merge-candidate verify pass (ADR-090 D3 / #4018): a Fishhawk write
 	// (a base advance, a conflict-resolution push or a fan-in integration)
@@ -2172,6 +2182,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// all three anchors and the runner can route on the flag alone.
 	if conflictResolution != nil {
 		resp.ConflictResolution = true
+		resp.ConflictResolutionSummary = true
 		resp.ConflictResolutionBranch = conflictResolution.Branch
 		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
 		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA
@@ -2988,6 +2999,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// all three anchors and the runner can route on the flag alone.
 	if conflictResolution != nil {
 		resp.ConflictResolution = true
+		resp.ConflictResolutionSummary = true
 		resp.ConflictResolutionBranch = conflictResolution.Branch
 		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
 		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA

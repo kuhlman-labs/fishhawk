@@ -7,13 +7,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // prFakeBackend mimics POST /v0/runs/{run_id}/pull-request with a
@@ -507,7 +510,7 @@ func TestShipPullRequest_ChildPushOutcome_MarshalsPushBody(t *testing.T) {
 		Outcome: "pushed", Branch: "fishhawk/run-aaa",
 		HeadSHA: "head-abc", BaseSHA: "base-def", FilesChangedCount: 3,
 	}
-	if sent != want {
+	if !reflect.DeepEqual(sent, want) {
 		t.Errorf("sent body = %+v, want %+v", sent, want)
 	}
 	// #5192 byte identity: a pushed report without PRBody carries no `body` key.
@@ -1392,4 +1395,132 @@ func TestPushReportBudget_DefaultSeriesFitsBudget(t *testing.T) {
 	if sleep >= DefaultPushReportBudget {
 		t.Errorf("assert: sleep %v leaves the attempts no time inside %v", sleep, DefaultPushReportBudget)
 	}
+}
+
+// shipConflictSummary ships a conflict_resolution_pushed report whose args
+// mut populates, returning the decoded and raw received body.
+func shipConflictSummary(t *testing.T, outcome string, mut func(*ShipPullRequestArgs)) (pullRequestChildPushBody, []byte) {
+	t.Helper()
+	pf, srv := newPRFakeBackend(t)
+	pf.status = http.StatusOK
+	pf.body = `{"stage_id":"stage-bbb","outcome":"` + outcome + `","branch":"fishhawk/run-aaa/slice-0","head_sha":"head-abc"}`
+	priv := makePRKey(t)
+	args := childPushTestArgs(priv, outcome, "")
+	mut(&args)
+	if _, err := quickPRClient(srv).ShipPullRequest(context.Background(), args); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	var sent pullRequestChildPushBody
+	if err := json.Unmarshal(pf.receivedBody, &sent); err != nil {
+		t.Fatalf("unmarshal received body: %v", err)
+	}
+	return sent, pf.receivedBody
+}
+
+// TestShipPullRequest_ConflictResolutionLegacyBodyUnchanged: a
+// conflict_resolution_pushed report with no summary (the capability was not
+// advertised) is byte-identical to the pre-#4795 body, and a summary set on any
+// other push-shaped outcome is never carried.
+func TestShipPullRequest_ConflictResolutionLegacyBodyUnchanged(t *testing.T) {
+	_, raw := shipConflictSummary(t, "conflict_resolution_pushed", func(*ShipPullRequestArgs) {})
+	const want = `{"outcome":"conflict_resolution_pushed","branch":"fishhawk/run-aaa/slice-0","head_sha":"head-abc","base_sha":"base-def","files_changed_count":3}`
+	if string(raw) != want {
+		t.Errorf("legacy body = %s, want %s", raw, want)
+	}
+	_, raw = shipConflictSummary(t, "fixup_pushed", func(a *ShipPullRequestArgs) {
+		a.ResolvedPaths = []string{"x.go"}
+		a.ResolutionPatch = "diff"
+	})
+	if strings.Contains(string(raw), "resol") {
+		t.Errorf("fixup_pushed report carries resolution fields: %s", raw)
+	}
+}
+
+// TestShipPullRequest_ConflictResolutionSummaryFitsCap is the #4795 shrink
+// ladder, budgeted on MARSHALLED bytes: truncate the patch first, then drop it
+// with reason resolution_patch_exceeds_report_cap, and only then cut paths.
+func TestShipPullRequest_ConflictResolutionSummaryFitsCap(t *testing.T) {
+	t.Run("fits_untouched", func(t *testing.T) {
+		sent, _ := shipConflictSummary(t, "conflict_resolution_pushed", func(a *ShipPullRequestArgs) {
+			a.ResolvedPaths = []string{"a.go", "b.go"}
+			a.ResolutionPatch = "diff --git a/a.go b/a.go\n-<<<<<<< x\n+y\n"
+		})
+		if fmt.Sprint(sent.ResolvedPaths) != "[a.go b.go]" || sent.ResolutionPatch == "" || sent.ResolutionPatchTruncated || sent.ResolvedPathsTruncated {
+			t.Errorf("small summary not shipped verbatim: %+v", sent)
+		}
+	})
+	t.Run("long_patch_truncated", func(t *testing.T) {
+		patch := strings.Repeat("é", 30*1024) // 60 KiB, 2-byte runes
+		sent, raw := shipConflictSummary(t, "conflict_resolution_pushed", func(a *ShipPullRequestArgs) {
+			a.ResolvedPaths = []string{"a.go"}
+			a.ResolutionPatch = patch
+		})
+		if len(raw) > MaxPullRequestReportBytes {
+			t.Errorf("body %d bytes > cap %d", len(raw), MaxPullRequestReportBytes)
+		}
+		if sent.ResolutionPatch == "" || !strings.HasPrefix(patch, sent.ResolutionPatch) || !utf8.ValidString(sent.ResolutionPatch) || !sent.ResolutionPatchTruncated {
+			t.Errorf("patch = %d bytes (truncated %t), want a rune-safe head cut with the flag", len(sent.ResolutionPatch), sent.ResolutionPatchTruncated)
+		}
+		if sent.ResolutionPatchUnavailableReason != "" || sent.ResolvedPathsTruncated {
+			t.Errorf("truncation should not drop the patch or cut paths: %+v", sent.ResolutionPatchUnavailableReason)
+		}
+	})
+	// 20 KiB raw is under the 32 KiB cap, but `<`, `>` and `&` marshal to six
+	// bytes each (~120 KiB): only a MARSHALLED budget catches it.
+	t.Run("escaped_patch_budgeted_marshalled", func(t *testing.T) {
+		patch := strings.Repeat("<>&", 20*1024/3)
+		if len(patch) >= MaxPullRequestReportBytes {
+			t.Fatalf("fixture: raw patch %d bytes must be under the cap", len(patch))
+		}
+		sent, raw := shipConflictSummary(t, "conflict_resolution_pushed", func(a *ShipPullRequestArgs) {
+			a.ResolvedPaths = []string{"a.go"}
+			a.ResolutionPatch = patch
+		})
+		if len(raw) > MaxPullRequestReportBytes {
+			t.Errorf("body %d bytes > cap %d", len(raw), MaxPullRequestReportBytes)
+		}
+		if !sent.ResolutionPatchTruncated || sent.ResolutionPatch == "" || len(sent.ResolutionPatch) >= len(patch) {
+			t.Errorf("escaped patch not truncated: %d bytes, flag %t", len(sent.ResolutionPatch), sent.ResolutionPatchTruncated)
+		}
+	})
+	// A single path larger than the cap cannot be cut further (the backend
+	// requires a non-empty list beside any summary field), so every summary
+	// field is cleared and the legacy body ships rather than a 413.
+	t.Run("single_oversized_path_ships_legacy", func(t *testing.T) {
+		sent, raw := shipConflictSummary(t, "conflict_resolution_pushed", func(a *ShipPullRequestArgs) {
+			a.ResolvedPaths = []string{strings.Repeat("p", 40*1024)}
+			a.ResolutionPatchUnavailableReason = "remerge_diff_failed"
+		})
+		if len(raw) > MaxPullRequestReportBytes {
+			t.Errorf("body %d bytes > cap %d", len(raw), MaxPullRequestReportBytes)
+		}
+		if sent.ResolvedPaths != nil || sent.ResolvedPathsTruncated || sent.ResolutionPatchUnavailableReason != "" {
+			t.Errorf("oversized summary not cleared: paths=%d reason=%q", len(sent.ResolvedPaths), sent.ResolutionPatchUnavailableReason)
+		}
+	})
+	// 400 paths of 300 bytes are ~120 KiB on their own: no patch cut can fit, so
+	// the patch is dropped with the reason, and then the list is cut.
+	t.Run("paths_overflow_drops_patch_then_cuts_paths", func(t *testing.T) {
+		paths := make([]string, 400)
+		for i := range paths {
+			paths[i] = fmt.Sprintf("dir/%03d-%s.go", i, strings.Repeat("p", 290))
+		}
+		sent, raw := shipConflictSummary(t, "conflict_resolution_pushed", func(a *ShipPullRequestArgs) {
+			a.ResolvedPaths = paths
+			a.ResolutionPatch = strings.Repeat("x", 60*1024)
+			a.ResolutionPatchTruncated = true
+		})
+		if len(raw) > MaxPullRequestReportBytes {
+			t.Errorf("body %d bytes > cap %d", len(raw), MaxPullRequestReportBytes)
+		}
+		if sent.ResolutionPatch != "" || sent.ResolutionPatchTruncated ||
+			sent.ResolutionPatchUnavailableReason != ResolutionPatchExceedsReportCap || sent.ResolutionPatchUnavailableDetail != "" {
+			t.Errorf("patch = %d bytes truncated=%t reason=%q detail=%q, want dropped with %q",
+				len(sent.ResolutionPatch), sent.ResolutionPatchTruncated, sent.ResolutionPatchUnavailableReason,
+				sent.ResolutionPatchUnavailableDetail, ResolutionPatchExceedsReportCap)
+		}
+		if len(sent.ResolvedPaths) == 0 || len(sent.ResolvedPaths) >= len(paths) || !sent.ResolvedPathsTruncated || sent.ResolvedPaths[0] != paths[0] {
+			t.Errorf("paths = %d (truncated %t), want a non-empty head cut with the flag", len(sent.ResolvedPaths), sent.ResolvedPathsTruncated)
+		}
+	})
 }

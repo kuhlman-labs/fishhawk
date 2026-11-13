@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agentenv"
@@ -133,7 +134,16 @@ type conflictResolutionRequest struct {
 	// $GIT_COMMON_DIR/config (ADR-115 D2, #4648).
 	AuthorName  string
 	AuthorEmail string
+	// SupportsSummary is the backend's conflict_resolution_summary capability
+	// advert (#4795, FetchedPrompt.ConflictResolutionSummary). Only when it is
+	// set does the pass compute and ship the resolution summary; otherwise the
+	// report body is byte-identical to the pre-#4795 shape.
+	SupportsSummary bool
 }
+
+// shipsSummary reports whether the pass computes and ships the resolution
+// summary (#4795 D5): only when the backend advertised the capability.
+func (r conflictResolutionRequest) shipsSummary() bool { return r.SupportsSummary }
 
 // commitIdentity returns the merge commit's identity with the
 // gitops.DefaultAuthorName/Email fallback for an unset field.
@@ -171,6 +181,7 @@ func conflictResolutionFromPrompt(got *upload.FetchedPrompt) *conflictResolution
 		Branch:          got.ConflictResolutionBranch,
 		BaseRef:         got.ConflictResolutionBaseRef,
 		ExpectedHeadSHA: got.ConflictResolutionExpectedHeadSHA,
+		SupportsSummary: got.ConflictResolutionSummary,
 	}
 }
 
@@ -194,6 +205,9 @@ type conflictResolutionResult struct {
 	// when the host could not provide operator-required signal confinement
 	// (#4858) — environment, not judgement.
 	Category string
+	// Summary is the resolution summary of a PASSING pass (#4795), nil unless
+	// the request shipsSummary(). It never refuses the pass.
+	Summary *conflictResolutionSummaryResult
 }
 
 // refused reports whether the pass refused.
@@ -669,7 +683,136 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 	logEvent(logSink, "conflict_resolution_committed", map[string]string{
 		"head_sha": newHead, "base_sha": head, "merge_ref": mergeRef,
 	})
-	return conflictResolutionResult{HeadSHA: newHead, BaseSHA: head, Recovered: true}
+	res := conflictResolutionResult{HeadSHA: newHead, BaseSHA: head, Recovered: true}
+	// (8) The resolution summary (#4795), ONLY behind the backend's capability
+	// advert and only for the commit verifyAuthorizedCommit just accepted. It
+	// never refuses the pass: every failure degrades to a named reason.
+	if req.shipsSummary() {
+		summary := conflictResolutionSummary(obsCtx, repoDir, newHead, base.Conflicted)
+		res.Summary = &summary
+	}
+	return res
+}
+
+// Resolution-summary bounds and reasons (#4795). The reasons are stable wire
+// text the backend maps onto its closed slug set.
+const (
+	// maxResolutionSummaryPaths caps the shipped resolved-path list; the
+	// backend applies the same cap.
+	maxResolutionSummaryPaths = 200
+	// maxRemergePatchBytes caps the shipped remerge-diff patch (rune-safe).
+	maxRemergePatchBytes = 24 * 1024
+	// maxRemergeDetailBytes caps the remerge failure detail (rune-safe).
+	maxRemergeDetailBytes = 256
+	// reasonRemergeDiffFailed — `git show --remerge-diff` failed (e.g. a git
+	// older than 2.36). The paths still ship.
+	reasonRemergeDiffFailed = "remerge_diff_failed"
+	// reasonRemergeDiffCustomMergeDriver — the effective config defines a
+	// `merge.<name>.driver`, so the remerge-diff is NOT run: re-merging would
+	// execute that driver (D8). The paths still ship.
+	reasonRemergeDiffCustomMergeDriver = "remerge_diff_custom_merge_driver"
+)
+
+// conflictResolutionSummaryResult is the resolution summary a passing pass
+// ships on its conflict_resolution_pushed report (#4795): the sorted resolved
+// paths, the merge commit's remerge-diff, or the reason it is absent.
+type conflictResolutionSummaryResult struct {
+	ResolvedPaths          []string
+	ResolvedPathsTruncated bool
+	Patch                  string
+	PatchTruncated         bool
+	UnavailableReason      string
+	UnavailableDetail      string
+}
+
+// remergeDiffFn is a TEST SEAM, never reassigned outside tests: it lets a test
+// count remerge-diff invocations and inject a failure. Production runs
+// remergeDiff.
+var remergeDiffFn = remergeDiff
+
+// remergeDiff renders the merge commit's `git show --remerge-diff`: `-` lines
+// carry git's conflict-marker re-merge, `+` lines the committed resolution. It
+// runs through gitOutRaw so the HardeningArgs choke point applies, with
+// merge.renormalize=false (so no clean/smudge filter runs during the re-merge),
+// --no-ext-diff and --no-textconv (so no diff driver runs).
+func remergeDiff(ctx context.Context, repoDir, head string) ([]byte, error) {
+	return gitOutRaw(ctx, repoDir, "-c", "merge.renormalize=false", "show", "--remerge-diff",
+		"--format=", "--no-color", "--no-ext-diff", "--no-textconv", head)
+}
+
+// conflictResolutionSummary computes the resolution summary of the merge
+// commit head. The resolved paths are the sorted conflicted set, capped at
+// maxResolutionSummaryPaths. D8 merge-driver neutralisation: git resolves a
+// custom merge driver ONLY from a `merge.<name>.driver` config key (an
+// attribute naming an undefined driver falls back to the built-in text merge),
+// and a remerge-diff re-merges EVERY path the merge touched, conflicted or
+// not. So when the effective config (every scope, include.path resolved)
+// defines any such key, the remerge-diff is not run at all; with none, no
+// merge driver can execute for any path. A config read or remerge failure
+// degrades to a reason; it never refuses the pass.
+func conflictResolutionSummary(ctx context.Context, repoDir, head string, conflicted map[string]conflictresolve.ConflictedFile) conflictResolutionSummaryResult {
+	var out conflictResolutionSummaryResult
+	out.ResolvedPaths = sortedStringKeys(conflicted)
+	if len(out.ResolvedPaths) > maxResolutionSummaryPaths {
+		out.ResolvedPaths = out.ResolvedPaths[:maxResolutionSummaryPaths]
+		out.ResolvedPathsTruncated = true
+	}
+	// An unreadable config cannot prove no driver is defined, so the
+	// remerge-diff is not run.
+	cfgStream, err := readGitConfigFn(ctx, repoDir)
+	if err != nil {
+		out.UnavailableReason = reasonRemergeDiffFailed
+		out.UnavailableDetail = clampUTF8(err.Error(), maxRemergeDetailBytes)
+		return out
+	}
+	if configDefinesMergeDriver(cfgStream) {
+		out.UnavailableReason = reasonRemergeDiffCustomMergeDriver
+		return out
+	}
+	patch, err := remergeDiffFn(ctx, repoDir, head)
+	if err != nil {
+		out.UnavailableReason = reasonRemergeDiffFailed
+		out.UnavailableDetail = clampUTF8(err.Error(), maxRemergeDetailBytes)
+		return out
+	}
+	text := strings.ToValidUTF8(string(patch), "\uFFFD")
+	if len(text) > maxRemergePatchBytes {
+		text = clampUTF8(text, maxRemergePatchBytes)
+		out.PatchTruncated = true
+	}
+	out.Patch = text
+	return out
+}
+
+// configDefinesMergeDriver reports whether a `git config --list -z` stream
+// defines any custom merge driver: a key whose section is `merge`
+// (case-insensitive), which has a subsection, and whose variable is `driver`
+// (case-insensitive). Each -z record is `key\nvalue`; the subsection is the
+// text between the first and last dot and may itself contain dots.
+func configDefinesMergeDriver(stream string) bool {
+	for _, rec := range strings.Split(stream, "\x00") {
+		key, _, _ := strings.Cut(rec, "\n")
+		first, last := strings.IndexByte(key, '.'), strings.LastIndexByte(key, '.')
+		if first < 0 || first == last {
+			continue
+		}
+		if strings.EqualFold(key[:first], "merge") && strings.EqualFold(key[last+1:], "driver") {
+			return true
+		}
+	}
+	return false
+}
+
+// clampUTF8 cuts s to at most max bytes without splitting a rune.
+func clampUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // verifyStagedMatchesObserved confirms the index `git add` just wrote holds
@@ -1539,7 +1682,7 @@ func runConflictResolutionStage(ctx context.Context, cfg config, req conflictRes
 		return exitFailure
 	}
 
-	if _, err := client.ShipPullRequest(reportCtx, upload.ShipPullRequestArgs{
+	report := upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
 		PrivateKey: issued.PrivateKey,
@@ -1547,7 +1690,19 @@ func runConflictResolutionStage(ctx context.Context, cfg config, req conflictRes
 		Branch:     req.Branch,
 		HeadSHA:    pushed,
 		BaseSHA:    res.BaseSHA,
-	}); err != nil {
+	}
+	// #4795: the resolution summary rides the report only when the pass
+	// computed one (the backend advertised the capability); otherwise the body
+	// is byte-identical to today's.
+	if sm := res.Summary; sm != nil {
+		report.ResolvedPaths = sm.ResolvedPaths
+		report.ResolvedPathsTruncated = sm.ResolvedPathsTruncated
+		report.ResolutionPatch = sm.Patch
+		report.ResolutionPatchTruncated = sm.PatchTruncated
+		report.ResolutionPatchUnavailableReason = sm.UnavailableReason
+		report.ResolutionPatchUnavailableDetail = sm.UnavailableDetail
+	}
+	if _, err := client.ShipPullRequest(reportCtx, report); err != nil {
 		logEvent(logSink, "conflict_resolution_report_failed", map[string]string{"error": err.Error()})
 		return exitFailure
 	}
