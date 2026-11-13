@@ -1,0 +1,14 @@
+id: scenario:issue-4525/auto-start-flag-advertised
+statement: fishhawkd serve's help output lists the auto-start-runner-kind flag with its github_actions default.
+verify_hint: 'CLI: `fishhawkd serve -h` output contains -auto-start-runner-kind and the default github_actions.'
+steps: Ran fishhawkd serve -h (binary built from the sanctioned tree) and grepped for auto-start.
+assertions:
+    expected: flag listed with the github_actions default
+    observed_at_record: '''-auto-start-runner-kind string'' is listed. Its help covers both auto-start paths, github_actions|local, gitlab_ci refused, and ''(default "github_actions")''. sha256:844f04426764158e1b4f87c29e579cce88da45f4fb8c25c8974074ef04da241c'
+    repro_handle: fishhawkd serve -h 2>&1 | grep -A1 auto-start-runner-kind
+origin:
+    issue: 4525
+    pr: 5233
+    run_id: 2aeb32d1-c0f3-49b3-ba33-44c9db8daa59
+    head_sha: 6530b5113b726cf9e23a9be5f90a28abb5ce536f
+    recorded_at: 2026-11-12T23:31:17Z

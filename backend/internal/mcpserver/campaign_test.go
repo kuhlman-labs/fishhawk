@@ -4203,3 +4203,135 @@ func TestGetCampaignStatus_PassesThroughPendingAmendments(t *testing.T) {
 		})
 	}
 }
+
+// TestGetCampaignStatus_PassesThroughAutoStartRefusal (E88.1 / #4525): a
+// present auto_start_refusal block passes through fishhawk_get_campaign_status
+// verbatim, and an absent block stays ABSENT on the tool output's wire bytes.
+func TestGetCampaignStatus_PassesThroughAutoStartRefusal(t *testing.T) {
+	block := &campaignAutoStartRefusal{
+		Reason:           "working_dir_unbound",
+		RunnerKind:       "local",
+		RunnerKindSource: "auto_start_flag",
+		Detail:           "the campaign binds no working_dir",
+		Remedy:           "start each item with fishhawk_start_campaign_item_run passing an absolute working_dir",
+	}
+	for _, tc := range []struct {
+		name  string
+		block *campaignAutoStartRefusal
+	}{
+		{"present", block},
+		{"absent", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			id := uuid.New()
+			fb.campaignStatusByID[id] = CampaignStatus{
+				Campaign:         Campaign{ID: id.String(), Repo: "acme/widgets", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign"},
+				Items:            []CampaignItem{},
+				Rollup:           CampaignRollup{Eligible: []string{}, Blocked: []string{}, Running: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+				NextAction:       CampaignNextAction{Action: "wait"},
+				AutoStartRefusal: tc.block,
+			}
+			r := newResolver(srv, nil)
+
+			_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus: %v", err)
+			}
+			raw, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if tc.block == nil {
+				if strings.Contains(string(raw), `"auto_start_refusal"`) || out.AutoStartRefusal != nil {
+					t.Fatalf("absent block surfaced: %s", raw)
+				}
+				return
+			}
+			if out.AutoStartRefusal == nil || *out.AutoStartRefusal != *tc.block {
+				t.Fatalf("auto_start_refusal = %+v, want %+v", out.AutoStartRefusal, tc.block)
+			}
+		})
+	}
+}
+
+// autoStartStatusRepo is a read-only campaign repository holding one campaign
+// and its items for the real-server status read.
+type autoStartStatusRepo struct {
+	campaign.BaseFake
+	c     *campaign.Campaign
+	items []*campaign.Item
+}
+
+func (f *autoStartStatusRepo) GetCampaign(_ context.Context, id uuid.UUID) (*campaign.Campaign, error) {
+	if f.c == nil || id != f.c.ID {
+		return nil, campaign.ErrNotFound
+	}
+	cp := *f.c
+	return &cp, nil
+}
+
+func (f *autoStartStatusRepo) ListCampaignItemsForCampaign(_ context.Context, id uuid.UUID) ([]*campaign.Item, error) {
+	if f.c == nil || id != f.c.ID {
+		return nil, nil
+	}
+	return f.items, nil
+}
+
+// TestGetCampaignStatus_AutoStartRefusal_ThroughRealServer (C6, #4525) drives
+// the REAL server handler (server.New behind httptest) through the real MCP
+// HTTP client to the fishhawk_get_campaign_status result: a running campaign
+// that recorded runner_kind local and binds no working_dir, on a deployment
+// whose campaign driver runs, carries auto_start_refusal {reason
+// working_dir_unbound, remedy}; with the driver off the block is absent.
+func TestGetCampaignStatus_AutoStartRefusal_ThroughRealServer(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		driverKind string
+		wantBlock  bool
+	}{
+		{"driver on", runpkg.RunnerKindGitHubActions, true},
+		{"driver off", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			c := &campaign.Campaign{
+				ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:1",
+				State: campaign.StateRunning, PausePolicy: campaign.PausePolicyPauseCampaign,
+				RunnerKind: runpkg.RunnerKindLocal, CreatedAt: now, UpdatedAt: now,
+			}
+			repo := &autoStartStatusRepo{c: c, items: []*campaign.Item{
+				{ID: uuid.New(), CampaignID: c.ID, IssueRef: "issue:2", State: campaign.ItemStatePending, CreatedAt: now, UpdatedAt: now},
+			}}
+			const bearer = "fhk_auto_start_status_e2e"
+			tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+				ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:campaigns", "read:runs"}, PlainText: bearer,
+			}}
+			s := server.New(server.Config{CampaignRepo: repo, APITokenRepo: tokRepo, CampaignAutoStartRunnerKind: tc.driverKind})
+			httpSrv := httptest.NewServer(s.Handler())
+			t.Cleanup(httpSrv.Close)
+			r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+
+			_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: c.ID.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus through the real server: %v", err)
+			}
+			if !tc.wantBlock {
+				if out.AutoStartRefusal != nil {
+					t.Fatalf("driver off: auto_start_refusal = %+v, want absent", out.AutoStartRefusal)
+				}
+				return
+			}
+			got := out.AutoStartRefusal
+			if got == nil {
+				t.Fatal("auto_start_refusal absent, want reason working_dir_unbound")
+			}
+			if got.Reason != "working_dir_unbound" || got.RunnerKind != runpkg.RunnerKindLocal || got.RunnerKindSource != "campaign" {
+				t.Fatalf("auto_start_refusal = %+v, want reason working_dir_unbound, runner_kind local, source campaign", got)
+			}
+			if got.Detail == "" || !strings.Contains(got.Remedy, "fishhawk_start_campaign_item_run") {
+				t.Fatalf("auto_start_refusal detail/remedy = %q / %q", got.Detail, got.Remedy)
+			}
+		})
+	}
+}

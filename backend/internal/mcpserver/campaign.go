@@ -132,6 +132,10 @@ type GetCampaignStatusOutput struct {
 	// PendingAmendments passes the backend's campaign-wide pending
 	// scope-amendment block through (E86.85 / #4486).
 	PendingAmendments *campaignPendingAmendments `json:"pending_amendments,omitempty" jsonschema:"every PENDING scope amendment on any run of the campaign (each item's linked run, whatever the item state, plus its recovery and decomposition descendants), oldest requested_at first; decision_live is true while the filing stage has not settled (an agent may still be waiting), false for a still-pending request on a settled stage. Decide one with fishhawk_decide_scope_amendment on amendment.run_id. ABSENT when the backend did not compute it — an older backend, a read failure, or a caller without read:audit — which is NOT the same claim as a present block with items [] (computed, none pending). truncated marks a run set past the backend's cap (#4486)"`
+
+	// AutoStartRefusal passes the backend's campaign-driver auto-start refusal
+	// through (E88.1 / #4525).
+	AutoStartRefusal *campaignAutoStartRefusal `json:"auto_start_refusal,omitempty" jsonschema:"present while the server-side campaign driver runs and cannot auto-start this RUNNING campaign, so it starts none of its items: reason is working_dir_unbound (the resolved runner_kind is local and the campaign binds no working_dir), working_dir_not_absolute (the bound working_dir is relative) or campaign_runner_kind_invalid (the recorded runner_kind is not a valid kind); runner_kind and runner_kind_source (campaign: the campaign's recorded runner_kind; auto_start_flag: the deployment's --auto-start-runner-kind) name the resolution; remedy names the operator-driven path (fishhawk_start_campaign_item_run with an absolute working_dir). Absent when the driver is off, the campaign is not running, or it auto-starts normally"`
 }
 
 // appendCampaignItemsInput is the fishhawk_append_campaign_items tool's input.
@@ -1053,6 +1057,7 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		DependencyRefresh: st.DependencyRefresh,
 		DispatchHold:      st.DispatchHold,
 		PendingAmendments: st.PendingAmendments,
+		AutoStartRefusal:  st.AutoStartRefusal,
 	}, nil
 }
 

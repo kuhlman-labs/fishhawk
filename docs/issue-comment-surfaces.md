@@ -2918,6 +2918,17 @@ Notes:
   run_id, page_event, policy}`). The human page itself is fired separately
   through the `Notifier` seam (see `campaign_gate_paged` below), not by this
   marker. Best-effort like the other driver kinds.
+- The campaign **auto-start refusal** marker — `campaign_auto_start_refused`
+  (E88.1 / #4525) — is also a **system-actor GLOBAL-chain audit kind, NOT an
+  issue-comment surface**. Nothing in `issuecomment` posts it. The
+  campaign-driver ticker (`campaigndriver.Ticker.start`) is the SOLE writer:
+  when its `RunStarter` returns a `campaigndriver.StartRefusal` (the campaign
+  resolves to a `local` run with no or a relative `working_dir`, or records an
+  invalid `runner_kind`), the driver starts no item of that campaign and
+  records `campaign_auto_start_refused` (payload `{campaign_id, issue_ref,
+  reason, runner_kind, runner_kind_source, detail}`) once per campaign and
+  reason while the campaign stays running. The operator-facing surface is the
+  `auto_start_refusal` block on `GET /v0/campaigns/{id}/status`.
 - The campaign auto-driver audit kinds — `campaign_gate_acted` and
   `campaign_gate_paged` (E25.6 / #1445, ADR-047 Track C) — are **audit-only
   kinds with no dedicated Notifier method and are NOT issue-comment surfaces**.
