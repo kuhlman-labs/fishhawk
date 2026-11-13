@@ -1052,9 +1052,9 @@ func helperCmd(t *testing.T, repo, root, runID string) *exec.Cmd {
 // and runner are separate Go modules with no dependency edge in either
 // direction.
 func TestLineageLock_CancelledRunHolder_NextDispatchAdmitted(t *testing.T) {
-	if _, err := exec.LookPath("ps"); err != nil {
-		t.Skip("ps not available")
-	}
+	// The real exec probe, not LookPath: a signal-confined agent shell
+	// (#4858) finds ps but cannot exec it (requirePsExec, lockholder_test.go).
+	requirePsExec(t)
 	repo := initRepo(t)
 	const (
 		root      = "d0d0d0d0"

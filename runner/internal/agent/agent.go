@@ -143,11 +143,14 @@ type Invocation struct {
 	// (see WrapArgv — both adapters route through it so they cannot
 	// drift). The wrapper must enclose the WHOLE process tree (the runner
 	// wires runner/internal/netsandbox's `sandbox-exec -p <profile>` here
-	// for the acceptance stage, #3393), so adapters MUST NOT reorder, drop,
-	// or interpolate it, and everything downstream — cmd.Dir, env
-	// composition, Setpgid, the kill-tree, the out-of-tree detector — is
-	// unchanged: the wrapped process is still the direct child and group
-	// leader. Nil / empty is byte-identical to today's spawn.
+	// at two consumers: the acceptance stage's composed profile, #3393 /
+	// #4855, and the signal-only SignalProfile() on every implement-stage
+	// spawn — implement, fix-up, conflict resolution — #4858), so adapters
+	// MUST NOT reorder, drop, or interpolate it, and everything
+	// downstream — cmd.Dir, env composition, Setpgid, the kill-tree, the
+	// out-of-tree detector — is unchanged: the wrapped process is still
+	// the direct child and group leader. Nil / empty is byte-identical to
+	// today's spawn.
 	ExecWrapper []string
 
 	// ProgressSink receives single-line JSON stage_progress
