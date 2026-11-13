@@ -32,7 +32,8 @@
 // run's gate under the operator_agent contract (E25.6 / ADR-047 Track C):
 // during the ADVANCE pass, every running item whose linked run is NON-terminal
 // is handed to the optional GateActor seam BEFORE terminal observation. The
-// actor (server.Server.AutoDriveRunGate, bound in serve.go) re-evaluates the
+// actor (server.Server.DriveCampaignRunGate over AutoDriveRunGate, bound in
+// serve.go) re-evaluates the
 // run's delegation in-process and, for a delegated knob whose condition is met
 // AND whose real gate state matches, takes the gate action (approve/fixup/
 // retry/merge) under the campaign operator identity, recording the run-level
@@ -42,7 +43,10 @@
 // driver then advances campaigns mechanically and observes only. pause/page is
 // E25.7; this child's actor only EMITS the campaign_gate_paged hand-off (on the
 // run chain, written by the actor) and takes no action on a must_page_human
-// gate. The driver consumes existing surfaces through narrow interfaces so it
+// gate. A DecisionRequired outcome (a gate that needs a human decision) is
+// recorded once per occurrence as a run-chained
+// campaign_gate_decision_required marker and cleared with a
+// campaign_gate_decision_cleared row (E88.4 / #4528; README). The driver consumes existing surfaces through narrow interfaces so it
 // is independently unit-testable with the campaign.fake and recording fakes,
 // plus a Postgres-backed end-to-end test over a 2-issue depends_on campaign.
 //
@@ -111,6 +115,42 @@ const (
 	categoryCampaignAutoStartRefused = "campaign_auto_start_refused"
 )
 
+// Decision-required marker categories and the run-level gate token (E88.4 /
+// #4528). Exported so the server's campaign status read names them without a
+// string copy. Unlike the campaign-level markers above, both ride the RUN chain
+// (AppendChained, RunID = the item's linked run, actor system): a parked
+// decision belongs to one run, and the status read looks it up by that run.
+//
+// The marker/clear pair is an INTERIM registration under ADR-106's existing
+// audit-category mechanism (audit.KnownCategories); it needs no new ADR and
+// takes the mandatory run-bound flag when #4599 / E89 #4537 lands. The payload
+// carries no cross-run identifiers: only this run's own campaign_id, issue_ref,
+// run_id, gate stage and closed-set tokens (never the actor's Note, which can
+// name other runs). The once-per-occurrence dedupe assumes a single campaign
+// driver per deployment; two concurrent drivers could double-append.
+const (
+	// CategoryCampaignGateDecisionRequired records that the GateActor returned
+	// a DecisionRequired outcome: the gate needs a human decision. Appended
+	// once per occurrence key (run, decision_state, action, gate).
+	CategoryCampaignGateDecisionRequired = "campaign_gate_decision_required"
+	// CategoryCampaignGateDecisionCleared records that a previously recorded
+	// decision stopped being current: a later non-decision outcome whose stage
+	// read positively showed the keyed gate no longer parked.
+	CategoryCampaignGateDecisionCleared = "campaign_gate_decision_cleared"
+	// GateRunLevel is the gate value of a decision with no parked plan or
+	// implement stage (for example fixup_budget_exhausted on a run whose
+	// implement stage already succeeded).
+	GateRunLevel = "run"
+)
+
+// Values of the cleared row's cleared_by field: the outcome kind that cleared
+// the decision.
+const (
+	clearedByActed      = "acted"
+	clearedByPaged      = "paged"
+	clearedByNoDecision = "no_decision"
+)
+
 // StartRefusal is the error a RunStarter returns when a CAMPAIGN cannot be
 // auto-started at all (#4525), as opposed to a transient per-item failure.
 // On a StartRefusal the driver ends the campaign's START pass for the tick, so
@@ -173,14 +213,20 @@ type RunStarter interface {
 }
 
 // AuditAppender records the driver's campaign-level audit entries on the
-// global chain. Satisfied by audit.Repository.
+// global chain, and the decision-required marker and clear rows on the run
+// chain (E88.4 / #4528), which it reads back once per run per process to
+// hydrate the dedupe key. Satisfied by audit.Repository.
 type AuditAppender interface {
 	AppendGlobalChained(ctx context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error)
+	AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error)
+	ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error)
 }
 
 // GateActionOutcome reports what the GateActor did at a run gate so the
 // driver can record the campaign-level marker. It mirrors the fields of
-// server.AutoDriveOutcome the driver needs; the serve.go adapter translates.
+// server.AutoDriveOutcome the driver needs; server.Server.DriveCampaignRunGate
+// translates (the serve.go adapter delegates to it) and adds the stage read
+// behind GateKnown, GateStageID and ParkedGateStageIDs.
 // On an observe-only outcome both Acted and Paged are false.
 type GateActionOutcome struct {
 	// Acted is true when the actor dispatched a delegated gate action;
@@ -195,13 +241,58 @@ type GateActionOutcome struct {
 	Paged     bool
 	PageEvent string
 	// Note is a short human-readable summary for the driver log. Always set.
+	// Never recorded in an audit payload: it can name other runs.
 	Note string
+	// DecisionRequired is true when the actor could not auto-act on an
+	// expected gate state and hands the gate to a human (E88.4 / #4528);
+	// DecisionState names the state (human_quorum_required,
+	// fixup_budget_exhausted, ...) and Action the delegated verb whose arm
+	// surfaced it. Set with Acted=false and Paged=false. The driver records one
+	// campaign_gate_decision_required marker per occurrence.
+	DecisionRequired bool
+	DecisionState    string
+	// GateKnown is true when the adapter read the run's stages after the gate
+	// evaluation. False when the read failed, the run repository is unwired,
+	// or the read was skipped because the driver holds no key and the outcome
+	// is not a decision. An unknown gate never appends a marker and never
+	// clears one.
+	GateKnown bool
+	// GateStageID is the parked plan/implement awaiting_approval stage (the
+	// earliest by sequence), or nil when none is parked. Meaningful only when
+	// GateKnown. A nil stage on a decision keys it at GateRunLevel.
+	GateStageID *uuid.UUID
+	// ParkedGateStageIDs lists every plan, implement or review stage in
+	// awaiting_approval in the same stage read. Meaningful only when
+	// GateKnown. A recorded decision clears only when this read positively
+	// shows its gate no longer parked: a stage key clears when its stage is
+	// absent here, a run-level key only when the list is empty.
+	ParkedGateStageIDs []uuid.UUID
+}
+
+// decisionKeyHeldCtxKey carries the driver's hint to the GateActor of whether
+// it may hold a decision key for the run being driven.
+type decisionKeyHeldCtxKey struct{}
+
+// WithDecisionKeyHeld returns ctx carrying the driver's hint for the run being
+// driven: held=false means the driver hydrated the run and holds no decision
+// key, so an adapter may skip its post-evaluation stage read for a
+// non-decision outcome (nothing could be cleared). driveGate sets it on every
+// actor call.
+func WithDecisionKeyHeld(ctx context.Context, held bool) context.Context {
+	return context.WithValue(ctx, decisionKeyHeldCtxKey{}, held)
+}
+
+// DecisionKeyHeld reads the hint WithDecisionKeyHeld set. ok=false when no
+// hint is present; an adapter must then read the stages (the safe default).
+func DecisionKeyHeld(ctx context.Context) (held, ok bool) {
+	held, ok = ctx.Value(decisionKeyHeldCtxKey{}).(bool)
+	return held, ok
 }
 
 // GateActor auto-acts on a single running run's gate under the operator_agent
 // contract (E25.6 / ADR-047). The single seam between the campaign driver and
 // the gate-action machinery: the serve.go adapter satisfies it over
-// server.Server.AutoDriveRunGate (binding the campaign operator identity + the
+// server.Server.DriveCampaignRunGate (binding the campaign operator identity + the
 // GitHub merge client), while unit tests substitute a recording fake. Defined
 // HERE so the driver never imports server (avoiding an import cycle) and stays
 // decoupled from how a gate action is taken. OPTIONAL on the Ticker: a nil
@@ -285,6 +376,37 @@ type Ticker struct {
 	// restart records each standing refusal once more.
 	refusedMu sync.Mutex
 	refused   map[uuid.UUID]map[string]struct{}
+
+	// decisionMu guards decisions and decisionsHydrated (E88.4 / #4528).
+	// decisions is the last recorded, uncleared decision key per run;
+	// decisionsHydrated marks the runs whose key was loaded from the run chain
+	// this process. Both are pruned to the runs driven in the latest tick
+	// (forgetUndrivenDecisions); a forgotten run re-hydrates when driven again.
+	decisionMu        sync.Mutex
+	decisions         map[uuid.UUID]decisionKey
+	decisionsHydrated map[uuid.UUID]struct{}
+}
+
+// decisionKey is one decision occurrence for a run (R3): the run is the map
+// key, and Gate is the parked stage id or GateRunLevel. It deliberately omits
+// the stage's updated_at, so a stage that re-parks with the same decision and
+// no non-decision tick in between is the same occurrence.
+type decisionKey struct {
+	DecisionState string
+	Action        string
+	Gate          string
+}
+
+// stageID returns the gate's stage id, or nil for a run-level gate.
+func (k decisionKey) stageID() *uuid.UUID {
+	if k.Gate == GateRunLevel {
+		return nil
+	}
+	id, err := uuid.Parse(k.Gate)
+	if err != nil {
+		return nil
+	}
+	return &id
 }
 
 // Run drives the ticker until ctx is cancelled. Per-campaign and per-item
@@ -335,6 +457,10 @@ func (t *Ticker) Tick(ctx context.Context) {
 		return
 	}
 	t.pruneStartRefusals(campaigns)
+	// driven collects the runs handed to the GateActor this tick, so the
+	// decision keys of every other run (settled, unlinked, or no longer in a
+	// running campaign) are dropped at the end of the tick.
+	driven := map[uuid.UUID]struct{}{}
 	for _, c := range campaigns {
 		if c.State != campaign.StateRunning {
 			// Defense-in-depth: the filter already constrains to running. A
@@ -342,15 +468,16 @@ func (t *Ticker) Tick(ctx context.Context) {
 			// reach the advance/start passes.
 			continue
 		}
-		t.processCampaign(ctx, logger, c)
+		t.processCampaign(ctx, logger, c, driven)
 	}
+	t.forgetUndrivenDecisions(driven)
 }
 
 // processCampaign runs the ADVANCE then START passes for one running
 // campaign, re-reading items between them so a predecessor settled this tick
 // unblocks its dependent in the same tick. Per-item errors WARN-log and never
 // abort the campaign.
-func (t *Ticker) processCampaign(ctx context.Context, logger *slog.Logger, c *campaign.Campaign) {
+func (t *Ticker) processCampaign(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, driven map[uuid.UUID]struct{}) {
 	items, err := t.Campaigns.ListCampaignItemsForCampaign(ctx, c.ID)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: list items failed",
@@ -359,7 +486,7 @@ func (t *Ticker) processCampaign(ctx context.Context, logger *slog.Logger, c *ca
 		return
 	}
 
-	settledAny := t.advance(ctx, logger, c, items)
+	settledAny := t.advance(ctx, logger, c, items, driven)
 
 	if settledAny {
 		// Re-read so the campaign re-derivation and the START pass see the
@@ -390,7 +517,7 @@ func (t *Ticker) processCampaign(ctx context.Context, logger *slog.Logger, c *ca
 // campaign state). Idempotent: a non-running item, an item with no run, or an
 // item whose run is still in flight is skipped, so a re-tick over an
 // already-settled item does nothing.
-func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, items []*campaign.Item) bool {
+func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, items []*campaign.Item, driven map[uuid.UUID]struct{}) bool {
 	settledAny := false
 	for _, it := range items {
 		if it.State != campaign.ItemStateRunning || it.RunID == nil {
@@ -412,6 +539,9 @@ func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.C
 			// any action it takes moves the run toward terminal, observed and
 			// settled on a subsequent tick (the 60s-latency posture). Disabled
 			// (nil actor) leaves the run parked for the human operator-agent.
+			if t.GateActor != nil {
+				driven[runRow.ID] = struct{}{}
+			}
 			t.driveGate(ctx, logger, c, it, runRow)
 			continue
 		}
@@ -469,10 +599,11 @@ func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign
 		out GateActionOutcome
 		err error
 	)
+	actx := WithDecisionKeyHeld(ctx, t.decisionKeyMayBeHeld(runRow.ID))
 	if ca, ok := t.GateActor.(CampaignGateActor); ok {
-		out, err = ca.DriveRunGateWithCampaign(ctx, runRow, c.OperatorAgent)
+		out, err = ca.DriveRunGateWithCampaign(actx, runRow, c.OperatorAgent)
 	} else {
-		out, err = t.GateActor.DriveRunGate(ctx, runRow)
+		out, err = t.GateActor.DriveRunGate(actx, runRow)
 	}
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: auto-drive run gate failed; left for next tick",
@@ -482,6 +613,9 @@ func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign
 			slog.String("error", err.Error()))
 		return
 	}
+	// Record or clear the decision-required marker (E88.4 / #4528). After the
+	// error return, so an actor error never appends and never clears.
+	t.trackDecision(ctx, logger, c, it, runRow, out)
 	if out.Acted {
 		t.emit(ctx, logger, c.ID, categoryCampaignGateActed, map[string]any{
 			"campaign_id": c.ID.String(),
@@ -556,6 +690,283 @@ func (t *Ticker) pageGate(ctx context.Context, logger *slog.Logger, c *campaign.
 			slog.String("campaign_id", c.ID.String()),
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
+	}
+}
+
+// trackDecision records the decision-required marker for a DecisionRequired
+// outcome, once per occurrence key, and the cleared row when a later
+// non-decision outcome positively shows the recorded gate no longer parked
+// (E88.4 / #4528, R3, approval condition C1). Every step that cannot decide
+// defers: nothing is appended or cleared, and the next tick retries.
+func (t *Ticker) trackDecision(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, out GateActionOutcome) {
+	if !t.decisionHydrated(ctx, logger, runRow.ID) {
+		return
+	}
+	if !out.DecisionRequired {
+		t.clearDecision(ctx, logger, c, it, runRow, out)
+		return
+	}
+	if !out.GateKnown {
+		// The gate stage is unknown (stage read failed or unwired): defer the
+		// occurrence rather than re-key it to the run level.
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: decision gate unknown; marker deferred",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("decision_state", out.DecisionState))
+		return
+	}
+	gate := GateRunLevel
+	if out.GateStageID != nil {
+		gate = out.GateStageID.String()
+	}
+	key := decisionKey{DecisionState: out.DecisionState, Action: out.Action, Gate: gate}
+	if t.decisionUnchanged(runRow.ID, key) {
+		return
+	}
+	t.recordDecision(ctx, logger, c, it, runRow, key)
+}
+
+// recordDecision appends one campaign_gate_decision_required row on the run
+// chain and stores the key only after the append succeeds, so a failed append
+// is retried on the next tick.
+func (t *Ticker) recordDecision(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, key decisionKey) {
+	payload := decisionPayload(c, it, runRow, key)
+	if _, err := t.appendRunChained(ctx, runRow.ID, key.stageID(), CategoryCampaignGateDecisionRequired, payload); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: decision marker append failed",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	t.storeDecision(runRow.ID, key)
+}
+
+// clearDecision appends one campaign_gate_decision_cleared row for the run's
+// stored key when the outcome's own stage read positively shows the keyed gate
+// no longer parked (C1), and deletes the key only after the append succeeds.
+// A no-op without a stored key. An indeterminate outcome (GateKnown=false)
+// never clears: AutoDriveRunGate answers observe-only with a nil error on its
+// fail-closed reads, which is not evidence the gate moved.
+func (t *Ticker) clearDecision(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, out GateActionOutcome) {
+	key, ok := t.storedDecision(runRow.ID)
+	if !ok {
+		return
+	}
+	if !gateReleased(key, out) {
+		return
+	}
+	clearedBy := clearedByNoDecision
+	switch {
+	case out.Acted:
+		clearedBy = clearedByActed
+	case out.Paged:
+		clearedBy = clearedByPaged
+	}
+	payload := decisionPayload(c, it, runRow, key)
+	payload["cleared_by"] = clearedBy
+	if _, err := t.appendRunChained(ctx, runRow.ID, key.stageID(), CategoryCampaignGateDecisionCleared, payload); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: decision clear append failed",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	t.deleteDecision(runRow.ID, key)
+}
+
+// gateReleased reports whether out's stage read positively shows key's gate no
+// longer parked (C1). A stage key is released when its stage is absent from
+// the parked set (it left awaiting_approval); a run-level key only when no
+// plan, implement or review stage is parked.
+func gateReleased(key decisionKey, out GateActionOutcome) bool {
+	if !out.GateKnown {
+		return false
+	}
+	if key.Gate == GateRunLevel {
+		return len(out.ParkedGateStageIDs) == 0
+	}
+	for _, id := range out.ParkedGateStageIDs {
+		if id.String() == key.Gate {
+			return false
+		}
+	}
+	return true
+}
+
+// decisionPayload is the exact marker payload: this run's own campaign_id,
+// issue_ref, run_id, gate and closed-set tokens. out.Note is never included.
+func decisionPayload(c *campaign.Campaign, it *campaign.Item, runRow *run.Run, key decisionKey) map[string]any {
+	return map[string]any{
+		"campaign_id":    c.ID.String(),
+		"issue_ref":      it.IssueRef,
+		"run_id":         runRow.ID.String(),
+		"gate":           key.Gate,
+		"decision_state": key.DecisionState,
+		"action":         key.Action,
+	}
+}
+
+// appendRunChained appends one system-actor entry on runID's chain.
+func (t *Ticker) appendRunChained(ctx context.Context, runID uuid.UUID, stageID *uuid.UUID, category string, payload map[string]any) (*audit.Entry, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	systemKind := audit.ActorSystem
+	return t.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   stageID,
+		Timestamp: t.now(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   body,
+	})
+}
+
+// decisionHydrated loads the run's current decision key from its chain once
+// per run per process: when the latest decision_required row is newer
+// (higher Sequence) than the latest decision_cleared row, its payload seeds
+// the key. Reports false on a read error (WARN-logged), leaving the run
+// unhydrated so this tick neither appends nor clears and the next tick
+// retries.
+func (t *Ticker) decisionHydrated(ctx context.Context, logger *slog.Logger, runID uuid.UUID) bool {
+	t.decisionMu.Lock()
+	_, done := t.decisionsHydrated[runID]
+	t.decisionMu.Unlock()
+	if done {
+		return true
+	}
+	marker, cleared, err := t.latestDecisionRows(ctx, runID)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: decision chain read failed; marker tracking deferred",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	var (
+		key  decisionKey
+		seed bool
+	)
+	if marker != nil && (cleared == nil || marker.Sequence > cleared.Sequence) {
+		var p struct {
+			Gate          string `json:"gate"`
+			DecisionState string `json:"decision_state"`
+			Action        string `json:"action"`
+		}
+		if uerr := json.Unmarshal(marker.Payload, &p); uerr != nil {
+			// A malformed marker seeds no key: the next decision records a fresh
+			// marker that supersedes it.
+			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: decision marker payload unreadable; not seeded",
+				slog.String("run_id", runID.String()),
+				slog.String("error", uerr.Error()))
+		} else {
+			key = decisionKey{DecisionState: p.DecisionState, Action: p.Action, Gate: p.Gate}
+			seed = true
+		}
+	}
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	if t.decisionsHydrated == nil {
+		t.decisionsHydrated = map[uuid.UUID]struct{}{}
+	}
+	t.decisionsHydrated[runID] = struct{}{}
+	if seed {
+		if t.decisions == nil {
+			t.decisions = map[uuid.UUID]decisionKey{}
+		}
+		t.decisions[runID] = key
+	}
+	return true
+}
+
+// latestDecisionRows returns the highest-Sequence decision_required and
+// decision_cleared rows on runID's chain (nil when none).
+func (t *Ticker) latestDecisionRows(ctx context.Context, runID uuid.UUID) (marker, cleared *audit.Entry, err error) {
+	markers, err := t.Audit.ListForRunByCategory(ctx, runID, CategoryCampaignGateDecisionRequired)
+	if err != nil {
+		return nil, nil, err
+	}
+	clears, err := t.Audit.ListForRunByCategory(ctx, runID, CategoryCampaignGateDecisionCleared)
+	if err != nil {
+		return nil, nil, err
+	}
+	return latestEntry(markers), latestEntry(clears), nil
+}
+
+// latestEntry returns the highest-Sequence entry, or nil.
+func latestEntry(entries []*audit.Entry) *audit.Entry {
+	var latest *audit.Entry
+	for _, e := range entries {
+		if e != nil && (latest == nil || e.Sequence > latest.Sequence) {
+			latest = e
+		}
+	}
+	return latest
+}
+
+// decisionKeyMayBeHeld reports the hint driveGate passes the actor: false only
+// when the run is hydrated and no key is stored (nothing could be cleared).
+func (t *Ticker) decisionKeyMayBeHeld(runID uuid.UUID) bool {
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	if _, ok := t.decisionsHydrated[runID]; !ok {
+		return true
+	}
+	_, held := t.decisions[runID]
+	return held
+}
+
+// decisionUnchanged reports whether key equals the run's stored key.
+func (t *Ticker) decisionUnchanged(runID uuid.UUID, key decisionKey) bool {
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	stored, ok := t.decisions[runID]
+	return ok && stored == key
+}
+
+// storedDecision returns the run's stored key.
+func (t *Ticker) storedDecision(runID uuid.UUID) (decisionKey, bool) {
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	k, ok := t.decisions[runID]
+	return k, ok
+}
+
+// storeDecision records key as the run's current decision.
+func (t *Ticker) storeDecision(runID uuid.UUID, key decisionKey) {
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	if t.decisions == nil {
+		t.decisions = map[uuid.UUID]decisionKey{}
+	}
+	t.decisions[runID] = key
+}
+
+// deleteDecision forgets the run's key when it still equals key.
+func (t *Ticker) deleteDecision(runID uuid.UUID, key decisionKey) {
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	if t.decisions[runID] == key {
+		delete(t.decisions, runID)
+	}
+}
+
+// forgetUndrivenDecisions drops the stored key and hydration flag of every run
+// not driven this tick (a run that settled terminal, was unlinked, or whose
+// campaign left running). No cleared row is written: the status read ignores
+// terminal runs, and a run driven again re-hydrates from its chain.
+func (t *Ticker) forgetUndrivenDecisions(driven map[uuid.UUID]struct{}) {
+	t.decisionMu.Lock()
+	defer t.decisionMu.Unlock()
+	for id := range t.decisions {
+		if _, ok := driven[id]; !ok {
+			delete(t.decisions, id)
+		}
+	}
+	for id := range t.decisionsHydrated {
+		if _, ok := driven[id]; !ok {
+			delete(t.decisionsHydrated, id)
+		}
 	}
 }
 
