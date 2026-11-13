@@ -332,6 +332,17 @@ func deferConcernAction(concerns int) SuggestedAction {
 // disagreement; the mcp integration test in
 // backend/internal/integration/mcp/fixup_test.go is the machine check that
 // this mirror and the endpoint still agree.
+//
+// #5249 exemption: the OPERATOR fix-up route (and only it) ALSO admits the
+// category-C acceptance park — acceptance failed/C, implement succeeded,
+// review exactly pending (run.findOpenReviewStage branch (e), opted into by
+// run.FixupOptions.AdmitInfraParkedAcceptance). fixupGateOpen itself stays
+// the two-shape predicate the other fix-up callers share; the review-action
+// hint's "fix-up gate is not open yet" NOTE checks the exemption separately
+// (acceptanceInfraParkFixupShape, the same predicate next_actions'
+// acceptanceParkFixupAction offers fishhawk_fixup_stage on), so the hint
+// never says the fix-up refuses where next_actions offers it.
+// TestE2E_Fixup_InfraParkedAcceptanceAdmitsFixup cross-checks both.
 func fixupGateOpen(impl, review *Stage) bool {
 	if impl == nil {
 		return false
@@ -802,7 +813,11 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 	if len(stages) > 0 {
 		impl := stageByType(stages, "implement")
 		review := stageByType(stages, "review")
-		if !fixupGateOpen(impl, review) {
+		// #5249: the category-C acceptance park is fix-up-eligible on the
+		// operator route (see fixupGateOpen's doc), so it gets no
+		// "gate is not open" NOTE.
+		infraPark := acceptanceInfraParkFixupShape(stageByType(stages, "acceptance"), stages)
+		if !fixupGateOpen(impl, review) && !infraPark {
 			if acc := blockingAcceptanceStage(stages); acc != nil {
 				// Split by what the operator can actually DO, exactly as the endpoint
 				// refusal does (run.findOpenReviewStage): a dispatchable acceptance

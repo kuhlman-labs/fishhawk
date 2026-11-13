@@ -179,6 +179,12 @@ Applies to an implement stage in either flow:
     push_and_open_pr flow. The review stage is re-parked alongside the
     re-open so the fix-up flows back into a fresh review. Refused once
     the review gate has merged/resolved.
+  - (#5249) the implement stage has succeeded, the review stage is still
+    pending, and the acceptance stage is PARKED failed with
+    failure_category C — the change itself broke the acceptance preview,
+    so a retry re-fails on the same head. The fix-up re-parks acceptance
+    failed -> pending, re-opens implement, and leaves review pending.
+    Category A/B/D failures and an unsettled acceptance keep the refusal.
 
 Inputs:
   - stage_id : the implement stage (parked at the review gate, or

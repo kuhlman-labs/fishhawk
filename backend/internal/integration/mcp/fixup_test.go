@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -4176,5 +4178,202 @@ func TestE2E_Fixup_ConcernsOverflowRefused(t *testing.T) {
 	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
 	if err != nil || len(entries) != 0 {
 		t.Errorf("stage_fixup_triggered entries = %d (err %v), want 0", len(entries), err)
+	}
+}
+
+// TestE2E_Fixup_InfraParkedAcceptanceAdmitsFixup drives #5249 across the real
+// fishhawk-mcp binary → HTTP fix-up handler → run admission → Postgres repo →
+// audit chain: a push_and_open_pr run whose acceptance stage is parked
+// failed/category C (#4356) while review is still pending. next_actions from
+// BOTH fishhawk_get_run_status and fishhawk_drive_run's acceptance_stage_failed
+// stop offer retry → fishhawk_fixup_stage → cancel; the review_action_hint
+// carries no "fix-up gate is not open yet" NOTE; the real fix-up is admitted
+// and the rows read back from Postgres show implement / acceptance / review
+// pending with acceptance's failure metadata cleared. The category-A variant
+// offers no fix-up, keeps the NOTE, and the server refuses. This is the
+// KEEP-IN-SYNC cross-check between run.findOpenReviewStage branch (e),
+// next_actions' acceptanceParkFixupAction and review_action_hint's exemption.
+func TestE2E_Fixup_InfraParkedAcceptanceAdmitsFixup(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	seed := func(cat runpkg.FailureCategory) (runID uuid.UUID, impl, acc, review *runpkg.Stage) {
+		t.Helper()
+		r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+			TriggerSource: runpkg.TriggerCLI, RunnerKind: runpkg.RunnerKindLocal,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if _, err := fx.runRepo.TransitionRun(ctx, r.ID, runpkg.StateRunning); err != nil {
+			t.Fatalf("run → running: %v", err)
+		}
+		mk := func(seq int, typ runpkg.StageType) *runpkg.Stage {
+			st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+				RunID: r.ID, Sequence: seq, Type: typ, ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+			})
+			if err != nil {
+				t.Fatalf("CreateStage(%s): %v", typ, err)
+			}
+			return st
+		}
+		plan := mk(1, runpkg.StageTypePlan)
+		walkToSucceeded(t, ctx, fx.runRepo, plan.ID)
+		impl = mk(2, runpkg.StageTypeImplement)
+		walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+		acc = mk(3, runpkg.StageTypeAcceptance)
+		review = mk(4, runpkg.StageTypeReview)
+		for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning} {
+			if _, err := fx.runRepo.TransitionStage(ctx, acc.ID, to, nil); err != nil {
+				t.Fatalf("acceptance → %s: %v", to, err)
+			}
+		}
+		reason := "acceptance_preview_provision_failed"
+		c := cat
+		if _, err := fx.runRepo.TransitionStage(ctx, acc.ID, runpkg.StageStateFailed, &runpkg.StageCompletion{FailureCategory: &c, FailureReason: &reason}); err != nil {
+			t.Fatalf("acceptance → failed/%s: %v", cat, err)
+		}
+		// An open implement concern so review_action_hint renders (K2).
+		seedImplementReview(t, ctx, auditRepo, r.ID, impl.ID,
+			planreview.Concern{Severity: planreview.SeverityMedium, Category: "correctness", Note: "the preview server does not boot"})
+		return r.ID, impl, acc, review
+	}
+	statusActions := func(runID uuid.UUID) []string {
+		t.Helper()
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_get_run_status", Arguments: map[string]any{"run_id": runID.String()}})
+		if err != nil || res.IsError {
+			t.Fatalf("get_run_status: %v %s", err, toolContentString(t, res))
+		}
+		var out struct {
+			NextActions struct {
+				Actions []struct {
+					Action string            `json:"action"`
+					Params map[string]string `json:"params"`
+				} `json:"actions"`
+			} `json:"next_actions"`
+		}
+		decodeStructured(t, res, &out)
+		var names []string
+		for _, a := range out.NextActions.Actions {
+			names = append(names, a.Action+":"+a.Params["stage_id"]+a.Params["run_id"])
+		}
+		return names
+	}
+	driveActions := func(runID uuid.UUID) (string, []string) {
+		t.Helper()
+		// A stub runner binary: the drive stops at the acceptance park
+		// before any spawn, so it is resolved but never executed.
+		stub := filepath.Join(t.TempDir(), "fishhawk-runner")
+		if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatalf("write stub runner: %v", err)
+		}
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_drive_run", Arguments: map[string]any{
+			"run_id": runID.String(), "working_dir": t.TempDir(), "github_repo": "kuhlman-labs/fishhawk", "base_branch": "main", "max_minutes": 1,
+			"runner_binary": stub,
+		}})
+		if err != nil || res.IsError {
+			t.Fatalf("drive_run: %v %s", err, toolContentString(t, res))
+		}
+		var out struct {
+			StoppedReason string `json:"stopped_reason"`
+			NextActions   *struct {
+				Actions []struct {
+					Action string            `json:"action"`
+					Params map[string]string `json:"params"`
+				} `json:"actions"`
+			} `json:"next_actions"`
+		}
+		decodeStructured(t, res, &out)
+		var names []string
+		if out.NextActions != nil {
+			for _, a := range out.NextActions.Actions {
+				names = append(names, a.Action+":"+a.Params["stage_id"]+a.Params["run_id"])
+			}
+		}
+		return out.StoppedReason, names
+	}
+	const gateNote = "fix-up gate is not open yet"
+
+	// --- Category C: the fix-up is offered and admitted. ---
+	runID, impl, acc, review := seed(runpkg.FailureC)
+	want := []string{
+		"fishhawk_retry_stage:" + acc.ID.String(),
+		"fishhawk_fixup_stage:" + impl.ID.String(),
+		"fishhawk_cancel_run:" + runID.String(),
+	}
+	if got := statusActions(runID); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("get_run_status next_actions = %v, want %v", got, want)
+	}
+	// K1: the drive_run call site passes its stages.
+	if reason, got := driveActions(runID); reason != "acceptance_stage_failed" || strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("drive_run stop = %q next_actions = %v, want acceptance_stage_failed %v", reason, got, want)
+	}
+	// K2: no contradictory gate NOTE where the fix-up is offered.
+	if hint := getReviewActionHint(t, ctx, session, runID); hint == nil || strings.Contains(hint.Message, gateNote) {
+		t.Errorf("review_action_hint = %+v, want a hint WITHOUT %q on the C park", hint, gateNote)
+	}
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_fixup_stage", Arguments: map[string]any{
+		"stage_id": impl.ID.String(), "operator_concern": "make the preview server boot", "reason": "#5249 C park",
+	}})
+	if err != nil || res.IsError {
+		t.Fatalf("fishhawk_fixup_stage over the C park: %v %s", err, toolContentString(t, res))
+	}
+	for _, c := range []struct {
+		id   uuid.UUID
+		name string
+	}{{impl.ID, "implement"}, {acc.ID, "acceptance"}, {review.ID, "review"}} {
+		st, err := fx.runRepo.GetStage(ctx, c.id)
+		if err != nil {
+			t.Fatalf("GetStage(%s): %v", c.name, err)
+		}
+		if st.State != runpkg.StageStatePending {
+			t.Errorf("%s = %q, want pending", c.name, st.State)
+		}
+		if c.name == "acceptance" && (st.FailureCategory != nil || st.FailureReason != nil) {
+			t.Errorf("acceptance failure metadata not cleared: cat=%v reason=%v", st.FailureCategory, st.FailureReason)
+		}
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, runID, server.CategoryStageFixupTriggered)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d (%v), want 1", len(entries), err)
+	}
+	var trig struct {
+		From     string `json:"acceptance_reparked_from"`
+		AccID    string `json:"reparked_acceptance_stage_id"`
+		ReviewID string `json:"reparked_review_stage_id"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &trig); err != nil {
+		t.Fatalf("unmarshal trigger: %v", err)
+	}
+	if trig.From != runpkg.AcceptanceReparkedFromFailedC || trig.AccID != acc.ID.String() || trig.ReviewID != "" {
+		t.Errorf("trigger = %+v, want acceptance_reparked_from=failed_c on %s and no reparked_review_stage_id", trig, acc.ID)
+	}
+
+	// --- Category A: no fix-up offered, the NOTE stays, the server refuses. ---
+	runA, implA, _, _ := seed(runpkg.FailureA)
+	for _, a := range statusActions(runA) {
+		if strings.HasPrefix(a, "fishhawk_fixup_stage:") {
+			t.Errorf("category A next_actions offer a fix-up: %v", a)
+		}
+	}
+	if _, got := driveActions(runA); strings.Contains(strings.Join(got, ","), "fishhawk_fixup_stage") {
+		t.Errorf("category A drive_run next_actions offer a fix-up: %v", got)
+	}
+	if hint := getReviewActionHint(t, ctx, session, runA); hint == nil || !strings.Contains(hint.Message, gateNote) {
+		t.Errorf("category A review_action_hint = %+v, want the %q NOTE", hint, gateNote)
+	}
+	resA, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_fixup_stage", Arguments: map[string]any{
+		"stage_id": implA.ID.String(), "operator_concern": "make the preview server boot", "reason": "category A",
+	}})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !resA.IsError || !strings.Contains(toolContentString(t, resA), "fixup_not_applicable") {
+		t.Errorf("category A fix-up = %s, want a fixup_not_applicable refusal", toolContentString(t, resA))
 	}
 }

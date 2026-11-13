@@ -6392,3 +6392,125 @@ func TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen(t *testing.T) {
 		u()
 	}
 }
+
+// seedInfraParkedAcceptance seeds the #5249 shape on a running run: implement
+// succeeded, acceptance FAILED with the given category, review pending.
+func seedInfraParkedAcceptance(repo *approvalRunRepo, cat run.FailureCategory) (impl, acc, review *run.Stage) {
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	impl = repo.seedStageOnRunSeq(runID, 1, run.StageTypeImplement, run.StageStateSucceeded)
+	acc = repo.seedStageOnRunSeq(runID, 2, run.StageTypeAcceptance, run.StageStateFailed)
+	c := cat
+	reason := "preview did not boot"
+	acc.FailureCategory = &c
+	acc.FailureReason = &reason
+	review = repo.seedStageOnRunSeq(runID, 3, run.StageTypeReview, run.StageStatePending)
+	return impl, acc, review
+}
+
+// TestFixupStage_InfraParkedAcceptanceAdmittedAndAudited pins the #5249
+// operator route: a fix-up over a category-C acceptance park with review
+// pending is admitted (the handler opts in), commits implement pending /
+// acceptance pending / review pending, and records the re-park on the
+// stage_fixup_triggered entry. A category-A park keeps the 422. A run-bound
+// token on its OWN run is admitted too: the opt-in is route-keyed (K5).
+func TestFixupStage_InfraParkedAcceptanceAdmittedAndAudited(t *testing.T) {
+	cases := []struct {
+		name     string
+		cat      run.FailureCategory
+		runBound bool
+		wantCode int
+	}{
+		{"operator category C admitted", run.FailureC, false, http.StatusOK},
+		{"run-bound token on own run category C admitted", run.FailureC, true, http.StatusOK},
+		{"category A refused", run.FailureA, false, http.StatusUnprocessableEntity},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au := fixupServer(t)
+			impl, acc, review := seedInfraParkedAcceptance(repo, tc.cat)
+
+			var w *httptest.ResponseRecorder
+			if tc.runBound {
+				raw, _ := json.Marshal(fixupRequest{OperatorConcern: "fix the preview boot", Reason: "r"})
+				req := httptest.NewRequest(http.MethodPost, "/v0/stages/"+impl.ID.String()+"/fixup", bytes.NewReader(raw))
+				req.SetPathValue("stage_id", impl.ID.String())
+				w = httptest.NewRecorder()
+				s.handleFixupStage(w, withMCPFixupAuth(req, impl.RunID))
+			} else {
+				w = postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: "fix the preview boot", Reason: "r"})
+			}
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
+			}
+
+			if tc.wantCode != http.StatusOK {
+				if !strings.Contains(w.Body.String(), "fixup_not_applicable") {
+					t.Errorf("body = %s, want fixup_not_applicable", w.Body.String())
+				}
+				if impl.State != run.StageStateSucceeded || acc.State != run.StageStateFailed || review.State != run.StageStatePending {
+					t.Errorf("refused call moved stages: implement=%q acceptance=%q review=%q", impl.State, acc.State, review.State)
+				}
+				for _, e := range au.appended {
+					if e.Category == CategoryStageFixupTriggered {
+						t.Errorf("refused call appended a stage_fixup_triggered entry")
+					}
+				}
+				return
+			}
+
+			if impl.State != run.StageStatePending || acc.State != run.StageStatePending || review.State != run.StageStatePending {
+				t.Errorf("committed implement=%q acceptance=%q review=%q, want pending/pending/pending", impl.State, acc.State, review.State)
+			}
+			if acc.FailureCategory != nil || acc.FailureReason != nil {
+				t.Errorf("acceptance failure metadata not cleared: cat=%v reason=%v", acc.FailureCategory, acc.FailureReason)
+			}
+			n := 0
+			for _, e := range au.appended {
+				if e.Category == CategoryStageFixupTriggered {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Fatalf("stage_fixup_triggered entries = %d, want 1", n)
+			}
+			payload := latestFixupTriggeredPayload(t, au)
+			if payload["acceptance_reparked_from"] != run.AcceptanceReparkedFromFailedC {
+				t.Errorf("acceptance_reparked_from = %v, want %q", payload["acceptance_reparked_from"], run.AcceptanceReparkedFromFailedC)
+			}
+			if payload["reparked_acceptance_stage_id"] != acc.ID.String() {
+				t.Errorf("reparked_acceptance_stage_id = %v, want %s", payload["reparked_acceptance_stage_id"], acc.ID)
+			}
+			if payload["reparked_acceptance_failure_reason"] != "preview did not boot" {
+				t.Errorf("reparked_acceptance_failure_reason = %v, want the pre-re-park reason", payload["reparked_acceptance_failure_reason"])
+			}
+			if _, ok := payload["reparked_review_stage_id"]; ok {
+				t.Errorf("reparked_review_stage_id present = %v, want absent (review left pending)", payload["reparked_review_stage_id"])
+			}
+			if r, _ := payload["admissibility_reason"].(string); !strings.Contains(r, "category-C acceptance park") {
+				t.Errorf("admissibility_reason = %q, want the acceptance-park clause", r)
+			}
+		})
+	}
+}
+
+// TestFixupStage_InfraParkedAcceptance_TriggerAppendFailureMovesNothing pins
+// the ordering (K4): the stage_fixup_triggered entry carrying the re-park keys
+// is appended BEFORE run.FixupStage moves any stage, so a failed append
+// refuses the fix-up with acceptance still parked failed/C.
+func TestFixupStage_InfraParkedAcceptance_TriggerAppendFailureMovesNothing(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	impl, acc, review := seedInfraParkedAcceptance(repo, run.FailureC)
+	au.appendErrCategory = CategoryStageFixupTriggered
+
+	w := postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: "fix the preview boot", Reason: "r"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (trigger not recorded):\n%s", w.Code, w.Body.String())
+	}
+	if impl.State != run.StageStateSucceeded || acc.State != run.StageStateFailed || review.State != run.StageStatePending {
+		t.Errorf("after failed append implement=%q acceptance=%q review=%q, want succeeded/failed/pending", impl.State, acc.State, review.State)
+	}
+	if acc.FailureCategory == nil || *acc.FailureCategory != run.FailureC {
+		t.Errorf("acceptance category = %v, want C (park intact)", acc.FailureCategory)
+	}
+}
