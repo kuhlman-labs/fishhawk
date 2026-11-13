@@ -147,6 +147,19 @@ func runTestMain(m *testing.M) int {
 	// it OFF for the whole binary; a test that needs the real sweeper opts in via
 	// enableOrphanSweepForTest.
 	orphanSweepDefaultOn = false
+	// Implement-stage signal-sandbox probe stub (#4858, R6). Every run()-driving
+	// implement test and both direct callers of the production conflict invoker
+	// would otherwise exec sandbox-exec per spawn and — on a darwin host that
+	// enforces — wrap their fake agents. The stub reports unavailable, so under
+	// the default auto every spawn keeps a nil ExecWrapper, byte-identical to
+	// pre-#4858, plus one stderr event and one trace event matched by kind. The
+	// variable is unset so an operator shell exporting require does not fail
+	// every implement test. A test needing the real probe opts in via
+	// withRealImplementSignalProbe; hermetic tests use withImplementSignalProbe.
+	probeImplementSignalSandbox = func(context.Context) (bool, string) {
+		return false, runTestMainImplementSignalStubReason
+	}
+	os.Unsetenv(implementSignalSandboxEnvVar)
 	if _, err := exec.LookPath("git"); err != nil {
 		return runSuite() // git unavailable — degrade to the original CWD.
 	}
