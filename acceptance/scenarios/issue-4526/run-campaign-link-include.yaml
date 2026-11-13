@@ -1,0 +1,14 @@
+id: scenario:issue-4526/run-campaign-link-include
+statement: GET /v0/runs/{run_id}?include=campaign_link returns a campaign_link object with status unlinked for a run that belongs to no campaign, while the same GET without the include carries no campaign_link field.
+verify_hint: 'HTTP: POST /v0/runs to create a run, then GET /v0/runs/{run_id}?include=campaign_link (campaign_link.status is unlinked) and GET /v0/runs/{run_id} (no campaign_link key); an unknown include value returns 400.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} -> run 19cbea1b-b3b4-49c6-9aef-cf44f9770efa. The run was seeded because POST /v0/runs is egress-denied. GET /v0/runs/{run_id}?include=campaign_link; GET /v0/runs/{run_id}; GET /v0/runs/{run_id}?include=bogus.
+assertions:
+    expected: unlinked with the include, absent without it, 400 on an unknown include
+    observed_at_record: 'with include: 200, campaign_link {status: unlinked, campaigns: []}; without include: 200, no campaign_link key; include=bogus: 400 validation_failed ''include must be campaign_link'''
+    repro_handle: curl 'http://localhost:8090/v0/runs/<run>?include=campaign_link'
+origin:
+    issue: 4526
+    pr: 5243
+    run_id: cf249c6d-0f93-4e61-8d4d-0aba7a7f2350
+    head_sha: ca0b4608c8d1e07a8e109dade0ac35637569de20
+    recorded_at: 2026-11-13T05:21:39Z

@@ -1,0 +1,14 @@
+id: scenario:issue-4526/host-dispatch-refuses-without-allowed-roots
+statement: '`fishhawk-mcp host-dispatch` started with neither --allowed-roots nor FISHHAWK_MCP_ALLOWED_ROOTS exits non-zero without ticking, naming the missing flag.'
+verify_hint: 'CLI: exit code 2 and stderr naming --allowed-roots.'
+steps: Built fishhawk-mcp from the sanctioned tree (cd backend && go build -o /tmp/fhacc4526/fishhawk-mcp ./cmd/fishhawk-mcp). Ran env -i PATH=/usr/bin:/bin HOME=/tmp/fhacc4526/home FISHHAWK_BACKEND_URL=http://localhost:8090 /tmp/fhacc4526/fishhawk-mcp host-dispatch --state-dir /tmp/fhacc4526/sd0 with no --allowed-roots and no FISHHAWK_MCP_ALLOWED_ROOTS.
+assertions:
+    expected: exit 2, stderr naming --allowed-roots
+    observed_at_record: 'exit 2; stderr ''no allowed roots: pass --allowed-roots or set FISHHAWK_MCP_ALLOWED_ROOTS''; state dir never created (no tick)'
+    repro_handle: fishhawk-mcp host-dispatch --state-dir /tmp/x; echo $?
+origin:
+    issue: 4526
+    pr: 5243
+    run_id: cf249c6d-0f93-4e61-8d4d-0aba7a7f2350
+    head_sha: ca0b4608c8d1e07a8e109dade0ac35637569de20
+    recorded_at: 2026-11-13T05:21:39Z

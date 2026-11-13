@@ -1,0 +1,14 @@
+id: scenario:issue-4526/host-dispatch-state-dir-refuses-symlink
+statement: '`fishhawk-mcp host-dispatch` given a --state-dir that is a symlink exits non-zero naming the state dir, and a state dir it creates has mode 0700.'
+verify_hint: 'CLI: with --allowed-roots set and --state-dir pointing at a symlink, the command exits 2 and stderr names state_dir_symlink; `--state-dir <new path> --pause` exits 0 and the created directory is 0700 and its pause file 0600.'
+steps: Built fishhawk-mcp from the sanctioned tree. mkdir -m700 /tmp/fhacc4526/realsd; ln -s /tmp/fhacc4526/realsd /tmp/fhacc4526/linksd. Ran env -i PATH=/usr/bin:/bin HOME=/tmp/fhacc4526/home FISHHAWK_BACKEND_URL=http://localhost:8090 FISHHAWK_API_TOKEN=fictional-acceptance-token-not-real fishhawk-mcp host-dispatch --allowed-roots /tmp/fhacc4526/roots --state-dir /tmp/fhacc4526/linksd. The token is needed because the credential check runs first. Then ran the same with --state-dir /tmp/fhacc4526/newsd --pause and stat'd the directory and the pause file.
+assertions:
+    expected: non-zero exit naming the state dir; created dir 0700 and pause file 0600
+    observed_at_record: 'symlink: exit 1, stderr ''state_dir_symlink: state dir /tmp/fhacc4526/linksd is a symlink; point --state-dir at a real directory''; the target dir stayed empty. --pause: exit 0; newsd drwx------ (0700), newsd/pause -rw------- (0600)'
+    repro_handle: fishhawk-mcp host-dispatch --allowed-roots /tmp/r --state-dir <symlink>; echo $?
+origin:
+    issue: 4526
+    pr: 5243
+    run_id: cf249c6d-0f93-4e61-8d4d-0aba7a7f2350
+    head_sha: ca0b4608c8d1e07a8e109dade0ac35637569de20
+    recorded_at: 2026-11-13T05:21:39Z
