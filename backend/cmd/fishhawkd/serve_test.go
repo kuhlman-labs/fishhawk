@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -43,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
@@ -882,7 +884,7 @@ func TestNewCampaignDriver_WiresDependencies(t *testing.T) {
 		Audit:       cfg.AuditRepo,
 		ExternalURL: "https://app.fishhawk.test",
 	})
-	tk := newCampaignDriver(cfg, srv, slog.Default(), notifier, time.Minute, "feature_change", "")
+	tk := newCampaignDriver(cfg, srv, slog.Default(), notifier, time.Minute, "feature_change", "", "")
 	if tk == nil {
 		t.Fatal("newCampaignDriver returned nil")
 	}
@@ -917,7 +919,7 @@ func TestNewCampaignDriver_NilNotifier_ObserveOnly(t *testing.T) {
 		GitHub:       &githubclient.Client{},
 	}
 	srv := server.New(cfg)
-	tk := newCampaignDriver(cfg, srv, slog.Default(), nil, time.Minute, "feature_change", "")
+	tk := newCampaignDriver(cfg, srv, slog.Default(), nil, time.Minute, "feature_change", "", "")
 	if tk.Notifier != nil {
 		t.Errorf("ticker Notifier = %#v, want a true nil interface (observe-only)", tk.Notifier)
 	}
@@ -8131,5 +8133,459 @@ func TestGithubAutoMerger_AllowedMergeMethods(t *testing.T) {
 	}
 	if fg.settingsHits != 1 {
 		t.Errorf("settings reads = %d, want 1", fg.settingsHits)
+	}
+}
+
+// TestValidateAutoStartRunnerKind pins the --auto-start-runner-kind accepted
+// set (#4525): github_actions and local only. gitlab_ci is refused because the
+// GitHub webhook intake cannot fire a GitLab pipeline.
+func TestValidateAutoStartRunnerKind(t *testing.T) {
+	for _, ok := range []string{runpkg.RunnerKindGitHubActions, runpkg.RunnerKindLocal} {
+		if err := validateAutoStartRunnerKind(ok); err != nil {
+			t.Errorf("validateAutoStartRunnerKind(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"bogus", runpkg.RunnerKindGitLabCI, "", "Local"} {
+		err := validateAutoStartRunnerKind(bad)
+		if err == nil {
+			t.Errorf("validateAutoStartRunnerKind(%q) = nil, want a refusal", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "github_actions, local") {
+			t.Errorf("refusal %q must name the accepted set", err)
+		}
+	}
+}
+
+// TestRunServe_AutoStartRunnerKindFailsStartup binds validateAutoStartRunnerKind
+// to the REAL runServe flag set. Like TestRunServe_SchedulerFlagsFailStartup,
+// every invocation carries an invalid --operator-min-permission backstop, so a
+// deleted check exits on THAT line (and the assertion goes RED) instead of
+// booting a server, and the exit is pre-database either way.
+func TestRunServe_AutoStartRunnerKindFailsStartup(t *testing.T) {
+	run := func(args ...string) string {
+		var sink bytes.Buffer
+		if code := runServe(args, &sink); code == 0 {
+			t.Fatalf("runServe(%v) = 0, want non-zero; output: %s", args, sink.String())
+		}
+		return sink.String()
+	}
+	for _, bad := range []string{"bogus", runpkg.RunnerKindGitLabCI} {
+		if out := run("--auto-start-runner-kind", bad, "--operator-min-permission", "not-a-permission"); !strings.Contains(out, "invalid --auto-start-runner-kind") {
+			t.Errorf("--auto-start-runner-kind %s must fail startup naming the flag; output: %s", bad, out)
+		}
+	}
+	valid := run("--auto-start-runner-kind", "local", "--operator-min-permission", "not-a-permission")
+	if strings.Contains(valid, "invalid --auto-start-runner-kind") || strings.Contains(valid, "not defined") {
+		t.Errorf("a valid --auto-start-runner-kind was refused; output: %s", valid)
+	}
+}
+
+// TestCampaignRunStarter_AutoStartKind pins the serve adapter's mapping of
+// server.ResolveCampaignAutoStart onto the run-start params (#4525).
+func TestCampaignRunStarter_AutoStartKind(t *testing.T) {
+	item := &campaign.Item{IssueRef: "issue:10"}
+	const dir = "/work/checkout"
+
+	// Default deployment, unrecorded bound campaign: params byte-identical to
+	// the pre-#4525 starter (no RunnerKind, no WorkingDir).
+	def := campaignRunStarter{workflowID: "feature_change", workflowRef: "main"}
+	bound := &campaign.Campaign{Repo: "kuhlman-labs/fishhawk", WorkingDir: dir}
+	if got, want := def.startParams(item, bound), (server.StartRunForCampaignIssueParams{Repo: bound.Repo, IssueRef: "issue:10", WorkflowID: "feature_change", WorkflowRef: "main"}); got != want {
+		t.Errorf("default params = %+v, want %+v", got, want)
+	}
+	if r := def.startRefusal(bound); r != nil {
+		t.Errorf("default bound campaign refused: %+v", r)
+	}
+
+	// --auto-start-runner-kind local + bound: a local run inheriting the binding.
+	local := campaignRunStarter{workflowID: "feature_change", workflowRef: "main", runnerKind: runpkg.RunnerKindLocal}
+	if got := local.startParams(item, bound); got.RunnerKind != runpkg.RunnerKindLocal || got.WorkingDir != dir {
+		t.Errorf("local bound params = %+v, want RunnerKind local + WorkingDir %s", got, dir)
+	}
+
+	// A recorded gitlab_ci passes through, as handleStartCampaignItemRun
+	// accepts it (approval condition C2), unbound.
+	gl := &campaign.Campaign{Repo: "kuhlman-labs/fishhawk", RunnerKind: runpkg.RunnerKindGitLabCI, WorkingDir: dir}
+	if got := def.startParams(item, gl); got.RunnerKind != runpkg.RunnerKindGitLabCI || got.WorkingDir != "" {
+		t.Errorf("recorded gitlab_ci params = %+v, want RunnerKind gitlab_ci and no WorkingDir", got)
+	}
+	if r := def.startRefusal(gl); r != nil {
+		t.Errorf("recorded gitlab_ci refused: %+v", r)
+	}
+
+	// --auto-start-runner-kind local + unbound: StartCampaignRun refuses BEFORE
+	// any forge call (srv is nil here, so reaching it would panic).
+	unbound := &campaign.Campaign{Repo: "kuhlman-labs/fishhawk"}
+	runRow, err := local.StartCampaignRun(context.Background(), item, unbound)
+	var refusal *campaigndriver.StartRefusal
+	if runRow != nil || !errors.As(err, &refusal) {
+		t.Fatalf("StartCampaignRun(local, unbound) = %v, %v; want a *campaigndriver.StartRefusal", runRow, err)
+	}
+	if refusal.Reason != server.CampaignAutoStartRefusalWorkingDirUnbound || refusal.RunnerKind != runpkg.RunnerKindLocal ||
+		refusal.RunnerKindSource != server.CampaignAutoStartSourceFlag || refusal.Detail == "" {
+		t.Errorf("refusal = %+v, want working_dir_unbound / local / auto_start_flag with a detail", refusal)
+	}
+}
+
+// TestCampaignAutoStartStatusKind pins the Config.CampaignAutoStartRunnerKind
+// gating (#4525): the kind only when the campaign driver starts.
+func TestCampaignAutoStartStatusKind(t *testing.T) {
+	wired := server.Config{
+		CampaignRepo: campaign.BaseFake{},
+		RunRepo:      runpkg.BaseFake{},
+		AuditRepo:    audit.BaseFake{},
+		GitHub:       &githubclient.Client{},
+	}
+	unwired := wired
+	unwired.GitHub = nil
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		cfg     server.Config
+		kind    string
+		want    string
+	}{
+		{"driver starts, local", true, wired, runpkg.RunnerKindLocal, runpkg.RunnerKindLocal},
+		{"driver starts, default", true, wired, runpkg.RunnerKindGitHubActions, runpkg.RunnerKindGitHubActions},
+		{"driver flag off", false, wired, runpkg.RunnerKindLocal, ""},
+		{"driver skipped (no GitHub)", true, unwired, runpkg.RunnerKindLocal, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start, _ := campaignDriverStartDecision(tc.enabled, tc.cfg)
+			if got := campaignAutoStartStatusKind(start, tc.kind); got != tc.want {
+				t.Errorf("campaignAutoStartStatusKind = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServeGo_AutoStartRunnerKindWiring walks the PARSED runServe body
+// (#4525): the webhook.Dispatcher literal must set RunnerKind from
+// *autoStartRunnerKind, newCampaignDriver must receive it, and
+// cfg.CampaignAutoStartRunnerKind must be assigned through
+// campaignAutoStartStatusKind. Without them the flag is accepted but inert,
+// which no unit test over the helpers can see.
+func TestServeGo_AutoStartRunnerKindWiring(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	isFlagDeref := func(e ast.Expr) bool {
+		star, ok := e.(*ast.StarExpr)
+		if !ok {
+			return false
+		}
+		id, ok := star.X.(*ast.Ident)
+		return ok && id.Name == "autoStartRunnerKind"
+	}
+	var dispatcherWired, driverWired, statusWired bool
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CompositeLit:
+			sel, ok := x.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Dispatcher" {
+				return true
+			}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "webhook" {
+				return true
+			}
+			for _, el := range x.Elts {
+				kv, ok := el.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				if k, ok := kv.Key.(*ast.Ident); ok && k.Name == "RunnerKind" && isFlagDeref(kv.Value) {
+					dispatcherWired = true
+				}
+			}
+		case *ast.CallExpr:
+			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "newCampaignDriver" && len(x.Args) > 0 && isFlagDeref(x.Args[len(x.Args)-1]) {
+				driverWired = true
+			}
+		case *ast.AssignStmt:
+			if len(x.Lhs) != 1 || len(x.Rhs) != 1 {
+				return true
+			}
+			lhs, ok := x.Lhs[0].(*ast.SelectorExpr)
+			if !ok || lhs.Sel.Name != "CampaignAutoStartRunnerKind" {
+				return true
+			}
+			call, ok := x.Rhs[0].(*ast.CallExpr)
+			if !ok || len(call.Args) != 2 || !isFlagDeref(call.Args[1]) {
+				return true
+			}
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "campaignAutoStartStatusKind" {
+				statusWired = true
+			}
+		}
+		return true
+	})
+	if !dispatcherWired {
+		t.Error("runServe's webhook.Dispatcher literal does not set `RunnerKind: *autoStartRunnerKind`; webhook intake would ignore --auto-start-runner-kind")
+	}
+	if !driverWired {
+		t.Error("runServe does not pass *autoStartRunnerKind to newCampaignDriver; the campaign driver would ignore --auto-start-runner-kind")
+	}
+	if !statusWired {
+		t.Error("runServe does not assign cfg.CampaignAutoStartRunnerKind = campaignAutoStartStatusKind(..., *autoStartRunnerKind); the status read would never report auto_start_refusal")
+	}
+}
+
+// --- TestCampaignDriver_AutoStartLocal_EndToEnd harness (#4525) ---
+//
+// Store approach (approval condition C5): no store-backed campaign or run
+// harness exists in this package and run.BaseFake / campaign.BaseFake
+// materialize nothing, so the minimal stores below are hand-written over the
+// BaseFakes. The GitHub side is a real githubclient.Client pointed at an
+// httptest server serving the installation and a valid workflow spec (the
+// newMergeFallbackClient pattern); every other GitHub path 404s, which the
+// best-effort capture/hydration seams degrade on.
+
+// autoStartE2ECampaigns serves one running campaign and its items.
+type autoStartE2ECampaigns struct {
+	campaign.BaseFake
+	mu    sync.Mutex
+	c     *campaign.Campaign
+	items []*campaign.Item
+}
+
+func (s *autoStartE2ECampaigns) ListCampaigns(context.Context, campaign.ListCampaignsFilter) ([]*campaign.Campaign, error) {
+	return []*campaign.Campaign{s.c}, nil
+}
+
+func (s *autoStartE2ECampaigns) ListCampaignItemsForCampaign(context.Context, uuid.UUID) ([]*campaign.Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.items, nil
+}
+
+func (s *autoStartE2ECampaigns) SetCampaignItemRun(_ context.Context, id uuid.UUID, runID *uuid.UUID) (*campaign.Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, it := range s.items {
+		if it.ID == id {
+			it.RunID = runID
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
+}
+
+func (s *autoStartE2ECampaigns) TransitionCampaignItem(_ context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, it := range s.items {
+		if it.ID == id {
+			it.State = to
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
+}
+
+func (s *autoStartE2ECampaigns) TransitionCampaign(_ context.Context, _ uuid.UUID, to campaign.State) (*campaign.Campaign, error) {
+	s.c.State = to
+	return s.c, nil
+}
+
+// autoStartE2ERuns materializes the runs and stages CreateRunForTrigger mints.
+type autoStartE2ERuns struct {
+	runpkg.BaseFake
+	mu   sync.Mutex
+	runs []*runpkg.Run
+}
+
+func (s *autoStartE2ERuns) CreateRun(_ context.Context, p runpkg.CreateRunParams) (*runpkg.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := &runpkg.Run{
+		ID: uuid.New(), Repo: p.Repo, WorkflowID: p.WorkflowID, TriggerSource: p.TriggerSource,
+		TriggerRef: p.TriggerRef, RunnerKind: p.RunnerKind, WorkingDir: p.WorkingDir,
+		InstallationID: p.InstallationID, State: runpkg.StatePending,
+	}
+	s.runs = append(s.runs, r)
+	return r, nil
+}
+
+func (s *autoStartE2ERuns) CreateStage(_ context.Context, p runpkg.CreateStageParams) (*runpkg.Stage, error) {
+	return &runpkg.Stage{ID: uuid.New(), RunID: p.RunID, Sequence: p.Sequence, Type: p.Type, State: runpkg.StageStatePending}, nil
+}
+
+func (s *autoStartE2ERuns) GetRun(_ context.Context, id uuid.UUID) (*runpkg.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.runs {
+		if r.ID == id {
+			return r, nil
+		}
+	}
+	return nil, runpkg.ErrNotFound
+}
+
+// autoStartE2EAudit records the driver's global-chain appends with payloads.
+type autoStartE2EAudit struct {
+	audit.BaseFake
+	mu      sync.Mutex
+	entries []audit.GlobalChainAppendParams
+}
+
+func (a *autoStartE2EAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.entries = append(a.entries, p)
+	return &audit.Entry{}, nil
+}
+
+func (a *autoStartE2EAudit) byCategory(category string) []audit.GlobalChainAppendParams {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []audit.GlobalChainAppendParams
+	for _, e := range a.entries {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+const autoStartE2ESpec = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+            sla: 4_business_hours
+`
+
+func newAutoStartE2EGitHub(t *testing.T) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/kuhlman-labs/fishhawk/installation":
+			_, _ = io.WriteString(w, `{"id":42}`)
+		case "/repos/kuhlman-labs/fishhawk/contents/.fishhawk/workflows.yaml":
+			body, _ := json.Marshal(map[string]string{
+				"type": "file", "path": ".fishhawk/workflows.yaml", "sha": "specsha",
+				"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(autoStartE2ESpec)),
+			})
+			_, _ = w.Write(body)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  fakeTokenProvider{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "jwt", nil },
+	}
+}
+
+// TestCampaignDriver_AutoStartLocal_EndToEnd crosses the whole #4525 campaign
+// path: the flag value -> newCampaignDriver -> campaignRunStarter ->
+// campaigndriver.Ticker.Tick -> server.StartRunForCampaignIssue ->
+// CreateRunForTrigger -> the minted run row. The default-flag rows pin
+// approval condition C2: a recorded runner_kind wins under the default flag.
+func TestCampaignDriver_AutoStartLocal_EndToEnd(t *testing.T) {
+	const dir = "/work/checkout"
+	for _, tc := range []struct {
+		name         string
+		flagKind     string
+		recordedKind string
+		workingDir   string
+		wantKind     string // minted run's RunnerKind ("" = repo-layer default); ignored on refusal
+		wantDir      string
+		wantRefusal  string
+	}{
+		{name: "flag local, bound", flagKind: runpkg.RunnerKindLocal, workingDir: dir, wantKind: runpkg.RunnerKindLocal, wantDir: dir},
+		{name: "flag local, unbound", flagKind: runpkg.RunnerKindLocal, wantRefusal: server.CampaignAutoStartRefusalWorkingDirUnbound},
+		{name: "default flag, recorded local, bound", flagKind: "", recordedKind: runpkg.RunnerKindLocal, workingDir: dir, wantKind: runpkg.RunnerKindLocal, wantDir: dir},
+		{name: "default flag, recorded local, unbound", flagKind: "", recordedKind: runpkg.RunnerKindLocal, wantRefusal: server.CampaignAutoStartRefusalWorkingDirUnbound},
+		{name: "default flag, unrecorded, bound (no inference)", flagKind: runpkg.RunnerKindGitHubActions, workingDir: dir, wantKind: "", wantDir: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &campaign.Campaign{
+				ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", State: campaign.StateRunning,
+				RunnerKind: tc.recordedKind, WorkingDir: tc.workingDir,
+			}
+			camps := &autoStartE2ECampaigns{c: c, items: []*campaign.Item{
+				{ID: uuid.New(), CampaignID: c.ID, IssueRef: "issue:10", State: campaign.ItemStatePending},
+			}}
+			runs := &autoStartE2ERuns{}
+			au := &autoStartE2EAudit{}
+			cfg := server.Config{
+				Addr:         "127.0.0.1:0",
+				CampaignRepo: camps,
+				RunRepo:      runs,
+				AuditRepo:    au,
+				GitHub:       newAutoStartE2EGitHub(t),
+			}
+			if start, reason := campaignDriverStartDecision(true, cfg); !start {
+				t.Fatalf("campaign driver would not start: %s", reason)
+			}
+			srv := server.New(cfg)
+			tk := newCampaignDriver(cfg, srv, slog.Default(), nil, time.Minute, "feature_change", "", tc.flagKind)
+			tk.Tick(context.Background())
+
+			refused := au.byCategory("campaign_auto_start_refused")
+			if tc.wantRefusal != "" {
+				if len(runs.runs) != 0 {
+					t.Fatalf("minted %d runs, want 0 for a refused campaign", len(runs.runs))
+				}
+				if len(refused) != 1 {
+					t.Fatalf("campaign_auto_start_refused entries = %d, want 1", len(refused))
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(refused[0].Payload, &payload); err != nil {
+					t.Fatalf("decode refusal payload: %v", err)
+				}
+				if payload["reason"] != tc.wantRefusal || payload["runner_kind"] != runpkg.RunnerKindLocal {
+					t.Errorf("refusal payload = %v, want reason %s, runner_kind local", payload, tc.wantRefusal)
+				}
+				if camps.items[0].RunID != nil || camps.items[0].State != campaign.ItemStatePending {
+					t.Errorf("refused item was touched: %+v", camps.items[0])
+				}
+				return
+			}
+			if len(refused) != 0 {
+				t.Fatalf("unexpected campaign_auto_start_refused entries: %d", len(refused))
+			}
+			if len(runs.runs) != 1 {
+				t.Fatalf("minted %d runs, want exactly 1", len(runs.runs))
+			}
+			got := runs.runs[0]
+			if got.RunnerKind != tc.wantKind || got.WorkingDir != tc.wantDir {
+				t.Errorf("minted run RunnerKind=%q WorkingDir=%q, want %q / %q", got.RunnerKind, got.WorkingDir, tc.wantKind, tc.wantDir)
+			}
+			if camps.items[0].RunID == nil || *camps.items[0].RunID != got.ID {
+				t.Errorf("item not linked to the minted run: %+v", camps.items[0])
+			}
+		})
 	}
 }

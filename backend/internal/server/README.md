@@ -157,6 +157,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Artifact upload endpoints
 - Release endpoints (ADR-051)
 - Campaign REST API + rollup status (`campaigns.go`, ADR-047 / #1437, E25.4 / #1456, resume #1460)
+- Campaign driver auto-start resolution (`campaign_auto_start.go`, #4525): `ResolveCampaignAutoStart` is campaign-recorded `runner_kind` (re-validated) > `--auto-start-runner-kind` (empty = `github_actions`), with NO `working_dir` → `local` inference; a `local` result inherits the campaign `working_dir` (refused `working_dir_unbound` / `working_dir_not_absolute`). `Config.CampaignAutoStartRunnerKind` (set by serve.go only when the driver starts) gates the status read's `auto_start_refusal` block, shown for a `running` campaign only.
 - Campaign item-run `runner_kind` ladder (`campaigns.go`, #4485): explicit > campaign-recorded (re-validated) > `local` for a `working_dir`-bound campaign > `github_actions`; `working_dir_required` keys on the RESOLVED kind; the 201 body's `runner_kind_resolution` and the `campaign_issue_started` payload name the source. Long-form lives cross-package in `backend/internal/mcpserver/README.md` § "`runner_kind` is recorded once at start_campaign and resolved per item", not in `docs/endpoints.md`.
 - Read + export surfaces
 

@@ -1,0 +1,14 @@
+id: scenario:issue-4525/auto-start-flag-bogus-fails-startup
+statement: Running fishhawkd serve with --auto-start-runner-kind bogus exits non-zero before dialing a database, and its output names 'invalid --auto-start-runner-kind' together with the accepted values github_actions and local.
+verify_hint: 'CLI: build fishhawkd from the tree, run `fishhawkd serve --auto-start-runner-kind bogus` with no database configured, and observe the non-zero exit code and the stderr log line naming the flag and the accepted set.'
+steps: 'Posture B (verify_hint names a build-from-tree CLI check). Built fishhawkd from the sanctioned merge-candidate tree /tmp/fishhawk-acceptance-tree-2aeb32d1-c0f3-49b3-ba33-44c9db8daa59-ecc0ccda-acd7-4f50-961f-3a64a59f25e7 (HEAD 6530b5113b72 == preview git_sha): cd backend && go build -o /tmp/fhacc4525/fishhawkd ./cmd/fishhawkd. Ran env -i PATH=/usr/bin:/bin HOME=/tmp/fhacc4525 /tmp/fhacc4525/fishhawkd serve --auto-start-runner-kind bogus with no database configured.'
+assertions:
+    expected: non-zero exit before any DB dial, naming the flag and github_actions, local
+    observed_at_record: Exit 1 immediately. The only output line is ERROR msg 'invalid --auto-start-runner-kind', error '"bogus" is not an auto-start runner kind; want one of github_actions, local'. No DB dial and no other log line. sha256:2457dcf77682a5008622367a3ccea1a84156ee69291745b6a2a2cbeb3e4dc5cf
+    repro_handle: fishhawkd serve --auto-start-runner-kind bogus; echo $?
+origin:
+    issue: 4525
+    pr: 5233
+    run_id: 2aeb32d1-c0f3-49b3-ba33-44c9db8daa59
+    head_sha: 6530b5113b726cf9e23a9be5f90a28abb5ce536f
+    recorded_at: 2026-11-12T23:31:17Z

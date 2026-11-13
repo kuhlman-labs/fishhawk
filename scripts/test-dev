@@ -1066,6 +1066,18 @@ else
   fail "cmd_up serve should pass --enable-scheduler --scheduler-repos <repo> --scheduler-runner-kind local"
 fi
 
+# 9a3b. cmd_up serve launch sets --auto-start-runner-kind local (#4525) so
+# webhook intake and the campaign driver mint local runs that park for a host
+# dispatch instead of firing fishhawk.yml. The env opt-out must exist and the
+# flag array must reach the serve argv, not only be assigned.
+if print -r -- "$up_body" | grep_q -- '--auto-start-runner-kind local' \
+  && print -r -- "$up_body" | grep_q -- 'FISHHAWK_DEV_AUTO_START_LOCAL' \
+  && print -r -- "$up_body" | grep_q -- 'serve --enable-child-completion-sweeper .*auto_start_flags\[@\]'; then
+  pass "cmd_up serve sets the auto-start runner kind to local (opt-out FISHHAWK_DEV_AUTO_START_LOCAL=0)"
+else
+  fail "cmd_up serve should pass --auto-start-runner-kind local through auto_start_flags, with the FISHHAWK_DEV_AUTO_START_LOCAL opt-out"
+fi
+
 # 9a4. cmd_up serve launch enables the merge-outcome CI observer (E82.2 /
 # #3779, ADR-085): it reads the forge and writes only internal
 # run_merge_ci_observed audit rows. The flag array must reach the serve argv,
