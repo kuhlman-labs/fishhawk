@@ -260,12 +260,22 @@ func TestRunnerIdentityMatches_AcceptsFullSpawnArgvShape(t *testing.T) {
 	}
 }
 
+// requirePsExec skips t loudly unless ps can really EXEC here. A LookPath
+// guard is not enough: inside a signal-confined agent shell (#4858)
+// sandbox-exec refuses the setuid /bin/ps (exit 71) while LookPath still
+// finds it, so a ps-backed test would go red (TestProcessArgv_ReadsOwnArgv)
+// or pass vacuously on the exec refusal (TestProcessArgv_NonexistentPid).
+func requirePsExec(t *testing.T) {
+	t.Helper()
+	if out, err := exec.Command("ps", "-o", "pid=", "-p", strconv.Itoa(os.Getpid())).CombinedOutput(); err != nil {
+		t.Skipf("ps cannot exec on this host (%v: %s) — e.g. a signal-confined agent shell (#4858) where setuid /bin/ps is refused; not a regression", err, strings.TrimSpace(string(out)))
+	}
+}
+
 // TestProcessArgv_ReadsOwnArgv exercises the PRODUCTION ps-backed reader (no
 // stub) against this process, so the seam's real body is covered.
 func TestProcessArgv_ReadsOwnArgv(t *testing.T) {
-	if _, err := exec.LookPath("ps"); err != nil {
-		t.Skip("ps not available")
-	}
+	requirePsExec(t)
 	argv, err := processArgv(os.Getpid())
 	if err != nil {
 		t.Fatalf("processArgv(self): %v", err)
@@ -279,9 +289,7 @@ func TestProcessArgv_ReadsOwnArgv(t *testing.T) {
 // TestProcessArgv_NonexistentPid asserts the reader FAILS for a pid that
 // cannot exist — the failure that routes to the unprovable-identity refusal.
 func TestProcessArgv_NonexistentPid(t *testing.T) {
-	if _, err := exec.LookPath("ps"); err != nil {
-		t.Skip("ps not available")
-	}
+	requirePsExec(t)
 	if argv, err := processArgv(0x7FFFFFFF); err == nil {
 		t.Errorf("processArgv(impossible pid) = %q, nil; want an error", argv)
 	}
