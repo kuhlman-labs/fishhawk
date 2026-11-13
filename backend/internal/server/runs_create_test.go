@@ -1521,3 +1521,127 @@ func TestCreateRun_BadRunnerKindMessageNamesEveryKind(t *testing.T) {
 		t.Fatalf("ValidRunnerKinds has %d members; the done-means needs gitlab_ci present", len(run.ValidRunnerKinds))
 	}
 }
+
+// postCreateRunAs drives handleCreateRun with body under identity id.
+func postCreateRunAs(t *testing.T, s *Server, id Identity, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withIdentity(req, id))
+	return w
+}
+
+// getRunAsWithQuery drives handleGetRun for runID with rawQuery under identity id and
+// returns the recorder.
+func getRunAsWithQuery(t *testing.T, s *Server, id Identity, runID uuid.UUID, rawQuery string) *httptest.ResponseRecorder {
+	t.Helper()
+	target := "/v0/runs/" + runID.String()
+	if rawQuery != "" {
+		target += "?" + rawQuery
+	}
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.SetPathValue("run_id", runID.String())
+	w := httptest.NewRecorder()
+	s.handleGetRun(w, withIdentity(req, id))
+	return w
+}
+
+// TestCreateRun_AutoDispatchPersistedAndRead is the slice's cross-boundary
+// test (E88.2 / #4526): POST /v0/runs {auto_dispatch:true} through the create
+// handler into the repository, then GET /v0/runs/{id} through the read handler
+// reads auto_dispatch:true back. An omitted field reads ABSENT (omitempty) on
+// both the create response and the read. Dropping the field anywhere on the
+// handler -> CreateRunForTriggerParams -> CreateRunParams pass turns the read
+// RED.
+func TestCreateRun_AutoDispatchPersistedAndRead(t *testing.T) {
+	const base = `"repo": "kuhlman-labs/fishhawk", "workflow_id": "feature_change", "workflow_sha": "abc123", "trigger_source": "cli", "runner_kind": "local"`
+	cases := []struct {
+		name   string
+		body   string
+		marked bool
+	}{
+		{"auto_dispatch true is persisted and read back", `{` + base + `, "auto_dispatch": true}`, true},
+		{"auto_dispatch omitted reads absent", `{` + base + `}`, false},
+		{"auto_dispatch false reads absent", `{` + base + `, "auto_dispatch": false}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			s := newServer(t, repo)
+			w := postCreateRunAs(t, s, testOperatorIdentity(), tc.body)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("create status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			var created runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+
+			g := getRunAsWithQuery(t, s, testOperatorIdentity(), created.ID, "")
+			if g.Code != http.StatusOK {
+				t.Fatalf("get status = %d, want 200:\n%s", g.Code, g.Body.String())
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(g.Body.Bytes(), &raw); err != nil {
+				t.Fatalf("decode get body: %v", err)
+			}
+			v, present := raw["auto_dispatch"]
+			switch {
+			case tc.marked && (!present || string(v) != "true"):
+				t.Errorf("GET auto_dispatch = %s (present=%v), want true", v, present)
+			case !tc.marked && present:
+				t.Errorf("GET carries auto_dispatch = %s for an unmarked run, want the key absent (omitempty)", v)
+			}
+			if _, present := raw["campaign_link"]; present {
+				t.Errorf("GET without include carries campaign_link; the block is opt-in only")
+			}
+		})
+	}
+}
+
+// TestCreateRun_HostDispatcherSubjectRefused pins ADR-104 Q4's dispatch-only
+// rule on the create seam (E88.2 / #4526): a host-dispatcher/<host> token
+// holding write:runs is refused 403 host_dispatcher_cannot_start_runs, and the
+// repository records ZERO created runs (state read, not just the error code) —
+// so a dispatcher can never mint, and therefore never mark, its own run. An
+// operator token with the same scope and body creates the run.
+func TestCreateRun_HostDispatcherSubjectRefused(t *testing.T) {
+	const body = `{"repo": "kuhlman-labs/fishhawk", "workflow_id": "feature_change", "workflow_sha": "abc123", "trigger_source": "cli", "runner_kind": "local", "auto_dispatch": true}`
+	dispatcher := Identity{Subject: "host-dispatcher/devbox", TokenID: "tok-dispatcher", Scopes: []string{"read:runs", "read:audit", "write:runs", "write:stages"}, AccountID: testOperatorAccountID}
+	operator := Identity{Subject: "github:test-operator", TokenID: "tok-operator", Scopes: []string{"write:runs"}, AccountID: testOperatorAccountID}
+
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	w := postCreateRunAs(t, s, dispatcher, body)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("dispatcher status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if env.Error.Code != "host_dispatcher_cannot_start_runs" {
+		t.Errorf("error code = %q, want host_dispatcher_cannot_start_runs", env.Error.Code)
+	}
+	repo.mu.Lock()
+	n := len(repo.runs)
+	repo.mu.Unlock()
+	if n != 0 {
+		t.Errorf("repository holds %d runs after the refused dispatcher create, want 0", n)
+	}
+
+	if w := postCreateRunAs(t, s, operator, body); w.Code != http.StatusCreated {
+		t.Fatalf("operator status = %d, want 201 (the refusal is subject-specific):\n%s", w.Code, w.Body.String())
+	}
+	repo.mu.Lock()
+	n = len(repo.runs)
+	repo.mu.Unlock()
+	if n != 1 {
+		t.Errorf("repository holds %d runs after the operator create, want 1", n)
+	}
+}

@@ -5410,3 +5410,70 @@ func TestPostgres_TerminalRunObserver_FiresOnTerminalOnly(t *testing.T) {
 		t.Fatalf("observer calls after SetRunTerminalObserver(nil) = %v, want no new call", runs)
 	}
 }
+
+// TestCreateRun_AutoDispatchRoundTrip pins the ADR-104 Q3 host-dispatcher mark
+// (migration 0116, E88.2 / #4526) through every Run-returning read path the
+// dispatcher and the run read rely on: CreateRun's RETURNING, GetRun,
+// TransitionRun (an Update* query) and ListRuns. A Run-returning query that
+// missed the column in its SELECT list fails here as a pgx column-count error;
+// a dropped mapping in rowToRun reads false for the marked row.
+func TestCreateRun_AutoDispatchRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	const repoSlug = "kuhlman-labs/fishhawk-auto-dispatch"
+	created := make(map[uuid.UUID]bool, 2)
+	for _, marked := range []bool{true, false} {
+		t.Run(fmt.Sprintf("auto_dispatch=%v", marked), func(t *testing.T) {
+			r, err := repo.CreateRun(ctx, run.CreateRunParams{
+				Repo:          repoSlug,
+				WorkflowID:    "feature_change",
+				WorkflowSHA:   "deadbeef",
+				TriggerSource: run.TriggerCLI,
+				RunnerKind:    run.RunnerKindLocal,
+				AutoDispatch:  marked,
+			})
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			if r.AutoDispatch != marked {
+				t.Errorf("CreateRun AutoDispatch = %v, want %v", r.AutoDispatch, marked)
+			}
+			got, err := repo.GetRun(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if got.AutoDispatch != marked {
+				t.Errorf("GetRun AutoDispatch = %v, want %v", got.AutoDispatch, marked)
+			}
+			moved, err := repo.TransitionRun(ctx, r.ID, run.StateRunning)
+			if err != nil {
+				t.Fatalf("transition run: %v", err)
+			}
+			if moved.AutoDispatch != marked {
+				t.Errorf("TransitionRun AutoDispatch = %v, want %v", moved.AutoDispatch, marked)
+			}
+			created[r.ID] = marked
+		})
+	}
+
+	list, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: repoSlug, Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	seen := 0
+	for _, r := range list {
+		want, ok := created[r.ID]
+		if !ok {
+			continue
+		}
+		seen++
+		if r.AutoDispatch != want {
+			t.Errorf("ListRuns run %s AutoDispatch = %v, want %v", r.ID, r.AutoDispatch, want)
+		}
+	}
+	if seen != len(created) {
+		t.Errorf("ListRuns returned %d of the %d created runs", seen, len(created))
+	}
+}

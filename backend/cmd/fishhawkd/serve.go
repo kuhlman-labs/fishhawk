@@ -4498,11 +4498,18 @@ func (a campaignRunStarter) startRefusal(c *campaign.Campaign) *campaigndriver.S
 // startRefusal first. An EXPEDITED item (the campaign hotfix verb, #4234) runs
 // under the workflow its hotfix recorded; every other item runs under
 // --campaign-driver-workflow-id. A github_actions resolution maps to an EMPTY
-// RunnerKind (the repo-layer default), so the default deployment's params are
-// byte-identical to the pre-#4525 starter; any other resolved kind is passed
-// through (a recorded gitlab_ci included, as handleStartCampaignItemRun
-// accepts it) with the WorkingDir the resolver bound (non-empty only for
-// local).
+// RunnerKind (the repo-layer default), so the default deployment's params match
+// the pre-#4525 starter apart from the AutoDispatch stamp below; any other
+// resolved kind is passed through (a recorded gitlab_ci included, as
+// handleStartCampaignItemRun accepts it) with the WorkingDir the resolver
+// bound (non-empty only for local).
+//
+// Every driver-started run is stamped AutoDispatch (ADR-104 Q3, E88.2 /
+// #4526): the campaign driver is the starter that marks a run for
+// `fishhawk-mcp host-dispatch`, whatever its runner kind (the dispatcher
+// itself only spawns local runs). The operator item-start path
+// (handleStartCampaignItemRun) and the webhook path never reach this starter
+// and stay unmarked.
 func (a campaignRunStarter) startParams(item *campaign.Item, c *campaign.Campaign) server.StartRunForCampaignIssueParams {
 	workflowID := a.workflowID
 	if item.Expedite != nil && item.Expedite.Workflow != "" {
@@ -4510,6 +4517,7 @@ func (a campaignRunStarter) startParams(item *campaign.Item, c *campaign.Campaig
 	}
 	params := server.StartRunForCampaignIssueParams{
 		Repo: c.Repo, IssueRef: item.IssueRef, WorkflowID: workflowID, WorkflowRef: a.workflowRef,
+		AutoDispatch: true,
 	}
 	res := server.ResolveCampaignAutoStart(c, a.runnerKind)
 	if !res.Refused() && res.RunnerKind != runpkg.RunnerKindGitHubActions {

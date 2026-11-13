@@ -107,9 +107,12 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		// forge read surfaces derive from it, so a dropped ref would make the
 		// 201-body / GET forge:gitlab assertions vacuous.
 		InstallationRef: p.InstallationRef,
-		State:           run.StatePending,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		// The ADR-104 Q3 host-dispatcher mark (E88.2 / #4526), so the POST ->
+		// GET round-trip reads back what the handler threaded.
+		AutoDispatch: p.AutoDispatch,
+		State:        run.StatePending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	f.runs[r.ID] = r
 	return r, nil

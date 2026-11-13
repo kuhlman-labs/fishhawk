@@ -313,6 +313,7 @@ type Run struct {
 	InstallationRef         *string            `json:"installation_ref"`
 	RequiresCharter         *bool              `json:"requires_charter"`
 	DocumentBaseCommit      *string            `json:"document_base_commit"`
+	AutoDispatch            bool               `json:"auto_dispatch"`
 }
 
 type ScopeAmendment struct {

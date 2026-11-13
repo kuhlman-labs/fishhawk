@@ -2606,6 +2606,28 @@ components:
             projection, so it appears on both `GET /v0/runs/{run_id}` and
             the list endpoint.
           example: abcdef0123456789abcdef0123456789abcdef01
+        auto_dispatch:
+          type: boolean
+          description: |
+            The ADR-104 Q3 host-dispatcher mark (E88.2 / #4526, migration
+            0116), read-only after create: `true` when the run's STARTER
+            marked it for `fishhawk-mcp host-dispatch` — the campaign driver
+            stamps every run it starts, and an operator may opt in with
+            `auto_dispatch: true` on `POST /v0/runs` — or when the run was
+            minted from a marked parent (a CI-retry, operator-recovery or
+            decomposition child inherits it). A webhook-started run is never
+            marked. The dispatcher spawns the parked stages of a marked local
+            run only; the mark grants no gate act. OMITTED for an unmarked
+            run. A pure row projection, so it appears on both
+            `GET /v0/runs/{run_id}` and the list endpoint.
+          example: true
+        campaign_link:
+          $ref: '#/components/schemas/CampaignLink'
+          description: |
+            The run's campaign membership and state (E88.2 / #4526). Served
+            by `GET /v0/runs/{run_id}` ONLY when called with
+            `include=campaign_link`; omitted on every other read, which is
+            byte-identical to a read without the parameter.
         concerns:
           $ref: '#/components/schemas/RunConcerns'
           description: |
@@ -3480,6 +3502,50 @@ components:
           type: string
           description: Link to the alert on GitHub.
 
+    CampaignLink:
+      type: object
+      required: [status, campaigns]
+      description: |
+        A run's campaign membership (E88.2 / #4526), served under
+        `GET /v0/runs/{run_id}?include=campaign_link`. Resolved server-side
+        through the same ancestry walk the campaign dispatch hold uses: a run
+        not itself linked to a campaign item resolves through its
+        `decomposed_from` (else `parent_run_id`) link, at most 8 hops, so a
+        decomposition child or follow-up run reports its parent's campaign.
+        The host dispatcher gates every spawn on this block and FAILS CLOSED
+        on anything but `unlinked` or `linked` with every campaign `running`.
+      properties:
+        status:
+          type: string
+          enum: [linked, unlinked, unresolved]
+          description: |
+            `linked` — the run (or its nearest linked ancestor) is a campaign
+            item. `unlinked` — the walk reached a root with no campaign item.
+            `unresolved` — the walk could not decide (see `reason`); never
+            reported as `unlinked`.
+        reason:
+          type: string
+          enum: [missing_parent, cycle, depth_exceeded, campaign_not_in_account]
+          description: |
+            Present only when `status` is `unresolved`: an ancestor run row is
+            missing, the links form a cycle, the walk exceeded its depth, or a
+            linked campaign is stamped with a workspace account other than the
+            caller's (that campaign is withheld from `campaigns`).
+        campaigns:
+          type: array
+          description: |
+            Each linked campaign item visible to the caller: a campaign in
+            the caller's own account, or an untenanted one. Always present
+            (empty when none).
+          items:
+            type: object
+            required: [campaign_id, item_id, state]
+            properties:
+              campaign_id: { $ref: '#/components/schemas/UUID' }
+              item_id: { $ref: '#/components/schemas/UUID' }
+              state:
+                type: string
+                description: The campaign's state (`running`, `paused`, `cancelled`, ...).
     RunConcerns:
       type: object
       description: |
@@ -14320,6 +14386,16 @@ paths:
                     The resolved flag is snapshotted on the run row
                     at create time and echoed back as `drive` on the
                     Run resource.
+                auto_dispatch:
+                  type: boolean
+                  description: |
+                    Optional. The operator's opt-in to the ADR-104 Q3
+                    host-dispatcher mark (E88.2 / #4526): `true` stamps
+                    `auto_dispatch` on the minted run so
+                    `fishhawk-mcp host-dispatch` may spawn its parked
+                    local stages. Omitted or `false` leaves the run
+                    unmarked. Persisted at create and echoed back as
+                    `auto_dispatch` on the Run resource.
                 budget_override:
                   type: boolean
                   description: |
@@ -14443,7 +14519,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            The caller may not create runs: `insufficient_scope` (the
+            token lacks `write:runs`), or `host_dispatcher_cannot_start_runs`
+            — a `host-dispatcher/<host>` subject (ADR-104 Q4, E88.2 / #4526)
+            holds `write:runs` to record its dispatch acts but is
+            dispatch-only and never starts a run. The refusal fires before
+            the body is read; nothing is written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: |
             Returned when the GitHub-fetch fallback can't resolve
@@ -14542,19 +14628,61 @@ paths:
         (ADR-057 Amendment A2 / #2071) rather than filtered — the same rule
         covers the run's stage, artifact, concern and per-run audit reads,
         which share this run-scoped authorization path.
+
+        `include=campaign_link` (E88.2 / #4526) is opt-in: it adds the
+        `campaign_link` block (see `CampaignLink`), resolved server-side, so
+        the host dispatcher can gate a candidate on its campaign's state
+        without enumerating campaigns. Unlike the read's other best-effort
+        blocks it FAILS CLOSED: a campaign read error answers 503
+        `campaign_link_unavailable`, never a guessed `unlinked`. Without the
+        parameter the read is unchanged and performs no campaign read.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: include
+          in: query
+          required: false
+          description: |
+            Optional. The only value is `campaign_link` (repeated or
+            comma-joined values must all be `campaign_link`). Refused 403
+            `run_token_forbidden` for a run-bound `mcp:run:<id>` token.
+          schema:
+            type: string
+            enum: [campaign_link]
       responses:
         '200':
           description: Run details.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
+        '400':
+          description: '`include` carries a value other than `campaign_link` (`validation_failed`, naming the field). No store is read.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '403':
+          description: |
+            `repo_forbidden` (see above), `account_forbidden` (the run
+            belongs to another workspace account), or `run_token_forbidden`
+            — a run-bound `mcp:run:<id>` token asked for
+            `include=campaign_link`, which only an operator or
+            host-dispatcher token may read.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '503':
+          description: |
+            The run repository is unconfigured (`run_repo_unconfigured`),
+            or `include=campaign_link` could not be resolved
+            (`campaign_link_unavailable`: no campaign repository, or a
+            campaign item, ancestor run, campaign or campaign-account read
+            failed). Retry the read; a consumer must not treat it as
+            unlinked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/runs/{run_id}/cancel:
     post:
@@ -17895,7 +18023,15 @@ paths:
         authoritative. Validation fails CLOSED — an unknown run 404s and every
         missing/bad field 400s, appending nothing. A record-append failure is
         fail-loud (`500 auto_drive_record_failed`) so the driver does NOT
-        dispatch. Requires `write:approvals`.
+        dispatch. Requires `write:approvals` — or, for a
+        `host-dispatcher/<host>` subject (ADR-104 Q4, E88.2 / #4526),
+        `write:runs` with `source: host_dispatcher` (any other source is
+        `400 validation_failed`). A dispatcher token's scopes are clamped at
+        authentication to its profile (`read:runs`, `read:audit`,
+        `write:runs`, `write:stages`), so it never holds `write:approvals`
+        even when minted with it, and the subject is honoured only from the
+        api-token store (an OAuth, session or run-bound credential carrying
+        it is treated as anonymous).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -17934,7 +18070,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: 'The identity lacks `write:approvals` (`insufficient_scope`).'
+          description: 'The identity lacks `write:approvals` (`insufficient_scope`); for a `host-dispatcher/<host>` subject, it lacks `write:runs`.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
