@@ -211,6 +211,8 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		// name or an uppercase SHA fails the insert instead of persisting a
 		// mutable read point.
 		DocumentBaseCommit: p.DocumentBaseCommit,
+		// The ADR-104 Q3 starter-stamped mark (migration 0116, #4526).
+		AutoDispatch: p.AutoDispatch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -1532,6 +1534,9 @@ func rowToRun(r rundb.Run) *Run {
 	out.CostUSDTotal = r.CostUsdTotal
 	out.ResolvedModel = r.ResolvedModel
 	out.Drive = r.Drive
+	// AutoDispatch (migration 0116, #4526) rides the single shared mapper:
+	// every Run-returning sqlc query selects auto_dispatch and scans it.
+	out.AutoDispatch = r.AutoDispatch
 	out.SliceIndex = int32PtrToIntPtr(r.SliceIndex)
 	// WorkingDir round-trips through the single shared row mapper (E66.42 /
 	// #2482). Every Run-returning sqlc query now carries working_dir in its

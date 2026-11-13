@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/escalation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
@@ -232,9 +233,21 @@ type runResponse struct {
 	// declarations are WITHHELD at prompt serve with a named degradation
 	// rather than read at a mutable ref. Surfaced so an operator can see which
 	// commit a run's declared documents come from.
-	DocumentBaseCommit *string   `json:"document_base_commit,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	DocumentBaseCommit *string `json:"document_base_commit,omitempty"`
+	// AutoDispatch echoes the run's ADR-104 Q3 host-dispatcher mark (E88.2 /
+	// #4526, migration 0116): true when the run's starter (the campaign
+	// driver, or an operator's POST /v0/runs opt-in) marked it for
+	// `fishhawk-mcp host-dispatch`, or when it was minted from a marked
+	// parent. Omitted (omitempty) for an unmarked run. The MCP client mirror
+	// decodes this field; the json tag MUST byte-match its counterpart.
+	AutoDispatch bool `json:"auto_dispatch,omitempty"`
+	// CampaignLink is the run's campaign membership and state, served ONLY
+	// when GET /v0/runs/{id} is called with include=campaign_link (E88.2 /
+	// #4526). Nil (omitted) on every other read, so a read without the include
+	// is byte-identical and costs no extra query.
+	CampaignLink *campaignLinkPayload `json:"campaign_link,omitempty"`
+	CreatedAt    time.Time            `json:"created_at"`
+	UpdatedAt    time.Time            `json:"updated_at"`
 	// Concerns is the run's OPEN review-concern summary (#964): count,
 	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
 	// concern_ids addressing needs. Populated by handleGetRun ONLY —
@@ -1083,6 +1096,7 @@ func toRunResponse(r *run.Run) runResponse {
 		PredictedRuntimeMinutes: r.PredictedRuntimeMinutes,
 		RequiresCharter:         r.RequiresCharter,
 		DocumentBaseCommit:      r.DocumentBaseCommit,
+		AutoDispatch:            r.AutoDispatch,
 		CreatedAt:               r.CreatedAt,
 		UpdatedAt:               r.UpdatedAt,
 	}
@@ -1171,6 +1185,11 @@ type createRunRequest struct {
 	// wins over the spec value. The resolved flag is snapshotted on
 	// the run row at create time.
 	Drive *bool `json:"drive,omitempty"`
+	// AutoDispatch is the operator's opt-in to the ADR-104 Q3 host-dispatcher
+	// mark (E88.2 / #4526): true stamps auto_dispatch on the minted run so
+	// `fishhawk-mcp host-dispatch` may spawn its parked local stages. Omitted
+	// or false leaves the run unmarked. The mark grants no gate act.
+	AutoDispatch bool `json:"auto_dispatch,omitempty"`
 	// BudgetOverride lets an operator force a run past a blocking
 	// periodic budget that is over its limit for the current period
 	// (#688 / ADR-030). When true and a blocking budget would
@@ -1365,6 +1384,16 @@ func (s *Server) resolveCreateGitLabInstallation(w http.ResponseWriter, r *http.
 // run.StatePending.
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
+	// A host-dispatcher/<host> subject (ADR-104 Q4, E88.2 / #4526) holds
+	// write:runs to record its dispatch acts, but it is dispatch-only: it
+	// never STARTS a run (and so can never stamp its own auto_dispatch mark).
+	// Refused before the body is read, so a refused request writes nothing.
+	if hostdispatcher.IsSubject(IdentityFrom(r.Context()).Subject) {
+		s.writeError(w, r, http.StatusForbidden, "host_dispatcher_cannot_start_runs",
+			"a host-dispatcher subject is dispatch-only and cannot start runs; start the run with an operator token or the campaign driver",
+			nil)
 		return
 	}
 	if s.cfg.RunRepo == nil {
@@ -1900,6 +1929,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		InstallationRef:    installationRef,
 		IssueContext:       issueCtx,
 		Drive:              req.Drive,
+		AutoDispatch:       req.AutoDispatch,
 		IdempotencyKey:     idemp,
 		UpstreamRunID:      req.UpstreamRunID,
 		HaveStageDefs:      haveStageDefs,
@@ -2030,6 +2060,7 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, p StartRunForCamp
 		TriggerRef:         &triggerRef,
 		RunnerKind:         p.RunnerKind,
 		WorkingDir:         p.WorkingDir,
+		AutoDispatch:       p.AutoDispatch,
 		InstallationID:     &instID,
 		IssueContext:       issueCtx,
 		HaveStageDefs:      true,
@@ -2062,6 +2093,10 @@ type StartRunForCampaignIssueParams struct {
 	// — the github_actions / auto-driver case, which spawns no local runner and
 	// so binds no checkout.
 	WorkingDir string
+	// AutoDispatch stamps the ADR-104 Q3 host-dispatcher mark on the minted
+	// run (E88.2 / #4526). The campaign driver's starter sets it true; the
+	// operator item-start path leaves it false.
+	AutoDispatch bool
 }
 
 // hydrateCampaignIssueContext best-effort fetches a campaign item's issue into
@@ -2144,6 +2179,11 @@ type CreateRunForTriggerParams struct {
 	// Drive is the per-run advancement override (#1023). Nil → use the
 	// workflow spec's drive default; non-nil wins.
 	Drive *bool
+	// AutoDispatch is the starter-stamped ADR-104 Q3 host-dispatcher mark
+	// (E88.2 / #4526), persisted verbatim on the run row. The campaign
+	// driver passes true, an operator POST /v0/runs passes its opt-in, and
+	// the webhook path never reaches this seam marked.
+	AutoDispatch bool
 	// IdempotencyKey makes the create idempotent against (Repo, key) when
 	// non-nil.
 	IdempotencyKey *string
@@ -2207,6 +2247,8 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		IssueContext:    p.IssueContext,
 		IdempotencyKey:  p.IdempotencyKey,
 		UpstreamRunID:   p.UpstreamRunID,
+		// The starter-stamped host-dispatcher mark (ADR-104 Q3, #4526).
+		AutoDispatch: p.AutoDispatch,
 		// Capture the required-status-checks snapshot for the local / MCP /
 		// CLI / campaign create paths (#2506), from the best-effort App
 		// installation resolved at handleCreateRun (runs.go, #713). Fail-safe:
@@ -2378,6 +2420,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
 		return
 	}
+	// include=campaign_link (E88.2 / #4526) is validated BEFORE any read, so a
+	// malformed or refused include touches no store.
+	includeCampaignLink, ok := s.parseRunInclude(w, r)
+	if !ok {
+		return
+	}
 
 	got, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
 	if err != nil {
@@ -2392,6 +2440,21 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := toRunResponse(got)
+	if includeCampaignLink {
+		// Opt-in and FAIL CLOSED: unlike the best-effort blocks below, a read
+		// error answers 503 rather than omitting the block, because the host
+		// dispatcher gates every spawn on this answer and an omitted or
+		// guessed "unlinked" would admit a stage of a paused or cancelled
+		// campaign.
+		link, lerr := s.campaignLinkFor(r.Context(), got)
+		if lerr != nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "campaign_link_unavailable",
+				"could not resolve the run's campaign membership; retry the read",
+				map[string]any{"run_id": runID.String(), internalCauseKey: lerr.Error()})
+			return
+		}
+		resp.CampaignLink = link
+	}
 	// forge_base_url (E45.46 / #3463) on the single-run read ONLY — the
 	// list endpoint deliberately omits it (no per-row registry read), and
 	// the spawn-side helper relies on that asymmetry to insist on this
@@ -2628,6 +2691,136 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		resp.MergeCandidateStaleness = stale
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// runIncludeCampaignLink is the one GET /v0/runs/{run_id} include value
+// (E88.2 / #4526).
+const runIncludeCampaignLink = "campaign_link"
+
+// Campaign-link statuses served under include=campaign_link.
+const (
+	campaignLinkLinked     = "linked"
+	campaignLinkUnlinked   = "unlinked"
+	campaignLinkUnresolved = "unresolved"
+)
+
+// campaignLinkNotInAccount is the unresolved reason when a linked campaign is
+// stamped with an account other than the caller's: the campaign is withheld,
+// and the answer is unresolved (never unlinked) so a consumer gating on it
+// fails closed.
+const campaignLinkNotInAccount = "campaign_not_in_account"
+
+// campaignLinkPayload is the include=campaign_link block (E88.2 / #4526): the
+// run's campaign membership, resolved server-side through the same ancestry
+// walk the dispatch hold uses (a decomposition child or follow-up run resolves
+// through its parent), and each linked campaign's state. The MCP client mirror
+// decodes this block; the json tags MUST byte-match its counterpart.
+type campaignLinkPayload struct {
+	// Status is linked | unlinked | unresolved.
+	Status string `json:"status"`
+	// Reason names why the link is unresolved (missing_parent, cycle,
+	// depth_exceeded, campaign_not_in_account); omitted otherwise.
+	Reason string `json:"reason,omitempty"`
+	// Campaigns lists each linked campaign visible to the caller; always
+	// present (an empty array when none) so a consumer never mistakes an
+	// absent list for an unread one.
+	Campaigns []campaignLinkEntry `json:"campaigns"`
+}
+
+// campaignLinkEntry is one linked campaign item and its campaign's state.
+type campaignLinkEntry struct {
+	CampaignID uuid.UUID `json:"campaign_id"`
+	ItemID     uuid.UUID `json:"item_id"`
+	State      string    `json:"state"`
+}
+
+// parseRunInclude validates GET /v0/runs/{run_id}'s include query (E88.2 /
+// #4526) and reports whether campaign_link was requested. Every value (repeated
+// or comma-separated) must be campaign_link, else 400 validation_failed. The
+// include is refused 403 run_token_forbidden for a run-bound mcp:run: subject:
+// a stage agent has no use for campaign membership, and the read walks runs
+// outside the token's own run. Returns false when it wrote a refusal.
+func (s *Server) parseRunInclude(w http.ResponseWriter, r *http.Request) (bool, bool) {
+	values, present := r.URL.Query()["include"]
+	if !present {
+		return false, true
+	}
+	for _, v := range values {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.TrimSpace(tok) != runIncludeCampaignLink {
+				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+					"include must be campaign_link",
+					map[string]any{"field": "include", "got": v, "allowed": []string{runIncludeCampaignLink}})
+				return false, false
+			}
+		}
+	}
+	if strings.HasPrefix(IdentityFrom(r.Context()).Subject, "mcp:run:") {
+		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
+			"a run-bound token cannot read include=campaign_link; use an operator or host-dispatcher token",
+			map[string]any{"field": "include"})
+		return false, false
+	}
+	return true, true
+}
+
+// campaignLinkFor resolves the include=campaign_link block for got (E88.2 /
+// #4526). It reuses resolveCampaignAncestry, so membership resolves through
+// DecomposedFrom / ParentRunID exactly as the dispatch hold does. An
+// unresolvable walk (missing parent, cycle, depth) is status unresolved with
+// the walk's reason. Each linked campaign is returned only when it is in the
+// caller's account (or untenanted, the enforceCampaignAccount NULL-allow
+// posture); a campaign stamped with another account is withheld and the
+// status is unresolved (campaign_not_in_account), never unlinked. Any read
+// error (no campaign repository, the item list, an ancestor run, the campaign
+// or its account) is returned, which the handler answers 503 — never a guessed
+// unlinked.
+func (s *Server) campaignLinkFor(ctx context.Context, got *run.Run) (*campaignLinkPayload, error) {
+	if s.cfg.CampaignRepo == nil {
+		return nil, errors.New("campaign repository unconfigured")
+	}
+	anc, err := s.resolveCampaignAncestry(ctx, got)
+	if err != nil {
+		return nil, err
+	}
+	out := &campaignLinkPayload{Campaigns: []campaignLinkEntry{}}
+	if anc.unresolved != "" {
+		out.Status = campaignLinkUnresolved
+		out.Reason = anc.unresolved
+		return out, nil
+	}
+	if len(anc.items) == 0 {
+		out.Status = campaignLinkUnlinked
+		return out, nil
+	}
+	callerAccount := IdentityFrom(ctx).AccountID
+	withheld := false
+	for _, it := range anc.items {
+		acct, aerr := s.cfg.CampaignRepo.GetCampaignAccountID(ctx, it.CampaignID)
+		if aerr != nil {
+			return nil, fmt.Errorf("read campaign %s account: %w", it.CampaignID, aerr)
+		}
+		if acct != "" && acct != callerAccount {
+			withheld = true
+			continue
+		}
+		c, cerr := s.cfg.CampaignRepo.GetCampaign(ctx, it.CampaignID)
+		if cerr != nil {
+			return nil, fmt.Errorf("read campaign %s: %w", it.CampaignID, cerr)
+		}
+		out.Campaigns = append(out.Campaigns, campaignLinkEntry{
+			CampaignID: it.CampaignID,
+			ItemID:     it.ID,
+			State:      string(c.State),
+		})
+	}
+	if withheld {
+		out.Status = campaignLinkUnresolved
+		out.Reason = campaignLinkNotInAccount
+		return out, nil
+	}
+	out.Status = campaignLinkLinked
+	return out, nil
 }
 
 // completionBlockedForRun names the stage stopping a `running` run from

@@ -15,7 +15,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1788,4 +1790,296 @@ func TestGetRun_SurfacesReviewHeadMismatch(t *testing.T) {
 			t.Error("review_head_mismatch key present with no recorded mismatch, want it omitted")
 		}
 	})
+}
+
+// TestStartRunForCampaignIssue_ThreadsAutoDispatch pins that the campaign
+// start seam passes the starter's ADR-104 Q3 mark (E88.2 / #4526) onto the
+// CREATED run, read back from the repository: the campaign driver's true
+// lands as auto_dispatch, and the operator item-start path's false leaves the
+// run unmarked.
+func TestStartRunForCampaignIssue_ThreadsAutoDispatch(t *testing.T) {
+	for _, marked := range []bool{true, false} {
+		t.Run(fmt.Sprintf("auto_dispatch=%v", marked), func(t *testing.T) {
+			rrepo := newFakeRepo()
+			gh := campaignHydrationGitHub(t, http.StatusOK, http.StatusOK)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
+			created, err := s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+				Repo:         "kuhlman-labs/fishhawk",
+				IssueRef:     "issue:100",
+				WorkflowID:   "feature_change",
+				RunnerKind:   "local",
+				WorkingDir:   "/work/checkout",
+				AutoDispatch: marked,
+			})
+			if err != nil {
+				t.Fatalf("StartRunForCampaignIssue: %v", err)
+			}
+			stored, err := rrepo.GetRun(context.Background(), created.ID)
+			if err != nil {
+				t.Fatalf("read back created run: %v", err)
+			}
+			if stored.AutoDispatch != marked {
+				t.Errorf("created run AutoDispatch = %v, want %v", stored.AutoDispatch, marked)
+			}
+		})
+	}
+}
+
+// acctErrCampaignRepo fails only the campaign-account probe, leaving every
+// other campaign read (items, the campaign row) answering normally.
+type acctErrCampaignRepo struct{ *holdCampaignRepo }
+
+func (acctErrCampaignRepo) GetCampaignAccountID(context.Context, uuid.UUID) (string, error) {
+	return "", errors.New("campaign account probe unavailable")
+}
+
+// campaignLinkFixture is a server over a fake run repository and a
+// holdCampaignRepo, with helpers that seed runs, campaigns and item links.
+type campaignLinkFixture struct {
+	runs *fakeRepo
+	cmp  *holdCampaignRepo
+	s    *Server
+}
+
+func newCampaignLinkFixture(t *testing.T) *campaignLinkFixture {
+	t.Helper()
+	f := &campaignLinkFixture{runs: newFakeRepo(), cmp: &holdCampaignRepo{fakeCampaignRepo: newFakeCampaignRepo()}}
+	f.s = New(Config{Addr: "127.0.0.1:0", RunRepo: f.runs, CampaignRepo: f.cmp, AccountRoles: fakeAccountRoles{role: account.RoleAdmin}})
+	return f
+}
+
+// seedRun stores a run whose ancestry link is decomposedFrom (nil for a root).
+func (f *campaignLinkFixture) seedRun(decomposedFrom *uuid.UUID) *run.Run {
+	r := &run.Run{
+		ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+		RunnerKind: run.RunnerKindLocal, State: run.StateRunning, AutoDispatch: true,
+		DecomposedFrom: decomposedFrom, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	f.runs.mu.Lock()
+	f.runs.runs[r.ID] = r
+	f.runs.mu.Unlock()
+	return r
+}
+
+// seedCampaign stores a campaign in state with one item linked to runID,
+// stamped with account (empty = untenanted). Returns the campaign and item ids.
+func (f *campaignLinkFixture) seedCampaign(state campaign.State, account string, runID uuid.UUID) (uuid.UUID, uuid.UUID) {
+	cid, iid := uuid.New(), uuid.New()
+	rid := runID
+	f.cmp.mu.Lock()
+	defer f.cmp.mu.Unlock()
+	f.cmp.campaigns[cid] = &campaign.Campaign{ID: cid, Repo: "kuhlman-labs/fishhawk", State: state}
+	f.cmp.itemsByCmp[cid] = []*campaign.Item{{ID: iid, CampaignID: cid, IssueRef: "issue:1", RunID: &rid, State: campaign.ItemStateRunning}}
+	if account != "" {
+		f.cmp.accounts[cid] = account
+	}
+	return cid, iid
+}
+
+// readLink GETs runID with include=campaign_link as the operator and decodes
+// the campaign_link block, failing unless the read answered 200.
+func (f *campaignLinkFixture) readLink(t *testing.T, runID uuid.UUID) campaignLinkPayload {
+	t.Helper()
+	w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), runID, "include=campaign_link")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET include=campaign_link status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		CampaignLink *campaignLinkPayload `json:"campaign_link"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.CampaignLink == nil {
+		t.Fatalf("GET include=campaign_link carried no campaign_link block:\n%s", w.Body.String())
+	}
+	return *body.CampaignLink
+}
+
+// TestGetRun_IncludeCampaignLink pins the opt-in campaign_link read (E88.2 /
+// #4526, R5): a run linked to a running campaign, a run linked to a paused
+// campaign, a decomposition child whose PARENT is linked (resolved through the
+// ancestry walk), an unlinked run, and a child whose parent row is missing
+// (unresolved, missing_parent). A GET without the include carries no
+// campaign_link key. Mutating the handler to always serve unlinked turns the
+// paused-linked row RED.
+func TestGetRun_IncludeCampaignLink(t *testing.T) {
+	f := newCampaignLinkFixture(t)
+
+	runningRun := f.seedRun(nil)
+	runningCmp, runningItem := f.seedCampaign(campaign.StateRunning, "", runningRun.ID)
+	pausedRun := f.seedRun(nil)
+	pausedCmp, pausedItem := f.seedCampaign(campaign.StatePaused, testOperatorAccountID, pausedRun.ID)
+	parentID := runningRun.ID
+	child := f.seedRun(&parentID)
+	unlinked := f.seedRun(nil)
+	missing := uuid.New()
+	orphan := f.seedRun(&missing)
+
+	cases := []struct {
+		name     string
+		runID    uuid.UUID
+		status   string
+		reason   string
+		campaign uuid.UUID
+		item     uuid.UUID
+		state    string
+	}{
+		{"linked to a running campaign", runningRun.ID, "linked", "", runningCmp, runningItem, "running"},
+		{"linked to a paused campaign in the caller's account", pausedRun.ID, "linked", "", pausedCmp, pausedItem, "paused"},
+		{"decomposition child resolves through its linked parent", child.ID, "linked", "", runningCmp, runningItem, "running"},
+		{"unlinked run", unlinked.ID, "unlinked", "", uuid.Nil, uuid.Nil, ""},
+		{"child of a missing parent is unresolved", orphan.ID, "unresolved", "missing_parent", uuid.Nil, uuid.Nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := f.readLink(t, tc.runID)
+			if got.Status != tc.status || got.Reason != tc.reason {
+				t.Fatalf("campaign_link = {status:%q reason:%q}, want {status:%q reason:%q}", got.Status, got.Reason, tc.status, tc.reason)
+			}
+			if got.Campaigns == nil {
+				t.Errorf("campaign_link.campaigns is nil; want a present (possibly empty) list")
+			}
+			if tc.campaign == uuid.Nil {
+				if len(got.Campaigns) != 0 {
+					t.Errorf("campaigns = %+v, want none", got.Campaigns)
+				}
+				return
+			}
+			if len(got.Campaigns) != 1 {
+				t.Fatalf("campaigns = %+v, want exactly one", got.Campaigns)
+			}
+			c := got.Campaigns[0]
+			if c.CampaignID != tc.campaign || c.ItemID != tc.item || c.State != tc.state {
+				t.Errorf("campaign entry = %+v, want {campaign_id:%s item_id:%s state:%s}", c, tc.campaign, tc.item, tc.state)
+			}
+		})
+	}
+
+	t.Run("a read without the include carries no campaign_link", func(t *testing.T) {
+		w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), pausedRun.ID, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := raw["campaign_link"]; ok {
+			t.Errorf("campaign_link present without include=campaign_link")
+		}
+	})
+}
+
+// TestGetRun_IncludeCampaignLink_ReadErrorFailsClosed pins the fail-closed
+// arm: a campaign membership read error answers 503 campaign_link_unavailable
+// and no 200 body, never a guessed unlinked (the dispatcher would then spawn
+// a stage of a campaign it could not read). Mutating the error arm to answer
+// unlinked turns this RED.
+func TestGetRun_IncludeCampaignLink_ReadErrorFailsClosed(t *testing.T) {
+	f := newCampaignLinkFixture(t)
+	r := f.seedRun(nil)
+	f.cmp.listForRunErr = errors.New("campaign store unavailable")
+
+	w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), r.ID, "include=campaign_link")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"campaign_link_unavailable"`) {
+		t.Errorf("body does not name campaign_link_unavailable:\n%s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"unlinked"`) {
+		t.Errorf("a read error leaked an unlinked answer:\n%s", w.Body.String())
+	}
+
+	// An unconfigured campaign repository is also unavailable, never unlinked.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: f.runs, AccountRoles: fakeAccountRoles{role: account.RoleAdmin}})
+	if w := getRunAsWithQuery(t, s, testOperatorIdentity(), r.ID, "include=campaign_link"); w.Code != http.StatusServiceUnavailable {
+		t.Errorf("no campaign repo: status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+
+	// A linked item whose campaign-account probe ALONE fails is unavailable,
+	// never linked or unlinked. The campaign row itself stays readable, so the
+	// later GetCampaign read cannot mask a dropped account-error arm.
+	t.Run("campaign account read error", func(t *testing.T) {
+		g := newCampaignLinkFixture(t)
+		lr := g.seedRun(nil)
+		g.seedCampaign(campaign.StateRunning, "", lr.ID)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: g.runs, CampaignRepo: acctErrCampaignRepo{g.cmp}, AccountRoles: fakeAccountRoles{role: account.RoleAdmin}})
+		if w := getRunAsWithQuery(t, s, testOperatorIdentity(), lr.ID, "include=campaign_link"); w.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+		}
+	})
+	// A linked item whose campaign read fails is unavailable too.
+	t.Run("campaign read error", func(t *testing.T) {
+		g := newCampaignLinkFixture(t)
+		lr := g.seedRun(nil)
+		g.seedCampaign(campaign.StateRunning, "", lr.ID)
+		g.cmp.getErr = errors.New("campaign row unreadable")
+		if w := getRunAsWithQuery(t, g.s, testOperatorIdentity(), lr.ID, "include=campaign_link"); w.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestGetRun_IncludeCampaignLink_AccountScoped pins F5's account rule (E88.2 /
+// #4526): a linked campaign stamped with ANOTHER account is withheld from the
+// answer, and the status is unresolved (campaign_not_in_account), never
+// unlinked — a consumer gating on the link fails closed rather than reading
+// a foreign campaign's state or mistaking the run for a non-campaign one.
+// Deleting the account check returns the foreign campaign as linked, RED.
+func TestGetRun_IncludeCampaignLink_AccountScoped(t *testing.T) {
+	f := newCampaignLinkFixture(t)
+	r := f.seedRun(nil)
+	f.seedCampaign(campaign.StateRunning, "00000000-0000-0000-0000-0000000000ff", r.ID)
+
+	got := f.readLink(t, r.ID)
+	if got.Status != "unresolved" || got.Reason != "campaign_not_in_account" {
+		t.Errorf("campaign_link = {status:%q reason:%q}, want {unresolved campaign_not_in_account}", got.Status, got.Reason)
+	}
+	if len(got.Campaigns) != 0 {
+		t.Errorf("campaigns = %+v, want the foreign-account campaign withheld", got.Campaigns)
+	}
+}
+
+// TestGetRun_IncludeCampaignLink_RefusesRunBoundToken pins F5's subject rule:
+// a run-bound mcp:run: token is refused the include with 403
+// run_token_forbidden BEFORE any campaign read, while the same read without
+// the include still answers 200. Deleting the refusal answers 200 with a
+// campaign_link block, RED.
+func TestGetRun_IncludeCampaignLink_RefusesRunBoundToken(t *testing.T) {
+	f := newCampaignLinkFixture(t)
+	r := f.seedRun(nil)
+	f.seedCampaign(campaign.StateRunning, "", r.ID)
+	runToken := Identity{Subject: "mcp:run:" + r.ID.String(), TokenID: "mcp-tok", Scopes: []string{"read:runs"}, AccountID: testOperatorAccountID}
+
+	w := getRunAsWithQuery(t, f.s, runToken, r.ID, "include=campaign_link")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"run_token_forbidden"`) {
+		t.Fatalf("mcp:run include: status = %d, want 403 run_token_forbidden:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "campaign_link\":{") {
+		t.Errorf("refused read leaked a campaign_link block:\n%s", w.Body.String())
+	}
+	if w := getRunAsWithQuery(t, f.s, runToken, r.ID, ""); w.Code != http.StatusOK {
+		t.Errorf("mcp:run plain read: status = %d, want 200 (only the include is refused)", w.Code)
+	}
+}
+
+// TestGetRun_IncludeRejectsUnknownValue pins the include grammar: any value
+// other than campaign_link (alone, comma-joined or repeated) is 400
+// validation_failed, so a typo is never silently served as a plain read.
+func TestGetRun_IncludeRejectsUnknownValue(t *testing.T) {
+	f := newCampaignLinkFixture(t)
+	r := f.seedRun(nil)
+	for _, q := range []string{"include=concerns", "include=campaign_link,concerns", "include=campaign_link&include=bogus", "include="} {
+		t.Run(q, func(t *testing.T) {
+			w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), r.ID, q)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"validation_failed"`) {
+				t.Errorf("status = %d, want 400 validation_failed:\n%s", w.Code, w.Body.String())
+			}
+		})
+	}
+	if w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), r.ID, "include=campaign_link&include=campaign_link"); w.Code != http.StatusOK {
+		t.Errorf("repeated campaign_link: status = %d, want 200", w.Code)
+	}
 }

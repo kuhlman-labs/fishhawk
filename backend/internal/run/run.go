@@ -666,9 +666,19 @@ type Run struct {
 	// unrepresentable. The repo layer passes it through verbatim in BOTH
 	// directions: nil persists as SQL NULL and NULL scans back as nil.
 	DocumentBaseCommit *string
-	State              State
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// AutoDispatch is the ADR-104 Q3 host-dispatcher mark (migration 0116,
+	// E88.2 / #4526): stamped by the run's STARTER at create time and never
+	// changed afterwards. The campaign driver stamps it true; an operator's
+	// POST /v0/runs may opt in; a webhook-started run is never marked. A run
+	// minted FROM another run (CI retry, operator recovery, decomposition)
+	// inherits its parent's value via ChildParamsFrom, so a child of a
+	// campaign-driver run stays dispatchable. The host dispatcher spawns the
+	// parked stages of a marked local run only; the mark grants no gate act.
+	// false for every legacy row (the column default).
+	AutoDispatch bool
+	State        State
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

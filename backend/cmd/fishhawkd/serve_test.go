@@ -7799,7 +7799,7 @@ func TestCampaignRunStarter_ExpeditedItemUsesRecordedWorkflow(t *testing.T) {
 	c := &campaign.Campaign{Repo: "kuhlman-labs/fishhawk"}
 	plain := &campaign.Item{IssueRef: "issue:10"}
 	hot := &campaign.Item{IssueRef: "issue:42", Expedite: &campaign.Expedite{Kind: campaign.ExpediteKindHotfix, Workflow: "hotfix_change"}}
-	if got := a.startParams(plain, c); got != (server.StartRunForCampaignIssueParams{Repo: c.Repo, IssueRef: "issue:10", WorkflowID: "feature_change", WorkflowRef: "main"}) {
+	if got := a.startParams(plain, c); got != (server.StartRunForCampaignIssueParams{Repo: c.Repo, IssueRef: "issue:10", WorkflowID: "feature_change", WorkflowRef: "main", AutoDispatch: true}) {
 		t.Errorf("plain item params = %+v", got)
 	}
 	if got := a.startParams(hot, c); got.WorkflowID != "hotfix_change" || got.IssueRef != "issue:42" || got.WorkflowRef != "main" {
@@ -8181,6 +8181,44 @@ func TestRunServe_AutoStartRunnerKindFailsStartup(t *testing.T) {
 	}
 }
 
+// TestCampaignRunStarter_StampsAutoDispatch pins the ADR-104 Q3 starter stamp
+// (E88.2 / #4526): the campaign driver marks EVERY run it starts with
+// auto_dispatch, for a local campaign and a github_actions one alike, and for
+// an expedited item too. Deleting the stamp in startParams turns every row RED.
+func TestCampaignRunStarter_StampsAutoDispatch(t *testing.T) {
+	const dir = "/work/checkout"
+	item := &campaign.Item{IssueRef: "issue:10"}
+	hot := &campaign.Item{IssueRef: "issue:42", Expedite: &campaign.Expedite{Kind: campaign.ExpediteKindHotfix, Workflow: "hotfix_change"}}
+	cases := []struct {
+		name    string
+		starter campaignRunStarter
+		c       *campaign.Campaign
+		item    *campaign.Item
+		kind    string
+	}{
+		{"local campaign", campaignRunStarter{workflowID: "feature_change", workflowRef: "main"},
+			&campaign.Campaign{Repo: "kuhlman-labs/fishhawk", RunnerKind: runpkg.RunnerKindLocal, WorkingDir: dir}, item, runpkg.RunnerKindLocal},
+		{"github_actions campaign", campaignRunStarter{workflowID: "feature_change", workflowRef: "main"},
+			&campaign.Campaign{Repo: "kuhlman-labs/fishhawk"}, item, ""},
+		{"expedited item", campaignRunStarter{workflowID: "feature_change", workflowRef: "main", runnerKind: runpkg.RunnerKindLocal},
+			&campaign.Campaign{Repo: "kuhlman-labs/fishhawk", WorkingDir: dir}, hot, runpkg.RunnerKindLocal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if r := tc.starter.startRefusal(tc.c); r != nil {
+				t.Fatalf("campaign refused: %+v", r)
+			}
+			got := tc.starter.startParams(tc.item, tc.c)
+			if !got.AutoDispatch {
+				t.Errorf("startParams AutoDispatch = false, want true (the campaign driver is the auto_dispatch starter); params %+v", got)
+			}
+			if got.RunnerKind != tc.kind {
+				t.Errorf("startParams RunnerKind = %q, want %q", got.RunnerKind, tc.kind)
+			}
+		})
+	}
+}
+
 // TestCampaignRunStarter_AutoStartKind pins the serve adapter's mapping of
 // server.ResolveCampaignAutoStart onto the run-start params (#4525).
 func TestCampaignRunStarter_AutoStartKind(t *testing.T) {
@@ -8188,10 +8226,11 @@ func TestCampaignRunStarter_AutoStartKind(t *testing.T) {
 	const dir = "/work/checkout"
 
 	// Default deployment, unrecorded bound campaign: params byte-identical to
-	// the pre-#4525 starter (no RunnerKind, no WorkingDir).
+	// the pre-#4525 starter (no RunnerKind, no WorkingDir) apart from the
+	// ADR-104 Q3 AutoDispatch stamp every driver start carries (#4526).
 	def := campaignRunStarter{workflowID: "feature_change", workflowRef: "main"}
 	bound := &campaign.Campaign{Repo: "kuhlman-labs/fishhawk", WorkingDir: dir}
-	if got, want := def.startParams(item, bound), (server.StartRunForCampaignIssueParams{Repo: bound.Repo, IssueRef: "issue:10", WorkflowID: "feature_change", WorkflowRef: "main"}); got != want {
+	if got, want := def.startParams(item, bound), (server.StartRunForCampaignIssueParams{Repo: bound.Repo, IssueRef: "issue:10", WorkflowID: "feature_change", WorkflowRef: "main", AutoDispatch: true}); got != want {
 		t.Errorf("default params = %+v, want %+v", got, want)
 	}
 	if r := def.startRefusal(bound); r != nil {
