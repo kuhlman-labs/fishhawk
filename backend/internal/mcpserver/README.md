@@ -52,10 +52,11 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 385 identifiers, not 3
+## Exported surface: why 390 identifiers, not 3
 
-The package presents **385** exported top-level identifiers, but only the three
-above are intended entry points. The other 382 are the tool I/O
+The package presents **390** exported top-level identifiers, but only the three
+above are intended entry points, plus the five `host-dispatch` entry points
+(see "Host dispatcher" below). The other 382 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -66,6 +67,147 @@ types for exactly that reason, so it adds nothing to the pinned surface. The
 correct — see #2408; renaming them is churn with no behavioural gain); instead `export_surface_test.go` pins the full sorted surface against a
 baseline generated from the tree, so a NEW export is caught in either direction
 while the pre-existing ones are grandfathered. (The figure above is a snapshot; `TestExportedSurfaceMatchesBaseline`'s count-mismatch message names this heading as a site to update when it moves.)
+
+## Host dispatcher (`fishhawk-mcp host-dispatch`, ADR-104, [E88.2 / #4526](https://github.com/kuhlman-labs/fishhawk/issues/4526))
+
+The host dispatcher is a long-lived loop that spawns the parked stages of
+`auto_dispatch`-marked local runs on this host. It only dispatches. It never
+acts at a gate: it holds no reference to `AutoDriveRunGate`, approval, merge or
+scope-amendment-decision methods. The identity contract (the
+`host-dispatcher/<host>` subject, its four-scope profile, the record-act
+admission, and the accepted `write:stages` residual) is
+`backend/internal/hostdispatcher/README.md`. Mint the credential with
+`fishhawkd token issue --subject host-dispatcher/<host>`. The command takes it
+through the same `loadConfig` ladder as the server modes.
+
+**Entry points** (`host_dispatcher_loop.go`, five names pinned in
+`export_surface_test.go`): `HostDispatcherConfig`, `RunHostDispatcher`,
+`HostDispatcherStatus` (with `Stale`), `ReadHostDispatcherStatus` and
+`SetHostDispatcherPaused`. `backend/cmd/fishhawk-mcp/host_dispatch.go` routes
+`fishhawk-mcp host-dispatch` to them before the transport flag parse. Its flags
+are `--allowed-roots` (falls back to `FISHHAWK_MCP_ALLOWED_ROOTS`; leaving both
+empty exits 2), `--interval` (default 30s; above 45s exits 2),
+`--max-in-flight` (default 2, ADR-104 Q6), `--per-tick-cap` (default 4),
+`--daily-cap` (default 48), `--state-dir` (default
+`$TMPDIR/fishhawk-host-dispatch`), `--stale-after`, `--runner-binary`,
+`--pause` / `--resume`, and `--status` (exit 0 when live or paused, 1 when
+absent or stale, where stale means the last tick is older than 3 intervals,
+a chosen default). SIGINT/SIGTERM lets the in-flight tick finish, then exits.
+The scripts/dev wiring and its operator documentation are
+[E88.3 / #4527](https://github.com/kuhlman-labs/fishhawk/issues/4527).
+
+**Eligibility** (`host_dispatcher.go`). A run is a candidate when it is local,
+not terminal, has a `working_dir` that is non-empty, absolute and inside an
+allowed root (`path_outside_allowed_roots` otherwise), and either carries the
+mark or is a decomposition child whose parent carries it. A parent read error
+skips the child (fail closed). A verify-only re-open is eligible only through
+that same mark: an unmarked run is never spawned, whatever re-opened it. The
+stage comes from `driveDispatchableStage`. A failed stage is never re-picked,
+so the dispatcher originates no retries.
+
+**The single pre-marker sequence.** For each candidate, in order: the argv is
+composed (`composeStageRunnerArgv`, or `childRunnerArgv` for a child), then
+(1) the campaign-link read (`GET /v0/runs/{id}?include=campaign_link`)
+proceeds only when the run is unlinked, or linked with every campaign
+`running`. A read error is `campaign_link_unavailable` and an unresolved
+ancestry is `campaign_link_unresolved`, both fail closed. Any other campaign
+state is `campaign_not_running`. (2) The loop's gate (`hostDispatchLoop.Admit`)
+checks the pause file, max in-flight and the daily cap, then reserves the
+ledger entry and persists it. (3) `run_auto_driven` is recorded with
+`source: host_dispatcher`, fail closed, once per queue episode. (4) The
+host-dispatch marker is POSTed. (5) The runner is spawned. Each refusal commits
+nothing: the reservation is released and no marker or spawn follows.
+A 409 `concurrency_slot_queued` leaves the stage at `awaiting_host_dispatch` for
+the next tick. There is no asynchronous slot waiter: the tick is the only
+admission path, and `concurrency_slot.go` is untouched. A 409
+`host_memory_pressure` stops markers for the rest of the tick. A
+`transitioned:false` answer is `marker_not_transitioned` with no spawn.
+
+**Refusal codes.** Per candidate: `runner_kind_not_local`, `run_terminal`,
+`path_outside_allowed_roots`, `not_eligible`, `parent_unreadable`,
+`nothing_dispatchable`, `in_flight`, `stale_runner_live`,
+`stale_runner_unknown`, `stale_respawn_cap_reached`, the three campaign codes,
+`paused`, `cap_reached:max_in_flight`, `cap_reached:daily`,
+`ledger_write_failed`, `record_act_failed`, `concurrency_slot_queued`,
+`host_memory_pressure`, `marker_not_transitioned`, `spawn_failed`. Per tick:
+`cap_reached:per_tick`, `ledger_read_failed`, `list_runs_failed`,
+`state_dir_lock_lost`. The status file records the latest one that is not a
+routine skip.
+
+**Tick and caps.** Each tick runs these steps in order. It checks that this
+process still holds the state-dir lock (`state_dir_lock_lost` stops the loop).
+If the pause file exists (`Lstat`: any entry, even a symlink, counts), the tick
+writes a paused status and returns without reads or markers. It loads the
+ledger and rolls the UTC day. It reaps: a run this process spawned that is now
+`cancelled`, or whose linked campaign is `cancelled`, gets
+`detachedRunners.terminateRunners`. It refreshes the in-flight set, keeping
+only stages the server still reports `dispatched` or `running` (a read error
+keeps the entry, fail closed). It lists local `pending` and `running` runs
+(bounded pagination). It orders them: live queue episodes first, oldest
+episode first, then `created_at` and `id`. A run whose latest read refused it
+for campaign state moves last until a fresh read stops refusing it, and is
+never skipped without that read. Finally it evaluates candidates until the
+per-tick cap of candidates that reached the campaign-link read is spent. That
+cap therefore bounds both the campaign-link reads and the marker POSTs per tick.
+The daily count is persisted and rolls over at 00:00:00Z, so a restart does
+not reset it.
+
+**Queue fairness (forgone FIFO).** A re-POST within the server's 60s QueueTTL
+keeps the queue row's `enqueued_at` (`backend/internal/concurrency/README.md`
+"Admit, step by step"; ADR-094, amended by ADR-100 and ADR-115), which is why
+`--interval` is capped at 45s. Sometimes a tick cannot re-POST a queued stage:
+the dispatcher is paused, a cap is reached, the campaign is not running, the
+budget is spent, or the dispatcher is down. The row then goes stale, and the
+stage re-enters at the tail on its next POST. The dispatcher deliberately gives
+up its FIFO position in those cases, because the stage could not have been
+admitted at that moment anyway.
+
+**Stale re-spawn.** A `dispatched` stage that this process is not running, and
+that is past `--stale-after`, is probed. When the probe answers live or
+unknown, the stage is reported and never spawned. When it answers dead, the
+stage is re-spawned at most once per (stage id, marker epoch). The marker epoch
+is the later of the stage's `updated_at` and `started_at`. The counter is
+persisted in the ledger and reserved before the spawn, so a restart never
+grants a second re-spawn for the same epoch (ADR-104 Q2). When a runner this
+process spawned exits early, its own detached reaper reports a failed stage,
+and selection never re-picks a failed stage. The single re-spawn therefore
+happens only after a dispatcher restart, or for a stage another process
+spawned.
+
+**State dir.** `--state-dir` is created 0700. It is refused when it is a
+symlink (`state_dir_symlink`), when it is not a directory, or when it is not
+owned by `os.Getuid()` (`state_dir_not_owned`). The owner is read from the
+`Uid` field of `FileInfo.Sys()` by reflection, and the check fails closed
+where that field is absent, for example on Windows. An existing dir is
+tightened to 0700. The ledger, status and pause files are 0600, written by
+temp file and rename. The `lock` file is a pid lock taken with `O_EXCL`: a
+live holder refuses a second dispatcher (`state_dir_locked`), and a dead
+holder's lock is taken over once. Every tick re-reads the lock, so if two
+dispatchers race a takeover, the loser stops at its next tick. Deleting the
+state dir resets the ledger.
+
+**Env custody.** The spawned runner's environment is `os.Environ()` with every
+`FISHHAWK_API_TOKEN` entry removed, and every entry whose value equals the
+dispatcher's bearer. Nothing is appended. The runner needs no bearer: its
+signing key, prompt fetch and uploads are Ed25519-signed, and the agent
+receives a run-bound token that the runner mints. This fits ADR-104 Q1's "may
+be the forwarded token" and is narrower than ADR-104 Q4; it is a proposed
+amendment for Captain ratification.
+
+**Residuals (not in this delivery).** These remain open: the ADR-101 D4 kill
+switch for charter runs, a campaign's `max_in_flight`, the `fishhawk_doctor`
+liveness/pause rung (it will read the status file), scheduler stamping of
+`auto_dispatch`, the `fishhawk_start_run` `auto_dispatch` flag, and the
+real-server end-to-end
+([E88.4 / #4528](https://github.com/kuhlman-labs/fishhawk/issues/4528)). After a
+restart, reaping covers only this process's own runners. A previous
+incarnation's runner of a cancelled run is left to the runner's own
+stage-state probe and the server's cancel path.
+
+Tests: `host_dispatcher_test.go` (the core, wire to spawn seam),
+`host_dispatcher_loop_test.go` (ticks, caps, ledger, pause, reap, order, state
+dir, lock), and `backend/cmd/fishhawk-mcp/host_dispatch_test.go` (flags,
+status, pause/resume, routing).
 
 ## Tool reference and internals
 
