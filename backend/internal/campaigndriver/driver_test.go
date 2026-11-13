@@ -2119,12 +2119,18 @@ func TestTick_DecisionRequired_StageReadErrorNoClear(t *testing.T) {
 	}
 }
 
-// C1 run-level: a run-level key clears only when the stage read shows no
-// parked plan, implement or review stage.
+// actedReleased is an acted outcome whose stage read shows nothing parked.
+func actedReleased() scriptStep {
+	return scriptStep{out: GateActionOutcome{Acted: true, Action: "merge", GateKnown: true, Note: "merged"}}
+}
+
+// C1 run-level: a run-level key clears only on a positive (acted or paged)
+// outcome whose stage read shows no parked plan, implement or review stage.
 func TestTick_DecisionRequired_RunLevelClearsOnlyWithNoParkedStage(t *testing.T) {
 	review := uuid.New()
-	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted", review), observeParked(review), observeReleased()))
-	f.ticks(2)
+	acted := scriptStep{out: GateActionOutcome{Acted: true, Action: "merge", GateKnown: true, ParkedGateStageIDs: []uuid.UUID{review}, Note: "merged"}}
+	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted", review), observeParked(review), acted, actedReleased()))
+	f.ticks(3)
 	if n := len(f.clears()); n != 0 {
 		t.Fatalf("decision_cleared rows = %d with the review stage parked, want 0", n)
 	}
@@ -2135,6 +2141,44 @@ func TestTick_DecisionRequired_RunLevelClearsOnlyWithNoParkedStage(t *testing.T)
 	}
 	if cl[0].StageID != nil {
 		t.Fatalf("run-level cleared StageID = %v, want nil", cl[0].StageID)
+	}
+	if p := assertPayloadKeys(t, cl[0], clearedKeys...); p["cleared_by"] != clearedByActed {
+		t.Fatalf("cleared_by = %v, want acted", p["cleared_by"])
+	}
+}
+
+// C1 run-level, fail-closed: AutoDriveRunGate answers observe-only with a nil
+// error on its own fail-closed reads, and the translator's stage read then
+// succeeds with nothing parked (a merge-arm decision is reached only when no
+// stage is awaiting_approval). That outcome is indistinguishable from a
+// positive observe-only, so it must hold a run-level key: no clear row, and the
+// recurring decision records no second marker.
+func TestTick_DecisionRequired_RunLevelHeldThroughFailClosedObserveOnly(t *testing.T) {
+	merge := scriptStep{out: GateActionOutcome{
+		DecisionRequired: true, DecisionState: "first_officer_finding_open", Action: "merge",
+		GateKnown: true, Note: "decision_required: merge hold",
+	}}
+	f := newDecisionFixture(t, scriptedActor(merge, observeReleased(), observeReleased(), observeReleased(), merge))
+	f.ticks(5)
+	if n := len(f.clears()); n != 0 {
+		t.Fatalf("decision_cleared rows = %d after fail-closed observe-only ticks, want 0", n)
+	}
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows = %d, want 1 (the held key dedupes the recurring decision)", n)
+	}
+}
+
+// C1 run-level: a paged outcome is positive and clears a run-level key.
+func TestTick_DecisionRequired_RunLevelPagedClears(t *testing.T) {
+	paged := scriptStep{out: GateActionOutcome{Paged: true, PageEvent: "reviewer_reject", GateKnown: true, Note: "page"}}
+	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted"), paged))
+	f.ticks(2)
+	cl := f.clears()
+	if len(cl) != 1 {
+		t.Fatalf("decision_cleared rows = %d, want 1", len(cl))
+	}
+	if p := assertPayloadKeys(t, cl[0], clearedKeys...); p["cleared_by"] != clearedByPaged {
+		t.Fatalf("cleared_by = %v, want paged", p["cleared_by"])
 	}
 }
 

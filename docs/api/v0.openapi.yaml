@@ -6249,18 +6249,22 @@ components:
         omits the block for that item; the status read never fails on it.
 
         `kind` and `reason` come from the linked run's own stages (the
-        earliest non-terminal stage by sequence) and are the same for every
-        caller: they are intentionally ungated, because the item's `run_id`
-        is already in the item payload. `kind` is `host_dispatcher` (reason
-        `host_dispatch`: a `pending` or `awaiting_host_dispatch` stage of an
-        `auto_dispatch`-marked run whose runner is `local`), `human`
-        (`operator_dispatch` for any other pending stage, `gate_approval` for
+        earliest stage by sequence that is `failed` or not terminal) and are
+        the same for every caller: they are intentionally ungated, because
+        the item's `run_id` is already in the item payload. `kind` is
+        `host_dispatcher` (reason `host_dispatch`: a `pending` or
+        `awaiting_host_dispatch` stage of an `auto_dispatch`-marked run whose
+        runner is `local`), `human` (`stage_retry` for a `failed` stage on
+        the live run: an infrastructure park, and no later stage is
+        dispatched until it is retried, so `stage_*` name the failed stage
+        for `fishhawk_retry_stage`; `operator_dispatch` for any other pending
+        stage, `gate_approval` for
         `awaiting_approval` whatever the stage type, so a parked review stage
         reads `gate_approval` with `stage_type` `review`, `deploy_approval`,
         `input`, `scope_decision`) or `system` (`in_flight` for `dispatched`,
         `running` or `awaiting_deployment`, `children` for
-        `awaiting_children`, `no_active_stage` when every stage is terminal,
-        with no `stage_*` fields).
+        `awaiting_children`, `no_active_stage` when every stage is terminal
+        and none failed, with no `stage_*` fields).
 
         The DECISION SOURCES are gated by the same predicate as
         `pending_amendments`: a caller that is not run-bound and holds
@@ -6286,6 +6290,7 @@ components:
           enum:
             - host_dispatch
             - operator_dispatch
+            - stage_retry
             - gate_approval
             - deploy_approval
             - input

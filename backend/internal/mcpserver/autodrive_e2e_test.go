@@ -877,6 +877,13 @@ func TestAutoDriveE2E_DecisionMarkerOncePerOccurrence(t *testing.T) {
 	if n := len(h.auditRows(runID, campaigndriver.CategoryCampaignGateDecisionRequired)); n != 1 {
 		t.Fatalf("decision_required rows = %d after the approval, want still 1", n)
 	}
+	// The block now sits on the running implement stage, so the overlay drops
+	// the plan-gate marker at its foreign-stage and awaiting_approval checks
+	// whether or not the clear row exists: this asserts the operator-visible
+	// outcome, not the cleared-row check. That check (CF14) is pinned where
+	// only the clear row hides the decision, on a stage still awaiting_approval:
+	// server TestCampaignStatus_Awaiting_ClearRowHidesDecisionOnParkedStage.
+	// The clear row itself is asserted by count above.
 	_, blk = h.status(h.operatorBearer)
 	if blk != nil && blk.Decision != nil {
 		t.Fatalf("awaiting = %+v after the approval, want no decision", blk)

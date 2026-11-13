@@ -2971,7 +2971,8 @@ Notes:
   - `campaign_gate_decision_cleared` (the same payload plus `cleared_by`:
     `acted`, `paged` or `no_decision`) records that a later non-decision
     outcome whose stage read positively showed the gate no longer parked
-    cleared it. An indeterminate read never clears.
+    cleared it. An indeterminate read never clears, and a run-level (`run`)
+    gate clears only on an acted or paged outcome.
   Both are run-bound readable: the payload names only the run's own campaign,
   issue, stage and closed-set tokens, never the actor's note. They are an
   interim registration under ADR-106's existing audit-category mechanism and

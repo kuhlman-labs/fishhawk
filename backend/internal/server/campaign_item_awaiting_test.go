@@ -59,6 +59,27 @@ func TestClassifyCampaignItemAwaiting(t *testing.T) {
 			awaitStage(2, run.StageTypeImplement, run.StageStateSucceeded),
 			awaitStage(3, run.StageTypeReview, run.StageStateSuperseded),
 		}, awaitingKindSystem, awaitingReasonNoActiveStage, -1},
+		// A category-C infrastructure park (#4426 implement): the run stays
+		// running with implement failed and acceptance pending. The
+		// host-dispatch marker refuses acceptance (earlier_stage_failed), so
+		// the block is human/stage_retry on the FAILED stage, never
+		// host_dispatch on the pending one.
+		{"failed implement ahead of pending acceptance, marked local", marked, []*run.Stage{
+			awaitStage(1, run.StageTypePlan, run.StageStateSucceeded),
+			awaitStage(2, run.StageTypeImplement, run.StageStateFailed),
+			awaitStage(3, run.StageTypeAcceptance, run.StageStatePending),
+		}, awaitingKindHuman, awaitingReasonStageRetry, 1},
+		{"failed implement ahead of pending acceptance, unmarked", awaitRun(false, run.RunnerKindLocal), []*run.Stage{
+			awaitStage(1, run.StageTypePlan, run.StageStateSucceeded),
+			awaitStage(2, run.StageTypeImplement, run.StageStateFailed),
+			awaitStage(3, run.StageTypeAcceptance, run.StageStatePending),
+		}, awaitingKindHuman, awaitingReasonStageRetry, 1},
+		// #4356 acceptance park with no later stage: not no_active_stage.
+		{"failed last stage on a live run", marked, []*run.Stage{
+			awaitStage(1, run.StageTypePlan, run.StageStateSucceeded),
+			awaitStage(2, run.StageTypeImplement, run.StageStateSucceeded),
+			awaitStage(3, run.StageTypeAcceptance, run.StageStateFailed),
+		}, awaitingKindHuman, awaitingReasonStageRetry, 2},
 		// Earliest non-terminal by SEQUENCE, not slice order: the slice lists
 		// the later pending review first.
 		{"earliest non-terminal selection", marked, []*run.Stage{
@@ -409,6 +430,30 @@ func TestCampaignStatus_Awaiting_ThroughHandler(t *testing.T) {
 	}
 	if strings.Join(keys["issue:1"], ",") != "kind,next_step,reason,run_id,stage_id,stage_state,stage_type" {
 		t.Fatalf("host awaiting keys = %v", keys["issue:1"])
+	}
+}
+
+// CF14 through the handler: the gate run's plan stage is STILL
+// awaiting_approval and the marker names it, so the foreign-stage and C2
+// checks both pass; only the later campaign_gate_decision_cleared row hides
+// the decision (currentAwaitingMarker).
+func TestCampaignStatus_Awaiting_ClearRowHidesDecisionOnParkedStage(t *testing.T) {
+	f := newAwaitingFixture(t)
+	f.au.seed(f.gate.ID, 4, campaigndriver.CategoryCampaignGateDecisionCleared, f.gateSt.ID.String())
+	got, keys := statusAwaitingByRef(t, callCampaignStatusAs(f.s, f.c.ID, gateViewReadIdentity()))
+	gate := got["issue:3"]
+	if gate == nil || gate.Kind != awaitingKindHuman || gate.Reason != awaitingReasonGateApproval ||
+		gate.StageID != f.gateSt.ID.String() || gate.StageState != string(run.StageStateAwaitingApproval) {
+		t.Fatalf("gate item awaiting = %+v, want human/gate_approval on the still-parked plan stage", gate)
+	}
+	if gate.Decision != nil {
+		t.Fatalf("gate decision = %+v, want none once a later cleared row follows the marker", gate.Decision)
+	}
+	if gate.DecisionWithheld || gate.DecisionUnavailable {
+		t.Fatalf("gate withheld/unavailable = %v/%v, want false/false", gate.DecisionWithheld, gate.DecisionUnavailable)
+	}
+	if strings.Join(keys["issue:3"], ",") != "kind,next_step,reason,run_id,stage_id,stage_state,stage_type" {
+		t.Fatalf("gate awaiting keys = %v, want no decision key", keys["issue:3"])
 	}
 }
 

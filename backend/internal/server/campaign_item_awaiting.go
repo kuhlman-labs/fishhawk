@@ -54,6 +54,7 @@ const (
 const (
 	awaitingReasonHostDispatch          = "host_dispatch"
 	awaitingReasonOperatorDispatch      = "operator_dispatch"
+	awaitingReasonStageRetry            = "stage_retry"
 	awaitingReasonGateApproval          = "gate_approval"
 	awaitingReasonDeployApproval        = "deploy_approval"
 	awaitingReasonInput                 = "input"
@@ -69,6 +70,7 @@ const (
 var awaitingNextSteps = map[string]string{
 	awaitingReasonHostDispatch:          "The host dispatcher spawns this stage on its next tick; no operator action is needed.",
 	awaitingReasonOperatorDispatch:      "Dispatch the stage with fishhawk_dispatch_stage; this run is not host-dispatched.",
+	awaitingReasonStageRetry:            "The stage failed and parked the run; retry it with fishhawk_retry_stage or cancel the run with fishhawk_cancel_run. Nothing sequenced after it is dispatched until then.",
 	awaitingReasonGateApproval:          "The gate needs a human decision; read fishhawk_get_run_status next_actions for the verb.",
 	awaitingReasonDeployApproval:        "Approve or reject the deploy with fishhawk_approve_deploy or fishhawk_reject_deploy.",
 	awaitingReasonInput:                 "The stage asked a clarification; answer it with fishhawk_answer_clarification.",
@@ -81,7 +83,8 @@ var awaitingNextSteps = map[string]string{
 }
 
 // campaignItemAwaitingPayload mirrors docs/api/v0.openapi.yaml's
-// `CampaignItemAwaiting` schema. stage_* are omitted for no_active_stage.
+// `CampaignItemAwaiting` schema. stage_* are omitted for no_active_stage;
+// for stage_retry they name the failed stage.
 // decision_withheld and decision_unavailable are omitempty: absent means
 // false.
 type campaignItemAwaitingPayload struct {
@@ -117,14 +120,20 @@ type awaitingMarker struct {
 }
 
 // classifyCampaignItemAwaiting is the pure stage-state classifier. It takes
-// the earliest stage by sequence whose state is not terminal; with none, the
-// non-terminal run is system/no_active_stage with no stage fields.
+// the earliest stage by sequence that is failed or not terminal. A FAILED
+// stage there is a category-C infrastructure park (the run stays running,
+// orchestrator.go / run.ClassifyInfraFailurePark): the host-dispatch marker
+// refuses every stage sequenced after it (failedStageAhead, 409
+// earlier_stage_failed), so the run waits on a retry, not on a dispatch. That
+// block is human/stage_retry with the stage fields naming the failed stage, the
+// one fishhawk_retry_stage takes. With no such stage, the non-terminal run is
+// system/no_active_stage with no stage fields.
 func classifyCampaignItemAwaiting(r *run.Run, stages []*run.Stage) campaignItemAwaitingPayload {
 	ordered := append([]*run.Stage(nil), stages...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
 	var active *run.Stage
 	for _, st := range ordered {
-		if st != nil && !st.State.IsTerminal() {
+		if st != nil && (st.State == run.StageStateFailed || !st.State.IsTerminal()) {
 			active = st
 			break
 		}
@@ -138,6 +147,8 @@ func classifyCampaignItemAwaiting(r *run.Run, stages []*run.Stage) campaignItemA
 	blk.StageType = string(active.Type)
 	blk.StageState = string(active.State)
 	switch active.State {
+	case run.StageStateFailed:
+		setAwaitingReason(&blk, awaitingKindHuman, awaitingReasonStageRetry)
 	case run.StageStatePending, run.StageStateAwaitingHostDispatch:
 		kind, reason := hostDispatchKind(r)
 		setAwaitingReason(&blk, kind, reason)

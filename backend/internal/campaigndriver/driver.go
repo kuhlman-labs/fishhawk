@@ -135,7 +135,8 @@ const (
 	CategoryCampaignGateDecisionRequired = "campaign_gate_decision_required"
 	// CategoryCampaignGateDecisionCleared records that a previously recorded
 	// decision stopped being current: a later non-decision outcome whose stage
-	// read positively showed the keyed gate no longer parked.
+	// read positively showed the keyed gate no longer parked (for a run-level
+	// key, only an acted or paged outcome).
 	CategoryCampaignGateDecisionCleared = "campaign_gate_decision_cleared"
 	// GateRunLevel is the gate value of a decision with no parked plan or
 	// implement stage (for example fixup_budget_exhausted on a run whose
@@ -265,7 +266,8 @@ type GateActionOutcome struct {
 	// awaiting_approval in the same stage read. Meaningful only when
 	// GateKnown. A recorded decision clears only when this read positively
 	// shows its gate no longer parked: a stage key clears when its stage is
-	// absent here, a run-level key only when the list is empty.
+	// absent here, a run-level key only on an acted or paged outcome with the
+	// list empty.
 	ParkedGateStageIDs []uuid.UUID
 }
 
@@ -746,7 +748,8 @@ func (t *Ticker) recordDecision(ctx context.Context, logger *slog.Logger, c *cam
 // no longer parked (C1), and deletes the key only after the append succeeds.
 // A no-op without a stored key. An indeterminate outcome (GateKnown=false)
 // never clears: AutoDriveRunGate answers observe-only with a nil error on its
-// fail-closed reads, which is not evidence the gate moved.
+// fail-closed reads, which is not evidence the gate moved. For the same reason
+// an observe-only outcome never clears a run-level key (gateReleased).
 func (t *Ticker) clearDecision(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, out GateActionOutcome) {
 	key, ok := t.storedDecision(runRow.ID)
 	if !ok {
@@ -776,14 +779,19 @@ func (t *Ticker) clearDecision(ctx context.Context, logger *slog.Logger, c *camp
 
 // gateReleased reports whether out's stage read positively shows key's gate no
 // longer parked (C1). A stage key is released when its stage is absent from
-// the parked set (it left awaiting_approval); a run-level key only when no
-// plan, implement or review stage is parked.
+// the parked set (it left awaiting_approval): the keyed stage's own state is
+// the evidence. A run-level key has no stage of its own, and an observe-only
+// outcome cannot be told apart from AutoDriveRunGate's fail-closed observe-only
+// (both are nil-error outcomes with nothing parked), so a run-level key is
+// released only on a POSITIVE outcome (acted or paged) whose stage read shows
+// no plan, implement or review stage parked. A run that goes terminal drops the
+// key with no clear row (forgetUndrivenDecisions).
 func gateReleased(key decisionKey, out GateActionOutcome) bool {
 	if !out.GateKnown {
 		return false
 	}
 	if key.Gate == GateRunLevel {
-		return len(out.ParkedGateStageIDs) == 0
+		return (out.Acted || out.Paged) && len(out.ParkedGateStageIDs) == 0
 	}
 	for _, id := range out.ParkedGateStageIDs {
 		if id.String() == key.Gate {
