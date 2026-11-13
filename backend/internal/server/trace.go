@@ -4428,6 +4428,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// them as scope drift (a parent fix-up admitted by the #4338 serve, or the
 	// first consolidated round). Approval adds first, fan-out paths after.
 	trig.AmendedScopeFiles = appendFanOutPaths(approvalScopeAdds, parentFanOut)
+	// Conflict-resolution framing (#4795): an additional prompt section on a
+	// conflict_resolution round, read through the one framing loader.
+	if fr, ok := conflictResolutionFramingFrom(ctx); ok {
+		trig.ConflictResolution = fr.promptContext()
+	}
 	// Decomposed-parent rollup (#2820): a fan-out CHILD's APPROVED mid-stage scope
 	// amendment lives under the CHILD run id, so a path an operator authorized on a
 	// slice reaches this parent's consolidated diff with no provenance on the
@@ -4543,8 +4548,14 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// from it (not from `diff`) so a truncated full diff with a complete delta
 	// writes no false record and a complete full diff with a truncated delta
 	// writes the true one (#2875 condition 2).
+	//
+	// A conflict_resolution round (#4795 E3) never takes the delta: its prior
+	// reviewed head is not an ancestor-only predecessor of the merge head, so
+	// ComparePatch(prior head, merge head) would carry every base commit the
+	// merge brought in under delta framing. It reviews the full
+	// base...merge-head compare; its addressed_pending concerns still render.
 	reviewedDiff := diff
-	if hasFixupRoutedConcern(trig.PriorConcerns) {
+	if hasFixupRoutedConcern(trig.PriorConcerns) && !isConflictResolutionRound(ctx) {
 		if delta, ok := s.resolveFixupDeltaDiff(ctx, runRow, runID, stageID, headSHA); ok {
 			trig.Diff = renderDiffForReview(delta)
 			trig.DiffPatch = delta.Patch

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -20,21 +21,33 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
-// fakeTokenProvider stands in for githubapp.TokenProvider.
+// fakeTokenProvider stands in for githubapp.TokenProvider. mu guards calls
+// and gotInst: a conflict-resolution report's automatic review (#4795) calls
+// Token from a background goroutine while the test's next request does too.
 type fakeTokenProvider struct {
 	tok     string
 	err     error
+	mu      sync.Mutex
 	gotInst int64
 	calls   int
 }
 
 func (f *fakeTokenProvider) Token(_ context.Context, installationID int64) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	f.gotInst = installationID
 	if f.err != nil {
 		return "", f.err
 	}
 	return f.tok, nil
+}
+
+// lastInst returns the installation ID of the latest Token call under mu.
+func (f *fakeTokenProvider) lastInst() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gotInst
 }
 
 func newInstTokenServer(t *testing.T, runID, stageID uuid.UUID, instID *int64) (*Server, *signingFake, *auditFake, *promptRunRepo, *fakeTokenProvider) {
@@ -92,8 +105,8 @@ func TestIssueInstallationToken_HappyPath(t *testing.T) {
 	if resp.Token != "ghs_xyz" {
 		t.Errorf("token = %q", resp.Token)
 	}
-	if tp.gotInst != 123456 {
-		t.Errorf("installationID = %d, want 123456", tp.gotInst)
+	if got := tp.lastInst(); got != 123456 {
+		t.Errorf("installationID = %d, want 123456", got)
 	}
 
 	if len(au.appended) != 1 {
@@ -236,8 +249,8 @@ func TestIssueInstallationToken_OIDC_HappyPath(t *testing.T) {
 	if resp.Token != "ghs_xyz" {
 		t.Errorf("token = %q", resp.Token)
 	}
-	if tp.gotInst != 123456 {
-		t.Errorf("installationID = %d", tp.gotInst)
+	if got := tp.lastInst(); got != 123456 {
+		t.Errorf("installationID = %d", got)
 	}
 	if verifier.callCount != 1 {
 		t.Errorf("OIDC Verify called %d times, want 1", verifier.callCount)

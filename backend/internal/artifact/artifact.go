@@ -30,8 +30,9 @@ type Artifact struct {
 
 // Kind enumerates the artifact kinds. Closed set per the schema's
 // CHECK constraint (migration 0002, widened by 0037, 0045, 0051, 0073, 0083,
-// 0095 and 0098): plan, pull_request, deployment, acceptance, release_notes,
-// grooming_report, acceptance_transcript, upkeep_report, comms_report.
+// 0095, 0098 and 0116): plan, pull_request, deployment, acceptance,
+// release_notes, grooming_report, acceptance_transcript, upkeep_report,
+// comms_report, conflict_resolution_diff.
 type Kind string
 
 // Artifact kinds.
@@ -101,4 +102,76 @@ const (
 	// SQLSTATE 23514 against the un-widened CHECK), exactly as 0095 paired
 	// with KindUpkeepReport.
 	KindCommsReport Kind = "comms_report"
+	// KindConflictResolutionDiff is the REDACTED remerge-diff summary of a
+	// conflict-resolution pass (#4795): how the conflicted files of a merge
+	// commit were resolved, written by the conflict_resolution_pushed report
+	// handler on the implement stage the report arrived on, validated as
+	// conflict_resolution_diff_v1, and read back ONLY through the server's
+	// single framing loader, which renders it as an additional section of the
+	// conflict-resolution implement-review round. Admitted by migration 0116,
+	// which widens artifacts_kind_check; the constant and migration ship
+	// together (a Create with this kind fails SQLSTATE 23514 against the
+	// un-widened CHECK), exactly as 0098 paired with KindCommsReport.
+	KindConflictResolutionDiff Kind = "conflict_resolution_diff"
 )
+
+// ConflictResolutionDiffSchema is the SchemaVersion of a
+// KindConflictResolutionDiff artifact (#4795).
+const ConflictResolutionDiffSchema = "conflict_resolution_diff_v1"
+
+// ConflictResolutionDiffContent is the JSON content of a
+// KindConflictResolutionDiff artifact (#4795). Patch is the REDACTED remerge
+// patch; PatchUnavailable is a closed slug naming why Patch is empty, and
+// PatchUnavailableDetail a redacted, 256-byte-bounded runner detail that is
+// stored for the operator and never rendered into a prompt.
+type ConflictResolutionDiffContent struct {
+	Schema                 string   `json:"schema"`
+	HeadSHA                string   `json:"head_sha"`
+	BaseSHA                string   `json:"base_sha"`
+	ResolvedPaths          []string `json:"resolved_paths"`
+	ResolvedPathsTruncated bool     `json:"resolved_paths_truncated,omitempty"`
+	Patch                  string   `json:"patch,omitempty"`
+	PatchTruncated         bool     `json:"patch_truncated,omitempty"`
+	PatchUnavailable       string   `json:"patch_unavailable,omitempty"`
+	PatchUnavailableDetail string   `json:"patch_unavailable_detail,omitempty"`
+}
+
+// Conflict-resolution-diff cross-check causes (#4795), returned by
+// CheckConflictResolutionDiff. They are internal log causes, never rendered.
+const (
+	ConflictResolutionDiffCauseArtifactMissing = "artifact_missing"
+	ConflictResolutionDiffCauseKindMismatch    = "kind_mismatch"
+	ConflictResolutionDiffCauseStageMismatch   = "stage_mismatch"
+	ConflictResolutionDiffCauseHashMismatch    = "hash_mismatch"
+	ConflictResolutionDiffCauseHeadMismatch    = "head_mismatch"
+	ConflictResolutionDiffCauseUndecodable     = "undecodable"
+)
+
+// CheckConflictResolutionDiff cross-checks a read-back artifact against the
+// conflict_resolution_pushed row that names it and decodes its content. It
+// returns the content and "" on success, else nil and the cause.
+//
+// The hash is compared COLUMN TO ROW: a's stored ContentHash against the row's
+// resolution_diff_sha256. It is never recomputed over a.Content, because the
+// artifacts table stores content as JSONB, which normalises whitespace and key
+// order, so a recomputed hash would differ from the one computed at insert.
+func CheckConflictResolutionDiff(a *Artifact, stageID uuid.UUID, rowSHA256, headSHA string) (*ConflictResolutionDiffContent, string) {
+	switch {
+	case a == nil:
+		return nil, ConflictResolutionDiffCauseArtifactMissing
+	case a.Kind != KindConflictResolutionDiff:
+		return nil, ConflictResolutionDiffCauseKindMismatch
+	case a.StageID != stageID:
+		return nil, ConflictResolutionDiffCauseStageMismatch
+	case rowSHA256 == "" || a.ContentHash != rowSHA256:
+		return nil, ConflictResolutionDiffCauseHashMismatch
+	}
+	var c ConflictResolutionDiffContent
+	if err := json.Unmarshal(a.Content, &c); err != nil || c.Schema != ConflictResolutionDiffSchema {
+		return nil, ConflictResolutionDiffCauseUndecodable
+	}
+	if c.HeadSHA != headSHA {
+		return nil, ConflictResolutionDiffCauseHeadMismatch
+	}
+	return &c, ""
+}
