@@ -367,6 +367,18 @@ type Run struct {
 	// silently decodes to empty and every inheriting verb reverts to demanding
 	// the parameter — the #371-class hand-maintained-wire-mirror trap.
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"the run's bound local checkout (bound once at start_run; the later runner-spawning verbs inherit it). Omitted when the run carries no binding"`
+	// AutoDispatch mirrors the backend runResponse.auto_dispatch (E88.2 /
+	// #4526): the starter-stamped ADR-104 Q3 host-dispatcher mark. The host
+	// dispatcher (host_dispatcher.go) spawns only a marked run or a child of a
+	// marked parent. Absent (false) on an unmarked run and on an older backend,
+	// so an older backend makes nothing eligible (fail closed). The json tag
+	// MUST byte-match the backend.
+	AutoDispatch bool `json:"auto_dispatch,omitempty" jsonschema:"the run carries the ADR-104 host-dispatcher mark (set by its starter, e.g. a campaign driver); absent on an unmarked run"`
+	// CampaignLink mirrors the backend's include=campaign_link block (E88.2 /
+	// #4526). It is served only when the read asked for it
+	// (GetRunCampaignLink), so it is nil on every other read. The json tag MUST
+	// byte-match the backend's campaignLinkPayload.
+	CampaignLink *runCampaignLink `json:"campaign_link,omitempty" jsonschema:"the run's campaign membership and each linked campaign's state; present only on a read that requested include=campaign_link"`
 	// PredictedRuntimeMinutes mirrors the backend runResponse
 	// .predicted_runtime_minutes (E48.62 / #2489): the approved plan's own
 	// runtime prediction, stamped onto the run row at plan approval. The
@@ -572,6 +584,18 @@ func init() {
 		// and the gate view as its retrieval pointers.
 		pathClassification{Path: "run.merge_candidate_staleness", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
 			return append(restRun(runID), gateView(runID)...)
+		}},
+		// The ADR-104 Q3 host-dispatcher mark (E88.2 / #4526). A stored
+		// scalar on the run row surfaced by the single-run REST read, so it
+		// classifies like run.working_dir.
+		pathClassification{Path: "run.auto_dispatch", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		// The campaign-link block (E88.2 / #4526). Served only on a read that
+		// asks for include=campaign_link, so the run-status read normally
+		// carries none; should it appear, its retrieval pointer is that
+		// include read. Small and fixed-shape per linked campaign, it is
+		// retained through T1..T9 and itemised out only at the skeleton.
+		pathClassification{Path: "run.campaign_link", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+			return []retrievalPointer{pointerREST("/v0/runs/" + runID + "?include=campaign_link").retrievalPointer}
 		}},
 	)
 }
@@ -813,8 +837,60 @@ type listRunsFilter struct {
 	TriggerRef     string
 	WorkflowID     string
 	State          string
-	Limit          int
-	Cursor         string
+	// RunnerKind filters on runner_kind (the host dispatcher lists local runs
+	// only, E88.2 / #4526). Empty sends no filter.
+	RunnerKind string
+	Limit      int
+	Cursor     string
+}
+
+// Campaign-link statuses the backend serves under include=campaign_link
+// (backend/internal/server/runs.go campaignLinkPayload).
+const (
+	campaignLinkStatusLinked     = "linked"
+	campaignLinkStatusUnlinked   = "unlinked"
+	campaignLinkStatusUnresolved = "unresolved"
+)
+
+// runCampaignLink mirrors the backend campaignLinkPayload (E88.2 / #4526): the
+// run's campaign membership, resolved server-side through the run's ancestry
+// (a decomposition child resolves through its parent). Status is linked |
+// unlinked | unresolved; Reason names an unresolved walk. The json tags MUST
+// byte-match the backend. Unexported like runCompletionBlocked: nothing outside
+// this package names the type, and the export-surface baseline is not in this
+// slice's scope; the Run field is exported, so encoding/json and the jsonschema
+// reflector reach it unchanged.
+type runCampaignLink struct {
+	Status    string                 `json:"status" jsonschema:"linked | unlinked | unresolved"`
+	Reason    string                 `json:"reason,omitempty" jsonschema:"why the link is unresolved (missing_parent, cycle, depth_exceeded, campaign_not_in_account)"`
+	Campaigns []runCampaignLinkEntry `json:"campaigns" jsonschema:"each linked campaign visible to the caller and its state"`
+}
+
+// runCampaignLinkEntry is one linked campaign item and its campaign's state.
+type runCampaignLinkEntry struct {
+	CampaignID string `json:"campaign_id" jsonschema:"the campaign UUID"`
+	ItemID     string `json:"item_id" jsonschema:"the campaign item UUID"`
+	State      string `json:"state" jsonschema:"the campaign's state (running, paused, cancelled, ...)"`
+}
+
+// errCampaignLinkAbsent is returned when a backend answered an
+// include=campaign_link read without the block (an older backend that ignores
+// the include). A consumer gating on the link must fail closed on it.
+var errCampaignLinkAbsent = errors.New("campaign_link absent from the run read: the backend does not serve include=campaign_link (older fishhawkd?)")
+
+// GetRunCampaignLink calls GET /v0/runs/{id}?include=campaign_link (E88.2 /
+// #4526) and returns the run's campaign-link block. A transport error, a
+// non-2xx answer (503 campaign_link_unavailable) or an absent block is an
+// error, never a guessed unlinked: the host dispatcher fails closed on it.
+func (c *apiClient) GetRunCampaignLink(ctx context.Context, id uuid.UUID) (*runCampaignLink, error) {
+	var r Run
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+id.String()+"?include=campaign_link", nil, &r); err != nil {
+		return nil, err
+	}
+	if r.CampaignLink == nil {
+		return nil, errCampaignLinkAbsent
+	}
+	return r.CampaignLink, nil
 }
 
 func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
@@ -2651,6 +2727,19 @@ func asConcurrencySlotQueued(err error) (*concurrencySlotQueuedError, bool) {
 		return q, true
 	}
 	return nil, false
+}
+
+// hostMemoryPressureCode is the host-dispatch marker's memory-pressure
+// refusal (backend/internal/server/host_dispatch.go): 409, the stage left
+// untouched at its park.
+const hostMemoryPressureCode = "host_memory_pressure"
+
+// asHostMemoryPressure reports whether a HostDispatchStage error is the 409
+// host_memory_pressure refusal (E88.2 / #4526). The match is on the structured
+// code, never on message text.
+func asHostMemoryPressure(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Code == hostMemoryPressureCode
 }
 
 // HostDispatchStage marks a host spawn against a runner_kind-locked-local stage
@@ -7241,6 +7330,9 @@ func (c *apiClient) ListRuns(ctx context.Context, f listRunsFilter) (*listRunsRe
 	}
 	if f.State != "" {
 		q.Set("state", f.State)
+	}
+	if f.RunnerKind != "" {
+		q.Set("runner_kind", f.RunnerKind)
 	}
 	if f.Limit > 0 {
 		q.Set("limit", strconv.Itoa(f.Limit))
