@@ -629,6 +629,8 @@ func TestReviewRedispatch_CompareOrigins(t *testing.T) {
 	}{
 		{name: "fixup_push", origin: reviewRoundOriginFixupPush, base: "base-pass", head: "head-pushed"},
 		{name: "consolidated", origin: reviewRoundOriginConsolidated, base: "consolidated-base", head: "headsha1"},
+		// #4795: a conflict_resolution round is rebuilt as ComparePatch(base_ref, merge head).
+		{name: "conflict_resolution", origin: reviewRoundOriginConflictResolution, base: "main", head: "headsha1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

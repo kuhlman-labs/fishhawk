@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
@@ -1139,4 +1140,476 @@ func TestRerunReview_FirstRoundReadAndAppendErrors(t *testing.T) {
 			t.Errorf("compare calls = %v, want 1 (the round body ran)", p)
 		}
 	})
+}
+
+// ---- Conflict-head arm (#4795) ----
+
+const (
+	conflictArmPreHead   = "premergehead0"
+	conflictArmMergeHead = "mergehead1"
+	conflictArmFullDiff  = `{"total_commits":1,"commits":[{"sha":"mergehead1"}],"files":[{"filename":"backend/x.go","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+FULL-DIFF-HUNK"}]}`
+)
+
+// newConflictArmFixture is an ELIGIBLE conflict-head fixture minus its
+// conflict rows: a wired compare answering FULL-DIFF-HUNK (unless noForge) and
+// an approved plan. It returns the compare-call recorder.
+func newConflictArmFixture(t *testing.T, opts redispatchFixtureOpts, noForge bool) (*redispatchFixture, func() []string) {
+	t.Helper()
+	gh, paths := recordingCompareClient(t, conflictArmFullDiff)
+	if !noForge {
+		opts.github = gh
+	}
+	f := newRedispatchFixture(t, opts)
+	f.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
+	return f, paths
+}
+
+func seedConflictArmTrigger(t *testing.T, f *redispatchFixture) int64 {
+	t.Helper()
+	return f.appendAt(t, f.implStage.ID, beforeBoot, CategoryStageConflictResolutionTriggered, map[string]any{
+		"branch": "fishhawk/run-1", "base_ref": "main", "expected_head_sha": conflictArmPreHead, "pass": 1,
+	})
+}
+
+// seedConflictArmPushed appends the conflict_resolution_pushed row C; extra
+// keys (a summary) are merged in.
+func seedConflictArmPushed(t *testing.T, f *redispatchFixture, extra map[string]any) int64 {
+	t.Helper()
+	p := map[string]any{
+		"run_id": f.runRow.ID.String(), "stage_id": f.implStage.ID.String(), "branch": "fishhawk/run-1",
+		"head_sha": conflictArmMergeHead, "base_sha": conflictArmPreHead, "files_changed_count": 1,
+	}
+	for k, v := range extra {
+		p[k] = v
+	}
+	return f.appendAt(t, f.implStage.ID, beforeBoot, CategoryConflictResolutionPushed, p)
+}
+
+// seedVerdictRound seeds a settled 2-agent round at head with two verdicts.
+func seedVerdictRound(t *testing.T, f *redispatchFixture, origin, head string) int64 {
+	t.Helper()
+	started := advisoryImplementStarted(origin, "main", head)
+	started.ConfiguredAgents = 2
+	seq := f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", started)
+	for range 2 {
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_reviewed", map[string]any{"verdict": "approve", "authority": "advisory"})
+	}
+	return seq
+}
+
+func decodeRerunOK(t *testing.T, rec *httptest.ResponseRecorder) rerunReviewResponse {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp rerunReviewResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp
+}
+
+func conflictArmRequestRows(t *testing.T, f *redispatchFixture) []reviewRoundRerunRequestedPayload {
+	t.Helper()
+	var out []reviewRoundRerunRequestedPayload
+	for _, e := range redispatchEntries(t, f.au, f.runRow.ID, categoryReviewRoundRerunRequested) {
+		var p reviewRoundRerunRequestedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode request row: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestRerunReview_ConflictHeadAfterVerdictRound is the issue case (D4): a
+// 2-verdict round at the pre-merge head, then a newer code conflict row at
+// the merge head. The arm starts a full-diff conflict_resolution round at the
+// merge head instead of refusing review_round_has_verdict.
+//
+// COUNTERFACTUAL: delete the arm's call site → this fixture reaches today's
+// verdict check → 409 review_round_has_verdict → RED.
+func TestRerunReview_ConflictHeadAfterVerdictRound(t *testing.T) {
+	f, paths := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	pre := seedVerdictRound(t, f, reviewRoundOriginTrace, conflictArmPreHead)
+	seedConflictArmTrigger(t, f)
+	c := seedConflictArmPushed(t, f, nil)
+
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	resp := decodeRerunOK(t, rec)
+	if resp.RoundOrigin != reviewRoundOriginConflictResolution || resp.HeadSHA != conflictArmMergeHead || resp.RerunOfSequence != 0 || resp.RoundAlreadyStarted {
+		t.Errorf("response = %+v, want origin conflict_resolution, head %s, rerun_of 0, not joined", resp, conflictArmMergeHead)
+	}
+	rows := conflictArmRequestRows(t, f)
+	if len(rows) != 1 || rows[0].ConflictResolutionSequence != c || rows[0].SupersededRoundSequence != pre ||
+		rows[0].RoundOrigin != reviewRoundOriginConflictResolution || rows[0].HeadSHA != conflictArmMergeHead || rows[0].RerunOfSequence != 0 {
+		t.Fatalf("request rows = %+v, want one naming C %d superseding %d", rows, c, pre)
+	}
+	started, seqs := startedAfter(t, f.au, f.runRow.ID, "implement_review_started", c)
+	if len(started) != 1 || seqs[0] != resp.NewRoundSequence {
+		t.Fatalf("rounds after C = %d (%v), want exactly one at %d", len(started), seqs, resp.NewRoundSequence)
+	}
+	if got := started[0]; got.RoundOrigin != reviewRoundOriginConflictResolution || got.RoundBaseSHA != "main" || got.HeadSHA != conflictArmMergeHead || got.RerunOf != 0 {
+		t.Errorf("started = %+v, want conflict_resolution main...%s with no re-run marker", got, conflictArmMergeHead)
+	}
+	// The reviewed diff is the full main...merge-head compare. (A second,
+	// pre-existing compare is resolveStageCumulativeEval's policy read, not
+	// the reviewed diff.)
+	full := 0
+	for _, p := range paths() {
+		if strings.HasSuffix(p, "/compare/main..."+conflictArmMergeHead) {
+			full++
+		}
+	}
+	if full != 1 {
+		t.Errorf("compare calls = %v, want exactly one main...%s", paths(), conflictArmMergeHead)
+	}
+}
+
+// TestRerunReview_ConflictArmWithNoPriorRound: a non-decomposed run with a
+// conflict row and NO started rows is reviewed.
+//
+// COUNTERFACTUAL: gate the arm on ok (after today's !ok branch) → the request
+// reaches rerunFirstConsolidatedRound → 409 no_review_round → RED.
+func TestRerunReview_ConflictArmWithNoPriorRound(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedConflictArmTrigger(t, f)
+	seedConflictArmPushed(t, f, nil)
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	resp := decodeRerunOK(t, rec)
+	if resp.RoundOrigin != reviewRoundOriginConflictResolution || resp.NewRoundSequence == 0 {
+		t.Errorf("response = %+v, want a conflict_resolution round", resp)
+	}
+	if rows := conflictArmRequestRows(t, f); len(rows) != 1 || rows[0].SupersededRoundSequence != 0 {
+		t.Errorf("request rows = %+v, want one with no superseded round", rows)
+	}
+}
+
+// TestRerunReview_ConflictArmDecomposedParentYields is E7: a decomposed parent
+// with zero rounds and a conflict row yields to rerunFirstConsolidatedRound,
+// which starts the CONSOLIDATED round, never a conflict_resolution one.
+//
+// COUNTERFACTUAL: delete the decomposed-parent yield → the arm fires →
+// response and started row carry conflict_resolution → RED.
+func TestRerunReview_ConflictArmDecomposedParentYields(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedFirstRoundParent(t, f)
+	seedConflictArmTrigger(t, f)
+	seedConflictArmPushed(t, f, nil)
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	resp := decodeRerunOK(t, rec)
+	if resp.RoundOrigin != "" {
+		t.Errorf("response round_origin = %q, want absent (first consolidated round)", resp.RoundOrigin)
+	}
+	started, _ := startedAfter(t, f.au, f.runRow.ID, "implement_review_started", 0)
+	if len(started) != 1 || started[0].RoundOrigin != reviewRoundOriginConsolidated {
+		t.Errorf("started = %+v, want one consolidated round", started)
+	}
+	if rows := conflictArmRequestRows(t, f); len(rows) != 1 || !rows[0].FirstRound || rows[0].ConflictResolutionSequence != 0 {
+		t.Errorf("request rows = %+v, want the first-round row", rows)
+	}
+}
+
+// TestRerunReview_ConflictRowOlderThanLatestRoundRefusesAsToday (D4): a
+// conflict row at H1, then a later 2-verdict round at H2 with no fix-up
+// trigger, refuses exactly as today.
+//
+// COUNTERFACTUAL: replace the "nothing started after C" check with true → the
+// arm fires (H2 differs from H1) → 200 → RED.
+func TestRerunReview_ConflictRowOlderThanLatestRoundRefusesAsToday(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedConflictArmTrigger(t, f)
+	seedConflictArmPushed(t, f, nil)
+	seedVerdictRound(t, f, reviewRoundOriginFixupPush, "laterhead2")
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	if code, _ := rerunErr(t, rec); rec.Code != http.StatusConflict || code != rerunCodeRoundHasVerdict {
+		t.Fatalf("status %d code %q, want 409 %s:\n%s", rec.Code, code, rerunCodeRoundHasVerdict, rec.Body.String())
+	}
+	if rows := conflictArmRequestRows(t, f); len(rows) != 0 {
+		t.Errorf("request rows = %d, want 0", len(rows))
+	}
+}
+
+// TestRerunReview_ConflictHeadRoundBeforeRowFallsThrough isolates the
+// same-head check: a 2-verdict round at (stage, H1) sequenced BEFORE C (built
+// by construction; unreachable in production), nothing started after C.
+//
+// COUNTERFACTUAL: replace the same-head check with true → the arm fires →
+// 200 → RED.
+func TestRerunReview_ConflictHeadRoundBeforeRowFallsThrough(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedConflictArmTrigger(t, f)
+	seedVerdictRound(t, f, reviewRoundOriginConflictResolution, conflictArmMergeHead)
+	seedConflictArmPushed(t, f, nil)
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	if code, _ := rerunErr(t, rec); rec.Code != http.StatusConflict || code != rerunCodeRoundHasVerdict {
+		t.Fatalf("status %d code %q, want 409 %s:\n%s", rec.Code, code, rerunCodeRoundHasVerdict, rec.Body.String())
+	}
+}
+
+// TestRerunReview_VerdictlessConflictRoundReRuns: an existing settled
+// zero-verdict conflict round is just the latest round, re-run through today's
+// ladder from its recorded compare and the artifact's redacted section.
+//
+// COUNTERFACTUAL: delete conflict_resolution from implementRoundRebuildSlug's
+// compare case → 409 review_rerun_ineligible unknown_round_source → RED.
+func TestRerunReview_VerdictlessConflictRoundReRuns(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedConflictArmTrigger(t, f)
+	content, _ := json.Marshal(artifact.ConflictResolutionDiffContent{
+		Schema: artifact.ConflictResolutionDiffSchema, HeadSHA: conflictArmMergeHead, BaseSHA: conflictArmPreHead,
+		ResolvedPaths: []string{"backend/x.go"}, Patch: "-<<<<<<< HEAD\n+REMERGE-RESOLVED-LINE",
+	})
+	sv := artifact.ConflictResolutionDiffSchema
+	a, err := f.art.Create(context.Background(), artifact.CreateParams{
+		StageID: f.implStage.ID, Kind: artifact.KindConflictResolutionDiff, SchemaVersion: &sv, Content: content, ContentHash: "crd-hash",
+	})
+	if err != nil {
+		t.Fatalf("seed artifact: %v", err)
+	}
+	seedConflictArmPushed(t, f, map[string]any{
+		"resolved_paths": []string{"backend/x.go"}, "resolution_diff_artifact_id": a.ID.String(),
+		"resolution_diff_sha256": "crd-hash", "resolution_diff_bytes": len(content),
+	})
+	round := f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginConflictResolution, "main", conflictArmMergeHead))
+	f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_failed", planreview.ReviewFailedPayload{Reason: "provider quota exhausted", Authority: planreview.AuthorityAdvisory})
+
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	resp := decodeRerunOK(t, rec)
+	if resp.RerunOfSequence != round || resp.RoundOrigin != "" {
+		t.Errorf("response = %+v, want today's re-run of %d", resp, round)
+	}
+	f.reviewer.mu.Lock()
+	calls := append([]string(nil), f.reviewer.calls...)
+	f.reviewer.mu.Unlock()
+	if len(calls) != 1 || !strings.Contains(calls[0], "FULL-DIFF-HUNK") ||
+		!strings.Contains(calls[0], "### How the merge conflict was resolved") || !strings.Contains(calls[0], "REMERGE-RESOLVED-LINE") {
+		t.Errorf("re-run prompts = %d, want one carrying the full diff and the artifact's resolution section", len(calls))
+	}
+}
+
+// TestRerunReview_ConflictArmPrecedesVerdictlessPreMergeRound: a settled
+// zero-verdict re-runnable round R1 at H0, then a conflict row at H1. The arm
+// reviews the merge head rather than re-running R1.
+//
+// COUNTERFACTUALS: move the arm below today's verdict / eligibility ladder →
+// 200 rerun_of R1 → RED. In-flight subtest: place the arm above the in-flight
+// refusals → 200 instead of 409 review_round_in_flight → RED.
+func TestRerunReview_ConflictArmPrecedesVerdictlessPreMergeRound(t *testing.T) {
+	t.Run("settled", func(t *testing.T) {
+		f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginFixupPush, "main", conflictArmPreHead))
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_failed", planreview.ReviewFailedPayload{Reason: "quota", Authority: planreview.AuthorityAdvisory})
+		seedConflictArmTrigger(t, f)
+		seedConflictArmPushed(t, f, nil)
+		rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+		f.s.waitBackgroundReviews()
+		resp := decodeRerunOK(t, rec)
+		if resp.RoundOrigin != reviewRoundOriginConflictResolution || resp.HeadSHA != conflictArmMergeHead || resp.RerunOfSequence != 0 {
+			t.Errorf("response = %+v, want the merge-head conflict round, not a re-run of R1", resp)
+		}
+	})
+	t.Run("in flight", func(t *testing.T) {
+		f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginFixupPush, "main", conflictArmPreHead))
+		seedConflictArmTrigger(t, f)
+		seedConflictArmPushed(t, f, nil)
+		rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+		f.s.waitBackgroundReviews()
+		if code, d := rerunErr(t, rec); rec.Code != http.StatusConflict || code != rerunCodeRoundInFlight || d["reason"] != rerunInFlightUnsettled {
+			t.Fatalf("status %d code %q reason %v, want 409 %s %s", rec.Code, code, d["reason"], rerunCodeRoundInFlight, rerunInFlightUnsettled)
+		}
+		if rows := conflictArmRequestRows(t, f); len(rows) != 0 {
+			t.Errorf("request rows = %d, want 0", len(rows))
+		}
+	})
+}
+
+// conflictRaceAudit injects an implement_review_started at (stage, merge
+// head) immediately BEFORE the review_round_rerun_requested append — the
+// automatic dispatch landing between the arm's check and its append — and
+// stamps the appended entry's sequence the way the real store does.
+type conflictRaceAudit struct {
+	*auditFake
+	f        *redispatchFixture
+	injected int64
+}
+
+func (a *conflictRaceAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == categoryReviewRoundRerunRequested && a.injected == 0 {
+		b, _ := json.Marshal(advisoryImplementStarted(reviewRoundOriginConflictResolution, "main", conflictArmMergeHead))
+		sid := a.f.implStage.ID
+		if _, err := a.auditFake.AppendChained(ctx, audit.ChainAppendParams{
+			RunID: p.RunID, StageID: &sid, Timestamp: time.Now().UTC(), Category: "implement_review_started", Payload: b,
+		}); err != nil {
+			return nil, err
+		}
+		a.mu.Lock()
+		a.injected = int64(len(a.appended))
+		a.mu.Unlock()
+	}
+	e, err := a.auditFake.AppendChained(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	e.Sequence = int64(len(a.appended))
+	a.mu.Unlock()
+	return e, nil
+}
+
+// TestRerunReview_ConflictArmJoinsConcurrentAutoRound (D4 race): the
+// automatic dispatch's round lands between the arm's check and its append;
+// the arm's own dispatch dedups on #797 and the arm answers 200 joining it.
+//
+// COUNTERFACTUAL: bound the post-dispatch read by the request row instead of
+// by C → nothing is found → 502 → RED.
+func TestRerunReview_ConflictArmJoinsConcurrentAutoRound(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedConflictArmTrigger(t, f)
+	c := seedConflictArmPushed(t, f, nil)
+	race := &conflictRaceAudit{auditFake: f.au, f: f}
+	f.s.cfg.AuditRepo = race
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	resp := decodeRerunOK(t, rec)
+	if race.injected == 0 || resp.NewRoundSequence != race.injected || !resp.RoundAlreadyStarted {
+		t.Errorf("response = %+v, want new_round_sequence %d with round_already_started", resp, race.injected)
+	}
+	if started, _ := startedAfter(t, f.au, f.runRow.ID, "implement_review_started", c); len(started) != 1 {
+		t.Errorf("rounds at the merge head = %d, want exactly 1", len(started))
+	}
+}
+
+// TestRerunReview_ConflictArmRefusals: one subtest per rung, each on an
+// otherwise eligible fixture, each reading the chain for ZERO request rows.
+//
+// COUNTERFACTUAL: delete a rung → its fixture reaches the append and writes
+// the request row → RED.
+func TestRerunReview_ConflictArmRefusals(t *testing.T) {
+	cases := []struct {
+		name       string
+		opts       redispatchFixtureOpts
+		noForge    bool
+		noTrigger  bool
+		after      func(t *testing.T, f *redispatchFixture)
+		wantReason string
+	}{
+		{name: "reviewer unwired", opts: redispatchFixtureOpts{reviewerUnwired: true}, wantReason: redispatchSlugReviewerUnwired},
+		{name: "no agent reviewers", opts: redispatchFixtureOpts{spec: specRedispatchNoReviewers}, wantReason: rerunSlugNoAgentReviewers},
+		{name: "gating authority", opts: redispatchFixtureOpts{spec: specRerunGatingImplement}, wantReason: redispatchSlugGatingAuthority},
+		{name: "superseded by fixup", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryStageFixupTriggered, map[string]any{"stage_id": f.implStage.ID.String()})
+		}, wantReason: redispatchSlugSupersededByFixup},
+		// E8: a head-recording row after C names another head — the PR no
+		// longer carries C's head.
+		{name: "E8 branch_rebased after C", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{"new_head_sha": "rebasedhead"})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 branch_reset after C", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchReset, map[string]any{"reset_to_sha": "resethead", "prior_head_sha": conflictArmMergeHead})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 acceptance_scenarios_pushed after C", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, "acceptance_scenarios_pushed", map[string]any{"head_sha": "scenariohead"})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 operator_commit_vouched after C", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": "vouchedhead"})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "E8 moved after an up-to-date rebase", after: func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{
+				"prior_head_sha": conflictArmMergeHead, "new_head_sha": conflictArmMergeHead, "already_up_to_date": true})
+			f.appendAt(t, f.implStage.ID, beforeBoot, "child_pushed", map[string]any{"head_sha": "childhead"})
+		}, wantReason: rerunSlugConflictHeadMoved},
+		{name: "implement stage terminal", opts: redispatchFixtureOpts{implStageState: run.StageStateFailed}, wantReason: redispatchSlugImplementStageTerminal},
+		{name: "advanced past review", opts: redispatchFixtureOpts{reviewStageState: run.StageStateSucceeded}, wantReason: redispatchSlugAdvancedPastReview},
+		{name: "conflict base unresolved", noTrigger: true, wantReason: conflictResolutionSlugBaseUnknown},
+		{name: "forge compare unavailable", noForge: true, wantReason: redispatchSlugForgeCompareUnavail},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, paths := newConflictArmFixture(t, tc.opts, tc.noForge)
+			if !tc.noTrigger {
+				seedConflictArmTrigger(t, f)
+			}
+			c := seedConflictArmPushed(t, f, nil)
+			if tc.after != nil {
+				tc.after(t, f)
+			}
+			rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+			f.s.waitBackgroundReviews()
+			code, d := rerunErr(t, rec)
+			if rec.Code != http.StatusConflict || code != rerunCodeIneligible || d["reason"] != tc.wantReason {
+				t.Fatalf("status %d code %q reason %v, want 409 %s %s:\n%s", rec.Code, code, d["reason"], rerunCodeIneligible, tc.wantReason, rec.Body.String())
+			}
+			if d["head_sha"] != conflictArmMergeHead || d["conflict_resolution_sequence"] != float64(c) {
+				t.Errorf("details = %v, want head_sha %s and conflict_resolution_sequence %d", d, conflictArmMergeHead, c)
+			}
+			assertNothingRerun(t, f, 0)
+			if p := paths(); len(p) != 0 {
+				t.Errorf("compare calls = %v, want none", p)
+			}
+		})
+	}
+}
+
+// TestRerunReview_ConflictArmHeadUnmovedRowsStillFire (E8): a head-recording
+// row after C that still names C's head moves nothing, so the arm starts the
+// round. An already-up-to-date rebase check keeps new_head_sha equal to the
+// prior head; a vouch of the merge head records the same head.
+//
+// COUNTERFACTUAL: refuse on ANY head-recording row after C (the category-only
+// rung) → 409 conflict_head_moved → RED.
+func TestRerunReview_ConflictArmHeadUnmovedRowsStillFire(t *testing.T) {
+	cases := map[string]func(t *testing.T, f *redispatchFixture){
+		"already up-to-date rebase": func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{
+				"prior_head_sha": conflictArmMergeHead, "new_head_sha": conflictArmMergeHead, "already_up_to_date": true})
+		},
+		"vouch of the merge head": func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": conflictArmMergeHead})
+		},
+		"reset back to the merge head": func(t *testing.T, f *redispatchFixture) {
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchRebased, map[string]any{"new_head_sha": "rebasedhead"})
+			f.appendAt(t, f.implStage.ID, beforeBoot, CategoryBranchReset, map[string]any{"reset_to_sha": conflictArmMergeHead, "prior_head_sha": "rebasedhead"})
+		},
+	}
+	for name, after := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+			seedConflictArmTrigger(t, f)
+			seedConflictArmPushed(t, f, nil)
+			after(t, f)
+			rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+			f.s.waitBackgroundReviews()
+			if resp := decodeRerunOK(t, rec); resp.RoundOrigin != reviewRoundOriginConflictResolution || resp.HeadSHA != conflictArmMergeHead {
+				t.Errorf("response = %+v, want a conflict_resolution round at %s", resp, conflictArmMergeHead)
+			}
+		})
+	}
+}
+
+// TestRerunReview_DocsOnlySkipThenRerunStartsRound: after a docs-only skip,
+// the operator's re-run still starts a conflict round — the arm ignores the
+// docs_only class because the operator asked.
+//
+// COUNTERFACTUAL: make the arm refuse when a resolution_docs_only skip row
+// exists → 409 → RED.
+func TestRerunReview_DocsOnlySkipThenRerunStartsRound(t *testing.T) {
+	f, _ := newConflictArmFixture(t, redispatchFixtureOpts{}, false)
+	seedConflictArmTrigger(t, f)
+	seedConflictArmPushed(t, f, map[string]any{"resolved_paths": []string{"docs/a.md"}, "resolution_diff_unavailable": conflictResolutionDiffStoreFailed})
+	f.appendAt(t, f.implStage.ID, beforeBoot, CategoryConflictResolutionReviewSkipped, map[string]any{
+		"head_sha": conflictArmMergeHead, "reason": conflictResolutionSkipDocsOnly, "resolved_paths": []string{"docs/a.md"},
+	})
+	rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	if resp := decodeRerunOK(t, rec); resp.RoundOrigin != reviewRoundOriginConflictResolution || resp.NewRoundSequence == 0 {
+		t.Errorf("response = %+v, want a conflict_resolution round", resp)
+	}
 }

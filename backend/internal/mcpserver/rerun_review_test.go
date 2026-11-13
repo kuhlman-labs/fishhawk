@@ -161,6 +161,11 @@ func TestRerunReview_RefusalsSurfaceVerbatimWithHint(t *testing.T) {
 		// The first-round fan-in hold (#4282): details.merge_candidate_state
 		// passes through verbatim and the hint names the await / fix-up remedy.
 		{http.StatusBadGateway, "review_rerun_not_started", `"merge_candidate_state":"failed","reason":"fanin_verify_held"`, "except fanin_verify_held"},
+		// The conflict-head arm (#4795): an arm refusal carries
+		// details.conflict_resolution_sequence and its reason-specific remedy.
+		{http.StatusConflict, "review_rerun_ineligible", `"conflict_resolution_sequence":7,"head_sha":"m1","reason":"conflict_base_unresolved"`, "fishhawk_fixup_stage on the implement stage"},
+		{http.StatusConflict, "review_rerun_ineligible", `"conflict_resolution_sequence":7,"head_sha":"m1","reason":"superseded_by_fixup"`, "fishhawk_fixup_stage on the implement stage"},
+		{http.StatusConflict, "review_rerun_ineligible", `"conflict_resolution_sequence":7,"head_sha":"m1","reason":"conflict_head_moved"`, "no longer carries that merge head"},
 		{http.StatusForbidden, "operator_agent_forbidden", "", ""},
 		{http.StatusNotFound, "run_not_found", "", ""},
 	}
@@ -220,5 +225,61 @@ func TestRerunReviewRefusalHint(t *testing.T) {
 	}
 	if got := rerunReviewRefusalHint("insufficient_scope"); got != "" {
 		t.Errorf("hint(insufficient_scope) = %q, want empty", got)
+	}
+	// The conflict-head arm's reason hints (#4795).
+	for _, reason := range []string{"conflict_base_unresolved", "superseded_by_fixup"} {
+		if got := rerunConflictArmHint(reason); !strings.Contains(got, "fishhawk_fixup_stage") {
+			t.Errorf("arm hint(%s) = %q, want it to name fishhawk_fixup_stage", reason, got)
+		}
+	}
+	if got := rerunConflictArmHint("conflict_head_moved"); got == "" {
+		t.Error("arm hint(conflict_head_moved) is empty, want a remedy")
+	}
+	if got := rerunConflictArmHint("gating_authority"); got != "" {
+		t.Errorf("arm hint(gating_authority) = %q, want empty (the generic hint applies)", got)
+	}
+}
+
+// TestRerunReview_ConflictResolutionMessage (#4795): a 200 from the
+// conflict-head arm decodes round_origin / head_sha / round_already_started
+// and names the merge head — "started a full-diff conflict-resolution" round,
+// or "joined" the automatic dispatch's round — never a re-run of "round 0" or
+// a decomposed parent's FIRST consolidated round.
+//
+// COUNTERFACTUAL: drop the conflict_resolution cases in rerunReview → the
+// message falls to the first-consolidated-round wording → RED.
+func TestRerunReview_ConflictResolutionMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		joined bool
+		want   string
+	}{
+		{"started", false, "started a full-diff conflict-resolution implement-review round on merge head mergeH1"},
+		{"joined", true, "joined the conflict-resolution round already started on head mergeH1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			joined := "false"
+			if tc.joined {
+				joined = "true"
+			}
+			stub := &rerunReviewStub{body: `{"run_id":"` + runID.String() + `","stage":"implement","stage_id":"s1","rerun_of_sequence":0,"new_round_sequence":31,"configured_agents":1,"round_origin":"conflict_resolution","head_sha":"mergeH1","round_already_started":` + joined + `}`}
+			_, out, err := stub.resolver(t).rerunReview(context.Background(), nil, RerunReviewInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("rerunReview: %v", err)
+			}
+			if out.Result.RoundOrigin != "conflict_resolution" || out.Result.HeadSHA != "mergeH1" || out.Result.RoundAlreadyStarted != tc.joined {
+				t.Errorf("result = %+v, want the arm fields decoded", out.Result)
+			}
+			if !strings.Contains(out.Message, tc.want) || !strings.Contains(out.Message, "round 31") {
+				t.Errorf("message = %q, want %q and round 31", out.Message, tc.want)
+			}
+			if strings.Contains(out.Message, "FIRST consolidated") || strings.Contains(out.Message, "round 0") {
+				t.Errorf("message = %q, want no first-round or round-0 wording", out.Message)
+			}
+			if out.NextAction == nil || out.NextAction.Action != "fishhawk_await_review" || out.NextAction.Params["stage"] != "implement" {
+				t.Errorf("next_action = %+v, want fishhawk_await_review stage=implement", out.NextAction)
+			}
+		})
 	}
 }

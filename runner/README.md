@@ -1144,6 +1144,67 @@ rewrites the ref after the push is accepted.
 WHAT is published; `verifyPushDestination` (above) fixes WHERE, and it runs in
 the same pre-remote window for the same reason.
 
+### Resolution summary on the report ([#4795](https://github.com/kuhlman-labs/fishhawk/issues/4795))
+
+A passing pass can ship a **resolution summary** on its
+`conflict_resolution_pushed` report, so the backend's full-diff re-review of the
+merge head can show the reviewer how the conflicts were resolved
+(`backend/internal/server/docs/review.md` § Conflict-resolution re-review).
+
+- **Capability handshake.** The runner computes the summary ONLY when the served
+  prompt carries `conflict_resolution_summary: true`
+  (`FetchedPrompt.ConflictResolutionSummary` → `conflictResolutionRequest.SupportsSummary`,
+  read through `shipsSummary()`). Without it neither the summary's config read
+  nor the remerge-diff runs, and the report body is byte-identical to the
+  pre-#4795 shape, so either skew direction is safe.
+- **What ships.** Only after `verifyAuthorizedCommit` accepts the merge commit,
+  `conflictResolutionSummary` ships `resolved_paths` (the sorted conflicted set,
+  capped at 200 with `resolved_paths_truncated`) and `resolution_patch`. A
+  conflicted path the backend's wire rule refuses (a control byte such as a
+  newline, a backslash, a `..` segment, over 512 bytes: `shippableResolvedPath`)
+  is omitted with `resolved_paths_truncated`, because one such path would make
+  the post-push report a 400; with no shippable path left, no summary ships.
+  The patch is the
+  merge commit's `git -c merge.renormalize=false show --remerge-diff --format=
+  --no-color --no-ext-diff --no-textconv <head>`, run through `gitOutRaw` (so
+  `HardeningArgs` applies) and cut rune-safe at 24 KiB with
+  `resolution_patch_truncated`. Its `-` lines are git's conflict-marker
+  re-merge, its `+` lines the committed resolution.
+- **Merge drivers never run (D8).** A remerge-diff re-merges EVERY path the merge
+  touched, conflicted or not, and runs any custom merge driver the path's
+  attributes name. git resolves a custom driver only from a
+  `merge.<name>.driver` config key; an attribute naming an undefined driver
+  falls back to the built-in text merge. So the summary reads the effective
+  config (`readGitConfigFn`, `git config --list -z`: every scope, `include.path`
+  resolved) and, when ANY `merge.<name>.driver` key exists (section and variable
+  matched case-insensitively), does NOT run the remerge-diff. It ships reason
+  `remerge_diff_custom_merge_driver` and the paths. An unreadable config cannot
+  prove that no driver exists, so it ships `remerge_diff_failed` without running
+  the remerge-diff either. The `-c merge.renormalize=false` override keeps the
+  re-merge from running a `filter.<name>.clean`/`smudge` command, even when the
+  repository sets `merge.renormalize=true`.
+- **Never a refusal.** A remerge-diff error (for example a git older than 2.36)
+  ships `resolution_patch_unavailable_reason: remerge_diff_failed` and a detail cut
+  rune-safe to 256 bytes. The paths still ship and the push still happens.
+- **Shrink order.** `upload.shrinkConflictResolutionSummary` budgets the
+  MARSHALLED body against `MaxPullRequestReportBytes` (JSON escapes `<`, `>`, `&`
+  to six bytes each). It first truncates the patch rune-safe, keeping its head.
+  It then drops the patch with reason `resolution_patch_exceeds_report_cap` and no
+  detail, and only then cuts the path list to its largest fitting prefix (at
+  least one path) with `resolved_paths_truncated`. When not even one path fits,
+  every summary field is cleared and the legacy body ships.
+
+The runner text is UNTRUSTED input to the backend, which validates the fields,
+secret-scans the raw patch, stores it redacted, and maps the reason onto a
+closed slug set. Tests: `conflictresolve_test.go`
+(`TestConflictResolutionStage_ReportCarriesRemergeDiff`,
+`TestConflictResolutionStage_NoCapabilityShipsLegacyBody`,
+`TestConflictResolutionStage_RemergeDiffFailureStillPushes`,
+`TestConflictResolutionSummary_CustomMergeDriverNeverExecutes`, whose
+fixture-validity step proves an UNGUARDED remerge-diff runs the driver on a
+non-conflicted path) and `internal/upload/upload_pullrequest_test.go`
+(`TestShipPullRequest_ConflictResolutionSummaryFitsCap`).
+
 
 ## Local invocation
 

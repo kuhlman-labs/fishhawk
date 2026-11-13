@@ -555,3 +555,52 @@ func TestPostgres_ListForStage_OrderedByCreatedAt(t *testing.T) {
 		}
 	}
 }
+
+// TestPostgres_ConflictResolutionDiff_RoundTripAndCrossCheck pins #4795 E4:
+// a conflict_resolution_diff artifact round-trips through Create, Get and
+// GetByHash on the real DB (migration 0117 admits the kind), and the loader's
+// cross-check over the READ-BACK row decodes the patch and accepts the stored
+// hash even though JSONB normalised the content bytes.
+func TestPostgres_ConflictResolutionDiff_RoundTripAndCrossCheck(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := artifact.NewPostgresRepository(pool)
+	stageID := makeStage(t, pool)
+
+	body, err := json.Marshal(artifact.ConflictResolutionDiffContent{
+		Schema: artifact.ConflictResolutionDiffSchema, HeadSHA: "h1", BaseSHA: "h0",
+		ResolvedPaths: []string{"backend/x.go"}, Patch: "-<<<<<<< HEAD\n+resolved\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256Hex(body)
+	schema := artifact.ConflictResolutionDiffSchema
+	created, err := repo.Create(context.Background(), artifact.CreateParams{
+		StageID: stageID, Kind: artifact.KindConflictResolutionDiff, SchemaVersion: &schema,
+		Content: body, ContentHash: hash,
+	})
+	if err != nil {
+		t.Fatalf("Create conflict_resolution_diff (migration 0117 must admit the kind): %v", err)
+	}
+	got, err := repo.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if sha256Hex(got.Content) == hash {
+		t.Logf("JSONB kept the bytes identical; the column-to-row comparison is still the one exercised")
+	}
+	byHash, err := repo.GetByHash(context.Background(), stageID, hash)
+	if err != nil || byHash.ID != created.ID {
+		t.Fatalf("GetByHash = %v, %v; want the created artifact", byHash, err)
+	}
+	content, cause := artifact.CheckConflictResolutionDiff(got, stageID, hash, "h1")
+	if cause != "" {
+		t.Fatalf("cross-check over the read-back row failed: %s", cause)
+	}
+	if content.Patch != "-<<<<<<< HEAD\n+resolved\n" || len(content.ResolvedPaths) != 1 {
+		t.Errorf("decoded content = %+v", content)
+	}
+	if _, cause := artifact.CheckConflictResolutionDiff(got, stageID, hash, "other-head"); cause != artifact.ConflictResolutionDiffCauseHeadMismatch {
+		t.Errorf("head mismatch cause = %q", cause)
+	}
+}

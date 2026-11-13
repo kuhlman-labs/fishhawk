@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/conflictresolve"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
@@ -2679,4 +2680,390 @@ func TestConflictResolutionSpawnMergesTrimpathIntoGOFLAGS(t *testing.T) {
 	if len(got) != 1 || got[0] != want[0] {
 		t.Errorf("child GOFLAGS entries = %q, want exactly %q — the conflict-resolution spawn must compose its env through agentenv.Env (#4180)", got, want)
 	}
+}
+
+// --- #4795 resolution summary (capability-gated remerge-diff) ---
+
+// TestConflictResolutionFromPrompt_ReadsSummaryCapability decodes the served
+// prompt JSON: `conflict_resolution_summary: true` sets SupportsSummary, and
+// its absence leaves the request on the legacy body.
+func TestConflictResolutionFromPrompt_ReadsSummaryCapability(t *testing.T) {
+	const base = `"conflict_resolution":true,"conflict_resolution_branch":"feature",` +
+		`"conflict_resolution_base_ref":"main","conflict_resolution_expected_head_sha":"abc"`
+	for _, tc := range []struct {
+		name string
+		json string
+		want bool
+	}{
+		{"advertised", `{` + base + `,"conflict_resolution_summary":true}`, true},
+		{"absent", `{` + base + `}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var p upload.FetchedPrompt
+			if err := json.Unmarshal([]byte(tc.json), &p); err != nil {
+				t.Fatal(err)
+			}
+			req := conflictResolutionFromPrompt(&p)
+			if req == nil {
+				t.Fatal("fully populated instruction yielded no pass")
+			}
+			if req.SupportsSummary != tc.want || req.shipsSummary() != tc.want {
+				t.Errorf("SupportsSummary = %t, shipsSummary() = %t, want %t", req.SupportsSummary, req.shipsSummary(), tc.want)
+			}
+		})
+	}
+}
+
+// crSummarySeams wraps readGitConfigFn and remergeDiffFn with call counters
+// (delegating to the originals unless remergeErr is set), restoring both.
+func crSummarySeams(t *testing.T, remergeErr error) (configCalls, remergeCalls *int) {
+	t.Helper()
+	origCfg, origRemerge := readGitConfigFn, remergeDiffFn
+	t.Cleanup(func() { readGitConfigFn, remergeDiffFn = origCfg, origRemerge })
+	var c, r int
+	readGitConfigFn = func(ctx context.Context, repoDir string) (string, error) {
+		c++
+		return origCfg(ctx, repoDir)
+	}
+	remergeDiffFn = func(ctx context.Context, repoDir, head string) ([]byte, error) {
+		r++
+		if remergeErr != nil {
+			return nil, remergeErr
+		}
+		return origRemerge(ctx, repoDir, head)
+	}
+	return &c, &r
+}
+
+// crRunSummaryStage drives the whole stage on the dispatch fixture with the
+// capability set to supports and returns the single terminal report.
+func crRunSummaryStage(t *testing.T, supports bool) upload.ShipPullRequestArgs {
+	t.Helper()
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	fp := &fakePusher{}
+	// Resolve to text from NEITHER side, so the remerge-diff carries a `+` line.
+	crStageHarness(t, fp, func(cfg config) error {
+		return os.WriteFile(filepath.Join(cfg.workingDir, "conflict.txt"), []byte("ours and theirs\n"), 0o644)
+	})
+	req := crDispatchRequest(featureTip)
+	req.SupportsSummary = supports
+	client := &crFakeUpload{}
+	if code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), req,
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard); code != exitOK {
+		t.Fatalf("exit code = %d, want %d (ships %+v)", code, exitOK, client.ships)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("the merge commit was never pushed")
+	}
+	if len(client.ships) != 1 || client.ships[0].Outcome != "conflict_resolution_pushed" {
+		t.Fatalf("ships = %+v, want one conflict_resolution_pushed report", client.ships)
+	}
+	return client.ships[0]
+}
+
+// TestConflictResolutionStage_ReportCarriesRemergeDiff is the runner end to
+// end: a real two-branch conflict, the capability advertised, and the report
+// carries the resolved paths and a remerge-diff whose `-` side is git's
+// conflict-marker re-merge and whose `+` side is the committed resolution.
+func TestConflictResolutionStage_ReportCarriesRemergeDiff(t *testing.T) {
+	got := crRunSummaryStage(t, true)
+	if want := []string{"conflict.txt"}; fmt.Sprint(got.ResolvedPaths) != fmt.Sprint(want) || got.ResolvedPathsTruncated {
+		t.Errorf("resolved paths = %v (truncated %t), want %v", got.ResolvedPaths, got.ResolvedPathsTruncated, want)
+	}
+	if got.ResolutionPatchUnavailableReason != "" || got.ResolutionPatchTruncated {
+		t.Errorf("reason = %q truncated = %t, want a whole patch", got.ResolutionPatchUnavailableReason, got.ResolutionPatchTruncated)
+	}
+	lines := strings.Split(got.ResolutionPatch, "\n")
+	var removal, resolved bool
+	claimed := map[string]bool{}
+	for _, p := range got.ResolvedPaths {
+		claimed[p] = true
+	}
+	for _, l := range lines {
+		removal = removal || strings.HasPrefix(l, "-<<<<<<<")
+		resolved = resolved || l == "+ours and theirs"
+		if rest, ok := strings.CutPrefix(l, "diff --git a/"); ok {
+			path, _, _ := strings.Cut(rest, " b/")
+			if !claimed[path] {
+				t.Errorf("patch names %q, outside resolved_paths %v", path, got.ResolvedPaths)
+			}
+		}
+	}
+	if !removal || !resolved {
+		t.Errorf("patch lacks the conflict-marker removal (%t) or the resolved + line (%t):\n%s", removal, resolved, got.ResolutionPatch)
+	}
+}
+
+// TestConflictResolutionStage_NoCapabilityShipsLegacyBody is the D5 capability
+// gate: without the advert the report carries no summary field and neither the
+// summary's config read nor the remerge-diff runs. The pass itself reads the
+// config three times (baseline, observe, post-add), so the summary's read is
+// measured as the delta against an otherwise identical advertised run.
+func TestConflictResolutionStage_NoCapabilityShipsLegacyBody(t *testing.T) {
+	var advertisedCfg int
+	t.Run("advertised_twin", func(t *testing.T) {
+		cfgCalls, remergeCalls := crSummarySeams(t, nil)
+		crRunSummaryStage(t, true)
+		advertisedCfg = *cfgCalls
+		if *remergeCalls != 1 {
+			t.Errorf("advertised remergeDiffFn calls = %d, want 1", *remergeCalls)
+		}
+	})
+	cfgCalls, remergeCalls := crSummarySeams(t, nil)
+	got := crRunSummaryStage(t, false)
+	if *remergeCalls != 0 {
+		t.Errorf("remergeDiffFn calls = %d without the capability, want 0", *remergeCalls)
+	}
+	if *cfgCalls != advertisedCfg-1 {
+		t.Errorf("readGitConfigFn calls = %d without the capability, want %d (the advertised run's %d minus the summary read)",
+			*cfgCalls, advertisedCfg-1, advertisedCfg)
+	}
+	if got.ResolvedPaths != nil || got.ResolvedPathsTruncated || got.ResolutionPatch != "" || got.ResolutionPatchTruncated ||
+		got.ResolutionPatchUnavailableReason != "" || got.ResolutionPatchUnavailableDetail != "" {
+		t.Errorf("legacy report carries summary fields: %+v", got)
+	}
+}
+
+// TestConflictResolutionStage_RemergeDiffFailureStillPushes: a remerge-diff
+// error never refuses the pass. The report still pushes and ships the paths,
+// reason remerge_diff_failed, and a detail cut rune-safe to 256 bytes.
+func TestConflictResolutionStage_RemergeDiffFailureStillPushes(t *testing.T) {
+	_, remergeCalls := crSummarySeams(t, errors.New("git show --remerge-diff: "+strings.Repeat("é", 400)))
+	got := crRunSummaryStage(t, true)
+	if *remergeCalls != 1 {
+		t.Errorf("remergeDiffFn calls = %d, want 1", *remergeCalls)
+	}
+	if got.ResolutionPatchUnavailableReason != reasonRemergeDiffFailed || got.ResolutionPatch != "" {
+		t.Errorf("reason = %q patch %q, want %q and no patch", got.ResolutionPatchUnavailableReason, got.ResolutionPatch, reasonRemergeDiffFailed)
+	}
+	if d := got.ResolutionPatchUnavailableDetail; d == "" || len(d) > maxRemergeDetailBytes || !utf8.ValidString(d) {
+		t.Errorf("detail = %d bytes (valid UTF-8 %t), want 1..%d valid bytes", len(d), utf8.ValidString(d), maxRemergeDetailBytes)
+	}
+	if fmt.Sprint(got.ResolvedPaths) != "[conflict.txt]" {
+		t.Errorf("resolved paths = %v, want [conflict.txt]", got.ResolvedPaths)
+	}
+}
+
+// TestConflictResolutionSummary_ConfigReadFailureSkipsRemerge: an unreadable
+// config cannot prove no merge driver is defined, so the remerge-diff is not
+// run; the paths still ship under remerge_diff_failed.
+func TestConflictResolutionSummary_ConfigReadFailureSkipsRemerge(t *testing.T) {
+	_, remergeCalls := crSummarySeams(t, nil)
+	readGitConfigFn = func(context.Context, string) (string, error) { return "", errors.New("read git config: boom") }
+	got := conflictResolutionSummary(context.Background(), t.TempDir(), "HEAD",
+		map[string]conflictresolve.ConflictedFile{"b.txt": {}, "a.txt": {}})
+	if *remergeCalls != 0 {
+		t.Errorf("remergeDiffFn calls = %d after a config read failure, want 0", *remergeCalls)
+	}
+	if got.UnavailableReason != reasonRemergeDiffFailed || fmt.Sprint(got.ResolvedPaths) != "[a.txt b.txt]" {
+		t.Errorf("summary = %+v, want remerge_diff_failed with sorted paths", got)
+	}
+}
+
+// TestConflictResolutionSummary_CapsPathsAndPatch pins the two rune-safe caps:
+// over maxResolutionSummaryPaths paths are cut with the truncated flag, and a
+// patch over maxRemergePatchBytes is cut on a rune boundary with its flag.
+func TestConflictResolutionSummary_CapsPathsAndPatch(t *testing.T) {
+	crSummarySeams(t, nil)
+	readGitConfigFn = func(context.Context, string) (string, error) { return "", nil }
+	remergeDiffFn = func(context.Context, string, string) ([]byte, error) {
+		// 2x the cap in 2-byte runes behind a 1-byte prefix, so a byte cut at
+		// the cap lands mid-rune.
+		return []byte("x" + strings.Repeat("é", maxRemergePatchBytes)), nil
+	}
+	conflicted := map[string]conflictresolve.ConflictedFile{}
+	for i := 0; i < maxResolutionSummaryPaths+50; i++ {
+		conflicted[fmt.Sprintf("p%03d.txt", i)] = conflictresolve.ConflictedFile{}
+	}
+	got := conflictResolutionSummary(context.Background(), t.TempDir(), "HEAD", conflicted)
+	if len(got.ResolvedPaths) != maxResolutionSummaryPaths || !got.ResolvedPathsTruncated || got.ResolvedPaths[0] != "p000.txt" {
+		t.Errorf("paths = %d (truncated %t), want %d sorted with the flag", len(got.ResolvedPaths), got.ResolvedPathsTruncated, maxResolutionSummaryPaths)
+	}
+	if len(got.Patch) > maxRemergePatchBytes || len(got.Patch) == 0 || !utf8.ValidString(got.Patch) || !got.PatchTruncated {
+		t.Errorf("patch = %d bytes (valid %t, truncated %t), want <= %d valid with the flag",
+			len(got.Patch), utf8.ValidString(got.Patch), got.PatchTruncated, maxRemergePatchBytes)
+	}
+}
+
+// TestConflictResolutionSummary_DropsPathsTheBackendRefuses: a conflicted
+// path the backend's wire rule refuses (git supports newline-bearing names) is
+// dropped from resolved_paths with the truncated flag, so the report the
+// runner sends after its push is never a 400; with no shippable path left, no
+// summary ships and the remerge-diff is not run.
+func TestConflictResolutionSummary_DropsPathsTheBackendRefuses(t *testing.T) {
+	crSummarySeams(t, nil)
+	readGitConfigFn = func(context.Context, string) (string, error) { return "", nil }
+	remergeCalls := new(int)
+	remergeDiffFn = func(context.Context, string, string) ([]byte, error) { *remergeCalls++; return []byte("PATCH"), nil }
+	bad := []string{"new\nline.go", "tab\t.go", "cr\r.go", "del\x7f.go", "back\\slash.go", "a/../b.go",
+		strings.Repeat("p", maxResolutionSummaryPathBytes+1)}
+	conflicted := map[string]conflictresolve.ConflictedFile{"ok.go": {}, strings.Repeat("q", maxResolutionSummaryPathBytes): {}}
+	for _, p := range bad {
+		conflicted[p] = conflictresolve.ConflictedFile{}
+	}
+	got := conflictResolutionSummary(context.Background(), t.TempDir(), "HEAD", conflicted)
+	if len(got.ResolvedPaths) != 2 || got.ResolvedPaths[0] != "ok.go" || !got.ResolvedPathsTruncated || got.Patch != "PATCH" {
+		t.Errorf("summary = %d paths %q (truncated %t, patch %q), want ok.go and the 512-byte path, truncated, with the patch",
+			len(got.ResolvedPaths), got.ResolvedPaths, got.ResolvedPathsTruncated, got.Patch)
+	}
+	*remergeCalls = 0
+	only := map[string]conflictresolve.ConflictedFile{}
+	for _, p := range bad {
+		only[p] = conflictresolve.ConflictedFile{}
+	}
+	if got := conflictResolutionSummary(context.Background(), t.TempDir(), "HEAD", only); fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", conflictResolutionSummaryResult{}) || *remergeCalls != 0 {
+		t.Errorf("all-unshippable summary = %+v (remerge calls %d), want the zero summary and no remerge-diff", got, *remergeCalls)
+	}
+}
+
+// TestConfigDefinesMergeDriver is the D8 key matcher over `git config --list
+// -z` records: section merge (any case), a subsection (which may contain dots),
+// variable driver (any case).
+func TestConfigDefinesMergeDriver(t *testing.T) {
+	for _, tc := range []struct {
+		stream string
+		want   bool
+	}{
+		{"core.bare\nfalse\x00merge.evil.driver\ntouch x\x00", true},
+		{"MERGE.Evil.DRIVER\nx\x00", true},
+		{"merge.a.b.driver\nx\x00", true},
+		{"merge.renormalize\ntrue\x00merge.evil.name\nEvil\x00", false},
+		{"mergex.evil.driver\nx\x00submodule.merge.driver\nx\x00", false},
+		{"merge.driver\nx\x00", false},
+		{"", false},
+	} {
+		if got := configDefinesMergeDriver(tc.stream); got != tc.want {
+			t.Errorf("configDefinesMergeDriver(%q) = %t, want %t", tc.stream, got, tc.want)
+		}
+	}
+}
+
+// crMergeDriverRepo builds, with plain git, a merge commit in which the
+// NON-conflicted n.txt was changed on both sides in disjoint hunks (a clean
+// three-way content merge) and c.txt conflicted and was resolved. It returns
+// (repo, mergeHead).
+func crMergeDriverRepo(t *testing.T) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	crGit(t, repo, "init", "--initial-branch=main")
+	crGit(t, repo, "config", "user.name", "test")
+	crGit(t, repo, "config", "user.email", "test@example.com")
+	crWrite(t, repo, "n.txt", "a\nb\nc\nd\ne\nf\ng\nh\n")
+	crWrite(t, repo, "c.txt", "base\n")
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "initial")
+	crGit(t, repo, "checkout", "-b", "feature")
+	crWrite(t, repo, "n.txt", "A-feature\nb\nc\nd\ne\nf\ng\nh\n")
+	crWrite(t, repo, "c.txt", "ours\n")
+	crGit(t, repo, "commit", "-am", "ours")
+	crGit(t, repo, "checkout", "main")
+	crWrite(t, repo, "n.txt", "a\nb\nc\nd\ne\nf\ng\nH-main\n")
+	crWrite(t, repo, "c.txt", "theirs\n")
+	crGit(t, repo, "commit", "-am", "theirs")
+	crGit(t, repo, "checkout", "feature")
+	if err := exec.Command("git", "-C", repo, "merge", "--no-edit", "main").Run(); err == nil {
+		t.Fatal("fixture: merge did not conflict")
+	}
+	crWrite(t, repo, "c.txt", "resolved\n")
+	crGit(t, repo, "add", "c.txt")
+	crGit(t, repo, "-c", "core.editor=true", "commit", "--no-edit")
+	return repo, crGitOut(t, repo, "rev-parse", "HEAD")
+}
+
+// crUnguardedRemerge runs the remerge-diff WITHOUT the summary step's guard
+// (only HardeningArgs), the fixture-validity vehicle.
+func crUnguardedRemerge(repo, head string) {
+	cmd := exec.Command("git", append(gitops.HardeningArgs(), "show", "--remerge-diff", "--format=", head)...)
+	cmd.Dir = repo
+	_ = cmd.Run()
+}
+
+func crExists(path string) bool { _, err := os.Stat(path); return err == nil }
+
+// TestConflictResolutionSummary_CustomMergeDriverNeverExecutes is D8. A
+// config-defined merge driver attributed to a NON-conflicted path is executed
+// by an unguarded remerge-diff (the fixture-validity assertion proves it on the
+// installed git); the summary step refuses to re-merge, so it never runs.
+func TestConflictResolutionSummary_CustomMergeDriverNeverExecutes(t *testing.T) {
+	conflicted := map[string]conflictresolve.ConflictedFile{"c.txt": {}}
+	driverCases := []struct {
+		name   string
+		define func(t *testing.T, repo, script string)
+	}{
+		{"local_config", func(t *testing.T, repo, script string) {
+			crGit(t, repo, "config", "merge.evil.driver", script)
+		}},
+		// --list resolves include.path, so a driver defined only in an included
+		// file is refused the same way.
+		{"include_path", func(t *testing.T, repo, script string) {
+			inc := filepath.Join(t.TempDir(), "included.gitconfig")
+			if err := os.WriteFile(inc, []byte("[merge \"evil\"]\n\tdriver = "+script+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			crGit(t, repo, "config", "include.path", inc)
+		}},
+	}
+	for _, tc := range driverCases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crMergeDriverRepo(t)
+			sentinel := filepath.Join(t.TempDir(), "driver-ran")
+			crWrite(t, repo, ".gitattributes", "n.txt merge=evil\n")
+			tc.define(t, repo, "touch "+sentinel+"; exit 1")
+
+			crUnguardedRemerge(repo, head)
+			if !crExists(sentinel) {
+				t.Fatal("fixture invalid: the unguarded remerge-diff did not run the merge driver on the non-conflicted path")
+			}
+			if err := os.Remove(sentinel); err != nil {
+				t.Fatal(err)
+			}
+
+			_, remergeCalls := crSummarySeams(t, nil)
+			got := conflictResolutionSummary(context.Background(), repo, head, conflicted)
+			if crExists(sentinel) {
+				t.Error("the summary step executed the configured merge driver")
+			}
+			if got.UnavailableReason != reasonRemergeDiffCustomMergeDriver || got.Patch != "" {
+				t.Errorf("reason = %q patch %q, want %q and no patch", got.UnavailableReason, got.Patch, reasonRemergeDiffCustomMergeDriver)
+			}
+			if fmt.Sprint(got.ResolvedPaths) != "[c.txt]" {
+				t.Errorf("resolved paths = %v, want [c.txt]", got.ResolvedPaths)
+			}
+			if *remergeCalls != 0 {
+				t.Errorf("remergeDiffFn calls = %d, want 0", *remergeCalls)
+			}
+		})
+	}
+
+	// A clean/smudge filter (no merge driver) on the non-conflicted path, with
+	// the REPOSITORY setting merge.renormalize=true so the re-merge would
+	// renormalize through the filter. The summary step's -c
+	// merge.renormalize=false is what keeps the filter from running.
+	t.Run("filter_not_run", func(t *testing.T) {
+		repo, head := crMergeDriverRepo(t)
+		sentinel := filepath.Join(t.TempDir(), "filter-ran")
+		crWrite(t, repo, ".gitattributes", "n.txt filter=evil\n")
+		crGit(t, repo, "config", "merge.renormalize", "true")
+		crGit(t, repo, "config", "filter.evil.clean", "touch "+sentinel+"; cat")
+		crGit(t, repo, "config", "filter.evil.smudge", "touch "+sentinel+"; cat")
+
+		crUnguardedRemerge(repo, head)
+		if !crExists(sentinel) {
+			t.Fatal("fixture invalid: the unguarded remerge-diff did not run the filter under merge.renormalize=true")
+		}
+		if err := os.Remove(sentinel); err != nil {
+			t.Fatal(err)
+		}
+
+		got := conflictResolutionSummary(context.Background(), repo, head, conflicted)
+		if crExists(sentinel) {
+			t.Error("the summary step ran a clean/smudge filter during the remerge-diff")
+		}
+		if got.UnavailableReason != "" || !strings.Contains(got.Patch, "+resolved") {
+			t.Errorf("reason = %q patch %q, want a patch carrying the resolution", got.UnavailableReason, got.Patch)
+		}
+	})
 }

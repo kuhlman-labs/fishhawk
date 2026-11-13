@@ -285,7 +285,7 @@ func (s *Server) roundConsumerGoneSlug(ctx context.Context, runID uuid.UUID) (st
 func (s *Server) implementRoundRebuildSlug(ctx context.Context, runID, stageID uuid.UUID, roundSeq int64, payload planreview.ReviewStartedPayload) (string, error) {
 	switch payload.RoundOrigin {
 	case reviewRoundOriginTrace:
-	case reviewRoundOriginFixupPush, reviewRoundOriginConsolidated:
+	case reviewRoundOriginFixupPush, reviewRoundOriginConsolidated, reviewRoundOriginConflictResolution:
 		// A compare-sourced round is rebuilt as ComparePatch(base, head); a
 		// payload missing either cannot name its input.
 		if payload.RoundBaseSHA == "" || payload.HeadSHA == "" {
@@ -733,6 +733,13 @@ func (s *Server) redispatchImplementRound(ctx context.Context, runID uuid.UUID, 
 		// A re-dispatched round owns no stage edge; its outcome is not read.
 		s.runImplementReviewsForTree(ctx, runID, stageID, in.diff, in.scopeDrift, in.headSHA, in.treeSHA, in.changeID, in.gateEvidence)
 		return ""
+	}
+	// A conflict_resolution round (#4795) is rebuilt by the shared round body:
+	// the full ComparePatch(base, head) plus the framing re-read through the one
+	// loader. A missing or mismatched artifact never refuses the rebuild; the
+	// round renders the resolution_diff_unavailable sentence instead.
+	if payload.RoundOrigin == reviewRoundOriginConflictResolution {
+		return s.startConflictResolutionRound(ctx, runID, stageID, payload.RoundBaseSHA, payload.HeadSHA)
 	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)

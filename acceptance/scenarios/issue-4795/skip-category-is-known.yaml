@@ -1,0 +1,14 @@
+id: scenario:issue-4795/skip-category-is-known
+statement: 'The audit read route accepts the new category: GET /v0/runs/{run_id}/audit?category=conflict_resolution_review_skipped answers 200 with an entries list (empty for a run with no conflict resolution), not the 400 validation_failed the route returns for an unknown category.'
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/audit?category=conflict_resolution_review_skipped on any seeded run returns 200 and an entries array. Compare it with an unregistered category, which returns 400 validation_failed.'
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"} and read run_id. GET /v0/runs/{run}/audit?category=conflict_resolution_review_skipped. Control: GET /v0/runs/{run}/audit?category=conflict_resolution_review_skipped_bogus.'
+assertions:
+    expected: 200 with an (empty) entries list; unknown category 400 validation_failed
+    observed_at_record: 200 {"items":[],"next_cursor":""}; control 400 validation_failed 'category is not a known audit category', whose suggestions list conflict_resolution_review_skipped
+    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run>/audit?category=conflict_resolution_review_skipped'
+origin:
+    issue: 4795
+    pr: 5244
+    run_id: 5fcb6201-6986-45ec-a11f-738adb68b273
+    head_sha: a4a9b5b5ca1bc37436d562807006ab1f535551a1
+    recorded_at: 2026-11-13T15:18:53Z

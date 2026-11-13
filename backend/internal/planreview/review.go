@@ -1234,13 +1234,15 @@ type ReviewStartedPayload struct {
 	// (#4077), so a round orphaned by a daemon restart can be re-dispatched
 	// against the same input: "trace" (the stage's uploaded trace bundle),
 	// "fixup_push" (ComparePatch(RoundBaseSHA, HeadSHA) after a fix-up push)
-	// or "consolidated" (a decomposed parent's ComparePatch(RoundBaseSHA,
-	// HeadSHA)). Empty on plan_review_started and on every implement round
+	// "consolidated" (a decomposed parent's ComparePatch(RoundBaseSHA,
+	// HeadSHA)) or "conflict_resolution" (#4795: a conflict-resolved merge
+	// head's full ComparePatch(base_ref, merge head)). Empty on plan_review_started and on every implement round
 	// written before #4077 — a reader treats empty as an unknown source.
 	// omitempty keeps those payloads byte-identical.
 	RoundOrigin string `json:"round_origin,omitempty"`
 
-	// RoundBaseSHA is the compare base of a fixup_push / consolidated round
+	// RoundBaseSHA is the compare base of a fixup_push / consolidated /
+	// conflict_resolution round (the trigger's base_ref for the last)
 	// (#4077): the re-dispatch rebuilds the diff as ComparePatch(RoundBaseSHA,
 	// HeadSHA). Empty for a trace round (its diff lives in the stored bundle)
 	// and for plan rounds. omitempty keeps those payloads byte-identical.

@@ -14626,6 +14626,14 @@ func conflictFailedEntry(runID, stageID uuid.UUID, seq int64) *audit.Entry {
 // response.
 func promptWithConflictEntries(t *testing.T, entries func(runID, stageID uuid.UUID) []*audit.Entry) promptResponse {
 	t.Helper()
+	return promptWithConflictEntriesAt(t, false, entries)
+}
+
+// promptWithConflictEntriesAt serves the implement prompt through the signed
+// runner path (render false) or the SPA render path (render true), so a test
+// can pin a field at BOTH serve sites (#4795 conflict_resolution_summary).
+func promptWithConflictEntriesAt(t *testing.T, render bool, entries func(runID, stageID uuid.UUID) []*audit.Entry) promptResponse {
+	t.Helper()
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
 	art := newFakeArtifactRepo()
@@ -14645,7 +14653,14 @@ func promptWithConflictEntries(t *testing.T, entries func(runID, stageID uuid.UU
 	})
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 
-	w := promptRequest(t, s, runID, implStageID, priv, "")
+	var w *httptest.ResponseRecorder
+	if render {
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/prompt-render", implStageID), nil)
+		w = httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+	} else {
+		w = promptRequest(t, s, runID, implStageID, priv, "")
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -14654,6 +14669,55 @@ func promptWithConflictEntries(t *testing.T, entries func(runID, stageID uuid.UU
 		t.Fatalf("decode: %v", err)
 	}
 	return resp
+}
+
+// TestGetStagePrompt_ServesConflictResolutionSummaryCapability pins the #4795
+// capability advert at BOTH serve sites (the signed runner path and the SPA
+// render path): conflict_resolution_summary is true on a conflict-resolution
+// prompt and ABSENT from an ordinary implement prompt, so a runner never runs
+// the remerge-diff summary step against a backend that cannot take it.
+func TestGetStagePrompt_ServesConflictResolutionSummaryCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		render bool
+	}{{"signed runner path", false}, {"render path", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := promptWithConflictEntriesAt(t, tc.render, func(runID, stageID uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{conflictTriggerEntry(runID, stageID, 1, "fishhawk/run-1", "main", "head1")}
+			})
+			if !resp.ConflictResolution {
+				t.Fatal("conflict_resolution = false, want true for a stage with a live trigger")
+			}
+			if !resp.ConflictResolutionSummary {
+				t.Error("conflict_resolution_summary = false on a conflict-resolution prompt, want true")
+			}
+		})
+		t.Run(tc.name+"/ordinary implement prompt omits the key", func(t *testing.T) {
+			rr := newPromptRunRepo()
+			sf := newSigningFake()
+			runID, stageID := uuid.New(), uuid.New()
+			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {{ID: stageID, RunID: runID, Type: run.StageTypeImplement}}}
+			rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+			rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+			priv, _ := sf.issue(t, runID)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+				AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{}}})
+			s.promptIssueGetterOverride = &stubIssueGetter{}
+			var w *httptest.ResponseRecorder
+			if tc.render {
+				w = httptest.NewRecorder()
+				s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/prompt-render", stageID), nil))
+			} else {
+				w = promptRequest(t, s, runID, stageID, priv, "")
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), `"conflict_resolution_summary"`) {
+				t.Errorf("ordinary implement prompt carries conflict_resolution_summary:\n%.400s", w.Body.String())
+			}
+		})
+	}
 }
 
 // TestGetStagePrompt_ServesConflictResolutionInstruction is the cross-boundary
