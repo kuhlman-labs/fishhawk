@@ -898,7 +898,8 @@
       "amended_by": [
         "ADR-118",
         "ADR-120",
-        "ADR-139"
+        "ADR-139",
+        "ADR-143"
       ],
       "applies_to": []
     },
@@ -1679,6 +1680,18 @@
       "superseded_by": [],
       "amends": [
         "ADR-090"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-143",
+      "title": "Human-only actions are refused on agent-drivable channels (amends ADR-084)",
+      "path": "docs/adr/143-human-only-actions-credential-kind.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-084"
       ],
       "applies_to": []
     }
