@@ -286,6 +286,129 @@ _verify_healthz_nonce() {
   return 1
 }
 
+# --- Liveness of a pid this shell did not spawn: ESRCH-only (#4858) ---------
+# A bare `kill -0 <pid> 2>/dev/null` reads EPERM as dead. EPERM is a LIVE
+# process this shell may not signal: another user's process, a pid REUSED by
+# one, or — the #4858 case — any pid outside a signal-confined implement/fix-up
+# agent shell's Seatbelt sandbox. scripts/dev resolves REPO_ROOT from its own
+# path, so a confined agent that runs <shared checkout>/scripts/dev by absolute
+# path acts on the LIVE stack's .fishhawk/*.pid: with a bare check, `up` would
+# delete the live dev.pid and start a duplicate fishhawkd, `_relay_up` would
+# spawn a second relay over the sole pid file, and every stop path would report
+# "stopped" and delete the pid file of a process still running. So:
+#   * _pid_alive reads ONLY "no such process" (ESRCH) as dead — EPERM reads
+#     LIVE, the fail-safe direction. A non-numeric argument is not a pid and
+#     reads dead (an empty or torn pid file, exactly as before).
+#   * every stop path keeps the pid file and returns non-zero when a signal it
+#     sends is refused on a pid that is still live (_term_kill_ladder +
+#     _stop_refused).
+#   * the refusals say WHY (_pid_unsignalable_note) and name the file to remove
+#     when it is stale: since EPERM reads live, a pid file whose pid was reused
+#     by another user's process no longer self-heals.
+# Every cross-invocation `kill -0` in this file goes through _pid_alive; the
+# only bare ones left are own-child polls (a pid this shell just spawned is in
+# its own sandbox): _await_healthz, _await_tls_healthz, _relay_up's
+# just-spawned relay and _await_preview_healthz. scripts/test-dev ratchets that.
+# zsh prints "kill <pid> failed: no such process" in lowercase, so the match is
+# case-insensitive; LC_ALL=C pins the strerror text. The assignment form keeps
+# a failing kill out of the #631 ZERR/set -e path.
+typeset -g _PID_ALIVE_ERR=""
+_pid_alive() {
+  local out
+  _PID_ALIVE_ERR=""
+  if [[ "$1" != <-> ]]; then
+    return 1
+  fi
+  out="$(export LC_ALL=C; kill -0 "$1" 2>&1)" && return 0
+  _PID_ALIVE_ERR="$out"
+  case "${out:l}" in
+    *"no such process"*) return 1 ;;
+  esac
+  return 0
+}
+
+# _pid_unsignalable <pid>: 0 when the pid is live but `kill -0` is refused with
+# EPERM. Used only to make a refusal say why.
+_pid_unsignalable() {
+  _pid_alive "$1" || return 1
+  case "${_PID_ALIVE_ERR:l}" in
+    *"operation not permitted"*) return 0 ;;
+  esac
+  return 1
+}
+
+# _pid_unsignalable_note <pid> <file>: on EPERM, print the line every refusal
+# carries (stdout), naming the exact file to remove when it is stale. Prints
+# nothing for a signalable pid.
+_pid_unsignalable_note() {
+  if _pid_unsignalable "$1"; then
+    print -r -- "pid $1 is alive but not signalable by you (another user's process, a reused pid, or a confined shell); if it is stale, remove $2"
+  fi
+}
+
+# _term_kill_ladder <pid>: TERM, wait up to 5s, then KILL. errexit-safe: no
+# signal send can abort the caller under `set -e`, so an unsignalable pid always
+# reaches the caller's keep-pid-file guard. Sets _LADDER_KILLED=1 when the KILL
+# step ran, and _LADDER_REFUSED=1 with _LADDER_ERR=<kill output> when a send
+# failed on a pid _pid_alive still reads live (EPERM). A refused TERM skips the
+# wait: the KILL would be refused the same way. Always returns 0.
+typeset -g _LADDER_KILLED=0 _LADDER_REFUSED=0 _LADDER_ERR=""
+_term_kill_ladder() {
+  local pid="$1" out="" i=0
+  _LADDER_KILLED=0
+  _LADDER_REFUSED=0
+  _LADDER_ERR=""
+  if ! out="$(export LC_ALL=C; kill -TERM "$pid" 2>&1)"; then
+    if _pid_alive "$pid"; then
+      _LADDER_REFUSED=1
+      _LADDER_ERR="$out"
+    fi
+    return 0
+  fi
+  while _pid_alive "$pid" && (( i < 5 )); do
+    sleep 1
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+  done
+  if _pid_alive "$pid"; then
+    _LADDER_KILLED=1
+    if ! out="$(export LC_ALL=C; kill -KILL "$pid" 2>&1)"; then
+      if _pid_alive "$pid"; then
+        _LADDER_REFUSED=1
+        _LADDER_ERR="$out"
+      fi
+    fi
+  fi
+  return 0
+}
+
+# _stop_refused <label> <pid> <pid_file> <kill output>: the stop-path refusal
+# (stderr). The caller keeps <pid_file> and returns non-zero.
+_stop_refused() {
+  local note
+  print -u2 -r -- "error: $1 pid $2 is still running and could not be signalled; pid file kept: $3 (${4:-signal refused})"
+  note="$(_pid_unsignalable_note "$2" "$3")"
+  if [[ -n "$note" ]]; then
+    print -u2 -r -- "  $note"
+  fi
+  return 0
+}
+
+# _dev_pid_running <pid_file>: cmd_up's idempotency read, factored so
+# scripts/test-dev can drive it without a build. Prints the pid and returns 0
+# when <pid_file> names a live pid (EPERM included — see _pid_alive); removes
+# ONLY a pid file whose pid is ESRCH-dead (or that holds no pid) and returns 1.
+_dev_pid_running() {
+  local pid_file="$1" pid=""
+  [[ -f "$pid_file" ]] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null)" || pid=""
+  if _pid_alive "$pid"; then
+    print -r -- "$pid"
+    return 0
+  fi
+  rm -f "$pid_file"
+  return 1
+}
+
 # cmd_down port fallback (#965): after the pid-file kill (or when the pid file
 # is missing), the port must actually be free — 'down succeeded but a daemon
 # still serves the port' is the exact false-success shape. If <port> is still
@@ -336,14 +459,13 @@ _down_port_fallback() {
     comm="?"
     if ! comm="$(ps -p "$lpid" -o comm= 2>/dev/null)"; then comm="?"; fi
     if (( nonce_verified )) || [[ "${comm:t}" == "fishhawkd" ]]; then
-      kill -TERM "$lpid" 2>/dev/null || true
-      local i=0
-      while kill -0 "$lpid" 2>/dev/null && (( i < 5 )); do
-        sleep 1
-        (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
-      done
-      if kill -0 "$lpid" 2>/dev/null; then
-        kill -KILL "$lpid" 2>/dev/null || true
+      _term_kill_ladder "$lpid"
+      if (( _LADDER_REFUSED )); then
+        # #4858: never report a listener we could not signal as killed, and
+        # never drop the pid file that still names it.
+        _stop_refused "fishhawkd listener on port ${port}" "$lpid" "$pid_file" "$_LADDER_ERR"
+        rc=1
+        continue
       fi
       if (( nonce_verified )); then
         print "killed nonce-verified stale fishhawkd (pid ${lpid}) on port ${port} (#1018)"
@@ -2530,19 +2652,17 @@ _tls_down() {
   fi
   local pid
   pid="$(cat "$pid_file")"
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if ! _pid_alive "$pid"; then
     print "TLS front end already stopped"
     rm -f "$pid_file"
     return 0
   fi
-  kill -TERM "$pid" 2>/dev/null || true
-  local i=0
-  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
-    sleep 1
-    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
+  _term_kill_ladder "$pid"
+  if (( _LADDER_REFUSED )); then
+    _stop_refused "TLS front end" "$pid" "$pid_file" "$_LADDER_ERR"
+    return 1
+  fi
+  if (( _LADDER_KILLED )); then
     print "TLS front end killed (SIGKILL after 5s)"
   else
     print "TLS front end stopped"
@@ -2668,8 +2788,9 @@ _relay_up() {
   if [[ -f "$RELAY_PID_FILE" ]]; then
     local existing
     existing="$(cat "$RELAY_PID_FILE" 2>/dev/null)"
-    if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+    if [[ -n "$existing" ]] && _pid_alive "$existing"; then
       print "webhook relay already running (pid ${existing})"
+      _pid_unsignalable_note "$existing" "$RELAY_PID_FILE"
       return 0
     fi
   fi
@@ -2771,19 +2892,17 @@ _relay_down() {
   fi
   local pid
   pid="$(cat "$pid_file")"
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if ! _pid_alive "$pid"; then
     print "webhook relay already stopped"
     rm -f "$pid_file"
     return 0
   fi
-  kill -TERM "$pid" 2>/dev/null || true
-  local i=0
-  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
-    sleep 1
-    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
+  _term_kill_ladder "$pid"
+  if (( _LADDER_REFUSED )); then
+    _stop_refused "webhook relay" "$pid" "$pid_file" "$_LADDER_ERR"
+    return 1
+  fi
+  if (( _LADDER_KILLED )); then
     print "webhook relay killed (SIGKILL after 5s)"
   else
     print "webhook relay stopped"
@@ -2923,15 +3042,18 @@ cmd_up() {
     if [[ "$arg" == "--start-deps" ]]; then start_deps=1; fi
   done
 
-  # Idempotency: bail if already running
-  if [[ -f "$PID_FILE" ]]; then
-    local existing_pid
-    existing_pid="$(cat "$PID_FILE")"
-    if kill -0 "$existing_pid" 2>/dev/null; then
-      print "fishhawkd already running (pid ${existing_pid})"
-      return 0
+  # Idempotency: bail if already running. _dev_pid_running removes only an
+  # ESRCH-dead pid file (#4858). A live pid we may not signal (EPERM) is NOT
+  # reported as a bare "already running": it may be another user's process
+  # that reused a stale pid, so refuse loudly and name the file to remove.
+  local existing_pid
+  if existing_pid="$(_dev_pid_running "$PID_FILE")"; then
+    if _pid_unsignalable "$existing_pid"; then
+      print -u2 -r -- "error: not starting fishhawkd ($PID_FILE): $(_pid_unsignalable_note "$existing_pid" "$PID_FILE")"
+      return 1
     fi
-    rm -f "$PID_FILE"
+    print "fishhawkd already running (pid ${existing_pid})"
+    return 0
   fi
 
   # Logs directory
@@ -3296,13 +3418,17 @@ cmd_down() {
   # CONDITION 2: unconditional (guarded on the pid file inside _tls_down, NEVER
   # on FISHHAWK_DEV_TLS) — an operator who disabled the flag between `up` and
   # `down`/`reload` must not orphan the proxy. Idempotent on an absent pid file.
-  _tls_down "$TLS_PID_FILE"
+  # A stop path that could not signal its pid keeps the pid file and returns 1
+  # (#4858); record it rather than letting `set -e` abort before the stray
+  # sweep and the port fallback run, and exit 1 at the end.
+  local down_rc=0
+  _tls_down "$TLS_PID_FILE" || down_rc=1
 
   # Tear down the webhook relay UNCONDITIONALLY (guarded on the pid file inside
   # _relay_down, NEVER on FISHHAWK_DEV_WEBHOOK_RELAY) — an operator who disabled
   # the flag between `up` and `down`/`reload` must not orphan the client.
   # Idempotent on an absent pid file (a no-op when no relay ran).
-  _relay_down "$RELAY_PID_FILE"
+  _relay_down "$RELAY_PID_FILE" || down_rc=1
 
   # The missing-pid-file and already-stopped paths no longer return success
   # immediately — every path falls through to the port fallback below, so
@@ -3313,26 +3439,22 @@ cmd_down() {
     local pid
     pid="$(cat "$PID_FILE")"
 
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! _pid_alive "$pid"; then
       print "fishhawkd already stopped"
       rm -f "$PID_FILE"
     else
-      kill -TERM "$pid"
-
-      local i=0
-      while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
-        sleep 1
-        (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (the #631 trigger)
-      done
-
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid"
-        print "fishhawkd killed (SIGKILL after 5s)"
+      _term_kill_ladder "$pid"
+      if (( _LADDER_REFUSED )); then
+        _stop_refused "fishhawkd" "$pid" "$PID_FILE" "$_LADDER_ERR"
+        down_rc=1
       else
-        print "fishhawkd stopped"
+        if (( _LADDER_KILLED )); then
+          print "fishhawkd killed (SIGKILL after 5s)"
+        else
+          print "fishhawkd stopped"
+        fi
+        rm -f "$PID_FILE"
       fi
-
-      rm -f "$PID_FILE"
     fi
   fi
 
@@ -3348,6 +3470,9 @@ cmd_down() {
     exit 1
   fi
   rm -f "$NONCE_FILE"
+  if (( down_rc )); then
+    exit 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -4209,31 +4334,37 @@ cmd_k8s_up() {
   fi
 }
 
+# _k8s_pf_down <label> <pid_file>: stop one tracked kubectl port-forward (a
+# single TERM, as before). An absent or ESRCH-dead pid is a no-op that removes
+# the file; a TERM refused on a still-live pid (#4858) keeps the pid file and
+# returns 1 — the same guard as every other stop path, never a bare rm.
+_k8s_pf_down() {
+  local label="$1" pid_file="$2" pf_pid out=""
+  [[ -f "$pid_file" ]] || return 0
+  pf_pid="$(cat "$pid_file")"
+  if _pid_alive "$pf_pid"; then
+    if ! out="$(export LC_ALL=C; kill "$pf_pid" 2>&1)" && _pid_alive "$pf_pid"; then
+      _stop_refused "$label" "$pf_pid" "$pid_file" "$out"
+      return 1
+    fi
+    print "${label} stopped (pid ${pf_pid})"
+  fi
+  rm -f "$pid_file"
+  return 0
+}
+
 # Tear down the local k8s deployment: kill the tracked port-forward, then
 # helm-uninstall the release. Both steps are idempotent — a missing pid file or
 # an already-uninstalled release ('release: not found') is a no-op — so a double
 # teardown is harmless.
 cmd_k8s_down() {
-  if [[ -f "$K8S_PF_PID_FILE" ]]; then
-    local pf_pid
-    pf_pid="$(cat "$K8S_PF_PID_FILE")"
-    if kill -0 "$pf_pid" 2>/dev/null; then
-      kill "$pf_pid" 2>/dev/null || true
-      print "port-forward stopped (pid ${pf_pid})"
-    fi
-    rm -f "$K8S_PF_PID_FILE"
-  fi
+  # A forward that could not be signalled keeps its pid file (#4858); the helm
+  # uninstall still runs, and the command exits 1 at the end.
+  local k8s_down_rc=0
+  _k8s_pf_down "port-forward" "$K8S_PF_PID_FILE" || k8s_down_rc=1
 
   # Tear down the jaeger forward too (only present when jaeger was enabled).
-  if [[ -f "$K8S_JAEGER_PF_PID_FILE" ]]; then
-    local jaeger_pf_pid
-    jaeger_pf_pid="$(cat "$K8S_JAEGER_PF_PID_FILE")"
-    if kill -0 "$jaeger_pf_pid" 2>/dev/null; then
-      kill "$jaeger_pf_pid" 2>/dev/null || true
-      print "jaeger port-forward stopped (pid ${jaeger_pf_pid})"
-    fi
-    rm -f "$K8S_JAEGER_PF_PID_FILE"
-  fi
+  _k8s_pf_down "jaeger port-forward" "$K8S_JAEGER_PF_PID_FILE" || k8s_down_rc=1
 
   # Only an absent release is a no-op. Capture stderr so a genuine failure
   # (unreachable cluster, bad kubeconfig, permission denied) is surfaced and
@@ -4246,6 +4377,9 @@ cmd_k8s_down() {
   else
     print -u2 "error: helm uninstall fishhawk failed:"
     print -u2 -- "$uninstall_out"
+    exit 1
+  fi
+  if (( k8s_down_rc )); then
     exit 1
   fi
 }
@@ -4482,19 +4616,17 @@ _preview_kill_tracked() {
   fi
   local pid
   pid="$(cat "$pid_file")"
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if ! _pid_alive "$pid"; then
     print "preview fishhawkd already stopped"
     rm -f "$pid_file"
     return 0
   fi
-  kill -TERM "$pid" 2>/dev/null || true
-  local i=0
-  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
-    sleep 1
-    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
+  _term_kill_ladder "$pid"
+  if (( _LADDER_REFUSED )); then
+    _stop_refused "preview fishhawkd" "$pid" "$pid_file" "$_LADDER_ERR"
+    return 1
+  fi
+  if (( _LADDER_KILLED )); then
     print "preview fishhawkd killed (SIGKILL after 5s)"
   else
     print "preview fishhawkd stopped"
@@ -4824,7 +4956,7 @@ _preview_lock_owner() {
     IFS= read -r v < "$f" 2>/dev/null || true
   fi
   v="${v//[[:space:]]/}"
-  if [[ "$v" == <-> ]] && kill -0 "$v" 2>/dev/null; then
+  if [[ "$v" == <-> ]] && _pid_alive "$v"; then
     print -r -- "$v"
   else
     print -r -- unknown

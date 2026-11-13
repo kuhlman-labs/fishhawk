@@ -617,6 +617,106 @@ else
   fi
 fi
 
+# (xvi) LIVE-BUT-UNSIGNALABLE OWNERS (#4858). Liveness is ESRCH-only: a pid this
+# shell gets EPERM for (another user's process, or anything outside a
+# signal-confined agent shell's sandbox) must read LIVE. A lease named by it
+# SURVIVES _prune_dead_leases, and a lease lock naming it is NOT broken —
+# _lease_lock at cap 2 returns non-zero AND readlink still names the pid (both,
+# so cap exhaustion cannot mask a broken-then-reacquired lock) — and the refusal
+# carries the D3 "alive but not signalable by you" line naming the lock file.
+# The dead-pid arms (c)/(d) above prove ESRCH still reads dead. Discrimination is
+# decided from OBSERVED behaviour, never from uid; a non-discriminating host
+# prints a loud SKIP and never passes silently. These arms sit after (vii), so
+# they are not in its expected_prior count.
+#
+# SIGNAL_PROFILE mirrors netsandbox.SignalProfile(); drift is caught by the
+# discrimination probe, which checks enforcement independently of the literal.
+SIGNAL_PROFILE='(version 1)
+(allow default)
+(deny signal)
+(allow signal (target same-sandbox))'
+
+# The judgement, run in a CHILD bash (directly for pid 1, under sandbox-exec for
+# the darwin arm) so both arms exercise the identical code path. Args: the
+# scripts/test path, the lease dir, the pid under judgement.
+lease_judge='set +e
+FISHHAWK_TEST_LIB_ONLY=1 . "$1"
+set +e
+LEASE_DIR="$2"; v="$3"
+_prune_dead_leases 2>/dev/null
+if [ -e "$LEASE_DIR/$v" ]; then echo "lease=kept"; else echo "lease=pruned"; fi
+FISHHAWK_TEST_LEASE_LOCK_CAP=2 _lease_lock 2>"$LEASE_DIR.err"
+echo "lock_rc=$?"
+echo "link=$(readlink "$LEASE_DIR.lock" 2>/dev/null)"
+if grep -qF "pid $v is alive but not signalable by you" "$LEASE_DIR.err" \
+   && grep -qF "remove $LEASE_DIR.lock" "$LEASE_DIR.err"; then echo "note=yes"; else echo "note=no"; fi'
+
+# assert_lease_unsignalable <label> <pid> <judge output>
+assert_lease_unsignalable() {
+  local label="$1" pid="$2" out="$3"
+  if grep -qx 'lease=kept' <<< "$out"; then
+    pass "$label: lease named by EPERM-live pid $pid survives _prune_dead_leases"
+  else
+    fail "$label: lease named by EPERM-live pid $pid was pruned (out=[$(printf '%s' "$out" | tr '\n' ';')])"
+  fi
+  if grep -qx 'lock_rc=[1-9][0-9]*' <<< "$out" \
+     && grep -qx "link=$pid" <<< "$out"; then
+    pass "$label: lease lock owned by EPERM-live pid $pid is not broken (non-zero return, link intact)"
+  else
+    fail "$label: lease lock owned by EPERM-live pid $pid was broken or acquired (out=[$(printf '%s' "$out" | tr '\n' ';')])"
+  fi
+  if grep -qx 'note=yes' <<< "$out"; then
+    pass "$label: lock refusal names the unsignalable pid and the lock file to remove"
+  else
+    fail "$label: lock refusal lacks the 'alive but not signalable by you' line (stderr=[$(tr '\n' ';' < "$LEASE_DIR.err" 2>/dev/null)])"
+  fi
+}
+
+# (xvi-a) portable pid-1 arm.
+reset_case xvi-a
+pid1_out="$(export LC_ALL=C; kill -0 1 2>&1)"; pid1_rc=$?
+if [ "$pid1_rc" -ne 0 ] && grep -q 'Operation not permitted' <<< "$pid1_out"; then
+  mkdir -p "$LEASE_DIR"
+  : > "$LEASE_DIR/1"
+  ln -s 1 "$LEASE_DIR.lock"
+  judged="$(bash -c "$lease_judge" _ "$REPO_ROOT/scripts/test" "$LEASE_DIR" 1)"
+  assert_lease_unsignalable "unsignalable pid-1" 1 "$judged"
+  rm -rf "$LEASE_DIR.lock"
+else
+  echo "SKIP: unsignalable pid-1 arm (non-discriminating: kill -0 1 -> rc=$pid1_rc '$pid1_out')"
+fi
+
+# (xvi-b) darwin discriminating arm: an UNSANDBOXED victim judged from INSIDE the
+# signal profile. Probe 1 (apply) and probe 2 (discrimination) each SKIP loudly.
+reset_case xvi-b
+if [ "$(uname -s)" != "Darwin" ] || ! command -v sandbox-exec >/dev/null 2>&1; then
+  echo "SKIP: darwin signal-confined arm (sandbox-exec cannot apply the signal profile: rc=127 'not darwin or sandbox-exec absent')"
+else
+  sleep 300 &
+  victim=$!
+  if ! kill -0 "$victim" 2>/dev/null; then
+    fail "darwin signal-confined arm: victim sleep $victim not alive at start"
+  else
+    apply_err="$(sandbox-exec -p "$SIGNAL_PROFILE" /usr/bin/true 2>&1)"; apply_rc=$?
+    if [ "$apply_rc" -ne 0 ]; then
+      echo "SKIP: darwin signal-confined arm (sandbox-exec cannot apply the signal profile: rc=$apply_rc '$apply_err')"
+    else
+      disc_out="$(export LC_ALL=C; sandbox-exec -p "$SIGNAL_PROFILE" /bin/kill -0 "$victim" 2>&1)"; disc_rc=$?
+      if [ "$disc_rc" -eq 0 ] || ! grep -q 'Operation not permitted' <<< "$disc_out"; then
+        echo "SKIP: darwin signal-confined arm (non-discriminating: sandboxed kill -0 $victim -> rc=$disc_rc '$disc_out'; already inside an identical sandbox, or the host does not enforce the profile)"
+      else
+        mkdir -p "$LEASE_DIR"
+        : > "$LEASE_DIR/$victim"
+        ln -s "$victim" "$LEASE_DIR.lock"
+        judged="$(sandbox-exec -p "$SIGNAL_PROFILE" bash -c "$lease_judge" _ "$REPO_ROOT/scripts/test" "$LEASE_DIR" "$victim")"
+        assert_lease_unsignalable "signal-confined victim" "$victim" "$judged"
+        rm -rf "$LEASE_DIR.lock"
+      fi
+    fi
+  fi
+  kill "$victim" 2>/dev/null; wait "$victim" 2>/dev/null
+fi
+
 # (f) parse-clean: scripts/test itself parses with no syntax errors.
 if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then
   pass "bash -n scripts/test parses clean"

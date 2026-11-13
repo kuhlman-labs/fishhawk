@@ -1123,6 +1123,90 @@ assert_eq "b18 a refusal runs no lint" "0" "$(count_lines "$FX/logs/lint.log")"
 assert_eq "b18 the holder's lock is untouched" "$livepid:shell" "$(readlink "$LOCK")"
 lock_reset
 
+# b19 — LIVE-BUT-UNSIGNALABLE HOLDER (#4858). Liveness is ESRCH-only: a holder
+# this shell gets EPERM for (another user's process, or anything outside a
+# signal-confined agent shell's sandbox) must read LIVE — a `<pid>:runner` lock
+# classifies live-runner, the b17 shape (shell kind meeting a live holder)
+# refuses with 73 carrying the D3 "alive but not signalable by you" line naming
+# the lock file, and the lock link is unchanged. The spawn_dead arms above (b2,
+# b3*) prove ESRCH still reads dead. Discrimination is decided from OBSERVED
+# behaviour, never from uid; a non-discriminating host prints a loud SKIP.
+#
+# SIGNAL_PROFILE mirrors netsandbox.SignalProfile(); drift is caught by the
+# discrimination probe, which checks enforcement independently of the literal.
+SIGNAL_PROFILE='(version 1)
+(allow default)
+(deny signal)
+(allow signal (target same-sandbox))'
+
+# The judgement, run in a CHILD bash (directly for pid 1, under sandbox-exec for
+# the darwin arm) so both arms exercise the identical code path. Args: the
+# scripts/test path, the lock path, the holder pid. The child's own $$ is the
+# (live, shell-kind) self.
+lock_judge='set +e
+FISHHAWK_TEST_LIB_ONLY=1 . "$1"
+set +eu
+lock="$2"; v="$3"
+echo "class=$(_verify_lock_classify "$lock")"
+_acquire_verify_lock_at "$lock" >"$lock.judge.out" 2>&1
+echo "acq_rc=$?"
+echo "link=$(readlink "$lock" 2>/dev/null)"'
+
+# assert_lock_unsignalable <label> <pid> <judge output>
+assert_lock_unsignalable() {
+  local label="$1" pid="$2" out="$3"
+  assert_eq "$label: a <pid>:runner lock held by EPERM-live pid $pid classifies live-runner" \
+    "class=live-runner" "$(printf '%s\n' "$out" | grep '^class=')"
+  assert_eq "$label: a shell verify meeting it refuses with 73" \
+    "acq_rc=73" "$(printf '%s\n' "$out" | grep '^acq_rc=')"
+  assert_eq "$label: the holder's lock link is unchanged" \
+    "link=$pid:runner" "$(printf '%s\n' "$out" | grep '^link=')"
+  assert_contains "$label: the refusal names the unsignalable pid" "$LOCK.judge.out" \
+    "pid $pid is alive but not signalable by you (another user's process, a reused pid, or a confined shell)"
+  assert_contains "$label: the refusal names the lock file to remove" "$LOCK.judge.out" \
+    "if it is stale, remove $LOCK"
+}
+
+# b19a — portable pid-1 arm.
+lock_reset
+pid1_out="$(export LC_ALL=C; kill -0 1 2>&1)"; pid1_rc=$?
+if [ "$pid1_rc" -ne 0 ] && grep -q 'Operation not permitted' <<< "$pid1_out"; then
+  ln -s "1:runner" "$LOCK"
+  judged="$(bash -c "$lock_judge" _ "$REPO_ROOT/scripts/test" "$LOCK" 1)"
+  assert_lock_unsignalable "b19a pid 1" 1 "$judged"
+else
+  echo "SKIP: b19a unsignalable pid-1 arm (non-discriminating: kill -0 1 -> rc=$pid1_rc '$pid1_out')"
+fi
+rm -f "$LOCK.judge.out"
+lock_reset
+
+# b19b — darwin discriminating arm: an UNSANDBOXED victim judged from INSIDE the
+# signal profile. Probe 1 (apply) and probe 2 (discrimination) each SKIP loudly.
+if [ "$(uname -s)" != "Darwin" ] || ! command -v sandbox-exec >/dev/null 2>&1; then
+  echo "SKIP: b19b darwin signal-confined arm (sandbox-exec cannot apply the signal profile: rc=127 'not darwin or sandbox-exec absent')"
+else
+  victim="$(spawn_live)"
+  if ! kill -0 "$victim" 2>/dev/null; then
+    fail "b19b victim $victim not alive at start"
+  else
+    apply_err="$(sandbox-exec -p "$SIGNAL_PROFILE" /usr/bin/true 2>&1)"; apply_rc=$?
+    if [ "$apply_rc" -ne 0 ]; then
+      echo "SKIP: b19b darwin signal-confined arm (sandbox-exec cannot apply the signal profile: rc=$apply_rc '$apply_err')"
+    else
+      disc_out="$(export LC_ALL=C; sandbox-exec -p "$SIGNAL_PROFILE" /bin/kill -0 "$victim" 2>&1)"; disc_rc=$?
+      if [ "$disc_rc" -eq 0 ] || ! grep -q 'Operation not permitted' <<< "$disc_out"; then
+        echo "SKIP: b19b darwin signal-confined arm (non-discriminating: sandboxed kill -0 $victim -> rc=$disc_rc '$disc_out'; already inside an identical sandbox, or the host does not enforce the profile)"
+      else
+        ln -s "$victim:runner" "$LOCK"
+        judged="$(sandbox-exec -p "$SIGNAL_PROFILE" bash -c "$lock_judge" _ "$REPO_ROOT/scripts/test" "$LOCK" "$victim")"
+        assert_lock_unsignalable "b19b signal-confined victim" "$victim" "$judged"
+      fi
+    fi
+  fi
+fi
+rm -f "$LOCK.judge.out"
+lock_reset
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

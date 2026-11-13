@@ -2964,7 +2964,11 @@ else
   fail "_preview_kill_tracked should return 0 for a missing pid file"
 fi
 kt_body="$(typeset -f _preview_kill_tracked)"
-if print -r -- "$kt_body" | grep_q 'kill -TERM' && print -r -- "$kt_body" | grep_q 'kill -KILL'; then
+# The TERM -> KILL ladder is shared by every stop path (_term_kill_ladder,
+# #4858): the stop path must call it, and the ladder must carry both signals.
+kt_ladder_body="$(typeset -f _term_kill_ladder)"
+if print -r -- "$kt_body" | grep_q '_term_kill_ladder' \
+   && print -r -- "$kt_ladder_body" | grep_q 'kill -TERM' && print -r -- "$kt_ladder_body" | grep_q 'kill -KILL'; then
   pass "_preview_kill_tracked escalates TERM -> KILL"
 else
   fail "_preview_kill_tracked should carry the TERM -> KILL ladder"
@@ -3530,9 +3534,16 @@ else
       (( ++i ))
     done
   fi
+  # R5 (#4858): a real exec probe first, so a ps that cannot exec (a
+  # signal-confined agent shell refuses setuid /bin/ps) is named as such rather
+  # than misread as "could not bind as comm=fishhawkd".
+  fhd_ps_err="$(ps -o pid= -p $$ 2>&1 >/dev/null)"; fhd_ps_rc=$?
   fhd_comm=""
-  if [[ -n "$fhd_pid" ]]; then fhd_comm="$(ps -p "$fhd_pid" -o comm= 2>/dev/null)"; fi
-  if [[ -z "$fhd_pid" ]] || ! kill -0 "$fhd_pid" 2>/dev/null \
+  if [[ -n "$fhd_pid" ]] && (( fhd_ps_rc == 0 )); then fhd_comm="$(ps -p "$fhd_pid" -o comm= 2>/dev/null)"; fi
+  if (( fhd_ps_rc != 0 )); then
+    print "SKIP (ps cannot exec on this host: ${fhd_ps_err} — e.g. a signal-confined agent shell, #4858; setuid /bin/ps is refused under sandbox-exec): skipping the reclaim KILL-leg assertion"
+    if [[ -n "$fhd_pid" ]]; then kill "$fhd_pid" 2>/dev/null; wait "$fhd_pid" 2>/dev/null; fi
+  elif [[ -z "$fhd_pid" ]] || ! kill -0 "$fhd_pid" 2>/dev/null \
      || [[ -z "$(_port_listeners "$fhd_port")" ]] || [[ "${fhd_comm:t}" != fishhawkd ]]; then
     print "skip: 'fishhawkd'-named nc copy could not bind as comm=fishhawkd — skipping the reclaim KILL-leg assertion"
     if [[ -n "$fhd_pid" ]]; then kill "$fhd_pid" 2>/dev/null; wait "$fhd_pid" 2>/dev/null; fi
@@ -7569,8 +7580,11 @@ fi
 # GC-l the REAL process scan (the issue's explicit check): a process whose argv[0]
 # basename is fishhawk-runner makes `gocache --trim` refuse and NAME that pid,
 # with the REAL _scan_live_runs. _scan_live_go is stubbed clean so the refusal is
-# attributable to the runner arm alone.
-if command -v ps >/dev/null 2>&1; then
+# attributable to the runner arm alone. R5 (#4858): gated on a REAL exec probe,
+# not `command -v ps` — a signal-confined agent shell finds ps on PATH but cannot
+# exec setuid /bin/ps, and the scan then fails closed without naming the pid.
+gc_ps_err="$(ps -o pid= -p $$ 2>&1 >/dev/null)"; gc_ps_rc=$?
+if (( gc_ps_rc == 0 )); then
   _gc_reset; _gc_fixture
   (exec -a fishhawk-runner sleep 60) &
   gc_sleep_pid=$!
@@ -7586,7 +7600,7 @@ if command -v ps >/dev/null 2>&1; then
   fi
   rm -rf "$gc_tmp"
 else
-  print "skip: GC-l — ps is not available on this host, the real-process scan cannot run"
+  print "SKIP (ps cannot exec on this host: ${gc_ps_err:-ps not found} — e.g. a signal-confined agent shell, #4858; setuid /bin/ps is refused under sandbox-exec): GC-l real-process scan"
 fi
 # GC-m per-branch coverage of the remaining defensive arms (one case each).
 # m1 _gocache_resolve_dir arms not covered by GC-h: a missing absolute dir; go
@@ -8414,6 +8428,144 @@ fi
 rm -rf "$wq_dir"
 wq_interval=""
 
+# ---------------------------------------------------------------------------
+# 19. ESRCH-only liveness in scripts/dev (#4858, R4). A pid this shell gets EPERM
+# for — another user's process, or anything outside a signal-confined agent
+# shell's sandbox — must read LIVE: cmd_up's idempotency read keeps the pid file,
+# _relay_up does not spawn a second relay, and every stop path refuses, keeps
+# the pid file and returns non-zero instead of reporting "stopped". Pid 1 is the
+# EPERM victim; discrimination is decided from the OBSERVED `kill -0 1`, never
+# from uid, and a non-discriminating host prints a loud SKIP. The dead-pid arms
+# above (absent pid file, reaped pid) prove ESRCH still reads dead.
+esr_k1_out="$(export LC_ALL=C; kill -0 1 2>&1)"; esr_k1_rc=$?
+if (( esr_k1_rc != 0 )) && [[ "${esr_k1_out:l}" == *"operation not permitted"* ]]; then
+  esr_wd="$(mktemp -d -t test-dev-esrch.XXXXXX)"
+  esr_note="pid 1 is alive but not signalable by you (another user's process, a reused pid, or a confined shell)"
+
+  # 19a. _dev_pid_running (cmd_up's idempotency read) over a pid file naming 1.
+  print 1 > "$esr_wd/dev.pid"
+  esr_out="$(_dev_pid_running "$esr_wd/dev.pid")"; esr_rc=$?
+  if (( esr_rc == 0 )) && [[ "$esr_out" == 1 && -f "$esr_wd/dev.pid" ]]; then
+    pass "19a _dev_pid_running reads EPERM pid 1 as running, prints it and KEEPS the pid file"
+  else
+    fail "19a _dev_pid_running over EPERM pid 1 (rc=${esr_rc} out='${esr_out}' file=$([[ -f "$esr_wd/dev.pid" ]] && print kept || print removed))"
+  fi
+  # cmd_up composes the read and the D3 note instead of a bare "already running".
+  esr_up_body="$(typeset -f cmd_up)"
+  if print -r -- "$esr_up_body" | grep_q '_dev_pid_running "\$PID_FILE"' \
+     && print -r -- "$esr_up_body" | grep_q '_pid_unsignalable_note'; then
+    pass "19a cmd_up reads liveness via _dev_pid_running and names an unsignalable pid's file"
+  else
+    fail "19a cmd_up should call _dev_pid_running \"\$PID_FILE\" and _pid_unsignalable_note"
+  fi
+
+  # 19b. _relay_up's re-entrancy guard with RELAY_PID_FILE naming pid 1: prints
+  # "already running" and never execs the stub (its spawn marker stays absent).
+  print 1 > "$esr_wd/relay.pid"
+  print "#!/bin/sh\n: > \"$esr_wd/spawned\"\nsleep 30\n" > "$esr_wd/smee"; chmod +x "$esr_wd/smee"
+  esr_out="$(
+    RELAY_PID_FILE="$esr_wd/relay.pid"; RELAY_LOG_FILE="$esr_wd/relay.log"; LOG_DIR="$esr_wd"
+    export FISHHAWK_DEV_SMEE_BIN="$esr_wd/smee"
+    export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/esrchtoken"
+    _relay_up 2>&1
+  )"
+  sleep 0.3
+  if [[ "$esr_out" == *"already running (pid 1)"* && ! -f "$esr_wd/spawned" && "$(<"$esr_wd/relay.pid")" == 1 ]] \
+     && [[ "$esr_out" == *"$esr_note"* ]]; then
+    pass "19b _relay_up treats EPERM pid 1 as a running relay: no second spawn, pid file intact, note printed"
+  else
+    fail "19b _relay_up over EPERM pid 1 (out='${esr_out}' spawned=$([[ -f "$esr_wd/spawned" ]] && print yes || print no) pidfile='$(<"$esr_wd/relay.pid")')"
+  fi
+
+  # 19c. _tls_down over a pid file naming 1: refuses, KEEPS the pid file, returns
+  # non-zero and names the file to remove.
+  print 1 > "$esr_wd/tls.pid"
+  esr_out="$(_tls_down "$esr_wd/tls.pid" 2>&1)"; esr_rc=$?
+  if (( esr_rc != 0 )) && [[ -f "$esr_wd/tls.pid" ]] \
+     && [[ "$esr_out" == *"TLS front end pid 1 is still running and could not be signalled; pid file kept"* ]] \
+     && [[ "$esr_out" == *"$esr_note; if it is stale, remove $esr_wd/tls.pid"* ]] \
+     && [[ "$esr_out" != *"TLS front end stopped"* ]]; then
+    pass "19c _tls_down over EPERM pid 1 refuses, keeps the pid file and returns non-zero"
+  else
+    fail "19c _tls_down over EPERM pid 1 (rc=${esr_rc} file=$([[ -f "$esr_wd/tls.pid" ]] && print kept || print removed) out='${esr_out}')"
+  fi
+
+  # 19d. cmd_down's stop path (D2) under the REAL `set -e`: fishhawkd's and the
+  # TLS proxy's pid files both name pid 1. The refusals must not abort cmd_down —
+  # the stray sweep and the port fallback still run — both pid files are kept,
+  # and cmd_down exits non-zero. The port fallback is stubbed (it needs lsof and
+  # a live port); its run marker is the evidence it was reached.
+  esr_root="$esr_wd/root"; mkdir -p "$esr_root/.fishhawk"
+  print 1 > "$esr_root/.fishhawk/dev.pid"
+  print 1 > "$esr_root/.fishhawk/tls-proxy.pid"
+  : > "$esr_root/.fishhawk/dev 2.pid"
+  esr_out="$(
+    set -e
+    REPO_ROOT="$esr_root"
+    PID_FILE="$esr_root/.fishhawk/dev.pid"; NONCE_FILE="$esr_root/.fishhawk/dev.nonce"
+    TLS_PID_FILE="$esr_root/.fishhawk/tls-proxy.pid"; RELAY_PID_FILE="$esr_root/.fishhawk/webhook-relay.pid"
+    _healthz_port() { print 1; }
+    _down_port_fallback() { : > "$esr_wd/fallback-ran"; return 0; }
+    cmd_down 2>&1
+  )"; esr_rc=$?
+  if (( esr_rc != 0 )) && [[ -f "$esr_root/.fishhawk/dev.pid" && -f "$esr_root/.fishhawk/tls-proxy.pid" ]] \
+     && [[ ! -e "$esr_root/.fishhawk/dev 2.pid" && -f "$esr_wd/fallback-ran" ]] \
+     && [[ "$esr_out" == *"fishhawkd pid 1 is still running and could not be signalled; pid file kept"* ]] \
+     && [[ "$esr_out" == *"TLS front end pid 1 is still running and could not be signalled; pid file kept"* ]] \
+     && [[ "$esr_out" == *"$esr_note; if it is stale, remove $esr_root/.fishhawk/dev.pid"* ]] \
+     && [[ "$esr_out" != *"fishhawkd stopped"* ]]; then
+    pass "19d cmd_down over EPERM pid 1 keeps both pid files, still sweeps strays and runs the port fallback, exits non-zero"
+  else
+    fail "19d cmd_down over EPERM pid 1 (rc=${esr_rc} dev.pid=$([[ -f "$esr_root/.fishhawk/dev.pid" ]] && print kept || print removed) tls=$([[ -f "$esr_root/.fishhawk/tls-proxy.pid" ]] && print kept || print removed) stray=$([[ -e "$esr_root/.fishhawk/dev 2.pid" ]] && print kept || print swept) fallback=$([[ -f "$esr_wd/fallback-ran" ]] && print ran || print skipped) out='${esr_out}')"
+  fi
+
+  # 19e. cmd_k8s_down's forward teardown (D2): a pid file naming 1 is kept and
+  # the helper returns non-zero — the same guard, not a bare rm.
+  print 1 > "$esr_wd/k8s-pf.pid"
+  esr_out="$(_k8s_pf_down "port-forward" "$esr_wd/k8s-pf.pid" 2>&1)"; esr_rc=$?
+  if (( esr_rc != 0 )) && [[ -f "$esr_wd/k8s-pf.pid" ]] \
+     && [[ "$esr_out" == *"port-forward pid 1 is still running and could not be signalled; pid file kept"* ]]; then
+    pass "19e _k8s_pf_down over EPERM pid 1 refuses and keeps the pid file"
+  else
+    fail "19e _k8s_pf_down over EPERM pid 1 (rc=${esr_rc} file=$([[ -f "$esr_wd/k8s-pf.pid" ]] && print kept || print removed) out='${esr_out}')"
+  fi
+  esr_k8s_body="$(typeset -f cmd_k8s_down)"
+  if print -r -- "$esr_k8s_body" | grep_q '_k8s_pf_down "port-forward" "\$K8S_PF_PID_FILE"' \
+     && print -r -- "$esr_k8s_body" | grep_q '_k8s_pf_down "jaeger port-forward" "\$K8S_JAEGER_PF_PID_FILE"'; then
+    pass "19e cmd_k8s_down routes both forwards through _k8s_pf_down"
+  else
+    fail "19e cmd_k8s_down should stop both forwards via _k8s_pf_down"
+  fi
+  rm -rf "$esr_wd"
+else
+  print "SKIP (non-discriminating: kill -0 1 -> rc=${esr_k1_rc} '${esr_k1_out}'): 19a-19e ESRCH-only liveness arms"
+fi
+
+# 19f. RATCHET: every `kill -0` left in scripts/dev is either inside _pid_alive
+# (exactly one) or one own-child poll in exactly these functions (one each). A
+# new bare cross-invocation liveness read — or a reverted guard inside an
+# allowlisted function — fails here. Comment lines are ignored.
+esr_ratchet="$(awk '
+  /^[A-Za-z_][A-Za-z0-9_]*\(\) \{/ { fn = $1; sub(/\(\)$/, "", fn) }
+  /^}/ { fn = "" }
+  /kill -0/ { line = $0; sub(/^[[:space:]]+/, "", line); if (line !~ /^#/) print (fn == "" ? "<top>" : fn) }
+' "${REPO_ROOT}/scripts/dev" | sort | uniq -c | awk '{print $2 "=" $1}' | tr '\n' ' ')"
+esr_ratchet_want="_await_healthz=1 _await_preview_healthz=1 _await_tls_healthz=1 _pid_alive=1 _relay_up=1 "
+if [[ "$esr_ratchet" == "$esr_ratchet_want" ]]; then
+  pass "19f ratchet: scripts/dev's only bare kill -0 sites are _pid_alive and the four own-child polls"
+else
+  fail "19f ratchet: kill -0 sites by function are '${esr_ratchet}', want '${esr_ratchet_want}' — route a cross-invocation liveness read through _pid_alive (#4858)"
+fi
+
+# R5 (#4858): every row in the #4875 section reads process state through ps
+# (_srp_alive, the exit poll, the comm scan, SRP_PS / ps_bin). Gate the whole
+# section on a REAL exec probe: inside a signal-confined agent shell setuid
+# /bin/ps cannot exec, and a failed ps would read as "exited" or "dead" and
+# silently flip assertions.
+srp_ps_err="$(ps -o pid= -p $$ 2>&1 >/dev/null)"; srp_ps_rc=$?
+if (( srp_ps_rc != 0 )); then
+  print "SKIP (ps cannot exec on this host: ${srp_ps_err} — e.g. a signal-confined agent shell, #4858; setuid /bin/ps is refused under sandbox-exec): the #4875 bounded registration probe section"
+else
 # ---------------------------------------------------------------------------
 # Bounded registration probe (#4875)
 # BEGIN #4875 SECTION
@@ -9948,6 +10100,7 @@ PATH="$herm_path"
 rm -rf "$herm_dir"
 # END ROW HERM-a
 # END #4875 SECTION
+fi  # R5 ps exec-probe gate (#4858)
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
