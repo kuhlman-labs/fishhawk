@@ -2966,9 +2966,18 @@ _host_dispatch_ps_args() {
 
 # FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT in seconds (default 120). A
 # non-positive or non-numeric value falls back to the default (the
-# relay-polls fail-safe precedent).
+# relay-polls fail-safe precedent). The value is the one the shell would hold
+# after the .env load: reload and post-merge quiesce BEFORE any .env load of
+# their own, so .env is sourced here, in a subshell (the
+# _detect_shim_registered_with_env precedent), silenced and tested.
 _host_dispatch_drain_timeout() {
-  local v="${FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT:-}"
+  local v=""
+  v="$(
+    if [[ -f "${REPO_ROOT}/.env" ]]; then
+      { set -a; source "${REPO_ROOT}/.env"; set +a; } >/dev/null 2>&1 || true
+    fi
+    print -r -- "${FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT:-}"
+  )" || v=""
   if [[ "$v" == <-> ]] && (( v > 0 )); then
     print -r -- "$v"
   else
@@ -2994,19 +3003,36 @@ _host_dispatch_sleep() {
 }
 
 # The scrubbed child environment (approval condition G3), into the global array
-# _HD_ENV as NAME=value words for `env -i`. An explicit allowlist: the process
-# basics, the dispatcher's own bearer (from FISHHAWK_DEV_HOST_DISPATCH_TOKEN —
-# never the operator's FISHHAWK_API_TOKEN, and its presence also stops
-# fishhawk-mcp's loadConfig before the credential-store rung), the backend URL,
-# and the documented runner/gate variables when set. Nothing else from .env
-# reaches it: not FISHHAWKD_DATABASE_URL, the webhook or OAuth secrets, the App
-# key file, or the AWS trace-store keys.
+# _HD_ENV as NAME=value words. An explicit allowlist: the process basics, the
+# dispatcher's own bearer (from FISHHAWK_DEV_HOST_DISPATCH_TOKEN — never the
+# operator's FISHHAWK_API_TOKEN, and its presence also stops fishhawk-mcp's
+# loadConfig before the credential-store rung), the backend URL, and the
+# documented runner variables when set. The dispatcher hands each runner this
+# environment minus the bearer, so the allowlist is also every dispatcher-spawned
+# runner's environment: it carries the runner's security-policy knobs (an
+# operator's fail-closed `require` or `off` kill switch must hold on this spawn
+# path too), its env-carried model credentials and their config locators, and
+# the documented FISHHAWK_AGENT_ENV_* / FISHHAWK_ACCEPTANCE_ENV_* passthrough
+# families. DOCKER_HOST and DOCKER_CONTEXT stay: the gate's isolation check
+# (runner/internal/gateiso) resolves the docker endpoint from them and refuses
+# a non-local one, so dropping them would point the gate at the wrong daemon.
+# SSH_AUTH_SOCK is NOT carried: it is a credential locator the runner refuses
+# for untrusted execution (acceptenv), and no runner path needs it. Nothing
+# else from .env reaches it: not FISHHAWKD_DATABASE_URL, the webhook or OAuth
+# secrets, the App key file, or the AWS trace-store keys.
 typeset -ga _HD_ENV_PASSTHROUGH
-_HD_ENV_PASSTHROUGH=(USER LOGNAME SHELL LANG XDG_STATE_HOME SSH_AUTH_SOCK DOCKER_HOST
-  FISHHAWK_HOST_LABEL FISHHAWK_RUNNER_BIN
+_HD_ENV_PASSTHROUGH=(USER LOGNAME SHELL LANG XDG_STATE_HOME DOCKER_HOST DOCKER_CONTEXT
+  FISHHAWK_HOST_LABEL FISHHAWK_RUNNER_BIN FISHHAWK_AGENT_BIN FISHHAWK_CODEX_BIN
+  FISHHAWK_DEPLOYMENT_PROFILE FISHHAWK_FORGE_WRITES
+  FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION FISHHAWK_ACCEPTANCE_NET_SANDBOX
+  FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX
+  ANTHROPIC_API_KEY OPENAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR CODEX_HOME
+  FISHHAWK_ACCEPTANCE_PREVIEW_CMD FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD
+  FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS FISHHAWK_ACCEPTANCE_PREVIEW_READY_TIMEOUT_SECS
+  FISHHAWK_ACCEPTANCE_REPLAY_MAX_SCENARIOS FISHHAWK_ACCEPTANCE_REPLAY_TIME_CAP_SECS
   FISHHAWK_GATE_IMAGE FISHHAWK_GATE_IMAGE_ALLOWLIST FISHHAWK_GATE_CONTAINER
   FISHHAWK_GATE_CACHE FISHHAWK_GATE_DOCKER_CONFIG FISHHAWK_GATE_SERVICES
-  FISHHAWK_GATE_BUILD FISHHAWK_GATE_ISOLATION)
+  FISHHAWK_GATE_BUILD FISHHAWK_GATE_ISOLATION FISHHAWK_GATE_POSTGRES_IMAGE)
 typeset -ga _HD_ENV
 _host_dispatch_env() {
   local token="$1" name
@@ -3017,12 +3043,29 @@ _host_dispatch_env() {
     "FISHHAWK_API_TOKEN=${token}"
     "FISHHAWK_BACKEND_URL=http://localhost:$(_healthz_port)"
   )
-  for name in "${_HD_ENV_PASSTHROUGH[@]}"; do
+  for name in "${_HD_ENV_PASSTHROUGH[@]}" \
+      ${parameters[(I)FISHHAWK_AGENT_ENV_*]} ${parameters[(I)FISHHAWK_ACCEPTANCE_ENV_*]}; do
     if [[ -n "${(P)name:-}" ]]; then
       _HD_ENV+=("${name}=${(P)name}")
     fi
   done
   return 0
+}
+
+# Exec <cmd...> with EXACTLY the _HD_ENV words as its environment. Call it only
+# in a subshell: it un-exports every exported parameter, exports the _HD_ENV
+# words, then execs. The words never become an argv (an `env -i NAME=value`
+# prefix would show the bearer to `ps` until env execs), and the exec keeps the
+# subshell's pid, which _host_dispatch_up records.
+_host_dispatch_exec_scrubbed() {
+  local n w
+  for n in ${(k)parameters[(R)*export*]}; do
+    typeset -g +x -- "$n" 2>/dev/null
+  done
+  for w in "${_HD_ENV[@]}"; do
+    export -- "$w"
+  done
+  exec -- "$@"
 }
 
 # 0 when HD_PID_FILE names a live host dispatcher; sets _HD_PID (and prints it)
@@ -3087,7 +3130,7 @@ _host_dispatch_up() {
   _HD_PAUSE_CREATED=0
   local roots="${FISHHAWK_MCP_ALLOWED_ROOTS:-$REPO_ROOT}"
   _host_dispatch_env "$token"
-  env -i "${_HD_ENV[@]}" "$HD_BIN" host-dispatch --allowed-roots "$roots" --state-dir "$HD_STATE_DIR" >> "$HD_LOG_FILE" 2>&1 &
+  ( _host_dispatch_exec_scrubbed "$HD_BIN" host-dispatch --allowed-roots "$roots" --state-dir "$HD_STATE_DIR" ) >> "$HD_LOG_FILE" 2>&1 &
   local hd_pid=$!
   # The relay's subshell-safe disown (see _relay_up).
   local disown_err="${HD_LOG_FILE}.disown"
@@ -3145,8 +3188,8 @@ _host_dispatch_resume() {
   return 0
 }
 
-# INT/TERM during the --when-quiet wait or the drain wait (approval condition
-# G4): remove the pause file this invocation created, then exit 128+signal. A
+# INT/TERM during the --when-quiet wait (and the registration probe after it)
+# or the drain wait (approval condition G4): remove the pause file this invocation created, then exit 128+signal. A
 # hard kill (SIGKILL) cannot be trapped; `fishhawk-mcp host-dispatch --resume`
 # is the remedy.
 _host_dispatch_interrupted() {
@@ -4354,6 +4397,8 @@ cmd_reload() {
     # Keep the host dispatcher paused for the WHOLE wait (E88.3 / #4527), so
     # it cannot keep starting runners the wait is waiting out. A timeout
     # resumes it; an INT/TERM removes the pause this command created (G4).
+    # The trap stays armed through the registration probe below, and the
+    # quiesce re-arms it for the drain.
     _host_dispatch_pause
     _host_dispatch_arm_interrupt_trap
     if ! _reload_wait_until_quiet "$q_interval" "$q_timeout"; then
@@ -4361,7 +4406,6 @@ cmd_reload() {
       _host_dispatch_resume
       exit 1
     fi
-    _host_dispatch_disarm_interrupt_trap
   fi
 
   # Registration probe (#4875): BEFORE the guards, so a slow probe cannot widen the
@@ -4371,6 +4415,9 @@ cmd_reload() {
   local shim_state=""
   if ! shim_state="$(_detect_shim_registered_with_env)"; then shim_state=""; fi
   _SHIM_REGISTERED_PRECOMPUTED="$(_normalize_shim_state "$shim_state")"
+  if (( when_quiet )); then
+    _host_dispatch_disarm_interrupt_trap
+  fi
 
   # Host dispatcher quiesce (E88.3 / #4527, ADR-104 Q5) BEFORE the live-run
   # scan: a runner the draining tick spawns is then visible to the scan below

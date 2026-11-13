@@ -1842,20 +1842,45 @@ What it runs:
   `working_dir` local runs bind). The other flags keep their defaults
   (`--interval` 30s, `--max-in-flight` 2, `--per-tick-cap` 4, `--daily-cap`
   48).
-- **Scrubbed environment (approval condition G3).** It is spawned with `env -i`
-  and an explicit allowlist, `_HD_ENV_PASSTHROUGH`. The allowlist carries `PATH`,
-  `HOME`, `TMPDIR`, `FISHHAWK_API_TOKEN` (set from
+- **Scrubbed environment (approval condition G3).** It is spawned with an
+  explicit allowlist and nothing else: `_host_dispatch_exec_scrubbed`, in a
+  subshell, un-exports every exported variable, exports the allowlist and
+  execs the binary. The variables are never an argv (an `env -i NAME=value`
+  prefix would show the bearer to `ps` until `env` execs). The allowlist
+  carries `PATH`, `HOME`, `TMPDIR`, `FISHHAWK_API_TOKEN` (set from
   `FISHHAWK_DEV_HOST_DISPATCH_TOKEN`, so an operator `FISHHAWK_API_TOKEN` in
   `.env` never reaches it, and its presence also stops `fishhawk-mcp`'s
   `loadConfig` before the credential-store rung) and `FISHHAWK_BACKEND_URL`
-  (`http://localhost:<port>`). When set, it also carries `USER`, `LOGNAME`,
-  `SHELL`, `LANG`, `XDG_STATE_HOME`, `SSH_AUTH_SOCK`, `DOCKER_HOST`,
-  `FISHHAWK_HOST_LABEL`, `FISHHAWK_RUNNER_BIN` and the `FISHHAWK_GATE_*` runner
-  variables. Nothing else from `.env` reaches it: not `FISHHAWKD_DATABASE_URL`,
-  the webhook or OAuth secrets, the App key file or the AWS trace-store keys.
-  The runners it spawns inherit this environment minus every
-  `FISHHAWK_API_TOKEN`, so a runner variable missing from the allowlist does
-  not reach them either. Add it to `_HD_ENV_PASSTHROUGH` with a test row.
+  (`http://localhost:<port>`). When set, it also carries the names in
+  `_HD_ENV_PASSTHROUGH`:
+  - process basics: `USER`, `LOGNAME`, `SHELL`, `LANG`, `XDG_STATE_HOME`;
+  - the docker endpoint, `DOCKER_HOST` and `DOCKER_CONTEXT`. The gate's
+    isolation check (`runner/internal/gateiso`) resolves the endpoint from
+    them and refuses a non-local one, so dropping them would point the gate
+    at the wrong daemon;
+  - the runner's security-policy knobs: `FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION`,
+    `FISHHAWK_ACCEPTANCE_NET_SANDBOX`, `FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX` and
+    `FISHHAWK_FORGE_WRITES`, so an operator's `require`, `off` or `deny` holds
+    on this spawn path as on the MCP-verb one;
+  - env-carried model credentials and their config locators:
+    `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+    `CLAUDE_CONFIG_DIR`, `CODEX_HOME`. The acceptance synthetic HOME needs an
+    env-carried model credential (`runner/README.md`), so without these the
+    credential isolation would degrade on this path only;
+  - the other documented runner variables: `FISHHAWK_HOST_LABEL`,
+    `FISHHAWK_RUNNER_BIN`, `FISHHAWK_AGENT_BIN`, `FISHHAWK_CODEX_BIN`,
+    `FISHHAWK_DEPLOYMENT_PROFILE`, the `FISHHAWK_ACCEPTANCE_PREVIEW_*` and
+    `FISHHAWK_ACCEPTANCE_REPLAY_*` settings and the `FISHHAWK_GATE_*` variables;
+  - every `FISHHAWK_AGENT_ENV_*` and `FISHHAWK_ACCEPTANCE_ENV_*` variable, the
+    runner's own operator passthrough families.
+
+  `SSH_AUTH_SOCK` is NOT carried: it is a credential locator the runner already
+  refuses for untrusted execution, and no runner path needs it. Nothing else
+  from `.env` reaches it: not `FISHHAWKD_DATABASE_URL`, the webhook or OAuth
+  secrets, the App key file or the AWS trace-store keys. The runners it spawns
+  inherit this environment minus every `FISHHAWK_API_TOKEN`, so a runner
+  variable missing from the allowlist does not reach them either. Add it to
+  `_HD_ENV_PASSTHROUGH` with a test row.
 - **Files.** The pid file is `.fishhawk/host-dispatch.pid`, gitignored by
   `.fishhawk/*.pid`. It is not space-prefixed, so `_clean_stray_pid_files`
   leaves it alone. The log is `logs/host-dispatch.log`. The state dir is
@@ -1906,7 +1931,10 @@ quiesce is a no-op. Otherwise:
    runs on a context detached from the cancel) and exits. `scripts/dev` polls
    every 0.5 s for the exit, bounded by `FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT`
    (seconds, default 120; a non-positive or non-numeric value falls back to
-   120). It NEVER sends SIGKILL inside that window: a kill mid-tick can leave a
+   120). Set it in `.env` or the shell. The value used is the one the shell
+   would hold after the `.env` load, so a `.env` setting wins. `reload` and
+   `post-merge` quiesce before their own `.env` load, so the knob is read
+   through a subshell that sources `.env`. It NEVER sends SIGKILL inside that window: a kill mid-tick can leave a
    POSTed marker with no runner behind it (#1912). A refused SIGTERM (EPERM) is
    the #4858 `_stop_refused` error: the pid file is kept, and the quiesce
    returns 1.
@@ -1949,7 +1977,8 @@ deliberate refusal never fires the #631 `TRAPZERR` diagnostic.
 
 #### Interrupted waits (approval condition G4)
 
-An INT/TERM trap is armed around the `--when-quiet` wait and the drain wait.
+An INT/TERM trap is armed around the `--when-quiet` wait, the registration
+probe that follows it, and the drain wait.
 Ctrl-C or SIGTERM there removes the pause file THIS command created, prints
 `interrupted: removed the host dispatcher pause file this command created`, and
 exits 130 or 143. An interrupted drain still ends with the dispatcher exiting,
@@ -2012,7 +2041,7 @@ The next `scripts/dev up` or reload also clears it.
 - **Pure and body pins** (always run). HD-f1 pins the campaign-driver flag, its
   opt-out and the `serve` argv. HD-s3c is the argv identity table, including a
   rejected `/bin/zsh /x/fishhawk-mcp host-dispatch`. HD-s5 is the drain-timeout
-  knob. HD-o pins the orderings: reload's quiesce after the probe and before
+  knob, including a value set only in `.env`. HD-o pins the orderings: reload's quiesce after the probe and before
   the scan, the pause before the `--when-quiet` wait, post-merge's quiesce
   before its scan and `git checkout main`, `down`'s quiesce before `_tls_down`,
   and both guard refusals restoring. HD-u7 pins the start after `_await_healthz`
@@ -2024,20 +2053,32 @@ The next `scripts/dev up` or reload also clears it.
   when `ps` cannot exec (#4858) or `go` is not on PATH.
   - Start: HD-u1 (argv, the dedicated token and never the operator's, the
     backend URL, the pause file and `status.json` cleared), HD-e1 (env custody:
-    seeded `.env`, AWS and operator-token sentinels never reach the stub),
+    seeded `.env`, AWS, `SSH_AUTH_SOCK` and operator-token sentinels never
+    reach the stub; a runner policy knob, a model credential, `DOCKER_HOST`
+    and a `FISHHAWK_AGENT_ENV_*` variable do; an `env` shim proves the bearer
+    is on no argv),
     HD-u2 (opt-out), HD-u3 (token required), HD-u3b (missing binary), HD-u4
     (exit at start), HD-u5 (alive without status), HD-u6 (re-entrancy).
   - Stop: HD-s1, HD-s2 and HD-s3 (no pid file, dead pid, and a reused pid
     never signalled), HD-s3b (`ps` fails: degraded, still stopped), HD-s3d (G5:
-    no unconfirmed SIGKILL), HD-s4 (drain timeout in each context), HD-s4e (a
-    refused SIGTERM), HD-s6 (the #1912 drain counterfactual: every POSTed
-    marker has its runner, and the pause preceded SIGTERM).
+    no unconfirmed SIGKILL), HD-s4 (drain timeout in each context), HD-s4e and
+    HD-s4k (a refused SIGTERM, a refused SIGKILL), HD-s6 (the #1912 drain
+    counterfactual: every POSTed marker has its runner, the pause preceded
+    SIGTERM, and the stop is recorded for the restore).
   - Wiring: HD-r1 (the scan-ordering counterfactual: the runner the draining
     tick spawns is caught, no teardown), HD-r2 (restore after a refusal, and
     nothing started when none was running), HD-w1 and HD-w2 (`--when-quiet`
     paused at every poll; resumed on a timeout), HD-p1 (post-merge refuses
-    before git and restores), HD-i1 and HD-i2 (G4: SIGTERM during either wait
-    removes the pause file).
+    before git and restores), HD-p2 (post-merge into the real `cmd_reload`,
+    whose post-pull scan refuses: the dispatcher post-merge stopped is
+    restored), HD-x1 (a restore without a token prints its failure line; a
+    token only in `.env` is sourced), HD-i1 to HD-i4 (G4: SIGTERM during
+    either wait, SIGINT during the `--when-quiet` wait, and SIGTERM during the
+    probe after it each remove the pause file).
+- **Row-dir guards.** HD-g1: a failed `mktemp` fails the row and leaves a
+  non-empty, missing dir, and `_hd_cleanup` signals and removes only a
+  `fishhawk-hd.*` dir directly under the temp root, so an empty dir can never
+  become a `pkill -KILL -f /`.
 - Every pre-existing row runs against a throwaway `HD_*` dir, so no row reaches
   a live dispatcher.
 

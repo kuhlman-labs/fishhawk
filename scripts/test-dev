@@ -10159,15 +10159,25 @@ else
 fi
 
 # HD-s5 the drain-timeout knob falls back to 120 on a non-positive or
-# non-numeric value.
+# non-numeric value, and is read from .env too: reload and post-merge quiesce
+# before any .env load of their own. REPO_ROOT points at a dir with no .env
+# for the shell rows, so the host's .env cannot leak into them.
 hd_tbl_ok=1
 for hd_row in "|120" "0|120" "-3|120" "abc|120" "7|7"; do
   hd_in="${hd_row%%|*}"; hd_want="${hd_row#*|}"
-  hd_got="$(FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT="$hd_in"; _host_dispatch_drain_timeout)"
+  hd_got="$(REPO_ROOT="$hd_global_dir"; FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT="$hd_in"; _host_dispatch_drain_timeout)"
   if [[ "$hd_got" != "$hd_want" ]]; then hd_tbl_ok=0; print "  HD-s5 [${hd_in}] got ${hd_got} want ${hd_want}"; fi
 done
+hd_env_root="${hd_global_dir}/envroot"
+mkdir -p "$hd_env_root"
+print -r -- 'FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT=9' > "${hd_env_root}/.env"
+hd_got="$(REPO_ROOT="$hd_env_root"; unset FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT; _host_dispatch_drain_timeout)"
+if [[ "$hd_got" != 9 ]]; then hd_tbl_ok=0; print "  HD-s5 [.env 9, shell unset] got ${hd_got} want 9"; fi
+hd_got="$(REPO_ROOT="$hd_env_root"; FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT=7; _host_dispatch_drain_timeout)"
+if [[ "$hd_got" != 9 ]]; then hd_tbl_ok=0; print "  HD-s5 [.env 9, shell 7] got ${hd_got} want 9 (the value after the .env load)"; fi
+rm -rf "$hd_env_root"
 if (( hd_tbl_ok )); then
-  pass "HD-s5 _host_dispatch_drain_timeout: unset/0/-3/abc -> 120, 7 -> 7"
+  pass "HD-s5 _host_dispatch_drain_timeout: unset/0/-3/abc -> 120, 7 -> 7, and a .env value applies before any .env load"
 else
   fail "HD-s5 _host_dispatch_drain_timeout table (rows above)"
 fi
@@ -10353,16 +10363,29 @@ if [[ ! -x "$hd_stub_bin" ]]; then
 else
 
 hd_saved_log_dir="$LOG_DIR"
-# Fresh row dir with the stub installed; re-points the HD_* globals at it.
+hd_saved_repo_root="$REPO_ROOT"
+hd_tmp_root="${${TMPDIR:-/tmp}:A}"
+# Fresh row dir with the stub installed; re-points the HD_* globals, and
+# REPO_ROOT (so no row reads the host's .env), at it. A failed mktemp FAILS the
+# row and points everything at a dir that does not exist, so the row fails
+# closed (HD_BIN is not executable: nothing is spawned) and _hd_cleanup, which
+# acts only on a fishhawk-hd.* dir directly under the temp root, does nothing.
 _hd_case() {
-  hd_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-hd.XXXXXX")"
-  # Canonical: a TMPDIR ending in '/' leaves a '//' that Go's filepath.Dir
-  # cleans out of the runner argv, and the ps filter would then miss it.
-  hd_dir="${hd_dir:A}"
-  mkdir -p "${hd_dir}/bin" "${hd_dir}/logs"
-  cp "$hd_stub_bin" "${hd_dir}/bin/fishhawk-mcp"
-  ln -s fishhawk-mcp "${hd_dir}/bin/fishhawk-runner"
-  print -r -- normal > "${hd_dir}/bin/hd-stub.mode"
+  hd_dir=""
+  hd_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-hd.XXXXXX" 2>/dev/null)" || hd_dir=""
+  if [[ -n "$hd_dir" && -d "$hd_dir" ]]; then
+    # Canonical: a TMPDIR ending in '/' leaves a '//' that Go's filepath.Dir
+    # cleans out of the runner argv, and the ps filter would then miss it.
+    hd_dir="${hd_dir:A}"
+    mkdir -p "${hd_dir}/bin" "${hd_dir}/logs"
+    cp "$hd_stub_bin" "${hd_dir}/bin/fishhawk-mcp"
+    ln -s fishhawk-mcp "${hd_dir}/bin/fishhawk-runner"
+    print -r -- normal > "${hd_dir}/bin/hd-stub.mode"
+  else
+    fail "HD row setup: mktemp -d under ${TMPDIR:-/tmp} failed — the next row runs against a missing dir and fails closed"
+    hd_dir="${hd_build_dir}/no-row-dir"
+  fi
+  REPO_ROOT="$hd_dir"
   HD_PID_FILE="${hd_dir}/.fishhawk/host-dispatch.pid"
   HD_STATE_DIR="${hd_dir}/.fishhawk/cache/host-dispatch"
   HD_LOG_FILE="${hd_dir}/logs/host-dispatch.log"
@@ -10374,9 +10397,12 @@ _hd_case() {
   hd_marker="${hd_dir}/teardown"
 }
 _hd_cleanup() {
-  pkill -KILL -f -- "${hd_dir}/" 2>/dev/null || true
-  sleep 0.1
-  rm -rf "$hd_dir"
+  if [[ -n "$hd_dir" && -d "$hd_dir" && "${hd_dir:h}" == "$hd_tmp_root" && "${hd_dir:t}" == fishhawk-hd.* ]]; then
+    pkill -KILL -f -- "${hd_dir}/" 2>/dev/null || true
+    sleep 0.1
+    rm -rf "$hd_dir"
+  fi
+  REPO_ROOT="$hd_saved_repo_root"
   HD_PID_FILE="${hd_global_dir}/host-dispatch.pid"
   HD_LOG_FILE="${hd_global_dir}/host-dispatch.log"
   HD_STATE_DIR="${hd_global_dir}/state"
@@ -10403,6 +10429,45 @@ _hd_wait_dead() { local n=0; while _hd_alive "$1" && (( n < 100 )); do sleep 0.1
 # The live-run scan over REAL ps, filtered to this row's dir.
 _hd_scan_def='_scan_live_runs() { ps -axww -o pid=,args= 2>/dev/null | grep -F -- "${hd_dir}/" | _parse_live_runs; return 0 }'
 
+# HD-g1 the row-dir guards: a failed mktemp never leaves hd_dir empty (a
+# `pkill -KILL -f /` would hit every process of this user), and _hd_cleanup
+# signals and removes nothing for an empty dir or one that is not a
+# fishhawk-hd.* row dir under the temp root. pkill and rm are stubbed to record.
+hd_g_calls="${hd_build_dir}/guard.calls"
+hd_g_out="$(
+  cd "$hd_build_dir" || exit 1
+  mktemp() { return 1 }
+  pkill() { print -r -- "pkill $*" >> "$hd_g_calls" }
+  rm() { print -r -- "rm $*" >> "$hd_g_calls" }
+  _hd_case
+  print -r -- "dir=${hd_dir}"
+  _hd_cleanup
+  hd_dir=""
+  _hd_cleanup
+  hd_dir="$hd_build_dir"
+  _hd_cleanup
+)"
+if [[ ! -e "$hd_g_calls" ]] && print -r -- "$hd_g_out" | grep_q 'HD row setup: mktemp -d' \
+   && print -r -- "$hd_g_out" | grep_q -Fx "dir=${hd_build_dir}/no-row-dir"; then
+  pass "HD-g1 a failed mktemp fails the row with a non-empty missing dir; _hd_cleanup signals and removes nothing outside a fishhawk-hd.* row dir"
+else
+  fail "HD-g1 row-dir guards (out=${hd_g_out} calls=$(cat "$hd_g_calls" 2>/dev/null))"
+fi
+rm -f "$hd_g_calls"
+hd_g_out="$(
+  pkill() { print -r -- "pkill $*" >> "$hd_g_calls" }
+  _hd_case
+  print -r -- "dir=${hd_dir}"
+  _hd_cleanup
+)"
+hd_g_dir="${${(M)${(f)hd_g_out}:#dir=*}#dir=}"
+if [[ -n "$hd_g_dir" && ! -e "$hd_g_dir" ]] && grep_q -Fx "pkill -KILL -f -- ${hd_g_dir}/" < "$hd_g_calls"; then
+  pass "HD-g1 a real row dir is signalled by its own path and removed"
+else
+  fail "HD-g1 real row cleanup (dir=${hd_g_dir} calls=$(cat "$hd_g_calls" 2>/dev/null))"
+fi
+rm -f "$hd_g_calls"
+
 # HD-u1 the spawn: argv, dedicated token (never the operator's), backend URL,
 # pid file, and the pause + status.json cleared before the spawn.
 _hd_case
@@ -10426,8 +10491,12 @@ else
 fi
 _hd_cleanup
 
-# HD-e1 env custody (G3): sentinel secrets in the invoking shell never reach the
-# dispatcher; the allowlisted runner variables do.
+# HD-e1 env custody (G3): sentinel secrets in the invoking shell (including the
+# ssh-agent socket) never reach the dispatcher; the allowlisted runner variables
+# do, among them a runner policy knob, a model credential, the docker endpoint
+# and the agent passthrough family (the dispatcher hands its runners this
+# environment). The bearer never rides an argv: an `env` shim records any argv
+# that would carry it.
 _hd_case
 hd_up_out="$(
   unset FISHHAWK_DEV_HOST_DISPATCH
@@ -10435,7 +10504,11 @@ hd_up_out="$(
   export FISHHAWKD_DATABASE_URL=hd-sentinel-db FISHHAWKD_GITHUB_WEBHOOK_SECRET=hd-sentinel-webhook
   export FISHHAWKD_GITHUB_OAUTH_CLIENT_SECRET=hd-sentinel-oauth FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE=hd-sentinel-key
   export AWS_SECRET_ACCESS_KEY=hd-sentinel-aws AWS_ACCESS_KEY_ID=hd-sentinel-awsid HD_SENTINEL_OTHER=hd-sentinel-other
+  export SSH_AUTH_SOCK=/tmp/hd-sentinel-ssh-agent
   export FISHHAWK_RUNNER_BIN=/hd/runner-bin FISHHAWK_GATE_IMAGE=hd-gate-image
+  export FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION=require ANTHROPIC_API_KEY=hd-model-key
+  export DOCKER_HOST=unix:///hd/docker.sock FISHHAWK_AGENT_ENV_HD_EXTRA=hd-agent-extra
+  env() { print -r -- "$*" >> "${hd_dir}/env.argv"; command env "$@" }
   REPO_ROOT="$hd_dir"
   _host_dispatch_up 2>&1
 )"; hd_up_rc=$?
@@ -10445,10 +10518,15 @@ if (( hd_up_rc == 0 )) && [[ -n "$hd_env" ]] && ! print -r -- "$hd_env" | grep_q
    && print -r -- "$hd_env" | grep_q -x 'FISHHAWK_API_TOKEN=hd-token' \
    && print -r -- "$hd_env" | grep_q -x 'FISHHAWK_RUNNER_BIN=/hd/runner-bin' \
    && print -r -- "$hd_env" | grep_q -x 'FISHHAWK_GATE_IMAGE=hd-gate-image' \
-   && print -r -- "$hd_env" | grep_q '^PATH='; then
-  pass "HD-e1 the dispatcher runs under a scrubbed env: no .env/AWS sentinel and no operator token reach it; the allowlisted runner vars do"
+   && print -r -- "$hd_env" | grep_q -x 'FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION=require' \
+   && print -r -- "$hd_env" | grep_q -x 'ANTHROPIC_API_KEY=hd-model-key' \
+   && print -r -- "$hd_env" | grep_q -x 'DOCKER_HOST=unix:///hd/docker.sock' \
+   && print -r -- "$hd_env" | grep_q -x 'FISHHAWK_AGENT_ENV_HD_EXTRA=hd-agent-extra' \
+   && print -r -- "$hd_env" | grep_q '^PATH=' \
+   && ! grep -qs -- 'hd-token' "${hd_dir}/env.argv"; then
+  pass "HD-e1 the dispatcher runs under a scrubbed env: no .env/AWS/ssh-agent sentinel and no operator token reach it; the runner policy knob, model credential, docker endpoint and allowlisted runner vars do; the bearer is on no argv"
 else
-  fail "HD-e1 env custody (rc=${hd_up_rc} env=$(print -r -- "$hd_env" | tr '\n' ' '))"
+  fail "HD-e1 env custody (rc=${hd_up_rc} argv=$(cat "${hd_dir}/env.argv" 2>/dev/null) env=$(print -r -- "$hd_env" | tr '\n' ' '))"
 fi
 _hd_cleanup
 
@@ -10642,19 +10720,37 @@ else
 fi
 _hd_cleanup
 
+# HD-s4k a refused SIGKILL (EPERM) on the drain-timeout escalation keeps the
+# pid file and returns 1.
+_hd_case
+_hd_start ignoreterm
+hd_q_out="$(
+  kill() { if [[ "$1" == -KILL ]]; then print -r -- "kill: kill $2 failed: operation not permitted"; return 1; fi; builtin kill "$@" }
+  export FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT=1
+  _host_dispatch_quiesce 1 down 2>&1
+)"; hd_q_rc=$?
+if (( hd_q_rc == 1 )) && _hd_alive "$hd_pid" && [[ -f "$HD_PID_FILE" ]] \
+   && print -r -- "$hd_q_out" | grep_q 'sending SIGKILL' && print -r -- "$hd_q_out" | grep_q 'could not be signalled'; then
+  pass "HD-s4k a refused SIGKILL on a drain timeout: _stop_refused, pid file kept, rc 1"
+else
+  fail "HD-s4k refused KILL (rc=${hd_q_rc} alive=$(_hd_alive "$hd_pid" && print yes) out=${hd_q_out})"
+fi
+_hd_cleanup
+
 # HD-s6 the #1912 drain counterfactual: a stub mid-tick (marker POSTed, runner
 # spawning after the pause) drains with every marker's runner spawned, and the
 # pause was in place when SIGTERM arrived.
 _hd_case
 _hd_start tick
-hd_q_out="$(_host_dispatch_quiesce 0 reload 2>&1)"; hd_q_rc=$?
+# The rc and _HD_RESTORE are read INSIDE the substitution that ran the quiesce.
+hd_q_out="$(_host_dispatch_quiesce 0 reload 2>&1; print -r -- "quiesce_rc=$? restore=${_HD_RESTORE}")"
 hd_markers="$(grep -c '^marker ' "$hd_ticks" 2>/dev/null)"
 hd_runners="$(grep -c '^runner ' "$hd_ticks" 2>/dev/null)"
-if (( hd_q_rc == 0 )) && [[ -n "$hd_markers" ]] && (( hd_markers >= 1 && hd_markers == hd_runners )) \
-   && grep_q -x 'term pause=present' < "$hd_ticks" && [[ ! -f "$HD_PID_FILE" ]] && (( _HD_RESTORE == 0 )); then
-  pass "HD-s6 drain: every POSTed marker has its runner, the pause preceded SIGTERM, the pid file is gone"
+if print -r -- "$hd_q_out" | grep_q -x 'quiesce_rc=0 restore=1' && [[ -n "$hd_markers" ]] && (( hd_markers >= 1 && hd_markers == hd_runners )) \
+   && grep_q -x 'term pause=present' < "$hd_ticks" && [[ ! -f "$HD_PID_FILE" ]]; then
+  pass "HD-s6 drain: every POSTed marker has its runner, the pause preceded SIGTERM, the pid file is gone, the stop is recorded for the restore"
 else
-  fail "HD-s6 drain (rc=${hd_q_rc} out=${hd_q_out} ticks=$(tr '\n' ' ' < "$hd_ticks" 2>/dev/null))"
+  fail "HD-s6 drain (out=${hd_q_out} ticks=$(tr '\n' ' ' < "$hd_ticks" 2>/dev/null))"
 fi
 _hd_cleanup
 
@@ -10792,9 +10888,81 @@ else
 fi
 _hd_cleanup
 
-# HD-i1 / HD-i2 (G4) SIGTERM during the --when-quiet wait and during the drain
-# wait removes the pause file the command created. Driven as a separate zsh
-# process so a real signal reaches it.
+# HD-p2 post-merge into the REAL cmd_reload: post-merge's guards pass, the git
+# steps run, then reload's post-pull live-run scan refuses. The dispatcher
+# post-merge stopped is restored through the persisted _HD_RESTORE.
+_hd_case
+_hd_start normal
+hd_first="$hd_pid"
+mkdir -p "${hd_dir}/scripts"
+print -rl -- '#!/bin/sh' "echo cleanup-merged >> '${hd_marker}'" > "${hd_dir}/scripts/cleanup-merged"
+chmod +x "${hd_dir}/scripts/cleanup-merged"
+hd_r_out="$(
+  REPO_ROOT="$hd_dir"
+  PID_FILE="${hd_dir}/dev.pid"
+  : > "$PID_FILE"
+  unset FISHHAWK_DEV_HOST_DISPATCH
+  export FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-token
+  _scan_live_runs() {
+    local n=0; [[ -f "${hd_dir}/scans" ]] && n="$(cat "${hd_dir}/scans")"
+    n=$(( n + 1 )); print -r -- "$n" > "${hd_dir}/scans"
+    if (( n >= 2 )); then print -r -- "4242"$'\t'"hd-post-pull"; fi
+    return 0
+  }
+  _refuse_on_restart_blockers() { return 0 }
+  _gocache_maintain() { return 0 }
+  git() { print -r -- "git $*" >> "$hd_marker" }
+  cmd_down() { print -r -- down >> "$hd_marker" }
+  cmd_up() { print -r -- up >> "$hd_marker" }
+  cmd_post_merge 2>"${hd_dir}/err"
+)"; hd_r_rc=$?
+hd_new="$(cat "$HD_PID_FILE" 2>/dev/null)"
+if (( hd_r_rc == 1 )) && grep_q -Fx 'git pull --ff-only origin main' < "$hd_marker" && grep_q -x 'cleanup-merged' < "$hd_marker" \
+   && ! grep_q -x 'down' < "$hd_marker" && ! grep_q -x 'up' < "$hd_marker" && grep_q 'hd-post-pull' < "${hd_dir}/err" \
+   && ! _hd_alive "$hd_first" && [[ -n "$hd_new" && "$hd_new" != "$hd_first" && "$(_hd_starts)" == 2 ]] && _hd_alive "$hd_new"; then
+  pass "HD-p2 post-merge then a refusal in the real cmd_reload's post-pull scan: the dispatcher post-merge stopped is restored, no teardown"
+else
+  fail "HD-p2 post-merge hand-off (rc=${hd_r_rc} marker=$(tr '\n' ' ' < "$hd_marker" 2>/dev/null) first=${hd_first} new=${hd_new} starts=$(_hd_starts) err=$(cat "${hd_dir}/err" 2>/dev/null))"
+fi
+_hd_cleanup
+
+# HD-x1 _host_dispatch_restore: with no dedicated token in the shell or .env it
+# prints the reason and its one failure line, starts nothing, clears the flag
+# and returns 0; a token only in .env is sourced and the restore starts it.
+_hd_case
+hd_x_out="$(
+  unset FISHHAWK_DEV_HOST_DISPATCH FISHHAWK_DEV_HOST_DISPATCH_TOKEN
+  _HD_RESTORE=1
+  _host_dispatch_restore 2>&1
+  print -r -- "restore_rc=$? restore=${_HD_RESTORE}"
+)"
+if print -r -- "$hd_x_out" | grep_q -x 'restore_rc=0 restore=0' \
+   && print -r -- "$hd_x_out" | grep_q 'FISHHAWK_DEV_HOST_DISPATCH_TOKEN is unset' \
+   && print -r -- "$hd_x_out" | grep_q -F "host dispatcher not restored (see reason above)" \
+   && [[ ! -f "$hd_rec" && ! -f "$HD_PID_FILE" ]]; then
+  pass "HD-x1 restore without a dedicated token: the reason, 'host dispatcher not restored', nothing started, rc 0"
+else
+  fail "HD-x1 restore without a token (out=${hd_x_out})"
+fi
+print -r -- 'FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-env-token' > "${hd_dir}/.env"
+hd_x_out="$(
+  unset FISHHAWK_DEV_HOST_DISPATCH FISHHAWK_DEV_HOST_DISPATCH_TOKEN
+  _HD_RESTORE=1
+  _host_dispatch_restore 2>&1
+)"
+hd_pid="$(cat "$HD_PID_FILE" 2>/dev/null)"
+if grep_q -Fx 'token hd-env-token' < "$hd_rec" && _hd_alive "$hd_pid" && print -r -- "$hd_x_out" | grep_q "host dispatcher started (pid ${hd_pid})"; then
+  pass "HD-x1 restore sources .env: a token set only there starts the dispatcher"
+else
+  fail "HD-x1 restore from .env (pid=${hd_pid} out=${hd_x_out} rec=$(cat "$hd_rec" 2>/dev/null))"
+fi
+_hd_cleanup
+
+# HD-i1 / HD-i2 / HD-i3 / HD-i4 (G4) SIGTERM or SIGINT during the --when-quiet
+# wait, the registration probe after it, or the drain wait removes the pause
+# file the command created. Driven as a separate zsh process so a real signal
+# reaches it. Args: <wq|probe|drain> [TERM|INT]. The wait for the driver is
+# bounded (10 s, then SIGKILL: rc 137), so a lost trap fails instead of hanging.
 _hd_driver() {
   cat > "${hd_dir}/driver.zsh" <<'DRV'
 DEV_LIB_ONLY=1 source "${HD_T_REPO}/scripts/dev"
@@ -10811,6 +10979,12 @@ if [[ "$HD_T_MODE" == wq ]]; then
   _reload_quiet_sleep() { print -r -- waiting >> "${HD_T_DIR}/driver.polls"; sleep 0.2 }
   export FISHHAWK_RELOAD_QUIET_INTERVAL=1 FISHHAWK_RELOAD_QUIET_TIMEOUT=3600
   cmd_reload --when-quiet
+elif [[ "$HD_T_MODE" == probe ]]; then
+  _reload_quiet_check() { return 0 }
+  _detect_shim_registered_with_env() { print -r -- waiting >> "${HD_T_DIR}/driver.polls"; sleep 2; print -r -- undetermined }
+  _host_dispatch_quiesce() { print -r -- quiesce >> "${HD_T_DIR}/teardown"; return 1 }
+  export FISHHAWK_RELOAD_QUIET_INTERVAL=1 FISHHAWK_RELOAD_QUIET_TIMEOUT=3600
+  cmd_reload --when-quiet
 else
   _host_dispatch_sleep() { print -r -- waiting >> "${HD_T_DIR}/driver.polls"; sleep 0.2 }
   export FISHHAWK_DEV_HOST_DISPATCH_DRAIN_TIMEOUT=60
@@ -10823,7 +10997,10 @@ DRV
   while [[ ! -s "${hd_dir}/driver.polls" ]] && (( n < 100 )); do sleep 0.1; (( ++n )); done
   hd_pause_before="absent"
   [[ -e "${HD_STATE_DIR}/pause" ]] && hd_pause_before="present"
-  kill -TERM "$hd_drv" 2>/dev/null
+  kill -"${2:-TERM}" "$hd_drv" 2>/dev/null
+  n=0
+  while kill -0 "$hd_drv" 2>/dev/null && (( n < 100 )); do sleep 0.1; (( ++n )); done
+  if kill -0 "$hd_drv" 2>/dev/null; then kill -KILL "$hd_drv" 2>/dev/null; fi
   wait "$hd_drv"; hd_drv_rc=$?
 }
 _hd_case
@@ -10842,6 +11019,24 @@ if (( hd_drv_rc == 143 )) && [[ "$hd_pause_before" == present && ! -e "${HD_STAT
   pass "HD-i2 SIGTERM during the drain wait removes the pause file it created (exit 143)"
 else
   fail "HD-i2 drain interrupt (rc=${hd_drv_rc} before=${hd_pause_before} after=$([[ -e ${HD_STATE_DIR}/pause ]] && print present) out=$(cat "${hd_dir}/driver.out" 2>/dev/null))"
+fi
+_hd_cleanup
+_hd_case
+_hd_start normal
+_hd_driver wq INT
+if (( hd_drv_rc == 130 )) && [[ "$hd_pause_before" == present && ! -e "${HD_STATE_DIR}/pause" && ! -f "$hd_marker" ]] && _hd_alive "$hd_pid"; then
+  pass "HD-i3 SIGINT (Ctrl-C) during the --when-quiet wait removes the pause file it created (exit 130, no teardown)"
+else
+  fail "HD-i3 when-quiet INT (rc=${hd_drv_rc} before=${hd_pause_before} after=$([[ -e ${HD_STATE_DIR}/pause ]] && print present) out=$(cat "${hd_dir}/driver.out" 2>/dev/null))"
+fi
+_hd_cleanup
+_hd_case
+_hd_start normal
+_hd_driver probe
+if (( hd_drv_rc == 143 )) && [[ "$hd_pause_before" == present && ! -e "${HD_STATE_DIR}/pause" && ! -f "$hd_marker" ]] && _hd_alive "$hd_pid"; then
+  pass "HD-i4 SIGTERM during the registration probe after a --when-quiet wait removes the pause file it created (exit 143, no quiesce)"
+else
+  fail "HD-i4 probe interrupt (rc=${hd_drv_rc} before=${hd_pause_before} after=$([[ -e ${HD_STATE_DIR}/pause ]] && print present) teardown=$(cat "$hd_marker" 2>/dev/null) out=$(cat "${hd_dir}/driver.out" 2>/dev/null))"
 fi
 _hd_cleanup
 
