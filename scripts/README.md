@@ -1181,11 +1181,18 @@ separate acquisitions inside the same microseconds and this invocation still
 refuses, but it is a window rather than a guarantee — a clobbering `mv` restore
 would delete the third invocation's live lock instead, which is strictly worse.
 
-**Residual, stated:** `kill -0 <pid>` succeeding does not prove the pid is the
-ORIGINAL holder — a reused pid reads as live. That is the identical residual the
-container lease already accepts, and the consequence here is a bounded wait plus
-a loud displacement, or a refusal with an escape hatch printed in the message —
-never a lost or corrupted run.
+Holder liveness is ESRCH-only (`_pid_alive`, #4858): only `No such process`
+reads dead, and EPERM reads live. See "Liveness contract: ESRCH-only" under the
+`scripts/dev` section for why and what it costs.
+
+**Residual, stated:** `_pid_alive <pid>` succeeding does not prove the pid is the
+ORIGINAL holder — a reused pid reads as live, including one reused by another
+user's process (EPERM). That is the identical residual the container lease
+already accepts, and the consequence here is a bounded wait plus a loud
+displacement, or a refusal with an escape hatch printed in the message — never
+a lost or corrupted run. A refusal on an EPERM holder adds `pid N is alive but
+not signalable by you (another user's process, a reused pid, or a confined
+shell); if it is stale, remove <lock path>`.
 
 ### Degrades to no locking
 
@@ -1498,8 +1505,9 @@ registers a per-invocation lease file (named by its PID) in a shared lease dir
 under an atomic symlink lock, and the trap removes only its OWN lease and
 `docker rm`s the container only when no leases remain (an empty-dir `rmdir`
 succeeds → last holder). Stale leases from a SIGKILL'd invocation are pruned by
-a `kill -0` PID liveness check so a crashed run never permanently pins the
-container. A single-invocation `scripts/test verify` is unaffected — the lease
+an ESRCH-only PID liveness check (`_pid_alive`, #4858; see "Liveness contract:
+ESRCH-only" under `scripts/dev`) so a crashed run never permanently pins the
+container. A lease whose pid reads EPERM is kept and named on stderr. A single-invocation `scripts/test verify` is unaffected — the lease
 logic reduces to prior behavior when only one lease exists.
 
 The lock (`_lease_lock`) is an atomically-created SYMLINK whose target IS the
@@ -1508,8 +1516,9 @@ if the path is taken, with a `readlink`-equals-`$$` re-check rejecting a stray
 link landed inside a leftover dir lock), so it carries its owner from the
 instant it exists and gets the SAME stale-owner recovery the leases do: the spin
 loop reads the owner via `readlink` and breaks a lock whose owner PID is dead
-(`kill -0` fails → `rm`, retry) so a killed holder can't wedge later
-invocations. Because acquisition is atomic there is NO window in which the lock
+(`_pid_alive` reads ESRCH → `rm`, retry) so a killed holder can't wedge later
+invocations. An owner that reads EPERM is never broken: the bounded cap
+exhausts, the caller fails safe, and the refusal names the lock file. Because acquisition is atomic there is NO window in which the lock
 exists yet is unowned, so a live holder's lock can never be observed as
 ownerless and broken out from under it — this eliminates BY CONSTRUCTION both
 the earlier `mkdir`-then-stamp lock's ownerless-forever wedge (a holder
@@ -1542,6 +1551,60 @@ All of this is pinned by `scripts/test-dev`, which
 `scripts/test verify` runs via `_verify_gate_harnesses` since #2455 (skipped
 in-loop when zsh is absent from PATH), so a `scripts/dev` regression fails
 in-loop rather than only when a human runs the harness.
+
+### Liveness contract: ESRCH-only ([#4858](https://github.com/kuhlman-labs/fishhawk/issues/4858))
+
+Every liveness read of a pid the reading shell did NOT spawn — the container
+lease and its lock and the verify lock in `scripts/test`, and in `scripts/dev`
+`cmd_up` (via `_dev_pid_running`), the `_relay_up` re-entrancy guard, every stop
+path (`_tls_down`, `_relay_down`, `cmd_down`, `_down_port_fallback`,
+`cmd_k8s_down` via `_k8s_pf_down`, `_preview_kill_tracked`) and
+`_preview_lock_owner` — goes through `_pid_alive`. Only ESRCH (`No such
+process`) reads dead. EPERM reads LIVE, the fail-safe direction: a
+signal-confined implement or fix-up agent shell (#4858) gets EPERM for every pid
+outside its sandbox, so a bare `kill -0 <pid> 2>/dev/null` there would read
+every live peer as dead. The remaining bare `kill -0` calls are own-child polls
+(`_await_healthz`, `_await_tls_healthz`, `_relay_up`'s just-spawned relay,
+`_await_preview_healthz`); `scripts/test-dev` ratchets that list.
+
+Consequences:
+
+- A dead pid returns ESRCH and still self-heals: stale leases are pruned, a
+  dead-owner lock is broken, and a dead pid file is removed.
+- A pid file, lease or lock whose pid was REUSED by another user's process now
+  reads live and no longer self-heals. The lease lock's bounded cap fails safe
+  with its existing refusal, a verify-lock refusal exits 73, `scripts/dev up`
+  refuses to start (exit 1) rather than printing a bare `already running`, and a
+  `scripts/dev` stop path prints `error: <label> pid N is still running and could
+  not be signalled; pid file kept`, keeps the pid file and returns 1. Each of
+  these adds `pid N is alive but not signalable by you (another user's process,
+  a reused pid, or a confined shell); if it is stale, remove <file>`. Manual
+  recovery: confirm with `ps -p N -o user=,comm=` that the pid is not yours, then
+  remove the named file.
+- `cmd_down` and `cmd_k8s_down` run under `set -euo pipefail`; every signal they
+  send is errexit-safe, so an unsignalable pid reaches the guard, the stray
+  pid-file sweep and the port fallback still run (the helm uninstall too, for
+  k8s), and the command exits 1 at the end.
+
+**Boundary, stated.** Signal confinement protects PROCESSES, not files. A
+confined agent can still write, replace or delete any pid, lease or lock file
+its file permissions allow; `_pid_alive` only stops it from misreading a live
+process as dead.
+
+**`REPO_ROOT` exposure.** `scripts/dev` resolves `REPO_ROOT="${0:A:h:h}"` from
+its OWN path. Run from a lineage worktree
+(`<shared checkout>/.git/fishhawk-worktrees/run-<id>`) it acts on that
+worktree's gitignored `.fishhawk/*.pid`, which is absent or the agent's own. The
+signal-only profile has no file rules, though, and the shared checkout is the
+worktree's ancestor, so a confined agent that runs `<shared
+checkout>/scripts/dev ...` by absolute path (or after a `cd`) acts on the LIVE
+stack's `.fishhawk/dev.pid`, `tls-proxy.pid` and `webhook-relay.pid`.
+`scripts/dev` has no run-agent refusal of its own; only the skills call
+`scripts/is-run-agent`. Before confinement such a `down` would have killed the
+live stack. Under confinement with a bare `kill -0`, `up` would have deleted
+the live `dev.pid` and started a duplicate fishhawkd, and every `down` would
+have reported "stopped" and deleted pid files of processes still running. With
+`_pid_alive`, the kill is refused, the pid file is kept and the command exits 1.
 
 ### Rebuild matrix and activation
 

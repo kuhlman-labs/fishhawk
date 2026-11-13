@@ -160,8 +160,8 @@ export TESTCONTAINERS_RYUK_DISABLED=true
 # by its PID) in a shared lease directory under a mkdir-based lock; the EXIT
 # trap removes only its OWN lease and docker-rm's the container only when no
 # leases remain (rmdir of the now-empty lease dir succeeds). Stale leases left
-# by a SIGKILL'd invocation are pruned by a `kill -0` PID liveness check so a
-# crashed run never permanently pins the container. LEASE_DIR / LEASE_TOKEN are
+# by a SIGKILL'd invocation are pruned by an ESRCH-only `_pid_alive` PID
+# liveness check (#4858) so a crashed run never permanently pins the container. LEASE_DIR / LEASE_TOKEN are
 # overridable to make the refcount contract hermetically testable
 # (scripts/test-container-lease).
 LEASE_DIR="${FISHHAWK_TEST_LEASE_DIR:-${TMPDIR:-/tmp}/fishhawk-test-postgres.leases}"
@@ -331,6 +331,46 @@ EOF
   return 0
 }
 
+# _pid_alive <pid>: cross-invocation liveness, ESRCH-only (#4858). ONLY "No such
+# process" (ESRCH) reads dead. EPERM — a live process this shell may not signal:
+# another user's process, a pid REUSED by one, or any pid outside the sandbox of a
+# signal-confined implement/fix-up agent shell — reads LIVE, the fail-safe
+# direction. A bare `kill -0 <pid> 2>/dev/null` reads EPERM as dead, so a confined
+# shell would prune a live peer's lease, break its lease lock and displace its
+# verify lock. LC_ALL=C pins the strerror text the match reads. Every
+# cross-invocation liveness read in this file goes through here; callers keep
+# their own numeric/garbage filtering. Long form: scripts/README.md.
+_pid_alive() {
+  local out
+  out="$(export LC_ALL=C; kill -0 "$1" 2>&1)" && return 0
+  case "$out" in
+    *[Nn]o\ such\ process*) return 1 ;;
+  esac
+  return 0
+}
+
+# _pid_unsignalable <pid>: 0 when `kill -0` is refused with EPERM — the pid is
+# alive but this shell may not signal it. Used only to make a refusal say WHY.
+_pid_unsignalable() {
+  local out
+  out="$(export LC_ALL=C; kill -0 "$1" 2>&1)" && return 1
+  case "$out" in
+    *[Oo]peration\ not\ permitted*) return 0 ;;
+  esac
+  return 1
+}
+
+# _pid_unsignalable_note <pid> <file>: on EPERM, print (stdout) the line every
+# lease/verify-lock refusal carries, naming the exact file to remove when stale.
+# Prints nothing for a signalable pid. Since EPERM reads live, a pid file or lock
+# whose pid was REUSED by another user's process no longer self-heals; this line
+# is the manual recovery.
+_pid_unsignalable_note() {
+  if _pid_unsignalable "$1"; then
+    printf 'pid %s is alive but not signalable by you (another user'"'"'s process, a reused pid, or a confined shell); if it is stale, remove %s\n' "$1" "$2"
+  fi
+}
+
 # _lease_token: this invocation's lease identity (its PID by default). Injectable
 # so the hermetic test can register/reap distinct synthetic leases.
 _lease_token() {
@@ -343,8 +383,10 @@ _lease_token() {
 # atomic syscall that fails EEXIST if the path is already taken, and there is NO
 # separate stamp step. Exactly one racer wins; the loser reads the winner's PID
 # via `readlink`. Before each retry the spin loop breaks a lock whose owner PID
-# is dead (`kill -0` fails → rm, then retry) so a SIGKILL'd holder can never
-# permanently wedge later invocations.
+# is dead (`_pid_alive` reads ESRCH → rm, then retry) so a SIGKILL'd holder can
+# never permanently wedge later invocations. An EPERM owner (alive but not
+# signalable by this shell, #4858) is never broken: the cap exhausts and the
+# refusal names the lock file.
 #
 # Because acquisition is atomic there is NO window in which the lock exists yet
 # is unowned. That eliminates BY CONSTRUCTION both the old mkdir-then-stamp lock's
@@ -379,13 +421,21 @@ _lease_lock() {
         rm -rf "$lock" 2>/dev/null || true
         ;;
       *)
-        if ! kill -0 "$owner" 2>/dev/null; then
-          rm -f "$lock" 2>/dev/null || true  # dead owner → break the stale lock
+        if ! _pid_alive "$owner"; then
+          rm -f "$lock" 2>/dev/null || true  # ESRCH-dead owner → break the stale lock
         fi
         ;;
     esac
     tries=$((tries + 1))
     if [ "$tries" -ge "$cap" ]; then
+      case "$owner" in
+        ''|*[!0-9]*) ;;
+        *)
+          if _pid_unsignalable "$owner"; then
+            echo "scripts/test: the container lease lock at $lock is held by $(_pid_unsignalable_note "$owner" "$lock")" >&2
+          fi
+          ;;
+      esac
       return 1
     fi
     sleep 0.1
@@ -399,8 +449,9 @@ _lease_unlock() {
 
 # _prune_dead_leases: drop lease files whose PID name no longer names a live
 # process — crashed-invocation cleanup so a SIGKILL'd run never pins the
-# container. Guards the empty glob and skips non-numeric names. Callers hold the
-# lock.
+# container. Guards the empty glob and skips non-numeric names. Liveness is
+# ESRCH-only (`_pid_alive`): an EPERM-live lease is kept and named on stderr.
+# Callers hold the lock.
 _prune_dead_leases() {
   [ -d "$LEASE_DIR" ] || return 0
   local f base
@@ -410,8 +461,10 @@ _prune_dead_leases() {
     case "$base" in
       ''|*[!0-9]*) continue ;;  # non-PID lease name — can't liveness-check, leave it
     esac
-    if ! kill -0 "$base" 2>/dev/null; then
+    if ! _pid_alive "$base"; then
       rm -f "$f" 2>/dev/null || true
+    elif _pid_unsignalable "$base"; then
+      echo "scripts/test: keeping container lease $f: $(_pid_unsignalable_note "$base" "$f")" >&2
     fi
   done
 }
@@ -1983,8 +2036,14 @@ _verify_pipefail_grep() {
 # that releases into a fresh RUNNER holder in that window is met by the normal
 # live-runner refusal instead of being deleted.
 #
-# RESIDUAL, stated: `kill -0 <pid>` succeeding does not prove the pid is the
-# ORIGINAL holder — a reused pid reads as live. That is the identical residual
+# Liveness is ESRCH-only (`_pid_alive`, #4858): only "No such process" reads
+# dead, and EPERM (a live pid this shell may not signal — another user's, or one
+# outside a signal-confined agent shell's sandbox) reads LIVE, so a confined
+# shell can never displace a live holder it cannot see.
+#
+# RESIDUAL, stated: `_pid_alive <pid>` succeeding does not prove the pid is the
+# ORIGINAL holder — a reused pid reads as live, including one reused by another
+# user's process (EPERM); the refusal then names the lock file to remove. That is the identical residual
 # the container lease already accepts, and the consequence here is a bounded wait
 # plus a loud displacement, or a refusal with an escape hatch printed in the
 # message — never a lost or corrupted run.
@@ -2097,7 +2156,7 @@ _verify_lock_classify() {
   kind="${target#*:}"
   case "$pid" in ''|*[!0-9]*) printf 'garbage'; return 0 ;; esac
   case "$kind" in runner|shell) ;; *) printf 'garbage'; return 0 ;; esac
-  if kill -0 "$pid" 2>/dev/null; then
+  if _pid_alive "$pid"; then
     printf 'live-%s' "$kind"
   else
     printf 'dead'
@@ -2178,8 +2237,8 @@ _verify_lock_recover_marker() {
       claim="$marker.reap.garbage"
       ;;
     *)
-      if kill -0 "$victim" 2>/dev/null; then
-        return 1  # a LIVE pruner holds it: there is nothing to recover
+      if _pid_alive "$victim"; then
+        return 1  # a LIVE (or EPERM-unsignalable) pruner holds it: nothing to recover
       fi
       claim="$marker.reap.$victim"
       ;;
@@ -2354,6 +2413,7 @@ The runner owns verify for this stage. Do NOT poll or retry this in a loop — i
 fast failure, not a queue. Run your package's tests directly instead:
   scripts/test single -run TestX ./your/package/...
 EOF
+          [ -n "$holder" ] && _pid_unsignalable_note "$holder" "$lock" >&2
           return "$VERIFY_EXIT_LOCK_REFUSED"
         fi
         if [ "$waited" -ge "$budget" ]; then
@@ -2364,6 +2424,7 @@ scripts/test: another RUNNER verify still holds the lock at $lock after ${budget
 worktree family is a bug to surface, not one to paper over — refusing rather than
 displacing a peer runner.
 EOF
+            [ -n "$holder" ] && _pid_unsignalable_note "$holder" "$lock" >&2
             return "$VERIFY_EXIT_LOCK_REFUSED"
           fi
           if [ "$stole" -eq 1 ]; then
@@ -2527,8 +2588,8 @@ cmd_verify() {
 #   1. docker absent from PATH -> exit 1 naming docker. Never a skip. Argument
 #      validation already ran in _parse_verify_args/_parse_lint_args.
 #   2. verify only: take the HOST per-repository verify lock, refusing exactly
-#      as `verify` does on a live holder (exit VERIFY_EXIT_LOCK_REFUSED, 73). Lock liveness is a `kill -0` PID
-#      check, which cannot cross a PID namespace, so a container sharing the
+#      as `verify` does on a live holder (exit VERIFY_EXIT_LOCK_REFUSED, 73). Lock liveness is an ESRCH-only
+#      `kill -0` PID check (`_pid_alive`, #4858), which cannot cross a PID namespace, so a container sharing the
 #      host lock would judge a live host holder dead and displace it. The host
 #      lock is therefore the real one, and the container gets a private
 #      FISHHAWK_VERIFY_LOCK_PATH. lint stays lock-free, as on the host.
