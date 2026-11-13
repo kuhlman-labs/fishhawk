@@ -5440,9 +5440,10 @@ func parseCampaignPRURL(prURL string) (forge.RepoRef, int, error) {
 }
 
 // campaignGateActor adapts *server.Server to campaigndriver.GateActor: it drives
-// a run gate via Server.AutoDriveRunGate under the campaign operator identity,
-// dispatching may_merge through the GitHub auto-merge client. Translates the
-// server outcome to the driver's GateActionOutcome shape.
+// a run gate via Server.DriveCampaignRunGate (which wraps AutoDriveRunGate)
+// under the campaign operator identity, dispatching may_merge through the
+// GitHub auto-merge client. The outcome translation lives in
+// DriveCampaignRunGate (E88.4 / #4528), so this adapter only delegates.
 type campaignGateActor struct {
 	srv    *server.Server
 	id     server.Identity
@@ -5457,16 +5458,9 @@ func (a campaignGateActor) DriveRunGate(ctx context.Context, runRow *runpkg.Run)
 
 // DriveRunGateWithCampaign satisfies the campaign-aware extension
 // (campaigndriver.CampaignGateActor): it threads the owning campaign's
-// operator_agent override bytes (E25.12 / #1451) into AutoDriveRunGate.
+// operator_agent override bytes (E25.12 / #1451) into DriveCampaignRunGate.
 func (a campaignGateActor) DriveRunGateWithCampaign(ctx context.Context, runRow *runpkg.Run, campaignOverride []byte) (campaigndriver.GateActionOutcome, error) {
-	out, err := a.srv.AutoDriveRunGate(ctx, runRow, a.id, a.merger, campaignOverride)
-	return campaigndriver.GateActionOutcome{
-		Acted:     out.Acted,
-		Action:    out.Action,
-		Paged:     out.Paged,
-		PageEvent: out.PageEvent,
-		Note:      out.Note,
-	}, err
+	return a.srv.DriveCampaignRunGate(ctx, runRow, a.id, a.merger, campaignOverride)
 }
 
 // newCampaignGateActor builds the campaigndriver.GateActor that auto-acts on

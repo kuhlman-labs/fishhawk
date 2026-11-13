@@ -991,6 +991,34 @@ func TestNewCampaignGateActor(t *testing.T) {
 	}
 }
 
+// TestCampaignGateActor_DelegatesToDriveCampaignRunGate pins the E88.4 / #4528
+// wiring: the adapter's outcome and error presence equal
+// Server.DriveCampaignRunGate's for the same run, for both the base and the
+// campaign-aware seam, so the translation lives only in the server.
+func TestCampaignGateActor_DelegatesToDriveCampaignRunGate(t *testing.T) {
+	srv := server.New(server.Config{Addr: "127.0.0.1:0"})
+	actor := campaignGateActor{srv: srv, id: campaignOperatorIdentity(), merger: newForgeMerger(nil)}
+	runRow := &runpkg.Run{ID: uuid.New(), State: runpkg.StateRunning}
+	override := []byte(`{"may_retry":"infra_flake"}`)
+	ctx := context.Background()
+
+	want, wantErr := srv.DriveCampaignRunGate(ctx, runRow, actor.id, actor.merger, override)
+	got, gotErr := actor.DriveRunGateWithCampaign(ctx, runRow, override)
+	if !reflect.DeepEqual(got, want) || (gotErr == nil) != (wantErr == nil) {
+		t.Fatalf("adapter = (%+v, %v), want DriveCampaignRunGate's (%+v, %v)", got, gotErr, want, wantErr)
+	}
+	if got.Note == "" {
+		t.Fatal("adapter outcome note is empty; the outcome was not translated")
+	}
+
+	wantBase, wantBaseErr := srv.DriveCampaignRunGate(ctx, runRow, actor.id, actor.merger, nil)
+	gotBase, gotBaseErr := actor.DriveRunGate(ctx, runRow)
+	if !reflect.DeepEqual(gotBase, wantBase) || (gotBaseErr == nil) != (wantBaseErr == nil) {
+		t.Fatalf("base adapter = (%+v, %v), want (%+v, %v)", gotBase, gotBaseErr, wantBase, wantBaseErr)
+	}
+	var _ campaigndriver.CampaignGateActor = actor
+}
+
 // TestNewForgeMerger_NilGitHub_LeavesGitHubSeamNil pins the typed-nil trap
 // (E45.47 / #3464): with no GitHub client the ForgeMerger's github leaf must be
 // a NIL INTERFACE, not a githubAutoMerger wrapping a nil client (a non-nil

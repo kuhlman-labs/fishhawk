@@ -404,6 +404,18 @@ import "sort"
 // issue ref and server-constant reason, runner kind and detail, never a
 // working_dir or other run's data — INTERNAL, actor system, not an
 // issue-comment surface.
+// E88.4 / #4528 added campaign_gate_decision_required and
+// campaign_gate_decision_cleared, the campaign driver's RUN-chain record that
+// its gate actor returned a DecisionRequired outcome (once per occurrence key:
+// run, decision_state, action, gate stage or "run") and that a later
+// non-decision outcome whose stage read positively showed the gate no longer
+// parked cleared it (campaigndriver/driver.go). Actor system, INTERNAL, not an
+// issue-comment surface. Both are run-bound READABLE: the payload names only
+// this run's own campaign_id, issue_ref, run_id, gate stage and closed-set
+// tokens (never the actor's note, so no cross-run identifier). This comment is
+// an INTERIM registration under ADR-106's existing audit-category mechanism —
+// not ADR-106 registry option B, and no new ADR is needed; both take the
+// mandatory run-bound flag when #4599 / E89 #4537 lands.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -441,6 +453,8 @@ var KnownCategories = map[string]struct{}{
 	"campaign_cancelled":                      {},
 	"campaign_dependencies_refreshed":         {}, // E86.47 / #4358: the monotone tracker-edge refresh added held depends_on edges (server/campaign_dependency_refresh.go) — INTERNAL
 	"campaign_gate_acted":                     {},
+	"campaign_gate_decision_cleared":          {},
+	"campaign_gate_decision_required":         {},
 	"campaign_gate_paged":                     {},
 	"campaign_grooming_source_resolved":       {},
 	"campaign_hold_released":                  {}, // E83.100 / #4234: a campaign dispatch hold released (hotfix_terminal | timeout) by the hotfix verb, a status read or the host-dispatch marker, recorded before commit under the system actor (server/campaign_hotfix.go) — INTERNAL
