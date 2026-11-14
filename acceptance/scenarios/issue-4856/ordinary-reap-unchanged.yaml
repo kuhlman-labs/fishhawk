@@ -1,0 +1,14 @@
+id: scenario:issue-4856/ordinary-reap-unchanged
+statement: 'Reaping an implement stage that was never fixed up still fails it as before: POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure answers 200 with transitioned true and stage_state failed, and the run''s audit carries a dispatch_reaper_failed row and no stage_fixup_recovered row.'
+verify_hint: 'HTTP: on the implement-running preview fixture, POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure as an operator, then read the response and GET /v0/runs/{run_id}/audit.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"} -> run 57455bf1-2aa5-4cba-9233-c5654ff15f47, implement stage 7f25c402-4720-41d1-a449-379085b28e17 (state running, never fixed up). 2) Minted a run-bound bearer: POST /v0/runs/{run}/signing-key {}, POST /v0/dev/sign over ''{}'' with X-Fishhawk-Dev-Private-Key, POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature. 3) GET /v0/stages/{stage}/prompt-render with that bearer and read stage_attempt ''2026-11-14T17:46:00.105647Z'' (the render had no fixup_expected_head_sha). 4) POST /v0/runs/{run}/stages/{stage}/reap-failure with body {"category":"C","reason":"acceptance probe: ordinary reap","expected_state":"running","expected_attempt":"2026-11-14T17:46:00.105647Z"}. 5) GET /v0/runs/{run}/stages and GET /v0/runs/{run}/audit.'
+assertions:
+    expected: 200 transitioned true, stage_state failed; a dispatch_reaper_failed row and no stage_fixup_recovered row
+    observed_at_record: Reap returned 200 {"transitioned":true,"stage_state":"failed"}. The implement stage is failed with category C; acceptance and review are still pending. The audit shows mcp_token_issued, issue_context_unresolved, plan_missing_for_implement, dispatch_reaper_failed (reported_by runner, expected_state running) and stage_infra_parked. There is no stage_fixup_recovered row (GET ?category=stage_fixup_recovered is a known category, 200 with empty items).
+    repro_handle: curl -XPOST http://localhost:8090/v0/runs/{run}/stages/{stage}/reap-failure -H '[REDACTED:authorization-bearer]' -d '{"category":"C","reason":"x","expected_state":"running","expected_attempt":"<stage_attempt>"}'
+origin:
+    issue: 4856
+    pr: 5263
+    run_id: 5f174b2b-d855-468d-8973-c3b13c4ff2a3
+    head_sha: 0c06a40e35115c82b1c8fcda5a07acbe1b890f9d
+    recorded_at: 2026-11-14T17:54:03Z

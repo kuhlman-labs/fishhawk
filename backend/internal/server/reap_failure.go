@@ -225,6 +225,10 @@ func validateReapExpectedState(raw json.RawMessage) (conditional bool, expected 
 // reapFailureResponse is the 200 body. Transitioned is false on the idempotent
 // no-op path (the stage was already terminal — a double-report or a race with
 // the dispatch watchdog), true when this call drove the stage to failed.
+// StageState is the resulting stage state: failed after a reap, EXCEPT when
+// the reaped dispatch was an ACTIVE fix-up re-dispatch that the #788 recovery
+// restored (maybeRecoverReapedFixupFailure), where it names the restored gate
+// state (succeeded or awaiting_approval) with Transitioned still true.
 type reapFailureResponse struct {
 	Transitioned bool   `json:"transitioned"`
 	StageState   string `json:"stage_state"`
@@ -261,6 +265,13 @@ type reapFailureResponse struct {
 // stage is the same benign no-op (#1891): that state is a live decomposition
 // park owned by its children, and failing it would destroy the fan-in park a
 // doomed mis-dispatched runner never owned.
+//
+// Fix-up recovery (#4856): after the dispatch_reaper_failed append, a reap of
+// an ACTIVE fix-up re-dispatch goes through the #788 fix-up recovery (see
+// maybeRecoverReapedFixupFailure). It restores the implement stage and the
+// review gate the pass re-opened, refunds the pass, answers
+// {transitioned:true, stage_state:<restored state>} and skips Advance. It runs
+// on both auth arms.
 //
 // An OPERATOR-scoped reap (a write:runs token or a session) that performs the
 // failing transition stamps its dispatch_reaper_failed row with the failed
@@ -740,6 +751,32 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 			slog.String("error", err.Error()))
 	}
 
+	// Fix-up recovery (#788, #4856): a reaped fix-up re-dispatch restores the
+	// implement stage and the review gate it re-opened instead of failing the
+	// run. It runs AFTER the dispatch_reaper_failed append above, so the #1957
+	// category-C refund signal precedes the stage_fixup_recovered row in the
+	// same trigger window, and on BOTH arms (operator reap and the run-bound
+	// self-report, which is where the runner's pre-agent fixup_base_mismatch
+	// exit lands). A recovered stage skips Advance, exactly as the trace path's
+	// advanceAfterFailure does; every other path below is unchanged.
+	if s.maybeRecoverReapedFixupFailure(r.Context(), runID, stageID) {
+		restored := string(run.StageStateFailed)
+		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"reap-failure: fix-up recovered but the stage re-read failed; reporting failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", gerr.Error()))
+		} else {
+			restored = string(cur.State)
+		}
+		s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
+			Transitioned: true,
+			StageState:   restored,
+		})
+		return
+	}
+
 	// Walk the run's state machine so a run whose only dispatched stage is now
 	// failed doesn't sit in pending/running forever. Best-effort, like the
 	// watchdog.
@@ -757,6 +794,40 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		Transitioned: true,
 		StageState:   string(run.StageStateFailed),
 	})
+}
+
+// maybeRecoverReapedFixupFailure is the reap path's gate in front of the #788
+// fix-up recovery (maybeRecoverFixupFailure), which the trace and PR-failure
+// paths already call. It returns true only when that recovery restored the
+// stage. Every guard that cannot prove the recovery is safe returns false and
+// leaves today's fail-and-Advance path in force:
+//
+//   - a LIVE merge-candidate verify-only pass owns the stage (#4816's
+//     runner_lost park of such a pass is untouched), or its trigger is
+//     unreadable or malformed;
+//   - a LIVE conflict-resolution pass owns the stage, or its trigger state is
+//     unreadable. Either live pass restores from ITS OWN trigger anchors, so
+//     restoring from an older fix-up trigger would be wrong;
+//   - the newest stage_fixup_triggered is no longer ACTIVE (fixupTriggerActive:
+//     spent by fixup_pushed, fixup_no_changes, stage_fixup_recovered or a
+//     confirmed supersession), or its state is unreadable. A spent trigger
+//     means the failing dispatch is not that fix-up pass (a later retry_stage
+//     re-dispatch, say), and a read error never restores from a possibly
+//     stale trigger.
+//
+// The handler's own dispatch_reaper_failed row spends nothing, so it does not
+// close the window this check reads.
+func (s *Server) maybeRecoverReapedFixupFailure(ctx context.Context, runID, stageID uuid.UUID) bool {
+	if live, err := s.liveMergeCandidateTrigger(ctx, runID, stageID); err != nil || live != nil {
+		return false
+	}
+	if live, err := s.liveConflictResolutionTrigger(ctx, runID, stageID); err != nil || live != nil {
+		return false
+	}
+	if active, err := s.fixupTriggerActive(ctx, runID, stageID); err != nil || !active {
+		return false
+	}
+	return s.maybeRecoverFixupFailure(ctx, runID, stageID)
 }
 
 // writeStageAttemptSuperseded writes the 409 stage_attempt_superseded refusal

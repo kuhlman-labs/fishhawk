@@ -342,7 +342,10 @@ func TestImplementInfraFailure_SupersedeRestoreFailureStillFailsRun(t *testing.T
 
 // TestImplementInfraFailure_ReapedNonReplayablePassStillFailsRun: an operator
 // runner_lost reap whose pass is NOT a live, newest merge-candidate verify-only
-// pass fails the run, because a retry would not replay it.
+// pass fails the run, because a retry would not replay it. A reap of an ACTIVE
+// fix-up pass is restored instead (#4856, the sibling test below), so the
+// fix-up row here carries a SPENT trigger: the failing dispatch is not that
+// pass, and nothing is restored.
 func TestImplementInfraFailure_ReapedNonReplayablePassStillFailsRun(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -350,9 +353,10 @@ func TestImplementInfraFailure_ReapedNonReplayablePassStillFailsRun(t *testing.T
 		seed        func(t *testing.T, w *implParkReplayWorld)
 		order       []string
 	}{
-		{"fix-up pass, no merge-candidate trigger", false, func(t *testing.T, w *implParkReplayWorld) {
+		{"spent fix-up trigger, no merge-candidate trigger", false, func(t *testing.T, w *implParkReplayWorld) {
 			implParkAppend(t, w.au, w.runID, w.impl.ID, CategoryStageFixupTriggered, map[string]any{"prior_state": "succeeded"})
-		}, []string{"pull_request_opened", CategoryStageFixupTriggered, CategoryDispatchReaperFailed}},
+			implParkAppend(t, w.au, w.runID, w.impl.ID, CategoryFixupPushed, map[string]any{"head_sha": "abc123"})
+		}, []string{"pull_request_opened", CategoryStageFixupTriggered, CategoryFixupPushed, CategoryDispatchReaperFailed}},
 		{"conflict-resolution pass, no merge-candidate trigger", false, func(t *testing.T, w *implParkReplayWorld) {
 			implParkAppend(t, w.au, w.runID, w.impl.ID, CategoryStageConflictResolutionTriggered, map[string]any{"prior_state": "succeeded"})
 		}, []string{"pull_request_opened", CategoryStageConflictResolutionTriggered, CategoryDispatchReaperFailed}},
@@ -376,7 +380,42 @@ func TestImplementInfraFailure_ReapedNonReplayablePassStillFailsRun(t *testing.T
 				t.Fatalf("PRECONDITION: reap rows %v, want one stamped with the current episode %q", reaps, at)
 			}
 			w.requireFailedNoPark(t)
+			if n := len(auditEntries(w.au.auditFake, CategoryStageFixupRecovered)); n != 0 {
+				t.Errorf("stage_fixup_recovered rows = %d, want 0 (nothing is restored)", n)
+			}
 		})
+	}
+}
+
+// TestImplementInfraFailure_ReapedActiveFixupPassIsRecoveredNotParked (#4856):
+// an operator runner_lost reap of an ACTIVE fix-up pass, with no merge-candidate
+// or conflict-resolution trigger, goes through the #788 fix-up recovery. The
+// implement stage is restored, and the run is neither failed nor infra-parked.
+func TestImplementInfraFailure_ReapedActiveFixupPassIsRecoveredNotParked(t *testing.T) {
+	w := newImplParkProducerWorld(t, false)
+	implParkAppend(t, w.au, w.runID, w.impl.ID, CategoryStageFixupTriggered, map[string]any{"prior_state": "succeeded"})
+
+	resp := decodeReapResponse(t, w.operatorReap(t, "C"))
+	if !resp.Transitioned || resp.StageState != string(run.StageStateSucceeded) {
+		t.Errorf("response = %+v, want {transitioned:true stage_state:succeeded}", resp)
+	}
+	implParkRequireDistinctSequences(t, w.entries(t), w.impl.ID,
+		"pull_request_opened", CategoryStageFixupTriggered, CategoryDispatchReaperFailed, CategoryStageFixupRecovered)
+	if st, _ := w.rr.GetStage(t.Context(), w.impl.ID); st == nil || st.State != run.StageStateSucceeded {
+		t.Fatalf("implement stage = %+v, want succeeded (restored)", st)
+	}
+	if n := len(auditEntries(w.au.auditFake, CategoryStageFixupRecovered)); n != 1 {
+		t.Errorf("stage_fixup_recovered rows = %d, want 1", n)
+	}
+	if n := len(implParkRows(w.au.auditFake, w.impl.ID)); n != 0 {
+		t.Errorf("stage_infra_parked rows = %d, want 0 (a recovered pass never parks)", n)
+	}
+	runRow, err := w.rr.GetRun(t.Context(), w.runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if runRow.State == run.StateFailed {
+		t.Errorf("run state = %q, want not failed (Advance skipped on recovery)", runRow.State)
 	}
 }
 
