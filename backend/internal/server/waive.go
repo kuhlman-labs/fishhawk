@@ -179,9 +179,11 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Human-only clearing (E80.3 / #3760): a server_check concern refuses an
-	// agent token or a delegated request with 403 concern_requires_human,
-	// BEFORE delegation is evaluated or the intent entry is appended.
+	// Human-only clearing (E80.3 / #3760, ADR-143 D1 / #5228): a server_check
+	// concern refuses an agent token or a delegated request with 403
+	// concern_requires_human, and any other request not on a `session`
+	// credential with 403 concern_requires_session, BEFORE delegation is
+	// evaluated or the intent entry is appended.
 	if s.refuseNonHumanServerCheckClear(w, r, row, id.Subject, reqBody.Delegated, clearVerbWaive) {
 		return
 	}

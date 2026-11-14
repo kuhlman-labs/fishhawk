@@ -461,27 +461,77 @@ func TestIsAgentSubject(t *testing.T) {
 }
 
 // TestRefuseNonHumanServerCheckClear_NilAndHumanPassThrough pins the guard's
-// two pass-through branches directly: a nil row and a human non-delegated
-// subject on a server_check row both return false and write nothing.
+// pass-through branches directly: a nil row on any credential, a reviewer row
+// on a bearer, and a human non-delegated subject on a `session` credential
+// clearing a server_check row all return false and write nothing.
 func TestRefuseNonHumanServerCheckClear_NilAndHumanPassThrough(t *testing.T) {
 	s, _, cr := waiveServer(t)
 	row := seedServerCheckRow(t, cr, uuid.New(), uuid.New(), "high")
-	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	reviewer := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "naming nit")
+	sessionReq := withAuth(httptest.NewRequest(http.MethodPost, "/", nil))
+	bearerReq := identityAs(Identity{Subject: "github:alice", TokenID: "tok-static", AuthMethod: "static"})(httptest.NewRequest(http.MethodPost, "/", nil))
 
 	for name, tc := range map[string]struct {
+		req     *http.Request
 		row     *concern.Concern
 		subject string
 	}{
-		"nil_row":           {nil, operatorAgentSubject},
-		"human_on_check":    {row, "github:alice"},
-		"anonymous_subject": {row, ""},
+		"nil_row":                 {bearerReq, nil, operatorAgentSubject},
+		"reviewer_row_on_bearer":  {bearerReq, reviewer, "github:alice"},
+		"human_session_on_check":  {sessionReq, row, "github:test-operator"},
+		"anonymous_subject_on_ok": {sessionReq, row, ""},
 	} {
 		w := httptest.NewRecorder()
-		if s.refuseNonHumanServerCheckClear(w, req, tc.row, tc.subject, false, clearVerbWaive) {
-			t.Errorf("%s: refused, want pass-through", name)
+		if s.refuseNonHumanServerCheckClear(w, tc.req, tc.row, tc.subject, false, clearVerbWaive) {
+			t.Errorf("%s: refused, want pass-through:\n%s", name, w.Body.String())
 		}
 		if w.Body.Len() != 0 {
 			t.Errorf("%s: wrote a response body on pass-through: %s", name, w.Body.String())
 		}
 	}
+}
+
+// TestRefuseNonHumanServerCheckClear_D1ArmDirect pins the ADR-143 D1 arm on
+// the guard directly: a non-agent, non-delegated subject on every non-session
+// credential kind — including an identity carrying NO credential marker
+// (unknown, fail closed) — is refused with concern_requires_session naming
+// the kind, for every D2 verb. The identities are built by construction (the
+// markers the middleware would set), never by calling the guard.
+//
+// COUNTERFACTUAL (hand-run, #5228): making the credential-kind test in
+// refuseServerCheckClearOffSession permissive (`|| kind != ""`, admitting
+// every kind) reddened every case here ("passed through, want
+// concern_requires_session").
+func TestRefuseNonHumanServerCheckClear_D1ArmDirect(t *testing.T) {
+	s, _, cr := waiveServer(t)
+	row := seedServerCheckRow(t, cr, uuid.New(), uuid.New(), "high")
+	for kind, id := range map[string]Identity{
+		"static":     {Subject: "github:alice", TokenID: "t1", AuthMethod: "static"},
+		"oauth":      {Subject: "github:alice", TokenID: "t2", AuthMethod: "oauth"},
+		"oauth_as":   {Subject: "github:alice", TokenID: "t3", OAuthAudience: "https://as.example/mcp"},
+		"unrecorded": {Subject: "github:alice", TokenID: "t4"},
+		"unknown":    {Subject: "github:alice", TokenID: "t5", AuthMethod: "saml-assertion"},
+		// A session id together with a token id is a bearer, not a session.
+		"oauth_as_with_session_marker": {Subject: "github:alice", TokenID: "t6", SessionID: "s1", OAuthAudience: "https://as.example/mcp"},
+	} {
+		want := kind
+		if kind == "oauth_as_with_session_marker" {
+			want = "oauth_as"
+		}
+		for _, verb := range serverCheckClearAction.Verbs {
+			w := httptest.NewRecorder()
+			req := identityAs(id)(httptest.NewRequest(http.MethodPost, "/", nil))
+			if !s.refuseNonHumanServerCheckClear(w, req, row, id.Subject, false, verb) {
+				t.Errorf("%s/%s: passed through, want concern_requires_session", kind, verb)
+				continue
+			}
+			assertRequiresSession(t, w, row, verb, want)
+		}
+	}
+	// No identity at all classifies as unknown (fail closed).
+	w := httptest.NewRecorder()
+	if !s.refuseNonHumanServerCheckClear(w, httptest.NewRequest(http.MethodPost, "/", nil), row, "", false, clearVerbWaive) {
+		t.Fatalf("no identity: passed through, want concern_requires_session")
+	}
+	assertRequiresSession(t, w, row, clearVerbWaive, "unknown")
 }

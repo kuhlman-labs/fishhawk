@@ -205,6 +205,41 @@ func TestResolveConcerns_StampsProvenance(t *testing.T) {
 	}
 }
 
+// TestResolveConcerns_ServerCheckRefusedOnStaticBearer (ADR-143 D1, #5228): a
+// routed server_check concern named in a batch beside a routed reviewer
+// concern, resolved by a NON-agent subject on a static bearer, refuses the
+// WHOLE batch with 403 concern_requires_session: both rows stay
+// addressed_pending and nothing is appended. The pre-body isAgentSubject guard
+// does not fire for github:alice, so the per-row call is the only refusal.
+//
+// COUNTERFACTUAL (hand-run): prefixing the per-row call in
+// handleResolveConcerns with `false &&` reddened this test — status 200, both
+// rows read back addressed and two concern_resolved_with_evidence rows were
+// appended.
+func TestResolveConcerns_ServerCheckRefusedOnStaticBearer(t *testing.T) {
+	s, au, cr := resolveServer(t)
+	runID := uuid.New()
+	reviewer := seedResolvableConcern(t, cr, runID, "routed nit")
+	check := seedServerCheckRow(t, cr, runID, uuid.New(), "high")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{check.ID}, "routed"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	static := identityAs(Identity{Subject: "github:alice", TokenID: "tok-static", AuthMethod: "static", Scopes: []string{"write:stages"}})
+
+	w := postResolveAs(t, s, runID.String(), resolveConcernsRequest{
+		ConcernIDs: []string{reviewer.ID.String(), check.ID.String()}, Evidence: "re-ran",
+	}, static)
+
+	assertConcernStates(t, cr, map[uuid.UUID]concern.State{
+		reviewer.ID: concern.StateAddressedPending,
+		check.ID:    concern.StateAddressedPending,
+	})
+	if n := len(auditEntriesByCategory(au, CategoryConcernResolvedWithEvidence)); n != 0 {
+		t.Errorf("concern_resolved_with_evidence entries = %d, want 0 (the refusal precedes every append)", n)
+	}
+	assertRequiresSession(t, w, check, clearVerbResolve, "static")
+}
+
 // TestResolveConcerns_PreValidation is the all-or-nothing ladder. Every row
 // reads COMMITTED state after the call: zero concern_resolved_with_evidence
 // rows and every seeded concern's state unchanged — so a deleted guard that
