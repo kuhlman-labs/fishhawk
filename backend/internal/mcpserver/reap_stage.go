@@ -75,6 +75,16 @@ const (
 	// refuses a B-reaped stage with 422 retry_not_applicable and the recovery
 	// sequence needs the operator-only override escape hatch (#698) instead.
 	reapStageNextStepHintB = "the stage is now 'failed' (category B, the constraint/policy class), which fishhawk_retry_stage does NOT admit — it refuses with 422 retry_not_applicable, because category B means a spec/workflow change rather than a re-run. Re-opening it needs the operator-only category-B override: POST /v0/stages/{stage_id}/retry with {\"override\":true,\"reason\":\"...\"} (an operator token; agent tokens are refused), then re-dispatch. To recover an ordinary strand, reap at the default category C instead — B is for recording a genuine constraint/policy failure."
+	// reapStageFailedState is the stage state a reap that FAILED the stage
+	// reports. Any other state on a transitioned reap is the #4856 fix-up
+	// recovery's restored gate.
+	reapStageFailedState = "failed"
+	// reapStageNextStepHintRecovered is the guidance when the server RECOVERED
+	// the reaped dispatch (#4856): it was an ACTIVE fix-up re-dispatch, so the
+	// reap-failure endpoint ran the #788 fix-up recovery and the stage is back
+	// at its pre-fix-up gate, not failed. The category-derived hints would send
+	// the operator at a verb that refuses a stage that is not failed.
+	reapStageNextStepHintRecovered = "the reaped dispatch was an ACTIVE fix-up re-dispatch, so the server recovered it instead of failing it: the stage is back at its pre-fix-up gate (stage_state) and the review gate the pass re-opened is re-parked; a category-C reap also refunds the pass. Nothing is failed, so there is nothing to re-run. Read the restored gate with fishhawk_get_run_status or fishhawk_get_gate_view, then decide it, or fix the cause (for a fixup_base_mismatch: fishhawk_vouch_commit or fishhawk_rebase_run_branch) and route the fix-up again with fishhawk_fixup_stage."
 )
 
 // reapStageConditionalAnchors mirrors the ENDPOINT's own closed anchor set for
@@ -232,12 +242,12 @@ type ReapStageInput struct {
 // verdict this verb classified before making the call, the post-reap next step,
 // and any warnings raised while classifying.
 type ReapStageOutput struct {
-	Transitioned bool   `json:"transitioned" jsonschema:"whether this report drove the stage to failed; false on the idempotent no-op against an already-terminal stage"`
-	StageState   string `json:"stage_state" jsonschema:"the stage state after the report; failed on a successful reap"`
+	Transitioned bool   `json:"transitioned" jsonschema:"whether this report changed the stage: true when it drove the stage to failed, and also when the reaped dispatch was an ACTIVE fix-up re-dispatch the server recovered instead (stage_state then names the restored gate state); false on the idempotent no-op against an already-terminal stage"`
+	StageState   string `json:"stage_state" jsonschema:"the stage state after the report: failed on a successful reap, or the restored pre-fix-up gate state (succeeded or awaiting_approval) when the server recovered an ACTIVE fix-up re-dispatch and re-parked its review gate"`
 	// RunnerLiveness is deliberately NARROW: see classifyReapLiveness. It is
 	// "dead" ONLY for a runner_kind=local run this host could probe.
 	RunnerLiveness string   `json:"runner_liveness" jsonschema:"the host runner-liveness verdict classified before the reap: live (refused), dead (a local run this host probed and found no runner for), or unknown (a non-local runner_kind, an unreadable run row, or an inconclusive probe)"`
-	NextStep       string   `json:"next_step" jsonschema:"the post-reap guidance, which DIFFERS by the category reported: at C the stage is failed/category-C so fishhawk_retry_stage admits it, then re-dispatch; at B fishhawk_retry_stage refuses (422 retry_not_applicable) and re-opening needs the operator-only category-B override on POST /v0/stages/{stage_id}/retry"`
+	NextStep       string   `json:"next_step" jsonschema:"the post-reap guidance, which DIFFERS by the category reported: at C the stage is failed/category-C so fishhawk_retry_stage admits it, then re-dispatch; at B fishhawk_retry_stage refuses (422 retry_not_applicable) and re-opening needs the operator-only category-B override on POST /v0/stages/{stage_id}/retry. When the server recovered an ACTIVE fix-up re-dispatch (transitioned with a stage_state other than failed) it names the restored gate instead, since nothing is failed"`
 	Warnings       []string `json:"warnings,omitempty" jsonschema:"non-fatal notes raised while classifying runner liveness, including the unverifiable-from-this-host note for a non-local runner_kind"`
 }
 
@@ -259,7 +269,11 @@ It wraps POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure — the same
 endpoint the detached reaper uses — reporting the stage failed at category C,
 the retryable infrastructure class. After it lands the stage is 'failed' and
 fishhawk_retry_stage becomes applicable; the recovery sequence is
-fishhawk_reap_stage -> fishhawk_retry_stage -> re-dispatch.
+fishhawk_reap_stage -> fishhawk_retry_stage -> re-dispatch. One exception: when
+the reaped dispatch is an ACTIVE fix-up re-dispatch, the server recovers it
+instead (#4856). The stage returns to its pre-fix-up gate, its review gate is
+re-parked and a category-C reap refunds the pass, so the result is
+transitioned:true with stage_state naming that gate, and next_step says so.
 
 This never destroys a live park, and it refuses a stable 'pending' stage
 locally. The SERVER refuses to reap a terminal stage and the five
@@ -456,11 +470,15 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 		// refusal, 403 insufficient_scope — reach the operator verbatim.
 		return nil, ReapStageOutput{}, fmt.Errorf("reap stage: %w", err)
 	}
+	nextStep := reapStageNextStep(category)
+	if res.Transitioned && res.StageState != reapStageFailedState {
+		nextStep = reapStageNextStepHintRecovered
+	}
 	return nil, ReapStageOutput{
 		Transitioned:   res.Transitioned,
 		StageState:     res.StageState,
 		RunnerLiveness: runnerLivenessLabel(verdict),
-		NextStep:       reapStageNextStep(category),
+		NextStep:       nextStep,
 		Warnings:       warnings,
 	}, nil
 }
