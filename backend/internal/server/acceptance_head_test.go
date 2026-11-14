@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -26,6 +27,8 @@ const (
 	ahF2 = "2f00000000000000000000000000000000000002" // a later integration merge
 	ahX  = "eeee000000000000000000000000000000000000" // a foreign concurrent push
 	ahH  = "4000000000000000000000000000000000000004" // the implement (PR-open) head of the #4673 shape
+	ahV  = "7000000000000000000000000000000000000007" // a server-verified vouched tip (#4874)
+	ahW  = "8000000000000000000000000000000000000008" // a second, chained vouched tip
 )
 
 var ahT0 = time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
@@ -66,6 +69,22 @@ func ahReset(runID uuid.UUID, seq int64, prior, resetTo string) *audit.Entry {
 	rid := runID
 	e.ID, e.RunID, e.Timestamp = uuid.New(), &rid, ahT0.Add(time.Duration(seq)*time.Second)
 	return e
+}
+
+// ahVerifiedVouch is an operator_commit_vouched row in the writer's verified
+// shape (#4856): prior -> vouched, head_advance_verified true.
+func ahVerifiedVouch(runID uuid.UUID, seq int64, prior, vouched string) *audit.Entry {
+	return ahRow(runID, CategoryOperatorCommitVouched, seq, int(seq), map[string]any{
+		"run_id": runID.String(), auditcomplete.VouchedSHAField: vouched, "reason": "x",
+		auditcomplete.VouchPriorHeadSHAField: prior, auditcomplete.VouchHeadAdvanceVerifiedField: true,
+	})
+}
+
+// ahLegacyVouch is the membership-only {run_id, vouched_sha, reason} row.
+func ahLegacyVouch(runID uuid.UUID, seq int64, vouched string) *audit.Entry {
+	return ahRow(runID, CategoryOperatorCommitVouched, seq, int(seq), map[string]any{
+		"run_id": runID.String(), auditcomplete.VouchedSHAField: vouched, "reason": "x",
+	})
 }
 
 func ahServer(rows ...*audit.Entry) (*Server, *auditFake) {
@@ -117,6 +136,12 @@ func TestAcceptanceHeadAsOf(t *testing.T) {
 			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahS), ahClean(run, 11, 1, ahS, ahM), ahClean(run, 12, 2, ahM, ahM2), ahReset(run, 13, ahM2, ahM)}, 0, false, ahM},
 		{"a reset off the chain answers the seed",
 			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahS), ahClean(run, 11, 1, ahS, ahM), ahReset(run, 12, ahM, ahX)}, 0, false, ahS},
+		// D1 (#4856 concern 8b5ca6c9): an off-chain reset RE-SEEDS the walk and
+		// the walk continues, so a later clean rebase from the seed applies.
+		{"an off-chain reset re-seeds and a later clean rebase from the seed walks",
+			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahS), ahClean(run, 11, 1, ahS, ahM), ahReset(run, 12, ahM, ahX), ahClean(run, 13, 3, ahS, ahM2)}, 0, false, ahM2},
+		{"bounded between the off-chain reset and the later clean rebase answers the re-seeded seed",
+			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahS), ahClean(run, 11, 1, ahS, ahM), ahReset(run, 12, ahM, ahX), ahClean(run, 13, 3, ahS, ahM2)}, 12, true, ahS},
 		{"an undecodable branch_rebased row keeps the seed",
 			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahS), {RunID: &run, Category: CategoryBranchRebased, Sequence: 11, Payload: []byte("{not json")}}, 0, false, ahS},
 		{"a later fixup_pushed supersedes the rebase",
@@ -241,8 +266,13 @@ func TestAcceptanceHeadAsOf_SeedOrderedByChainSequence(t *testing.T) {
 // TestAcceptanceHeadAsOf_BaseMergeReadErrorFailsClosed: the seed read succeeds
 // (so a seed answer is distinguishable), the base-merge read errors, and the
 // resolver answers "" with an error — never the stale seed.
+//
+// The category list is a LITERAL, never acceptanceBaseMergeCategories, so
+// dropping a category from production cannot also drop its subtest. With
+// operator_commit_vouched unread the fixture answers (M, nil): the clean
+// S -> M rebase still walks, so only the fail-closed read refuses.
 func TestAcceptanceHeadAsOf_BaseMergeReadErrorFailsClosed(t *testing.T) {
-	for _, cat := range []string{CategoryBranchRebased, CategoryBranchReset} {
+	for _, cat := range []string{CategoryBranchRebased, CategoryBranchReset, CategoryOperatorCommitVouched} {
 		t.Run(cat, func(t *testing.T) {
 			run := uuid.New()
 			s, au := ahServer(ahHead(run, "pull_request_opened", 10, 0, ahS), ahClean(run, 11, 1, ahS, ahM))
@@ -253,6 +283,113 @@ func TestAcceptanceHeadAsOf_BaseMergeReadErrorFailsClosed(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "list base-merge rows") {
 				t.Errorf("error = %v, want it to name the base-merge read", err)
+			}
+		})
+	}
+}
+
+// TestAcceptanceBaseMergeCategories_MatchFixupWalk: the acceptance walk and the
+// fix-up walk read ONE category set, so a verified vouch moves both heads and
+// any other vouch moves neither (#4874, #4856).
+func TestAcceptanceBaseMergeCategories_MatchFixupWalk(t *testing.T) {
+	if !reflect.DeepEqual(acceptanceBaseMergeCategories, fixupHeadWalkCategories) {
+		t.Errorf("acceptanceBaseMergeCategories = %v, want fixupHeadWalkCategories %v", acceptanceBaseMergeCategories, fixupHeadWalkCategories)
+	}
+}
+
+// recordedWalkParityFile is the walk-parity table shared with the MCP preview
+// mirror (backend/internal/mcpserver latestReportedHeadSHA).
+const recordedWalkParityFile = "../auditcomplete/testdata/recorded-walk-parity.json"
+
+type recordedWalkParityRow struct {
+	Category string          `json:"category"`
+	Sequence int64           `json:"sequence"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+type recordedWalkParityCase struct {
+	Name     string                  `json:"name"`
+	Rows     []recordedWalkParityRow `json:"rows"`
+	WantHead string                  `json:"want_head"`
+	Skip     string                  `json:"skip"`
+}
+
+// TestAcceptanceHeadAsOf_RecordedWalkParity runs the server resolver over every
+// case of the shared parity table, so the server and the MCP preview mirror
+// are held to the same answers. An emptied or truncated file fails the
+// case-count floor rather than passing vacuously.
+func TestAcceptanceHeadAsOf_RecordedWalkParity(t *testing.T) {
+	raw, err := os.ReadFile(recordedWalkParityFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", recordedWalkParityFile, err)
+	}
+	var doc struct {
+		Cases []recordedWalkParityCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode %s: %v", recordedWalkParityFile, err)
+	}
+	if len(doc.Cases) < 15 {
+		t.Fatalf("%s holds %d cases, want at least 15", recordedWalkParityFile, len(doc.Cases))
+	}
+	for _, tc := range doc.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			if tc.Skip != "" {
+				t.Skip(tc.Skip)
+			}
+			run := uuid.New()
+			rows := make([]*audit.Entry, 0, len(tc.Rows))
+			for _, r := range tc.Rows {
+				rid := run
+				rows = append(rows, &audit.Entry{ID: uuid.New(), RunID: &rid, Category: r.Category, Sequence: r.Sequence,
+					Timestamp: ahT0.Add(time.Duration(r.Sequence) * time.Second), Payload: r.Payload})
+			}
+			s, _ := ahServer(rows...)
+			got, err := s.acceptanceHeadAsOf(context.Background(), run, 0, false)
+			if err != nil {
+				t.Fatalf("acceptanceHeadAsOf error = %v, want nil", err)
+			}
+			if got != tc.WantHead {
+				t.Errorf("acceptanceHeadAsOf = %q, want %q", got, tc.WantHead)
+			}
+		})
+	}
+}
+
+// TestAcceptanceHeadAsOf_VerifiedVouchAdvances pins the consumer shapes the
+// unbounded parity table cannot express: the dispatch-anchor bound, the
+// standalone and parent seeds, a legacy row, and the reset-then-re-vouch shape
+// #4856's re-seeding reset arm now walks (D1: asserted, not skipped).
+func TestAcceptanceHeadAsOf_VerifiedVouchAdvances(t *testing.T) {
+	run := uuid.New()
+	pr := func(seq int64, sha string) *audit.Entry {
+		return ahHead(run, "pull_request_opened", seq, int(seq), sha)
+	}
+	tests := []struct {
+		name    string
+		rows    []*audit.Entry
+		maxSeq  int64
+		bounded bool
+		want    string
+	}{
+		{"standalone", []*audit.Entry{pr(10, ahS), ahVerifiedVouch(run, 11, ahS, ahV)}, 0, false, ahV},
+		{"bounded below the vouch answers the seed", []*audit.Entry{pr(10, ahS), ahVerifiedVouch(run, 12, ahS, ahV)}, 11, true, ahS},
+		{"bounded at the vouch answers the vouched head", []*audit.Entry{pr(10, ahS), ahVerifiedVouch(run, 12, ahS, ahV)}, 12, true, ahV},
+		{"bounded above the vouch answers the vouched head", []*audit.Entry{pr(10, ahS), ahVerifiedVouch(run, 12, ahS, ahV)}, 13, true, ahV},
+		{"parent integration seed", []*audit.Entry{ahIntegration(run, 10, 10, ahF1), ahVerifiedVouch(run, 11, ahF1, ahW)}, 0, false, ahW},
+		{"legacy", []*audit.Entry{pr(10, ahS), ahLegacyVouch(run, 11, ahV)}, 0, false, ahS},
+		{"reset_then_verified_revouch",
+			[]*audit.Entry{pr(10, ahS), ahLegacyVouch(run, 11, ahV), ahReset(run, 12, ahX, ahV), ahVerifiedVouch(run, 13, ahS, ahV)}, 0, false, ahV},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := ahServer(tt.rows...)
+			got, err := s.acceptanceHeadAsOf(context.Background(), run, tt.maxSeq, tt.bounded)
+			if err != nil {
+				t.Fatalf("acceptanceHeadAsOf error = %v, want nil", err)
+			}
+			if got != tt.want {
+				t.Errorf("acceptanceHeadAsOf = %q, want %q", got, tt.want)
 			}
 		})
 	}
