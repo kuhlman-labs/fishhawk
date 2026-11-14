@@ -14612,10 +14612,11 @@ func extractEnvGateVal(s, key string) string {
 // GOLANGCI_LINT_CACHE=/shared planted, two runVerifyCommittedTree invocations
 // must each see a GOLANGCI_LINT_CACHE that is non-empty, differs from the
 // ambient /shared, and differs BETWEEN the invocations — proving the linter's
-// path-keyed analysis cache is isolated per verify-gate invocation so one local
-// run's cached results can't leak into another's re-verify. Asserting the
-// observed subprocess-env value (not mere edit presence) means a no-op touch
-// fails this test (Done-means test rule, #1169).
+// analysis cache (content-keyed, but storing absolute positions) is isolated
+// per verify-gate invocation so one local run's cached results can't leak into
+// another's re-verify (host `scripts/test lint` derives its own per-checkout
+// cache, #5151). Asserting the observed subprocess-env value (not mere edit
+// presence) means a no-op touch fails this test (Done-means test rule, #1169).
 func TestVerifyCommittedTree_IsolatesLintCachePerInvocation(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")

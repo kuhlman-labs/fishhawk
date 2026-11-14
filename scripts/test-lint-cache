@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/test's per-checkout golangci-lint cache (#5151):
+# _lint_cache_dir and _export_lint_cache, as cmd_lint runs them.
+#
+# THE LEAK. golangci-lint keys its issue cache by package CONTENT (path-
+# independent) but stores each finding's ABSOLUTE position. With one shared
+# cache dir (the default os.UserCacheDir()/golangci-lint), a checkout whose
+# package is byte-identical to another checkout's hits that checkout's entry and
+# inherits its paths; the result processors (the generated-file and nolint
+# filters) then read the file at the FOREIGN path. A removed peer (`Can't process
+# results by generated_file_filter processor: ... failed to get doc (strict) ...
+# no such file or directory`) or a peer whose line no longer carries the
+# //nolint makes the suppressed finding reappear as `../<other-tree>/x.go`. The
+# evidence is empirical, against the pinned golangci-lint v2.12.2: R1/R2 go RED
+# under CF1, with and without GOFLAGS=-trimpath (both observed 2026-11-14).
+#
+# Two vehicles:
+#   * HERMETIC arms (L1-L12, with L6b/L6c/L7b/L10b) source the real scripts/test
+#     lib-only (FISHHAWK_TEST_LIB_ONLY=1), stub _require_lint_host_toolchain
+#     and `modules`, and run cmd_lint with a fake `golangci-lint` first on PATH. The fake logs
+#     the GOLANGCI_LINT_CACHE and GOCACHE it saw, then MODELS the real cache:
+#     dir = GOLANGCI_LINT_CACHE, or $XDG_CACHE_HOME/golangci-lint when unset or
+#     empty; key = cksum of x.go; a miss stores $PWD/x.go, a hit reuses the
+#     stored path; a nolint processor reads the file at the stored path.
+#   * REAL arms (R0-R2) copy the real scripts/test, scripts/check-gate-image and
+#     deploy/gate-image/Dockerfile into a fixture and run `scripts/test lint` end
+#     to end against the REAL pinned golangci-lint, with GOFLAGS=-trimpath (the
+#     reported environment) and GOTOOLCHAIN=local, in worktrees whose files
+#     diverge. They SKIP with a printed reason (exit 0) when go, golangci-lint,
+#     jq or git is absent or `scripts/check-gate-image --host` refuses: lint
+#     itself refuses there, so nothing unprotected ships, and the hermetic arms
+#     always run.
+#
+# Every arm runs with GOLANGCI_LINT_CACHE and GITHUB_ACTIONS unset and HOME /
+# XDG_CACHE_HOME pinned to a temp dir, so the user's real caches are never
+# touched, even under a counterfactual. GOCACHE and GOMODCACHE are captured from
+# `go env` BEFORE HOME moves, so the shared Go build cache stays the real one.
+#
+# LOCAL ITERATION AID ONLY: FISHHAWK_LINT_CACHE_HERMETIC_ONLY=1 skips the REAL
+# arms (printed), for re-running the hermetic counterfactuals quickly. The verify
+# gate never sets it, and _verify_gate_harnesses unsets it before every harness.
+#
+# Why #1796's tests could not catch this: its fix (withIsolatedLintCache in
+# runner/cmd/fishhawk-runner/gateenv.go) and its two IsolatesLintCachePerInvocation
+# tests cover only the runner-spawned gate subprocesses, asserting the env value
+# those see. An implement agent's own shell `scripts/verify-change` / `scripts/test
+# lint` never passes through those call sites.
+#
+# House style follows scripts/test-in-gate-image: PASS/FAIL counters, non-zero
+# exit on any FAIL, no network, no Docker. Run by `scripts/test verify` via
+# _verify_gate_harnesses, and standalone.
+#
+# ---------------------------------------------------------------------------
+# COUNTERFACTUALS — run EMPIRICALLY on 2026-11-14 against scripts/test, each by
+# mutating the control's BODY or deleting its CALL SITE (never a referenced
+# function), then running this harness (FISHHAWK_LINT_CACHE_HERMETIC_ONLY=1 for
+# all but CF1); every named arm was observed RED, and the file was restored and
+# cmp-verified byte-identical:
+#   CF1 `_export_lint_cache` CALL deleted from cmd_lint      -> L1 L2 L4 L6 L6b
+#       L6c L7 L7b L8 L9 L11 L12 R1 R2 (42 FAIL). Both trees resolve the shared
+#       default cache, so tree B hits tree A's entry carrying A's absolute path:
+#       R1 printed generated_file_filter's `failed to get doc (strict) of file
+#       <tmp>/ra/mod/x.go ... no such file or directory`, R2 printed
+#       `../rc/mod/x.go:6:27: SA1012`. Also RED with GOFLAGS unset (no -trimpath).
+#   CF2 branch (a) ignores an explicit value (`if false`)    -> L3
+#   CF3 `${GOLANGCI_LINT_CACHE+set}` test instead of `:-`    -> L4 (the empty
+#       value passes through, and golangci-lint would use the shared default)
+#   CF4 GITHUB_ACTIONS branch deleted                        -> L5
+#   CF5 non-git fallback made `return 1`                     -> L6 L6b L12
+#       (the unresolvable-dir refusal fires: exit 1, the fake never runs)
+#   CF6 host mkdir refusal made a fall-through (`&& false`)  -> L7
+#   CF7 test-lint-cache removed from _verify_gate_harnesses  -> L10 L10b
+#   CF10 <root-key> component dropped from the git-dir path  -> L1 L2 L4 L11 (a
+#       moved worktree keeps its admin dir, so it re-reads the old location's
+#       entry and prints `failed to get doc` and the finding)
+#   CF11 show-toplevel equality check deleted                -> L12
+#   CF12 host resolve refusal disabled (`if false`)          -> L6c L7b
+#       (message only: the mkdir refusal downstream still exits 1 on the
+#       empty dir)
+#   CF14 FISHHAWK_LINT_CACHE_HERMETIC_ONLY dropped from the harness-loop
+#       `unset`                                              -> L10b
+#   CF15 (N5) no-HOME fallback back to /tmp/.cache           -> L6c (exit 0, the
+#       key dir created under /tmp/.cache; the arm removes what it made)
+# CF8/CF9/CF13 (the gate-image mount and its two refusals) are pinned by
+# scripts/test-in-gate-image i6/i7, i15b and i15c. CF7 and CF14 also turn
+# backend/internal/basedelta TestVerifyLegsCoveredByDeclaration RED.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+SKIP=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+skip() { echo "SKIP: $1"; SKIP=$((SKIP + 1)); }
+
+assert_contains() { # <desc> <file> <needle>
+  if grep -qF -- "$3" "$2" 2>/dev/null; then pass "$1"; else
+    fail "$1 (expected '$3' in $2)"
+    sed -n '1,30p' "$2" 2>/dev/null | sed 's/^/    | /'
+  fi
+}
+assert_not_contains() { # <desc> <file> <needle>
+  if grep -qF -- "$3" "$2" 2>/dev/null; then
+    fail "$1 (unexpected '$3' in $2)"
+    sed -n '1,30p' "$2" 2>/dev/null | sed 's/^/    | /'
+  else pass "$1"; fi
+}
+assert_eq() { # <desc> <expected> <actual>
+  if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected '$2', got '$3')"; fi
+}
+assert_ne() { # <desc> <a> <b>
+  if [ "$2" != "$3" ]; then pass "$1"; else fail "$1 (both '$2')"; fi
+}
+assert_absent() { # <desc> <path>
+  if [ -e "$2" ] || [ -L "$2" ]; then fail "$1 ($2 exists)"; else pass "$1"; fi
+}
+assert_dir() { # <desc> <path>
+  if [ -d "$2" ]; then pass "$1"; else fail "$1 ($2 is not a directory)"; fi
+}
+
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+unset FISHHAWK_TEST_LIB_ONLY FISHHAWK_VERIFY_PACKAGES GOLANGCI_LINT_CACHE GITHUB_ACTIONS
+
+# Capture the real Go environment BEFORE HOME moves (a `go env -w` file lives
+# under HOME, and GOCACHE must stay the shared build cache).
+REAL_GOROOT="" REAL_GOCACHE="" REAL_GOMODCACHE="" REAL_GOPATH=""
+if command -v go >/dev/null 2>&1; then
+  REAL_GOROOT="$(go env GOROOT 2>/dev/null || true)"
+  REAL_GOCACHE="$(go env GOCACHE 2>/dev/null || true)"
+  REAL_GOMODCACHE="$(go env GOMODCACHE 2>/dev/null || true)"
+  REAL_GOPATH="$(go env GOPATH 2>/dev/null || true)"
+fi
+
+tmproot="$(mktemp -d)"
+trap 'rm -rf "$tmproot"' EXIT
+tmproot="$(cd "$tmproot" && pwd -P)"
+export HOME="$tmproot/home" XDG_CACHE_HOME="$tmproot/home/.cache"
+mkdir -p "$HOME" "$XDG_CACHE_HOME"
+export GOCACHE="${REAL_GOCACHE:-$tmproot/gocache}"
+if [ -n "$REAL_GOMODCACHE" ]; then export GOMODCACHE="$REAL_GOMODCACHE"; fi
+if [ -n "$REAL_GOPATH" ]; then export GOPATH="$REAL_GOPATH"; fi
+
+# rootkey <dir>: the cksum (CRC-length) of the physical path, as _lint_cache_dir
+# derives it.
+rootkey() { printf '%s' "$(cd "$1" && pwd -P)" | cksum | awk '{print $1 "-" $2}'; }
+gitdir_of() { git -C "$1" rev-parse --absolute-git-dir; }
+# reset_default_caches: wipe the SHARED default cache dirs between leak arms, so
+# an earlier arm's entry cannot mask (or fake) a later arm's leak.
+reset_default_caches() {
+  rm -rf "$XDG_CACHE_HOME/golangci-lint" "$HOME/Library/Caches/golangci-lint" "$HOME/.cache/golangci-lint"
+}
+
+# --- fixture -----------------------------------------------------------------
+write_module() { # <root> [nolint=1]
+  mkdir -p "$1/mod"
+  printf 'go 1.22\n\nuse ./mod\n' > "$1/go.work"
+  printf 'module example.invalid/mod\n\ngo 1.22\n' > "$1/mod/go.mod"
+  printf 'version: "2"\nlinters:\n  default: none\n  enable:\n    - staticcheck\n' > "$1/.golangci.yml"
+  if [ "${2:-1}" = 1 ]; then
+    printf 'package mod\n\nimport "context"\n\nfunc F() context.Context {\n\treturn context.WithValue(nil, "k", 1) //nolint:staticcheck // fixture\n}\n' > "$1/mod/x.go"
+  else
+    printf 'package mod\n\nimport "context"\n\nfunc F() context.Context {\n\treturn context.WithValue(nil, "k", 1)\n}\n' > "$1/mod/x.go"
+  fi
+}
+git_init_commit() { # <root>
+  (
+    cd "$1" || exit 1
+    git init -q -b main . && git config user.email h@example.invalid \
+      && git config user.name harness && git config commit.gpgsign false \
+      && git add -A && git commit -q -m fixture
+  ) >/dev/null 2>&1
+}
+
+FX="$tmproot/fx"
+write_module "$FX"
+git_init_commit "$FX" || { echo "test-lint-cache: fixture git init failed" >&2; exit 1; }
+FXGIT="$(gitdir_of "$FX")"
+
+# --- fake golangci-lint --------------------------------------------------------
+FAKEBIN="$tmproot/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/golangci-lint" <<'EOF'
+#!/bin/sh
+printf 'CACHE=%s\n' "${GOLANGCI_LINT_CACHE-<unset>}" >> "$FAKE_LOG"
+printf 'GOCACHE=%s\n' "${GOCACHE-<unset>}" >> "$FAKE_LOG"
+dir="${GOLANGCI_LINT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/golangci-lint}"
+mkdir -p "$dir" || exit 98
+key="$(cksum < x.go | awk '{print $1 "-" $2}')"
+if [ -f "$dir/$key" ]; then
+  stored="$(cat "$dir/$key")"
+else
+  stored="$PWD/x.go"
+  printf '%s\n' "$stored" > "$dir/$key"
+fi
+if [ -f "$stored" ]; then
+  case "$(sed -n 6p "$stored")" in *//nolint*) echo '0 issues.'; exit 0 ;; esac
+else
+  echo "level=warning msg=\"[runner] Can't process results by generated_file_filter processor: failed to get doc (strict) of file $stored: open $stored: no such file or directory\""
+fi
+echo "$stored:6:27: SA1012: do not pass a nil Context (staticcheck)"
+echo '1 issues:'
+exit 1
+EOF
+chmod +x "$FAKEBIN/golangci-lint"
+
+# lint_lib NAME ROOT — cmd_lint from the real scripts/test, lib-only, with the
+# fake first on PATH and the host-toolchain check and module list stubbed. Env
+# knobs come from the caller's prefix; LINT_UNSET names variables to UNSET
+# (not merely empty) after scripts/test is sourced. Sets $out, $log, $rc and
+# $seen (the GOLANGCI_LINT_CACHE value the fake logged, empty when it never ran).
+lint_lib() {
+  local name="$1" root="$2"
+  out="$tmproot/out-$name"
+  log="$tmproot/log-$name"
+  : > "$log"
+  (
+    FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+    cd "$root" || exit 97
+    ROOT="$root"
+    _require_lint_host_toolchain() { :; }
+    modules() { echo mod; }
+    export PATH="${PRE_PATH:+$PRE_PATH:}$FAKEBIN:$PATH" FAKE_LOG="$log"
+    if [ -n "${LINT_UNSET:-}" ]; then
+      # shellcheck disable=SC2086 # word-split on purpose: a list of names
+      unset $LINT_UNSET
+    fi
+    cmd_lint
+  ) > "$out" 2>&1
+  rc=$?
+  seen="$(sed -n 's/^CACHE=//p' "$log" | head -n 1)"
+}
+
+# --- L1: primary checkout ------------------------------------------------------
+lint_lib l1 "$FX"
+L1_WANT="$FXGIT/fishhawk-lint-cache/$(rootkey "$FX")/host"
+assert_eq "L1: primary checkout lint exits 0" 0 "$rc"
+assert_eq "L1: the fake sees <git-dir>/fishhawk-lint-cache/<root-key>/host" "$L1_WANT" "$seen"
+case "$seen" in
+  "$FXGIT"/*) pass "L1: the cache lies inside the primary checkout's .git" ;;
+  *) fail "L1: the cache '$seen' is not under $FXGIT" ;;
+esac
+assert_dir "L1: the derived dir exists" "$L1_WANT"
+assert_contains "L1: GOCACHE is the inherited (shared) value" "$log" "GOCACHE=$GOCACHE"
+assert_eq "L1: nothing is printed beyond the module header and lint output" "" \
+  "$(grep -v -e '^>>> mod$' -e '^0 issues.$' "$out")"
+assert_eq "L1: git status stays clean" "" "$(git -C "$FX" status --porcelain)"
+
+# --- L2: linked worktree --------------------------------------------------------
+WT2="$tmproot/wt2"
+git -C "$FX" worktree add -q --detach "$WT2" HEAD >/dev/null 2>&1
+lint_lib l2 "$WT2"
+WT2GIT="$(gitdir_of "$WT2")"
+assert_eq "L2: linked worktree lint exits 0" 0 "$rc"
+assert_eq "L2: the fake sees the worktree's own git dir" \
+  "$WT2GIT/fishhawk-lint-cache/$(rootkey "$WT2")/host" "$seen"
+case "$WT2GIT" in
+  "$FXGIT"/worktrees/*) pass "L2: the git dir is <common>/worktrees/<id>" ;;
+  *) fail "L2: unexpected git dir $WT2GIT" ;;
+esac
+assert_ne "L2: distinct from the primary checkout's cache" "$L1_WANT" "$seen"
+
+# --- L3: an explicit value is honoured verbatim -------------------------------
+rm -rf "$FXGIT/fishhawk-lint-cache"
+GOLANGCI_LINT_CACHE="$tmproot/explicit" lint_lib l3 "$FX"
+assert_eq "L3: explicit GOLANGCI_LINT_CACHE lint exits 0" 0 "$rc"
+assert_eq "L3: the fake sees the explicit value verbatim" "$tmproot/explicit" "$seen"
+assert_absent "L3: no per-checkout dir is created" "$FXGIT/fishhawk-lint-cache"
+assert_absent "L3: no fallback dir is created" "$XDG_CACHE_HOME/fishhawk-lint-cache"
+
+# --- L4: an EMPTY value is treated as unset ------------------------------------
+GOLANGCI_LINT_CACHE="" lint_lib l4 "$FX"
+assert_eq "L4: empty GOLANGCI_LINT_CACHE lint exits 0" 0 "$rc"
+assert_eq "L4: the derived dir is used, exactly as L1" "$L1_WANT" "$seen"
+
+# --- L5: GitHub Actions leaves it unset ----------------------------------------
+rm -rf "$FXGIT/fishhawk-lint-cache"
+GITHUB_ACTIONS=true lint_lib l5 "$FX"
+assert_eq "L5: GITHUB_ACTIONS=true lint exits 0" 0 "$rc"
+assert_eq "L5: the fake sees GOLANGCI_LINT_CACHE unset" "<unset>" "$seen"
+assert_absent "L5: no per-checkout dir is created" "$FXGIT/fishhawk-lint-cache"
+
+# --- L6/L6b: a non-git root falls back to a per-root key ----------------------
+NG1="$tmproot/nogit1"
+NG2="$tmproot/nogit2"
+write_module "$NG1"
+write_module "$NG2"
+if [ "$(git -C "$NG1" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; then
+  echo "test-lint-cache: precondition failed — $NG1 lies inside a git work tree; L6 needs a non-git root" >&2
+  exit 1
+fi
+lint_lib l6 "$NG1"
+L6_SEEN="$seen"
+assert_eq "L6: non-git root lint exits 0" 0 "$rc"
+assert_eq "L6: the fallback is \$XDG_CACHE_HOME/fishhawk-lint-cache/<root-key>/host" \
+  "$XDG_CACHE_HOME/fishhawk-lint-cache/$(rootkey "$NG1")/host" "$seen"
+assert_dir "L6: the fallback dir exists" "$XDG_CACHE_HOME/fishhawk-lint-cache/$(rootkey "$NG1")/host"
+lint_lib l6-2 "$NG2"
+assert_eq "L6: a second non-git root lint exits 0" 0 "$rc"
+assert_ne "L6: a second non-git root gets a different key" "$L6_SEEN" "$seen"
+case "$seen" in
+  "$XDG_CACHE_HOME/fishhawk-lint-cache/"*) pass "L6: the second root also takes the fallback" ;;
+  *) fail "L6: the second root's cache '$seen' is not a fallback dir" ;;
+esac
+XDG_CACHE_HOME="" lint_lib l6b "$NG1"
+assert_eq "L6b: unset XDG_CACHE_HOME lint exits 0" 0 "$rc"
+assert_eq "L6b: the fallback uses \$HOME/.cache" \
+  "$HOME/.cache/fishhawk-lint-cache/$(rootkey "$NG1")/host" "$seen"
+
+# --- L6c: no XDG_CACHE_HOME and no HOME refuses: never a shared /tmp fallback ---
+# The old fallback was /tmp/.cache, so a regression would create the key dir
+# there; record whether its parent existed, and remove only what this arm made.
+L6C_KEY="$(rootkey "$NG1")"
+L6C_TMP_HAD=0
+if [ -d /tmp/.cache/fishhawk-lint-cache ]; then L6C_TMP_HAD=1; fi
+LINT_UNSET="XDG_CACHE_HOME HOME" lint_lib l6c "$NG1"
+assert_eq "L6c: no XDG_CACHE_HOME and no HOME exits 1" 1 "$rc"
+assert_contains "L6c: the refusal names the resolution failure" "$out" "cannot resolve the per-checkout golangci-lint cache for $NG1"
+assert_contains "L6c: the refusal names GOLANGCI_LINT_CACHE as the remedy" "$out" "set GOLANGCI_LINT_CACHE to a writable directory private to this checkout"
+assert_eq "L6c: golangci-lint NEVER ran" "" "$(cat "$log")"
+assert_absent "L6c: nothing is created under /tmp/.cache" "/tmp/.cache/fishhawk-lint-cache/$L6C_KEY"
+rm -rf "/tmp/.cache/fishhawk-lint-cache/$L6C_KEY"
+if [ "$L6C_TMP_HAD" = 0 ]; then rmdir /tmp/.cache/fishhawk-lint-cache 2>/dev/null || true; fi
+
+# --- L7: an uncreatable dir refuses, the linter never runs ---------------------
+rm -rf "$FXGIT/fishhawk-lint-cache"
+: > "$FXGIT/fishhawk-lint-cache"
+lint_lib l7 "$FX"
+assert_eq "L7: an uncreatable per-checkout cache exits 1" 1 "$rc"
+assert_contains "L7: the refusal names the dir" "$out" "cannot create the per-checkout golangci-lint cache $FXGIT/fishhawk-lint-cache/"
+assert_contains "L7: the refusal names GOLANGCI_LINT_CACHE as the remedy" "$out" "set GOLANGCI_LINT_CACHE"
+assert_eq "L7: golangci-lint NEVER ran" "" "$(cat "$log")"
+rm -f "$FXGIT/fishhawk-lint-cache"
+
+# --- L7b: an unresolvable dir (a failing cksum) refuses, the linter never runs --
+BADCK="$tmproot/badcksum"
+mkdir -p "$BADCK"
+printf '#!/bin/sh\nexit 1\n' > "$BADCK/cksum"
+chmod +x "$BADCK/cksum"
+PRE_PATH="$BADCK" lint_lib l7b "$FX"
+assert_eq "L7b: an unresolvable per-checkout cache exits 1" 1 "$rc"
+assert_contains "L7b: the refusal names the resolution failure" "$out" "cannot resolve the per-checkout golangci-lint cache for $FX"
+assert_contains "L7b: the refusal names GOLANGCI_LINT_CACHE as the remedy" "$out" "set GOLANGCI_LINT_CACHE"
+assert_eq "L7b: golangci-lint NEVER ran" "" "$(cat "$log")"
+assert_absent "L7b: nothing is created" "$FXGIT/fishhawk-lint-cache"
+
+# --- L8: removed peer ------------------------------------------------------------
+reset_default_caches
+W1="$tmproot/w1"
+W2="$tmproot/w2"
+git -C "$FX" worktree add -q --detach "$W1" HEAD >/dev/null 2>&1
+git -C "$FX" worktree add -q --detach "$W2" HEAD >/dev/null 2>&1
+W1GIT="$(gitdir_of "$W1")"
+lint_lib l8-a "$W1"
+assert_eq "L8: tree A lint exits 0" 0 "$rc"
+W1CACHE="$seen"
+git -C "$FX" worktree remove --force "$W1" >/dev/null 2>&1
+assert_absent "L8: git worktree remove deletes A's admin dir" "$W1GIT"
+case "$W1CACHE" in
+  "$W1GIT"/*) assert_absent "L8: and so A's lint cache" "$W1CACHE" ;;
+  *) fail "L8: A's cache '$W1CACHE' was not inside its admin dir $W1GIT" ;;
+esac
+lint_lib l8 "$W2"
+assert_eq "L8: tree B lint exits 0 after A is removed" 0 "$rc"
+assert_contains "L8: tree B reports 0 issues" "$out" "0 issues"
+assert_not_contains "L8: no path from the removed tree" "$out" "$W1"
+
+# --- L9/L9c: diverged peer --------------------------------------------------------
+reset_default_caches
+W3="$tmproot/w3"
+W4="$tmproot/w4"
+git -C "$FX" worktree add -q --detach "$W3" HEAD >/dev/null 2>&1
+git -C "$FX" worktree add -q --detach "$W4" HEAD >/dev/null 2>&1
+lint_lib l9-a "$W3"
+assert_eq "L9: tree A lint exits 0" 0 "$rc"
+sed 's| //nolint:staticcheck // fixture||' "$W3/mod/x.go" > "$W3/mod/x.go.new" && mv "$W3/mod/x.go.new" "$W3/mod/x.go"
+lint_lib l9 "$W4"
+assert_eq "L9: tree B lint exits 0 after A's line diverged" 0 "$rc"
+assert_contains "L9: tree B reports 0 issues" "$out" "0 issues"
+assert_not_contains "L9: no path from the diverged tree" "$out" "$W3"
+lint_lib l9c "$W3"
+assert_eq "L9c: control — the diverged tree itself fails" 1 "$rc"
+assert_contains "L9c: control — and reports its own finding at its own path" "$out" "$W3/mod/x.go:6:27: SA1012"
+
+# --- L10: registered in _verify_gate_harnesses -----------------------------------
+HARN="$tmproot/harn"
+mkdir -p "$HARN/scripts" "$HARN/markers"
+# The stub records what it saw of the local-only switch (L10b).
+printf '#!/bin/sh\nprintf "%%s" "${FISHHAWK_LINT_CACHE_HERMETIC_ONLY-<unset>}" > "%s"\n' \
+  "$HARN/markers/test-lint-cache" > "$HARN/scripts/test-lint-cache"
+chmod +x "$HARN/scripts/test-lint-cache"
+(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$HARN"
+  export FISHHAWK_LINT_CACHE_HERMETIC_ONLY=1
+  ( set -e; _verify_gate_harnesses )
+) > "$tmproot/out-l10" 2>&1
+assert_eq "L10: the harness loop exits 0" 0 "$?"
+assert_eq "L10: test-lint-cache is run by verify" ok "$([ -e "$HARN/markers/test-lint-cache" ] && echo ok)"
+assert_eq "L10b: the gate unsets FISHHAWK_LINT_CACHE_HERMETIC_ONLY before the harness" \
+  "<unset>" "$(cat "$HARN/markers/test-lint-cache" 2>/dev/null)"
+
+# --- L11: a moved worktree misses the old location's entries (C1) ---------------
+reset_default_caches
+W5="$tmproot/w5"
+W5M="$tmproot/w5-moved"
+git -C "$FX" worktree add -q --detach "$W5" HEAD >/dev/null 2>&1
+lint_lib l11-a "$W5"
+assert_eq "L11: lint before the move exits 0" 0 "$rc"
+L11_BEFORE="$seen"
+git -C "$FX" worktree move "$W5" "$W5M" >/dev/null 2>&1
+assert_absent "L11: git worktree move left nothing at the old location" "$W5"
+lint_lib l11 "$W5M"
+assert_eq "L11: lint after the move (nothing edited) exits 0" 0 "$rc"
+assert_ne "L11: the moved worktree sees a different cache dir" "$L11_BEFORE" "$seen"
+assert_eq "L11: the new dir is keyed by the new path" \
+  "$(gitdir_of "$W5M")/fishhawk-lint-cache/$(rootkey "$W5M")/host" "$seen"
+assert_not_contains "L11: no path from the old location" "$out" "$W5/"
+
+# --- L12: a plain dir nested inside a work tree takes the fallback (C2) ---------
+NEST="$FX/nested"
+write_module "$NEST"
+rm -rf "$FXGIT/fishhawk-lint-cache"
+lint_lib l12 "$NEST"
+assert_eq "L12: nested non-git root lint exits 0" 0 "$rc"
+assert_eq "L12: the nested root takes the per-root fallback" \
+  "$XDG_CACHE_HOME/fishhawk-lint-cache/$(rootkey "$NEST")/host" "$seen"
+assert_absent "L12: nothing is created in the enclosing tree's git dir" "$FXGIT/fishhawk-lint-cache"
+rm -rf "$NEST"
+
+# --- R0-R2: the REAL golangci-lint via the real scripts/test lint ----------------
+real_skip=""
+if [ "${FISHHAWK_LINT_CACHE_HERMETIC_ONLY:-}" = 1 ]; then
+  real_skip="FISHHAWK_LINT_CACHE_HERMETIC_ONLY=1 (local iteration aid)"
+else
+  for b in go golangci-lint jq git; do
+    if ! command -v "$b" >/dev/null 2>&1; then real_skip="$b not on PATH"; break; fi
+  done
+fi
+RPATH="$PATH"
+if [ -z "$real_skip" ] && [ -n "$REAL_GOROOT" ] && [ -x "$REAL_GOROOT/bin/go" ]; then
+  # The pinned Go's own bin first, so the standalone gofmt the host check reads
+  # is the pinned one (scripts/test's host_toolchain_mismatch remedy).
+  RPATH="$REAL_GOROOT/bin:$PATH"
+fi
+RFX="$tmproot/rfx"
+if [ -z "$real_skip" ]; then
+  write_module "$RFX"
+  mkdir -p "$RFX/scripts" "$RFX/deploy/gate-image"
+  cp "$REPO_ROOT/scripts/test" "$REPO_ROOT/scripts/check-gate-image" "$RFX/scripts/"
+  cp "$REPO_ROOT/deploy/gate-image/Dockerfile" "$RFX/deploy/gate-image/Dockerfile"
+  chmod +x "$RFX/scripts/test" "$RFX/scripts/check-gate-image"
+  git_init_commit "$RFX" || { echo "test-lint-cache: real fixture git init failed" >&2; exit 1; }
+  if ! PATH="$RPATH" GOTOOLCHAIN=local "$RFX/scripts/check-gate-image" --root "$RFX" --host > "$tmproot/out-rhost" 2>&1; then
+    real_skip="scripts/check-gate-image --host refuses this host's toolchain (lint would refuse too): $(tr '\n' ' ' < "$tmproot/out-rhost")"
+  fi
+fi
+
+# real_lint NAME TREE — `scripts/test lint` end to end in TREE. Sets $out, $rc.
+real_lint() {
+  out="$tmproot/out-$1"
+  ( cd "$2" && PATH="$RPATH" GOFLAGS=-trimpath GOTOOLCHAIN=local GOPROXY=off \
+      ./scripts/test lint ) > "$out" 2>&1
+  rc=$?
+}
+
+if [ -n "$real_skip" ]; then
+  skip "R0-R2: $real_skip"
+else
+  reset_default_caches
+  R0="$tmproot/r0"
+  git -C "$RFX" worktree add -q --detach "$R0" HEAD >/dev/null 2>&1
+  sed 's| //nolint:staticcheck // fixture||' "$R0/mod/x.go" > "$R0/mod/x.go.new" && mv "$R0/mod/x.go.new" "$R0/mod/x.go"
+  real_lint r0 "$R0"
+  assert_eq "R0: control — a tree with no //nolint fails real lint" 1 "$rc"
+  assert_contains "R0: control — SA1012 at the tree's own path" "$out" "x.go:6:27: SA1012"
+  assert_not_contains "R0: control — no foreign path" "$out" "../"
+
+  reset_default_caches
+  RA="$tmproot/ra"
+  RB="$tmproot/rb"
+  git -C "$RFX" worktree add -q --detach "$RA" HEAD >/dev/null 2>&1
+  git -C "$RFX" worktree add -q --detach "$RB" HEAD >/dev/null 2>&1
+  real_lint r1-a "$RA"
+  assert_eq "R1: tree A real lint exits 0" 0 "$rc"
+  git -C "$RFX" worktree remove --force "$RA" >/dev/null 2>&1
+  real_lint r1 "$RB"
+  assert_eq "R1: tree B real lint exits 0 after A is removed" 0 "$rc"
+  assert_contains "R1: tree B reports 0 issues" "$out" "0 issues"
+  assert_not_contains "R1: no path from the removed tree" "$out" "ra/mod/x.go"
+  assert_not_contains "R1: no failed-to-get-doc warning" "$out" "failed to get doc"
+
+  reset_default_caches
+  RC="$tmproot/rc"
+  RD="$tmproot/rd"
+  git -C "$RFX" worktree add -q --detach "$RC" HEAD >/dev/null 2>&1
+  git -C "$RFX" worktree add -q --detach "$RD" HEAD >/dev/null 2>&1
+  real_lint r2-a "$RC"
+  assert_eq "R2: tree A real lint exits 0" 0 "$rc"
+  sed 's| //nolint:staticcheck // fixture||' "$RC/mod/x.go" > "$RC/mod/x.go.new" && mv "$RC/mod/x.go.new" "$RC/mod/x.go"
+  real_lint r2 "$RD"
+  assert_eq "R2: tree B real lint exits 0 after A's line diverged" 0 "$rc"
+  assert_contains "R2: tree B reports 0 issues" "$out" "0 issues"
+  assert_not_contains "R2: no path from the diverged tree" "$out" "rc/mod/x.go"
+  assert_not_contains "R2: no failed-to-get-doc warning" "$out" "failed to get doc"
+fi
+
+echo
+echo "scripts/test-lint-cache: $PASS passed, $FAIL failed, $SKIP skipped"
+[ "$FAIL" -eq 0 ]

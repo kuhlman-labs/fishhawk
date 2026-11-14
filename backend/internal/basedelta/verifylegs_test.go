@@ -168,6 +168,9 @@ var realLegTable = legTable{
 		}},
 		"test-check-gate-image": {inputs: gateImagePinInputs},
 		"test-in-gate-image":    {inputs: []legInput{g("deploy/gate-image/Dockerfile")}},
+		// Its real-lint arms (R0-R2) copy scripts/test, scripts/check-gate-image
+		// and the gate-image Dockerfile into a fixture (#5151).
+		"test-lint-cache": {inputs: []legInput{g("scripts/**"), g("deploy/gate-image/Dockerfile")}},
 		"test-release-ldflags": {inputs: append(append([]legInput{}, versionFiles...),
 			r("backend/cmd/fishhawkd/*.go"), r("backend/cmd/fishhawk-mcp/*.go"), r("backend/cmd/fishhawk-mcp-shim/*.go"),
 			r("runner/cmd/fishhawk-runner/*.go"), r("cli/cmd/fishhawk/*.go"), g("go.work"))},
@@ -200,7 +203,7 @@ var realLegTable = legTable{
 		`if [ "$h" = "test-dev" ] && ! command -v zsh >/dev/null 2>&1; then`,
 		`echo "scripts/test: scripts/test-dev needs zsh, absent from PATH — skipping that harness" >&2`,
 		`printf '>>> scripts/%s\n' "$h"`,
-		`( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER; "$ROOT/scripts/$h" )`,
+		`( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER FISHHAWK_LINT_CACHE_HERMETIC_ONLY; "$ROOT/scripts/$h" )`,
 		`done`,
 	},
 }
