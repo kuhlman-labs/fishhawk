@@ -877,6 +877,15 @@
       "applies_to": []
     },
     {
+      "id": "ADR-081",
+      "title": "Crew messages: a closed set of typed, role-addressed messages on the audit chain, with consults answered mid-stage and disagreement escalated to the captain",
+      "path": "docs/adr/081-crew-messages.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
       "id": "ADR-082",
       "title": "Historian: a derived decision index over the audit chain, deterministic precedent at the gate for the captain, and a thresholded divergence question",
       "path": "docs/adr/082-historian-precedent.md",
@@ -886,6 +895,15 @@
       "amended_by": [
         "ADR-125"
       ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-083",
+      "title": "Captain semantics: approvals stay predicate-governed; the captain record routes pages, owns the digest, and confirms delegation, and changes hands by a recorded two-step handover",
+      "path": "docs/adr/083-captain-semantics.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
       "applies_to": []
     },
     {
@@ -914,6 +932,15 @@
         "ADR-101",
         "ADR-122"
       ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-086",
+      "title": "Acceptance validation-environment contract: operator instructions, declared credential bindings, named provisioners, per-run side-effect namespace",
+      "path": "docs/adr/086-acceptance-validation-environment-contract.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
       "applies_to": []
     },
     {

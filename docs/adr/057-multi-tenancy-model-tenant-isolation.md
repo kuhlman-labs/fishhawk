@@ -91,3 +91,38 @@ Risks: a missed `account_id` predicate is a cross-tenant leak within a cell (RLS
 **Accepted (date not stated).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Accepted (founder-directed).** Decisions above are locked.".
 
 Amendment A1 supersedes ADR-061 (#2069), which was folded into it (confirmed by the Captain 2026-10-23).
+
+**Amendments A1 and A2 (transcribed 2026-11-14).** Both were ratified as comments on this issue ([A1](https://github.com/kuhlman-labs/fishhawk/issues/1823#issuecomment-5013715614), [A2](https://github.com/kuhlman-labs/fishhawk/issues/1823#issuecomment-5016114662)) and are copied below verbatim, at the Captain's direction, so that the record carries them.
+
+## Amendment A1 (accepted 2026-07-18) — tenant granularity is a forge-agnostic workspace
+
+Supersedes Decision #1 ("default tenant granularity = GitHub Enterprise account") and reconciles ADR-058's "tenant = forge account" into one model.
+
+**New tenant definition:** a tenant (the `accounts` row) is a **forge-agnostic Fishhawk workspace** that owns one or more forge **installations** — GitHub App installs (org/enterprise) AND GitLab OAuth grants (group/account) — across providers. One customer with both a GitHub org and a GitLab group is ONE tenant. The workspace, not any single forge account, is the trust / identity / billing / residency boundary.
+
+**Why now:** GitLab is committed (ADR-058 / E45), so the tenant model must not be GitHub-Enterprise-intrinsic. #1854 (E45.1) already folded a forge `provider` discriminator into the `installations` table, so the multi-forge-installation shape is partly in place.
+
+**What does NOT change (the isolation core is forge-independent):** shared-Postgres + `account_id`/`tenant_id` + Postgres RLS (Approach D), the per-account audit chain (#1828), tenant-scoped queries + RLS (#1830), regional cells + data residency (#1831). These operate on the tenant id regardless of which forge(s) the tenant owns — no amendment needed.
+
+**What DOES change (children amended — see per-issue comments):**
+- **#1825 (schema):** `accounts` is a forge-agnostic workspace, not "keyed to a GitHub Enterprise account." Move the per-forge endpoint config (`github_base_url`/`oauth_base_url`) OFF the `accounts` row and ONTO the per-installation row (a workspace spans forges → a single per-account base URL is wrong); `installations` carries `(provider, account/group ref, installation_id, base_url)`. `account_members` materializes from whichever forge(s) the workspace owns.
+- **#1826 (endpoints):** generalize to per-installation FORGE endpoints — GitLab base/OAuth URLs too, resolved by the installation's `provider`.
+- **#1827 (login gate):** forge-agnostic membership gate — resolve the OAuth login to its workspace(s) via the membership of the LOGIN'S forge (GitHub Enterprise membership OR GitLab group membership), keyed on the provider the login came through.
+- **#1829 (authz):** `Identity.AccountID` is the workspace/tenant id (forge-agnostic); ownership checks are workspace-scoped, provider-independent.
+- **#1832 (EMU/SSO):** EMU stays GitHub-specific; add GitLab SSO/group-sync identity resolution as the sibling forge path behind the same membership-resolution seam.
+
+Terminology: the table may keep the name `accounts` (redefined as the workspace) to minimize churn, or be renamed `workspaces` — implementer's call; the SEMANTICS are the workspace model above.
+
+Origin: the operator-drafted duplicate ADR-061 (#2069, closed) surfaced the forge-agnostic-vs-GH-Enterprise granularity gap; founder ratified the forge-agnostic workspace model 2026-07-18.
+
+## Amendment A2 (founder-ratified 2026-07-19) — workspace admission & in-workspace visibility model
+
+Settles the two authorization layers the A1 workspace model left open. Three layers, kept distinct:
+
+**1. Identity (authn):** forge OAuth; an identity is `(provider, subject)`. A user may later hold multiple *linked* forge identities (linking itself is a follow-on).
+
+**2. Workspace admission — native rows + JIT auto-join.** `account_members` is the AUTHORITATIVE, revocable, role-carrying workspace grant. No forge can be authoritative for a multi-forge workspace (union-of-forges over-admits and makes revocation impossible without forge-side removal). Bootstrap via **per-installation auto-join policies**: a workspace admin declares "members of org/group X may auto-join as role R"; at login the live forge check the user's OAuth token CAN answer (`/user/orgs` for GitHub; group membership for GitLab later) is evaluated against the policies, and a match UPSERTS an **audited** `account_members` row (`origin=auto_join`) then admits. Auto-joined rows are **re-verified against the predicate at each login** (predicate fails → row no longer admits); invited rows (`origin=invited`) are explicit admin grants that persist until revoked, and admit **without** any forge call (DB-only — forge API availability never locks out invited members). **The enterprise-membership API is NOT required for admission:** GitHub App installations are org-scoped, so policies anchor to orgs the user token can verify; enterprise tenants are workspaces owning several org installations (invite or org-scoped auto-join).
+
+**3. In-workspace visibility — repo-scoped least-privilege.** Invariant #1 keeps *source* off the backend, but traces/plans/review comments DO carry code excerpts and file paths — so workspace-wide member visibility would leak restricted-repo content. A non-admin member sees runs/campaigns/audit **only for repos where their forge permission ≥ read**, via a per-user mirrored repo-ACL cache (login refresh + TTL; webhook invalidation later), enforced at the query layer ON TOP of tenant RLS. Workspace `admin` sees all workspace data + settings. Approval *eligibility* remains E39's live per-approval forge check. **Cross-forge:** visibility for a forge's data resolves via the user's linked identity for THAT forge; no linked identity → default deny for that forge's repos.
+
+**Child impact:** #1827 revised — admission = native row OR auto-join match (live org check as the bootstrap predicate only); enterprise-API claims dropped. NEW child files repo-ACL mirroring + read-path filtering (see E44.10). #1829 unchanged (account-scoped ownership; the visibility child layers within-account repo filtering on top). #1830 RLS unchanged (tenant boundary).

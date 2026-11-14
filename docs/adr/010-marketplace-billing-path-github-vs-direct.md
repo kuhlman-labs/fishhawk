@@ -30,6 +30,8 @@ _To be recorded._
 
 Status confirmed by the Captain 2026-10-23 as **proposed**: open and deferred ("No decision expected until the design-partner phase produces signal").
 
+Revisit trigger set by the Captain 2026-11-14: Fishhawk stays free, Apache-2.0 and local-only through the solo-captain alpha, with no billing. This record stays **proposed** until beta entry, or the first inbound request to pay for Fishhawk or to have it hosted, whichever comes first. The hypothesis to test then is that the paid offer is the hosted control plane and team features, within ADR-013's designated-enterprise boundary.
+
 ## Consequences
 
 _To be recorded._
