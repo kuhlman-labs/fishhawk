@@ -296,6 +296,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-147"
+      ],
       "applies_to": []
     },
     {
@@ -632,7 +635,8 @@
       ],
       "superseded_by": [],
       "amended_by": [
-        "ADR-105"
+        "ADR-105",
+        "ADR-147"
       ],
       "applies_to": []
     },
@@ -690,6 +694,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-147"
+      ],
       "applies_to": [
         "directory/**"
       ]
@@ -735,6 +742,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-147"
+      ],
       "applies_to": []
     },
     {
@@ -794,6 +804,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-147"
+      ],
       "applies_to": []
     },
     {
@@ -819,6 +832,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-147"
+      ],
       "applies_to": []
     },
     {
@@ -857,6 +873,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-147"
+      ],
       "applies_to": []
     },
     {
@@ -930,7 +949,8 @@
         "ADR-118",
         "ADR-120",
         "ADR-139",
-        "ADR-143"
+        "ADR-143",
+        "ADR-147"
       ],
       "applies_to": []
     },
@@ -1791,6 +1811,25 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-147",
+      "title": "Execution and data boundary: where agents run, what a control plane stores, what reviewers read",
+      "path": "docs/adr/147-execution-and-data-boundary.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-027",
+        "ADR-057",
+        "ADR-062",
+        "ADR-066",
+        "ADR-072",
+        "ADR-074",
+        "ADR-078",
+        "ADR-084"
+      ],
       "applies_to": []
     },
     {
