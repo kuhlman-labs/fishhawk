@@ -1718,6 +1718,15 @@
         "ADR-144"
       ],
       "applies_to": []
+    },
+    {
+      "id": "ADR-146",
+      "title": "The workflow catalogue: five families, presets, and cross-cutting controls",
+      "path": "docs/adr/146-workflow-catalogue.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }

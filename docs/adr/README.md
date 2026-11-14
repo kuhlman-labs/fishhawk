@@ -407,6 +407,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-143: `amends: [ADR-084]`; ADR-084 gains `amended_by: [ADR-143]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It narrows the CLI arm of ADR-084's in-body Amendment A1 until a proof of presence is adopted.
 - ADR-144: no edge. Its record-metadata line declares `amends: []`: it decides the proof-of-presence mechanism and adopts it for no action, so each later adoption is an amendment of the record that governs the action.
 - ADR-145: `amends: [ADR-144]`; ADR-144 gains `amended_by: [ADR-145]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It decides the recovery and unowned-enrolment matters ADR-144 D6 reserved; it was reviewed as an in-body amendment and ratified as a new amending ADR.
+- ADR-146: no edge. Its record-metadata line declares `amends: []`: it restates ADR-121 and ADR-126 and places ADR-139's workflow without changing any of them, and it governs the product preset library, not what a repository declares.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -618,6 +619,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-143](143-human-only-actions-credential-kind.md) | Human-only actions are refused on agent-drivable channels (amends ADR-084) | `accepted` | [#5231](https://github.com/kuhlman-labs/fishhawk/issues/5231) |
 | [ADR-144](144-proof-of-presence.md) | Proof of presence: a passkey step-up for decisions only a human may take | `accepted` | [#5239](https://github.com/kuhlman-labs/fishhawk/issues/5239) |
 | [ADR-145](145-proof-of-presence-recovery.md) | Recovery and the response to an unowned enrolment for the proof of presence (amends ADR-144) | `accepted` | [#5255](https://github.com/kuhlman-labs/fishhawk/issues/5255) |
+| [ADR-146](146-workflow-catalogue.md) | The workflow catalogue: five families, presets, and cross-cutting controls | `accepted` | [#5260](https://github.com/kuhlman-labs/fishhawk/issues/5260) |
 
 ## Status unknown — needs captain confirmation
 
