@@ -792,6 +792,26 @@ func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run,
 		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(fo))
 	}
 
+	// Blocking-concern hold (#5045): the merge endpoint's in-lock leg (d),
+	// READ-ONLY here. This is a GET, so it never runs the child-slice
+	// reconcile: it reads the run's own ledger (already-copied concerns
+	// only), and an uncopied succeeded-child HIGH appears only when the
+	// POST reconciles it. A read failure records the history gap and names
+	// the check in Undetermined, never a silent "no blocker".
+	if s.cfg.ConcernRepo != nil {
+		if ids, berr := s.ledgerBlockingConcernIDs(ctx, runRow.ID); berr != nil {
+			recordGap()
+			block.Undetermined = append(block.Undetermined, "blocking concerns: the open concerns could not be read: "+berr.Error())
+		} else if len(ids) > 0 {
+			block.Blockers = append(block.Blockers, gateViewMergeBlocker{
+				Code: mergeQueueReasonBlockingConcernOpen,
+				Message: "an open blocking concern (high severity or first_officer provenance) is on this run's ledger; " +
+					"the merge endpoint refuses until each is dispositioned",
+				Details: map[string]any{"concern_ids": ids, "next_step": blockingConcernHoldNextStep},
+			})
+		}
+	}
+
 	// ADVISORY (ADR-112 / #4619): the merge endpoint no longer runs this
 	// check; its approval refusal is the forge-approval fold.
 	approval := s.approvalDismissedCheck(ctx, runRow)

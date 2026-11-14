@@ -459,7 +459,13 @@ func TestMergeRun_ReviewerConcernDoesNotTriggerFirstOfficerHold(t *testing.T) {
 	h := newCoverageHarness(t)
 	cr := newFakeConcernRepo()
 	h.s.cfg.ConcernRepo = cr
-	seedFOConcern(t, cr, h.parentID, concern.StageKindImplement, "")
+	// Medium, not high: a reviewer HIGH is now held as blocking_concern_open, not first_officer_finding_open (TestMergeRun_InlineBlockingConcern_OpenReviewerHighRefuses).
+	if _, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID: h.parentID, StageID: uuid.New(), StageKind: concern.StageKindImplement, OriginReviewSequence: 7,
+		Concerns: []concern.RaisedConcern{{Severity: "medium", Category: crewConvertedConcernCategory, Note: "verify failed"}},
+	}); err != nil {
+		t.Fatalf("seed concern: %v", err)
+	}
 	w := postMergeRun(t, h.s, h.parentID, mergeRunRequest{Verdict: "lgtm"}, withMergeOperator)
 	if strings.Contains(w.Body.String(), codeFirstOfficerFindingOpen) {
 		t.Fatalf("a reviewer concern held the merge as a first-officer finding:\n%s", w.Body.String())

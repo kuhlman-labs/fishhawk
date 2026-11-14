@@ -5376,3 +5376,86 @@ func TestShipPullRequest_SupplementalTerminalFence_PG(t *testing.T) {
 		}
 	})
 }
+
+// TestGateView_MergeReadiness_BlockingConcern pins the gate view's #5045
+// half: an already-copied open HIGH (or first_officer) concern on the run's
+// own ledger surfaces as a READ-ONLY blocking_concern_open blocker; a medium
+// does not; an uncopied succeeded-child HIGH does NOT appear (the GET never
+// runs the reconcile, so it writes no copy); a read failure is Undetermined
+// plus the merge_readiness history gap.
+func TestGateView_MergeReadiness_BlockingConcern(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Server, *fakeRepo, *fakeConcernRepo, *run.Run) {
+		t.Helper()
+		s, repo, _, cr := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		if _, err := repo.SetRunPullRequestURL(ctx, runID, mergePR); err != nil {
+			t.Fatal(err)
+		}
+		runRow, err := repo.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s, repo, cr, runRow
+	}
+	raise := func(t *testing.T, cr *fakeConcernRepo, runID uuid.UUID, severity string) *concern.Concern {
+		t.Helper()
+		rows, err := cr.InsertRaised(ctx, concern.InsertRaisedParams{
+			RunID: runID, StageID: uuid.New(), StageKind: concern.StageKindImplement, OriginReviewSequence: 1,
+			Concerns: []concern.RaisedConcern{{Severity: severity, Category: "correctness", Note: "n"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows[0]
+	}
+	t.Run("open high: blocker", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		high := raise(t, cr, runRow.ID, "high")
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		b := mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen)
+		if b == nil {
+			t.Fatalf("blockers = %+v, want blocking_concern_open", mr.Blockers)
+		}
+		ids, _ := b.Details["concern_ids"].([]string)
+		if len(ids) != 1 || ids[0] != high.ID.String() || b.Details["next_step"] != blockingConcernHoldNextStep {
+			t.Errorf("blocker details = %v, want concern_ids [%s] and the next step", b.Details, high.ID)
+		}
+	})
+	t.Run("open medium: no blocker", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		raise(t, cr, runRow.ID, "medium")
+		var resp gateViewResponse
+		if mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp); mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen) != nil {
+			t.Errorf("blockers = %+v, want no blocking_concern_open for a medium", mr.Blockers)
+		}
+	})
+	t.Run("uncopied child high: not shown, nothing written", func(t *testing.T) {
+		s, repo, cr, runRow := setup(t)
+		childID, idx := uuid.New(), 0
+		repo.mu.Lock()
+		repo.runs[childID] = &run.Run{ID: childID, Repo: "x/y", State: run.StateSucceeded, DecomposedFrom: &runRow.ID, SliceIndex: &idx}
+		repo.mu.Unlock()
+		raise(t, cr, childID, "high")
+		var resp gateViewResponse
+		if mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp); mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen) != nil {
+			t.Errorf("blockers = %+v, want none: the GET does not reconcile", mr.Blockers)
+		}
+		if rows, _ := cr.ListByRun(ctx, runRow.ID); len(rows) != 0 {
+			t.Errorf("parent ledger rows = %d, want 0 (the gate view never writes)", len(rows))
+		}
+	})
+	t.Run("read error: undetermined and history gap", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		cr.listErr = errors.New("concerns down")
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		if !undeterminedContains(mr, "blocking concerns") {
+			t.Errorf("undetermined = %v, want a blocking concerns entry", mr.Undetermined)
+		}
+		if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
+			t.Errorf("history_incomplete=%v gaps=%v, want the merge_readiness gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+	})
+}
