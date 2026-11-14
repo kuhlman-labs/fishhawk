@@ -1280,3 +1280,66 @@ func TestReapStage_StaleBeforeObservationPinsAnyway(t *testing.T) {
 		t.Errorf("expected_state = %q, want %q (the earlier observation, pinned rather than dropped)", got, "dispatched")
 	}
 }
+
+// reapWithBackendBody reaps once against a fake whose reap-failure 200 body is
+// respBody, returning the verb's output.
+func reapWithBackendBody(t *testing.T, respBody, category string) ReapStageOutput {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	fb.mu.Lock()
+	fb.reapFailureRespBody = respBody
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+	runID, stageID := uuid.New(), uuid.New()
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(), Category: category,
+	})
+	if err != nil {
+		t.Fatalf("reapStage: %v", err)
+	}
+	return out
+}
+
+// (D) TestReapStage_RecoveredFixupReapNamesRestoredGate (#4856): when the
+// server recovered an ACTIVE fix-up re-dispatch, the reap answers
+// transitioned:true with the restored gate state, and next_step names that gate
+// rather than the category's fishhawk_retry_stage path, which would refuse a
+// stage that is not failed.
+func TestReapStage_RecoveredFixupReapNamesRestoredGate(t *testing.T) {
+	cases := []struct{ name, state, category string }{
+		{"restored to succeeded", "succeeded", ""},
+		{"restored to awaiting_approval", "awaiting_approval", ""},
+		{"category B reap recovered", "succeeded", "B"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := reapWithBackendBody(t, `{"transitioned":true,"stage_state":"`+tc.state+`"}`, tc.category)
+			if !out.Transitioned || out.StageState != tc.state {
+				t.Errorf("output = {transitioned:%v stage_state:%q}, want the mirrored {true %q}", out.Transitioned, out.StageState, tc.state)
+			}
+			if out.NextStep != reapStageNextStepHintRecovered {
+				t.Errorf("next_step = %q, want the recovered-gate guidance", out.NextStep)
+			}
+			if strings.Contains(out.NextStep, "fishhawk_retry_stage") {
+				t.Errorf("next_step names fishhawk_retry_stage for a stage that is not failed: %q", out.NextStep)
+			}
+		})
+	}
+}
+
+// (D) TestReapStage_FailedReapNextStepUnchanged: a reap that FAILED the stage,
+// and the idempotent no-op, keep the category-derived guidance byte-for-byte.
+func TestReapStage_FailedReapNextStepUnchanged(t *testing.T) {
+	cases := []struct{ name, body, category, want string }{
+		{"failed at C", `{"transitioned":true,"stage_state":"failed"}`, "", reapStageNextStepHintC},
+		{"failed at B", `{"transitioned":true,"stage_state":"failed"}`, "B", reapStageNextStepHintB},
+		{"idempotent no-op", `{"transitioned":false,"stage_state":"succeeded"}`, "", reapStageNextStepHintC},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if out := reapWithBackendBody(t, tc.body, tc.category); out.NextStep != tc.want {
+				t.Errorf("next_step = %q, want %q", out.NextStep, tc.want)
+			}
+		})
+	}
+}

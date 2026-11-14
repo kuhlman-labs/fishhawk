@@ -4400,12 +4400,29 @@ type vouchCommitRequest struct {
 	Reason string `json:"reason"`
 }
 
-// VouchCommitResult mirrors the backend's vouch-commit 200 body: the
-// recorded declaration, surfaced back to the operator.
+// VouchCommitResult mirrors the backend's vouch-commit 200 body
+// (server/vouch.go vouchCommitResponse): the recorded declaration, the
+// audit-check re-post outcome (E64.14 / #3109, #3129) and whether the vouch
+// advanced the run's recorded fix-up head (#4856).
 type VouchCommitResult struct {
 	RunID      string `json:"run_id"`
 	VouchedSHA string `json:"vouched_sha"`
 	Reason     string `json:"reason"`
+	// AuditCheckRepublished reports whether the fishhawk_audit_complete check
+	// was re-posted at the vouched head.
+	AuditCheckRepublished bool `json:"audit_check_republished"`
+	// AuditCheckRepublishWarning names why the re-post did not land.
+	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
+	// RecordedHeadAdvanced reports whether the server verified the vouched
+	// commit as the run's live pull-request head and a fast-forward of the
+	// recorded head whose new commits are all run lineage, so the next fix-up
+	// expects the vouched commit (a decomposed parent with only a fan-in
+	// integration head has no fix-up expectation; the advance is recorded for
+	// the acceptance walk).
+	RecordedHeadAdvanced bool `json:"recorded_head_advanced"`
+	// RecordedHeadAdvanceNote names why the recorded head did not advance and
+	// the remedy.
+	RecordedHeadAdvanceNote string `json:"recorded_head_advance_note,omitempty"`
 }
 
 // VouchCommit declares a foreign commit on a run branch to be run-authored

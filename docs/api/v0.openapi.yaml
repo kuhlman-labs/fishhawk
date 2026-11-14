@@ -16246,8 +16246,8 @@ paths:
         onto any commit in the repository, including the head of an unrelated
         pull request. WHAT DID NOT CHANGE: the record is unverified for any
         well-formed full sha — the `operator_commit_vouched` append and the 200
-        are identical for a matching and a non-matching full sha, and there is
-        no new response field, error code or status code. An
+        are identical for a matching and a non-matching full sha, and the bound
+        added no error code or status code. An
         operator-pushed commit appears in no head-report audit category, so the
         publisher's normal head resolution would re-post against a stale sha and
         leave the check absent from the live merge head — the exact base-advance
@@ -16264,6 +16264,37 @@ paths:
         agent-driven conflict-resolution pass that endpoint now authorizes
         (202, ceiling 1 — E64.62 / #3202) has been REFUSED or was never
         startable, at which point it fails closed (`rebase_conflict`).
+
+        **A verified fast-forward vouch advances the recorded fix-up head
+        (#4856, recorded against ADR-035).** Before recording, the endpoint
+        runs a read-only probe against the forge, bounded by its own 5s
+        deadline (on expiry the vouch is still recorded, unverified, with a
+        note). When the vouched commit IS the run's live pull-request head
+        (resolved through the publish bound's ladder before the compares and
+        re-read after them, so a push during the probe refuses the stamp), it
+        is a fast-forward of the run's recorded head (an empty
+        `compare(vouched...recorded)`; a recorded head that is not a full
+        commit id never reaches the forge), it is ahead of it, the compare is below
+        the 250-commit cap, and every commit between them is already run
+        lineage, the entry also carries `prior_head_sha` and
+        `head_advance_verified: true`. The recorded fix-up head walk treats
+        such an entry like a clean rebase when its prior is the head walked so
+        far, so a later fix-up's `fixup_expected_head_sha` names the vouched
+        commit: the same commit `reset-branch` treats as the last run-authored
+        HEAD. A decomposed parent whose only head is a fan-in integration
+        commit has no fix-up expectation; its stamp is recorded for the
+        acceptance walk. Trust is closed transitively: the closure check counts only
+        run-reported pushes, recorded clean base merges, fan-in integration
+        merges and EARLIER verified vouches, so a commit present only through
+        an unverified vouch never lets a later vouch verify. The prior head is
+        the one both recorded walks (the fix-up walk and the acceptance-seeded
+        walk) resolve; when they disagree the vouch is recorded unverified.
+        Every other vouch stays membership-only and keeps the
+        `{run_id, vouched_sha, reason}` key set, including every vouch recorded
+        before this change (re-vouch to advance). The probe never fails the
+        vouch: `recorded_head_advanced` reports the outcome and
+        `recorded_head_advance_note` names why the head did not advance and
+        the remedy.
 
         **Authorization.** Operator-token-only by design (ADR-035 sole-writer
         invariant). Requires `write:stages`. A run-bound MCP token (subject
@@ -16338,6 +16369,35 @@ paths:
                       could not be resolved, naming the resolution failure (the
                       latter two are the E64.26 / #3129 publish bound). Omitted
                       when the re-post succeeded and when no publisher is wired.
+                  recorded_head_advanced:
+                    type: boolean
+                    description: |
+                      True when this vouch advanced the run's recorded head
+                      to the vouched commit (#4856): the server verified that
+                      the vouched commit is the run's live pull-request head
+                      and a fast-forward of the recorded head whose new commits
+                      are all run lineage, and the entry carries
+                      `prior_head_sha` and `head_advance_verified: true`. For a
+                      decomposed parent whose only head is a fan-in integration
+                      commit the stamp is recorded for the acceptance walk and
+                      no fix-up expectation exists yet. False for every other
+                      vouch, which stays membership-only.
+                  recorded_head_advance_note:
+                    type: string
+                    description: |
+                      Present only when the recorded head did NOT advance:
+                      names why (the forge could not be probed, the recorded
+                      head or lineage ledger could not be read, the run has no
+                      recorded head, the recorded head is not a full commit id,
+                      the commit already is it, the recorded walks disagree,
+                      the live pull-request head could not be resolved, is not
+                      the vouched commit or moved during the probe, a compare
+                      failed, the probe deadline expired, not a fast-forward,
+                      not ahead, the 250-commit cap, or a named intermediate
+                      commit that is not run lineage) and the remedy (re-invoke
+                      once readable, re-vouch naming the live head, vouch the
+                      named commit first, or use `rebase-branch` /
+                      `reset-branch`).
         '400':
           description: |
             Malformed body, an empty `sha`/`reason`, or a `sha` that is not a
@@ -18825,6 +18885,21 @@ paths:
         then parks the run (stage `failed`/`C`, run `running`) instead of
         failing it.
 
+        **Fix-up recovery (#4856).** A reap of an implement stage re-opened by
+        a still-ACTIVE fix-up (its newest `stage_fixup_triggered` not yet spent
+        by `fixup_pushed`, `fixup_no_changes` or `stage_fixup_recovered`) does
+        NOT end `failed`: after the `dispatch_reaper_failed` entry it goes
+        through the same fix-up recovery the trace and PR-failure paths use,
+        restoring the stage to its pre-fix-up state and the review gate it
+        re-opened, and refunding the pass, with no `orchestrator.Advance`. It
+        runs on both the operator reap and the run-bound attempt-pinned
+        self-report (a runner's pre-agent `fixup_base_mismatch` exit reaches
+        the latter). A live merge-candidate or conflict-resolution pass on the
+        stage, a spent trigger, or a trigger read error keeps the failure path
+        above. The 200 then reports `transitioned: true` with the RESTORED
+        `stage_state`, so read `stage_state`, not `transitioned`, for the
+        outcome.
+
         **Idempotent.** A report against an already-terminal stage (a
         double-report, or a race with the dispatch watchdog reaping the same
         stuck stage) is a benign no-op: 200 with `transitioned: false`, NO
@@ -19002,9 +19077,10 @@ paths:
         '200':
           description: |
             The report was recorded. `transitioned` is `true` when this call
-            drove the stage to `failed`, `false` on the idempotent
-            already-terminal no-op or the protected `awaiting_children`
-            decomposition-park no-op (#1891).
+            drove the stage to `failed`, or reaped an active fix-up re-dispatch
+            and restored the stage (#4856; `stage_state` is then the restored
+            state), `false` on the idempotent already-terminal no-op or the
+            protected `awaiting_children` decomposition-park no-op (#1891).
           content:
             application/json:
               schema:
@@ -19013,10 +19089,10 @@ paths:
                 properties:
                   transitioned:
                     type: boolean
-                    description: True when this call transitioned the stage to failed.
+                    description: True when this call transitioned the stage to failed, or reaped an active fix-up re-dispatch and restored the stage to its pre-fix-up state (#4856).
                   stage_state:
                     type: string
-                    description: The resulting stage state.
+                    description: The resulting stage state (`failed`, or the restored pre-fix-up state after a fix-up recovery).
                   acceptance_verdict_unshipped_recorded:
                     type: boolean
                     description: |
