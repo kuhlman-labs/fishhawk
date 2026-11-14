@@ -209,6 +209,14 @@ The hold releases through the verify pass's report: the report arm settles the r
 | `fan_in_conflict` `slice_conflict` | a slice failed to merge into the consolidated branch. The conflicting child already SUCCEEDED, so `fishhawk_resume_run` refuses it (`recovery_not_eligible`); restart the item with `fishhawk_start_campaign_item_run` or `fishhawk_start_run` |
 | `fan_in_conflict` `base_fold_conflict` | the integrated head is clean but conflicts with the base's newer commits. `fishhawk_rebase_run_branch` authorizes the bounded conflict-resolution pass; the block stays until a landed fold, a rebase, a resolution push or a merged PR supersedes it |
 
+## 6. Campaign pre-flight on this repository's deployment
+
+The product surfaces carry the repository-agnostic pre-flight: `fishhawk_start_campaign`'s description (preview first, prose sequencing yields no edge, a clean checkout of the base branch) and the MCP runbook's *Batch-as-campaign* step 0. When the campaign runs against Fishhawk's own local deployment from this repository, three more checks apply before `fishhawk_start_campaign` (#5214):
+
+1. **Reload when quiet.** The daemon must run the code on `main`. Use the `deploy-local` route `reload --when-quiet`, which waits for live runners and restart-blocking reviews instead of refusing on them. Never force it past a live run (`docs/agents/operations.md` § Stack lifecycle).
+2. **Check the served SHA.** `/healthz` reports `git_sha`. It must equal `git rev-parse --short HEAD` on the `main` checkout the campaign binds. Rebuilt is not activated: a stale daemon assembles and drives the campaign with the old code.
+3. **Re-run the preview** after the reload and after any tracker edit, then start the campaign from the same source.
+
 ## Sources
 
 | Topic | Canonical file |

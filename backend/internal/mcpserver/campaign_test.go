@@ -4466,3 +4466,155 @@ func TestGetCampaignStatus_Awaiting_ThroughRealServer(t *testing.T) {
 		})
 	}
 }
+
+// --- #5214: campaign-start guidance folded into the campaign surfaces ---
+
+// toolOutputSchemaPropertyDescription returns one TOP-LEVEL output-schema
+// property's wire-visible description for toolName, read from the tools/list
+// result an agent actually sees (not the Go struct tag).
+func toolOutputSchemaPropertyDescription(t *testing.T, toolName, property string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != toolName {
+			continue
+		}
+		if tool.OutputSchema == nil {
+			t.Fatalf("%s: no output schema on the wire", toolName)
+		}
+		raw, err := json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatalf("%s: marshal output schema: %v", toolName, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("%s: decode output schema: %v", toolName, err)
+		}
+		prop, ok := schema.Properties[property]
+		if !ok {
+			t.Fatalf("%s: output schema has no %q property: %s", toolName, property, raw)
+		}
+		return prop.Description
+	}
+	t.Fatalf("%s is not registered/visible over ListTools", toolName)
+	return ""
+}
+
+// TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy drives the tool → real
+// client → wire → decode chain: of three items tiered low, medium and unset,
+// human_led names exactly the low one. A filter that drops everything misses
+// issue:100; one that admits everything adds issue:101 and issue:102.
+func TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	waveCount := 1
+	waveZero := 0
+	fb.previewCampaignResp = CampaignPreview{
+		Valid: true, Repo: "x/y", EpicRef: "issue:99",
+		ItemCount: 3, WaveCount: &waveCount,
+		Waves: [][]string{{"issue:100", "issue:101", "issue:102"}},
+		Items: []CampaignPreviewItem{
+			{IssueRef: "issue:100", DependsOn: []string{}, Wave: &waveZero, Autonomy: "low", Position: 0},
+			{IssueRef: "issue:101", DependsOn: []string{}, Wave: &waveZero, Autonomy: "medium", Position: 1},
+			{IssueRef: "issue:102", DependsOn: []string{}, Wave: &waveZero, Position: 2},
+		},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	if got, want := strings.Join(out.HumanLed, ","), "issue:100"; got != want {
+		t.Fatalf("human_led = %q, want %q (only the autonomy:low item)", got, want)
+	}
+
+	// No low item: the field is absent from the wire shape (omitempty), not [].
+	fb.previewCampaignResp.Items[0].Autonomy = "high"
+	_, out, err = r.previewCampaign(context.Background(), nil, PreviewCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("previewCampaign (no low): %v", err)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"human_led"`) {
+		t.Errorf("human_led present with no autonomy:low item: %s", raw)
+	}
+}
+
+// TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse pins the
+// wire-visible fishhawk_start_campaign description to the preview-first and
+// prose-sequencing rules (#5214 rules 3 and 16).
+func TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_start_campaign"]
+	for _, want := range []string{
+		"Preview first",
+		"fishhawk_preview_campaign",
+		"edges[].source",
+		"warnings[]",
+		"produces NO edge",
+		"lands in wave 0",
+		"clean, current checkout of the base branch",
+		"re-run the preview after any tracker edit",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_start_campaign description missing %q:\n%s", want, desc)
+		}
+	}
+}
+
+// TestPreviewCampaign_Description_NamesHumanLed pins both the tool description
+// and the human_led output-schema description an agent reads.
+func TestPreviewCampaign_Description_NamesHumanLed(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_preview_campaign"]
+	for _, want := range []string{"human_led", "never agent-starts", "item_human_led"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_preview_campaign description missing %q:\n%s", want, desc)
+		}
+	}
+	field := toolOutputSchemaPropertyDescription(t, "fishhawk_preview_campaign", "human_led")
+	for _, want := range []string{"autonomy tier is low", "NEVER agent-start", "item_human_led", "out of band"} {
+		if !strings.Contains(field, want) {
+			t.Errorf("human_led output-schema description missing %q: %s", want, field)
+		}
+	}
+}
+
+// TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule pins the
+// overlapping-predecessor rule (#5214 rule 2) on the wire-visible scope_overlap
+// output-schema description.
+func TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule(t *testing.T) {
+	desc := toolOutputSchemaPropertyDescription(t, "fishhawk_get_campaign_status", "scope_overlap")
+	for _, want := range []string{"LAST still-open overlapping item in queue order", "PR has opened", "unstarted item has no plan scope"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("scope_overlap description missing %q: %s", want, desc)
+		}
+	}
+}

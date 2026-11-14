@@ -94,6 +94,25 @@ type PreviewCampaignInput struct {
 // PreviewCampaignOutput carries the preview report.
 type PreviewCampaignOutput struct {
 	Preview CampaignPreview `json:"preview"`
+	// HumanLed rolls up preview.items whose autonomy tier is "low" (#5214),
+	// composed MCP-side by previewHumanLed. It mirrors the campaign engine's
+	// diversion (an Autonomy=="low" item is never Eligible), so the operator
+	// sees before the start which items no agent will ever run.
+	HumanLed []string `json:"human_led,omitempty" jsonschema:"the issue refs of preview items whose autonomy tier is low (human-led), in item order. The campaign will NEVER agent-start them while they stay low: once its dependencies are satisfied, fishhawk_start_campaign_item_run refuses such an item with item_human_led, so a human leads it out of band (the tier is re-read from the issue's autonomy label on every fishhawk_get_campaign_status poll, so a relabel changes it). Composed from preview.items[].autonomy; absent when no item is autonomy:low"`
+}
+
+// previewHumanLed returns the refs of the items whose autonomy tier is exactly
+// "low" — the same predicate the campaign engine uses to divert a deps-satisfied
+// item to HumanLed (campaign.NextEligible). nil when there are none, so the
+// omitempty field is absent.
+func previewHumanLed(items []CampaignPreviewItem) []string {
+	var out []string
+	for _, it := range items {
+		if it.Autonomy == "low" {
+			out = append(out, it.IssueRef)
+		}
+	}
+	return out
 }
 
 // GetCampaignStatusInput is the fishhawk_get_campaign_status tool's input.
@@ -121,7 +140,7 @@ type GetCampaignStatusOutput struct {
 	// (E83.60 / #4118): for each in-flight item, the OTHER in-flight items whose
 	// runs share files with it. Composed MCP-side from one live scope-overlap
 	// read per item (capped). Nil when no item is in flight.
-	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read)"`
+	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read). To sequence a NEW item behind overlapping work, make it depend on the LAST still-open overlapping item in queue order (not the first), and plan it once that item's PR has opened: an unstarted item has no plan scope to overlap yet, so this block cannot show it"`
 	// DependencyRefresh passes the backend's monotone dependency refresh block
 	// through (E86.47 / #4358).
 	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty" jsonschema:"the monotone dependency refresh this poll ran: tracker blocked-by links and Depends-on lines re-read for unstarted items; edges are only ever ADDED (held), never removed. skipped_reason is in_flight/min_interval (30 s per campaign)/foreign_account/repo_not_visible/no_candidates/insufficient_scope (the caller lacks write:campaigns, is run-bound or anonymous: the persisted DAG is served, no tracker read); warnings name an unrecorded or unreadable refresh. Absent when the deployment disables it"`
@@ -294,6 +313,16 @@ wave-orders them into a DAG, and persists the campaign; poll it afterwards with
 fishhawk_get_campaign_status and hand a paused campaign back with
 fishhawk_resume_campaign.
 
+Preview first (#5214): call fishhawk_preview_campaign with the same source and
+read its edges[].source and warnings[] before starting. Sequencing stated only
+in prose (anything that is not a native "blocked by" link or a line-start
+'Depends on:' body line) produces NO edge, so that item lands in wave 0 and can
+start alongside the work it was meant to follow; add a real edge and preview
+again. Pre-flight: start from a clean, current checkout of the base branch, and
+re-run the preview after any tracker edit, because the DAG is assembled from
+the tracker as it reads at this call (a later status poll only ever ADDS
+edges).
+
 repo (owner/name) is required, plus ONE of epic_ref / items. pause_policy is
 optional — pause_campaign (the default, block the whole campaign at a gate
 hand-off) or pause_item (continue the other items). Two ways to scope the batch:
@@ -391,7 +420,10 @@ target (closed without completing) or a target_state_unreadable one cannot be
 satisfied by widening, so it is reported in dangling but never offered as a
 candidate. closure_candidates is ONE HOP: adding those refs can surface a new
 generation of dangling edges, so iterate until valid rather than reading one
-preview as a completeness proof.
+preview as a completeness proof. human_led lists the items whose autonomy tier
+is low: while they stay low the campaign never agent-starts them
+(fishhawk_start_campaign_item_run refuses each with item_human_led), so plan for
+a human to lead them out of band.
 
 A dangling set and a cycle are REPORTS at 200, not errors. Request-shaped
 problems are still refusals, identical to fishhawk_start_campaign's: a malformed
@@ -504,7 +536,7 @@ func (r *runResolver) previewCampaign(ctx context.Context, _ *mcp.CallToolReques
 		}
 		return nil, PreviewCampaignOutput{}, err
 	}
-	return nil, PreviewCampaignOutput{Preview: *preview}, nil
+	return nil, PreviewCampaignOutput{Preview: *preview, HumanLed: previewHumanLed(preview.Items)}, nil
 }
 
 // startCampaign is the tool handler.
