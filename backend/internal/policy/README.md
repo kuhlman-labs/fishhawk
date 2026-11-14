@@ -29,6 +29,8 @@ Two deliberate omissions, both load-bearing:
 - **No filename inspection.** `isTestPath` / `diffTouchesTests` are not consulted, so a diff whose only change is a test-*named* file does not satisfy this outcome. That is exactly the diff shape that satisfies `tests_added_or_updated`, and the asymmetry is the entire point.
 - **No docs-only vacuous branch.** The `diffTouchesTestableCode` carve-out that vacuously satisfies `tests_added_or_updated` on a docs-only diff is not inherited. A docs-only diff with no verification signal still violates.
 
+An exit-75-only violation (every failing verify command exited `75`, EX_TEMPFAIL, and it is the stage's sole violation) is still a violation here, but the server's trace re-evaluation (`backend/internal/server/trace.go`, `verifyInfraTempFailOnly`, #5264) files it category C instead of B, matching it by exact Detail equality against the exported `VerificationNotPassedDetail`.
+
 It is also **not deferrable**. `DeferredRequiredOutcomes` still returns only `ci_green` (whose missing signal defers to branch protection per #251 / ADR-017). Adding `verification_reported` there would reconstruct the vacuous pass it exists to remove.
 
 ### Permanent `ci_green` deferral — `deferred_unresolvable` (#3465)
