@@ -53,6 +53,12 @@
 #   sha256: ID validation made permissive                    -> i17
 #   missing check-gate-image guard deleted                   -> i14
 #   cache mkdir failure guard made a no-op                   -> i15
+#   #5151, observed RED 2026-11-14 (scripts/test-lint-cache CF8/CF9/CF13):
+#   `-v "$lintdir:/lintcache"` back to `$cache/lintcache`    -> i6 i7
+#   gate-image lint-cache mkdir refusal made a fall-through  -> i15b
+#   gate-image lint-cache resolve refusal disabled (`if false`) -> i15c
+#     (message only: the mkdir refusal downstream still exits 1 on the empty
+#     dir)
 #   test-in-gate-image removed from _verify_gate_harnesses   -> i16
 #   `-v $pwdir/passwd:/etc/passwd:ro` argument deleted       -> i18
 #   uid-already-mapped check made always-false (append)      -> i18b
@@ -109,7 +115,7 @@ trap '[ -n "$HOLDER" ] && kill "$HOLDER" 2>/dev/null; rm -rf "$tmproot"' EXIT
 SAFEBIN="$tmproot/safebin"
 mkdir -p "$SAFEBIN"
 for b in bash sh env dirname basename cat head tail tr sed awk grep git ln \
-         readlink rm mkdir mktemp id sleep cut sort uname mv cp chmod touch wc; do
+         readlink rm mkdir mktemp id sleep cut sort uname mv cp chmod touch wc cksum; do
   p="$(command -v "$b" 2>/dev/null || true)"
   if [ -z "$p" ]; then
     echo "test-in-gate-image: required binary '$b' not found on PATH" >&2
@@ -240,6 +246,10 @@ chmod +x "$FX/scripts/test" "$FX/scripts/check-gate-image"
 FX="$(cd "$FX" && pwd)"
 LOCK="$tmproot/verify.lock"
 CACHE="$tmproot/cache"
+# The per-checkout gate-image lint cache (#5151): <git-dir>/fishhawk-lint-cache/
+# <cksum of the physical root path>/gate-image, as scripts/test derives it.
+rootkey() { printf '%s' "$(cd "$1" && pwd -P)" | cksum | awk '{print $1 "-" $2}'; }
+FXLINT="$(git -C "$FX" rev-parse --absolute-git-dir)/fishhawk-lint-cache/$(rootkey "$FX")/gate-image"
 
 # st CASE ROOT PATHMODE ARGS... — run ROOT/scripts/test with a fresh FAKE_STATE.
 # PATHMODE is `docker` (fake prepended) or `nodocker`. Knobs come from the
@@ -252,7 +262,7 @@ st() {
   out="$tmproot/out-$name"
   mkdir -p "$st"
   : > "$st/log"
-  if [ "$mode" = docker ]; then p="$FAKEBIN:$SAFEBIN"; else p="$SAFEBIN"; fi
+  if [ "$mode" = docker ]; then p="$FAKEBIN:${CASE_SAFEBIN:-$SAFEBIN}"; else p="${CASE_SAFEBIN:-$SAFEBIN}"; fi
   if [ "${KEEP_LOCK:-0}" != 1 ]; then rm -f "$LOCK"; fi
   ( cd "$root" && env PATH="$p" FAKE_STATE="$st" FAKE_LOCK="$LOCK" \
       FAKE_GO="${FAKE_GO:-$PIN_GO}" FAKE_GL="${FAKE_GL:-$PIN_GL}" \
@@ -337,7 +347,8 @@ assert_contains "i6: --user uid:gid" "$argv" "|--user|$(id -u):$(id -g)|"
 assert_contains "i6: checkout mounted at its own path" "$argv" "|-v|$FX:$FX|-w|$FX|"
 assert_contains "i6: gocache mount" "$argv" "|-v|$CACHE/gocache:/gocache|"
 assert_contains "i6: gomodcache mount" "$argv" "|-v|$CACHE/gomodcache:/gomodcache|"
-assert_contains "i6: lintcache mount" "$argv" "|-v|$CACHE/lintcache:/lintcache|"
+assert_contains "i6: per-checkout gate-image lint cache mount (#5151)" "$argv" "|-v|$FXLINT:/lintcache|"
+assert_not_contains "i6: never the shared per-user lintcache" "$argv" "$CACHE/lintcache"
 assert_contains "i6: HOME=/tmp" "$argv" "|-e|HOME=/tmp|"
 assert_contains "i6: GOPATH" "$argv" "|-e|GOPATH=/tmp/gopath|"
 assert_contains "i6: GOCACHE" "$argv" "|-e|GOCACHE=/gocache|"
@@ -351,7 +362,8 @@ assert_contains "i6: runs the checked ID, inner verify --no-tests" "$argv" "|$IM
 assert_not_contains "i6: never the tag" "$argv" "fishhawk-gate:harness"
 assert_not_contains "i6: no docker socket" "$argv" "docker.sock"
 assert_eq "i6: the cache dirs were created" "ok" \
-  "$([ -d "$CACHE/gocache" ] && [ -d "$CACHE/gomodcache" ] && [ -d "$CACHE/lintcache" ] && echo ok)"
+  "$([ -d "$CACHE/gocache" ] && [ -d "$CACHE/gomodcache" ] && [ -d "$FXLINT" ] && echo ok)"
+assert_absent "i6: no shared lintcache dir under FISHHAWK_GATE_CACHE_DIR" "$CACHE/lintcache"
 
 # --- i6b/i7: lint — no lock, default image, primary vs linked worktree -------
 st i6b "$FX" docker lint --in-gate-image
@@ -373,6 +385,10 @@ assert_eq "i7: lint --in-gate-image from a linked worktree exits 0" 0 "$rc"
 assert_contains "i7: the worktree is mounted at its own path" "$argv" "|-v|$WT:$WT|"
 assert_contains "i7: the git common dir outside ROOT is mounted at its own path" "$argv" "|-v|$COMMON:$COMMON|"
 assert_eq "i7: exactly one extra mount (6 mounts)" 6 "$(grep -o '|-v|' "$argv" | wc -l | tr -d ' ')"
+WTLINT="$(git -C "$WT" rev-parse --absolute-git-dir)/fishhawk-lint-cache/$(rootkey "$WT")/gate-image"
+assert_contains "i7: the worktree mounts its OWN gate-image lint cache" "$argv" "|-v|$WTLINT:/lintcache|"
+if [ "$WTLINT" != "$FXLINT" ]; then pass "i7: distinct from the primary checkout's"; else
+  fail "i7: the worktree shares the primary's lint cache ($WTLINT)"; fi
 
 # --- i8: the container's exit status propagates, lock released ---------------
 FAKE_INNER_RC=7 st i8 "$FX" docker verify --in-gate-image
@@ -429,6 +445,29 @@ CASE_CACHE="$tmproot/afile/sub" st i15 "$FX" docker lint --in-gate-image
 assert_eq "i15: an uncreatable cache dir exits 1" 1 "$rc"
 assert_contains "i15: names FISHHAWK_GATE_CACHE_DIR" "$out" "set FISHHAWK_GATE_CACHE_DIR"
 assert_absent "i15: the inner command NEVER ran" "$st/inner.argv"
+
+# --- i15b/i15c: the per-checkout gate-image lint cache refuses closed (#5151) --
+FXGITDIR="$(git -C "$FX" rev-parse --absolute-git-dir)"
+mv "$FXGITDIR/fishhawk-lint-cache" "$tmproot/lint-cache-saved"
+: > "$FXGITDIR/fishhawk-lint-cache"
+CASE_CACHE="$tmproot/cache15b" st i15b "$FX" docker lint --in-gate-image
+assert_eq "i15b: an uncreatable gate-image lint cache exits 1" 1 "$rc"
+assert_contains "i15b: names the lint cache dir" "$out" "cannot create the per-checkout gate-image lint cache dir $FXGITDIR/fishhawk-lint-cache/"
+assert_absent "i15b: the inner command NEVER ran" "$st/inner.argv"
+rm -f "$FXGITDIR/fishhawk-lint-cache"
+mv "$tmproot/lint-cache-saved" "$FXGITDIR/fishhawk-lint-cache"
+
+# A failing cksum leaves the root key unresolvable.
+NOCK="$tmproot/safebin-nocksum"
+mkdir -p "$NOCK"
+for f in "$SAFEBIN"/*; do ln -s "$(readlink "$f")" "$NOCK/$(basename "$f")"; done
+rm -f "$NOCK/cksum"
+printf '#!/bin/sh\nexit 1\n' > "$NOCK/cksum"
+chmod +x "$NOCK/cksum"
+CASE_SAFEBIN="$NOCK" CASE_CACHE="$tmproot/cache15c" st i15c "$FX" docker lint --in-gate-image
+assert_eq "i15c: an unresolvable gate-image lint cache exits 1" 1 "$rc"
+assert_contains "i15c: names the resolution failure" "$out" "cannot resolve the per-checkout gate-image lint cache"
+assert_absent "i15c: the inner command NEVER ran" "$st/inner.argv"
 
 # --- i18: the caller's uid gets a name inside the container -----------------
 # --user uid:gid alone leaves the uid nameless: whoami fails and test-helm-render

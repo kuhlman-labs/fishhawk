@@ -233,7 +233,7 @@ fi
 # PRE-HELD lock, classifies it live-runner (since OWNER=runner), and either
 # waits out the budget and refuses (kind runner) or refuses immediately (kind
 # shell) — exactly the #3451 self-deadlock. With the fix, the harness's
-# `unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER` subshell strips
+# `unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER ...` subshell strips
 # both before exec, so the nested verify never sees them: it derives its OWN
 # lock at its OWN root's git-common-dir, acquires it as shell-kind (no OWNER),
 # runs its stubbed cmd_test, and releases it on exit — while the pre-held lock

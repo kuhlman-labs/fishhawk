@@ -127,8 +127,11 @@ above `cmd_in_gate_image` in `scripts/test`):
 7. `docker run --rm --entrypoint '' --user $(id -u):$(id -g)` on that same ID,
    with the checkout bind-mounted at its own absolute path (plus the git common
    dir at its own path when it lies outside the checkout, for a linked
-   worktree), three persistent per-user caches (`gocache`, `gomodcache`,
-   `lintcache` under `${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-gate}`),
+   worktree), two persistent per-user caches (`gocache` and `gomodcache` under
+   `${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-gate}`),
+   the per-checkout lint cache `<git-dir>/fishhawk-lint-cache/<root-key>/gate-image`
+   mounted at `/lintcache` (#5151: a shared one leaked another checkout's
+   findings; see scripts/README.md § "Lint"),
    `HOME=/tmp`, `GOTOOLCHAIN=local`, and `safe.directory=*` as COMMAND-scope git
    config (`GIT_CONFIG_COUNT/KEY/VALUE`, which survives the inner scripts/test's
    `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` pins). No docker socket is ever mounted.
