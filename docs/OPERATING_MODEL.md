@@ -143,7 +143,7 @@ A waive, bulk waive (`fishhawk_waive_concerns`), resolve (`fishhawk_resolve_conc
 | `timeout` | row | none | recorded only; the 5-minute run or 20-minute phase budget ran out; re-examine the declaration (a narrower selector, a smaller package) |
 | `error` | row | none | recorded only; the `reason` field says why (for example `baseline_not_green`, `build_failed`, `no_tests_matched`, `mutation_not_applied`, `mutation_ambiguous`, `control_not_built`); fix the declaration, because an `error` is not evidence the control works |
 
-**Who may clear a `control_unpinned` concern.** Only a human: an agent token or a delegated request is refused with 403 `concern_requires_human`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb does not consult open concerns, so only delegated settlement is held; read `open[]` before merging by hand.
+**Who may clear a `control_unpinned` concern.** Only a human: an agent token or a delegated request is refused with 403 `concern_requires_human`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb consults only blocking concerns (high severity or first_officer provenance), so a medium `control_unpinned` concern holds only delegated settlement; read `open[]` before merging by hand.
 
 **A missing `counterfactual_observed` row has three different causes.**
 

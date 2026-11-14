@@ -58,6 +58,15 @@ stage; otherwise it gives counts. To merge anyway, send
 audit chain as `merge_overlap_overridden` before any merge verdict, and a
 failed record refuses the merge (503 `overlap_override_unrecorded`).
 
+The merge verb also refuses 409 `blocking_concern_open` while a high-severity
+concern, or a concern raised by the first officer, is open on the run. For a
+decomposed run it first copies any such concern still open on a finished slice
+onto the run, so a late slice review is not missed. The refusal names the
+concerns; waive one with a reason, defer it, or route a fix-up, then merge
+again. Nothing new is recorded by the refused call, and a merge an earlier call
+already queued is not withdrawn. The delegated merge holds on the same
+concerns. A merge made directly on the forge is not held.
+
 Verify-only passes for a base advance or a conflict resolution are serialized
 per repository base ref (ADR-092): one pass is live per base, and every other
 waits in a held queue without a runner slot until the line frees. While a

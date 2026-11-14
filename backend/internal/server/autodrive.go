@@ -127,7 +127,10 @@ func observeOnly(note string) AutoDriveOutcome { return AutoDriveOutcome{Note: n
 // evaluation error, a knob whose condition is unmet, a knob whose real
 // gate state does not match, an unrecognised / unmapped condition, or an
 // unconfigured merge seam. In each case the actor returns an observe-only
-// outcome (no error) and changes nothing.
+// outcome (no error) and changes nothing, with one exception: the may_merge
+// arm's in-lock blocking-concern hold (delegatedBlockingConcernHold, #5045)
+// may carry leg (d)'s idempotent child-slice reconcile write (concern copies
+// plus one concern_rolled_up row) on its observe-only outcome.
 //
 // A must_page_human condition (reviewer_reject, requirement_arbitration)
 // is REFUSED before any knob is considered: the actor emits the
@@ -320,7 +323,11 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		// still awaiting approval; resolveReviewStageOnMerge settles it ON the
 		// merge). The acceptance-gate + nil-merger + dispatch tail is the
 		// extracted helper (E48.7 / #1954), run under the run's merge-intent lock
-		// after the queue-ownership check (ADR-093 slice 2, delegatedMergeUnderLock).
+		// after the queue-ownership check (ADR-093 slice 2, delegatedMergeUnderLock),
+		// and, inside that lock, after leg (d)'s blocking-concern hold
+		// (delegatedBlockingConcernHold, #5045): the evaluator's
+		// gates_resolved_ci_green read the run's own ledger before the lock
+		// and never ran the child-slice reconcile.
 		// The merge overlap guard (#4119) is evaluated BEFORE that tail —
 		// handleMergeRun inline, this arm via mergeOverlapAutoDriveHold (#4582).
 		if !mergeGateReady(runRow, stages) {
@@ -587,6 +594,41 @@ func autoDriveHeadMovedNote(settled mergeDispatchLedgerOutcome, merr error) stri
 	return autoDriveNoteHeadMovedUnclaimed
 }
 
+// delegatedBlockingConcernHold is the delegated may_merge arm's leg (d)
+// (#5045), run INSIDE the merge-intent lock after the queue-ownership check
+// and before the dispatch tail. The evaluator's gates_resolved_ci_green read
+// the run's own ledger before the lock and never ran the child-slice
+// reconcile, so an uncopied succeeded-child HIGH, or a HIGH raised between
+// that read and the lock, would otherwise reach the merger. It evaluates
+// openBlockingConcernIDs (the predicate's leg (d), reconcile included): an
+// open HIGH or first_officer concern is observe-only naming the ids, and a
+// reconcile or ledger-read failure is observe-only too (fail closed); the
+// merger is never called on either. It answers observe-only, not
+// decision_required: the reconcile has put any copy on the run's ledger, so
+// the next tick's evaluator sees the open concern and the existing knobs
+// (fix-up routing, or nothing met) take over. An unwired concern repository
+// skips the leg with one WARN (no ledger exists to read).
+func (s *Server) delegatedBlockingConcernHold(ctx context.Context, runRow *run.Run) (AutoDriveOutcome, bool) {
+	if s.cfg.ConcernRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: no concern repository is wired; the blocking-concern hold is skipped",
+			slog.String("run_id", runRow.ID.String()))
+		return AutoDriveOutcome{}, false
+	}
+	ids, blockErr := s.openBlockingConcernIDs(ctx, runRow)
+	if blockErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but blocking concerns are unreadable or unreconciled; observe-only",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", blockErr.Error()))
+		return observeOnly("blocking concerns could not be read or reconciled (fail-closed); observe-only"), true
+	}
+	if len(ids) == 0 {
+		return AutoDriveOutcome{}, false
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but an open blocking concern holds the merge; observe-only",
+		slog.String("run_id", runRow.ID.String()), slog.String("concern_ids", strings.Join(ids, ",")))
+	return observeOnly("blocking concern open (high severity or first_officer provenance): " + strings.Join(ids, ", ") +
+		"; " + blockingConcernHoldNextStep + "; observe-only"), true
+}
+
 // delegatedMergeLocked is delegatedMergeUnderLock's fn: the ownership check,
 // then the shared acceptance-gated dispatch tail, translated to the delegated
 // arm's outcome. ctx is the lock fn's context.
@@ -601,6 +643,11 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but the merge queue owns this run's merge; observe-only",
 			slog.String("run_id", runRow.ID.String()))
 		return observeOnly(autoDriveNoteQueueOwnsMerge), nil
+	}
+	// #5045: leg (d), the blocking-concern hold, after the ownership check
+	// and BEFORE the dispatch tail, inside this lock.
+	if out, held := s.delegatedBlockingConcernHold(ctx, runRow); held {
+		return out, nil
 	}
 	// #4397: the gate's admitted live head rides into the pre-merge
 	// republish so the required check lands where the merge will.

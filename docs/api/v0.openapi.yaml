@@ -4497,7 +4497,11 @@ components:
           description: |
             Each determined refusal: `acceptance_stale`,
             `review_coverage_incomplete` (#4219), `first_officer_finding_open`
-            (ADR-089 D4, E85.6 / #4148) and/or `approval_dismissed`, with the
+            (ADR-089 D4, E85.6 / #4148), `blocking_concern_open` (#5045,
+            read-only over the run's own ledger: the GET never runs the
+            child-slice reconcile, so an uncopied succeeded-child concern
+            appears only once a POST reconciles it; case 17) and/or
+            `approval_dismissed`, with the
             merge endpoint's message and details verbatim (see that
             operation's 409 cases 8, 10 and 11). `approval_dismissed` is an
             ADVISORY display only (ADR-112 R3, #4619): the merge endpoint's
@@ -4565,7 +4569,7 @@ components:
       properties:
         code:
           type: string
-          enum: [acceptance_stale, review_coverage_incomplete, first_officer_finding_open, approval_dismissed]
+          enum: [acceptance_stale, review_coverage_incomplete, first_officer_finding_open, blocking_concern_open, approval_dismissed]
         message:
           type: string
           description: The merge endpoint's refusal message, verbatim.
@@ -17150,7 +17154,22 @@ paths:
             "allow_merge_method_or_merge_by_hand"`. Every value is a closed-set
             name; no forge response text is carried. The declaration is fixed
             by the run's admission spec: an edit applies to runs admitted
-            after it merges.
+            after it merges. (17) `blocking_concern_open` (#5045): an OPEN
+            concern of high severity or `first_officer` provenance is on the
+            run's ledger. Checked INSIDE the merge-intent lock, after
+            `merge_queue_owns_merge` and BEFORE case (9), the overlap-override
+            record and the verdict append, by the merge-queue eligibility
+            predicate's leg (d), whose idempotent child-slice reconcile first
+            copies an uncopied open HIGH from a succeeded decomposition child
+            onto the run's ledger (that copy and its `concern_rolled_up` row
+            are the only write). `details` carry `{run_id, pr_url,
+            concern_ids[], next_step}`. Nothing new is recorded by the call,
+            and the hold never retracts a merge an earlier call already
+            dispatched. Clear it by waiving each concern with a reason,
+            deferring it, or routing a fix-up; there is no override. A PR that
+            already merged answers `200 already_merged` instead. A
+            `first_officer` concern open before the lock still answers case
+            (11) first.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -17160,7 +17179,11 @@ paths:
             outcome history the stale-acceptance check reads (#4086), or the
             decomposed children / implement-review history the
             review-coverage check reads (#4219), could not be read. FAIL-CLOSED: nothing was recorded and nothing was
-            dispatched; retry once the store is healthy.
+            dispatched; retry once the store is healthy. Also (#5045) when
+            the in-lock blocking-concern leg's child-slice reconcile or
+            ledger read fails: nothing new was recorded by this call and
+            nothing was dispatched by it (`details` `{run_id, pr_url,
+            retryable: true}`); re-invoke to retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -18061,7 +18084,13 @@ paths:
         GitHub auto-merge via the configured seam; the real merge lands when
         branch protection clears, observed via the `pull_request`-closed
         webhook. A nil merge seam keeps `may_merge` fail-closed to
-        observe-only.
+        observe-only. Inside the run's merge-intent lock the `may_merge` arm
+        evaluates the merge endpoint's blocking-concern leg (#5045, the
+        child-slice reconcile included): an open high-severity or
+        `first_officer` concern, or a reconcile or ledger-read failure, is
+        observe-only with the merger never called. That observe-only outcome
+        may carry the leg's idempotent reconcile write (concern copies and
+        one `concern_rolled_up` row).
 
         **Decision-required parks the operator, not a 500.** When the
         delegated `route_fixup` arm cannot dispatch because the fix-up budget
