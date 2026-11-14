@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -19,10 +21,42 @@ import (
 // head_advance_verified = true on the operator_commit_vouched row, which makes
 // the row a head edge in walkRecordedBaseMerges. Note names, on every
 // non-advance answer, why the head did not advance and the remedy.
+//
+// LiveHeadRead reports that the probe read the run's live pull-request head
+// (resolveVouchPublishHead); LiveHead and LiveHeadErr are then its NEWEST read
+// (the post-compare re-read when the probe got that far). The handler's
+// audit-check publish bound reuses a successful read instead of reading the
+// pull request again.
 type vouchHeadAdvance struct {
 	PriorHeadSHA string
 	Verified     bool
 	Note         string
+
+	LiveHeadRead bool
+	LiveHead     string
+	LiveHeadErr  error
+}
+
+// defaultVouchHeadAdvanceProbeTimeout bounds the whole head-advance probe:
+// its audit reads, both live-head reads and both compares (#4856). The vouch
+// records its row only after the probe returns, so an unbounded probe on a
+// hanging forge could outlast the caller's deadline (the MCP client's 30s) and
+// the row would never be appended. On expiry the probe answers a non-advance
+// note and the vouch records today's three-key row. It matches the 5s
+// staleness read bound (defaultMergeCandidateStalenessReadTimeout).
+const defaultVouchHeadAdvanceProbeTimeout = 5 * time.Second
+
+// vouchHeadAdvanceProbeTimeout is the bound the vouch handler applies. Tests
+// shorten it; production never writes it.
+var vouchHeadAdvanceProbeTimeout = defaultVouchHeadAdvanceProbeTimeout
+
+// vouchProbeErrText renders a probe read failure for a note, naming the probe
+// deadline when it is what cut the read short.
+func vouchProbeErrText(ctx context.Context, err error) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "the head-advance probe's " + vouchHeadAdvanceProbeTimeout.String() + " deadline expired: " + err.Error()
+	}
+	return err.Error()
 }
 
 // vouchNoAdvancePrefix opens every non-advance note, so an operator reading
@@ -37,22 +71,35 @@ func vouchNoAdvance(reason string) vouchHeadAdvance {
 // probeVouchHeadAdvance decides whether a vouch of sha may ADVANCE the run's
 // recorded head (#4856). It is READ-ONLY (no appends, no transitions) and
 // never returns an error: every rung that cannot verify answers Verified=false
-// with a note naming the reason and the remedy. The rungs run in this order:
+// with a note naming the reason and the remedy. The caller bounds ctx
+// (vouchHeadAdvanceProbeTimeout). The rungs run in this order:
 //
 //	(a) the forge cannot be probed (no GitHub client, no installation, an
 //	    unparseable repo);
 //	(b) the recorded head cannot be read, or the fix-up walk and the
 //	    acceptance-seeded walk disagree on it (vouchPriorHead);
 //	(c) the run has no recorded head (a vouch never invents one);
-//	(d) sha already IS the recorded head;
-//	(e) compare(sha...prior) is not empty: sha is not a fast-forward of the
+//	(d) the recorded head is not a full commit id (isDeployCommitSHA): a
+//	    reported head_sha is only required to be non-empty, and a ref name
+//	    would make a compare operand movable, so it never reaches the forge;
+//	(e) sha already IS the recorded head;
+//	(f) the run's live pull-request head (resolveVouchPublishHead, the
+//	    publish bound's ladder) cannot be resolved, or is not sha: only the
+//	    live head may advance the recorded head (the Captain's 2026-11-14
+//	    ruling on #4856/#4874);
+//	(g) compare(sha...prior) is not empty: sha is not a fast-forward of the
 //	    recorded head, and a history rewrite is never admitted;
-//	(f) compare(prior...sha) is empty (sha is not ahead) or at the 250-commit
+//	(h) compare(prior...sha) is empty (sha is not ahead) or at the 250-commit
 //	    cap (too many commits to prove);
-//	(g) the run-lineage closure ledger is incomplete;
-//	(h) a commit between prior and sha (other than sha itself) is not run
+//	(i) the run-lineage closure ledger is incomplete;
+//	(j) a commit between prior and sha (other than sha itself) is not run
 //	    lineage under the closure ledger (vouchClosureLedger);
-//	(i) otherwise Verified=true with PriorHeadSHA=prior.
+//	(k) the live head, re-read after the compares, cannot be resolved or is no
+//	    longer sha: it moved during the probe, so the stamp is refused;
+//	(l) otherwise Verified=true with PriorHeadSHA=prior.
+//
+// Notes render the recorded head through formatReportedHeadObjectID, the
+// diagnostic form of a runner-reported value (reported_head.go).
 //
 // The compares use GitHub's three-dot semantics (base...head = commits
 // reachable from head and not from the merge base), the same reading
@@ -75,7 +122,7 @@ func (s *Server) probeVouchHeadAdvance(ctx context.Context, runRow *run.Run, sha
 	// (b) The ONE prior-head answer both recorded walks resolve.
 	prior, disagree, err := s.vouchPriorHead(ctx, runRow.ID)
 	if err != nil {
-		return vouchNoAdvance("the recorded head could not be read (" + err.Error() + "); re-invoke fishhawk_vouch_commit once the audit chain is readable")
+		return vouchNoAdvance("the recorded head could not be read (" + vouchProbeErrText(ctx, err) + "); re-invoke fishhawk_vouch_commit once the audit chain is readable")
 	}
 	if disagree != "" {
 		return vouchNoAdvance(disagree)
@@ -84,43 +131,78 @@ func (s *Server) probeVouchHeadAdvance(ctx context.Context, runRow *run.Run, sha
 	if prior == "" {
 		return vouchNoAdvance("the run has no recorded head, and a vouch never invents one; the vouch is membership-only")
 	}
-	// (d) Already the recorded head.
+	// (d) The recorded head must be a full commit id before it reaches the
+	// forge as a compare operand or a note.
+	if !isDeployCommitSHA(prior) {
+		return vouchNoAdvance("the run's recorded head is not a full commit id, so it cannot anchor a fast-forward proof; record a fresh push or reset, then re-vouch")
+	}
+	priorText := formatReportedHeadObjectID(prior)
+	// (e) Already the recorded head.
 	if strings.EqualFold(prior, sha) {
 		return vouchNoAdvance("the vouched commit " + sha + " is already the run's recorded head")
 	}
 
-	// (e) Fast-forward: nothing on prior is missing from sha.
+	// (f) Only the run's live pull-request head may advance the recorded head.
+	adv := vouchHeadAdvance{LiveHeadRead: true}
+	adv.LiveHead, adv.LiveHeadErr = s.resolveVouchPublishHead(ctx, runRow)
+	if adv.LiveHeadErr != nil {
+		return adv.noAdvance("the run's live pull-request head could not be resolved (" + vouchProbeErrText(ctx, adv.LiveHeadErr) + "), so the vouched commit " + sha + " cannot be verified as it; re-invoke fishhawk_vouch_commit once the pull request is readable")
+	}
+	if !shaEqualsHead(sha, adv.LiveHead) {
+		return adv.noAdvance("the vouched commit " + sha + " is not the run's live pull-request head " + adv.LiveHead + ", and only the live head may advance the recorded head; re-invoke fishhawk_vouch_commit naming the live head")
+	}
+
+	// (g) Fast-forward: nothing on prior is missing from sha.
 	behind, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, sha, prior)
 	if err != nil {
-		return vouchNoAdvance("comparing the vouched commit " + sha + " against the recorded head " + prior + " failed (" + err.Error() + "); re-invoke fishhawk_vouch_commit once the forge answers")
+		return adv.noAdvance("comparing the vouched commit " + sha + " against the recorded head " + priorText + " failed (" + vouchProbeErrText(ctx, err) + "); re-invoke fishhawk_vouch_commit once the forge answers")
 	}
 	if len(behind) != 0 {
-		return vouchNoAdvance("the vouched commit " + sha + " is not a fast-forward of the recorded head " + prior + " (" + strconv.Itoa(len(behind)) + " recorded commit(s) are not in its history), and a history rewrite is never admitted; use fishhawk_reset_run_branch or fishhawk_rebase_run_branch instead")
+		return adv.noAdvance("the vouched commit " + sha + " is not a fast-forward of the recorded head " + priorText + " (" + strconv.Itoa(len(behind)) + " recorded commit(s) are not in its history), and a history rewrite is never admitted; use fishhawk_reset_run_branch or fishhawk_rebase_run_branch instead")
 	}
 
-	// (f) The commits the vouch would add.
+	// (h) The commits the vouch would add.
 	ahead, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, prior, sha)
 	if err != nil {
-		return vouchNoAdvance("comparing the recorded head " + prior + " against the vouched commit " + sha + " failed (" + err.Error() + "); re-invoke fishhawk_vouch_commit once the forge answers")
+		return adv.noAdvance("comparing the recorded head " + priorText + " against the vouched commit " + sha + " failed (" + vouchProbeErrText(ctx, err) + "); re-invoke fishhawk_vouch_commit once the forge answers")
 	}
 	if len(ahead) == 0 {
-		return vouchNoAdvance("the vouched commit " + sha + " is not ahead of the recorded head " + prior)
+		return adv.noAdvance("the vouched commit " + sha + " is not ahead of the recorded head " + priorText)
 	}
 	if vouchProbeAtCap(len(ahead)) {
-		return vouchNoAdvance("too many commits to prove: the compare from the recorded head " + prior + " to " + sha + " reached the " + strconv.Itoa(vouchProbeCompareCap) + "-commit cap and may be truncated")
+		return adv.noAdvance("too many commits to prove: the compare from the recorded head " + priorText + " to " + sha + " reached the " + strconv.Itoa(vouchProbeCompareCap) + "-commit cap and may be truncated")
 	}
 
-	// (g) The closure ledger must be complete.
+	// (i) The closure ledger must be complete.
 	ledger, complete := s.vouchClosureLedger(ctx, runRow)
 	if !complete {
-		return vouchNoAdvance("the run lineage ledger could not be read completely, so the commits between the recorded head " + prior + " and " + sha + " cannot be proved run lineage; re-invoke fishhawk_vouch_commit once the audit chain is readable")
+		return adv.noAdvance("the run lineage ledger could not be read completely, so the commits between the recorded head " + priorText + " and " + sha + " cannot be proved run lineage; re-invoke fishhawk_vouch_commit once the audit chain is readable")
 	}
-	// (h) Every intermediate commit is already run lineage.
+	// (j) Every intermediate commit is already run lineage.
 	if offender := firstUnattributedCommit(ahead, ledger, sha); offender != "" {
-		return vouchNoAdvance("the commit " + offender + " between the recorded head " + prior + " and " + sha + " is not run lineage; vouch " + offender + " first, then re-vouch " + sha + " (for a hand merge of the base, which brings in base commits, use fishhawk_rebase_run_branch instead)")
+		return adv.noAdvance("the commit " + offender + " between the recorded head " + priorText + " and " + sha + " is not run lineage; vouch " + offender + " first, then re-vouch " + sha + " (for a hand merge of the base, which brings in base commits, use fishhawk_rebase_run_branch instead)")
 	}
-	// (i) Verified.
-	return vouchHeadAdvance{PriorHeadSHA: prior, Verified: true}
+
+	// (k) Re-read the live head: a push during the compares refuses the stamp.
+	adv.LiveHead, adv.LiveHeadErr = s.resolveVouchPublishHead(ctx, runRow)
+	if adv.LiveHeadErr != nil {
+		return adv.noAdvance("the run's live pull-request head could not be re-read after the compares (" + vouchProbeErrText(ctx, adv.LiveHeadErr) + "), so the vouched commit " + sha + " cannot be confirmed as it; re-invoke fishhawk_vouch_commit once the pull request is readable")
+	}
+	if !shaEqualsHead(sha, adv.LiveHead) {
+		return adv.noAdvance("the run's live pull-request head moved from " + sha + " to " + adv.LiveHead + " while the vouch was being verified, so the stamp is refused; re-invoke fishhawk_vouch_commit naming the live head")
+	}
+	// (l) Verified.
+	adv.PriorHeadSHA = prior
+	adv.Verified = true
+	return adv
+}
+
+// noAdvance turns a probe answer that has read the live head into a
+// non-advance answer, keeping the live-head read for the publish bound.
+func (a vouchHeadAdvance) noAdvance(reason string) vouchHeadAdvance {
+	out := vouchNoAdvance(reason)
+	out.LiveHeadRead, out.LiveHead, out.LiveHeadErr = a.LiveHeadRead, a.LiveHead, a.LiveHeadErr
+	return out
 }
 
 // vouchPriorHead is the ONE prior-head answer the probe stamps (#4856, approval
@@ -136,7 +218,10 @@ func (s *Server) probeVouchHeadAdvance(ctx context.Context, runRow *run.Run, sha
 //   - Only the acceptance-seeded walk has a seed (a decomposed parent whose head
 //     is a fan-in integration commit): its head is the prior. The fix-up walk
 //     has no seed, so it never reads the stamp and cannot reach a different
-//     answer.
+//     answer. The stamp is then recorded for the acceptance walk (#4874 reads
+//     vouch rows); no fix-up expectation exists yet, so
+//     resolveFixupExpectedHeadSHA still answers "" and the runner keeps its
+//     checkout-only path.
 //   - Both have a seed and they differ: disagree names both heads, and the
 //     vouch is recorded unverified. A prior one walk would not reach is never
 //     stamped.
@@ -164,7 +249,7 @@ func (s *Server) vouchPriorHead(ctx context.Context, runID uuid.UUID) (prior, di
 		return seededHead, "", nil
 	}
 	if fixupHead != seededHead {
-		return "", "the fix-up walk resolves the recorded head " + fixupHead + " but the acceptance-seeded walk resolves " + seededHead + ", so no single prior head can be stamped; the vouch is membership-only (record a fresh push or reset so both walks agree, then re-vouch)", nil
+		return "", "the fix-up walk resolves the recorded head " + formatReportedHeadObjectID(fixupHead) + " but the acceptance-seeded walk resolves " + formatReportedHeadObjectID(seededHead) + ", so no single prior head can be stamped; the vouch is membership-only (record a fresh push or reset so both walks agree, then re-vouch)", nil
 	}
 	return fixupHead, "", nil
 }

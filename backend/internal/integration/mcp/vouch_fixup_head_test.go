@@ -3,6 +3,7 @@ package mcpe2e_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -21,9 +22,11 @@ import (
 
 // vouchHeadForge is the httptest GitHub the vouch probe compares against:
 // compares maps "base...head" to the commit list; an unstubbed compare 404s.
+// prHead is the run's live pull-request head the probe's live-head rung reads.
 type vouchHeadForge struct {
 	mu       sync.Mutex
 	compares map[string][]string
+	prHead   string
 }
 
 type vouchHeadTokens struct{}
@@ -52,6 +55,13 @@ func (g *vouchHeadForge) client(t *testing.T) *githubclient.Client {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(body)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		g.mu.Lock()
+		head := g.prHead
+		g.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"node_id":"PR_vouch","state":"open","head":{"sha":%q,"ref":"run/branch"},"base":{"ref":"main"}}`, head)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -99,7 +109,7 @@ func TestE2E_VouchCommit_AdvancesFixupExpectedHead(t *testing.T) {
 			forge := &vouchHeadForge{compares: map[string][]string{
 				vouchedTip + "..." + recordedHead: tt.behind,
 				recordedHead + "..." + vouchedTip: {vouchedTip},
-			}}
+			}, prHead: vouchedTip}
 			auditRepo := audit.NewPostgresRepository(fx.pool)
 			srv := server.New(server.Config{
 				Addr:         "127.0.0.1:0",
@@ -120,6 +130,10 @@ func TestE2E_VouchCommit_AdvancesFixupExpectedHead(t *testing.T) {
 			})
 			if err != nil {
 				t.Fatalf("CreateRun: %v", err)
+			}
+			// The probe advances only the run's live pull-request head (#4856).
+			if _, err := fx.runRepo.SetRunPullRequestURL(ctx, runRow.ID, "https://github.com/kuhlman-labs/fishhawk/pull/4856"); err != nil {
+				t.Fatalf("SetRunPullRequestURL: %v", err)
 			}
 			stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
 				RunID: runRow.ID, Sequence: 1, Type: runpkg.StageTypeImplement,

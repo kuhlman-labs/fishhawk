@@ -4414,8 +4414,11 @@ type VouchCommitResult struct {
 	// AuditCheckRepublishWarning names why the re-post did not land.
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
 	// RecordedHeadAdvanced reports whether the server verified the vouched
-	// commit as a fast-forward of the recorded head whose new commits are all
-	// run lineage, so the next fix-up expects the vouched commit.
+	// commit as the run's live pull-request head and a fast-forward of the
+	// recorded head whose new commits are all run lineage, so the next fix-up
+	// expects the vouched commit (a decomposed parent with only a fan-in
+	// integration head has no fix-up expectation; the advance is recorded for
+	// the acceptance walk).
 	RecordedHeadAdvanced bool `json:"recorded_head_advanced"`
 	// RecordedHeadAdvanceNote names why the recorded head did not advance and
 	// the remedy.

@@ -100,8 +100,14 @@ func (s *Server) advanceFixupHeadThroughBaseMerges(ctx context.Context, runID, s
 //     included, is skipped: it leaves the head where it was.
 //   - A branch_reset row moves the head to its reset_to_sha when that sha is
 //     already on the walked chain (the seed or a merge commit walked through).
-//     A reset anywhere else, or an undecodable reset row, returns the SEED:
-//     today's answer, never something more permissive.
+//     A reset anywhere else, or an undecodable reset row, RE-SEEDS the walk
+//     (head = seed, walked chain = {seed}) and the walk continues: the state is
+//     exactly the walk's starting state, never something more permissive, and
+//     a LATER row whose prior is the seed still applies. That is what lets a
+//     verified re-vouch S→V land after "legacy vouch V; reset to V" (reset
+//     selects a legacy-vouched V through resolveLastRunAuthoredHead, which this
+//     walk's chain does not hold), so the walk never stops at a row older than
+//     the stamp the probe verified (#4856).
 //   - An operator_commit_vouched row (#4856) advances the head to its
 //     vouched_sha ONLY when it is a server-verified fast-forward vouch
 //     (isVerifiedVouchAdvance) AND its prior_head_sha is the head walked so
@@ -134,7 +140,10 @@ func (s *Server) advanceFixupHeadThroughBaseMerges(ctx context.Context, runID, s
 // so the stamp's ancestry and closure proof cannot go stale; a push after the
 // vouched tip still fails the runner's unchanged equality check, and a vouch
 // whose stamped prior is no longer the walked head (a newer seed, a rebase in
-// between) is skipped.
+// between) is skipped. Because no row ends the walk early, a vouch stamped
+// with the prior this walk resolved at probe time and appended after every
+// row the walk read is always reached: the response's recorded_head_advanced
+// never reports an advance the walk does not apply.
 func walkRecordedBaseMerges(rows []*audit.Entry, seedSeq int64, seed string) string {
 	ordered := make([]*audit.Entry, 0, len(rows))
 	for _, e := range rows {
@@ -166,7 +175,9 @@ func walkRecordedBaseMerges(rows []*audit.Entry, seedSeq int64, seed string) str
 				ResetToSHA string `json:"reset_to_sha"`
 			}
 			if json.Unmarshal(e.Payload, &p) != nil || !onChain[p.ResetToSHA] {
-				return seed
+				head = seed
+				onChain = map[string]bool{seed: true}
+				continue
 			}
 			head = p.ResetToSHA
 		case CategoryOperatorCommitVouched:

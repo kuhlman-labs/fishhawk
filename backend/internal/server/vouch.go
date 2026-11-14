@@ -90,16 +90,21 @@ type vouchCommitResponse struct {
 	// publisher is wired.
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
 	// RecordedHeadAdvanced reports whether this vouch ADVANCED the run's
-	// recorded fix-up head to the vouched commit (#4856): the handler verified
-	// against the forge that the vouched commit fast-forwards the recorded head
-	// and that every commit between them is already run lineage, and stamped
-	// prior_head_sha + head_advance_verified on the row. FALSE for every other
-	// vouch, which stays membership-only; RecordedHeadAdvanceNote says why.
+	// recorded head to the vouched commit (#4856): the handler verified that
+	// the vouched commit is the run's live pull-request head, that it
+	// fast-forwards the recorded head and that every commit between them is
+	// already run lineage, and stamped prior_head_sha + head_advance_verified on
+	// the row. For a decomposed parent whose only head is a fan-in integration
+	// commit the stamp is recorded for the acceptance walk and no fix-up
+	// expectation exists yet. FALSE for every other vouch, which stays
+	// membership-only; RecordedHeadAdvanceNote says why.
 	RecordedHeadAdvanced bool `json:"recorded_head_advanced"`
 	// RecordedHeadAdvanceNote, when non-empty, names why the recorded head did
 	// not advance and the remedy (vouch an intermediate commit first, re-vouch
-	// once the forge or audit chain is readable, or use fishhawk_rebase_run_branch
-	// for a base merge). Empty when RecordedHeadAdvanced is true.
+	// naming the live pull-request head, re-vouch once the forge or audit chain
+	// is readable or the probe deadline is not hit, or use
+	// fishhawk_rebase_run_branch for a base merge). Empty when
+	// RecordedHeadAdvanced is true.
 	RecordedHeadAdvanceNote string `json:"recorded_head_advance_note,omitempty"`
 }
 
@@ -172,14 +177,19 @@ type vouchCommitResponse struct {
 // code (the non-full refusal reuses validation_failed).
 //
 // THE VERIFIED HEAD ADVANCE (#4856, recorded against ADR-035). Before the
-// append the handler runs the read-only probeVouchHeadAdvance: when the forge
-// proves the vouched commit is a fast-forward of the run's recorded head and
-// every commit between them is already run lineage, the row ALSO carries
-// prior_head_sha and head_advance_verified:true
-// (auditcomplete.VouchPriorHeadSHAField / VouchHeadAdvanceVerifiedField). Those
-// two keys are what the recorded fix-up head walk (walkRecordedBaseMerges)
-// reads, so a later fix-up's fixup_expected_head_sha names the vouched commit,
-// the same commit fishhawk_reset_run_branch calls the last run-authored HEAD. A
+// append the handler runs the read-only probeVouchHeadAdvance, bounded by its
+// own vouchHeadAdvanceProbeTimeout: when the server verifies that the vouched
+// commit IS the run's live pull-request head (read through the publish bound's
+// ladder before the compares and re-read after them), the forge proves it is a
+// fast-forward of the run's recorded head, and every commit between them is
+// already run lineage, the row ALSO carries prior_head_sha and
+// head_advance_verified:true (auditcomplete.VouchPriorHeadSHAField /
+// VouchHeadAdvanceVerifiedField). Those two keys are what the recorded head
+// walk (walkRecordedBaseMerges) reads, so a later fix-up's
+// fixup_expected_head_sha names the vouched commit, the same commit
+// fishhawk_reset_run_branch calls the last run-authored HEAD. (A decomposed
+// parent whose only head is a fan-in integration commit has no fix-up
+// expectation at all; its stamp is recorded for the acceptance walk.) A
 // server-verified fast-forward vouch is an ADR-112-style step in the recorded
 // walk; any other vouch stays membership-only and keeps the {run_id,
 // vouched_sha, reason} key set. Trust is closed transitively: the closure check
@@ -187,7 +197,9 @@ type vouchCommitResponse struct {
 // vouches, so a commit present only through an unverified vouch never lets a
 // later vouch verify (vouchClosureLedger). The outcome is reported on
 // recorded_head_advanced / recorded_head_advance_note. The probe never fails
-// the vouch and never touches the audit-check publish path below.
+// the vouch: an expired deadline is a non-advance note. Its newest live-head
+// read is reused by the audit-check publish bound below, which reads the pull
+// request itself only when the probe did not.
 func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -296,10 +308,14 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 		subject = "anonymous"
 	}
 	actorKind := audit.ActorUser
-	// Probe BEFORE the append (#4856): read-only, never an error. Only a
-	// forge-verified fast-forward adds the two advance keys; every other row
-	// keeps today's {run_id, vouched_sha, reason} key set.
-	adv := s.probeVouchHeadAdvance(r.Context(), runRow, sha)
+	// Probe BEFORE the append (#4856): read-only, never an error, and bounded
+	// by its own deadline so a slow or hanging forge can never hold the request
+	// past the caller's deadline and keep the row from being appended. Only a
+	// forge-verified fast-forward of the live head adds the two advance keys;
+	// every other row keeps today's {run_id, vouched_sha, reason} key set.
+	probeCtx, cancelProbe := context.WithTimeout(r.Context(), vouchHeadAdvanceProbeTimeout)
+	adv := s.probeVouchHeadAdvance(probeCtx, runRow, sha)
+	cancelProbe()
 	payloadFields := map[string]any{
 		"run_id":               runID.String(),
 		lineageVouchedSHAField: sha,
@@ -381,7 +397,13 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	// PR head we would never publish to would newly warn on every dev vouch.
 	// publishAuditCheckWithOptions already returns (false, nil) here.
 	if s.auditCheckPublisher != nil {
-		liveHead, headErr := s.resolveVouchPublishHead(r.Context(), runRow)
+		// Reuse the probe's newest live-head read (#4856) so the vouch makes no
+		// extra pull-request read; read here only when the probe never read the
+		// head or its read failed (its deadline may have cut it short).
+		liveHead, headErr := adv.LiveHead, adv.LiveHeadErr
+		if !adv.LiveHeadRead || headErr != nil {
+			liveHead, headErr = s.resolveVouchPublishHead(r.Context(), runRow)
+		}
 		switch {
 		case headErr != nil:
 			// FAIL CLOSED, mirroring the rebase verb: an unresolvable head is

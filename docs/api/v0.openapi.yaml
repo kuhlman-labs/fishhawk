@@ -16267,16 +16267,23 @@ paths:
 
         **A verified fast-forward vouch advances the recorded fix-up head
         (#4856, recorded against ADR-035).** Before recording, the endpoint
-        runs a read-only probe against the forge. When the vouched commit is a
-        fast-forward of the run's recorded head (an empty
-        `compare(vouched...recorded)`), it is ahead of it, the compare is below
+        runs a read-only probe against the forge, bounded by its own 5s
+        deadline (on expiry the vouch is still recorded, unverified, with a
+        note). When the vouched commit IS the run's live pull-request head
+        (resolved through the publish bound's ladder before the compares and
+        re-read after them, so a push during the probe refuses the stamp), it
+        is a fast-forward of the run's recorded head (an empty
+        `compare(vouched...recorded)`; a recorded head that is not a full
+        commit id never reaches the forge), it is ahead of it, the compare is below
         the 250-commit cap, and every commit between them is already run
         lineage, the entry also carries `prior_head_sha` and
         `head_advance_verified: true`. The recorded fix-up head walk treats
         such an entry like a clean rebase when its prior is the head walked so
         far, so a later fix-up's `fixup_expected_head_sha` names the vouched
         commit: the same commit `reset-branch` treats as the last run-authored
-        HEAD. Trust is closed transitively: the closure check counts only
+        HEAD. A decomposed parent whose only head is a fan-in integration
+        commit has no fix-up expectation; its stamp is recorded for the
+        acceptance walk. Trust is closed transitively: the closure check counts only
         run-reported pushes, recorded clean base merges, fan-in integration
         merges and EARLIER verified vouches, so a commit present only through
         an unverified vouch never lets a later vouch verify. The prior head is
@@ -16365,11 +16372,15 @@ paths:
                   recorded_head_advanced:
                     type: boolean
                     description: |
-                      True when this vouch advanced the run's recorded fix-up
-                      head to the vouched commit (#4856): the server verified a
-                      fast-forward of the recorded head whose new commits are
-                      all run lineage, and the entry carries `prior_head_sha` and
-                      `head_advance_verified: true`. False for every other
+                      True when this vouch advanced the run's recorded head
+                      to the vouched commit (#4856): the server verified that
+                      the vouched commit is the run's live pull-request head
+                      and a fast-forward of the recorded head whose new commits
+                      are all run lineage, and the entry carries
+                      `prior_head_sha` and `head_advance_verified: true`. For a
+                      decomposed parent whose only head is a fan-in integration
+                      commit the stamp is recorded for the acceptance walk and
+                      no fix-up expectation exists yet. False for every other
                       vouch, which stays membership-only.
                   recorded_head_advance_note:
                     type: string
@@ -16377,12 +16388,16 @@ paths:
                       Present only when the recorded head did NOT advance:
                       names why (the forge could not be probed, the recorded
                       head or lineage ledger could not be read, the run has no
-                      recorded head, the commit already is it, the recorded
-                      walks disagree, a compare failed, not a fast-forward, not
-                      ahead, the 250-commit cap, or a named intermediate commit
-                      that is not run lineage) and the remedy (re-invoke once
-                      readable, vouch the named commit first, or use
-                      `rebase-branch` / `reset-branch`).
+                      recorded head, the recorded head is not a full commit id,
+                      the commit already is it, the recorded walks disagree,
+                      the live pull-request head could not be resolved, is not
+                      the vouched commit or moved during the probe, a compare
+                      failed, the probe deadline expired, not a fast-forward,
+                      not ahead, the 250-commit cap, or a named intermediate
+                      commit that is not run lineage) and the remedy (re-invoke
+                      once readable, re-vouch naming the live head, vouch the
+                      named commit first, or use `rebase-branch` /
+                      `reset-branch`).
         '400':
           description: |
             Malformed body, an empty `sha`/`reason`, or a `sha` that is not a

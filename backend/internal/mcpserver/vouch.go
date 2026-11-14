@@ -88,15 +88,24 @@ the vouch is still durable; re-invoke naming the live head to re-post.
 
 RECORDED HEAD ADVANCE (#4856). A vouch can also move the run's recorded
 fix-up head, so the next fishhawk_fixup_stage expects the vouched commit
-instead of failing fixup_base_mismatch. The backend checks, before recording,
-that the vouched commit is a FAST-FORWARD of the recorded head and that every
-commit between them is already run lineage (a run-reported push, a recorded
+instead of failing fixup_base_mismatch (a decomposed parent whose only head is
+a fan-in integration commit has no fix-up expectation; its advance is recorded
+for the acceptance walk). The backend checks, before recording and within a
+5s probe deadline, that the vouched commit IS the run's live pull-request head
+(re-read after the forge compares), that it is a FAST-FORWARD of the recorded
+head, and that every commit between them is already run lineage (a run-reported push, a recorded
 clean base merge, or an EARLIER verified vouch; an unverified vouch does not
 count). Only then does the row advance the head. recorded_head_advanced says
 whether it did; recorded_head_advance_note says why not:
   - cannot probe the forge / the recorded head could not be read / the
-    lineage ledger could not be read completely / a compare failed:
-    re-invoke once the forge or audit chain is readable;
+    lineage ledger could not be read completely / a compare failed / the
+    probe deadline expired: re-invoke once the forge or audit chain is
+    readable;
+  - the vouched commit is not the run's live pull-request head, the head
+    could not be resolved, or it moved during the probe: re-vouch naming
+    the live head once the pull request is readable;
+  - the recorded head is not a full commit id: record a fresh push or reset,
+    then re-vouch;
   - the run has no recorded head, or the commit is already the recorded
     head: nothing to advance;
   - not a fast-forward of the recorded head: a history rewrite is never

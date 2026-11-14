@@ -35,11 +35,34 @@ const (
 // vouchProbeForge is the httptest GitHub the probe compares against. compares
 // maps "base...head" to the commit list the compare answers; statuses maps the
 // same key to a non-200 status. An unstubbed compare answers 404.
+//
+// The PR read answers the run's live head: prHeads[i] on the (i+1)th read and
+// the last entry after that (vouchProbeTip when empty), or prStatus when it is
+// non-zero. blockCompares holds every compare until the client gives up, a
+// forge that hangs rather than failing fast.
 type vouchProbeForge struct {
-	mu           sync.Mutex
-	compares     map[string][]string
-	statuses     map[string]int
-	compareCalls int
+	mu            sync.Mutex
+	compares      map[string][]string
+	statuses      map[string]int
+	compareCalls  int
+	prHeads       []string
+	prStatus      int
+	prCalls       int
+	blockCompares bool
+}
+
+// setPRHead sets the live pull-request head every PR read answers.
+func (f *vouchProbeForge) setPRHead(heads ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prHeads = heads
+	f.prCalls = 0
+}
+
+func (f *vouchProbeForge) prReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prCalls
 }
 
 func (f *vouchProbeForge) set(base, head string, commits ...string) {
@@ -74,7 +97,12 @@ func newVouchProbeGitHubClient(t *testing.T, f *vouchProbeForge) *githubclient.C
 		f.compareCalls++
 		status, failed := f.statuses[key]
 		commits, ok := f.compares[key]
+		block := f.blockCompares
 		f.mu.Unlock()
+		if block {
+			<-r.Context().Done()
+			return
+		}
 		if failed {
 			w.WriteHeader(status)
 			return
@@ -96,8 +124,20 @@ func newVouchProbeGitHubClient(t *testing.T, f *vouchProbeForge) *githubclient.C
 		_ = json.NewEncoder(w).Encode(body)
 	})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		f.prCalls++
+		head := vouchProbeTip
+		if n := len(f.prHeads); n > 0 {
+			head = f.prHeads[min(f.prCalls, n)-1]
+		}
+		status := f.prStatus
+		f.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"node_id":"PR_x","state":"open","head":{"sha":%q,"ref":"run/branch"},"base":{"ref":"main"}}`, vouchProbeTip)
+		fmt.Fprintf(w, `{"node_id":"PR_x","state":"open","head":{"sha":%q,"ref":"run/branch"},"base":{"ref":"main"}}`, head)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -304,8 +344,10 @@ func TestVouchHeadAdvance_UnverifiedIntermediateVouch_NoAdvance(t *testing.T) {
 	f.seedHead("fixup_pushed", vouchProbeHead)
 	f.forge.set(vouchProbeMid, vouchProbeHead, vouchProbeOther)
 	f.forge.set(vouchProbeHead, vouchProbeMid, vouchProbeMid)
+	f.forge.setPRHead(vouchProbeMid)
 	assertNoAdvance(t, f, f.vouch(t, vouchProbeMid), "is not a fast-forward")
 
+	f.forge.setPRHead(vouchProbeTip)
 	f.forge.set(vouchProbeTip, vouchProbeHead)
 	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeMid, vouchProbeTip)
 	resp := f.vouch(t, vouchProbeTip)
@@ -439,12 +481,30 @@ func TestVouchHeadAdvance_CannotProbe_PayloadUnchanged(t *testing.T) {
 // condition C4): a decomposed parent's only head is its fan-in integration
 // merge F. The acceptance-seeded walk resolves F, the fix-up walk has no seed,
 // so F is the ONE prior and the vouch F→W verifies.
+//
+// The readers pin what the stamp moves: the acceptance-seeded walk (the one
+// #4874 runs) reaches W, while the fix-up resolvers still answer "" because
+// the fix-up seed has no integration category, so no fix-up expectation exists
+// and the runner keeps its checkout-only path. The response and the docs say
+// exactly that.
 func TestVouchHeadAdvance_DecomposedParent_IntegrationSeed_Advances(t *testing.T) {
 	f := newVouchProbeFixture(t, vouchProbeOpts{})
 	f.appendRow(lineageIntegrationCommitCategory, map[string]any{"merge_sha": vouchProbeFanIn})
 	f.forge.set(vouchProbeTip, vouchProbeFanIn)
 	f.forge.set(vouchProbeFanIn, vouchProbeTip, vouchProbeTip)
 	assertAdvanced(t, f, f.vouch(t, vouchProbeTip), vouchProbeFanIn)
+
+	ctx := context.Background()
+	if got := f.s.resolveFixupExpectedHeadSHA(ctx, f.runRow.ID, f.stageID); got != "" {
+		t.Errorf("resolveFixupExpectedHeadSHA = %q, want \"\" (no fix-up seed on an integration-only parent)", got)
+	}
+	if got, err := f.s.recordedFixupHead(ctx, f.runRow.ID); got != "" || err != nil {
+		t.Errorf("recordedFixupHead = (%q, %v), want (\"\", nil)", got, err)
+	}
+	prior, disagree, err := f.s.vouchPriorHead(ctx, f.runRow.ID)
+	if prior != vouchProbeTip || disagree != "" || err != nil {
+		t.Errorf("vouchPriorHead after the vouch = (%q, %q, %v), want the acceptance-seeded walk at the vouched tip %s", prior, disagree, err, vouchProbeTip)
+	}
 }
 
 // TestVouchHeadAdvance_WalksDisagree_NoAdvance (approval condition C4): the
@@ -468,7 +528,9 @@ func TestVouchHeadAdvance_ChainedVerifiedVouches_Advance(t *testing.T) {
 	f.seedHead("fixup_pushed", vouchProbeHead)
 	f.forge.set(vouchProbeMid, vouchProbeHead)
 	f.forge.set(vouchProbeHead, vouchProbeMid, vouchProbeMid)
+	f.forge.setPRHead(vouchProbeMid)
 	assertAdvanced(t, f, f.vouch(t, vouchProbeMid), vouchProbeHead)
+	f.forge.setPRHead(vouchProbeTip)
 	f.forge.set(vouchProbeTip, vouchProbeMid)
 	f.forge.set(vouchProbeMid, vouchProbeTip, vouchProbeTip)
 	assertAdvanced(t, f, f.vouch(t, vouchProbeTip), vouchProbeMid)
@@ -718,5 +780,204 @@ func TestVouchClosureLedger_FieldDecoders(t *testing.T) {
 		if got := field(bad); got != nil {
 			t.Errorf("%s(undecodable) = %v, want nil", name, got)
 		}
+	}
+}
+
+// --- #4856 fix-up pass: the live-head rung, the probe deadline, the recorded
+// head's shape and the reset-before-re-vouch walk ---
+
+// TestVouchHeadAdvance_NotLiveHead_NoAdvance: V fast-forwards H and adds only
+// itself, so every later rung would verify, but the run's live pull-request
+// head is another commit. Only the live head may advance the recorded head, and
+// the probe refuses before any compare (so the post-compare re-read cannot be
+// what refuses it).
+func TestVouchHeadAdvance_NotLiveHead_NoAdvance(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.forge.set(vouchProbeTip, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeTip)
+	f.forge.setPRHead(vouchProbeOther)
+	resp := f.vouch(t, vouchProbeTip)
+	assertNoAdvance(t, f, resp, "the vouched commit "+vouchProbeTip+" is not the run's live pull-request head "+vouchProbeOther)
+	if !strings.Contains(resp.RecordedHeadAdvanceNote, "re-invoke fishhawk_vouch_commit naming the live head") {
+		t.Errorf("note %q does not name the remedy", resp.RecordedHeadAdvanceNote)
+	}
+	if n := f.forge.calls(); n != 0 {
+		t.Errorf("compare calls = %d, want 0 (the live-head rung runs before the compares)", n)
+	}
+}
+
+// TestVouchHeadAdvance_LiveHeadUnresolved_NoAdvance: the pull request cannot
+// be read, so the vouched commit cannot be verified as the live head; the
+// probe fails closed before any compare.
+func TestVouchHeadAdvance_LiveHeadUnresolved_NoAdvance(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.forge.set(vouchProbeTip, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeTip)
+	f.forge.prStatus = http.StatusInternalServerError
+	resp := f.vouch(t, vouchProbeTip)
+	assertNoAdvance(t, f, resp, "the run's live pull-request head could not be resolved (read live pull request head failed")
+	if !strings.Contains(resp.RecordedHeadAdvanceNote, "re-invoke fishhawk_vouch_commit once the pull request is readable") {
+		t.Errorf("note %q does not name the remedy", resp.RecordedHeadAdvanceNote)
+	}
+	if n := f.forge.calls(); n != 0 {
+		t.Errorf("compare calls = %d, want 0", n)
+	}
+}
+
+// TestVouchHeadAdvance_LiveHeadMovedDuringProbe_NoAdvance: the live head is V
+// when the probe starts and the compares verify V, but a push lands during the
+// compares; the post-compare re-read sees the new head and refuses the stamp.
+func TestVouchHeadAdvance_LiveHeadMovedDuringProbe_NoAdvance(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.forge.set(vouchProbeTip, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeTip)
+	f.forge.setPRHead(vouchProbeTip, vouchProbeOther)
+	resp := f.vouch(t, vouchProbeTip)
+	assertNoAdvance(t, f, resp, "the run's live pull-request head moved from "+vouchProbeTip+" to "+vouchProbeOther+" while the vouch was being verified")
+	if n := f.forge.calls(); n != 2 {
+		t.Errorf("compare calls = %d, want 2 (both compares ran before the re-read)", n)
+	}
+	if n := f.forge.prReads(); n != 2 {
+		t.Errorf("pull-request reads = %d, want 2 (the pre-compare read and the re-read)", n)
+	}
+}
+
+// TestVouchHeadAdvance_ProbeDeadline_RecordsThreeKeyRow: a forge that hangs
+// rather than failing fast cannot keep the vouch from being recorded. The
+// compare blocks past the probe's own deadline; the vouch still answers 200,
+// records the three-key row and names the expired deadline.
+func TestVouchHeadAdvance_ProbeDeadline_RecordsThreeKeyRow(t *testing.T) {
+	prev := vouchHeadAdvanceProbeTimeout
+	vouchHeadAdvanceProbeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { vouchHeadAdvanceProbeTimeout = prev })
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.forge.blockCompares = true
+	start := time.Now()
+	resp := f.vouch(t, vouchProbeTip)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("vouch took %s, want it bounded near the %s probe deadline", elapsed, vouchHeadAdvanceProbeTimeout)
+	}
+	assertNoAdvance(t, f, resp, "the head-advance probe's "+vouchHeadAdvanceProbeTimeout.String()+" deadline expired")
+}
+
+// TestVouchHeadAdvance_NonHexRecordedHead_NoForgeCall: a reported head_sha is
+// only required to be non-empty, so a ref name can be the recorded head. It
+// never reaches the forge as a compare operand (where it would be movable) and
+// is never echoed raw into the note.
+func TestVouchHeadAdvance_NonHexRecordedHead_NoForgeCall(t *testing.T) {
+	const refHead = "feature/movable-ref"
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("pull_request_opened", refHead)
+	resp := f.vouch(t, vouchProbeTip)
+	assertNoAdvance(t, f, resp, "the run's recorded head is not a full commit id")
+	if strings.Contains(resp.RecordedHeadAdvanceNote, refHead) {
+		t.Errorf("note %q echoes the raw recorded head", resp.RecordedHeadAdvanceNote)
+	}
+	if n := f.forge.calls(); n != 0 {
+		t.Errorf("compare calls = %d, want 0", n)
+	}
+}
+
+// TestVouchHeadAdvance_ResetBeforeReVouch_AdvanceMatchesWalk (concern
+// e32e07e1): reported head H; a legacy vouch of V; a foreign push X; a reset
+// X→V (reset selects the legacy-vouched V as the last run-authored HEAD); then
+// a verified re-vouch of V. The reset is off the walked chain, so it re-seeds
+// the walk at H rather than ending it, the probe stamps H→V, and every reader
+// then answers V. The regression assertion: the response's
+// recorded_head_advanced agrees with what the walk resolves.
+func TestVouchHeadAdvance_ResetBeforeReVouch_AdvanceMatchesWalk(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.appendRow(CategoryOperatorCommitVouched, map[string]any{
+		"run_id": f.runRow.ID.String(), auditcomplete.VouchedSHAField: vouchProbeTip, "reason": vouchProbeReason,
+	})
+	f.appendRow(CategoryBranchReset, map[string]any{
+		"prior_head_sha": vouchProbeOther, "reset_to_sha": vouchProbeTip, "dropped_offending_sha": vouchProbeOther,
+	})
+	f.forge.set(vouchProbeTip, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeTip)
+	ctx := context.Background()
+	if got, err := f.s.recordedFixupHead(ctx, f.runRow.ID); got != vouchProbeHead || err != nil {
+		t.Fatalf("precondition: recordedFixupHead = (%q, %v), want the re-seeded %s", got, err, vouchProbeHead)
+	}
+
+	resp := f.vouch(t, vouchProbeTip)
+	assertAdvanced(t, f, resp, vouchProbeHead)
+
+	resolved := f.s.resolveFixupExpectedHeadSHA(ctx, f.runRow.ID, f.stageID)
+	strict, err := f.s.recordedFixupHead(ctx, f.runRow.ID)
+	if err != nil {
+		t.Fatalf("recordedFixupHead: %v", err)
+	}
+	prior, disagree, err := f.s.vouchPriorHead(ctx, f.runRow.ID)
+	if err != nil || disagree != "" {
+		t.Fatalf("vouchPriorHead = (%q, %q, %v)", prior, disagree, err)
+	}
+	for name, got := range map[string]string{"resolveFixupExpectedHeadSHA": resolved, "recordedFixupHead": strict, "vouchPriorHead": prior} {
+		if got != vouchProbeTip {
+			t.Errorf("%s = %q, want the re-vouched tip %s", name, got, vouchProbeTip)
+		}
+	}
+	if resp.RecordedHeadAdvanced != (resolved == vouchProbeTip) {
+		t.Errorf("recorded_head_advanced = %v but the walk resolves %q: the response reports an advance the walk does not reach", resp.RecordedHeadAdvanced, resolved)
+	}
+}
+
+// TestVouchCommit_PublishBoundReusesProbeLiveHead: on a verified advance the
+// probe read the live head twice (before and after the compares) and the
+// audit-check publish bound reuses that read, so the vouch makes no third
+// pull-request read; the check is still stamped at the vouched head.
+func TestVouchCommit_PublishBoundReusesProbeLiveHead(t *testing.T) {
+	creator := &vouchCheckCreator{}
+	s, au, runID := newVouchRepublishServer(t, creator)
+	probe := &vouchProbeForge{compares: map[string][]string{}, statuses: map[string]int{}}
+	s.cfg.GitHub = newVouchProbeGitHubClient(t, probe)
+	probe.setPRHead(vouchedSHA)
+	au.stampSequence = true
+	payload, _ := json.Marshal(map[string]any{"head_sha": vouchProbeHead})
+	au.mu.Lock()
+	au.appended = append(au.appended, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC), Category: "fixup_pushed", Payload: payload,
+	})
+	au.mu.Unlock()
+	probe.set(vouchedSHA, vouchProbeHead)
+	probe.set(vouchProbeHead, vouchedSHA, vouchedSHA)
+
+	w := postVouchCommit(t, s, runID, vouchCommitRequest{SHA: vouchedSHA, Reason: vouchProbeReason}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp vouchCommitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.RecordedHeadAdvanced {
+		t.Fatalf("precondition: recorded_head_advanced = false (note %q)", resp.RecordedHeadAdvanceNote)
+	}
+	if !resp.AuditCheckRepublished || resp.AuditCheckRepublishWarning != "" {
+		t.Errorf("audit_check_republished = %v, warning %q; want a clean re-post", resp.AuditCheckRepublished, resp.AuditCheckRepublishWarning)
+	}
+	if n := probe.prReads(); n != 2 {
+		t.Errorf("pull-request reads = %d, want 2 (the publish bound reuses the probe's re-read)", n)
+	}
+}
+
+// TestVouchHeadAdvance_WalksDisagree_NonHexHeadFormatted: the disagreement
+// rung runs before the recorded head's shape check, so a ref-name reported
+// head can reach its note; it is rendered through formatReportedHeadObjectID,
+// never raw.
+func TestVouchHeadAdvance_WalksDisagree_NonHexHeadFormatted(t *testing.T) {
+	const refHead = "feature/movable-ref"
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("pull_request_opened", refHead)
+	f.appendRow(lineageIntegrationCommitCategory, map[string]any{"merge_sha": vouchProbeFanIn})
+	resp := f.vouch(t, vouchProbeTip)
+	assertNoAdvance(t, f, resp, "the fix-up walk resolves the recorded head "+reportedHeadObjectIDFallback+" but the acceptance-seeded walk resolves "+vouchProbeFanIn)
+	if strings.Contains(resp.RecordedHeadAdvanceNote, refHead) {
+		t.Errorf("note %q echoes the raw recorded head", resp.RecordedHeadAdvanceNote)
 	}
 }
