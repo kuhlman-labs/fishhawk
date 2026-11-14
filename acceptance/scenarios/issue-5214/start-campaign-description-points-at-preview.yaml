@@ -1,0 +1,14 @@
+id: scenario:issue-5214/start-campaign-description-points-at-preview
+statement: In the MCP tools/list result, the fishhawk_start_campaign description tells the operator to run fishhawk_preview_campaign first and read edges[].source and warnings[]. It states that sequencing written only in prose produces no edge and lands the item in wave 0, and names the clean, current checkout pre-flight.
+verify_hint: 'MCP tool result: the tools/list response from a fishhawk-mcp stdio session (in-process ListTools harness in campaign_test.go).'
+steps: Built fishhawk-mcp from the sanctioned tree and ran a stdio tools/list (env -i, fictional token, closed backend port). Read the fishhawk_start_campaign description.
+assertions:
+    expected: The description points at preview_campaign with edges[].source and warnings[], says prose-only sequencing yields no edge and lands in wave 0, and names the clean, current checkout pre-flight.
+    observed_at_record: 'It says: ''Preview first (#5214): call fishhawk_preview_campaign with the same source and read its edges[].source and warnings[] before starting. Sequencing stated only in prose ... produces NO edge, so that item lands in wave 0 ... Pre-flight: start from a clean, current checkout of the base branch, and re-run the preview after any tracker edit''.'
+    repro_handle: fishhawk-mcp stdio tools/list, then read tools[name=fishhawk_start_campaign].description
+origin:
+    issue: 5214
+    pr: 5291
+    run_id: f65b0607-f8e0-4cad-88e8-b0eb6075f7f6
+    head_sha: e0d3e2cff0d09ca2178c5a7a20f768a0630009cd
+    recorded_at: 2026-11-14T22:20:34Z
