@@ -212,6 +212,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-148"
+      ],
       "applies_to": []
     },
     {
@@ -302,6 +305,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-149"
+      ],
       "applies_to": []
     },
     {
@@ -311,6 +317,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-149"
+      ],
       "applies_to": []
     },
     {
@@ -693,7 +702,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-115"
+        "ADR-115",
+        "ADR-149"
       ],
       "applies_to": []
     },
@@ -904,6 +914,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-148"
+      ],
       "applies_to": []
     },
     {
@@ -975,7 +988,8 @@
       "superseded_by": [],
       "amended_by": [
         "ADR-097",
-        "ADR-101"
+        "ADR-101",
+        "ADR-148"
       ],
       "applies_to": []
     },
@@ -1095,7 +1109,8 @@
         "ADR-089"
       ],
       "amended_by": [
-        "ADR-101"
+        "ADR-101",
+        "ADR-148"
       ],
       "applies_to": []
     },
@@ -1154,7 +1169,9 @@
       ],
       "amended_by": [
         "ADR-121",
-        "ADR-122"
+        "ADR-122",
+        "ADR-148",
+        "ADR-149"
       ],
       "applies_to": []
     },
@@ -1301,7 +1318,8 @@
       "amended_by": [
         "ADR-120",
         "ADR-123",
-        "ADR-139"
+        "ADR-139",
+        "ADR-148"
       ],
       "applies_to": []
     },
@@ -1329,7 +1347,8 @@
         "ADR-112"
       ],
       "amended_by": [
-        "ADR-116"
+        "ADR-116",
+        "ADR-149"
       ],
       "applies_to": []
     },
@@ -1391,6 +1410,9 @@
       "amends": [
         "ADR-042"
       ],
+      "amended_by": [
+        "ADR-149"
+      ],
       "applies_to": [
         "runner/cmd/fishhawk-runner/fixupresume.go",
         "runner/internal/agent/claudecode/**"
@@ -1427,6 +1449,9 @@
         "ADR-112",
         "ADR-118"
       ],
+      "amended_by": [
+        "ADR-148"
+      ],
       "applies_to": []
     },
     {
@@ -1441,6 +1466,9 @@
         "ADR-101",
         "ADR-118"
       ],
+      "amended_by": [
+        "ADR-149"
+      ],
       "applies_to": []
     },
     {
@@ -1454,7 +1482,8 @@
         "ADR-113"
       ],
       "amended_by": [
-        "ADR-132"
+        "ADR-132",
+        "ADR-148"
       ],
       "applies_to": []
     },
@@ -1495,6 +1524,9 @@
       "amends": [
         "ADR-103",
         "ADR-117"
+      ],
+      "amended_by": [
+        "ADR-148"
       ],
       "applies_to": []
     },
@@ -1571,6 +1603,9 @@
         "ADR-055",
         "ADR-079",
         "ADR-123"
+      ],
+      "amended_by": [
+        "ADR-148"
       ],
       "applies_to": []
     },
@@ -1720,6 +1755,9 @@
       "amends": [
         "ADR-084"
       ],
+      "amended_by": [
+        "ADR-148"
+      ],
       "applies_to": []
     },
     {
@@ -1753,6 +1791,46 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-148",
+      "title": "The human-authority ladder: three credential tiers and the first presence adoptions",
+      "path": "docs/adr/148-human-authority-ladder.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-019",
+        "ADR-083",
+        "ADR-089",
+        "ADR-097",
+        "ADR-101",
+        "ADR-113",
+        "ADR-121",
+        "ADR-123",
+        "ADR-126",
+        "ADR-132",
+        "ADR-143"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-149",
+      "title": "Confinement before charter operation: a charter operator cannot reach human credentials",
+      "path": "docs/adr/149-confinement-before-charter-operation.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-028",
+        "ADR-029",
+        "ADR-063",
+        "ADR-101",
+        "ADR-115",
+        "ADR-119",
+        "ADR-122"
+      ],
       "applies_to": []
     }
   ]

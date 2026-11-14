@@ -408,6 +408,8 @@ Amendments recorded under the upkeep rule since:
 - ADR-144: no edge. Its record-metadata line declares `amends: []`: it decides the proof-of-presence mechanism and adopts it for no action, so each later adoption is an amendment of the record that governs the action.
 - ADR-145: `amends: [ADR-144]`; ADR-144 gains `amended_by: [ADR-145]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It decides the recovery and unowned-enrolment matters ADR-144 D6 reserved; it was reviewed as an in-body amendment and ratified as a new amending ADR.
 - ADR-146: no edge. Its record-metadata line declares `amends: []`: it restates ADR-121 and ADR-126 and places ADR-139's workflow without changing any of them, and it governs the product preset library, not what a repository declares.
+- ADR-148: `amends: [ADR-019, ADR-083, ADR-089, ADR-097, ADR-101, ADR-113, ADR-121, ADR-123, ADR-126, ADR-132, ADR-143]`; each gains `amended_by: [ADR-148]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It places every human-reserved action on one of three credential tiers and is the adopting amendment ADR-144 D3 requires for each tier-2 entry.
+- ADR-149: `amends: [ADR-028, ADR-029, ADR-063, ADR-101, ADR-115, ADR-119, ADR-122]`; each gains `amended_by: [ADR-149]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It makes confinement of the charter operator a prerequisite of charter operation.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -623,6 +625,8 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-144](144-proof-of-presence.md) | Proof of presence: a passkey step-up for decisions only a human may take | `accepted` | [#5239](https://github.com/kuhlman-labs/fishhawk/issues/5239) |
 | [ADR-145](145-proof-of-presence-recovery.md) | Recovery and the response to an unowned enrolment for the proof of presence (amends ADR-144) | `accepted` | [#5255](https://github.com/kuhlman-labs/fishhawk/issues/5255) |
 | [ADR-146](146-workflow-catalogue.md) | The workflow catalogue: five families, presets, and cross-cutting controls | `accepted` | [#5260](https://github.com/kuhlman-labs/fishhawk/issues/5260) |
+| [ADR-148](148-human-authority-ladder.md) | The human-authority ladder: three credential tiers and the first presence adoptions | `accepted` | [#5274](https://github.com/kuhlman-labs/fishhawk/issues/5274) |
+| [ADR-149](149-confinement-before-charter-operation.md) | Confinement before charter operation: a charter operator cannot reach human credentials | `accepted` | [#5275](https://github.com/kuhlman-labs/fishhawk/issues/5275) |
 
 ## Status unknown — needs captain confirmation
 
