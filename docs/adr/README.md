@@ -26,7 +26,7 @@ Drafted by the first officer at the Captain's direction (2026-10-23); it is the 
 **Which form an ADR takes:**
 - **An in-body amendment** (an "Amendment A<n>" section added to the ratified ADR's tracker body, then re-transcribed) clarifies or narrows that ADR's own rules. Examples: ADR-112 A1, ADR-114 A1.
 - **A new ADR that `amends`** adds a decision of its own within another ADR's area. Examples: ADR-116, ADR-118, ADR-119, ADR-120.
-- **`supersedes`** is for a FULL replacement only. A partial replacement is an amendment, or a clarifying line on the old record (see the status rule).
+- **`supersedes`** is for a FULL replacement only. A partial replacement is an amendment, or a clarifying line on the old record (see the status rule). This governs how a new ADR is drafted. Older sources that state a partial supersession are still encoded as `supersedes` under the precedence rule in "Field semantics", so an `accepted` record can carry `superseded_by`: the record still governs except where its successor says otherwise.
 
 **Titles** are at most 100 characters from ADR-119 onward (`C-title-length`).
 
@@ -407,6 +407,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-143: `amends: [ADR-084]`; ADR-084 gains `amended_by: [ADR-143]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It narrows the CLI arm of ADR-084's in-body Amendment A1 until a proof of presence is adopted.
 - ADR-144: no edge. Its record-metadata line declares `amends: []`: it decides the proof-of-presence mechanism and adopts it for no action, so each later adoption is an amendment of the record that governs the action.
 - ADR-145: `amends: [ADR-144]`; ADR-144 gains `amended_by: [ADR-145]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It decides the recovery and unowned-enrolment matters ADR-144 D6 reserved; it was reviewed as an in-body amendment and ratified as a new amending ADR.
+- ADR-146: no edge. Its record-metadata line declares `amends: []`: it restates ADR-121 and ADR-126 and places ADR-139's workflow without changing any of them, and it governs the product preset library, not what a repository declares.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -556,9 +557,12 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-078](078-ground-review-agents-widen-context-narrow-capability.md) | Ground the review agents by widening context and narrowing capability: export the reviewed tree, scrub the inherited environment, grant read and search only | `accepted` | [#2519](https://github.com/kuhlman-labs/fishhawk/issues/2519) |
 | [ADR-079](079-product-and-program-management-agent.md) | Product and program management agent for human-ratified charters, release strategy, and readiness | `accepted` | [#3238](https://github.com/kuhlman-labs/fishhawk/issues/3238) |
 | [ADR-080](080-solo-captain-alpha.md) | Solo-captain alpha: the repository is the unit, one developer commands the full crew locally from the bridge | `accepted` | [#3693](https://github.com/kuhlman-labs/fishhawk/issues/3693) |
+| [ADR-081](081-crew-messages.md) | Crew messages: a closed set of typed, role-addressed messages on the audit chain, with consults answered mid-stage and disagreement escalated to the captain | `accepted` | [#3727](https://github.com/kuhlman-labs/fishhawk/issues/3727) |
 | [ADR-082](082-historian-precedent.md) | Historian: a derived decision index over the audit chain, deterministic precedent at the gate for the captain, and a thresholded divergence question | `accepted` | [#3728](https://github.com/kuhlman-labs/fishhawk/issues/3728) |
+| [ADR-083](083-captain-semantics.md) | Captain semantics: approvals stay predicate-governed; the captain record routes pages, owns the digest, and confirms delegation, and changes hands by a recorded two-step handover | `accepted` | [#3751](https://github.com/kuhlman-labs/fishhawk/issues/3751) |
 | [ADR-084](084-reviewer-personas.md) | Reviewer personas: a separate reviewer invocation with a declared remit, attached per stage or by an escalation, advisory with ingest-time checks, plus deterministic security checks as concern sources | `accepted` | [#3752](https://github.com/kuhlman-labs/fishhawk/issues/3752) |
 | [ADR-085](085-earned-autonomy-recommendations-only.md) | Earned autonomy: recommendations only, from server-attested evidence and a blind shadow record, with asymmetric thresholds (lower fast, raise slowly) and captain ratification through a human-authored spec change | `accepted` | [#3777](https://github.com/kuhlman-labs/fishhawk/issues/3777) |
+| [ADR-086](086-acceptance-validation-environment-contract.md) | Acceptance validation-environment contract: operator instructions, declared credential bindings, named provisioners, per-run side-effect namespace | `accepted` | [#3791](https://github.com/kuhlman-labs/fishhawk/issues/3791) |
 | [ADR-087](087-local-stage-concurrency-groups.md) | Local stage concurrency groups: server-coordinated admission of host-dispatched stages | `accepted` | [#3968](https://github.com/kuhlman-labs/fishhawk/issues/3968) |
 | [ADR-088](088-declarative-gate-services.md) | Declarative gate services: a closed, Fishhawk-owned `services:` schema under workflow-v2 `gate_container`, joined to the gate by a shared --network=none namespace (not raw compose, not a bridge network) | `accepted` | [#4042](https://github.com/kuhlman-labs/fishhawk/issues/4042) |
 | [ADR-089](089-first-officer-read-only-crew-seat.md) | First officer: a structurally read-only crew seat whose evidence-backed findings gate actions | `accepted` | [#4149](https://github.com/kuhlman-labs/fishhawk/issues/4149) |
@@ -618,6 +622,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-143](143-human-only-actions-credential-kind.md) | Human-only actions are refused on agent-drivable channels (amends ADR-084) | `accepted` | [#5231](https://github.com/kuhlman-labs/fishhawk/issues/5231) |
 | [ADR-144](144-proof-of-presence.md) | Proof of presence: a passkey step-up for decisions only a human may take | `accepted` | [#5239](https://github.com/kuhlman-labs/fishhawk/issues/5239) |
 | [ADR-145](145-proof-of-presence-recovery.md) | Recovery and the response to an unowned enrolment for the proof of presence (amends ADR-144) | `accepted` | [#5255](https://github.com/kuhlman-labs/fishhawk/issues/5255) |
+| [ADR-146](146-workflow-catalogue.md) | The workflow catalogue: five families, presets, and cross-cutting controls | `accepted` | [#5260](https://github.com/kuhlman-labs/fishhawk/issues/5260) |
 
 ## Status unknown — needs captain confirmation
 

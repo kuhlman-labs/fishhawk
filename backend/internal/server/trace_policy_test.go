@@ -13,11 +13,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -65,6 +67,10 @@ type policyRunRepo struct {
 	// sees a realistic multi-row run. listErr, when set, fails that read.
 	siblings []*run.Stage
 	listErr  error
+	// runTransitions records every TransitionRun target, so a test that
+	// wires a real orchestrator can tell a parked run (no transition to
+	// failed) from a completed-failed one (#5264).
+	runTransitions []run.State
 }
 
 func newPolicyRunRepo(stage *run.Stage, runRow *run.Run) *policyRunRepo {
@@ -95,6 +101,12 @@ func (r *policyRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.
 			r.stage.FailureCategory = c.FailureCategory
 			r.stage.FailureReason = c.FailureReason
 		}
+		// Mirror the real repo's ended_at stamp on a terminal failure: it is
+		// half of the infra-park episode identity (run.InfraParkEpisode).
+		if to == run.StageStateFailed {
+			now := time.Now().UTC()
+			r.stage.EndedAt = &now
+		}
 	}
 	return r.stage, nil
 }
@@ -113,8 +125,15 @@ func (r *policyRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Ru
 	// path), breaking the category-C retryability seam this file asserts.
 	return nil, nil
 }
-func (r *policyRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
-	return nil, errors.New("not used")
+func (r *policyRunRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runRow == nil || r.runRow.ID != id {
+		return nil, run.ErrNotFound
+	}
+	r.runTransitions = append(r.runTransitions, to)
+	r.runRow.State = to
+	return r.runRow, nil
 }
 func (r *policyRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
@@ -153,6 +172,11 @@ func (r *policyRunRepo) RetryStage(_ context.Context, id uuid.UUID, to run.Stage
 		r.stage.State = to
 		r.stage.FailureCategory = nil
 		r.stage.FailureReason = nil
+		// Mirror RetryStageState: a failed → pending re-open clears ended_at
+		// and bumps self_retry_count, so each failure is a distinct
+		// infra-park episode.
+		r.stage.EndedAt = nil
+		r.stage.SelfRetryCount++
 		return r.stage, nil
 	}
 	return nil, run.ErrNotFound
@@ -557,6 +581,362 @@ func TestShipTrace_PolicyReEval_EmptyDiff_InvalidPattern_StaysFailedB(t *testing
 	}
 	if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureB {
 		t.Errorf("FailureCategory = %v, want B (invalid-pattern config error must not be reclassified)", repo.stage.FailureCategory)
+	}
+}
+
+// testWorkflowSpecRequireTestsAndVerification declares BOTH
+// tests_added_or_updated and verification_reported, so a diff with no test
+// file under an exit-75 verify carries TWO violations (#5264): the
+// verify_infra_tempfail arm must leave that a category B.
+const testWorkflowSpecRequireTestsAndVerification = `
+version: "1.5"
+roles:
+  eng_team:
+    members: ["@org/eng"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: scripts/test verify
+        constraints:
+          - required_outcomes:
+              - tests_added_or_updated
+              - verification_reported
+        gates:
+          - type: approval
+            approvers:
+              any_of: [eng_team]
+            sla: 4_hours
+`
+
+// newVerifyTempFailTraceServer wires the policy trace server with a REAL
+// orchestrator (Runs + Audit) so the category-C infra-park decision runs
+// for real, and caches spec on the run row.
+func newVerifyTempFailTraceServer(t *testing.T, spec string, changed []map[string]string) (
+	*Server, *signingFake, *policyRunRepo, *auditFake,
+) {
+	t.Helper()
+	s, sf, repo, au := newPolicyTraceServer(t, changed)
+	repo.runRow.WorkflowSpec = []byte(spec)
+	repo.runRow.State = run.StateRunning
+	s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: repo, Audit: au}
+	return s, sf, repo, au
+}
+
+// verifyTempFailEvidence is a runner-shaped exit-75 committed-tree verify:
+// a superseded first exit-75 run, a terminal exit-75 run, and a failed
+// verify_summary.
+func verifyTempFailEvidence() *gateEvidenceSpec {
+	return &gateEvidenceSpec{
+		verifySummary: map[string]any{"outcome": "failed", "iterations": 2, "max_iterations": 3},
+		verifyRuns: []map[string]any{
+			{"command": "scripts/test verify", "exit_code": 75, "outcome": "failed", "superseded": true},
+			{"command": "scripts/test verify", "exit_code": 75, "outcome": "failed"},
+		},
+	}
+}
+
+func countRunTransitionsTo(repo *policyRunRepo, want run.State) int {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	n := 0
+	for _, st := range repo.runTransitions {
+		if st == want {
+			n++
+		}
+	}
+	return n
+}
+
+func countTraceAuditCategory(au *auditFake, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, c := range categoryNames(au.appended) {
+		if c == category {
+			n++
+		}
+	}
+	return n
+}
+
+// TestShipTrace_PolicyReEval_VerifyInfraTempFail_FailedC_Retryable is the
+// #5264 cross-boundary assertion: a real trace upload whose committed-tree
+// verify exited 75 (EX_TEMPFAIL, the change was not judged) and whose ONLY
+// policy violation is that verification_reported one crosses the bundle
+// extractor, verificationSignalFromBundle, the policy evaluator, the trace
+// switch, run.FailStage, the real orchestrator's infra-park decision and
+// run.RetryStage. The stage fails category C with the verify_infra_tempfail
+// reason, the run is PARKED (no transition to failed, a stage_infra_parked
+// row), and retry_stage's seam admits the stage back to pending.
+// Counterfactual vehicle for the trace.go switch arm: neutralise it and
+// the stage falls to the default arm's category B, failing this test.
+func TestShipTrace_PolicyReEval_VerifyInfraTempFail_FailedC_Retryable(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	s, sf, repo, au := newVerifyTempFailTraceServer(t, testWorkflowSpecRequireVerification, changed)
+	b := makeTestBundleWithGateEvidence(t, changed, verifyTempFailEvidence())
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	pl := decodePolicyPayload(t, au)
+	wantDetail := policy.VerificationNotPassedDetail(&policy.VerificationSignal{
+		Outcome:  "failed",
+		Commands: []policy.VerificationCommand{{Command: "scripts/test verify", ExitCode: 75, Outcome: "failed"}},
+	})
+	if pl.Passed || len(pl.Violations) != 1 ||
+		pl.Violations[0].Constraint != "required_outcomes" || pl.Violations[0].Detail != wantDetail {
+		t.Fatalf("policy payload passed=%v violations=%+v, want exactly the one exit-75 verification violation %q",
+			pl.Passed, pl.Violations, wantDetail)
+	}
+
+	if repo.stage.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", repo.stage.State)
+	}
+	if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureC {
+		t.Fatalf("FailureCategory = %v, want C (exit-75 verify is an infrastructure failure, not a policy breach)",
+			repo.stage.FailureCategory)
+	}
+	if repo.stage.FailureReason == nil || *repo.stage.FailureReason != verifyInfraTempFailTraceReason ||
+		!strings.HasPrefix(*repo.stage.FailureReason, "verify_infra_tempfail:") {
+		t.Errorf("FailureReason = %v, want verifyInfraTempFailTraceReason", repo.stage.FailureReason)
+	}
+	if n := countRunTransitionsTo(repo, run.StateFailed); n != 0 {
+		t.Errorf("run transitions to failed = %d, want 0 (category-C implement failure parks the run)", n)
+	}
+	if n := countTraceAuditCategory(au, run.CategoryStageInfraParked); n != 1 {
+		t.Errorf("%s rows = %d, want 1", run.CategoryStageInfraParked, n)
+	}
+
+	dec, err := run.RetryStage(context.Background(), repo, repo.stage.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage on the verify_infra_tempfail stage = %v, want nil", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-retry state = %q, want pending", dec.Stage.State)
+	}
+}
+
+// TestShipTrace_PolicyReEval_VerifyFailure_StaysFailedB is the control and
+// fail-closed table for the verify_infra_tempfail arm (#5264): every row
+// carries a verification_reported violation that is NOT the sole exit-75
+// signature, so the stage must stay category B, the run must complete
+// failed, and retry_stage must refuse. Each row isolates one predicate
+// check (named in the row comment) so deleting that check flips the row.
+func TestShipTrace_PolicyReEval_VerifyFailure_StaysFailedB(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	cases := []struct {
+		name           string
+		spec           string
+		evidence       *gateEvidenceSpec
+		wantViolations int
+	}{
+		{
+			// Exit-code check: a real red verify.
+			name:           "exit_1",
+			spec:           testWorkflowSpecRequireVerification,
+			evidence:       &gateEvidenceSpec{verifyRuns: []map[string]any{{"command": "scripts/test verify", "exit_code": 1, "outcome": "failed"}}},
+			wantViolations: 1,
+		},
+		{
+			// Exit-code check, summary path.
+			name: "exit_2_summary",
+			spec: testWorkflowSpecRequireVerification,
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "failed", "iterations": 3, "max_iterations": 3},
+				verifyRuns:    []map[string]any{{"command": "scripts/test verify", "exit_code": 2, "outcome": "failed"}},
+			},
+			wantViolations: 1,
+		},
+		{
+			// Sole-violation check: the verify exited 75, but the diff has
+			// no test file under tests_added_or_updated — a second, genuine
+			// policy violation.
+			name:           "exit_75_plus_tests_violation",
+			spec:           testWorkflowSpecRequireTestsAndVerification,
+			evidence:       &gateEvidenceSpec{verifyRuns: []map[string]any{{"command": "scripts/test verify", "exit_code": 75, "outcome": "failed"}}},
+			wantViolations: 2,
+		},
+		{
+			// Exit-code check across EVERY non-superseded failing command:
+			// one exit 75 and one real exit 1.
+			name: "mixed_75_and_1",
+			spec: testWorkflowSpecRequireVerification,
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "failed", "iterations": 1, "max_iterations": 3},
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 75, "outcome": "failed"},
+					{"command": "scripts/test verify", "exit_code": 1, "outcome": "failed"},
+				},
+			},
+			wantViolations: 1,
+		},
+		{
+			// Zero-failing-command check: a failed summary over a passing
+			// command list has nothing that exited 75.
+			name: "failed_summary_passing_command",
+			spec: testWorkflowSpecRequireVerification,
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "failed", "iterations": 3, "max_iterations": 3},
+				verifyRuns:    []map[string]any{{"command": "scripts/test verify", "exit_code": 0, "outcome": "passed"}},
+			},
+			wantViolations: 1,
+		},
+		{
+			// Outcome check: a skipped gate is not an infrastructure
+			// failure, even when its command exited 75.
+			name: "skipped_summary_exit_75_command",
+			spec: testWorkflowSpecRequireVerification,
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "skipped"},
+				verifyRuns:    []map[string]any{{"command": "scripts/test verify", "exit_code": 75, "outcome": "failed"}},
+			},
+			wantViolations: 1,
+		},
+		{
+			// Nil-signal check: no gate_evidence at all.
+			name:           "no_gate_evidence",
+			spec:           testWorkflowSpecRequireVerification,
+			evidence:       nil,
+			wantViolations: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, repo, au := newVerifyTempFailTraceServer(t, tc.spec, changed)
+			b := makeTestBundleWithGateEvidence(t, changed, tc.evidence)
+			priv, _ := sf.issue(t, repo.runRow.ID)
+
+			w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			pl := decodePolicyPayload(t, au)
+			if len(pl.Violations) != tc.wantViolations {
+				t.Fatalf("violations = %+v, want %d", pl.Violations, tc.wantViolations)
+			}
+			if repo.stage.State != run.StageStateFailed {
+				t.Fatalf("stage state = %q, want failed", repo.stage.State)
+			}
+			if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureB {
+				t.Fatalf("FailureCategory = %v (reason %v), want B", repo.stage.FailureCategory, repo.stage.FailureReason)
+			}
+			if repo.stage.FailureReason == nil || *repo.stage.FailureReason != "policy violations on backend re-evaluation" {
+				t.Errorf("FailureReason = %v, want the category-B re-evaluation reason", repo.stage.FailureReason)
+			}
+			if n := countRunTransitionsTo(repo, run.StateFailed); n != 1 {
+				t.Errorf("run transitions to failed = %d, want 1", n)
+			}
+			if _, err := run.RetryStage(context.Background(), repo, repo.stage.ID, run.RetryOptions{}); !errors.Is(err, run.ErrRetryNotApplicable) {
+				t.Errorf("RetryStage on a category-B stage = %v, want ErrRetryNotApplicable", err)
+			}
+		})
+	}
+}
+
+// TestVerifyInfraTempFailOnly_StageGuards covers the predicate's stage
+// and empty-list guards directly (#5264): a non-implement stage carries no implement
+// constraints through the trace handler, so the stage-type check is only
+// reachable by calling the predicate. The implement row is the control
+// proving the same bundle and violation otherwise reclassify.
+func TestVerifyInfraTempFailOnly_StageGuards(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	b := makeTestBundleWithGateEvidence(t, changed, verifyTempFailEvidence())
+	sig := verificationSignalFromBundle(b)
+	if sig == nil {
+		t.Fatal("verificationSignalFromBundle = nil, want the exit-75 signal")
+	}
+	violations := []policy.Violation{{Constraint: "required_outcomes", Detail: policy.VerificationNotPassedDetail(sig)}}
+
+	for _, tc := range []struct {
+		name         string
+		stageType    run.StageType
+		unknownID    bool
+		noViolations bool
+		want         bool
+	}{
+		{name: "implement_control", stageType: run.StageTypeImplement, want: true},
+		{name: "review_stage", stageType: run.StageTypeReview, want: false},
+		{name: "acceptance_stage", stageType: run.StageTypeAcceptance, want: false},
+		{name: "stage_read_error", stageType: run.StageTypeImplement, unknownID: true, want: false},
+		// Defense in depth: the switch only reaches the predicate with a
+		// non-empty violation list, so an empty one is only reachable here.
+		{name: "no_violations", stageType: run.StageTypeImplement, noViolations: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, repo, _ := newPolicyTraceServer(t, changed)
+			repo.stage.Type = tc.stageType
+			id := repo.stage.ID
+			if tc.unknownID {
+				id = uuid.New()
+			}
+			vs := violations
+			if tc.noViolations {
+				vs = nil
+			}
+			if got := s.verifyInfraTempFailOnly(context.Background(), id, b, vs); got != tc.want {
+				t.Errorf("verifyInfraTempFailOnly = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShipTrace_VerifyInfraTempFail_ParkBudgetExhaustsToTerminal pins that
+// the verify_infra_tempfail category C cannot loop forever (#5264, binding
+// condition H3): a stage whose committed-tree verify exits 75 on every
+// attempt parks the run InfraFailureParkRetryBudget times, each followed by
+// an admitted retry, and the next exit-75 upload fails the run terminal
+// with a stage_infra_park_budget_exhausted row. The loop crosses the trace
+// handler, the real orchestrator's park budget and run.RetryStage on every
+// iteration.
+func TestShipTrace_VerifyInfraTempFail_ParkBudgetExhaustsToTerminal(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	s, sf, repo, au := newVerifyTempFailTraceServer(t, testWorkflowSpecRequireVerification, changed)
+	b := makeTestBundleWithGateEvidence(t, changed, verifyTempFailEvidence())
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	for i := 0; i <= run.InfraFailureParkRetryBudget; i++ {
+		// The orchestrator's re-dispatch of the retried stage.
+		repo.stage.State = run.StageStateDispatched
+		w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("attempt %d: status = %d:\n%s", i+1, w.Code, w.Body.String())
+		}
+		if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureC {
+			t.Fatalf("attempt %d: FailureCategory = %v, want C", i+1, repo.stage.FailureCategory)
+		}
+		if i < run.InfraFailureParkRetryBudget {
+			if n := countRunTransitionsTo(repo, run.StateFailed); n != 0 {
+				t.Fatalf("attempt %d: run transitions to failed = %d, want 0 (parked)", i+1, n)
+			}
+			if n := countTraceAuditCategory(au, run.CategoryStageInfraParked); n != i+1 {
+				t.Fatalf("attempt %d: %s rows = %d, want %d", i+1, run.CategoryStageInfraParked, n, i+1)
+			}
+			if _, err := run.RetryStage(context.Background(), repo, repo.stage.ID, run.RetryOptions{}); err != nil {
+				t.Fatalf("attempt %d: RetryStage = %v, want nil", i+1, err)
+			}
+			continue
+		}
+		if n := countRunTransitionsTo(repo, run.StateFailed); n != 1 {
+			t.Fatalf("attempt %d: run transitions to failed = %d, want 1 (park budget exhausted)", i+1, n)
+		}
+		if repo.runRow.State != run.StateFailed {
+			t.Errorf("run state = %q, want failed", repo.runRow.State)
+		}
+		if n := countTraceAuditCategory(au, run.CategoryStageInfraParkBudgetExhausted); n != 1 {
+			t.Errorf("%s rows = %d, want 1", run.CategoryStageInfraParkBudgetExhausted, n)
+		}
+		if n := countTraceAuditCategory(au, run.CategoryStageInfraParked); n != run.InfraFailureParkRetryBudget {
+			t.Errorf("%s rows = %d, want %d", run.CategoryStageInfraParked, n, run.InfraFailureParkRetryBudget)
+		}
 	}
 }
 

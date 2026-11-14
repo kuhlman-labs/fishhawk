@@ -250,3 +250,35 @@ func TestFullObjectName_ShaAcceptanceParity(t *testing.T) {
 		})
 	}
 }
+
+// TestVouchCommit_SurfacesHeadAdvanceAndRepublishFields (#4856): the tool
+// result carries all four response fields the backend writes, including the
+// two audit-check fields the mirror previously dropped on decode.
+func TestVouchCommit_SurfacesHeadAdvanceAndRepublishFields(t *testing.T) {
+	fb, srv := newVouchFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	want := VouchCommitResult{
+		RunID: runID.String(), VouchedSHA: vouchFullSHA, Reason: "remediation",
+		AuditCheckRepublished:      true,
+		AuditCheckRepublishWarning: "republish warning text",
+		RecordedHeadAdvanced:       true,
+		RecordedHeadAdvanceNote:    "advance note text",
+	}
+	fb.mu.Lock()
+	fb.vouchResp[runID] = want
+	fb.mu.Unlock()
+	_, out, err := r.vouchCommit(context.Background(), nil, VouchCommitInput{RunID: runID.String(), SHA: vouchFullSHA, Reason: "remediation"})
+	if err != nil {
+		t.Fatalf("vouchCommit: %v", err)
+	}
+	if out.Result != want {
+		t.Errorf("result = %+v, want %+v", out.Result, want)
+	}
+	raw, _ := json.Marshal(out.Result)
+	for _, key := range []string{"audit_check_republished", "audit_check_republish_warning", "recorded_head_advanced", "recorded_head_advance_note"} {
+		if !strings.Contains(string(raw), `"`+key+`"`) {
+			t.Errorf("tool result JSON %s is missing %s", raw, key)
+		}
+	}
+}

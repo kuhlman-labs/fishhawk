@@ -118,7 +118,9 @@ Mechanics:
   `auditcomplete.VouchedSHAField`, as `CategoryOperatorCommitVouched` is
   of `auditcomplete.CategoryOperatorCommitVouched`; auditcomplete owns
   the literals because it cannot import this package).
-- The entry has TWO readers, and the union flows to BOTH ledgers:
+- The entry has TWO membership readers, and the union flows to BOTH
+  ledgers (a third reader, the recorded fix-up head walk, reads only a
+  server-verified row's advance keys; see § FIX-UP BASE, VERIFIED VOUCH):
   - `lineage.go::buildReportedHeadLedger` unions vouched SHAs
     (`lineageVouchLedgerCategory`, read via `addVouchedSHAs` from the
     `vouched_sha` field — parallel to `addReportedHeads`/`head_sha`) into
@@ -470,8 +472,9 @@ is load-bearing: the lease re-check runs BEFORE `MergeBranch`, so a foreign
 push in that window becomes the merge's first parent, and only the verified
 parents [prior head, base tip] prove the merge carries none. A `branch_reset`
 row moves the head to its `reset_to_sha` when that sha is already on the
-walked chain; a reset anywhere else (or an undecodable reset row) resolves the
-seed. A failed read of either category WARNs and resolves the SEED, never ""
+walked chain; a reset anywhere else (or an undecodable reset row) RE-SEEDS the
+walk (head = seed, walked chain = {seed}) and the walk continues, so a later
+row from the seed still applies (#4856). A failed read of either category WARNs and resolves the SEED, never ""
 (which would switch the runner to its checkout-only path); with no reported
 head the field stays "" (a rebase alone never invents a head).
 `acceptance_expected_head_sha` now walks the same clean advances through its
@@ -484,6 +487,74 @@ rebase handler; also asserts the acceptance resolver names the merge commit),
 `..._BaseMergeReadErrorKeepsRecordedHead`, `..._NoRecordedHeadStaysEmpty`
 (`fixup_expected_head_test.go`) and the Postgres + MCP e2e
 `integration/mcp::TestE2E_Fixup_ExpectedHeadAdvancesThroughRecordedRebase`.
+
+**VERIFIED VOUCH (#4856, recorded against ADR-035; no separate ADR).** A
+vouch used to be membership-only, so after an operator remediation commit the
+next fix-up died `fixup_base_mismatch` while `fishhawk_reset_run_branch`
+already called the vouched tip the last run-authored HEAD. A server-verified
+fast-forward vouch is now an ADR-112-style step in the recorded walk; any
+other vouch stays membership-only. Before recording, `vouch.go` runs the
+read-only `vouch_head_advance.go::probeVouchHeadAdvance`, bounded by its own
+`defaultVouchHeadAdvanceProbeTimeout` (5s): an expired deadline is a
+non-advance note and the three-key row is still recorded, so a hanging forge
+never outlasts the caller's deadline and drops the vouch. The prior is the
+head BOTH recorded walks resolve (`vouchPriorHead`: the strict
+`recordedFixupHead`, and the `acceptanceHeadSeed` seed walked over the same
+rows; a disagreement records the vouch unverified, and a decomposed parent
+with only an integration seed uses that seed, which the acceptance walk reads
+once #4874 lands; such a parent has no fix-up expectation, so
+`fixup_expected_head_sha` stays empty and the runner keeps its checkout-only
+path). A prior that is not a full commit id (`isDeployCommitSHA`; a reported
+`head_sha` need only be non-empty) never reaches the forge, and notes render
+it through `formatReportedHeadObjectID`. The vouched commit must be the run's
+LIVE pull-request head (the Captain's 2026-11-14 ruling), resolved through the
+publish bound's ladder (`resolveVouchPublishHead`) before the compares and
+re-read after them, so a push during the probe refuses the stamp; the publish
+bound reuses that read. The vouch verifies only when
+`compare(vouched...prior)` is empty (a fast-forward; a history rewrite is
+never admitted), `compare(prior...vouched)` is non-empty and below the
+250-commit cap, and every commit between them is in `vouchClosureLedger`.
+That ledger is TRANSITIVELY CLOSED: it counts run-reported pushes, the merge
+commits of clean `branch_rebased` rows, fan-in integration merges and EARLIER
+verified vouches only, so a commit present only through an unverified vouch
+never lets a later vouch verify. A verified row also carries
+`prior_head_sha` and `head_advance_verified: true`
+(`auditcomplete.VouchPriorHeadSHAField` / `VouchHeadAdvanceVerifiedField`);
+`walkRecordedBaseMerges` advances to its `vouched_sha` only when
+`isVerifiedVouchAdvance` holds AND its prior is the head walked so far, and
+puts the vouched sha on the walked chain so a later reset to it stays there.
+`fixupHeadWalkCategories` adds `operator_commit_vouched` to the fix-up walk;
+the acceptance walk (`acceptanceBaseMergeRows`) does not read vouch rows until
+#4874 adds them. Commits are immutable and the chain append-only, so the stamp
+cannot go stale; a push or rebase between the probe and the append either
+re-seeds the walk or makes the stamped prior differ from the walked head, and
+the walk skips the vouch. No row ends the walk early (an unanchored reset
+re-seeds it), so a stamp whose prior is the head the walk resolved at probe
+time is always reached and `recorded_head_advanced` never reports an advance
+the walk does not apply: after "reported head H; legacy vouch V; reset to V"
+(reset picks the legacy-vouched V), re-vouching V stamps H→V and every reader
+answers V. LIMIT: a vouch recorded before #4856 carries no
+advance keys and never advances (re-vouch it), and on a run whose legacy vouch
+of V is followed by a `branch_rebased` row from V to M, re-vouching V ends the
+walk at V, not M, because the rebase row was walked before the re-vouch; the
+exit is to move the branch back to V and run `fishhawk_rebase_run_branch`
+again from it, whose clean row from V walks through to the new merge
+(`TestWalkRecordedBaseMerges` rows `(C7)` and `(C7 exit)`). Pinned by the
+`(1)`-`(11)` vouch rows of `TestWalkRecordedBaseMerges`,
+`TestResolveFixupExpectedHeadSHA_AdvancesThroughVerifiedVouch` (the REAL
+vouch handler; also asserts `resolveLastRunAuthoredHead` agrees),
+`..._UnverifiedVouchKeepsRecordedHead`, `..._VouchReadErrorKeepsRecordedHead`,
+`TestRecordedFixupHead_AgreesWithFixupResolver`,
+`TestRecordedFixupHead_ReadErrorReturned`, one
+`vouch_head_advance_test.go::TestVouchHeadAdvance_*` test per probe rung
+(including `..._UnverifiedIntermediateVouch_NoAdvance`,
+`..._DecomposedParent_IntegrationSeed_Advances`, `..._WalksDisagree_NoAdvance`,
+`..._NotLiveHead_NoAdvance`, `..._LiveHeadUnresolved_NoAdvance`,
+`..._LiveHeadMovedDuringProbe_NoAdvance`, `..._ProbeDeadline_RecordsThreeKeyRow`,
+`..._NonHexRecordedHead_NoForgeCall` and
+`..._ResetBeforeReVouch_AdvanceMatchesWalk`),
+`TestVouchCommit_PublishBoundReusesProbeLiveHead` and the Postgres + MCP e2e
+`integration/mcp::TestE2E_VouchCommit_AdvancesFixupExpectedHead`.
 
 Other invariants:
 
