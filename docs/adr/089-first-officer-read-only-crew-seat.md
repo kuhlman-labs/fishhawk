@@ -6,7 +6,7 @@ date: 2026-10-08
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4149
 supersedes: []
 superseded_by: []
-amended_by: ["ADR-097", "ADR-101"]
+amended_by: ["ADR-097", "ADR-101", "ADR-148"]
 applies_to: []
 ---
 

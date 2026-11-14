@@ -7,6 +7,7 @@ issue: https://github.com/kuhlman-labs/fishhawk/issues/4708
 supersedes: []
 superseded_by: []
 amends: ["ADR-042"]
+amended_by: ["ADR-149"]
 applies_to: ["runner/cmd/fishhawk-runner/fixupresume.go", "runner/internal/agent/claudecode/**"]
 ---
 
