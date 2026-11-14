@@ -647,6 +647,118 @@ func TestDevFixtures_AcceptanceRebasedHead_ServesAdvancedHead(t *testing.T) {
 	}
 }
 
+// TestDevFixtures_AcceptanceVouchedHead_ServesVouchedHead applies the
+// acceptance-vouched-head scenario over real Postgres and reads the signed
+// acceptance prompt for all five runs (#4874): a server-verified vouch moves the
+// served head (V), a clean rebase from the vouched head moves it again (M), a
+// legacy vouch leaves the seed (S), the parent's verified vouch moves its
+// integration seed (W, on the consolidated branch), and a verified vouch AFTER
+// the dispatch anchor moves the unbounded prompt (V) while a signed verdict on
+// that run binds the anchor-bounded head (S).
+func TestDevFixtures_AcceptanceVouchedHead_ServesVouchedHead(t *testing.T) {
+	d := newDevPGServer(t)
+	s := d.s
+	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{
+		Number: 4874, Title: "Acceptance vouched head fixture", Body: "seed", State: "open",
+	}}
+	w := devRequest(t, s, http.MethodPost, "/v0/dev/fixtures", []byte(`{"scenario":"acceptance-vouched-head"}`), devLoopbackPeer, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /v0/dev/fixtures: status = %d, want 201\n%s", w.Code, w.Body.String())
+	}
+	var res devfixtures.Result
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	const (
+		s1 = "1111111111111111111111111111111111111111"
+		v1 = "2222222222222222222222222222222222222222"
+		s2 = "3333333333333333333333333333333333333333"
+		m2 = "5555555555555555555555555555555555555555"
+		s3 = "6666666666666666666666666666666666666666"
+		f4 = "8888888888888888888888888888888888888888"
+		w4 = "9999999999999999999999999999999999999999"
+		s5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		v5 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	cases := []struct {
+		run, acceptance, wantHead, seed string
+		parent                          bool
+	}{
+		{"vouched-run", "vr-acceptance", v1, s1, false},
+		{"vouched-then-rebased-run", "vb-acceptance", m2, s2, false},
+		{"unverified-vouch-run", "uv-acceptance", s3, s3, false},
+		{"vouched-parent", "vp-acceptance", w4, f4, true},
+		{"vouched-after-dispatch-run", "va-acceptance", v5, s5, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.run, func(t *testing.T) {
+			rr, ok := res.Runs[tc.run]
+			if !ok {
+				t.Fatalf("scenario result has no run %q", tc.run)
+			}
+			acceptanceID := rr.Stages[tc.acceptance]
+			priv := issueDevSigningKey(t, s, rr.ID)
+			sig := devSignBody(t, s, priv, []byte("prompt:"+acceptanceID.String()))
+			pw := devRequest(t, s, http.MethodGet, "/v0/stages/"+acceptanceID.String()+"/prompt", nil, devLoopbackPeer,
+				map[string]string{"X-Fishhawk-Signature": sig})
+			if pw.Code != http.StatusOK {
+				t.Fatalf("GET prompt: status = %d, want 200\n%s", pw.Code, pw.Body.String())
+			}
+			var prompt struct {
+				AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha"`
+				AcceptanceRunBranch       string `json:"acceptance_run_branch"`
+			}
+			if err := json.Unmarshal(pw.Body.Bytes(), &prompt); err != nil {
+				t.Fatalf("decode prompt: %v", err)
+			}
+			if prompt.AcceptanceExpectedHeadSHA != tc.wantHead {
+				t.Errorf("acceptance_expected_head_sha = %q, want %q (seed %q)", prompt.AcceptanceExpectedHeadSHA, tc.wantHead, tc.seed)
+			}
+			if tc.parent {
+				literal := "fishhawk/run-" + rr.ID.String()[:8] + "-consolidated"
+				if prompt.AcceptanceRunBranch != orchestrator.ConsolidatedBranch(rr.ID) || prompt.AcceptanceRunBranch != literal {
+					t.Errorf("acceptance_run_branch = %q, want the consolidated branch %q", prompt.AcceptanceRunBranch, literal)
+				}
+			} else if want := "e97.24-" + tc.run; prompt.AcceptanceRunBranch != want {
+				t.Errorf("acceptance_run_branch = %q, want the ledger branch %q", prompt.AcceptanceRunBranch, want)
+			}
+			if tc.run != "vouched-after-dispatch-run" {
+				return
+			}
+			// The vouch is after the dispatch anchor: a signed verdict binds
+			// the anchor-bounded head S, never the unbounded V.
+			body, _ := json.Marshal(acceptanceBody{Verdict: "passed", Criteria: critRaw(
+				acceptanceCriterionResult{ID: "run-readable", Result: "passed", ExpectationBasis: "seeded run readable"},
+				acceptanceCriterionResult{ID: "stages-listed", Result: "passed", ExpectationBasis: "seeded stages listed"},
+			)})
+			vsig := devSignBody(t, s, priv, body)
+			aw := devRequest(t, s, http.MethodPost,
+				"/v0/runs/"+rr.ID.String()+"/acceptance?stage_id="+acceptanceID.String(), body, devLoopbackPeer,
+				map[string]string{"X-Fishhawk-Signature": vsig, "Content-Type": "application/json"})
+			if aw.Code != http.StatusCreated {
+				t.Fatalf("POST acceptance: status = %d, want 201\n%s", aw.Code, aw.Body.String())
+			}
+			var newest *auditEntryResponse
+			rows := listAuditByCategory(t, s, "acceptance_outcome_recorded")
+			for i := range rows {
+				if rows[i].RunID != nil && *rows[i].RunID == rr.ID && (newest == nil || rows[i].Sequence > newest.Sequence) {
+					newest = &rows[i]
+				}
+			}
+			if newest == nil {
+				t.Fatalf("no acceptance_outcome_recorded row for run %s", rr.ID)
+			}
+			var p map[string]any
+			if err := json.Unmarshal(newest.Payload, &p); err != nil {
+				t.Fatalf("decode outcome payload: %v", err)
+			}
+			if p["head_sha"] != s5 {
+				t.Errorf("acceptance_outcome_recorded.head_sha = %v, want the anchor-bounded head %s (the vouch to %s is after dispatch)", p["head_sha"], s5, v5)
+			}
+		})
+	}
+}
+
 func TestShipTrace_UnconfiguredWithoutTraceStore_503(t *testing.T) {
 	d := newDevPGServer(t)
 	// Rebuild the server from the same repositories with TraceStore nil.
