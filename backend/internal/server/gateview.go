@@ -803,12 +803,7 @@ func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run,
 			recordGap()
 			block.Undetermined = append(block.Undetermined, "blocking concerns: the open concerns could not be read: "+berr.Error())
 		} else if len(ids) > 0 {
-			block.Blockers = append(block.Blockers, gateViewMergeBlocker{
-				Code: mergeQueueReasonBlockingConcernOpen,
-				Message: "an open blocking concern (high severity or first_officer provenance) is on this run's ledger; " +
-					"the merge endpoint refuses until each is dispositioned",
-				Details: map[string]any{"concern_ids": ids, "next_step": blockingConcernHoldNextStep},
-			})
+			block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(blockingConcernHoldRefusal(ids)))
 		}
 	}
 

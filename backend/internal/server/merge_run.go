@@ -202,8 +202,11 @@ type mergeRunResponse struct {
 //     next_step and nothing new recorded. The lock order is the merge-intent
 //     lock first, then the concern store's child-source row locks. A
 //     reconcile or ledger-read failure is 500 internal_error with nothing
-//     recorded (fail-closed). A PR that already merged answers already_merged
-//     instead (the ownership check's escape). A first_officer concern still
+//     recorded (fail-closed); a decomposed parent with a succeeded child and
+//     no readable implement stage is such a failure by design. A PR that
+//     already merged answers 200 already_merged instead, on either answer,
+//     from the hold's own observe (no verdict appended, nothing dispatched).
+//     A first_officer concern still
 //     refuses first as first_officer_finding_open before the lock; this leg
 //     is the in-lock backstop for it and the only hold on a reviewer HIGH.
 //     The hold never retracts a merge an earlier call already dispatched;
@@ -958,6 +961,20 @@ const forgeApprovalReasonSnapshotUnreadable = "snapshot_unreadable"
 // delegated blocking-concern hold (#5045), worded like firstOfficerHoldNextStep.
 const blockingConcernHoldNextStep = "waive the concern with a reason (POST /v0/concerns/{concern_id}/waive), defer it (POST /v0/concerns/{concern_id}/defer), or route a fix-up naming it, then re-invoke the merge"
 
+// blockingConcernHoldRefusal is the ONE blocking_concern_open refusal value
+// (#5045): the inline merge endpoint renders it as its 409 and the gate view's
+// merge_readiness reuses it as a blocker, so the two carry the same message
+// and details verbatim.
+func blockingConcernHoldRefusal(ids []string) *mergeReadinessRefusal {
+	return &mergeReadinessRefusal{
+		Code: mergeQueueReasonBlockingConcernOpen,
+		Message: "an open blocking concern (high severity or first_officer provenance) is on this run's ledger, so the merge is held; " +
+			"nothing new was recorded by this call and nothing was dispatched by it, and a merge an earlier call already dispatched is not retracted. " +
+			"Disposition each named concern (waive it with a reason, defer it, or route a fix-up naming it), then re-invoke the merge.",
+		Details: map[string]any{"concern_ids": ids, "next_step": blockingConcernHoldNextStep},
+	}
+}
+
 // inlineBlockingConcernHold is the inline merge_run's leg (d) (#5045), run
 // INSIDE the merge-intent lock after the queue-ownership check and BEFORE the
 // forge-approval fold, the overlap-override record and the verdict append. It
@@ -966,13 +983,22 @@ const blockingConcernHoldNextStep = "waive the concern with a reason (POST /v0/c
 // succeeded-child HIGH and a HIGH raised after the pre-lock holds are both
 // seen. An open HIGH or first_officer concern refuses 409
 // blocking_concern_open naming the ids; a reconcile or ledger-read failure
-// fails closed (500 internal_error). Nothing new is recorded by the call on
-// either answer (the reconcile's idempotent concern copy aside), and a merge
-// an earlier call already dispatched is never retracted. A PR that already
-// merged is not refused: the normal path answers already_merged (#3622), the
-// escape the ownership check uses. An unwired concern repository skips the
-// leg with one WARN (no ledger exists to read), the firstOfficerHoldRefusal
-// posture.
+// fails closed (500 internal_error). A decomposed parent with a succeeded
+// child and no readable implement stage is such a failure by design: the
+// reconcile has nowhere to attach a copy, so the merge is not waved through.
+// Nothing new is recorded by the call on either answer (the reconcile's
+// idempotent concern copy aside), and a merge an earlier call already
+// dispatched is never retracted.
+//
+// A PR that already merged is never refused, on either answer: before
+// refusing, the hold runs the observe rung with the live forge read
+// (observeMergeAlreadyLanded, the escape the ownership check uses) and, when
+// it reports the merge landed, answers 200 already_merged ITSELF from that
+// observe result (writeBlockingHoldAlreadyMerged): merge_observation_recorded
+// is true exactly when this call appended the observation row, a failed
+// append names record-merge-observation, and no verdict is appended and
+// nothing is dispatched. An unwired concern repository skips the leg with one
+// WARN (no ledger exists to read), the firstOfficerHoldRefusal posture.
 func (s *Server) inlineBlockingConcernHold(w http.ResponseWriter, r *http.Request, runID uuid.UUID, runRow *run.Run, prURL, subject string) bool {
 	if s.cfg.ConcernRepo == nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: no concern repository is wired; the blocking-concern hold is skipped",
@@ -980,6 +1006,13 @@ func (s *Server) inlineBlockingConcernHold(w http.ResponseWriter, r *http.Reques
 		return false
 	}
 	ids, blockErr := s.openBlockingConcernIDs(r.Context(), runRow)
+	if blockErr == nil && len(ids) == 0 {
+		return false
+	}
+	if landed := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true); landed.Landed {
+		s.writeBlockingHoldAlreadyMerged(w, r, runID, prURL, landed)
+		return true
+	}
 	if blockErr != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: blocking concerns unreadable or unreconciled; refusing (fail closed)",
 			slog.String("run_id", runID.String()), slog.String("error", blockErr.Error()))
@@ -988,20 +1021,28 @@ func (s *Server) inlineBlockingConcernHold(w http.ResponseWriter, r *http.Reques
 			map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
 		return true
 	}
-	if len(ids) == 0 {
-		return false
-	}
-	if landed := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true); landed.Landed {
-		return false
-	}
-	s.writeMergeReadinessRefusal(w, r, runID, prURL, &mergeReadinessRefusal{
-		Code: mergeQueueReasonBlockingConcernOpen,
-		Message: "an open blocking concern (high severity or first_officer provenance) is on this run's ledger, so the merge is held; " +
-			"nothing new was recorded by this call and nothing was dispatched by it, and a merge an earlier call already dispatched is not retracted. " +
-			"Disposition each named concern (waive it with a reason, defer it, or route a fix-up naming it), then re-invoke the merge.",
-		Details: map[string]any{"concern_ids": ids, "next_step": blockingConcernHoldNextStep},
-	})
+	s.writeMergeReadinessRefusal(w, r, runID, prURL, blockingConcernHoldRefusal(ids))
 	return true
+}
+
+// writeBlockingHoldAlreadyMerged answers the blocking-concern hold's
+// already-merged escape with the #3622 200 already_merged, carrying the
+// hold's own observe result so merge_observation_recorded and the
+// record-merge-observation recovery describe what THIS call did. It appends
+// no verdict: verdict_sequence and already_recorded report an existing
+// verdict row when one is readable (best-effort; a read error reports none).
+func (s *Server) writeBlockingHoldAlreadyMerged(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string, obs mergeObserveResult) {
+	var verdictSequence int64
+	alreadyRecorded := false
+	existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
+	switch {
+	case err != nil:
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: prior merge verdict unreadable on the already-merged escape; reporting none",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+	case len(existing) > 0:
+		verdictSequence, alreadyRecorded = earliestMergeVerdictSequence(existing), true
+	}
+	s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
 }
 
 // inlineForgeApproval is the inline merge_run's ADR-112 step, run inside the

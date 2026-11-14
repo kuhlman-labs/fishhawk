@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -54,6 +55,9 @@ type bcLockProbeQueue struct {
 	held   *atomic.Bool
 	events *bcEvents
 	onLock func()
+	// fnTimeout, when set, bounds fn's context like the real store's intent
+	// fn deadline, and a lapse is reported after fn returns, as it does.
+	fnTimeout time.Duration
 }
 
 func newBCLockProbe() bcLockProbeQueue {
@@ -67,7 +71,15 @@ func (q bcLockProbeQueue) WithMergeIntentLock(ctx context.Context, _ uuid.UUID, 
 	}
 	q.held.Store(true)
 	defer q.held.Store(false)
-	return fn(ctx)
+	if q.fnTimeout <= 0 {
+		return fn(ctx)
+	}
+	fctx, cancel := context.WithTimeout(ctx, q.fnTimeout)
+	defer cancel()
+	if err := fn(fctx); err != nil {
+		return err
+	}
+	return fctx.Err()
 }
 
 func (q bcLockProbeQueue) ActiveForRun(context.Context, uuid.UUID) (mergequeue.Status, bool, error) {
@@ -101,6 +113,9 @@ type bcConcernRepo struct {
 	mu         sync.Mutex
 	importHeld []bool
 	failRun    uuid.UUID
+	// blockImport makes ImportRolledUp wait for its context to end (a
+	// contended child-source row lock) and return that context's error.
+	blockImport bool
 }
 
 func (c *bcConcernRepo) ImportRolledUp(ctx context.Context, p concern.ImportRolledUpParams) ([]*concern.Concern, error) {
@@ -108,6 +123,10 @@ func (c *bcConcernRepo) ImportRolledUp(ctx context.Context, p concern.ImportRoll
 	c.mu.Lock()
 	c.importHeld = append(c.importHeld, c.held.Load())
 	c.mu.Unlock()
+	if c.blockImport {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return c.fakeConcernRepo.ImportRolledUp(ctx, p)
 }
 
@@ -765,4 +784,136 @@ func TestMergeRunBlockingConcernPG_CrossLayer(t *testing.T) {
 			t.Errorf("inline dispatches = %d, want 1", m.inlineCalls())
 		}
 	})
+}
+
+// --- fix-up pass: already-merged escape, lock deadline, no implement stage --
+
+// The already-merged escape's LIVE-forge arm on a FIRST post (no chain row):
+// the hold answers 200 already_merged from its own observe, so
+// merge_observation_recorded is true exactly when this call appended the
+// row, a failed append names record-merge-observation, and neither appends a
+// verdict nor dispatches the merger.
+func TestMergeRun_InlineBlockingConcern_AlreadyMergedLiveForge(t *testing.T) {
+	setup := func(t *testing.T) *bcInline {
+		t.Helper()
+		b := newBCInline(t)
+		b.s.cfg.PRStateReader = &fakePRStateReader{pr: mergedPR()}
+		b.repo.mu.Lock()
+		b.repo.runs[b.runID].Repo = observeMergeRepo
+		b.repo.mu.Unlock()
+		b.raise(t, "high", "")
+		return b
+	}
+	t.Run("observation recorded by this call", func(t *testing.T) {
+		b := setup(t)
+		resp := decodeMergeResponse(t, b.post(t))
+		if !resp.AlreadyMerged || resp.MergeQueued || !resp.MergeObservationRecorded {
+			t.Fatalf("response = %+v, want already_merged, not queued, merge_observation_recorded:true", resp)
+		}
+		if !strings.Contains(resp.Message, "This call recorded the merge observation") {
+			t.Errorf("message = %q, want it to say this call recorded the observation", resp.Message)
+		}
+		if n := len(mergeObservationRows(b.au)); n != 1 {
+			t.Errorf("merge_observation_recorded rows = %d, want 1", n)
+		}
+		if n := len(mergeVerdictRows(b.au)); n != 0 || b.merger.called != 0 {
+			t.Errorf("verdict rows = %d, dispatches = %d; want 0 and 0", n, b.merger.called)
+		}
+	})
+	t.Run("observation append fails", func(t *testing.T) {
+		b := setup(t)
+		fa := &failCategoryAudit{auditFake: b.au, failCategory: CategoryMergeObservationRecorded}
+		b.s.cfg.AuditRepo = fa
+		w := b.post(t)
+		resp := decodeMergeResponse(t, w)
+		if !resp.AlreadyMerged || resp.MergeQueued || resp.MergeObservationRecorded {
+			t.Fatalf("response = %+v, want already_merged, not queued, merge_observation_recorded:false", resp)
+		}
+		if !strings.Contains(resp.Message, "record-merge-observation") {
+			t.Errorf("message = %q, want it to name record-merge-observation", resp.Message)
+		}
+		if n := len(mergeVerdictRows(b.au)); n != 0 || b.merger.called != 0 {
+			t.Errorf("verdict rows = %d, dispatches = %d; want 0 and 0 (no dispatch with a blocking concern open)", n, b.merger.called)
+		}
+	})
+}
+
+// A PR that already merged keeps the already_merged answer on the hold's
+// ERROR path too: a failed in-lock ledger read does not turn a resume into a
+// retryable 500.
+func TestMergeRun_InlineBlockingConcern_ErrorPathAlreadyMerged(t *testing.T) {
+	b := newBCInline(t)
+	q := newBCLockProbe()
+	b.s.cfg.MergeQueue = q
+	b.s.cfg.ConcernRepo = &bcConcernRepo{fakeConcernRepo: b.cr, held: q.held, events: q.events, failRun: b.runID}
+	seedReviewEntry(t, b.au, b.runID, 3, CategoryPRMerged, map[string]any{"pr_url": mergePR})
+	resp := bcRequireMerged(t, b.post(t))
+	if !resp.AlreadyMerged || resp.MergeQueued {
+		t.Errorf("response = %+v, want already_merged:true merge_queued:false", resp)
+	}
+	b.requireNothingRecorded(t)
+}
+
+// A contended import that outlives the lock fn's deadline fails closed on
+// both paths: the reconcile returns the context error, the inline merge
+// answers 500 with nothing recorded and the delegated arm is observe-only.
+func TestMergeRun_InlineBlockingConcern_LockDeadlineFailsClosed(t *testing.T) {
+	f, merger := newBCRollup(t)
+	f.seedChildConcern(t, 0, "high", "uncopied child high")
+	q := newBCLockProbe()
+	q.fnTimeout = 50 * time.Millisecond
+	f.s.cfg.MergeQueue = q
+	f.s.cfg.ConcernRepo = &bcConcernRepo{fakeConcernRepo: f.cr, held: q.held, events: q.events, blockImport: true}
+	w := bcRollupPost(t, f)
+	if code, msg, _ := bcErrCode(t, w); w.Code != http.StatusInternalServerError || code != "internal_error" ||
+		!strings.Contains(msg, "nothing new was recorded by this call") {
+		t.Fatalf("answer = %d %q %q, want 500 internal_error: %s", w.Code, code, msg, w.Body.String())
+	}
+	if n := len(f.parentCopies(t)); n != 0 {
+		t.Errorf("parent copies = %d, want 0", n)
+	}
+	if n := bcRollupVerdicts(t, f); n != 0 || merger.called != 0 {
+		t.Errorf("verdict rows = %d, dispatches = %d; want 0 and 0", n, merger.called)
+	}
+}
+
+func TestAutoDriveMerge_BlockingConcern_LockDeadlineObserveOnly(t *testing.T) {
+	d := newBCDelegated(t, true)
+	q := newBCLockProbe()
+	q.fnTimeout = 50 * time.Millisecond
+	d.s.cfg.MergeQueue = q
+	d.s.cfg.ConcernRepo = &bcConcernRepo{fakeConcernRepo: d.cr, held: q.held, events: q.events, blockImport: true}
+	bcRequireObserveOnly(t, d.drive(t), "blocking concerns could not be read or reconciled (fail-closed)")
+	if d.merger.called != 0 {
+		t.Errorf("merger called %d times, want 0", d.merger.called)
+	}
+}
+
+// A decomposed parent with a SUCCEEDED child and no implement stage fails
+// closed (500) even when no child holds a concern: the reconcile reads the
+// parent stages before it looks for sources, and a parent that reached merge
+// always has the stage the fan-in attached copies to. With the stage, the
+// same fixture merges.
+func TestMergeRun_InlineBlockingConcern_NoImplementStageFailsClosed(t *testing.T) {
+	for name, withStage := range map[string]bool{"no implement stage": false, "implement stage control": true} {
+		t.Run(name, func(t *testing.T) {
+			b := newBCInline(t)
+			childID, idx := uuid.New(), 0
+			b.repo.mu.Lock()
+			if !withStage {
+				b.repo.stagesByRun[b.runID] = nil
+			}
+			b.repo.runs[childID] = &run.Run{ID: childID, Repo: "x/y", WorkflowID: "feature_change", State: run.StateSucceeded, DecomposedFrom: &b.runID, SliceIndex: &idx}
+			b.repo.mu.Unlock()
+			w := b.post(t)
+			if withStage {
+				bcRequireMerged(t, w)
+				return
+			}
+			if code, _, _ := bcErrCode(t, w); w.Code != http.StatusInternalServerError || code != "internal_error" {
+				t.Fatalf("answer = %d %q, want 500 internal_error: %s", w.Code, code, w.Body.String())
+			}
+			b.requireNothingRecorded(t)
+		})
+	}
 }
