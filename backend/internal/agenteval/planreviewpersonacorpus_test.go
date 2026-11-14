@@ -823,9 +823,9 @@ func TestPersonaCatchCorpus_NotLeakedIntoPersonaPrompt(t *testing.T) {
 // of the four supersedes another. A record not listed keeps its shipped links.
 var adr040AmendmentEdges = map[string]struct{ amends, amendedBy []string }{
 	"ADR-040": {nil, []string{"ADR-097", "ADR-101", "ADR-132"}},
-	"ADR-089": {nil, []string{"ADR-097", "ADR-101"}},
-	"ADR-097": {[]string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
-	"ADR-101": {[]string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}, []string{"ADR-121", "ADR-122"}},
+	"ADR-089": {nil, []string{"ADR-097", "ADR-101", "ADR-148"}},
+	"ADR-097": {[]string{"ADR-040", "ADR-089"}, []string{"ADR-101", "ADR-148"}},
+	"ADR-101": {[]string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}, []string{"ADR-121", "ADR-122", "ADR-148", "ADR-149"}},
 }
 
 // TestPersonaPrompt_AmendmentFramingCrossesTheBoundary is approval
