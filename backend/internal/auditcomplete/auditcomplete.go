@@ -401,6 +401,21 @@ const (
 	VouchedSHAField               = "vouched_sha"
 )
 
+// VouchPriorHeadSHAField and VouchHeadAdvanceVerifiedField are the two payload
+// keys a SERVER-VERIFIED vouch adds to an operator_commit_vouched entry (#4856):
+// the recorded head the vouched commit fast-forwards (prior_head_sha) and the
+// verification stamp (head_advance_verified, written only as true). They are
+// the write→read seam between server.handleVouchCommit (the writer) and the
+// recorded head walk (server.walkRecordedBaseMerges), and the MCP acceptance
+// preview mirror reads them too (#4874). A row without BOTH keys, which is
+// every unverified vouch, the rebase verb's attribution row and every row
+// written before #4856, keeps the {run_id, vouched_sha, reason} key set and is
+// membership-only: it never moves a recorded head.
+const (
+	VouchPriorHeadSHAField        = "prior_head_sha"
+	VouchHeadAdvanceVerifiedField = "head_advance_verified"
+)
+
 // The integration-commit seam constants are the fan-in's write→read seam,
 // exported so the server aliases them (server/lineage.go) and a rename on
 // either reader is a compile-time drift, not a silent one (#3429 — the same
