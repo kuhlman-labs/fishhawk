@@ -86,6 +86,30 @@ a vouched sha that is not the run's live PR head (naming both shas), or a
 live head that could not be resolved. A skipped publish is still a 200 and
 the vouch is still durable; re-invoke naming the live head to re-post.
 
+RECORDED HEAD ADVANCE (#4856). A vouch can also move the run's recorded
+fix-up head, so the next fishhawk_fixup_stage expects the vouched commit
+instead of failing fixup_base_mismatch. The backend checks, before recording,
+that the vouched commit is a FAST-FORWARD of the recorded head and that every
+commit between them is already run lineage (a run-reported push, a recorded
+clean base merge, or an EARLIER verified vouch; an unverified vouch does not
+count). Only then does the row advance the head. recorded_head_advanced says
+whether it did; recorded_head_advance_note says why not:
+  - cannot probe the forge / the recorded head could not be read / the
+    lineage ledger could not be read completely / a compare failed:
+    re-invoke once the forge or audit chain is readable;
+  - the run has no recorded head, or the commit is already the recorded
+    head: nothing to advance;
+  - not a fast-forward of the recorded head: a history rewrite is never
+    admitted; use fishhawk_reset_run_branch or fishhawk_rebase_run_branch;
+  - a commit between the recorded head and the vouched commit is not run
+    lineage (the note names it): vouch that commit first, then re-vouch;
+    for a hand merge of the base use fishhawk_rebase_run_branch instead;
+  - the fix-up and acceptance walks disagree on the recorded head: record a
+    fresh push or reset so they agree, then re-vouch;
+  - too many commits to prove (the 250-commit compare cap).
+A commit vouched before this change never advances the head: re-vouch it.
+A non-advanced vouch is still recorded and still attributes the commit.
+
 Tool errors:
   - invalid UUID (caught before the HTTP hop)
   - sha that is not a full 40/64-hex commit id (caught before the HTTP hop;

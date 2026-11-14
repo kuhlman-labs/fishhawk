@@ -10,6 +10,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // --- E89.6 / #4574: a recorded base merge counts as fix-up lineage ---
@@ -57,6 +59,29 @@ func fixupWalkResetRow(seq int64, prior, resetTo string) *audit.Entry {
 	return &audit.Entry{Category: CategoryBranchReset, Sequence: seq, Payload: payload}
 }
 
+// fixupWalkVouched is a vouched tip V (#4856).
+const fixupWalkVouched = "7a0c4ed000000000000000000000000000000000"
+
+// fixupWalkVouchRow builds an operator_commit_vouched entry BY CONSTRUCTION
+// with arbitrary payload fields.
+func fixupWalkVouchRow(seq int64, fields map[string]any) *audit.Entry {
+	payload, _ := json.Marshal(fields)
+	return &audit.Entry{Category: CategoryOperatorCommitVouched, Sequence: seq, Payload: payload}
+}
+
+// fixupWalkVerifiedVouchRow is the handler's verified shape.
+func fixupWalkVerifiedVouchRow(seq int64, prior, vouched string) *audit.Entry {
+	return fixupWalkVouchRow(seq, map[string]any{
+		"run_id": "r", auditcomplete.VouchedSHAField: vouched, "reason": "x",
+		auditcomplete.VouchPriorHeadSHAField: prior, auditcomplete.VouchHeadAdvanceVerifiedField: true,
+	})
+}
+
+// fixupWalkLegacyVouchRow is today's {run_id, vouched_sha, reason} key set.
+func fixupWalkLegacyVouchRow(seq int64, vouched string) *audit.Entry {
+	return fixupWalkVouchRow(seq, map[string]any{"run_id": "r", "vouched_sha": vouched, "reason": "x"})
+}
+
 // TestWalkRecordedBaseMerges pins every mode of the pure walk: one row per
 // mode, entries built by construction with explicit sequences. The seed is at
 // sequence 10, so every participating row sits above it.
@@ -100,6 +125,33 @@ func TestWalkRecordedBaseMerges(t *testing.T) {
 			[]*audit.Entry{fixupWalkCleanRow(11, fixupWalkSeed, fixupWalkMerge), {Category: CategoryBranchReset, Sequence: 12, Payload: []byte("{not json")}}, fixupWalkSeed},
 		{"nil rows and unrelated categories are ignored",
 			[]*audit.Entry{nil, {Category: "fixup_pushed", Sequence: 11, Payload: []byte(`{"head_sha":"` + fixupWalkRacer + `"}`)}, fixupWalkCleanRow(12, fixupWalkSeed, fixupWalkMerge)}, fixupWalkMerge},
+		// #4856: the verified-vouch arm.
+		{"(1) a verified vouch whose prior is the seed advances to the vouched sha",
+			[]*audit.Entry{fixupWalkVerifiedVouchRow(11, fixupWalkSeed, fixupWalkVouched)}, fixupWalkVouched},
+		{"(2) a verified vouch whose prior is not the walked head is skipped",
+			[]*audit.Entry{fixupWalkVerifiedVouchRow(11, fixupWalkRacer, fixupWalkVouched)}, fixupWalkSeed},
+		{"(3) a vouch with the seed as prior and head_advance_verified absent is skipped",
+			[]*audit.Entry{fixupWalkVouchRow(11, map[string]any{"vouched_sha": fixupWalkVouched, "prior_head_sha": fixupWalkSeed})}, fixupWalkSeed},
+		{"(4) a vouch with the seed as prior and head_advance_verified false is skipped",
+			[]*audit.Entry{fixupWalkVouchRow(11, map[string]any{"vouched_sha": fixupWalkVouched, "prior_head_sha": fixupWalkSeed, "head_advance_verified": false})}, fixupWalkSeed},
+		{"(5) a legacy vouch with neither advance key is skipped",
+			[]*audit.Entry{fixupWalkLegacyVouchRow(11, fixupWalkVouched)}, fixupWalkSeed},
+		{"(6) the rebase verb's attribution row is skipped",
+			[]*audit.Entry{fixupWalkVouchRow(11, map[string]any{"run_id": "r", "vouched_sha": fixupWalkSeed, "reason": "fishhawk_rebase_run_branch advanced run/branch onto main"})}, fixupWalkSeed},
+		{"(7) an undecodable vouch payload is skipped and the walk continues",
+			[]*audit.Entry{{Category: CategoryOperatorCommitVouched, Sequence: 11, Payload: []byte("{not json")}, fixupWalkCleanRow(12, fixupWalkSeed, fixupWalkMerge)}, fixupWalkMerge},
+		{"(8) a verified vouch with an empty vouched_sha is skipped",
+			[]*audit.Entry{fixupWalkVerifiedVouchRow(11, fixupWalkSeed, "")}, fixupWalkSeed},
+		{"(9) a verified vouch then a reset to the vouched sha stays at the vouched sha",
+			[]*audit.Entry{fixupWalkVerifiedVouchRow(11, fixupWalkSeed, fixupWalkVouched), fixupWalkResetRow(12, fixupWalkRacer, fixupWalkVouched)}, fixupWalkVouched},
+		{"(10) a verified vouch then a clean rebase of the vouched sha advances to the merge (run 5fcb6201)",
+			[]*audit.Entry{fixupWalkVerifiedVouchRow(11, fixupWalkSeed, fixupWalkVouched), fixupWalkCleanRow(12, fixupWalkVouched, fixupWalkMerge)}, fixupWalkMerge},
+		{"(11) a verified vouch at or below the seed's sequence is ignored",
+			[]*audit.Entry{fixupWalkVerifiedVouchRow(seedSeq, fixupWalkSeed, fixupWalkVouched)}, fixupWalkSeed},
+		{"(C7) legacy vouch, then a rebase of it, then a re-vouch ends at the vouched tip, not the merge",
+			[]*audit.Entry{fixupWalkLegacyVouchRow(11, fixupWalkVouched), fixupWalkCleanRow(12, fixupWalkVouched, fixupWalkMerge), fixupWalkVerifiedVouchRow(13, fixupWalkSeed, fixupWalkVouched)}, fixupWalkVouched},
+		{"(C7 exit) a fresh clean rebase from the re-vouched tip walks through to its merge",
+			[]*audit.Entry{fixupWalkLegacyVouchRow(11, fixupWalkVouched), fixupWalkCleanRow(12, fixupWalkVouched, fixupWalkMerge), fixupWalkVerifiedVouchRow(13, fixupWalkSeed, fixupWalkVouched), fixupWalkCleanRow(14, fixupWalkVouched, fixupWalkMerge2)}, fixupWalkMerge2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -273,5 +325,169 @@ func TestResolveFixupExpectedHeadSHA_SeedKeepsTimestampOrdering(t *testing.T) {
 	}
 	if got, err := s.acceptanceHeadAsOf(ctx, runID, 0, false); err != nil || got != ahS {
 		t.Errorf("acceptanceHeadAsOf = (%q, %v), want (%q, nil) (chain sequence)", got, err, ahS)
+	}
+}
+
+// TestVouchAdvanceRow_DecodesSeamKeys pins that vouchAdvanceRow's json tags are
+// the auditcomplete seam constants the writer uses (approval condition C6).
+func TestVouchAdvanceRow_DecodesSeamKeys(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		auditcomplete.VouchedSHAField:               fixupWalkVouched,
+		auditcomplete.VouchPriorHeadSHAField:        fixupWalkSeed,
+		auditcomplete.VouchHeadAdvanceVerifiedField: true,
+	})
+	var p vouchAdvanceRow
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.VouchedSHA != fixupWalkVouched || p.PriorHeadSHA != fixupWalkSeed || p.HeadAdvanceVerified == nil || !*p.HeadAdvanceVerified {
+		t.Errorf("decoded %+v: the struct tags drifted from the auditcomplete seam constants", p)
+	}
+	if !isVerifiedVouchAdvance(p) {
+		t.Error("isVerifiedVouchAdvance(writer shape) = false, want true")
+	}
+}
+
+// TestResolveFixupExpectedHeadSHA_AdvancesThroughVerifiedVouch drives the REAL
+// vouch handler (writer to reader field seam) over a recorded
+// acceptance_scenarios_pushed head H (the run 3a390a2e shape): after a verified
+// vouch of V the fix-up expectation is V, and resolveLastRunAuthoredHead with
+// tip V answers V too, so reset and the fix-up base check agree.
+func TestResolveFixupExpectedHeadSHA_AdvancesThroughVerifiedVouch(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("acceptance_scenarios_pushed", vouchProbeHead)
+	f.forge.set(vouchProbeTip, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeTip)
+	f.forge.set("main", vouchProbeTip, vouchProbeHead, vouchProbeTip)
+	if resp := f.vouch(t, vouchProbeTip); !resp.RecordedHeadAdvanced {
+		t.Fatalf("vouch did not advance: %q", resp.RecordedHeadAdvanceNote)
+	}
+	ctx := context.Background()
+	got := f.s.resolveFixupExpectedHeadSHA(ctx, f.runRow.ID, f.stageID)
+	if got != vouchProbeTip {
+		t.Fatalf("resolveFixupExpectedHeadSHA = %q, want the vouched tip %q", got, vouchProbeTip)
+	}
+	repo, _ := parseRepoOwnerName(f.runRow.Repo)
+	last, _, _, ok := f.s.resolveLastRunAuthoredHead(ctx, f.runRow, forge.FromGitHubInstallationID(99), repo, vouchProbeTip, 7)
+	if !ok || last != got {
+		t.Errorf("resolveLastRunAuthoredHead = (%q, ok=%v), want %q == the fix-up head", last, ok, got)
+	}
+}
+
+// TestResolveFixupExpectedHeadSHA_UnverifiedVouchKeepsRecordedHead: a legacy
+// vouch row is membership-only.
+func TestResolveFixupExpectedHeadSHA_UnverifiedVouchKeepsRecordedHead(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("acceptance_scenarios_pushed", vouchProbeHead)
+	f.appendRow(CategoryOperatorCommitVouched, map[string]any{"run_id": f.runRow.ID.String(), "vouched_sha": vouchProbeTip, "reason": "x"})
+	if got := f.s.resolveFixupExpectedHeadSHA(context.Background(), f.runRow.ID, f.stageID); got != vouchProbeHead {
+		t.Errorf("resolveFixupExpectedHeadSHA = %q, want the recorded head %q", got, vouchProbeHead)
+	}
+}
+
+// TestResolveFixupExpectedHeadSHA_VouchReadErrorKeepsRecordedHead: a read error
+// on the vouch category answers the seed, never "".
+func TestResolveFixupExpectedHeadSHA_VouchReadErrorKeepsRecordedHead(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.seedVerifiedVouch(vouchProbeHead, vouchProbeTip)
+	f.au.listByCategoryErrCategory = CategoryOperatorCommitVouched
+	if got := f.s.resolveFixupExpectedHeadSHA(context.Background(), f.runRow.ID, f.stageID); got != vouchProbeHead {
+		t.Errorf("resolveFixupExpectedHeadSHA = %q, want the seed %q", got, vouchProbeHead)
+	}
+}
+
+// TestRecordedFixupHead_AgreesWithFixupResolver: the strict resolver and the
+// dispatch-time resolver share one seed rule and one walk.
+func TestRecordedFixupHead_AgreesWithFixupResolver(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(f *vouchProbeFixture)
+		want string
+	}{
+		{"no seed", func(*vouchProbeFixture) {}, ""},
+		{"seed only", func(f *vouchProbeFixture) { f.seedHead("fixup_pushed", vouchProbeHead) }, vouchProbeHead},
+		{"newest reported head wins", func(f *vouchProbeFixture) {
+			f.seedHead("pull_request_opened", vouchProbeOlder)
+			f.seedHead("fixup_pushed", vouchProbeHead)
+		}, vouchProbeHead},
+		{"verified vouch advances", func(f *vouchProbeFixture) {
+			f.seedHead("fixup_pushed", vouchProbeHead)
+			f.seedVerifiedVouch(vouchProbeHead, vouchProbeTip)
+		}, vouchProbeTip},
+		{"verified vouch then clean rebase", func(f *vouchProbeFixture) {
+			f.seedHead("fixup_pushed", vouchProbeHead)
+			f.seedVerifiedVouch(vouchProbeHead, vouchProbeTip)
+			f.appendRow(CategoryBranchRebased, map[string]any{"prior_head_sha": vouchProbeTip, "new_head_sha": fixupWalkMerge, "merge_commit_sha": fixupWalkMerge, "already_up_to_date": false, "clean_verified": true})
+		}, fixupWalkMerge},
+		{"legacy vouch stays", func(f *vouchProbeFixture) {
+			f.seedHead("fixup_pushed", vouchProbeHead)
+			f.appendRow(CategoryOperatorCommitVouched, map[string]any{"vouched_sha": vouchProbeTip})
+		}, vouchProbeHead},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newVouchProbeFixture(t, vouchProbeOpts{})
+			tt.seed(f)
+			ctx := context.Background()
+			strict, err := f.s.recordedFixupHead(ctx, f.runRow.ID)
+			if err != nil {
+				t.Fatalf("recordedFixupHead: %v", err)
+			}
+			lenient := f.s.resolveFixupExpectedHeadSHA(ctx, f.runRow.ID, f.stageID)
+			if strict != lenient || strict != tt.want {
+				t.Errorf("recordedFixupHead = %q, resolveFixupExpectedHeadSHA = %q, want both %q", strict, lenient, tt.want)
+			}
+		})
+	}
+}
+
+// TestRecordedFixupHead_ReadErrorReturned: every category read error is
+// RETURNED, never degraded to the seed.
+func TestRecordedFixupHead_ReadErrorReturned(t *testing.T) {
+	cats := append(append([]string{}, lineageLedgerCategories...), fixupHeadWalkCategories...)
+	for _, cat := range cats {
+		t.Run(cat, func(t *testing.T) {
+			f := newVouchProbeFixture(t, vouchProbeOpts{})
+			f.seedHead("fixup_pushed", vouchProbeHead)
+			f.au.listByCategoryErrCategory = cat
+			got, err := f.s.recordedFixupHead(context.Background(), f.runRow.ID)
+			if err == nil {
+				t.Fatalf("recordedFixupHead = (%q, nil), want the %s read error", got, cat)
+			}
+			if got != "" {
+				t.Errorf("recordedFixupHead head = %q on error, want \"\"", got)
+			}
+		})
+	}
+}
+
+// TestNewestReportedHeadEntry_SkipsUnusableRows: a nil entry, an undecodable
+// payload and an empty head_sha never become the seed, even when newer.
+func TestNewestReportedHeadEntry_SkipsUnusableRows(t *testing.T) {
+	base := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	good := &audit.Entry{Timestamp: base, Sequence: 1, Payload: json.RawMessage(`{"head_sha":"` + fixupWalkSeed + `"}`)}
+	entries := []*audit.Entry{
+		good,
+		nil,
+		{Timestamp: base.Add(time.Minute), Sequence: 2, Payload: json.RawMessage(`not json`)},
+		{Timestamp: base.Add(2 * time.Minute), Sequence: 3, Payload: json.RawMessage(`{"head_sha":""}`)},
+	}
+	gotEntry, gotSHA := newestReportedHeadEntry(entries)
+	if gotEntry != good || gotSHA != fixupWalkSeed {
+		t.Errorf("newestReportedHeadEntry = (%v, %q), want the only usable row (%q)", gotEntry, gotSHA, fixupWalkSeed)
+	}
+	if e, sha := newestReportedHeadEntry(entries[1:]); e != nil || sha != "" {
+		t.Errorf("newestReportedHeadEntry(no usable row) = (%v, %q), want (nil, \"\")", e, sha)
+	}
+}
+
+// TestRecordedFixupHead_NoAuditRepo: an unconfigured audit repository answers
+// no recorded head and no error.
+func TestRecordedFixupHead_NoAuditRepo(t *testing.T) {
+	s := &Server{}
+	got, err := s.recordedFixupHead(context.Background(), uuid.New())
+	if got != "" || err != nil {
+		t.Errorf("recordedFixupHead = (%q, %v), want (\"\", nil)", got, err)
 	}
 }
