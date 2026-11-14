@@ -83,8 +83,9 @@ type bulkWaiveResponse struct {
 //     (E94.7 / #4840), empty list, over-cap, non-UUID id, duplicate id
 //     (compared on the PARSED uuid, so two spellings of one id collide),
 //     unwired store, unknown id, an id belonging to ANOTHER run, a server_check concern named by an agent token or a delegated
-//     request (403 concern_requires_human, E80.3 / #3760), or an id not in an
-//     OPEN state.
+//     request (403 concern_requires_human, E80.3 / #3760) or by any other
+//     request not on a `session` credential (403 concern_requires_session,
+//     ADR-143 D1), or an id not in an OPEN state.
 //   - the APPLY loop is PER-ITEM. The batch is deliberately NOT a database
 //     transaction: each concern carries its own audit row, and wrapping N chained
 //     audit appends plus N transitions in one transaction would either serialize
@@ -235,10 +236,12 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 				})
 			return
 		}
-		// Human-only clearing (E80.3 / #3760): ANY server_check row in the
-		// batch refuses the WHOLE batch (all-or-nothing, like every other
-		// pre-validation rule here) before delegation is evaluated or any
-		// intent entry is appended.
+		// Human-only clearing (E80.3 / #3760, ADR-143 D1 / #5228): ANY
+		// server_check row in the batch refuses the WHOLE batch (all-or-nothing,
+		// like every other pre-validation rule here) — concern_requires_human
+		// for an agent token or a delegated request, concern_requires_session
+		// for any other request not on a `session` credential — before
+		// delegation is evaluated or any intent entry is appended.
 		if s.refuseNonHumanServerCheckClear(w, r, row, id.Subject, reqBody.Delegated, clearVerbBulkWaive) {
 			return
 		}

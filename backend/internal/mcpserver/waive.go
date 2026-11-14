@@ -98,6 +98,12 @@ Returns a tool error on:
     backend only.
   - concern_not_found (404)
   - cross_run_waive (a run-bound token reaching another run's concern, 403)
+  - concern_requires_human (403: a server-check concern, provenance
+    server_check, named by an agent token or a delegated request)
+  - concern_requires_session (403: a server-check concern can be cleared
+    only from the Fishhawk Web UI session; every MCP and CLI credential is
+    refused, whatever its subject — ADR-143 D1. Waive or defer it from the
+    Web UI attention queue)
   - concern_waive_conflict (the concern is not open — already waived,
     superseded, or addressed; 422)
   - concern_store_unconfigured (503)
@@ -213,6 +219,12 @@ Returns a tool error on:
   - concern_waive_conflict (422: an id is not open — the WHOLE batch is
     refused and nothing is waived)
   - cross_run_waive (403: a run-bound token reaching another run)
+  - concern_requires_human (403: a server-check concern in the batch named
+    by an agent token or a delegated request — the WHOLE batch is refused)
+  - concern_requires_session (403: a server-check concern in the batch —
+    it can be cleared only from the Fishhawk Web UI session; every MCP and
+    CLI credential is refused, whatever its subject — ADR-143 D1. The WHOLE
+    batch is refused and nothing is waived)
   - concern_store_unconfigured (503)
 `),
 	}, resolver.waiveConcerns)
