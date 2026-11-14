@@ -1,0 +1,14 @@
+id: scenario:issue-4874/unverified-vouch-keeps-recorded-head
+statement: 'A vouch row without server verification (the legacy {run_id, vouched_sha, reason} payload) does not move the acceptance head: the prompt still names the recorded head.'
+verify_hint: Same fixture; GET /v0/stages/{unverified-vouch-run acceptance}/prompt → acceptance_expected_head_sha equals the seeded pull_request_opened sha, not the vouched sha.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-vouched-head"} and read the run_id plus the *-acceptance stage id of run key unverified-vouch-run from the 201 body. 2) GET audit: pull_request_opened 6666…, operator_commit_vouched with only {reason,run_id,vouched_sha 7777…} (no prior_head_sha or head_advance_verified), acceptance_dispatched. 3) POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over ''prompt:<acceptance stage id>''; GET /v0/stages/{acceptance stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: the seeded pull_request_opened sha
+    observed_at_record: acceptance_expected_head_sha=6666666666666666666666666666666666666666 (the recorded pull_request_opened head), not 7777…
+    repro_handle: GET /v0/stages/31bef872-1936-4448-bb11-658a145221af/prompt (signed)
+origin:
+    issue: 4874
+    pr: 5293
+    run_id: 1c1b9276-fd70-419b-ac15-28e3c4158ef4
+    head_sha: f14b941b89ebb3dcc37b1394b55e094230a7513a
+    recorded_at: 2026-11-14T22:14:27Z
