@@ -9873,72 +9873,21 @@ func isRuleLine(s string) bool {
 // Renders nothing when no comments survive the bot filter (the
 // body-only fallback is unchanged).
 func writeIssueComments(b *strings.Builder, comments []IssueComment, issueURL string) {
-	surviving := make([]IssueComment, 0, len(comments))
-	for _, c := range comments {
-		if strings.HasSuffix(c.Author, "[bot]") {
-			continue
-		}
-		surviving = append(surviving, c)
-	}
-	if len(surviving) == 0 {
+	rendered, elided := renderIssueComments(comments, issueURL)
+	if len(rendered) == 0 {
 		return
 	}
 
-	// Per-comment cap so a single long comment can't dominate the
-	// budget. The cut is on the RAW body BEFORE sanitization (the
-	// sanitizer's "| " prefixes inflate byte count, so capping after
-	// would make the total budget depend on line count); keep this
-	// ordering — TestBuild_Plan_TotalBudgetDropsOldest pins it.
-	//
-	// Keep in sync: these numbers are the exported MaxIssueCommentBytes /
-	// MaxTotalIssueCommentBytes, documented in
-	// docs/spec/work-management-v0.md ("Comment-vs-body refinement channel").
-	rendered := make([]string, len(surviving))
-	elided := make([]bool, len(surviving))
-	for i, c := range surviving {
-		author := c.Author
-		if author == "" {
-			author = "unknown"
-		}
-		body := c.Body
-		if len(body) > MaxIssueCommentBytes {
-			// Cut the RAW body to the cap, rune-safe, then report len() of
-			// the POST-normalization prefix so shown + dropped == original
-			// holds even when ToValidUTF8 dropped a trailing partial rune
-			// (#2946). Sanitize ONLY the kept prefix, then append the marker
-			// OUTSIDE the `| ` quoting so it is unforgeable.
-			kept := strings.ToValidUTF8(body[:MaxIssueCommentBytes], "")
-			marker := elisionMarker(len(kept), len(body), MaxIssueCommentBytes,
-				"This comment is INCOMPLETE — the withheld remainder may carry the most decision-relevant material, so do NOT read the visible fragment as the whole comment.",
-				issueCommentRetrievalPointer(issueURL))
-			rendered[i] = fmt.Sprintf("**@%s** (%s):\n%s%s",
-				author, c.CreatedAt, sanitizeUntrustedComment(kept), marker)
-			elided[i] = true
-			continue
-		}
-		rendered[i] = fmt.Sprintf("**@%s** (%s):\n%s", author, c.CreatedAt, sanitizeUntrustedComment(body))
-	}
-
-	// Total budget: walk newest->oldest accumulating bytes; once over
-	// budget, drop everything older (recency is load-bearing). The
-	// newest comment always survives — the per-comment cap is below the
-	// total budget.
-	//
-	// Keep in sync: see the docs/spec/work-management-v0.md note above.
-	start := 0
-	total := 0
-	for i := len(rendered) - 1; i >= 0; i-- {
-		total += len(rendered[i])
-		if total > MaxTotalIssueCommentBytes {
-			start = i + 1
-			break
-		}
-	}
+	// Total budget: drop everything older than the newest comments that fit
+	// (issueCommentBudgetStart). OmittedIssueCommentCount reuses the same two
+	// helpers, so the count fishhawk_start_run warns with is the N printed in
+	// the omission marker below (#5214).
+	start := issueCommentBudgetStart(rendered)
 
 	// Count how many of the comments actually RENDERED (i.e. surviving the
 	// budget trim) were elided, for the renderer-emitted preamble notice.
 	elidedShown := 0
-	for i := start; i < len(surviving); i++ {
+	for i := start; i < len(rendered); i++ {
 		if elided[i] {
 			elidedShown++
 		}
@@ -9962,6 +9911,94 @@ func writeIssueComments(b *strings.Builder, comments []IssueComment, issueURL st
 		b.WriteString("\n\n")
 	}
 	b.WriteString("<<<END UNTRUSTED ISSUE COMMENTS>>>\n")
+}
+
+// renderIssueComments is writeIssueComments' per-comment render pass, factored
+// out (#5214) so OmittedIssueCommentCount counts exactly the bytes the renderer
+// emits. It drops `[bot]`-authored comments and returns one rendered entry per
+// survivor, oldest first, with elided[i] true when entry i was cut at
+// MaxIssueCommentBytes. An empty result means nothing survived the bot filter.
+//
+// Per-comment cap so a single long comment can't dominate the budget. The cut
+// is on the RAW body BEFORE sanitization (the sanitizer's "| " prefixes inflate
+// byte count, so capping after would make the total budget depend on line
+// count); keep this ordering — TestBuild_Plan_TotalBudgetDropsOldest pins it.
+//
+// Keep in sync: these numbers are the exported MaxIssueCommentBytes /
+// MaxTotalIssueCommentBytes, documented in
+// docs/spec/work-management-v0.md ("Comment-vs-body refinement channel").
+func renderIssueComments(comments []IssueComment, issueURL string) (rendered []string, elided []bool) {
+	surviving := make([]IssueComment, 0, len(comments))
+	for _, c := range comments {
+		if strings.HasSuffix(c.Author, "[bot]") {
+			continue
+		}
+		surviving = append(surviving, c)
+	}
+	if len(surviving) == 0 {
+		return nil, nil
+	}
+
+	rendered = make([]string, len(surviving))
+	elided = make([]bool, len(surviving))
+	for i, c := range surviving {
+		author := c.Author
+		if author == "" {
+			author = "unknown"
+		}
+		body := c.Body
+		if len(body) > MaxIssueCommentBytes {
+			// Cut the RAW body to the cap, rune-safe, then report len() of
+			// the POST-normalization prefix so shown + dropped == original
+			// holds even when ToValidUTF8 dropped a trailing partial rune
+			// (#2946). Sanitize ONLY the kept prefix, then append the marker
+			// OUTSIDE the `| ` quoting so it is unforgeable.
+			kept := strings.ToValidUTF8(body[:MaxIssueCommentBytes], "")
+			marker := elisionMarker(len(kept), len(body), MaxIssueCommentBytes,
+				"This comment is INCOMPLETE — the withheld remainder may carry the most decision-relevant material, so do NOT read the visible fragment as the whole comment.",
+				issueCommentRetrievalPointer(issueURL))
+			rendered[i] = fmt.Sprintf("**@%s** (%s):\n%s%s",
+				author, c.CreatedAt, sanitizeUntrustedComment(kept), marker)
+			elided[i] = true
+			continue
+		}
+		rendered[i] = fmt.Sprintf("**@%s** (%s):\n%s", author, c.CreatedAt, sanitizeUntrustedComment(body))
+	}
+	return rendered, elided
+}
+
+// issueCommentBudgetStart is writeIssueComments' total-budget walk, factored
+// out (#5214): it walks newest->oldest accumulating rendered bytes and returns
+// the index of the oldest entry kept — equivalently, how many of the OLDEST
+// entries are dropped. Once over MaxTotalIssueCommentBytes everything older is
+// dropped (recency is load-bearing). The newest comment always survives — the
+// per-comment cap is below the total budget.
+//
+// Keep in sync: see the docs/spec/work-management-v0.md note on
+// renderIssueComments.
+func issueCommentBudgetStart(rendered []string) int {
+	total := 0
+	for i := len(rendered) - 1; i >= 0; i-- {
+		total += len(rendered[i])
+		if total > MaxTotalIssueCommentBytes {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// OmittedIssueCommentCount returns how many of the OLDEST issue comments the
+// plan prompt drops to fit MaxTotalIssueCommentBytes — exactly the N
+// writeIssueComments prints in its "[N older comment(s) omitted to fit budget]"
+// marker, and 0 when nothing is dropped (#5214). It runs the renderer's own
+// helpers (bot filter, per-comment cap with its issueURL-dependent elision
+// marker, sanitization, then the newest-first budget walk), so the count cannot
+// drift from the render. issueURL must be the URL the renderer will be given;
+// it changes the marker bytes of an over-cap comment. fishhawk_start_run uses it
+// to warn the operator at run creation, while a steer is still cheap to move.
+func OmittedIssueCommentCount(comments []IssueComment, issueURL string) int {
+	rendered, _ := renderIssueComments(comments, issueURL)
+	return issueCommentBudgetStart(rendered)
 }
 
 // crewMessageAttributionPrefix is the FIXED, writer-controlled opening of every

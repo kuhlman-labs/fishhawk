@@ -293,7 +293,7 @@ type Run struct {
 	// (#1346/#1348). The host-dispatch guard (guardHostDispatch) reads it to
 	// reject a local host dispatch against a github_actions-locked run.
 	RunnerKindResolved bool          `json:"runner_kind_resolved,omitempty"`
-	IssueContext       *IssueContext `json:"issue_context,omitempty"`
+	IssueContext       *IssueContext `json:"issue_context,omitempty" jsonschema:"the issue title, body and comments captured at run creation. Every stage prompt reads this snapshot, never the live issue, so a comment posted later is absent. Read issue_context.comments to confirm a steer was captured; if it is missing, cancel and restart the run before the plan is dispatched, or once a plan exists steer with fishhawk_reject_plan or fishhawk_revise_plan"`
 	// Concerns is the run's OPEN review-concern summary (#964), mirrored
 	// from GET /v0/runs/{run_id}: count, per-state breakdown, and the
 	// stable concern IDs fishhawk_fixup_stage's concern_ids addressing
