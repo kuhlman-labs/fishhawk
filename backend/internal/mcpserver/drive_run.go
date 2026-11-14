@@ -385,6 +385,11 @@ timed out) hands the manual verify-first re-dispatch to the operator.
 A fresh manual fishhawk_dispatch_stage marks a new spawn so a re-invoked drive
 reads it as live and polls to convergence rather than re-reporting stale.
 
+A refused or errored tool call mid-drive (this verb's own error, or a 409 from a
+verb you call between drives) is a STATE signal, not a stop condition: re-read
+fishhawk_get_run_status and act on its next_actions before ending the turn
+(#5214).
+
 Requires the fishhawk-runner binary to resolve on the MCP server's host, like
 fishhawk_run_stage / fishhawk_dispatch_stage (local-only by design, ADR-024).
 Reach for fishhawk_dispatch_stage instead to drive a single stage by hand.

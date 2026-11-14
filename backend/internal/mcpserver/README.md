@@ -844,6 +844,13 @@ Pinned by `TestStageRunnerAgent`, `TestRunStage_RoutesStageExecutorAgent`, `Test
 
 `fishhawk_start_run` already carries a best-effort `warnings` channel on its tool result (the `gh CLI not on PATH` / issue-fetch-failed advisories). It is extended (`overCapCommentWarnings`) to scan the **RESOLVED** `issue_context` — whether fetched via `gh` or supplied inline by the caller, so the scan runs on what the run will actually carry, not on the fetch — and warn when any comment body exceeds `prompt.MaxIssueCommentBytes` (**2000 bytes**). The warning states the true total count, then names the first `maxOverCapDetailLines` (**5**) over-cap comments individually (author, `created_at`, byte count, overflow) and summarises the remainder as a count — bounded so a pathological thread of many over-cap comments cannot dominate the tool result. Contract is "name the first five, summarise the rest", not "name each": an operator staring at a truncated result learns nothing from the 200th line, and the summary count still gives the true total. Each named comment carries the two remedies: **split the comment** into several, or **move the durable content into the issue BODY**, which is not per-comment capped. Nothing is added when no comment is over cap, and the new entries are ADDITIVE — the pre-existing `gh`-absent warning still surfaces on the same result. This is the MCP-path visibility surface for the per-comment truncation the renderer marks with an elision marker (`backend/internal/prompt` `writeIssueComments`); run paths with no tool result (webhook, campaign) instead get a greppable `fillIssueContext` server-side WARN. No new tool is added — the tool count and registration are unchanged.
 
+### `fishhawk_start_run` checkout-hygiene and total comment-budget warnings ([#5214](https://github.com/kuhlman-labs/fishhawk/issues/5214))
+
+The same `warnings` channel carries two more best-effort advisories. Neither blocks the create.
+
+- **Total comment budget.** `issueCommentBudgetWarnings` (`tools.go`) converts the RESOLVED `issue_context` comments to `prompt.IssueComment` and calls `prompt.OmittedIssueCommentCount(comments, ic.URL)`, the renderer's own exported helper, so the count is the N the plan prompt's `[N older comment(s) omitted to fit budget]` marker prints. When N > 0 it warns that the comments exceed `prompt.MaxTotalIssueCommentBytes` (**12000 bytes**), that the plan prompt drops the N OLDEST and keeps the newest, and that the issue BODY is never budget-dropped. The count is computed from the issue context's own url, which changes only an over-cap comment's marker bytes. This complements the per-comment warning above, which cannot see that the comments together are over budget.
+- **Checkout hygiene.** After the HTTP admission and confinement checks, `startRun` probes the bound `working_dir` through the `startRunCheckoutProbe` seam (`probeCheckout`, `checkout_hygiene.go`) and appends `checkoutHygieneWarnings`. The probe is offline: no fetch, no auth, a 5 s timeout, and every git call goes through the hardened `checkoutGit` seam (`--no-optional-locks`, `core.fsmonitor`, `core.hooksPath` and `core.sshCommand` neutralised, a PATH-and-HOME-only environment that ignores the system and global git config). A directory outside a git work tree reports nothing, and each failed git call degrades that one check to no finding. It reports W1, a dirty tree, naming up to 5 paths; W2, uncommitted `.fishhawk/` paths, only when the spec was auto-discovered from the checkout, because only then did the run pin those working-tree bytes; and W3, a HEAD that is detached, on another branch, or ahead of or behind the remote default branch as last fetched (`refs/remotes/origin/HEAD`). An unresolvable base skips only W3. Each interpolated repository string is stripped of control characters, cut to 80 bytes and quoted as data. `checkoutSurface` selects the W2/W3 wording by where the pinned spec came from.
+
 ### `working_dir` is bound once at start_campaign and inherited by every item run ([E48.87 / #2527](https://github.com/kuhlman-labs/fishhawk/issues/2527))
 
 The run-level binding above removes the per-VERB repetition; this removes the per-ITEM repetition. `fishhawk_start_campaign` takes `working_dir` and binds it onto the CAMPAIGN row (`campaigns.working_dir`, migration `0071`, echoed as `working_dir` on the Campaign), and every item run minted by `fishhawk_start_campaign_item_run` inherits it. The per-item `working_dir` becomes an OVERRIDE, needed only when the campaign carries no binding.
@@ -3392,6 +3399,23 @@ per-tool contract). Internals not covered there:
   `TestPreviewCampaign_E2E_ThroughRealServer` drives the tool through the REAL `server.Handler()` over a
   write-refusing `campaign.BaseFake`, so the `CampaignPreview` wire struct is proven against the JSON the server
   EMITS rather than a hand-built approximation, and a handler that tried to persist would 500 rather than pass.
+  **`human_led` (#5214).** `PreviewCampaignOutput.HumanLed` (beside `preview`, not inside it, so the backend wire
+  struct is unchanged) is composed MCP-side by `previewHumanLed`: the refs of `preview.items` whose `autonomy` is
+  exactly `low`, the predicate `campaign.NextEligible` uses to divert a deps-satisfied item to HumanLed. Those items
+  are never agent-started while they stay low (`fishhawk_start_campaign_item_run` refuses `item_human_led`). Absent
+  when none is low. Pinned by `TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy`.
+- **Run-start and campaign-start guidance in the descriptions (#5214).** The operator rules from the #4745 inventory
+  live on the surface where the operator acts, each pinned on the wire-visible ListTools text:
+  `fishhawk_start_campaign` says preview first and read `edges[].source` / `warnings[]`, that prose-only sequencing
+  yields no edge (the item lands in wave 0), and to start from a clean, current checkout of the base branch
+  (`TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse`); `fishhawk_preview_campaign` names `human_led`
+  (`TestPreviewCampaign_Description_NamesHumanLed`); `fishhawk_get_campaign_status`'s `scope_overlap` says to
+  sequence a new item behind the LAST still-open overlapping item and plan it once that item's PR has opened
+  (`TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule`); `fishhawk_dispatch_stage` says only a local
+  implement joins a default concurrency group, so plan stages are ungrouped
+  (`TestDispatchStage_Description_PlansUngrouped`); and `fishhawk_drive_run` says an error mid-drive is a state
+  signal (`TestDriveRun_Description_ErrorIsStateSignal`). Operator-judgement rules live in `runbook.md`
+  (§ "Starting a run: pre-flight", § "Batch-as-campaign" step 0).
 - **Dependency sources and legacy warnings (#4028).** Both campaign tools surface where each `depends_on` edge came
   from: `native` (the tracker's native "blocked by" relation, read on the campaign paths) or `legacy_text` (every
   line-start `Depends on:` body line). `CampaignPreview` gains `edges[]` (`campaignPreviewEdge` `{from,to,source}`,

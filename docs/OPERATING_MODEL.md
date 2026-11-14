@@ -143,7 +143,7 @@ A waive, bulk waive (`fishhawk_waive_concerns`), resolve (`fishhawk_resolve_conc
 | `timeout` | row | none | recorded only; the 5-minute run or 20-minute phase budget ran out; re-examine the declaration (a narrower selector, a smaller package) |
 | `error` | row | none | recorded only; the `reason` field says why (for example `baseline_not_green`, `build_failed`, `no_tests_matched`, `mutation_not_applied`, `mutation_ambiguous`, `control_not_built`); fix the declaration, because an `error` is not evidence the control works |
 
-**Who may clear a `control_unpinned` concern.** Only a human: an agent token or a delegated request is refused with 403 `concern_requires_human`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb does not consult open concerns, so only delegated settlement is held; read `open[]` before merging by hand.
+**Who may clear a `control_unpinned` concern.** Only a human: an agent token or a delegated request is refused with 403 `concern_requires_human`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb consults only blocking concerns (high severity or first_officer provenance), so a medium `control_unpinned` concern holds only delegated settlement; read `open[]` before merging by hand.
 
 **A missing `counterfactual_observed` row has three different causes.**
 
@@ -208,6 +208,14 @@ The hold releases through the verify pass's report: the report arm settles the r
 | `merge_candidate_staleness` `undetermined` | re-read after the cache window; never treat it as fresh. If it persists, the merge gate's own check decides |
 | `fan_in_conflict` `slice_conflict` | a slice failed to merge into the consolidated branch. The conflicting child already SUCCEEDED, so `fishhawk_resume_run` refuses it (`recovery_not_eligible`); restart the item with `fishhawk_start_campaign_item_run` or `fishhawk_start_run` |
 | `fan_in_conflict` `base_fold_conflict` | the integrated head is clean but conflicts with the base's newer commits. `fishhawk_rebase_run_branch` authorizes the bounded conflict-resolution pass; the block stays until a landed fold, a rebase, a resolution push or a merged PR supersedes it |
+
+## 6. Campaign pre-flight on this repository's deployment
+
+The product surfaces carry the repository-agnostic pre-flight: `fishhawk_start_campaign`'s description (preview first, prose sequencing yields no edge, a clean checkout of the base branch) and the MCP runbook's *Batch-as-campaign* step 0. When the campaign runs against Fishhawk's own local deployment from this repository, three more checks apply before `fishhawk_start_campaign` (#5214):
+
+1. **Reload when quiet.** The daemon must run the code on `main`. Use the `deploy-local` route `reload --when-quiet`, which waits for live runners and restart-blocking reviews instead of refusing on them. Never force it past a live run (`docs/agents/operations.md` § Stack lifecycle).
+2. **Check the served SHA.** `/healthz` reports `git_sha`. It must equal `git rev-parse --short HEAD` on the `main` checkout the campaign binds. Rebuilt is not activated: a stale daemon assembles and drives the campaign with the old code.
+3. **Re-run the preview** after the reload and after any tracker edit, then start the campaign from the same source.
 
 ## Sources
 

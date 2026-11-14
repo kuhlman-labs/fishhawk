@@ -5277,3 +5277,15 @@ func TestDriveFixupConcernActions_JudgementParam(t *testing.T) {
 		t.Errorf("the shared base params map was mutated: %v", base)
 	}
 }
+
+// TestDriveRun_Description_ErrorIsStateSignal pins the #5214 rule 15 sentence:
+// an error mid-drive is a state signal, so the caller re-reads the run status
+// before ending the turn.
+func TestDriveRun_Description_ErrorIsStateSignal(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_drive_run"]
+	for _, want := range []string{"STATE signal, not a stop condition", "fishhawk_get_run_status", "next_actions before ending the turn"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_drive_run description missing %q:\n%s", want, desc)
+		}
+	}
+}
