@@ -89,6 +89,23 @@ type vouchCommitResponse struct {
 	// E64.26 / #3129 publish bound. Empty when the re-post succeeded or when no
 	// publisher is wired.
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
+	// RecordedHeadAdvanced reports whether this vouch ADVANCED the run's
+	// recorded head to the vouched commit (#4856): the handler verified that
+	// the vouched commit is the run's live pull-request head, that it
+	// fast-forwards the recorded head and that every commit between them is
+	// already run lineage, and stamped prior_head_sha + head_advance_verified on
+	// the row. For a decomposed parent whose only head is a fan-in integration
+	// commit the stamp is recorded for the acceptance walk and no fix-up
+	// expectation exists yet. FALSE for every other vouch, which stays
+	// membership-only; RecordedHeadAdvanceNote says why.
+	RecordedHeadAdvanced bool `json:"recorded_head_advanced"`
+	// RecordedHeadAdvanceNote, when non-empty, names why the recorded head did
+	// not advance and the remedy (vouch an intermediate commit first, re-vouch
+	// naming the live pull-request head, re-vouch once the forge or audit chain
+	// is readable or the probe deadline is not hit, or use
+	// fishhawk_rebase_run_branch for a base merge). Empty when
+	// RecordedHeadAdvanced is true.
+	RecordedHeadAdvanceNote string `json:"recorded_head_advance_note,omitempty"`
 }
 
 // handleVouchCommit implements POST /v0/runs/{run_id}/vouch-commit.
@@ -154,10 +171,35 @@ type vouchCommitResponse struct {
 // the check at an unverified sha.
 //
 // What did NOT change: the RECORD stays unverified for any well-formed full
-// sha. The operator_commit_vouched append and the 200 are byte-identical for a
-// matching and a non-matching full sha, the ADR-035 escape hatch is untouched,
-// and vouching a wrong sha still un-wedges nothing. No new response field, no
-// new error code (the non-full refusal reuses validation_failed).
+// sha. The operator_commit_vouched append and the 200 are recorded for a
+// matching and a non-matching full sha alike, the ADR-035 escape hatch is
+// untouched, and vouching a wrong sha still un-wedges nothing. No new error
+// code (the non-full refusal reuses validation_failed).
+//
+// THE VERIFIED HEAD ADVANCE (#4856, recorded against ADR-035). Before the
+// append the handler runs the read-only probeVouchHeadAdvance, bounded by its
+// own vouchHeadAdvanceProbeTimeout: when the server verifies that the vouched
+// commit IS the run's live pull-request head (read through the publish bound's
+// ladder before the compares and re-read after them), the forge proves it is a
+// fast-forward of the run's recorded head, and every commit between them is
+// already run lineage, the row ALSO carries prior_head_sha and
+// head_advance_verified:true (auditcomplete.VouchPriorHeadSHAField /
+// VouchHeadAdvanceVerifiedField). Those two keys are what the recorded head
+// walk (walkRecordedBaseMerges) reads, so a later fix-up's
+// fixup_expected_head_sha names the vouched commit, the same commit
+// fishhawk_reset_run_branch calls the last run-authored HEAD. (A decomposed
+// parent whose only head is a fan-in integration commit has no fix-up
+// expectation at all; its stamp is recorded for the acceptance walk.) A
+// server-verified fast-forward vouch is an ADR-112-style step in the recorded
+// walk; any other vouch stays membership-only and keeps the {run_id,
+// vouched_sha, reason} key set. Trust is closed transitively: the closure check
+// counts only run-reported pushes, recorded clean merges and EARLIER VERIFIED
+// vouches, so a commit present only through an unverified vouch never lets a
+// later vouch verify (vouchClosureLedger). The outcome is reported on
+// recorded_head_advanced / recorded_head_advance_note. The probe never fails
+// the vouch: an expired deadline is a non-advance note. Its newest live-head
+// read is reused by the audit-check publish bound below, which reads the pull
+// request itself only when the probe did not.
 func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -266,11 +308,24 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 		subject = "anonymous"
 	}
 	actorKind := audit.ActorUser
-	payload, _ := json.Marshal(map[string]any{
+	// Probe BEFORE the append (#4856): read-only, never an error, and bounded
+	// by its own deadline so a slow or hanging forge can never hold the request
+	// past the caller's deadline and keep the row from being appended. Only a
+	// forge-verified fast-forward of the live head adds the two advance keys;
+	// every other row keeps today's {run_id, vouched_sha, reason} key set.
+	probeCtx, cancelProbe := context.WithTimeout(r.Context(), vouchHeadAdvanceProbeTimeout)
+	adv := s.probeVouchHeadAdvance(probeCtx, runRow, sha)
+	cancelProbe()
+	payloadFields := map[string]any{
 		"run_id":               runID.String(),
 		lineageVouchedSHAField: sha,
 		"reason":               reason,
-	})
+	}
+	if adv.Verified {
+		payloadFields[auditcomplete.VouchPriorHeadSHAField] = adv.PriorHeadSHA
+		payloadFields[auditcomplete.VouchHeadAdvanceVerifiedField] = true
+	}
+	payload, _ := json.Marshal(payloadFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		Timestamp:    time.Now().UTC(),
@@ -321,17 +376,34 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	// there. The three arms below run AFTER the append, so they can only affect
 	// WHERE the check is posted: the record is already durable and the 200 is
 	// byte-identical for a matching and a non-matching sha.
+	if adv.Verified {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+			"vouch-commit: verified fast-forward vouch advanced the recorded head",
+			vouchAdvanceLogAttrs(runID, sha, adv)...)
+	} else {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"vouch-commit: vouch recorded membership-only; the recorded head did not advance",
+			vouchAdvanceLogAttrs(runID, sha, adv)...)
+	}
 	resp := vouchCommitResponse{
-		RunID:      runID.String(),
-		VouchedSHA: sha,
-		Reason:     reason,
+		RunID:                   runID.String(),
+		VouchedSHA:              sha,
+		Reason:                  reason,
+		RecordedHeadAdvanced:    adv.Verified,
+		RecordedHeadAdvanceNote: adv.Note,
 	}
 	// ARM (a): no publisher wired (dev/CLI posture). Checked FIRST so this
 	// posture keeps its documented silent, warning-free skip — resolving a live
 	// PR head we would never publish to would newly warn on every dev vouch.
 	// publishAuditCheckWithOptions already returns (false, nil) here.
 	if s.auditCheckPublisher != nil {
-		liveHead, headErr := s.resolveVouchPublishHead(r.Context(), runRow)
+		// Reuse the probe's newest live-head read (#4856) so the vouch makes no
+		// extra pull-request read; read here only when the probe never read the
+		// head or its read failed (its deadline may have cut it short).
+		liveHead, headErr := adv.LiveHead, adv.LiveHeadErr
+		if !adv.LiveHeadRead || headErr != nil {
+			liveHead, headErr = s.resolveVouchPublishHead(r.Context(), runRow)
+		}
 		switch {
 		case headErr != nil:
 			// FAIL CLOSED, mirroring the rebase verb: an unresolvable head is

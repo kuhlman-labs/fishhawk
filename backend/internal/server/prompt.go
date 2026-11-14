@@ -5141,6 +5141,15 @@ func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uu
 // invents a head: with no seed the field stays "". The acceptance resolvers
 // walk the same rows through acceptanceHeadAsOf (#4874), with a sequence-ordered
 // seed and a fail-closed read; this fix-up seed keeps its timestamp ordering.
+//
+// #4856: the walk also reads operator_commit_vouched rows
+// (fixupHeadWalkCategories), and a SERVER-VERIFIED fast-forward vouch (one
+// carrying prior_head_sha + head_advance_verified:true, isVerifiedVouchAdvance)
+// whose prior is the head walked so far advances the expectation to the
+// vouched commit. That is the commit fishhawk_reset_run_branch already treats
+// as the last run-authored HEAD, so reset and this base check agree. A legacy
+// or unverified vouch stays membership-only and moves nothing. recordedFixupHead
+// is the strict (error-returning) twin the vouch probe reads.
 func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
 	seed, seedSHA := s.newestReportedHead(ctx, runID, stageID, "fixup_expected_head_sha")
 	if seed == nil {
@@ -6457,13 +6466,14 @@ func (s *Server) resolveNewestReportedHeadSHA(ctx context.Context, runID, stageI
 // newestReportedHead is resolveNewestReportedHeadSHA's walk returning the
 // winning entry as well as its head_sha, so the fix-up resolver can order
 // later rows against the seed's chain sequence (E89.6 / #4574). It returns
-// (nil, "") on every case resolveNewestReportedHeadSHA resolves "".
+// (nil, "") on every case resolveNewestReportedHeadSHA resolves "". The
+// selection rule itself is newestReportedHeadEntry, shared with the vouch
+// probe's strict recordedFixupHead (#4856).
 func (s *Server) newestReportedHead(ctx context.Context, runID, stageID uuid.UUID, forField string) (*audit.Entry, string) {
 	if s.cfg.AuditRepo == nil {
 		return nil, ""
 	}
-	var newest *audit.Entry
-	var newestSHA string
+	var reported []*audit.Entry
 	for _, cat := range lineageLedgerCategories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
 		if err != nil {
@@ -6477,20 +6487,9 @@ func (s *Server) newestReportedHead(ctx context.Context, runID, stageID uuid.UUI
 			)
 			return nil, ""
 		}
-		for _, e := range entries {
-			var payload struct {
-				HeadSHA string `json:"head_sha"`
-			}
-			if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.HeadSHA == "" {
-				continue
-			}
-			if newest == nil || e.Timestamp.After(newest.Timestamp) ||
-				(e.Timestamp.Equal(newest.Timestamp) && e.Sequence > newest.Sequence) {
-				newest = e
-				newestSHA = payload.HeadSHA
-			}
-		}
+		reported = append(reported, entries...)
 	}
+	newest, newestSHA := newestReportedHeadEntry(reported)
 	if newest == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: no reported-head audit entry found; omitting field",
