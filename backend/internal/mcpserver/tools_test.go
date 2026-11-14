@@ -19297,3 +19297,282 @@ func TestGetPlan_ScopeOverlap_NotReadWithoutPlan(t *testing.T) {
 		t.Errorf("scope-overlap reads = %d, want 0 on no_plan_yet", len(fb.scopeOverlapCalls))
 	}
 }
+
+// TestStartRun_CommentBudgetWarning is the #5214 total-budget warning: eight
+// 1900-byte comments are each UNDER the per-comment cap (so the #2946 over-cap
+// warning cannot carry the text) but together over the 12000-byte total, so the
+// plan prompt drops the oldest. The warning names exactly the count the prompt
+// renderer's own helper reports; three such comments are under budget and warn
+// nothing.
+func TestStartRun_CommentBudgetWarning(t *testing.T) {
+	mk := func(n int) []IssueComment {
+		var cs []IssueComment
+		for i := 0; i < n; i++ {
+			cs = append(cs, IssueComment{Author: "u" + strconv.Itoa(i), Body: strings.Repeat("q", 1900), CreatedAt: "2026-05-01T00:00:0" + strconv.Itoa(i) + "Z"})
+		}
+		return cs
+	}
+	run := func(t *testing.T, comments []IssueComment) string {
+		t.Helper()
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+			TriggerSource: string(runpkg.TriggerOnDemand),
+			IssueContext:  &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1, Comments: comments},
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		return rejectResultText(t, meta)
+	}
+
+	t.Run("over_total_budget_warns_with_renderer_count", func(t *testing.T) {
+		comments := mk(8)
+		pc := make([]prompt.IssueComment, len(comments))
+		for i, c := range comments {
+			pc[i] = prompt.IssueComment{Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt}
+		}
+		want := prompt.OmittedIssueCommentCount(pc, "https://github.com/x/y/issues/1")
+		if want == 0 {
+			t.Fatal("fixture must be over the total budget")
+		}
+		text := run(t, comments)
+		if strings.Contains(text, "per-comment cap") {
+			t.Fatalf("fixture must stay under the per-comment cap so only the budget warning fires:\n%s", text)
+		}
+		wantPhrase := fmt.Sprintf("drops the %d OLDEST comment(s)", want)
+		for _, p := range []string{
+			fmt.Sprintf("over the %d-byte total comment budget", prompt.MaxTotalIssueCommentBytes),
+			wantPhrase,
+			"computed from the issue's own url",
+			"issue BODY",
+			"takes precedence",
+		} {
+			if !strings.Contains(text, p) {
+				t.Errorf("budget warning must say %q:\n%s", p, text)
+			}
+		}
+	})
+
+	t.Run("under_total_budget_no_warning", func(t *testing.T) {
+		if text := run(t, mk(3)); strings.Contains(text, "total comment budget") {
+			t.Errorf("three 1900-byte comments are under budget; no warning expected:\n%s", text)
+		}
+	})
+
+	t.Run("nil_context_no_warning", func(t *testing.T) {
+		if got := issueCommentBudgetWarnings(nil); got != nil {
+			t.Errorf("nil issue context must warn nothing, got %q", got)
+		}
+	})
+}
+
+// stubStartRunProbe replaces startRun's checkout probe seam, recording the dirs
+// it is called with.
+func stubStartRunProbe(t *testing.T, st checkoutState, ok bool) *[]string {
+	t.Helper()
+	var dirs []string
+	prev := startRunCheckoutProbe
+	startRunCheckoutProbe = func(_ context.Context, dir string) (checkoutState, bool) {
+		dirs = append(dirs, dir)
+		return st, ok
+	}
+	t.Cleanup(func() { startRunCheckoutProbe = prev })
+	return &dirs
+}
+
+// TestStartRun_CheckoutWarnings_Wired crosses the startRun handler → probe →
+// warnings channel: a dirty probe surfaces W1 on the tool result, a clean probe
+// adds nothing, ok=false adds nothing, and no working_dir never probes.
+func TestStartRun_CheckoutWarnings_Wired(t *testing.T) {
+	start := func(t *testing.T, wd string) string {
+		t.Helper()
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, WorkingDir: wd,
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		return rejectResultText(t, meta)
+	}
+	wd := t.TempDir()
+
+	t.Run("dirty_probe_warns", func(t *testing.T) {
+		dirs := stubStartRunProbe(t, checkoutState{DirtyPaths: []string{"a.go"}, Branch: "main", BaseRef: "origin/main", CountsKnown: true}, true)
+		text := start(t, wd)
+		if !strings.Contains(text, w1Marker) || !strings.Contains(text, `"a.go"`) {
+			t.Errorf("dirty checkout must surface W1 on the start_run result:\n%s", text)
+		}
+		if len(*dirs) != 1 || (*dirs)[0] != wd {
+			t.Errorf("probe must run once on the bound working_dir %q, got %v", wd, *dirs)
+		}
+	})
+	t.Run("clean_probe_silent", func(t *testing.T) {
+		stubStartRunProbe(t, checkoutState{Branch: "main", BaseRef: "origin/main", CountsKnown: true}, true)
+		if text := start(t, wd); strings.Contains(text, "checkout hygiene") {
+			t.Errorf("clean checkout must add no warning:\n%s", text)
+		}
+	})
+	t.Run("not_a_checkout_silent", func(t *testing.T) {
+		stubStartRunProbe(t, checkoutState{DirtyPaths: []string{"a.go"}}, false)
+		if text := start(t, wd); strings.Contains(text, "checkout hygiene") {
+			t.Errorf("ok=false must add no warning even with state set:\n%s", text)
+		}
+	})
+	t.Run("no_working_dir_never_probes", func(t *testing.T) {
+		dirs := stubStartRunProbe(t, checkoutState{DirtyPaths: []string{"a.go"}}, true)
+		if text := start(t, ""); strings.Contains(text, "checkout hygiene") {
+			t.Errorf("no working_dir must add no checkout warning:\n%s", text)
+		}
+		if len(*dirs) != 0 {
+			t.Errorf("probe must not run without a working_dir, called with %v", *dirs)
+		}
+	})
+}
+
+// TestStartRun_CheckoutWarnings_SpecSource pins approval condition C5 through
+// the real handler: W2 fires (start_run wording) only when the spec was
+// auto-discovered from working_dir, not when workflow_spec was passed inline
+// or spec_file named it.
+func TestStartRun_CheckoutWarnings_SpecSource(t *testing.T) {
+	dirty := checkoutState{DirtyPaths: []string{".fishhawk/workflows.yaml"}, Branch: "main", BaseRef: "origin/main", CountsKnown: true}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".fishhawk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(dir, ".fishhawk", "workflows.yaml")
+	if err := os.WriteFile(specPath, []byte(validTrivialSpec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		in     StartRunInput
+		wantW2 bool
+	}{
+		{"discovered_from_working_dir", StartRunInput{WorkingDir: dir}, true},
+		{"inline_workflow_spec", StartRunInput{WorkingDir: dir, WorkflowSpec: validTrivialSpec}, false},
+		{"explicit_spec_file", StartRunInput{WorkingDir: dir, SpecFile: specPath}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubStartRunProbe(t, dirty, true)
+			_, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			in := tc.in
+			in.Repo, in.WorkflowID = "x/y", "trivial"
+			meta, _, err := r.startRun(context.Background(), nil, in)
+			if err != nil {
+				t.Fatalf("startRun: %v", err)
+			}
+			text := rejectResultText(t, meta)
+			if !strings.Contains(text, w1Marker) {
+				t.Errorf("W1 must fire for the dirty .fishhawk/ path:\n%s", text)
+			}
+			gotW2 := strings.Contains(text, w2Marker)
+			if gotW2 != tc.wantW2 {
+				t.Errorf("W2 present = %v, want %v:\n%s", gotW2, tc.wantW2, text)
+			}
+			if tc.wantW2 && !strings.Contains(text, "WORKING-TREE workflow spec bytes") {
+				t.Errorf("discovered-spec W2 must use the start_run wording:\n%s", text)
+			}
+		})
+	}
+}
+
+// TestStartRun_Description_PinsSpecAndContextCapture reads the WIRE-VISIBLE
+// fishhawk_start_run description (#5214): the pinned spec, the issue-context
+// capture at creation, the restart remedy, the reject/revise steer, and the
+// warnings it reports.
+func TestStartRun_Description_PinsSpecAndContextCapture(t *testing.T) {
+	desc := registeredToolDescription(t, "fishhawk_start_run")
+	flat := strings.Join(strings.Fields(desc), " ")
+	for _, want := range []string{
+		"pinned at creation and fixed for the run's life",
+		"a later .fishhawk/workflows.yaml edit needs a new run",
+		"captured into issue_context at this call",
+		"never re-reading the issue",
+		"cancel and restart the run before dispatching the plan",
+		"fishhawk_reject_plan",
+		"fishhawk_revise_plan",
+		"unclean or off-base working_dir",
+		"total comment budget",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("fishhawk_start_run description must say %q; got:\n%s", want, desc)
+		}
+	}
+}
+
+// TestStartRunInput_WorkflowSHA_StatesPinned: the workflow_sha field states the
+// spec is fixed for the run's life.
+func TestStartRunInput_WorkflowSHA_StatesPinned(t *testing.T) {
+	desc := toolInputPropertyDescription(t, "fishhawk_start_run", "workflow_sha")
+	if !strings.Contains(desc, "fixed for the run's life") || !strings.Contains(desc, "needs a new run") {
+		t.Errorf("workflow_sha description must say the spec is fixed for the run's life; got %q", desc)
+	}
+}
+
+// TestRun_IssueContext_DescriptionStatesSnapshot pins approval condition C6:
+// the Run.issue_context description is asserted through the WIRE-VISIBLE
+// tools/list OUTPUT schema (fishhawk_start_run's run.issue_context), not the
+// struct tag, so an agent reading the result schema learns the snapshot rule.
+func TestRun_IssueContext_DescriptionStatesSnapshot(t *testing.T) {
+	cs := connectInMemory(t)
+	list, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var schema map[string]any
+	for _, tool := range list.Tools {
+		if tool.Name == "fishhawk_start_run" {
+			raw, err := json.Marshal(tool.OutputSchema)
+			if err != nil {
+				t.Fatalf("marshal output schema: %v", err)
+			}
+			if err := json.Unmarshal(raw, &schema); err != nil {
+				t.Fatalf("decode output schema: %v", err)
+			}
+		}
+	}
+	if schema == nil {
+		t.Fatal("fishhawk_start_run has no output schema on the wire")
+	}
+	// resolve follows a local "$ref": "#/$defs/<Name>" if the SDK emitted one.
+	resolve := func(node map[string]any) map[string]any {
+		ref, _ := node["$ref"].(string)
+		if !strings.HasPrefix(ref, "#/$defs/") {
+			return node
+		}
+		defs, _ := schema["$defs"].(map[string]any)
+		if d, ok := defs[strings.TrimPrefix(ref, "#/$defs/")].(map[string]any); ok {
+			return d
+		}
+		return node
+	}
+	prop := func(node map[string]any, name string) map[string]any {
+		props, _ := resolve(node)["properties"].(map[string]any)
+		p, _ := props[name].(map[string]any)
+		if p == nil {
+			t.Fatalf("output schema has no %q property under %v", name, node)
+		}
+		return p
+	}
+	ic := prop(prop(schema, "run"), "issue_context")
+	desc, _ := ic["description"].(string)
+	for _, want := range []string{
+		"captured at run creation",
+		"never the live issue",
+		"a comment posted later is absent",
+		"issue_context.comments",
+		"cancel and restart the run",
+		"fishhawk_reject_plan",
+		"fishhawk_revise_plan",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("run.issue_context output-schema description must say %q; got %q", want, desc)
+		}
+	}
+}
