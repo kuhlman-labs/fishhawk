@@ -306,13 +306,16 @@ func redactURLEntryUserinfo(entry string) string {
 // "last wins"; see https://pkg.go.dev/os/exec#Cmd — Env is passed as-is with no
 // dedup guarantee).
 //
-// golangci-lint keys its analysis cache by ABSOLUTE file path and shares one
-// cache dir across processes when GOLANGCI_LINT_CACHE is unset (falling back to
-// os.UserCacheDir()/golangci-lint). Under the shared local gitdir, two
-// concurrent runs' lineage worktrees carry distinct absolute paths, so run A's
-// cached lint results could surface in run B's strict re-verify — a spurious
-// category-B (#1796). Isolating the linter cache per verify-gate invocation
-// makes that leak impossible. GOCACHE is deliberately left SHARED: the Go build
+// golangci-lint keys its issue cache by package CONTENT, which is
+// path-INDEPENDENT, but stores each finding's ABSOLUTE position, and it shares
+// one cache dir across processes when GOLANGCI_LINT_CACHE is unset (falling back
+// to os.UserCacheDir()/golangci-lint). So an identical package linted in another
+// worktree inherits that tree's paths, and the //nolint processor then resolves
+// suppressions against the OTHER tree's file: run A's cached lint results could
+// surface in run B's strict re-verify — a spurious category-B (#1796).
+// Isolating the linter cache per verify-gate invocation makes that leak
+// impossible. Host `scripts/test lint` derives its own per-checkout cache for
+// the same reason (#5151). GOCACHE is deliberately left SHARED: the Go build
 // cache is SAFE across worktrees (a hit is keyed by an action ID covering every
 // input, so it can never serve a stale artifact), and sharing it keeps the
 // standard library and module-cache dependencies warm; only the linter analysis

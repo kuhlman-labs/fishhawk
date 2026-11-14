@@ -17,7 +17,8 @@
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
 #   scripts/test lint         run `golangci-lint run --allow-serial-runners ./...` in every module;
 #                             refuses (host_toolchain_mismatch) on a host golangci-lint/gofmt
-#                             that differs from the gate-image pins (#4245)
+#                             that differs from the gate-image pins (#4245); with no
+#                             GOLANGCI_LINT_CACHE set it uses a per-checkout lint cache (#5151)
 #   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
 #   scripts/test verify --packages backend/internal/run,cli/internal/spec
 #                             the SCOPED verify form (#3315): every non-test leg
@@ -1116,6 +1117,95 @@ EOF
   fi
 }
 
+# Per-checkout golangci-lint cache (#5151). golangci-lint's issue cache is keyed
+# by package CONTENT, which is path-INDEPENDENT, but it stores each finding's
+# ABSOLUTE position. With GOLANGCI_LINT_CACHE unset every checkout on a host
+# shares os.UserCacheDir()/golangci-lint, so a second checkout with a
+# byte-identical package hits the first one's entry and inherits its paths; the
+# result processors (the generated-file and nolint filters) then read the file
+# at that FOREIGN path. A removed peer logs `Can't process results by
+# generated_file_filter processor: ... failed to get doc (strict) ... no such
+# file or directory` and an edited one no longer carries the //nolint, and
+# either way the suppressed finding is reported as `../<other-tree>/x.go`. The evidence is empirical, against the pinned
+# golangci-lint v2.12.2: scripts/test-lint-cache's R1/R2 arms go RED with the
+# _export_lint_cache call deleted. It reproduces with and without
+# GOFLAGS=-trimpath, so -trimpath is not the trigger and the Go build cache
+# (GOCACHE, action-ID keyed) stays SHARED: only the lint cache moves. #1796 fixed
+# this for the runner's gate subprocesses only (withIsolatedLintCache in
+# runner/cmd/fishhawk-runner/gateenv.go); an agent's own shell lint never passed
+# through those call sites, so its tests could not see this.
+#
+# _lint_cache_dir <flavor> prints <git-dir>/fishhawk-lint-cache/<root-key>/<flavor>
+# when $ROOT is the TOP of a git work tree (the per-worktree git dir: `.git` for
+# a primary checkout, <common>/worktrees/<id> for a linked one), so it never
+# shows in `git status` and `git worktree remove` deletes it with the worktree.
+# <root-key> is the cksum (CRC-length) of `pwd -P` of $ROOT, so a moved
+# (`git worktree move`, `mv`) or copied checkout misses the old entries. A $ROOT
+# that is not a work-tree top (no git, a bare repo, or a plain dir NESTED inside
+# another tree) falls back to
+# ${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-lint-cache/<root-key>/<flavor>; with
+# neither XDG_CACHE_HOME nor HOME set there is no private fallback (a shared /tmp
+# would not be one), so it fails. The `host` and `gate-image` flavors never
+# share entries: a gate-container analysis never feeds a host lint, or the
+# reverse. Returns non-zero when the dir cannot be resolved.
+_lint_cache_dir() {
+  local flavor="$1" phys crc len top gitdir base
+  phys="$(cd "$ROOT" 2>/dev/null && pwd -P)" || return 1
+  read -r crc len _ <<EOF
+$(printf '%s' "$phys" | cksum)
+EOF
+  if [ -z "${crc:-}" ] || [ -z "${len:-}" ]; then
+    return 1
+  fi
+  if command -v git >/dev/null 2>&1 \
+     && top="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" && [ -n "$top" ] \
+     && [ "$(cd "$top" 2>/dev/null && pwd -P)" = "$phys" ] \
+     && gitdir="$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null)" && [ -n "$gitdir" ]; then
+    printf '%s/fishhawk-lint-cache/%s-%s/%s\n' "$gitdir" "$crc" "$len" "$flavor"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    base="$XDG_CACHE_HOME"
+  elif [ -n "${HOME:-}" ]; then
+    base="$HOME/.cache"
+  else
+    return 1
+  fi
+  printf '%s/fishhawk-lint-cache/%s-%s/%s\n' "$base" "$crc" "$len" "$flavor"
+}
+
+# _export_lint_cache: resolve GOLANGCI_LINT_CACHE for cmd_lint, in order:
+#   (a) a NON-EMPTY value is left untouched: the runner's withIsolatedLintCache
+#       gates, the gate image's /lintcache and an operator's explicit choice win.
+#       An EMPTY value is treated as unset, as golangci-lint itself treats it
+#       (the pinned v2.12.2 `cache status` reports the default dir for it).
+#   (b) GITHUB_ACTIONS=true leaves it unset: a hosted job has one checkout, and
+#       ci.yml's 'Cache golangci-lint analysis cache' step restores the default
+#       ~/.cache/golangci-lint. This trusts the environment; an explicit ci.yml
+#       export would remove the branch.
+#   (c) otherwise derive the `host` flavor of _lint_cache_dir, create it and
+#       export it. An unresolvable or uncreatable dir REFUSES (exit 1): silently
+#       falling back to the shared default would reopen the leak.
+# GOCACHE, GOFLAGS and GOMODCACHE are never touched. Silent on the happy path.
+_export_lint_cache() {
+  local dir=""
+  if [ -n "${GOLANGCI_LINT_CACHE:-}" ]; then
+    return 0
+  fi
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    return 0
+  fi
+  if ! dir="$(_lint_cache_dir host)" || [ -z "$dir" ]; then
+    echo "scripts/test: cannot resolve the per-checkout golangci-lint cache for $ROOT — set GOLANGCI_LINT_CACHE to a writable directory private to this checkout" >&2
+    exit 1
+  fi
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    echo "scripts/test: cannot create the per-checkout golangci-lint cache $dir — set GOLANGCI_LINT_CACHE to a writable directory private to this checkout" >&2
+    exit 1
+  fi
+  export GOLANGCI_LINT_CACHE="$dir"
+}
+
 # cmd_lint passes --allow-serial-runners (#3962): golangci-lint holds a global
 # lock, and WITHOUT the flag a second concurrent instance exits immediately with
 # "parallel golangci-lint is running". Two local runs' verify gates (or an
@@ -1126,10 +1216,12 @@ EOF
 # what the lock exists to prevent. CI runs one lint per job and never contends,
 # so its ci.yml invocation stays flagless; that is the only difference. Before
 # any module is linted, _require_lint_host_toolchain refuses on a host toolchain
-# that differs from the gate-image pins (#4245).
+# that differs from the gate-image pins (#4245), and _export_lint_cache gives
+# the checkout its own golangci-lint cache (#5151).
 cmd_lint() {
   _require_golangci_lint
   _require_lint_host_toolchain
+  _export_lint_cache
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     (cd "$m" && golangci-lint run --allow-serial-runners ./...)
@@ -1823,10 +1915,19 @@ _verify_patch_coverage() {
 # _verify_pipefail_grep leg and its place before the --no-tests return; its G13
 # case also EXECUTES every shipped copy of the harnesses' drain helper against a
 # >= 256 KiB first-line match. Bash, temp-dir fixtures, no network/Docker, ~3s.
+# test-lint-cache (#5151) pins the per-checkout golangci-lint cache
+# (_lint_cache_dir / _export_lint_cache): bash, hermetic temp git fixtures plus a
+# fake golangci-lint that models the content-keyed cache, and a real-lint arm
+# (R0-R2) that runs the real `scripts/test lint` in two diverging worktrees and
+# skips itself with a printed reason when the pinned toolchain is absent. Wall
+# time on the dev host (2026-11-14): ~8.9s with a cold GOCACHE, ~6.7s warm,
+# ~1.5s with FISHHAWK_LINT_CACHE_HERMETIC_ONLY=1, which the gate never sets.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 #
 # Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER
-# unset (#3451). A harness is a CHILD of the verify invocation that is already
+# unset (#3451), and with FISHHAWK_LINT_CACHE_HERMETIC_ONLY unset, so the gate
+# always runs test-lint-cache's real-lint arms (that switch is a local iteration
+# aid only). A harness is a CHILD of the verify invocation that is already
 # holding the per-repository lock at that path (the runner injects both vars
 # into its gate env per ADR-063 / #2134). scripts/test-patch-coverage's (f)
 # block drives the REAL `cmd_verify` against its own temp git roots — if the
@@ -1841,7 +1942,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-verify-change test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep test-agent-context; do
+  for h in test-verify-change test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep test-agent-context test-lint-cache; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1854,7 +1955,7 @@ _verify_gate_harnesses() {
       continue
     fi
     printf '>>> scripts/%s\n' "$h"
-    ( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER; "$ROOT/scripts/$h" )
+    ( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER FISHHAWK_LINT_CACHE_HERMETIC_ONLY; "$ROOT/scripts/$h" )
   done
 }
 
@@ -2679,7 +2780,7 @@ _gate_image_passwd() {
 
 # cmd_in_gate_image <lint|verify>: see the block comment above.
 cmd_in_gate_image() {
-  local mode="$1" image id cache common pwdir rc=0
+  local mode="$1" image id cache common pwdir lintdir="" rc=0
   local inner=() args=()
   if ! command -v docker >/dev/null 2>&1; then
     cat >&2 <<'EOF'
@@ -2715,8 +2816,20 @@ EOF
     exit 1
   fi
   cache="${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/fishhawk-gate}"
-  if ! mkdir -p "$cache/gocache" "$cache/gomodcache" "$cache/lintcache" 2>/dev/null; then
+  if ! mkdir -p "$cache/gocache" "$cache/gomodcache" 2>/dev/null; then
     echo "scripts/test: cannot create the gate-image cache dirs under $cache — set FISHHAWK_GATE_CACHE_DIR to a writable directory" >&2
+    exit 1
+  fi
+  # The lint cache is the per-checkout `gate-image` flavor (#5151), never a
+  # per-user dir under $cache: a shared one leaks another checkout's findings
+  # (see _lint_cache_dir). The inner scripts/test lint sees an explicit
+  # GOLANGCI_LINT_CACHE and leaves it alone.
+  if ! lintdir="$(_lint_cache_dir gate-image)" || [ -z "$lintdir" ]; then
+    echo "scripts/test: cannot resolve the per-checkout gate-image lint cache for $ROOT — refusing to run (fail closed)" >&2
+    exit 1
+  fi
+  if ! mkdir -p "$lintdir" 2>/dev/null; then
+    echo "scripts/test: cannot create the per-checkout gate-image lint cache dir $lintdir — refusing to run (fail closed); remove whatever blocks it" >&2
     exit 1
   fi
   # Under the cache dir, not $TMPDIR: it must be a path the docker daemon can
@@ -2742,7 +2855,7 @@ EOF
   args+=(
     -v "$cache/gocache:/gocache"
     -v "$cache/gomodcache:/gomodcache"
-    -v "$cache/lintcache:/lintcache"
+    -v "$lintdir:/lintcache"
     -e HOME=/tmp
     -e GOPATH=/tmp/gopath
     -e GOCACHE=/gocache
@@ -2779,7 +2892,8 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
   test                 (default) run `go test -race ./...` in every module; every
                        module runs, then a summary names each failed module
   coverage             run tests + aggregate coverage gate
-  lint                 run `golangci-lint run --allow-serial-runners ./...` in every module
+  lint                 run `golangci-lint run --allow-serial-runners ./...` in every module,
+                       with a per-checkout lint cache unless GOLANGCI_LINT_CACHE is set
   verify               lint + schema-sync + tests + patch-scoped coverage — the runner's verify gate
   verify --packages P  the SCOPED verify form: P is a comma-separated list of
                        repo-relative package DIRECTORIES (e.g.
