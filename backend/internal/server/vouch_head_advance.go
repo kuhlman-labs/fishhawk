@@ -180,7 +180,7 @@ func (s *Server) probeVouchHeadAdvance(ctx context.Context, runRow *run.Run, sha
 	}
 	// (j) Every intermediate commit is already run lineage.
 	if offender := firstUnattributedCommit(ahead, ledger, sha); offender != "" {
-		return adv.noAdvance("the commit " + offender + " between the recorded head " + priorText + " and " + sha + " is not run lineage; vouch " + offender + " first, then re-vouch " + sha + " (for a hand merge of the base, which brings in base commits, use fishhawk_rebase_run_branch instead)")
+		return adv.noAdvance(vouchIntermediateNotLineageNote(offender, priorText, sha))
 	}
 
 	// (k) Re-read the live head: a push during the compares refuses the stamp.
@@ -195,6 +195,19 @@ func (s *Server) probeVouchHeadAdvance(ctx context.Context, runRow *run.Run, sha
 	adv.PriorHeadSHA = prior
 	adv.Verified = true
 	return adv
+}
+
+// vouchIntermediateNotLineageNote is rung (j)'s remedy (#5280). An intermediate
+// commit can only be verified while it is the run's live pull-request head
+// (rung (f)), and an unverified vouch never joins the closure ledger, so
+// "vouch the intermediate first" while the live head is the tip is a dead end.
+// The real exits are named: vouch each commit as it is pushed, or move the
+// branch back to the intermediate commit, vouch it, then push and vouch the tip.
+func vouchIntermediateNotLineageNote(offender, priorText, sha string) string {
+	return "the commit " + offender + " between the recorded head " + priorText + " and " + sha + " is not run lineage. " +
+		"An intermediate commit can only be verified while it is the run's live pull-request head, so vouching " + offender + " now (the live head is " + sha + ") records it unverified and does not help: " +
+		"vouch each commit as it is pushed, or move the branch back to " + offender + ", vouch it, then push " + sha + " and vouch it " +
+		"(for a hand merge of the base, which brings in base commits, use fishhawk_rebase_run_branch instead)"
 }
 
 // noAdvance turns a probe answer that has read the live head into a
