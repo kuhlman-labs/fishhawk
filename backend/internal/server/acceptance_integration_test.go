@@ -1901,6 +1901,122 @@ func TestAcceptanceE2E_RebaseThenRedispatch_BindsNewHead(t *testing.T) {
 	}
 }
 
+// TestAcceptanceE2E_VouchThenRedispatch_BindsVouchedHead drives the #4874 vouch
+// half across the real boundary: the REAL vouch-commit handler runs #4856's
+// forge probe against an httptest GitHub (PR read + the two compares) and
+// appends operator_commit_vouched to the audit chain; the host-dispatch marker
+// writes the anchor; the REST prompt serves acceptance_expected_head_sha
+// through the shared walk; and a real signed verdict records head_sha through
+// the dispatch-bounded binding. Arms:
+//
+//   - verified_before_dispatch: a verified fast-forward vouch S -> V before the
+//     anchor. The prompt names V and the verdict binds V.
+//   - verified_after_dispatch: the same vouch AFTER the anchor. The unbounded
+//     prompt names V, but the verdict binds S: a vouch after dispatch never
+//     re-binds that dispatch's verdict.
+//   - not_fast_forward: the forge reports S carries a commit V lacks, so the
+//     row is recorded membership-only and both the prompt and the verdict stay
+//     on S.
+//
+// Counterfactual: dropping CategoryOperatorCommitVouched from
+// acceptanceBaseMergeCategories serves and binds S in verified_before_dispatch.
+func TestAcceptanceE2E_VouchThenRedispatch_BindsVouchedHead(t *testing.T) {
+	const (
+		headS   = "5e00000000000000000000000000000000000005" // the PR-open head
+		headV   = "7e00000000000000000000000000000000000007" // the operator-pushed tip
+		foreign = "eeee000000000000000000000000000000000001" // a commit on S that V lacks
+	)
+	arms := []struct {
+		name          string
+		vouchAfter    bool
+		fastForward   bool
+		wantAdvanced  bool
+		wantPrompt    string
+		wantVerdictAt string
+	}{
+		{"verified_before_dispatch", false, true, true, headV, headV},
+		{"verified_after_dispatch", true, true, true, headV, headS},
+		{"not_fast_forward", false, false, false, headS, headS},
+	}
+	for _, arm := range arms {
+		t.Run(arm.name, func(t *testing.T) {
+			exampleBytes, _ := readAcceptanceExampleSpec(t)
+			seam := buildLocalAcceptanceSeam(t, exampleBytes)
+			prURL := "https://github.com/kuhlman-labs/fishhawk/pull/77"
+			seam.rr.getRuns[seam.runID].PullRequestURL = &prURL
+			seam.rr.getRuns[seam.runID].InstallationID = instID(99)
+			forge := &vouchProbeForge{compares: map[string][]string{}, statuses: map[string]int{}}
+			forge.setPRHead(headV)
+			if arm.fastForward {
+				forge.set(headV, headS)
+			} else {
+				forge.set(headV, headS, foreign)
+			}
+			forge.set(headS, headV, headV)
+			seam.s.cfg.GitHub = newVouchProbeGitHubClient(t, forge)
+			ctx := context.Background()
+
+			vouch := func() {
+				t.Helper()
+				w := postVouchCommit(t, seam.s, seam.runID, vouchCommitRequest{SHA: headV, Reason: "operator remediation commit"}, withVouchOperator)
+				if w.Code != http.StatusOK {
+					t.Fatalf("vouch status = %d, want 200:\n%s", w.Code, w.Body.String())
+				}
+				var resp vouchCommitResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("decode vouch response: %v", err)
+				}
+				if resp.RecordedHeadAdvanced != arm.wantAdvanced {
+					t.Fatalf("precondition: recorded_head_advanced = %v, want %v (note %q)", resp.RecordedHeadAdvanced, arm.wantAdvanced, resp.RecordedHeadAdvanceNote)
+				}
+				if n := len(seam.au.snapshot(seam.runID, CategoryOperatorCommitVouched)); n != 1 {
+					t.Fatalf("operator_commit_vouched rows = %d, want 1", n)
+				}
+			}
+
+			// 1) PR opened at S; Advance parks acceptance.
+			seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": headS})
+			o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+			if _, err := o.Advance(ctx, seam.runID); err != nil {
+				t.Fatalf("orchestrator advance to acceptance: %v", err)
+			}
+			// 2) The vouch through the REAL handler, before or after the anchor.
+			if !arm.vouchAfter {
+				vouch()
+			}
+			if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+				t.Fatalf("host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if arm.vouchAfter {
+				vouch()
+			}
+
+			// 3) The REST prompt serves the walked head.
+			w := promptRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode prompt: %v", err)
+			}
+			if resp.AcceptanceExpectedHeadSHA != arm.wantPrompt {
+				t.Errorf("acceptance_expected_head_sha = %q, want %q", resp.AcceptanceExpectedHeadSHA, arm.wantPrompt)
+			}
+
+			// 4) A real signed verdict binds the dispatch-bounded head.
+			seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+			if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+				localSeamAcceptanceBody(t, "vouch episode"), ""); w.Code != 201 {
+				t.Fatalf("ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != arm.wantVerdictAt {
+				t.Errorf("verdict head_sha = %v, want %q", got, arm.wantVerdictAt)
+			}
+		})
+	}
+}
+
 // TestAcceptanceE2E_ScenarioCommitThenFixup_SecondVerdictBindsFixupHead is the
 // #4673 cross-layer regression: acceptance -> the stage's own scenario-corpus
 // commit S1 -> a fix-up F -> acceptance again. It runs on ONE sequenced audit
