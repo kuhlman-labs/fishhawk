@@ -80,8 +80,9 @@ import (
 //	    for the run's succeeded decomposition children (site merge_reconcile),
 //	    so a late child review the best-effort hook lost is blocked on, not
 //	    missed; a failed reconcile is undeterminable. The inline admitted
-//	    merge (merge_run.go) does not evaluate this predicate, so it does not
-//	    run leg (d) at all (#5045).
+//	    merge (merge_run.go) and the delegated may_merge arm (autodrive.go)
+//	    do not evaluate this predicate, but each evaluates leg (d) through
+//	    openBlockingConcernIDs under the run's merge-intent lock (#5045).
 //
 // Leg (a)'s FORGE sub-legs differ by variant (ADR-112, #4619 / #4632):
 //
@@ -642,30 +643,64 @@ func (s *Server) listMergeGateChecks(ctx context.Context, runRow *run.Run, headS
 	return checks, nil
 }
 
-// mergeQueueConcernLeg is leg (d). Before it reads the run's ledger it re-runs
-// the idempotent child-slice import for the run's succeeded decomposition
-// children (reconcileSliceConcerns), so a late child review the best-effort
-// hook lost reaches the ledger this leg then blocks on. That import is the
-// predicate's one write; it is idempotent (a repeat pass inserts nothing),
-// writes only concern rows plus a concern_rolled_up audit row, and a
-// reconcile failure is an error here, which the caller maps to
-// undeterminable: the merge is held, never waved through. A refusal's
-// "nothing written" therefore means no verdict, intent or queue row, not no
-// concern row. On the merge variant the call can run under the merge-intent
-// lock, and ImportRolledUp takes the child-source row locks; the added cost is
-// one indexed child listing per evaluation, plus, for a decomposed parent with
-// succeeded children, one parent stage list, one open-concern read per
-// succeeded child and one import transaction.
+// mergeQueueConcernLeg is leg (d): openBlockingConcernIDs translated to the
+// predicate's reason code and detail. Its write, cost and lock order are
+// openBlockingConcernIDs's.
 func (s *Server) mergeQueueConcernLeg(ctx context.Context, runRow *run.Run) (string, string, error) {
-	if s.cfg.ConcernRepo == nil {
-		return "", "", errors.New("no concern repository is wired")
-	}
-	if err := s.reconcileSliceConcerns(ctx, runRow); err != nil {
-		return "", "", fmt.Errorf("reconcile child-slice concerns: %w", err)
-	}
-	open, err := s.cfg.ConcernRepo.ListOpenByRun(ctx, runRow.ID)
+	ids, err := s.openBlockingConcernIDs(ctx, runRow)
 	if err != nil {
 		return "", "", err
+	}
+	if len(ids) > 0 {
+		return mergeQueueReasonBlockingConcernOpen,
+			"open blocking concern(s) (high severity or first_officer provenance): " + strings.Join(ids, ", "), nil
+	}
+	return "", "", nil
+}
+
+// openBlockingConcernIDs is leg (d)'s ONE evaluation, shared by the
+// predicate (mergeQueueConcernLeg), the inline merge endpoint
+// (inlineBlockingConcernHold) and the delegated may_merge arm
+// (delegatedBlockingConcernHold). Before it reads the run's ledger it re-runs
+// the idempotent child-slice import for the run's succeeded decomposition
+// children (reconcileSliceConcerns), so a late child review the best-effort
+// hook lost reaches the ledger it then reads. That import is its one write;
+// it is idempotent (a repeat pass inserts nothing), writes only concern rows
+// plus a concern_rolled_up audit row, and a reconcile failure is an error
+// here: the predicate maps it to undeterminable, the inline merge to a 500
+// and the delegated arm to observe-only, so the merge is held, never waved
+// through. A refusal's "nothing written" therefore means no verdict, intent
+// or queue row, not no concern row. An unwired concern repository is an
+// error too (the inline and delegated callers skip the leg before calling).
+//
+// Locking: the inline merge endpoint and the delegated may_merge arm call it
+// INSIDE the run's merge-intent lock (mergequeue.Store.WithMergeIntentLock);
+// the predicate's own callers (the enqueue arm, re-entry, merge-on-pass)
+// evaluate before they take that lock. ImportRolledUp takes the child-source
+// row locks (FOR NO KEY UPDATE) inside that lock, so the order is always the
+// merge-intent lock first, then the concern store's child-source row locks;
+// no path takes those row locks and then waits on the merge-intent lock. The
+// added cost is one indexed child listing per evaluation, plus, for a
+// decomposed parent with succeeded children, one parent stage list, one
+// open-concern read per succeeded child and one import transaction, all
+// inside the lock fn's deadline.
+func (s *Server) openBlockingConcernIDs(ctx context.Context, runRow *run.Run) ([]string, error) {
+	if s.cfg.ConcernRepo == nil {
+		return nil, errors.New("no concern repository is wired")
+	}
+	if err := s.reconcileSliceConcerns(ctx, runRow); err != nil {
+		return nil, fmt.Errorf("reconcile child-slice concerns: %w", err)
+	}
+	return s.ledgerBlockingConcernIDs(ctx, runRow.ID)
+}
+
+// ledgerBlockingConcernIDs reads the run's OWN ledger and returns the ids of
+// its open blocking concerns (high severity or first_officer provenance),
+// with no reconcile and so no write: the gate view (a GET) reads it directly.
+func (s *Server) ledgerBlockingConcernIDs(ctx context.Context, runID uuid.UUID) ([]string, error) {
+	open, err := s.cfg.ConcernRepo.ListOpenByRun(ctx, runID)
+	if err != nil {
+		return nil, err
 	}
 	var ids []string
 	for _, c := range open {
@@ -676,9 +711,5 @@ func (s *Server) mergeQueueConcernLeg(ctx context.Context, runRow *run.Run) (str
 			ids = append(ids, c.ID.String())
 		}
 	}
-	if len(ids) > 0 {
-		return mergeQueueReasonBlockingConcernOpen,
-			"open blocking concern(s) (high severity or first_officer provenance): " + strings.Join(ids, ", "), nil
-	}
-	return "", "", nil
+	return ids, nil
 }

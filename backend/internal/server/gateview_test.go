@@ -5376,3 +5376,152 @@ func TestShipPullRequest_SupplementalTerminalFence_PG(t *testing.T) {
 		}
 	})
 }
+
+// gvbcNthListFail fails ListOpenByRun on exactly its failOn-th call. In
+// gateViewMergeReadinessFor the first-officer half makes the first read and
+// the blocking-concern half the second, so failOn 2 fails ONLY the new half.
+type gvbcNthListFail struct {
+	*fakeConcernRepo
+	mu     sync.Mutex
+	calls  int
+	failOn int
+}
+
+func (c *gvbcNthListFail) ListOpenByRun(ctx context.Context, runID uuid.UUID) ([]*concern.Concern, error) {
+	c.mu.Lock()
+	c.calls++
+	n := c.calls
+	c.mu.Unlock()
+	if n == c.failOn {
+		return nil, errors.New("concerns down")
+	}
+	return c.fakeConcernRepo.ListOpenByRun(ctx, runID)
+}
+
+// TestGateView_MergeReadiness_BlockingConcern pins the gate view's #5045
+// half (condition C2). The fixture's parent has a READABLE implement stage
+// (readinessGateViewServer), so a reconcile, if the GET ran one, would
+// write a parent copy and surface it.
+//   - an already-copied open HIGH, and an open first_officer concern, each
+//     surface as a blocking_concern_open blocker whose message and details
+//     are the merge endpoint's verbatim (blockingConcernHoldRefusal);
+//   - a medium does not;
+//   - an uncopied succeeded-child HIGH does NOT appear, no parent row is
+//     written, and no check is undetermined: the GET never reconciles;
+//   - a failure of ONLY this half's ledger read is an Undetermined entry
+//     plus the merge_readiness history gap, which no other half records on
+//     this fixture.
+func TestGateView_MergeReadiness_BlockingConcern(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Server, *fakeRepo, *fakeConcernRepo, *run.Run) {
+		t.Helper()
+		s, repo, _, cr := readinessGateViewServer(t)
+		runRow := seedMergeReadinessRun(repo, run.StateRunning, mergePR, func(id uuid.UUID) []*run.Stage {
+			return []*run.Stage{{ID: uuid.New(), RunID: id, Sequence: 1, Type: run.StageTypeImplement, State: run.StageStateSucceeded}}
+		})
+		return s, repo, cr, runRow
+	}
+	raise := func(t *testing.T, cr *fakeConcernRepo, runID uuid.UUID, severity, provenance string) *concern.Concern {
+		t.Helper()
+		rows, err := cr.InsertRaised(ctx, concern.InsertRaisedParams{
+			RunID: runID, StageID: uuid.New(), StageKind: concern.StageKindImplement, Provenance: provenance,
+			OriginReviewSequence: 1, Concerns: []concern.RaisedConcern{{Severity: severity, Category: "correctness", Note: "n"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows[0]
+	}
+	// onlyApprovalUndetermined: the approval half has no GitHub client here,
+	// so it is the one expected Undetermined entry; it records no gap.
+	onlyApprovalUndetermined := func(t *testing.T, mr *gateViewMergeReadiness, resp *gateViewResponse) {
+		t.Helper()
+		for _, u := range mr.Undetermined {
+			if !strings.HasPrefix(u, "approval dismissal:") {
+				t.Errorf("undetermined = %v, want only the approval dismissal entry", mr.Undetermined)
+			}
+		}
+		if resp.HistoryIncomplete {
+			t.Errorf("history_incomplete = true (gaps %v), want false", resp.HistoryGaps)
+		}
+	}
+	requireVerbatim := func(t *testing.T, mr *gateViewMergeReadiness, id string) {
+		t.Helper()
+		b := mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen)
+		if b == nil {
+			t.Fatalf("blockers = %+v, want blocking_concern_open", mr.Blockers)
+		}
+		want := blockingConcernHoldRefusal([]string{id})
+		if b.Message != want.Message {
+			t.Errorf("message = %q, want the merge endpoint's verbatim %q", b.Message, want.Message)
+		}
+		ids, _ := b.Details["concern_ids"].([]string)
+		if len(ids) != 1 || ids[0] != id || b.Details["next_step"] != blockingConcernHoldNextStep {
+			t.Errorf("blocker details = %v, want concern_ids [%s] and the next step", b.Details, id)
+		}
+	}
+	t.Run("open high: blocker", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		high := raise(t, cr, runRow.ID, "high", "")
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		requireVerbatim(t, mr, high.ID.String())
+		onlyApprovalUndetermined(t, mr, &resp)
+	})
+	t.Run("open first_officer: blocker", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		fo := raise(t, cr, runRow.ID, "low", concern.ProvenanceFirstOfficer)
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		requireVerbatim(t, mr, fo.ID.String())
+		if mergeBlockerByCode(mr, codeFirstOfficerFindingOpen) == nil {
+			t.Errorf("blockers = %+v, want first_officer_finding_open too (the POST answers it first)", mr.Blockers)
+		}
+	})
+	t.Run("open medium: no blocker", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		raise(t, cr, runRow.ID, "medium", "")
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		if mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen) != nil {
+			t.Errorf("blockers = %+v, want no blocking_concern_open for a medium", mr.Blockers)
+		}
+		onlyApprovalUndetermined(t, mr, &resp)
+	})
+	t.Run("uncopied child high: not shown, nothing written", func(t *testing.T) {
+		s, repo, cr, runRow := setup(t)
+		childID, idx := uuid.New(), 0
+		repo.mu.Lock()
+		repo.runs[childID] = &run.Run{ID: childID, Repo: "x/y", State: run.StateSucceeded, DecomposedFrom: &runRow.ID, SliceIndex: &idx}
+		repo.mu.Unlock()
+		raise(t, cr, childID, "high", "")
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		if mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen) != nil {
+			t.Errorf("blockers = %+v, want none: the GET does not reconcile", mr.Blockers)
+		}
+		if rows, _ := cr.ListByRun(ctx, runRow.ID); len(rows) != 0 {
+			t.Errorf("parent ledger rows = %d, want 0 (the gate view never writes)", len(rows))
+		}
+		onlyApprovalUndetermined(t, mr, &resp)
+	})
+	t.Run("read error: undetermined and history gap", func(t *testing.T) {
+		s, _, cr, runRow := setup(t)
+		raise(t, cr, runRow.ID, "high", "")
+		s.cfg.ConcernRepo = &gvbcNthListFail{fakeConcernRepo: cr, failOn: 2}
+		var resp gateViewResponse
+		mr := s.gateViewMergeReadinessFor(ctx, runRow, &resp)
+		if undeterminedContains(mr, "first-officer") {
+			t.Fatalf("undetermined = %v: the first-officer read failed, so the fixture does not isolate this half", mr.Undetermined)
+		}
+		if !undeterminedContains(mr, "blocking concerns") {
+			t.Errorf("undetermined = %v, want a blocking concerns entry", mr.Undetermined)
+		}
+		if mergeBlockerByCode(mr, mergeQueueReasonBlockingConcernOpen) != nil {
+			t.Errorf("blockers = %+v, want no blocking_concern_open on an unread ledger", mr.Blockers)
+		}
+		if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
+			t.Errorf("history_incomplete=%v gaps=%v, want the merge_readiness gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+	})
+}

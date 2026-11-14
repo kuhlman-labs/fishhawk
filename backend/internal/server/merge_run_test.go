@@ -3207,6 +3207,13 @@ func TestMergeRun_ReviewCoverageCovered_Proceeds(t *testing.T) {
 	h := newCoverageHarness(t)
 	h.d3b1d915(t)
 	h.round(h.parentID, 30, 1, "implement_reviewed")
+	// #5045: a decomposed parent carries its implement stage (the stage the
+	// in-lock blocking-concern reconcile attaches copies to); the harness
+	// seeds none, which that reconcile reads as fail-closed.
+	h.repo.mu.Lock()
+	h.repo.stagesByRun[h.parentID] = []*run.Stage{{ID: uuid.New(), RunID: h.parentID, Sequence: 1,
+		Type: run.StageTypeImplement, State: run.StageStateSucceeded}}
+	h.repo.mu.Unlock()
 	w := postMergeRun(t, h.s, h.parentID, mergeRunRequest{Verdict: "lgtm"}, withMergeOperator)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())

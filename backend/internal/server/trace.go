@@ -428,6 +428,14 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			s.failStageCategoryC(r, runID, stageID,
 				"no_diff_captured: implement stage produced an empty diff; nothing was staged or captured (retryable; see #691/#692)",
 				body)
+		case s.verifyInfraTempFailOnly(r.Context(), stageID, body, violations):
+			// #5264: the committed-tree verify's only failing commands
+			// exited 75 (EX_TEMPFAIL, ADR-102 / #4022), so the change
+			// was never judged, and that verification_reported
+			// violation is the SOLE violation. Route it to retryable
+			// category C so the orchestrator parks the run
+			// retry-eligible instead of failing it on a B.
+			s.failStageCategoryC(r, runID, stageID, verifyInfraTempFailTraceReason, body)
 		default:
 			s.failStageCategoryB(r, runID, stageID, "policy violations on backend re-evaluation", body)
 		}
@@ -1509,9 +1517,11 @@ func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, r
 // (infrastructure/transient per MVP_SPEC §6), which — unlike B — is
 // retryable via the existing failed → pending path
 // (run.RetryStage + orchestrator re-dispatch). The trace handler uses
-// it for the #691 staging-bug signature (an implement stage's
-// present-but-empty diff), so operators get an escape hatch instead
-// of an un-redrivable B. Same best-effort posture as the B helper:
+// it for its two category-C reclassification arms: the #691 staging-bug
+// signature (an implement stage's present-but-empty diff, noDiffCaptured)
+// and the #5264 exit-75 verify signature (verifyInfraTempFailOnly), so
+// operators get an escape hatch instead of an un-redrivable B. Same
+// best-effort posture as the B helper:
 // failures log at WARN and never unwind the already-stored upload.
 func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureC, reason); err != nil {
@@ -1529,7 +1539,7 @@ func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, r
 	}
 	s.advanceAfterFailure(r, runID, stageID)
 	// Best-effort: emit runtime calibration for implement stages that
-	// failed with an empty captured diff.
+	// failed with an empty captured diff or an exit-75 verify.
 	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
 }
 
@@ -1569,6 +1579,76 @@ func (s *Server) noDiffCaptured(ctx context.Context, stageID uuid.UUID, bundleBy
 	// failure as a genuine category-B.
 	for _, v := range violations {
 		if v.Constraint != "required_outcomes" || v.Detail != "no test files added or updated" {
+			return false
+		}
+	}
+	return len(violations) > 0
+}
+
+// verifyExitTempFail is the verify exit-code contract's EX_TEMPFAIL
+// (sysexits(3) 75): an infrastructure / temporary failure that did NOT
+// judge the change. It mirrors the runner's constant of the same name in
+// runner/cmd/fishhawk-runner/verifyexit.go (ADR-102 / #4022); the
+// contract is docs/spec/workflow-v2.md § Verify exit-code contract.
+const verifyExitTempFail = 75
+
+// verifyInfraTempFailTraceReason is the stage failure reason the trace
+// handler stamps when verifyInfraTempFailOnly reclassifies a backend
+// policy re-evaluation failure as retryable category C (#5264). It is a
+// constant so the reason is stable and greppable across the stage row,
+// the audit trail and the tests.
+const verifyInfraTempFailTraceReason = "verify_infra_tempfail: the committed-tree verify's only failing command exited 75 (EX_TEMPFAIL, an infrastructure / temporary failure) and backend policy re-evaluation found no other violation; the change was NOT judged. Retry the stage in place (#5264, #4022)"
+
+// verifyInfraTempFailOnly reports whether a failed policy re-evaluation
+// is the #5264 exit-75 signature: an implement stage whose committed-tree
+// verify reported `failed` because every non-passing, non-superseded
+// verify command exited 75 (EX_TEMPFAIL — the change was not judged), and
+// where the resulting verification_reported violation is the SOLE cause
+// of the failure. The caller routes it to a retryable category C instead
+// of an un-redrivable B, matching the runner's own exit-75 → category-C
+// contract (ADR-102).
+//
+// It fails closed — returning false and preserving the genuine
+// category-B classification — when:
+//   - the stage can't be read or isn't an implement stage,
+//   - the bundle carries no verification signal (no or malformed
+//     gate_evidence; that violation is "no verification evidence"),
+//   - the signal's outcome is anything but `failed` (a `skipped` gate is
+//     not an infrastructure failure),
+//   - any non-passing command exited with anything other than 75
+//     (a real red verify, or a mix of 75 and a real failure),
+//   - no command failed at all (a summary-only failure, or a failed
+//     summary over passing commands, never reclassifies), or
+//   - any violation is not exactly the verification_reported violation
+//     for this signal (matched by exact Detail equality against
+//     policy.VerificationNotPassedDetail). Every other policy constraint
+//     must have passed, so a forbidden path, a missing test file or an
+//     `invalid pattern` config error keeps the failure a category B.
+func (s *Server) verifyInfraTempFailOnly(ctx context.Context, stageID uuid.UUID, bundleBytes []byte, violations []policy.Violation) bool {
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil || stage.Type != run.StageTypeImplement {
+		return false
+	}
+	sig := verificationSignalFromBundle(bundleBytes)
+	if sig == nil || sig.Outcome != "failed" {
+		return false
+	}
+	failing := 0
+	for _, c := range sig.Commands {
+		if c.Outcome == "passed" {
+			continue
+		}
+		if c.ExitCode != verifyExitTempFail {
+			return false
+		}
+		failing++
+	}
+	if failing == 0 {
+		return false
+	}
+	want := policy.VerificationNotPassedDetail(sig)
+	for _, v := range violations {
+		if v.Constraint != "required_outcomes" || v.Detail != want {
 			return false
 		}
 	}

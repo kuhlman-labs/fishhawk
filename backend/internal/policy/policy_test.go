@@ -674,6 +674,34 @@ func TestRequiredOutcomes_VerificationReported_NotDeferred(t *testing.T) {
 	}
 }
 
+// TestVerificationNotPassedDetail_MatchesEvaluatedViolation pins the
+// exported helper to the evaluator's REAL output (#5264). The server's
+// trace handler recognises the verification_reported violation of an
+// exit-75-only verify by exact Detail equality against
+// VerificationNotPassedDetail, so a drift between the helper and the
+// Detail Evaluate emits would silently disable that category-C arm.
+func TestVerificationNotPassedDetail_MatchesEvaluatedViolation(t *testing.T) {
+	sig := &VerificationSignal{
+		Outcome: "failed",
+		Commands: []VerificationCommand{
+			{Command: "scripts/test verify", ExitCode: 75, Outcome: "failed"},
+		},
+	}
+	got := Evaluate(diff("a.go"), Constraints{
+		RequiredOutcomes: []string{"verification_reported"},
+		Verification:     sig,
+	})
+	if len(got) != 1 {
+		t.Fatalf("violations = %+v, want exactly 1", got)
+	}
+	if got[0].Constraint != "required_outcomes" {
+		t.Errorf("Constraint = %q, want required_outcomes", got[0].Constraint)
+	}
+	if want := VerificationNotPassedDetail(sig); got[0].Detail != want {
+		t.Errorf("Detail = %q, want VerificationNotPassedDetail = %q", got[0].Detail, want)
+	}
+}
+
 // TestConstraints_VerificationRoundTrip pins binding condition 5: the
 // signal must survive the marshal/unmarshal round-trip through the
 // audit payload's applied_constraints, which is what the post-CI policy

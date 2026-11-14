@@ -381,19 +381,26 @@ below); eject/promote and durability are slices 3-4.
   transaction, which takes the child-source row locks (`FOR NO KEY UPDATE`).
   The reconcile takes no lock of its own. The lock order is the merge-intent
   lock first, then the concern store's row locks, never the reverse: a
-  merge-variant evaluation that runs under the merge-intent lock nests the
-  row locks inside it and inherits its `fn` deadline. Today's callers
-  (the enqueue arm, re-entry and merge-on-pass) evaluate BEFORE they take
-  that lock, and admission and the re-probe run on detached pump or tick
-  contexts, so none nests the import today. Every caller is a POST or pump path
+  caller that runs it under the merge-intent lock nests the row locks inside
+  it and inherits its `fn` deadline. Two callers do: the inline merge
+  endpoint (`inlineBlockingConcernHold`, after the ownership check) and the
+  delegated may_merge arm (`delegatedBlockingConcernHold`, in
+  `delegatedMergeLocked`) evaluate leg (d) through `openBlockingConcernIDs`
+  inside the lock (#5045). The predicate's callers (the enqueue arm, re-entry
+  and merge-on-pass) evaluate BEFORE they take that lock, and admission and
+  the re-probe run on detached pump or tick contexts. No path takes the
+  concern row locks and then waits on the merge-intent lock, so the nesting
+  has no cycle. Every caller is a POST or pump path
   (the enqueue arm, re-entry, admission, merge-on-pass, the yield re-probe,
   rebase); no GET evaluates the predicate, so no GET writes. A parent copy
   and its child source resolve independently except for retry-sweep
-  supersession (the concern README, § "Child-slice rollup"). **Residual
-  (#5045):** the inline admitted merge (`handleMergeRun` when
-  `mergeCandidateGate` admits) never evaluates this predicate, so it runs no
-  leg (d) at all; this reconcile does not make an open HIGH block every
-  merge path. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
+  supersession (the concern README, § "Child-slice rollup"). **Boundary
+  (#5045):** every Fishhawk-owned merge path evaluates leg (d): the inline
+  merge endpoint (409 `blocking_concern_open`, nothing new recorded) and the
+  delegated may_merge arm (observe-only) in-lock, the queue paths through
+  this predicate. Merge-on-pass evaluates it before it takes the lock, so a
+  concern raised in that window is not seen on that pump (a residual). A
+  merge made directly on the forge is not held. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
   `review_coverage_incomplete`, `acceptance_not_eligible`,
   `acceptance_stale`, `checks_not_green`, `checks_red`,
   `blocking_concern_open`, `undeterminable`. The ADMISSION variant differs

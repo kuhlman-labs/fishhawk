@@ -674,7 +674,7 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool, verifica
 			case verification.Outcome != "passed":
 				v = append(v, Violation{
 					Constraint: "required_outcomes",
-					Detail:     verificationNotPassedDetail(verification),
+					Detail:     VerificationNotPassedDetail(verification),
 				})
 			}
 		default:
@@ -689,11 +689,19 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool, verifica
 	return v
 }
 
-// verificationNotPassedDetail renders the violation detail for a
+// VerificationNotPassedDetail renders the violation detail for a
 // non-passing verification signal: the reported outcome, plus the
 // first non-passing command when the signal carried one, so the
 // audit entry names WHAT failed rather than just that something did.
-func verificationNotPassedDetail(v *VerificationSignal) string {
+//
+// Exported because the server's trace handler identifies the
+// verification_reported violation by exact Detail equality against
+// this helper's output when it reclassifies an exit-75-only verify
+// failure as retryable category C (verify_infra_tempfail, #5264).
+// Changing the rendered string therefore changes both sides at once;
+// TestVerificationNotPassedDetail_MatchesEvaluatedViolation pins it to
+// the evaluator's real output.
+func VerificationNotPassedDetail(v *VerificationSignal) string {
 	outcome := v.Outcome
 	if outcome == "" {
 		outcome = "unknown"

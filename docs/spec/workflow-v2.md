@@ -1063,6 +1063,7 @@ Evaluated **after** the stage runs, against the produced diff. A hit is a catego
 |---|---|
 | committed-tree verify reported `passed` | satisfied |
 | committed-tree verify reported `failed` | violation, naming the outcome and the failing command |
+| committed-tree verify reported `failed` and every failing command exited `75` | still a violation, but when it is the stage's **only** violation the backend fails the stage category C (reason lead `verify_infra_tempfail`, retryable in place) instead of B, matching the [exit-code contract](#verify-exit-code-contract); any other exit code or any other violation stays B (#5264) |
 | committed-tree verify reported `skipped` | violation — a skipped gate is not a passed gate |
 | no verification evidence in the trace | violation (`no verification evidence in trace`) |
 
