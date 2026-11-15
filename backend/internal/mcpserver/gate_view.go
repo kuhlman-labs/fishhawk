@@ -166,6 +166,20 @@ Response (gate_view):
     entry), so an empty blockers[] is not "nothing blocks" while
     undetermined[] is non-empty.
     Omitted when the run has no pull request or is failed/cancelled.
+    This is the SIDE-EFFECT-FREE readiness read: use it to check readiness and
+    never call fishhawk_merge_run with a placeholder verdict to probe, because
+    every merge call is a real merge attempt.
+    PRE-APPROVAL CHECKLIST. Before you approve the pull request, confirm in this
+    view: merge_candidate_verdict.head_sha is the head every piece of evidence is
+    bound to and matches the PR head you are about to approve (re-read the PR
+    head once acceptance settles — an acceptance scenario commit moves it);
+    review_head_mismatch is absent; merge_readiness.blockers[] is empty EXCEPT
+    approval_dismissed, which approving clears; there is no open blocking concern
+    and no open control_unpinned concern; and the acceptance outcome is known, so
+    your merge verdict can name it. A non-empty undetermined[] is informational
+    and does not block approval: a healthy PR that is not blocked reports its
+    approval check as undetermined. Approve after any vouch or hardening push,
+    never before it.
   - merge_candidate_queue — the run's active ADR-092 merge-candidate queue
     entry, the same block fishhawk_get_run_status carries: state held (the
     pass waits behind the base's live pass at position N with live_run_id,

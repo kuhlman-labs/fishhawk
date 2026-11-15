@@ -99,7 +99,9 @@ One issue → one run → one PR.
    endpoint is idempotent: a timed-out re-invoke or a 502 retry re-queues the
    merge with no duplicate verdict row, so it is safe to re-call. Queueing the
    merge before the approval settles is also safe — GitHub fires it once branch
-   protection is satisfied.
+   protection is satisfied. Before you approve, and for what to do when a wait
+   or a refusal stalls, read "Merge and acceptance: approve, wait and recover"
+   in the edge-case playbook.
 
 ## Edge-case playbook
 
@@ -1144,6 +1146,76 @@ commit on its own branch would defeat the cross-write protection the vouch
 exists to preserve. So the surfaced remedy is only actionable with the operator
 token. If the finding is not worth an in-loop fix, the ceiling-reached hint's
 other arms still apply: merge with a follow-up issue, or start a fresh run.
+
+### Merge and acceptance: approve, wait and recover
+
+The judgement half of step 6. The tool descriptions carry the mechanics; this
+is what to weigh before and around the merge.
+
+**Pre-approval checklist.** Read `fishhawk_get_gate_view` first and confirm,
+before you approve:
+
+- the PR head is unmoved since the evidence: `merge_candidate_verdict.head_sha`
+  is the head every piece of evidence is bound to, and it matches the PR head you
+  are about to approve (`review_head_mismatch` is absent);
+- the required checks are green at that head;
+- the reviews are settled and no blocking concern is open;
+- every counterfactual the plan declared was observed RED, so no
+  `control_unpinned` concern is open;
+- the acceptance outcome is known, so your merge verdict can name it;
+- `merge_readiness.blockers[]` is empty EXCEPT `approval_dismissed`, which
+  approving clears. A non-empty `undetermined[]` is informational and does not
+  block approval: a healthy pull request that is not blocked reports its
+  approval check as undetermined.
+
+**Order, to waste nothing.** Push, vouch (`fishhawk_vouch_commit`), wait for the
+checks to go green at the vouched head, approve, then `fishhawk_merge_run`. Any
+push, a vouch included, moves the head, restarts CI and, where branch protection
+dismisses stale approvals, dismisses the approval: approve after the last push,
+never before it, and re-approve after any push. When `fishhawk_merge_run` answers
+`forge_approval_required` on an approval-gated run after a vouch, that is the
+dismissed approval; the gate view reports it as `approval_dismissed`.
+
+**Re-read the head after acceptance settles.** An acceptance stage can push a
+scenario commit after its verdict is recorded. That moves the head and restarts
+CI, so re-read the PR head once acceptance settles and approve the head you
+re-read, not the one you reviewed.
+
+**Bound every CI wait.** Give each wait a timeout and read the check status
+between calls (`fishhawk_merge_run` `timeout_seconds`, then
+`fishhawk_get_run_status`); never watch checks unbounded. A merge that stays
+queued while the pull request is BLOCKED is answered by the
+`fishhawk_audit_complete` check output on the pull request, whose summary names
+the missing item (where branch protection makes that check gate the merge), or
+by `merge_readiness`.
+
+**Expect all-skip for observables the preview cannot drive.** A plan whose every
+acceptance criterion is `skip_expected` with a basis settles `not_validated`
+with no runner. Bind a preview or target only when a criterion drives a runtime
+HTTP or MCP surface; a prompt, script, struct or PR-text observable is expected
+to all-skip. A settled acceptance stage is not re-run by re-invoking
+`fishhawk_drive_run`; re-open it through the verb its `next_actions` name.
+
+**A rebase on a decomposed parent means waiting for the new round.**
+`fishhawk_rebase_run_branch` moves the parent's head, and a fresh consolidated
+implement-review round starts on it (behind the verify-only pass when the
+workflow declares a verify command). Await it (`fishhawk_await_review`) before
+`fishhawk_merge_run`: the earlier round judged a tree the PR no longer carries.
+
+**Never probe `fishhawk_merge_run`.** Every call is a real merge attempt; with a
+placeholder verdict it records the verdict and queues the merge as soon as the
+gates pass. For a readiness check that records nothing, read `merge_readiness`
+on the gate view.
+
+**Parallel items that collide on shared registration files.** Recommended, not
+required: resolve the collision as a union of both sides, then re-run the
+repository's generators so the generated surfaces follow.
+
+**Settled runs and `fishhawk_reconcile_merge`.** A run the merge webhook already
+settled (state `succeeded`, for example after an out-of-band or admin merge)
+answers `reconcile_merge_not_applicable` or an empty-list 200. If
+`fishhawk_get_run_status` shows the run already succeeded, that is not an
+error; otherwise follow the server message.
 
 ### Scope-amendment decide / naming flow
 

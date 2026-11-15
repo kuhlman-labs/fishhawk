@@ -285,6 +285,16 @@ Whoever routes a fix-up decides how big the pass is, whether it is worth its cos
 3. **Confirmed is not a reproduction.** A re-reviewer's "confirmed" resolution is an opinion over the diff. Re-run your own reproduction at the fix-up head, and re-route a defect that still reproduces with `operator_evidence`, then close that concern yourself.
 4. **Recover by shape.** A no-commit pass (`fixup_no_changes`) is refunded, but do not repeat the same route unchanged. A pass that died category A or C having pushed nothing is refunded, and re-routing is fine once the cause is fixed; a category-B failure consumes a pass. At the fix-up ceiling, fold the verified findings into the issue body as a dated constraints block, cancel the run, close its pull request and start a fresh run.
 
+## 9. Merge and acceptance
+
+The MCP runbook's *Merge and acceptance: approve, wait and recover* section and the `fishhawk_merge_run`, `fishhawk_vouch_commit` and `fishhawk_get_gate_view` descriptions carry the repository-agnostic judgement. Five rules apply on this repository (#5213):
+
+1. **Approve on evidence bound to the current head.** Read the gate view's pre-approval checklist, and re-read the pull request head after acceptance settles, because an acceptance scenario commit moves it. A handler-authorization change also needs this repository's authorization checklist from `docs/agents/change-checklists.md` (the token-impact inventory, the migration and the category registry) answered in the PR body before you approve.
+2. **Push, vouch, CI, approve, merge.** Any push, a vouch included, restarts CI and can dismiss the approval, so approve after the last push and then call `fishhawk_merge_run`. A `forge_approval_required` answer after a vouch is that dismissed approval; re-approve the vouched head.
+3. **Bound each CI wait at about 30 minutes.** Give the wait a timeout and read the check status between calls; a check still pending past the bound is an incident to read, not a reason to watch longer.
+4. **Resolve registration collisions as a union.** Recommended where parallel items collide on a shared registration file: keep both sides, then regenerate the site reference with `scripts/gen-site-reference`. This is a recommendation, not a confirmed rule of the tooling.
+5. **`verified=false` is a halt.** `fishhawk_verify_run` answering `verified=false` stops the merge and is an incident: do not approve over it, and do not retry it as a routine step.
+
 ## Sources
 
 | Topic | Canonical file |

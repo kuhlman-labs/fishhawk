@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -222,6 +223,10 @@ Named refusals, each surfacing the backend's code verbatim so you can act on it:
     and (with supersede_stranded) no stranded candidate, so there is nothing this
     verb may terminalize; completion_blocked.reason says what the stage needs
     instead. For a stage stranded in flight, retry with supersede_stranded: true.
+    A run the merge webhook already settled (run state succeeded, e.g. after an
+    out-of-band or admin merge) answers either this 409 or an empty-list 200.
+    Neither is an error when fishhawk_get_run_status shows the run already
+    succeeded; otherwise follow the server message.
   - reconcile_merge_stage_live (409) — supersede_stranded was set and a
     candidate stage showed activity inside the idle threshold (or was touched
     after the check); details.live_stages names each one. Let it settle.
@@ -267,6 +272,15 @@ func (r *runResolver) recordMergeObservation(ctx context.Context, _ *mcp.CallToo
 	return nil, out, nil
 }
 
+// reconcileMergeNotApplicableCode is the backend's 409 code for a run holding
+// nothing this verb may settle.
+const reconcileMergeNotApplicableCode = "reconcile_merge_not_applicable"
+
+// reconcileMergeNotApplicableHint is the static, conditional hint wrapped onto
+// a reconcile_merge_not_applicable refusal (E106.28 / #5213, rule 4): a run the
+// merge webhook already settled answers this 409, which is not an error.
+const reconcileMergeNotApplicableHint = "If fishhawk_get_run_status shows the run already succeeded (the merge webhook settled it, e.g. after an out-of-band or admin merge), this is not an error and there is nothing to reconcile; otherwise follow the server message above."
+
 // reconcileMerge is the settle tool's handler. Same pre-hop UUID guard.
 func (r *runResolver) reconcileMerge(ctx context.Context, _ *mcp.CallToolRequest, in ReconcileMergeInput) (*mcp.CallToolResult, ReconcileMergeOutput, error) {
 	runUUID, err := uuid.Parse(in.RunID)
@@ -283,6 +297,14 @@ func (r *runResolver) reconcileMerge(ctx context.Context, _ *mcp.CallToolRequest
 	}
 	res, err := r.api.ReconcileMerge(ctx, runUUID, in.SupersedeStranded)
 	if err != nil {
+		// E106.28 / #5213, rule 4: wrap ONLY reconcile_merge_not_applicable, by
+		// code, with a static conditional hint. It makes no extra read, every
+		// other refusal is unchanged, and the server message stays in the
+		// wrapped error.
+		var ae *apiError
+		if errors.As(err, &ae) && ae.Code == reconcileMergeNotApplicableCode {
+			return nil, ReconcileMergeOutput{}, fmt.Errorf("reconcile merge: %w. %s", err, reconcileMergeNotApplicableHint)
+		}
 		return nil, ReconcileMergeOutput{}, fmt.Errorf("reconcile merge: %w", err)
 	}
 	out := ReconcileMergeOutput{RunID: res.RunID, RunState: res.RunState, Warnings: warnings}
