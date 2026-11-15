@@ -162,6 +162,15 @@ type campaignPreviewResponse struct {
 	// a defensively-wrapped dangling error with no typed form still says WHY
 	// rather than reporting an empty failure. Omitted on a valid report.
 	Message string `json:"message,omitempty"`
+	// AdmissionScreen is the ADVISORY #3649 admission screen (runnable:no and
+	// forbidden-path candidates), the same block create returns (#5221). Set
+	// only by attachPreviewScreens, on all three report paths; omitted when
+	// the screen found nothing. The preview writes no audit row for it.
+	AdmissionScreen *campaignAdmissionScreenPayload `json:"admission_screen,omitempty"`
+	// PathOverlap is the ADVISORY path_overlap block (#5221): item pairs that
+	// name the same file path with no depends_on ordering them. Set only by
+	// attachPreviewScreens; omitted when no pair shares a path.
+	PathOverlap *campaignPreviewPathOverlap `json:"path_overlap,omitempty"`
 }
 
 // Per-reason remedies rendered into a dangling report entry. They are one short
@@ -181,7 +190,8 @@ const (
 // and reports the wave-ordered DAG — or the edges that block it — as a 200
 // report. It creates no campaign row, no item row and no audit entry on ANY
 // path, which is what makes iterating toward a dependency-closed item set cheap
-// instead of a sequence of 422s.
+// instead of a sequence of 422s. Every report also carries the advisory
+// admission_screen and path_overlap blocks (#5221) when they find something.
 //
 // It requires the SAME write:campaigns scope create does, deliberately. A
 // preview costs the IDENTICAL per-item forge sweep and is the pre-flight of a
@@ -244,57 +254,59 @@ func (s *Server) handlePreviewCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One exit: every report path (valid, dangling, cycle) fills resp, then
+	// the advisory screens are attached and the 200 is written once.
+	var resp campaignPreviewResponse
 	assembly, err := campaign.Assemble(epicRef, source.Result)
-	if err != nil {
-		switch {
-		case errors.Is(err, campaign.ErrDanglingDependency):
-			// THE POINT OF THE VERB: a dangling set is a 200 report, not the
-			// 422 create refuses with.
-			resp := partialPreviewReport(req.Repo, epicRef, source)
-			resp.Message = err.Error()
-			resp.Dangling, resp.ClosureCandidates = danglingPreview(err)
-			s.writeJSON(w, r, http.StatusOK, resp)
-			return
-		case errors.Is(err, campaign.ErrCycle):
-			resp := partialPreviewReport(req.Repo, epicRef, source)
-			resp.Cycle = err.Error()
-			s.writeJSON(w, r, http.StatusOK, resp)
-			return
-		default:
-			// Neither sentinel (today: only Assemble's nil-result invariant).
-			// That is not a property of the item set, so it stays the same 400
-			// create answers with rather than becoming a valid:false report.
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				err.Error(), map[string]any{"epic_ref": req.EpicRef})
-			return
+	switch {
+	case err == nil:
+		items := make([]campaignPreviewItem, 0, len(assembly.Items))
+		for _, it := range assembly.Items {
+			wave := it.Wave
+			items = append(items, campaignPreviewItem{
+				IssueRef:  it.IssueRef,
+				DependsOn: nonNilRefs(it.DependsOn),
+				Wave:      &wave,
+				Autonomy:  it.Autonomy,
+				Position:  it.Position,
+			})
 		}
+		waveCount := len(assembly.Waves)
+		resp = campaignPreviewResponse{
+			Valid:                 true,
+			Repo:                  req.Repo,
+			EpicRef:               epicRef,
+			ItemCount:             len(assembly.Items),
+			WaveCount:             &waveCount,
+			Waves:                 assembly.Waves,
+			Items:                 items,
+			Edges:                 previewEdges(source.Result),
+			Warnings:              legacyDependencyWarnings(source.Result),
+			SatisfiedDependencies: satisfiedDependencyPayloads(assembly.SatisfiedDependencies),
+			GroomingSource:        source.Provenance,
+		}
+	case errors.Is(err, campaign.ErrDanglingDependency):
+		// THE POINT OF THE VERB: a dangling set is a 200 report, not the
+		// 422 create refuses with.
+		resp = partialPreviewReport(req.Repo, epicRef, source)
+		resp.Message = err.Error()
+		resp.Dangling, resp.ClosureCandidates = danglingPreview(err)
+	case errors.Is(err, campaign.ErrCycle):
+		resp = partialPreviewReport(req.Repo, epicRef, source)
+		resp.Cycle = err.Error()
+	default:
+		// Neither sentinel (today: only Assemble's nil-result invariant).
+		// That is not a property of the item set, so it stays the same 400
+		// create answers with rather than becoming a valid:false report.
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			err.Error(), map[string]any{"epic_ref": req.EpicRef})
+		return
 	}
-
-	items := make([]campaignPreviewItem, 0, len(assembly.Items))
-	for _, it := range assembly.Items {
-		wave := it.Wave
-		items = append(items, campaignPreviewItem{
-			IssueRef:  it.IssueRef,
-			DependsOn: nonNilRefs(it.DependsOn),
-			Wave:      &wave,
-			Autonomy:  it.Autonomy,
-			Position:  it.Position,
-		})
-	}
-	waveCount := len(assembly.Waves)
-	s.writeJSON(w, r, http.StatusOK, campaignPreviewResponse{
-		Valid:                 true,
-		Repo:                  req.Repo,
-		EpicRef:               epicRef,
-		ItemCount:             len(assembly.Items),
-		WaveCount:             &waveCount,
-		Waves:                 assembly.Waves,
-		Items:                 items,
-		Edges:                 previewEdges(source.Result),
-		Warnings:              legacyDependencyWarnings(source.Result),
-		SatisfiedDependencies: satisfiedDependencyPayloads(assembly.SatisfiedDependencies),
-		GroomingSource:        source.Provenance,
-	})
+	// The advisory admission_screen and path_overlap blocks (#5221). They
+	// never change valid, waves or items, and the preview writes NO
+	// campaign_admission_screened audit row (only create does).
+	s.attachPreviewScreens(r.Context(), &resp, source, owner, name)
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 // previewEdges renders the result's IN-SET depends_on edges — those whose BOTH
