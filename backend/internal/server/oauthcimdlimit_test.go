@@ -1,8 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -307,6 +312,112 @@ func TestOAuthCIMDLimiter_RateLimitedErrorCarriesTypedWait(t *testing.T) {
 	}
 	if rl.retryAfter != 7*time.Second {
 		t.Fatalf("retryAfter = %v, want 7s", rl.retryAfter)
+	}
+}
+
+// TestOAuthCIMDLimiter_RefusalNamesRatesAndRemedy (#5224) drives the REAL
+// authorize and token routes against a server whose limiter is configured
+// through Config with DISTINCTIVE refill values (7s per source, 3s global, so
+// neither matches a default), exhausts the per-source bucket, and asserts the
+// 429's error_description names both configured rates, both bursts and the
+// pre-registration remedy. Restoring the old constant description, or rendering
+// the defaults instead of the configured values, turns this RED.
+func TestOAuthCIMDLimiter_RefusalNamesRatesAndRemedy(t *testing.T) {
+	newServer := func() *Server {
+		return New(Config{
+			OAuthASIssuer:               "https://as.example",
+			OAuthStore:                  newFakeOAuthStore(),
+			OAuthCIMDFetcher:            newCIMDFetcher(newCIMD()),
+			OAuthCIMDRateBurst:          1,
+			OAuthCIMDRateInterval:       7 * time.Second,
+			OAuthCIMDGlobalRateBurst:    40,
+			OAuthCIMDGlobalRateInterval: 3 * time.Second,
+		})
+	}
+	wantParts := []string{
+		"one per 7s per source, burst 1",
+		"one per 3s globally, burst 40",
+		"fishhawkd oauth client register",
+		"Retry-After",
+	}
+	check := func(t *testing.T, rr *httptest.ResponseRecorder) {
+		t.Helper()
+		if rr.Code != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429; body=%s", rr.Code, rr.Body.String())
+		}
+		var body oauthErrorBody
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode the 429 body: %v (%s)", err, rr.Body.String())
+		}
+		if body.Error != "temporarily_unavailable" {
+			t.Fatalf("error = %q, want temporarily_unavailable", body.Error)
+		}
+		for _, want := range wantParts {
+			if !strings.Contains(body.ErrorDescription, want) {
+				t.Errorf("error_description %q does not name %q", body.ErrorDescription, want)
+			}
+		}
+	}
+
+	t.Run("authorize", func(t *testing.T) {
+		srv := newServer()
+		const src = "198.51.100.7:7777"
+		if rr := getAuthorizeFrom(srv, authorizeQuery(map[string]string{"client_id": "https://d0.example/cimd"}), src); rr.Code == http.StatusTooManyRequests {
+			t.Fatalf("the first request (burst 1) was rate limited; body=%s", rr.Body.String())
+		}
+		check(t, getAuthorizeFrom(srv, authorizeQuery(map[string]string{"client_id": "https://d1.example/cimd"}), src))
+	})
+	t.Run("token", func(t *testing.T) {
+		srv := newServer()
+		form := func(clientID string) url.Values {
+			v := url.Values{}
+			v.Set("grant_type", "authorization_code")
+			v.Set("code", "irrelevant")
+			v.Set("client_id", clientID)
+			return v
+		}
+		if rr := postToken(srv, form("https://t0.example/cimd"), nil); rr.Code == http.StatusTooManyRequests {
+			t.Fatalf("the first request (burst 1) was rate limited; body=%s", rr.Body.String())
+		}
+		check(t, postToken(srv, form("https://t1.example/cimd"), nil))
+	})
+}
+
+// TestOAuthCIMDLimiter_RefusalDescriptionIsRFC6749Charset pins the rendering of
+// sub-second intervals: RFC 6749 §5.2 limits error_description to %x20-21 /
+// %x23-5B / %x5D-7E. A 500µs refill must render in decimal seconds, not as
+// time.Duration.String's "500µs" (U+00B5); rendering with Duration.String turns
+// this RED.
+func TestOAuthCIMDLimiter_RefusalDescriptionIsRFC6749Charset(t *testing.T) {
+	lim := newOAuthCIMDLimiter(newFrozen().now, 2, 500*time.Microsecond, 3, 1500*time.Millisecond, 10)
+	desc := lim.refusalDescription()
+	for i := 0; i < len(desc); i++ {
+		if c := desc[i]; c < 0x20 || c > 0x7e || c == '"' || c == '\\' {
+			t.Fatalf("error_description byte %d = %#x is outside the RFC 6749 §5.2 set: %q", i, c, desc)
+		}
+	}
+	for _, want := range []string{"one per 0.0005s per source, burst 2", "one per 1.5s globally, burst 3"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("error_description %q does not name %q", desc, want)
+		}
+	}
+}
+
+// TestOAuthCIMDLimiter_RefusalDescriptionDocumented pins the two prose copies
+// of the default 429 text (#5224) to the accessor that builds it. Each site
+// quotes the default-policy description inside backticks, wrapped across
+// lines, so the comparison collapses whitespace. When the text changes, update
+// BOTH sites this test names.
+func TestOAuthCIMDLimiter_RefusalDescriptionDocumented(t *testing.T) {
+	want := newOAuthCIMDLimiter(newFrozen().now, 0, 0, 0, 0, 0).refusalDescription()
+	for _, site := range []string{"docs/auth.md", "../../../docs/local-tls.md"} {
+		b, err := os.ReadFile(site)
+		if err != nil {
+			t.Fatalf("read %s: %v", site, err)
+		}
+		if !strings.Contains(strings.Join(strings.Fields(string(b)), " "), want) {
+			t.Errorf("%s does not quote the default CIMD limiter 429 text %q; update backend/internal/server/docs/auth.md (\"In-place 429\") and docs/local-tls.md (\"Known limitation — no loopback CIMD\")", site, want)
+		}
 	}
 }
 

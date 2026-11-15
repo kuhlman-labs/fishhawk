@@ -11045,6 +11045,589 @@ rm -rf "$hd_build_dir"
 fi  # HD ps + go gate
 rm -rf "$hd_global_dir"
 
+# ---------------------------------------------------------------------------
+# Post-merge re-exec and dependency refresh (E106.37 / #5224) — PM-RX, PM-E2E, FD
+#
+# Exported knobs these rows rely on (set at the top of this file, approval
+# condition L4): FISHHAWK_GOCACHE_MAX_GB=0 (the cache step never touches the host
+# cache) and FISHHAWK_DEV_HOST_DISPATCH=0 (nothing starts a host dispatcher).
+# Every row re-points REPO_ROOT and HD_PID_FILE at a throwaway dir, so no row
+# reaches the host's stack, dispatcher, network or checkout.
+#
+# Counterfactuals, each run by mutating the control's BODY or CALL SITE in
+# scripts/dev, observing RED, restoring and cmp-verifying the file:
+#   PM-RX0  ignore <reexecd> in _post_merge_reexec_decide -> RED (exec on reexecd=1)
+#   PM-RX1  delete the _post_merge_reexec call site -> RED (cleanup + reload ran)
+#   PM-RX3  ignore the opt-out in _post_merge_reexec_decide -> RED (exec recorded)
+#   PM-RX4a drop the pid-equality test -> RED (checkout/pull skipped)
+#   PM-RX4b drop the pid-equality test -> RED (_host_dispatch_up restore ran)
+#   PM-RX6  drop the -x test -> RED (exec seam ran, no reload)
+#   PM-RX9  delete the pre-exec dispatcher line -> RED (a); print it
+#           unconditionally -> RED (b)
+#   PM-RX7  drop the regex -> case a RED; drop cat-file -> case b RED
+#   PM-RX8  _merge_diff_base ignores _PM_RANGE_BASE -> RED (empty diff)
+#   PM-E2E1 delete the skip branch AND the _PM_RANGE_BASE assignment -> RED
+#   PM-E2E2 delete only the skip branch -> RED (main->main entry; E2E1 green)
+#   PM-E2E3 delete the HD_RESTORE adopt line -> RED; delete the old process's
+#           HD_RESTORE export -> RED (no restore line)
+#   FD1 delete the pnpm call -> RED; FD3 treat the range as always changed -> RED
+#   FD4 drop the node_modules test -> RED; FD5 drop the stamp clause -> RED
+#   FD6 invert -nt -> RED; FD8 write the stamp unconditionally -> RED
+#   FD9 delete the _frontend_deps_refresh call site -> RED
+#   FD-T call pnpm unbounded -> RED; FD-S drop `git -C "$REPO_ROOT"` -> RED
+#   FD2 drop --ignore-scripts -> RED (FD1 too); drop the site remedy -> RED
+#   FD7 drop the pnpm-present test -> RED; adopt without the unset -> PM-RX4a
+#       and PM-RX5 RED (leak=3)
+# PM-RX5 is masked by design: an honoured marker skips the pull, so the decide
+# helper is never asked; its <reexecd> clause is pinned by PM-RX0 instead.
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1; then
+pm_tmp="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-pmrx.XXXXXX")"
+pm_git_c=(git -c user.email=t@e.com -c user.name=t -c commit.gpgsign=false -c core.hooksPath=/dev/null)
+pm_sha_a="1111111111111111111111111111111111111111"
+# One template repo, copied per case, so every case shares one known HEAD.
+pm_template="${pm_tmp}/template"
+mkdir -p "$pm_template"
+( cd "$pm_template" && git init -q -b main && print x > f && "${pm_git_c[@]}" add f \
+    && "${pm_git_c[@]}" commit -qm base ) >/dev/null 2>&1
+pm_case_head="$(git -C "$pm_template" rev-parse HEAD 2>/dev/null)"
+# A fake gh for every row that passes an issue number: no row reaches GitHub.
+pm_fakebin="${pm_tmp}/fakebin"
+mkdir -p "$pm_fakebin"
+print -r -- '#!/bin/sh' > "${pm_fakebin}/gh"
+print -r -- 'echo CLOSED' >> "${pm_fakebin}/gh"
+chmod +x "${pm_fakebin}/gh"
+
+# PM-RX0: the pure decision table.
+pm_tab_ok=1
+for pm_row in "a b 0 '' exec" "a b 0 1 exec" "a b 0 0 optout" "a a 0 '' stay" "'' b 0 '' stay" "a '' 0 '' stay" "a b 1 '' stay" "a b 1 0 stay"; do
+  eval "pm_cols=($pm_row)"
+  if [[ "$(_post_merge_reexec_decide "${pm_cols[1]}" "${pm_cols[2]}" "${pm_cols[3]}" "${pm_cols[4]}")" != "${pm_cols[5]}" ]]; then
+    pm_tab_ok=0
+    print -r -- "  decide(${pm_row}) = $(_post_merge_reexec_decide "${pm_cols[1]}" "${pm_cols[2]}" "${pm_cols[3]}" "${pm_cols[4]}")"
+  fi
+done
+if (( pm_tab_ok )); then
+  pass "PM-RX0 _post_merge_reexec_decide: exec only on differing non-empty blobs, not re-executed, opt-out not 0"
+else
+  fail "PM-RX0 _post_merge_reexec_decide table"
+fi
+
+# Sourced-library harness (LR-f pattern). The case dir is a REAL one-commit git
+# repo, so the hand-off's `git -C … cat-file` resolves HEAD and a junk BASE is
+# rejected by the control under test, not by a missing repo. Every other git
+# call is the logging stub; rev-parse prints the scripted sha and blobs.
+# Knobs (caller globals): pmk_pre pmk_post pm_marker (none|self|parent)
+# pmk_base pm_hd pm_mode (clean|live) pm_target (exec|plain|fail|none) pm_qset (0|1)
+# pm_stub_refresh (0|1) pm_optout (unset when empty) pm_nm (0|1: frontend/node_modules)
+# pm_realexec (0|1: keep the production _post_merge_exec, so the exec is real).
+# Args: [cmd_post_merge args...]. Sets pm_rc pm_out pm_err and the marker paths.
+_pm_reset_knobs() {
+  pmk_pre="" pmk_post="" pm_marker=none pmk_base="" pm_hd="" pm_mode=clean
+  pm_target=exec pm_qset=0 pm_stub_refresh=0 pm_optout="" pm_nm=0 pm_realexec=0
+}
+_pm_run() {
+  pm_case="$(mktemp -d "${pm_tmp}/case.XXXXXX")"
+  cp -R "${pm_template}/." "$pm_case"
+  mkdir -p "${pm_case}/scripts"
+  if (( pm_nm )); then mkdir -p "${pm_case}/frontend/node_modules"; fi
+  pm_git="${pm_case}/git.log" pm_clean="${pm_case}/cleanup.marker"
+  pm_reload="${pm_case}/reload.marker" pm_exec="${pm_case}/exec.argv"
+  pm_execenv="${pm_case}/exec.env" pm_restore="${pm_case}/restore.marker"
+  pm_refresh="${pm_case}/refresh.arg"
+  print -r -- '#!/bin/sh' > "${pm_case}/scripts/cleanup-merged"
+  print -r -- "echo ran >> '${pm_clean}'" >> "${pm_case}/scripts/cleanup-merged"
+  chmod +x "${pm_case}/scripts/cleanup-merged"
+  case "$pm_target" in
+    exec)  print -r -- '#!/bin/sh' > "${pm_case}/scripts/dev"; chmod +x "${pm_case}/scripts/dev" ;;
+    plain) print -r -- '#!/bin/sh' > "${pm_case}/scripts/dev"; chmod 644 "${pm_case}/scripts/dev" ;;
+    fail)  printf '#!/bin/sh\nexit 3\n' > "${pm_case}/scripts/dev"; chmod +x "${pm_case}/scripts/dev" ;;
+  esac
+  pm_out="$(
+    REPO_ROOT="$pm_case"
+    HD_PID_FILE="${pm_case}/no-host-dispatch.pid"
+    PATH="${pm_fakebin}:${PATH}"
+    zmodload zsh/system
+    case "$pm_marker" in
+      self)   export FISHHAWK_DEV_POST_MERGE_REEXEC_PID="${sysparams[pid]}" ;;
+      parent) export FISHHAWK_DEV_POST_MERGE_REEXEC_PID="$$" ;;
+    esac
+    if [[ "$pm_marker" != none ]]; then
+      export FISHHAWK_DEV_POST_MERGE_BASE="$pmk_base" FISHHAWK_DEV_POST_MERGE_HD_RESTORE="$pm_hd"
+    fi
+    if [[ -n "$pm_optout" ]]; then export FISHHAWK_DEV_POST_MERGE_REEXEC="$pm_optout"; fi
+    case "$pm_mode" in
+      live)  _scan_live_runs() { print -r -- "7777"$'\t'"run-live-xyz"; return 0 } ;;
+      clean) _scan_live_runs() { return 0 } ;;
+    esac
+    _refuse_on_restart_blockers() { return 0 }
+    if (( pm_qset )); then _host_dispatch_quiesce() { _HD_RESTORE=1; return 0 }; fi
+    _host_dispatch_up() { print -r -- restore >> "$pm_restore"; return 0 }
+    if (( pm_stub_refresh )); then _frontend_deps_refresh() { print -r -- "arg=${1-}" >> "$pm_refresh"; return 0 }; fi
+    git() {
+      print -r -- "git $*" >> "$pm_git"
+      case "$*" in
+        -C*) command git "$@"; return $? ;;
+        "rev-parse --verify -q HEAD") print -r -- "$pm_sha_a" ;;
+        "rev-parse --verify -q HEAD:scripts/dev")
+          if [[ -f "${pm_case}/pulled" ]]; then print -r -- "$pmk_post"; else print -r -- "$pmk_pre"; fi ;;
+        "pull --ff-only origin main") : > "${pm_case}/pulled" ;;
+      esac
+      return 0
+    }
+    if (( ! pm_realexec )); then
+      _post_merge_exec() {
+        print -r -- "$*" > "$pm_exec"
+        { env | grep '^FISHHAWK_DEV_POST_MERGE_' | sort; print -r -- "self=${sysparams[pid]}"; } > "$pm_execenv"
+        exit 0
+      }
+    fi
+    cmd_reload() {
+      { print -r -- "reload $* base=${_PM_RANGE_BASE} reexecd=${_PM_REEXECD}"
+        print -r -- "leak=$(env | grep -c '^FISHHAWK_DEV_POST_MERGE_\(REEXEC_PID\|BASE\|HD_RESTORE\)=' || true)"; } >> "$pm_reload"
+    }
+    cmd_post_merge "$@" 2>"${pm_case}/err"
+  )"
+  pm_rc=$?
+  pm_err="$(cat "${pm_case}/err" 2>/dev/null)"
+}
+_pm_has() { [[ -f "$1" ]] && print present || print absent }
+
+# PM-RX1: blobs differ -> the seam receives post-merge + the ORIGINAL argv and the
+# validated hand-off; the old process never reaches cleanup-merged or reload.
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_qset=1
+_pm_run 5224 --force --start-deps
+pm_self="$(sed -n 's/^self=//p' "$pm_execenv" 2>/dev/null)"
+if (( pm_rc == 0 )) && [[ "$(cat "$pm_exec" 2>/dev/null)" == "post-merge 5224 --force --start-deps" ]] \
+   && [[ -n "$pm_self" ]] && grep -qx "FISHHAWK_DEV_POST_MERGE_REEXEC_PID=${pm_self}" "$pm_execenv" \
+   && grep -qx "FISHHAWK_DEV_POST_MERGE_BASE=${pm_sha_a}" "$pm_execenv" \
+   && grep -qx "FISHHAWK_DEV_POST_MERGE_HD_RESTORE=1" "$pm_execenv" \
+   && [[ ! -f "$pm_clean" && ! -f "$pm_reload" && ! -f "$pm_restore" ]]; then
+  pass "PM-RX1 scripts/dev changed: exec seam gets 'post-merge 5224 --force --start-deps' + pid/base/HD_RESTORE; no cleanup, reload or restore in the old process"
+else
+  fail "PM-RX1 re-exec (rc=${pm_rc} exec=$(cat "$pm_exec" 2>/dev/null) env=$(cat "$pm_execenv" 2>/dev/null | tr '\n' ' ') cleanup=$(_pm_has "$pm_clean") reload=$(_pm_has "$pm_reload") err=${pm_err})"
+fi
+
+# PM-RX2 (control): equal blobs, and empty blobs, run the whole walk in-process.
+pm_rx2_ok=1
+for pm_pair in "aaa aaa" "'' ''"; do
+  _pm_reset_knobs; eval "pm_cols=($pm_pair)"; pmk_pre="${pm_cols[1]}" pmk_post="${pm_cols[2]}"
+  _pm_run
+  if ! (( pm_rc == 0 )) || [[ -f "$pm_exec" || ! -f "$pm_clean" || ! -f "$pm_reload" ]]; then pm_rx2_ok=0; fi
+done
+if (( pm_rx2_ok )); then
+  pass "PM-RX2 equal or empty blob ids: no exec, cleanup-merged and reload run in-process"
+else
+  fail "PM-RX2 control (rc=${pm_rc} exec=$(_pm_has "$pm_exec") cleanup=$(_pm_has "$pm_clean") reload=$(_pm_has "$pm_reload") err=${pm_err})"
+fi
+
+# PM-RX3: the kill switch. Blobs differ, FISHHAWK_DEV_POST_MERGE_REEXEC=0.
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_optout=0
+_pm_run
+if (( pm_rc == 0 )) && [[ ! -f "$pm_exec" && -f "$pm_reload" ]] \
+   && [[ "$pm_out" == *"FISHHAWK_DEV_POST_MERGE_REEXEC=0 — continuing with the already-loaded copy"* ]]; then
+  pass "PM-RX3 FISHHAWK_DEV_POST_MERGE_REEXEC=0: no exec, one line printed, the walk reaches reload"
+else
+  fail "PM-RX3 kill switch (rc=${pm_rc} exec=$(_pm_has "$pm_exec") reload=$(_pm_has "$pm_reload") out=${pm_out})"
+fi
+
+# PM-RX4a (clean scan): a marker naming ANOTHER pid ($$, the parent shell) with a
+# valid BASE and HD_RESTORE=1 is ignored: checkout and pull run, the three
+# variables are unset before reload, and the base is not adopted.
+_pm_reset_knobs; pm_marker=parent pm_hd=1 pmk_base="$pm_case_head"
+_pm_run
+if (( pm_rc == 0 )) && [[ "$pm_err" == *"ignoring a re-exec hand-off this process did not receive"* ]] \
+   && grep -qx 'git checkout main' "$pm_git" && grep -qx 'git pull --ff-only origin main' "$pm_git" \
+   && grep -qx 'leak=0' "$pm_reload" && grep -q 'base= reexecd=0' "$pm_reload"; then
+  pass "PM-RX4a spoofed marker, clean scan: ignore line, checkout + pull logged, hand-off variables unset, base not adopted"
+else
+  fail "PM-RX4a spoofed marker (rc=${pm_rc} git=$(cat "$pm_git" 2>/dev/null | tr '\n' ';') reload=$(cat "$pm_reload" 2>/dev/null | tr '\n' ';') err=${pm_err})"
+fi
+# PM-RX4b (live scan): the same spoof never restores a dispatcher it did not stop.
+pm_mode=live pmk_base="$pm_case_head"
+_pm_run
+if (( pm_rc != 0 )) && [[ "$pm_err" == *run-live-xyz* && ! -f "$pm_restore" && ! -f "$pm_git" ]]; then
+  pass "PM-RX4b spoofed marker with HD_RESTORE=1, live scan: refuses and does NOT call _host_dispatch_up"
+else
+  fail "PM-RX4b spoofed restore (rc=${pm_rc} restore=$(_pm_has "$pm_restore") err=${pm_err})"
+fi
+
+# PM-RX5: an honoured marker (this process's own pid) with blobs that would
+# differ never execs a second time, and skips checkout and pull.
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_marker=self pmk_base="$pm_case_head"
+_pm_run 5224
+if (( pm_rc == 0 )) && [[ ! -f "$pm_exec" ]] && ! grep -q 'checkout\|pull' "$pm_git" 2>/dev/null \
+   && [[ "$pm_out" == *"re-executed after the pull; not repeating checkout and pull"* ]] \
+   && grep -q "base=${pm_case_head} reexecd=1" "$pm_reload" && grep -qx 'leak=0' "$pm_reload"; then
+  pass "PM-RX5 honoured marker: no second exec, checkout/pull skipped, the carried base adopted, variables unset"
+else
+  fail "PM-RX5 honoured marker (rc=${pm_rc} exec=$(_pm_has "$pm_exec") git=$(cat "$pm_git" 2>/dev/null | tr '\n' ';') reload=$(cat "$pm_reload" 2>/dev/null | tr '\n' ';') out=${pm_out})"
+fi
+
+# PM-RX6: a non-executable pulled scripts/dev warns and continues in-process.
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_target=plain
+_pm_run
+if (( pm_rc == 0 )) && [[ ! -f "$pm_exec" && -f "$pm_reload" && "$pm_err" == *"is not executable"* ]]; then
+  pass "PM-RX6 non-executable target: warning, no exec, the walk reaches reload"
+else
+  fail "PM-RX6 non-executable target (rc=${pm_rc} exec=$(_pm_has "$pm_exec") reload=$(_pm_has "$pm_reload") err=${pm_err})"
+fi
+
+# PM-RX9: an EXECUTABLE pulled scripts/dev that exits 3 at once, through the REAL
+# exec seam. The old process stopped the dispatcher and by design does not
+# restore before the exec, so the documented outcome is: the walk exits 3 with
+# no cleanup, reload or restore, and the remedy line was printed before the
+# exec. Sub-run b (control): the old process stopped nothing, so no line.
+pm_rx9_hint="the host dispatcher is stopped and the pulled copy restarts it; if that copy fails before its reload, the dispatcher is left stopped — run 'scripts/dev reload'"
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_target=fail pm_realexec=1 pm_qset=1
+_pm_run 5224
+pm_rx9a="rc=${pm_rc} cleanup=$(_pm_has "$pm_clean") reload=$(_pm_has "$pm_reload") restore=$(_pm_has "$pm_restore")"
+pm_rx9a_out="$pm_out"
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_target=fail pm_realexec=1
+_pm_run 5224
+pm_rx9b="rc=${pm_rc} reload=$(_pm_has "$pm_reload")"
+if [[ "$pm_rx9a" == "rc=3 cleanup=absent reload=absent restore=absent" && "$pm_rx9a_out" == *"$pm_rx9_hint"* ]] \
+   && [[ "$pm_rx9b" == "rc=3 reload=absent" && "$pm_out" != *"host dispatcher is stopped"* ]]; then
+  pass "PM-RX9 executable pulled copy that exits 3: walk exits 3, no cleanup/reload/restore, the 'run scripts/dev reload' line printed before the exec only when the dispatcher was stopped"
+else
+  fail "PM-RX9 failing pulled copy (a: ${pm_rx9a} out=${pm_rx9a_out}; b: ${pm_rx9b} out=${pm_out})"
+fi
+
+# PM-RX7: a junk BASE under an honoured marker is dropped with a warning, and the
+# walk degrades to the stamp-only refresh. a: HEAD (resolves, not a sha);
+# b: a well-formed absent sha; c: an option-shaped value that must create nothing.
+pm_rx7_out="${pm_tmp}/rx7-output-$$"
+pm_rx7_ok=1 pm_rx7_why=""
+for pm_junk in HEAD 0123456789abcdef0123456789abcdef01234567 "--output=${pm_rx7_out}"; do
+  _pm_reset_knobs; pm_marker=self pmk_base="$pm_junk" pm_nm=1 pmk_pre=aaa pmk_post=bbb
+  _pm_run
+  if ! (( pm_rc == 0 )) || ! grep -q 'base= reexecd=1' "$pm_reload" 2>/dev/null \
+     || [[ -f "$pm_exec" ]] || grep -q 'checkout\|pull' "$pm_git" 2>/dev/null \
+     || [[ "$pm_err" != *"carried pre-pull base is not a full commit sha"* ]] \
+     || [[ "$pm_out" != *"checking the install stamps only"* ]]; then
+    pm_rx7_ok=0; pm_rx7_why+=" [${pm_junk}: rc=${pm_rc} reload=$(cat "$pm_reload" 2>/dev/null | tr '\n' ';') err=${pm_err}]"
+  fi
+done
+if (( pm_rx7_ok )) && [[ ! -e "$pm_rx7_out" ]]; then
+  pass "PM-RX7 junk BASE (HEAD, absent sha, --output=…): warning, base empty, no exec/checkout/pull, stamp-only refresh, reload rc 0, no file created"
+else
+  fail "PM-RX7 junk BASE${pm_rx7_why} created=$([[ -e $pm_rx7_out ]] && print yes)"
+fi
+rm -f "$pm_rx7_out"
+
+# Fixture origin + clone: commit A, then B (which touches fishhawk-mcp source).
+# Args: <dir>. Leaves the clone at A with origin/main at B; sets pm_fx_a/pm_fx_b.
+_pm_fixture() {
+  local d="$1"
+  git init -q --bare "${d}/origin.git"
+  git init -q -b main "${d}/clone"
+  (
+    set -e
+    cd "${d}/clone"
+    mkdir -p scripts backend/cmd/fishhawk-mcp
+    print -r -- '#!/bin/sh' > scripts/dev; chmod +x scripts/dev
+    print a > f
+    "${pm_git_c[@]}" add -A; "${pm_git_c[@]}" commit -qm A
+    git remote add origin "${d}/origin.git"
+    git push -q origin HEAD:main
+    cp "${orig_repo_root}/scripts/dev" scripts/dev.lib
+    cat > scripts/dev <<'WRAP'
+#!/usr/bin/env zsh
+# PM-E2E wrapper: the production library with only the guards, the dispatcher
+# start and reload replaced. Logs one start per process.
+print -r -- "start $*" >> "${PM_E2E_LOG}/starts"
+DEV_LIB_ONLY=1 source "${0:A:h}/dev.lib"
+_scan_live_runs() { if [[ "${PM_E2E_MODE:-clean}" == live ]]; then print -r -- "7777"$'\t'"run-live-xyz"; fi; return 0 }
+_refuse_on_restart_blockers() { return 0 }
+_host_dispatch_up() { print -r -- restore >> "${PM_E2E_LOG}/restore"; return 0 }
+cmd_reload() {
+  local reflog_ok=0 merge_diff="" old_spec_text=""
+  _merge_diff_inputs
+  print -r -- "argv=$*" >> "${PM_E2E_LOG}/reload"
+  print -r -- "reflog_ok=${reflog_ok}" >> "${PM_E2E_LOG}/reload"
+  print -r -- "merge_diff=${merge_diff//$'\n'/,}" >> "${PM_E2E_LOG}/reload"
+}
+cmd_post_merge "${@:2}"
+WRAP
+    chmod +x scripts/dev
+    print -r -- '#!/bin/sh' > scripts/cleanup-merged; chmod +x scripts/cleanup-merged
+    print -r -- 'package main' > backend/cmd/fishhawk-mcp/x.go
+    "${pm_git_c[@]}" add -A; "${pm_git_c[@]}" commit -qm B
+    git push -q origin HEAD:main
+    git reset -q --hard HEAD~1
+  ) >/dev/null 2>&1
+  pm_fx_a="$(git -C "${d}/clone" rev-parse HEAD)"
+  pm_fx_b="$(git -C "${d}/origin.git" rev-parse main)"
+}
+
+# PM-RX8: base isolation. Pull A..B, then one extra `git checkout main`, so
+# HEAD@{1}==HEAD. With _PM_RANGE_BASE=A the inputs carry the real range; empty
+# (a standalone up) reproduces today's empty diff.
+pm_d8="$(mktemp -d "${pm_tmp}/rx8.XXXXXX")"
+_pm_fixture "$pm_d8"
+( cd "${pm_d8}/clone" && git pull -q --ff-only origin main && git checkout -q main ) >/dev/null 2>&1
+pm_rx8_want="$(git -C "${pm_d8}/clone" diff --name-only "$pm_fx_a" "$pm_fx_b" | tr '\n' ',')"
+pm_rx8_with="$( cd "${pm_d8}/clone"; _PM_RANGE_BASE="$pm_fx_a"; _merge_diff_inputs; print -r -- "${reflog_ok}|${merge_diff//$'\n'/,},")"
+pm_rx8_ctl="$( cd "${pm_d8}/clone"; _PM_RANGE_BASE=""; _merge_diff_inputs; print -r -- "${reflog_ok}|${merge_diff}")"
+if [[ -n "$pm_rx8_want" && "$pm_rx8_with" == "1|${pm_rx8_want}" && "$pm_rx8_ctl" == "1|" ]]; then
+  pass "PM-RX8 _merge_diff_inputs: the carried base yields git diff A B after a main->main checkout; empty base keeps today's HEAD@{1} (empty)"
+else
+  fail "PM-RX8 base isolation (want=${pm_rx8_want} with=${pm_rx8_with} control=${pm_rx8_ctl})"
+fi
+
+# PM-E2E: a REAL exec. The old process is this sourced library in a subshell
+# cd'd into the clone (REPO_ROOT=clone, real git, stubbed guards); the pulled
+# scripts/dev is the wrapper above around a byte copy of production.
+# Args: <mode clean|live> <old quiesce sets _HD_RESTORE 0|1> [post-merge args...].
+# Sets pm_e_*.
+_pm_e2e() {
+  local mode="$1" qset="$2"; shift 2
+  pm_e="$(mktemp -d "${pm_tmp}/e2e.XXXXXX")"
+  _pm_fixture "$pm_e"
+  mkdir -p "${pm_e}/log" "${pm_e}/fakebin"
+  print -r -- '#!/bin/sh' > "${pm_e}/fakebin/gh"
+  print -r -- 'echo CLOSED' >> "${pm_e}/fakebin/gh"
+  chmod +x "${pm_e}/fakebin/gh"
+  (
+    cd "${pm_e}/clone"
+    REPO_ROOT="${pm_e}/clone"
+    HD_PID_FILE="${pm_e}/no-host-dispatch.pid"
+    PATH="${pm_e}/fakebin:${PATH}"
+    export PM_E2E_LOG="${pm_e}/log" PM_E2E_MODE="$mode"
+    _scan_live_runs() { return 0 }
+    _refuse_on_restart_blockers() { return 0 }
+    if (( qset )); then _host_dispatch_quiesce() { _HD_RESTORE=1; return 0 }; fi
+    _host_dispatch_up() { print -r -- restore-old >> "${PM_E2E_LOG}/restore"; return 0 }
+    cmd_post_merge "$@"
+  ) >"${pm_e}/out" 2>"${pm_e}/err"
+  pm_e_rc=$?
+  pm_e_err="$(cat "${pm_e}/err" 2>/dev/null)"
+}
+
+_pm_e2e clean 0 5224 --force --start-deps
+pm_e_want="$(git -C "${pm_e}/clone" diff --name-only "$pm_fx_a" "$pm_fx_b" | tr '\n' ',')"
+pm_e_want="${pm_e_want%,}"
+if (( pm_e_rc == 0 )) && cmp -s "${orig_repo_root}/scripts/dev" "${pm_e}/clone/scripts/dev.lib" \
+   && [[ "$(wc -l < "${pm_e}/log/starts" | tr -d ' ')" == 1 ]] \
+   && grep -qx 'start post-merge 5224 --force --start-deps' "${pm_e}/log/starts" \
+   && grep -qx 'argv=--force --start-deps' "${pm_e}/log/reload" \
+   && grep -qx 'reflog_ok=1' "${pm_e}/log/reload" \
+   && grep -qx "merge_diff=${pm_e_want}" "${pm_e}/log/reload" \
+   && [[ "$pm_e_want" == *backend/cmd/fishhawk-mcp/x.go* ]]; then
+  pass "PM-E2E1 real re-exec: one start with the original argv, and the pulled walk's REAL _merge_diff_inputs reports git diff A B (fishhawk-mcp path)"
+else
+  fail "PM-E2E1 real re-exec (rc=${pm_e_rc} starts=$(cat "${pm_e}/log/starts" 2>/dev/null | tr '\n' ';') reload=$(cat "${pm_e}/log/reload" 2>/dev/null | tr '\n' ';') want=${pm_e_want} err=${pm_e_err})"
+fi
+# PM-E2E2: the re-executed walk wrote no reflog entry after the old pull.
+pm_e_gs="$(git -C "${pm_e}/clone" reflog -1 --format=%gs 2>/dev/null)"
+if [[ "$pm_e_gs" == pull* ]] && [[ "$(git -C "${pm_e}/clone" rev-parse HEAD)" == "$pm_fx_b" ]]; then
+  pass "PM-E2E2 the clone's HEAD@{0} is still the old process's pull entry (no repeated checkout)"
+else
+  fail "PM-E2E2 reflog after re-exec (HEAD@{0}=${pm_e_gs})"
+fi
+rm -rf "$pm_e"
+
+# PM-E2E3: the old process stopped the dispatcher (_HD_RESTORE=1); the pulled
+# walk's live-run scan refuses AFTER the exec. The pid file is already gone, so
+# only the carried flag can restart it: exactly one restore, from the NEW process.
+_pm_e2e live 1 5224 --start-deps
+if (( pm_e_rc == 1 )) && [[ "$pm_e_err" == *run-live-xyz* ]] \
+   && [[ "$(cat "${pm_e}/log/restore" 2>/dev/null)" == restore ]] && [[ ! -f "${pm_e}/log/reload" ]]; then
+  pass "PM-E2E3 refusal after the exec restores the dispatcher the old process stopped (one restore line, no reload)"
+else
+  fail "PM-E2E3 dispatcher carry (rc=${pm_e_rc} restore=$(cat "${pm_e}/log/restore" 2>/dev/null | tr '\n' ';') reload=$(_pm_has "${pm_e}/log/reload") err=${pm_e_err})"
+fi
+rm -rf "$pm_e"
+
+# FD: _frontend_deps_refresh against a fixture repo with a fake pnpm that logs
+# its cwd and argv. Commit A, then B changes the lockfile(s) named by <which>.
+# Args: <which frontend|site|none> <nm frontend|site|both|none>. Sets fd_*.
+fd_bin="${pm_tmp}/fd-bin"
+mkdir -p "$fd_bin"
+cat > "${fd_bin}/pnpm" <<'PNPM'
+#!/bin/sh
+echo "$PWD $*" >> "$FD_PNPM_LOG"
+case "${FD_PNPM_MODE:-ok}" in
+  fail) echo "ERR_PNPM_FAKE lockfile mismatch"; exit 1 ;;
+  sleep) sleep 8 ;;
+esac
+exit 0
+PNPM
+chmod +x "${fd_bin}/pnpm"
+_fd_fixture() {
+  local which="$1" nm="$2"
+  fd_repo="$(mktemp -d "${pm_tmp}/fd.XXXXXX")"
+  fd_repo="${fd_repo:A}"
+  fd_log="${fd_repo}.pnpm.log"
+  (
+    set -e
+    cd "$fd_repo"; git init -q -b main
+    mkdir -p frontend/src site
+    print v1 > frontend/pnpm-lock.yaml; print v1 > site/pnpm-lock.yaml
+    "${pm_git_c[@]}" add -A; "${pm_git_c[@]}" commit -qm A
+    case "$which" in
+      frontend|site) print v2 > "${which}/pnpm-lock.yaml" ;;
+      none) print other > other.txt ;;
+    esac
+    "${pm_git_c[@]}" add -A; "${pm_git_c[@]}" commit -qm B
+  ) >/dev/null 2>&1
+  fd_a="$(git -C "$fd_repo" rev-parse HEAD~1)"
+  case "$nm" in
+    frontend|site) mkdir -p "${fd_repo}/${nm}/node_modules" ;;
+    both) mkdir -p "${fd_repo}/frontend/node_modules" "${fd_repo}/site/node_modules" ;;
+  esac
+}
+# Args: <base> [cwd]. Runs the REAL helper with REPO_ROOT=fixture.
+_fd_run() {
+  local base="$1" cwd="${2:-$orig_pwd}"
+  fd_out="$(
+    cd "$cwd"
+    REPO_ROOT="$fd_repo"
+    export FD_PNPM_LOG="$fd_log"
+    PATH="${fd_path:-${fd_bin}:${PATH}}"
+    _frontend_deps_refresh "$base"
+  )"
+  fd_rc=$?
+}
+fd_st() { [[ -f "${fd_repo}/$1/node_modules/.fishhawk-deps-stamp" ]] && print stamp || print nostamp }
+
+# FD1: the frontend lockfile changed in range -> frontend install only, stamped.
+_fd_fixture frontend both; _fd_run "$fd_a" 2>/dev/null
+if (( fd_rc == 0 )) && [[ "$(cat "$fd_log" 2>/dev/null)" == "${fd_repo}/frontend install --frozen-lockfile --ignore-scripts" ]] \
+   && [[ "$(fd_st frontend)" == stamp && "$(fd_st site)" == nostamp ]]; then
+  pass "FD1 frontend lockfile changed: pnpm install --frozen-lockfile --ignore-scripts in frontend/ only, stamp written"
+else
+  fail "FD1 frontend refresh (rc=${fd_rc} log=$(cat "$fd_log" 2>/dev/null) stamp=$(fd_st frontend)/$(fd_st site) out=${fd_out})"
+fi
+
+# FD2 (L1): site gets the SAME flag set (never lifecycle scripts) + the remedy line.
+_fd_fixture site both; _fd_run "$fd_a" 2>/dev/null
+if (( fd_rc == 0 )) && [[ "$(cat "$fd_log" 2>/dev/null)" == "${fd_repo}/site install --frozen-lockfile --ignore-scripts" ]] \
+   && [[ "$fd_out" == *"onlyBuiltDependencies: esbuild, sharp"* && "$fd_out" == *"(cd site && pnpm install --frozen-lockfile)"* ]] \
+   && [[ "$(fd_st site)" == stamp ]]; then
+  pass "FD2 site lockfile changed: install --frozen-lockfile --ignore-scripts in site/, skipped-builds remedy printed, stamp written"
+else
+  fail "FD2 site refresh (rc=${fd_rc} log=$(cat "$fd_log" 2>/dev/null) out=${fd_out})"
+fi
+
+# FD3: lockfiles unchanged, no stamp -> no install.
+_fd_fixture none both; _fd_run "$fd_a" 2>/dev/null
+if (( fd_rc == 0 )) && [[ ! -s "$fd_log" ]]; then
+  pass "FD3 lockfiles unchanged in range and no stamp: no install"
+else
+  fail "FD3 unchanged (log=$(cat "$fd_log" 2>/dev/null))"
+fi
+
+# FD4: a changed lockfile but no node_modules -> no install.
+_fd_fixture frontend none; _fd_run "$fd_a" 2>/dev/null
+if (( fd_rc == 0 )) && [[ ! -s "$fd_log" && -z "$fd_out" ]]; then
+  pass "FD4 no node_modules: no install, nothing printed"
+else
+  fail "FD4 no node_modules (log=$(cat "$fd_log" 2>/dev/null) out=${fd_out})"
+fi
+
+# FD5 (K7 retry): empty range, stamp older than the lockfile -> install.
+_fd_fixture none frontend
+touch -t 202001010000 "${fd_repo}/frontend/node_modules/.fishhawk-deps-stamp"
+touch -t 202101010000 "${fd_repo}/frontend/pnpm-lock.yaml"
+_fd_run "" 2>/dev/null
+if (( fd_rc == 0 )) && [[ "$(cat "$fd_log" 2>/dev/null)" == "${fd_repo}/frontend install --frozen-lockfile --ignore-scripts" ]] \
+   && [[ "$fd_out" == *"checking the install stamps only"* ]]; then
+  pass "FD5 retried walk (no base): a stamp older than the lockfile triggers the install"
+else
+  fail "FD5 stale stamp (log=$(cat "$fd_log" 2>/dev/null) out=${fd_out})"
+fi
+
+# FD6: stamp newer than the lockfile, empty range -> no install.
+_fd_fixture none frontend
+touch -t 202101010000 "${fd_repo}/frontend/node_modules/.fishhawk-deps-stamp"
+touch -t 202001010000 "${fd_repo}/frontend/pnpm-lock.yaml"
+_fd_run "" 2>/dev/null
+if (( fd_rc == 0 )) && [[ ! -s "$fd_log" ]]; then
+  pass "FD6 stamp newer than the lockfile and no base: no install"
+else
+  fail "FD6 fresh stamp (log=$(cat "$fd_log" 2>/dev/null))"
+fi
+
+# FD7: pnpm missing -> remedy, rc 0, no stamp. PATH holds only system dirs.
+_fd_fixture none frontend
+touch -t 202001010000 "${fd_repo}/frontend/node_modules/.fishhawk-deps-stamp"
+touch -t 202101010000 "${fd_repo}/frontend/pnpm-lock.yaml"
+fd_path="/usr/bin:/bin"; _fd_run "" 2>"${fd_repo}.err"; fd_path=""
+fd_err="$(cat "${fd_repo}.err")"
+if (( fd_rc == 0 )) && [[ "$fd_err" == *"pnpm is not on PATH"* && "$fd_err" == *"pnpm install --frozen-lockfile --ignore-scripts"* ]] \
+   && [[ ! -s "$fd_log" ]] && [[ "${fd_repo}/frontend/node_modules/.fishhawk-deps-stamp" -ot "${fd_repo}/frontend/pnpm-lock.yaml" ]]; then
+  pass "FD7 pnpm missing: remedy printed, rc 0, stamp not refreshed"
+else
+  fail "FD7 pnpm missing (rc=${fd_rc} err=${fd_err})"
+fi
+
+# FD8: pnpm fails -> warning, rc 0, no stamp.
+_fd_fixture frontend frontend
+FD_PNPM_MODE=fail _fd_run "$fd_a" 2>"${fd_repo}.err"
+fd_err="$(cat "${fd_repo}.err")"
+if (( fd_rc == 0 )) && [[ "$fd_err" == *"install failed (exit 1); no stamp written"* && "$fd_err" == *ERR_PNPM_FAKE* ]] \
+   && [[ "$(fd_st frontend)" == nostamp ]]; then
+  pass "FD8 pnpm fails: warning with the tail, rc 0, no stamp"
+else
+  fail "FD8 pnpm failure (rc=${fd_rc} stamp=$(fd_st frontend) err=${fd_err})"
+fi
+
+# FD-T (L2): an install past the bound is stopped; remedy, rc 0, no stamp.
+_fd_fixture frontend frontend
+fd_t0=$SECONDS
+fd_out="$(
+  REPO_ROOT="$fd_repo"; export FD_PNPM_LOG="$fd_log" FD_PNPM_MODE=sleep
+  PATH="${fd_bin}:${PATH}"
+  _FRONTEND_DEPS_INSTALL_TIMEOUT=1 _FRONTEND_DEPS_INSTALL_GRACE=1
+  _frontend_deps_refresh "$fd_a" 2>&1
+)"
+fd_rc=$? fd_el=$(( SECONDS - fd_t0 ))
+if (( fd_rc == 0 && fd_el < 7 )) && [[ "$fd_out" == *"did not finish within 1s and was stopped; no stamp written"* ]] \
+   && [[ "$(fd_st frontend)" == nostamp ]]; then
+  pass "FD-T a hung install is stopped at the bound (${fd_el}s): remedy printed, rc 0, no stamp"
+else
+  fail "FD-T bounded install (rc=${fd_rc} elapsed=${fd_el}s stamp=$(fd_st frontend) out=${fd_out})"
+fi
+
+# FD-S (L3): invoked from a subdirectory, git and paths stay anchored at REPO_ROOT.
+_fd_fixture frontend frontend; _fd_run "$fd_a" "${fd_repo}/frontend/src" 2>/dev/null
+if (( fd_rc == 0 )) && [[ "$(cat "$fd_log" 2>/dev/null)" == "${fd_repo}/frontend install --frozen-lockfile --ignore-scripts" ]] \
+   && [[ "$(fd_st frontend)" == stamp ]]; then
+  pass "FD-S invoked from frontend/src: the range check and the stamp stay anchored at REPO_ROOT"
+else
+  fail "FD-S subdirectory (rc=${fd_rc} log=$(cat "$fd_log" 2>/dev/null) out=${fd_out})"
+fi
+rm -rf "${pm_tmp}"/fd.*
+
+# FD9: cmd_post_merge hands the refresh the in-process pre-pull sha on a normal
+# walk, and the carried base on an honoured re-exec.
+_pm_reset_knobs; pm_stub_refresh=1
+_pm_run
+fd9_normal="$(cat "$pm_refresh" 2>/dev/null)"
+_pm_reset_knobs; pm_stub_refresh=1 pm_marker=self pmk_base="$pm_case_head"
+_pm_run
+fd9_reexec="$(cat "$pm_refresh" 2>/dev/null)" fd9_head="$pm_case_head"
+if [[ "$fd9_normal" == "arg=${pm_sha_a}" && "$fd9_reexec" == "arg=${fd9_head}" ]]; then
+  pass "FD9 cmd_post_merge passes the pre-pull sha (normal walk) and the carried base (re-exec) to _frontend_deps_refresh"
+else
+  fail "FD9 refresh base (normal=${fd9_normal} reexec=${fd9_reexec} want=${pm_sha_a}/${fd9_head})"
+fi
+
+# PM-W wiring: the refresh runs after the cache step and before reload, non-fatally.
+pm_w_body="$(typeset -f cmd_post_merge)"
+pm_w_maint="$(print -r -- "$pm_w_body" | grep -n '_gocache_maintain || true' | head -n 1 | cut -d: -f1)"
+pm_w_fd="$(print -r -- "$pm_w_body" | grep -n '_frontend_deps_refresh "$pm_base" || true' | head -n 1 | cut -d: -f1)"
+pm_w_reload="$(print -r -- "$pm_w_body" | grep -n 'cmd_reload ' | head -n 1 | cut -d: -f1)"
+if [[ -n "$pm_w_maint" && -n "$pm_w_fd" && -n "$pm_w_reload" ]] && (( pm_w_maint < pm_w_fd && pm_w_fd < pm_w_reload )); then
+  pass "PM-W cmd_post_merge: _gocache_maintain < _frontend_deps_refresh || true < cmd_reload"
+else
+  fail "PM-W refresh ordering (maint=${pm_w_maint} refresh=${pm_w_fd} reload=${pm_w_reload})"
+fi
+
+rm -rf "$pm_tmp"
+fi  # git present
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"

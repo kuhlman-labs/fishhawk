@@ -1,0 +1,14 @@
+id: scenario:issue-5224/readyz-ok-with-database
+statement: On the localhost preview, GET /readyz returns 200 with a JSON body whose status is ok and whose checks.database is ok, and the response carries Cache-Control no-store.
+verify_hint: 'HTTP: GET /readyz on the preview; check the status code, the Cache-Control header and the status/checks.database body fields.'
+steps: curl -s -D - http://localhost:8090/readyz
+assertions:
+    expected: 200, status ok, checks.database ok, no-store
+    observed_at_record: 'HTTP 200, Cache-Control: no-store, body {"status":"ok","checks":{"database":"ok"}}'
+    repro_handle: curl -s -D - http://localhost:8090/readyz
+origin:
+    issue: 5224
+    pr: 5400
+    run_id: 2a293e02-92c0-4299-a0f2-c2e01b707ac9
+    head_sha: 1e37d5070f325032fdd5a87a1a8fd467384e70f1
+    recorded_at: 2026-11-15T19:33:43Z

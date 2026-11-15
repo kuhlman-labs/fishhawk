@@ -3400,6 +3400,33 @@ _wire_trace_store() {
   return 0
 }
 
+# The merge-aware diff base (#5224): the carried pre-pull sha when a VALIDATED
+# post-merge re-exec hand-off set _PM_RANGE_BASE, otherwise the literal
+# 'HEAD@{1}'. Only _post_merge_adopt_handoff sets _PM_RANGE_BASE, so a standalone
+# up or reload diffs exactly as before.
+_merge_diff_base() {
+  if [[ -n "${_PM_RANGE_BASE:-}" ]]; then
+    print -r -- "$_PM_RANGE_BASE"
+  else
+    print -r -- 'HEAD@{1}'
+  fi
+}
+
+# cmd_up's banner inputs: sets the CALLER's reflog_ok, merge_diff and
+# old_spec_text from _merge_diff_base. Each git call is an if-condition, so an
+# unresolvable base (fresh clone, detached HEAD) degrades to reflog_ok=0 and an
+# empty spec text rather than aborting cmd_up under set -e.
+_merge_diff_inputs() {
+  local diff_base
+  diff_base="$(_merge_diff_base)"
+  reflog_ok=0
+  merge_diff=""
+  if merge_diff="$(git diff --name-only "$diff_base" HEAD 2>/dev/null)"; then
+    reflog_ok=1
+  fi
+  if ! old_spec_text="$(git show "${diff_base}:.fishhawk/workflows.yaml" 2>/dev/null)"; then old_spec_text=""; fi
+}
+
 # cmd_reload's registration answer for the cmd_up it is about to call (#4875), so
 # nothing probes after the teardown. Declared here, unexported, so an ambient value
 # cannot inject a state.
@@ -3561,10 +3588,11 @@ cmd_up() {
   # the brace literal; run the git call as an if-condition so set -e is suppressed
   # and an unresolvable reflog (fresh clone / detached HEAD) branches to the safe
   # fallback (fire the banner) rather than aborting cmd_up.
-  local reflog_ok=0 merge_diff=""
-  if merge_diff="$(git diff --name-only 'HEAD@{1}' HEAD 2>/dev/null)"; then
-    reflog_ok=1
-  fi
+  # The diff base is HEAD@{1} unless a validated post-merge re-exec hand-off
+  # carried the pre-pull sha (_merge_diff_base, #5224): the re-executed walk
+  # skips checkout and pull, so its reflog no longer names the pre-pull commit.
+  local reflog_ok=0 merge_diff="" old_spec_text="" new_spec_text=""
+  _merge_diff_inputs
 
   # Schema-MAJOR bump detection (#1422): a `.fishhawk/workflows.yaml` version
   # MAJOR change breaks every fishhawk_start_run whose live stdio MCP is still
@@ -3576,8 +3604,7 @@ cmd_up() {
   # and post-pull spec text via git show; each as an if-condition so a missing
   # file / unresolvable reflog branches to empty text (treated as no-version)
   # rather than aborting cmd_up under set -e.
-  local old_spec_text="" new_spec_text=""
-  if ! old_spec_text="$(git show 'HEAD@{1}:.fishhawk/workflows.yaml' 2>/dev/null)"; then old_spec_text=""; fi
+  # old_spec_text came from _merge_diff_inputs above.
   if ! new_spec_text="$(git show 'HEAD:.fishhawk/workflows.yaml' 2>/dev/null)"; then new_spec_text=""; fi
   local workflow_major_changed
   workflow_major_changed="$(_workflow_major_changed "$old_spec_text" "$new_spec_text")"
@@ -4449,6 +4476,188 @@ cmd_reload() {
   cmd_up --all "${fwd[@]}"
 }
 
+# Post-merge re-exec (E106.37 / #5224). `git pull` replaces scripts/dev with a
+# new file, but this zsh keeps running the text it already loaded, so without a
+# re-exec a merge that changes post-merge itself only takes effect one walk
+# later. When the pull changed scripts/dev's blob, the walk execs the pulled copy
+# with its original argv. FISHHAWK_DEV_POST_MERGE_REEXEC=0 is the kill switch.
+#
+# The hand-off is three exported variables, validated by the new process:
+#   FISHHAWK_DEV_POST_MERGE_REEXEC_PID  the pid that exec'd. exec(2) keeps the
+#                                       pid, so the marker is honoured ONLY when
+#                                       it equals this process's own
+#                                       $sysparams[pid] ($$ is the top-level pid
+#                                       inside $( )); a leaked or inherited value
+#                                       names another pid and is ignored.
+#   FISHHAWK_DEV_POST_MERGE_BASE        the pre-pull sha: a full hex sha that
+#                                       `git cat-file -e` resolves, or it is
+#                                       dropped with one warning line.
+#   FISHHAWK_DEV_POST_MERGE_HD_RESTORE  the old process's _HD_RESTORE. The old
+#                                       process already removed the dispatcher's
+#                                       pid file, so the new quiesce is a no-op
+#                                       and only this carry lets a guard refusal
+#                                       after the exec restart the dispatcher.
+# All three are unset either way, so fishhawkd and other children never inherit
+# them. An honoured marker skips ONLY `git checkout main` and `git pull` (a
+# repeated checkout writes a main->main reflog entry, so HEAD@{1}==HEAD and the
+# banner diff would be empty); quiesce and every guard run again.
+typeset -g _PM_REEXECD=0 _PM_RANGE_BASE=""
+
+# Read, validate and unset the hand-off. Call at cmd_post_merge entry.
+_post_merge_adopt_handoff() {
+  local marker="${FISHHAWK_DEV_POST_MERGE_REEXEC_PID-}"
+  local base="${FISHHAWK_DEV_POST_MERGE_BASE-}"
+  local hd="${FISHHAWK_DEV_POST_MERGE_HD_RESTORE-}"
+  local present="${FISHHAWK_DEV_POST_MERGE_REEXEC_PID+x}${FISHHAWK_DEV_POST_MERGE_BASE+x}${FISHHAWK_DEV_POST_MERGE_HD_RESTORE+x}"
+  local self=""
+  unset FISHHAWK_DEV_POST_MERGE_REEXEC_PID FISHHAWK_DEV_POST_MERGE_BASE FISHHAWK_DEV_POST_MERGE_HD_RESTORE
+  _PM_REEXECD=0
+  _PM_RANGE_BASE=""
+  if [[ -z "$present" ]]; then return 0; fi
+  zmodload zsh/system 2>/dev/null || true
+  self="${sysparams[pid]:-}"
+  if [[ -z "$marker" || -z "$self" || "$marker" != "$self" ]]; then
+    print -u2 "post-merge: ignoring a re-exec hand-off this process did not receive"
+    return 0
+  fi
+  _PM_REEXECD=1
+  if [[ "$hd" == 1 ]]; then
+    _HD_RESTORE=1
+  fi
+  if [[ "$base" =~ '^[0-9a-f]{40}([0-9a-f]{24})?$' ]] \
+     && git -C "$REPO_ROOT" cat-file -e "${base}^{commit}" 2>/dev/null; then
+    _PM_RANGE_BASE="$base"
+  else
+    print -u2 "warning: post-merge: the carried pre-pull base is not a full commit sha in this repository — ignoring it (the MCP banner falls back to the reflog; the dependency refresh checks its stamps only)"
+  fi
+  return 0
+}
+
+# PURE decision. Args: <pre_blob> <post_blob> <reexecd 0|1> <optout>.
+# Prints exec (both blob ids set and different, not yet re-executed, opt-out not
+# '0'), optout (it would exec, but FISHHAWK_DEV_POST_MERGE_REEXEC=0) or stay.
+_post_merge_reexec_decide() {
+  local pre="${1:-}" post="${2:-}" reexecd="${3:-0}" optout="${4:-}"
+  if [[ -z "$pre" || -z "$post" || "$pre" == "$post" ]] || (( reexecd )); then
+    print stay
+    return 0
+  fi
+  if [[ "$optout" == 0 ]]; then
+    print optout
+    return 0
+  fi
+  print exec
+}
+
+# The exec seam, replaced by scripts/test-dev. Never returns in production: a
+# successful exec replaces this process and a failed one exits the shell.
+# Args: post-merge <original argv...>.
+_post_merge_exec() {
+  exec -- "${REPO_ROOT}/scripts/dev" "$@"
+}
+
+# Hand off to the pulled scripts/dev. Args: <pre_sha> <original argv...>.
+# A non-executable target warns and returns, and the walk continues in-process.
+# The dispatcher is NOT restored here: the new process inherits that duty. When
+# this process stopped it, one line says so BEFORE the exec, because a pulled
+# copy that fails to start (a failed exec, or a top-level abort before its
+# hand-off is adopted) restores nothing and leaves it stopped.
+_post_merge_reexec() {
+  local base="$1"; shift
+  local target="${REPO_ROOT}/scripts/dev"
+  if [[ ! -f "$target" || ! -x "$target" ]]; then
+    print -u2 "warning: post-merge: the pull changed scripts/dev, but ${target} is not executable — continuing with the already-loaded copy"
+    return 0
+  fi
+  zmodload zsh/system 2>/dev/null || true
+  if [[ -z "${sysparams[pid]:-}" ]]; then
+    print -u2 "warning: post-merge: the pull changed scripts/dev, but zsh/system is unavailable to mark the hand-off — continuing with the already-loaded copy"
+    return 0
+  fi
+  export FISHHAWK_DEV_POST_MERGE_REEXEC_PID="${sysparams[pid]}"
+  export FISHHAWK_DEV_POST_MERGE_BASE="$base"
+  export FISHHAWK_DEV_POST_MERGE_HD_RESTORE="$_HD_RESTORE"
+  print "post-merge: the pull changed scripts/dev — re-executing the pulled copy (FISHHAWK_DEV_POST_MERGE_REEXEC=0 opts out)"
+  if (( _HD_RESTORE )); then
+    print "post-merge: the host dispatcher is stopped and the pulled copy restarts it; if that copy fails before its reload, the dispatcher is left stopped — run 'scripts/dev reload'"
+  fi
+  _post_merge_exec post-merge "$@"
+  exit $?
+}
+
+# Bound for each post-merge pnpm install (#5224), so a hung network install
+# cannot hold the host dispatcher quiesced. File scope: the environment cannot
+# change it. Uses _run_bounded_capture, the registration probe's bounded exec.
+_FRONTEND_DEPS_INSTALL_TIMEOUT=300
+_FRONTEND_DEPS_INSTALL_GRACE=5
+
+# Refresh an EXISTING frontend/ or site/ install whose lockfile moved (#5224).
+# Arg: <base> — the pre-pull sha, or empty (stamp check only). For each
+# directory that has node_modules, the lockfile counts as changed when <base> is
+# set and `git diff <base> HEAD` names it, or stale when
+# node_modules/.fishhawk-deps-stamp exists and the lockfile is newer (a retried
+# walk after an abort). Either runs `pnpm install --frozen-lockfile
+# --ignore-scripts` in that directory, bounded: post-merge never runs dependency
+# lifecycle scripts unattended. Success writes the stamp; a missing pnpm, a
+# failure or a timeout prints a remedy, writes no stamp and returns 0, so the
+# walk always reaches reload. Paths and git are anchored at REPO_ROOT.
+_frontend_deps_refresh() {
+  local base="${1:-}" dir="" lock="" stamp="" reason="" changed="" out="" rc=0
+  local remedy=""
+  local -a dirs
+  dirs=()
+  for dir in frontend site; do
+    if [[ -d "${REPO_ROOT}/${dir}/node_modules" ]]; then
+      dirs+=("$dir")
+    fi
+  done
+  if (( ${#dirs} == 0 )); then return 0; fi
+  if [[ -z "$base" ]]; then
+    print "post-merge: no pre-pull base for the dependency refresh — checking the install stamps only"
+  fi
+  for dir in "${dirs[@]}"; do
+    lock="${REPO_ROOT}/${dir}/pnpm-lock.yaml"
+    stamp="${REPO_ROOT}/${dir}/node_modules/.fishhawk-deps-stamp"
+    remedy="(cd ${REPO_ROOT}/${dir} && pnpm install --frozen-lockfile --ignore-scripts)"
+    reason=""
+    changed=""
+    if [[ -n "$base" ]] \
+       && changed="$(git -C "$REPO_ROOT" diff --name-only "$base" HEAD -- "${dir}/pnpm-lock.yaml" 2>/dev/null)" \
+       && [[ -n "$changed" ]]; then
+      reason="its lockfile changed in the pulled range"
+    elif [[ -f "$stamp" && -f "$lock" && "$lock" -nt "$stamp" ]]; then
+      reason="its lockfile is newer than the last refresh"
+    fi
+    if [[ -z "$reason" ]]; then continue; fi
+    if ! command -v pnpm >/dev/null 2>&1; then
+      print -u2 "warning: post-merge: ${dir}/node_modules needs a refresh (${reason}), but pnpm is not on PATH — run ${remedy}"
+      continue
+    fi
+    print "post-merge: refreshing ${dir}/node_modules (${reason})"
+    rc=0
+    if out="$(cd "${REPO_ROOT}/${dir}" && _run_bounded_capture "$_FRONTEND_DEPS_INSTALL_TIMEOUT" "$_FRONTEND_DEPS_INSTALL_GRACE" pnpm install --frozen-lockfile --ignore-scripts)"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if (( rc == 124 )); then
+      print -u2 "warning: post-merge: the ${dir}/ install did not finish within ${_FRONTEND_DEPS_INSTALL_TIMEOUT}s and was stopped; no stamp written — run ${remedy}"
+      continue
+    fi
+    if (( rc != 0 )); then
+      print -u2 "warning: post-merge: the ${dir}/ install failed (exit ${rc}); no stamp written — run ${remedy}"
+      if [[ -n "$out" ]]; then print -r -- "${out}" | tail -n 5 >&2; fi
+      continue
+    fi
+    touch "$stamp" 2>/dev/null || true
+    print "post-merge: ${dir}/node_modules refreshed"
+    if [[ "$dir" == site ]]; then
+      print "post-merge: site/ was refreshed with --ignore-scripts, so its allowlisted builds (onlyBuiltDependencies: esbuild, sharp) were skipped; run (cd site && pnpm install --frozen-lockfile) by hand if a site build needs them"
+    fi
+  done
+  return 0
+}
+
 # One-step post-merge walk: collapse the per-PR post-merge ritual into a single
 # invocation. Fast-forward-pull main, prune the merged local branch via the
 # existing scripts/cleanup-merged, trim the Go build cache past its threshold
@@ -4458,9 +4667,18 @@ cmd_reload() {
 # the verdict is the command's final printed line. reload is the down-then-up
 # stack primitive this composes. An optional leading numeric arg is the issue
 # number to confirm closed (warn-only, non-fatal); remaining flags (--start-deps,
-# a redundant --all) forward to cmd_reload unchanged.
+# a redundant --all) forward to cmd_reload unchanged. When the pull changes
+# scripts/dev, the walk re-execs the pulled copy (#5224, _post_merge_reexec),
+# and after the cache step it refreshes an existing frontend/ or site/ install
+# whose lockfile moved (_frontend_deps_refresh).
 cmd_post_merge() {
+  # The original argv, kept for a re-exec: the issue number is shifted below.
+  local -a pm_orig_argv
+  pm_orig_argv=("$@")
   print "post-merge: starting"
+  # Validate and clear a re-exec hand-off BEFORE the quiesce (#5224), so a
+  # carried dispatcher-restore flag is in place for every refusal below.
+  _post_merge_adopt_handoff
 
   # Live-run guard (#2897) at the top — after only the host dispatcher quiesce,
   # before git checkout/pull and cleanup-merged — so a refusal never leaves
@@ -4502,8 +4720,29 @@ cmd_post_merge() {
   # main exits non-zero (ZERR trap reports the site) rather than silently landing
   # a merge commit or proceeding onto a stale tree. git pull updates the reflog,
   # so cmd_up's merge-aware HEAD@{1}..HEAD diff reflects exactly what was pulled.
-  git checkout main
-  git pull --ff-only origin main
+  # A re-executed walk (#5224) skips both: the old process already pulled, and a
+  # second checkout would write a main->main reflog entry and blank that diff, so
+  # cmd_up reads the carried base through _merge_diff_base instead.
+  local pm_base="" pm_pre_blob="" pm_post_blob="" pm_decision=""
+  if (( _PM_REEXECD )); then
+    print "post-merge: re-executed after the pull; not repeating checkout and pull"
+    pm_base="$_PM_RANGE_BASE"
+  else
+    git checkout main
+    if ! pm_base="$(git rev-parse --verify -q HEAD 2>/dev/null)"; then pm_base=""; fi
+    if ! pm_pre_blob="$(git rev-parse --verify -q HEAD:scripts/dev 2>/dev/null)"; then pm_pre_blob=""; fi
+    git pull --ff-only origin main
+    if ! pm_post_blob="$(git rev-parse --verify -q HEAD:scripts/dev 2>/dev/null)"; then pm_post_blob=""; fi
+    pm_decision="$(_post_merge_reexec_decide "$pm_pre_blob" "$pm_post_blob" "$_PM_REEXECD" "${FISHHAWK_DEV_POST_MERGE_REEXEC-}")"
+    case "$pm_decision" in
+      exec)
+        _post_merge_reexec "$pm_base" "${pm_orig_argv[@]}"
+        ;;
+      optout)
+        print "post-merge: the pull changed scripts/dev, but FISHHAWK_DEV_POST_MERGE_REEXEC=0 — continuing with the already-loaded copy"
+        ;;
+    esac
+  fi
 
   # Prune the merged branch. cleanup-merged self-fetches origin/main and deletes
   # only branches that are ancestors of origin/main, so it is safe to call
@@ -4516,6 +4755,11 @@ cmd_post_merge() {
   # scan, an invalid floor) prints an advisory and the walk continues to reload.
   # --force does NOT bypass the cache guard.
   _gocache_maintain || true
+
+  # Dependency refresh (#5224): an EXISTING frontend/ or site/ install whose
+  # lockfile the pulled range changed, or whose stamp is older than the lockfile.
+  # Bounded and non-fatal; never runs dependency lifecycle scripts.
+  _frontend_deps_refresh "$pm_base" || true
 
   # Optional issue-closed confirmation. Warn-only: a not-yet-closed issue must
   # not block the local stack reload, and an absent/unauthenticated gh degrades
@@ -6360,8 +6604,13 @@ _usage() {
   print -u2 ""
   print -u2 "  post-merge runs the full per-PR post-merge walk: git pull --ff-only,"
   print -u2 "  scripts/cleanup-merged, a guarded Go build-cache trim past the threshold"
-  print -u2 "  (non-fatal), an optional issue-closed check (<issue>), then reload"
-  print -u2 "  (whose /healthz gate + MCP reconnect verdict are inherited)."
+  print -u2 "  (non-fatal), a bounded refresh of an existing frontend/ or site/"
+  print -u2 "  node_modules whose pnpm-lock.yaml the pull changed (--frozen-lockfile"
+  print -u2 "  --ignore-scripts; never runs dependency build scripts; non-fatal), an"
+  print -u2 "  optional issue-closed check (<issue>), then reload (whose /healthz gate"
+  print -u2 "  + MCP reconnect verdict are inherited). When the pull changes"
+  print -u2 "  scripts/dev itself, post-merge re-execs the pulled copy with the same"
+  print -u2 "  arguments; FISHHAWK_DEV_POST_MERGE_REEXEC=0 keeps the loaded copy."
   print -u2 ""
   print -u2 "  reload is the down-then-up stack primitive post-merge composes; plain up"
   print -u2 "  no-ops when fishhawkd is already running and so never rebuilds."

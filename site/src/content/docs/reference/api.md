@@ -12,10 +12,13 @@ The source of truth is
 the human companion is
 [`docs/api/v0.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.md).
 
-`GET /healthz` needs no credential and reports the build's commit and its
-embedded schema hashes. Everything else requires a bearer token. A daemon with
-a dev-only surface mounted (`--dev-fixtures` / `--dev-stub-forge`, the shape
-`scripts/dev preview` runs) advertises `dev_mode: true` there; such a daemon
+`GET /healthz` and `GET /readyz` need no credential. `/healthz` is liveness:
+it reports the build's commit and its embedded schema hashes and never touches
+the database. `/readyz` is readiness: it pings the database and answers 503
+when the database is unreachable or not configured. Everything else requires a
+bearer token. A daemon with a dev-only surface mounted (`--dev-fixtures` /
+`--dev-stub-forge`, the shape `scripts/dev preview` runs) advertises
+`dev_mode: true` on `/healthz`; such a daemon
 refuses the host-dispatch spawn marker for every caller (403
 `host_dispatch_refused_dev_mode`, before the credential check) and stamps
 `forge_writes: deny` on every prompt response, so no runner it could dispatch
@@ -202,7 +205,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **184 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **185 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -216,6 +219,7 @@ The v0 REST API exposes **184 operations** across the paths below, generated fro
 | `POST` | `/v0/oauth/authorize` | OAuth 2.1 authorization endpoint (consent decision) |
 | `POST` | `/v0/oauth/token` | OAuth 2.1 token endpoint |
 | `GET` | `/healthz` | Liveness probe |
+| `GET` | `/readyz` | Readiness probe |
 | `GET` | `/v0/auth/github/login` | Begin GitHub OAuth sign-in |
 | `GET` | `/v0/auth/github/callback` | GitHub OAuth callback |
 | `GET` | `/v0/auth/gitlab/login` | Begin GitLab OAuth sign-in |
