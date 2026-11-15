@@ -16,6 +16,7 @@ package workmgmt
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 )
@@ -41,6 +42,12 @@ import (
 // request has already been cleared to act. A provider MAY re-check the
 // expected-source set as defence in depth (Transition already does), and MUST
 // return a typed error rather than a silent no-op for a kind it cannot execute.
+//
+// A provider MAY mark a failure transient with MarkGroomingTransient (#5225).
+// Marking only NOMINATES the failure for a re-settle: ApplyGrooming still
+// decides, by kind (GroomingMutationKind.TransientRetrySafe), whether to re-run
+// the candidate, and a re-run re-enters the WHOLE containment ladder, including
+// the fresh pre-dispatch read. It is never a blind re-dispatch of the request.
 type GroomingMutator interface {
 	ApplyGroomingMutation(ctx context.Context, req GroomingMutationRequest) (*GroomingMutationResult, error)
 }
@@ -180,6 +187,69 @@ var valueSetKinds = map[GroomingMutationKind]bool{
 // IdempotenceChecked so which arm settled a candidate is visible in the audit
 // row rather than only in this comment.
 func (k GroomingMutationKind) IdempotenceObservable() bool { return !valueSetKinds[k] }
+
+// transientRetrySafeKinds is the ONE declaration of which kinds ApplyGrooming
+// may re-settle after a TRANSIENT provider failure (#5225). See
+// TransientRetrySafe for the rule each member satisfies and each absentee fails.
+var transientRetrySafeKinds = map[GroomingMutationKind]bool{
+	GroomingKindDependsOnAdd:    true,
+	GroomingKindLabelSet:        true,
+	GroomingKindCloseDuplicate:  true,
+	GroomingKindCloseNotPlanned: true,
+}
+
+// TransientRetrySafe reports whether a transient failure of this kind may be
+// re-settled in the same apply (#5225).
+//
+// THE RULE: a kind is retry-safe only when its provider write is ONE request
+// AND the idempotence re-read (groomingObserved / groomingSatisfied) observes
+// EVERYTHING that request writes. A write that landed before its error then
+// re-reads as already_applied, and a re-dispatch duplicates nothing. The four
+// members each issue one REST write the re-read sees whole: depends_on_add (one
+// body PATCH; the re-read checks the `Depends on:` line), label_set (one
+// additive label POST; the re-read checks the label set), and the two closes
+// (one PATCH carrying state and state_reason together; the re-read sees
+// state=closed).
+//
+// Every other kind FAILS the rule:
+//   - epic_link writes AddSubIssue THEN a marker PATCH, and its re-read settles
+//     on the structural parent alone, so an edge that landed before a 502 would
+//     re-read as already_applied with no `Parent epic:` marker ever written.
+//   - board_place and icebox write AddItem THEN a status write, and an AddItem
+//     that landed before a 5xx re-reads as an on-board card, which is then
+//     refused manual_placement_preserved or misread.
+//   - field_set, priority_set and rank_set are unobservable
+//     (IdempotenceObservable is false), so a re-read cannot settle them at all.
+func (k GroomingMutationKind) TransientRetrySafe() bool {
+	return transientRetrySafeKinds[k]
+}
+
+// ErrGroomingTransient is the sentinel a provider's transient-failure mark
+// carries (#5225). Test for it with IsGroomingTransient.
+var ErrGroomingTransient = errors.New("workmgmt: transient grooming failure")
+
+// transientGroomingError is MarkGroomingTransient's wrap. Its Error() is the
+// cause's message UNCHANGED, so marking never alters the audit row's error
+// text, and Unwrap exposes BOTH the cause and the sentinel, so errors.Is/As
+// against the forge error keeps working through the mark.
+type transientGroomingError struct{ cause error }
+
+func (e *transientGroomingError) Error() string   { return e.cause.Error() }
+func (e *transientGroomingError) Unwrap() []error { return []error{e.cause, ErrGroomingTransient} }
+
+// MarkGroomingTransient marks err as a TRANSIENT provider failure: one a
+// re-attempt may succeed on (a forge 5xx or 429, a transport fault). It returns
+// nil for nil. The mark only nominates the failure — see GroomingMutator.
+func MarkGroomingTransient(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &transientGroomingError{cause: err}
+}
+
+// IsGroomingTransient reports whether err carries MarkGroomingTransient's mark
+// anywhere on its chain.
+func IsGroomingTransient(err error) bool { return errors.Is(err, ErrGroomingTransient) }
 
 // GroomingMutationStep names ONE step of a MULTI-STEP tracker mutation, and
 // the set is CLOSED (#2810).

@@ -4090,3 +4090,437 @@ func TestGroomingApply_StaleOrderedLast(t *testing.T) {
 		t.Errorf("last candidate = %+v, want the stale entry (scoping, no kind)", last)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Bounded transient re-settle (#5225)
+// ---------------------------------------------------------------------------
+
+// recordRetrySleeps swaps groomingRetrySleep for a recorder that returns nil
+// without waiting, restored on cleanup. step, when non-nil, runs after each
+// recorded sleep and its error is returned in place of nil.
+func recordRetrySleeps(t *testing.T, step func(total time.Duration) error) *[]time.Duration {
+	t.Helper()
+	var got []time.Duration
+	var total time.Duration
+	prev := groomingRetrySleep
+	groomingRetrySleep = func(_ context.Context, d time.Duration) error {
+		got = append(got, d)
+		total += d
+		if step != nil {
+			return step(total)
+		}
+		return nil
+	}
+	t.Cleanup(func() { groomingRetrySleep = prev })
+	return &got
+}
+
+// scriptedGroomingReader serves the nth read (1-based) of each ref from fn,
+// counting reads so a test can tell a re-settle (a second read) from none.
+type scriptedGroomingReader struct {
+	mu    sync.Mutex
+	reads map[string]int
+	fn    func(ref string, n int) *WorkItemRecord
+}
+
+func (s *scriptedGroomingReader) ReadWorkItem(_ context.Context, req ReadWorkItemRequest) (*WorkItemRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reads == nil {
+		s.reads = map[string]int{}
+	}
+	s.reads[req.Ref]++
+	return s.fn(req.Ref, s.reads[req.Ref]), nil
+}
+
+func (s *scriptedGroomingReader) ListWorkItems(context.Context, ListWorkItemsRequest) (*WorkItemPage, error) {
+	return nil, errors.New("not used by the apply layer")
+}
+
+func (s *scriptedGroomingReader) total() int {
+	n := 0
+	for _, v := range s.reads {
+		n += v
+	}
+	return n
+}
+
+// openItem is a record for an open issue whose body records no edge.
+func openItem(string, int) *WorkItemRecord {
+	return &WorkItemRecord{State: "open", Body: "Summary"}
+}
+
+// scriptedMutator returns errs[n-1] on the nth dial of an entry (Applied once
+// the script runs out), so a failure sequence is seeded BY CONSTRUCTION.
+func scriptedMutator(script map[string][]error) *fakeGroomingMutator {
+	dials := map[string]int{}
+	return &fakeGroomingMutator{errOn: func(req GroomingMutationRequest) error {
+		dials[req.EntryID]++
+		if s := script[req.EntryID]; dials[req.EntryID] <= len(s) {
+			return s[dials[req.EntryID]-1]
+		}
+		return nil
+	}}
+}
+
+// alwaysTransient fails every dial with a transient-marked 502.
+func alwaysTransient() *fakeGroomingMutator {
+	return &fakeGroomingMutator{errOn: func(GroomingMutationRequest) error {
+		return MarkGroomingTransient(errors.New("502 bad gateway"))
+	}}
+}
+
+func dependsOnApply(report *plan.GroomingReport, policy *GroomingRetryPolicy) GroomingApplyRequest {
+	return GroomingApplyRequest{
+		Target:      groomingTarget(),
+		Report:      report,
+		Decisions:   approveAll(report),
+		Modes:       map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:      groomingStates(),
+		RetryPolicy: policy,
+	}
+}
+
+func marshalRecord(t *testing.T, rec GroomingMutationRecord) string {
+	t.Helper()
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal record: %v", err)
+	}
+	return string(raw)
+}
+
+// TestApplyGrooming_TransientFailureIsRetried: a depends_on_add whose first
+// dial is a transient 502 and whose second succeeds settles APPLIED, carrying
+// attempts and the first attempt's error, with ONE audit row.
+func TestApplyGrooming_TransientFailureIsRetried(t *testing.T) {
+	sleeps := recordRetrySleeps(t, nil)
+	dep := dependencyEntry(1, 5)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+	mut := scriptedMutator(map[string][]error{dep.ID: {MarkGroomingTransient(errors.New("502 bad gateway"))}})
+	sink := &fakeGroomingSink{}
+	res, err := ApplyGrooming(context.Background(), mut, &scriptedGroomingReader{fn: openItem}, sink, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, dep.ID)
+	if rec.Outcome != GroomingOutcomeApplied || rec.Attempts != 2 || rec.FirstError != "502 bad gateway" {
+		t.Fatalf("record = outcome %q attempts %d first_error %q, want applied / 2 / %q", rec.Outcome, rec.Attempts, rec.FirstError, "502 bad gateway")
+	}
+	if len(res.Summary.FailedIDs) != 0 {
+		t.Errorf("failed_ids = %v, want none", res.Summary.FailedIDs)
+	}
+	if len(mut.calls) != 2 {
+		t.Errorf("dials = %d, want 2", len(mut.calls))
+	}
+	if len(sink.records) != 1 {
+		t.Errorf("sink records = %d, want exactly ONE row for the retried entry", len(sink.records))
+	}
+	if got := *sleeps; len(got) != 1 || got[0] != time.Second {
+		t.Errorf("sleeps = %v, want [1s] (the nil-policy default)", got)
+	}
+	js := marshalRecord(t, rec)
+	if !strings.Contains(js, `"attempts":2`) || !strings.Contains(js, `"first_error":"502 bad gateway"`) {
+		t.Errorf("marshalled record = %s, want attempts and first_error", js)
+	}
+}
+
+// TestApplyGrooming_RetryReReadsBeforeRedispatch: the re-settle re-runs the
+// pre-dispatch READ, so a write that landed before its 502 settles
+// already_applied rather than being dispatched twice.
+func TestApplyGrooming_RetryReReadsBeforeRedispatch(t *testing.T) {
+	recordRetrySleeps(t, nil)
+	dep := dependencyEntry(1, 5)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+	mut := scriptedMutator(map[string][]error{dep.ID: {MarkGroomingTransient(errors.New("502 bad gateway"))}})
+	reader := &scriptedGroomingReader{fn: func(_ string, n int) *WorkItemRecord {
+		if n >= 2 {
+			return &WorkItemRecord{State: "open", Body: "Summary\n\nDepends on: #5"}
+		}
+		return &WorkItemRecord{State: "open", Body: "Summary"}
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, dep.ID)
+	if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipAlreadyApplied {
+		t.Fatalf("record = %q/%q, want skipped/%s", rec.Outcome, rec.SkipReason, GroomingSkipAlreadyApplied)
+	}
+	if len(mut.calls) != 1 {
+		t.Errorf("dials = %d, want 1 — the re-read saw the landed write", len(mut.calls))
+	}
+	if rec.Attempts != 2 || rec.FirstError == "" {
+		t.Errorf("attempts=%d first_error=%q, want 2 and the first error", rec.Attempts, rec.FirstError)
+	}
+}
+
+// TestApplyGrooming_NonTransientFailureIsNotRetried: an UNMARKED failure is
+// settled once, and its row carries no retry keys.
+func TestApplyGrooming_NonTransientFailureIsNotRetried(t *testing.T) {
+	sleeps := recordRetrySleeps(t, nil)
+	dep := dependencyEntry(1, 5)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+	mut := &fakeGroomingMutator{errOn: func(GroomingMutationRequest) error { return errors.New("validation failed") }}
+	res, err := ApplyGrooming(context.Background(), mut, &scriptedGroomingReader{fn: openItem}, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, dep.ID)
+	if rec.Outcome != GroomingOutcomeFailed || len(mut.calls) != 1 || len(*sleeps) != 0 {
+		t.Fatalf("outcome=%q dials=%d sleeps=%v, want failed / 1 / none", rec.Outcome, len(mut.calls), *sleeps)
+	}
+	js := marshalRecord(t, rec)
+	for _, k := range []string{`"attempts"`, `"first_error"`, `"retry_suppressed"`} {
+		if strings.Contains(js, k) {
+			t.Errorf("marshalled record carries %s on a single-attempt row: %s", k, js)
+		}
+	}
+}
+
+// TestApplyGrooming_TransientRetryIsBounded pins the nil-policy default: 2
+// re-settles at 1s then 2s, so an always-transient entry is dialled 3 times.
+func TestApplyGrooming_TransientRetryIsBounded(t *testing.T) {
+	sleeps := recordRetrySleeps(t, nil)
+	dep := dependencyEntry(1, 5)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+	mut := alwaysTransient()
+	res, err := ApplyGrooming(context.Background(), mut, &scriptedGroomingReader{fn: openItem}, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, dep.ID)
+	if len(mut.calls) != 3 || rec.Outcome != GroomingOutcomeFailed || rec.Attempts != 3 {
+		t.Fatalf("dials=%d outcome=%q attempts=%d, want 3 / failed / 3", len(mut.calls), rec.Outcome, rec.Attempts)
+	}
+	if got := *sleeps; len(got) != 2 || got[0] != time.Second || got[1] != 2*time.Second {
+		t.Errorf("sleeps = %v, want [1s 2s]", got)
+	}
+}
+
+// TestApplyGrooming_PartialWriteIsNotRetriedInApply: a PartialGroomingWriteError
+// is never re-settled in-apply even when its cause is transient and its kind
+// retry-safe — its ledger evidence is the next apply's resume path.
+func TestApplyGrooming_PartialWriteIsNotRetriedInApply(t *testing.T) {
+	recordRetrySleeps(t, nil)
+	dep := dependencyEntry(1, 5)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+	mut := &fakeGroomingMutator{errOn: func(GroomingMutationRequest) error {
+		return &PartialGroomingWriteError{Steps: []GroomingMutationStep{GroomingStepEpicEdgeAdded},
+			Cause: MarkGroomingTransient(errors.New("502 bad gateway"))}
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, &scriptedGroomingReader{fn: openItem}, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, dep.ID)
+	if len(mut.calls) != 1 || rec.Outcome != GroomingOutcomeFailed {
+		t.Fatalf("dials=%d outcome=%q, want 1 / failed", len(mut.calls), rec.Outcome)
+	}
+	if len(rec.StepsLanded) != 1 || rec.StepsLanded[0] != GroomingStepEpicEdgeAdded || rec.Attempts != 0 {
+		t.Errorf("steps_landed=%v attempts=%d, want [epic_edge_added] / 0", rec.StepsLanded, rec.Attempts)
+	}
+}
+
+// TestApplyGrooming_RetryStopsWhenBudgetExpiresDuringBackoff: a budget expiry
+// during the backoff keeps the first failed record unstamped, re-reads nothing,
+// and hands the next candidate to the apply_budget_exhausted arm.
+func TestApplyGrooming_RetryStopsWhenBudgetExpiresDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prev := groomingRetrySleep
+	groomingRetrySleep = func(ctx context.Context, _ time.Duration) error {
+		cancel()
+		return ctx.Err()
+	}
+	t.Cleanup(func() { groomingRetrySleep = prev })
+
+	first, second := dependencyEntry(1, 5), dependencyEntry(2, 5)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{first, second}}
+	mut := alwaysTransient()
+	reader := &scriptedGroomingReader{fn: openItem}
+	res, err := ApplyGrooming(ctx, mut, reader, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, first.ID)
+	if len(mut.calls) != 1 || reader.total() != 1 {
+		t.Fatalf("dials=%d reads=%d, want 1 / 1 — no re-settle on a dead budget", len(mut.calls), reader.total())
+	}
+	if rec.Outcome != GroomingOutcomeFailed || rec.Attempts != 0 || rec.FirstError != "" {
+		t.Errorf("first record = %q attempts=%d first_error=%q, want failed with no retry stamp", rec.Outcome, rec.Attempts, rec.FirstError)
+	}
+	if got := recordFor(t, res, second.ID); got.SkipReason != GroomingSkipApplyBudgetExhausted {
+		t.Errorf("second record skip_reason = %q, want %s", got.SkipReason, GroomingSkipApplyBudgetExhausted)
+	}
+}
+
+// TestApplyGrooming_EpicLinkTransientFailureIsNotRetried pins the M2 rule at
+// the core: an epic_link whose AddSubIssue landed before a 502 would re-read as
+// already_applied with no marker, so it is never re-settled.
+func TestApplyGrooming_EpicLinkTransientFailureIsNotRetried(t *testing.T) {
+	recordRetrySleeps(t, nil)
+	epic := hygieneEntry(1, "unlinked_parent_epic", "#389")
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{epic}}
+	mut := alwaysTransient()
+	reader := &scriptedGroomingReader{fn: func(_ string, n int) *WorkItemRecord {
+		if n >= 2 {
+			return &WorkItemRecord{State: "open", Body: "Summary", ParentRef: "#389", ParentResolved: true}
+		}
+		return &WorkItemRecord{State: "open", Body: "Summary", ParentResolved: true}
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, epic.ID)
+	if rec.Outcome != GroomingOutcomeFailed || reader.total() != 1 || len(mut.calls) != 1 {
+		t.Fatalf("outcome=%q/%q reads=%d dials=%d, want failed / 1 read / 1 dial — never settled already_applied",
+			rec.Outcome, rec.SkipReason, reader.total(), len(mut.calls))
+	}
+}
+
+// TestApplyGrooming_BoardPlaceTransientFailureIsNotRetried: a board_place is
+// AddItem then a status write, so a transient failure is not re-settled.
+func TestApplyGrooming_BoardPlaceTransientFailureIsNotRetried(t *testing.T) {
+	recordRetrySleeps(t, nil)
+	board := hygieneEntry(1, "unboarded", "backlog")
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{board}}
+	mut := alwaysTransient()
+	reader := &scriptedGroomingReader{fn: func(string, int) *WorkItemRecord {
+		return &WorkItemRecord{State: "open", OnBoard: false}
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, board.ID)
+	if rec.Outcome != GroomingOutcomeFailed || len(mut.calls) != 1 {
+		t.Fatalf("outcome=%q dials=%d (%s), want failed / 1", rec.Outcome, len(mut.calls), rec.Error)
+	}
+}
+
+// TestApplyGrooming_RetryPolicyOverridesDefault pins the exported seam: a
+// non-nil policy replaces the default, {Retries: 0} disables the re-settle, and
+// a negative value clamps to 0.
+func TestApplyGrooming_RetryPolicyOverridesDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		policy    GroomingRetryPolicy
+		wantDials int
+		wantSleep []time.Duration
+	}{
+		{"one retry, no backoff", GroomingRetryPolicy{Retries: 1, Backoff: 0}, 2, []time.Duration{0}},
+		{"retry disabled", GroomingRetryPolicy{Retries: 0}, 1, nil},
+		{"negative clamps to zero", GroomingRetryPolicy{Retries: -3, Backoff: -time.Second}, 1, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sleeps := recordRetrySleeps(t, nil)
+			dep := dependencyEntry(1, 5)
+			report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+			mut := alwaysTransient()
+			policy := tc.policy
+			if _, err := ApplyGrooming(context.Background(), mut, &scriptedGroomingReader{fn: openItem}, &fakeGroomingSink{}, dependsOnApply(report, &policy)); err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			if len(mut.calls) != tc.wantDials {
+				t.Errorf("dials = %d, want %d", len(mut.calls), tc.wantDials)
+			}
+			if fmt.Sprint(*sleeps) != fmt.Sprint(tc.wantSleep) {
+				t.Errorf("sleeps = %v, want %v", *sleeps, tc.wantSleep)
+			}
+		})
+	}
+}
+
+// TestApplyGrooming_PerApplyRetryCapSuppressesLaterRetries pins approval
+// condition N1b. With every write failing transient, the first
+// GroomingTransientRetryCandidateCap candidates are re-settled and the rest
+// settle on their first error with no backoff, recorded retry_suppressed. The
+// sleeper models an apply budget that expires after 9.5s of backoff: with the
+// cap, the whole report settles inside it; without, the tail is
+// apply_budget_exhausted.
+func TestApplyGrooming_PerApplyRetryCapSuppressesLaterRetries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sleeps := recordRetrySleeps(t, func(total time.Duration) error {
+		if total > 9500*time.Millisecond {
+			cancel()
+			return ctx.Err()
+		}
+		return nil
+	})
+	var edges []plan.DependencyEdge
+	for n := 1; n <= 6; n++ {
+		edges = append(edges, dependencyEntry(n, 9))
+	}
+	report := &plan.GroomingReport{DependencyEdges: edges}
+	deterministic := edges[5].ID
+	mut := &fakeGroomingMutator{errOn: func(req GroomingMutationRequest) error {
+		if req.EntryID == deterministic {
+			return errors.New("validation failed")
+		}
+		return MarkGroomingTransient(errors.New("502 bad gateway"))
+	}}
+	res, err := ApplyGrooming(ctx, mut, &scriptedGroomingReader{fn: openItem}, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if res.Summary.BudgetExhausted != 0 {
+		t.Fatalf("budget_exhausted = %d, want 0 — backoff must not drain the apply budget", res.Summary.BudgetExhausted)
+	}
+	for i, e := range edges {
+		rec := recordFor(t, res, e.ID)
+		if rec.Outcome != GroomingOutcomeFailed {
+			t.Errorf("edge %d outcome = %q, want failed", i, rec.Outcome)
+		}
+		switch {
+		case i < GroomingTransientRetryCandidateCap:
+			if rec.Attempts != 3 || rec.RetrySuppressed {
+				t.Errorf("edge %d attempts=%d suppressed=%v, want 3 / false", i, rec.Attempts, rec.RetrySuppressed)
+			}
+		case e.ID == deterministic:
+			if rec.Attempts != 0 || rec.RetrySuppressed {
+				t.Errorf("deterministic edge attempts=%d suppressed=%v, want 0 / false — it would not have been retried", rec.Attempts, rec.RetrySuppressed)
+			}
+		default:
+			if rec.Attempts != 0 || !rec.RetrySuppressed {
+				t.Errorf("edge %d attempts=%d suppressed=%v, want 0 / true", i, rec.Attempts, rec.RetrySuppressed)
+			}
+			if js := marshalRecord(t, rec); !strings.Contains(js, `"retry_suppressed":true`) {
+				t.Errorf("edge %d marshalled = %s, want retry_suppressed", i, js)
+			}
+		}
+	}
+	if want := 3*3 + 3; len(mut.calls) != want {
+		t.Errorf("dials = %d, want %d", len(mut.calls), want)
+	}
+	if len(*sleeps) != 2*GroomingTransientRetryCandidateCap {
+		t.Errorf("sleeps = %v, want %d — none after the cap", *sleeps, 2*GroomingTransientRetryCandidateCap)
+	}
+}
+
+// TestApplyGrooming_RecoveredRetriesDoNotCountTowardTheCap: only a candidate
+// that was re-settled and STILL failed transient counts toward the cap, so
+// three recovered retries leave the fourth candidate free to retry.
+func TestApplyGrooming_RecoveredRetriesDoNotCountTowardTheCap(t *testing.T) {
+	recordRetrySleeps(t, nil)
+	var edges []plan.DependencyEdge
+	script := map[string][]error{}
+	for n := 1; n <= 4; n++ {
+		e := dependencyEntry(n, 9)
+		edges = append(edges, e)
+		script[e.ID] = []error{MarkGroomingTransient(errors.New("502 bad gateway"))}
+	}
+	report := &plan.GroomingReport{DependencyEdges: edges}
+	res, err := ApplyGrooming(context.Background(), scriptedMutator(script), &scriptedGroomingReader{fn: openItem}, &fakeGroomingSink{}, dependsOnApply(report, nil))
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	for i, e := range edges {
+		rec := recordFor(t, res, e.ID)
+		if rec.Outcome != GroomingOutcomeApplied || rec.Attempts != 2 || rec.RetrySuppressed {
+			t.Errorf("edge %d = %q attempts=%d suppressed=%v, want applied / 2 / false", i, rec.Outcome, rec.Attempts, rec.RetrySuppressed)
+		}
+	}
+}

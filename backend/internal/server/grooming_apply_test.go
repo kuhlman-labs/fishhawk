@@ -3107,3 +3107,130 @@ func TestApplyApprovedGrooming_StaleEntryIsFindingOnly(t *testing.T) {
 		t.Errorf("stale grooming_mutation_applied rows = %d, want exactly 1 (categories %v)", staleRows, f.groomingAuditCategories())
 	}
 }
+
+// transientOnceMutator fails the FIRST dial of failEntry with a
+// transient-marked 502 and applies every other dial (#5225).
+type transientOnceMutator struct {
+	mu        sync.Mutex
+	failEntry string
+	dials     map[string]int
+}
+
+func (m *transientOnceMutator) ApplyGroomingMutation(_ context.Context, req workmgmt.GroomingMutationRequest) (*workmgmt.GroomingMutationResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dials == nil {
+		m.dials = map[string]int{}
+	}
+	m.dials[req.EntryID]++
+	if req.EntryID == m.failEntry && m.dials[req.EntryID] == 1 {
+		return nil, workmgmt.MarkGroomingTransient(errors.New("githubclient: add labels: 502: bad gateway"))
+	}
+	return &workmgmt.GroomingMutationResult{Applied: true, ProviderResponse: "applied " + string(req.Kind)}, nil
+}
+
+// TestApproveGroomStage_RetriedMutationPersistsAttempts (pgtest, #5225 M5)
+// drives the REAL approve handler -> ApplyGrooming -> groomingApplyAuditSink ->
+// Postgres AppendChained, then reads the persisted rows' RAW payloads: the
+// retried label row carries attempts and first_error, and the single-attempt
+// ordering row carries neither key.
+func TestApproveGroomStage_RetriedMutationPersistsAttempts(t *testing.T) {
+	prevPolicy := groomingApplyRetryPolicy
+	groomingApplyRetryPolicy = &workmgmt.GroomingRetryPolicy{Retries: 2, Backoff: 0}
+	t.Cleanup(func() { groomingApplyRetryPolicy = prevPolicy })
+
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	apprRepo := approval.NewPostgresRepository(pool)
+
+	rn, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: groomingApplyRepo, WorkflowID: "backlog_grooming", WorkflowSHA: "abc",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(groomingApplySpec),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: rn.ID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("create groom stage: %v", err)
+	}
+	if _, err := runRepo.TransitionStage(ctx, stage.ID, run.StageStateAwaitingApproval, nil); err != nil {
+		t.Fatalf("park stage: %v", err)
+	}
+	report, orderingID := groomingApplyGoldenReport()
+	report.HygieneDefects = report.HygieneDefects[:1]
+	labelID := report.HygieneDefects[0].ID
+	sv := "grooming_report_v1"
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: stage.ID, Kind: artifact.KindGroomingReport, SchemaVersion: &sv,
+		Content: groomingApplyReportJSON(t, report),
+	}); err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+
+	mut := &transientOnceMutator{failEntry: labelID}
+	prevConv, prevMut, prevRdr := conventionsLoader, groomingMutatorFor, groomingReaderFor
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Conventions{Provider: "github", States: map[string]string{
+			workmgmt.CanonicalStateBacklog: "Backlog", workmgmt.CanonicalStateUpNext: "Up Next",
+		}}, nil
+	}
+	groomingMutatorFor = func(string) (workmgmt.GroomingMutator, error) { return mut, nil }
+	groomingReaderFor = func(string) (workmgmt.WorkItemReader, error) { return &groomingApplyReader{}, nil }
+	t.Cleanup(func() {
+		conventionsLoader, groomingMutatorFor, groomingReaderFor = prevConv, prevMut, prevRdr
+	})
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: runRepo, ArtifactRepo: artRepo,
+		AuditRepo: auditRepo, ApprovalRepo: apprRepo,
+	})
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"retry persists"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	s.waitGroomingApply()
+
+	rows, err := auditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingMutationAppliedCategory)
+	if err != nil {
+		t.Fatalf("list mutation rows: %v", err)
+	}
+	raw := map[string]map[string]json.RawMessage{}
+	for _, e := range rows {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(e.Payload, &m); err != nil {
+			t.Fatalf("decode mutation payload: %v", err)
+		}
+		var id string
+		_ = json.Unmarshal(m["entry_id"], &id)
+		if _, dup := raw[id]; dup {
+			t.Fatalf("entry %s has more than one grooming_mutation_applied row; a retry must land ONE", id)
+		}
+		raw[id] = m
+	}
+	label, ok := raw[labelID]
+	if !ok {
+		t.Fatalf("no persisted row for the label entry %s; rows: %d", labelID, len(rows))
+	}
+	if string(label["attempts"]) != "2" || string(label["outcome"]) != `"applied"` {
+		t.Errorf("label row attempts=%s outcome=%s, want 2 / applied", label["attempts"], label["outcome"])
+	}
+	if fe := string(label["first_error"]); !strings.Contains(fe, "502") {
+		t.Errorf("label row first_error = %s, want the first attempt's 502", fe)
+	}
+	ordering, ok := raw[orderingID]
+	if !ok {
+		t.Fatalf("no persisted row for the ordering entry %s", orderingID)
+	}
+	for _, k := range []string{"attempts", "first_error", "retry_suppressed"} {
+		if _, present := ordering[k]; present {
+			t.Errorf("single-attempt ordering row carries %q: %v", k, ordering)
+		}
+	}
+}
