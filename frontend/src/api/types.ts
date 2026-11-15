@@ -409,6 +409,12 @@ export interface AttentionContext {
   new_evidence?: string;
   dispute_reasons?: string[];
   confirmation_note?: string;
+  /**
+   * 'server_check' when a deterministic server check raised the concern
+   * (absent for a reviewer-raised one). Only a Web UI session can clear such
+   * a concern (ADR-143 D1); the card and decision panel mark it.
+   */
+  provenance?: 'server_check';
   // attend_human_led_campaign
   epic_ref?: string;
   human_led_refs?: string[];

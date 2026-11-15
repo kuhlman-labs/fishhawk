@@ -57,6 +57,13 @@ function stubFetch(router: Router): ReturnType<typeof vi.fn> {
   return fetchMock;
 }
 
+/** The golden's server-check paged concern (context.provenance server_check). */
+function serverCheckItem(): AttentionItem {
+  const item = golden.items.find((i) => i.context.provenance === 'server_check');
+  if (!item) throw new Error('golden carries no server-check item');
+  return structuredClone(item);
+}
+
 function renderPanel(item: AttentionItem) {
   const onResolved = vi.fn();
   const onCancel = vi.fn();
@@ -81,6 +88,31 @@ function bodyOf(call: unknown[]): Record<string, unknown> {
 function chooseJudgement(value: string) {
   fireEvent.change(screen.getByLabelText('Judgement'), { target: { value } });
 }
+
+describe('DecisionPanel — server-check concern (ADR-143 D1)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  // COUNTERFACTUAL (run by hand): removing the `provenance === 'server_check'`
+  // conditional in ConcernDecision removes the notice this test asserts → RED.
+  it('the golden server-check concern shows the Web-UI-session-only notice', () => {
+    renderPanel(serverCheckItem());
+    const notice = screen.getByTestId('server-check-notice');
+    expect(notice).toHaveTextContent(/deterministic server check raised this concern/i);
+    expect(notice).toHaveTextContent(
+      /only a human signed in to this Web UI can waive or defer it/i,
+    );
+    expect(notice).toHaveTextContent(/CLI, MCP and API tokens are refused/);
+    // The decision verbs are unchanged: the session clears it from here.
+    expect(screen.getByRole('button', { name: 'Waive' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Defer' })).toBeInTheDocument();
+  });
+
+  it('a reviewer-raised concern shows no server-check notice', () => {
+    renderPanel(itemOf('paged_concern'));
+    expect(screen.queryByTestId('server-check-notice')).not.toBeInTheDocument();
+  });
+});
 
 describe('DecisionPanel — happy paths (one per kind)', () => {
   beforeEach(() => vi.unstubAllGlobals());
@@ -414,6 +446,17 @@ describe('DecisionPanel — failure modes leave the item (onResolved not called)
     fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
     await screen.findByRole('alert');
     expect(screen.getByRole('alert')).toHaveTextContent(/422 · concern_waive_conflict/);
+    expect(onResolved).not.toHaveBeenCalled();
+  });
+
+  it('F5: server-check waive 403 concern_requires_session surfaces the error, no resolve', async () => {
+    stubFetch(() => ({ status: 403, body: { error: 'concern_requires_session' } }));
+    const { onResolved } = renderPanel(serverCheckItem());
+    chooseJudgement('no_defect');
+    fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'x' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent(/403 · concern_requires_session/);
     expect(onResolved).not.toHaveBeenCalled();
   });
 
