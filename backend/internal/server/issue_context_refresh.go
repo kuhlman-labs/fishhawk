@@ -38,14 +38,22 @@ import (
 //     the live prompt-visible content differs from the cached snapshot. Deduped
 //     per (stage, snapshot digest), so a re-fetch of the same live content
 //     appends nothing while a second, different steer appends a second row.
-//   - issue_context_rendered: EVERY signed plan-stage /prompt fetch records the
+//   - issue_context_rendered: every signed plan-stage /prompt fetch records the
 //     digest of the snapshot it rendered (refreshed or cached). Not drift-gated
-//     and not deduped, so the newest row is what the planner last rendered even
-//     across an edit-and-revert (A→B→A) or a drift-then-revert-to-cache.
+//     and never deduped against OLDER digests, so the newest row is what the
+//     planner last rendered even across an edit-and-revert (A→B→A) or a
+//     drift-then-revert-to-cache; only a repeat of the stage's newest digest is
+//     skipped, which bounds the chain without changing what the newest row says.
 //   - issue_context_refreshed, surface plan_review: the plan review rendered a
 //     different snapshot than the planner's newest issue_context_rendered row —
-//     the issue changed between the two fetches. Detected, not prevented: exact
-//     parity needs a stored per-stage snapshot (deferred).
+//     either the issue changed between the two fetches (refreshed=true) or the
+//     review's own live fetch fell back to the cache (refreshed=false).
+//     Detected, not prevented: exact parity needs a stored per-stage snapshot
+//     (deferred).
+//
+// The live read is bounded by issueContextRefreshTimeout across both forge
+// calls, so a slow forge falls back to the cache rather than stalling a prompt
+// fetch or a plan upload.
 const (
 	issueContextRefreshedCategory = "issue_context_refreshed"
 	issueContextRenderedCategory  = "issue_context_rendered"
@@ -200,14 +208,23 @@ func (s *Server) logRefreshSkipped(ctx context.Context, runRow *run.Run, issueNu
 	)
 }
 
+// issueContextRefreshTimeout bounds the whole live read (issue + comments) so
+// a slow or hung forge delays a plan-stage prompt fetch or a plan upload by at
+// most this long before the cached snapshot is used — well under the forge
+// clients' own 30s per-call timeout and the runner's 120s upload/prompt client
+// timeout. A var so a test can shorten it.
+var issueContextRefreshTimeout = 10 * time.Second
+
 // fetchLiveIssueSnapshot reads the issue's live title, body and comments
 // through fillIssueContext's credential and forge ladder, writing nothing to a
 // trigger. ok=false means the cached snapshot must be used: no credential,
-// forge unresolved (nil github or nil issue ops), repo unparseable, fetch error,
-// or an empty issue. Comments are fetched only after the issue resolves; a
-// comment-fetch error sets CommentsOK=false and WARNs, and does not fail the
-// read.
+// forge unresolved (nil github or nil issue ops), repo unparseable, fetch error
+// (including the issueContextRefreshTimeout deadline), or an empty issue.
+// Comments are fetched only after the issue resolves; a comment-fetch error
+// sets CommentsOK=false and WARNs, and does not fail the read.
 func (s *Server) fetchLiveIssueSnapshot(ctx context.Context, github issueGetter, runRow *run.Run, issueNumber int) (liveIssueSnapshot, bool) {
+	ctx, cancel := context.WithTimeout(ctx, issueContextRefreshTimeout)
+	defer cancel()
 	family := runForge(runRow)
 	if family == forgeNameGitHub {
 		if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
@@ -326,6 +343,10 @@ func (s *Server) refreshPlanIssueContext(ctx context.Context, github issueGetter
 	res.planStage = true
 	live, ok := s.fetchLiveIssueSnapshot(ctx, github, runRow, issueNumber)
 	if !ok {
+		// The fallback renders the cache, so its drift against the cache is
+		// zero but its comment counts are the cache's — a plan_review row
+		// written for a review-side fallback reports them truthfully.
+		res.drift = diffIssueSnapshots(runRow.IssueContext, runRow.IssueContext)
 		return res
 	}
 	refreshed := *runRow.IssueContext
@@ -344,8 +365,9 @@ func (s *Server) refreshPlanIssueContext(ctx context.Context, github issueGetter
 }
 
 // recordPlanPromptRefresh writes the signed /prompt fetch's refresh evidence:
-// ONE issue_context_rendered row on every plan-stage fetch (the planner's
-// rendered digest, C1 of #5219's approval), and an issue_context_refreshed
+// the issue_context_rendered row on every plan-stage fetch whose digest differs
+// from the stage's newest row (the planner's rendered digest, C1 of #5219's
+// approval), and an issue_context_refreshed
 // plan_prompt row when the live content drifted from the cache. /prompt-render
 // never calls it, so a preview writes no row.
 func (s *Server) recordPlanPromptRefresh(ctx context.Context, runRow *run.Run, stageID uuid.UUID, issueNumber int, res issueContextRefresh) {
@@ -359,10 +381,25 @@ func (s *Server) recordPlanPromptRefresh(ctx context.Context, runRow *run.Run, s
 	s.appendIssueContextRefreshed(ctx, runRow, stageID, issueNumber, res, refreshSurfacePlanPrompt, "")
 }
 
-// appendIssueContextRendered appends the per-fetch rendered-digest row. Not
-// deduped: the newest row is the planner's last rendering. Best-effort.
+// appendIssueContextRendered appends the per-fetch rendered-digest row. It is
+// never deduped against OLDER digests — the newest row is the planner's last
+// rendering, so A→B→A appends three rows — but a fetch whose digest equals the
+// stage's NEWEST row appends nothing, since it would not change what the newest
+// row says; that bounds the chain under repeated identical fetches. The check
+// is a non-atomic list-then-append: a race appends a harmless identical row,
+// and a list error appends without the check. Best-effort.
 func (s *Server) appendIssueContextRendered(ctx context.Context, runRow *run.Run, stageID uuid.UUID, issueNumber int, res issueContextRefresh) {
 	if s.cfg.AuditRepo == nil {
+		return
+	}
+	newest, ok, err := s.newestRenderedDigest(ctx, runRow.ID, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list issue_context_rendered entries failed; appending without the unchanged-digest check",
+			slog.String("run_id", runRow.ID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
+	}
+	if err == nil && ok && newest == res.digest {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug, "prompt: issue_context_rendered unchanged since the stage's newest row; not appended",
+			slog.String("run_id", runRow.ID.String()), slog.String("stage_id", stageID.String()))
 		return
 	}
 	payload, _ := json.Marshal(map[string]any{
@@ -419,7 +456,12 @@ func (s *Server) appendIssueContextRefreshed(ctx context.Context, runRow *run.Ru
 	if surface == refreshSurfacePlanReview {
 		dedupeKey += ":" + plannerDigest
 		fields["planner_snapshot_digest"] = plannerDigest
-		hint = "the plan review rendered a different issue snapshot than the planner's last signed prompt fetch; the issue changed between the two fetches, so re-read the issue before approving"
+		fields["refreshed"] = res.refreshed
+		if res.refreshed {
+			hint = "the plan review rendered a different issue snapshot than the planner's last signed prompt fetch; the issue changed between the two fetches, so re-read the issue before approving"
+		} else {
+			hint = "the plan review's own live issue fetch fell back to the run's cached snapshot, so the review judged the plan against the cached issue while the planner's last signed prompt fetch rendered a different snapshot; re-read the issue before approving"
+		}
 	}
 	fields["dedupe_key"] = dedupeKey
 	fields["hint"] = hint
@@ -483,11 +525,23 @@ func (s *Server) plannerSnapshotDigest(ctx context.Context, runID, stageID uuid.
 	if s.cfg.AuditRepo == nil {
 		return "", false
 	}
-	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, issueContextRenderedCategory)
+	digest, ok, err := s.newestRenderedDigest(ctx, runID, stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: list issue_context_rendered entries failed; skipping the planner snapshot parity check",
 			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
 		return "", false
+	}
+	return digest, ok
+}
+
+// newestRenderedDigest reads the snapshot_digest of the newest (highest
+// Sequence) issue_context_rendered row for stageID. ok=false when no row exists
+// or the newest row's payload is undecodable or carries no digest; err is the
+// list error.
+func (s *Server) newestRenderedDigest(ctx context.Context, runID, stageID uuid.UUID) (string, bool, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, issueContextRenderedCategory)
+	if err != nil {
+		return "", false, err
 	}
 	var newest *audit.Entry
 	for _, e := range entries {
@@ -499,23 +553,25 @@ func (s *Server) plannerSnapshotDigest(ctx context.Context, runID, stageID uuid.
 		}
 	}
 	if newest == nil {
-		return "", false
+		return "", false, nil
 	}
 	var payload struct {
 		SnapshotDigest string `json:"snapshot_digest"`
 	}
 	if err := json.Unmarshal(newest.Payload, &payload); err != nil || payload.SnapshotDigest == "" {
-		return "", false
+		return "", false, nil
 	}
-	return payload.SnapshotDigest, true
+	return payload.SnapshotDigest, true, nil
 }
 
 // planReviewIssueContext returns the row the plan review renders its issue
 // context from: the same plan-stage refresh the planner's signed fetch ran. It
 // compares the review's snapshot digest with the planner's newest
 // issue_context_rendered row and, when they differ, appends an
-// issue_context_refreshed row with surface plan_review. The review always
-// renders the refreshed snapshot.
+// issue_context_refreshed row with surface plan_review whose `refreshed` flag
+// and hint distinguish a mid-window issue edit (the review's fetch succeeded)
+// from a review-side fallback to the cache (it failed). The review always
+// renders whatever the refresh returned.
 func (s *Server) planReviewIssueContext(ctx context.Context, runRow *run.Run, stageID uuid.UUID, issueNumber int) *run.Run {
 	res := s.refreshPlanIssueContext(ctx, s.issueGetter(), runRow, run.StageTypePlan, issueNumber)
 	if res.digest == "" {

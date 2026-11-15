@@ -1690,8 +1690,10 @@ func (s *Server) dispatchPlanReviews(ctx context.Context, runID, stageID uuid.UU
 	// Plan-stage refresh (#5219): the review maps the same refreshed snapshot
 	// the planner's signed prompt fetch rendered — the live issue for a
 	// credentialed run, else the cached snapshot. It is exact when the issue
-	// did not change between the two fetches; a difference is RECORDED as an
-	// issue_context_refreshed row with surface plan_review, not prevented.
+	// did not change between the two fetches and the review's own fetch
+	// succeeded; a difference (a mid-window edit, or a review-side fallback to
+	// the cache) is RECORDED as an issue_context_refreshed row with surface
+	// plan_review and its refreshed flag, not prevented.
 	// Exact parity would need a stored per-stage snapshot (deferred;
 	// runs.issue_context stays immutable). Comments map in fillIssueContext
 	// branch 1's shape (#622).
