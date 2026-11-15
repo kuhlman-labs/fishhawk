@@ -96,6 +96,7 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
+        "ADR-073",
         "ADR-138"
       ],
       "applies_to": [
@@ -224,6 +225,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-123"
+      ],
       "applies_to": []
     },
     {
@@ -243,6 +247,7 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
+        "ADR-045",
         "ADR-104"
       ],
       "applies_to": []
@@ -375,6 +380,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-073"
+      ],
       "applies_to": []
     },
     {
@@ -436,6 +444,7 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
+        "ADR-066",
         "ADR-097",
         "ADR-101",
         "ADR-132"
@@ -502,6 +511,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amends": [
+        "ADR-022"
+      ],
       "applies_to": []
     },
     {
@@ -742,6 +754,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amends": [
+        "ADR-040"
+      ],
       "amended_by": [
         "ADR-147"
       ],
@@ -805,6 +820,7 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
+        "ADR-074",
         "ADR-147"
       ],
       "applies_to": []
@@ -816,6 +832,10 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amends": [
+        "ADR-009",
+        "ADR-034"
+      ],
       "amended_by": [
         "ADR-131",
         "ADR-137",
@@ -832,6 +852,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amends": [
+        "ADR-072"
+      ],
       "amended_by": [
         "ADR-147"
       ],
@@ -1499,6 +1522,7 @@
       "supersedes": [],
       "superseded_by": [],
       "amends": [
+        "ADR-020",
         "ADR-113"
       ],
       "amended_by": [

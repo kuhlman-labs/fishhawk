@@ -6,6 +6,7 @@ date: 2026-06-07
 issue: https://github.com/kuhlman-labs/fishhawk/issues/845
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-073"]
 applies_to: []
 ---
 
@@ -48,3 +49,5 @@ Defer between (a)/(b)/(c) until the local chart + prod-foundation children land 
 #168 (ECS path), #182, #388, #650, #655, #843. Child cluster: the `[E22.X]` k8s issues filed alongside this ADR.
 
 Parent epic: #389
+
+**Captain clarification (2026-11-14):** ADR-073 amends this record: it decides the question this record deferred.

@@ -99,3 +99,36 @@ All impl issues landed:
 Audit-log categories introduced: `pr_merged`, `pr_approved_on_github`, `pr_review_submitted`, `pr_closed_without_merge`. Reopen handling stays out of scope; the v0 escape hatch is re-trigger via `/fishhawk run`.
 
 **Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-031 (review-resolution mechanism: verified landing, by webhook or poll, with GitHub merge as the `github_merge` provider). Option B still governs: the PR merge is the review approval, and `/approvals` refuses review stages (409).
+
+## Amendment A1 (accepted 2026-11-14) — non-code review gates may use `/approvals` under their governing contracts
+
+This amendment narrows the Captain's 2026-10-23 clarification at the end of this record. It is one of three companion amendments: ADR-017 Amendment A1 and ADR-031 Amendment A1 state the same scope for the merge gate and for verified landing.
+
+**What it replaces.** The clarification says "the PR merge is the review approval, and `/approvals` refuses review stages (409)." Both halves now hold for **code-delivery review gates**. A code-delivery gate authorizes a change to land on the repository: the merge gate of ADR-146's families 1 (planned change) and 2 (PR adoption) (`docs/adr/146-workflow-catalogue.md:63-64`).
+
+**A code-delivery review gate.** Option B governs it, and its `approvals.members` check at merge settlement stands (`backend/internal/server/merge_members.go:50-72`). It resolves on verified landing (ADR-031), and `POST /v0/stages/{id}/approvals` refuses it with 409 `review_stage_managed_by_github`. For a merge Fishhawk dispatches, "the PR merge is the review approval" is read as ADR-031 Amendment A1 restates it.
+
+**A non-code review gate.** It resolves under its governing contract (ADR-146 D1, `:62`). `/approvals` is available where that contract and the server's existing admission predicate permit it. Today that predicate admits a review stage only when all of these hold (`backend/internal/server/review_gate_admission.go:159-206`):
+- the persisted stage row is human-executor;
+- the workflow declares exactly one review stage;
+- that stage declares a human executor;
+- that stage takes no `pull_request` input.
+
+A resolution failure refuses. `backlog_grooming`'s confirm stage is admitted under these conditions. Any other review stage keeps the 409, which is the predicate's not-admitted arm (`backend/internal/server/approvals.go:2513-2518`). This amendment changes no admission rule.
+
+`/approvals` substitutes for neither ADR-113 ratification nor ADR-139 D9's verified-record-landing condition on `adr_change` confirmation (`docs/adr/139-adr-change-workflow.md:65`, `:67`).
+
+**Verified, not asserted, on every gate.** No gate succeeds because an operator or an agent asserts that it succeeded. Each gate resolves only on what it declares and the server checks:
+- for a code-delivery gate, verified landing (ADR-031 D1);
+- for any other gate, its own recorded, attributed decision, checked against that gate's approval rules.
+
+A human confirmation that is the gate's declared decision, as on `backlog_grooming`'s confirm stage, is that gate's check, not an override (`.fishhawk/workflows.yaml:357-364`). No gate gains a force-succeed or manual-override path.
+
+**Families explain the scope; they do not select it at runtime.** ADR-146 says of its catalogue that "no validator rule follows from it" (`docs/adr/146-workflow-catalogue.md:71`). No runtime check reads a family. A running gate is recognised by its own declaration, and this amendment does not change how.
+
+**What stands.**
+- The PR-side audit categories and the plan-stage approval surface stand.
+- The ADR-031 partial supersession of this record's resolution mechanism stands.
+- This amendment does not change the issue-comment channel; ADR-020 Amendment A1 does.
+
+- **Record metadata:** an in-body amendment of ADR-018. No new edge. ADR-018 keeps `superseded_by: ["ADR-031"]` and `status: accepted`.

@@ -5,6 +5,7 @@ status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/321
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-123"]
 applies_to: []
 ---
 
@@ -80,3 +81,32 @@ Adopt option **A**.
 - ADR-017 / #249 — CI gating moved to branch protection. Same pattern.
 - #234 — original "comment back on the issue" feature; this builds on it.
 - E17 / #323 — the impl track this ADR unblocks.
+
+## Amendment A1 (accepted 2026-11-14) — comment approvals are retired on workflow-v2 gates
+
+This amendment retires the issue-comment approval channel on workflow-v2 or later gates. It keeps the plan comment. It also keeps the channel on v0/v1 gates that declare the legacy `approvers` block.
+
+**Relation.** ADR-123 decision 4 amends this record. That decision refused comment approvals and rejections on every workflow-v2 gate "Until that parity exists" (`docs/adr/123-forge-verified-stage-approvals.md:59`). ADR-123 Amendment A1 makes the refusal permanent, and this amendment records the same change here.
+
+**1. Retired on workflow-v2 or later gates, permanently.** The channel has three inputs (`backend/internal/server/issue_approval.go:41-43`):
+- the `/fishhawk approve` and `/fishhawk reject` slash commands;
+- reply-comment approvals;
+- the reactions the reaction poller forwards.
+
+On every gate of a workflow-v2 or later spec, all three are refused, for approve and reject alike. Parity with the approvals predicate will not be built. The code already refuses these gates (`issue_approval.go:586-587`).
+
+**How a refusal is recorded.** A comment refused through `authorizeCommentApproval` is recorded as `approval_comment_refused`. It records no approval and transitions nothing. A reply comment is refused silently; the other inputs get a reply naming the supported channels (`issue_approval.go:128-146`). The review-stage help and silent-return path is unchanged (`issue_approval.go:113-125`).
+
+**Why.** The channel never evaluated the gate's approvals predicate. It recorded the webhook sender and "advances the stage directly, without the approvals predicate or quorum" (`docs/adr/123-forge-verified-stage-approvals.md:22`). Building parity is not worth its cost while the HTTP route already evaluates the predicate.
+
+**2. The plan comment stays, as a read surface.** Option A stands: the full plan is posted on the originating issue and edited in place on each revision. On a v2 plan gate the decision is taken through `POST /v0/stages/{id}/approvals`, the HTTP approval surface this record's Consequences keep. A review gate resolves as ADR-018 Amendment A1 states. That surface stays subject to ADR-148's enabled tier requirements and its D5 and D6 exceptions.
+
+ADR-148 D7 applies on every major and every channel (`docs/adr/148-human-authority-ladder.md:82`, `:144`). Where a tier-1 or tier-2 entry is enforced and its D6 does not scope the request out, the action completes only in the Web UI; no issue-comment verb completes it.
+
+**3. v0/v1 gates that declare `approvers` keep the channel.** "Permanently" covers workflow-v2 or later gates only. The v0 and v1 majors are "frozen, not removed, and no removal is planned" (`docs/spec/workflow-v2.md:1793`). While they stay frozen, a v0/v1 gate that declares the legacy `approvers` block keeps the channel. There, a comment approval is checked against that block. The check uses the same role check as the HTTP legacy role-check helper (`issue_approval.go:600-605`; `backend/internal/server/approvals.go:2404-2411`). Where the check cannot run, the comment channel fails closed and that helper fails open (`approvals.go:2381-2383`, `:2391-2402`, `:2412-2420`).
+
+Any other v0/v1 gate, one that declares the `approvals` block or neither block, is refused on this channel, as a v2 gate is, because the channel has no rule to check. This applies from the change tracked as #5300.
+
+**What stands.** Option A, `update_on_change` and the HTTP approval surface stand, and so does the out-of-scope list. On v0/v1 gates that declare `approvers`, the slash, reply-comment and reaction inputs stand within section 3.
+
+- **Record metadata:** an in-body amendment of ADR-020. It states that ADR-123 amends this record: ADR-123 gains `amends: ["ADR-020"]` beside ADR-113, and ADR-020 gains `amended_by: ["ADR-123"]`. Both keep `status: accepted`.
