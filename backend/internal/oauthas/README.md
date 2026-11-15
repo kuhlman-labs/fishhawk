@@ -312,6 +312,23 @@ the injected client's `Transport` is nil, so a caller passing
 falls through to `http.DefaultTransport`). A caller who injects a client with a
 non-nil `Transport` owns that transport's egress policy — it is used as-is.
 
+### Fetch timeout (#4578)
+
+`Timeout` bounds one `Fetch` (default 5s). A transport or body-read failure
+after the Fetcher's **own** `Timeout` fires carries `ErrFetchTimeout` in its
+`Cause`, whatever the transport returned. `ErrFetchTimeout` wraps
+`context.DeadlineExceeded`, so an existing `errors.Is(err,
+context.DeadlineExceeded)` check keeps matching. A caller cancellation or a
+caller deadline does **not** carry `ErrFetchTimeout`. The OAuth code and the
+client-facing `Description` are unchanged on every path; the sentinel is
+log-only. A response that arrived in time is validated as-is, so a status,
+content-type, size or JSON refusal never carries the sentinel.
+
+One exception: when the transport chain already carries a typed `*Error` (a
+redirect refusal, a `guardedDialer` `invalid_target` lookup failure, or a guard
+refusal), `wrapFetchErr` returns that `*Error` as-is and it carries no
+`ErrFetchTimeout`. The more specific refusal wins.
+
 ## Cache bounds (#2429)
 
 The `Fetcher` caches validated CIMD documents keyed by `client_id` — an
@@ -398,5 +415,14 @@ Every test is a Go unit test with **zero network egress**: the CIMD tests drive 
 in-process `httptest` TLS server bound to loopback (in-process, not egress) or a
 scripted dialer through the `Fetcher`'s injected `HTTPClient` / `Guard` / `Lookup`
 seams. See the plan's per-failure-mode checklist for the one-named-test-per-branch
-matrix. Wall-clock durations in the timeout test derive from
+matrix. Wall-clock durations in the timeout tests derive from
 `backend/internal/timescale` `D(base)` per the AGENTS.md rule.
+
+The timeout stubs abort the connection with `panic(http.ErrAbortHandler)` when
+the client gives up, instead of returning. A handler that returns without
+writing makes net/http send an implicit empty `200` with no `Content-Type`, and
+on a loaded runner that response can race the client's cancellation back into
+`Fetch` (the #4578 `non-JSON content type` flake). Two timeout tests inject a
+transport or body that fails with a plain error wrapping nothing, so the
+Fetcher's own `ErrFetchTimeout` mapping is what they pin, not Go's transport
+returning the context's cause.

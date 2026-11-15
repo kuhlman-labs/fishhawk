@@ -110,7 +110,14 @@ type Fetcher struct {
 	Guard addrGuard
 	// Lookup defaults to net.DefaultResolver.LookupNetIP.
 	Lookup lookupFunc
-	// Timeout bounds a single Fetch (default 5s).
+	// Timeout bounds a single Fetch (default 5s). A transport or body-read
+	// failure after this Timeout fires carries ErrFetchTimeout (which wraps
+	// context.DeadlineExceeded) in its Cause, whatever the transport returned;
+	// the OAuth code and Description are unchanged. A caller cancellation or
+	// deadline does not carry ErrFetchTimeout. One exception: when the transport
+	// chain already carries a typed *Error (a redirect refusal, a guardedDialer
+	// invalid_target lookup failure, or a guard refusal), wrapFetchErr returns
+	// that *Error as-is and it carries no ErrFetchTimeout.
 	Timeout time.Duration
 	// MaxBytes caps the document body (default 64 KiB).
 	MaxBytes int64
@@ -248,7 +255,7 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadata, 
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, f.timeout())
+	ctx, cancel := context.WithTimeoutCause(ctx, f.timeout(), ErrFetchTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -259,7 +266,7 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadata, 
 
 	resp, err := f.effectiveClient().Do(req)
 	if err != nil {
-		return nil, wrapFetchErr(err)
+		return nil, wrapFetchErr(timeoutCause(ctx, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -272,7 +279,7 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadata, 
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, f.maxBytes()+1))
 	if err != nil {
-		return nil, newError(ErrCodeServerError, "could not read client_id document").withCause(err)
+		return nil, newError(ErrCodeServerError, "could not read client_id document").withCause(timeoutCause(ctx, err))
 	}
 	if int64(len(body)) > f.maxBytes() {
 		return nil, newError(ErrCodeInvalidClient, "client_id document exceeds the maximum size").withCause(ErrDocumentTooLarge)
@@ -428,6 +435,25 @@ func wrapFetchErr(err error) error {
 		return oe
 	}
 	return newError(ErrCodeInvalidClient, "client_id document could not be fetched").withCause(err)
+}
+
+// fetchTimedOut reports whether THIS Fetch's own Timeout ended ctx. A caller
+// cancellation or a caller deadline leaves the parent's cause in place, so it
+// reports false.
+func fetchTimedOut(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), ErrFetchTimeout)
+}
+
+// timeoutCause joins ErrFetchTimeout onto err when the Fetcher's own Timeout
+// fired, so the sentinel is in the chain whatever the transport returned. The
+// original error stays in the log-only chain. Otherwise err is returned as-is.
+// It is applied only to transport and body-read failures: a response received
+// in time is validated as-is.
+func timeoutCause(ctx context.Context, err error) error {
+	if fetchTimedOut(ctx) {
+		return errors.Join(ErrFetchTimeout, err)
+	}
+	return err
 }
 
 // isJSONContentType reports whether ct is application/json, with or without

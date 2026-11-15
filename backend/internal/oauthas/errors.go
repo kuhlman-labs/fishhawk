@@ -1,6 +1,7 @@
 package oauthas
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -52,6 +53,13 @@ var (
 	// ErrNotSelfReferential marks a client-metadata document that fails the
 	// self-referential / shape validation admitting it.
 	ErrNotSelfReferential = errors.New("oauthas: client metadata is not self-referential")
+	// ErrFetchTimeout marks a CIMD fetch that the Fetcher's OWN Timeout ended,
+	// never one ended by the caller's context (a caller cancellation or deadline
+	// does not carry it). It wraps context.DeadlineExceeded, so an existing
+	// errors.Is(err, context.DeadlineExceeded) check keeps matching. Go's
+	// transport can return a context's custom cause in place of
+	// context.DeadlineExceeded, which is why the wrap is load-bearing.
+	ErrFetchTimeout = fmt.Errorf("oauthas: client metadata fetch exceeded the fetch timeout: %w", context.DeadlineExceeded)
 )
 
 // Error is a typed OAuth error. Description is the SAFE, client-returnable text;
