@@ -101,6 +101,12 @@ type Config struct {
 	// surviving OS pid reuse (#1018).
 	StartNonce string
 
+	// DBPing checks the database for GET /readyz (#5224 G7). serve.go wires
+	// the pool's Ping; nil (no database configured) makes /readyz answer 503
+	// not_configured. /healthz never calls it. The probe coalesces and caches
+	// calls (readyz.go), so this is invoked at most once per second.
+	DBPing func(context.Context) error
+
 	// PushDispatcher delivers push notifications to the operator's
 	// configured sinks (#2292). serve.go builds it from
 	// pushnotify.SinksFromEnv; nil (no FISHHAWKD_NOTIFY_* configured) keeps
@@ -1466,6 +1472,11 @@ type Server struct {
 	// costs nothing outbound and is never throttled. Always non-nil after New().
 	oauthCIMDLimiter *oauthCIMDLimiter
 
+	// readiness coalesces and caches the GET /readyz database ping
+	// (#5224 G7). Built at New() from Config.DBPing; always non-nil after
+	// New().
+	readiness *readinessProbe
+
 	// mcpHandler is the streamable-HTTP handler backing /mcp, built once
 	// at New() when mcpRoute.mode is mcpRouteEnabled and nil otherwise —
 	// handleMCP's ladder returns before dereferencing it in every other
@@ -1555,6 +1566,9 @@ func New(cfg Config) *Server {
 		cfg.OAuthCIMDGlobalRateBurst, cfg.OAuthCIMDGlobalRateInterval,
 		defaultOAuthCIMDMaxSources,
 	)
+	// The /readyz probe reads the clock through the same closure, so a test
+	// that reassigns s.nowFunc after New drives its cache TTL.
+	s.readiness = newReadinessProbe(cfg.DBPing, func() time.Time { return s.nowFunc() }, cfg.Logger)
 	// Stamp the boot marker the startup orphaned-review reconcile compares
 	// audit timestamps against (#1781). Default to now; a test-injected
 	// Config.ProcessStart lets the boot-marker gate be exercised deterministically.

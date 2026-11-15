@@ -10,7 +10,8 @@ FAIL=0
 
 tmpdir=$(mktemp -d)
 tmpdir2=$(mktemp -d)
-trap 'rm -rf "$tmpdir" "$tmpdir2"' EXIT
+tmpdir3=$(mktemp -d)
+trap 'rm -rf "$tmpdir" "$tmpdir2" "$tmpdir3"' EXIT
 
 git -C "$tmpdir" init -q
 git -C "$tmpdir" config user.email "test@example.com"
@@ -169,6 +170,105 @@ if [ "$status2" -eq 0 ]; then
 else
   fail "fail-open: script should exit 0 (got $status2; output: $output2)"
 fi
+
+# ---------------------------------------------------------------------------
+# Argument parsing (#5224 G1). The CM arms share one fixture: two merged
+# branches (cm-merged-a, cm-merged-b) and one unmerged (cm-unmerged-c).
+cm="$tmpdir3/repo"
+git init -q "$cm"
+git -C "$cm" config user.email "test@example.com"
+git -C "$cm" config user.name "Test"
+touch "$cm/README"
+git -C "$cm" add README
+git -C "$cm" commit -q -m "init"
+git -C "$cm" branch -m main
+for b in cm-merged-a cm-merged-b; do
+  git -C "$cm" checkout -q -b "$b"
+  echo "$b" > "$cm/$b.txt"
+  git -C "$cm" add "$b.txt"
+  git -C "$cm" commit -q -m "$b commit"
+  git -C "$cm" checkout -q main
+  git -C "$cm" merge --no-ff -q -m "merge $b" "$b"
+done
+git -C "$cm" checkout -q -b cm-unmerged-c
+echo "c" > "$cm/c.txt"
+git -C "$cm" add c.txt
+git -C "$cm" commit -q -m "unmerged commit"
+git -C "$cm" checkout -q main
+git -C "$cm" remote add origin "$cm"
+git -C "$cm" fetch -q origin main
+
+cm_all_branches_survive() {
+  local b
+  for b in cm-merged-a cm-merged-b cm-unmerged-c; do
+    git -C "$cm" show-ref --verify --quiet "refs/heads/$b" || return 1
+  done
+}
+cm_err="$tmpdir3/stderr"
+
+# CM-D: --dry-run fetches, lists exactly the two merged branches (not the
+# unmerged one), prints the would-clean total, and deletes nothing. Without
+# the dry-run guard around `git branch -D`, both merged branches are deleted.
+set +e
+cm_out=$(cd "$cm" && bash "$REPO_ROOT/scripts/cleanup-merged" --dry-run 2>"$cm_err")
+cm_status=$?
+set -e
+if [ "$cm_status" -eq 0 ] \
+  && printf '%s\n' "$cm_out" | grep_q -Fx "would delete (merged): cm-merged-a" \
+  && printf '%s\n' "$cm_out" | grep_q -Fx "would delete (merged): cm-merged-b" \
+  && ! printf '%s\n' "$cm_out" | grep_q -F "cm-unmerged-c" \
+  && ! printf '%s\n' "$cm_out" | grep_q -F "deleted (merged)" \
+  && printf '%s\n' "$cm_out" | grep_q -Fx "would clean 2 branch(es)"; then
+  pass "CM-D: --dry-run lists exactly the two merged branches and the would-clean total"
+else
+  fail "CM-D: --dry-run output wrong (status $cm_status; output: $cm_out; stderr: $(cat "$cm_err"))"
+fi
+if cm_all_branches_survive; then
+  pass "CM-D: --dry-run deleted no branch"
+else
+  fail "CM-D: --dry-run deleted a branch (output: $cm_out)"
+fi
+
+# The remaining arms run with origin pointed at a path that does not exist,
+# so any fetch dies: an arm that exits as asserted proves it never fetched.
+git -C "$cm" remote set-url origin "$tmpdir3/no-such-origin"
+
+# CM-H: --help and -h print usage to stdout and exit 0 with no fetch and no
+# deletion. Without the parse, the fetch dies (or, with a reachable origin,
+# the merged branches are deleted).
+for flag in --help -h; do
+  set +e
+  cm_out=$(cd "$cm" && bash "$REPO_ROOT/scripts/cleanup-merged" "$flag" 2>"$cm_err")
+  cm_status=$?
+  set -e
+  if [ "$cm_status" -eq 0 ] \
+    && printf '%s\n' "$cm_out" | grep_q -F -- "--help" \
+    && printf '%s\n' "$cm_out" | grep_q -F -- "--dry-run" \
+    && [ ! -s "$cm_err" ] && cm_all_branches_survive; then
+    pass "CM-H: $flag prints usage, exits 0, no fetch, no deletion"
+  else
+    fail "CM-H: $flag (status $cm_status; output: $cm_out; stderr: $(cat "$cm_err"))"
+  fi
+done
+
+# CM-U: an unknown argument exits 2, names the argument on stderr, and leaves
+# every branch, including after a valid --dry-run. Without the unknown arm the
+# argument is ignored and the script runs on to the fetch.
+for args in "--bogus" "--dry-run --bogus"; do
+  set +e
+  # shellcheck disable=SC2086 # word-splitting the arg list is the point
+  cm_out=$(cd "$cm" && bash "$REPO_ROOT/scripts/cleanup-merged" $args 2>"$cm_err")
+  cm_status=$?
+  set -e
+  if [ "$cm_status" -eq 2 ] \
+    && grep -qFx "unknown argument: --bogus" "$cm_err" \
+    && grep -qF "usage:" "$cm_err" \
+    && [ -z "$cm_out" ] && cm_all_branches_survive; then
+    pass "CM-U: '$args' exits 2 naming the argument, no branch touched"
+  else
+    fail "CM-U: '$args' (status $cm_status; output: $cm_out; stderr: $(cat "$cm_err"))"
+  fi
+done
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
