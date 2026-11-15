@@ -13549,7 +13549,12 @@ paths:
             Not ready. `checks.database` is `unreachable` (the ping failed or
             timed out) or `not_configured` (the daemon runs without a
             database URL, the posture in which every repository route already
-            answers 503).
+            answers 503). Probe anonymously: a probe that presents a bearer
+            token or session cookie while the database is unreachable is
+            answered 503 by the authentication middleware before this handler
+            runs, with the generic `service_unavailable` `Error` envelope
+            instead of this body (no `checks.database`, no `no-store`), the
+            same as `/healthz`.
           headers:
             Cache-Control:
               schema: { type: string, example: no-store }

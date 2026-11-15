@@ -1850,7 +1850,12 @@ pulled copy with its ORIGINAL arguments (`post-merge <issue> --force
 decision is `_post_merge_reexec_decide`; the exec itself is the `_post_merge_exec`
 seam. **Kill switch:** `FISHHAWK_DEV_POST_MERGE_REEXEC=0` keeps the loaded copy and
 prints one line. A pulled `scripts/dev` that is not executable prints a warning
-and the walk continues in-process, as before.
+and the walk continues in-process, as before. **Residual:** a pulled copy that is
+executable but fails to start (the exec fails, or the script aborts at top level
+before `cmd_post_merge` adopts the hand-off) restores nothing, and the walk exits
+with the host dispatcher still stopped. So when the old process stopped the
+dispatcher, it prints one line before the exec naming the remedy, `run
+'scripts/dev reload'`.
 
 The hand-off is three exported variables, which `_post_merge_adopt_handoff`
 validates at the top of the new process, before the quiesce, and then UNSETS, so

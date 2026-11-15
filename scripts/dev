@@ -4558,7 +4558,10 @@ _post_merge_exec() {
 
 # Hand off to the pulled scripts/dev. Args: <pre_sha> <original argv...>.
 # A non-executable target warns and returns, and the walk continues in-process.
-# The dispatcher is NOT restored here: the new process inherits that duty.
+# The dispatcher is NOT restored here: the new process inherits that duty. When
+# this process stopped it, one line says so BEFORE the exec, because a pulled
+# copy that fails to start (a failed exec, or a top-level abort before its
+# hand-off is adopted) restores nothing and leaves it stopped.
 _post_merge_reexec() {
   local base="$1"; shift
   local target="${REPO_ROOT}/scripts/dev"
@@ -4575,6 +4578,9 @@ _post_merge_reexec() {
   export FISHHAWK_DEV_POST_MERGE_BASE="$base"
   export FISHHAWK_DEV_POST_MERGE_HD_RESTORE="$_HD_RESTORE"
   print "post-merge: the pull changed scripts/dev — re-executing the pulled copy (FISHHAWK_DEV_POST_MERGE_REEXEC=0 opts out)"
+  if (( _HD_RESTORE )); then
+    print "post-merge: the host dispatcher is stopped and the pulled copy restarts it; if that copy fails before its reload, the dispatcher is left stopped — run 'scripts/dev reload'"
+  fi
   _post_merge_exec post-merge "$@"
   exit $?
 }

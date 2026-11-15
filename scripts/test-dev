@@ -11062,6 +11062,8 @@ rm -rf "$hd_global_dir"
 #   PM-RX4a drop the pid-equality test -> RED (checkout/pull skipped)
 #   PM-RX4b drop the pid-equality test -> RED (_host_dispatch_up restore ran)
 #   PM-RX6  drop the -x test -> RED (exec seam ran, no reload)
+#   PM-RX9  delete the pre-exec dispatcher line -> RED (a); print it
+#           unconditionally -> RED (b)
 #   PM-RX7  drop the regex -> case a RED; drop cat-file -> case b RED
 #   PM-RX8  _merge_diff_base ignores _PM_RANGE_BASE -> RED (empty diff)
 #   PM-E2E1 delete the skip branch AND the _PM_RANGE_BASE assignment -> RED
@@ -11116,12 +11118,13 @@ fi
 # rejected by the control under test, not by a missing repo. Every other git
 # call is the logging stub; rev-parse prints the scripted sha and blobs.
 # Knobs (caller globals): pmk_pre pmk_post pm_marker (none|self|parent)
-# pmk_base pm_hd pm_mode (clean|live) pm_target (exec|plain|none) pm_qset (0|1)
-# pm_stub_refresh (0|1) pm_optout (unset when empty) pm_nm (0|1: frontend/node_modules).
+# pmk_base pm_hd pm_mode (clean|live) pm_target (exec|plain|fail|none) pm_qset (0|1)
+# pm_stub_refresh (0|1) pm_optout (unset when empty) pm_nm (0|1: frontend/node_modules)
+# pm_realexec (0|1: keep the production _post_merge_exec, so the exec is real).
 # Args: [cmd_post_merge args...]. Sets pm_rc pm_out pm_err and the marker paths.
 _pm_reset_knobs() {
   pmk_pre="" pmk_post="" pm_marker=none pmk_base="" pm_hd="" pm_mode=clean
-  pm_target=exec pm_qset=0 pm_stub_refresh=0 pm_optout="" pm_nm=0
+  pm_target=exec pm_qset=0 pm_stub_refresh=0 pm_optout="" pm_nm=0 pm_realexec=0
 }
 _pm_run() {
   pm_case="$(mktemp -d "${pm_tmp}/case.XXXXXX")"
@@ -11138,6 +11141,7 @@ _pm_run() {
   case "$pm_target" in
     exec)  print -r -- '#!/bin/sh' > "${pm_case}/scripts/dev"; chmod +x "${pm_case}/scripts/dev" ;;
     plain) print -r -- '#!/bin/sh' > "${pm_case}/scripts/dev"; chmod 644 "${pm_case}/scripts/dev" ;;
+    fail)  printf '#!/bin/sh\nexit 3\n' > "${pm_case}/scripts/dev"; chmod +x "${pm_case}/scripts/dev" ;;
   esac
   pm_out="$(
     REPO_ROOT="$pm_case"
@@ -11171,11 +11175,13 @@ _pm_run() {
       esac
       return 0
     }
-    _post_merge_exec() {
-      print -r -- "$*" > "$pm_exec"
-      { env | grep '^FISHHAWK_DEV_POST_MERGE_' | sort; print -r -- "self=${sysparams[pid]}"; } > "$pm_execenv"
-      exit 0
-    }
+    if (( ! pm_realexec )); then
+      _post_merge_exec() {
+        print -r -- "$*" > "$pm_exec"
+        { env | grep '^FISHHAWK_DEV_POST_MERGE_' | sort; print -r -- "self=${sysparams[pid]}"; } > "$pm_execenv"
+        exit 0
+      }
+    fi
     cmd_reload() {
       { print -r -- "reload $* base=${_PM_RANGE_BASE} reexecd=${_PM_REEXECD}"
         print -r -- "leak=$(env | grep -c '^FISHHAWK_DEV_POST_MERGE_\(REEXEC_PID\|BASE\|HD_RESTORE\)=' || true)"; } >> "$pm_reload"
@@ -11265,6 +11271,26 @@ if (( pm_rc == 0 )) && [[ ! -f "$pm_exec" && -f "$pm_reload" && "$pm_err" == *"i
   pass "PM-RX6 non-executable target: warning, no exec, the walk reaches reload"
 else
   fail "PM-RX6 non-executable target (rc=${pm_rc} exec=$(_pm_has "$pm_exec") reload=$(_pm_has "$pm_reload") err=${pm_err})"
+fi
+
+# PM-RX9: an EXECUTABLE pulled scripts/dev that exits 3 at once, through the REAL
+# exec seam. The old process stopped the dispatcher and by design does not
+# restore before the exec, so the documented outcome is: the walk exits 3 with
+# no cleanup, reload or restore, and the remedy line was printed before the
+# exec. Sub-run b (control): the old process stopped nothing, so no line.
+pm_rx9_hint="the host dispatcher is stopped and the pulled copy restarts it; if that copy fails before its reload, the dispatcher is left stopped — run 'scripts/dev reload'"
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_target=fail pm_realexec=1 pm_qset=1
+_pm_run 5224
+pm_rx9a="rc=${pm_rc} cleanup=$(_pm_has "$pm_clean") reload=$(_pm_has "$pm_reload") restore=$(_pm_has "$pm_restore")"
+pm_rx9a_out="$pm_out"
+_pm_reset_knobs; pmk_pre=aaa pmk_post=bbb pm_target=fail pm_realexec=1
+_pm_run 5224
+pm_rx9b="rc=${pm_rc} reload=$(_pm_has "$pm_reload")"
+if [[ "$pm_rx9a" == "rc=3 cleanup=absent reload=absent restore=absent" && "$pm_rx9a_out" == *"$pm_rx9_hint"* ]] \
+   && [[ "$pm_rx9b" == "rc=3 reload=absent" && "$pm_out" != *"host dispatcher is stopped"* ]]; then
+  pass "PM-RX9 executable pulled copy that exits 3: walk exits 3, no cleanup/reload/restore, the 'run scripts/dev reload' line printed before the exec only when the dispatcher was stopped"
+else
+  fail "PM-RX9 failing pulled copy (a: ${pm_rx9a} out=${pm_rx9a_out}; b: ${pm_rx9b} out=${pm_out})"
 fi
 
 # PM-RX7: a junk BASE under an honoured marker is dropped with a warning, and the
