@@ -119,6 +119,67 @@ bounds what the gate can detect. A dilution that spares every committed shape
 is invisible to it. The 0.10 tolerance and the 95% level are judgement
 calls.
 
+## The recording sequence
+
+A recording is several hours of paid model calls followed by a commit that a
+moving `main` can stale, so run it in this order (#5224). Steps 1-4 below
+explain each part; this is the order that keeps a finished recording
+committable.
+
+1. **A fresh worktree from `origin/main`.** Record on a clean tree of the
+   branch the recording lands on: `git fetch origin`, then
+   `git worktree add -b <branch> <dir> origin/main` (or the run branch, when the
+   plan says the recording lands there before merge). Set `GOFLAGS=-trimpath`
+   in that shell so the worktree shares build-cache entries. A dirty or stale
+   checkout records a fingerprint no reviewer can reproduce.
+2. **One credential, in this shell only.** Export exactly one of
+   `FISHHAWKD_ANTHROPIC_API_KEY` (preferred) or
+   `FISHHAWKD_ANTHROPIC_AUTH_TOKEN`, on the command line or in this shell. Never
+   put it in the checkout's `.env`; see "Step 2 — run the arms" for why.
+3. **Record with every setting named.** `FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1`,
+   `FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1`, a
+   `FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON` when the recording re-pins (Step
+   2 says when), and `FISHHAWK_AGENTEVAL_DIAG_DIR` pointing OUTSIDE the
+   repository (a path under `testdata/` is refused). Pass `-v` and a long
+   `-timeout` (`4h` for a full recording; `go test` defaults to 10 minutes):
+
+   ```sh
+   FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+     FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+     FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='<issue>: <why the old baseline is not comparable>' \
+     FISHHAWK_AGENTEVAL_DIAG_DIR="$HOME/fishhawk-agenteval-diag" \
+     scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+   ```
+
+4. **Commit the pair.** Add the "Results" row for the recording and commit it
+   with `evidence.json` and `evidence.trials.json` together, signed off (Step
+   3).
+5. **Rebase onto the current `origin/main`.** `git fetch origin` and
+   `git rebase origin/main`. A recording takes hours, and anything that merged
+   meanwhile is part of the tree the gate will judge.
+6. **Re-run the gate on the rebased tree.**
+   `(cd backend && go run ./internal/agenteval/catchrategate)` must end in
+   `catchrategate: PASS`. A STALE refusal here means a fingerprinted input
+   (a prompt, the corpus, a fixture, `docs/adr/`) moved on `main` during the
+   recording: re-measure on the rebased tree. Never hand-edit the record.
+7. **Scan for secrets before the push.** The diagnostics file stays outside
+   the repository and is never committed, but scan what IS committed. Gate the
+   push on a zero count, not on an exit status after a pipe:
+
+   ```sh
+   n=$(git diff origin/main...HEAD | grep -cE 'sk-ant-[A-Za-z0-9_-]{8,}')
+   k=$(git diff origin/main...HEAD | grep -cFf <(printf '%s\n' "$FISHHAWKD_ANTHROPIC_API_KEY"))
+   [ "$n" -eq 0 ] && [ "$k" -eq 0 ] && echo "secret scan clean"
+   ```
+
+   The second count reads the key from a process substitution, so the key
+   never appears in a process listing. Use `$FISHHAWKD_ANTHROPIC_AUTH_TOKEN`
+   instead when that is the credential you set; an unset variable matches every
+   line, so the scan fails closed rather than passing.
+8. **Hand off the PR.** Push the branch and open or update its PR with the
+   gate's PASS output and the Step 4 distribution check in the body, then hand
+   it to review. Remove the worktree after the merge.
+
 ## Step 1 — check the corpus loads
 
 ```sh
@@ -533,9 +594,29 @@ then the honest rate (every miss transcript read) and the outcome:
 ## Step 2 — run the arms
 
 Authenticate with exactly one of `FISHHAWKD_ANTHROPIC_API_KEY` or
-`FISHHAWKD_ANTHROPIC_AUTH_TOKEN` (an OAuth bearer; substitute it for the key in
-any command below). Neither set skips the arm naming both variables; both set
-fails it. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
+`FISHHAWKD_ANTHROPIC_AUTH_TOKEN` (an OAuth bearer, sent as
+`Authorization: Bearer`). Neither set skips the arm naming both variables; both
+set fails it, and that refusal repeats the two points below.
+
+- **Prefer the API key.** The harness sends a token as a bearer
+  (`TestLiveCredential_TokenOnlyReachesWireAsBearer` pins the wire), but
+  reaching the wire is not the same as the provider accepting it. The
+  operator's notes record a Claude subscription token rejected by the Messages
+  API. That cannot be confirmed offline, so treat the token variable as a
+  substitute only for a bearer the provider accepts for direct API use, and use
+  the key otherwise. A provider rejection of a token-only run is not yet
+  explained by the harness's own failure text (#5224 remaining scope). Which
+  bearer tokens Anthropic's terms permit for direct API use is the operator's
+  responsibility.
+- **Keep the credential out of `.env`.** `scripts/dev` loads the checkout's
+  `.env` into `fishhawkd`, and `FISHHAWKD_ANTHROPIC_API_KEY` there switches on
+  the daemon's Anthropic API reviewer (`--anthropic-api-key` in
+  `backend/cmd/fishhawkd/serve.go`), billing the reviews it runs to that key.
+  A shell that also loads `.env` while you export the other variable
+  has both kinds set, and the eval refuses. Set the credential on the command
+  line or in the recording shell only.
+
+The commands below show the key; substitute the token variable to use a bearer.
 
 Every command below passes `-v` (so the per-trial progress lines stream
 instead of arriving when the package finishes) and an explicit `-timeout`

@@ -27,7 +27,12 @@ import (
 // a refusal, not a skip, because the operator opted in with a contradictory
 // configuration and a silent skip would read as "unmeasured" rather than
 // "misconfigured". Which bearer tokens Anthropic's terms permit for direct API
-// use is the operator's responsibility.
+// use is the operator's responsibility. A bearer reaching the wire is not the
+// same as the provider accepting it: the operator's notes record a Claude
+// subscription token rejected by the Messages API (not reproducible offline),
+// so the API key is the credential to prefer (#5224). The both-set refusal below says so, and says to
+// keep the credential out of .env, where FISHHAWKD_ANTHROPIC_API_KEY would also
+// switch on fishhawkd's API reviewer.
 //
 // This file is test-only on purpose: it is not a scripts/check-review-prompt-eval
 // trigger path, and the runner's default-deny gate env drops every FISHHAWKD_*
@@ -63,11 +68,18 @@ func resolveLiveCredential(getenv func(string) string) (cred liveCredential, ski
 }
 
 // liveCredentialConflictError is the both-set refusal. It names both variables
-// and the exactly-one rule.
+// and the exactly-one rule, then the two remedies an operator in this state
+// needs (#5224): prefer the API key, because the provider API can reject a
+// subscription bearer, and set it in the shell for the one command rather than
+// in .env, where the API-key variable also switches on fishhawkd's API reviewer
+// and is how a stale second credential ends up beside the first.
 type liveCredentialConflictError struct{}
 
 func (*liveCredentialConflictError) Error() string {
-	return liveAPIKeyEnv + " and " + liveAuthTokenEnv + " are both set; exactly one is accepted"
+	return liveAPIKeyEnv + " and " + liveAuthTokenEnv + " are both set; exactly one is accepted. " +
+		"Prefer " + liveAPIKeyEnv + ": the Messages API can reject a Claude subscription token sent as " +
+		liveAuthTokenEnv + ". Set the variable on the command line, not in .env, where " +
+		liveAPIKeyEnv + " also switches on fishhawkd's API reviewer"
 }
 
 // config stamps exactly the resolved credential onto cfg, overwriting both
@@ -118,7 +130,7 @@ func TestResolveLiveCredential(t *testing.T) {
 		{name: "key only", env: map[string]string{liveAPIKeyEnv: key}, want: liveCredential{apiKey: key}},
 		{name: "token only", env: map[string]string{liveAuthTokenEnv: tok}, want: liveCredential{authToken: tok}},
 		{name: "both", env: map[string]string{liveAPIKeyEnv: key, liveAuthTokenEnv: tok}, wantErr: true,
-			errNames: []string{liveAPIKeyEnv, liveAuthTokenEnv, "exactly one"}},
+			errNames: []string{liveAPIKeyEnv, liveAuthTokenEnv, "exactly one", "Prefer " + liveAPIKeyEnv, "subscription token", "not in .env", "API reviewer"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cred, skip, err := resolveLiveCredential(func(k string) string { return tc.env[k] })

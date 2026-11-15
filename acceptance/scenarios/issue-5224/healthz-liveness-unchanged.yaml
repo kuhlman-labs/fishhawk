@@ -1,0 +1,14 @@
+id: scenario:issue-5224/healthz-liveness-unchanged
+statement: GET /healthz on the preview still returns 200 with status ok and its existing fields; the readiness check does not change liveness.
+verify_hint: 'HTTP: GET /healthz on the preview; check the status code and body fields.'
+steps: curl -s -D - http://localhost:8090/healthz
+assertions:
+    expected: 200 ok with existing fields
+    observed_at_record: HTTP 200 with status ok, version, git_sha 1e37d5070, min_runner_version, schemas, process_start, dev_mode and push_sinks; no database field was added
+    repro_handle: curl -s -D - http://localhost:8090/healthz
+origin:
+    issue: 5224
+    pr: 5400
+    run_id: 2a293e02-92c0-4299-a0f2-c2e01b707ac9
+    head_sha: 1e37d5070f325032fdd5a87a1a8fd467384e70f1
+    recorded_at: 2026-11-15T19:33:43Z

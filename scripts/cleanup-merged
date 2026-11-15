@@ -1,6 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+usage: scripts/cleanup-merged [--dry-run] [-h|--help]
+
+Fetch origin/main, then delete every local branch already merged into it.
+A merged branch still checked out by a worktree is skipped with a warning;
+remove it with scripts/dev sweep. main is never deleted.
+
+  --dry-run   fetch and list the branches that would be deleted; delete nothing
+  -h, --help  print this help and exit; no fetch, no deletion
+USAGE
+}
+
+# Parse every argument BEFORE the fetch (#5224 G1): --help used to fall
+# through to the deletion, because nothing read the arguments at all.
+dry_run=0
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --dry-run)
+      dry_run=1
+      ;;
+    *)
+      usage >&2
+      echo "unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
 git fetch origin main --quiet
 
 # Snapshot the worktree map ONCE before the loop. A git failure yields an empty
@@ -37,14 +70,23 @@ while IFS= read -r branch; do
       skipped=$((skipped + 1))
       continue
     fi
+    if [ "$dry_run" -eq 1 ]; then
+      echo "would delete (merged): $branch"
+      count=$((count + 1))
+      continue
+    fi
     git branch -D "$branch" >/dev/null
     echo "deleted (merged): $branch"
     count=$((count + 1))
   fi
 done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
 
+verb="cleaned"
+if [ "$dry_run" -eq 1 ]; then
+  verb="would clean"
+fi
 if [ "$skipped" -ne 0 ]; then
-  echo "cleaned $count branch(es), skipped $skipped held by worktree(s)"
+  echo "$verb $count branch(es), skipped $skipped held by worktree(s)"
 else
-  echo "cleaned $count branch(es)"
+  echo "$verb $count branch(es)"
 fi

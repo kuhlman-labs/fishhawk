@@ -385,11 +385,13 @@ func (s *Server) resolveOAuthClient(r *http.Request, clientID string) (*resolved
 	// purpose is bounding outbound VOLUME, and the burst default is sized so a
 	// legitimate re-authorising client never notices. The wait is carried as a
 	// TYPED cimdRateLimitedError in Cause (binding CONDITION 2), so the renderer
-	// reads Retry-After structurally instead of re-consulting the limiter.
+	// reads Retry-After structurally instead of re-consulting the limiter. The
+	// description names the configured rates and the pre-registration remedy
+	// (#5224).
 	if ok, wait := s.oauthCIMDLimiter.Allow(oauthCIMDSourceKey(r)); !ok {
 		return nil, &oauthas.Error{
 			Code:        oauthas.ErrCodeTemporarilyUnavailable,
-			Description: "client resolution is temporarily rate limited; retry after the interval in Retry-After",
+			Description: s.oauthCIMDLimiter.refusalDescription(),
 			Cause:       &cimdRateLimitedError{retryAfter: wait},
 		}
 	}

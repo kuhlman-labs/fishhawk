@@ -1981,6 +1981,18 @@ API-key variable directly. The runner's default-deny gate env drops every
 `FISHHAWKD_*` and `FISHHAWK_AGENTEVAL_*` variable, so no in-loop run resolves a
 credential and the arms stay operator-executed. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
 
+Prefer the API key. A token reaches the wire as a bearer, but the operator's
+notes record the Messages API rejecting a Claude subscription token, so use
+the token variable only for a bearer the provider accepts for direct API use
+(#5224). Keep either credential out of the checkout's `.env`: `scripts/dev`
+loads it into `fishhawkd`, where `FISHHAWKD_ANTHROPIC_API_KEY` switches on the
+daemon's Anthropic API reviewer, and a shell that loads `.env` beside an
+exported token has both kinds set, which the gate refuses. The both-set
+refusal text says both things. The ordered catch-rate recording procedure
+(worktree, record, rebase, re-run the gate, secret scan, PR hand-off) is
+[`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md)
+§ "The recording sequence".
+
 ```sh
 # Offline (runs in scripts/test verify; no model call):
 scripts/test single -run 'TestInjection|TestLoadInjection|TestEnvelopeQuality|TestStripBodyEnvelope|TestQualityArm|TestCompareQualityArms|TestJudgeRubric|TestRubric' ./backend/internal/agenteval/

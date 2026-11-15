@@ -195,6 +195,32 @@ func (l *oauthCIMDLimiter) Allow(key string) (bool, time.Duration) {
 	return false, wait
 }
 
+// refusalDescription is the error_description of this limiter's 429 (#5224).
+// It names the CONFIGURED refill rates and bursts, so an operator who hits it
+// can see the policy without reading the serve flags, and it names the remedy
+// that avoids the limiter altogether: a pre-registered client resolves from the
+// store and never reaches it (resolveOAuthClient's store-hit branch). That is
+// also the only local path for a client whose metadata document would be on
+// loopback, which the CIMD dialguard refuses (docs/local-tls.md). The fields it
+// reads are set once at construction and never mutated, so no lock is taken.
+func (l *oauthCIMDLimiter) refusalDescription() string {
+	return "client resolution is temporarily rate limited (CIMD fetch limit: one per " +
+		oauthCIMDSecondsText(l.sourceRefill.Seconds()) + "s per source, burst " +
+		oauthCIMDSecondsText(l.sourceBurst) + "; one per " +
+		oauthCIMDSecondsText(l.globalRefill.Seconds()) + "s globally, burst " +
+		oauthCIMDSecondsText(l.globalBurst) +
+		"); retry after the interval in Retry-After, or pre-register the client with " +
+		"fishhawkd oauth client register so it resolves without a CIMD fetch"
+}
+
+// oauthCIMDSecondsText renders a number in plain decimal ("10", "0.0005").
+// time.Duration.String is NOT used for the refill intervals: it renders a
+// sub-millisecond value with the U+00B5 micro sign, and RFC 6749 §5.2 limits
+// error_description to printable ASCII without '"' or '\'.
+func oauthCIMDSecondsText(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
 // sourceBucketLocked returns key's bucket, creating it (and evicting the LRU
 // tail past maxSources) on first sight. The map and list are mutated only
 // together under mu — the single capped LRU the doc comment promises.

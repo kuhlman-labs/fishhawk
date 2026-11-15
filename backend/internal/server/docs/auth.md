@@ -1523,7 +1523,16 @@ gate is available. Shipped contract:
   `cimdRateLimitedError` in the `*oauthas.Error` Cause, so the renderer reads it
   structurally rather than re-consulting the limiter (which would burn a second
   token). NOTE: `temporarily_unavailable` is not in the RFC 6749 §5.2
-  token-endpoint code set — see "Deliberate §5.2 departure" below.
+  token-endpoint code set — see "Deliberate §5.2 departure" below. The
+  `error_description` names the CONFIGURED policy and the remedy (#5224), e.g.
+  at the defaults: `client resolution is temporarily rate limited (CIMD fetch
+  limit: one per 10s per source, burst 5; one per 1s globally, burst 30); retry
+  after the interval in Retry-After, or pre-register the client with fishhawkd
+  oauth client register so it resolves without a CIMD fetch`. The text comes
+  from `oauthCIMDLimiter.refusalDescription`, which renders the intervals in
+  plain decimal seconds (never `time.Duration`'s `µs`) so it stays inside the
+  §5.2 `error_description` character set. Pre-registration is the remedy
+  because a store-resolved client never reaches the limiter (placement above).
 - **Four-verdict loopback gate.** `resolveOAuthASState` gained an
   `oauthASNotLoopback` verdict: when `--oauth-require-loopback` is set and the
   listener is not loopback, all four OAuth routes answer `403 oauth_as_loopback_only`
