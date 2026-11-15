@@ -5856,9 +5856,12 @@ components:
         implement-stage `forbidden_paths` forbid (`forbidden_path`, matched with
         the post-implement gate's matcher against the UNION of every workflow's
         implement-stage `forbidden_paths` in the default-branch spec). It never
-        refuses, excludes or reorders an item. Like `satisfied_dependencies`
-        this is CREATE-response-only — NOT persisted, so GET/list/status omit
-        it — and omitted when the screen found nothing. Class 2 degrades
+        refuses, excludes or reorders an item. It rides the `POST /v0/campaigns`
+        create response and the `POST /v0/campaigns/preview` report (#5221);
+        like `satisfied_dependencies` it is NOT persisted, so GET/list/status
+        omit it, and it is omitted when the screen found nothing. Only create
+        appends the `campaign_admission_screened` audit row; the preview
+        writes none. Class 2 degrades
         silently (fail-open, `forbidden_paths_screened: false`) when the spec
         cannot be fetched or parsed or declares no forbidden paths; issue prose
         is noisy, so false positives are expected.
@@ -5866,7 +5869,7 @@ components:
       properties:
         advisory:
           type: boolean
-          description: Always `true` — the screen reports and never blocks the create.
+          description: Always `true` — the screen reports and never blocks the create or changes the preview.
         findings:
           type: array
           description: Sorted by issue, then kind, then path; capped at 50.
@@ -6124,6 +6127,98 @@ components:
         message:
           type: string
           description: The assembler's own message on a dangling report.
+        admission_screen:
+          $ref: '#/components/schemas/CampaignAdmissionScreen'
+          description: |
+            ADVISORY (#5221): the same `runnable:no` / forbidden-path screen
+            `POST /v0/campaigns` runs (#3649), on every report path (valid,
+            dangling, cycle). It never changes `valid`, `waves` or `items`, and
+            the preview writes no audit row for it. Absent when the screen
+            found nothing.
+        path_overlap:
+          $ref: '#/components/schemas/CampaignPreviewPathOverlap'
+
+    CampaignPreviewPathOverlap:
+      type: object
+      description: |
+        ADVISORY (#5221): item pairs whose title or body name the same file
+        path and that no in-set `depends_on` chain orders in either direction,
+        so their plans may conflict. Present on every report path (valid,
+        dangling, cycle) and absent when no pair shares a path; it never
+        changes `valid`, `waves` or `items`.
+
+        LEXICAL over issue prose. Path tokens are the admission screen's
+        (`file.go:12` yields `file.go`), filtered to drop prose: globs,
+        absolute and `../` paths, Go import paths (a first segment with a
+        non-leading dot, such as `github.com/...`), dotted identifiers
+        (`campaign.NextEligible`), version tokens (`v1.2`) and one-slash words
+        (`and/or`). A token counts when it carries an allowlisted file
+        extension (the ambiguous `cfg`, `env`, `conf`, `h`, `c`, `cs`, `sh`,
+        `lock`, `sum` and `mod` also need a `/`), or is a directory of three or
+        more segments. Expected false positives: a path named only as an
+        example, a bare file name shared by different directories,
+        three-segment slash prose, and a backticked identifier ending in a
+        non-ambiguous extension (`resp.JSON`). Expected false negatives: a
+        path the issue never names, directory-prefix overlap, two-segment
+        directories and extensionless files.
+
+        Pairs rank by the fanout of their rarest shared path (how many items
+        name it), then `code` before `docs_only`, then issue number, so a hub
+        path named by many items sorts last and cannot crowd specific overlaps
+        out of the 50-pair cap.
+      required: [advisory, pairs, total_pairs]
+      properties:
+        advisory:
+          type: boolean
+          description: Always `true`.
+        pairs:
+          type: array
+          description: The ranked pairs, capped at 50.
+          items:
+            $ref: '#/components/schemas/CampaignPreviewPathOverlapPair'
+        total_pairs:
+          type: integer
+          description: The uncapped pair count.
+        truncated:
+          type: boolean
+          description: Present and `true` when more than 50 pairs were found and the list was capped.
+
+    CampaignPreviewPathOverlapPair:
+      type: object
+      description: One unordered item pair sharing at least one path (#5221).
+      required: [items, paths, class, remedy]
+      properties:
+        items:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: string }
+          description: The two issue refs, lower issue number first.
+          example: ["issue:1441", "issue:1442"]
+        paths:
+          type: array
+          items: { type: string }
+          description: The shared path tokens, cleaned and sorted, capped at 10 per pair. Only filtered path tokens, never free issue text.
+        paths_truncated:
+          type: boolean
+          description: Present and `true` when the pair shared more than 10 paths and `paths` lists only the first 10 sorted ones.
+        class:
+          type: string
+          enum: [code, docs_only]
+          description: |
+            `docs_only` when every shared path is documentation under the merge
+            overlap guard's conservative rule (a `.md`, `.mdx`, `.markdown`,
+            `.rst` or `.adoc` file outside `docs/review`, `docs/spec`,
+            `docs/adr`, `docs/compliance` and instruction files); otherwise
+            `code`. `docs/api/v0.openapi.yaml` is `code`.
+        remedy:
+          type: string
+          description: |
+            One operator-facing sentence. `code`: add a native blocked-by link
+            so the later item plans after the earlier one's PR opens, or
+            confirm they touch unrelated parts of the file, then re-preview.
+            `docs_only`: parallel plans are fine; the merges serialize through
+            the merge overlap guard.
 
     CampaignItem:
       type: object
@@ -23539,6 +23634,15 @@ paths:
         and a dependency cycle are `200` reports with `valid: false`, where
         create answers `422 campaign_dangling_dependency` / `400
         validation_failed`.
+
+        ADVISORY SCREENS (#5221). Every report path (valid, dangling, cycle)
+        also carries `admission_screen` (the create path's `runnable:no` /
+        forbidden-path screen) and `path_overlap` (item pairs naming the same
+        file path with no `depends_on` ordering them) when they find
+        something. Neither changes `valid`, `waves` or `items`, and neither
+        writes an audit row: only create appends `campaign_admission_screened`.
+        The forbidden-path class costs one workflow-spec read at the default
+        branch and fails open exactly as on create.
       tags: [campaigns]
       requestBody:
         required: true

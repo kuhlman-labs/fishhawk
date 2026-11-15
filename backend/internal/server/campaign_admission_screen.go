@@ -17,7 +17,8 @@ import (
 // only — campaign.Assemble fails closed on a dangling depends_on edge — and
 // nothing asks whether a candidate is runnable at all, so the batch commitment
 // discovers an unrunnable item one item-run at a time. This screen reports two
-// such classes on the CREATE response:
+// such classes, on the CREATE response and on the POST /v0/campaigns/preview
+// response (#5221, via screenCampaignAdmission):
 //
 //   - not_runnable_declared (class 1): the candidate carries an explicit
 //     `runnable:no` label (workmgmt.EpicChild.NotRunnable) — a DECLARATION that
@@ -43,8 +44,8 @@ const (
 	campaignScreenKindNotRunnable = "not_runnable_declared"
 	// campaignScreenKindForbiddenPath is the class-2 finding kind.
 	campaignScreenKindForbiddenPath = "forbidden_path"
-	// campaignAdmissionScreenMaxFindings caps the findings per create response
-	// so a prose-heavy batch cannot flood the block.
+	// campaignAdmissionScreenMaxFindings caps the findings per create or
+	// preview response so a prose-heavy batch cannot flood the block.
 	campaignAdmissionScreenMaxFindings = 50
 	// categoryCampaignAdmissionScreened is the best-effort audit row the create
 	// handler appends when the screen produced at least one finding.
@@ -66,9 +67,11 @@ type campaignScreenFinding struct {
 	ForbiddenPattern string `json:"forbidden_pattern,omitempty"`
 }
 
-// campaignAdmissionScreenPayload is the create-response-only admission_screen
-// block. Like satisfied_dependencies (#2953) it is never persisted, so a later
-// GET omits it. Mirrors docs/api/v0.openapi.yaml's CampaignAdmissionScreen.
+// campaignAdmissionScreenPayload is the admission_screen block carried by the
+// create response and the preview response (#5221), never by a GET or list
+// read. Like satisfied_dependencies (#2953) it is never persisted. Only create
+// appends the campaign_admission_screened audit row; the preview writes none.
+// Mirrors docs/api/v0.openapi.yaml's CampaignAdmissionScreen.
 type campaignAdmissionScreenPayload struct {
 	// Advisory is always true: the screen reports and never blocks.
 	Advisory bool                    `json:"advisory"`

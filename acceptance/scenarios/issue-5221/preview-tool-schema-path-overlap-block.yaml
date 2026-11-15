@@ -1,0 +1,15 @@
+id: scenario:issue-5221/preview-tool-schema-path-overlap-block
+statement: fishhawk_preview_campaign's advertised outputSchema declares properties.preview.properties.path_overlap as an object with advisory, pairs (each with items, paths, class and remedy), total_pairs and truncated. Its description marks it ADVISORY and names the code and docs_only classes. The tool description names path_overlap and the native blocked-by remedy.
+verify_hint: 'MCP tools/list over POST /mcp (or the fishhawk-mcp stdio binary): read fishhawk_preview_campaign''s description and outputSchema.properties.preview.properties.path_overlap.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} and read the run_id. 2) Minted an fhm_ bearer: POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over ''{}'', POST /v0/runs/{run}/mcp-token. 3) POST /mcp tools/list with the Mcp-Protocol-Version 2026-07-28 and Mcp-Method headers. 4) Read fishhawk_preview_campaign''s description and outputSchema.properties.preview.properties.path_overlap.'
+steps_carried_from: head 97de74b47e02763e275610c93812d77557c95da2 recorded_at 2026-11-15T08:50:51Z
+assertions:
+    expected: The listed fields, marked ADVISORY, with code and docs_only named, and the tool description naming path_overlap and the native blocked-by remedy.
+    observed_at_record: path_overlap has type [null, object], with properties advisory (boolean), pairs (array; items carry items, paths, paths_truncated, class and remedy), total_pairs (integer) and truncated (boolean). Its description begins 'ADVISORY path overlap'. The classes appear in its class sub-property ('code or docs_only. docs_only means …') rather than its top-level sentence. The tool description names preview.path_overlap, class code and class docs_only, and says 'add a native blocked-by link'.
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5221
+    pr: 5376
+    run_id: 562f90a0-bee6-4f66-a282-d115b46300f2
+    head_sha: 4d7cd7f2f55a01c21cdfadbf3f24a77608591138
+    recorded_at: 2026-11-15T10:13:21Z

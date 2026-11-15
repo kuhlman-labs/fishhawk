@@ -1,0 +1,15 @@
+id: scenario:issue-5221/preview-tool-schema-single-human-led-block
+statement: 'MCP tools/list advertises exactly one human-led block for fishhawk_preview_campaign: the top-level human_led output property. It is an array whose items carry issue_ref, position, blocked_dependents and remedy, and no property under the preview output property has a name containing human_led.'
+verify_hint: On the localhost preview, POST /mcp a JSON-RPC tools/list request with the operator bearer token, or send tools/list to the fishhawk-mcp binary over stdio. In fishhawk_preview_campaign's outputSchema, read properties.human_led.items.properties and the property names under properties.preview.properties.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} and read the run_id. 2) POST /v0/runs/{run}/signing-key {}. POST /v0/dev/sign over the bytes ''{}'' with X-Fishhawk-Dev-Private-Key. POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. 3) POST /mcp with Authorization Bearer, Mcp-Protocol-Version: 2026-07-28 and Mcp-Method: tools/list, sending a tools/list JSON-RPC request with _meta protocolVersion/clientCapabilities/clientInfo. 4) Read fishhawk_preview_campaign outputSchema.properties.human_led and walked every property name under properties.preview (nested properties and items included).'
+steps_carried_from: head 97de74b47e02763e275610c93812d77557c95da2 recorded_at 2026-11-15T08:50:51Z
+assertions:
+    expected: 'Exactly one human-led block: the top-level human_led array with those item fields and none under preview.'
+    observed_at_record: properties.human_led has type [null, array]. items.properties are issue_ref, position, blocked_dependents and remedy. The only property whose name contains human_led is the top-level one; there are zero under properties.preview.
+    repro_handle: POST /mcp tools/list with an fhm_ bearer
+origin:
+    issue: 5221
+    pr: 5376
+    run_id: 562f90a0-bee6-4f66-a282-d115b46300f2
+    head_sha: 4d7cd7f2f55a01c21cdfadbf3f24a77608591138
+    recorded_at: 2026-11-15T10:13:21Z

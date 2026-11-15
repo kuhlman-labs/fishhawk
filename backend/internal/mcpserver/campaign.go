@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -105,22 +106,107 @@ type PreviewCampaignOutput struct {
 	// HumanLed rolls up preview.items whose autonomy tier is "low" (#5214),
 	// composed MCP-side by previewHumanLed. It mirrors the campaign engine's
 	// diversion (an Autonomy=="low" item is never Eligible), so the operator
-	// sees before the start which items no agent will ever run.
-	HumanLed []string `json:"human_led,omitempty" jsonschema:"the issue refs of preview items whose autonomy tier is low (human-led), in item order. The campaign will NEVER agent-start them while they stay low: once its dependencies are satisfied, fishhawk_start_campaign_item_run refuses such an item with item_human_led, so a human leads it out of band (the tier is re-read from the issue's autonomy label on every fishhawk_get_campaign_status poll, so a relabel changes it). Composed from preview.items[].autonomy; absent when no item is autonomy:low"`
+	// sees before the start which items no agent will ever run, where each sits
+	// in the queue, which in-set items wait behind it, and what to do (#5221).
+	// It is the ONE human-led surface: the backend preview report carries none.
+	HumanLed []previewHumanLedItem `json:"human_led,omitempty" jsonschema:"one entry per preview item whose autonomy tier is low (human-led), in item order. The campaign will NEVER agent-start them while they stay low: once its dependencies are satisfied, fishhawk_start_campaign_item_run refuses such an item with item_human_led, so a human leads it out of band (the tier is re-read from the issue's autonomy label on every fishhawk_get_campaign_status poll, so a relabel changes it). Each entry carries issue_ref, position (its zero-based queue position, the same value as preview.items[].position), blocked_dependents (the in-set items that transitively depend on it and so wait until it completes) and a remedy. On a grooming_run_id preview the remedy for position N > 0 is grooming_order_limit=N, which keeps only the N items ranked above it; an item at position 0 heads the order and no grooming_order_limit can exclude it (0 means no cap), so lead it by hand first or preview an explicit items list without it and its blocked_dependents. Composed from preview.items[].autonomy and depends_on; absent when no item is autonomy:low"`
 }
 
-// previewHumanLed returns the refs of the items whose autonomy tier is exactly
-// "low" — the same predicate the campaign engine uses to divert a deps-satisfied
-// item to HumanLed (campaign.NextEligible). nil when there are none, so the
+// previewHumanLedItem is one autonomy:low item in the preview's human_led
+// block (#5221). Unexported (FIELDS exported for JSON) so it stays off the
+// frozen MCP export surface, like campaignPreviewEdge.
+type previewHumanLedItem struct {
+	IssueRef          string   `json:"issue_ref" jsonschema:"the human-led item, as issue:N"`
+	Position          int      `json:"position" jsonschema:"the item's zero-based queue position (preview.items[].position)"`
+	BlockedDependents []string `json:"blocked_dependents" jsonschema:"the in-set items that depend on this one directly or transitively, sorted by position; they wait until it completes. Always an array, empty when nothing depends on it"`
+	Remedy            string   `json:"remedy" jsonschema:"what to do about this item, by source and position"`
+}
+
+// previewHumanLedRemedyLead opens every human_led remedy: the campaign
+// consequence, then the two ways out.
+const previewHumanLedRemedyLead = "the campaign never agent-starts this item while it stays autonomy:low " +
+	"(fishhawk_start_campaign_item_run refuses it with item_human_led), its blocked_dependents wait until it completes, " +
+	"and independent items still run. A human leads it out of band, or relabel it autonomy:medium only if an agent may author it. "
+
+// previewHumanLed returns one entry per item whose autonomy tier is exactly
+// "low" — the same predicate the campaign engine uses to divert a
+// deps-satisfied item to HumanLed (campaign.NextEligible) — with its position,
+// its transitive in-set dependents and a source-specific remedy. grooming is
+// true for a grooming_run_id preview. nil when there are none, so the
 // omitempty field is absent.
-func previewHumanLed(items []CampaignPreviewItem) []string {
-	var out []string
+func previewHumanLed(items []CampaignPreviewItem, grooming bool) []previewHumanLedItem {
+	position := make(map[string]int, len(items))
+	for _, it := range items {
+		position[it.IssueRef] = it.Position
+	}
+	// dependents[x] are the items whose depends_on names x. preview.items
+	// carry in-set edges only, and the walk starts from an item, so an
+	// out-of-set target is never reached.
+	dependents := make(map[string][]string, len(items))
+	for _, it := range items {
+		for _, dep := range it.DependsOn {
+			dependents[dep] = append(dependents[dep], it.IssueRef)
+		}
+	}
+	var out []previewHumanLedItem
 	for _, it := range items {
 		if it.Autonomy == "low" {
-			out = append(out, it.IssueRef)
+			out = append(out, previewHumanLedItem{
+				IssueRef:          it.IssueRef,
+				Position:          it.Position,
+				BlockedDependents: previewBlockedDependents(it.IssueRef, dependents, position),
+				Remedy:            previewHumanLedRemedy(it.Position, grooming),
+			})
 		}
 	}
 	return out
+}
+
+// previewBlockedDependents is a visited-set BFS from root along the reverse
+// depends_on edges. The visited set (seeded with root) excludes the item itself
+// and terminates on a cycle. The result is sorted by position, then ref, and is
+// never nil, so the wire carries [] rather than null.
+func previewBlockedDependents(root string, dependents map[string][]string, position map[string]int) []string {
+	out := []string{}
+	visited := map[string]bool{root: true}
+	queue := []string{root}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, d := range dependents[cur] {
+			if visited[d] {
+				continue
+			}
+			visited[d] = true
+			out = append(out, d)
+			queue = append(queue, d)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if position[out[i]] != position[out[j]] {
+			return position[out[i]] < position[out[j]]
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// previewHumanLedRemedy renders a human_led entry's remedy. position is the
+// item's zero-based queue position; grooming is true for a grooming_run_id
+// preview. grooming_order_limit=N keeps the top N ranked items, and 0 means no
+// cap, so an item at position 0 cannot be excluded by any limit.
+func previewHumanLedRemedy(position int, grooming bool) string {
+	if !grooming {
+		return previewHumanLedRemedyLead + "To start the campaign without it, preview an items list that names the other items " +
+			"explicitly without it AND without its blocked_dependents: dropping only this item leaves them dangling."
+	}
+	if position == 0 {
+		return previewHumanLedRemedyLead + "It heads the ratified grooming order, so no grooming_order_limit can exclude it " +
+			"(0 means no cap): lead it by hand first, or preview the rest as an explicit items list without it and its blocked_dependents."
+	}
+	return previewHumanLedRemedyLead + fmt.Sprintf("To start the campaign without it, re-preview with grooming_order_limit=%d: "+
+		"that keeps only the %d items ranked above it (positions are zero-based) and drops it and everything ranked below; "+
+		"re-preview to confirm the set stays valid.", position, position)
 }
 
 // GetCampaignStatusInput is the fishhawk_get_campaign_status tool's input.
@@ -435,6 +521,30 @@ is low: while they stay low the campaign never agent-starts them
 (fishhawk_start_campaign_item_run refuses each with item_human_led), so plan for
 a human to lead them out of band.
 
+Advisory hazards (#5221). Three blocks report hazards before the campaign
+exists. None of them changes valid, waves or items, and each appears only when
+it found something, on the valid, dangling and cycle reports alike.
+- human_led entries carry issue_ref, position (the zero-based queue position),
+  blocked_dependents (the in-set items that wait behind it, transitively) and a
+  remedy. Independent items still run. To start without the item, preview an
+  items list without it AND its blocked_dependents. On a grooming_run_id preview,
+  grooming_order_limit=N excludes an item at position N > 0; an item at position
+  0 heads the order and no limit can exclude it (0 means no cap).
+- preview.admission_screen is the same ADVISORY screen fishhawk_start_campaign
+  runs: items labelled runnable:no (no agent run is expected) and items whose
+  title or body names a path the repo's implement-stage forbidden_paths forbid
+  (an implement agent cannot edit it). forbidden_paths_screened:false means the
+  forbidden-path class could not run. The preview writes no audit row. Drop or
+  re-scope a flagged item, or plan to lead it by hand.
+- preview.path_overlap lists pairs of items whose title or body name the same
+  file path while no depends_on chain orders them. class code means their plans
+  may conflict: add a native blocked-by link so the later item plans after the
+  earlier one's PR opens, or confirm they touch unrelated parts of the file.
+  class docs_only means only documentation paths are shared and parallel plans
+  are fine. It is lexical over issue prose, so read the paths before acting;
+  pairs are ranked rarest path first and capped, with total_pairs the uncapped
+  count. Re-preview after any tracker edit.
+
 A dangling set and a cycle are REPORTS at 200, not errors. Request-shaped
 problems are still refusals, identical to fishhawk_start_campaign's: a malformed
 items ref fails campaign_item_ref_invalid, a non-child subset ref fails
@@ -546,7 +656,7 @@ func (r *runResolver) previewCampaign(ctx context.Context, _ *mcp.CallToolReques
 		}
 		return nil, PreviewCampaignOutput{}, err
 	}
-	return nil, PreviewCampaignOutput{Preview: *preview, HumanLed: previewHumanLed(preview.Items)}, nil
+	return nil, PreviewCampaignOutput{Preview: *preview, HumanLed: previewHumanLed(preview.Items, groomingRunID != "")}, nil
 }
 
 // startCampaign is the tool handler.
