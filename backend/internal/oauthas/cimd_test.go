@@ -112,36 +112,151 @@ func TestFetch_RefusesOversizeBody(t *testing.T) {
 	}
 }
 
-func TestFetch_RefusesOnTimeout(t *testing.T) {
-	t.Parallel()
+// newWedgedDocServer starts a TLS doc server whose handler serves a valid
+// self-referential document only after wedge. When the client gives up first, the
+// handler aborts the connection with http.ErrAbortHandler instead of returning.
+// Returning normally makes net/http send an implicit empty 200 with no
+// Content-Type, and on a loaded runner that response can race the client's
+// cancellation back into Fetch (the 2026-11-15 "non-JSON content type" failure in
+// #4578). An aborted connection can never produce a parseable response.
+func newWedgedDocServer(t *testing.T, wedge time.Duration) *httptest.Server {
+	t.Helper()
 	var clientID string
-	handlerWedge := timescale.D(400 * time.Millisecond)
 	srv := newDocServer(t, func(w http.ResponseWriter, r *http.Request) {
 		select {
-		case <-time.After(handlerWedge):
+		case <-time.After(wedge):
 			writeJSON(w, http.StatusOK, validDocJSON(clientID))
 		case <-r.Context().Done():
+			panic(http.ErrAbortHandler)
 		}
 	})
 	clientID = srv.URL
+	return srv
+}
+
+// roundTripFunc adapts a function to http.RoundTripper so a test can inject a
+// transport whose error shape it controls.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
+func TestFetch_RefusesOnTimeout(t *testing.T) {
+	t.Parallel()
+	handlerWedge := timescale.D(400 * time.Millisecond)
+	srv := newWedgedDocServer(t, handlerWedge)
 	f := &Fetcher{HTTPClient: srv.Client(), Timeout: timescale.D(80 * time.Millisecond)}
 	start := time.Now()
-	_, err := f.Fetch(context.Background(), clientID)
+	_, err := f.Fetch(context.Background(), srv.URL)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("Fetch = nil, want timeout error")
 	}
-	// Pin the timeout behavior, not merely "some error": the failure must be a
-	// context deadline, and it must return well before the handler would have
+	// Pin the timeout behavior, not merely "some error": the failure must carry
+	// ErrFetchTimeout, and it must return well before the handler would have
 	// completed. Without the Fetcher applying its own Timeout the handler responds
-	// after handlerWedge with a valid document and Fetch succeeds; a non-deadline
+	// after handlerWedge with a valid document and Fetch succeeds; a non-timeout
 	// error would also slip past a bare err != nil check.
+	if !errors.Is(err, ErrFetchTimeout) {
+		t.Fatalf("Fetch error = %v, want it to carry ErrFetchTimeout", err)
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Fetch error = %v, want it to wrap context.DeadlineExceeded", err)
 	}
+	assertCode(t, err, ErrCodeInvalidClient)
 	if elapsed >= handlerWedge {
-		t.Fatalf("Fetch took %v, want it to return before the handler wedge %v (its Timeout must fire first)", elapsed, handlerWedge)
+		t.Fatalf("Fetch took %v, want it to return before the handler wedge %v (its Timeout must fire first); err=%v", elapsed, handlerWedge, err)
 	}
+}
+
+func TestFetch_TimeoutSentinelIndependentOfTransportError(t *testing.T) {
+	t.Parallel()
+	// The transport returns a plain error that wraps NOTHING once the request
+	// context ends, so the Fetcher's own mapping is the only route by which
+	// ErrFetchTimeout can enter the chain. The time.After arm is a liveness bound:
+	// a Fetcher that applies no Timeout fails the test instead of hanging it.
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		select {
+		case <-req.Context().Done():
+		case <-time.After(timescale.D(5 * time.Second)):
+		}
+		return nil, errors.New("transport: request canceled")
+	})
+	f := &Fetcher{HTTPClient: &http.Client{Transport: transport}, Timeout: timescale.D(80 * time.Millisecond)}
+	_, err := f.Fetch(context.Background(), "https://client.example/id")
+	if err == nil {
+		t.Fatalf("Fetch = nil, want timeout error")
+	}
+	if !errors.Is(err, ErrFetchTimeout) {
+		t.Fatalf("Fetch error = %v, want it to carry ErrFetchTimeout", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	assertCode(t, err, ErrCodeInvalidClient)
+}
+
+func TestFetch_CallerDeadlineIsNotFetchTimeout(t *testing.T) {
+	t.Parallel()
+	srv := newWedgedDocServer(t, timescale.D(400*time.Millisecond))
+	f := &Fetcher{HTTPClient: srv.Client(), Timeout: timescale.D(5 * time.Second)}
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(80*time.Millisecond))
+	defer cancel()
+	_, err := f.Fetch(ctx, srv.URL)
+	// The contract: the fetch fails, and the CALLER's deadline is not reported as
+	// the Fetcher's own timeout.
+	if err == nil {
+		t.Fatalf("Fetch = nil, want the caller's deadline to end it")
+	}
+	if errors.Is(err, ErrFetchTimeout) {
+		t.Fatalf("Fetch error = %v, want no ErrFetchTimeout (the caller's deadline fired, not the Fetcher's Timeout)", err)
+	}
+	// Knowingly transport-dependent, not the contract: Go's native transport
+	// returns the request context's cause, which here is the caller's
+	// context.DeadlineExceeded. A transport that drops it would fail this check
+	// without the Fetcher being wrong.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch error = %v, want the caller's context.DeadlineExceeded to stay visible", err)
+	}
+}
+
+// blockingBody is a response body whose Read blocks until ctx ends (or a
+// liveness bound passes) and then fails with a plain error that wraps nothing.
+type blockingBody struct {
+	ctx context.Context
+}
+
+func (b blockingBody) Read([]byte) (int, error) {
+	select {
+	case <-b.ctx.Done():
+	case <-time.After(timescale.D(5 * time.Second)):
+	}
+	return 0, errors.New("read: connection reset")
+}
+
+func (blockingBody) Close() error { return nil }
+
+func TestFetch_BodyReadTimeoutCarriesFetchTimeout(t *testing.T) {
+	t.Parallel()
+	// The headers arrive in time; the body read then blocks past the Fetcher's
+	// Timeout and fails with a plain error, so the Fetcher's mapping is the only
+	// source of ErrFetchTimeout.
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       blockingBody{ctx: req.Context()},
+			Request:    req,
+		}, nil
+	})
+	f := &Fetcher{HTTPClient: &http.Client{Transport: transport}, Timeout: timescale.D(80 * time.Millisecond)}
+	_, err := f.Fetch(context.Background(), "https://client.example/id")
+	if err == nil {
+		t.Fatalf("Fetch = nil, want body-read timeout error")
+	}
+	if !errors.Is(err, ErrFetchTimeout) {
+		t.Fatalf("Fetch error = %v, want it to carry ErrFetchTimeout", err)
+	}
+	assertCode(t, err, ErrCodeServerError)
 }
 
 func TestFetch_RefusesMissingRedirectURIs(t *testing.T) {

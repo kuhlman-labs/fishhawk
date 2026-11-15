@@ -1,6 +1,7 @@
 package oauthas
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -73,5 +74,23 @@ func TestError_IsRejectsNonError(t *testing.T) {
 	e := newError(ErrCodeServerError, "boom")
 	if e.Is(errors.New("plain")) {
 		t.Fatalf("Is matched a non-*Error target")
+	}
+}
+
+func TestErrFetchTimeout_WrapsDeadlineExceeded(t *testing.T) {
+	t.Parallel()
+	if !errors.Is(ErrFetchTimeout, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(ErrFetchTimeout, context.DeadlineExceeded) = false, want the sentinel to wrap it")
+	}
+	someErr := errors.New("transport: request canceled")
+	e := newError(ErrCodeInvalidClient, "client_id document could not be fetched").withCause(errors.Join(ErrFetchTimeout, someErr))
+	if !errors.Is(e, ErrFetchTimeout) {
+		t.Fatalf("errors.Is(%v, ErrFetchTimeout) = false", e)
+	}
+	if !errors.Is(e, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(%v, context.DeadlineExceeded) = false", e)
+	}
+	if !errors.Is(e, someErr) {
+		t.Fatalf("errors.Is(%v, someErr) = false, want the original error kept in the chain", e)
 	}
 }
