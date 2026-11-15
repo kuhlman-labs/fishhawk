@@ -49,7 +49,8 @@ Use this when you want to show the captain exactly what a draft work item
 would look like when filed, with its intake signals, BEFORE filing anything
 (#3774). It wraps POST /v0/work-items/preview: the backend runs the same
 conventions and intake hook fishhawk_file_issue runs and returns the rendered
-title, the body the tracker would receive (advisory intake section included),
+title, the body the tracker would receive (advisory intake section included,
+except for a type whose intake_section resolves to omit, adr by default),
 the merged labels, the number a numbered type would be allocated, and the
 intake object. It creates NOTHING: no issue, no label, no board placement, no
 epic link, and it writes no audit entry.

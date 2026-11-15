@@ -41,6 +41,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
 | `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (zero-pad width for the rendered `{number}`, bounded 0..12; e.g. `3` → `041`, `0`/absent → no padding). Required when the type is `adr` (semantic check). The shipped default declares a second numbered type, `epic` (prefix `E`, `pad: 0` → the bare `[E29]`, not `[E029]`); its next number is discovered from existing `[E{number}]` titles, and the anchored discovery regexp skips child titles like `[E29.1]` because it demands `] ` immediately after the captured number. |
 | `epic_link` | no | enum `required` \| `optional` \| `none` | Whether items of this type link to a parent epic. |
+| `intake_section` | no | enum `append` \| `omit` | Whether the intake advisory section and its hidden `fishhawk-intake` marker are appended to a filed body (#5223). Absent means `omit` for the type keyed `adr` and `append` for every other type. See [Intake section](#intake-section). |
 
 Every object level is `additionalProperties: false` — the surface is closed; new sections are additive schema changes within v0.
 
@@ -116,6 +117,18 @@ The `feature` and `bug` skeletons carry an optional **Where to look** section (E
 - A **Where to look** pointer neither folds into that scope nor obligates the plan to touch it. It grounds the planner; it does not constrain the plan. A path named here that the plan never touches is not a scope violation, and a plan may touch files no pointer named.
 
 Give paths and names, never toolchain commands — the register is language-agnostic (a pointer is `dir/file.ext` or a symbol name, not `go test …`). Because it is optional, an item filed with no Where-to-look content renders byte-identically to the pre-section skeleton, so the section carries no retroactive requirement on existing issues.
+
+## Intake section
+
+Every filing runs the intake hook (#2239), which looks for likely duplicates and epic candidates and scores the draft against the charter. When those signals carry findings, the filing core appends an advisory section and a hidden `fishhawk-intake` marker to the filed body. A type's `intake_section` controls that render (#5223):
+
+- `append` — render the section and marker when the signals carry findings.
+- `omit` — never render them. The body is exactly what `workmgmt.Apply` assembled.
+- **Absent** — the type keyed `adr` resolves to `omit`, so decision records stay clean; every other type resolves to `append`. The default depends on the type key, on the same precedent as the rule that the type keyed `adr` must declare `numbering`, so the schema declares no `default`. A repository whose decision type has a different key declares `intake_section: omit` on it explicitly.
+
+Only the body render is gated. The intake signals are still computed for every type and still returned on the `201` (`intake`), in the `work_item_filed` audit summary and in the preview (`POST /v0/work-items/preview`), which renders exactly the body a filing would send. The gate sits in the shared filing core, so the HTTP filing, defer-concern, live-validation, refinement and split filings all follow it.
+
+An omitted body carries no `fishhawk-intake` marker, so `intakegroom.ParseBody` treats the issue as unanalysed, and `userreport.Classify` cannot earn it `fishhawk_filed` from that marker: it classifies by author instead (`bot` for the Fishhawk App, `internal` for the captain). Both classes are excluded from the comms user-report set, as `fishhawk_filed` is.
 
 ## Label completeness
 

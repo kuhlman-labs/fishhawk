@@ -317,7 +317,8 @@ type commsDraftPreview struct {
 }
 
 // CommsRenderedPreview is what previewWorkItem rendered for a draft. Body is
-// the FULL rendered preview, intake advisory section included: the exact text
+// the FULL rendered preview, intake advisory section included unless the draft's
+// type resolves intake_section to omit (adr by default): the exact text
 // the captain reviews. It is exported only so encoding/json can allocate it
 // when a recorded row is decoded (an unexported embedded pointer cannot be).
 type CommsRenderedPreview struct {

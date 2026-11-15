@@ -73,6 +73,13 @@ unit-testable against literals.
 - `RenderBody` is a **no-op** when the signals are degraded and carry no
   findings: the filed body is then byte-identical to the one it would have
   had before this feature existed.
+- Whether `RenderBody` runs at all is **per type**, decided by the caller
+  (#5223): the server's filing core skips it for a type whose
+  work-management `intake_section` resolves to `omit` (the type keyed `adr`
+  by default), so that body carries neither the section nor the marker.
+  `Evaluate` is unaffected — the signals are still computed and returned on
+  the filing response, the audit entry and the preview. A marker-less body
+  makes `ParseBody` report `ok=false`, so the sweep treats it as unanalysed.
 - `HasFindings` deliberately ignores `DerivesFrom`: it echoes what the filer
   declared, not anything grooming found, so a degraded filing that declared
   source refs still files a byte-identical body. When the section does render,
