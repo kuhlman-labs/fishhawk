@@ -1,14 +1,14 @@
 id: scenario:issue-5224/cleanup-merged-help-is-safe
 statement: '`scripts/cleanup-merged --help` exits 0 and prints usage naming --help and --dry-run without fetching or deleting; `scripts/cleanup-merged --bogus` exits 2 naming the argument and deletes nothing.'
 verify_hint: 'CLI: run both commands inside a throwaway git repository; read the exit codes and stdout/stderr; compare `git branch` output before and after.'
-steps: Throwaway repo with local bare origin, branches main/merged1/unmerged1; ran tree scripts/cleanup-merged --help and --bogus; compared git branch; --help with origin removed under GIT_TRACE showed no fetch.
+steps: Created a throwaway repo /tmp/acc5224/cm/work with a bare local origin (/tmp/acc5224/cm/origin.git). main contains a --no-ff merge of merged1; unmerged1 holds an unpushed commit. Ran <sanctioned checkout>/scripts/cleanup-merged --help, then --bogus, diffing `git branch` against a saved before-list. Renamed origin away and ran --help with GIT_TRACE=1, grepping for 'trace:' lines.
 assertions:
-    expected: as statement
-    observed_at_record: '--help exit 0 usage naming --dry-run and --help; --bogus exit 2 ''unknown argument: --bogus''; branches unchanged.'
-    repro_handle: scripts/cleanup-merged --help; scripts/cleanup-merged --bogus
+    expected: --help exit 0 naming --help/--dry-run without fetch or delete; --bogus exit 2 naming the arg, deleting nothing
+    observed_at_record: '--help: exit 0; usage ''scripts/cleanup-merged [--dry-run] [-h|--help]'' plus option lines for --dry-run and -h, --help (''no fetch, no deletion''). --bogus: exit 2, usage plus ''unknown argument: --bogus''. Branch list unchanged after both. GIT_TRACE showed no git commands (no fetch).'
+    repro_handle: cd <repo>; scripts/cleanup-merged --help; echo $?; scripts/cleanup-merged --bogus; echo $?; git branch
 origin:
     issue: 5224
     pr: 5400
     run_id: 2a293e02-92c0-4299-a0f2-c2e01b707ac9
-    head_sha: 7992ac9d079277e559cfaea4957810077a0d66dd
-    recorded_at: 2026-11-15T18:22:11Z
+    head_sha: 1e37d5070f325032fdd5a87a1a8fd467384e70f1
+    recorded_at: 2026-11-15T19:33:43Z
