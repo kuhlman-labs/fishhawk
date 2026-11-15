@@ -270,6 +270,18 @@ func (f *attnFixture) seedAllSixKinds(t *testing.T) {
 		Reason: "already decided", RequestedAt: attnT0.Add(6 * time.Hour),
 	}
 	f.amends.order = append(f.amends.order, attnID(23))
+	// A server-check concern (ADR-143 D1 / #5228) on the same run, which has NO
+	// parked implement/review gate: it is listed directly as a paged_concern
+	// carrying context.provenance=server_check, so the Web UI panel — the only
+	// place it can be cleared — reaches it. The SPA's server-check marker tests
+	// consume THIS golden item.
+	f.concerns.rows = append(f.concerns.rows, &concern.Concern{
+		ID: attnID(24), RunID: amRun, StageID: amStage, StageKind: concern.StageKindImplement,
+		OriginReviewSequence: 3, Severity: "high", Category: "security",
+		Note:       "The diff adds a string that matches a GitHub token pattern (backend/internal/x/fixture.go:12).",
+		Provenance: concern.ProvenanceServerCheck,
+		State:      concern.StateRaised, CreatedAt: attnT0.Add(6*time.Hour + 30*time.Minute),
+	})
 
 	// Plan gate (priority 1) — the NEWEST, on a PENDING run.
 	planRun := attnID(10)
@@ -319,10 +331,15 @@ func TestAttention_EndToEnd_AllSixKinds(t *testing.T) {
 
 	want := []string{
 		attentionKindPlanGate, attentionKindScopeAmendment, attentionKindAcceptanceDisposition,
-		attentionKindSplitVerdict, attentionKindPagedConcern, attentionKindAttendHumanLed,
+		attentionKindSplitVerdict, attentionKindPagedConcern, attentionKindPagedConcern, attentionKindAttendHumanLed,
 	}
 	if k := attnKinds(got.Items); strings.Join(k, ",") != strings.Join(want, ",") {
 		t.Fatalf("kinds = %v, want %v", k, want)
+	}
+	// The second paged_concern is the server-check row on the run with no
+	// parked gate, carrying its provenance across the wire.
+	if sc := got.Items[5]; sc.ConcernID != attnID(24).String() || sc.Context.Provenance != concern.ProvenanceServerCheck {
+		t.Errorf("server-check item = %+v, want concern %s with provenance %q", sc, attnID(24), concern.ProvenanceServerCheck)
 	}
 	// Both the pending (plan gate) and running runs contributed: a scan of only
 	// one state would drop the plan_gate or every running-run item.
@@ -365,7 +382,7 @@ func TestAttention_PriorityOrdering(t *testing.T) {
 	want := []string{
 		attentionKindPlanGate, attentionKindPlanGate, attentionKindScopeAmendment,
 		attentionKindAcceptanceDisposition, attentionKindSplitVerdict, attentionKindPagedConcern,
-		attentionKindAttendHumanLed,
+		attentionKindPagedConcern, attentionKindAttendHumanLed,
 	}
 	if k := attnKinds(got.Items); strings.Join(k, ",") != strings.Join(want, ",") {
 		t.Fatalf("kinds = %v, want %v", k, want)
@@ -443,8 +460,8 @@ func TestAttention_NilAmendmentRepo_DegradesVisibly(t *testing.T) {
 	if !attnHasDegraded(got, attentionDegradedAmendmentStoreUnconfigured, "") {
 		t.Errorf("degraded = %+v, want %s", got.Degraded, attentionDegradedAmendmentStoreUnconfigured)
 	}
-	if len(got.Items) != 5 {
-		t.Errorf("items = %v, want the other five kinds intact", attnKinds(got.Items))
+	if len(got.Items) != 6 {
+		t.Errorf("items = %v, want the other five kinds intact (six items: two paged concerns)", attnKinds(got.Items))
 	}
 }
 
@@ -462,8 +479,8 @@ func TestAttention_NilCampaignRepo_DegradesVisibly(t *testing.T) {
 	if !attnHasDegraded(got, attentionDegradedCampaignStoreUnconfigured, "") {
 		t.Errorf("degraded = %+v, want %s", got.Degraded, attentionDegradedCampaignStoreUnconfigured)
 	}
-	if len(got.Items) != 5 {
-		t.Errorf("items = %v, want the other five kinds intact", attnKinds(got.Items))
+	if len(got.Items) != 6 {
+		t.Errorf("items = %v, want the other five kinds intact (six items: two paged concerns)", attnKinds(got.Items))
 	}
 }
 
@@ -476,8 +493,8 @@ func TestAttention_CampaignReadErrors_DegradeVisibly(t *testing.T) {
 		if !attnHasDegraded(got, attentionDegradedCampaignReadFailed, "") {
 			t.Errorf("degraded = %+v, want %s", got.Degraded, attentionDegradedCampaignReadFailed)
 		}
-		if len(got.Items) != 5 {
-			t.Errorf("items = %v, want the five run kinds intact", attnKinds(got.Items))
+		if len(got.Items) != 6 {
+			t.Errorf("items = %v, want the five run kinds intact (six items: two paged concerns)", attnKinds(got.Items))
 		}
 	})
 	t.Run("items error keeps the campaign item", func(t *testing.T) {
@@ -542,6 +559,10 @@ func TestAttention_StageReadError_DegradesOneRun(t *testing.T) {
 		Reason: "r", RequestedAt: attnT0,
 	}
 	f.amends.order = append(f.amends.order, attnID(5))
+	// An open server-check concern on the erroring run pins a NAMED residual
+	// state (ADR-143 D1 / #5228): stage_read_failed skips the run before the
+	// concern read, so the concern is not reachable from the panel this read.
+	f.concerns.rows = append(f.concerns.rows, attnServerCheckRow(attnID(6), attnID(3), attnID(4), attnT0))
 	got := decodeAttention(t, getAttention(t, New(f.config()), attnReader(""), ""))
 	if len(got.Items) != 1 || got.Items[0].RunID != attnID(1).String() || got.Items[0].Kind != attentionKindPlanGate {
 		t.Fatalf("items = %+v, want only the healthy run's plan_gate (the stage-unreadable run is skipped whole)", got.Items)
@@ -564,8 +585,8 @@ func TestAttention_AcceptanceGateStateError_DegradesOneRun(t *testing.T) {
 	if !attnHasDegraded(got, attentionDegradedAcceptanceUnreadable, attnID(30).String()) {
 		t.Errorf("degraded = %+v, want %s naming the acceptance run", got.Degraded, attentionDegradedAcceptanceUnreadable)
 	}
-	if len(got.Items) != 5 {
-		t.Errorf("items = %v, want the other five kinds intact", attnKinds(got.Items))
+	if len(got.Items) != 6 {
+		t.Errorf("items = %v, want the other five kinds intact (six items: two paged concerns)", attnKinds(got.Items))
 	}
 }
 
@@ -879,5 +900,206 @@ func TestAttention_EmptyQueue(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"items":[]`) || !strings.Contains(rec.Body.String(), `"degraded":[]`) {
 		t.Errorf("body = %s, want items/degraded as [] not null", rec.Body.String())
+	}
+}
+
+// attnServerCheckRow is an open concern a deterministic server check raised
+// (provenance server_check) — the class ADR-143 D1 lets only a Web UI session
+// clear.
+func attnServerCheckRow(id, runID, stageID uuid.UUID, created time.Time) *concern.Concern {
+	return &concern.Concern{
+		ID: id, RunID: runID, StageID: stageID, StageKind: concern.StageKindImplement,
+		OriginReviewSequence: 2, Severity: "high", Category: "security",
+		Note: "server check: secret-shaped string in the diff", NewEvidence: "fixture.go:12",
+		Provenance: concern.ProvenanceServerCheck, State: concern.StateRaised, CreatedAt: created,
+	}
+}
+
+// attnReviewerRow is an open reviewer-raised concern (no provenance).
+func attnReviewerRow(id, runID, stageID uuid.UUID, created time.Time) *concern.Concern {
+	model := "claude-opus"
+	return &concern.Concern{
+		ID: id, RunID: runID, StageID: stageID, StageKind: concern.StageKindImplement,
+		OriginReviewSequence: 1, ReviewerModel: &model, Severity: "medium", Category: "correctness",
+		Note: "reviewer note", State: concern.StateRaised, CreatedAt: created,
+	}
+}
+
+func attnFindConcernItem(items []attentionItem, concernID uuid.UUID) *attentionItem {
+	for i := range items {
+		if items[i].ConcernID == concernID.String() {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+// TestAttention_ServerCheckConcern_ListedWithoutParkedGate pins ADR-143 D1's
+// reachability half (#5228): a server-check concern can be cleared only from
+// the Web UI session, so it is listed on a scanned run with NO parked
+// implement/review gate, while a reviewer-raised concern on the same run keeps
+// the parked-gate rule and is NOT listed. A terminal run is a named residual
+// state: the scan reads pending and running runs only.
+//
+// COUNTERFACTUAL (8), run by hand: deleting the collectServerCheckConcerns
+// call at the end of collectRunAttention lists no item for the running run →
+// RED ("items = [], want exactly the server-check concern").
+func TestAttention_ServerCheckConcern_ListedWithoutParkedGate(t *testing.T) {
+	f := newAttnFixture()
+	runID, stageID := attnID(1), attnID(2)
+	f.runs.seed(runID, "acme/app", run.StateRunning, attnT0, "Running run")
+	f.runs.addStage(runID, stageID, run.StageTypeImplement, run.StageStateRunning, attnT0)
+	f.concerns.rows = append(f.concerns.rows,
+		attnServerCheckRow(attnID(3), runID, stageID, attnT0.Add(time.Minute)),
+		attnReviewerRow(attnID(4), runID, stageID, attnT0.Add(2*time.Minute)),
+	)
+	// A terminal run's open server-check concern is out of the scan.
+	doneID, doneStage := attnID(5), attnID(6)
+	f.runs.seed(doneID, "acme/app", run.StateSucceeded, attnT0, "Done run")
+	f.runs.addStage(doneID, doneStage, run.StageTypeImplement, run.StageStateSucceeded, attnT0)
+	f.concerns.rows = append(f.concerns.rows, attnServerCheckRow(attnID(7), doneID, doneStage, attnT0))
+
+	got := decodeAttention(t, getAttention(t, New(f.config()), attnReader(""), ""))
+	if len(got.Items) != 1 {
+		t.Fatalf("items = %+v, want exactly the server-check concern (reviewer row and terminal run not listed)", got.Items)
+	}
+	it := got.Items[0]
+	wantPath := "/runs/" + runID.String() + "/stages/" + stageID.String()
+	if it.Kind != attentionKindPagedConcern || it.ConcernID != attnID(3).String() || it.ID != attnID(3).String() ||
+		it.StageID != stageID.String() || it.DetailPath != wantPath || !it.Since.Equal(attnT0.Add(time.Minute)) {
+		t.Errorf("item = %+v, want paged_concern %s on stage %s at %s", it, attnID(3), stageID, wantPath)
+	}
+	c := it.Context
+	if c.Provenance != concern.ProvenanceServerCheck || c.StageKind != concern.StageKindImplement ||
+		c.Severity != "high" || c.Category != "security" || c.Note == "" || c.NewEvidence != "fixture.go:12" {
+		t.Errorf("context = %+v, want the row's stage_kind/severity/category/note/new_evidence and provenance server_check", c)
+	}
+	if attnFindConcernItem(got.Items, attnID(4)) != nil {
+		t.Errorf("reviewer-raised concern listed without a parked gate: %+v", got.Items)
+	}
+	if len(got.Degraded) != 0 {
+		t.Errorf("degraded = %+v, want none", got.Degraded)
+	}
+}
+
+// TestAttention_ServerCheckConcern_ListedPastGateViewBudget: a run parked at
+// its implement gate but PAST the gate-view budget still lists its open
+// server-check concern (no gate view), and the over-budget degraded count
+// names only the runs that lost reviewer-raised concerns.
+//
+// COUNTERFACTUAL (9), run by hand: returning after *overBudget++ (no
+// past-budget listing) drops the server-check row → RED ("server-check
+// concern past the gate-view budget not listed").
+func TestAttention_ServerCheckConcern_ListedPastGateViewBudget(t *testing.T) {
+	f := newAttnFixture()
+	for i := 0; i < attentionGateViewBudget+1; i++ {
+		f.seedConcernRun(attnID(3000+3*i), attnID(3001+3*i), attnID(3002+3*i), "acme/app", attnT0.Add(time.Duration(i)*time.Minute))
+	}
+	scRun, scStage := attnID(9000), attnID(9001)
+	f.runs.seed(scRun, "acme/app", run.StateRunning, attnT0.Add(time.Hour), "")
+	f.runs.addStage(scRun, scStage, run.StageTypeImplement, run.StageStateAwaitingApproval, attnT0.Add(time.Hour))
+	f.concerns.rows = append(f.concerns.rows, attnServerCheckRow(attnID(9002), scRun, scStage, attnT0.Add(time.Hour)))
+
+	got := decodeAttention(t, getAttention(t, New(f.config()), attnReader(""), ""))
+	it := attnFindConcernItem(got.Items, attnID(9002))
+	if it == nil {
+		t.Fatalf("server-check concern past the gate-view budget not listed: %v", attnKinds(got.Items))
+	}
+	if it.Kind != attentionKindPagedConcern || it.Context.Provenance != concern.ProvenanceServerCheck || it.StageID != scStage.String() {
+		t.Errorf("item = %+v, want a server_check paged_concern on stage %s", it, scStage)
+	}
+	if len(got.Items) != attentionGateViewBudget+1 {
+		t.Errorf("items = %d, want %d (budget's reviewer concerns + the server-check one)", len(got.Items), attentionGateViewBudget+1)
+	}
+	var detail string
+	for _, d := range got.Degraded {
+		if d.Reason == attentionDegradedGateViewBudgetExhausted {
+			detail = d.Detail
+		}
+	}
+	if !strings.HasPrefix(detail, "1 run(s)") {
+		t.Errorf("gate_view_budget_exhausted detail = %q, want it to count only the one reviewer-concern run past the budget", detail)
+	}
+}
+
+// TestAttention_GateViewPath_StampsProvenance: on the parked-gate gate-view
+// path each item's context carries the open row's provenance, so a
+// server-check concern is marked and a reviewer one is not.
+//
+// COUNTERFACTUAL (10), run by hand: dropping `Provenance: provenance[c.ID]`
+// from collectGateViewConcerns leaves context.provenance absent → RED.
+func TestAttention_GateViewPath_StampsProvenance(t *testing.T) {
+	f := newAttnFixture()
+	runID, stageID := attnID(1), attnID(2)
+	f.runs.seed(runID, "acme/app", run.StateRunning, attnT0, "")
+	f.runs.addStage(runID, stageID, run.StageTypeImplement, run.StageStateAwaitingApproval, attnT0)
+	f.concerns.rows = append(f.concerns.rows,
+		attnServerCheckRow(attnID(3), runID, stageID, attnT0.Add(time.Minute)),
+		attnReviewerRow(attnID(4), runID, stageID, attnT0.Add(2*time.Minute)),
+	)
+	got := decodeAttention(t, getAttention(t, New(f.config()), attnReader(""), ""))
+	if len(got.Items) != 2 {
+		t.Fatalf("items = %+v, want both open concerns via the gate view", got.Items)
+	}
+	sc, rv := attnFindConcernItem(got.Items, attnID(3)), attnFindConcernItem(got.Items, attnID(4))
+	if sc == nil || sc.Context.Provenance != concern.ProvenanceServerCheck {
+		t.Errorf("server-check item = %+v, want provenance %q", sc, concern.ProvenanceServerCheck)
+	}
+	if rv == nil || rv.Context.Provenance != "" {
+		t.Errorf("reviewer item = %+v, want no provenance", rv)
+	}
+}
+
+// attnCountingConcernRepo counts ListOpenByRun calls.
+type attnCountingConcernRepo struct {
+	*fakeConcernRepo
+	cmu   sync.Mutex
+	calls int
+}
+
+func (r *attnCountingConcernRepo) ListOpenByRun(ctx context.Context, runID uuid.UUID) ([]*concern.Concern, error) {
+	r.cmu.Lock()
+	r.calls++
+	r.cmu.Unlock()
+	return r.fakeConcernRepo.ListOpenByRun(ctx, runID)
+}
+
+// TestAttention_ScanCapsHoldWithPerRunConcernRead (#5228 approval condition
+// C9): the concern read now runs for every scanned run, and both caps still
+// bite — the run scan stops at attentionRunScanLimit (one ListOpenByRun per
+// scanned run, none past the cap) and ?limit cuts the item list.
+func TestAttention_ScanCapsHoldWithPerRunConcernRead(t *testing.T) {
+	seed := func() (*attnFixture, *attnCountingConcernRepo) {
+		f := newAttnFixture()
+		for i := 0; i < attentionRunScanLimit+5; i++ {
+			runID, stageID := attnID(4000+3*i), attnID(4001+3*i)
+			at := attnT0.Add(time.Duration(i) * time.Minute)
+			f.runs.seed(runID, "acme/app", run.StateRunning, at, "")
+			f.runs.addStage(runID, stageID, run.StageTypeImplement, run.StageStateRunning, at)
+			f.concerns.rows = append(f.concerns.rows, attnServerCheckRow(attnID(4002+3*i), runID, stageID, at))
+		}
+		return f, &attnCountingConcernRepo{fakeConcernRepo: f.concerns}
+	}
+
+	f, counting := seed()
+	cfg := f.config()
+	cfg.ConcernRepo = counting
+	got := decodeAttention(t, getAttention(t, New(cfg), attnReader(""), "?limit=500"))
+	if got.ScannedRuns != attentionRunScanLimit || !got.Truncated {
+		t.Fatalf("scanned_runs = %d truncated = %v, want %d + truncated", got.ScannedRuns, got.Truncated, attentionRunScanLimit)
+	}
+	if len(got.Items) != attentionRunScanLimit {
+		t.Errorf("items = %d, want %d (one server-check concern per scanned run)", len(got.Items), attentionRunScanLimit)
+	}
+	if counting.calls != attentionRunScanLimit {
+		t.Errorf("ListOpenByRun calls = %d, want %d (one per scanned run, none past the scan cap)", counting.calls, attentionRunScanLimit)
+	}
+
+	f, counting = seed()
+	cfg = f.config()
+	cfg.ConcernRepo = counting
+	got = decodeAttention(t, getAttention(t, New(cfg), attnReader(""), "?limit=10"))
+	if len(got.Items) != 10 || !got.Truncated {
+		t.Errorf("items = %d truncated = %v, want 10 + truncated (?limit cuts the list)", len(got.Items), got.Truncated)
 	}
 }

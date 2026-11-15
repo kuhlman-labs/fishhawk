@@ -1,0 +1,15 @@
+id: scenario:issue-5228/mcp-tools-registered-and-refuse
+statement: The MCP tools fishhawk_waive_concern, fishhawk_waive_concerns, fishhawk_defer_concern and fishhawk_resolve_concerns stay registered.
+verify_hint: 'MCP tool result: a tools/list call over POST /mcp with a bearer lists the four tool names. The refusal they return for a server-check concern is decided by concern_session_only_mcp_test.go.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}; read runs.target-run.run_id. 2) POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over ''{}'' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token body ''{}'' with X-Fishhawk-Signature -> fhm_ bearer. 3) POST /mcp with Authorization: Bearer <fhm_>, Accept application/json, text/event-stream, Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list, body tools/list with params._meta io.modelcontextprotocol/protocolVersion, clientCapabilities and clientInfo. 4) Parsed the SSE data line and looked up the four tool names and their descriptions.'
+steps_carried_from: head 790ffc4f8a5d61a34519b183649ea4b2412987f3 recorded_at 2026-11-15T03:41:39Z
+assertions:
+    expected: tools/list lists the four tool names
+    observed_at_record: '200 with 86 tools. fishhawk_waive_concern, fishhawk_waive_concerns, fishhawk_defer_concern and fishhawk_resolve_concerns are all registered. Each description lists concern_requires_session (403: a server-check concern can be cleared only from the Web UI session).'
+    repro_handle: POST http://localhost:8090/mcp tools/list with an fhm_ run bearer
+origin:
+    issue: 5228
+    pr: 5312
+    run_id: ccc78a40-f454-4bd9-b8af-358cf284e05f
+    head_sha: 48b27840060252bc0e66a23cc24b4bf7c155db88
+    recorded_at: 2026-11-15T04:30:55Z

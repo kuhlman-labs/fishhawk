@@ -110,7 +110,10 @@ type resolveConcernsResponse struct {
 // Auth: authenticated required; write:stages OR write:fixups (the waive
 // predicate); and ANY agent subject is refused with 403 resolve_requires_human
 // (isAgentSubject — an operator-agent/ token or a run-bound mcp:run: token,
-// even on its own run). There is no delegated path.
+// even on its own run). There is no delegated path. A server_check concern is
+// additionally refused with 403 concern_requires_session on any credential
+// kind but `session` (ADR-143 D1, refuseNonHumanServerCheckClear), so a
+// bearer of any kind cannot resolve one.
 //
 // Like the bulk waive the batch has two halves:
 //
@@ -118,7 +121,8 @@ type resolveConcernsResponse struct {
 //     over-cap evidence, a refused judgement (E94.7 / #4840), empty or
 //     over-cap list, non-UUID id, duplicate id
 //     (compared on the PARSED uuid), unwired store (503), unknown id (404), an
-//     id from another run (400 concern_run_mismatch), or an id not in
+//     id from another run (400 concern_run_mismatch), a server_check id on a
+//     non-session credential (403 concern_requires_session), or an id not in
 //     addressed_pending (409 concern_resolve_conflict naming its state and the
 //     recovery).
 //   - the APPLY loop is PER-ITEM: the concern_resolved_with_evidence intent
@@ -260,6 +264,16 @@ func (s *Server) handleResolveConcerns(w http.ResponseWriter, r *http.Request) {
 					"concern_run_id": row.RunID.String(),
 					"path_run_id":    runID.String(),
 				})
+			return
+		}
+		// Human-only clearing (ADR-143 D1, #5228): a server_check row in the
+		// batch refuses the WHOLE batch (all-or-nothing, like every other
+		// pre-validation rule here) on any credential kind but `session`,
+		// before any audit append or ApplyHumanDisposition. Resolve carries no
+		// delegated flag, and the pre-body isAgentSubject guard above already
+		// refused every agent subject, so only the D1 arm can fire here. A
+		// reviewer-raised concern is unaffected (ADR-143 exclusion (vi)).
+		if s.refuseNonHumanServerCheckClear(w, r, row, id.Subject, false, clearVerbResolve) {
 			return
 		}
 		if row.State != concern.StateAddressedPending {

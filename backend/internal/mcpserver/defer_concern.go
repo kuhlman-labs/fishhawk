@@ -110,6 +110,12 @@ Returns a tool error on:
     before any follow-up is filed)
   - concern_not_found (404)
   - cross_run_defer (a run-bound token reaching another run's concern, 403)
+  - concern_requires_human (403: a server-check concern, provenance
+    server_check, named by an agent token; nothing is filed)
+  - concern_requires_session (403: a server-check concern can be cleared
+    only from the Fishhawk Web UI session; every MCP and CLI credential is
+    refused, whatever its subject — ADR-143 D1. Nothing is filed; defer it
+    from the Web UI attention queue)
   - concern_defer_conflict (the concern is not open, or a post-filing
     transition race; 422)
   - work_item_invalid (422) / provider_unimplemented (501) /

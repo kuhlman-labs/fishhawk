@@ -154,14 +154,23 @@ function AcceptanceContext({ ctx }: { ctx: AttentionContext }) {
 }
 
 function ConcernContext({ ctx, split }: { ctx: AttentionContext; split: boolean }) {
+  const serverCheck = ctx.provenance === 'server_check';
   const meta = [ctx.severity, ctx.category, ctx.stage_kind && `${ctx.stage_kind} gate`]
     .filter(Boolean)
     .join(' · ');
   return (
     <>
-      {meta && (
+      {(meta || serverCheck) && (
         <Field label="Concern">
-          <span className="font-mono text-xs">{meta}</span>
+          {serverCheck && (
+            <span
+              data-testid="server-check-marker"
+              className="mr-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+            >
+              Server check
+            </span>
+          )}
+          {meta && <span className="font-mono text-xs">{meta}</span>}
           {ctx.reviewer_model && (
             <span className="ml-2 text-xs text-neutral-500 dark:text-neutral-400">
               raised by {ctx.reviewer_model}
@@ -170,7 +179,7 @@ function ConcernContext({ ctx, split }: { ctx: AttentionContext; split: boolean 
         </Field>
       )}
       {ctx.note && (
-        <Field label="Reviewer note">
+        <Field label={serverCheck ? 'Check note' : 'Reviewer note'}>
           <Prose text={ctx.note} />
         </Field>
       )}

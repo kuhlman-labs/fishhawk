@@ -112,6 +112,25 @@
       "since": "2026-09-01T13:30:00Z"
     },
     {
+      "id": "00000000-0000-4000-8000-000000000024",
+      "kind": "paged_concern",
+      "priority": 5,
+      "run_id": "00000000-0000-4000-8000-000000000020",
+      "stage_id": "00000000-0000-4000-8000-000000000021",
+      "concern_id": "00000000-0000-4000-8000-000000000024",
+      "repo": "acme/app",
+      "title": "Amendment run",
+      "context": {
+        "stage_kind": "implement",
+        "severity": "high",
+        "category": "security",
+        "note": "The diff adds a string that matches a GitHub token pattern (backend/internal/x/fixture.go:12).",
+        "provenance": "server_check"
+      },
+      "detail_path": "/runs/00000000-0000-4000-8000-000000000020/stages/00000000-0000-4000-8000-000000000021",
+      "since": "2026-09-01T18:30:00Z"
+    },
+    {
       "id": "00000000-0000-4000-8000-000000000060",
       "kind": "attend_human_led_campaign",
       "priority": 6,
