@@ -1,0 +1,14 @@
+id: scenario:issue-5212/runbook-carries-fixup-routing-judgement
+statement: The MCP runbook resource carries a fix-up routing section. It covers per-pass sizing, defer vs fix-up after acceptance, the trigger-anchored post-fix-up wait, re-routing a dropped item, closing operator_evidence concerns, confirmed-is-not-a-reproduction, fresh-run recovery, and the refund rule split by shape (no-commit vs death). It also covers git-auth setup failures, naming the minted-token and ambient-fallback credential paths and saying the pass is refunded only when it died category A or C. Nowhere does the runbook still claim a no-op fix-up burns the budget.
+verify_hint: 'MCP resources/read of the Fishhawk runbook resource on the localhost preview: find the ''Fix-up routing: sizing, cost and recovery'' section, and search the whole text for ''still burns the''.'
+steps: 'Seed trace-upload-target, mint fhm_ bearer, POST /mcp resources/read {uri: fishhawk://runbook}. Find ''### Fix-up routing: sizing, cost and recovery'' and search the whole text for ''still burns the''.'
+assertions:
+    expected: section covering all topics; no stale claim
+    observed_at_record: The section covers sizing, defer vs fix-up, the trigger-anchored three-category wait, dropped-item re-route, closing operator_evidence concerns, confirmed-is-not-a-reproduction, the no-commit vs died refund split (refunded only when it died category A or C), and fresh-run recovery. It covers git-auth fixup_base_git_auth, naming installation_token_received (minted token, source field) and base_auth_token_unavailable (ambient fallback). 'still burns the' is absent.
+    repro_handle: POST http://localhost:8090/mcp resources/read fishhawk://runbook
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z

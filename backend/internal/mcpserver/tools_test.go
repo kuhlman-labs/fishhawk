@@ -10344,6 +10344,19 @@ func TestStartRun_LegacyStagelessSeed_StillWorks(t *testing.T) {
 
 // --- fishhawk_cancel_run (E22.2 / #391) ---
 
+// TestCancelRun_DescriptionStatesFreshRunRecovery (E106.27 / #5212, R3): the
+// served fishhawk_cancel_run description carries the restart-after-a-fix-up-
+// dead-end recipe — fold the findings into the issue body first, and close the
+// pull request yourself because cancel does not.
+func TestCancelRun_DescriptionStatesFreshRunRecovery(t *testing.T) {
+	desc := strings.Join(strings.Fields(strings.ToLower(registeredToolDescription(t, "fishhawk_cancel_run"))), " ")
+	for _, want := range []string{"dated constraints block", "does not close", "do not carry over"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_cancel_run description lacks %q:\n%s", want, desc)
+		}
+	}
+}
+
 func TestCancelRun_HappyPath_TransitionsToCancelled(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)

@@ -6590,6 +6590,12 @@ func TestIsRemoteAuthRejected(t *testing.T) {
 			if got := isRemoteAuthRejected(tc.err); got != tc.want {
 				t.Errorf("isRemoteAuthRejected(%v) = %v, want %v", tc.err, got, tc.want)
 			}
+			// The exported form (#5212) must agree with the internal
+			// classifier on every fixture: the runner's fix-up base-checkout
+			// reason mapping reads it.
+			if got := IsRemoteAuthRejected(tc.err); got != tc.want {
+				t.Errorf("IsRemoteAuthRejected(%v) = %v, want %v", tc.err, got, tc.want)
+			}
 		})
 	}
 	t.Run("real git stderr from a 401", func(t *testing.T) {
@@ -6605,6 +6611,9 @@ func TestIsRemoteAuthRejected(t *testing.T) {
 		}
 		if !isRemoteAuthRejected(lsErr) {
 			t.Errorf("the classifier does not match git's real 401 stderr — update remoteAuthRejectedMarkers: %v", lsErr)
+		}
+		if !IsRemoteAuthRejected(lsErr) {
+			t.Errorf("IsRemoteAuthRejected does not match git's real 401 stderr: %v", lsErr)
 		}
 	})
 }

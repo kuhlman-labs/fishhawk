@@ -1,0 +1,14 @@
+id: scenario:issue-5212/operator-evidence-schema-names-close-out-verbs
+statement: The fishhawk_fixup_stage operator_evidence input description says a concern routed with operator_evidence stays open until the operator closes it with fishhawk_resolve_concerns (fixed) or fishhawk_waive_concern / fishhawk_defer_concern (not fixed but acceptable). It also names re-routing a dropped item, with the diff in reason and disagreement stated in the self-report.
+verify_hint: 'MCP tools/list on the localhost preview: tools[name=fishhawk_fixup_stage].inputSchema.properties.operator_evidence.description.'
+steps: Seed trace-upload-target, mint fhm_ bearer, POST /mcp tools/list. Read fishhawk_fixup_stage inputSchema.properties.operator_evidence.description.
+assertions:
+    expected: close-out verbs and the dropped-item case
+    observed_at_record: The concern stays open until you close it with fishhawk_resolve_concerns (fixed) or fishhawk_waive_concern / fishhawk_defer_concern (not fixed but acceptable). It also covers re-routing a dropped item, with the diff in reason and disagreement stated in the fix-up self-report.
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z

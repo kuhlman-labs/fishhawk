@@ -1,0 +1,1 @@
+{"event":"runner_failed","reason":"fixup_base_git_auth","detail":"gitops: fetch fishhawk/run-example from origin: git fetch --no-tags origin +refs/heads/fishhawk/run-example:refs/fishhawk/fixup-base: exit status 128 (stderr: fatal: Authentication failed for 'https://github.com/example-org/example-repo/')"}

@@ -2176,6 +2176,16 @@ func isRemoteAuthRejected(err error) bool {
 	return false
 }
 
+// IsRemoteAuthRejected is the exported form of isRemoteAuthRejected, for
+// callers outside gitops that classify a runOutEnv-wrapped git failure: the
+// runner's fix-up base-checkout reason mapping (fixupCheckoutFailReason in
+// runner/cmd/fishhawk-runner, token fixup_base_git_auth, #5212). It shares
+// the one marker set, so the retry and the failure classification cannot
+// disagree about what an auth rejection looks like.
+func IsRemoteAuthRejected(err error) bool {
+	return isRemoteAuthRejected(err)
+}
+
 // RemoteConfigured reports whether the named remote (defaulting to
 // DefaultRemote) is configured in repoDir, via `git remote get-url <remote>`:
 // a configured remote prints its URL and exits 0, while an unconfigured one

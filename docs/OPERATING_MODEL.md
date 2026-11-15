@@ -276,6 +276,15 @@ Plan reviews are advisory; whoever holds the plan gate (the captain, or a delega
 1. **Wrong approach or localized defect.** When a plan reviewer rejects, decide what the reject is about. A wrong approach (the wrong fork, or a design that cannot meet the issue) gets a reject and a replan, or a revise when a constraint can still amend it. A sound approach with a localized defect gets an approval over the advisory reject, with a surgical condition that fixes that defect and nothing more.
 2. **Conditions refine; new design replans.** Approval conditions are fixed at approval and no plan reviewer sees them, so they may only refine the reviewed design. A design dependency, a new state machine, an external read or a fail-closed gate is new design: send it through `fishhawk_revise_plan`, or reject and replan, so the reviewers see it. Prefer revise when the direction is sound, because a reject ends the run.
 
+## 8. Fix-up routing
+
+Whoever routes a fix-up decides how big the pass is, whether it is worth its cost, and how to recover when it fails. The MCP runbook's *Fix-up routing: sizing, cost and recovery* section carries the full judgement; four rules decide most routes (#5212):
+
+1. **Size the pass.** Route one substantive concern per pass, and a high-severity concern or a must-land fix alone. A bundled pass can fix the easier items and drop the hard one. Allow one counterfactual cycle per pass, because several in one implement budget can time out and deliver nothing.
+2. **Defer or fix up.** A pass that pushes re-opens a settled acceptance stage and can dismiss an existing pull request approval. Once acceptance has passed, prefer `fishhawk_defer_concern` for a low finding. Before routing an acceptance failure, read `acceptance_triage_decided`: a `fixup_dispatched` disposition means triage already spent the pass.
+3. **Confirmed is not a reproduction.** A re-reviewer's "confirmed" resolution is an opinion over the diff. Re-run your own reproduction at the fix-up head, and re-route a defect that still reproduces with `operator_evidence`, then close that concern yourself.
+4. **Recover by shape.** A no-commit pass (`fixup_no_changes`) is refunded, but do not repeat the same route unchanged. A pass that died category A or C having pushed nothing is refunded, and re-routing is fine once the cause is fixed; a category-B failure consumes a pass. At the fix-up ceiling, fold the verified findings into the issue body as a dated constraints block, cancel the run, close its pull request and start a fresh run.
+
 ## Sources
 
 | Topic | Canonical file |
