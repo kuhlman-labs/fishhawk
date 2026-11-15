@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,16 @@ type liveValidationWalkMarker struct {
 	// section to an existing rolling walk rather than filing a new one (#3323).
 	// Diagnostic; empty on the file-new path and on every non-healthy marker.
 	WalkAppended bool `json:"walk_appended,omitempty"`
+	// UnmarkedWalkCandidates are the "#N" refs of the epic's OPEN, walk-shaped
+	// children that carry NO rolling-walk marker, recorded on a healthy linked
+	// marker when this run FILED a new rolling walk beside them (#5223). Adoption
+	// stays marker-only, so they were not adopted; the new walk's body names them
+	// and gives the marker line that would make one of them the rolling walk.
+	// DIAGNOSTIC ONLY: nothing projects it onto run-status, gate_view or
+	// next_actions — the operator-visible signal is the note in the walk body.
+	// Empty (omitted) on the append path, the companion arm and every
+	// non-healthy marker.
+	UnmarkedWalkCandidates []string `json:"unmarked_walk_candidates,omitempty"`
 }
 
 // runLiveValidationPayload is the run-status / gate-view wire surface for a
@@ -409,7 +420,7 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	// on success with the walk ref, on ANY filing failure with filing_failed=true
 	// and an empty ref — so approval never advances leaving pending
 	// live-validation criteria with zero surfaced indication (replan directive 1).
-	walkRef, anchor, appended, filed := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, wc)
+	walkRef, anchor, appended, filed, unmarked := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, wc)
 	linked := liveValidationWalkMarker{
 		Phase:                "linked",
 		PendingCriteriaCount: len(wc.Live),
@@ -421,6 +432,9 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 		// companion arm returns an empty anchor.
 		linked.ChecklistAnchor = anchor
 		linked.WalkAppended = appended
+		// Set only when this run FILED a new rolling walk beside unmarked
+		// walk-shaped children (#5223); nil on every other healthy path.
+		linked.UnmarkedWalkCandidates = unmarked
 	} else {
 		linked.FilingFailed = true
 	}
@@ -515,7 +529,12 @@ type walkEpicResolution struct {
 	EpicVar  string // "<epic digits>"
 	ChildN   string // allocated {n} for a file-new; "" is legal on the append path
 	AppendTo int    // >0 → append to this open rolling walk's issue number
-	Unlock   func()
+	// UnmarkedWalks are the issue numbers of the epic's OPEN, walk-shaped children
+	// that carry no rolling marker (#5223). Set ONLY on the file-new path (no
+	// marked candidate), from the authoritative locked children read; nil on the
+	// append path, so its degrade file-new never carries them either.
+	UnmarkedWalks []int
+	Unlock        func()
 }
 
 // findHighestOpenRollingCandidate returns the HIGHEST-numbered child that carries
@@ -539,6 +558,47 @@ func findHighestOpenRollingCandidate(children []workmgmt.EpicChild, rollingKey s
 		}
 	}
 	return best
+}
+
+// liveValidationWalkTitleShape is the normalized title fragment that makes an
+// epic child look like a live-validation walk (#5223): the shipped rolling
+// summary "Operator live-validation walk (rolling)", a pre-#3323 per-run walk
+// "Operator live-validation walk for #N", and a hand-made "Live validation walk
+// for E48" all contain it once lowercased with '-' read as ' '.
+const liveValidationWalkTitleShape = "live validation walk"
+
+// isLiveValidationWalkTitle reports whether title is walk-shaped: lowercased,
+// with every '-' replaced by ' ', it contains liveValidationWalkTitleShape.
+func isLiveValidationWalkTitle(title string) bool {
+	normalized := strings.ReplaceAll(strings.ToLower(title), "-", " ")
+	return strings.Contains(normalized, liveValidationWalkTitleShape)
+}
+
+// findUnmarkedWalkShapedChildren returns, in ascending number order, every
+// child that is positively OPEN (State == "OPEN"; an empty/unknown state is
+// never flagged, mirroring the adoption rule), does NOT carry rollingKey, and
+// has a walk-shaped title (#5223). It is ADVISORY ONLY: the caller names these
+// children in the new rolling walk's body and never appends to them. Adoption
+// stays marker-only (findHighestOpenRollingCandidate) — the ratified #3323 rule
+// is not weakened to a title match. The heuristic flags false positives by
+// design (an open pre-#3323 per-run walk is walk-shaped too); the note it drives
+// tells the operator to ignore it in that case.
+func findUnmarkedWalkShapedChildren(children []workmgmt.EpicChild, rollingKey string) []int {
+	var out []int
+	for _, c := range children {
+		if c.State != "OPEN" {
+			continue // empty/CLOSED → not flagged
+		}
+		if workmgmt.BodyHasIdempotencyKey(c.Body, rollingKey) {
+			continue // already the rolling walk (adoptable), not unmarked
+		}
+		if !isLiveValidationWalkTitle(c.Title) {
+			continue
+		}
+		out = append(out, c.Number)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // resolveWalkParentEpic decides whether the live-validation walk should be
@@ -675,12 +735,22 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 		unlock()
 		return none // (7)
 	}
-	return walkEpicResolution{EpicArm: true, EpicRef: epicRef, EpicVar: epicVar, ChildN: strconv.Itoa(n), Unlock: unlock}
+	// UNMARKED-WALK ADVISORY (#5223, file-new path only): no marked candidate
+	// exists, so name any open walk-shaped child without the marker. Computed from
+	// the same authoritative locked read; adoption above is unchanged.
+	return walkEpicResolution{
+		EpicArm: true, EpicRef: epicRef, EpicVar: epicVar, ChildN: strconv.Itoa(n),
+		UnmarkedWalks: findUnmarkedWalkShapedChildren(res.Children, rollingKey),
+		Unlock:        unlock,
+	}
 }
 
 // fileLiveValidationChore files the `chore`-type operator-validation walk work
 // item and returns ("#N", true) on a successful filing and ("", false) on any
-// failure (the caller then writes a filing-failure linked marker).
+// failure (the caller then writes a filing-failure linked marker). unmarked is
+// the "#N" refs of the unmarked walk-shaped epic children the no-candidate
+// file-new path filed (or tried to file) a NEW rolling walk beside (#5223); it
+// is nil on every other path, and the caller records it only when filed.
 //
 // TWO ARMS, ONE FILING (#2179). The originating issue (#2045) asks for the walk
 // filed "under the epic"; this hook now resolves the triggering child's TRUE
@@ -735,11 +805,11 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 //     A filed unparented walk is still a better outcome than a hook that errors,
 //     and the residual is rare and visible via the EpicLinkError WARN. See
 //     backend/internal/server/README.md.
-func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, wc liveValidationWalkCriteria) (walkRef, anchor string, appended, filed bool) {
+func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, wc liveValidationWalkCriteria) (walkRef, anchor string, appended, filed bool, unmarked []string) {
 	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {
 		s.logLiveValidationWarn(ctx, runRow.ID, "load work-management conventions failed", err.Error())
-		return "", "", false, false
+		return "", "", false, false, nil
 	}
 	target := workmgmt.Target{
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
@@ -774,14 +844,14 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 			// (#3323). No File, no addSubIssue, no {n}.
 			a, appended, retryable := s.appendRollingWalkSection(ctx, target.Scope, runRow, owner, name, res.AppendTo, parentRef, wc)
 			if appended {
-				return fmt.Sprintf("#%d", res.AppendTo), a, true, true
+				return fmt.Sprintf("#%d", res.AppendTo), a, true, true, nil
 			}
 			if !retryable {
 				// UpdateIssue FAILED on an existing walk: route to filing_failed and
 				// NEVER file a second walk — a re-file would reopen the same-approval
 				// double-file window (#2045). The walk exists; the operator's surface
 				// renders file-manually and a re-approval no-ops on the intent marker.
-				return "", "", false, false
+				return "", "", false, false, nil
 			}
 			// Retryable degrade (the candidate could not be READ, or was CLOSED at the
 			// fresh read): file a NEW rolling walk when {n} is allocatable (never a
@@ -789,13 +859,16 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 			if res.ChildN == "" {
 				s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk append degraded and no allocatable child number; filing companion", res.EpicRef)
 			} else {
+				// res.UnmarkedWalks is nil on the append path, so the degrade's
+				// new walk carries no unmarked-walk note.
 				ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, wc)
-				return ref, a, false, ok
+				return ref, a, false, ok, nil
 			}
 		} else {
 			// No candidate: FIRST rolling filing under this epic.
+			// The caller records unmarked only on a healthy (filed) linked marker.
 			ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, wc)
-			return ref, a, false, ok
+			return ref, a, false, ok, issueRefs(res.UnmarkedWalks)
 		}
 	}
 
@@ -813,11 +886,24 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 		},
 	}
 	if _, created, werr := s.applyAndFileWorkItem(ctx, req, conv, target, owner, name); werr == nil {
-		return fmt.Sprintf("#%d", created.Number), "", false, true
+		return fmt.Sprintf("#%d", created.Number), "", false, true, nil
 	} else {
 		s.logLiveValidationWarn(ctx, runRow.ID, "live-validation walk filing failed", werr.msg)
-		return "", "", false, false
+		return "", "", false, false, nil
 	}
+}
+
+// issueRefs renders issue numbers as "#N" refs, nil for an empty input so an
+// omitempty field stays absent.
+func issueRefs(numbers []int) []string {
+	if len(numbers) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(numbers))
+	for _, n := range numbers {
+		out = append(out, "#"+strconv.Itoa(n))
+	}
+	return out
 }
 
 // fileNewRollingWalk files the FIRST rolling walk under an epic (#3323): summary
@@ -827,8 +913,15 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 // per-epic lock) makes deriveChildNumberTitleVar short-circuit so it does not
 // re-take the lock (no deadlock). Returns ("#N", "run-<id>", true) on success and
 // ("", "", false) on a File failure (the caller routes that to filing_failed).
+// When res.UnmarkedWalks is non-empty (#5223) the body carries the unmarked-walk
+// note and a WARN names the children; adoption is not attempted.
 func (s *Server) fileNewRollingWalk(ctx context.Context, runRow *run.Run, conv workmgmt.Conventions, target workmgmt.Target, owner, name string, res walkEpicResolution, parentRef, rollingKey string, wc liveValidationWalkCriteria) (string, string, bool) {
-	body, anchor := liveValidationRollingWalkBody(runRow.ID, res.EpicRef, parentRef, wc)
+	if len(res.UnmarkedWalks) > 0 {
+		s.logLiveValidationWarn(ctx, runRow.ID,
+			"epic has open walk-shaped children without the rolling-walk marker; not adopted (adoption is marker-only), filing a new rolling walk that names them",
+			fmt.Sprintf("epic %s: %s", res.EpicRef, strings.Join(issueRefs(res.UnmarkedWalks), ", ")))
+	}
+	body, anchor := liveValidationRollingWalkBody(runRow.ID, res.EpicRef, parentRef, rollingKey, res.UnmarkedWalks, wc)
 	req := workmgmt.FilingRequest{
 		Type:           "chore",
 		Summary:        "Operator live-validation walk (rolling)",
@@ -968,8 +1061,10 @@ func liveValidationRetiredBlock(retired []retiredLiveValidationCriterion) string
 // liveValidationRollingWalkBody assembles the body of a NEW rolling walk's first
 // filing (#3323): the walk summary, a Parent-epic reference, a line stating that
 // each run appends its own section and the walk closes only when every section is
-// ticked, then this run's first section. It returns (body, anchor).
-func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, wc liveValidationWalkCriteria) (string, string) {
+// ticked, then — only when unmarked is non-empty (#5223) — the unmarked-walk note,
+// then this run's first section. It returns (body, anchor). With no unmarked
+// children the body is byte-identical to the pre-#5223 render.
+func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef, rollingKey string, unmarked []int, wc liveValidationWalkCriteria) (string, string) {
 	body := "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
 		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
 		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
@@ -977,9 +1072,57 @@ func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, 
 	body += "Parent epic: " + epicRef + ".\n\n"
 	body += "This is a ROLLING walk (#3323): each run under this epic appends its own section below, " +
 		"and the walk closes only when EVERY section's criteria are ticked.\n\n"
+	body += liveValidationUnmarkedWalkNote(epicRef, rollingKey, unmarked)
 	section, anchor := liveValidationRunSection(runID, triggerRef, wc)
 	body += section
 	return body, anchor
+}
+
+// liveValidationUnmarkedWalkNoteHeading opens the unmarked-walk note (#5223). It
+// is bold text rather than a heading so the per-run `### Run` sections that
+// follow are not nested under it.
+const liveValidationUnmarkedWalkNoteHeading = "**Open walk-shaped issues not adopted.**"
+
+// liveValidationUnmarkedWalkNote renders the visible note a NEW rolling walk
+// carries when its epic already has OPEN, walk-shaped children without the
+// rolling marker (#5223), or "" when unmarked is empty. It names each child and
+// gives the remedy: stamp the marker line into the child, move this run's
+// section there, close this issue.
+//
+// STAMP-ONCE SAFETY (approval condition H1). The marker is shown in a ```diff
+// fence with a leading '+', never as a bare marker line. BodyHasIdempotencyKey
+// trims whitespace before its whole-line match, so indentation alone would still
+// match; the '+' prefix does not. workmgmt.Apply therefore still stamps the
+// REAL hidden marker on its own line at the end of the body, and deleting this
+// note leaves the walk adoptable.
+func liveValidationUnmarkedWalkNote(epicRef, rollingKey string, unmarked []int) string {
+	if len(unmarked) == 0 {
+		return ""
+	}
+	refs := issueRefs(unmarked)
+	var b strings.Builder
+	b.WriteString(liveValidationUnmarkedWalkNoteHeading + " ")
+	if len(refs) == 1 {
+		fmt.Fprintf(&b, "%s is an open child of %s that looks like a live-validation walk but carries no rolling-walk marker, "+
+			"so it was not adopted (adoption is marker-only) and this rolling walk was filed instead.\n\n", refs[0], epicRef)
+		fmt.Fprintf(&b, "To make %s the rolling walk: add the marker line below to %s's body without the leading `+`, "+
+			"move this run's section into it, and close this issue. The next run under %s then appends to %s. "+
+			"If %s is not meant to be the rolling walk, ignore this note: later runs under %s append here.\n\n",
+			refs[0], refs[0], epicRef, refs[0], refs[0], epicRef)
+	} else {
+		fmt.Fprintf(&b, "%s are open children of %s that look like live-validation walks but carry no rolling-walk marker, "+
+			"so none was adopted (adoption is marker-only) and this rolling walk was filed instead.\n\n",
+			strings.Join(refs, ", "), epicRef)
+		fmt.Fprintf(&b, "To make one of them the rolling walk: add the marker line below to its body without the leading `+`, "+
+			"move this run's section into it, and close this issue. The next run under %s then appends to that issue. "+
+			"If none is meant to be the rolling walk, ignore this note: later runs under %s append here.\n\n",
+			epicRef, epicRef)
+	}
+	b.WriteString("This issue's own marker is separate, so deleting this note does not change which issue later runs adopt.\n\n")
+	b.WriteString("```diff\n+")
+	b.WriteString(workmgmt.StampIdempotencyKey("", rollingKey))
+	b.WriteString("\n```\n\n")
+	return b.String()
 }
 
 // liveValidationWalkBody assembles the walk body: what the walk is, the criteria

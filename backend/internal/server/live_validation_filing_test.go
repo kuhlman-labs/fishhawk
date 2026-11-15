@@ -2014,3 +2014,245 @@ func TestLiveValidationWalk_RepoDeclarationKeepsAreaBackend(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Unmarked walk-shaped children (#5223): advisory only, adoption stays
+// marker-only.
+// ---------------------------------------------------------------------------
+
+// liveValUnmarkedWalkChild is an OPEN epic child titled like the shipped
+// rolling walk whose body carries NO rolling marker — the hand-made walk #5223
+// says gets duplicated.
+func liveValUnmarkedWalkChild(number int) workmgmt.EpicChild {
+	return workmgmt.EpicChild{
+		Number: number,
+		Title:  fmt.Sprintf("[E48.%d] Operator live-validation walk (rolling)", number),
+		Body:   "## Summary\n\nHand-made walk for epic #1940.\n\n- [ ] check the webhook",
+		State:  "OPEN",
+	}
+}
+
+// liveValFenceSplit splits body into the lines OUTSIDE every ``` fence and the
+// lines INSIDE one, so a test can tell where a marker line sits.
+func liveValFenceSplit(body string) (outside, inside []string) {
+	in := false
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			in = !in
+			continue
+		}
+		if in {
+			inside = append(inside, line)
+		} else {
+			outside = append(outside, line)
+		}
+	}
+	return outside, inside
+}
+
+// liveValStripUnmarkedNote removes the unmarked-walk note (its heading through
+// the closing fence after it) from body, the edit an operator makes when they
+// delete the note.
+func liveValStripUnmarkedNote(t *testing.T, body string) string {
+	t.Helper()
+	start := strings.Index(body, "**Open walk-shaped issues not adopted.**")
+	if start < 0 {
+		t.Fatalf("body has no unmarked-walk note to strip:\n%s", body)
+	}
+	open := strings.Index(body[start:], "```diff\n")
+	if open < 0 {
+		t.Fatalf("note has no ```diff fence:\n%s", body[start:])
+	}
+	closeRel := strings.Index(body[start+open+len("```diff\n"):], "```\n")
+	if closeRel < 0 {
+		t.Fatalf("note fence is not closed:\n%s", body[start:])
+	}
+	end := start + open + len("```diff\n") + closeRel + len("```\n")
+	return body[:start] + body[end:]
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingUnmarkedWalkShapedChildFlagged (B1,
+// plus approval condition H1): an epic holding an OPEN walk-shaped child #7
+// WITHOUT the rolling marker files a NEW rolling walk (adoption by title stays
+// forbidden: #7 is never PATCHed), the new body names #7 and gives the marker
+// line inside a ```diff fence, the real marker sits on its own line OUTSIDE the
+// fence, deleting the note leaves the walk adoptable, and the healthy linked
+// marker records unmarked_walk_candidates == ["#7"].
+func TestFileOrLinkLiveValidationWalk_RollingUnmarkedWalkShapedChildFlagged(t *testing.T) {
+	hand := liveValUnmarkedWalkChild(7)
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), hand))
+	store.seed(7, hand.Body, "open")
+	logs := captureLogger(h.s)
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "without the rolling-walk marker") || !strings.Contains(out, "epic #1940: #7") {
+		t.Errorf("no WARN naming the unmarked walk-shaped child #7; logs:\n%s", out)
+	}
+	if h.provider.calls != 1 || len(h.provider.reqs) != 1 {
+		t.Fatalf("File called %d (reqs %d), want exactly one new rolling walk", h.provider.calls, len(h.provider.reqs))
+	}
+	if store.patchCount(7) != 0 || store.totalPatches() != 0 {
+		t.Fatalf("patches #7=%d total=%d, want 0: a title-shaped child is never adopted", store.patchCount(7), store.totalPatches())
+	}
+	body := h.provider.reqs[0].Item.Body
+	marker := workmgmt.StampIdempotencyKey("", liveValRollingKeyOR())
+
+	if !strings.Contains(body, "**Open walk-shaped issues not adopted.**") {
+		t.Errorf("filed body missing the unmarked-walk note heading:\n%s", body)
+	}
+	if !strings.Contains(body, "#7 is an open child of #1940") || !strings.Contains(body, "To make #7 the rolling walk") {
+		t.Errorf("filed body does not name #7 and its remedy:\n%s", body)
+	}
+	if !strings.Contains(body, "```diff\n+"+marker+"\n```") {
+		t.Errorf("filed body missing the marker line inside a ```diff fence:\n%s", body)
+	}
+	// The note precedes this run's section.
+	if ni, si := strings.Index(body, "**Open walk-shaped"), strings.Index(body, "### Run "+h.runID.String()); ni < 0 || si < 0 || ni > si {
+		t.Errorf("note index %d, section index %d: want the note before this run's section", ni, si)
+	}
+
+	// H1: the note's copy is NOT a bare marker line; Apply stamped the real one
+	// on its own line OUTSIDE the fence.
+	outside, inside := liveValFenceSplit(body)
+	if workmgmt.BodyHasIdempotencyKey(strings.Join(inside, "\n"), liveValRollingKeyOR()) {
+		t.Errorf("the fenced copy whole-line-matches the rolling marker; Apply's stamp-once would skip the real marker")
+	}
+	if !slices.Contains(outside, marker) {
+		t.Errorf("no rolling marker on its own line outside the fence; outside lines:\n%s", strings.Join(outside, "\n"))
+	}
+	stripped := liveValStripUnmarkedNote(t, body)
+	if strings.Contains(stripped, "Open walk-shaped") || strings.Contains(stripped, "```") {
+		t.Fatalf("strip left note residue:\n%s", stripped)
+	}
+	adopted := findHighestOpenRollingCandidate([]workmgmt.EpicChild{{Number: 4001, State: "OPEN", Body: stripped}}, liveValRollingKeyOR())
+	if adopted == nil {
+		t.Errorf("with the note deleted the new walk is no longer adoptable:\n%s", stripped)
+	}
+
+	linked, ok := h.newestLinked(t)
+	if !ok || linked.FilingFailed || linked.WalkRef != "#4001" || linked.WalkAppended {
+		t.Fatalf("linked = %+v (ok=%v), want a healthy file-new marker for #4001", linked, ok)
+	}
+	if !reflect.DeepEqual(linked.UnmarkedWalkCandidates, []string{"#7"}) {
+		t.Errorf("unmarked_walk_candidates = %v, want [#7]", linked.UnmarkedWalkCandidates)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingAppendPathNotFlagged: with a MARKED
+// open candidate present the append path is taken, so an unmarked walk-shaped
+// sibling is neither flagged on the linked marker nor written into the walk
+// (the advisory is computed on the file-new path only).
+func TestFileOrLinkLiveValidationWalk_RollingAppendPathNotFlagged(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR())
+	hand := liveValUnmarkedWalkChild(7)
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand, hand))
+	store.seed(5001, cand.Body, "open")
+	store.seed(7, hand.Body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 || store.patchCount(5001) != 1 || store.patchCount(7) != 0 {
+		t.Fatalf("File=%d patches #5001=%d #7=%d, want an append to #5001 only", h.provider.calls, store.patchCount(5001), store.patchCount(7))
+	}
+	si, _ := store.get(5001)
+	if strings.Contains(si.body, "Open walk-shaped issues not adopted") {
+		t.Errorf("appended section carries the unmarked-walk note; it belongs to the file-new path only")
+	}
+	linked, _ := h.newestLinked(t)
+	if !linked.WalkAppended || len(linked.UnmarkedWalkCandidates) != 0 {
+		t.Errorf("linked = %+v, want appended with no unmarked_walk_candidates", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingUnmarkedFilingFailureNotRecorded: a
+// File failure beside an unmarked walk-shaped child writes the filing_failed
+// marker WITHOUT unmarked_walk_candidates (recorded on a healthy marker only).
+func TestFileOrLinkLiveValidationWalk_RollingUnmarkedFilingFailureNotRecorded(t *testing.T) {
+	h, _ := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), liveValUnmarkedWalkChild(7)),
+		func(c *liveValConfig) { c.providerFail = true })
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	linked, ok := h.newestLinked(t)
+	if !ok || !linked.FilingFailed {
+		t.Fatalf("linked = %+v (ok=%v), want filing_failed", linked, ok)
+	}
+	if len(linked.UnmarkedWalkCandidates) != 0 {
+		t.Errorf("unmarked_walk_candidates = %v on a filing-failure marker, want none", linked.UnmarkedWalkCandidates)
+	}
+}
+
+// TestFindUnmarkedWalkShapedChildren (B2) pins each predicate of the advisory
+// scan: positively OPEN, no rolling marker, walk-shaped title ('-' read as ' ').
+func TestFindUnmarkedWalkShapedChildren(t *testing.T) {
+	key := liveValRollingKeyOR()
+	walk := func(n int, title, state, body string) workmgmt.EpicChild {
+		return workmgmt.EpicChild{Number: n, Title: title, State: state, Body: body}
+	}
+	cases := []struct {
+		name  string
+		child workmgmt.EpicChild
+		want  []int
+	}{
+		{"open hyphenated walk title, unmarked", walk(7, "[E48.7] Operator live-validation walk (rolling)", "OPEN", "hand-made"), []int{7}},
+		{"same child CLOSED", walk(7, "[E48.7] Operator live-validation walk (rolling)", "CLOSED", "hand-made"), nil},
+		{"same child empty State", walk(7, "[E48.7] Operator live-validation walk (rolling)", "", "hand-made"), nil},
+		{"open non-walk title", walk(8, "[E48.8] Fix the widget", "OPEN", "hand-made"), nil},
+		{"open walk title carrying the rolling key", walk(9, "[E48.9] Operator live-validation walk (rolling)", "OPEN", workmgmt.StampIdempotencyKey("walk", key)), nil},
+		{"open hyphen-less walk title", walk(10, "Live validation walk for E48", "OPEN", ""), []int{10}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findUnmarkedWalkShapedChildren([]workmgmt.EpicChild{tc.child}, key)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("findUnmarkedWalkShapedChildren = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	t.Run("ascending order over a mixed set", func(t *testing.T) {
+		children := []workmgmt.EpicChild{
+			walk(30, "Live-validation walk B", "OPEN", ""),
+			walk(12, "[E48.8] Fix the widget", "OPEN", ""),
+			walk(5, "live validation walk A", "OPEN", ""),
+		}
+		if got := findUnmarkedWalkShapedChildren(children, key); !reflect.DeepEqual(got, []int{5, 30}) {
+			t.Errorf("got %v, want [5 30] in ascending order", got)
+		}
+	})
+}
+
+// liveValRollingGoldenNoUnmarked is the rolling first-filing body exactly as the
+// PRE-#5223 code filed it, captured from main (0052f59ed) through this harness
+// with the per-run values normalized (approval condition H3: an independent
+// baseline, not derived from liveValidationRollingWalkBody).
+const liveValRollingGoldenNoUnmarked = "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach (`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the operator live check so nothing ships silently unvalidated (#2045).\n\nParent epic: #1940.\n\nThis is a ROLLING walk (#3323): each run under this epic appends its own section below, and the walk closes only when EVERY section's criteria are ticked.\n\n### Run <RUN_ID>\n\n<!-- fishhawk-idempotency-key <SECTION_KEY> -->\n\nFiled for #2045.\n\n- [ ] `ac1` — the webhook fires on a real push\n  Verify: trigger a real push and observe the webhook delivery\n\n<!-- fishhawk-idempotency-key <ROLLING_KEY> -->"
+
+// TestFileOrLinkLiveValidationWalk_RollingNoUnmarkedChildBodyUnchanged (B3):
+// with no walk-shaped child (an open non-walk child is present), the filed
+// rolling body equals the pre-change golden, carries no note heading or diff
+// fence, and the linked payload has no unmarked_walk_candidates key at all.
+func TestFileOrLinkLiveValidationWalk_RollingNoUnmarkedChildBodyUnchanged(t *testing.T) {
+	other := workmgmt.EpicChild{Number: 1004, Title: "[E48.4] Fix the widget", State: "OPEN", Body: "unrelated"}
+	h, _ := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), other))
+	logs := captureLogger(h.s)
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("filed %d walks, want 1", len(h.provider.reqs))
+	}
+	if strings.Contains(logs.String(), "without the rolling-walk marker") {
+		t.Errorf("unmarked-walk WARN logged with nothing flagged:\n%s", logs.String())
+	}
+	body := h.provider.reqs[0].Item.Body
+	if strings.Contains(body, "Open walk-shaped issues not adopted") || strings.Contains(body, "```diff") {
+		t.Errorf("unflagged body carries the unmarked-walk note:\n%s", body)
+	}
+	got := strings.ReplaceAll(body, liveValidationSectionKey(h.runID), "<SECTION_KEY>")
+	got = strings.ReplaceAll(got, liveValRollingKeyOR(), "<ROLLING_KEY>")
+	got = strings.ReplaceAll(got, h.runID.String(), "<RUN_ID>")
+	if got != liveValRollingGoldenNoUnmarked {
+		t.Errorf("rolling body drifted from the pre-#5223 golden.\n got: %q\nwant: %q", got, liveValRollingGoldenNoUnmarked)
+	}
+	for _, e := range h.au.appended {
+		if e.Category == liveValidationWalkLinkedKind && strings.Contains(string(e.Payload), "unmarked_walk_candidates") {
+			t.Errorf("linked payload carries unmarked_walk_candidates with nothing flagged: %s", e.Payload)
+		}
+	}
+}
