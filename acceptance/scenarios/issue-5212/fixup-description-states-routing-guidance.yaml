@@ -1,0 +1,14 @@
+id: scenario:issue-5212/fixup-description-states-routing-guidance
+statement: The fishhawk_fixup_stage tool listing recommends one substantive concern per pass and routing a high-severity or must-land concern alone. It states that a pass which pushes re-opens a settled acceptance stage and can dismiss a PR approval, and names fishhawk_defer_concern for a low finding after acceptance passed. It says to read acceptance_triage_decided before routing an acceptance failure. It says not to repeat the same route after a NO-COMMIT refund, while a pass refunded because it died can be re-routed once the cause is fixed. It gives the fresh-run recovery (dated constraints block in the issue body, cancel, close the PR, restart).
+verify_hint: 'MCP tools/list on the localhost preview: read tools[name=fishhawk_fixup_stage].description.'
+steps: POST /v0/dev/fixtures trace-upload-target. signing-key, then dev/sign over '{}', then mcp-token -> fhm_. POST /mcp tools/list. Read tools[name=fishhawk_fixup_stage].description.
+assertions:
+    expected: all listed guidance
+    observed_at_record: 'The ''Sizing, cost and follow-through (#5212)'' block says: route one substantive concern per pass, and route a must-land or high-severity concern alone. A pushing pass re-opens a settled acceptance stage and can dismiss a PR approval. Prefer fishhawk_defer_concern for a low finding after acceptance passed. Read the acceptance_triage_decided disposition before routing. After a no-commit refund, do not repeat the same route. A pass that died category A/C may be re-routed once the cause is fixed. The fixup_ceiling_reached recipe: dated constraints block in the issue body, fishhawk_cancel_run, close the PR, start the new run.'
+    repro_handle: POST http://localhost:8090/mcp tools/list with fhm_ bearer
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z

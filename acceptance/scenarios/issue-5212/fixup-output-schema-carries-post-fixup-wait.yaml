@@ -1,0 +1,14 @@
+id: scenario:issue-5212/fixup-output-schema-carries-post-fixup-wait
+statement: The fishhawk_fixup_stage output schema declares next_steps, fixup_trigger_sequence and expected_reviewers. They describe the pre-filled fishhawk_await_audit wait on implement_reviewed, anchored at the fix-up trigger's sequence. next_steps' description says it is an ordered list (plural, unlike the singular next_step on sibling verbs) because the local runner needs a dispatch before the wait.
+verify_hint: 'MCP tools/list on the localhost preview: tools[name=fishhawk_fixup_stage].outputSchema.properties next_steps, fixup_trigger_sequence, expected_reviewers.'
+steps: Seed trace-upload-target, mint fhm_ bearer, POST /mcp tools/list. Read fishhawk_fixup_stage outputSchema next_steps, fixup_trigger_sequence, expected_reviewers.
+assertions:
+    expected: three fields describing the trigger-anchored wait
+    observed_at_record: All three are declared. next_steps is an ORDERED sequence, plural unlike the sibling verbs' singular next_step because the local runner needs a dispatch first. The wait is fishhawk_await_audit over implement_reviewed / implement_review_failed / implement_review_skipped with since_sequence = fixup_trigger_sequence, the stage_fixup_triggered sequence. expected_reviewers is the count of terminal review entries.
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z

@@ -1,0 +1,14 @@
+id: scenario:issue-5212/confirmed-resolution-is-not-a-reproduction
+statement: The fishhawk_get_gate_view and fishhawk_await_review tool listings state that a confirmed resolution is the re-reviewer's opinion over the diff, not an executed reproduction. The gate-view listing names fishhawk_resolve_concerns for a dispute vetoed with operator_evidence_routed.
+verify_hint: 'MCP tools/list on the localhost preview: descriptions of fishhawk_get_gate_view and fishhawk_await_review.'
+steps: Seed trace-upload-target, mint fhm_ bearer, POST /mcp tools/list. Read the fishhawk_get_gate_view and fishhawk_await_review descriptions.
+assertions:
+    expected: both state it; gate view names resolve_concerns
+    observed_at_record: 'gate_view: veto_reason operator_evidence_routed -> close it yourself with fishhawk_resolve_concerns; a confirmed resolution is an opinion over the diff, not an executed reproduction. await_review: a confirmed resolution is the reviewer''s reading of the diff, not an executed reproduction.'
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z

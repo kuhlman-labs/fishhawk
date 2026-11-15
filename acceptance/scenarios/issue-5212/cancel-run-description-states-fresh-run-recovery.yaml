@@ -1,0 +1,14 @@
+id: scenario:issue-5212/cancel-run-description-states-fresh-run-recovery
+statement: The fishhawk_cancel_run tool listing tells the operator to fold verified findings into the issue body as a dated constraints block before cancelling, and states that cancel does not close the run's pull request.
+verify_hint: 'MCP tools/list on the localhost preview: tools[name=fishhawk_cancel_run].description.'
+steps: Seed trace-upload-target, mint fhm_ bearer, POST /mcp tools/list. Read the fishhawk_cancel_run description.
+assertions:
+    expected: constraints block before cancel; cancel leaves the PR open
+    observed_at_record: '''fold the verified findings into the issue body as a dated constraints block FIRST ... Cancel does not close the pull request ... so close it yourself; then start the new run.'''
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z
