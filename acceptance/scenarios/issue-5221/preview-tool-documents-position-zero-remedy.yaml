@@ -1,0 +1,14 @@
+id: scenario:issue-5221/preview-tool-documents-position-zero-remedy
+statement: The fishhawk_preview_campaign description or its human_led output-schema description states that position is zero-based and that grooming_order_limit cannot exclude a position-0 item, because 0 means no cap.
+verify_hint: 'MCP tools/list over POST /mcp (or the fishhawk-mcp stdio binary): search the fishhawk_preview_campaign description and outputSchema.properties.human_led description for ''zero-based'' and ''0 means no cap''.'
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}. 2) Minted an fhm_ bearer via signing-key, /v0/dev/sign over '{}' and mcp-token. 3) POST /mcp tools/list. 4) Searched the fishhawk_preview_campaign description and outputSchema.properties.human_led.description for 'zero-based' and '0 means no cap'.
+assertions:
+    expected: Position is stated as zero-based, and grooming_order_limit is stated as unable to exclude a position-0 item because 0 means no cap.
+    observed_at_record: Both texts contain 'zero-based' and '(0 means no cap)'. The tool description says 'an item at position 0 heads the order and no limit can exclude it'. The human_led description says 'no grooming_order_limit can exclude it'.
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5221
+    pr: 5376
+    run_id: 562f90a0-bee6-4f66-a282-d115b46300f2
+    head_sha: 4d7cd7f2f55a01c21cdfadbf3f24a77608591138
+    recorded_at: 2026-11-15T10:13:21Z

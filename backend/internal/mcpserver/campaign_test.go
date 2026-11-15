@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4704,8 +4705,12 @@ func TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("previewCampaign: %v", err)
 	}
-	if got, want := strings.Join(out.HumanLed, ","), "issue:100"; got != want {
-		t.Fatalf("human_led = %q, want %q (only the autonomy:low item)", got, want)
+	if len(out.HumanLed) != 1 {
+		t.Fatalf("human_led = %+v, want exactly one entry (only the autonomy:low item)", out.HumanLed)
+	}
+	if got := out.HumanLed[0]; got.IssueRef != "issue:100" || got.Position != 0 ||
+		got.BlockedDependents == nil || len(got.BlockedDependents) != 0 || got.Remedy == "" {
+		t.Fatalf("human_led[0] = %+v, want {issue:100, position 0, blocked_dependents [], a remedy}", got)
 	}
 
 	// No low item: the field is absent from the wire shape (omitempty), not [].
@@ -4721,6 +4726,413 @@ func TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy(t *testing.T) {
 	if strings.Contains(string(raw), `"human_led"`) {
 		t.Errorf("human_led present with no autonomy:low item: %s", raw)
 	}
+}
+
+// TestPreviewHumanLed_ReportsTransitiveBlockedDependents pins the human_led
+// entry shape (#5221): A is low and heads a chain B → A, C → B, so C waits on A
+// only THROUGH B (a direct-dependents-only walk drops it); D is independent and
+// high (never listed); E is low with nothing behind it, so its
+// blocked_dependents marshal as [] rather than null.
+func TestPreviewHumanLed_ReportsTransitiveBlockedDependents(t *testing.T) {
+	items := []CampaignPreviewItem{
+		{IssueRef: "issue:1", DependsOn: []string{}, Autonomy: "low", Position: 0},
+		{IssueRef: "issue:2", DependsOn: []string{"issue:1"}, Autonomy: "medium", Position: 1},
+		{IssueRef: "issue:3", DependsOn: []string{"issue:2"}, Position: 2},
+		{IssueRef: "issue:4", DependsOn: []string{}, Autonomy: "high", Position: 3},
+		{IssueRef: "issue:5", DependsOn: []string{}, Autonomy: "low", Position: 4},
+	}
+	got := previewHumanLed(items, false)
+	if len(got) != 2 {
+		t.Fatalf("human_led = %+v, want exactly the two autonomy:low items", got)
+	}
+	if a := got[0]; a.IssueRef != "issue:1" || a.Position != 0 || strings.Join(a.BlockedDependents, ",") != "issue:2,issue:3" {
+		t.Errorf("human_led[0] = %+v, want {issue:1, position 0, blocked_dependents [issue:2 issue:3]}", a)
+	}
+	if e := got[1]; e.IssueRef != "issue:5" || e.Position != 4 || e.BlockedDependents == nil || len(e.BlockedDependents) != 0 {
+		t.Errorf("human_led[1] = %+v, want {issue:5, position 4, blocked_dependents []}", e)
+	}
+	raw, err := json.Marshal(got[1])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"blocked_dependents":[]`) {
+		t.Errorf("issue:5 marshals %s, want \"blocked_dependents\":[] (an array, never null)", raw)
+	}
+
+	// Sorted by position, not walk order: the walk from issue:1 reaches
+	// issue:3 (position 2) before issue:2 (position 1), which waits on it.
+	reordered := []CampaignPreviewItem{
+		{IssueRef: "issue:1", DependsOn: []string{}, Autonomy: "low", Position: 0},
+		{IssueRef: "issue:2", DependsOn: []string{"issue:3"}, Position: 1},
+		{IssueRef: "issue:3", DependsOn: []string{"issue:1"}, Position: 2},
+	}
+	if got := previewHumanLed(reordered, false); len(got) != 1 || strings.Join(got[0].BlockedDependents, ",") != "issue:2,issue:3" {
+		t.Errorf("human_led = %+v, want blocked_dependents [issue:2 issue:3] in position order", got)
+	}
+}
+
+// TestPreviewCampaign_HumanLed_GroomingSourceRemedy drives the tool handler with
+// grooming_run_id, so the remedy takes the grooming_order_limit form: the
+// handler, not just the remedy function, must know the source.
+func TestPreviewCampaign_HumanLed_GroomingSourceRemedy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.previewCampaignResp = CampaignPreview{
+		Valid: true, Repo: "x/y", ItemCount: 3,
+		Items: []CampaignPreviewItem{
+			{IssueRef: "issue:100", DependsOn: []string{}, Autonomy: "medium", Position: 0},
+			{IssueRef: "issue:101", DependsOn: []string{}, Autonomy: "medium", Position: 1},
+			{IssueRef: "issue:102", DependsOn: []string{}, Autonomy: "low", Position: 2},
+		},
+	}
+	r := newResolver(srv, nil)
+	_, out, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{Repo: "x/y", GroomingRunID: uuid.NewString()})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	if len(out.HumanLed) != 1 || !strings.Contains(out.HumanLed[0].Remedy, "grooming_order_limit=2") {
+		t.Fatalf("human_led = %+v, want issue:102 with the grooming_order_limit=2 remedy", out.HumanLed)
+	}
+}
+
+// TestPreviewHumanLed_CycleTerminates: A (low) depends on B and B on A. The
+// visited set must stop the walk; A's dependents are [B] and never A itself.
+func TestPreviewHumanLed_CycleTerminates(t *testing.T) {
+	items := []CampaignPreviewItem{
+		{IssueRef: "issue:1", DependsOn: []string{"issue:2"}, Autonomy: "low", Position: 0},
+		{IssueRef: "issue:2", DependsOn: []string{"issue:1"}, Position: 1},
+	}
+	done := make(chan []previewHumanLedItem, 1)
+	go func() { done <- previewHumanLed(items, false) }()
+	select {
+	case got := <-done:
+		if len(got) != 1 || got[0].IssueRef != "issue:1" || strings.Join(got[0].BlockedDependents, ",") != "issue:2" {
+			t.Fatalf("human_led = %+v, want one entry issue:1 with blocked_dependents [issue:2]", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("previewHumanLed did not terminate on a depends_on cycle")
+	}
+}
+
+// TestPreviewHumanLed_RemedyByPositionAndSource pins the remedy per source and
+// position. grooming_order_limit=N keeps the top N, and 0 means no cap, so a
+// position-0 grooming item must NOT be told grooming_order_limit=0.
+func TestPreviewHumanLed_RemedyByPositionAndSource(t *testing.T) {
+	cases := []struct {
+		name     string
+		position int
+		grooming bool
+		want     []string
+		notWant  []string
+	}{
+		{"grooming position 0", 0, true, []string{"0 means no cap", "item_human_led", "out of band"}, []string{"grooming_order_limit=0"}},
+		{"grooming position 3", 3, true, []string{"grooming_order_limit=3", "zero-based", "item_human_led"}, nil},
+		{"items position 0", 0, false, []string{"explicitly without it", "blocked_dependents"}, []string{"grooming_order_limit="}},
+		{"items position 5", 5, false, []string{"explicitly without it", "blocked_dependents"}, []string{"grooming_order_limit="}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := previewHumanLedRemedy(tc.position, tc.grooming)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("remedy missing %q: %s", w, got)
+				}
+			}
+			for _, nw := range tc.notWant {
+				if strings.Contains(got, nw) {
+					t.Errorf("remedy must not contain %q: %s", nw, got)
+				}
+			}
+		})
+	}
+}
+
+// previewOutputSchema returns fishhawk_preview_campaign's advertised
+// outputSchema, read over ListTools, as a generic map.
+func previewOutputSchema(t *testing.T) map[string]any {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_preview_campaign" {
+			if tool.OutputSchema == nil {
+				t.Fatal("fishhawk_preview_campaign advertises no output schema")
+			}
+			return outputMap(t, tool.OutputSchema)
+		}
+	}
+	t.Fatal("fishhawk_preview_campaign is not registered")
+	return nil
+}
+
+// schemaProps returns a schema object's properties map.
+func schemaProps(t *testing.T, schema any, where string) map[string]any {
+	t.Helper()
+	m, ok := schema.(map[string]any)
+	if !ok {
+		t.Fatalf("%s: not a schema object: %#v", where, schema)
+	}
+	props, ok := m["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s: no properties: %#v", where, m)
+	}
+	return props
+}
+
+// humanLedKeys returns the property names containing "human_led", sorted.
+func humanLedKeys(m map[string]any) []string {
+	var out []string
+	for k := range m {
+		if strings.Contains(k, "human_led") {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestPreviewCampaign_OutputSchema_ExactlyOneHumanLedBlock pins ONE human-led
+// surface (#5221 V1): the top level advertises exactly human_led, its items
+// carry the four entry fields, and the backend preview mirror carries none.
+func TestPreviewCampaign_OutputSchema_ExactlyOneHumanLedBlock(t *testing.T) {
+	top := schemaProps(t, previewOutputSchema(t), "outputSchema")
+	if got := humanLedKeys(top); strings.Join(got, ",") != "human_led" {
+		t.Fatalf("top-level human_led-named properties = %v, want exactly [human_led]", got)
+	}
+	hl, ok := top["human_led"].(map[string]any)
+	if !ok {
+		t.Fatalf("human_led schema = %#v", top["human_led"])
+	}
+	entry := schemaProps(t, hl["items"], "human_led.items")
+	for _, f := range []string{"issue_ref", "position", "blocked_dependents", "remedy"} {
+		if _, ok := entry[f]; !ok {
+			t.Errorf("human_led.items.properties missing %q: %v", f, entry)
+		}
+	}
+	if got := humanLedKeys(schemaProps(t, top["preview"], "preview")); len(got) != 0 {
+		t.Errorf("preview properties carry a human_led-named block %v: the backend report must add none", got)
+	}
+}
+
+// TestPreviewCampaign_Description_NamesScreens pins the wire-visible guidance
+// on the two advisory screen blocks and the path_overlap remedy.
+func TestPreviewCampaign_Description_NamesScreens(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_preview_campaign"]
+	for _, want := range []string{"admission_screen", "path_overlap", "docs_only", "blocked-by", "writes no audit row"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_preview_campaign description missing %q:\n%s", want, desc)
+		}
+	}
+	preview := schemaProps(t, schemaProps(t, previewOutputSchema(t), "outputSchema")["preview"], "preview")
+	for _, key := range []string{"admission_screen", "path_overlap"} {
+		prop, ok := preview[key].(map[string]any)
+		if !ok {
+			t.Fatalf("preview.%s not advertised: %#v", key, preview[key])
+		}
+		if d, _ := prop["description"].(string); !strings.Contains(d, "ADVISORY") {
+			t.Errorf("preview.%s description = %q, want it to say ADVISORY", key, d)
+		}
+	}
+}
+
+// TestPreviewCampaign_ScreensPassthrough serves RAW server-shaped JSON (the
+// backend's json tags, not a round-trip of the client's own struct) and reads
+// the tool output back as a generic map, so a client mirror tag that drifts
+// from the server's drops the field and fails here.
+func TestPreviewCampaign_ScreensPassthrough(t *testing.T) {
+	srv := campaignJSONBackend(t, "/v0/campaigns/preview", http.StatusOK, `{
+		"valid":true,"repo":"kuhlman-labs/fishhawk","item_count":2,"wave_count":1,
+		"waves":[["issue:1","issue:2"]],
+		"items":[{"issue_ref":"issue:1","depends_on":[],"wave":0,"position":0},{"issue_ref":"issue:2","depends_on":[],"wave":0,"position":1}],
+		"edges":[],
+		"admission_screen":{"advisory":true,"forbidden_paths_screened":true,"truncated":true,"findings":[
+			{"issue":1,"kind":"not_runnable_declared"},
+			{"issue":2,"kind":"forbidden_path","path":".gitlab-ci.yml","location":"body","forbidden_pattern":".gitlab-ci.yml"}]},
+		"path_overlap":{"advisory":true,"total_pairs":3,"truncated":true,"pairs":[
+			{"items":["issue:1","issue:2"],"paths":["backend/internal/x/y.go"],"class":"code","remedy":"add a native blocked-by link"}]}
+	}`)
+	r := newResolver(srv, nil)
+	_, out, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:1", "issue:2"},
+	})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	m := outputMap(t, out)
+	for _, c := range []struct {
+		path []any
+		want any
+	}{
+		{[]any{"preview", "admission_screen", "advisory"}, true},
+		{[]any{"preview", "admission_screen", "forbidden_paths_screened"}, true},
+		{[]any{"preview", "admission_screen", "truncated"}, true},
+		{[]any{"preview", "admission_screen", "findings", 0, "issue"}, float64(1)},
+		{[]any{"preview", "admission_screen", "findings", 0, "kind"}, "not_runnable_declared"},
+		{[]any{"preview", "admission_screen", "findings", 1, "path"}, ".gitlab-ci.yml"},
+		{[]any{"preview", "admission_screen", "findings", 1, "location"}, "body"},
+		{[]any{"preview", "admission_screen", "findings", 1, "forbidden_pattern"}, ".gitlab-ci.yml"},
+		{[]any{"preview", "path_overlap", "advisory"}, true},
+		{[]any{"preview", "path_overlap", "total_pairs"}, float64(3)},
+		{[]any{"preview", "path_overlap", "truncated"}, true},
+		{[]any{"preview", "path_overlap", "pairs", 0, "items", 0}, "issue:1"},
+		{[]any{"preview", "path_overlap", "pairs", 0, "items", 1}, "issue:2"},
+		{[]any{"preview", "path_overlap", "pairs", 0, "paths", 0}, "backend/internal/x/y.go"},
+		{[]any{"preview", "path_overlap", "pairs", 0, "class"}, "code"},
+		{[]any{"preview", "path_overlap", "pairs", 0, "remedy"}, "add a native blocked-by link"},
+	} {
+		if got := dig(t, m, c.path...); got != c.want {
+			t.Errorf("%v = %#v, want %#v", c.path, got, c.want)
+		}
+	}
+}
+
+// previewToolThroughRealServer stands up the REAL server.Handler() (over a
+// write-refusing campaign.BaseFake) behind httptest, registers the MCP tools on
+// a resolver pointed at it, and calls fishhawk_preview_campaign over in-memory
+// MCP transports. It returns the call result as the MCP client sees it.
+func previewToolThroughRealServer(t *testing.T, scopes []string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	ctx := context.Background()
+	const bearer = "fhk_preview_screens_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: scopes, PlainText: bearer,
+	}}
+	s := server.New(server.Config{CampaignRepo: campaign.BaseFake{}, APITokenRepo: tokRepo})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	cfg := config{backendURL: httpSrv.URL, apiToken: bearer}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_preview_campaign", Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_preview_campaign: %v", err)
+	}
+	return res
+}
+
+// TestPreviewCampaign_E2E_ScreensThroughRegisteredTool is the cross-boundary
+// test (#5221): server handler → JSON wire → client mirror → MCP-side
+// human_led composition → SDK output schema → structuredContent. 101 is
+// autonomy:low with 102 blocked behind it; 103 and 104 both name one code path
+// with no edge between them; 104 is runnable:no.
+func TestPreviewCampaign_E2E_ScreensThroughRegisteredTool(t *testing.T) {
+	prov := &fakeMCPResolverProvider{
+		name: workmgmt.Default().Provider,
+		result: &workmgmt.EpicChildrenResult{
+			Children: []workmgmt.EpicChild{
+				{Number: 101, Title: "first", Autonomy: "low"},
+				{Number: 102, Title: "second"},
+				{Number: 103, Title: "third", Body: "Change backend/internal/x/y.go to add the field."},
+				{Number: 104, Title: "fourth", Body: "Also edits backend/internal/x/y.go.", NotRunnable: true},
+			},
+			Edges: []workmgmt.DependsEdge{{From: 102, To: 101}},
+		},
+	}
+	workmgmt.Register(prov)
+	args := map[string]any{
+		"repo":  "kuhlman-labs/fishhawk",
+		"items": []string{"issue:101", "issue:102", "issue:103", "issue:104"},
+	}
+
+	t.Run("screens and human_led reach structuredContent", func(t *testing.T) {
+		res := previewToolThroughRealServer(t, []string{"write:campaigns"}, args)
+		if res.IsError {
+			t.Fatalf("tool error: %+v", res.Content)
+		}
+		m := outputMap(t, res.StructuredContent)
+
+		hl, ok := m["human_led"].([]any)
+		if !ok || len(hl) != 1 {
+			t.Fatalf("human_led = %#v, want exactly one entry", m["human_led"])
+		}
+		if got := dig(t, hl, 0, "issue_ref"); got != "issue:101" {
+			t.Errorf("human_led[0].issue_ref = %v, want issue:101", got)
+		}
+		if got := dig(t, hl, 0, "position"); got != float64(0) {
+			t.Errorf("human_led[0].position = %v, want 0", got)
+		}
+		if deps, _ := dig(t, hl, 0, "blocked_dependents").([]any); len(deps) != 1 || deps[0] != "issue:102" {
+			t.Errorf("human_led[0].blocked_dependents = %#v, want [issue:102]", dig(t, hl, 0, "blocked_dependents"))
+		}
+		if remedy, _ := dig(t, hl, 0, "remedy").(string); !strings.Contains(remedy, "explicitly without it") {
+			t.Errorf("human_led[0].remedy = %q, want the items-source remedy", remedy)
+		}
+
+		if got := dig(t, m, "preview", "admission_screen", "findings", 0, "issue"); got != float64(104) {
+			t.Errorf("admission_screen.findings[0].issue = %v, want 104", got)
+		}
+		if got := dig(t, m, "preview", "admission_screen", "findings", 0, "kind"); got != "not_runnable_declared" {
+			t.Errorf("admission_screen.findings[0].kind = %v, want not_runnable_declared", got)
+		}
+		if got := dig(t, m, "preview", "path_overlap", "pairs", 0, "items", 0); got != "issue:103" {
+			t.Errorf("path_overlap.pairs[0].items[0] = %v, want issue:103", got)
+		}
+		if got := dig(t, m, "preview", "path_overlap", "pairs", 0, "items", 1); got != "issue:104" {
+			t.Errorf("path_overlap.pairs[0].items[1] = %v, want issue:104", got)
+		}
+		if got := dig(t, m, "preview", "path_overlap", "pairs", 0, "class"); got != "code" {
+			t.Errorf("path_overlap.pairs[0].class = %v, want code", got)
+		}
+
+		preview, _ := m["preview"].(map[string]any)
+		keys := append(humanLedKeys(m), humanLedKeys(preview)...)
+		if strings.Join(keys, ",") != "human_led" {
+			t.Errorf("human_led-named keys across the top level and preview = %v, want exactly one [human_led]", keys)
+		}
+	})
+
+	// The preview route keeps its write:campaigns gate: a token without it is
+	// refused and no screen leaks into a result.
+	t.Run("token without write:campaigns is refused", func(t *testing.T) {
+		res := previewToolThroughRealServer(t, []string{"read:runs", "write:runs"}, args)
+		if !res.IsError {
+			t.Fatalf("a read-only token previewed: %+v", res.StructuredContent)
+		}
+		var text string
+		for _, c := range res.Content {
+			if tc, ok := c.(*mcp.TextContent); ok {
+				text += tc.Text
+			}
+		}
+		if !strings.Contains(text, "insufficient_scope") {
+			t.Errorf("refusal = %q, want insufficient_scope", text)
+		}
+		if res.StructuredContent != nil {
+			if strings.Contains(fmt.Sprint(res.StructuredContent), "path_overlap") {
+				t.Errorf("refused call leaked path_overlap: %#v", res.StructuredContent)
+			}
+		}
+	})
 }
 
 // TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse pins the
@@ -4748,13 +5160,13 @@ func TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse(t *testing.T) {
 // and the human_led output-schema description an agent reads.
 func TestPreviewCampaign_Description_NamesHumanLed(t *testing.T) {
 	desc := listToolDescriptions(t)["fishhawk_preview_campaign"]
-	for _, want := range []string{"human_led", "never agent-starts", "item_human_led"} {
+	for _, want := range []string{"human_led", "never agent-starts", "item_human_led", "blocked_dependents", "zero-based", "0 means no cap"} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_preview_campaign description missing %q:\n%s", want, desc)
 		}
 	}
 	field := toolOutputSchemaPropertyDescription(t, "fishhawk_preview_campaign", "human_led")
-	for _, want := range []string{"autonomy tier is low", "NEVER agent-start", "item_human_led", "out of band"} {
+	for _, want := range []string{"autonomy tier is low", "NEVER agent-start", "item_human_led", "out of band", "blocked_dependents", "zero-based", "0 means no cap"} {
 		if !strings.Contains(field, want) {
 			t.Errorf("human_led output-schema description missing %q: %s", want, field)
 		}
