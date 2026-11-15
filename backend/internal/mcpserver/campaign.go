@@ -66,7 +66,15 @@ type StartCampaignInput struct {
 // StartCampaignOutput carries the created campaign row.
 type StartCampaignOutput struct {
 	Campaign Campaign `json:"campaign"`
+	// CheckoutWarnings is the checkout-hygiene report on the bound working_dir
+	// (#5214), in the campaign wording (checkoutSurfaceCampaign). Advisory and
+	// best-effort: it never changes whether the campaign is created.
+	CheckoutWarnings []string `json:"checkout_warnings,omitempty" jsonschema:"present only when the bound working_dir is a git checkout that is dirty, has uncommitted .fishhawk/ edits (INVISIBLE to the campaign's runs until committed and pushed to the base branch: they fetch the workflow spec from the forge at workflow_ref, not from the checkout), or whose HEAD is detached, on another branch, or ahead of or behind the remote default branch as last fetched (refs/remotes/origin/HEAD). Advisory: never changes whether the campaign is created. Absent for a clean checkout on its base, a directory that is not a git checkout, or no working_dir"`
 }
+
+// campaignCheckoutProbe is the campaign-start verbs' checkout-hygiene probe
+// seam (#5214); tests stub it.
+var campaignCheckoutProbe = probeCheckout
 
 // --- fishhawk_preview_campaign (#3647) ---
 
@@ -94,6 +102,25 @@ type PreviewCampaignInput struct {
 // PreviewCampaignOutput carries the preview report.
 type PreviewCampaignOutput struct {
 	Preview CampaignPreview `json:"preview"`
+	// HumanLed rolls up preview.items whose autonomy tier is "low" (#5214),
+	// composed MCP-side by previewHumanLed. It mirrors the campaign engine's
+	// diversion (an Autonomy=="low" item is never Eligible), so the operator
+	// sees before the start which items no agent will ever run.
+	HumanLed []string `json:"human_led,omitempty" jsonschema:"the issue refs of preview items whose autonomy tier is low (human-led), in item order. The campaign will NEVER agent-start them while they stay low: once its dependencies are satisfied, fishhawk_start_campaign_item_run refuses such an item with item_human_led, so a human leads it out of band (the tier is re-read from the issue's autonomy label on every fishhawk_get_campaign_status poll, so a relabel changes it). Composed from preview.items[].autonomy; absent when no item is autonomy:low"`
+}
+
+// previewHumanLed returns the refs of the items whose autonomy tier is exactly
+// "low" — the same predicate the campaign engine uses to divert a deps-satisfied
+// item to HumanLed (campaign.NextEligible). nil when there are none, so the
+// omitempty field is absent.
+func previewHumanLed(items []CampaignPreviewItem) []string {
+	var out []string
+	for _, it := range items {
+		if it.Autonomy == "low" {
+			out = append(out, it.IssueRef)
+		}
+	}
+	return out
 }
 
 // GetCampaignStatusInput is the fishhawk_get_campaign_status tool's input.
@@ -121,7 +148,7 @@ type GetCampaignStatusOutput struct {
 	// (E83.60 / #4118): for each in-flight item, the OTHER in-flight items whose
 	// runs share files with it. Composed MCP-side from one live scope-overlap
 	// read per item (capped). Nil when no item is in flight.
-	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read)"`
+	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read). To sequence a NEW item behind overlapping work, make it depend on the LAST still-open overlapping item in queue order (not the first), and plan it once that item's PR has opened: an unstarted item has no plan scope to overlap yet, so this block cannot show it"`
 	// DependencyRefresh passes the backend's monotone dependency refresh block
 	// through (E86.47 / #4358).
 	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty" jsonschema:"the monotone dependency refresh this poll ran: tracker blocked-by links and Depends-on lines re-read for unstarted items; edges are only ever ADDED (held), never removed. skipped_reason is in_flight/min_interval (30 s per campaign)/foreign_account/repo_not_visible/no_candidates/insufficient_scope (the caller lacks write:campaigns, is run-bound or anonymous: the persisted DAG is served, no tracker read); warnings name an unrecorded or unreadable refresh. Absent when the deployment disables it"`
@@ -294,6 +321,18 @@ wave-orders them into a DAG, and persists the campaign; poll it afterwards with
 fishhawk_get_campaign_status and hand a paused campaign back with
 fishhawk_resume_campaign.
 
+Preview first (#5214): call fishhawk_preview_campaign with the same source and
+read its edges[].source and warnings[] before starting. Sequencing stated only
+in prose (anything that is not a native "blocked by" link or a line-start
+'Depends on:' body line) produces NO edge, so that item lands in wave 0 and can
+start alongside the work it was meant to follow; add a real edge and preview
+again. Pre-flight: start from a clean, current checkout of the base branch, and
+re-run the preview after any tracker edit, because the DAG is assembled from
+the tracker as it reads at this call (a later status poll only ever ADDS
+edges). checkout_warnings on the result reports a dirty or off-base
+working_dir; an uncommitted .fishhawk/ edit is invisible to the campaign's runs
+until it is committed and pushed, because they fetch the spec from the forge.
+
 repo (owner/name) is required, plus ONE of epic_ref / items. pause_policy is
 optional — pause_campaign (the default, block the whole campaign at a gate
 hand-off) or pause_item (continue the other items). Two ways to scope the batch:
@@ -391,7 +430,10 @@ target (closed without completing) or a target_state_unreadable one cannot be
 satisfied by widening, so it is reported in dangling but never offered as a
 candidate. closure_candidates is ONE HOP: adding those refs can surface a new
 generation of dangling edges, so iterate until valid rather than reading one
-preview as a completeness proof.
+preview as a completeness proof. human_led lists the items whose autonomy tier
+is low: while they stay low the campaign never agent-starts them
+(fishhawk_start_campaign_item_run refuses each with item_human_led), so plan for
+a human to lead them out of band.
 
 A dangling set and a cycle are REPORTS at 200, not errors. Request-shaped
 problems are still refusals, identical to fishhawk_start_campaign's: a malformed
@@ -504,7 +546,7 @@ func (r *runResolver) previewCampaign(ctx context.Context, _ *mcp.CallToolReques
 		}
 		return nil, PreviewCampaignOutput{}, err
 	}
-	return nil, PreviewCampaignOutput{Preview: *preview}, nil
+	return nil, PreviewCampaignOutput{Preview: *preview, HumanLed: previewHumanLed(preview.Items)}, nil
 }
 
 // startCampaign is the tool handler.
@@ -784,7 +826,12 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 		return nil, StartCampaignOutput{}, fmt.Errorf("create campaign: %w", err)
 	}
-	return nil, StartCampaignOutput{Campaign: *created}, nil
+	// Checkout hygiene (#5214), after the create so it can never change the
+	// outcome; re-confined at probe time like start_run's.
+	return nil, StartCampaignOutput{
+		Campaign:         *created,
+		CheckoutWarnings: r.checkoutWarningsFor(ctx, campaignCheckoutProbe, checkoutSurfaceCampaign, workingDir),
+	}, nil
 }
 
 // --- fishhawk_start_campaign_item_run (E26.2 / #1481) ---
@@ -824,6 +871,12 @@ type StartCampaignItemRunOutput struct {
 	// the response is reduced hardest. Null only against a backend that predates
 	// it.
 	RunnerKindResolution *campaignRunnerKindResolution `json:"runner_kind_resolution" jsonschema:"the runner kind the minted run was given and why: source 'explicit' (this call's runner_kind), 'campaign' (the campaign's recorded runner_kind), 'campaign_working_dir' (the campaign records none but binds working_dir, so local) or 'default' (neither, so github_actions). Null only against a backend that predates it"`
+	// CheckoutWarnings is the checkout-hygiene report on the minted run's bound
+	// working_dir (#5214), in the campaign wording. Deliberately NOT omitempty,
+	// for the same floor-tier reason as RunnerKindResolution: it is set before
+	// bounding, so it counts against the byte budget, and its floorCarryTable
+	// row (classComputed) itemises any reduction.
+	CheckoutWarnings []string `json:"checkout_warnings" jsonschema:"the checkout-hygiene report on the minted run's bound working_dir: a dirty tree, uncommitted .fishhawk/ edits (INVISIBLE to the run until committed and pushed to the base branch: it fetches the workflow spec from the forge at workflow_ref, not from the checkout), or a HEAD that is detached, on another branch, or ahead of or behind the remote default branch as last fetched (refs/remotes/origin/HEAD). Advisory: never changes whether the run is minted. Null for a clean checkout on its base, a directory that is not a git checkout, or no binding"`
 	// Elisions is the ADR-077 byte-bound block (#2510). This is the verb that
 	// concretely broke on 2026-08-07 at 75,963 characters — a mutating verb
 	// whose run had ALREADY been minted when the response failed to render — so
@@ -871,7 +924,10 @@ item. Pass it here only when the campaign carries no binding, or when this one
 item genuinely executes in a DIFFERENT checkout (a differing value is accepted as
 a deliberate override, and the minted run row records what actually applied).
 Whatever resolves binds the minted run, so
-run_stage/dispatch_stage/run_children/drive_run for that item all inherit it. An
+run_stage/dispatch_stage/run_children/drive_run for that item all inherit it.
+checkout_warnings on the result reports a dirty or off-base bound checkout; an
+uncommitted .fishhawk/ edit is invisible to the run until it is committed and
+pushed, because the run fetches its spec from the forge at workflow_ref. An
 item whose resolved runner_kind is local with neither a campaign binding nor a
 per-item value is refused
 working_dir_required rather than falling through to the client's cwd; a
@@ -970,8 +1026,19 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 		}
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
 	}
+	// Checkout hygiene (#5214) on the binding the minted run actually carries,
+	// else this call's explicit value. Set BEFORE bounding (approval condition
+	// C2), so the warnings count against the byte budget and the floor tier
+	// carries them.
+	probeDir := res.Run.WorkingDir
+	if probeDir == "" {
+		probeDir = workingDir
+	}
 	bounded, berr := boundRunRowOutput(
-		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item, RunnerKindResolution: res.RunnerKindResolution}, res.Run.ID, r.responseBudget(req),
+		StartCampaignItemRunOutput{
+			Run: res.Run, Item: res.Item, RunnerKindResolution: res.RunnerKindResolution,
+			CheckoutWarnings: r.checkoutWarningsFor(ctx, campaignCheckoutProbe, checkoutSurfaceCampaign, probeDir),
+		}, res.Run.ID, r.responseBudget(req),
 		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
 		// The campaign id is not carried on the CampaignItem, so the floor's

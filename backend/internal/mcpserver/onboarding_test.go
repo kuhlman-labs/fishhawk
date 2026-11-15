@@ -288,6 +288,11 @@ func TestOnboardingInstructions_DirectTheAgentToResolveItsOwnCheckout(t *testing
 	if !strings.Contains(lower, "inherit") {
 		t.Errorf("onboardingInstructions must state the later verbs inherit the binding; got:\n%s", got)
 	}
+	// (4) Bind a clean checkout of the base branch, not a session worktree
+	// carrying unmerged commits (#5214).
+	if !strings.Contains(lower, "clean checkout of the base branch") || !strings.Contains(lower, "not a session-scoped worktree carrying unmerged commits") {
+		t.Errorf("onboardingInstructions must tell the agent to bind a clean checkout of the base branch, not a session-scoped worktree; got:\n%s", got)
+	}
 }
 
 // TestOnboardingInstructions_NameAwaitStage is the #2491 onboarding done-means:
@@ -391,6 +396,10 @@ func TestStartRunSchema_WorkingDirInstructsTheCaller(t *testing.T) {
 	// (4) The later verbs INHERIT it.
 	if !strings.Contains(desc, "inherit") {
 		t.Errorf("working_dir description must state the later verbs inherit it; got %q", descRaw)
+	}
+	// (5) Bind a clean checkout of the base branch (#5214).
+	if !strings.Contains(desc, "clean checkout of the base branch") || !strings.Contains(desc, "not a session-scoped worktree carrying unmerged commits") {
+		t.Errorf("working_dir description must say to bind a clean checkout of the base branch, not a session-scoped worktree; got %q", descRaw)
 	}
 }
 

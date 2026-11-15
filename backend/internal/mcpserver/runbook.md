@@ -177,6 +177,43 @@ checkout — regardless of whether you supplied an explicit value (an explicit p
 is self-validating, but its non-conflict with the binding is not). On stdio the
 same read failure degrades to today's behavior.
 
+### Starting a run: pre-flight
+
+A run captures its inputs once, at `fishhawk_start_run`, and never re-reads them
+(#5214). Check them before the call, not after the plan:
+
+1. **Bind a clean checkout of the base branch.** Run `git status` in the
+   checkout first, and bind that checkout, not a session-scoped worktree carrying
+   unmerged commits. `fishhawk_start_run`'s `warnings` text reports a dirty tree,
+   uncommitted `.fishhawk/` edits, and a HEAD that is detached, on another
+   branch, or ahead of or behind the remote default branch as last fetched. A
+   warning never blocks the create, so read it and act on it. On an idempotent
+   replay (a repeated `idempotency_key`) it describes the checkout at that call,
+   not the spec the existing run pinned when it was first created. The probe
+   runs no content filter, so a file under one (git-lfs, git-crypt) can be
+   listed as dirty although `git status` shows it clean: check `git status`
+   before you commit, stash or remove what the warning names.
+2. **The workflow spec is pinned for the run's life.** An auto-discovered spec
+   is the checkout's working-tree bytes. A `.fishhawk/` edit made after the call,
+   or one that was never committed to the base branch, needs a new run: commit it
+   to the base first, then start the run.
+3. **Comment before `fishhawk_start_run`.** The issue title, body and comments
+   are captured into `issue_context` at this call. Every later stage reads that
+   snapshot. Put authoritative scope in the issue BODY: when the comments exceed
+   the total comment budget, the plan prompt drops the OLDEST ones, and
+   `warnings` says how many.
+4. **Read `issue_context.comments` on the run** to confirm a steer was captured.
+   A comment that arrived late never reaches the planner: cancel and restart the
+   run before the plan is dispatched. Once a plan exists, steer with
+   `fishhawk_reject_plan` or `fishhawk_revise_plan` instead.
+5. **A re-scoped issue needs its body rewritten first.** When an issue has been
+   split or partly shipped, the body may still describe work that already
+   landed, and the planner reads the body as scope. Search the base branch for
+   each deliverable the body names, then rewrite the body with an "already
+   shipped — do not re-plan" table and the expected file count before starting
+   the run. No verb checks this: `fishhawk_preview_issue` previews a draft
+   filing, not an existing issue.
+
 ### Local-drive fixup needs an explicit dispatch_stage
 
 On a local-drive run, `fishhawk_fixup_stage` re-opens the implement stage to
@@ -397,6 +434,12 @@ resumable:
 **Every stop is resumable by re-invoking with the SAME `run_id`.** `max_minutes`
 clamps to **[1,240]** (default **60**); a timeout is itself a resumable stop.
 
+**An error mid-drive is a state signal, not a stop condition** (#5214).
+When the driver, or any verb you call between drives, returns an error or a 409
+refusal, the run has usually moved on under you. Re-read
+`fishhawk_get_run_status` and act on its `next_actions` before ending the turn.
+Do not end the turn on the error text alone.
+
 ### Backlog grooming loop (non-diff)
 
 **Approving a grooming gate WRITES to the tracker.** `backlog_grooming` is a
@@ -561,6 +604,31 @@ source exists: an approved `backlog_grooming` order, passed as
 `grooming_run_id` instead of either (see the *Backlog grooming loop* section
 above).
 
+**0. Pre-flight: preview first** (#5214).
+Call `fishhawk_preview_campaign` with the source you will start, then read:
+
+- `edges[].source` and `warnings[]`. Only a native "blocked by" link or a
+  line-start `Depends on:` body line makes an edge. Sequencing written only in
+  prose ("after #123 lands") produces **no edge**, so that item lands in wave 0
+  and can start alongside the work it was meant to follow. Add a real edge and
+  preview again.
+- `human_led`. While they stay `autonomy:low`, these items are never
+  agent-started: `fishhawk_start_campaign_item_run` refuses each one with
+  `item_human_led`. Plan for a human to lead them out of band, or relabel one
+  whose tier is wrong before the start.
+
+Start from a clean, current checkout of the base branch, and re-run the preview
+after any tracker edit. The DAG is assembled from the tracker as it reads at
+create time, and a later status poll only ever adds edges.
+
+`checkout_warnings` on the `fishhawk_start_campaign` and
+`fishhawk_start_campaign_item_run` results reports a dirty bound checkout, or a
+HEAD that is detached, on another branch, or ahead of or behind the remote
+default branch as last fetched. An uncommitted `.fishhawk/` edit is invisible
+to the campaign's runs until it is committed and pushed to the base branch:
+they fetch the workflow spec from the forge at `workflow_ref`, not from the
+checkout. The warnings never block the create.
+
 **1. Start the campaign.** `fishhawk_start_campaign` (`repo` required, plus ONE of
 `epic_ref` / `items`; optional `pause_policy` of `pause_campaign` (default) /
 `pause_item`, fixed at create time). For a local campaign **bind
@@ -669,6 +737,23 @@ and serialize local verifies until the
 [#1918](https://github.com/kuhlman-labs/fishhawk/issues/1918) two-concurrent-local-runs
 experiment settles the rule. There is also no `idempotency_key` — the eligibility
 gate already refuses a re-start against a running item.
+
+**Sequencing behind overlapping work** (#5214).
+`fishhawk_get_campaign_status` `scope_overlap` names, for each in-flight item,
+the other in-flight runs sharing files with it. To order a new item behind
+overlapping work, make it depend on the **last** still-open overlapping item in
+queue order, not the first: that one merges last. Plan the new item once that
+item's PR has opened. An unstarted item has no plan scope yet, so
+`scope_overlap` cannot show it, and when to plan it is your judgement.
+
+**Carrying review findings forward.** No verb carries a finding into another
+item: `fishhawk_defer_concern` files a NEW issue. To fold a finding into a
+downstream item instead, edit that item's issue body before its run is started.
+`fishhawk_start_campaign_item_run` captures the body into the run's
+`issue_context`, and the plan reads that snapshot. Once the run exists, an edit
+reaches the planner only if you cancel and restart the run before its plan is
+dispatched. After a plan exists, steer it with `fishhawk_reject_plan` or
+`fishhawk_revise_plan`.
 
 **6. Per-item post-merge — before the next eligible item.** After each item's
 merge, run `scripts/dev post-merge <issue>` **before starting the next eligible

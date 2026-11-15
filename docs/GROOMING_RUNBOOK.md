@@ -255,6 +255,21 @@ because a full order cannot assemble.
 The alternative — walking the ranked list downward with individual `fishhawk_start_run`
 calls — respects the ordering and skips nothing. Slower, more reliable.
 
+**Pre-flight for an issue with split history (#5214).** Before an issue goes into a
+campaign or a `fishhawk_start_run`, check whether it was split or partly shipped: a
+"split from" or "re-scoped" comment, sibling issues carved out of it, or merged PRs that
+reference it. If it was, the body may still describe work that already landed, and the
+planner reads the body as scope. Do this by hand; no verb checks it.
+`fishhawk_preview_issue` previews a DRAFT filing, not an existing issue.
+
+1. Grep main for each deliverable the body names (the file, the function, the flag),
+   and list what already exists.
+2. Rewrite the body. Add an "Already shipped — do not re-plan" table that names each
+   landed piece and the PR that landed it, then state the remaining work and its
+   expected file count.
+3. Edit the BODY, not a comment. The run captures the body when it is created, and
+   when the comments are over budget the plan prompt drops the oldest ones.
+
 ## 7. Autonomy tiers
 
 **Policy for this repo: only agents author code.** `autonomy:low` therefore means an

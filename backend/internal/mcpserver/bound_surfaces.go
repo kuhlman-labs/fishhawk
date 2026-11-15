@@ -336,8 +336,12 @@ const floorCarryMaxDepth = 2
 //	                                              floorFieldCap.
 //	StartCampaignItemRunOutput.item             — CampaignItem whose depends_on is
 //	                                              TRUNCATED and whose strings are CAPPED.
+//	StartCampaignItemRunOutput.checkout_warnings — []string TRUNCATED to
+//	                                              floorCarryCollectionCap, each
+//	                                              warning CAPPED (#5214).
 //
-// Those three fields are the complete set the floor can silently reduce today.
+// Those fields (plus runner_kind_resolution) are the complete set the floor can
+// silently reduce today.
 // Each is classified in floorCarryTable so its reduction is ITEMISED with a
 // class whose promise holds, instead of being swept under the aggregate stored
 // elision (which cannot deliver a collection-truncated / string-capped field).
@@ -686,6 +690,12 @@ var floorCarryTable = map[reflect.Type][]floorCarryRow{
 		// and carried at the floor because it is non-omitempty; a capped value
 		// has no retrieval surface that returns the pair, so it is computed.
 		{Path: "runner_kind_resolution", Class: classComputed, Build: func(c floorCarryBuildCtx) elidedField {
+			return newComputedElision(c.field, c.reason, c.omitted)
+		}},
+		// The checkout-hygiene warnings (#5214) are probed from the caller's
+		// checkout at this call and persisted nowhere, so a reduced list has no
+		// retrieval surface: computed.
+		{Path: "checkout_warnings", Class: classComputed, Build: func(c floorCarryBuildCtx) elidedField {
 			return newComputedElision(c.field, c.reason, c.omitted)
 		}},
 	},

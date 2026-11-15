@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -178,6 +179,159 @@ func TestStartCampaignItemRun_SurfacesRunnerKindResolution(t *testing.T) {
 	}
 	if fb.startCampaignItemRunBody.RunnerKind != "" {
 		t.Errorf("POST body runner_kind = %q, want empty (never defaulted client-side)", fb.startCampaignItemRunBody.RunnerKind)
+	}
+}
+
+// campaignScratchCheckout is a real git checkout on main with
+// refs/remotes/origin/HEAD resolving to origin/main at HEAD, so it is clean on
+// its base. dirtySpec adds an untracked .fishhawk/workflows.yaml and moves HEAD
+// to a feature branch, so W1, W2 and W3 all fire.
+func campaignScratchCheckout(t *testing.T, dirtySpec bool) string {
+	t.Helper()
+	dir := newRealGitRepo(t)
+	realGit(t, dir, "branch", "-M", "main")
+	realGit(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+	realGit(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	if dirtySpec {
+		realGit(t, dir, "checkout", "-q", "-b", "feature")
+		if err := os.MkdirAll(filepath.Join(dir, ".fishhawk"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".fishhawk", "workflows.yaml"), []byte("version: 2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// assertCampaignCheckoutWording pins approval condition C1 on a campaign
+// surface's warnings for the dirty .fishhawk/ fixture: W2 says the edit is
+// INVISIBLE until committed and pushed, and neither W2 nor W3 claims the spec
+// was read from (or pinned out of) the checkout.
+func assertCampaignCheckoutWording(t *testing.T, ws []string) {
+	t.Helper()
+	text := strings.Join(ws, "\n")
+	for _, want := range []string{w1Marker, `".fishhawk/`, w2Marker, "INVISIBLE to the run until it is committed and pushed to the base branch", "from the forge at workflow_ref", w3Marker, `HEAD is on branch "feature", not "main"`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("campaign checkout_warnings must say %q:\n%s", want, text)
+		}
+	}
+	for _, bad := range []string{"WORKING-TREE", "This run pinned", "read from this checkout"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("campaign checkout_warnings must not claim %q:\n%s", bad, text)
+		}
+	}
+}
+
+// TestStartCampaign_CheckoutWarnings_Wired crosses startCampaign → the real
+// probe → checkout_warnings against a real scratch checkout (criterion
+// start-campaign-reports-checkout-warnings): a dirty .fishhawk/ fixture off its
+// base reports in the campaign wording, a clean checkout on its base omits the
+// field, and the campaign is created either way.
+func TestStartCampaign_CheckoutWarnings_Wired(t *testing.T) {
+	start := func(t *testing.T, wd string) StartCampaignOutput {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo: "kuhlman-labs/fishhawk", EpicRef: "#25", WorkingDir: wd,
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if out.Campaign.ID == "" || fb.createCampaignBody.WorkingDir != wd {
+			t.Fatalf("the campaign must be created with its binding regardless of hygiene: %+v / %+v", out.Campaign, fb.createCampaignBody)
+		}
+		return out
+	}
+	t.Run("dirty_fishhawk_off_base_warns_campaign_wording", func(t *testing.T) {
+		assertCampaignCheckoutWording(t, start(t, campaignScratchCheckout(t, true)).CheckoutWarnings)
+	})
+	t.Run("clean_on_base_omits_field", func(t *testing.T) {
+		out := start(t, campaignScratchCheckout(t, false))
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.CheckoutWarnings != nil || strings.Contains(string(raw), "checkout_warnings") {
+			t.Errorf("a clean checkout on its base must omit checkout_warnings: %s", raw)
+		}
+	})
+}
+
+// TestStartCampaignItemRun_CheckoutWarnings_Wired crosses startCampaignItemRun
+// → the real probe → checkout_warnings on the binding the MINTED run carries
+// (here the campaign's, with no per-item value), in the campaign wording. A
+// clean checkout leaves the non-omitempty field null (approval condition C2
+// keeps it on the wire), and the run is minted either way.
+func TestStartCampaignItemRun_CheckoutWarnings_Wired(t *testing.T) {
+	start := func(t *testing.T, bound string) StartCampaignItemRunOutput {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		runID := uuid.NewString()
+		fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+			Run:  Run{ID: runID, Repo: "x/y", State: "pending", WorkingDir: bound},
+			Item: CampaignItem{ID: uuid.NewString(), IssueRef: "issue:1", RunID: runID, State: "running"},
+		}
+		r := newResolver(srv, nil)
+		_, out, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+			CampaignID: uuid.NewString(), IssueRef: "issue:1", WorkflowID: "feature_change",
+		})
+		if err != nil {
+			t.Fatalf("startCampaignItemRun: %v", err)
+		}
+		if out.Run.ID != runID {
+			t.Fatalf("the run must be minted regardless of hygiene: %+v", out.Run)
+		}
+		return out
+	}
+	t.Run("dirty_fishhawk_off_base_warns_campaign_wording", func(t *testing.T) {
+		assertCampaignCheckoutWording(t, start(t, campaignScratchCheckout(t, true)).CheckoutWarnings)
+	})
+	t.Run("clean_on_base_null_on_the_wire", func(t *testing.T) {
+		out := start(t, campaignScratchCheckout(t, false))
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.CheckoutWarnings != nil || !strings.Contains(string(raw), `"checkout_warnings":null`) {
+			t.Errorf("a clean checkout must render checkout_warnings null (non-omitempty): %s", raw)
+		}
+	})
+}
+
+// TestStartCampaignItemRun_CheckoutWarnings_SurviveFloor pins approval
+// condition C2 at the ADR-077 floor tier: warnings set before bounding are
+// carried in reduced form (truncated to floorCarryCollectionCap, each capped),
+// never zeroed, and the reduction is itemised as a computed entry with no
+// pointer.
+func TestStartCampaignItemRun_CheckoutWarnings_SurviveFloor(t *testing.T) {
+	in := campaignItemFloorFixture(uuid.NewString(), 1)
+	in.CheckoutWarnings = nil
+	for i := 0; i < floorCarryCollectionCap+2; i++ {
+		in.CheckoutWarnings = append(in.CheckoutWarnings, fmt.Sprintf("checkout hygiene: warning %d %s", i, strings.Repeat("w", 200)))
+	}
+	out := boundCampaignItemFloor(t, in, uuid.NewString(), mcpConvergenceFloorBytes)
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("fixture must reach the floor tier: %+v", out.Elisions)
+	}
+	if len(out.CheckoutWarnings) == 0 || len(out.CheckoutWarnings) > floorCarryCollectionCap {
+		t.Fatalf("checkout_warnings must survive the floor truncated to %d, got %d", floorCarryCollectionCap, len(out.CheckoutWarnings))
+	}
+	if !strings.HasPrefix(out.CheckoutWarnings[0], "checkout hygiene: warning 0") {
+		t.Errorf("the carried warnings must be the leading originals, got %q", out.CheckoutWarnings[0])
+	}
+	var entry *ElidedField
+	for i := range out.Elisions.Fields {
+		if f := &out.Elisions.Fields[i]; f.Field == "checkout_warnings" {
+			entry = f
+		}
+	}
+	if entry == nil {
+		t.Fatalf("the floor must itemise the checkout_warnings reduction: %+v", out.Elisions.Fields)
+	}
+	if entry.Class != string(classComputed) || entry.Pointer != "" {
+		t.Errorf("checkout_warnings reduction must be computed with no pointer, got %+v", *entry)
 	}
 }
 
@@ -4464,5 +4618,157 @@ func TestGetCampaignStatus_Awaiting_ThroughRealServer(t *testing.T) {
 				t.Fatalf("re-emitted item = %s, want the awaiting block", raw)
 			}
 		})
+	}
+}
+
+// --- #5214: campaign-start guidance folded into the campaign surfaces ---
+
+// toolOutputSchemaPropertyDescription returns one TOP-LEVEL output-schema
+// property's wire-visible description for toolName, read from the tools/list
+// result an agent actually sees (not the Go struct tag).
+func toolOutputSchemaPropertyDescription(t *testing.T, toolName, property string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != toolName {
+			continue
+		}
+		if tool.OutputSchema == nil {
+			t.Fatalf("%s: no output schema on the wire", toolName)
+		}
+		raw, err := json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatalf("%s: marshal output schema: %v", toolName, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("%s: decode output schema: %v", toolName, err)
+		}
+		prop, ok := schema.Properties[property]
+		if !ok {
+			t.Fatalf("%s: output schema has no %q property: %s", toolName, property, raw)
+		}
+		return prop.Description
+	}
+	t.Fatalf("%s is not registered/visible over ListTools", toolName)
+	return ""
+}
+
+// TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy drives the tool → real
+// client → wire → decode chain: of three items tiered low, medium and unset,
+// human_led names exactly the low one. A filter that drops everything misses
+// issue:100; one that admits everything adds issue:101 and issue:102.
+func TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	waveCount := 1
+	waveZero := 0
+	fb.previewCampaignResp = CampaignPreview{
+		Valid: true, Repo: "x/y", EpicRef: "issue:99",
+		ItemCount: 3, WaveCount: &waveCount,
+		Waves: [][]string{{"issue:100", "issue:101", "issue:102"}},
+		Items: []CampaignPreviewItem{
+			{IssueRef: "issue:100", DependsOn: []string{}, Wave: &waveZero, Autonomy: "low", Position: 0},
+			{IssueRef: "issue:101", DependsOn: []string{}, Wave: &waveZero, Autonomy: "medium", Position: 1},
+			{IssueRef: "issue:102", DependsOn: []string{}, Wave: &waveZero, Position: 2},
+		},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	if got, want := strings.Join(out.HumanLed, ","), "issue:100"; got != want {
+		t.Fatalf("human_led = %q, want %q (only the autonomy:low item)", got, want)
+	}
+
+	// No low item: the field is absent from the wire shape (omitempty), not [].
+	fb.previewCampaignResp.Items[0].Autonomy = "high"
+	_, out, err = r.previewCampaign(context.Background(), nil, PreviewCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("previewCampaign (no low): %v", err)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"human_led"`) {
+		t.Errorf("human_led present with no autonomy:low item: %s", raw)
+	}
+}
+
+// TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse pins the
+// wire-visible fishhawk_start_campaign description to the preview-first and
+// prose-sequencing rules (#5214 rules 3 and 16).
+func TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_start_campaign"]
+	for _, want := range []string{
+		"Preview first",
+		"fishhawk_preview_campaign",
+		"edges[].source",
+		"warnings[]",
+		"produces NO edge",
+		"lands in wave 0",
+		"clean, current checkout of the base branch",
+		"re-run the preview after any tracker edit",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_start_campaign description missing %q:\n%s", want, desc)
+		}
+	}
+}
+
+// TestPreviewCampaign_Description_NamesHumanLed pins both the tool description
+// and the human_led output-schema description an agent reads.
+func TestPreviewCampaign_Description_NamesHumanLed(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_preview_campaign"]
+	for _, want := range []string{"human_led", "never agent-starts", "item_human_led"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_preview_campaign description missing %q:\n%s", want, desc)
+		}
+	}
+	field := toolOutputSchemaPropertyDescription(t, "fishhawk_preview_campaign", "human_led")
+	for _, want := range []string{"autonomy tier is low", "NEVER agent-start", "item_human_led", "out of band"} {
+		if !strings.Contains(field, want) {
+			t.Errorf("human_led output-schema description missing %q: %s", want, field)
+		}
+	}
+}
+
+// TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule pins the
+// overlapping-predecessor rule (#5214 rule 2) on the wire-visible scope_overlap
+// output-schema description.
+func TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule(t *testing.T) {
+	desc := toolOutputSchemaPropertyDescription(t, "fishhawk_get_campaign_status", "scope_overlap")
+	for _, want := range []string{"LAST still-open overlapping item in queue order", "PR has opened", "unstarted item has no plan scope"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("scope_overlap description missing %q: %s", want, desc)
+		}
 	}
 }
