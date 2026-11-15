@@ -166,12 +166,21 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
-	// SHARED PATH across decomposition slices (#4679), appended LAST so every
-	// earlier advisory keeps its position. One advisory per cross-slice
+	// SHARED PATH across decomposition slices (#4679), appended after every
+	// earlier advisory so each keeps its position. One advisory per cross-slice
 	// ownership overlap the decomposition validator does not refuse (directory
 	// containment or trailing-slash spelling; raw-equal duplicates are already
 	// refused in every wave). Reads only the parsed plan.
 	warnings = append(warnings, sliceSharedPathWarnings(&parsedPlan)...)
+
+	// ALL CRITERIA SKIP_EXPECTED advisory (#5211 R35), appended LAST so every
+	// earlier advisory keeps its index. The finding already rides the
+	// plan_acceptance_precheck row and the review prompt, but no operator
+	// surface read it; riding plan_warnings puts it in fishhawk_get_plan. Reads
+	// only the parsed plan.
+	if w := allCriteriaSkipExpectedWarning(&parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
 
 	if len(warnings) == 0 {
 		return nil
@@ -470,6 +479,39 @@ func partialDeliveryWarning(parsedPlan *plan.Plan) string {
 			"Remaining scope: %s. Confirm the issue should stay open; reject the plan if this run should deliver the "+
 			"whole issue.",
 		remaining,
+	)
+}
+
+// allCriteriaSkipExpectedWarning surfaces the all-skip acceptance short-circuit
+// (#5211 R35) to the approver as ONE advisory, or "" when it would not run. It
+// does not re-derive the condition: it reads the all_criteria_skip_expected
+// finding off plan.EvaluateAcceptanceCriteria, the shared evaluator the
+// plan_acceptance_precheck row is built from. That finding fires on
+// AcceptanceSkippableAllSkipWithBasis (the boolean the orchestrator
+// short-circuits on) && !DeclaresNoAcceptanceSurface (that declaration omits
+// the acceptance stage at approval), so this advisory, the pre-check finding
+// and the runtime short-circuit stay one boolean, and the server still makes
+// no second AcceptanceSkippableAllSkipWithBasis call. It gates nothing. Pure:
+// no RunRepo or cap dependency.
+func allCriteriaSkipExpectedWarning(parsedPlan *plan.Plan) string {
+	v := parsedPlan.Verification
+	fires := false
+	for _, f := range plan.EvaluateAcceptanceCriteria(v) {
+		if f.Rule == plan.RuleAllCriteriaSkipExpected {
+			fires = true
+			break
+		}
+	}
+	if !fires {
+		return ""
+	}
+	return fmt.Sprintf(
+		"plan marks ALL %d acceptance criteria skip_expected with an expectation_basis, so the acceptance stage will "+
+			"short-circuit to a not_validated verdict with no runner spawn and no preview: ZERO criteria are verified. "+
+			"The run stays merge-eligible, but this is not a validated pass. Act at this gate: revise the plan for a "+
+			"drivable criterion a reviewer will see, have it declare acceptance_surface none when the change exposes no "+
+			"observable surface, or approve knowing acceptance verifies nothing.",
+		len(v.AcceptanceCriteria),
 	)
 }
 

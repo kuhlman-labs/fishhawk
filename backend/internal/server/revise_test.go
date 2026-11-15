@@ -247,6 +247,105 @@ func TestRevisePlan_CeilingReached_409(t *testing.T) {
 	assertScopeError(t, w, http.StatusConflict, "revise_ceiling_reached")
 }
 
+// decodeReviseRefusal decodes a revise 409 body into its error envelope,
+// failing the test on a status or code mismatch.
+func decodeReviseRefusal(t *testing.T, w *httptest.ResponseRecorder, wantCode string) errorBody {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != wantCode {
+		t.Fatalf("code = %q, want %q", env.Error.Code, wantCode)
+	}
+	return env.Error
+}
+
+// assertReviseRefusalDetails pins that the remedy text changed only the
+// message: the details map keeps exactly its pre-#5211 keys and values.
+func assertReviseRefusalDetails(t *testing.T, got map[string]any, want map[string]float64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("details = %v, want exactly %v", got, want)
+	}
+	for k, v := range want {
+		if g, ok := got[k].(float64); !ok || g != v {
+			t.Errorf("details[%q] = %v, want %v", k, got[k], v)
+		}
+	}
+}
+
+// TestRevise_BudgetExhausted_MessageNamesApproveWithConditions (#5211 R12):
+// with the one-pass budget spent by a seeded plan_revised entry, the 409
+// message keeps the run package's sentinel text as its prefix and names both
+// remedies the gate still admits — approving with binding conditions and
+// force_additional_pass. The seeded prior pass is the only state that makes
+// the handler take this arm; deleting the remedy suffix leaves the bare
+// sentinel and fails the remedy assertions.
+func TestRevise_BudgetExhausted_MessageNamesApproveWithConditions(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+	seedPlanRevised(au, runID, stageID)
+
+	body := decodeReviseRefusal(t, revisePlan(t, s, stageID, `{"constraint":"another tweak"}`), "revise_budget_exhausted")
+
+	if !strings.HasPrefix(body.Message, "revise budget exhausted: 1 of 1 revise passes already used") {
+		t.Errorf("message must keep the sentinel text as its prefix, got %q", body.Message)
+	}
+	for _, want := range []string{
+		"approve the plan with binding conditions",
+		"force_additional_pass",
+		"ONE more revise pass",
+		"hard ceiling: 3 passes",
+	} {
+		if !strings.Contains(body.Message, want) {
+			t.Errorf("message missing remedy %q:\n%s", want, body.Message)
+		}
+	}
+	if strings.Contains(body.Message, "start a fresh run") {
+		t.Errorf("budget remedy must not send the operator to a fresh run while the override still works:\n%s", body.Message)
+	}
+	assertReviseRefusalDetails(t, body.Details, map[string]float64{"max_passes": 1, "used": 1})
+}
+
+// TestRevise_CeilingReached_MessageNamesApproveWithConditions (#5211 R5):
+// three seeded plan_revised entries reach the hard ceiling, so even a forced
+// pass is refused. The 409 message keeps the sentinel prefix, says the
+// override cannot pass the ceiling, and names the two remaining levers —
+// approve with binding conditions, or reject and replan in a fresh run. It
+// must NOT offer force_additional_pass as a remedy.
+func TestRevise_CeilingReached_MessageNamesApproveWithConditions(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+	seedPlanRevised(au, runID, stageID)
+	seedPlanRevised(au, runID, stageID)
+	seedPlanRevised(au, runID, stageID)
+
+	body := decodeReviseRefusal(t,
+		revisePlan(t, s, stageID, `{"constraint":"past the ceiling","force_additional_pass":true}`),
+		"revise_ceiling_reached")
+
+	if !strings.HasPrefix(body.Message, "revise ceiling reached: 3 of 3 revise passes already used (hard ceiling)") {
+		t.Errorf("message must keep the sentinel text as its prefix, got %q", body.Message)
+	}
+	for _, want := range []string{
+		"force_additional_pass cannot pass this ceiling",
+		"approve the plan with binding conditions",
+		"reject the plan and start a fresh run",
+	} {
+		if !strings.Contains(body.Message, want) {
+			t.Errorf("message missing remedy %q:\n%s", want, body.Message)
+		}
+	}
+	if strings.Contains(body.Message, "set force_additional_pass") {
+		t.Errorf("ceiling remedy must not offer the override:\n%s", body.Message)
+	}
+	assertReviseRefusalDetails(t, body.Details, map[string]float64{"ceiling": 3, "used": 3})
+}
+
 // TestRevisePlan_CrossLayer_ReviseResumePrompt crosses request →
 // persistence → prompt-render: a plan stage parked at awaiting_approval
 // is revised through the endpoint (request → plan_revised audit), the

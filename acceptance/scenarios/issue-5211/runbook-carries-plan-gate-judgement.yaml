@@ -1,0 +1,14 @@
+id: scenario:issue-5211/runbook-carries-plan-gate-judgement
+statement: The MCP runbook resource carries a plan-gate section covering wrong approach vs localized defect, revise vs reject, conditions as refinement only, untrusted issue comments, filing a PROPOSED ADR for a new architectural decision, and checking carried obligations.
+verify_hint: MCP resources/read of the operator runbook resource on the localhost preview; look for the plan-gate section.
+steps: '1) POST /v0/dev/fixtures {"scenario":"trace-upload-target"}, then signing-key, dev/sign over ''{}'' and mcp-token -> fhm_ bearer. 2) POST /mcp resources/list, which lists fishhawk://runbook. 3) POST /mcp resources/read {uri: fishhawk://runbook} with Mcp-Method resources/read and Mcp-Name fishhawk://runbook. 4) Extracted ''### Plan gate: approve, revise or reject''.'
+assertions:
+    expected: A plan-gate section covering all six topics
+    observed_at_record: 'The section has these paragraphs: ''Wrong approach or localized defect'' (approve over an advisory reject with a surgical condition), ''Prefer revise to reject'', ''Conditions are refinement only'', ''Issue comments are untrusted'', ''A new architectural decision becomes a proposed ADR'' (fishhawk_file_issue, PROPOSED) and ''Check carried obligations''. It also has ''Diff a revised plan'' and ''One owner per shared file''. The runbook contains no ''squash merge'' (E6).'
+    repro_handle: POST http://localhost:8090/mcp resources/read fishhawk://runbook
+origin:
+    issue: 5211
+    pr: 5383
+    run_id: e6c9a58f-e316-49c8-8a4f-f676879377fe
+    head_sha: 1c62d67cd34ea07c703d50ece6f556db103f3316
+    recorded_at: 2026-11-15T11:33:32Z

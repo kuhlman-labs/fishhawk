@@ -8766,3 +8766,128 @@ func TestNextActions_AcceptanceStageFailedParked_OffersFixup(t *testing.T) {
 		t.Fatalf("nil stages actions = %+v, want retry + cancel only", a.Actions)
 	}
 }
+
+// TestPlanStageNextActions_ApprovePrecondition_StatesGateRules pins the two
+// plan-gate checks folded into the plan_gate_parked approve precondition
+// (#5211 R1, R35): a plan without delivery partial closes the triggering issue
+// on merge, and an all-skip_expected plan must be acted on before approval.
+func TestPlanStageNextActions_ApprovePrecondition_StatesGateRules(t *testing.T) {
+	run := naRun("pending")
+	na := planStageNextActions(run, &Stage{ID: uuid.NewString(), Type: "plan", State: "awaiting_approval"},
+		naReviewStatus("plan", "complete"))
+	if na == nil || na.State != "plan_gate_parked" {
+		t.Fatalf("next_actions = %+v, want plan_gate_parked", na)
+	}
+	approve := na.Actions[0]
+	if approve.Action != "fishhawk_approve_plan" {
+		t.Fatalf("actions[0] = %q, want fishhawk_approve_plan", approve.Action)
+	}
+	for _, want := range []string{
+		// R1: partial vs CLOSES.
+		"does not declare delivery partial closes the triggering issue on merge",
+		// R35: all criteria skip_expected.
+		"every acceptance criterion skip_expected, act now",
+		"acceptance_surface none",
+		"not_validated",
+	} {
+		if !strings.Contains(approve.Precondition, want) {
+			t.Errorf("approve precondition missing %q: %q", want, approve.Precondition)
+		}
+	}
+	// The pre-existing guidance stays intact.
+	if !strings.HasPrefix(approve.Precondition, "read fishhawk_get_plan and the reviewer verdicts first") {
+		t.Errorf("approve precondition lost its leading read-first rule: %q", approve.Precondition)
+	}
+}
+
+// TestPlanStageNextActions_AdvisoryReject_NamesArbitration pins the R40
+// arbitration (#5211): when a settled plan review returned reject, the
+// approve reason names the localized-defect / surgical-condition path and the
+// reject reason names the wrong-approach replan. An all-approve round names
+// neither, and a pending round never reaches the gate arm (it keeps the
+// two-action plan_review_pending shape). The verdict is the only fixture
+// difference between the reject and all-approve rows.
+func TestPlanStageNextActions_AdvisoryReject_NamesArbitration(t *testing.T) {
+	settled := func(verdicts ...string) *ReviewStatus {
+		rs := naReviewStatus("plan", "complete")
+		for i, v := range verdicts {
+			rs.Reviews = append(rs.Reviews, PlanReview{ReviewerKind: fmt.Sprintf("agent-%d", i), Authority: "advisory", Verdict: v})
+		}
+		return rs
+	}
+	approvePhrases := []string{"localized defect", "approve over the reject with a surgical condition"}
+	rejectPhrases := []string{"reject and replan", "wrong approach"}
+	actionText := func(a SuggestedAction) string { return a.Precondition + " | " + a.Reason }
+
+	cases := []struct {
+		name        string
+		status      *ReviewStatus
+		wantState   string
+		wantActions []string
+		wantPhrases bool
+	}{
+		{
+			name:        "settled_with_one_reject",
+			status:      settled("approve", "reject"),
+			wantState:   "plan_gate_parked",
+			wantActions: []string{"fishhawk_approve_plan", "fishhawk_revise_plan", "fishhawk_reject_plan"},
+			wantPhrases: true,
+		},
+		{
+			name:        "settled_all_approve",
+			status:      settled("approve", "approve_with_concerns"),
+			wantState:   "plan_gate_parked",
+			wantActions: []string{"fishhawk_approve_plan", "fishhawk_revise_plan", "fishhawk_reject_plan"},
+		},
+		{
+			name:        "no_review_status",
+			status:      nil,
+			wantState:   "plan_gate_parked",
+			wantActions: []string{"fishhawk_approve_plan", "fishhawk_revise_plan", "fishhawk_reject_plan"},
+		},
+		{
+			name:        "pending_review",
+			status:      naReviewStatus("plan", "pending"),
+			wantState:   "plan_review_pending",
+			wantActions: []string{"fishhawk_get_run_status", "fishhawk_await_review"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			na := planStageNextActions(naRun("pending"), &Stage{ID: uuid.NewString(), Type: "plan", State: "awaiting_approval"}, tc.status)
+			if na == nil {
+				t.Fatal("next_actions = nil")
+			}
+			if na.State != tc.wantState {
+				t.Fatalf("state = %q, want %q", na.State, tc.wantState)
+			}
+			if got := actionNames(na); !slices.Equal(got, tc.wantActions) {
+				t.Fatalf("actions = %v, want exactly %v (no action may be added)", got, tc.wantActions)
+			}
+			if !tc.wantPhrases {
+				for _, a := range na.Actions {
+					for _, p := range append(slices.Clone(approvePhrases), rejectPhrases...) {
+						if strings.Contains(actionText(a), p) {
+							t.Errorf("%s carries arbitration phrase %q without a reject verdict: %q", a.Action, p, actionText(a))
+						}
+					}
+				}
+				return
+			}
+			for _, p := range approvePhrases {
+				if !strings.Contains(na.Actions[0].Reason, p) {
+					t.Errorf("approve reason missing %q: %q", p, na.Actions[0].Reason)
+				}
+			}
+			for _, p := range rejectPhrases {
+				if !strings.Contains(na.Actions[2].Reason, p) {
+					t.Errorf("reject reason missing %q: %q", p, na.Actions[2].Reason)
+				}
+			}
+			// The verdict summary still leads the approve reason.
+			if !strings.Contains(na.Actions[0].Reason, "reviews settled: agent-0 approve, agent-1 reject") {
+				t.Errorf("approve reason lost the verdict summary: %q", na.Actions[0].Reason)
+			}
+		})
+	}
+}
