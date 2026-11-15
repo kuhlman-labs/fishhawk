@@ -229,7 +229,9 @@ Response (gate_view):
     two overlapping runs while the other is mid-implement can strand it.
     When overlaps[] names a live run changing the same paths as a plan at
     its gate, hold that plan and revise it (fishhawk_revise_plan) after the
-    overlapping run merges, instead of approving into the conflict.
+    overlapping run merges, instead of approving into the conflict. When
+    the overlapping run is also still at its plan stage, the lower run_id
+    proceeds and the higher one holds.
     Run-level: stage_kind does not filter it. Omitted for a run-bound token,
     when the backend's compute failed, or against an older backend.
 `),

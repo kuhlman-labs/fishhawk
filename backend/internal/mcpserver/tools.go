@@ -851,9 +851,10 @@ type GetPlanOutput struct {
 	ScopeOverlap *scopeOverlap `json:"scope_overlap,omitempty" jsonschema:"live cross-run scope overlap (#4118) of THIS run's effective scope (plan scope, approval add/remove, approved amendments) with every other non-terminal run in the same repo and tenant, outside this run's decomposition/recovery lineage: overlaps[] names each run_id, issue_ref, decomposed_from, current stage/stage_state and the shared paths; scanned_runs/unscoped_runs/truncated say how complete the scan was. Advisory, never blocks approval — weigh merge order. Absent when the read failed (a run-bound token, a token without read:audit) or against an older backend"`
 	// ScopeOverlapHold is the plan-gate hold instruction derived from
 	// ScopeOverlap (#5211 R2/R23): built ONLY from the fields already in the
-	// returned block (no further lookup), and absent when overlaps[] is empty or
-	// the overlap read failed.
-	ScopeOverlapHold string `json:"scope_overlap_hold,omitempty" jsonschema:"plan-gate hold instruction derived from scope_overlap (#5211): when overlaps[] names a live run changing the same paths, it names each run_id, issue_ref and stage/stage_state and says to keep this plan parked and revise it with fishhawk_revise_plan after that run merges, instead of approving into the conflict. Built only from the scope_overlap block in this response. Absent when overlaps[] is empty or scope_overlap is absent (a failed read)"`
+	// returned block plus the requested run's plan stage state getPlan already
+	// listed (no further lookup), and absent when that plan stage is not at
+	// awaiting_approval, overlaps[] is empty, or the overlap read failed.
+	ScopeOverlapHold string `json:"scope_overlap_hold,omitempty" jsonschema:"plan-gate hold instruction derived from scope_overlap (#5211), present only while the requested run's plan stage is parked at awaiting_approval: when overlaps[] names a live run changing the same paths, it names each run_id, issue_ref and stage/stage_state and says to keep this plan parked and revise it with fishhawk_revise_plan after that run merges, instead of approving into the conflict. An overlapping run still at its own plan stage is tie-broken by run_id: the lower run_id proceeds and the higher one holds, so two mutually overlapping parked plans get complementary instructions. Built only from the scope_overlap block in this response and the requested run's own plan stage state. Absent when the requested run's plan stage is not at awaiting_approval, overlaps[] is empty, or scope_overlap is absent (a failed read)"`
 }
 
 // PlanSplitFilingChild is one filed phased child decoded from a
@@ -1109,8 +1110,10 @@ On "available" the response also carries scope_overlap: the LIVE cross-run
 overlap of the requested run's effective scope with every other non-terminal
 run in the repository (advisory, never blocks approval; absent when the read
 failed, including for a token without read:audit). When overlaps[] is
-non-empty, scope_overlap_hold names each overlapping run and says to keep the
-plan parked and revise it after that run merges.
+non-empty and the requested run's plan stage is parked at awaiting_approval,
+scope_overlap_hold names each overlapping run and says to keep the plan
+parked and revise it after that run merges; an overlapping run still at its
+own plan stage is tie-broken by run_id (the lower proceeds, the higher holds).
 `),
 	}, resolver.getPlan)
 }
@@ -1125,10 +1128,17 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 	// Walk the chain. Cap at retryPlanChainDepth so a corrupt
 	// parent cycle can't loop the agent.
 	current := runID
+	// subjectPlanState is the REQUESTED run's own plan stage state, read from
+	// the depth-0 stage list (no extra lookup). It gates scope_overlap_hold: a
+	// run whose plan is not parked at awaiting_approval has no gate to hold.
+	subjectPlanState := ""
 	for depth := 0; depth < retryPlanChainDepth; depth++ {
-		p, found, err := r.tryGetPlanForRun(ctx, current)
+		p, planState, found, err := r.tryGetPlanForRunStage(ctx, current)
 		if err != nil {
 			return nil, GetPlanOutput{}, err
+		}
+		if depth == 0 {
+			subjectPlanState = planState
 		}
 		if found {
 			resolvedVia := "self"
@@ -1186,7 +1196,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				Reachability:     reach,
 				SplitFiling:      splitFiling,
 				ScopeOverlap:     overlap,
-				ScopeOverlapHold: scopeOverlapHoldText(overlap),
+				ScopeOverlapHold: scopeOverlapHoldText(overlap, subjectPlanState),
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -1216,15 +1226,23 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 }
 
 // scopeOverlapHoldText renders GetPlanOutput.ScopeOverlapHold (#5211 R2/R23)
-// from the scope_overlap block getPlan already fetched. It reads ONLY that
-// block's fields (no further lookup), names no repository-specific value
-// (ADR-110), and returns "" when the read failed (nil) or no run overlaps, so
-// the omitempty field is absent from the wire in both cases.
-func scopeOverlapHoldText(ov *scopeOverlap) string {
-	if ov == nil || len(ov.Overlaps) == 0 {
+// from the scope_overlap block getPlan already fetched and the requested run's
+// own plan stage state. It reads ONLY those (no further lookup), names no
+// repository-specific value (ADR-110), and returns "" when the read failed
+// (nil), no run overlaps, or the plan stage is not parked at awaiting_approval
+// (fishhawk_revise_plan refuses any other state), so the omitempty field is
+// absent from the wire then.
+//
+// Overlap is symmetric: two runs parked at their plan gates on a shared path
+// each list the other. An overlapping run still at its own plan stage is
+// tie-broken by run_id so the two reads give complementary instructions: the
+// lower run_id proceeds and the higher one holds. A run past its plan stage
+// (or one whose stage read failed) always holds this plan.
+func scopeOverlapHoldText(ov *scopeOverlap, subjectPlanState string) string {
+	if ov == nil || len(ov.Overlaps) == 0 || subjectPlanState != "awaiting_approval" {
 		return ""
 	}
-	runs := make([]string, 0, len(ov.Overlaps))
+	var holdFor, yieldTo []string
 	for _, o := range ov.Overlaps {
 		desc := "run " + o.RunID
 		if o.IssueRef != "" {
@@ -1237,12 +1255,26 @@ func scopeOverlapHoldText(ov *scopeOverlap) string {
 			}
 			desc += " at " + at
 		}
-		runs = append(runs, desc)
+		if o.Stage == "plan" && strings.ToLower(ov.RunID) < strings.ToLower(o.RunID) {
+			yieldTo = append(yieldTo, desc)
+			continue
+		}
+		holdFor = append(holdFor, desc)
 	}
-	return fmt.Sprintf("Hold: %d live run(s) change paths this plan scopes: %s. "+
-		"Keep this plan parked at its gate and revise it with fishhawk_revise_plan after the overlapping run merges, "+
-		"instead of approving into the conflict.",
-		len(ov.Overlaps), strings.Join(runs, "; "))
+	var out []string
+	if len(holdFor) > 0 {
+		out = append(out, fmt.Sprintf("Hold: %d live run(s) change paths this plan scopes: %s. "+
+			"Keep this plan parked at its gate and revise it with fishhawk_revise_plan after the overlapping run merges, "+
+			"instead of approving into the conflict.",
+			len(holdFor), strings.Join(holdFor, "; ")))
+	}
+	if len(yieldTo) > 0 {
+		out = append(out, fmt.Sprintf("Proceeds first: %d run(s) still at their plan stage share paths with this plan: %s. "+
+			"The tie-break is the lower run_id, which is this run, so those runs hold for this one; "+
+			"this pairing does not hold this plan.",
+			len(yieldTo), strings.Join(yieldTo, "; ")))
+	}
+	return strings.Join(out, " ")
 }
 
 // tryGetPlanForRun mirrors prompt.go's tryLoadPlanForRun. Returns
@@ -1250,27 +1282,36 @@ func scopeOverlapHoldText(ov *scopeOverlap) string {
 // plan stage or no usable plan artifact (caller walks to parent);
 // (nil, false, err) on transport / decode failure.
 func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*PlanContent, bool, error) {
+	p, _, found, err := r.tryGetPlanForRunStage(ctx, runID)
+	return p, found, err
+}
+
+// tryGetPlanForRunStage is tryGetPlanForRun that also returns the run's plan
+// stage state from the stage list it already read ("" when the run has no
+// plan stage), so getPlan can gate scope_overlap_hold without another read.
+func (r *runResolver) tryGetPlanForRunStage(ctx context.Context, runID uuid.UUID) (*PlanContent, string, bool, error) {
 	stages, err := r.api.ListRunStages(ctx, runID)
 	if err != nil {
-		return nil, false, fmt.Errorf("list stages: %w", err)
+		return nil, "", false, fmt.Errorf("list stages: %w", err)
 	}
-	var planStageIDStr string
+	var planStageIDStr, planState string
 	for _, st := range stages {
 		if st.Type == "plan" {
 			planStageIDStr = st.ID
+			planState = st.State
 			break
 		}
 	}
 	if planStageIDStr == "" {
-		return nil, false, nil
+		return nil, "", false, nil
 	}
 	planStageID, parseErr := uuid.Parse(planStageIDStr)
 	if parseErr != nil {
-		return nil, false, fmt.Errorf("parse plan stage id %q: %w", planStageIDStr, parseErr)
+		return nil, "", false, fmt.Errorf("parse plan stage id %q: %w", planStageIDStr, parseErr)
 	}
 	arts, err := r.api.ListStageArtifacts(ctx, planStageID)
 	if err != nil {
-		return nil, false, fmt.Errorf("list plan stage artifacts: %w", err)
+		return nil, "", false, fmt.Errorf("list plan stage artifacts: %w", err)
 	}
 	var picked *Artifact
 	for i := range arts {
@@ -1286,14 +1327,14 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 		}
 	}
 	if picked == nil {
-		return nil, false, nil
+		return nil, planState, false, nil
 	}
 	if picked.Content == nil {
 		// Backend invariant: ListStageArtifacts returns content
 		// inline. An absent content suggests a partial response we
 		// shouldn't try to parse — surface as not-yet rather than
 		// a confusing JSON parse error.
-		return nil, false, nil
+		return nil, planState, false, nil
 	}
 	// Content is typed `any` so the MCP SDK's output schema infers
 	// an unconstrained shape (rather than RawMessage's []byte =
@@ -1302,11 +1343,11 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 	// only on the plan-fetch path.
 	raw, err := json.Marshal(picked.Content)
 	if err != nil {
-		return nil, false, fmt.Errorf("re-encode plan artifact content: %w", err)
+		return nil, "", false, fmt.Errorf("re-encode plan artifact content: %w", err)
 	}
 	var p PlanContent
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, false, fmt.Errorf("decode plan artifact: %w", err)
+		return nil, "", false, fmt.Errorf("decode plan artifact: %w", err)
 	}
 	// split_proposal (#2055): the wire shape nests files under scope.files per
 	// phase; the gate-view PlanSplitPhase flattens that to Files + a derived
@@ -1314,7 +1355,7 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 	// mis-decoded) SplitProposal the top-level Unmarshal produced.
 	p.SplitProposal = mapSplitProposal(raw)
 	normalizeSubPlanDependsOn(&p)
-	return &p, true, nil
+	return &p, planState, true, nil
 }
 
 // normalizeSubPlanDependsOn turns every decomposition sub-plan's omitted
@@ -4814,7 +4855,9 @@ Gate rules — check each before approving:
   - Overlap: when fishhawk_get_plan's scope_overlap names a live run
     changing the same paths (scope_overlap_hold spells it out), keep
     this plan parked and revise it with fishhawk_revise_plan after
-    that run merges, instead of approving into the conflict.
+    that run merges, instead of approving into the conflict. When the
+    other run is also still at its plan stage, the lower run_id
+    proceeds and the higher one holds.
   - Conditions vs replan: conditions in 'reason' skip plan review, so
     they may only refine the reviewed design. A new design dependency,
     state machine, external read or fail-closed gate needs a replan.
