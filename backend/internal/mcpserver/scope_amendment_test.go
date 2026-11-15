@@ -473,3 +473,107 @@ func TestScopeAmendmentTools_DescriptionsQualifyLapse(t *testing.T) {
 		}
 	}
 }
+
+// --- #5211 R39: effective_scope_files_after_approval names the whole-plan union ---
+
+// servedListAmendmentItemPropertyDescription reads one ScopeAmendmentItem
+// property description from the SERVED fishhawk_list_scope_amendments output
+// schema (properties.items.items.properties.<property>), resolving a local
+// $ref into $defs if the reflector emitted one. It reads the tools/list result
+// an agent sees, not the Go struct tag (#5211 condition E4).
+func servedListAmendmentItemPropertyDescription(t *testing.T, property string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != "fishhawk_list_scope_amendments" {
+			continue
+		}
+		if tool.OutputSchema == nil {
+			t.Fatal("fishhawk_list_scope_amendments: no output schema on the wire")
+		}
+		raw, err := json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatalf("marshal output schema: %v", err)
+		}
+		var root map[string]any
+		if err := json.Unmarshal(raw, &root); err != nil {
+			t.Fatalf("decode output schema: %v", err)
+		}
+		defs, _ := root["$defs"].(map[string]any)
+		resolve := func(node map[string]any) map[string]any {
+			ref, _ := node["$ref"].(string)
+			if ref == "" {
+				return node
+			}
+			name := strings.TrimPrefix(ref, "#/$defs/")
+			def, _ := defs[name].(map[string]any)
+			if def == nil {
+				t.Fatalf("unresolvable $ref %q in served schema", ref)
+			}
+			return def
+		}
+		child := func(node map[string]any, keys ...string) map[string]any {
+			for _, k := range keys {
+				next, _ := node[k].(map[string]any)
+				if next == nil {
+					t.Fatalf("served schema has no %q under %v", k, keys)
+				}
+				node = resolve(next)
+			}
+			return node
+		}
+		item := child(resolve(root), "properties", "items", "items")
+		prop := child(item, "properties", property)
+		desc, _ := prop["description"].(string)
+		if desc == "" {
+			t.Fatalf("served schema property %q carries no description", property)
+		}
+		return desc
+	}
+	t.Fatal("fishhawk_list_scope_amendments: not registered/visible over ListTools")
+	return ""
+}
+
+// TestScopeAmendment_EffectiveAfterApproval_DescriptionNamesWholePlanUnion pins
+// the R39 wording (#5211) on the served schema: the count is the whole-plan
+// union the plan-approval scope-cap gate refuses on, the post-implement gate
+// counts each stage's own diff, and the text never calls the union 'advisory'.
+// Counterfactual: deleting the union or own-diff sentence from the field tag
+// reddens the matching assertion.
+func TestScopeAmendment_EffectiveAfterApproval_DescriptionNamesWholePlanUnion(t *testing.T) {
+	desc := servedListAmendmentItemPropertyDescription(t, "effective_scope_files_after_approval")
+	for _, want := range []string{
+		"WHOLE-PLAN union",
+		"422 plan_violates_scope_cap",
+		"counts each implement stage's OWN diff",
+		"a decomposition child is checked against its own files",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("effective_scope_files_after_approval must state %q:\n%s", want, desc)
+		}
+	}
+	if strings.Contains(strings.ToLower(desc), "advisory") {
+		t.Errorf("effective_scope_files_after_approval must not call the union advisory (the approval gate enforces it):\n%s", desc)
+	}
+}

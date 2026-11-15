@@ -556,3 +556,21 @@ func TestRevisePlanDescription_DocumentsRevisionBaseElision(t *testing.T) {
 		}
 	}
 }
+
+// TestRevisePlan_Description_StatesBudgetAndReReview pins the #5211 folds on
+// the wire-visible fishhawk_revise_plan description: approve-with-conditions as
+// the alternative to another pass (R5/R12), the re-review anchor (R8) and the
+// diff-before-approving step (R26). Deleting either new paragraph reddens.
+func TestRevisePlan_Description_StatesBudgetAndReReview(t *testing.T) {
+	desc := registeredToolDescription(t, "fishhawk_revise_plan")
+	for _, tc := range []struct{ rule, want string }{
+		{"R5/R12", "approving with binding conditions (fishhawk_approve_plan reason) is the\nalternative to another revise"},
+		{"R5", "the hard\nceiling is 3 passes per stage"},
+		{"R8", "fishhawk_await_review\nstage=plan. It floors the round at this revise's plan_revised entry and\nwaits for every configured reviewer"},
+		{"R26", "diff the revised plan against the prior one before\napproving"},
+	} {
+		if !strings.Contains(desc, tc.want) {
+			t.Errorf("%s: fishhawk_revise_plan description must state %q:\n%s", tc.rule, tc.want, desc)
+		}
+	}
+}

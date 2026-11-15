@@ -147,8 +147,11 @@ func (r *runResolver) reconcileReviews(ctx context.Context, _ *mcp.CallToolReque
 // — when nothing was — the reason each stage gave. Pure so a table test pins
 // it.
 func reconcileReviewsMessage(out ReconcileReviewsOutput) string {
-	var healed, skipped []string
+	var healed, skipped, recovery []string
 	for _, st := range out.Stages {
+		if clause := liveRoundShortfallClause(st); clause != "" {
+			recovery = append(recovery, clause)
+		}
 		if st.Synthesized > 0 {
 			healed = append(healed, fmt.Sprintf(
 				"%s: synthesized %d terminal entr%s for the round's missing reviewers (%d of %d reviewers had already landed and are preserved)",
@@ -161,17 +164,48 @@ func reconcileReviewsMessage(out ReconcileReviewsOutput) string {
 		}
 		skipped = append(skipped, fmt.Sprintf("%s: %s", st.Stage, reason))
 	}
+	var msg string
 	if len(healed) == 0 {
-		return "no orphaned review round was terminated — " + strings.Join(skipped, "; ") +
+		msg = "no orphaned review round was terminated — " + strings.Join(skipped, "; ") +
 			". A review this daemon still has in flight is refused on purpose (review_dispatched_by_this_process); " +
 			"an already-settled round is an idempotent no-op."
+	} else {
+		msg = strings.Join(healed, "; ") +
+			". The review gate settles once every configured reviewer has a terminal entry: re-read it with fishhawk_get_run_status or fishhawk_get_gate_view."
+		if len(skipped) > 0 {
+			msg += " Untouched — " + strings.Join(skipped, "; ") + "."
+		}
 	}
-	msg := strings.Join(healed, "; ") +
-		". The review gate settles once every configured reviewer has a terminal entry: re-read it with fishhawk_get_run_status or fishhawk_get_gate_view."
-	if len(skipped) > 0 {
-		msg += " Untouched — " + strings.Join(skipped, "; ") + "."
+	for _, clause := range recovery {
+		msg += " " + clause
 	}
 	return msg
+}
+
+// liveRoundShortfallClause renders the conditional recovery hint (#5211 R4)
+// for a stage this daemon refused as in flight while the round is still short
+// of its configured reviewers. That shape is ALSO a healthy round whose
+// reviewers are still running, so the clause leads with the wait and applies
+// only once no reviewer is left. Only a plan round has an in-place recovery: a
+// revise re-plans and opens a fresh round. An implement round has none:
+// fishhawk_rerun_review refuses a round short of configured_agents (409
+// review_round_in_flight), retry_stage needs a failed stage, and a fix-up that
+// pushes nothing restores the prior round's status rather than settling it.
+// Returns "" for every other row.
+func liveRoundShortfallClause(st ReconcileReviewsStage) string {
+	if st.Synthesized > 0 || st.SkipReason != "review_dispatched_by_this_process" || st.LandedBefore >= st.ConfiguredAgents {
+		return ""
+	}
+	clause := fmt.Sprintf(
+		"%s round: %d of %d reviewers have landed. This is also the shape of a healthy in-flight round, so wait with fishhawk_await_review stage=%s first, and treat the round as stranded only once no reviewer for the round is still running.",
+		st.Stage, st.LandedBefore, st.ConfiguredAgents, st.Stage)
+	switch st.Stage {
+	case "plan":
+		clause += " If the plan round is still short then, recover with a no-design-change fishhawk_revise_plan: it re-plans in place and opens a fresh review round, but it consumes a revise pass and the re-plan can still change the plan, so diff the new plan against the old one before approving."
+	case "implement":
+		clause += " A short implement round has no recovery verb: fishhawk_rerun_review refuses it (409 review_round_in_flight) until every configured reviewer has a terminal entry, so keep waiting for it to settle."
+	}
+	return clause
 }
 
 // plural picks the singular or plural suffix for n.

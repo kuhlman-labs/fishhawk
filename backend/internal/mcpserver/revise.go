@@ -139,6 +139,18 @@ revise_ceiling_reached error (the override no longer helps — reject and
 start a fresh run). A run-bound token may revise only its own run's
 stages.
 
+Before spending a pass: when the change only refines the reviewed design,
+approving with binding conditions (fishhawk_approve_plan reason) is the
+alternative to another revise. The normal budget is one pass and the hard
+ceiling is 3 passes per stage.
+
+After a revise: wait for the re-review with fishhawk_await_review
+stage=plan. It floors the round at this revise's plan_revised entry and
+waits for every configured reviewer, so a verdict on the prior plan is
+never returned. Then diff the revised plan against the prior one before
+approving: the whole plan is regenerated, so check what changed outside
+your constraint.
+
 Scope-regression refusal: a revise regenerates the WHOLE plan, so a
 narrowly-scoped constraint can drop files the prior plan scoped. That drop
 is neither silent nor accepted. The plan gate diffs the new plan's scoped

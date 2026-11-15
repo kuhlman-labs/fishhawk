@@ -136,3 +136,63 @@ func TestReconcileReviewsMessage(t *testing.T) {
 		t.Errorf("a skipped row with no reason should still render a reason: %q", empty)
 	}
 }
+
+// TestReconcileReviewsMessage_LiveRoundShortfall_NamesRecovery pins the
+// conditional recovery clause (#5211 R4) for a round this daemon refused as in
+// flight while it is still short of configured_agents. The clause leads with
+// the wait, because the same shape is a healthy in-flight round. A plan round
+// recovers with a no-design-change revise (which costs a revise pass); an
+// implement round has no recovery verb, because fishhawk_rerun_review refuses a
+// short round (409 review_round_in_flight). Rows 3-5 isolate the landed-count,
+// skip-reason and synthesized conditions.
+func TestReconcileReviewsMessage_LiveRoundShortfall_NamesRecovery(t *testing.T) {
+	const qualifier = "treat the round as stranded only once no reviewer for the round is still running"
+	cases := []struct {
+		name    string
+		stage   ReconcileReviewsStage
+		want    []string
+		notWant []string
+	}{
+		{
+			name:  "plan_short_live_round",
+			stage: ReconcileReviewsStage{Stage: "plan", ConfiguredAgents: 2, LandedBefore: 1, Skipped: true, SkipReason: "review_dispatched_by_this_process"},
+			want:  []string{"plan round: 1 of 2 reviewers have landed", qualifier, "fishhawk_await_review stage=plan", "fishhawk_revise_plan", "consumes a revise pass", "diff the new plan against the old one"},
+		},
+		{
+			name:    "implement_short_live_round",
+			stage:   ReconcileReviewsStage{Stage: "implement", ConfiguredAgents: 2, LandedBefore: 1, Skipped: true, SkipReason: "review_dispatched_by_this_process"},
+			want:    []string{"implement round: 1 of 2 reviewers have landed", qualifier, "fishhawk_await_review stage=implement", "no recovery verb", "409 review_round_in_flight"},
+			notWant: []string{"fishhawk_revise_plan", "consumes a revise pass", "recover with"},
+		},
+		{
+			name:    "landed_equals_configured",
+			stage:   ReconcileReviewsStage{Stage: "plan", ConfiguredAgents: 2, LandedBefore: 2, Skipped: true, SkipReason: "review_dispatched_by_this_process"},
+			notWant: []string{qualifier, "fishhawk_await_review", "fishhawk_revise_plan"},
+		},
+		{
+			name:    "round_already_settled_short",
+			stage:   ReconcileReviewsStage{Stage: "plan", ConfiguredAgents: 2, LandedBefore: 1, Skipped: true, SkipReason: "round_already_settled"},
+			notWant: []string{qualifier, "fishhawk_await_review", "fishhawk_revise_plan"},
+		},
+		{
+			name:    "healed_stage",
+			stage:   ReconcileReviewsStage{Stage: "plan", ConfiguredAgents: 2, LandedBefore: 1, Synthesized: 1, SkipReason: "review_dispatched_by_this_process"},
+			notWant: []string{qualifier, "fishhawk_await_review", "fishhawk_revise_plan"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := reconcileReviewsMessage(ReconcileReviewsOutput{Stages: []ReconcileReviewsStage{tc.stage}})
+			for _, w := range tc.want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("message missing %q: %q", w, msg)
+				}
+			}
+			for _, nw := range tc.notWant {
+				if strings.Contains(msg, nw) {
+					t.Errorf("message must not contain %q: %q", nw, msg)
+				}
+			}
+		})
+	}
+}

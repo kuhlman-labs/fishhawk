@@ -269,6 +269,13 @@ The product surfaces carry the repository-agnostic pre-flight: `fishhawk_start_c
 2. **Check the served SHA.** `/healthz` reports `git_sha`. It must equal `git rev-parse --short HEAD` on the `main` checkout the campaign binds. Rebuilt is not activated: a stale daemon assembles and drives the campaign with the old code.
 3. **Re-run the preview** after the reload and after any tracker edit, then start the campaign from the same source.
 
+## 7. Plan-gate arbitration
+
+Plan reviews are advisory; whoever holds the plan gate (the captain, or a delegated first officer) arbitrates them. The MCP runbook's *Plan gate: approve, revise or reject* section carries the full judgement; two rules decide most gates (#5211):
+
+1. **Wrong approach or localized defect.** When a plan reviewer rejects, decide what the reject is about. A wrong approach (the wrong fork, or a design that cannot meet the issue) gets a reject and a replan, or a revise when a constraint can still amend it. A sound approach with a localized defect gets an approval over the advisory reject, with a surgical condition that fixes that defect and nothing more.
+2. **Conditions refine; new design replans.** Approval conditions are fixed at approval and no plan reviewer sees them, so they may only refine the reviewed design. A design dependency, a new state machine, an external read or a fail-closed gate is new design: send it through `fishhawk_revise_plan`, or reject and replan, so the reviewers see it. Prefer revise when the direction is sound, because a reject ends the run.
+
 ## Sources
 
 | Topic | Canonical file |
