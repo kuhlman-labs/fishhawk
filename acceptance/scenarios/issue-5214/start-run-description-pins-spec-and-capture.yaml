@@ -1,15 +1,14 @@
 id: scenario:issue-5214/start-run-description-pins-spec-and-capture
 statement: In the MCP tools/list result, the fishhawk_start_run description states that the workflow spec is fixed for the run's life and that the issue context, comments included, is captured at creation and never re-read. It names cancelling and restarting the run for a late comment before the plan is dispatched, and fishhawk_reject_plan or fishhawk_revise_plan once a plan exists.
 verify_hint: 'MCP tool result: the tools/list response from a fishhawk-mcp stdio session (the hermetic equivalent is the in-process ListTools harness in backend/internal/mcpserver/tools_test.go).'
-steps: Built fishhawk-mcp from the sanctioned tree (cd backend && go build -o /tmp/fhacc5214/ ./cmd/fishhawk-mcp). Ran it over stdio with env -i PATH, an empty HOME, FISHHAWK_API_TOKEN=fictional-acceptance-token-not-real and FISHHAWK_BACKEND_URL=http://127.0.0.1:9. Sent initialize, notifications/initialized and tools/list as JSON-RPC lines, then read the fishhawk_start_run description.
-steps_carried_from: head e0d3e2cff0d09ca2178c5a7a20f768a0630009cd recorded_at 2026-11-14T22:20:34Z
+steps: In the sanctioned tree /tmp/fishhawk-acceptance-tree-f65b0607-..., ran cd backend && go build -o /tmp/fhacc5214b/ ./cmd/fishhawk-mcp. Ran it over stdio with env -i PATH=/usr/bin:/bin HOME=/tmp/fhacc5214b/home FISHHAWK_API_TOKEN=fictional-acceptance-token-not-real FISHHAWK_BACKEND_URL=http://127.0.0.1:9. Sent initialize, notifications/initialized and tools/list as JSON-RPC lines, then read the fishhawk_start_run description.
 assertions:
-    expected: Spec fixed; context including comments captured at creation and never re-read; cancel and restart before plan dispatch; reject_plan or revise_plan once a plan exists.
-    observed_at_record: '''The workflow spec bytes are pinned at creation and fixed for the run''s life ... title, body and comments are captured into issue_context at this call, and later stages read that snapshot, never re-reading the issue. A comment posted after this call never reaches the planner: cancel and restart the run before dispatching the plan. Once a plan exists, steer with fishhawk_reject_plan or fishhawk_revise_plan instead.'' The test passes.'
-    repro_handle: printf initialize/initialized/tools/list JSON-RPC | env -i ... fishhawk-mcp
+    expected: Spec fixed for the run's life; context including comments captured at creation and never re-read; cancel and restart before plan dispatch; reject_plan or revise_plan once a plan exists.
+    observed_at_record: '"The workflow spec bytes are pinned at creation and fixed for the run''s life, so a later .fishhawk/workflows.yaml edit needs a new run. The issue title, body and comments are captured into issue_context at this call, and later stages read that snapshot, never re-reading the issue. A comment posted after this call never reaches the planner: cancel and restart the run before dispatching the plan. Once a plan exists, steer with fishhawk_reject_plan or fishhawk_revise_plan instead."'
+    repro_handle: printf initialize/initialized/tools/list | env -i ... fishhawk-mcp, then jq the fishhawk_start_run description
 origin:
     issue: 5214
     pr: 5291
     run_id: f65b0607-f8e0-4cad-88e8-b0eb6075f7f6
-    head_sha: f03c1ac5772bd3d48504cd69e93a5165a7df1e43
-    recorded_at: 2026-11-15T00:50:33Z
+    head_sha: 39d8734f32bfea7c4fc8774a188cce6f56ab7a28
+    recorded_at: 2026-11-15T02:21:01Z

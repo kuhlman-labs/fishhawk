@@ -5,11 +5,11 @@ steps: Built fishhawk-mcp from the sanctioned tree and ran a stdio tools/list (e
 steps_carried_from: head e0d3e2cff0d09ca2178c5a7a20f768a0630009cd recorded_at 2026-11-14T22:20:34Z
 assertions:
     expected: Plan stages ungrouped by default and may overlap; an error mid-drive is a state signal.
-    observed_at_record: 'dispatch_stage: ''plan, review and acceptance stages join no concurrency group unless the workflow spec declares a stage concurrency block, so plan stages may overlap''. drive_run: ''A refused or errored tool call mid-drive ... is a STATE signal, not a stop condition: re-read fishhawk_get_run_status and act on its next_actions''.'
-    repro_handle: fishhawk-mcp stdio tools/list
+    observed_at_record: 'dispatch_stage: ''Only a local implement stage joins a default group: plan, review and acceptance stages join no concurrency group unless the workflow spec declares a stage concurrency block, so plan stages may overlap each other and a running implement (#5214).'' drive_run: ''A refused or errored tool call mid-drive ... is a STATE signal, not a stop condition: re-read fishhawk_get_run_status and act on its next_actions before ending the turn (#5214).'''
+    repro_handle: stdio tools/list against the built fishhawk-mcp
 origin:
     issue: 5214
     pr: 5291
     run_id: f65b0607-f8e0-4cad-88e8-b0eb6075f7f6
-    head_sha: f03c1ac5772bd3d48504cd69e93a5165a7df1e43
-    recorded_at: 2026-11-15T00:50:33Z
+    head_sha: 39d8734f32bfea7c4fc8774a188cce6f56ab7a28
+    recorded_at: 2026-11-15T02:21:01Z
