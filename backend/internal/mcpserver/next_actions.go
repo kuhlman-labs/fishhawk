@@ -1373,15 +1373,23 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 				},
 			}
 		}
+		// R40 (#5211): a settled reject verdict is advisory input the operator
+		// arbitrates. The approve and reject reasons name the arbitration; the
+		// arm keeps exactly its three actions either way.
+		approveArbitration, rejectArbitration := "", ""
+		if planReviewRejected(planReviewStatus) {
+			approveArbitration = planGateApproveOverRejectReason
+			rejectArbitration = planGateRejectOnRejectReason
+		}
 		return &NextActions{
 			State: "plan_gate_parked",
 			Actions: []SuggestedAction{
 				{
 					Action:       "fishhawk_approve_plan",
 					Params:       map[string]string{"run_id": run.ID},
-					Precondition: "read fishhawk_get_plan and the reviewer verdicts first; scope amendments in the approval reason must name files as dir/name.ext (or use add_scope_files)",
+					Precondition: "read fishhawk_get_plan and the reviewer verdicts first; scope amendments in the approval reason must name files as dir/name.ext (or use add_scope_files)" + planGateApprovePreconditionRules,
 					Consumes:     consumesApprovalSlot,
-					Reason:       "the plan is parked at its approval gate" + reviewVerdictSummary(planReviewStatus),
+					Reason:       "the plan is parked at its approval gate" + reviewVerdictSummary(planReviewStatus) + approveArbitration,
 				},
 				{
 					Action:       "fishhawk_revise_plan",
@@ -1395,7 +1403,7 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 					Params:       map[string]string{"run_id": run.ID},
 					Precondition: "the plan takes a wrong fork that approval conditions cannot amend",
 					Consumes:     consumesApprovalSlot,
-					Reason:       "a detailed rejection reason propagates to a NEW run for the same issue as PriorRejectionFeedback",
+					Reason:       "a detailed rejection reason propagates to a NEW run for the same issue as PriorRejectionFeedback" + rejectArbitration,
 				},
 			},
 		}
@@ -1411,6 +1419,39 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 	default: // pending | awaiting_host_dispatch | awaiting_children
 		return &NextActions{State: "plan_pending", Actions: dispatchOrPollActions(run, "plan", plan)}
 	}
+}
+
+// planGateApprovePreconditionRules extends the plan_gate_parked approve
+// precondition with the two checks that are cheap at the gate and expensive
+// after it (#5211 R1, R35). R1: only a plan declaring delivery partial keeps
+// the triggering issue open, so a plan that silently covers part of the issue
+// closes it anyway. R35: an all-skip_expected plan short-circuits acceptance to
+// not_validated, so the lever has to be pulled before approval.
+const planGateApprovePreconditionRules = "; a plan that does not declare delivery partial closes the triggering issue on merge, so confirm it delivers the whole issue or revise it to declare partial; " +
+	"if fishhawk_get_plan's plan_warnings reports every acceptance criterion skip_expected, act now: revise for a drivable criterion, or revise to declare acceptance_surface none when the change has no operator-observable surface, " +
+	"because otherwise the acceptance stage short-circuits to not_validated and verifies zero criteria"
+
+// planGateApproveOverRejectReason and planGateRejectOnRejectReason name the
+// R40 arbitration (#5211) on the plan_gate_parked approve and reject reasons
+// when a settled plan review returned reject.
+const (
+	planGateApproveOverRejectReason = " — a plan reviewer returned reject, so arbitrate: when the approach is sound and the reviewer found a localized defect, approve over the reject with a surgical condition that fixes that defect"
+	planGateRejectOnRejectReason    = " — a plan reviewer returned reject: reject and replan when the reviewer showed a wrong approach; a localized defect in a sound approach is an approve with a surgical condition instead"
+)
+
+// planReviewRejected reports whether any settled plan-review verdict is a
+// reject. It is read only on the plan_gate_parked arm, which the pending
+// branch has already excluded, so every verdict it sees has landed.
+func planReviewRejected(rs *ReviewStatus) bool {
+	if rs == nil {
+		return false
+	}
+	for _, rev := range rs.Reviews {
+		if rev.Verdict == "reject" {
+			return true
+		}
+	}
+	return false
 }
 
 // implementStageNextActions covers the implement stage's post-plan
