@@ -195,6 +195,17 @@ function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
 
   return (
     <div className="flex flex-col gap-3 text-sm">
+      {item.context.provenance === 'server_check' && (
+        <p
+          data-testid="server-check-notice"
+          role="note"
+          className="rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+        >
+          A deterministic server check raised this concern, not a reviewer. Only a human signed in
+          to this Web UI can waive or defer it: CLI, MCP and API tokens are refused
+          (concern_requires_session).
+        </p>
+      )}
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         Waive resolves the concern with your reason. Defer files a follow-up issue under the parent
         epic and consumes no fix-up budget — both are terminal, and both record your judgement (a

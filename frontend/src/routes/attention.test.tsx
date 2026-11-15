@@ -57,6 +57,7 @@ const CONTEXT_KEYS = new Set([
   'new_evidence',
   'dispute_reasons',
   'confirmation_note',
+  'provenance',
   'epic_ref',
   'human_led_refs',
   'detail',
@@ -154,16 +155,18 @@ describe('<Attention>', () => {
     const cards = await screen.findAllByRole('article');
     expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toBe('/v0/attention');
 
-    // Six kinds, one card each, in the server's rank order.
+    // Six kinds, one card each, in the server's rank order — paged_concern
+    // twice: a reviewer-raised concern and a server-check one (ADR-143 D1).
     expect(golden.items.map((i) => i.kind)).toEqual([
       'plan_gate',
       'scope_amendment',
       'acceptance_disposition',
       'split_verdict',
       'paged_concern',
+      'paged_concern',
       'attend_human_led_campaign',
     ]);
-    expect(cards).toHaveLength(6);
+    expect(cards).toHaveLength(7);
 
     // Every card links to exactly its item's server-emitted detail_path.
     golden.items.forEach((item, i) => {
@@ -173,7 +176,7 @@ describe('<Attention>', () => {
     });
 
     // Each kind's one-screen context prose reaches the page.
-    const [plan, amend, accept, split, paged, campaign] = cards;
+    const [plan, amend, accept, split, paged, serverCheck, campaign] = cards;
     expect(plan).toHaveTextContent(golden.items[0].context.plan_summary!);
     expect(plan).toHaveTextContent('claude-opus: approve · 1 concern');
     expect(amend).toHaveTextContent(golden.items[1].context.reason!);
@@ -195,9 +198,10 @@ describe('<Attention>', () => {
     expect(split).toHaveTextContent(golden.items[3].context.note!);
     expect(split).toHaveTextContent(golden.items[3].context.confirmation_note!);
     expect(paged).toHaveTextContent(golden.items[4].context.note!);
-    expect(campaign).toHaveTextContent(golden.items[5].context.epic_ref!);
-    expect(campaign).toHaveTextContent(golden.items[5].context.human_led_refs![0]);
-    expect(campaign).toHaveTextContent(golden.items[5].context.detail!);
+    expect(serverCheck).toHaveTextContent(golden.items[5].context.note!);
+    expect(campaign).toHaveTextContent(golden.items[6].context.epic_ref!);
+    expect(campaign).toHaveTextContent(golden.items[6].context.human_led_refs![0]);
+    expect(campaign).toHaveTextContent(golden.items[6].context.detail!);
 
     // A complete golden renders no incomplete banner. The queue is now
     // actionable (E40.2), but NO rendered button or link is a drive-plane verb.

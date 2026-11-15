@@ -9160,8 +9160,9 @@ components:
         `criteria_failed`, `criteria_skipped`, `failed_criteria` (which
         criteria failed + each one's failing request); `split_verdict` /
         `paged_concern` → `stage_kind`, `severity`, `category`,
-        `reviewer_model`, `note` (FULL prose), `new_evidence`, and for a
-        split additionally `confirmation_note`, `dispute_reasons`;
+        `reviewer_model`, `note` (FULL prose), `new_evidence`, `provenance`
+        (`server_check` for a concern a deterministic server check raised),
+        and for a split additionally `confirmation_note`, `dispute_reasons`;
         `attend_human_led_campaign` → `epic_ref`, `human_led_refs`, `detail`.
       properties:
         plan_summary: { type: string }
@@ -9212,6 +9213,16 @@ components:
         new_evidence: { type: string }
         dispute_reasons: { type: array, items: { type: string } }
         confirmation_note: { type: string }
+        provenance:
+          type: string
+          enum: [server_check]
+          description: |
+            ADR-143 D1 / #5228. `server_check` when a deterministic server
+            check raised the concern (e.g. the diff secrets check, permission
+            drift, `control_unpinned`); absent for a reviewer-raised concern.
+            Only a Web UI session can waive or defer such a concern — every
+            bearer credential is refused with `concern_requires_session` — so
+            the SPA marks the card and the decision panel.
         epic_ref: { type: string }
         human_led_refs: { type: array, items: { type: string } }
         detail: { type: string }
@@ -20429,14 +20440,36 @@ paths:
         (2, a mid-stage amendment still `pending`), `acceptance_disposition`
         (3, the acceptance gate parked at triage), `split_verdict` (4, an open
         concern a reviewer recorded as confirmed), `paged_concern` (5, any
-        other open concern at a parked implement/review gate) and
+        other open concern at a parked implement/review gate, or an open
+        server-check concern on any scanned run) and
         `attend_human_led_campaign` (6, a campaign in `awaiting_human`).
+
+        **Server-check concerns (ADR-143 D1 / #5228).** A concern with
+        `provenance: server_check` can be cleared only from a Web UI session,
+        so it is listed as a `paged_concern` carrying
+        `context.provenance: server_check` on EVERY scanned (`pending` /
+        `running`) run — whether or not an implement/review gate is parked,
+        and even past the gate-view budget. Without a parked gate (or past the
+        budget) it is listed straight from the open concern row, with no gate
+        view: `stage_id` and `detail_path` name the concern's own stage and
+        the context carries `stage_kind`, `severity`, `category`, `note`,
+        `new_evidence` and `provenance`. Reviewer-raised concerns keep the
+        parked-gate rule. An open server-check concern is NOT reachable from
+        the queue on: a terminal run (only `pending` and `running` runs are
+        scanned); a run past the 100-run scan cap or an item past `limit`
+        (`truncated: true`); a run hidden by the caller's account or
+        repository filter; and a run whose read degrades with
+        `stage_read_failed` (the run is skipped before the concern read),
+        `concern_store_unconfigured`, and `concern_read_failed`.
 
         **Bounded scans, visible completeness.** At most 100 non-terminal runs
         (`pending` + `running`, oldest first) are scanned — a bite sets
         `truncated: true`, as does cutting the ranked list at `limit`. At most
-        25 runs build a gate view for concern items per request; the rest are
-        reported as a `gate_view_budget_exhausted` entry in `degraded`. At most
+        25 runs build a gate view for concern items per request; the rest
+        contribute no reviewer-raised concern items and are reported as a
+        `gate_view_budget_exhausted` entry in `degraded` (their server-check
+        concerns are still listed). The open-concern read runs once for every
+        scanned run. At most
         50 `awaiting_human` campaigns are scanned; a bite appends
         `campaign_scan_truncated` to `degraded`. A client MUST treat
         `truncated: true` or a non-empty `degraded` as "this list is
@@ -29906,7 +29939,19 @@ paths:
             test fixture); its `concern_waived` payload then carries
             `provenance: server_check`. `details` carries `concern_id`,
             `provenance`, `verb` (`waive`) and `refused_actor`
-            (`agent_token` or `delegated`).
+            (`agent_token` or `delegated`). (5)
+            `concern_requires_session` (ADR-143 D1 / #5228): the concern was
+            raised by a server check and the request's credential kind is
+            not `session` — a NON-agent bearer (`static`, `oauth`,
+            `oauth_as`, `unrecorded` or `unknown`; an agent subject, including
+            every `mcp:run:<uuid>` token, gets the agent refusal above
+            instead), whatever its subject or channel headers. Checked after
+            the agent and delegated refusals and before any audit append or
+            mutation. The remedy is the Web UI: sign in through the forge and
+            clear it from the attention queue's decision panel; no CLI or MCP
+            path exists (ADR-143 D3). `details` carries `concern_id`,
+            `provenance`, `verb` (`waive`), `credential_kind` and
+            `remedy: web_ui_session`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30191,7 +30236,19 @@ paths:
             waived and no audit entry appended; a human, non-delegated batch
             waive is the clearing path. `details` carries the offending
             `concern_id`, `provenance`, `verb` (`bulk_waive`) and
-            `refused_actor` (`agent_token` or `delegated`).
+            `refused_actor` (`agent_token` or `delegated`). Also
+            `concern_requires_session` (ADR-143 D1 / #5228): ANY named concern was
+            raised by a server check and the request's credential kind is
+            not `session` — a NON-agent bearer (`static`, `oauth`,
+            `oauth_as`, `unrecorded` or `unknown`; an agent subject, including
+            every `mcp:run:<uuid>` token, gets the agent refusal above
+            instead), whatever its subject or channel headers. Checked after
+            the agent and delegated refusals and before any audit append or
+            mutation, so the WHOLE batch is refused. The remedy is the Web UI: sign in through the forge and
+            clear it from the attention queue's decision panel; no CLI or MCP
+            path exists (ADR-143 D3). `details` carries `concern_id`,
+            `provenance`, `verb` (`bulk_waive`), `credential_kind` and
+            `remedy: web_ui_session`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30379,8 +30436,20 @@ paths:
           description: |
             `insufficient_scope` (the token lacks both `write:stages` and
             `write:fixups`), `account_forbidden` (the bearer belongs to another
-            account), or `resolve_requires_human` (an agent subject — refused
-            before the body is read, nothing appended).
+            account), `resolve_requires_human` (an agent subject — refused
+            before the body is read, nothing appended), or
+            `concern_requires_session` (ADR-143 D1 / #5228): ANY named concern was
+            raised by a server check and the request's credential kind is
+            not `session` — a NON-agent bearer (`static`, `oauth`,
+            `oauth_as`, `unrecorded` or `unknown`; an agent subject, including
+            every `mcp:run:<uuid>` token, gets the agent refusal above
+            instead), whatever its subject or channel headers. Checked per row in
+            the all-or-nothing pre-validation, before any audit append or
+            `ApplyHumanDisposition`, so the WHOLE batch is refused. The remedy is the Web UI: sign in through the forge and
+            clear it from the attention queue's decision panel; no CLI or MCP
+            path exists (ADR-143 D3). `details` carries `concern_id`,
+            `provenance`, `verb` (`resolve_with_evidence`), `credential_kind` and
+            `remedy: web_ui_session`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30885,7 +30954,19 @@ paths:
             pre-check and before any work item is filed, so nothing is
             filed, appended or mutated; a human defer is the clearing
             path. `details` carries `concern_id`, `provenance`, `verb`
-            (`defer`) and `refused_actor` (`agent_token`).
+            (`defer`) and `refused_actor` (`agent_token`). (4)
+            `concern_requires_session` (ADR-143 D1 / #5228): the concern was
+            raised by a server check and the request's credential kind is
+            not `session` — a NON-agent bearer (`static`, `oauth`,
+            `oauth_as`, `unrecorded` or `unknown`; an agent subject, including
+            every `mcp:run:<uuid>` token, gets the agent refusal above
+            instead), whatever its subject or channel headers. Checked after
+            the agent refusal and before any work item is filed, audit
+            append or mutation. The remedy is the Web UI: sign in through the forge and
+            clear it from the attention queue's decision panel; no CLI or MCP
+            path exists (ADR-143 D3). `details` carries `concern_id`,
+            `provenance`, `verb` (`defer`), `credential_kind` and
+            `remedy: web_ui_session`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
