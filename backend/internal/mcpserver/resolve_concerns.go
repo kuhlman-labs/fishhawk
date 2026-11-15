@@ -75,7 +75,8 @@ type resolveConcernsRequestBody struct {
 //     or unlabelled judgement, a tradeoff/tradeoff_cost mismatch, or a
 //     tradeoff_cost over 4000 bytes — details.rule "tradeoff_cost_too_long")
 //   - 401 authentication_required
-//   - 403 resolve_requires_human (any agent token), insufficient_scope, or
+//   - 403 resolve_requires_human (any agent token), concern_requires_session
+//     (a server-check concern on any non-session credential), insufficient_scope, or
 //     account_forbidden
 //   - 404 concern_not_found
 //   - 409 concern_resolve_conflict (an id not in addressed_pending — the WHOLE
@@ -162,6 +163,10 @@ Returns a tool error on:
     bytes — details.rule tradeoff_cost_too_long — checked by the backend
     only)
   - resolve_requires_human (403: an agent token)
+  - concern_requires_session (403: a server-check concern in the batch —
+    it can be cleared only from the Fishhawk Web UI session; every MCP and
+    CLI credential is refused, whatever its subject — ADR-143 D1. The WHOLE
+    batch is refused and nothing is resolved)
   - concern_not_found (404)
   - concern_resolve_conflict (409: an id not in addressed_pending — the
     WHOLE batch is refused and nothing is resolved)

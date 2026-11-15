@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // --- fishhawk_waive_concern (E22.X / #984) ---
@@ -422,5 +423,80 @@ func TestConcernJudgementInputs_NotSchemaRequired(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// concernRequiresSessionBody is the backend's ADR-143 D1 refusal (#5228): a
+// server-check concern cleared on any non-session credential.
+const concernRequiresSessionBody = `{"error":{"code":"concern_requires_session","message":"only a human signed in to the Fishhawk Web UI can clear it","details":{"credential_kind":"static","remedy":"web_ui_session"}}}`
+
+// TestConcernClearTools_RegisteredAndNameSessionRefusal (ADR-143 Enablement,
+// #5228): each of the four server-check clearing tools stays REGISTERED and its
+// description names the concern_requires_session refusal and the Web UI
+// remedy, read from the registered tool list over ListTools.
+func TestConcernClearTools_RegisteredAndNameSessionRefusal(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	tools := map[string]*mcp.Tool{}
+	for _, tl := range res.Tools {
+		tools[tl.Name] = tl
+	}
+	for _, name := range []string{"fishhawk_waive_concern", "fishhawk_waive_concerns", "fishhawk_defer_concern", "fishhawk_resolve_concerns"} {
+		tl := tools[name]
+		if tl == nil {
+			t.Errorf("%s is not registered; ADR-143 keeps every D2 tool registered so it returns the refusal with its remedy", name)
+			continue
+		}
+		for _, want := range []string{"concern_requires_session", "Web UI session", "every MCP and"} {
+			if !strings.Contains(tl.Description, want) {
+				t.Errorf("%s description does not name %q", name, want)
+			}
+		}
+	}
+}
+
+// TestConcernClearTools_SessionRefusalSurfaced: each of the four tools passes
+// the backend's 403 concern_requires_session through unchanged as a tool
+// error carrying the code.
+func TestConcernClearTools_SessionRefusalSurfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.waiveStatus = http.StatusForbidden
+	fb.waiveErrBody = concernRequiresSessionBody
+	fb.bulkWaiveStatus = http.StatusForbidden
+	fb.bulkWaiveErrBody = concernRequiresSessionBody
+	fb.deferStatus = http.StatusForbidden
+	fb.deferErrBody = concernRequiresSessionBody
+	r := newResolver(srv, nil)
+	ctx := context.Background()
+
+	_, _, werr := r.waiveConcern(ctx, nil, WaiveConcernInput{ConcernID: uuid.NewString(), Reason: "known test fixture"})
+	_, _, berr := r.waiveConcerns(ctx, nil, WaiveConcernsInput{RunID: uuid.NewString(), ConcernIDs: []string{uuid.NewString()}, Reason: "known test fixture"})
+	_, _, derr := r.deferConcern(ctx, nil, DeferConcernInput{ConcernID: uuid.NewString(), ParentEpic: "#389", N: "3"})
+	stub := &resolveConcernsStub{status: http.StatusForbidden, body: concernRequiresSessionBody}
+	_, _, rerr := stub.resolver(t).resolveConcerns(ctx, nil, ResolveConcernsInput{RunID: uuid.NewString(), ConcernIDs: []string{uuid.NewString()}, Evidence: "e"})
+
+	for name, err := range map[string]error{"waive": werr, "bulk_waive": berr, "defer": derr, "resolve": rerr} {
+		if err == nil || !strings.Contains(err.Error(), "concern_requires_session") {
+			t.Errorf("%s: err = %v, want the backend's concern_requires_session surfaced", name, err)
+		}
 	}
 }

@@ -23,6 +23,13 @@ function itemOf(kind: AttentionItemKind): AttentionItem {
   return item;
 }
 
+/** The golden's server-check paged concern (context.provenance server_check). */
+function serverCheckItem(): AttentionItem {
+  const item = golden.items.find((i) => i.context.provenance === 'server_check');
+  if (!item) throw new Error('golden carries no server-check item');
+  return item;
+}
+
 function renderCard(item: AttentionItem) {
   return render(
     <MemoryRouter>
@@ -93,6 +100,24 @@ describe('<AttentionItemCard>', () => {
       screen.getByText('The degraded branch has no test asserting its reason string.'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/recorded as resolved/i)).not.toBeInTheDocument();
+  });
+
+  // COUNTERFACTUAL (run by hand): removing the `provenance === 'server_check'`
+  // conditional in ConcernContext removes the marker this test asserts → RED.
+  it('marks a server-check concern from the golden as a server check (ADR-143 D1)', () => {
+    const item = serverCheckItem();
+    expect(item.kind).toBe('paged_concern');
+    renderCard(item);
+    expect(screen.getByTestId('server-check-marker')).toHaveTextContent('Server check');
+    expect(screen.getByText('Check note')).toBeInTheDocument();
+    expect(screen.queryByText('Reviewer note')).not.toBeInTheDocument();
+  });
+
+  it('does not mark a reviewer-raised concern as a server check', () => {
+    renderCard(itemOf('paged_concern'));
+    expect(itemOf('paged_concern').context.provenance).toBeUndefined();
+    expect(screen.queryByTestId('server-check-marker')).not.toBeInTheDocument();
+    expect(screen.getByText('Reviewer note')).toBeInTheDocument();
   });
 
   it("renders a human-led campaign's epic, human-led refs and next-action detail", () => {

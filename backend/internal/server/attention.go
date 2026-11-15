@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -37,8 +38,10 @@ const (
 	// request (pending + running combined). A bite sets truncated=true.
 	attentionRunScanLimit = 100
 	// attentionGateViewBudget bounds the per-request buildGateView calls (each
-	// is several audit reads). Runs past the budget contribute no concern items
-	// and a gate_view_budget_exhausted degraded entry names how many.
+	// is several audit reads). Runs past the budget contribute no
+	// reviewer-raised concern items and a gate_view_budget_exhausted degraded
+	// entry names how many; their open server-check concerns are still listed
+	// directly (ADR-143 D1 / #5228).
 	attentionGateViewBudget = 25
 	// attentionCampaignScanLimit bounds the awaiting_human campaigns scanned. A
 	// bite appends the campaign_scan_truncated degraded reason.
@@ -162,6 +165,11 @@ type attentionContext struct {
 	// ConfirmationNote is a split verdict's other side: the note of the newest
 	// re-review that recorded the still-open concern as confirmed resolved.
 	ConfirmationNote string `json:"confirmation_note,omitempty"`
+	// Provenance is the open row's provenance: concern.ProvenanceServerCheck
+	// ("server_check") for a concern a deterministic server check raised,
+	// absent for a reviewer-raised one. A server-check concern can be cleared
+	// only from a Web UI session (ADR-143 D1), so the panel marks it.
+	Provenance string `json:"provenance,omitempty"`
 	// attend_human_led_campaign
 	EpicRef      string   `json:"epic_ref,omitempty"`
 	HumanLedRefs []string `json:"human_led_refs,omitempty"`
@@ -291,7 +299,7 @@ func (s *Server) handleListAttention(w http.ResponseWriter, r *http.Request) {
 	}
 	if overBudget > 0 {
 		col.degrade(attentionDegradedGateViewBudgetExhausted, "", "",
-			fmt.Sprintf("%d run(s) with open concerns past the %d-run gate-view budget contributed no concern items", overBudget, attentionGateViewBudget))
+			fmt.Sprintf("%d run(s) with open reviewer-raised concerns past the %d-run gate-view budget contributed no reviewer concern items (server-check concerns are still listed)", overBudget, attentionGateViewBudget))
 	}
 
 	// The campaign scan applies the SAME fail-closed repo filter: a filter
@@ -387,8 +395,13 @@ func (s *Server) collectRunAttention(ctx context.Context, ru *run.Run, col *atte
 		}
 	}
 
-	// (d) open concerns at a parked review gate: split verdicts + paged concerns.
-	if s.cfg.ConcernRepo == nil || reviewGate == nil {
+	// (d) open concerns. The read runs for EVERY scanned run (ADR-143 D1 /
+	// #5228): a server-check concern can be cleared only from the Web UI
+	// session, so the panel must reach it whether or not a gate is parked and
+	// even past the gate-view budget. Reviewer-raised concerns keep the
+	// parked-gate rule: they surface only through a parked implement/review
+	// gate's gate view, within the budget.
+	if s.cfg.ConcernRepo == nil {
 		return
 	}
 	open, cerr := s.cfg.ConcernRepo.ListOpenByRun(ctx, ru.ID)
@@ -399,18 +412,40 @@ func (s *Server) collectRunAttention(ctx context.Context, ru *run.Run, col *atte
 	if len(open) == 0 {
 		return
 	}
-	if *gateViews >= attentionGateViewBudget {
-		*overBudget++
-		return
+	if reviewGate != nil {
+		if *gateViews < attentionGateViewBudget {
+			*gateViews++
+			s.collectGateViewConcerns(ctx, ru, reviewGate, title, open, col)
+			return
+		}
+		// Past the budget only the reviewer-raised concerns go unlisted: the
+		// degraded count names the runs that lost them. Server-check rows are
+		// listed directly below.
+		for _, c := range open {
+			if !c.IsServerCheck() {
+				*overBudget++
+				break
+			}
+		}
 	}
-	*gateViews++
+	collectServerCheckConcerns(ru, title, open, col)
+}
+
+// collectGateViewConcerns emits the split_verdict / paged_concern items of a
+// run parked at an implement/review gate, from that gate's gate view. Each
+// item's context carries the open row's provenance so the panel can mark a
+// server-check concern.
+func (s *Server) collectGateViewConcerns(ctx context.Context, ru *run.Run, reviewGate *run.Stage, title string, open []*concern.Concern, col *attentionCollector) {
+	runID := ru.ID.String()
 	gv := s.buildGateView(ctx, ru.ID, "", open)
 	if gv.HistoryIncomplete {
 		col.degrade(attentionDegradedGateViewHistoryIncomplete, runID, "", strings.Join(gv.HistoryGaps, ","))
 	}
 	since := map[uuid.UUID]time.Time{}
+	provenance := map[uuid.UUID]string{}
 	for _, c := range open {
 		since[c.ID] = c.CreatedAt
+		provenance[c.ID] = c.Provenance
 	}
 	for _, c := range gv.Open {
 		kind := attentionKindPagedConcern
@@ -447,6 +482,39 @@ func (s *Server) collectRunAttention(ctx context.Context, ru *run.Run, col *atte
 				NewEvidence:      c.NewEvidence,
 				DisputeReasons:   reasons,
 				ConfirmationNote: confirmation,
+				Provenance:       provenance[c.ID],
+			},
+		})
+	}
+}
+
+// collectServerCheckConcerns lists each open server_check row directly, with
+// no gate view: the path for a run with no parked implement/review gate, or a
+// parked run past the gate-view budget. The item points at the row's own
+// stage. Reviewer-raised rows are skipped (the parked-gate rule).
+func collectServerCheckConcerns(ru *run.Run, title string, open []*concern.Concern, col *attentionCollector) {
+	runID := ru.ID.String()
+	for _, c := range open {
+		if !c.IsServerCheck() {
+			continue
+		}
+		col.add(attentionItem{
+			ID:         c.ID.String(),
+			Kind:       attentionKindPagedConcern,
+			RunID:      runID,
+			StageID:    c.StageID.String(),
+			ConcernID:  c.ID.String(),
+			Repo:       ru.Repo,
+			Title:      title,
+			DetailPath: "/runs/" + runID + "/stages/" + c.StageID.String(),
+			Since:      c.CreatedAt,
+			Context: attentionContext{
+				StageKind:   c.StageKind,
+				Severity:    c.Severity,
+				Category:    c.Category,
+				Note:        c.Note,
+				NewEvidence: c.NewEvidence,
+				Provenance:  c.Provenance,
 			},
 		})
 	}

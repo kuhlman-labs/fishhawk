@@ -87,6 +87,28 @@ func validateReviseConstraint(constraint string) (ok bool, message string, detai
 	}
 }
 
+// reviseBudgetExhaustedMessage is the 409 revise_budget_exhausted message
+// (#5211 R12): the run package's sentinel text stays the prefix, so a reader
+// matching on it is unaffected, and the remedy names the two levers the gate
+// still admits. Approving with binding conditions is named first because a
+// refinement does not need another planner pass; force_additional_pass buys
+// ONE more pass, never past defaultReviseCeiling.
+func reviseBudgetExhaustedMessage(err error) string {
+	return fmt.Sprintf(
+		"%s. Remedy: approve the plan with binding conditions in the approval reason when the remaining change is a refinement, "+
+			"or set force_additional_pass for ONE more revise pass (hard ceiling: %d passes per plan stage, forced passes included)",
+		err.Error(), defaultReviseCeiling)
+}
+
+// reviseCeilingReachedMessage is the 409 revise_ceiling_reached message
+// (#5211 R5). The ceiling is a hard stop the override cannot pass, so the
+// remedy names only the levers left at the plan gate: approve with binding
+// conditions, or reject and replan in a fresh run.
+func reviseCeilingReachedMessage(err error) string {
+	return err.Error() + ". force_additional_pass cannot pass this ceiling. Remedy: approve the plan with binding conditions " +
+		"in the approval reason when the remaining change is a refinement, or reject the plan and start a fresh run to replan"
+}
+
 // handleRevisePlan implements POST /v0/stages/{stage_id}/revise.
 //
 // The plan-gate revise verdict (E22.X / #1099) is the third plan-gate
@@ -108,9 +130,11 @@ func validateReviseConstraint(constraint string) (ok bool, message string, detai
 //   - non-plan stage, or a plan stage not at awaiting_approval → 409
 //     revise_not_applicable
 //   - revise budget already spent (no override)                 → 409
-//     revise_budget_exhausted
+//     revise_budget_exhausted (message names the remedy: approve with
+//     binding conditions, or force_additional_pass)
 //   - hard ceiling reached (override cannot push past)           → 409
-//     revise_ceiling_reached
+//     revise_ceiling_reached (message names the remedy: approve with
+//     binding conditions, or reject and replan in a fresh run)
 //   - empty constraint                                           → 400
 //     validation_failed
 //   - constraint over prompt.MaxRevisionConstraintBytes           → 400
@@ -266,11 +290,11 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 			// hard-stop error is not masked (the override cannot push past
 			// this).
 			s.writeError(w, r, http.StatusConflict, "revise_ceiling_reached",
-				err.Error(), map[string]any{"ceiling": defaultReviseCeiling, "used": priorPasses})
+				reviseCeilingReachedMessage(err), map[string]any{"ceiling": defaultReviseCeiling, "used": priorPasses})
 			return
 		case errors.Is(err, run.ErrReviseBudgetExhausted):
 			s.writeError(w, r, http.StatusConflict, "revise_budget_exhausted",
-				err.Error(), map[string]any{"max_passes": defaultMaxRevisePasses, "used": priorPasses})
+				reviseBudgetExhaustedMessage(err), map[string]any{"max_passes": defaultMaxRevisePasses, "used": priorPasses})
 			return
 		case errors.Is(err, run.ErrReviseNotApplicable):
 			s.writeError(w, r, http.StatusConflict, "revise_not_applicable",

@@ -377,6 +377,21 @@ A non-empty `approvals.members` list is an exact-match approver allow-list (`ide
 
 **Counterfactual vehicles** (`approval_members_test.go`, `approval_members_pg_test.go`): the members-leg condition forced false → T1/T13 (200 + a row); `filterListedSubjects` returning its input → T11 advances (T1 stays green — the arms are isolated); `approvalPrincipal` returning the synthetic subject → T5 refused; a delegated early return before the leg → T6 records a row; the captain branch returning `""` → T7's seated arm refused (vacant arm green); qualifying the subject → T4 (`TestSubmitApproval_Members_NonForgeSubjectUnlisted`) + `TestSubjectListed` admit; `effectiveApprovals` dropping members → T8/T1 admit; a github fallback on either run-row read failure → T10 200 / T12 advances (both assert the `callerScopedGetRunFailRepo` fault `Fired() >= 1`). Credential leg (#4633, `approval_members_test.go`, `approval_credential_test.go`, `approval_credential_pg_test.go`, `identity/credential_test.go`): the credential guard forced false → `TestSubmitApproval_Members_StaticCredentialRefused` / `…UnrecordedCredentialRefused` / `…UnknownAuthMethodRefused` / `…NoCredentialRefused`, `…DelegatedHumanStaticRefused` and `TestApprovalCredential_PostgresCrossBoundary` admit (200 + a row); `ForgeVerifiedCredential`'s default returning true → `TestForgeVerifiedCredential`; an empty or static `auth_method` mapped to the device flow → `TestApprovalCredentialKind` + the matching members test; `credentialBound` narrowed with `&& !delegated` → `…DelegatedHumanStaticRefused`; dropping the `MembersCredential` copy into the forge resolution → `TestSubmitApproval_Members_WithForgePredicateRecordsCredential`.
 
+## Credential-kind tiers: forge-verified and `session` only (ADR-123 D1, ADR-143 D1)
+
+One classifier, two tiers. `approvalCredentialKind(IdentityFrom(ctx))` (`approval_credential.go`) passes the markers `bearerAuth` and the cookie path set to `identity.CredentialKind`, the ONE classifier (ADR-123 D1, order in the credential leg above). Nothing caller-set reaches it: no header, user agent, `Mcp-*` header or body field. Two allow-lists read its answer:
+
+| Tier | Kinds admitted | Who uses it |
+|---|---|---|
+| forge-verified (`identity.ForgeVerifiedCredential` / `ForgeVerifiedKinds`) | `session`, `oauth`, `oauth_as` | the `approvals.members` credential leg (ADR-123, `approvals.go`) and the escape-closure attestation (ADR-117 A1.3, `escape.go`); the records of ADR-126 D5 and ADR-139 name the same tier |
+| `session` only (ADR-143 D1) | `session` (a cookie minted by the forge sign-in callback, `handleForgeCallback`) | the ADR-143 D2 actions: clearing a `server_check` concern by waive, bulk waive, defer or resolve-with-evidence (`concern_human_only.go::refuseServerCheckClearOffSession`, 403 `concern_requires_session`) |
+
+The records on the forge-verified tier keep it; ADR-143 adds the stricter tier and changes none of them. The `session`-only tier sits BEHIND each action's existing subject and `delegated` refusals, which run first and unchanged, so it adds a refusal and never admits what they refuse: an `mcp_run` credential always carries an `mcp:run:` subject and is refused by the agent arm before the kind is read. The closed list of D2 actions and its recorded exclusions are `human_only_actions.go`; the enforced mark on its one entry (`server_check_clear`) is the switch, pinned by `TestHumanOnlyActions_EnforcedSetPinned`. `TestHumanOnlyActions_CompletenessOverAgentRefusals` parses `server`, `captain` and `delegationconfirm` and fails when a function refusing a caller on `isAgentSubject`, `operatorrole.IsTokenSubject` or `captainActorIsAgent`, or on a delegated flag, is in neither the D2 entry nor an exclusion. Concern-side contract: `backend/internal/concern/README.md` § "Server-check provenance slice".
+
+**The four properties the `session` tier rests on** (ADR-143 D1, `human_only_properties_test.go`): (a) a session cookie on `/mcp` reaches no D2 action, because the route refuses an identity without a `TokenID` (`TestHumanOnlyProperty_MCPRefusesSessionCookie`); (b) `auth.Repository.SignIn` has exactly one production caller, `handleForgeCallback` (`TestHumanOnlyProperty_SingleSignInCaller`, an AST scan of `backend/`); (c) no route mints a session from a bearer (`TestHumanOnlyProperty_SessionMintedOnlyByCallback`); (d) neither MCP transport forwards a session cookie (`TestHumanOnlyProperty_MCPRedialForwardsNoCookie`); and (e) a session request for a D2 route without `X-CSRF-Token` is refused by the CSRF middleware, none of the four routes being `csrfExemptPath`, with the same request plus the token as the positive control (`TestHumanOnlyProperty_CSRFGuardsClearRoutes`). A second `SignIn` caller, a bearer-to-session exchange, an MCP transport that forwards cookies or a CSRF exemption for a D2 route breaks the tier and must fail one of these tests.
+
+**Residual.** A session cookie proves the session's forge identity, not human presence. It is a bearer secret: a process that can read the browser's cookie store, or drive the browser, sends a `session` request with its CSRF token and acts as that human. The tier does not claim to prevent that. A human without a Web UI session, and a deployment with no forge sign-in configured, has no path to a D2 action; ADR-143 accepts both.
+
 ## The approve advance is a compare-and-swap (`approvals.go`, E50.15 / #2656)
 
 `advanceStage`'s approve leg applied the transition with the non-CAS `RunRepo.TransitionStage`, and `postgresRepo.transitionStage`'s row-locked `from == to` short-circuit returns a **silent success**. So an approval racing one that had already advanced the stage was told it succeeded and walked straight into `finishApprovalAdvance`'s post-approval tail — `fileSplitProposalChildren` and `fileOrLinkLiveValidationWalk` — filing duplicate work items. `advanceStage` now takes the loaded `*run.Stage` and routes the approve through `casTransitionFromObserved`.
@@ -614,6 +629,7 @@ Pinned by, in `onboarding_test.go`: `TestWorkItemProviderReadinessFor` (a table 
   Bearer-token clients (CLI, server-to-server) and GET-style methods bypass; safe-listed paths (`/v0/auth/github/*`, `/webhooks/github`) bypass too.
 - ONE path-scoped exception: on `POST /v0/oauth/authorize` with a form-encoded body and no header, the middleware verifies the consent form's `csrf_token` field as a session-bound signed token (`consentcsrf.go`, #2442) instead of comparing it to the cookie — see "CSRF on `/v0/oauth/authorize`" below. The header path is unchanged on that route too.
 - Mismatch returns `403 csrf_required`.
+- No ADR-143 D2 route is exempt. The four server-check clearing routes (`POST /v0/concerns/{id}/waive`, `POST /v0/runs/{run_id}/concerns/waive`, `POST /v0/concerns/{id}/defer`, `POST /v0/runs/{run_id}/concerns/resolve`) admit only a `session` credential for a server-check concern, so their CSRF check is load-bearing for that tier (§ "Credential-kind tiers", property (e)).
 - Frontend's `frontend/src/api/client.ts` reads the cookie via `getCookie()` (`frontend/src/lib/cookie.ts`) and auto-attaches the header on every state-changing call. Vitest runs jsdom under `https://localhost/` so `__Host-` cookies are accepted (jsdom rejects them under HTTP).
 
 ### Per-path escalation enforcement (`escalation_gate.go`, E53.4 / #2227)
@@ -1042,6 +1058,10 @@ Both `fhk_` and `fhm_` are accepted with no special-casing. A cookie session is
 refused `401`, and that refusal is what makes the `csrfExemptPath` entry for
 `/mcp` safe: a browser cookie session can never reach the tool surface, so
 exempting the path cannot open a browser-driven CSRF path onto it.
+The same refusal is ADR-143 D1 property (a): because `/mcp` never serves a cookie
+session and its inner re-dial carries the caller's bearer and no `Cookie` header,
+no MCP tool call can present the `session` credential a server-check clear
+needs (§ "Credential-kind tiers").
 
 `bearerAuth` resolves an absent OR invalid bearer to the anonymous Identity and
 falls through rather than rejecting, so the 401 is emitted by `handleMCP` itself

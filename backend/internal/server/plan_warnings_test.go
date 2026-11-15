@@ -2035,3 +2035,163 @@ func TestRunPlanWarnings_SliceSharedPath(t *testing.T) {
 		}
 	}
 }
+
+// --- #5211 R35: the all-criteria-skip_expected advisory ----------------------
+
+// allSkipMarker is a stable substring of the all-skip advisory, taken from the
+// sentence that states the consequence rather than from a count.
+const allSkipMarker = "short-circuit to a not_validated verdict"
+
+// skipCriterion is a criterion marked skip_expected with an expectation_basis.
+func skipCriterion(id string) map[string]any {
+	return map[string]any{
+		"id": id, "statement": id + " is pinned by a unit test", "source": "explicit", "source_ref": "#5211",
+		"skip_expected": true, "expectation_basis": "pinned by " + id + "_test.go",
+	}
+}
+
+// withVerification replaces body's verification.acceptance_criteria (omitted
+// when criteria is nil) and sets acceptance_surface when surface is non-empty,
+// leaving the rest of the plan untouched so the cap-family advisories still
+// see the same scope.files. The result must schema-validate.
+func withVerification(t *testing.T, body []byte, criteria []map[string]any, surface string) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode plan body: %v", err)
+	}
+	v, ok := m["verification"].(map[string]any)
+	if !ok {
+		t.Fatal("plan body has no verification object")
+	}
+	if criteria != nil {
+		v["acceptance_criteria"] = toAnySlice(criteria)
+	}
+	if surface != "" {
+		v["acceptance_surface"] = surface
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(out); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return out
+}
+
+// TestRunPlanWarnings_AllCriteriaSkipExpected_Advisory (#5211 R35): the
+// all-skip advisory fires exactly when the acceptance short-circuit would run,
+// rides the persisted plan_warnings entry, and is appended LAST so every
+// earlier advisory keeps its index. The criteria marking and
+// acceptance_surface are the only fixture differences between the fire row and
+// the silent rows; each row also asserts that advisory presence equals the
+// shared predicate pair, so the advisory cannot drift from the pre-check rule.
+func TestRunPlanWarnings_AllCriteriaSkipExpected_Advisory(t *testing.T) {
+	const capLimit = 2
+	allSkip := []map[string]any{skipCriterion("route-a"), skipCriterion("route-b")}
+
+	// predicateFires is the shared predicate pair the advisory must equal.
+	predicateFires := func(t *testing.T, body []byte) bool {
+		t.Helper()
+		v := mustParsePlan(t, body).Verification
+		return plan.AcceptanceSkippableAllSkipWithBasis(v) && !plan.DeclaresNoAcceptanceSurface(v)
+	}
+	// checkPresence asserts advisory presence against both the expectation
+	// and the shared predicate, in the returned result and in every row.
+	checkPresence := func(t *testing.T, body []byte, got *PlanWarningsPayload, au *auditFake, want bool) {
+		t.Helper()
+		if p := predicateFires(t, body); p != want {
+			t.Fatalf("fixture: shared predicate = %v, want %v", p, want)
+		}
+		present := got != nil && indexOfSubstr(got.Warnings, allSkipMarker) >= 0
+		if present != want {
+			t.Errorf("advisory present = %v, want %v (shared predicate); result = %+v", present, want, got)
+		}
+		recorded := false
+		for _, e := range planWarningsEntries(t, au) {
+			if indexOfSubstr(e.Warnings, allSkipMarker) >= 0 {
+				recorded = true
+			}
+		}
+		if recorded != want {
+			t.Errorf("advisory recorded in plan_warnings = %v, want %v", recorded, want)
+		}
+	}
+
+	t.Run("every criterion skip_expected with a basis fires last and persists", func(t *testing.T) {
+		s, au := newNilRunRepoWarningsServer(t)
+		body := withNewArchitecturalDecision(t,
+			withVerification(t, warningsPlanBody(t, nil), allSkip, ""), nadDecl("ADR-082"))
+
+		got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+		checkPresence(t, body, got, au, true)
+		if got == nil || len(got.Warnings) != 2 {
+			t.Fatalf("want 2 warnings (architectural decision, then all-skip), got %+v", got)
+		}
+		if !strings.Contains(got.Warnings[0], "NEW ARCHITECTURAL DECISION") {
+			t.Errorf("warnings[0] = %q, want the pre-existing advisory kept first", got.Warnings[0])
+		}
+		w := got.Warnings[1]
+		for _, want := range []string{
+			"ALL 2 acceptance criteria skip_expected",
+			"not_validated", "ZERO criteria are verified",
+			"revise the plan for a drivable criterion",
+			"acceptance_surface none",
+			"approve knowing acceptance verifies nothing",
+		} {
+			if !strings.Contains(w, want) {
+				t.Errorf("all-skip advisory missing %q:\n%s", want, w)
+			}
+		}
+		entries := planWarningsEntries(t, au)
+		if len(entries) != 1 || len(entries[0].Warnings) != 2 || entries[0].Warnings[1] != w {
+			t.Fatalf("plan_warnings entries = %+v, want one row carrying the advisory last", entries)
+		}
+	})
+
+	t.Run("acceptance_surface none suppresses it", func(t *testing.T) {
+		s, au := newNilRunRepoWarningsServer(t)
+		body := withVerification(t, warningsPlanBody(t, nil), allSkip, plan.AcceptanceSurfaceValueNone)
+
+		got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+		checkPresence(t, body, got, au, false)
+	})
+
+	t.Run("one drivable criterion silences it", func(t *testing.T) {
+		s, au := newNilRunRepoWarningsServer(t)
+		body := withVerification(t, warningsPlanBody(t, nil),
+			[]map[string]any{skipCriterion("route-a"), drivableCriterion("route-b")}, "")
+
+		got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+		checkPresence(t, body, got, au, false)
+	})
+
+	t.Run("zero criteria is silent", func(t *testing.T) {
+		s, au := newNilRunRepoWarningsServer(t)
+		body := warningsPlanBody(t, nil)
+
+		got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+		checkPresence(t, body, got, au, false)
+		if got != nil {
+			t.Errorf("an otherwise warning-free plan with no criteria must record nothing, got %+v", got)
+		}
+	})
+
+	t.Run("over-cap all-skip plan keeps the over-cap advisory first", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+		body := withVerification(t, overCapPlanBody(t, 3, nil), allSkip, "")
+
+		got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+		checkPresence(t, body, got, au, true)
+		if got == nil || len(got.Warnings) < 2 {
+			t.Fatalf("want at least 2 warnings (over-cap first, all-skip last), got %+v", got)
+		}
+		if !hasOverCapWarning(got.Warnings[:1], 3, capLimit) {
+			t.Errorf("count-derived over-cap advisory must stay first; warnings = %v", got.Warnings)
+		}
+		if !strings.Contains(got.Warnings[len(got.Warnings)-1], allSkipMarker) {
+			t.Errorf("all-skip advisory must be last; warnings = %v", got.Warnings)
+		}
+	})
+}

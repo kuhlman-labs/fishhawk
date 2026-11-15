@@ -1,8 +1,8 @@
 # Operating model runbook
 
-Operator handoff for the E85 bridge-crew operating model (E85.7 / #4151): who does what, how to attach a first-officer seat, how to read the ops-monitor, how to interpret runner-observed counterfactual findings, and how to handle fan-in verdicts on a decomposed parent. Written for an agent or human picking this up with no prior context. This file paraphrases and links; it does not restate the contracts.
+Operator handoff for the E85 bridge-crew operating model (E85.7 / #4151): who does what, how to attach a first-officer seat, how to read the ops-monitor, how to interpret runner-observed counterfactual findings, how to handle fan-in verdicts on a decomposed parent, and which credential an agent session uses and how a human clears a server-check concern. Written for an agent or human picking this up with no prior context. This file paraphrases and links; it does not restate the contracts.
 
-**Authority.** The settled decisions are ADR-089 (first-officer seat; amended by ADR-097 and ADR-101), ADR-090 (verify the merge candidate; D5 is the fan-in hold), ADR-097 (operator as orchestrator) and ADR-099 (role naming), all under `docs/adr/`. ADR-081 (crew messages) has no in-repo record yet; it is tracker issue #3727. Where this runbook and a record disagree, the record wins; where either disagrees with the code, the package README next to the code wins and this file needs a fix.
+**Authority.** The settled decisions are ADR-089 (first-officer seat; amended by ADR-097 and ADR-101), ADR-090 (verify the merge candidate; D5 is the fan-in hold), ADR-097 (operator as orchestrator), ADR-099 (role naming) and ADR-143 (human-only actions, § 6), all under `docs/adr/`. ADR-081 (crew messages) has no in-repo record yet; it is tracker issue #3727. Where this runbook and a record disagree, the record wins; where either disagrees with the code, the package README next to the code wins and this file needs a fix.
 
 **Built vs planned.** This runbook documents only behavior on the current base. #4148 (the seat) and #4330 (host health) are PARTIAL deliveries: the identity, routes, gate hold, probes, alert row and interim dispatch hold exist; the standing-watch trigger engine, the on-request runtime, the seat spawner, the spend cap and eager retirement do not. Each section says which half is which.
 
@@ -12,8 +12,8 @@ The model productizes what two improvised sessions did by convention: one drove,
 
 | Role | Who | May | May not |
 |---|---|---|---|
-| captain | the human approver of record for a repository | approve plans and merges; attach and retire a first-officer seat; waive, defer or route a fix-up for any concern, including the human-only ones | n/a (final authority) |
-| operator | the agent that drives runs and campaigns (ADR-040, ADR-097 D1) | read gates, approve and dispatch within its delegated tier, merge, request specialist jobs, disposition concerns its tier allows | do evidence work inline (a remit, not a permission fence); attach a seat (agent callers are refused on this base; the delegated `operator_agent` grant is not built); clear a human-only concern |
+| captain | the human approver of record for a repository | approve plans and merges; attach and retire a first-officer seat; waive, defer or route a fix-up for any concern, including the human-only ones (a server-check concern only from the Web UI session, § 6) | n/a (final authority) |
+| operator | the agent that drives runs and campaigns (ADR-040, ADR-097 D1) | read gates, approve and dispatch within its delegated tier, merge, request specialist jobs, disposition concerns its tier allows | do evidence work inline (a remit, not a permission fence); attach a seat (agent callers are refused on this base; the delegated `operator_agent` grant is not built); clear a human-only concern (every agent and bearer credential is refused on a server-check one, § 6) |
 | first officer | a structurally read-only seat, one per campaign or run (ADR-089) | read runs and audit, send `finding`/`notice` crew messages to the captain, request specialist jobs over REST | approve, dispatch, merge, reap, mint tokens, write tracker state, disposition its own findings (the scope clamp and the agent classification enforce this; see § 2) |
 | away team | run agents (planner, implementer, reviewers, acceptance) and stateless specialist jobs | the one stage or one typed job they are dispatched for | anything outside the dispatched stage's scope; a specialist job never pushes, commits to a run branch, or files issues |
 
@@ -139,11 +139,11 @@ A waive, bulk waive (`fishhawk_waive_concerns`), resolve (`fishhawk_resolve_conc
 | `observed` | Recorded | Concern | Operator action |
 |---|---|---|---|
 | `red` | row | none | pinned; no action |
-| `green` | row | one open `server_check` concern, category `control_unpinned`, medium severity | the mutated control left the named tests passing, so the control is unpinned. Before concluding the test is weak, check the declaration against the head: does the mutation change behavior, and does the test selector reach the control, or does a second guard on that path make the deletion unobservable? Then strengthen the test with a fix-up (`fishhawk_fixup_stage`), or waive with a reason (`fishhawk_waive_concern`), or defer to an issue (`fishhawk_defer_concern`) |
+| `green` | row | one open `server_check` concern, category `control_unpinned`, medium severity | the mutated control left the named tests passing, so the control is unpinned. Before concluding the test is weak, check the declaration against the head: does the mutation change behavior, and does the test selector reach the control, or does a second guard on that path make the deletion unobservable? Then strengthen the test with a fix-up (`fishhawk_fixup_stage`); the concern stays open after it, because no reviewer may close a server-check concern. A human then waives it with a reason, or defers it to an issue, from the Web UI (the attention queue's decision panel, § 6). `fishhawk_waive_concern` and `fishhawk_defer_concern` are refused for it on every credential |
 | `timeout` | row | none | recorded only; the 5-minute run or 20-minute phase budget ran out; re-examine the declaration (a narrower selector, a smaller package) |
 | `error` | row | none | recorded only; the `reason` field says why (for example `baseline_not_green`, `build_failed`, `no_tests_matched`, `mutation_not_applied`, `mutation_ambiguous`, `control_not_built`); fix the declaration, because an `error` is not evidence the control works |
 
-**Who may clear a `control_unpinned` concern.** Only a human: an agent token or a delegated request is refused with 403 `concern_requires_human`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb consults only blocking concerns (high severity or first_officer provenance), so a medium `control_unpinned` concern holds only delegated settlement; read `open[]` before merging by hand.
+**Who may clear a `control_unpinned` concern.** Only a human signed in to the Web UI (ADR-143 D1, § 6). An agent subject or a delegated request is refused with 403 `concern_requires_human`, and any other bearer, a human's own CLI login or MCP token included, with 403 `concern_requires_session`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb consults only blocking concerns (high severity or first_officer provenance), so a medium `control_unpinned` concern holds only delegated settlement; read `open[]` before merging by hand.
 
 **A missing `counterfactual_observed` row has three different causes.**
 
@@ -209,13 +209,72 @@ The hold releases through the verify pass's report: the report arm settles the r
 | `fan_in_conflict` `slice_conflict` | a slice failed to merge into the consolidated branch. The conflicting child already SUCCEEDED, so `fishhawk_resume_run` refuses it (`recovery_not_eligible`); restart the item with `fishhawk_start_campaign_item_run` or `fishhawk_start_run` |
 | `fan_in_conflict` `base_fold_conflict` | the integrated head is clean but conflicts with the base's newer commits. `fishhawk_rebase_run_branch` authorizes the bounded conflict-resolution pass; the block stays until a landed fold, a rebase, a resolution push or a merged PR supersedes it |
 
-## 6. Campaign pre-flight on this repository's deployment
+## 6. Credentials for agent sessions and human-only clears
+
+**Authority.** ADR-143 (amends ADR-084 rule 5 and Amendment A1) and ADR-040 D4. Server contract: `backend/internal/concern/README.md` § "Server-check provenance slice". The ADR-143 D2 registry is `backend/internal/server/human_only_actions.go`. Refusal codes are in the `docs/api/v0.md` error table.
+
+**Which credential an agent session uses.** Every agent session runs on a credential the server classifies as an agent (`isAgentSubject`).
+
+| Session | Credential |
+|---|---|
+| a campaign driver, an MCP client an agent drives, or any session that approves and dispatches for the operator, whatever it is called | an operator-agent token: subject `operator-agent/<role-spec-version>`, issued with `fishhawkd token issue --subject operator-agent/operator-role-v0` (ADR-040 D4; `docs/spec/operator-role.md`) |
+| a read-only first-officer seat | its seat token (§ 2) |
+
+The reason: an agent-classified credential pages the human for every action the operator has not delegated (ADR-040 D2), and a human-only action refuses it by subject. A human-bound credential in an agent's client (a `fishhawk token login` login, or a static token minted with a `github:` subject) stays a supported setup (ADR-076, ADR-143 D4). The server then treats the agent as that human on every action outside the ADR-143 D2 list, and never admits it to a D2 action.
+
+**No bearer clears a server-check concern (ADR-143 D1).** A concern with provenance `server_check` comes from a deterministic server check: the diff secrets check, the permission-drift check, or a GREEN counterfactual (`control_unpinned`, § 4). Its four clearing verbs are admitted only on a Web UI session credential. The credential kind comes from server-set markers (`approvalCredentialKind`). No header, user agent or body field is read, so a channel claim changes nothing.
+
+| Request | Waive, bulk waive, defer | Resolve with operator evidence |
+|---|---|---|
+| Web UI session (the cookie the forge sign-in callback mints), not delegated | admitted | admitted (no Web UI surface calls it) |
+| agent subject: `operator-agent/…` or any `mcp:run:<uuid>` token, own run included (a first-officer seat is refused earlier, by its scope clamp) | 403 `concern_requires_human`, `refused_actor: agent_token` | 403 `resolve_requires_human` |
+| `delegated: true` (waive and bulk waive; defer and resolve carry no delegated flag) | 403 `concern_requires_human`, `refused_actor: delegated` | n/a |
+| any other bearer, human-bound or not: `static`, `oauth` (`fishhawk token login`), `oauth_as` (HTTP `/mcp` OAuth), `unrecorded`, `unknown` | 403 `concern_requires_session`, with `details.credential_kind` | 403 `concern_requires_session` |
+
+A refusal appends no audit row and changes no state. A bulk or resolve batch holding one server-check row is refused whole. A reviewer-raised concern and a `first_officer` concern (§ 2) keep their present guards. There is no CLI verb and no MCP path (ADR-143 D3). The MCP tools `fishhawk_waive_concern`, `fishhawk_waive_concerns`, `fishhawk_defer_concern` and `fishhawk_resolve_concerns` stay registered and return the refusal with its remedy. `next_actions` and the merge hold's `next_step` can still name the waive or defer verb for a server-check concern; on a bearer that call is refused, so use the Web UI path below.
+
+**One non-human retirement remains: a stage retry.** Retrying an implement stage supersedes every open implement concern of that stage, a server-check one included (`retryStageAs` in `retry.go`, through `supersedeOpenImplementConcerns`). The retry is reachable on a bearer and is delegable. It is not a clear. The retried pass re-runs the checks, and each check's de-duplication ignores superseded rows, so a credential or permission widening still in the diff is raised again. A `control_unpinned` concern comes back only if the retried pass observes its control GREEN again. If the retried pass never reaches review, because it fails or the run is cancelled, nothing raises the concern again. `TestHumanOnlyActions_CompletenessOverAgentRefusals` pins this path and the re-raise.
+
+**How a human clears one.**
+
+1. Sign in to the Fishhawk Web UI through the forge.
+2. Open the attention queue. An open server-check concern on a pending or running run is listed as a `paged_concern` marked "Server check", whether or not a gate is parked.
+3. In the decision panel, waive it with a reason and a judgement, or defer it to an issue. When the check flagged a credential, rotate the credential and remove the flagged change (a fix-up) as well.
+
+**When the queue cannot show one.** These are the named residual states. The attention queue does not reach an open server-check concern on:
+
+- a terminal run (succeeded, failed or cancelled), because the queue scans pending and running runs only;
+- a run past the 100-run scan cap, or an item past `limit` (the response reads `truncated: true`);
+- a run hidden by the caller's account or repo filter;
+- a run degraded with `stage_read_failed` (skipped before the concern read), `concern_store_unconfigured` or `concern_read_failed`.
+
+A truncated or degraded response is incomplete even when it lists nothing. On a terminal run no path clears the concern.
+
+**What an open one holds.** Delegated settlement stays held while any concern is open (the `may_approve` and `may_merge` conditions require zero open concerns), so auto-drive cannot settle the run until a human clears it. Every Fishhawk-owned merge path, the human `fishhawk_merge_run` included, holds only on a blocking concern (high severity or `first_officer` provenance). A high diff-secrets or permission-drift concern therefore holds the merge with 409 `blocking_concern_open`. A medium one (a `control_unpinned` concern, a GitHub App permission-drift concern) holds only delegated settlement, so read the gate view's `open[]` before merging by hand.
+
+**When an agent meets one.** It pages the human with the concern id and the remedy, then moves to other work. It does not retry under another credential or ask for a human's token: D1 refuses every bearer, so a retry only adds refusals.
+
+**Impact, migration and safe to ship (#5228).** These are the auth-change statements `docs/review/security-conventions.md` requires for this tightening.
+
+- **Impact inventory.** No token's scopes change, so `fishhawkd token migrate` (dry-run) is expected to report `migrated=0`; the operator pastes the live summary into the enabling PR. The real impact is by credential kind: every non-agent bearer (`static`, `oauth`, `oauth_as`, `unrecorded`, `unknown`) loses waive, bulk waive, defer and resolve on server-check concerns, and agent subjects stay refused as before. Every other action and every other concern keeps its present guard. This repository's own operator agents and MCP clients, including those on a human-bound credential, can no longer clear a diff-secrets, permission-drift or `control_unpinned` concern.
+- **Migration path.** None restores a bearer path, by design (ADR-143 D3). ADR-144 (passkey proof of presence) is ratified but not adopted for these clears; adoption is a later amendment of ADR-143. Clear from the Web UI session, and issue an operator-agent token to any agent session still on a human-bound credential.
+- **Safe to ship.** Safe with no operator token action. Accepted consequences: a human without a Web UI session, and a deployment with no forge sign-in configured, has no path to clear a server-check concern; delegated settlement stays held while one is open; a high one holds every Fishhawk-owned merge path until a human clears it from the Web UI, while a medium one does not hold the human merge; a concern on a run in one of the residual states above is not reachable from the panel; and a stage retry supersedes an open server-check concern, relying on the retried pass to raise it again, which does not happen if that pass never reaches review. A session cookie is a bearer secret: a process that can read the browser's cookie store, or drive the browser, acts as that human, and D1 does not claim to prevent it.
+- **Rollback.** A revert. The change adds no migration, schema change or audit category.
+
+## 7. Campaign pre-flight on this repository's deployment
 
 The product surfaces carry the repository-agnostic pre-flight: `fishhawk_start_campaign`'s description (preview first, prose sequencing yields no edge, a clean checkout of the base branch) and the MCP runbook's *Batch-as-campaign* step 0. When the campaign runs against Fishhawk's own local deployment from this repository, three more checks apply before `fishhawk_start_campaign` (#5214):
 
 1. **Reload when quiet.** The daemon must run the code on `main`. Use the `deploy-local` route `reload --when-quiet`, which waits for live runners and restart-blocking reviews instead of refusing on them. Never force it past a live run (`docs/agents/operations.md` § Stack lifecycle).
 2. **Check the served SHA.** `/healthz` reports `git_sha`. It must equal `git rev-parse --short HEAD` on the `main` checkout the campaign binds. Rebuilt is not activated: a stale daemon assembles and drives the campaign with the old code.
 3. **Re-run the preview** after the reload and after any tracker edit, then start the campaign from the same source.
+
+## 7. Plan-gate arbitration
+
+Plan reviews are advisory; whoever holds the plan gate (the captain, or a delegated first officer) arbitrates them. The MCP runbook's *Plan gate: approve, revise or reject* section carries the full judgement; two rules decide most gates (#5211):
+
+1. **Wrong approach or localized defect.** When a plan reviewer rejects, decide what the reject is about. A wrong approach (the wrong fork, or a design that cannot meet the issue) gets a reject and a replan, or a revise when a constraint can still amend it. A sound approach with a localized defect gets an approval over the advisory reject, with a surgical condition that fixes that defect and nothing more.
+2. **Conditions refine; new design replans.** Approval conditions are fixed at approval and no plan reviewer sees them, so they may only refine the reviewed design. A design dependency, a new state machine, an external read or a fail-closed gate is new design: send it through `fishhawk_revise_plan`, or reject and replan, so the reviewers see it. Prefer revise when the direction is sound, because a reject ends the run.
 
 ## Sources
 
@@ -239,6 +298,7 @@ The product surfaces carry the repository-agnostic pre-flight: `fishhawk_start_c
 | counterfactual declaration schema | `docs/spec/plan-standard-v1.md` |
 | counterfactual execution | `runner/README.md` |
 | concern provenance and human-only clearing | `backend/internal/concern/README.md` |
+| human-only actions and the credential-kind test | `docs/adr/143-human-only-actions-credential-kind.md`; registry `backend/internal/server/human_only_actions.go` |
 | specialist-job contract | `docs/spec/specialist-job-v1.md` |
 | fan-in integration | `backend/internal/orchestrator/README.md` |
 | autonomy tiers | `docs/METHODOLOGY.md` |

@@ -211,10 +211,12 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Human-only clearing (E80.3 / #3760): a server_check concern refuses an
-	// agent token with 403 concern_requires_human BEFORE the open-state
-	// pre-check and, crucially, before any work item is filed. Defer carries
-	// no delegated flag, so only the agent-token arm applies.
+	// Human-only clearing (E80.3 / #3760, ADR-143 D1 / #5228): a server_check
+	// concern refuses an agent token with 403 concern_requires_human, and any
+	// other request not on a `session` credential with 403
+	// concern_requires_session, BEFORE the open-state pre-check and, crucially,
+	// before any work item is filed. Defer carries no delegated flag, so the
+	// delegated arm never applies.
 	if s.refuseNonHumanServerCheckClear(w, r, row, id.Subject, false, clearVerbDefer) {
 		return
 	}

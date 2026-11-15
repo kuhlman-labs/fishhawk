@@ -33,6 +33,11 @@ type inboundCall struct {
 	path   string
 	host   string
 	auth   string
+	// cookie is the inner request's Cookie header. An MCP tool re-dial
+	// authenticates by bearer only, so it must always be empty: a forwarded
+	// browser cookie would let /mcp act as the cookie's session (ADR-143 D1,
+	// #5228; asserted by TestHumanOnlyProperty_MCPRedialForwardsNoCookie).
+	cookie string
 }
 
 // inboundRecorder wraps the real fishhawkd handler and records every /v0/
@@ -52,6 +57,7 @@ func (rec *inboundRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			path:   r.URL.Path,
 			host:   r.Host,
 			auth:   r.Header.Get("Authorization"),
+			cookie: r.Header.Get("Cookie"),
 		})
 		rec.mu.Unlock()
 	}
