@@ -227,6 +227,9 @@ Response (gate_view):
     decomposed_from, stage, stage_state, paths[]), scanned_runs,
     unscoped_runs and truncated. Advisory: it never blocks, but merging one of
     two overlapping runs while the other is mid-implement can strand it.
+    When overlaps[] names a live run changing the same paths as a plan at
+    its gate, hold that plan and revise it (fishhawk_revise_plan) after the
+    overlapping run merges, instead of approving into the conflict.
     Run-level: stage_kind does not filter it. Omitted for a run-bound token,
     when the backend's compute failed, or against an older backend.
 `),
