@@ -1001,13 +1001,14 @@ func TestGetStagePrompt_GitHubFetchFails_StillReturns200(t *testing.T) {
 }
 
 // TestGetStagePrompt_PrefersCachedIssueContext is the #415
-// headline check: when the run row carries a cached IssueContext
-// (operator-side `gh issue view` shipped the payload inline at
-// run-create), the prompt builder reads from it and never calls
-// GitHub. Local-runner runs that have no installation_id depend
-// on this path; webhook flows that DO have installation_id should
-// still prefer the cache when present (cheaper, no rate-limit
-// pressure).
+// headline check, now the NO-CREDENTIAL fallback pin: when the run row
+// carries a cached IssueContext (operator-side `gh issue view` shipped
+// the payload inline at run-create) and no installation_id, the plan
+// prompt reads from the cache and never calls GitHub. Local-runner runs
+// that have no installation_id depend on this path. A credentialed
+// plan stage re-reads the live issue instead (#5219, see
+// TestGetStagePrompt_PlanStage_LiveFetchOverridesCachedIssueContext and
+// issue_context_refresh_test.go).
 func TestGetStagePrompt_PrefersCachedIssueContext(t *testing.T) {
 	s, rr, sf, gh := newPromptServer(t)
 	runID := uuid.New()
@@ -1052,13 +1053,14 @@ func TestGetStagePrompt_PrefersCachedIssueContext(t *testing.T) {
 	}
 }
 
-// TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch
-// guards the resolution-order invariant: even when InstallationID
-// is set (webhook-dispatched run that ALSO happened to carry
-// inline context — an unlikely cohabitation, but worth pinning),
-// the cache wins and the GitHub fetch is skipped. Prevents a
-// future "let's just always re-fetch" regression.
-func TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch(t *testing.T) {
+// TestGetStagePrompt_PlanStage_LiveFetchOverridesCachedIssueContext
+// records the #415 pin REVERSAL for plan stages (#5219): it used to
+// assert that a cached IssueContext beat the GitHub fetch even when
+// InstallationID was set. A credentialed PLAN stage now re-reads the
+// live issue so a late steer reaches the planner; the cached snapshot is
+// only the fallback. The non-plan cache-wins contract is pinned by
+// TestRefreshPlanIssueContext_NonPlanStageSkipsForgeFetch.
+func TestGetStagePrompt_PlanStage_LiveFetchOverridesCachedIssueContext(t *testing.T) {
 	s, rr, sf, gh := newPromptServer(t)
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -1080,24 +1082,25 @@ func TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch(t *testing.T
 		},
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
-	// If the GitHub fetch wins (regression), this would clobber
-	// the cache values; the assertions below catch it.
 	gh.issue = &githubclient.Issue{Number: 42, Title: "FROM GITHUB", Body: "FROM GITHUB"}
 
 	w := promptRequest(t, s, runID, stageID, priv, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
-	if gh.called {
-		t.Errorf("GetIssue should NOT be called when cache is populated")
+	if !gh.called {
+		t.Errorf("GetIssue should be called on a credentialed plan stage (#5219)")
+	}
+	if gh.gotInst != 99 {
+		t.Errorf("GetIssue installation = %d, want 99", gh.gotInst)
 	}
 	var resp promptResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if !contains(resp.Prompt, "Cached body") {
-		t.Errorf("cache should win; prompt missing cached body:\n%s", resp.Prompt)
+	if !contains(resp.Prompt, "FROM GITHUB") {
+		t.Errorf("live fetch should win on a plan stage; prompt missing GitHub fetch:\n%s", resp.Prompt)
 	}
-	if contains(resp.Prompt, "FROM GITHUB") {
-		t.Errorf("cache should win; prompt unexpectedly contained GitHub fetch:\n%s", resp.Prompt)
+	if contains(resp.Prompt, "Cached body") {
+		t.Errorf("live fetch should win on a plan stage; prompt unexpectedly contained the cached body:\n%s", resp.Prompt)
 	}
 }
 

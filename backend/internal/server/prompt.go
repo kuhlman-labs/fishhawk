@@ -1642,13 +1642,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// blocks the prompt response.
 	s.markStageRunningOnPromptFetch(r.Context(), stage)
 
-	// Build the trigger context. For issue-style triggers we fetch
-	// the issue from GitHub at request time so the prompt reflects
-	// the latest title/body — the cost is one API call per stage
-	// dispatch, which is acceptable. If the issue can't be fetched
-	// (e.g., deleted, App lacks access) we still return a prompt
-	// rather than failing — the agent will work without it, just
-	// with less context.
+	// Build the trigger context. For issue-style triggers the issue
+	// context comes from the run's cached snapshot when present, else a
+	// forge fetch at request time (fillIssueContext's ladder). A PLAN stage
+	// of a credentialed run re-reads the live issue even over a cached
+	// snapshot (#5219), so a late steer reaches the planner — two forge
+	// calls per fetch, which is acceptable. If the issue can't be fetched
+	// (e.g., deleted, App lacks access) we still return a prompt rather
+	// than failing — the agent will work without it, or with the cached
+	// snapshot.
 	trigger := prompt.Trigger{
 		Source: string(runRow.TriggerSource),
 		Repo:   runRow.Repo,
@@ -1659,8 +1661,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	if runRow.TriggerRef != nil {
 		if number, ok := parseIssueRef(*runRow.TriggerRef); ok {
 			trigger.IssueNumber = number
-			if reason := s.fillIssueContext(r.Context(), github, runRow, number, &trigger); reason != "" {
-				s.emitIssueContextUnresolved(r.Context(), runRow, stage.ID, number, runForge(runRow), reason)
+			// Plan-stage refresh (#5219): a credentialed run's PLAN prompt renders
+			// the live issue from an in-memory copy of the row (promptRun), so a
+			// late steer reaches the planner; runRow and runs.issue_context are
+			// never rewritten. Every other runRow use below stays on the persisted
+			// row. The signed fetch records the rendered digest (and a drift row
+			// when the live content differs from the cache).
+			refresh := s.refreshPlanIssueContext(r.Context(), github, runRow, stage.Type, number)
+			promptRun := refresh.run
+			s.recordPlanPromptRefresh(r.Context(), runRow, stage.ID, number, refresh)
+			if reason := s.fillIssueContext(r.Context(), github, promptRun, number, &trigger); reason != "" {
+				s.emitIssueContextUnresolved(r.Context(), promptRun, stage.ID, number, runForge(promptRun), reason)
 			}
 		}
 	}
@@ -2550,8 +2561,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if runRow.TriggerRef != nil {
 		if number, ok := parseIssueRef(*runRow.TriggerRef); ok {
 			trigger.IssueNumber = number
-			if reason := s.fillIssueContext(r.Context(), github, runRow, number, &trigger); reason != "" {
-				s.emitIssueContextUnresolved(r.Context(), runRow, stage.ID, number, runForge(runRow), reason)
+			// Plan-stage refresh preview (#5219): render what the runner's signed
+			// fetch would get, WITHOUT recording any audit row.
+			preview := s.refreshPlanIssueContext(r.Context(), github, runRow, stage.Type, number)
+			promptRun := preview.run
+			if reason := s.fillIssueContext(r.Context(), github, promptRun, number, &trigger); reason != "" {
+				s.emitIssueContextUnresolved(r.Context(), promptRun, stage.ID, number, runForge(promptRun), reason)
 			}
 		}
 	}
@@ -3407,7 +3422,10 @@ const issueContextUnresolvedCategory = "issue_context_unresolved"
 // Title/body/comments resolution order (#415, #618, #621):
 //  1. The run row's cached IssueContext — present when the CLI ran
 //     `gh issue view` at run-create time and shipped the payload inline, or
-//     the operator passed issue_context. Used as-is; no forge call.
+//     the operator passed issue_context. Used as-is; no forge call. On a
+//     PLAN stage the handlers first refresh it from the live forge when the
+//     run holds a credential (#5219, issue_context_refresh.go), passing an
+//     in-memory copy of the row here; the persisted snapshot never changes.
 //  2. github family: the webhook-dispatched path — fetch via the GitHub App
 //     installation token through the issueGetter seam (byte-for-byte the
 //     pre-#3347 path; it NEVER consults cfg.ForgeResolver). A nil issueGetter
