@@ -1,0 +1,14 @@
+id: scenario:issue-5214/start-run-warns-unclean-checkout
+statement: fishhawk_start_run called with working_dir pointing at a git checkout that has an uncommitted file returns tool-result warning text naming the dirty path and the clean-the-tree remedy. A path under .fishhawk/ additionally draws the commit-the-spec-to-the-base-first warning, and a clean checkout on its base draws neither.
+verify_hint: 'MCP tool result: the fishhawk_start_run result text from a fishhawk-mcp stdio session against the localhost preview, with working_dir set to a scratch git checkout inside the allowed roots (hermetic harness: checkout_hygiene_test.go and tools_test.go).'
+steps: 'Live: called fishhawk_start_run over stdio against http://localhost:8090 with working_dir set to a dirty scratch checkout; the call returned 401 authentication_required (no operator credential exists in the sandbox). Posture B (verify_hint names checkout_hygiene_test.go/tools_test.go): (1) in the sanctioned tree, go test ./internal/mcpserver -run ''TestProbeCheckout|TestCheckoutHygiene|TestCheckoutGitCommand'' passed, including W1, W2, campaign wording, ExplicitSpec_NoW2, AdversarialPathQuotedAsData and RealGit_FsmonitorSentinel. (2) Copied the tree to /tmp/fhacc5214b/scratch and routed http.DefaultTransport in-process, because loopback connects are sandbox-denied. TestStartRun_CheckoutWarnings_Wired/_SpecSource/_IdempotentReplay/_HTTPReconfinesAtProbeTime all passed. (3) Added scratch test TestFHACC_StartRun_RealCheckout. It builds three real git clones from a bare origin (clean; dirty with untracked notes.txt; .fishhawk/workflows.yaml modified), calls r.startRun with runner_kind local and working_dir, using the unstubbed probe and spec discovery, and prints the result text.'
+assertions:
+    expected: Dirty path named with the clean-the-tree remedy; a .fishhawk/ path adds the commit-to-base warning; a clean checkout on its base draws neither.
+    observed_at_record: 'dirty: ''checkout hygiene: working_dir "..." has 1 uncommitted or untracked path(s) (git status): "notes.txt". Clean the tree (check git status; commit, stash or remove the leftovers) before dispatching a stage...''. spec: the same W1 line naming ".fishhawk/workflows.yaml" plus ''has uncommitted change(s) under .fishhawk/ ... This run pinned the WORKING-TREE workflow spec bytes ... commit the change to the base branch first, then start a new run''. clean: empty result text (no warnings).'
+    repro_handle: cd /tmp/fhacc5214b/scratch/backend && go test ./internal/mcpserver/ -run 'TestFHACC_StartRun_RealCheckout|TestStartRun_Checkout' -count=1 -v
+origin:
+    issue: 5214
+    pr: 5291
+    run_id: f65b0607-f8e0-4cad-88e8-b0eb6075f7f6
+    head_sha: 39d8734f32bfea7c4fc8774a188cce6f56ab7a28
+    recorded_at: 2026-11-15T02:21:01Z

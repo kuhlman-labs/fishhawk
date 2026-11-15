@@ -1,0 +1,14 @@
+id: scenario:issue-5214/start-run-warns-comment-budget
+statement: fishhawk_start_run called with an issue_context whose comments total more than the 12000-byte comment budget returns a warning that names how many of the oldest comments the plan prompt drops and says to put authoritative scope in the issue body or the newest comment. Comments within the budget draw no such warning.
+verify_hint: 'MCP tool result: the fishhawk_start_run result text from a fishhawk-mcp stdio session against the localhost preview with an inline issue_context (hermetic harness: TestStartRun_CommentBudgetWarning in tools_test.go).'
+steps: 'Live start_run returns 401 (no credential). Posture B in the scratch copy of the sanctioned tree with the in-process transport: TestStartRun_CommentBudgetWarning (over, under and nil cases) and _IdempotentReplay passed. Scratch test TestFHACC_StartRun_CommentBudget calls r.startRun with an inline issue_context of 8x1900-byte comments, then 3x1900-byte comments, and prints the result text.'
+assertions:
+    expected: A warning naming how many oldest comments are dropped and telling the operator to put scope in the body or newest comment; none within budget.
+    observed_at_record: '8x1900: ''the issue''s comments are over the 12000-byte total comment budget, so the plan prompt drops the 2 OLDEST comment(s) and keeps the newest (count computed from the issue''s own url). The issue BODY is never budget-dropped: put authoritative scope there, or in the newest comment, and state which takes precedence...''. 3x1900: no warning.'
+    repro_handle: cd /tmp/fhacc5214b/scratch/backend && go test ./internal/mcpserver/ -run 'TestFHACC_StartRun_CommentBudget|TestStartRun_CommentBudget' -count=1 -v
+origin:
+    issue: 5214
+    pr: 5291
+    run_id: f65b0607-f8e0-4cad-88e8-b0eb6075f7f6
+    head_sha: 39d8734f32bfea7c4fc8774a188cce6f56ab7a28
+    recorded_at: 2026-11-15T02:21:01Z

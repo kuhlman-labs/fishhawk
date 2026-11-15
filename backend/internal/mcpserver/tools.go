@@ -3218,7 +3218,7 @@ const (
 type StartRunInput struct {
 	Repo           string `json:"repo" jsonschema:"owner/name on GitHub, or the GitLab path_with_namespace (nested groups allowed); the workflow spec must live at .fishhawk/workflows.yaml in this repo"`
 	WorkflowID     string `json:"workflow_id" jsonschema:"workflow key in .fishhawk/workflows.yaml (e.g. 'feature_change')"`
-	WorkflowSHA    string `json:"workflow_sha,omitempty" jsonschema:"blob SHA of the spec file; auto-computed from the discovered spec when omitted and working_dir resolves a checkout"`
+	WorkflowSHA    string `json:"workflow_sha,omitempty" jsonschema:"blob SHA of the spec file; auto-computed from the discovered spec when omitted and working_dir resolves a checkout. The spec bytes are pinned at creation and fixed for the run's life: a later .fishhawk/workflows.yaml edit needs a new run"`
 	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui', 'on_demand'; defaults to 'cli' when omitted, auto-flips to 'github_issue' when issue or issue_context is set. Pass 'on_demand' explicitly to start a NON-DIFF run (e.g. backlog_grooming, whose applies_to declares trigger: [scheduled, on_demand]); an explicit value is never overridden by the auto-flip, so 'on_demand' can be combined with issue/issue_context"`
 	TriggerRef     string `json:"trigger_ref,omitempty" jsonschema:"optional reference (e.g. 'issue:42') threading the run to its trigger; auto-derived from issue when omitted"`
 	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"E8.2 idempotency token; a second call with the same (repo, key) returns the existing run with Idempotent=true instead of fresh-creating"`
@@ -3248,7 +3248,7 @@ type StartRunInput struct {
 	// checkout) rather than a field description. The MCP server also walks up
 	// from this directory to `.fishhawk/workflows.yaml` to auto-discover the
 	// spec; that discovery only runs when this is set.
-	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this run executes in. REQUIRED over the HTTP transport when runner_kind is local. It is bound to the run here and the later runner-spawning verbs (run_stage, dispatch_stage, run_children, drive_run) INHERIT it, so you pass it once. YOU — the calling agent — resolve your own checkout (you are running inside one); do NOT ask the operator for a path. Also the directory the server searches for .fishhawk/workflows.yaml. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this run executes in. REQUIRED over the HTTP transport when runner_kind is local. It is bound to the run here and the later runner-spawning verbs (run_stage, dispatch_stage, run_children, drive_run) INHERIT it, so you pass it once. YOU — the calling agent — resolve your own checkout (you are running inside one); do NOT ask the operator for a path. Bind a clean checkout of the base branch, not a session-scoped worktree carrying unmerged commits; the result's warnings text reports a dirty or off-base checkout. Also the directory the server searches for .fishhawk/workflows.yaml. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 
 	// SpecFile overrides the walk-up auto-discovery with an
 	// explicit path. Used when the spec lives outside the
@@ -3411,6 +3411,20 @@ ships the bytes inline so the backend creates stages. Pass issue
 (a number, #N, or full URL) and the server shells to gh and ships
 the title/body inline so the prompt builder uses the cached payload.
 
+The workflow spec bytes are pinned at creation and fixed for the run's
+life, so a later .fishhawk/workflows.yaml edit needs a new run. The
+issue title, body and comments are captured into issue_context at this
+call, and later stages read that snapshot, never re-reading the issue.
+A comment posted after this call never reaches the planner: cancel and
+restart the run before dispatching the plan. Once a plan exists, steer
+with fishhawk_reject_plan or fishhawk_revise_plan instead.
+
+The result's warnings text reports an unclean or off-base working_dir
+(dirty tree, uncommitted .fishhawk/ edits, HEAD detached or off the
+remote default branch as last fetched), comments over the per-comment
+cap, and comments over the total comment budget (how many of the oldest
+the plan prompt drops). Warnings never block the create.
+
 Idempotency: when idempotency_key is set, a previously-created run
 with the same (repo, key) returns 200 with Idempotent=true instead
 of fresh-creating a duplicate. Re-running this call after a network
@@ -3487,6 +3501,34 @@ func overCapCommentWarnings(ic *IssueContext) []string {
 	}
 	return out
 }
+
+// issueCommentBudgetWarnings warns when the resolved issue context's comments
+// together exceed prompt.MaxTotalIssueCommentBytes (#5214), naming how many of
+// the OLDEST comments the plan prompt drops. The count is
+// prompt.OmittedIssueCommentCount over the same comments, computed from the
+// issue context's own url (the renderer's first-choice URL; it changes only an
+// over-cap comment's marker bytes), so it is the N the prompt's omission marker
+// prints. Returns nil when nothing is dropped.
+func issueCommentBudgetWarnings(ic *IssueContext) []string {
+	if ic == nil || len(ic.Comments) == 0 {
+		return nil
+	}
+	comments := make([]prompt.IssueComment, len(ic.Comments))
+	for i, c := range ic.Comments {
+		comments[i] = prompt.IssueComment{Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt}
+	}
+	n := prompt.OmittedIssueCommentCount(comments, ic.URL)
+	if n == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"the issue's comments are over the %d-byte total comment budget, so the plan prompt drops the %d OLDEST comment(s) and keeps the newest (count computed from the issue's own url). The issue BODY is never budget-dropped: put authoritative scope there, or in the newest comment, and state which takes precedence (the planner is told a later comment may supersede the body).",
+		prompt.MaxTotalIssueCommentBytes, n)}
+}
+
+// startRunCheckoutProbe is startRun's checkout-hygiene probe seam (#5214);
+// tests stub it.
+var startRunCheckoutProbe = probeCheckout
 
 func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in StartRunInput) (*mcp.CallToolResult, StartRunOutput, error) {
 	if in.Repo == "" {
@@ -3565,6 +3607,10 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// only useful for tests).
 	specBytes := []byte(in.WorkflowSpec)
 	computedSHA := ""
+	// checkoutSurface records where the pinned spec came from, for the
+	// checkout-hygiene warning wording (#5214): only a spec auto-discovered from
+	// working_dir is the checkout's WORKING-TREE .fishhawk/ bytes.
+	checkoutSurface := checkoutSurfaceStartRunExplicitSpec
 	if len(specBytes) == 0 && (in.WorkingDir != "" || in.SpecFile != "") {
 		startDir := in.WorkingDir
 		if startDir == "" {
@@ -3577,6 +3623,9 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 		if found != nil {
 			specBytes = found.Contents
 			computedSHA = found.BlobSHA
+			if in.SpecFile == "" {
+				checkoutSurface = checkoutSurfaceStartRunDiscovered
+			}
 			// Pre-parse so a YAML/schema typo is a fast local
 			// failure instead of a backend round-trip.
 			if perr := specValidate(specBytes); perr != nil {
@@ -3684,6 +3733,8 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// per-comment capped). This is the MCP-path visibility surface; runs with no
 	// tool result (webhook / campaign) get the server-side WARN in fillIssueContext.
 	warnings = append(warnings, overCapCommentWarnings(issueContext)...)
+	// The total-budget warning (#5214) is composed after the create, below: on
+	// an idempotent replay it must read the replayed run's own snapshot.
 
 	// (7) Validate the trigger_source / issue_context pairing.
 	// Mirrors the backend handler's check — better to fail here
@@ -3745,6 +3796,32 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
 	}
+
+	// Total-budget warning (#5214): the per-comment warning above cannot see
+	// that the comments TOGETHER exceed prompt.MaxTotalIssueCommentBytes, which
+	// silently drops the OLDEST ones from the plan prompt. An idempotent replay
+	// returns an EXISTING run whose prompt reads the issue_context captured at
+	// its original creation, so the count is computed from that snapshot (none
+	// on the response: no warning), not from this call's fresh fetch.
+	budgetContext := issueContext
+	if idempotent {
+		budgetContext = created.IssueContext
+	}
+	warnings = append(warnings, issueCommentBudgetWarnings(budgetContext)...)
+
+	// Checkout hygiene (#5214): best-effort, offline report of a dirty tree,
+	// uncommitted .fishhawk/ edits, or a HEAD off the remote default branch. It
+	// never fails the create. checkoutWarningsFor re-confines the path at probe
+	// time over HTTP and runs git on the RESOLVED path, so a symlink swapped in
+	// after the admission check above cannot point the probe outside the
+	// allowed roots. A replay of a DISCOVERED-spec call reports the checkout at
+	// this call without claiming it is what the existing run pinned; a replay
+	// of an inline workflow_spec or spec_file call keeps the explicit-spec
+	// surface, so W2 still does not fire (approval condition C5).
+	if idempotent && checkoutSurface == checkoutSurfaceStartRunDiscovered {
+		checkoutSurface = checkoutSurfaceStartRunReplay
+	}
+	warnings = append(warnings, r.checkoutWarningsFor(ctx, startRunCheckoutProbe, checkoutSurface, boundWorkingDir)...)
 
 	out := StartRunOutput{Run: *created, Idempotent: idempotent}
 	// Best-effort periodic-budget status (#693). A parse failure on the

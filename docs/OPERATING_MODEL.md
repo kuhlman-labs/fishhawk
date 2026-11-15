@@ -261,6 +261,14 @@ A truncated or degraded response is incomplete even when it lists nothing. On a 
 - **Safe to ship.** Safe with no operator token action. Accepted consequences: a human without a Web UI session, and a deployment with no forge sign-in configured, has no path to clear a server-check concern; delegated settlement stays held while one is open; a high one holds every Fishhawk-owned merge path until a human clears it from the Web UI, while a medium one does not hold the human merge; a concern on a run in one of the residual states above is not reachable from the panel; and a stage retry supersedes an open server-check concern, relying on the retried pass to raise it again, which does not happen if that pass never reaches review. A session cookie is a bearer secret: a process that can read the browser's cookie store, or drive the browser, acts as that human, and D1 does not claim to prevent it.
 - **Rollback.** A revert. The change adds no migration, schema change or audit category.
 
+## 7. Campaign pre-flight on this repository's deployment
+
+The product surfaces carry the repository-agnostic pre-flight: `fishhawk_start_campaign`'s description (preview first, prose sequencing yields no edge, a clean checkout of the base branch) and the MCP runbook's *Batch-as-campaign* step 0. When the campaign runs against Fishhawk's own local deployment from this repository, three more checks apply before `fishhawk_start_campaign` (#5214):
+
+1. **Reload when quiet.** The daemon must run the code on `main`. Use the `deploy-local` route `reload --when-quiet`, which waits for live runners and restart-blocking reviews instead of refusing on them. Never force it past a live run (`docs/agents/operations.md` § Stack lifecycle).
+2. **Check the served SHA.** `/healthz` reports `git_sha`. It must equal `git rev-parse --short HEAD` on the `main` checkout the campaign binds. Rebuilt is not activated: a stale daemon assembles and drives the campaign with the old code.
+3. **Re-run the preview** after the reload and after any tracker edit, then start the campaign from the same source.
+
 ## Sources
 
 | Topic | Canonical file |

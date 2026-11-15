@@ -174,7 +174,11 @@ command to run.
 
 Local concurrency slots (#3964 / ADR-087): by default one local IMPLEMENT
 stage runs per host at a time (group local-implement:<host>, limit 1; a
-workflow-v2 stage "concurrency" block overrides it). An implement stage
+workflow-v2 stage "concurrency" block overrides it). Only a local implement
+stage joins a default group: plan, review and acceptance stages join no
+concurrency group unless the workflow spec declares a stage concurrency block,
+so plan stages may overlap each other and a running implement (#5214).
+Acceptance serializes only on its shared preview slot. An implement stage
 re-opened for a merge-candidate VERIFY-ONLY pass (ADR-090/ADR-092 D3: a live
 stage_merge_candidate_verify_triggered row, no agent) is admitted through its
 own group local-verify:<host>, limit 1, never behind a queued full implement;

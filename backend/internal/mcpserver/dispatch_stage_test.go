@@ -3108,3 +3108,20 @@ func TestDispatchStage_UnresolvedDefaultBranch_RefusesBeforeMarker(t *testing.T)
 		t.Fatalf("record-act POSTs = %d, host-dispatch markers = %d, spawns = %d; the refusal must commit nothing", acts, marks, spawns)
 	}
 }
+
+// TestDispatchStage_Description_PlansUngrouped pins the #5214 rule 11 sentence:
+// only a local implement joins a default concurrency group, so plan stages are
+// ungrouped (mirrors server resolveStageConcurrency).
+func TestDispatchStage_Description_PlansUngrouped(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_dispatch_stage"]
+	for _, want := range []string{
+		"Only a local implement",
+		"join no",
+		"plan stages may overlap each other and a running implement",
+		"Acceptance serializes only on its shared preview slot",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_dispatch_stage description missing %q:\n%s", want, desc)
+		}
+	}
+}
