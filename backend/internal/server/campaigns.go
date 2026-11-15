@@ -161,9 +161,10 @@ type campaignResponse struct {
 	SatisfiedDependencies []satisfiedDependencyPayload `json:"satisfied_dependencies,omitempty"`
 	// AdmissionScreen is the ADVISORY admission screen (#3649): candidates
 	// declared `runnable:no` and candidates whose title/body names a path the
-	// repo's implement-stage forbidden_paths forbid. CREATE-response-only like
-	// SatisfiedDependencies (never persisted, so GET/list omit it), omitted
-	// when the screen found nothing. It never blocks or alters the create.
+	// repo's implement-stage forbidden_paths forbid. Carried by the create
+	// response and by the preview response (#5221); never persisted, so
+	// GET/list omit it, and omitted when the screen found nothing. It never
+	// blocks or alters the create or the preview.
 	AdmissionScreen *campaignAdmissionScreenPayload `json:"admission_screen,omitempty"`
 	// Warnings names every item whose depends_on relies on a legacy free-text
 	// `Depends on:` line rather than the tracker's native relation (#4028).
@@ -1038,8 +1039,9 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// informational — the campaign was created regardless. Nil = no item relies
 	// on a legacy `Depends on:` line → no key.
 	resp.Warnings = legacyDependencyWarnings(result)
-	// The admission screen block (#3649): create-response-only, plus one
-	// best-effort audit copy. Nil = nothing found → no key, no audit.
+	// The admission screen block (#3649): rendered on the create response (the
+	// preview carries it too, #5221), plus one best-effort audit copy that only
+	// create writes. Nil = nothing found → no key, no audit.
 	if admissionScreen != nil {
 		resp.AdmissionScreen = admissionScreen
 		s.emitCampaignAudit(r.Context(), categoryCampaignAdmissionScreened, map[string]any{

@@ -3428,8 +3428,8 @@ per-tool contract). Internals not covered there:
   **Advisory screens (#5221).** `CampaignPreview` mirrors the backend's two ADVISORY blocks, present on the valid,
   dangling and cycle reports alike and only when they found something. `admission_screen` reuses the create's
   `campaignAdmissionScreen` mirror: the same #3649 screen, with no audit row on the preview. `path_overlap`
-  (`campaignPreviewPathOverlap` / `campaignPreviewPathOverlapPair`, unexported) is `{advisory, pairs[{items, paths,
-  class, remedy}], total_pairs, truncated?}`: unordered item pairs whose title or body name the same file path,
+  (`campaignPreviewPathOverlap` / `campaignPreviewPathOverlapPair`, unexported) is `{advisory, pairs[{items, paths (max 10),
+  paths_truncated?, class, remedy}], total_pairs, truncated?}`: unordered item pairs whose title or body name the same file path,
   `class` `code` or `docs_only`. It is lexical over issue prose, so it has the false positives and negatives the
   backend documents (`backend/internal/server/campaign_preview_screen.go`). Neither block changes `valid`, `waves`
   or `items`. `TestPreviewCampaign_ScreensPassthrough` decodes LITERAL server-shaped JSON through the real client, so

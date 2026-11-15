@@ -6198,7 +6198,10 @@ components:
         paths:
           type: array
           items: { type: string }
-          description: The shared path tokens, cleaned and sorted. Only filtered path tokens, never free issue text.
+          description: The shared path tokens, cleaned and sorted, capped at 10 per pair. Only filtered path tokens, never free issue text.
+        paths_truncated:
+          type: boolean
+          description: Present and `true` when the pair shared more than 10 paths and `paths` lists only the first 10 sorted ones.
         class:
           type: string
           enum: [code, docs_only]

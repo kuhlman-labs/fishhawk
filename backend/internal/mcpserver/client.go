@@ -5531,10 +5531,11 @@ type campaignPreviewPathOverlap struct {
 // campaignPreviewPathOverlapPair mirrors the backend's
 // campaignPreviewPathOverlapPair (#5221): one unordered item pair.
 type campaignPreviewPathOverlapPair struct {
-	Items  []string `json:"items" jsonschema:"the two issue refs, lower number first, as issue:N"`
-	Paths  []string `json:"paths" jsonschema:"the shared path tokens, filtered and cleaned, sorted"`
-	Class  string   `json:"class" jsonschema:"code or docs_only. docs_only means every shared path is documentation (.md, .mdx, .markdown, .rst or .adoc outside docs/review, docs/spec, docs/adr and docs/compliance, and not an instruction file): parallel plans are fine. code means the plans may conflict: add a native blocked-by link or confirm they touch unrelated parts of the file"`
-	Remedy string   `json:"remedy" jsonschema:"what to do about this pair"`
+	Items          []string `json:"items" jsonschema:"the two issue refs, lower number first, as issue:N"`
+	Paths          []string `json:"paths" jsonschema:"the shared path tokens, filtered and cleaned, sorted; capped at 10 per pair"`
+	PathsTruncated bool     `json:"paths_truncated,omitempty" jsonschema:"true when the pair shared more than 10 paths and paths lists only the first 10 sorted ones"`
+	Class          string   `json:"class" jsonschema:"code or docs_only. docs_only means every shared path is documentation (.md, .mdx, .markdown, .rst or .adoc outside docs/review, docs/spec, docs/adr and docs/compliance, and not an instruction file): parallel plans are fine. code means the plans may conflict: add a native blocked-by link or confirm they touch unrelated parts of the file"`
+	Remedy         string   `json:"remedy" jsonschema:"what to do about this pair"`
 }
 
 // PreviewCampaign runs the NON-MUTATING dry run of POST /v0/campaigns via

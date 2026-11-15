@@ -51,6 +51,12 @@ const (
 	// the uncapped count.
 	previewPathOverlapMaxPairs = 50
 
+	// previewPathOverlapMaxPathsPerPair caps the paths listed in one pair, so
+	// two issues that paste the same file listing cannot inflate every pair of
+	// the block. The class, rank and overlap decision use the full shared set;
+	// only the listed paths are capped, and paths_truncated says so.
+	previewPathOverlapMaxPathsPerPair = 10
+
 	previewOverlapClassCode     = "code"
 	previewOverlapClassDocsOnly = "docs_only"
 
@@ -130,8 +136,13 @@ type campaignPreviewPathOverlap struct {
 type campaignPreviewPathOverlapPair struct {
 	// Items are the two issue refs, lower number first.
 	Items []string `json:"items"`
-	// Paths are the shared, filtered, cleaned path tokens, sorted.
+	// Paths are the shared, filtered, cleaned path tokens, sorted, capped at
+	// previewPathOverlapMaxPathsPerPair.
 	Paths []string `json:"paths"`
+	// PathsTruncated is true when the pair shared more than
+	// previewPathOverlapMaxPathsPerPair paths and Paths lists only the first
+	// sorted ones.
+	PathsTruncated bool `json:"paths_truncated,omitempty"`
 	// Class is docs_only when every shared path is documentation
 	// (isDocumentationPath), otherwise code.
 	Class  string `json:"class"`
@@ -213,12 +224,17 @@ func evaluatePreviewPathOverlap(children []workmgmt.EpicChild, edges []workmgmt.
 					minFanout = fanout[p]
 				}
 			}
+			listed, pathsTruncated := shared, false
+			if len(listed) > previewPathOverlapMaxPathsPerPair {
+				listed, pathsTruncated = listed[:previewPathOverlapMaxPathsPerPair], true
+			}
 			ranked = append(ranked, rankedPair{
 				pair: campaignPreviewPathOverlapPair{
-					Items:  []string{"issue:" + strconv.Itoa(a), "issue:" + strconv.Itoa(b)},
-					Paths:  shared,
-					Class:  class,
-					Remedy: remedy,
+					Items:          []string{"issue:" + strconv.Itoa(a), "issue:" + strconv.Itoa(b)},
+					Paths:          listed,
+					PathsTruncated: pathsTruncated,
+					Class:          class,
+					Remedy:         remedy,
 				},
 				fanout: minFanout,
 				a:      a,

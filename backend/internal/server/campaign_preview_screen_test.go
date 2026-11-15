@@ -200,6 +200,57 @@ func TestEvaluatePreviewPathOverlap_CapKeepsSpecificPairs(t *testing.T) {
 	}
 }
 
+// A pair's listed paths are capped, and the cap is only a display limit: the
+// ten sorted-first paths here are all documentation, so a class decided on the
+// listed paths would say docs_only, while the full shared set includes code.
+func TestEvaluatePreviewPathOverlap_CapsPathsPerPair(t *testing.T) {
+	var body string
+	var wantListed []string
+	for n := 1; n <= 10; n++ {
+		p := "docs/guides/a" + strconv.Itoa(100+n) + ".md"
+		body += "see " + p + " "
+		wantListed = append(wantListed, p)
+	}
+	for n := 1; n <= 5; n++ {
+		body += "edit src/pkg/z" + strconv.Itoa(100+n) + ".go "
+	}
+	got := evaluatePreviewPathOverlap([]workmgmt.EpicChild{
+		overlapChild(101, "a", body),
+		overlapChild(102, "b", body),
+	}, nil)
+	if got == nil || len(got.Pairs) != 1 {
+		t.Fatalf("overlap = %+v, want one pair", got)
+	}
+	pair := got.Pairs[0]
+	if !reflect.DeepEqual(pair.Paths, wantListed) {
+		t.Errorf("paths = %v, want the first %d sorted: %v", pair.Paths, previewPathOverlapMaxPathsPerPair, wantListed)
+	}
+	if !pair.PathsTruncated {
+		t.Error("paths_truncated = false, want true for 15 shared paths")
+	}
+	if pair.Class != previewOverlapClassCode {
+		t.Errorf("class = %q, want code: the cap must not change the class decision", pair.Class)
+	}
+}
+
+// At exactly the cap nothing is dropped and no marker is set.
+func TestEvaluatePreviewPathOverlap_PathsAtCapNotTruncated(t *testing.T) {
+	var body string
+	for n := 1; n <= previewPathOverlapMaxPathsPerPair; n++ {
+		body += "edit src/pkg/f" + strconv.Itoa(100+n) + ".go "
+	}
+	got := evaluatePreviewPathOverlap([]workmgmt.EpicChild{
+		overlapChild(101, "a", body),
+		overlapChild(102, "b", body),
+	}, nil)
+	if got == nil || len(got.Pairs) != 1 {
+		t.Fatalf("overlap = %+v, want one pair", got)
+	}
+	if len(got.Pairs[0].Paths) != previewPathOverlapMaxPathsPerPair || got.Pairs[0].PathsTruncated {
+		t.Errorf("paths=%d truncated=%v, want %d false", len(got.Pairs[0].Paths), got.Pairs[0].PathsTruncated, previewPathOverlapMaxPathsPerPair)
+	}
+}
+
 // Within one fanout, code pairs rank before docs_only pairs.
 func TestEvaluatePreviewPathOverlap_CodeBeforeDocsOnlyAtEqualFanout(t *testing.T) {
 	got := evaluatePreviewPathOverlap([]workmgmt.EpicChild{
