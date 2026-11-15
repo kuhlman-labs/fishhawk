@@ -203,7 +203,7 @@ function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
         >
           A deterministic server check raised this concern, not a reviewer. Only a human signed in
           to this Web UI can waive or defer it: CLI, MCP and API tokens are refused
-          (concern_requires_session).
+          (concern_requires_session, or concern_requires_human for an agent token).
         </p>
       )}
       <p className="text-xs text-neutral-500 dark:text-neutral-400">

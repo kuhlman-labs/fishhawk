@@ -9220,9 +9220,13 @@ components:
             ADR-143 D1 / #5228. `server_check` when a deterministic server
             check raised the concern (e.g. the diff secrets check, permission
             drift, `control_unpinned`); absent for a reviewer-raised concern.
-            Only a Web UI session can waive or defer such a concern — every
-            bearer credential is refused with `concern_requires_session` — so
-            the SPA marks the card and the decision panel.
+            Only a Web UI session can waive, defer or resolve such a concern,
+            so the SPA marks the card and the decision panel. An agent
+            credential (`operator-agent/…` or a run-bound `mcp:run:<uuid>`)
+            keeps its existing refusal: `concern_requires_human` on waive,
+            bulk waive and defer, `resolve_requires_human` on resolve. Every
+            other bearer (`static`, `oauth`, `oauth_as`, `unrecorded`,
+            `unknown`) is refused with `concern_requires_session`.
         epic_ref: { type: string }
         human_led_refs: { type: array, items: { type: string } }
         detail: { type: string }
