@@ -54,11 +54,13 @@ Only the LATEST window is ever attempted — never a backfill of the windows mis
 
 ## Local runners
 
-The scheduler does NOT dispatch. With `RunnerKind == local` a started run parks at `awaiting_host_dispatch` until a host dispatches it (`fishhawk_dispatch_stage` / `fishhawk_run_stage`); the audit payload and the snapshot both say so. A scheduled run otherwise stops at every gate exactly like a hand-started one: the starter drives `handleCreateRun`, so the plan-reviewer capability gate, the blocking periodic budget, `applies_to`, the charter and the Idempotency-Key replay all apply unchanged.
+The scheduler does NOT dispatch. With `RunnerKind == local` a started run parks at `awaiting_host_dispatch` until a host dispatches it (`fishhawk_dispatch_stage` / `fishhawk_run_stage`); the audit payload and the snapshot both say so. A scheduled run otherwise stops at every gate exactly like a hand-started one: the starter drives `handleCreateRun`, so the plan-reviewer capability gate, the blocking periodic budget, `applies_to`, the charter, the groom start guard and the Idempotency-Key replay all apply unchanged.
 
 ## Visibility
 
 `Snapshot()` (every configured repo, in `Repos` order) and `SnapshotFor(repo)` (`ok == false` for an unconfigured repo) expose `Scanned`, `LastTickAt`, `SpecError`, `RunnerKind`, `DispatchNote`, and per scheduled workflow its `Cron`, `Timezone`, `Issue`, `CurrentWindowStart`, `NextDueAt`, `ScheduleError` and `LastOutcome` (including `transient_error`, which is snapshot-only). serve.go adapts it to the `server.ScheduleSource` behind `GET /v0/schedules` and `fishhawk_list_schedules`.
+
+A grooming window refused because an earlier groom of the same repo and workflow is still parked at its groom or confirm gate (409 `grooming_run_parked`, [#5225](https://github.com/kuhlman-labs/fishhawk/issues/5225)) is recorded `scheduled_run_refused` carrying that code, so the pile-up the guard prevents is visible rather than silent. The scheduler identity is untenanted, so it sees only untenanted parked grooms (`backend/internal/server/docs/workmgmt.md` § Groom start guard).
 
 ## Deployment target
 

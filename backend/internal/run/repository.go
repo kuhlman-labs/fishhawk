@@ -221,6 +221,13 @@ type ListRunsFilter struct {
 	// DecomposedFrom == nil — see server.newestTerminalRecoveryDescendant,
 	// which does exactly that.
 	ParentRunID *uuid.UUID
+	// NonTerminal, when true, keeps only rows whose state is non-terminal
+	// (State.IsTerminal false: pending, running), applied IN SQL BEFORE
+	// LIMIT/OFFSET (#5225). A caller that wants "the open runs" must use this
+	// rather than skip terminal rows in Go: a Go-side skip after the LIMIT
+	// misses an open run sitting behind a page of newer terminal ones. False
+	// (the zero value) is no constraint.
+	NonTerminal bool
 	Limit       int
 	Offset      int
 }
