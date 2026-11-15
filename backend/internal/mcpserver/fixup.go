@@ -3,8 +3,10 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -98,7 +100,7 @@ type FixupStageInput struct {
 	OperatorConcern string `json:"operator_concern,omitempty" jsonschema:"optional free-text operator instruction delivered to the agent as a binding instruction with NO pre-existing review concern. Use for a required CI/CodeQL/SAST finding, an ad-hoc steer, or a missed edge case on a clean approve-with-zero-concerns diff. Folded into the routed concern set as a [high/operator] concern AND minted as a durable concern tracked to closure (#2623): if the agent does not address it, it stays open and surfaces as an OPEN concern at the gate — no longer silently dropped. At least one of concern_ids/concerns/operator_concern is required; operator_concern alone is admitted on a zero-concern gate-open stage. A whitespace-only or over-length (>4000 bytes) value returns validation_failed (400)."`
 	// OperatorEvidence declares the operator executed a reproduction of the
 	// routed concerns (E48.103 / #2551): an authority marker, not prose.
-	OperatorEvidence string `json:"operator_evidence,omitempty" jsonschema:"optional declaration that YOU, the operator, EXECUTED a reproduction of the concern(s) this pass routes back. Changes AUTHORITY, not delivery — put the reproduction prose in reason/operator_concern; this field records that the finding was verified by execution. Every concern routed by this pass is then EXEMPT from reviewer-confirmation auto-resolve: a later reviewer 'confirmed' verdict is vetoed (operator_evidence_routed) and the concern stays open until you waive or defer it, or a fix-up genuinely resolves it. PERMANENT for those concerns — use it when a reviewer has already retired a defect you can still reproduce. Not a selection input (it does not by itself satisfy the concern_ids requirement). Whitespace-only or over-length (>4000 bytes) returns validation_failed (400)."`
+	OperatorEvidence string `json:"operator_evidence,omitempty" jsonschema:"optional declaration that YOU, the operator, EXECUTED a reproduction of the concern(s) this pass routes back. Changes AUTHORITY, not delivery — put the reproduction prose in reason/operator_concern; this field records that the finding was verified by execution. Every concern routed by this pass is then EXEMPT from reviewer-confirmation auto-resolve: a later reviewer 'confirmed' verdict is vetoed (operator_evidence_routed) and the concern stays open until you close it yourself: fishhawk_resolve_concerns when it is fixed, fishhawk_waive_concern or fishhawk_defer_concern when it is not fixed but acceptable. PERMANENT for those concerns — use it when a reviewer has already retired a defect you can still reproduce. Also use it when re-routing an item a prior bundled pass dropped: put the diff showing it is still unaddressed in reason, and instruct the agent to state any disagreement in its fix-up self-report rather than skip the item. Not a selection input (it does not by itself satisfy the concern_ids requirement). Whitespace-only or over-length (>4000 bytes) returns validation_failed (400)."`
 	// InstructionTargets declares the surface each routed instruction asks the
 	// pass to change (E83.37 / #4022), passed through to the backend verbatim.
 	InstructionTargets map[string]string `json:"instruction_targets,omitempty" jsonschema:"optional per-instruction target: keys are a routed concern id from concern_ids, 'operator_concern', or 'reason'; values are 'code', 'pr_body', or 'docs'. An instruction with no key is 'code'. Declare 'pr_body' for an instruction that asks the agent to change the PULL-REQUEST BODY — a surface a fix-up pass cannot write — and the result carries a warning for it; the instruction's wording is never classified for that, so a code instruction that merely mentions the PR body raises nothing. Index-routed (deprecated positional) concerns cannot be targeted. A bad value, or a key naming an instruction this call does not route, returns validation_failed (400)."`
@@ -120,10 +122,25 @@ type FixupStageOutput struct {
 	// (#2782). It is rendered FROM the server-minted pr_body_obligations set on
 	// the fix-up response (never re-derived locally), so each line names the
 	// arrival channel and the same obligation id the reviewer will see, and it
-	// is ADVISORY: the fix-up still proceeded and returned its Stage. Present
-	// (omitempty) only when a routed instruction targeted the PR body, so an
-	// ordinary pass returns a byte-identical output.
-	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings emitted when a routed instruction was declared with the pr_body target (instruction_targets) — the PR body is a surface a fix-up pass cannot write. Each line names the arrival channel and obligation id and points at the surfaces that DO work. Present only when such an instruction was routed; the fix-up still proceeds regardless."`
+	// is ADVISORY: the fix-up still proceeded and returned its Stage. Since
+	// E106.27 / #5212 it may also carry ONE mixed-severity advisory
+	// (mixedSeverityWarning), appended after the pr_body lines. Present
+	// (omitempty) only when one of those two advisories fired; an ordinary pass
+	// leaves it nil.
+	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings: one per routed instruction declared with the pr_body target (instruction_targets) — the PR body is a surface a fix-up pass cannot write; each line names the arrival channel and obligation id and points at the surfaces that DO work — followed by at most one mixed-severity advisory when the routed set mixes a high concern with medium or low ones (a bundled pass can fix the lower-severity items and skip the high one). Present only when one of those fired; the fix-up still proceeds regardless."`
+	// NextSteps is the post-fix-up follow-through (E106.27 / #5212): an ORDERED
+	// sequence, plural where fishhawk_dispatch_stage / fishhawk_await_stage /
+	// fishhawk_await_children return a singular next_step, because the local
+	// runner needs TWO calls in order (dispatch the re-opened pass, then await
+	// its re-review) while every other runner needs only the wait.
+	NextSteps []SuggestedAction `json:"next_steps,omitempty" jsonschema:"the post-fix-up follow-through, an ORDERED sequence: run the entries in order. Plural where fishhawk_dispatch_stage, fishhawk_await_stage and fishhawk_await_children return a singular next_step, because on the local runner (stage state awaiting_host_dispatch) the re-opened pass must first be dispatched (fishhawk_dispatch_stage, stage implement) and then its re-review awaited — two calls; otherwise it is the one wait. The wait is fishhawk_await_audit over the categories implement_reviewed, implement_review_failed and implement_review_skipped, anchored at since_sequence = fixup_trigger_sequence: count every terminal kind (reviewed, failed or skipped) toward expected_reviewers and re-arm with since_sequence = the returned latest_sequence until all of them have landed. When the anchor could not be read, since_sequence names where to read it (the stage_fixup_triggered entry's sequence, fishhawk_list_audit)."`
+	// FixupTriggerSequence is the audit sequence of the stage_fixup_triggered
+	// entry this pass recorded — the anchor the post-fix-up review wait arms
+	// from. Omitted when the best-effort audit read failed.
+	FixupTriggerSequence int64 `json:"fixup_trigger_sequence,omitempty" jsonschema:"the audit sequence of the stage_fixup_triggered entry this pass recorded: the since_sequence anchor for the post-fix-up review wait. Best-effort: omitted when the audit read failed (the fix-up still succeeded)"`
+	// ExpectedReviewers is the configured reviewer count of the newest
+	// implement_review_started entry (the prior round). Advisory.
+	ExpectedReviewers int `json:"expected_reviewers,omitempty" jsonschema:"how many terminal review entries (implement_reviewed, implement_review_failed or implement_review_skipped) to wait for after the fix-up: the configured reviewer count of the newest implement_review_started entry (the prior round). Advisory — a workflow whose reviewer count changes mid-run differs; omitted when it could not be read"`
 }
 
 // registerFixupStage wires the fishhawk_fixup_stage tool (E22.X / #762).
@@ -146,9 +163,17 @@ type FixupStageOutput struct {
 // operator_evidence (E48.103 / #2551) declares the operator EXECUTED a
 // reproduction of the routed concerns. It is an authority marker: those
 // concerns can no longer be retired by a reviewer's `confirmed`
-// delta-verification verdict — only by an operator waive/defer or a genuine
-// fix. Use it when a reviewer has already retired a defect you can still
-// reproduce; the reproduction prose itself still travels in reason.
+// delta-verification verdict — the operator closes them: fishhawk_resolve_concerns
+// when fixed, fishhawk_waive_concern / fishhawk_defer_concern when not fixed but
+// acceptable. Use it when a reviewer has already retired a defect you can still
+// reproduce, or when re-routing an item a prior bundled pass dropped; the
+// reproduction prose itself still travels in reason.
+//
+// Follow-through (E106.27 / #5212): on success the verb makes a best-effort
+// audit read for this pass's stage_fixup_triggered anchor and the prior round's
+// configured reviewer count, and returns the ordered next_steps (dispatch on the
+// local runner, then the anchored review wait). A failed read never fails the
+// verb. A fixup_ceiling_reached refusal is wrapped with the fresh-run recipe.
 //
 // Auth: write tool. Operator-side fhk_* tokens with `write:stages` (or
 // the dedicated `write:fixups`) scope succeed; a token without either
@@ -276,7 +301,9 @@ file inside the declared scope), or make the change in a fresh run. When you
 declare a routed instruction (reason, operator_concern, OR a routed concern) with
 the "pr_body" target in instruction_targets, the tool result carries a
 "warnings" entry naming the arrival channel and the obligation id, and the
-implement review reports it as unsatisfiable; "warnings" is absent otherwise.
+implement review reports it as unsatisfiable. "warnings" also carries the
+mixed-severity advisory (see Sizing below) when the routed set mixes a high
+concern with medium or low ones; it is absent when neither fired.
 The instruction's wording is never classified for this: an undeclared
 instruction that merely mentions the PR body is an ordinary code instruction.
 
@@ -288,7 +315,7 @@ fixup_budget_exhausted — but the operator may grant ONE more pass with
 force_additional_pass=true, hard-capped at the ceiling. Once that hard
 ceiling is reached the tool returns the DISTINCT fixup_ceiling_reached
 error (the override no longer helps — file a follow-up and merge, or start
-a fresh run). A run-bound token may fix up only its own run's stages. The
+a fresh run with the recipe under fixup_ceiling_reached below). A run-bound token may fix up only its own run's stages. The
 operator still owns the merge.
 
 Delivered-nothing refund (#967 / #1957 / #3085 / #3335): a pass that landed
@@ -306,6 +333,14 @@ the absolute cap is 6 triggered passes (the base 3-pass ceiling plus 3
 credits); both 422s report remaining_ceiling_slots so you can size the next
 pass before spending it.
 
+What a refund means depends on its shape. A pass refunded because it produced
+no commit (fixup_no_changes) means the route did not work: do not repeat the
+same route unchanged. Re-route one sharper concern (an operator_concern naming
+the exact change), start a fresh run, or finish the change on the run branch
+and fishhawk_vouch_commit it. A pass refunded because it DIED having pushed
+nothing (category A or C), or a queued pass that was superseded, is different:
+re-routing the same concerns is fine once the cause is fixed.
+
 Every routed concern reaches the agent (#4284). The fix-up prompt lists the
 routed concerns in one 12000-byte concern block (acceptance failures in their
 own block of the same size): operator concerns FIRST and in full, then every
@@ -316,7 +351,46 @@ be listed even at that minimum is refused with fixup_concerns_overflow
 trimmed records concern_bodies_truncated + truncated_concern_ids on its
 stage_fixup_triggered entry.
 
-Returns the re-opened Stage row (pending → dispatched) on success.
+Sizing, cost and follow-through (#5212):
+  - Route one substantive concern per pass, and route a must-land fix or any
+    high-severity concern alone. Delivery is guaranteed (#4284) but
+    completion is not: a bundled pass can fix the easier items and drop one.
+    When the routed set mixes a high concern with medium or low ones, the
+    result carries a mixed-severity advisory in "warnings"; the pass still
+    proceeds.
+  - When each finding needs its own counterfactual cycle (delete the control,
+    observe red, restore), route one per pass: several in one implement-stage
+    budget can time out and deliver nothing.
+  - Cost: a pass that pushes re-opens a settled acceptance stage (its verdict
+    is invalidated and acceptance must re-run), and its new commit can dismiss
+    an existing pull-request approval where the forge dismisses stale
+    approvals. After acceptance has passed, prefer fishhawk_defer_concern for a
+    low finding.
+  - Before routing an acceptance failure yourself, read the
+    acceptance_triage_decided entry's disposition: fixup_dispatched means
+    triage already spent a pass from the shared budget, and the normal budget
+    is one pass.
+  - To re-route an item a prior bundled pass dropped, attach
+    operator_evidence: put the diff showing it is still unaddressed in reason,
+    and instruct the agent to state any disagreement in its fix-up
+    self-report rather than skip the item.
+  - Follow-through: the result carries next_steps, an ORDERED list (run the
+    entries in order; plural where sibling verbs return one next_step). On
+    the local runner (state awaiting_host_dispatch) the first entry is
+    fishhawk_dispatch_stage for the re-opened implement pass; the last is
+    always fishhawk_await_audit over implement_reviewed,
+    implement_review_failed and implement_review_skipped, anchored at
+    fixup_trigger_sequence (this pass's stage_fixup_triggered entry). Expect
+    expected_reviewers terminal entries (any of the three kinds count) and
+    re-arm with since_sequence = the returned latest_sequence until all have
+    landed. Both fields are best-effort: a failed audit read omits them and
+    the fix-up still succeeds.
+  - A re-reviewer's "confirmed" resolution is its opinion over the diff, not
+    an executed reproduction: re-run your own reproduction at the fix-up head,
+    and attach operator_evidence when a defect still reproduces.
+
+Returns the re-opened Stage row (pending → dispatched) on success, plus
+next_steps / fixup_trigger_sequence / expected_reviewers (above).
 Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - validation_failed (no selection at all — none of concern_ids /
@@ -337,7 +411,10 @@ Returns a tool error on:
     the override cannot push past it. Delivered-nothing refunds credit the
     ceiling up to 3 (absolute cap 6 triggered passes); the details carry
     ceiling_refunded_passes and remaining_ceiling_slots (0 here). File a
-    follow-up and merge, or start a fresh run)
+    follow-up and merge, or start a fresh run: fold every verified finding
+    into the issue body as a dated constraints block, fishhawk_cancel_run
+    this run (cancel leaves an open pull request open), close its pull
+    request, then start the new run. The tool error carries this recipe)
   - fixup_invalid_model (the resolved implement_model override is not in the
     deployment's per-adapter allow-list, 422; choose an allowed model or
     widen the allow-list)
@@ -369,9 +446,184 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	}
 	fixed, prBodyObligations, err := r.api.fixupStageWithObligations(ctx, stageID, in)
 	if err != nil {
-		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
+		return nil, FixupStageOutput{}, wrapFixupStageError(err)
 	}
-	return nil, FixupStageOutput{Stage: *fixed, Warnings: prBodyInstructionWarnings(prBodyObligations)}, nil
+	out := FixupStageOutput{Stage: *fixed, Warnings: prBodyInstructionWarnings(prBodyObligations)}
+	ft := r.fixupFollowThroughFor(ctx, stageID, fixed)
+	out.NextSteps = ft.steps
+	out.FixupTriggerSequence = ft.triggerSeq
+	out.ExpectedReviewers = ft.expectedReviewers
+	if w := mixedSeverityWarning(ft.severities); w != "" {
+		out.Warnings = append(out.Warnings, w)
+	}
+	return nil, out, nil
+}
+
+// fixupCeilingRecovery is the TRUSTED fresh-run recipe appended to a
+// fixup_ceiling_reached refusal (E106.27 / #5212, R3). It is product text, not
+// server text: the server's remediation string is unchanged.
+const fixupCeilingRecovery = "recovery: the hard ceiling is a stop, so either merge with a filed follow-up, or start a fresh run — " +
+	"fold every verified finding into the issue body as a dated constraints block (the cancelled run's concerns do not carry over), " +
+	"fishhawk_cancel_run this run (it leaves an open pull request open), close its pull request yourself, then start the new run"
+
+// wrapFixupStageError wraps the backend refusal. ONLY fixup_ceiling_reached
+// gains the fresh-run recipe; every other code keeps today's text.
+func wrapFixupStageError(err error) error {
+	var ae *apiError
+	if errors.As(err, &ae) && ae.Code == "fixup_ceiling_reached" {
+		return fmt.Errorf("fixup stage: %w; %s", err, fixupCeilingRecovery)
+	}
+	return fmt.Errorf("fixup stage: %w", err)
+}
+
+// implementReviewTerminalCategories are the three terminal implement-review
+// kinds the post-fix-up wait counts toward expected_reviewers, matching
+// reviewRound.Landed (any terminal kind lands a reviewer).
+var implementReviewTerminalCategories = []string{"implement_reviewed", "implement_review_failed", "implement_review_skipped"}
+
+// fixupFollowThrough is the best-effort post-fix-up read: the ordered
+// next_steps, the trigger anchor, the prior round's configured reviewer count
+// and the routed set's severities (from the trigger payload).
+type fixupFollowThrough struct {
+	steps             []SuggestedAction
+	triggerSeq        int64
+	expectedReviewers int
+	severities        []string
+}
+
+// fixupFollowThroughFor builds the follow-through for a pass the server just
+// admitted (E106.27 / #5212, R8/R9). Both audit reads FAIL OPEN: an error, an
+// unparseable run id, or no matching trigger entry omits the field it would
+// have filled and never fails the verb — the pass is already admitted. The
+// trigger anchor is the HIGHEST-sequence stage_fixup_triggered entry whose
+// StageID is THIS stage (the per-entry check guards a backend that ignores the
+// stage_id filter); the server appends it before the re-open, so it is on the
+// chain by the time the POST returns.
+func (r *runResolver) fixupFollowThroughFor(ctx context.Context, stageID uuid.UUID, stage *Stage) fixupFollowThrough {
+	var ft fixupFollowThrough
+	runID, perr := uuid.Parse(stage.RunID)
+	if perr == nil {
+		if trig := r.latestFixupTrigger(ctx, runID, stageID); trig != nil {
+			ft.triggerSeq = trig.Sequence
+			ft.severities = fixupTriggerSeverities(trig)
+		}
+		if n, _, err := r.decodeLatestStartedConfiguredAgents(ctx, runID, "implement_review_started"); err == nil && n > 0 {
+			ft.expectedReviewers = n
+		}
+	}
+
+	if stage.State == "awaiting_host_dispatch" {
+		ft.steps = append(ft.steps, SuggestedAction{
+			Action: "fishhawk_dispatch_stage",
+			Params: map[string]string{
+				"run_id":   stage.RunID,
+				"stage_id": stageID.String(),
+				"stage":    "implement",
+				"workflow": "run.workflow_id (fishhawk_get_run_status)",
+			},
+			Precondition: "the fix-up re-opened the implement stage and it parked at awaiting_host_dispatch (local runner): nothing runs the pass until you dispatch it",
+			Consumes:     consumesNone,
+			Reason:       "step 1 of 2: dispatch the re-opened fix-up pass on the host, then run the review wait below",
+		})
+	}
+
+	since := "the stage_fixup_triggered entry's sequence for this stage (fishhawk_list_audit, category stage_fixup_triggered)"
+	if ft.triggerSeq > 0 {
+		since = strconv.FormatInt(ft.triggerSeq, 10)
+	}
+	reviewers := "every configured reviewer"
+	if ft.expectedReviewers > 0 {
+		reviewers = fmt.Sprintf("%d configured reviewer(s)", ft.expectedReviewers)
+	}
+	ft.steps = append(ft.steps, SuggestedAction{
+		Action: "fishhawk_await_audit",
+		Params: map[string]string{
+			"run_id":         stage.RunID,
+			"categories":     strings.Join(implementReviewTerminalCategories, ","),
+			"since_sequence": since,
+		},
+		Precondition: "the fix-up pass has been dispatched; its re-review lands after the pass pushes",
+		Consumes:     consumesNone,
+		Reason: fmt.Sprintf(
+			"wait for the post-fix-up re-review: expect one terminal entry per configured reviewer (%s) past the fix-up trigger, and count every terminal kind (reviewed, failed or skipped) toward that number — a failed reviewer lands implement_review_failed and a skipped one implement_review_skipped instead of implement_reviewed. Re-arm with since_sequence = the returned latest_sequence until all of them have landed",
+			reviewers),
+	})
+	return ft
+}
+
+// latestFixupTrigger returns the highest-sequence stage_fixup_triggered entry
+// for stageID, or nil on a read error or when none matches (fail open).
+func (r *runResolver) latestFixupTrigger(ctx context.Context, runID, stageID uuid.UUID) *AuditEntry {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageFixupTriggered,
+		StageID:  stageID.String(),
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil
+	}
+	want := stageID.String()
+	var latest *AuditEntry
+	for i := range entries {
+		e := &entries[i]
+		if e.StageID == nil || *e.StageID != want {
+			continue
+		}
+		if latest == nil || e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+	return latest
+}
+
+// fixupTriggerSeverities decodes the routed set's severities from the trigger
+// payload's concerns[] — the server's selected slice, including the synthetic
+// operator_concern it appends at high severity. An undecodable payload yields
+// nil, which suppresses the mixed-severity advisory.
+func fixupTriggerSeverities(e *AuditEntry) []string {
+	if e == nil || e.Payload == nil {
+		return nil
+	}
+	raw, err := json.Marshal(e.Payload)
+	if err != nil {
+		return nil
+	}
+	var p struct {
+		Concerns []struct {
+			Severity string `json:"severity"`
+		} `json:"concerns"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(p.Concerns))
+	for _, c := range p.Concerns {
+		out = append(out, strings.ToLower(strings.TrimSpace(c.Severity)))
+	}
+	return out
+}
+
+// mixedSeverityWarning is the routing-time advisory (E106.27 / #5212, R13):
+// when the routed set holds at least one high AND at least one medium or low
+// concern, a bundled pass can address the lower-severity items and skip the
+// high one. It never blocks the pass. Returns "" for an all-high, all-lower or
+// single-concern set, and for an unread set (nil).
+func mixedSeverityWarning(severities []string) string {
+	high, lower := 0, 0
+	for _, s := range severities {
+		switch s {
+		case "high":
+			high++
+		case "medium", "low":
+			lower++
+		}
+	}
+	if high == 0 || lower == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"mixed-severity routing: this pass routed %d high and %d medium/low concern(s) together. A bundled pass can address the lower-severity items and skip the high one; when the high concern's fix must land, route it alone in its own pass. The pass still proceeds.",
+		high, lower)
 }
 
 // prBodyInstructionWarnings renders one advisory warning per routed instruction
@@ -383,8 +635,9 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 // be attacker-influenceable (an acceptance-derived note), and the reviewer-
 // facing gate evidence is the one site that prints an excerpt, under quarantine
 // — keeping this operator-facing warning free of any injection surface. Returns
-// nil for the common pass that targeted no instruction at the PR body, so the
-// output stays byte-identical.
+// nil for the common pass that targeted no instruction at the PR body, so an
+// ordinary pass's warnings stay nil (the mixed-severity advisory is appended
+// separately, after these lines).
 func prBodyInstructionWarnings(obligations []PRBodyObligation) []string {
 	if len(obligations) == 0 {
 		return nil

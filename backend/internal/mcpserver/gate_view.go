@@ -58,6 +58,14 @@ Response (gate_view):
                                  find in the injected text (demoted to low);
                                  severity_clamped_from is the reviewer's
                                  original severity when ingest lowered it.
+                                 disputes[] lists refused resolutions: a
+                                 veto_reason of operator_evidence_routed means
+                                 the concern was routed with operator_evidence
+                                 and no reviewer verdict can retire it, so close
+                                 it yourself with fishhawk_resolve_concerns
+                                 (fixed) or fishhawk_waive_concern /
+                                 fishhawk_defer_concern (not fixed but
+                                 acceptable).
   - settled[]                  — waived/deferred/addressed/superseded rows with
                                  state_reason (same reviewer_role /
                                  quote_unverified / severity_clamped_from).
@@ -66,6 +74,12 @@ Response (gate_view):
                                  fishhawk_resolve_concerns — distinct from a
                                  reviewer-confirmed addressed row (no basis)
                                  and from a waiver.
+                                 A 'confirmed' resolution (in open[] or
+                                 settled[] resolutions[]) is the re-reviewer's
+                                 opinion over the diff,
+                                 not an executed reproduction: re-run your own
+                                 reproduction at the fix-up head before
+                                 relying on it.
   - suppressed_relitigations[] — settled concerns a reviewer tried to re-raise.
   - history_incomplete + history_gaps[] — set when an audit-derived join could
     not be built (the concerns stay intact; only cross-references may be

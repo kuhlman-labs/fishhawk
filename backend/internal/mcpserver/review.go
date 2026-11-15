@@ -1321,6 +1321,11 @@ re-admitted with fishhawk_revive_run to progress past the gate. A SUCCEEDED
 run (e.g. a decomposition child whose slice was already integrated) needs
 nothing re-admitted — re-call to keep waiting. A CANCELLED run cannot be
 re-admitted by an operator verb; its verdict lands as a record only.
+
+A "confirmed" concern resolution in a post-fix-up round is the reviewer's
+reading of the diff, not an executed reproduction: when a defect still
+reproduces at the fix-up head, route it again with operator_evidence on
+fishhawk_fixup_stage.
 `),
 	}, resolver.awaitReview)
 }
