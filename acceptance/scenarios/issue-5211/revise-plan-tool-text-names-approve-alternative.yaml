@@ -2,13 +2,14 @@ id: scenario:issue-5211/revise-plan-tool-text-names-approve-alternative
 statement: The fishhawk_revise_plan tool listing names approving with binding conditions as the alternative once the revise budget is spent, and points at fishhawk_await_review for the re-review.
 verify_hint: 'MCP tools/list on the localhost preview: fishhawk_revise_plan description.'
 steps: '1) POST /v0/dev/fixtures {"scenario":"trace-upload-target"} -> run_id; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over the bytes ''{}'' with X-Fishhawk-Dev-Private-Key -> signature; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> fhm_ bearer; POST http://localhost:8090/mcp tools/list (Mcp-Method: tools/list, Mcp-Protocol-Version: 2026-07-28, _meta protocolVersion/clientCapabilities/clientInfo). 2) Read tools[name=fishhawk_revise_plan].description.'
+steps_carried_from: head 7003c8532577f844cd05e48f7f9bb99ee99497bf recorded_at 2026-11-15T10:43:23Z
 assertions:
     expected: Names approve-with-binding-conditions as the alternative once the budget is spent; points at fishhawk_await_review
-    observed_at_record: 'The description says: ''Before spending a pass: when the change only refines the reviewed design, approving with binding conditions (fishhawk_approve_plan reason) is the alternative to another revise. The normal budget is one pass and the hard ceiling is 3 passes per stage.'' It also says: ''After a revise: wait for the re-review with fishhawk_await_review stage=plan ... then diff the revised plan against the prior one''.'
+    observed_at_record: '''Before spending a pass: when the change only refines the reviewed design, approving with binding conditions (fishhawk_approve_plan reason) is the alternative to another revise. The normal budget is one pass and the hard ceiling is 3 passes per stage.'' and ''After a revise: wait for the re-review with fishhawk_await_review stage=plan''.'
     repro_handle: same tools/list request
 origin:
     issue: 5211
     pr: 5383
     run_id: e6c9a58f-e316-49c8-8a4f-f676879377fe
-    head_sha: 7003c8532577f844cd05e48f7f9bb99ee99497bf
-    recorded_at: 2026-11-15T10:43:23Z
+    head_sha: 1c62d67cd34ea07c703d50ece6f556db103f3316
+    recorded_at: 2026-11-15T11:33:32Z
