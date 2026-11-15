@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -558,7 +559,9 @@ func TestHandleApprovalCommand_LegacyRoleResolutionErrorRefused(t *testing.T) {
 // TestHandleApprovalCommand_LegacyGateBehaviourPinned pins the v0 AND v1 legacy
 // outcomes ADR-123 D4 keeps: a listed team member is approved, a non-member's
 // slash approve gets the existing deny reply with no row and NO refusal entry,
-// and a stage with no approval gate is approved.
+// and a stage with no approval gate is approved. The #5300 refusal of every
+// other v0/v1 approval gate leaves the legacy `approvers` gate and the
+// gate-less stage outcomes unchanged.
 func TestHandleApprovalCommand_LegacyGateBehaviourPinned(t *testing.T) {
 	members := map[string][]role.TeamMember{"org/tech-leads": {{Login: "alice"}}}
 	for _, version := range []string{"0.3", "1.0"} {
@@ -620,4 +623,361 @@ func TestHandleApprovalCommand_LegacyGateBehaviourPinned(t *testing.T) {
 			}
 		})
 	}
+}
+
+// v1ApprovalsGateSpec renders a PARSEABLE workflow-v1 spec (#5300) whose plan
+// stage carries gatesYAML verbatim (a full `gates:` block indented for the
+// stage). The `roles` block lets a mixed shape reference a legacy tech_lead
+// role over the @org/tech-leads team.
+func v1ApprovalsGateSpec(gatesYAML string) string {
+	return `version: "1.0"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+` + gatesYAML + `      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+}
+
+// v1ApprovalsGate is a v1 plan-stage approval gate declaring the forge-neutral
+// `approvals` predicate (no legacy `approvers`), admitting only alice.
+const v1ApprovalsGate = `        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: ["alice"]
+`
+
+// v1MixedGates declares a legacy `approvers` approval gate FIRST and an
+// `approvals` gate second on the same v1 plan stage. fetchGateForStage hands the
+// channel only the first, so this shape isolates the every-gate walk.
+const v1MixedGates = `        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+          - type: approval
+            approvals:
+              count: 1
+              members: ["alice"]
+`
+
+// v1ApprovalsGateFixture seeds a GitHub issue run (installation 99, workflow
+// feature_change, so fetchGateForStage resolves the gate and spec_unreadable
+// cannot mask) whose cached spec is v1ApprovalsGateSpec(gatesYAML). The
+// resolver is wired when non-nil: every refusal test wires one so the
+// role_resolver_unconfigured refusal cannot MASK a deleted
+// approvals_predicate_gate refusal — with it wired, the stage falls through to
+// the legacy path, whose no-approvers outcome (or approvers verdict) ADMITS.
+func v1ApprovalsGateFixture(t *testing.T, gatesYAML string, resolver *role.Resolver) (*Server, *run.Stage, *fakeApprovalRepo, *slashGitHubRecorder, *auditCompleteAuditFake) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	r, stage := channelGitHubIssueRun(rr)
+	r.WorkflowSpec = []byte(v1ApprovalsGateSpec(gatesYAML))
+	s, ar, gh, au := channelServer(rr, rr, resolver)
+	return s, stage, ar, gh, au
+}
+
+// shadowStampCount counts the delegation-shadow stamps the audit fake recorded.
+func shadowStampCount(t *testing.T, au *auditCompleteAuditFake) int {
+	t.Helper()
+	all, err := au.ListForRun(context.Background(), uuid.Nil)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	n := 0
+	for _, e := range all {
+		if e.Category == CategoryDelegationShadowEvaluated {
+			n++
+		}
+	}
+	return n
+}
+
+// TestV1ApprovalsGateFixturesParse guards the fixtures the V1 tests rely on: both
+// shapes PARSE, so a refusal they observe is approvals_predicate_gate and never
+// a masked spec_unreadable.
+func TestV1ApprovalsGateFixturesParse(t *testing.T) {
+	for name, gates := range map[string]string{"approvals": v1ApprovalsGate, "mixed": v1MixedGates} {
+		parsed, err := spec.ParseBytes([]byte(v1ApprovalsGateSpec(gates)))
+		if err != nil {
+			t.Fatalf("%s fixture does not parse: %v", name, err)
+		}
+		if got := spec.VersionMajor(parsed.Version); got != 1 {
+			t.Errorf("%s fixture major = %d, want 1", name, got)
+		}
+	}
+}
+
+// TestCommentGateNonLegacyApproval pins every branch of the pure helper,
+// including the fail-closed arms HandleApprovalCommand cannot reach (it calls
+// the helper only after fetchGateForStage resolved the workflow and stage).
+func TestCommentGateNonLegacyApproval(t *testing.T) {
+	legacyThenCheck := `        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+          - type: check
+`
+	cases := []struct {
+		name       string
+		gates      string
+		workflowID string
+		stageType  run.StageType
+		want       bool
+	}{
+		{"approvals gate", v1ApprovalsGate, "feature_change", run.StageTypePlan, true},
+		{"legacy approvers then approvals gate", v1MixedGates, "feature_change", run.StageTypePlan, true},
+		{"legacy approvers gate only", strings.SplitAfter(v1MixedGates, "any_of: [tech_lead]\n")[0], "feature_change", run.StageTypePlan, false},
+		{"legacy approvers plus a check gate", legacyThenCheck, "feature_change", run.StageTypePlan, false},
+		{"no gates", "", "feature_change", run.StageTypePlan, false},
+		{"workflow absent fails closed", v1ApprovalsGate, "missing", run.StageTypePlan, true},
+		{"stage type absent fails closed", "", "feature_change", run.StageTypeReview, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed, err := spec.ParseBytes([]byte(v1ApprovalsGateSpec(tc.gates)))
+			if err != nil {
+				t.Fatalf("fixture does not parse: %v", err)
+			}
+			if got := commentGateNonLegacyApproval(parsed, tc.workflowID, tc.stageType); got != tc.want {
+				t.Errorf("commentGateNonLegacyApproval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_NonMemberApproveRefused: a
+// non-member's slash approve on a v1 `approvals` gate is refused by the channel
+// (#5300). Counterfactual (A): with the refusal return removed, the gate-less
+// branch admits, bob's row is inserted and the stage advances, so the
+// committed-state assertions go RED. It also pins that a refused comment stamps
+// NO delegation shadow.
+func TestHandleApprovalCommand_V1ApprovalsGate_NonMemberApproveRefused(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	if err := s.HandleApprovalCommand(context.Background(), slashCmd("bob", webhook.MatchActionApprove)); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Decision != string(approval.DecisionApprove) || p.Approver != "bob" || p.Surface != string(approval.SurfaceGitHubComment) {
+		t.Errorf("payload = %+v, want an approve by bob on the github_comment surface", p)
+	}
+	reply := oneReply(t, gh)
+	if !strings.Contains(reply, "declare an `approvals` predicate") || !strings.Contains(reply, "ADR-123") {
+		t.Errorf("reply should say comment decisions are not accepted on `approvals` gates (ADR-123): %q", reply)
+	}
+	if !strings.Contains(reply, "still awaiting approval") || !strings.Contains(reply, "(Caller: @bob)") {
+		t.Errorf("reply should say nothing was recorded and name the caller: %q", reply)
+	}
+	if strings.Contains(reply, "could not verify") {
+		t.Errorf("reply must not use the generic could-not-verify text: %q", reply)
+	}
+	assertNamesSupportedChannels(t, reply)
+	if n := shadowStampCount(t, au); n != 0 {
+		t.Errorf("delegation shadow stamps = %d, want 0 for a refused comment (cause %s)", n, commentRefusalApprovalsPredicateGate)
+	}
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_NonMemberRejectRefused: a reject is
+// refused too — a comment reject on a v1 `approvals` gate does not fail the
+// stage.
+func TestHandleApprovalCommand_V1ApprovalsGate_NonMemberRejectRefused(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	cmd := slashCmd("bob", webhook.MatchActionReject)
+	cmd.Comment = "scope is too wide"
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if stage.State == run.StageStateFailed {
+		t.Fatalf("stage failed under a refused comment reject")
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Decision != string(approval.DecisionReject) {
+		t.Errorf("decision = %q, want reject", p.Decision)
+	}
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_ListedMemberRefused: membership is
+// not the question — alice, whom the predicate lists, is refused as well.
+func TestHandleApprovalCommand_V1ApprovalsGate_ListedMemberRefused(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	if err := s.HandleApprovalCommand(context.Background(), slashCmd("alice", webhook.MatchActionApprove)); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if !strings.Contains(oneReply(t, gh), "(Caller: @alice)") {
+		t.Errorf("reply should name the caller alice")
+	}
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_ReplyCommentRefusedSilently: the
+// reply-comment ("+1") channel keeps its silent suppression — no comment is
+// posted — but the refusal is still audited, with silent=true.
+func TestHandleApprovalCommand_V1ApprovalsGate_ReplyCommentRefusedSilently(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	cmd := slashCmd("alice", webhook.MatchActionApprove)
+	cmd.Source = webhook.ApprovalSourceReplyComment
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, true)
+	assertSpecMajor(t, p, 1)
+	if p.Surface != string(approval.SurfaceGitHubReplyComment) {
+		t.Errorf("surface = %q, want %q", p.Surface, approval.SurfaceGitHubReplyComment)
+	}
+	if calls := gh.calls(); len(calls) != 0 {
+		t.Errorf("posted %d comments, want 0 on the silent reply-comment channel: %v", len(calls), commentBodies(calls))
+	}
+}
+
+// TestHandleApprovalCommand_V1MixedGates_ListedApproverRefused: a v1 stage with
+// a legacy `approvers` gate FIRST and an `approvals` gate second is refused,
+// even for alice, whom the legacy check admits (she is in org/tech-leads).
+// Counterfactual (B): with the every-gate walk's `Approvers == nil` operand
+// neutralised, fetchGateForStage returns the approvers gate, CanApprove admits
+// alice and her row is inserted, so the committed-state assertions go RED.
+func TestHandleApprovalCommand_V1MixedGates_ListedApproverRefused(t *testing.T) {
+	members := map[string][]role.TeamMember{"org/tech-leads": {{Login: "alice"}}}
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1MixedGates, role.NewResolver(&stubTeamLister{teamMembers: members}))
+	if err := s.HandleApprovalCommand(context.Background(), slashCmd("alice", webhook.MatchActionApprove)); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+}
+
+// TestHandleApprovalCommand_V1MixedGates_ListedApproverRejectRefused: a reject
+// on the mixed-gate stage is refused too, even for alice, whom the legacy
+// `approvers` gate admits — the stage is not failed and nothing is recorded.
+func TestHandleApprovalCommand_V1MixedGates_ListedApproverRejectRefused(t *testing.T) {
+	members := map[string][]role.TeamMember{"org/tech-leads": {{Login: "alice"}}}
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1MixedGates, role.NewResolver(&stubTeamLister{teamMembers: members}))
+	cmd := slashCmd("alice", webhook.MatchActionReject)
+	cmd.Comment = "scope is too wide"
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if stage.State == run.StageStateFailed {
+		t.Fatalf("stage failed under a refused comment reject")
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Decision != string(approval.DecisionReject) {
+		t.Errorf("decision = %q, want reject", p.Decision)
+	}
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_ReactionEmojiRefused: an approval
+// forwarded by the reaction poller (the third comment-channel entry point) is
+// refused like a slash approve — the refusal is source-independent. The
+// reaction source is not silent, so exactly one reply goes out.
+func TestHandleApprovalCommand_V1ApprovalsGate_ReactionEmojiRefused(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	cmd := slashCmd("alice", webhook.MatchActionApprove)
+	cmd.Source = webhook.ApprovalSourceReactionEmoji
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Approver != "alice" || p.Surface != string(approval.SurfaceGitHubComment) {
+		t.Errorf("payload = %+v, want alice on the github_comment surface", p)
+	}
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+	if n := shadowStampCount(t, au); n != 0 {
+		t.Errorf("delegation shadow stamps = %d, want 0 for a refused reaction (cause %s)", n, commentRefusalApprovalsPredicateGate)
+	}
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_NilResolverStillRefused: with no
+// RoleResolver a v1 `approvals` gate is still refused, under the existing
+// role_resolver_unconfigured cause — the new check runs after it, so every
+// pre-#5300 cause is unchanged.
+func TestHandleApprovalCommand_V1ApprovalsGate_NilResolverStillRefused(t *testing.T) {
+	s, stage, ar, _, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, nil)
+	if err := s.HandleApprovalCommand(context.Background(), slashCmd("bob", webhook.MatchActionApprove)); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalResolverUnconfigured, false)
+	assertSpecMajor(t, p, 1)
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_DispatcherE2E drives a GitHub
+// issue_comment `/fishhawk approve` event through the REAL webhook.Dispatcher
+// (classifier -> handleApprovalCommand) into the real Server, and asserts the
+// same refusal.
+func TestHandleApprovalCommand_V1ApprovalsGate_DispatcherE2E(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	d := &webhook.Dispatcher{ApprovalHandler: s}
+	ev := webhook.Event{
+		Type:           "issue_comment",
+		Action:         "created",
+		Repo:           "x/y",
+		Sender:         "bob",
+		SenderType:     "User",
+		InstallationID: 99,
+		RawBody:        []byte(`{"comment":{"body":"/fishhawk approve"},"issue":{"number":42}}`),
+	}
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Dispatcher.Handle: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Approver != "bob" || p.Surface != string(approval.SurfaceGitHubComment) {
+		t.Errorf("payload = %+v, want bob on the github_comment surface", p)
+	}
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_RefusalReadableViaAuditEndpoint
+// reads the refusal back through GET
+// /v0/runs/{id}/audit?category=approval_comment_refused (handler -> audit chain
+// -> HTTP read surface).
+func TestHandleApprovalCommand_V1ApprovalsGate_RefusalReadableViaAuditEndpoint(t *testing.T) {
+	s, stage, _, _, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	if err := s.HandleApprovalCommand(context.Background(), slashCmd("bob", webhook.MatchActionApprove)); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if n := len(refusalEntries(t, au)); n != 1 {
+		t.Fatalf("approval_comment_refused entries = %d, want 1", n)
+	}
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?category=%s", stage.RunID, CategoryApprovalCommentRefused), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("filtered read returned %d items, want 1:\n%s", len(got.Items), w.Body.String())
+	}
+	var p channelRefusalPayload
+	if err := json.Unmarshal(got.Items[0].Payload, &p); err != nil {
+		t.Fatalf("decode item payload: %v", err)
+	}
+	if p.Reason != approvalCommentRefusedReasonChannel || p.Cause != commentRefusalApprovalsPredicateGate {
+		t.Errorf("read-back payload reason/cause = %q/%q, want %q/%q", p.Reason, p.Cause, approvalCommentRefusedReasonChannel, commentRefusalApprovalsPredicateGate)
+	}
+	assertSpecMajor(t, p, 1)
 }

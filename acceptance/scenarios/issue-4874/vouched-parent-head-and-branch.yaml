@@ -1,0 +1,14 @@
+id: scenario:issue-4874/vouched-parent-head-and-branch
+statement: For a decomposed-parent-shaped run (integration_commit_recorded F, then a verified vouch F→W), the acceptance prompt names W and the server-derived consolidated branch.
+verify_hint: Same fixture; GET /v0/stages/{vouched-parent acceptance}/prompt → acceptance_expected_head_sha equals W and acceptance_run_branch equals fishhawk/run-<first 8 of run id>-consolidated.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-vouched-head"} and read the run_id plus the *-acceptance stage id of run key vouched-parent from the 201 body. 2) GET audit: integration_commit_recorded merge_sha 8888…, verified vouch 8888…→9999…, acceptance_dispatched. 3) POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over ''prompt:<acceptance stage id>''; GET /v0/stages/{acceptance stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: W (9999…) and fishhawk/run-<first 8 of run id>-consolidated
+    observed_at_record: acceptance_expected_head_sha=9999999999999999999999999999999999999999; acceptance_run_branch=fishhawk/run-b6641e41-consolidated
+    repro_handle: GET /v0/stages/ee0a976b-01ca-4f5c-b57a-dae2939bbd6e/prompt (signed)
+origin:
+    issue: 4874
+    pr: 5293
+    run_id: 1c1b9276-fd70-419b-ac15-28e3c4158ef4
+    head_sha: f14b941b89ebb3dcc37b1394b55e094230a7513a
+    recorded_at: 2026-11-14T22:14:27Z

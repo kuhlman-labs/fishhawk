@@ -595,6 +595,63 @@ func (s *Server) republishAuditCheckOnMergeCandidateVerdict(ctx context.Context,
 	_, _ = s.recomputeAndForcePublishAuditCompleteAtHead(ctx, runID, headSHA)
 }
 
+// acceptanceVerdictRepublishTimeout bounds the acceptance-verdict republish
+// (the live-head read, the recompute and the publish together), so the ship
+// request it runs inside answers well within the runner's terminal egress
+// budget even when the forge hangs.
+const acceptanceVerdictRepublishTimeout = mergeOnPassForgeCallTimeout
+
+// republishAuditCheckOnAcceptanceVerdict force-publishes the
+// fishhawk_audit_complete Check Run AT the run's own live pull-request head
+// once an acceptance verdict is recorded (#5217 gap 3). handleShipAcceptance
+// calls it on the fresh-create path after triage, and on the idempotent replay
+// path only when that replay healed a missing acceptance_outcome_recorded row.
+//
+// The hole it closes: a vouch made while the acceptance stage is still running
+// re-posts the check AT the vouched head, and the recompute there is pending
+// (stage_not_terminal). Every later unforced publish resolves its head through
+// auditcheckpublisher.findHeadSHA, which reads only the head-report categories.
+// operator_commit_vouched is not one of them, so the green never landed on the
+// vouched live head; only merge_run's forced pre-dispatch republish healed it.
+// This publish re-reads the live head through the vouch publish bound's own
+// ladder (resolveVouchPublishHead), so it can only ever stamp the run's own PR
+// head, and it is forced past the dedup because the strand it clears is the
+// same head already published at pending.
+//
+// It heals only once the acceptance stage has SETTLED: the runner uploads the
+// acceptance trace (which settles the stage) before it ships the verdict, so
+// the recompute here sees a terminal stage. A verdict whose triage re-opens
+// the stage recomputes to pending and posts pending, never success.
+//
+// FAIL CLOSED: an unresolvable head (no installation, no tracked PR, no GitHub
+// client, a failed or empty PR read, which also covers every GitLab run) skips
+// the publish with a WARN rather than falling back to the findHeadSHA head.
+// Best-effort and bounded: it never unwinds the ship.
+func (s *Server) republishAuditCheckOnAcceptanceVerdict(ctx context.Context, runID uuid.UUID) {
+	if s.auditCheckPublisher == nil || s.cfg.RunRepo == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, acceptanceVerdictRepublishTimeout)
+	defer cancel()
+	runRow, err := s.cfg.RunRepo.GetRun(cctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(cctx, slog.LevelWarn,
+			"acceptance verdict republish: read run failed; skipping the audit-complete republish",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	verdictHead, headErr := s.resolveVouchPublishHead(cctx, runRow)
+	if headErr != nil {
+		s.cfg.Logger.LogAttrs(cctx, slog.LevelWarn,
+			"acceptance verdict republish: live pull-request head unresolvable; skipping the audit-complete republish",
+			slog.String("run_id", runID.String()),
+			slog.String("error", headErr.Error()))
+		return
+	}
+	_, _ = s.recomputeAndForcePublishAuditCompleteAtHead(cctx, runID, verdictHead)
+}
+
 // republishAuditCheckOnRunTerminal recomputes the run's audit-complete state
 // and republishes the fishhawk_audit_complete Check Run once the run has
 // reached its terminal state on a merge (E64.42 / #3159).

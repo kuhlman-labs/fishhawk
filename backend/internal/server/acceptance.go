@@ -1572,7 +1572,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		// for this artifact and append it idempotently if missing, so a
 		// retry-after-partial-failure ends with BOTH the artifact and its
 		// governance record. The helper fails closed on a read error.
-		if _, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
+		healed, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
 			CategoryAcceptanceOutcomeRecorded, existing.ID.String(), func() error {
 				_, aerr := s.appendAcceptanceOutcomeSerialized(r.Context(), stageID, audit.ChainAppendParams{
 					RunID:        runID,
@@ -1584,10 +1584,19 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 					Payload:      buildOutcomePayload(existing.ID.String()),
 				})
 				return aerr
-			}); herr != nil {
+			})
+		if herr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
 			return
+		}
+		// #5217 gap 3: a heal is the FIRST time this verdict's
+		// acceptance_outcome_recorded row lands (the original ship returned 500
+		// before its republish ran), so republish the audit-complete check at
+		// the run's live head now. A true replay, whose row already existed,
+		// published on its original ship and republishes nothing here.
+		if healed {
+			s.republishAuditCheckOnAcceptanceVerdict(r.Context(), runID)
 		}
 		// #2581 replay fidelity: the effective verdict above was recomputed from
 		// the CURRENT approval chain, which may carry a retirement recorded AFTER
@@ -1703,6 +1712,15 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	if paged {
 		s.notifyPageClass(r.Context(), runID, "acceptance_recorded")
 	}
+
+	// #5217 gap 3: republish fishhawk_audit_complete AT the run's live
+	// pull-request head. A vouch made while this stage was running left the
+	// check pending at the vouched head, and no later unforced publish resolves
+	// to a vouched head. Placed AFTER triage so a verdict whose triage re-opened
+	// the stage (or routed a fix-up) recomputes to pending, never success.
+	// Best-effort and bounded (acceptanceVerdictRepublishTimeout); it never
+	// unwinds the 201.
+	s.republishAuditCheckOnAcceptanceVerdict(r.Context(), runID)
 
 	s.writeJSON(w, r, http.StatusCreated, acceptanceResponse{
 		ID:               created.ID,

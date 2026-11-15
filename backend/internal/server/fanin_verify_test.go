@@ -1965,3 +1965,37 @@ func TestFanInVerifySettled_DivergedHead_WarnsWithoutChangingAnswer(t *testing.T
 		}
 	})
 }
+
+// TestFanInVerifySettled_VerifiedVouchedHead_AgreesWithoutWarn: a SERVER-VERIFIED
+// vouch F -> fanInHead (#4856's stamp) is a step the acceptance walk now reads
+// (#4874), so the ledger head IS the live consolidated head and the LOG-ONLY
+// divergence block stays silent. The settled answer is still the live head's.
+// The legacy "vouched" row of
+// TestFanInVerifySettled_DivergedHead_WarnsWithoutChangingAnswer keeps its
+// WARN: only the verified stamp moves the ledger head.
+func TestFanInVerifySettled_VerifiedVouchedHead_AgreesWithoutWarn(t *testing.T) {
+	ctx := context.Background()
+	f := newFanInFixture(t, fanInVerifySpec)
+	f.seedLedgerIntegration()
+	f.appendRow(nil, CategoryOperatorCommitVouched, map[string]any{
+		"run_id": f.parent.ID.String(), auditcomplete.VouchedSHAField: fanInHead, "reason": "operator remediation",
+		auditcomplete.VouchPriorHeadSHAField: fanInLedgerF, auditcomplete.VouchHeadAdvanceVerifiedField: true,
+	})
+	f.seedVerdictOnly(fanInHead, mergeCandidateResultPassed)
+	if got, err := f.s.acceptanceHeadAsOf(ctx, f.parent.ID, 0, false); err != nil || got != fanInHead {
+		t.Errorf("acceptanceHeadAsOf = (%q, %v), want the verified vouched head %q", got, err, fanInHead)
+	}
+	state, err := f.s.mergeCandidateVerifyState(ctx, f.runRow(), fanInHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSettled := state.State == mergeCandidateStateNotRequired || state.State == mergeCandidateStatePassed || state.State == mergeCandidateStateFailed
+	buf := captureLogger(f.s)
+	ans, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
+	if err != nil || ans.Settled != wantSettled || ans.UnavailableReason != "" {
+		t.Errorf("FanInVerifySettled = %+v, %v; want settled=%v with no reason (the live head's answer)", ans, err, wantSettled)
+	}
+	if lines := linesContaining(buf.String(), fanInDivergenceMsg); len(lines) != 0 {
+		t.Errorf("divergence WARN lines = %d, want 0 on a verified vouch of the live head:\n%s", len(lines), buf.String())
+	}
+}

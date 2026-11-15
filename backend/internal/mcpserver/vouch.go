@@ -67,6 +67,11 @@ verb can never post the run's recomputed check state onto an unrelated
 commit. A mismatch or an unresolvable head records the vouch and SKIPS the
 publish, naming both shas (or the resolution failure) on the warning.
 
+Vouching while the acceptance stage is still running re-posts the check as
+pending (the stage is not terminal). You do not need to re-vouch: when the
+acceptance verdict ships, the backend re-posts the check at the run's live
+pull-request head (#5217), and it heals only once the stage has settled.
+
 The sha MUST be the FULL commit id (40 hex, or 64 for a SHA-256 repository;
 upper-case is accepted and recorded lowercase). An ABBREVIATED sha is REFUSED
 before anything is recorded (#4435): fishhawk_audit_complete matches the PR
@@ -111,8 +116,12 @@ whether it did; recorded_head_advance_note says why not:
   - not a fast-forward of the recorded head: a history rewrite is never
     admitted; use fishhawk_reset_run_branch or fishhawk_rebase_run_branch;
   - a commit between the recorded head and the vouched commit is not run
-    lineage (the note names it): vouch that commit first, then re-vouch;
-    for a hand merge of the base use fishhawk_rebase_run_branch instead;
+    lineage (the note names it). An intermediate commit can only be
+    verified while it is the live pull-request head, so vouching it while
+    the tip is live does not help: vouch each commit as it is pushed, or
+    move the branch back to the intermediate commit, vouch it, then push
+    and vouch the tip; for a hand merge of the base use
+    fishhawk_rebase_run_branch instead;
   - the fix-up and acceptance walks disagree on the recorded head: record a
     fresh push or reset so they agree, then re-vouch;
   - too many commits to prove (the 250-commit compare cap).

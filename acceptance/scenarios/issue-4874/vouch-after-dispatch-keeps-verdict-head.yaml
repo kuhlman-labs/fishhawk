@@ -1,0 +1,14 @@
+id: scenario:issue-4874/vouch-after-dispatch-keeps-verdict-head
+statement: 'A verified vouch recorded AFTER the acceptance dispatch anchor does not re-bind that dispatch''s verdict: a signed verdict shipped for that stage is recorded against the pre-vouch head.'
+verify_hint: Same fixture; on vouched-after-dispatch-run ship a signed transcript then a signed verdict (POST /v0/runs/{run}/acceptance/transcript?stage_id=…, POST /v0/runs/{run}/acceptance?stage_id=…), then GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded → head_sha equals the seeded pull_request_opened sha, not the later vouched sha.
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-vouched-head"} and read run key vouched-after-dispatch-run (pull_request_opened aaaa…, acceptance_dispatched, THEN verified vouch aaaa…→bbbb…). 2) Sign and POST a transcript to /v0/runs/{run}/acceptance/transcript?stage_id={acceptance}, then sign and POST a passed verdict referencing it to /v0/runs/{run}/acceptance?stage_id={acceptance}. 3) GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded.
+assertions:
+    expected: head_sha equals the seeded pull_request_opened sha
+    observed_at_record: verdict 201; acceptance_outcome_recorded head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (the pre-vouch head), not bbbb…. The prompt for this stage names bbbb…, as the fixture description says.
+    repro_handle: GET /v0/runs/62661b77-5fcf-4ca2-b6c9-6ae65205a2da/audit?category=acceptance_outcome_recorded
+origin:
+    issue: 4874
+    pr: 5293
+    run_id: 1c1b9276-fd70-419b-ac15-28e3c4158ef4
+    head_sha: f14b941b89ebb3dcc37b1394b55e094230a7513a
+    recorded_at: 2026-11-14T22:14:27Z
