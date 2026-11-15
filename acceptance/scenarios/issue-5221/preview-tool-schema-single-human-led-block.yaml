@@ -1,0 +1,14 @@
+id: scenario:issue-5221/preview-tool-schema-single-human-led-block
+statement: 'MCP tools/list advertises exactly one human-led block for fishhawk_preview_campaign: the top-level human_led output property. It is an array whose items carry issue_ref, position, blocked_dependents and remedy, and no property under the preview output property has a name containing human_led.'
+verify_hint: On the localhost preview, POST /mcp a JSON-RPC tools/list request with the operator bearer token, or send tools/list to the fishhawk-mcp binary over stdio. In fishhawk_preview_campaign's outputSchema, read properties.human_led.items.properties and the property names under properties.preview.properties.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} and read the run_id. 2) POST /v0/runs/{run}/signing-key {}. POST /v0/dev/sign over the bytes ''{}'' with X-Fishhawk-Dev-Private-Key. POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. 3) POST /mcp with Authorization Bearer, Mcp-Protocol-Version: 2026-07-28 and Mcp-Method: tools/list, sending a tools/list JSON-RPC request with _meta protocolVersion/clientCapabilities/clientInfo. 4) Read fishhawk_preview_campaign outputSchema.properties.human_led and walked every property name under properties.preview (nested properties and items included).'
+assertions:
+    expected: Exactly one human-led block, the top-level human_led array with issue_ref/position/blocked_dependents/remedy; none under preview.
+    observed_at_record: Top-level output properties are [preview, human_led]. human_led is type [null, array]. Its items are objects with properties issue_ref, position, blocked_dependents and remedy, all required. No property under preview has a name containing human_led, and the string human_led does not appear anywhere in the preview subschema.
+    repro_handle: POST http://localhost:8090/mcp tools/list (Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list, fhm_ bearer)
+origin:
+    issue: 5221
+    pr: 5376
+    run_id: 562f90a0-bee6-4f66-a282-d115b46300f2
+    head_sha: 97de74b47e02763e275610c93812d77557c95da2
+    recorded_at: 2026-11-15T08:50:51Z

@@ -1,0 +1,14 @@
+id: scenario:issue-5221/preview-tool-schema-path-overlap-block
+statement: fishhawk_preview_campaign's advertised outputSchema declares properties.preview.properties.path_overlap as an object with advisory, pairs (each with items, paths, class and remedy), total_pairs and truncated. Its description marks it ADVISORY and names the code and docs_only classes. The tool description names path_overlap and the native blocked-by remedy.
+verify_hint: 'MCP tools/list over POST /mcp (or the fishhawk-mcp stdio binary): read fishhawk_preview_campaign''s description and outputSchema.properties.preview.properties.path_overlap.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} and read the run_id. 2) Minted an fhm_ bearer: POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over ''{}'', POST /v0/runs/{run}/mcp-token. 3) POST /mcp tools/list with the Mcp-Protocol-Version 2026-07-28 and Mcp-Method headers. 4) Read fishhawk_preview_campaign''s description and outputSchema.properties.preview.properties.path_overlap.'
+assertions:
+    expected: An object with advisory, pairs{items,paths,class,remedy}, total_pairs and truncated, marked ADVISORY and naming code and docs_only; the tool description names path_overlap and the native blocked-by remedy.
+    observed_at_record: path_overlap is type [null, object] with properties advisory (boolean, 'always true'), pairs (an array of objects with items, paths, class and remedy), total_pairs and truncated. Its description begins 'ADVISORY path overlap'. The class field description names code and docs_only and defines docs_only. The tool description has a preview.path_overlap paragraph naming class code and class docs_only and the remedy 'add a native blocked-by link'.
+    repro_handle: POST http://localhost:8090/mcp tools/list; jq '.result.tools[]|select(.name=="fishhawk_preview_campaign")|.outputSchema.properties.preview.properties.path_overlap'
+origin:
+    issue: 5221
+    pr: 5376
+    run_id: 562f90a0-bee6-4f66-a282-d115b46300f2
+    head_sha: 97de74b47e02763e275610c93812d77557c95da2
+    recorded_at: 2026-11-15T08:50:51Z

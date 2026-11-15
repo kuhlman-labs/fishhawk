@@ -1,0 +1,14 @@
+id: scenario:issue-5221/preview-tool-schema-admission-screen
+statement: fishhawk_preview_campaign's advertised outputSchema declares properties.preview.properties.admission_screen with findings (issue, kind, path, location, forbidden_pattern) and forbidden_paths_screened. Its description says the block is ADVISORY and that the preview writes no audit row for it.
+verify_hint: 'MCP tools/list over POST /mcp (or the fishhawk-mcp stdio binary): read outputSchema.properties.preview.properties.admission_screen and its description.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}. 2) Minted an fhm_ bearer: signing-key, /v0/dev/sign over ''{}'', mcp-token. 3) POST /mcp tools/list with the 2026-07-28 standard headers. 4) Read outputSchema.properties.preview.properties.admission_screen.'
+assertions:
+    expected: findings(issue, kind, path, location, forbidden_pattern) and forbidden_paths_screened; the description says ADVISORY and that the preview writes no audit row.
+    observed_at_record: admission_screen has findings (items with issue, kind, path, location and forbidden_pattern; issue and kind required), forbidden_paths_screened (boolean), advisory and truncated. Its description reads 'ADVISORY admission screen … The preview writes no audit row; only the create appends campaign_admission_screened'.
+    repro_handle: POST http://localhost:8090/mcp tools/list; read fishhawk_preview_campaign outputSchema.properties.preview.properties.admission_screen
+origin:
+    issue: 5221
+    pr: 5376
+    run_id: 562f90a0-bee6-4f66-a282-d115b46300f2
+    head_sha: 97de74b47e02763e275610c93812d77557c95da2
+    recorded_at: 2026-11-15T08:50:51Z
