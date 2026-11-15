@@ -1,6 +1,8 @@
 package mcpserver
 
 import (
+	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -388,7 +390,7 @@ func TestLatestReportedHeadSHA(t *testing.T) {
 			"abc1234",
 		},
 		{
-			"reset off the walked chain returns the seed",
+			"reset off the walked chain re-seeds the walk (nothing after it)",
 			[]AuditEntry{
 				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "elsewhere"}),
 				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
@@ -429,7 +431,7 @@ func TestLatestReportedHeadSHA(t *testing.T) {
 			"abc1234",
 		},
 		{
-			"undecodable reset row returns the seed",
+			"undecodable reset row re-seeds the walk (nothing after it)",
 			[]AuditEntry{
 				seqEntry(12, "branch_reset", "oops"),
 				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
@@ -446,6 +448,73 @@ func TestLatestReportedHeadSHA(t *testing.T) {
 				seqEntry(10, "pull_request_opened", head("abc1234")),
 			},
 			"mmm2222",
+		},
+		{
+			"reset off the walked chain re-seeds, then a clean rebase from the seed advances",
+			[]AuditEntry{
+				seqEntry(13, "branch_rebased", rebased("abc1234", "mmm2222", "mmm2222", true)),
+				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "elsewhere"}),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"mmm2222",
+		},
+		{
+			"off-chain reset drops the walked chain: a later reset to the old merge re-seeds",
+			[]AuditEntry{
+				seqEntry(13, "branch_reset", map[string]any{"reset_to_sha": "mmm1111"}),
+				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "elsewhere"}),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"undecodable reset re-seeds, then a verified vouch from the seed advances",
+			[]AuditEntry{
+				seqEntry(13, "operator_commit_vouched", verifiedVouch("abc1234", "vvv7777")),
+				seqEntry(12, "branch_reset", "oops"),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"vvv7777",
+		},
+		{
+			"verified vouch delivered BEFORE its seed still advances (response order carries no meaning)",
+			[]AuditEntry{
+				seqEntry(11, "operator_commit_vouched", verifiedVouch("abc1234", "vvv7777")),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"vvv7777",
+		},
+		{
+			"verified vouch then a reset back onto the vouched sha stays on the chain",
+			[]AuditEntry{
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+				seqEntry(11, "operator_commit_vouched", verifiedVouch("abc1234", "vvv7777")),
+				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "vvv7777"}),
+			},
+			"vvv7777",
+		},
+		{
+			"vouch with a mistyped head_advance_verified is skipped like the server's decode failure",
+			[]AuditEntry{
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+				seqEntry(11, "operator_commit_vouched", map[string]any{
+					auditcomplete.VouchedSHAField:               "vvv7777",
+					auditcomplete.VouchPriorHeadSHAField:        "abc1234",
+					auditcomplete.VouchHeadAdvanceVerifiedField: "true",
+				}),
+			},
+			"abc1234",
+		},
+		{
+			"vouch with a non-object payload is skipped",
+			[]AuditEntry{
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+				seqEntry(11, "operator_commit_vouched", "oops"),
+			},
+			"abc1234",
 		},
 		{
 			"seed outside the window with a rebase row inside -> empty",
@@ -475,6 +544,68 @@ func rebased(prior, merge, newHead string, clean bool) map[string]any {
 		"new_head_sha":       newHead,
 		"already_up_to_date": false,
 		"clean_verified":     clean,
+	}
+}
+
+// verifiedVouch is an operator_commit_vouched payload in the shape #4856's
+// handler writes for a server-verified fast-forward vouch, keyed BY the
+// auditcomplete constants.
+func verifiedVouch(prior, vouched string) map[string]any {
+	return map[string]any{
+		"run_id":                             "preview-run",
+		"reason":                             "operator remediation commit",
+		auditcomplete.VouchedSHAField:        vouched,
+		auditcomplete.VouchPriorHeadSHAField: prior,
+		auditcomplete.VouchHeadAdvanceVerifiedField: true,
+	}
+}
+
+// recordedWalkParityFile is the walk-parity table shared with the server
+// resolver (backend/internal/server TestAcceptanceHeadAsOf_RecordedWalkParity).
+const recordedWalkParityFile = "../auditcomplete/testdata/recorded-walk-parity.json"
+
+// TestLatestReportedHeadSHA_RecordedWalkParity runs the MCP preview mirror over
+// every case of the shared parity table, so the mirror and the server resolver
+// are held to the same answers, the reset re-seed rows included (#4874 D2).
+// Each payload reaches the mirror as the decoded JSON object a REST client
+// delivers (map[string]any). An emptied or truncated file fails the case-count
+// floor rather than passing vacuously.
+func TestLatestReportedHeadSHA_RecordedWalkParity(t *testing.T) {
+	raw, err := os.ReadFile(recordedWalkParityFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", recordedWalkParityFile, err)
+	}
+	var doc struct {
+		Cases []struct {
+			Name string `json:"name"`
+			Rows []struct {
+				Category string `json:"category"`
+				Sequence int64  `json:"sequence"`
+				Payload  any    `json:"payload"`
+			} `json:"rows"`
+			WantHead string `json:"want_head"`
+			Skip     string `json:"skip"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode %s: %v", recordedWalkParityFile, err)
+	}
+	if len(doc.Cases) < 15 {
+		t.Fatalf("%s holds %d cases, want at least 15", recordedWalkParityFile, len(doc.Cases))
+	}
+	for _, tc := range doc.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			if tc.Skip != "" {
+				t.Skip(tc.Skip)
+			}
+			recent := make([]AuditEntry, 0, len(tc.Rows))
+			for _, r := range tc.Rows {
+				recent = append(recent, AuditEntry{Category: r.Category, Sequence: r.Sequence, Payload: r.Payload})
+			}
+			if got := latestReportedHeadSHA(recent); got != tc.WantHead {
+				t.Errorf("latestReportedHeadSHA = %q, want %q", got, tc.WantHead)
+			}
+		})
 	}
 }
 

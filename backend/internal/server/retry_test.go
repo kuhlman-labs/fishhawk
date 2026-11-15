@@ -2083,6 +2083,91 @@ func TestRetryStage_AcceptanceReopen_VerdictAtRebasedHead_Refuses(t *testing.T) 
 	}
 }
 
+// retryVerifiedVouchRow is a server-verified operator_commit_vouched row
+// prior -> vouched in the writer's shape (#4856), which the acceptance walk
+// reads as a head step (#4874).
+func retryVerifiedVouchRow(seq int64, prior, vouched string) *audit.Entry {
+	e := fixupWalkVerifiedVouchRow(seq, prior, vouched)
+	e.ID = uuid.New()
+	return e
+}
+
+// TestRetryStage_AcceptanceReopen_VerifiedVouchAfterVerdict_Admits: a verdict at
+// S, then a verified vouch S -> V. The current acceptance head is V, so the
+// verdict is stale and the operator retry admits and re-opens (#4874).
+func TestRetryStage_AcceptanceReopen_VerifiedVouchAfterVerdict_Admits(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "S1reportedhead")},
+		"pull_request_opened":             {headReportEntry("pull_request_opened", "S1reportedhead", 1)},
+		CategoryOperatorCommitVouched:     {retryVerifiedVouchRow(3, "S1reportedhead", "V1vouchedhead")},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a verdict recorded before a verified vouch is stale):\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStatePending) {
+		t.Errorf("body.State = %q, want pending after reopen", body.State)
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
+// TestRetryStage_AcceptanceReopen_UnverifiedVouchAfterVerdict_422: the same
+// history with a legacy (membership-only) vouch row. The acceptance head stays
+// S, the verdict at S is current, and the retry keeps its 422.
+func TestRetryStage_AcceptanceReopen_UnverifiedVouchAfterVerdict_422(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "S1reportedhead")},
+		"pull_request_opened":             {headReportEntry("pull_request_opened", "S1reportedhead", 1)},
+		CategoryOperatorCommitVouched:     {func() *audit.Entry { e := fixupWalkLegacyVouchRow(3, "V1vouchedhead"); e.ID = uuid.New(); return e }()},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (an unverified vouch does not move the acceptance head):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "retry_not_applicable") {
+		t.Errorf("body = %s, want retry_not_applicable", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422", au.appended)
+	}
+}
+
+// TestRetryStage_AcceptanceReopen_VerdictAtVouchedHead_Refuses: a verdict at the
+// verified vouched head V is current, so the retry keeps the 422. The pre-#4874
+// walk (no vouch rows) would compare V to S and admit.
+func TestRetryStage_AcceptanceReopen_VerdictAtVouchedHead_Refuses(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "V1vouchedhead")},
+		"pull_request_opened":             {headReportEntry("pull_request_opened", "S1reportedhead", 1)},
+		CategoryOperatorCommitVouched:     {retryVerifiedVouchRow(3, "S1reportedhead", "V1vouchedhead")},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (the verdict is at the current acceptance head):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422", au.appended)
+	}
+}
+
 // TestRetryStage_AcceptanceReopen_BaseMergeReadError_500: a read error on
 // branch_rebased resolving the current head answers 500, never an admit.
 func TestRetryStage_AcceptanceReopen_BaseMergeReadError_500(t *testing.T) {

@@ -354,6 +354,50 @@ func TestVouchHeadAdvance_UnverifiedIntermediateVouch_NoAdvance(t *testing.T) {
 	assertNoAdvance(t, f, resp, "the commit "+vouchProbeMid+" between the recorded head")
 }
 
+// TestVouchHeadAdvance_IntermediateWhileTipLive_NoteNamesRealExit (#5280,
+// approval condition D3): H -> A -> V with the live pull-request head at V.
+// Following the OLD remedy ("vouch A first, then re-vouch V") dead-ends: A is
+// not the live head, so its vouch is recorded unverified and never joins the
+// closure ledger, and the re-vouch of V stays unverified. The rung (j) note
+// must name the real exit, and that exit (move the branch back to A, vouch it,
+// then push and vouch V) is driven last and verifies both.
+func TestVouchHeadAdvance_IntermediateWhileTipLive_NoteNamesRealExit(t *testing.T) {
+	f := newVouchProbeFixture(t, vouchProbeOpts{})
+	f.seedHead("fixup_pushed", vouchProbeHead)
+	f.forge.setPRHead(vouchProbeTip)
+	f.forge.set(vouchProbeMid, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeMid, vouchProbeMid)
+	f.forge.set(vouchProbeTip, vouchProbeHead)
+	f.forge.set(vouchProbeHead, vouchProbeTip, vouchProbeMid, vouchProbeTip)
+
+	// The old remedy, step 1: vouch A while V is live. Recorded unverified.
+	assertNoAdvance(t, f, f.vouch(t, vouchProbeMid), "is not the run's live pull-request head "+vouchProbeTip)
+	// Step 2: re-vouch V. Still unverified, and the note names the real exit.
+	resp := f.vouch(t, vouchProbeTip)
+	assertNoAdvance(t, f, resp, "the commit "+vouchProbeMid+" between the recorded head")
+	for _, phrase := range []string{
+		"An intermediate commit can only be verified while it is the run's live pull-request head",
+		"vouch each commit as it is pushed",
+		"move the branch back to " + vouchProbeMid + ", vouch it, then push " + vouchProbeTip + " and vouch it",
+	} {
+		if !strings.Contains(resp.RecordedHeadAdvanceNote, phrase) {
+			t.Errorf("recorded_head_advance_note = %q, want it to contain %q", resp.RecordedHeadAdvanceNote, phrase)
+		}
+	}
+	if strings.Contains(resp.RecordedHeadAdvanceNote, "first, then re-vouch") {
+		t.Errorf("recorded_head_advance_note = %q still names the dead-end remedy", resp.RecordedHeadAdvanceNote)
+	}
+
+	// The real exit: the branch moves back to A (A is live), A verifies H -> A;
+	// then V is pushed and verifies A -> V.
+	f.forge.setPRHead(vouchProbeMid)
+	assertAdvanced(t, f, f.vouch(t, vouchProbeMid), vouchProbeHead)
+	f.forge.setPRHead(vouchProbeTip)
+	f.forge.set(vouchProbeTip, vouchProbeMid)
+	f.forge.set(vouchProbeMid, vouchProbeTip, vouchProbeTip)
+	assertAdvanced(t, f, f.vouch(t, vouchProbeTip), vouchProbeMid)
+}
+
 // TestVouchHeadAdvance_NoRecordedHead_NoForgeCall: a vouch never invents a
 // head, and the probe returns before any compare.
 func TestVouchHeadAdvance_NoRecordedHead_NoForgeCall(t *testing.T) {

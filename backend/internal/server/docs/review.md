@@ -2016,13 +2016,18 @@ read it. Its properties:
   (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`). Correctness rests on
   the chain's sequence being unique and assigned in serialized append order,
   not on clocks.
-- **Walked through clean base advances.** The seed then advances through every
-  CLEAN `branch_rebased` row recorded after it, through the same
-  `walkRecordedBaseMerges` and `isCleanAdvance` the fix-up walk uses, so after a
-  Fishhawk rebase acceptance validates the merge commit rather than the
-  pre-rebase head.
-- **Fail-closed reads.** A read error on either seed set or on the base-merge
-  rows returns an error and resolves no head (an empty head makes the dispatch
+- **Walked through clean base advances and verified vouches.** The seed then
+  advances through every CLEAN `branch_rebased` row, every on-chain
+  `branch_reset` and every VERIFIED `operator_commit_vouched` step (#4856's arm,
+  `isVerifiedVouchAdvance`) recorded after it, through the same
+  `walkRecordedBaseMerges` the fix-up walk uses over the same categories
+  (`acceptanceBaseMergeCategories` equals `fixupHeadWalkCategories`, pinned by
+  `TestAcceptanceBaseMergeCategories_MatchFixupWalk`). So after a Fishhawk
+  rebase acceptance validates the merge commit rather than the pre-rebase head,
+  and after a server-verified fast-forward vouch it validates the vouched
+  commit (#4874). An unverified vouch is inert.
+- **Fail-closed reads.** A read error on either seed set or on the walk rows
+  (`branch_rebased`, `branch_reset` or `operator_commit_vouched`) returns an error and resolves no head (an empty head makes the dispatch
   verb and the runner refuse with `acceptance_expected_head_unresolved`), unlike
   the fix-up path's deliberate seed fallback
   (`TestAcceptanceHeadAsOf_LedgerReadErrorReturned`,
@@ -2037,7 +2042,7 @@ read it. Its properties:
 - **DISPATCH-SEQUENCE-BOUNDED on the validated-head path.**
   `acceptanceValidatedHeadSHA` reads `acceptanceHeadAsOf` with `bounded=true`
   at the `dispatchSeq` anchor: both seed sets and the base-merge rows are cut at
-  the anchor BEFORE selection, so a rebase, scenario commit or fan-in merge
+  the anchor BEFORE selection, so a rebase, vouch, scenario commit or fan-in merge
   recorded AFTER the dispatch can never re-bind the verdict to a tree the stage
   did not validate (`TestShipAcceptance_PostDispatchRebaseDoesNotBind`,
   `TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`). An error or an
@@ -2056,8 +2061,9 @@ verdict names the older head
 plan-stageless recovery child resolves its head from an ancestor while its
 verdict reads only its own chain
 ([#5083](https://github.com/kuhlman-labs/fishhawk/issues/5083); reachability
-UNVERIFIED). A vouched or unrecorded commit still does not advance the
-acceptance head (the Captain-held #4856 vouch half).
+UNVERIFIED). An unrecorded commit, or a vouch the server did not verify, still
+does not advance the acceptance head, by design; a server-verified vouch does
+(#4874).
 
 The #4673 corpus-commit contract (a verdict binds the pre-corpus head, and after a
 fix-up the fix-up head, never the prior episode's scenario commit), its

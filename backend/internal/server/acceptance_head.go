@@ -30,13 +30,20 @@ type acceptanceHeadResolution struct {
 // The seed is the newest row by CHAIN SEQUENCE across the run's reported-head
 // ledger rows (lineageLedgerCategories) AND its integration_commit_recorded
 // rows; the resolver never reads a timestamp. The seed is then advanced
-// through the CLEAN branch_rebased / branch_reset rows recorded after it
-// (walkRecordedBaseMerges), so a Fishhawk-performed base advance moves the
-// acceptance head to the merge commit it produced.
+// through the acceptanceBaseMergeCategories rows recorded after it
+// (walkRecordedBaseMerges, the walk the fix-up head also runs): every CLEAN
+// branch_rebased row, every on-chain branch_reset and every server-VERIFIED
+// operator_commit_vouched step (#4856's arm, isVerifiedVouchAdvance). So a
+// Fishhawk-performed base advance moves the acceptance head to the merge
+// commit it produced, and a verified fast-forward vouch moves it to the
+// vouched commit (#4874). Every other vouch row (legacy, unverified, the rebase
+// verb's attribution row, a stale prior) is inert: acceptance stays on the
+// recorded head.
 //
-// When bounded is true every candidate set — both seed sets and the base-merge
-// rows — is cut to Sequence <= maxSeq BEFORE any selection, so a row recorded
-// after the acceptance dispatch can never re-bind a verdict.
+// When bounded is true every candidate set — both seed sets and the walk rows,
+// vouch rows included — is cut to Sequence <= maxSeq BEFORE any selection, so
+// a row recorded after the acceptance dispatch (a rebase or a vouch) can never
+// re-bind that dispatch's verdict.
 //
 // Answers "" with a nil error when the AuditRepo is unconfigured or no seed
 // exists (a rebase alone never invents a head). Any read error is RETURNED:
@@ -106,8 +113,10 @@ func (s *Server) acceptanceHeadSeed(ctx context.Context, runID uuid.UUID, maxSeq
 }
 
 // advanceAcceptanceSeed walks the seed through the run's recorded base merges
-// after it. A base-merge read error is returned (fail closed), unlike the
-// fix-up path's seed fallback (advanceFixupHeadThroughBaseMerges).
+// and verified vouch steps after it (clean rebases, on-chain resets and
+// verified vouches advance; every other vouch row is inert). A read error on
+// any walk category is returned (fail closed), unlike the fix-up path's seed
+// fallback (advanceFixupHeadThroughBaseMerges).
 func (s *Server) advanceAcceptanceSeed(ctx context.Context, runID uuid.UUID, seed *audit.Entry, sha string, maxSeq int64, bounded bool) (string, error) {
 	rows, err := s.acceptanceBaseMergeRows(ctx, runID)
 	if err != nil {
@@ -119,11 +128,22 @@ func (s *Server) advanceAcceptanceSeed(ctx context.Context, runID uuid.UUID, see
 	return walkRecordedBaseMerges(rows, seed.Sequence, sha), nil
 }
 
-// acceptanceBaseMergeRows reads the run's branch_rebased and branch_reset rows
-// for the acceptance walk, returning the first read error.
+// acceptanceBaseMergeCategories are the categories the acceptance walk reads
+// after its seed: the recorded base merges and the operator vouches (#4874).
+// They are the fix-up walk's set (fixupHeadWalkCategories), so reset, the
+// fix-up base check and the acceptance expected head give ONE answer to "is a
+// vouched commit run lineage": a verified vouch is the head, any other vouch
+// is membership only. TestAcceptanceBaseMergeCategories_MatchFixupWalk pins
+// the agreement.
+var acceptanceBaseMergeCategories = []string{CategoryBranchRebased, CategoryBranchReset, CategoryOperatorCommitVouched}
+
+// acceptanceBaseMergeRows reads the run's acceptanceBaseMergeCategories rows
+// for the acceptance walk, returning the first read error. A vouch-row read
+// error fails closed exactly like a rebase-row one: acceptanceHeadAsOf then
+// resolves no head rather than a head that may predate a verified vouch.
 func (s *Server) acceptanceBaseMergeRows(ctx context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
 	var rows []*audit.Entry
-	for _, cat := range []string{CategoryBranchRebased, CategoryBranchReset} {
+	for _, cat := range acceptanceBaseMergeCategories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", cat, err)

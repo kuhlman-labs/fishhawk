@@ -1,0 +1,14 @@
+id: scenario:issue-4874/rebase-after-vouch-names-merge
+statement: When a clean rebase is recorded after a verified vouch and its prior head is the vouched commit, the acceptance prompt names the rebase's merge commit.
+verify_hint: Same acceptance-vouched-head fixture; GET /v0/stages/{vouched-then-rebased-run acceptance}/prompt → acceptance_expected_head_sha equals the seeded merge sha.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-vouched-head"} and read the run_id plus the *-acceptance stage id of run key vouched-then-rebased-run from the 201 body. 2) GET audit: pull_request_opened 3333…, verified vouch 3333…→4444…, branch_rebased prior 4444… merge_commit/new_head 5555… clean_verified true, then acceptance_dispatched. 3) POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over ''prompt:<acceptance stage id>''; GET /v0/stages/{acceptance stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: the rebase's merge commit sha
+    observed_at_record: acceptance_expected_head_sha=5555555555555555555555555555555555555555 (the rebase merge commit)
+    repro_handle: GET /v0/stages/4fead4cd-5d27-42f1-9aa9-fba5f8bfd993/prompt (signed)
+origin:
+    issue: 4874
+    pr: 5293
+    run_id: 1c1b9276-fd70-419b-ac15-28e3c4158ef4
+    head_sha: f14b941b89ebb3dcc37b1394b55e094230a7513a
+    recorded_at: 2026-11-14T22:14:27Z
