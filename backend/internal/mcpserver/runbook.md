@@ -298,10 +298,102 @@ Leaving the stage parked without one of those strands the run with a re-opened
 stage and no runner.
 
 Note also that a fixup re-drives the **entire** implement agent (tens of
-thousands of tokens), not a patch. A no-op fixup (zero diff) still burns the
-budget and wedges the run. Before approving a fixup, cross-check the
-files-changed against the plan scope; if a pass would be a no-op, abandon and
-start a fresh run instead.
+thousands of tokens), not a patch. A fixup that produces no commit (zero diff)
+records `fixup_no_changes`, re-parks the review gate and is refunded against
+the fix-up budget, but it still costs a full agent run, and the same route
+repeated unchanged tends to produce nothing again. Before routing a fixup,
+cross-check the files it must change against the plan scope; if a pass would be
+a no-op, start a fresh run instead. The refund rule for each failure shape is in
+*Fix-up routing: sizing, cost and recovery* below.
+
+### Fix-up routing: sizing, cost and recovery
+
+`fishhawk_fixup_stage` re-drives the whole implement agent against the concerns
+you route. A pass is guaranteed to deliver a commit or a recorded outcome; it is
+not guaranteed to complete every routed item. These rules decide how to size a
+pass, when it is worth its cost, how to follow it through, and how to recover
+when it fails.
+
+**Sizing.**
+
+- Route one substantive concern per pass. A bundled pass can fix the easier
+  items and drop one, so route a high-severity concern alone, and route any fix
+  that must land alone.
+- When each finding needs its own counterfactual (delete the control, observe
+  red, restore), allow one counterfactual cycle per pass. Several cycles in one
+  implement-stage budget can time out and deliver nothing.
+
+**Cost.**
+
+- A pass that pushes re-opens a settled acceptance stage: its verdict is
+  invalidated and acceptance must run again. The new commit can also dismiss an
+  existing pull request approval where the forge dismisses stale approvals. So
+  once acceptance has passed, prefer `fishhawk_defer_concern` for a low finding
+  over a fix-up.
+- Before routing an acceptance failure yourself, read the
+  `acceptance_triage_decided` audit entry. A disposition of `fixup_dispatched`
+  means triage already spent a pass from the same fix-up budget, and the default
+  budget is one pass.
+
+**Follow-through.**
+
+- Wait for the re-review from the trigger. `fishhawk_fixup_stage` returns
+  `fixup_trigger_sequence` (the sequence of its `stage_fixup_triggered` entry),
+  `expected_reviewers` and an ordered `next_steps`: on the local runner,
+  dispatch the re-opened implement stage first, then wait. Wait with
+  `fishhawk_await_audit` from that sequence over `implement_reviewed`,
+  `implement_review_failed` and `implement_review_skipped`, and expect one
+  terminal verdict per configured reviewer, counting every kind. Re-arm from the
+  returned `latest_sequence` until all have landed. When those fields are
+  absent, read the trigger entry's sequence with `fishhawk_list_audit`.
+- When a bundled pass dropped an item, re-route it and attach
+  `operator_evidence`. Put the diff showing the item is still unaddressed in
+  `reason`, and tell the agent to state any disagreement in its fix-up
+  self-report rather than skip the item.
+- A concern routed with `operator_evidence` cannot be retired by a reviewer's
+  confirmed verdict (the gate view's `disputes[]` shows `veto_reason`
+  `operator_evidence_routed`). Close it yourself: `fishhawk_resolve_concerns`
+  when it is fixed, `fishhawk_waive_concern` or `fishhawk_defer_concern` when it
+  is not fixed but acceptable.
+- A "confirmed" resolution in a post-fix-up round is the re-reviewer's opinion
+  over the diff, not an executed reproduction. Re-run your own reproduction at
+  the fix-up head before you trust it, and when the defect still reproduces,
+  route it again with `operator_evidence`.
+
+**Recovery.**
+
+- The refund rule depends on the failure's shape. A pass that produced no
+  commit (`fixup_no_changes`) is refunded, but the route did not work: do not
+  repeat the same route unchanged. Re-route one sharper concern (an
+  `operator_concern` naming the exact change), start a fresh run, or finish the
+  change on the run branch and `fishhawk_vouch_commit` it. A pass that died
+  having pushed nothing, or a queued pass that was superseded, is also refunded,
+  and once the cause is fixed, re-routing the same concerns is fine.
+- A pass that died is refunded only when it died category A or C having pushed
+  nothing; a locally reaped runner reports category C. A category-B (policy)
+  failure consumes a pass, because it is a verdict on delivered work, and so
+  does a pass that pushed and then died. When the recovery marker says
+  re-opening the routed concerns could not be completed, they may still read
+  `addressed_pending`: verify with `fishhawk_get_gate_view` before trusting them.
+- A git-auth setup failure (source failure reason `fixup_base_git_auth`) means
+  the remote rejected the git credential the fix-up base checkout used.
+  Re-routing does not fix it; the credential does. Find which credential ran
+  from the most recent `installation_token_received` /
+  `base_auth_token_unavailable` event before the `runner_failed` line in the
+  runner's dispatch log. `installation_token_received` means a token was minted
+  for this dispatch, and its `source` field names where it came from.
+  `base_auth_token_unavailable`, or a remote that is not http(s), means the
+  checkout fell back to the host's ambient git credentials. Fix that credential
+  before re-dispatching, because a re-dispatch that resolves the same credential
+  fails the same way.
+- When the fix-up ceiling is reached (`fishhawk_fixup_stage` refuses with
+  `fixup_ceiling_reached`), start fresh. Fold every verified finding into the
+  issue body as a dated constraints block, because the cancelled run's concerns
+  do not carry over. Then `fishhawk_cancel_run` this run, close its pull request
+  yourself (cancel does not close the pull request, and the branch sweep skips a
+  branch with an open one), and start the new run. For a late required-check
+  finding at the ceiling, the vouched-patch path in *Late CI/SAST finding after
+  the fix-up ceiling* still applies.
 
 ### Failed-run revive (`fishhawk_revive_run`)
 
