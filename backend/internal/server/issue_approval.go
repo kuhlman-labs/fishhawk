@@ -26,8 +26,9 @@ import (
 // share it, named by the payload's `reason`: `over_cap_approve_comment` (#2583's
 // over-cap approve refusal, made observable by E67.24 / #2621) and
 // `comment_channel_refused` (ADR-123 D4 / #4755: the channel itself refused,
-// with a `cause` — a workflow-v2 gate, or a gate whose approval rules could not
-// be verified). It exists for the
+// with a `cause` — a workflow-v2 gate, a v0/v1 approval gate not on the legacy
+// `approvers` path (#5300), or a gate whose approval rules could not be
+// verified). It exists for the
 // SILENT branch above all: a reply-comment ("+1") refusal deliberately posts no
 // reply, so without this entry an operator's approval evaporated with no reply,
 // no approval row, and no trace anywhere. The entry is written on the non-silent
@@ -43,7 +44,8 @@ const CategoryApprovalCommentRefused = "approval_comment_refused"
 // "+1" (E17.3 / #338) and reaction approvals the reactionpoller forwards.
 // Steps: (1) resolve the run's awaiting-approval stage; (2) authorize the
 // CHANNEL and the approver via authorizeCommentApproval — the ADR-123 D4 /
-// #4755 refusal on every workflow-v2 gate (approve and reject) and on any
+// #4755 refusal on every workflow-v2 gate (approve and reject), on every
+// v0/v1 approval gate not on the legacy `approvers` path (#5300), and on any
 // gate whose approval rules cannot be verified, then the legacy v0/v1
 // `approvers` role check; (3) the over-cap comment refusal; (4) Submit,
 // advance, orchestrator dispatch. The result is addressed in the issue
@@ -125,9 +127,10 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
-	// ADR-123 D4 (#4755): the issue-comment channel cannot evaluate a
-	// workflow-v2 `approvals` predicate, so it is REFUSED on every v2 gate and
-	// fails closed wherever the gate's approval rules cannot be verified. A
+	// ADR-123 D4 (#4755, #5300): the issue-comment channel cannot evaluate an
+	// `approvals` predicate, so it is REFUSED on every v2 gate and on every
+	// v0/v1 approval gate not on the legacy `approvers` path, and fails closed
+	// wherever the gate's approval rules cannot be verified. A
 	// refusal records nothing and transitions nothing; it is written as an
 	// approval_comment_refused audit entry on both channels (the reply-comment
 	// one stays silent) so the drop is visible in the run record. It precedes
@@ -513,6 +516,13 @@ const (
 	// commentRefusalRoleResolutionFailed: the legacy `approvers` check errored
 	// (for example a team-API failure).
 	commentRefusalRoleResolutionFailed = "role_resolution_failed"
+	// commentRefusalApprovalsPredicateGate: a v0/v1 stage carries an approval
+	// gate that is not the legacy `approvers` role check — on v1, a gate
+	// declaring the forge-neutral `approvals` predicate, alone or beside a
+	// legacy `approvers` gate. The channel cannot evaluate that predicate's
+	// members / quorum / author-exclusion rules, so it refuses approve AND
+	// reject (ADR-123 D4 / #5300).
+	commentRefusalApprovalsPredicateGate = "approvals_predicate_gate"
 )
 
 // commentApprovalAuthz is authorizeCommentApproval's outcome (ADR-123 D4 /
@@ -530,26 +540,57 @@ type commentApprovalAuthz struct {
 }
 
 // commentGateSpecMajor re-reads the stage's run and returns the major version
-// of its cached workflow spec (ADR-123 D4 / #4755). It errors on a run read
+// of its cached workflow spec (ADR-123 D4 / #4755), with the parsed spec and the
+// run's workflow id so the caller can inspect the stage's gates (#5300). It
+// errors on a run read
 // failure, an empty cached spec (errNoCachedWorkflowSpec) and a spec that does
 // not parse. It deliberately requires neither an installation_id nor the run's
 // workflow id in the spec: the version decision rests on the spec bytes alone,
 // so a v2 spec refuses even where the legacy gate lookup could not run.
 // spec.ParseBytes rejects a missing or unsupported version, so a parsed spec's
 // major is authoritative.
-func (s *Server) commentGateSpecMajor(ctx context.Context, stage *run.Stage) (int, error) {
+func (s *Server) commentGateSpecMajor(ctx context.Context, stage *run.Stage) (int, *spec.Spec, string, error) {
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
 	if err != nil {
-		return 0, fmt.Errorf("get run: %w", err)
+		return 0, nil, "", fmt.Errorf("get run: %w", err)
 	}
 	if len(runRow.WorkflowSpec) == 0 {
-		return 0, errNoCachedWorkflowSpec
+		return 0, nil, "", errNoCachedWorkflowSpec
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
-		return 0, fmt.Errorf("parse workflow spec: %w", err)
+		return 0, nil, "", fmt.Errorf("parse workflow spec: %w", err)
 	}
-	return spec.VersionMajor(parsed.Version), nil
+	return spec.VersionMajor(parsed.Version), parsed, runRow.WorkflowID, nil
+}
+
+// commentGateNonLegacyApproval reports whether the stage of stageType in the
+// run's workflow carries ANY approval gate that is not a legacy `approvers`
+// gate (ADR-123 D4 / #5300). It selects the FIRST stage of that type, as
+// fetchGateForStage and approvalsForRun do, and walks EVERY gate: a stage that
+// declares a legacy `approvers` gate AND an `approvals` gate is enforced on
+// both by the HTTP approval path, while fetchGateForStage hands the comment
+// channel only the first. The schema's per-gate oneOf rejects a gate carrying
+// both blocks at parse time, so a gate with Approvers == nil is the
+// non-legacy shape. It fails closed: a workflow or stage type absent from the
+// spec reports true.
+func commentGateNonLegacyApproval(parsed *spec.Spec, workflowID string, stageType run.StageType) bool {
+	wf, ok := parsed.Workflows[workflowID]
+	if !ok {
+		return true
+	}
+	for _, stg := range wf.Stages {
+		if string(stg.Type) != string(stageType) {
+			continue
+		}
+		for _, g := range stg.Gates {
+			if g.Type == spec.GateTypeApproval && g.Approvers == nil {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // authorizeCommentApproval decides whether an issue-comment decision (slash
@@ -566,16 +607,19 @@ func (s *Server) commentGateSpecMajor(ctx context.Context, stage *run.Stage) (in
 //  3. no RoleResolver → role_resolver_unconfigured;
 //  4. the stage's gate cannot be resolved (for example a workflow id missing
 //     from the spec, or a run without an installation_id) → spec_unreadable;
-//  5. a stage with no legacy `approvers` block → allowed (the legacy
-//     no-approvers outcome, kept);
-//  6. role resolution errors → role_resolution_failed;
-//  7. otherwise the legacy `approvers` verdict: allowed, or a deny message.
+//  5. any approval gate on the stage is not a legacy `approvers` gate (on v1,
+//     a gate declaring `approvals`, alone or beside an `approvers` gate) →
+//     approvals_predicate_gate, for approve AND reject (#5300);
+//  6. a stage with no approval gate → allowed (the legacy no-approvers
+//     outcome, kept);
+//  7. role resolution errors → role_resolution_failed;
+//  8. otherwise the legacy `approvers` verdict: allowed, or a deny message.
 //
 // Only a channel refusal (non-empty refusal) is audited; the legacy deny keeps
 // its unaudited reply / silent drop. The MCP, CLI and web-UI channels
 // (POST /v0/stages/{id}/approvals) are unaffected.
 func (s *Server) authorizeCommentApproval(ctx context.Context, stage *run.Stage, subject string) commentApprovalAuthz {
-	specMajor, err := s.commentGateSpecMajor(ctx, stage)
+	specMajor, parsed, workflowID, err := s.commentGateSpecMajor(ctx, stage)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"comment approval refused: cached workflow spec unreadable",
@@ -597,9 +641,13 @@ func (s *Server) authorizeCommentApproval(ctx context.Context, stage *run.Stage,
 			slog.String("error", err.Error()))
 		return commentApprovalAuthz{refusal: commentRefusalSpecUnreadable, specMajor: specMajor}
 	}
+	if commentGateNonLegacyApproval(parsed, workflowID, stage.Type) {
+		return commentApprovalAuthz{refusal: commentRefusalApprovalsPredicateGate, specMajor: specMajor}
+	}
 	if gate == nil || gate.approvers == nil {
-		// No legacy approvers block on the stage — the v0/v1 no-approvers
-		// outcome, matching the HTTP handler's posture.
+		// No approval gate on the stage — the v0/v1 no-approvers outcome,
+		// matching the HTTP handler's posture. Every approval gate here is a
+		// legacy `approvers` gate (the check above refused any other shape).
 		return commentApprovalAuthz{allowed: true, specMajor: specMajor}
 	}
 	allowed, err := s.cfg.RoleResolver.CanApprove(ctx, gate.scope, gate.approvers, gate.roles, subject)
@@ -622,8 +670,11 @@ func (s *Server) authorizeCommentApproval(ctx context.Context, stage *run.Stage,
 // the reviewer's next action is clear.
 func commentChannelRefusedReply(cause, subject string) string {
 	channels := "the MCP verbs `fishhawk_approve_plan` / `fishhawk_reject_plan`, the CLI `fishhawk plan approve` / `fishhawk plan reject`, or the web UI"
-	if cause == commentRefusalWorkflowV2Gate {
+	switch cause {
+	case commentRefusalWorkflowV2Gate:
 		return fmt.Sprintf("Comment approvals and rejections are not accepted on workflow-v2 gates (ADR-123). Nothing was recorded; the stage is still awaiting approval. Decide the gate with %s. (Caller: @%s)", channels, subject)
+	case commentRefusalApprovalsPredicateGate:
+		return fmt.Sprintf("Comment approvals and rejections are not accepted on gates that declare an `approvals` predicate (ADR-123). Nothing was recorded; the stage is still awaiting approval. Decide the gate with %s. (Caller: @%s)", channels, subject)
 	}
 	return fmt.Sprintf("Fishhawk could not verify this gate's approval rules (`%s`), so nothing was recorded; the stage is still awaiting approval. Decide the gate with %s. (Caller: @%s)", cause, channels, subject)
 }
