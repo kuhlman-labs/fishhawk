@@ -3340,10 +3340,13 @@ per-tool contract). Internals not covered there:
   path it REPLACES `issue_set_resolution_failed` (502), which now means a genuine forge fetch failure only.
 - **Advisory `admission_screen` on the create output (#3649).** The `Campaign` wire struct carries
   `AdmissionScreen` (`*campaignAdmissionScreen`, `json:"admission_screen,omitempty"`), mirroring the backend's
-  create-response-only block: `{advisory, findings[{issue, kind, path?, location?, forbidden_pattern?}],
+  never-persisted block: `{advisory, findings[{issue, kind, path?, location?, forbidden_pattern?}],
   forbidden_paths_screened, truncated?}`, `kind` being `not_runnable_declared` (a `runnable:no` label) or
-  `forbidden_path` (a title/body token the repo's implement-stage `forbidden_paths` forbid). It rides
-  `StartCampaignOutput.Campaign` unchanged — no new tool, no `campaign.go` change. Typed structs (unexported, fields
+  `forbidden_path` (a title/body token the repo's implement-stage `forbidden_paths` forbid). On the `Campaign` object
+  it is create-response-only: it rides `StartCampaignOutput.Campaign` unchanged — no new tool, no `campaign.go`
+  change. The same block also rides the preview report (`CampaignPreview.AdmissionScreen`, #5221; see the
+  `fishhawk_preview_campaign` bullet below), and only the create appends the `campaign_admission_screened` audit row.
+  Typed structs (unexported, fields
   exported) rather than `map[string]any` so the reflection-built output schema stays an object and the types stay off
   the frozen export surface, the same convention as `campaignSatisfiedDependency`. ADVISORY: the campaign was created
   regardless; a later `fishhawk_get_campaign_status` never carries it. Pinned by
@@ -3404,17 +3407,44 @@ per-tool contract). Internals not covered there:
   `TestPreviewCampaign_E2E_ThroughRealServer` drives the tool through the REAL `server.Handler()` over a
   write-refusing `campaign.BaseFake`, so the `CampaignPreview` wire struct is proven against the JSON the server
   EMITS rather than a hand-built approximation, and a handler that tried to persist would 500 rather than pass.
-  **`human_led` (#5214).** `PreviewCampaignOutput.HumanLed` (beside `preview`, not inside it, so the backend wire
-  struct is unchanged) is composed MCP-side by `previewHumanLed`: the refs of `preview.items` whose `autonomy` is
-  exactly `low`, the predicate `campaign.NextEligible` uses to divert a deps-satisfied item to HumanLed. Those items
-  are never agent-started while they stay low (`fishhawk_start_campaign_item_run` refuses `item_human_led`). Absent
-  when none is low. Pinned by `TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy`.
+  **`human_led` (#5214, extended by #5221).** `PreviewCampaignOutput.HumanLed` (beside `preview`, not inside it, so
+  the backend wire struct carries no human-led block) is composed MCP-side by `previewHumanLed`: one entry per
+  `preview.items` element whose `autonomy` is exactly `low`, the predicate `campaign.NextEligible` uses to divert a
+  deps-satisfied item to HumanLed. Those items are never agent-started while they stay low
+  (`fishhawk_start_campaign_item_run` refuses `item_human_led`). Each entry is `{issue_ref, position,
+  blocked_dependents, remedy}` (unexported `previewHumanLedItem`, fields exported). `position` is the item's
+  zero-based queue position. `blocked_dependents` is a visited-set BFS over the reverse in-set `depends_on` edges,
+  so it is transitive, excludes the item itself, terminates on a cycle, is sorted by position and is always an array.
+  `previewHumanLedRemedy` picks the remedy by source and position. An `epic_ref` / `items` preview gets "preview an
+  items list without it AND its blocked_dependents", because dropping only the item leaves them dangling. A
+  `grooming_run_id` preview at position N > 0 gets `grooming_order_limit=N`, which keeps the N items ranked above it.
+  At position 0, no limit can exclude it (0 means no cap), so it gets "lead it by hand first, or preview an explicit
+  items list". This is ONE human-led surface: elements changed from bare refs to objects in place, and no second
+  field exists. Absent when none is low. Pinned by `TestPreviewCampaign_HumanLed_ListsOnlyLowAutonomy`,
+  `TestPreviewHumanLed_ReportsTransitiveBlockedDependents`, `TestPreviewHumanLed_CycleTerminates`,
+  `TestPreviewHumanLed_RemedyByPositionAndSource`, `TestPreviewCampaign_HumanLed_GroomingSourceRemedy` and
+  `TestPreviewCampaign_OutputSchema_ExactlyOneHumanLedBlock` (the advertised schema has exactly one
+  human_led-named property, and `preview` has none).
+  **Advisory screens (#5221).** `CampaignPreview` mirrors the backend's two ADVISORY blocks, present on the valid,
+  dangling and cycle reports alike and only when they found something. `admission_screen` reuses the create's
+  `campaignAdmissionScreen` mirror: the same #3649 screen, with no audit row on the preview. `path_overlap`
+  (`campaignPreviewPathOverlap` / `campaignPreviewPathOverlapPair`, unexported) is `{advisory, pairs[{items, paths,
+  class, remedy}], total_pairs, truncated?}`: unordered item pairs whose title or body name the same file path,
+  `class` `code` or `docs_only`. It is lexical over issue prose, so it has the false positives and negatives the
+  backend documents (`backend/internal/server/campaign_preview_screen.go`). Neither block changes `valid`, `waves`
+  or `items`. `TestPreviewCampaign_ScreensPassthrough` decodes LITERAL server-shaped JSON through the real client, so
+  a json-tag drift fails it. `TestPreviewCampaign_E2E_ScreensThroughRegisteredTool` is the cross-boundary test: the
+  REAL `server.Handler()` behind httptest, the tools registered with `registerTools`, and a `CallTool` over in-memory
+  MCP transports. It asserts `human_led`, `preview.admission_screen` and `preview.path_overlap` in the
+  `structuredContent`, and that a token without `write:campaigns` is refused `insufficient_scope`.
+  `TestPreviewCampaign_Description_NamesScreens` pins the tool description and the ADVISORY schema text.
 - **Run-start and campaign-start guidance in the descriptions (#5214).** The operator rules from the #4745 inventory
   live on the surface where the operator acts, each pinned on the wire-visible ListTools text:
   `fishhawk_start_campaign` says preview first and read `edges[].source` / `warnings[]`, that prose-only sequencing
   yields no edge (the item lands in wave 0), and to start from a clean, current checkout of the base branch
   (`TestStartCampaign_Description_PointsAtPreviewAndNoEdgeProse`); `fishhawk_preview_campaign` names `human_led`
-  (`TestPreviewCampaign_Description_NamesHumanLed`); `fishhawk_get_campaign_status`'s `scope_overlap` says to
+  with its position, blocked_dependents and position-0 rule (`TestPreviewCampaign_Description_NamesHumanLed`) and the
+  `admission_screen` / `path_overlap` screens (`TestPreviewCampaign_Description_NamesScreens`); `fishhawk_get_campaign_status`'s `scope_overlap` says to
   sequence a new item behind the LAST still-open overlapping item and plan it once that item's PR has opened
   (`TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule`); `fishhawk_dispatch_stage` says only a local
   implement joins a default concurrency group, so plan stages are ungrouped
