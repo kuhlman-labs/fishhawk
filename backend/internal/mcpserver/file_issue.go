@@ -131,7 +131,9 @@ citing the rubric lines your filing's own structure fires. Read them; do NOT
 act on them as decisions. NOTHING was closed, merged, relabelled or
 transitioned on the strength of a duplicate candidate — the dedup decision
 stays a human/workflow action, and the same signals are also appended to the
-created issue body as an advisory section. Duplicate matching is LEXICAL, not
+created issue body as an advisory section, except for a type whose
+work-management intake_section resolves to omit (the adr type by default),
+which files a clean body and still returns intake here. Duplicate matching is LEXICAL, not
 semantic, so false positives and false negatives are expected. Pass
 source_refs ('#N' or 'N', same repo) naming the items this draft derives from
 (the concern or report it was written from): they are excluded from the

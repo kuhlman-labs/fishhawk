@@ -35,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/userreport"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
@@ -521,6 +522,190 @@ func TestFileWorkItem_IntakeSignalsEndToEnd(t *testing.T) {
 	// The duplicate candidate's own record is unchanged.
 	if p.items[0].Number != 1234 || p.items[0].Title != "[E22.4] Add the widget endpoint" {
 		t.Errorf("the duplicate candidate's record was mutated: %+v", p.items[0])
+	}
+}
+
+// igIntakeSectionConventions parses a work-management-v0 document through
+// workmgmt.Parse — schema validation plus the DisallowUnknownFields struct
+// decode — declaring a feature and an adr type whose intake_section lines are
+// featureKey and adrKey verbatim (empty means the key is absent).
+func igIntakeSectionConventions(t *testing.T, featureKey, adrKey string) workmgmt.Conventions {
+	t.Helper()
+	line := func(v string) string {
+		if v == "" {
+			return ""
+		}
+		return "    intake_section: " + v + "\n"
+	}
+	doc := `spec_version: work-management-v0
+provider: ` + workmgmt.Default().Provider + `
+required_fields: [Summary, Done-means, complexity]
+charter: {path: ` + igCharterPath + `}
+types:
+  feature:
+    title_format: "{summary}"
+    body_skeleton: [Summary]
+    default_fields: {complexity: medium}
+` + line(featureKey) + `  adr:
+    title_format: "[ADR-{number}] {summary}"
+    body_skeleton: [Summary]
+    default_fields: {complexity: medium}
+    numbering: {scheme: sequential, prefix: ADR-, pad: 3}
+` + line(adrKey)
+	conv, err := workmgmt.Parse(strings.NewReader(doc))
+	if err != nil {
+		t.Fatalf("workmgmt.Parse(intake_section fixture) = %v\n%s", err, doc)
+	}
+	return conv
+}
+
+// TestFileWorkItem_IntakeSectionPerType is the cross-boundary test for the
+// per-type intake_section key (#5223). Each row parses its conventions from
+// YAML (schema validation + struct decode), installs them through the
+// conventionsLoader seam and files through s.Handler() POST /v0/work-items, so
+// the path crosses the HTTP handler, the shared filing core's gate, the intake
+// hook and the body handed to provider.File.
+//
+// The reader window holds #1234, a duplicate of the filing's title, so the
+// signals carry a finding on EVERY row and RenderBody would append unless the
+// gate stops it: the append rows prove the fixture yields findings, so no
+// degraded no-op can mask the gate. The omit rows still return the signals on
+// the 201 (only the render is gated).
+//
+// Counterfactuals: deleting the gate reddens rows i and iii; mutating
+// IntakeSectionOmitted to `return false` reddens rows i and iii; dropping the
+// adr-key default reddens only row i; ignoring an explicit value reddens rows
+// iii and iv.
+func TestFileWorkItem_IntakeSectionPerType(t *testing.T) {
+	cases := []struct {
+		name        string
+		typ         string
+		featureKey  string
+		adrKey      string
+		wantSection bool
+	}{
+		{name: "i adr key absent omits", typ: "adr", wantSection: false},
+		{name: "ii feature key absent appends", typ: "feature", wantSection: true},
+		{name: "iii feature explicit omit", typ: "feature", featureKey: "omit", wantSection: false},
+		{name: "iv adr explicit append", typ: "adr", adrKey: "append", wantSection: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := pvRegisterRead(t, pvHealthyItems())
+			p.discovered = []int{79}
+			p.guard.fileOK.Store(true)
+			installConventions(t, igIntakeSectionConventions(t, tc.featureKey, tc.adrKey), nil)
+
+			s, token := mcpTestServer(t, igCharterConfig(igCharterDoc, false))
+			ts := httptest.NewServer(s.Handler())
+			defer ts.Close()
+
+			raw, err := json.Marshal(workItemRequest{
+				Repo:    "kuhlman-labs/fishhawk",
+				Type:    tc.typ,
+				Summary: "Add the widget endpoint",
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/v0/work-items", bytes.NewReader(raw))
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST /v0/work-items: %v", err)
+			}
+			respBody, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (body=%s)", resp.StatusCode, respBody)
+			}
+			if !p.called {
+				t.Fatal("the filing did not reach provider.File")
+			}
+
+			// The signals reach the 201 on every row, so a missing section on
+			// an omit row is the gate and not an empty finding set.
+			var wr workItemResponse
+			if err := json.Unmarshal(respBody, &wr); err != nil {
+				t.Fatalf("decode 201: %v (body=%s)", err, respBody)
+			}
+			if wr.Intake == nil || len(wr.Intake.Duplicates) == 0 {
+				t.Fatalf("201 intake = %+v, want at least one duplicate on every row (body=%s)", wr.Intake, respBody)
+			}
+
+			body := p.captured.Item.Body
+			hasHeading := strings.Contains(body, intakegroom.SectionHeading)
+			hasMarker := strings.Contains(body, intakegroom.MarkerPrefix)
+			if hasHeading != tc.wantSection || hasMarker != tc.wantSection {
+				t.Errorf("type %s (feature intake_section=%q, adr intake_section=%q): provider body heading=%v marker=%v, want both %v:\n%s",
+					tc.typ, tc.featureKey, tc.adrKey, hasHeading, hasMarker, tc.wantSection, body)
+			}
+		})
+	}
+}
+
+// TestFileWorkItem_ADRWithoutIntakeMarkerClassifiesByAuthor pins the
+// acceptable fallback of omitting the intake marker on an adr filing (#5223,
+// binding approval condition H5). userreport.Classify earns fishhawk_filed
+// only from a recognised provenance marker, and the intake marker was the one
+// an ordinary filing carried, so an adr filed without it now classifies by its
+// author: bot for the Fishhawk App, internal for the captain. Both are still
+// excluded from the comms user-report set (only external items are kept), so
+// the fallback never surfaces Fishhawk's own ADR as a user report. The feature
+// filing, which keeps the section, still classifies fishhawk_filed, which
+// shows the adr result is the omitted marker and not a dead classifier.
+func TestFileWorkItem_ADRWithoutIntakeMarkerClassifiesByAuthor(t *testing.T) {
+	bodyFor := func(t *testing.T, typ string) string {
+		t.Helper()
+		p := pvRegisterRead(t, pvHealthyItems())
+		p.discovered = []int{79}
+		p.guard.fileOK.Store(true)
+		installConventions(t, igIntakeSectionConventions(t, "", ""), nil)
+		s := New(igCharterConfig(igCharterDoc, false))
+		rec := fileWorkItem(t, s, workItemRequest{
+			Repo:    "kuhlman-labs/fishhawk",
+			Type:    typ,
+			Summary: "Add the widget endpoint",
+		}, "github:operator")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("%s filing status = %d, want 201 (body=%s)", typ, rec.Code, rec.Body.String())
+		}
+		if resp := decodeWorkItem(t, rec); resp.Intake == nil || !resp.Intake.HasFindings() {
+			t.Fatalf("%s filing intake = %+v, want findings so the marker would render if not gated", typ, resp.Intake)
+		}
+		return p.captured.Item.Body
+	}
+	adrBody := bodyFor(t, "adr")
+	featureBody := bodyFor(t, "feature")
+
+	app := workmgmt.ReportAuthor{Login: "fishhawk-dev[bot]", Bot: true, AssociationResolved: true}
+	captainAuthor := workmgmt.ReportAuthor{Login: "captain", Association: "NONE", AssociationResolved: true}
+	cc := userreport.ClassifyContext{CaptainLogin: "captain"}
+
+	cases := []struct {
+		name   string
+		body   string
+		author workmgmt.ReportAuthor
+		want   userreport.Classification
+	}{
+		{"adr filed by the App falls back to bot", adrBody, app, userreport.ClassBot},
+		{"adr filed by the captain falls back to internal", adrBody, captainAuthor, userreport.ClassInternal},
+		{"feature filed by the App keeps fishhawk_filed", featureBody, app, userreport.ClassFishhawkFiled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := userreport.Classify(workmgmt.UserReportItem{Kind: workmgmt.UserReportKindIssue, Body: tc.body, Author: tc.author}, cc)
+			if got.Class != tc.want {
+				t.Errorf("Classify = %+v, want class %s", got, tc.want)
+			}
+			if got.Class == userreport.ClassExternal {
+				t.Errorf("Classify = external: a Fishhawk-filed issue would surface as a user report")
+			}
+		})
 	}
 }
 

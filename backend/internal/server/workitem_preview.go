@@ -33,7 +33,8 @@ import (
 
 // workItemPreview is what a filing WOULD produce, rendered by the same
 // prepareWorkItem core the filing uses. Body is the RenderBody output
-// provider.File would receive (advisory section and hidden marker included).
+// provider.File would receive (advisory section and hidden marker included,
+// except for a type whose intake_section resolves to omit — adr by default).
 type workItemPreview struct {
 	Type                   string
 	Title                  string

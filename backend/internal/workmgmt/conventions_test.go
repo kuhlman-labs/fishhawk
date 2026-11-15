@@ -655,6 +655,112 @@ types:
 	}
 }
 
+// TestConventions_IntakeSectionOmitted pins the per-type intake_section
+// resolver (#5223): an explicit value wins in either direction, an absent value
+// omits only for the type keyed adr, and an undeclared type appends. Each row
+// isolates one arm: mutating the body to `return false` reddens the omit and
+// adr-absent rows, dropping the adr default reddens only the adr-absent row,
+// and ignoring the explicit value reddens the explicit-omit-on-feature and
+// explicit-append-on-adr rows.
+func TestConventions_IntakeSectionOmitted(t *testing.T) {
+	conv := Conventions{Types: map[string]ItemType{
+		"feature":         {},
+		"adr":             {},
+		"feature_omitted": {IntakeSection: IntakeSectionOmit},
+		"chore_appended":  {IntakeSection: IntakeSectionAppend},
+	}}
+	adrAppend := Conventions{Types: map[string]ItemType{"adr": {IntakeSection: IntakeSectionAppend}}}
+	adrOmit := Conventions{Types: map[string]ItemType{"adr": {IntakeSection: IntakeSectionOmit}}}
+	cases := []struct {
+		name    string
+		conv    Conventions
+		typeKey string
+		want    bool
+	}{
+		{"explicit omit on a non-adr type", conv, "feature_omitted", true},
+		{"explicit append on a non-adr type", conv, "chore_appended", false},
+		{"explicit append on adr overrides the default", adrAppend, "adr", false},
+		{"explicit omit on adr", adrOmit, "adr", true},
+		{"adr with the key absent defaults to omit", conv, "adr", true},
+		{"feature with the key absent defaults to append", conv, "feature", false},
+		{"unknown type appends", conv, "no_such_type", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.conv.IntakeSectionOmitted(tc.typeKey); got != tc.want {
+				t.Errorf("IntakeSectionOmitted(%q) = %v, want %v", tc.typeKey, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefault_IntakeSectionOmitted pins the shipped default's resolution: its
+// adr type omits the section and its feature type appends it.
+func TestDefault_IntakeSectionOmitted(t *testing.T) {
+	d := Default()
+	if !d.IntakeSectionOmitted("adr") {
+		t.Error("shipped default: adr should omit the intake section")
+	}
+	if d.IntakeSectionOmitted("feature") {
+		t.Error("shipped default: feature should append the intake section")
+	}
+}
+
+// TestParse_IntakeSection exercises the schema-to-struct seam for the optional
+// intake_section type key (#5223): a valid value satisfies the embedded schema
+// AND round-trips onto ItemType.IntakeSection through the DisallowUnknownFields
+// decode, and a value outside the enum is rejected by schema validation at the
+// key's JSON Pointer. Removing the property from the embedded schema reddens
+// the valid row (additionalProperties:false); removing the enum reddens the
+// invalid row.
+func TestParse_IntakeSection(t *testing.T) {
+	cfg := func(v string) string {
+		return `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types:
+  feature:
+    body_skeleton: [Summary]
+    intake_section: ` + v + "\n"
+	}
+	t.Run("omit round-trips", func(t *testing.T) {
+		c, err := Parse(strings.NewReader(cfg("omit")))
+		if err != nil {
+			t.Fatalf("Parse(intake_section: omit) = %v, want nil", err)
+		}
+		if got := c.Types["feature"].IntakeSection; got != IntakeSectionOmit {
+			t.Errorf("ItemType.IntakeSection = %q, want %q", got, IntakeSectionOmit)
+		}
+		if !c.IntakeSectionOmitted("feature") {
+			t.Error("IntakeSectionOmitted(feature) = false after parsing intake_section: omit")
+		}
+	})
+	t.Run("append round-trips", func(t *testing.T) {
+		c, err := Parse(strings.NewReader(cfg("append")))
+		if err != nil {
+			t.Fatalf("Parse(intake_section: append) = %v, want nil", err)
+		}
+		if got := c.Types["feature"].IntakeSection; got != IntakeSectionAppend {
+			t.Errorf("ItemType.IntakeSection = %q, want %q", got, IntakeSectionAppend)
+		}
+	})
+	t.Run("value outside the enum is rejected", func(t *testing.T) {
+		_, err := Parse(strings.NewReader(cfg("sometimes")))
+		if err == nil {
+			t.Fatal("Parse accepted intake_section: sometimes")
+		}
+		var serr *SchemaError
+		if !errors.As(err, &serr) {
+			t.Fatalf("error = %v (%T), want *SchemaError", err, err)
+		}
+		if want := "/types/feature/intake_section"; serr.Path != want {
+			t.Errorf("SchemaError.Path = %q, want %q (full error: %v)", serr.Path, want, serr)
+		}
+	})
+}
+
 // TestParseLabelCompletenessFields proves the additive label_defaults +
 // required_label_namespaces keys satisfy the schema AND round-trip through the
 // DisallowUnknownFields JSON decode into the typed ItemType — the schema↔struct

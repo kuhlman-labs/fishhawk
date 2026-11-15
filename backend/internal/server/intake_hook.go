@@ -124,7 +124,9 @@ const intakeCharterDeclarationSite = "charter.path in .fishhawk/work-management.
 //
 // It is called AFTER workmgmt.Apply (so the filing it evaluates is the rendered
 // title/labels/body a reader will actually see) and BEFORE the provider File
-// (so the rendered advisory section lands on the created issue itself).
+// (so the rendered advisory section lands on the created issue itself, for a
+// type whose intake_section does not resolve to omit; the signals are returned
+// for every type).
 func (s *Server) runIntakeGroom(ctx context.Context, conv workmgmt.Conventions, target workmgmt.Target, filing intakegroom.Filing) (sig intakegroom.Signals) {
 	start := time.Now()
 	// The panic guard for the hook's OWN frame: a bug in the sequential half

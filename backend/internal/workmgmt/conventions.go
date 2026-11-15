@@ -352,6 +352,40 @@ type ItemType struct {
 	DefaultFields           DefaultFields `json:"default_fields,omitempty"`
 	Numbering               *Numbering    `json:"numbering,omitempty"`
 	EpicLink                string        `json:"epic_link,omitempty"`
+	// IntakeSection controls whether the intake advisory section (and its
+	// hidden fishhawk-intake marker) is appended to a filed body of this type
+	// (#5223): "append", "omit", or empty for the type-keyed default. Read it
+	// through Conventions.IntakeSectionOmitted, never directly, because the
+	// absent default depends on the type key.
+	IntakeSection string `json:"intake_section,omitempty"`
+}
+
+// Intake-section values for ItemType.IntakeSection (#5223).
+const (
+	IntakeSectionAppend = "append"
+	IntakeSectionOmit   = "omit"
+)
+
+// intakeSectionOmitByDefaultType is the type key whose absent intake_section
+// defaults to omit: decision records stay clean of the advisory section. It is
+// the same key the semantic check requires to declare a numbering rule.
+const intakeSectionOmitByDefaultType = "adr"
+
+// IntakeSectionOmitted reports whether a filing of typeKey must NOT carry the
+// rendered intake advisory section (#5223). An explicit "omit" is true and an
+// explicit "append" is false. An absent value is true for the type keyed adr
+// and false for every other type, including a type the conventions do not
+// declare. Only the body render is gated: the intake signals are still
+// computed and returned on the filing response, the audit entry and the
+// preview.
+func (c Conventions) IntakeSectionOmitted(typeKey string) bool {
+	switch c.Types[typeKey].IntakeSection {
+	case IntakeSectionOmit:
+		return true
+	case IntakeSectionAppend:
+		return false
+	}
+	return typeKey == intakeSectionOmitByDefaultType
 }
 
 // DefaultFields holds a type's default board placement and complexity.
