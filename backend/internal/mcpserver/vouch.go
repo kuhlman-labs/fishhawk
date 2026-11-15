@@ -67,6 +67,11 @@ verb can never post the run's recomputed check state onto an unrelated
 commit. A mismatch or an unresolvable head records the vouch and SKIPS the
 publish, naming both shas (or the resolution failure) on the warning.
 
+Vouching while the acceptance stage is still running re-posts the check as
+pending (the stage is not terminal). You do not need to re-vouch: when the
+acceptance verdict ships, the backend re-posts the check at the run's live
+pull-request head (#5217), and it heals only once the stage has settled.
+
 The sha MUST be the FULL commit id (40 hex, or 64 for a SHA-256 repository;
 upper-case is accepted and recorded lowercase). An ABBREVIATED sha is REFUSED
 before anything is recorded (#4435): fishhawk_audit_complete matches the PR

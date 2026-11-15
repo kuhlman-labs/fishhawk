@@ -1,0 +1,14 @@
+id: scenario:issue-5217/vouch-tool-text-names-acceptance-settle
+statement: The fishhawk_vouch_commit tool description says that a vouch during in-flight acceptance re-posts pending and that the verdict re-posts the check at the live head.
+verify_hint: 'MCP tool result: the tools list over /mcp, fishhawk_vouch_commit description.'
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}; read run_id. 2) POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> fhm_ bearer. 3) POST /mcp tools/list with _meta protocolVersion 2026-07-28, clientCapabilities, clientInfo. 4) Read the fishhawk_vouch_commit description.
+assertions:
+    expected: Description says a vouch during in-flight acceptance re-posts pending and the verdict re-posts the check at the live head.
+    observed_at_record: 'Description contains: ''Vouching while the acceptance stage is still running re-posts the check as pending (the stage is not terminal). You do not need to re-vouch: when the acceptance verdict ships, the backend re-posts the check at the run''s live pull-request head (#5217), and it heals only once the stage has settled.'''
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5217
+    pr: 5303
+    run_id: b4fa7655-bde4-424b-a151-e175b60e0051
+    head_sha: bb2f9427fac819021a3db5002ff1842c5c651444
+    recorded_at: 2026-11-14T23:57:49Z
