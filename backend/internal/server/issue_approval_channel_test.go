@@ -859,6 +859,50 @@ func TestHandleApprovalCommand_V1MixedGates_ListedApproverRefused(t *testing.T) 
 	assertNamesSupportedChannels(t, oneReply(t, gh))
 }
 
+// TestHandleApprovalCommand_V1MixedGates_ListedApproverRejectRefused: a reject
+// on the mixed-gate stage is refused too, even for alice, whom the legacy
+// `approvers` gate admits — the stage is not failed and nothing is recorded.
+func TestHandleApprovalCommand_V1MixedGates_ListedApproverRejectRefused(t *testing.T) {
+	members := map[string][]role.TeamMember{"org/tech-leads": {{Login: "alice"}}}
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1MixedGates, role.NewResolver(&stubTeamLister{teamMembers: members}))
+	cmd := slashCmd("alice", webhook.MatchActionReject)
+	cmd.Comment = "scope is too wide"
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if stage.State == run.StageStateFailed {
+		t.Fatalf("stage failed under a refused comment reject")
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Decision != string(approval.DecisionReject) {
+		t.Errorf("decision = %q, want reject", p.Decision)
+	}
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+}
+
+// TestHandleApprovalCommand_V1ApprovalsGate_ReactionEmojiRefused: an approval
+// forwarded by the reaction poller (the third comment-channel entry point) is
+// refused like a slash approve — the refusal is source-independent. The
+// reaction source is not silent, so exactly one reply goes out.
+func TestHandleApprovalCommand_V1ApprovalsGate_ReactionEmojiRefused(t *testing.T) {
+	s, stage, ar, gh, au := v1ApprovalsGateFixture(t, v1ApprovalsGate, legacyCommentResolver())
+	cmd := slashCmd("alice", webhook.MatchActionApprove)
+	cmd.Source = webhook.ApprovalSourceReactionEmoji
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	p := assertChannelRefused(t, stage, ar, au, commentRefusalApprovalsPredicateGate, false)
+	assertSpecMajor(t, p, 1)
+	if p.Approver != "alice" || p.Surface != string(approval.SurfaceGitHubComment) {
+		t.Errorf("payload = %+v, want alice on the github_comment surface", p)
+	}
+	assertNamesSupportedChannels(t, oneReply(t, gh))
+	if n := shadowStampCount(t, au); n != 0 {
+		t.Errorf("delegation shadow stamps = %d, want 0 for a refused reaction (cause %s)", n, commentRefusalApprovalsPredicateGate)
+	}
+}
+
 // TestHandleApprovalCommand_V1ApprovalsGate_NilResolverStillRefused: with no
 // RoleResolver a v1 `approvals` gate is still refused, under the existing
 // role_resolver_unconfigured cause — the new check runs after it, so every
