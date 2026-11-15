@@ -116,8 +116,10 @@ are re-entrant per session), `_LapsedSessionSurfaces`, `_ReservesHeadroom`,
 `_WriteTimeoutAtDeadline` (a wrapping `DialFunc` trips a hand-fired ctx at the
 try-lock write, once on the Prepare flush and once on the cached-statement
 Bind flush, so no timer decides the injection; asserts the injection landed
-on the intended message, `DeadlineExceeded` and the original timeout both
-reachable, fn not run).
+on the intended message, `DeadlineExceeded` reachable, fn not run). pgx 5.12
+normalizes these write errors before returning them and discards the socket
+cause; `TestCtxTimeoutErr` separately pins preservation of a raw timeout when
+one reaches the helper.
 
 `mixed_test.go` (the three production helpers over ONE 6-connection pool,
 `HolderLimit` 2):
