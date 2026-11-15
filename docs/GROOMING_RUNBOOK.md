@@ -67,6 +67,17 @@ when fishhawkd runs with `--enable-scheduler` (`scripts/dev up` passes it; contr
 `fishhawk_run_stage` exactly as above. The approval gates declare no `sla`, so an unattended
 report waits for you instead of failing the run.
 
+**One parked groom at a time (#5225).** While a groom of the same repo and workflow is
+still open with a stage at `awaiting_approval` (its groom gate or its confirm gate), a new
+start is refused 409 `grooming_run_parked`, naming the parked run in
+`details.parked_run_id`. The weekly scheduler records the refusal as
+`scheduled_run_refused` instead of piling a new groom beside the parked one. To clear it,
+decide the groom gate (`fishhawk_approve_plan` / `fishhawk_reject_plan`), attest the
+confirm gate (§5, `fishhawk approve-review-gate <run-id> --attest "..."`), or
+`fishhawk_cancel_run` the parked run, then start again. Several parked grooms from before
+the guard surface one per 409: cancel or decide each named run in turn. There is no
+override flag, and the check is not atomic: two simultaneous starts can both pass it.
+
 Stage budget is 45m (#2838). A real pass over this backlog measures ~24m.
 
 ## 3. Reading the report
@@ -128,6 +139,17 @@ candidate in flight is recorded `failed` and every candidate after it is recorde
 row's `budget_exhausted` count names the tail. Those entries are NOT suppressed by the
 churn guard, so they RESURFACE on the next grooming run; approve that run rather than
 hand-applying them.
+
+**A transient write failure is re-settled in the apply, not handed to you (#5225).** A
+`depends_on_add`, `label_set`, `close_duplicate` or `close_not_planned` write that fails
+with a forge 5xx, 429 or transport fault is re-read and re-dispatched up to twice in the
+same apply (1s, then 2s), so a write that landed before its error settles
+`already_applied` rather than duplicating. A re-settled row carries `attempts` and
+`first_error`. Once three candidates in one apply have exhausted their retries the forge is
+treated as down: later rows settle on their first error with `retry_suppressed: true`. An
+entry still in `failed_ids` failed deterministically, failed three times, had its retry
+suppressed, or is an epic, board or field kind (never retried in-apply). It resurfaces on
+the next groom; do not hand-apply it.
 
 **Verify on the forge, not from the summary.** On walk #2844 the summary truthfully
 reported eight applied while every applied VALUE was garbage. An audit row saying

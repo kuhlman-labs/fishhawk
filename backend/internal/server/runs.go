@@ -1770,6 +1770,28 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Groom start guard (#5225). Refuses a new backlog-grooming run 409
+	// grooming_run_parked while a non-terminal run of the same repo and
+	// workflow is parked at its groom or confirm gate (grooming_start_guard.go).
+	// The ordering is load-bearing:
+	//
+	//   - POST-REPLAY: the Idempotency-Key lookup above short-circuits first,
+	//     so a replay (including the scheduler's window replay) still answers
+	//     200 already_started rather than being refused by its own parked run.
+	//   - PRE-ADMISSION: it runs BEFORE the plan-review capability gate,
+	//     checkBlockingBudget and checkAppliesTo, so a refused groom appends no
+	//     run_admitted_budget_override / run_admitted_applies_to_override grant
+	//     and leaves no run row.
+	//
+	// KNOWN TRADE-OFF: a request this guard and a later gate would both refuse
+	// gets grooming_run_parked, so no run_rejected_missing_charter (or
+	// run_rejected_misconfigured) row is written for it. The charter control is
+	// not weakened: the request is refused either way, and once the parked
+	// groom clears it meets every later gate unchanged.
+	if haveStageDefs && !s.checkNoParkedGroom(w, r, req.Repo, req.WorkflowID, workflowDef) {
+		return
+	}
+
 	// Plan-review capability gate (#574 / ADR-027 / #955 / #1495). The spec is
 	// authoritative for WHICH reviewers a gating plan stage (effective agent
 	// count > 0, human == 0) runs; the FISHHAWKD_ENABLE_* / FISHHAWKD_ANTHROPIC_API_KEY

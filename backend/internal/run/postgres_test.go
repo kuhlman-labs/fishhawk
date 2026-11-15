@@ -736,6 +736,101 @@ func TestPostgres_ListRuns(t *testing.T) {
 // or unrelated runs. This is the cross-layer guard for the hand-edited
 // positional-parameter renumber in db/queries.sql.go: a wrong $8/$9/$10 mapping
 // fails here.
+// TestPostgres_ListRuns_NonTerminalFilter pins ListRunsFilter.NonTerminal
+// (#5225) against the real SQL. Part one creates one run in EACH run.State and
+// asserts NonTerminal:true returns exactly the runs whose State.IsTerminal() is
+// false, which ties the SQL literal set ('succeeded','failed','cancelled') to
+// the Go predicate: a state added to one side and not the other reddens here.
+// Part two seeds an OLDER open run behind three NEWER terminal runs and asserts
+// Limit 1 still returns the open one, so the filter runs BEFORE the LIMIT.
+//
+// Counterfactual: drop the non_terminal arm from db/queries.sql.go's listRuns
+// constant and part one returns the three terminal runs too, and part two
+// returns the newest cancelled run.
+func TestPostgres_ListRuns_NonTerminalFilter(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	create := func(repoName string) *run.Run {
+		t.Helper()
+		r, err := repo.CreateRun(ctx, run.CreateRunParams{
+			Repo: repoName, WorkflowID: "backlog_grooming", WorkflowSHA: "sha",
+			TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return r
+	}
+	setState := func(id uuid.UUID, st run.State) {
+		t.Helper()
+		// A direct UPDATE: no single transition path reaches every state.
+		if _, err := pool.Exec(ctx, `UPDATE runs SET state=$1 WHERE id=$2`, string(st), id); err != nil {
+			t.Fatalf("set state %s: %v", st, err)
+		}
+	}
+
+	// Part one: every run.State, one run each.
+	allStates := []run.State{run.StatePending, run.StateRunning, run.StateSucceeded, run.StateFailed, run.StateCancelled}
+	wantOpen := map[uuid.UUID]run.State{}
+	for _, st := range allStates {
+		r := create("states/one")
+		setState(r.ID, st)
+		if !st.IsTerminal() {
+			wantOpen[r.ID] = st
+		}
+	}
+	if len(wantOpen) != 2 {
+		t.Fatalf("fixture expects 2 non-terminal states, got %d (%v); update allStates for a new run.State", len(wantOpen), wantOpen)
+	}
+	open, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: "states/one", NonTerminal: true, Limit: 100})
+	if err != nil {
+		t.Fatalf("list non-terminal: %v", err)
+	}
+	if len(open) != len(wantOpen) {
+		t.Errorf("NonTerminal returned %d runs, want %d (the !State.IsTerminal set)", len(open), len(wantOpen))
+	}
+	for _, r := range open {
+		if r.State.IsTerminal() {
+			t.Errorf("NonTerminal returned terminal run %s in state %s", r.ID, r.State)
+		}
+		if _, ok := wantOpen[r.ID]; !ok {
+			t.Errorf("NonTerminal returned unexpected run %s (%s)", r.ID, r.State)
+		}
+	}
+	// The zero value is no constraint.
+	everything, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: "states/one", Limit: 100})
+	if err != nil {
+		t.Fatalf("list unfiltered: %v", err)
+	}
+	if len(everything) != len(allStates) {
+		t.Errorf("unfiltered list returned %d runs, want %d", len(everything), len(allStates))
+	}
+
+	// Part two: an OLDER open run behind three NEWER terminal runs.
+	older := create("states/two")
+	setState(older.ID, run.StateRunning)
+	base := time.Now().UTC().Add(-time.Hour)
+	if _, err := pool.Exec(ctx, `UPDATE runs SET created_at=$1 WHERE id=$2`, base, older.ID); err != nil {
+		t.Fatalf("pin created_at: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		r := create("states/two")
+		setState(r.ID, run.StateCancelled)
+		if _, err := pool.Exec(ctx, `UPDATE runs SET created_at=$1 WHERE id=$2`, base.Add(time.Duration(i+1)*time.Minute), r.ID); err != nil {
+			t.Fatalf("pin created_at: %v", err)
+		}
+	}
+	page, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: "states/two", NonTerminal: true, Limit: 1})
+	if err != nil {
+		t.Fatalf("list limit 1: %v", err)
+	}
+	if len(page) != 1 || page[0].ID != older.ID {
+		t.Fatalf("NonTerminal Limit 1 = %v, want the older open run %s: the filter must apply before the LIMIT", page, older.ID)
+	}
+}
+
 func TestPostgres_ListRuns_ParentRunIDFilter(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
