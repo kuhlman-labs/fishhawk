@@ -19609,7 +19609,10 @@ func TestStartRun_CommentBudgetWarning_IdempotentReplay(t *testing.T) {
 // TestStartRun_CheckoutWarnings_SpecSource pins approval condition C5 through
 // the real handler: W2 fires (start_run wording) only when the spec was
 // auto-discovered from working_dir, not when workflow_spec was passed inline
-// or spec_file named it.
+// or spec_file named it. The replay arms (the fake's 200) pin that an
+// idempotent replay of an explicit-spec call still does not fire W2, while a
+// replay of a discovered-spec call does, in the replay wording (routed concern
+// e6415af1).
 func TestStartRun_CheckoutWarnings_SpecSource(t *testing.T) {
 	dirty := checkoutState{DirtyPaths: []string{".fishhawk/workflows.yaml"}, Branch: "main", BaseRef: "origin/main", CountsKnown: true}
 	dir := t.TempDir()
@@ -19623,19 +19626,27 @@ func TestStartRun_CheckoutWarnings_SpecSource(t *testing.T) {
 	cases := []struct {
 		name   string
 		in     StartRunInput
+		replay bool
 		wantW2 bool
 	}{
-		{"discovered_from_working_dir", StartRunInput{WorkingDir: dir}, true},
-		{"inline_workflow_spec", StartRunInput{WorkingDir: dir, WorkflowSpec: validTrivialSpec}, false},
-		{"explicit_spec_file", StartRunInput{WorkingDir: dir, SpecFile: specPath}, false},
+		{"discovered_from_working_dir", StartRunInput{WorkingDir: dir}, false, true},
+		{"inline_workflow_spec", StartRunInput{WorkingDir: dir, WorkflowSpec: validTrivialSpec}, false, false},
+		{"explicit_spec_file", StartRunInput{WorkingDir: dir, SpecFile: specPath}, false, false},
+		{"replay_discovered_from_working_dir", StartRunInput{WorkingDir: dir}, true, true},
+		{"replay_inline_workflow_spec", StartRunInput{WorkingDir: dir, WorkflowSpec: validTrivialSpec}, true, false},
+		{"replay_explicit_spec_file", StartRunInput{WorkingDir: dir, SpecFile: specPath}, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			stubStartRunProbe(t, dirty, true)
-			_, srv := newFakeBackend(t)
+			fb, srv := newFakeBackend(t)
 			r := newResolver(srv, nil)
 			in := tc.in
 			in.Repo, in.WorkflowID = "x/y", "trivial"
+			if tc.replay {
+				fb.createRunStatus = http.StatusOK
+				in.IdempotencyKey = "k-1"
+			}
 			meta, _, err := r.startRun(context.Background(), nil, in)
 			if err != nil {
 				t.Fatalf("startRun: %v", err)
@@ -19648,8 +19659,11 @@ func TestStartRun_CheckoutWarnings_SpecSource(t *testing.T) {
 			if gotW2 != tc.wantW2 {
 				t.Errorf("W2 present = %v, want %v:\n%s", gotW2, tc.wantW2, text)
 			}
-			if tc.wantW2 && !strings.Contains(text, "WORKING-TREE workflow spec bytes") {
+			if tc.wantW2 && !tc.replay && !strings.Contains(text, "WORKING-TREE workflow spec bytes") {
 				t.Errorf("discovered-spec W2 must use the start_run wording:\n%s", text)
+			}
+			if tc.wantW2 && tc.replay && !strings.Contains(text, "REPLAYED an existing run") {
+				t.Errorf("a replayed discovered-spec W2 must use the replay wording:\n%s", text)
 			}
 		})
 	}

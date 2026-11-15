@@ -45,11 +45,20 @@ const maxCheckoutDirtyPathsNamed = 5
 // checkoutFilterOverrides first enumerates the driver names the checkout's own
 // config declares and blanks each one, and the call passes
 // --ignore-submodules=all so status never recurses into a submodule whose own
-// config the enumeration did not read. Residual: an included config file
+// config the enumeration did not read. Residuals: (1) an included config file
 // (include.path) rewritten between the enumeration and the status call could
-// name a driver the enumeration missed; the runner's own later git calls in
+// name a driver the enumeration missed; (2) the runner's own later git calls in
 // the same checkout are not hardened at all (runner/internal/gitops
-// HardeningArgs is per-pass), so a planted filter there runs at those calls.
+// HardeningArgs is per-pass), so a planted filter there runs at those calls;
+// (3) checkoutProbeTarget confines the directory git is pointed at, not what
+// git reads: a checkout whose config sets core.worktree to an ancestor, or
+// whose .git is a gitfile naming a git dir elsewhere, makes status report path
+// names from outside the allowed roots (at most 5, each cut to 80 bytes).
+// `-c core.worktree=` does not override the repository's own core.worktree
+// (git reads it during repository discovery), and an explicit --work-tree
+// would misreport a working_dir that is a subdirectory of its work tree, so
+// this stays a stated residual. A partial clone's lazy fetch is closed in
+// checkoutGitEnv (GIT_NO_LAZY_FETCH).
 var checkoutGitHardeningArgs = []string{
 	"--no-optional-locks",
 	"-c", "core.fsmonitor=false",
@@ -68,9 +77,12 @@ func checkoutGitArgv(dir string, args ...string) []string {
 
 // checkoutGitEnv is the probe's MINIMAL environment: PATH and HOME only, plus
 // switches that ignore the system and global git config, disable optional
-// locks and refuse a terminal prompt. Nothing else is inherited, so no forge
-// token or credential helper setting in the serving process's environment
-// reaches the subprocess.
+// locks, refuse a terminal prompt and refuse a partial clone's lazy fetch of a
+// missing object from its promisor remote (GIT_NO_LAZY_FETCH, git 2.44+; an
+// older git ignores it), so rev-list on a missing commit fails offline rather
+// than starting a transport the checkout's config chooses. Nothing else is
+// inherited, so no forge token or credential helper setting in the serving
+// process's environment reaches the subprocess.
 func checkoutGitEnv() []string {
 	return []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -79,6 +91,7 @@ func checkoutGitEnv() []string {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_NO_LAZY_FETCH=1",
 	}
 }
 
@@ -269,10 +282,12 @@ const (
 	// (checkout_warnings on StartCampaignItemRunOutput), whose runs fetch the
 	// spec from the forge at workflow_ref, never from the checkout.
 	checkoutSurfaceCampaign
-	// checkoutSurfaceStartRunReplay: fishhawk_start_run returned an EXISTING run
-	// for a repeated idempotency_key. Its spec was pinned when it was first
-	// created, so the report describes the checkout at this call and makes no
-	// claim about what the run pinned.
+	// checkoutSurfaceStartRunReplay: fishhawk_start_run, with a spec it
+	// auto-discovered from working_dir, returned an EXISTING run for a repeated
+	// idempotency_key. Its spec was pinned when it was first created, so the
+	// report describes the checkout at this call and makes no claim about what
+	// the run pinned. A replay of an inline workflow_spec or spec_file call
+	// keeps checkoutSurfaceStartRunExplicitSpec, so W2 does not fire.
 	checkoutSurfaceStartRunReplay
 )
 

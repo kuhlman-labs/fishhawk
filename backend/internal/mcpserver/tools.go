@@ -3814,9 +3814,11 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// never fails the create. checkoutWarningsFor re-confines the path at probe
 	// time over HTTP and runs git on the RESOLVED path, so a symlink swapped in
 	// after the admission check above cannot point the probe outside the
-	// allowed roots. A replay reports the checkout at this call without
-	// claiming it is what the existing run pinned.
-	if idempotent {
+	// allowed roots. A replay of a DISCOVERED-spec call reports the checkout at
+	// this call without claiming it is what the existing run pinned; a replay
+	// of an inline workflow_spec or spec_file call keeps the explicit-spec
+	// surface, so W2 still does not fire (approval condition C5).
+	if idempotent && checkoutSurface == checkoutSurfaceStartRunDiscovered {
 		checkoutSurface = checkoutSurfaceStartRunReplay
 	}
 	warnings = append(warnings, r.checkoutWarningsFor(ctx, startRunCheckoutProbe, checkoutSurface, boundWorkingDir)...)

@@ -527,6 +527,7 @@ func TestCheckoutGitCommand_HardenedArgvAndEnv(t *testing.T) {
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_NO_LAZY_FETCH=1",
 	}
 	if !reflect.DeepEqual(cmd.Env, wantEnv) {
 		t.Errorf("env = %q, want %q", cmd.Env, wantEnv)
@@ -596,7 +597,11 @@ func TestProbeCheckout_RealGit_DirtyAndSpec(t *testing.T) {
 // filter.<driver>.clean command the checkout's own config names, selected by
 // .gitattributes, must NOT run when probeCheckout re-hashes a modified file.
 // The control runs a plain git status on the same fixture and requires the
-// sentinel, so the fixture is proven live.
+// sentinel, so the fixture is proven live. The modification keeps a.txt's
+// committed byte length ("a\n" -> "b\n"): a size change alone tells git the
+// file is modified without re-hashing it, so only a same-size edit makes every
+// status re-hash a.txt through the filter, whatever the timing (routed concern
+// 23fd34c9).
 func TestProbeCheckout_RealGit_CleanFilterSentinel(t *testing.T) {
 	dir := newRealGitRepo(t)
 	if err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("* filter=evil\n"), 0o644); err != nil {
@@ -612,7 +617,7 @@ func TestProbeCheckout_RealGit_CleanFilterSentinel(t *testing.T) {
 	}
 	realGit(t, dir, "config", "filter.evil.clean", filter)
 	realGit(t, dir, "config", "filter.evil.required", "true")
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("changed\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("b\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

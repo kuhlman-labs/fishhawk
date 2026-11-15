@@ -189,7 +189,10 @@ A run captures its inputs once, at `fishhawk_start_run`, and never re-reads them
    branch, or ahead of or behind the remote default branch as last fetched. A
    warning never blocks the create, so read it and act on it. On an idempotent
    replay (a repeated `idempotency_key`) it describes the checkout at that call,
-   not the spec the existing run pinned when it was first created.
+   not the spec the existing run pinned when it was first created. The probe
+   runs no content filter, so a file under one (git-lfs, git-crypt) can be
+   listed as dirty although `git status` shows it clean: check `git status`
+   before you commit, stash or remove what the warning names.
 2. **The workflow spec is pinned for the run's life.** An auto-discovered spec
    is the checkout's working-tree bytes. A `.fishhawk/` edit made after the call,
    or one that was never committed to the base branch, needs a new run: commit it
