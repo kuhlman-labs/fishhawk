@@ -1769,7 +1769,7 @@ Every seam is an EXISTING package-level var — no parallel seam was minted. `wi
 
 **Ordering of (e) before (f)/(g) is deliberate:** the dirty and ancestry guards are reached ONLY when the base actually moved, so an already-current dispatch is byte-identical to the pre-#3454 behaviour regardless of tree state — a worktree an operator legitimately left dirty draws no refusal on a base that did not move.
 
-**Failure classification.** `lineageBaseAdvanceFailureReason` maps a `*lineageBaseAdvanceRefusal` to the `runner_failed` reason `lineage_worktree_advance_refused` and anything else to `lineage_base_advance` — the same two-line reason-mapping shape `worktreeProvisionFailureReason` and `fixupCheckoutFailReason` use. Both are strictly PRE-AGENT: the stage fails having spent zero agent tokens and mutated nothing, and the refusal message names both resolved SHAs and the `git worktree remove` remedy.
+**Failure classification.** `lineageBaseAdvanceFailureReason` maps a `*lineageBaseAdvanceRefusal` to the `runner_failed` reason `lineage_worktree_advance_refused` and anything else to `lineage_base_advance` — the same two-way reason-mapping shape `worktreeProvisionFailureReason` uses. `fixupCheckoutFailReason` now maps three ways (#5212): a worktree conflict to `fixup_base_worktree_conflict`, a remote credential rejection (`gitops.IsRemoteAuthRejected`) to `fixup_base_git_auth`, and anything else to `fixup_base_checkout`. All three are strictly PRE-AGENT: the stage fails having spent zero agent tokens and mutated nothing, and the refusal message names both resolved SHAs and the `git worktree remove` remedy.
 
 ### Why fix-up and decomposed children are exempt
 

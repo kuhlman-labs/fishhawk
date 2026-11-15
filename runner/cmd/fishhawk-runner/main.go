@@ -8957,11 +8957,26 @@ var (
 // runner_failed reason token. A gitops.ErrBranchCheckedOutElsewhere failure
 // (the run branch is checked out in another worktree — typically the
 // operator's main tree) maps to the self-diagnosing "fixup_base_worktree_
-// conflict" whose wrapped message names the blocking path and recovery (#1549);
-// every other checkout failure keeps the generic "fixup_base_checkout".
+// conflict" whose wrapped message names the blocking path and recovery (#1549).
+// A failure whose git stderr carries a remote credential rejection
+// (gitops.IsRemoteAuthRejected: a 401, "Authentication failed for", "could not
+// read Username" under GIT_TERMINAL_PROMPT=0) maps to "fixup_base_git_auth"
+// (#5212), checked AFTER the worktree conflict so that sentinel still wins.
+// Every other checkout failure keeps the generic "fixup_base_checkout".
+//
+// KEEP IN SYNC: the "fixup_base_git_auth" token is matched by EQUALITY in
+// backend/internal/mcpserver/fixup_recovery_surface.go (fixupBaseGitAuthReason),
+// which renders the trusted credential-path remedy. The exact runner_failed line
+// this emits is pinned by the shared golden
+// testdata/wire/runner_failed_fixup_git_auth.json, read by both
+// TestRun_Fixup_BaseCheckoutAuthRejected_EmitsGoldenRunnerFailed here and the
+// mcpserver seam test TestFixupGitAuthSeam_RunnerFailedReapedToRenderedRemedy.
 func fixupCheckoutFailReason(err error) string {
 	if errors.Is(err, gitops.ErrBranchCheckedOutElsewhere) {
 		return "fixup_base_worktree_conflict"
+	}
+	if gitops.IsRemoteAuthRejected(err) {
+		return "fixup_base_git_auth"
 	}
 	return "fixup_base_checkout"
 }
