@@ -4014,6 +4014,13 @@ single override for both refusals and surfaces a warning naming
 the orphaned parent. To clear a stage stranded in
 dispatched/running, use fishhawk_reap_stage then
 fishhawk_retry_stage instead of cancelling.
+
+Restarting after a fix-up dead end (fixup_ceiling_reached, or a route
+that keeps delivering nothing): fold the verified findings into the
+issue body as a dated constraints block FIRST — the cancelled run's
+concerns do not carry over to a new run. Cancel does not close the
+pull request (the run-branch sweep skips a branch that heads an open
+pull request), so close it yourself; then start the new run.
 `),
 	}, resolver.cancelRun)
 }

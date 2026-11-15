@@ -1,0 +1,14 @@
+id: scenario:issue-5212/pending-implement-refusal-discriminates-queued-pass
+statement: POST /v0/stages/{stage_id}/fixup on an implement stage in pending or awaiting_host_dispatch returns 422 fixup_not_applicable with one conditional message for every such stage, whether it has never run, ran before, or is a decomposed parent with a queued fan-in pass. The message says that if a pass is queued, the operator should dispatch it with fishhawk_dispatch_stage (stage implement) and route the fix-up after it settles at the review gate, and that otherwise the stage has not run yet. It does not assert which case holds.
+verify_hint: 'HTTP POST /v0/stages/{stage_id}/fixup on the localhost preview: a never-run implement stage is available on any freshly started run before plan approval; a re-pending implement stage needs a fixture (both decided hermetically by TestFixupStage_PendingImplementRefusalDiscriminatesQueuedPass in backend/internal/run/fixup_test.go).'
+steps: 'Live: seeded plan-gate-criteria. POST /v0/stages/{implement}/fixup returned 401 anonymously and 403 insufficient_scope with the fhm_ bearer, so the 422 was unreachable without write:fixups. Posture B in the sanctioned tree (HEAD da261588 = served sha): go test ./internal/run/ -run TestFixupStage_PendingImplementRefusalIsConditional -v.'
+assertions:
+    expected: one conditional message naming fishhawk_dispatch_stage, not asserting which case holds
+    observed_at_record: 'PASS. Never-run pending, pending with StartedAt set, and awaiting_host_dispatch all return ErrFixupNotApplicable with the same conditional text: ''If a pass is queued on this stage (...fan-in or merge-candidate verify pass, an earlier fix-up, or a retry), dispatch it with fishhawk_dispatch_stage (stage implement), let it settle at the review gate, then route the fix-up; waiting consumes no fix-up budget. Otherwise the stage has not run yet...''. A running stage keeps the generic wording.'
+    repro_handle: cd backend && go test ./internal/run/ -run TestFixupStage_PendingImplementRefusalIsConditional -v
+origin:
+    issue: 5212
+    pr: 5398
+    run_id: 1d460908-02ba-46a5-a008-4d2fbadb2201
+    head_sha: da261588439351418f820ab01d8e4d4f44c9b3bf
+    recorded_at: 2026-11-15T17:32:00Z

@@ -1523,3 +1523,124 @@ func TestDeferConcernAction_JudgementParam(t *testing.T) {
 		t.Errorf("judgement placeholder %q offers unlabelled, which the backend refuses", j)
 	}
 }
+
+// TestReviewActionHint_RefundShapeSelectsRouteAdvice (E106.27 / #5212, J2): the
+// refunded arm tells a NO-COMMIT refund (the route did not work — do not repeat
+// it) apart from a death / supersession refund (fix the cause, then re-route),
+// keyed on the NEWEST refunded window. The count is unchanged (the existing
+// fixupRefundedPasses tests stay green over the thin wrapper).
+//
+// Counterfactuals: keying the clause on refunds>0 instead of LatestNoChanges
+// reddens the category-C/A rows; LatestNoChanges forced false reddens the
+// no-changes row; "any window" instead of the newest reddens the two-window row.
+func TestReviewActionHint_RefundShapeSelectsRouteAdvice(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		seed      func(fb *fakeBackend, runID, stageID uuid.UUID)
+		wantNoCmt bool
+	}{
+		{"no_changes", func(fb *fakeBackend, runID, stageID uuid.UUID) {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedFixupNoChangesAudit(fb, runID, stageID)
+		}, true},
+		{"category_c_reaper", func(fb *fakeBackend, runID, stageID uuid.UUID) {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+		}, false},
+		{"category_c_recovery", func(fb *fakeBackend, runID, stageID uuid.UUID) {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedStageFixupRecoveredAudit(fb, runID, stageID, "C")
+		}, false},
+		{"category_a_recovery", func(fb *fakeBackend, runID, stageID uuid.UUID) {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedStageFixupRecoveredAudit(fb, runID, stageID, "A")
+		}, false},
+		{"older_no_changes_then_newer_category_c", func(fb *fakeBackend, runID, stageID uuid.UUID) {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedFixupNoChangesAudit(fb, runID, stageID)
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+		}, false},
+		{"older_category_c_then_newer_no_changes", func(fb *fakeBackend, runID, stageID uuid.UUID) {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedFixupNoChangesAudit(fb, runID, stageID)
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID, stageID := uuid.New(), uuid.New()
+			tc.seed(fb, runID, stageID)
+			seedImplementReviewedAudit(fb, runID, stageID, 1)
+
+			r := newResolver(srv, nil)
+			hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
+			if err != nil {
+				t.Fatalf("reviewActionHintFor: %v", err)
+			}
+			if hint == nil {
+				t.Fatal("hint = nil, want a refunded route-back pointer")
+			}
+			if hint.RemainingFixupBudget != 1 {
+				t.Errorf("RemainingFixupBudget = %d, want 1 (every pass here was refunded)", hint.RemainingFixupBudget)
+			}
+			msg := hint.Message
+			if tc.wantNoCmt {
+				for _, want := range []string{"do not repeat the same route", "fishhawk_vouch_commit", "fixup_no_changes"} {
+					if !strings.Contains(msg, want) {
+						t.Errorf("no-commit refund message lacks %q:\n%s", want, msg)
+					}
+				}
+				if strings.Contains(msg, "once the cause is fixed") {
+					t.Errorf("no-commit refund message carries the crash-refund advice:\n%s", msg)
+				}
+				return
+			}
+			if strings.Contains(msg, "do not repeat") {
+				t.Errorf("death/supersession refund message tells the operator not to repeat the route:\n%s", msg)
+			}
+			if !strings.Contains(msg, "once the cause is fixed") {
+				t.Errorf("death/supersession refund message lacks the re-route-once-fixed advice:\n%s", msg)
+			}
+			if strings.Contains(msg, "produced no changes") || strings.Contains(msg, "produced no commit") {
+				t.Errorf("death/supersession refund message claims the pass produced nothing:\n%s", msg)
+			}
+		})
+	}
+}
+
+// TestReviewActionHint_RefundShape_UnrefundedAndCeilingArms (J2, R3): the
+// un-refunded below-budget arm carries neither refund clause, and the ceiling
+// arm's fresh-run option names folding the findings into the issue body.
+func TestReviewActionHint_RefundShape_UnrefundedAndCeilingArms(t *testing.T) {
+	t.Run("unrefunded", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID, stageID := uuid.New(), uuid.New()
+		seedImplementReviewedAudit(fb, runID, stageID, 1)
+		hint, err := newResolver(srv, nil).reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
+		if err != nil || hint == nil {
+			t.Fatalf("reviewActionHintFor = %v, %v", hint, err)
+		}
+		for _, banned := range []string{"do not repeat", "once the cause is fixed", "refunded"} {
+			if strings.Contains(hint.Message, banned) {
+				t.Errorf("un-refunded message carries %q:\n%s", banned, hint.Message)
+			}
+		}
+	})
+	t.Run("ceiling", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID, stageID := uuid.New(), uuid.New()
+		for i := 0; i < fixupCeiling; i++ {
+			seedFixupTriggeredAudit(fb, runID, stageID)
+		}
+		seedImplementReviewedAudit(fb, runID, stageID, 1)
+		hint, err := newResolver(srv, nil).reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
+		if err != nil || hint == nil {
+			t.Fatalf("reviewActionHintFor = %v, %v", hint, err)
+		}
+		if !strings.Contains(hint.Message, "issue body") || !strings.Contains(hint.Message, "dated constraints block") {
+			t.Errorf("ceiling message's fresh-run option does not name folding the findings into the issue body:\n%s", hint.Message)
+		}
+	})
+}

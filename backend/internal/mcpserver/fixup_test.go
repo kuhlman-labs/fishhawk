@@ -540,11 +540,18 @@ func TestFixupStage_InstructionTargets_ThreadsIntoBody(t *testing.T) {
 // fixupResolverReturning builds a resolver whose backend returns the given
 // fix-up response body (Stage fields + optional pr_body_obligations), so a test
 // can exercise the verb's warning rendering over the REAL client decode path
-// without touching the shared fakeBackend.
+// without touching the shared fakeBackend. Since E106.27 / #5212 the verb also
+// makes a best-effort audit read after the POST; this backend answers it with
+// an EMPTY audit page, so no trigger anchor is found and no mixed-severity
+// advisory can fire — the warnings these tests assert are the pr_body ones only.
 func fixupResolverReturning(t *testing.T, stageID, runID uuid.UUID, obligations []map[string]any) *runResolver {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}})
+			return
+		}
 		body := map[string]any{
 			"id": stageID.String(), "run_id": runID.String(), "type": "implement", "state": "pending",
 		}
@@ -605,7 +612,11 @@ func TestFixupStage_PRBodyInstruction_WarnsAtRouting(t *testing.T) {
 }
 
 // TestFixupStage_OrdinaryPass_NoWarnings: a response with no pr_body_obligations
-// yields no warnings, so an ordinary pass returns a byte-identical output.
+// (and no readable trigger, so no mixed-severity advisory) yields nil warnings.
+// The output is no longer byte-identical to the pre-#5212 shape: next_steps is
+// ALWAYS populated, here with the single review wait (the stage is pending, not
+// awaiting_host_dispatch) whose since_sequence is the field-path hint, because
+// this backend returns no trigger entry to anchor on.
 func TestFixupStage_OrdinaryPass_NoWarnings(t *testing.T) {
 	stageID, runID := uuid.New(), uuid.New()
 	r := fixupResolverReturning(t, stageID, runID, nil)
@@ -620,6 +631,15 @@ func TestFixupStage_OrdinaryPass_NoWarnings(t *testing.T) {
 	}
 	if out.Warnings != nil {
 		t.Errorf("warnings = %+v, want nil for an ordinary pass", out.Warnings)
+	}
+	if len(out.NextSteps) != 1 || out.NextSteps[0].Action != "fishhawk_await_audit" {
+		t.Fatalf("next_steps = %+v, want the single fishhawk_await_audit review wait", out.NextSteps)
+	}
+	if !strings.Contains(out.NextSteps[0].Params["since_sequence"], "stage_fixup_triggered") {
+		t.Errorf("since_sequence = %q, want the stage_fixup_triggered field-path hint when no anchor was read", out.NextSteps[0].Params["since_sequence"])
+	}
+	if out.FixupTriggerSequence != 0 || out.ExpectedReviewers != 0 {
+		t.Errorf("fixup_trigger_sequence = %d, expected_reviewers = %d, want both omitted (0) with no audit entries", out.FixupTriggerSequence, out.ExpectedReviewers)
 	}
 }
 
@@ -723,5 +743,273 @@ func TestFixupStage_ConcernIDsSurfaceDocumentsSupersededRoutable(t *testing.T) {
 	// post-retry recovery: that is the claim #3618 invalidated.
 	if strings.Contains(lower, "only recovery") && !strings.Contains(lower, "no longer the only recovery") {
 		t.Errorf("description still calls operator_concern the only recovery:\n%s", desc)
+	}
+}
+
+// --- E106.27 / #5212: post-fix-up follow-through ---
+
+// fixupFollowThroughSeedTrigger appends a stage_fixup_triggered entry for
+// stageID at an EXPLICIT sequence, carrying the given routed severities.
+func fixupFollowThroughSeedTrigger(fb *fakeBackend, runID, stageID uuid.UUID, seq int64, severities ...string) {
+	sid := stageID.String()
+	concerns := make([]any, 0, len(severities))
+	for _, sev := range severities {
+		concerns = append(concerns, map[string]any{"severity": sev, "category": "correctness", "note": "n"})
+	}
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID: uuid.NewString(), Sequence: seq, RunID: runID.String(), StageID: &sid,
+		Category: categoryStageFixupTriggered,
+		Payload:  map[string]any{"stage_id": sid, "concerns": concerns},
+	})
+	fb.mu.Unlock()
+}
+
+// fixupFollowThroughSeedStarted appends an implement_review_started entry
+// carrying configured_agents.
+func fixupFollowThroughSeedStarted(fb *fakeBackend, runID, stageID uuid.UUID, seq int64, configured int) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID: uuid.NewString(), Sequence: seq, RunID: runID.String(), StageID: &sid,
+		Category: "implement_review_started",
+		Payload:  map[string]any{"configured_agents": configured},
+	})
+	fb.mu.Unlock()
+}
+
+// TestFixupStage_NextSteps_PrefillsPostFixupReviewWait (R8/R9, A2): the verb
+// pre-fills the review wait anchored at THIS stage's trigger sequence, over all
+// three terminal review kinds, with the prior round's configured count.
+//
+// Counterfactual: ANOTHER stage's trigger has the HIGHER sequence (50), and the
+// fake ignores the stage_id filter, so a per-entry StageID check mutated to
+// always-true picks 50 and this goes RED.
+func TestFixupStage_NextSteps_PrefillsPostFixupReviewWait(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID, otherStage, runID := uuid.New(), uuid.New(), uuid.New()
+	fb.fixupResp[stageID] = Stage{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: "dispatched"}
+	fixupFollowThroughSeedStarted(fb, runID, stageID, 30, 2)
+	fixupFollowThroughSeedTrigger(fb, runID, stageID, 41, "medium")
+	fixupFollowThroughSeedTrigger(fb, runID, otherStage, 50, "high")
+
+	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: stageID.String(), ConcernIDs: []string{uuid.NewString()}})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if out.FixupTriggerSequence != 41 {
+		t.Errorf("fixup_trigger_sequence = %d, want 41 (this stage's trigger, not the other stage's 50)", out.FixupTriggerSequence)
+	}
+	if out.ExpectedReviewers != 2 {
+		t.Errorf("expected_reviewers = %d, want 2", out.ExpectedReviewers)
+	}
+	if len(out.NextSteps) != 1 {
+		t.Fatalf("next_steps = %+v, want exactly the review wait (state dispatched)", out.NextSteps)
+	}
+	step := out.NextSteps[0]
+	if step.Action != "fishhawk_await_audit" {
+		t.Fatalf("next_steps[0].action = %q, want fishhawk_await_audit", step.Action)
+	}
+	if step.Params["run_id"] != runID.String() || step.Params["since_sequence"] != "41" {
+		t.Errorf("params = %v, want run_id %s and since_sequence 41", step.Params, runID)
+	}
+	cats := strings.Split(step.Params["categories"], ",")
+	for _, want := range []string{"implement_reviewed", "implement_review_failed", "implement_review_skipped"} {
+		found := false
+		for _, c := range cats {
+			if c == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("categories = %q, want it to list %s", step.Params["categories"], want)
+		}
+	}
+	reason := strings.ToLower(step.Reason)
+	for _, want := range []string{"2 configured reviewer", "reviewed, failed or skipped", "latest_sequence"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("reason lacks %q:\n%s", want, step.Reason)
+		}
+	}
+	if out.Warnings != nil {
+		t.Errorf("warnings = %+v, want nil for a single-concern set", out.Warnings)
+	}
+}
+
+// TestFixupStage_NextSteps_LocalRunnerDispatchesFirst (R8, J7): on the local
+// runner the re-opened pass parks awaiting_host_dispatch, so the ORDERED
+// next_steps lead with the dispatch and end with the wait.
+//
+// Counterfactual: the awaiting_host_dispatch branch's condition mutated to false
+// leaves next_steps[0] = fishhawk_await_audit, so this goes RED.
+func TestFixupStage_NextSteps_LocalRunnerDispatchesFirst(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID, runID := uuid.New(), uuid.New()
+	fb.fixupResp[stageID] = Stage{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: "awaiting_host_dispatch"}
+	fixupFollowThroughSeedTrigger(fb, runID, stageID, 7, "high")
+
+	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: stageID.String(), OperatorConcern: "fix it"})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if len(out.NextSteps) != 2 {
+		t.Fatalf("next_steps = %+v, want [dispatch, await]", out.NextSteps)
+	}
+	d := out.NextSteps[0]
+	if d.Action != "fishhawk_dispatch_stage" || d.Params["stage"] != "implement" || d.Params["stage_id"] != stageID.String() || d.Params["run_id"] != runID.String() {
+		t.Errorf("next_steps[0] = %+v, want fishhawk_dispatch_stage for this implement stage", d)
+	}
+	if d.Params["workflow"] == "" {
+		t.Errorf("next_steps[0] carries no workflow hint: %+v", d)
+	}
+	if out.NextSteps[1].Action != "fishhawk_await_audit" || out.NextSteps[1].Params["since_sequence"] != "7" {
+		t.Errorf("next_steps[1] = %+v, want the anchored fishhawk_await_audit", out.NextSteps[1])
+	}
+}
+
+// TestFixupStage_NextSteps_AuditReadFailsOpen (R8): the pass is already
+// admitted when the read runs, so an audit outage never fails the verb — it
+// omits the anchor fields and leaves a field-path hint.
+//
+// Counterfactual: latestFixupTrigger's error branch mutated to return a bogus
+// entry instead of nil sets fixup_trigger_sequence, so this goes RED.
+func TestFixupStage_NextSteps_AuditReadFailsOpen(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID, runID := uuid.New(), uuid.New()
+	fb.fixupResp[stageID] = Stage{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: "dispatched"}
+	fixupFollowThroughSeedTrigger(fb, runID, stageID, 41, "high", "low")
+	fixupFollowThroughSeedStarted(fb, runID, stageID, 30, 2)
+	fb.perRunAuditStatus = http.StatusInternalServerError
+
+	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: stageID.String(), ConcernIDs: []string{uuid.NewString()}})
+	if err != nil {
+		t.Fatalf("fixupStage must fail open on an audit-read error, got: %v", err)
+	}
+	if out.Stage.ID != stageID.String() || out.Stage.State != "dispatched" {
+		t.Errorf("stage = %+v, want the re-opened stage unchanged", out.Stage)
+	}
+	if out.FixupTriggerSequence != 0 || out.ExpectedReviewers != 0 {
+		t.Errorf("fixup_trigger_sequence = %d, expected_reviewers = %d, want both omitted on a read failure", out.FixupTriggerSequence, out.ExpectedReviewers)
+	}
+	if out.Warnings != nil {
+		t.Errorf("warnings = %+v, want nil: an unread routed set cannot raise the mixed-severity advisory", out.Warnings)
+	}
+	if len(out.NextSteps) != 1 || !strings.Contains(out.NextSteps[0].Params["since_sequence"], "stage_fixup_triggered") {
+		t.Errorf("next_steps = %+v, want the wait with a stage_fixup_triggered since_sequence hint", out.NextSteps)
+	}
+}
+
+// TestFixupStage_MixedSeverityWarning (R13): one advisory when the routed set
+// holds a high AND a medium/low concern; none otherwise; pr_body lines first.
+//
+// Counterfactuals: mixedSeverityWarning returning "" reddens the [high low]
+// rows; a predicate reduced to "has a high" reddens [high high] and [high].
+func TestFixupStage_MixedSeverityWarning(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		severities []string
+		withPRBody bool
+		wantMixed  bool
+	}{
+		{"high_low", []string{"high", "low"}, false, true},
+		{"high_high", []string{"high", "high"}, false, false},
+		{"low_medium", []string{"low", "medium"}, false, false},
+		{"single_high", []string{"high"}, false, false},
+		{"high_low_with_pr_body", []string{"high", "low"}, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stageID, runID := uuid.New(), uuid.New()
+			sid := stageID.String()
+			concerns := make([]map[string]any, 0, len(tc.severities))
+			for _, sev := range tc.severities {
+				concerns = append(concerns, map[string]any{"severity": sev})
+			}
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if req.Method == http.MethodGet {
+					items := []AuditEntry{}
+					if req.URL.Query().Get("category") == categoryStageFixupTriggered {
+						items = append(items, AuditEntry{ID: uuid.NewString(), Sequence: 9, RunID: runID.String(), StageID: &sid,
+							Category: categoryStageFixupTriggered, Payload: map[string]any{"concerns": concerns}})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+					return
+				}
+				body := map[string]any{"id": sid, "run_id": runID.String(), "type": "implement", "state": "pending"}
+				if tc.withPRBody {
+					body["pr_body_obligations"] = []map[string]any{{"id": "ob-1", "source": "reason", "text_excerpt": "x"}}
+				}
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			t.Cleanup(ts.Close)
+			r := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})}
+
+			_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: sid, ConcernIDs: []string{uuid.NewString()}})
+			if err != nil {
+				t.Fatalf("fixupStage: %v", err)
+			}
+			var mixed []string
+			for _, w := range out.Warnings {
+				if strings.Contains(w, "mixed-severity") {
+					mixed = append(mixed, w)
+				}
+			}
+			if !tc.wantMixed {
+				if len(mixed) != 0 {
+					t.Errorf("warnings = %+v, want no mixed-severity advisory for %v", out.Warnings, tc.severities)
+				}
+				return
+			}
+			if len(mixed) != 1 {
+				t.Fatalf("warnings = %+v, want exactly one mixed-severity advisory", out.Warnings)
+			}
+			if !strings.Contains(mixed[0], "alone") || !strings.Contains(mixed[0], "1 high and 1 medium/low") {
+				t.Errorf("mixed-severity advisory must name the counts and say to route the high concern alone:\n%s", mixed[0])
+			}
+			if tc.withPRBody {
+				if len(out.Warnings) != 2 || !strings.Contains(out.Warnings[0], "PULL-REQUEST BODY") {
+					t.Errorf("warnings = %+v, want the pr_body warning FIRST, then the advisory", out.Warnings)
+				}
+			}
+		})
+	}
+}
+
+// TestFixupStage_CeilingReached_ErrorCarriesFreshRunRecovery (R3): only the
+// fixup_ceiling_reached refusal gains the fresh-run recipe.
+//
+// Counterfactuals: the code check mutated to always-true reddens the budget
+// row; removing the wrap's appended recipe reddens the ceiling row.
+func TestFixupStage_CeilingReached_ErrorCarriesFreshRunRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		code       string
+		wantRecipe bool
+	}{
+		{"fixup_ceiling_reached", true},
+		{"fixup_budget_exhausted", false},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			fb.fixupStatus = http.StatusUnprocessableEntity
+			fb.fixupErrBody = `{"error":{"code":"` + tc.code + `","message":"refused","details":{"used":3}}}`
+			r := newResolver(srv, nil)
+
+			_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: uuid.NewString(), Concerns: []int{0}})
+			if err == nil {
+				t.Fatal("expected the 422 as a tool error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.code) {
+				t.Errorf("err = %v, want the backend code %s preserved", err, tc.code)
+			}
+			for _, want := range []string{"dated constraints block", "fishhawk_cancel_run"} {
+				if got := strings.Contains(msg, want); got != tc.wantRecipe {
+					t.Errorf("%s: err contains %q = %v, want %v:\n%s", tc.code, want, got, tc.wantRecipe, msg)
+				}
+			}
+		})
 	}
 }

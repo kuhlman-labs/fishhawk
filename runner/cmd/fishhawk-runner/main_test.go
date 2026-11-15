@@ -8628,6 +8628,68 @@ func TestRun_Fixup_BaseTokenMintFailure_DegradesNotFails(t *testing.T) {
 	}
 }
 
+// TestRun_Fixup_BaseCheckoutAuthRejected_EmitsGoldenRunnerFailed is the RUNNER
+// end of the #5212 git-auth seam. checkoutFixupBase fails with a git fetch
+// error whose stderr carries a remote credential rejection; the runner_failed
+// line run() emits must be JSON-equal to the shared golden
+// testdata/wire/runner_failed_fixup_git_auth.json. The backend end
+// (mcpserver TestFixupGitAuthSeam_RunnerFailedReapedToRenderedRemedy) reaps the
+// SAME bytes, so emission and parse share one byte source across the two Go
+// modules, which cannot import each other.
+func TestRun_Fixup_BaseCheckoutAuthRejected_EmitsGoldenRunnerFailed(t *testing.T) {
+	root := requireWorkspaceRoot(t, pkgSrcDir)
+	golden, err := os.ReadFile(filepath.Join(root, "testdata", "wire", "runner_failed_fixup_git_auth.json")) //nolint:gosec // fixed workspace-relative path
+	if err != nil {
+		t.Fatalf("reading the shared runner_failed golden: %v", err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(golden, &want); err != nil {
+		t.Fatalf("golden is not JSON: %v", err)
+	}
+	detail, _ := want["detail"].(string)
+	if detail == "" {
+		t.Fatal("golden carries no detail")
+	}
+
+	implementEnv(t, "example-org/example-repo", "main")
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("fixup-branch-tip-sha")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	origCheckout := checkoutFixupBase
+	checkoutFixupBase = func(_ context.Context, _, _, _, _ string, _ []string) (string, error) {
+		return "", errors.New(detail)
+	}
+	t.Cleanup(func() { checkoutFixupBase = origCheckout })
+
+	var stderr strings.Builder
+	if code := runFixupStage(t, &stderr); code == 0 {
+		t.Fatalf("run() exited 0 on a failed base checkout:\n%s", stderr.String())
+	}
+	var got map[string]any
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var ev map[string]any
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) != nil {
+			continue
+		}
+		if ev["event"] == "runner_failed" {
+			got = ev
+		}
+	}
+	if got == nil {
+		t.Fatalf("no runner_failed line emitted:\n%s", stderr.String())
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("emitted runner_failed line drifted from testdata/wire/runner_failed_fixup_git_auth.json (update the golden AND backend/internal/mcpserver/fixup_recovery_surface.go fixupBaseGitAuthReason together):\n got: %v\nwant: %v", got, want)
+	}
+	if inv.gotInv != nil {
+		t.Error("agent was invoked after a failed base checkout")
+	}
+}
+
 // TestMintBaseAuthToken_NilDependency_DegradesWithEvent pins the #1951 nil-guard
 // degrade branch: a nil upload client or unissued signing key must NOT return ""
 // silently — it emits the same base_auth_token_unavailable event as the mint-error
@@ -21835,6 +21897,38 @@ func TestFixupCheckoutFailReason(t *testing.T) {
 			name: "other checkout failure",
 			err:  errors.New("gitops: fetch b from origin: exit status 128"),
 			want: "fixup_base_checkout",
+		},
+		// #5212: a remote credential rejection on the base fetch maps to the
+		// self-diagnosing fixup_base_git_auth token.
+		{
+			name: "auth failed for",
+			err:  errors.New("gitops: fetch b from origin: git fetch origin b: exit status 128 (stderr: fatal: Authentication failed for 'https://github.com/o/r/')"),
+			want: "fixup_base_git_auth",
+		},
+		{
+			name: "could not read username, prompts disabled",
+			err:  errors.New("gitops: fetch b from origin: git fetch origin b: exit status 128 (stderr: fatal: could not read Username for 'https://github.com': terminal prompts disabled)"),
+			want: "fixup_base_git_auth",
+		},
+		{
+			name: "literal 401",
+			err:  errors.New("gitops: fetch b from origin: git fetch origin b: exit status 128 (stderr: error: The requested URL returned error: 401)"),
+			want: "fixup_base_git_auth",
+		},
+		{
+			name: "403 stays generic",
+			err:  errors.New("gitops: fetch b from origin: git fetch origin b: exit status 128 (stderr: fatal: unable to access 'https://github.com/o/r/': The requested URL returned error: 403)"),
+			want: "fixup_base_checkout",
+		},
+		{
+			name: "bare exit 128 stays generic",
+			err:  errors.New("gitops: fetch b from origin: git fetch origin b: exit status 128"),
+			want: "fixup_base_checkout",
+		},
+		{
+			name: "worktree conflict wins over an auth marker",
+			err:  fmt.Errorf("gitops: %w: run branch %q is checked out in worktree %q (Authentication failed for x)", gitops.ErrBranchCheckedOutElsewhere, "b", "/p"),
+			want: "fixup_base_worktree_conflict",
 		},
 	}
 	for _, tc := range cases {
