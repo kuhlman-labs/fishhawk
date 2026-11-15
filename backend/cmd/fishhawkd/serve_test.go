@@ -6305,6 +6305,45 @@ func captureServerConfigAndProbe(t *testing.T, probe func(*server.Server)) *serv
 	return captured
 }
 
+// TestServe_Readyz_PingsConfiguredDatabase is the cross-boundary test for
+// GET /readyz (#5224 G7): the -db flag, serve.go's pool wiring
+// (cfg.DBPing = pool.Ping), the router and the handler, against a real
+// Postgres. Without the wiring DBPing is nil and /readyz answers 503
+// not_configured on a database-backed daemon.
+func TestServe_Readyz_PingsConfiguredDatabase(t *testing.T) {
+	dbURL := pgtest.NewURL(t)
+	var probed bool
+	captureServerConfigAndProbe(t, func(srv *server.Server) {
+		probed = true
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("/readyz status = %d, want 200 against a reachable database:\n%s", rec.Code, rec.Body.String())
+			return
+		}
+		var body struct {
+			Status string `json:"status"`
+			Checks struct {
+				Database string `json:"database"`
+			} `json:"checks"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Errorf("decode /readyz: %v\n%s", err, rec.Body.String())
+			return
+		}
+		if body.Status != "ok" || body.Checks.Database != "ok" {
+			t.Errorf("/readyz body = {status:%q database:%q}, want {ok ok}", body.Status, body.Checks.Database)
+		}
+	})
+	code, log := serveWithProfile(t, "-db", dbURL, "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts AFTER newServer); log:\n%s", code, exitFailure, log)
+	}
+	if !probed {
+		t.Fatalf("newServer was never reached, so /readyz was not probed; log:\n%s", log)
+	}
+}
+
 // TestServe_DevTraceStoreFlag_WiresMemStoreWithoutDevMode is the done-means
 // test for --dev-trace-store (E45.76 / #3601), and it asserts BOTH halves of
 // the claim TOGETHER at the PROCESS BOUNDARY, on the real serve wiring:
