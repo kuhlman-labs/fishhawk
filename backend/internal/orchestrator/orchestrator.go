@@ -2776,7 +2776,9 @@ const sliceIntegrationConflictReasonPrefix = "slice integration conflict"
 // run per sub_plan (inheriting parent's workflow + trigger +
 // installation context) and parks the parent's implement stage in
 // awaiting_children. Returns true when fanout happened, false when
-// the plan had no decomposition (caller falls through to dispatch).
+// the plan had no decomposition, carries a non-empty split_proposal
+// (#5222), or the parent already has children (caller falls through to
+// dispatch).
 //
 // Each child carries:
 //   - parent_run_id = parent.ID (CI-retry-chain semantic; preserved
@@ -2792,6 +2794,26 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 		return false, fmt.Errorf("load approved plan: %w", err)
 	}
 	if approvedPlan == nil || approvedPlan.Decomposition == nil || len(approvedPlan.Decomposition.SubPlans) == 0 {
+		return false, nil
+	}
+
+	// #5222: an over-cap plan that ALSO carries a split_proposal is split, not
+	// fanned out. On approval the split phases are filed as their own issues
+	// (fileSplitProposalChildren), but Advance runs first, so fanning out the
+	// decomposition here would mint over-cap children beside them. Key on the
+	// APPROVED PLAN, not on split_children_filed, because that record does
+	// not exist yet when this runs. Returning (false, nil) falls through to
+	// dispatchStage, so the parent implement still dispatches at its
+	// approved scope — including when split filing is refused or fails
+	// (split_filing_refused): then there are no split children and no
+	// fan-out. checkPlanBudget admits an over-budget plan because it carries
+	// a decomposition, so that parent runs whole; whether it should run at
+	// all is an operator follow-up (filed at merge).
+	if approvedPlan.SplitProposal != nil && len(approvedPlan.SplitProposal.Phases) > 0 {
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "fanout skipped: approved plan carries a split_proposal",
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.Int("split_phases", len(approvedPlan.SplitProposal.Phases)),
+		)
 		return false, nil
 	}
 

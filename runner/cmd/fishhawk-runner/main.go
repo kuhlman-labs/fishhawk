@@ -9096,6 +9096,23 @@ func looksLikeTestFailure(output string) bool {
 	return false
 }
 
+// subtractPaths returns the order-preserving entries of all absent from keep
+// (#5222: the build_required_drift_filtered trace names what PresentPaths
+// dropped).
+func subtractPaths(all, keep []string) []string {
+	kept := make(map[string]struct{}, len(keep))
+	for _, p := range keep {
+		kept[p] = struct{}{}
+	}
+	var out []string
+	for _, p := range all {
+		if _, ok := kept[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // verifyCommittedTreeCompiles compile-gates the scope-only committed
 // tree before the runner pushes it (#728). When a scope-bounded commit
 // drops build-required drift (e.g. an interface-conformance stub left in
@@ -11126,7 +11143,38 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			// record an empty parkBuildRequired slice, parkResult() would count
 			// zero classes, and the red commit would push reported as succeeded.
 			if parkOnBuildRequiredDrift && errors.Is(err, gitops.ErrCommittedTestsFailed) && len(drift) > 0 {
-				parkBuildRequired = append([]string(nil), drift...)
+				// #5222: the drift list is the `git status` view taken at
+				// staging time, so it can name a path that no longer exists
+				// anywhere by the time the park is recorded (a transient
+				// duplicate, a scratch file the tests removed). Drop paths
+				// absent from BOTH the held commit and the working tree, so
+				// the park names only paths a sibling slice could own. A
+				// helper error fails open: the unfiltered drift is recorded,
+				// exactly as before.
+				recordPaths := drift
+				present, perr := gitops.PresentPaths(ctx, repoDir, headSHA, drift)
+				if perr != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"build_required_drift_filter_skipped","run_id":%q,"stage_id":%q,"head_sha":%q,"error":%q}`+"\n",
+						cfg.runID, cfg.stageID, headSHA, perr.Error())
+				} else {
+					if dropped := subtractPaths(drift, present); len(dropped) > 0 {
+						droppedJSON, _ := json.Marshal(dropped)
+						_, _ = fmt.Fprintf(logSink,
+							`{"event":"build_required_drift_filtered","run_id":%q,"stage_id":%q,"head_sha":%q,"dropped_paths":%s}`+"\n",
+							cfg.runID, cfg.stageID, headSHA, droppedJSON)
+					}
+					recordPaths = present
+				}
+				// Nothing real survived: the drift was junk only, so the red
+				// tree has no scope-boundary cause a sibling owns. Keep the
+				// category-B abort (origin untouched) instead of a park that
+				// would name no path (an empty parkBuildRequired would count
+				// zero classes and push the red commit as succeeded).
+				if len(recordPaths) == 0 {
+					return err
+				}
+				parkBuildRequired = append([]string(nil), recordPaths...)
 				parkBuildRequiredMessage = err.Error()
 			} else {
 				return err

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -849,6 +850,148 @@ func TestAwaitChildrenEvaluate_ParentGETErrorHoldsThenRecovers(t *testing.T) {
 	}
 	if want := "/v0/runs/" + parent.String() + "/integrate-wave"; !strings.Contains(out.Message, want) {
 		t.Errorf("message %q must name the recovery %q", out.Message, want)
+	}
+}
+
+// seedLostRecordRace builds the #5222 read-order race BY CONSTRUCTION: four
+// succeeded children, authority available, NO slices_integrated record and the
+// parent's implement stage still awaiting_children — then a settle that lands
+// strictly AFTER the snapshot's audit read (on the first stage read of child
+// kids[0], which the snapshot's per-child enrichment issues after its audit
+// reads) and BEFORE the parent stage read. It mirrors every settle path's
+// order: append the covering slices_integrated, THEN stamp the stage
+// succeeded. Without the re-read, the evaluate pairs the stale no-record
+// snapshot with the succeeded stage and names the integrate-wave recovery for
+// a record that already exists.
+func seedLostRecordRace(t *testing.T, fb *fakeBackend, parent uuid.UUID) []uuid.UUID {
+	t.Helper()
+	kids := seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, "awaiting_children")
+	seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+	ids := make([]string, len(kids))
+	for i, k := range kids {
+		ids[i] = k.String()
+	}
+	payload := slicesIntegratedPayloadMap(t, "fishhawk/run-"+parent.String(), ids)
+	landed := false
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	// stagesFlip runs under fb.mu, so it mutates the maps directly.
+	fb.stagesFlip = func(id uuid.UUID, _ int) {
+		if id != kids[0] || landed {
+			return
+		}
+		landed = true
+		fb.perRunAuditByRun[parent] = append(fb.perRunAuditByRun[parent], AuditEntry{
+			ID:       uuid.NewString(),
+			Sequence: int64(len(fb.perRunAuditByRun[parent]) + 1),
+			RunID:    parent.String(),
+			Category: "slices_integrated",
+			Payload:  payload,
+		})
+		for i := range fb.stagesByRun[parent] {
+			if fb.stagesByRun[parent][i].Type == "implement" {
+				fb.stagesByRun[parent][i].State = "succeeded"
+			}
+		}
+	}
+	return kids
+}
+
+// TestAwaitChildren_LostRecordRace_ReReadBeforeNamingIntegrateWave is the
+// #5222 gap-3 done-means: a settle landing between the snapshot read and the
+// parent stage read must not release integration_pending naming the
+// integrate-wave recovery. The re-read keeps polling on the race, so
+// children_settled is released on the NEXT tick (approval condition G4): the
+// test drives two evaluate calls and the real poll loop, never one return.
+func TestAwaitChildren_LostRecordRace_ReReadBeforeNamingIntegrateWave(t *testing.T) {
+	t.Run("evaluate keeps polling on the race, then settles on the next tick", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedLostRecordRace(t, fb, parent)
+
+		out, done, err := r.awaitChildrenEvaluate(context.Background(), parent, time.Now(), false, 600)
+		if err != nil {
+			t.Fatalf("first evaluate: %v", err)
+		}
+		if done {
+			t.Fatalf("first evaluate released %q (message %q), want keep-polling: the covering record landed before the parent stage read", out.Status, out.Message)
+		}
+		out, done, err = r.awaitChildrenEvaluate(context.Background(), parent, time.Now(), false, 600)
+		if err != nil {
+			t.Fatalf("second evaluate: %v", err)
+		}
+		if !done || out.Status != "children_settled" {
+			t.Fatalf("second evaluate: done=%v status=%q (message %q), want children_settled", done, out.Status, out.Message)
+		}
+	})
+	t.Run("the poll loop releases children_settled, never the integrate-wave recovery", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedLostRecordRace(t, fb, parent)
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_settled" {
+			t.Fatalf("status = %q (message %q), want children_settled", out.Status, out.Message)
+		}
+		if strings.Contains(out.Message, "integrate-wave") {
+			t.Errorf("message %q names the integrate-wave recovery for a record that landed", out.Message)
+		}
+	})
+}
+
+// TestAwaitChildren_LostRecordReReadFailureNeverNamesIntegrateWave pins the
+// re-read failure mode by OUTCOME: on a genuine lost-record wedge, a failed
+// re-read (the parent's audit answers 500 after the parent stage read) keeps
+// polling with no error and no release — never the integrate-wave recovery on
+// the stale snapshot — and once the read recovers the same wedge releases
+// integration_pending naming integrate-wave. The ferr != nil disjunct alone is
+// MASKED here (a nil fresh snapshot already fails fanInRecordLost), so this
+// test is the counterfactual vehicle for the re-read as a whole.
+func TestAwaitChildren_LostRecordReReadFailureNeverNamesIntegrateWave(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, "succeeded")
+	seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+	failed := false
+	fb.mu.Lock()
+	fb.stagesFlip = func(id uuid.UUID, _ int) {
+		if id != parent || failed {
+			return
+		}
+		failed = true
+		fb.perRunAuditStatus = http.StatusInternalServerError
+	}
+	fb.mu.Unlock()
+
+	out, done, err := r.awaitChildrenEvaluate(context.Background(), parent, time.Now(), false, 600)
+	if err != nil {
+		t.Fatalf("evaluate err = %v, want nil (a failed re-read holds, it does not abort)", err)
+	}
+	if done {
+		t.Fatalf("evaluate released %q (message %q) on a failed re-read, want keep-polling", out.Status, out.Message)
+	}
+	if out.Status != "" {
+		t.Errorf("out = %+v, want the zero output while holding", out)
+	}
+
+	fb.mu.Lock()
+	fb.perRunAuditStatus = http.StatusOK
+	fb.mu.Unlock()
+
+	out, done, err = r.awaitChildrenEvaluate(context.Background(), parent, time.Now(), false, 600)
+	if err != nil {
+		t.Fatalf("evaluate after recovery: %v", err)
+	}
+	if !done || out.Status != "integration_pending" {
+		t.Fatalf("after recovery: done=%v status=%q, want integration_pending", done, out.Status)
+	}
+	if want := "/v0/runs/" + parent.String() + "/integrate-wave"; !strings.Contains(out.Message, want) {
+		t.Errorf("message %q must name the recovery %q on a genuine wedge", out.Message, want)
 	}
 }
 

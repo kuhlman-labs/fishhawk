@@ -848,6 +848,127 @@ func TestAdvance_FanoutSkippedWhenChildrenExist(t *testing.T) {
 	}
 }
 
+// TestFanout_SplitProposalPlanDoesNotFanOut is the #5222 gap-4 done-means: an
+// approved plan carrying BOTH a decomposition and a non-empty split_proposal
+// is split (its phases are filed as their own issues), so Advance must mint
+// NO decomposition children, append no plan_decomposed and leave the parent
+// implement out of awaiting_children. Approval condition G1(a): it also pins
+// what the parent does instead — it falls through to dispatchStage at its
+// approved scope (OutcomeDispatched), the residual the FO follow-up owns.
+// MECHANISM: the plan is decomposedPlanBytes (which fans out three children
+// in TestAdvance_FanoutDecomposedPlan) plus a split_proposal, and no children
+// exist, so without the guard the fan-out runs.
+func TestFanout_SplitProposalPlanDoesNotFanOut(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage, implementStage := stages[0], stages[1]
+
+	var body map[string]any
+	if err := json.Unmarshal(decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"}), &body); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	body["split_proposal"] = map[string]any{
+		"rationale": "over the cap by count",
+		"phases": []map[string]any{
+			{"title": "Expand", "scope": map[string]any{"files": []map[string]any{{"path": "x.go", "operation": "create"}}}},
+			{"title": "Contract", "scope": map[string]any{"files": []map[string]any{{"path": "y.go", "operation": "create"}}}, "depends_on": []int{0}},
+		},
+	}
+	planBytes, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID:            uuid.New(),
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       planBytes,
+				ContentHash:   "deadbeef",
+				CreatedAt:     time.Now().UTC(),
+			}},
+		},
+	}
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: au}
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out == OutcomeDecomposed {
+		t.Fatalf("outcome = %q: a split_proposal plan fanned out its decomposition", out)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("outcome = %q, want %q (the parent implement falls through to dispatchStage)", out, OutcomeDispatched)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if got := len(rs.createdRuns); got != 0 {
+		t.Errorf("createdRuns = %d, want 0 (no decomposition children beside the filed split)", got)
+	}
+	if got := len(rs.createdStages); got != 0 {
+		t.Errorf("createdStages = %d, want 0", got)
+	}
+	if implementStage.State == run.StageStateAwaitingChildren {
+		t.Errorf("parent implement state = %q, want it NOT parked awaiting_children", implementStage.State)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == "plan_decomposed" {
+			t.Errorf("a plan_decomposed audit entry was appended for a split_proposal plan")
+		}
+	}
+}
+
+// TestFanout_EmptySplitProposalStillFansOut pins the guard's len(phases) > 0
+// conjunct: a split_proposal with NO phases files nothing, so it is not a
+// split and the decomposition still fans out. The orchestrator decodes the
+// approved plan with plain json.Unmarshal, so this shape reaches the guard.
+func TestFanout_EmptySplitProposalStillFansOut(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage := stages[0]
+	var body map[string]any
+	if err := json.Unmarshal(decomposedPlanBytes(t, []string{"Part A", "Part B"}), &body); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	body["split_proposal"] = map[string]any{"rationale": "none", "phases": []map[string]any{}}
+	planBytes, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planStage.ID: {{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schemaV, Content: planBytes, ContentHash: "deadbeef", CreatedAt: time.Now().UTC()}},
+	}}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: &recordingAudit{}}
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Errorf("outcome = %q, want %q (an empty split_proposal is not a split)", out, OutcomeDecomposed)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if got := len(rs.createdRuns); got != 2 {
+		t.Errorf("createdRuns = %d, want 2", got)
+	}
+}
+
 func TestAdvance_NoDecomposition_DispatchesNormally(t *testing.T) {
 	rs := newFanoutRunsRepo()
 	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{

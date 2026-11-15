@@ -59,7 +59,10 @@ type AwaitChildrenInput struct {
 //     best-effort slices_integrated append — NO record at all (#4165), or only
 //     an earlier between-wave record surviving a lost FINAL append in a
 //     multi-wave fan-out (#4221) — and the release names the integrate-wave
-//     recovery instead of re-driving the already-succeeded children.
+//     recovery instead of re-driving the already-succeeded children. That
+//     wedge is named only when a re-read of the fan-in snapshot AFTER the
+//     parent stage read still shows it (#5222): a settle landing between the
+//     two reads keeps polling, and the next tick releases children_settled.
 //   - "children_settled"      — every child succeeded AND the newest
 //     slices_integrated entry covers every child (#4080; before, any terminal
 //     fan-out released this). On a deployment with no slice-integration
@@ -248,6 +251,10 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               message names the recovery, POST
                               /v0/runs/{run_id}/integrate-wave (do NOT re-drive
                               the uncovered children; they already succeeded).
+                              The fan-in record is re-read after the parent's
+                              stage first, so a settle landing between the two
+                              reads keeps the wait and the next poll releases
+                              children_settled instead.
   - "children_settled"      — every child succeeded AND the newest
                               slices_integrated record covers every child.
                               next_step is fishhawk_consolidate_slices. On a
@@ -539,7 +546,26 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 			// fan-in record covering every child was lost (no record, or only
 			// an earlier between-wave one) — the server refuses acceptance and
 			// nothing re-integrates on its own. Hold, and name the recovery.
-			return awaitChildrenFanInRecordLostOutput(base, parentUUID, cs), true, nil
+			//
+			// Read-order race (#5222): cs was read BEFORE the parent's stage.
+			// Every settle path appends slices_integrated BEFORE it calls
+			// SettleAwaitingChildrenStage — server/consolidate.go
+			// runConsolidation, childcompletion/sweeper.go resolveParent and
+			// the orchestrator's event-driven awaiting_children arm — so a
+			// settle that landed between the two reads shows a succeeded stage
+			// beside a snapshot that predates its covering record. Re-read the
+			// snapshot AFTER the stage read and name the integrate-wave
+			// recovery only if the fresh snapshot still shows the wedge.
+			// Otherwise keep polling: the next tick reads the covering record
+			// and releases children_settled. A failed re-read also keeps
+			// polling (the next tick re-reads; a persistent failure surfaces
+			// as the resumable timeout), never releasing on the stale snapshot.
+			fresh, ferr := r.childrenStatusForAwait(ctx, parentUUID)
+			if ferr != nil || !fanInRecordLost(fresh, parentImplementState, authority) {
+				return AwaitChildrenOutput{}, false, nil
+			}
+			base.Children = fresh
+			return awaitChildrenFanInRecordLostOutput(base, parentUUID, fresh), true, nil
 		}
 		return awaitChildrenIntegrationPendingOutput(base, parentUUID, cs, parentImplementState), true, nil
 	}

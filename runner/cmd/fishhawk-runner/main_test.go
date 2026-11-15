@@ -24793,6 +24793,120 @@ func TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable(t *testing.T) {
 	_ = bare
 }
 
+// buildRequiredJunkDrift extends buildRequiredDriftRepo with the #5222 junk
+// path BY CONSTRUCTION: an untracked mod/"seed 2.go" (an iCloud-style
+// duplicate) that `git status` lists as drift at staging time, plus a base
+// commit whose mod/reg_test.go init() REMOVES that file when the committed
+// tree's tests run. So the drift list names the path, and by the time the
+// build-required park is recorded it exists in neither the held commit
+// (untracked drift is never committed) nor the working tree. The init() uses
+// the absolute path because the gate runs the tests in an isolated worktree
+// with a sanitized environment. Go caches only successful test results, and
+// this tree's test is red, so the init() runs on every gate pass.
+func buildRequiredJunkDrift(t *testing.T, repo string) string {
+	t.Helper()
+	junk := filepath.Join(repo, "mod", "seed 2.go")
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), fmt.Sprintf(
+		"package mod\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc init() { _ = os.Remove(%q) }\n\n"+
+			"func TestGet(t *testing.T) {\n\tif Get(\"x\") != 42 {\n\t\tt.Fatalf(\"Get(x) = %%d, want 42\", Get(\"x\"))\n\t}\n}\n", junk))
+	for _, args := range [][]string{
+		{"add", "mod/reg_test.go"},
+		{"commit", "-m", "remove the junk duplicate when tests run"},
+		{"push", "origin", "main"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	mustWrite(t, junk, "package mod\n")
+	return junk
+}
+
+// TestVerifyCommit_BuildRequiredDriftDropsAbsentPaths is the #5222 gap-2
+// done-means: a decomposed child parks on real build-required drift
+// (mod/seed.go, modified on disk and in the commit's parent) and the park's
+// build_required_paths drops the junk drift path that vanished before the park.
+// The dropped path is named in the build_required_drift_filtered trace event.
+func TestVerifyCommit_BuildRequiredDriftDropsAbsentPaths(t *testing.T) {
+	repo, _ := buildRequiredDriftRepo(t)
+	junk := buildRequiredJunkDrift(t, repo)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSliceIndex = 0
+	cfg := buildRequiredCfg(repo, true)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("real build-required drift must still PARK, got: %v\n%s", err, logSink.String())
+	}
+	if _, serr := os.Lstat(junk); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("fixture: the committed test's init() must have removed %s before the park (lstat: %v)", junk, serr)
+	}
+	if !strings.Contains(logSink.String(), `"drift":["mod/seed.go","mod/seed 2.go"]`) {
+		t.Fatalf("fixture: the staging-time drift must name both paths:\n%s", logSink.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("must report a scope_park, got: %+v\n%s", fu.gotPRArgs, logSink.String())
+	}
+	if got := fu.gotPRArgs.BuildRequiredPaths; len(got) != 1 || got[0] != "mod/seed.go" {
+		t.Errorf("park report build_required_paths = %q, want [mod/seed.go] (the vanished junk path dropped)", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"build_required_drift_filtered"`) ||
+		!strings.Contains(logSink.String(), `"dropped_paths":["mod/seed 2.go"]`) {
+		t.Errorf("the dropped junk path must be named in a build_required_drift_filtered trace event:\n%s", logSink.String())
+	}
+}
+
+// TestVerifyCommit_BuildRequiredJunkOnlyDriftFailsNotParks pins the INFERRED
+// junk-only outcome (approval condition G5): when every drift path vanished
+// before the park, nothing a sibling slice could own survives, so the red
+// committed tree keeps the category-B abort (ErrCommittedTestsFailed, origin
+// untouched) rather than parking with no path. Contrast
+// TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable: there drift is
+// EMPTY at staging time, the gate's len(drift)==0 fast path never runs the
+// tests, and the child pushes plainly. Here drift is NON-empty at staging
+// time, so the gate DID run and DID see the red tree; pushing it would ship a
+// tree the runner knows is red.
+func TestVerifyCommit_BuildRequiredJunkOnlyDriftFailsNotParks(t *testing.T) {
+	repo, bare := buildRequiredDriftRepo(t)
+	junk := buildRequiredJunkDrift(t, repo)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSliceIndex = 0
+	cfg := buildRequiredCfg(repo, true)
+	// Restore seed.go to its base content: the junk duplicate is now the ONLY
+	// drift, and the committed tree is red (registry["x"] = 0, want 42).
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 0 }\n")
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil)
+	if _, serr := os.Lstat(junk); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("fixture: the committed test's init() must have removed %s before the park (lstat: %v)", junk, serr)
+	}
+	if !strings.Contains(logSink.String(), `"event":"test_gate_failed"`) || !strings.Contains(logSink.String(), `"drift":["mod/seed 2.go"]`) {
+		t.Fatalf("fixture: the gate must have run on the junk-only drift and failed:\n%s", logSink.String())
+	}
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("junk-only drift must keep the category-B abort, got: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Errorf("junk-only drift must NOT park, got %+v", fu.gotPRArgs)
+	}
+	wantBranch := childSliceBranch(buildRequiredParentRunID, 0)
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+wantBranch).Output(); rerr == nil {
+		t.Errorf("origin must be untouched on the junk-only abort, but %s exists", wantBranch)
+	}
+}
+
 // TestVerifyCommit_CompileFailureNotParkable (r3) pins that a COMPILE failure
 // (ErrCommitWouldNotCompile) is untouched by the new arm: the new branch is
 // gated on errors.Is(err, ErrCommittedTestsFailed), so a tree that will not
