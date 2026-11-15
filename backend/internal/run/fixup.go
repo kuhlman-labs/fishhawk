@@ -254,6 +254,10 @@ type FixupDecision struct {
 //     run's acceptance stage is parked failed with category C: the
 //     acceptance stage is re-parked failed → pending and the review stage
 //     is left pending.
+//   - an implement stage in pending or awaiting_host_dispatch is refused
+//     with a CONDITIONAL remedy (#5212): if a pass is queued, dispatch it
+//     and route the fix-up once it settles at the review gate; otherwise
+//     the stage has not run yet. The refusal does not claim which case holds.
 //
 // The bound decision (checked before any stage is touched — fix-up is
 // never an unbounded auto-loop) is, in order:
@@ -600,6 +604,15 @@ func admitFixup(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 			reviewToRepark = review
 			parkedAcceptance = parked
 		}
+	case StageStatePending, StageStateAwaitingHostDispatch:
+		// E106.27 / #5212 (R10): a pending implement stage is EITHER one that
+		// holds a queued pass (a decomposed parent's fan-in or merge-candidate
+		// verify pass, an earlier fix-up, a retry) OR one that has not run
+		// yet. No field this admission holds tells the two apart — a fan-in
+		// pass reaches pending without ever entering running, and a re-open
+		// resets ended_at — so the refusal is CONDITIONAL and never asserts
+		// which case holds.
+		return nil, fmt.Errorf("%w: %s", ErrFixupNotApplicable, pendingImplementFixupRefusal(stage.State))
 	default:
 		return nil, fmt.Errorf("%w: stage is in state %q (only an implement stage awaiting approval, or one that succeeded with its review gate still open, can be fixed up)",
 			ErrFixupNotApplicable, stage.State)
@@ -660,6 +673,19 @@ func admitFixup(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 		adm.acceptance = acc
 	}
 	return adm, nil
+}
+
+// pendingImplementFixupRefusal renders the conditional fixup_not_applicable
+// reason for an implement stage in pending or awaiting_host_dispatch
+// (E106.27 / #5212). It names both possibilities and the remedy for each,
+// and deliberately does not claim which one holds: the admission has no
+// stage field that discriminates a queued pass from a stage that has not run.
+func pendingImplementFixupRefusal(state StageState) string {
+	return fmt.Sprintf("implement stage is in state %q. If a pass is queued on this stage "+
+		"(a decomposed parent's fan-in or merge-candidate verify pass, an earlier fix-up, or a retry), "+
+		"dispatch it with fishhawk_dispatch_stage (stage implement), let it settle at the review gate, "+
+		"then route the fix-up; waiting consumes no fix-up budget. Otherwise the stage has not run yet, "+
+		"and a fix-up applies only after implement has run and its review gate is open", state)
 }
 
 // ErrFixupRecoveryNotApplicable is returned by RestoreFixupStage when

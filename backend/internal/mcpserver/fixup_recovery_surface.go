@@ -350,9 +350,66 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 	} else {
 		b.WriteString(" Confirm on the PR head with an inventory specialist job (fishhawk_request_specialist_job, command git_log): the fix-up commit is absent.")
 	}
+	// #5212 (R16): a git-auth base-checkout failure gets a TRUSTED remedy,
+	// rendered OUTSIDE the untrusted envelope and selected by EQUALITY on the
+	// neutralized reason, so a longer untrusted string that merely contains
+	// the token cannot select it. Nothing from the untrusted text is
+	// interpolated.
+	if rec.SourceFailureReason == fixupBaseGitAuthReason {
+		b.WriteString(fixupGitAuthRemedySentence)
+	}
 	b.WriteString(fixupRoundClosureSentence(rec))
+	b.WriteString(fixupReRouteSafeSentence(rec))
 	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. Since #3335 a delivered-nothing pass is credited against the hard ceiling as well as the normal budget, capped at 3 such credits, so the absolute bound is 6 triggered passes.")
 	return b.String()
+}
+
+// fixupBaseGitAuthReason is the runner_failed reason token the runner emits
+// when the fix-up base checkout's git fetch was rejected for its credential
+// (#5212). The detached reaper stores the runner_failed reason field ALONE as
+// the stage failure reason, and the #788 recovery copies it into
+// stage_fixup_recovered source_failure_reason, so the marker sees exactly this
+// token.
+//
+// KEEP IN SYNC with runner/cmd/fishhawk-runner/main.go fixupCheckoutFailReason
+// (the emitter) and the shared golden
+// testdata/wire/runner_failed_fixup_git_auth.json, which both
+// TestRun_Fixup_BaseCheckoutAuthRejected_EmitsGoldenRunnerFailed (runner) and
+// TestFixupGitAuthSeam_RunnerFailedReapedToRenderedRemedy (here) read.
+const fixupBaseGitAuthReason = "fixup_base_git_auth"
+
+// fixupGitAuthRemedySentence is the trusted remedy for fixupBaseGitAuthReason.
+// It names the real credential paths the runner's base checkout takes — a token
+// minted for this dispatch (with its source) or the host's ambient git
+// credentials — and points the operator at the dispatch-log events that say
+// which one ran. It makes no claim that every dispatch shares one credential.
+const fixupGitAuthRemedySentence = " Source failure reason fixup_base_git_auth means the git remote rejected the credential the fix-up base checkout used." +
+	" Find which credential that was in the runner's dispatch log: read the most recent installation_token_received / base_auth_token_unavailable event before the runner_failed line." +
+	" An installation_token_received event means a token was minted for this dispatch, and its source field names where it came from:" +
+	" backend (the forge app installation: check it is installed on the repository with read access)," +
+	" gh_cli (the host's gh login: check gh auth status) or gitlab_env (the configured GitLab token: check its scope and expiry)." +
+	" A base_auth_token_unavailable event, or a remote that is not http(s) (a minted token is applied only to an http(s) remote), means the checkout used the host's ambient git credentials (a credential helper or a configured extraheader): check those." +
+	" Fix that credential before re-dispatching; a re-dispatch that resolves the same credential fails the same way."
+
+// fixupReRouteSafeSentence renders the #5212 (R17) re-route-is-safe claim, and
+// ONLY when it is true: the backend verified the pass delivered nothing, the
+// recovery recorded source failure category A or C (the two the server's
+// fixupRefundedPasses refunds), and the routed concerns were re-opened without
+// error. A category-B recovery consumes a pass, a reopen error may leave
+// concerns reading addressed_pending, and a pushed or legacy entry has no
+// verified empty delivery, so each of those renders nothing and the closure and
+// budget sentences govern.
+func fixupReRouteSafeSentence(rec *FixupRecovery) string {
+	if rec.DeliveredNothing == nil || !*rec.DeliveredNothing {
+		return ""
+	}
+	if rec.SourceFailureCategory != "A" && rec.SourceFailureCategory != "C" {
+		return ""
+	}
+	if rec.ConcernReopenError != "" {
+		return ""
+	}
+	return fmt.Sprintf(" The pass delivered nothing and died category %s, so it was refunded: once the cause is fixed, re-routing these concerns with fishhawk_fixup_stage is safe and loses no routed work.", rec.SourceFailureCategory)
 }
 
 // fixupRoundClosureSentence renders the #3395 round-closure outcome. It keeps

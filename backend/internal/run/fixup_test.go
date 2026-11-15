@@ -174,6 +174,67 @@ func TestFixupStage_RefusesWrongState(t *testing.T) {
 	}
 }
 
+// TestFixupStage_PendingImplementRefusalIsConditional pins the #5212 (R10)
+// refusal for an implement stage that is pending or awaiting host dispatch.
+// The admission cannot tell a queued pass (a decomposed parent's fan-in /
+// merge-candidate verify pass, an earlier fix-up, a retry) from a stage that
+// has not run, so EVERY such row — never-run, a stage that has run before,
+// awaiting_host_dispatch — carries the SAME conditional text naming both
+// cases. Any other refused state keeps today's generic wording.
+func TestFixupStage_PendingImplementRefusalIsConditional(t *testing.T) {
+	started := time.Now().Add(-time.Hour)
+	const conditional = "If a pass is queued on this stage (a decomposed parent's fan-in or merge-candidate verify pass, an earlier fix-up, or a retry), " +
+		"dispatch it with fishhawk_dispatch_stage (stage implement), let it settle at the review gate, then route the fix-up; " +
+		"waiting consumes no fix-up budget. Otherwise the stage has not run yet, and a fix-up applies only after implement has run and its review gate is open"
+	rows := []struct {
+		name      string
+		state     run.StageState
+		startedAt *time.Time
+	}{
+		{"never-run pending implement", run.StageStatePending, nil},
+		{"pending implement that has run before", run.StageStatePending, &started},
+		{"awaiting_host_dispatch implement", run.StageStateAwaitingHostDispatch, nil},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			stage := newStage(tc.state)
+			stage.Type = run.StageTypeImplement
+			stage.StartedAt = tc.startedAt
+			repo := newFixupRepo(stage)
+
+			_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+			if !errors.Is(err, run.ErrFixupNotApplicable) {
+				t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+			}
+			if !strings.Contains(err.Error(), conditional) {
+				t.Errorf("refusal = %q, want the conditional remedy %q", err.Error(), conditional)
+			}
+			if !strings.Contains(err.Error(), string(tc.state)) {
+				t.Errorf("refusal = %q, want it to name the state %q", err.Error(), tc.state)
+			}
+			cur, _ := repo.GetStage(context.Background(), stage.ID)
+			if cur.State != tc.state {
+				t.Errorf("state = %q, want unchanged (%s)", cur.State, tc.state)
+			}
+		})
+	}
+
+	t.Run("other states keep the generic wording", func(t *testing.T) {
+		repo, stage := implementStage(t, run.StageStateRunning)
+		_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+		if !errors.Is(err, run.ErrFixupNotApplicable) {
+			t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+		}
+		const generic = `stage is in state "running" (only an implement stage awaiting approval, or one that succeeded with its review gate still open, can be fixed up)`
+		if !strings.Contains(err.Error(), generic) {
+			t.Errorf("refusal = %q, want the generic wording %q", err.Error(), generic)
+		}
+		if strings.Contains(err.Error(), "fishhawk_dispatch_stage") {
+			t.Errorf("refusal = %q names fishhawk_dispatch_stage for a running stage", err.Error())
+		}
+	})
+}
+
 func TestFixupStage_RefusesWhenBudgetExhausted(t *testing.T) {
 	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
 

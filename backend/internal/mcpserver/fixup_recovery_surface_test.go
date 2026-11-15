@@ -761,3 +761,105 @@ func TestFixupRecoveryMessage_NoDetailOpensNoEnvelope(t *testing.T) {
 		t.Errorf("the advisory itself is missing:\n%s", msg)
 	}
 }
+
+// --- #5212: git-auth remedy (R16, J4) and re-route-is-safe sentence (R17, J1) ---
+
+// TestFixupRecoveryMessage_GitAuthSetupFailureNamesCredentialPaths pins the
+// trusted git-auth remedy. It renders ONLY when the neutralized source failure
+// reason EQUALS fixup_base_git_auth, always AFTER the untrusted envelope's END
+// delimiter, names both credential-path events and the ambient fallback, and
+// makes no host-wide claim. A generic base-checkout failure and a longer
+// untrusted reason that merely contains the token render none of it.
+func TestFixupRecoveryMessage_GitAuthSetupFailureNamesCredentialPaths(t *testing.T) {
+	tru := true
+	anchors := []string{"installation_token_received", "base_auth_token_unavailable", "ambient",
+		"the most recent installation_token_received / base_auth_token_unavailable event before the runner_failed line"}
+	for _, tc := range []struct {
+		name   string
+		reason string
+		want   bool
+	}{
+		{"git-auth token", "fixup_base_git_auth", true},
+		{"generic base checkout", "fixup_base_checkout", false},
+		{"token embedded in longer text", "x fixup_base_git_auth y", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := fixupRecoveryMessage(latestFixupRecovery([]int64{10}, []fixupRecoverySignal{{
+				Sequence: 11, Parsed: true, RestoredState: "succeeded",
+				SourceFailureReason: tc.reason, SourceFailureCategory: "C", DeliveredNothing: &tru,
+			}}))
+			end := strings.Index(msg, fixupRecoveryUntrustedClose)
+			if end < 0 {
+				t.Fatalf("message carries no untrusted END delimiter: %q", msg)
+			}
+			for _, a := range anchors {
+				idx := strings.Index(msg, a)
+				switch {
+				case tc.want && idx < 0:
+					t.Errorf("git-auth remedy missing %q: %q", a, msg)
+				case tc.want && idx < end:
+					t.Errorf("%q appears inside the untrusted envelope (at %d, END at %d): %q", a, idx, end, msg)
+				case !tc.want && idx >= 0:
+					t.Errorf("reason %q rendered the git-auth remedy anchor %q: %q", tc.reason, a, msg)
+				}
+			}
+			if strings.Contains(msg, "every runner dispatch") {
+				t.Errorf("remedy makes a host-wide claim: %q", msg)
+			}
+			if strings.Contains(msg, "the event logged just before") {
+				t.Errorf("remedy uses the superseded wording: %q", msg)
+			}
+		})
+	}
+}
+
+// TestFixupRecoveryMessage_ReRouteSafeOnlyWhenRefunded pins the R17 sentence:
+// it renders only when the pass delivered nothing, died category A or C, and
+// the concern re-open completed. Every other shape defers to the existing
+// closure and budget sentences, which the rows assert are still present.
+func TestFixupRecoveryMessage_ReRouteSafeOnlyWhenRefunded(t *testing.T) {
+	tru, fal := true, false
+	const r17 = "loses no routed work"
+	for _, tc := range []struct {
+		name       string
+		category   string
+		delivered  *bool
+		reopenErr  string
+		want       bool
+		mustAlsoIn string
+	}{
+		{name: "category C, delivered nothing", category: "C", delivered: &tru, want: true},
+		{name: "category A, delivered nothing", category: "A", delivered: &tru, want: true},
+		{name: "category B consumes a pass", category: "B", delivered: &tru, mustAlsoIn: "A category-B (policy) failure still CONSUMES a pass"},
+		{name: "reopen error", category: "C", delivered: &tru, reopenErr: "store down", mustAlsoIn: "may still read addressed_pending"},
+		{name: "pushed", category: "C", delivered: &fal, mustAlsoIn: "the re-review of that head governs"},
+		{name: "legacy entry", category: "C", delivered: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := fixupRecoveryMessage(latestFixupRecovery([]int64{10}, []fixupRecoverySignal{{
+				Sequence: 11, Parsed: true, RestoredState: "succeeded",
+				SourceFailureReason: "runner exited 1", SourceFailureCategory: tc.category,
+				DeliveredNothing: tc.delivered, ConcernReopenError: tc.reopenErr,
+			}}))
+			got := strings.Contains(msg, r17)
+			if got != tc.want {
+				t.Fatalf("R17 sentence present = %v, want %v: %q", got, tc.want, msg)
+			}
+			if tc.want {
+				for _, a := range []string{"re-routing", "refunded", "category " + tc.category, "fishhawk_fixup_stage"} {
+					if !strings.Contains(msg, a) {
+						t.Errorf("R17 sentence missing %q: %q", a, msg)
+					}
+				}
+				// It sits after the closure sentence and before the budget sentence.
+				if strings.Index(msg, r17) < strings.Index(msg, "PREVIOUS review round stands again") ||
+					strings.Index(msg, r17) > strings.Index(msg, "Fix-up budget, as it stands today") {
+					t.Errorf("R17 sentence is out of order: %q", msg)
+				}
+			}
+			if tc.mustAlsoIn != "" && !strings.Contains(msg, tc.mustAlsoIn) {
+				t.Errorf("expected the existing sentence %q to govern: %q", tc.mustAlsoIn, msg)
+			}
+		})
+	}
+}
