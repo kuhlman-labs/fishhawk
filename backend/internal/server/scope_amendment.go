@@ -157,9 +157,19 @@ type amendmentDeadline struct {
 
 // amendmentDeadlineRemaining derives the executing implement stage's REMAINING
 // agent wall clock: the spec-resolved agent_timeout_seconds budget minus the
-// stage's elapsed time. It gates ONLY the OBSERVABILITY numbers on the request
-// response (stage_deadline_seconds_remaining + amendment_poll_window_seconds):
-// it returns ok=true with the remainder when that remainder is meaningfully
+// CURRENT ATTEMPT's elapsed time. Elapsed is measured from the per-attempt
+// dispatch clock (dispatchedAt) when present, else from the cumulative
+// startedAt — the same anchor mcpserver.stageAttemptStart uses for the
+// stage-wait deadline (#3335), written inline because server does not import
+// mcpserver. dispatched_at is stamped on every transition INTO 'dispatched'
+// (migration 0072's trigger), and every route into running passes through
+// dispatched, so a fix-up re-dispatch or a retry re-stamps it and the
+// remainder reflects the per-attempt budget the runner granted rather than a
+// cumulative clock (#5226 gap 3).
+//
+// It gates ONLY the OBSERVABILITY numbers on the request response
+// (stage_deadline_seconds_remaining + amendment_poll_window_seconds): it
+// returns ok=true with the remainder when that remainder is meaningfully
 // derivable, and otherwise FAILS OPEN (ok=false), which the caller treats as
 // "surface no deadline numbers, behave exactly as pre-#2540". It NEVER drives a
 // refusal — the remainder is uncertain in the pessimistic direction, so a
@@ -169,38 +179,56 @@ type amendmentDeadline struct {
 //	(a) budgetSeconds <= 0  — the spec budget is unresolvable (absent /
 //	    unparseable workflow_spec, or the stage is not matched in the spec);
 //	    resolveAgentTimeout already returns 0 there.
-//	(b) startedAt == nil    — the stage has never started, so there is no clock
-//	    to measure elapsed against.
+//	(b) dispatchedAt == nil && startedAt == nil — the stage has neither
+//	    dispatched nor started, so there is no clock to measure elapsed
+//	    against.
+//	(d) dispatchedAt == nil && selfRetryCount > 0 — the legacy started_at
+//	    fallback on a re-spawned stage. stages.started_at is written under
+//	    COALESCE(started_at, $3) and never overwritten, so a self-retried row
+//	    with no dispatch clock (pre-0072) has a CUMULATIVE elapsed and an
+//	    UNDERSTATED remainder (the same caveat documented on stageElapsed in
+//	    backend/internal/mcpserver/stage_wait.go). When dispatchedAt is set,
+//	    (d) does not apply: the retry routed failed -> pending -> dispatched,
+//	    which re-stamped dispatched_at for the current attempt.
 //	(c) remaining <= 0      — elapsed already meets/exceeds the whole budget. A
 //	    LIVE agent posting this request proves the deadline has NOT literally
 //	    passed, so a non-positive remainder evidences a bad derivation (the
-//	    stage's recorded started_at precedes the agent's real clock start), not
-//	    a passed deadline — refusing on it would be a false positive.
-//	(d) selfRetryCount > 0  — stages.started_at is written under
-//	    COALESCE(started_at, $3) and never overwritten, so a re-spawned stage's
-//	    elapsed is CUMULATIVE and its remainder UNDERSTATED (the same caveat
-//	    documented on stageElapsed in backend/internal/mcpserver/stage_wait.go).
+//	    anchor clock precedes the agent's real clock start), not a passed
+//	    deadline — refusing on it would be a false positive.
+//
+// A STALE dispatched_at is not detected. Migration 0072 stamps dispatched_at
+// and never clears it, so a stage that reaches running WITHOUT re-entering
+// dispatched (the retained awaiting_scope_decision -> running edge in
+// backend/internal/run/transition.go), or a self-retried stage resolved while
+// still pending, keeps the PREVIOUS attempt's non-nil dispatched_at. The
+// anchor is then that stale clock and (d) does not fire, because the
+// started_at fallback is never taken. The result is an understated remainder,
+// or a rule (c) omission, never a refusal.
 //
 // Because the remainder is only ever DISPLAYED, never used to refuse, these
 // cases cost nothing when they misfire: the worst outcome is that a slightly
 // understated (but still ok=true) remainder is shown, or that the numbers are
 // omitted entirely on a fail-open. There is deliberately no attempt to detect
-// the operator-retry-without-SelfRetryCount case (which leaves a cumulative
-// started_at indistinguishable from a first run) — a refusal built on it could
-// kill a winnable amendment, the regression #2540 approval condition 1 forbids,
-// so no refusal is built at all. Pure and table-testable; the handler supplies
-// the clock.
-func amendmentDeadlineRemaining(budgetSeconds int, startedAt *time.Time, selfRetryCount int, now time.Time) (remaining int, ok bool) {
+// the operator-retry-without-SelfRetryCount case on the legacy fallback (which
+// leaves a cumulative started_at indistinguishable from a first run) — a
+// refusal built on it could kill a winnable amendment, the regression #2540
+// approval condition 1 forbids, so no refusal is built at all. Pure and
+// table-testable; the handler supplies the clock.
+func amendmentDeadlineRemaining(budgetSeconds int, dispatchedAt, startedAt *time.Time, selfRetryCount int, now time.Time) (remaining int, ok bool) {
 	if budgetSeconds <= 0 { // (a)
 		return 0, false
 	}
-	if startedAt == nil { // (b)
+	anchor := dispatchedAt
+	if anchor == nil {
+		anchor = startedAt
+	}
+	if anchor == nil { // (b)
 		return 0, false
 	}
-	if selfRetryCount > 0 { // (d)
+	if dispatchedAt == nil && selfRetryCount > 0 { // (d)
 		return 0, false
 	}
-	remaining = budgetSeconds - int(now.Sub(*startedAt).Seconds())
+	remaining = budgetSeconds - int(now.Sub(*anchor).Seconds())
 	if remaining <= 0 { // (c)
 		return 0, false
 	}
@@ -427,7 +455,7 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 		budgetSeconds = s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)
 	}
 	var deadline *amendmentDeadline
-	if remaining, ok := amendmentDeadlineRemaining(budgetSeconds, stage.StartedAt, stage.SelfRetryCount, time.Now().UTC()); ok {
+	if remaining, ok := amendmentDeadlineRemaining(budgetSeconds, stage.DispatchedAt, stage.StartedAt, stage.SelfRetryCount, time.Now().UTC()); ok {
 		deadline = &amendmentDeadline{
 			remaining: remaining,
 			window:    AmendmentPollWindowSeconds,
