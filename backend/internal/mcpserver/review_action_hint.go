@@ -693,10 +693,11 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 	//     harness died having pushed nothing.
 	//   - #4391: a CONFIRMED stage_fixup_superseded marker — the operator's
 	//     verify-only re-run superseded a queued, never-dispatched D6 fix-up.
-	refunds, err := r.fixupRefundedPasses(ctx, runID, implementStageID, triggerSeqs)
+	refundSummary, err := r.fixupRefundSummary(ctx, runID, implementStageID, triggerSeqs)
 	if err != nil {
 		return nil, err
 	}
+	refunds := refundSummary.Count
 	// Defensive clamp, mirroring the backend's `if refundedPasses > priorPasses`
 	// clamp: a refund can never exceed the passes actually triggered.
 	if refunds > priorPasses {
@@ -749,19 +750,27 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 			RemainingFixupBudget: 0,
 			OverrideAvailable:    false,
 			Message: fmt.Sprintf(
-				"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached (delivered-nothing refunds credit up to %d, absolute cap %d) — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
+				"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached (delivered-nothing refunds credit up to %d, absolute cap %d) — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them after folding the verified findings into the issue body as a dated constraints block.",
 				concerns, fixupCeiling, maxCeilingRefundCredits, fixupCeiling+maxCeilingRefundCredits),
 		}
 	case effectiveConsumed < maxFixupPasses:
 		// Below the normal budget (after refunds): the original route-back vs
-		// approve pointer. A refunded no-op restores a normal route-back here, so
-		// the message explains WHY budget is non-zero after a spent pass.
+		// approve pointer. A refunded pass restores a normal route-back here, so
+		// the message explains WHY budget is non-zero after a spent pass — and,
+		// since E106.27 / #5212 (J2), WHICH refund shape the newest refunded
+		// window was: a no-commit pass (the route did not work) or a death /
+		// supersession that pushed nothing (fix the cause, then re-route).
 		var msg string
-		if refunds > 0 {
+		switch {
+		case refunds > 0 && refundSummary.LatestNoChanges:
 			msg = fmt.Sprintf(
-				"%d concern(s) from the implement review — a prior fix-up produced no changes and was refunded against the normal budget, so route-back is available again with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
+				"%d concern(s) from the implement review — a prior fix-up produced no commit (fixup_no_changes) and was refunded against the normal budget, so route-back is available again with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. The route did not work, so do not repeat the same route unchanged: re-route one sharper concern (an operator_concern naming the exact change), start a fresh run, or finish the change on the run branch and fishhawk_vouch_commit it. Remaining fix-up budget: %d.",
 				concerns, implementStageID, remaining)
-		} else {
+		case refunds > 0:
+			msg = fmt.Sprintf(
+				"%d concern(s) from the implement review — a prior fix-up pass delivered nothing to the PR branch (it died before pushing, or a queued pass was superseded) and was refunded against the normal budget, so route-back is available again with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Re-routing the same concerns is fine once the cause is fixed. Remaining fix-up budget: %d.",
+				concerns, implementStageID, remaining)
+		default:
 			msg = fmt.Sprintf(
 				"%d concern(s) from the implement review — route them back with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
 				concerns, implementStageID, remaining)
@@ -920,8 +929,33 @@ func (r *runResolver) fixupPassesAndLatestSeq(ctx context.Context, runID, stageI
 // triggerSeqs is the ascending-sorted trigger-window bounds from
 // fixupPassesAndLatestSeq (one shared stage_fixup_triggered read).
 func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uuid.UUID, triggerSeqs []int64) (int, error) {
+	sum, err := r.fixupRefundSummary(ctx, runID, stageID, triggerSeqs)
+	if err != nil {
+		return 0, err
+	}
+	return sum.Count, nil
+}
+
+// fixupRefundSummary is the refund count plus the refund SHAPE of the newest
+// refunded trigger window (E106.27 / #5212, J2).
+type fixupRefundSummary struct {
+	// Count is the number of refunded windows (fixupRefundedPasses' value).
+	Count int
+	// LatestNoChanges is true when the NEWEST refunded window holds a
+	// fixup_no_changes signal: that pass produced no commit, so the route did
+	// not work. A window holding both a no-change and a death signal counts as
+	// no-change. False when nothing was refunded or the newest refunded window
+	// holds only a death (category A/C) or supersession signal.
+	LatestNoChanges bool
+}
+
+// fixupRefundSummary evaluates the per-window refund question described on
+// fixupRefundedPasses and additionally records which shape the newest refunded
+// window was. The count is computed exactly as before (one question per
+// window), so fixupRefundedPasses is a thin wrapper over it.
+func (r *runResolver) fixupRefundSummary(ctx context.Context, runID, stageID uuid.UUID, triggerSeqs []int64) (fixupRefundSummary, error) {
 	if len(triggerSeqs) == 0 {
-		return 0, nil
+		return fixupRefundSummary{}, nil
 	}
 	want := stageID.String()
 
@@ -960,7 +994,7 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 
 	noChanges, err := readSeqs(categoryFixupNoChanges, nil)
 	if err != nil {
-		return 0, err
+		return fixupRefundSummary{}, err
 	}
 	signalSeqs = append(signalSeqs, noChanges...)
 
@@ -974,7 +1008,7 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 		return p.FailureCategory == failureCategoryC
 	})
 	if err != nil {
-		return 0, err
+		return fixupRefundSummary{}, err
 	}
 	signalSeqs = append(signalSeqs, reapers...)
 
@@ -988,7 +1022,7 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 		return p.SourceFailureCategory == failureCategoryC || p.SourceFailureCategory == failureCategoryA
 	})
 	if err != nil {
-		return 0, err
+		return fixupRefundSummary{}, err
 	}
 	signalSeqs = append(signalSeqs, recovered...)
 
@@ -1004,12 +1038,12 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 	}
 	markers, err := readEntries(categoryStageFixupSuperseded)
 	if err != nil {
-		return 0, err
+		return fixupRefundSummary{}, err
 	}
 	if len(markers) > 0 {
 		conversions, err := readEntries(categoryStageMergeCandidateVerifyTriggered)
 		if err != nil {
-			return 0, err
+			return fixupRefundSummary{}, err
 		}
 		for _, cs := range confirmedSupersessionSeqs(markers, conversions) {
 			if cs.StageID == want {
@@ -1022,11 +1056,12 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 	// read failure is never masked by an early return.
 	pushSeqs, err := readSeqs(categoryFixupPushed, nil)
 	if err != nil {
-		return 0, err
+		return fixupRefundSummary{}, err
 	}
 
 	// ONE question per window.
 	refunds := 0
+	latestNoChanges := false
 	for i, lo := range triggerSeqs {
 		hi := int64(math.MaxInt64)
 		if i+1 < len(triggerSeqs) {
@@ -1044,14 +1079,26 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 		if vetoed {
 			continue
 		}
+		refunded := false
 		for _, sig := range signalSeqs {
 			if inWindow(sig) {
 				refunds++
+				refunded = true
 				break
 			}
 		}
+		if refunded {
+			// triggerSeqs is ascending, so the last refunded window wins.
+			latestNoChanges = false
+			for _, nc := range noChanges {
+				if inWindow(nc) {
+					latestNoChanges = true
+					break
+				}
+			}
+		}
 	}
-	return refunds, nil
+	return fixupRefundSummary{Count: refunds, LatestNoChanges: latestNoChanges}, nil
 }
 
 // latestRoundConcerns sums the approve_with_concerns concerns from
