@@ -29,7 +29,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -142,15 +145,137 @@ func groomingUnavailable(reason workmgmt.UnavailableReason, detail string, cause
 // ApplyGroomingMutation implements workmgmt.GroomingMutator: execute exactly
 // one cleared mutation and report what it did.
 //
-// The kind switch is exhaustive over workmgmt's closed vocabulary and its
-// default arm returns *UnsupportedGroomingKindError — never a nil-error
-// no-op.
+// A failure of a retry-safe kind that came from an HTTP round trip is marked
+// transient (#5225, see markGroomingTransient), so the core may re-settle it.
+// Preflight errors are never marked: nothing reached the forge.
 func (p *Provider) ApplyGroomingMutation(ctx context.Context, req workmgmt.GroomingMutationRequest) (*workmgmt.GroomingMutationResult, error) {
 	repo, number, err := p.groomingPreflight(req)
 	if err != nil {
 		return nil, err
 	}
+	res, err := p.applyGroomingKind(ctx, req, repo, number)
+	return res, markGroomingTransient(ctx, req.Kind, err)
+}
 
+// markGroomingTransient marks err transient for the core's bounded in-apply
+// re-settle (#5225), and returns it UNCHANGED otherwise.
+//
+// THE KIND GATE IS HERE TOO, not only in the core: an epic_link, board or field
+// error is never marked, whatever it says. Those kinds are multi-step or
+// unobservable (workmgmt.GroomingMutationKind.TransientRetrySafe), so a
+// re-settle could settle a half-written mutation as already_applied. Gating at
+// both layers means neither alone has to be right.
+func markGroomingTransient(applyCtx context.Context, kind workmgmt.GroomingMutationKind, err error) error {
+	if err == nil || !kind.TransientRetrySafe() || !groomingErrorTransient(applyCtx, err) {
+		return err
+	}
+	return workmgmt.MarkGroomingTransient(err)
+}
+
+// groomingErrorTransient reports whether err is a failure a re-attempt may
+// succeed on. The arms run in this order:
+//
+//  1. THE APPLY BUDGET FIRST. When the APPLY ctx is done, nothing is transient:
+//     the core's budget arm owns what happens next. This keys on applyCtx.Err(),
+//     NEVER on errors.Is(err, context.DeadlineExceeded): net/http's per-request
+//     client-timeout error satisfies that sentinel (its timeoutError.Is, Go
+//     src/net/http/transport.go), so a request that timed out while the apply
+//     budget is live must stay retryable.
+//  2. THE DENY-LIST. A chain naming a deterministic refusal is never transient,
+//     even when it also wraps a transport fault: ErrForbidden, ErrNotFound,
+//     ErrValidation, and the provider's typed refusals. EVERY 403 is denied,
+//     including GitHub's secondary-rate-limit 403. githubclient's classifyStatus
+//     collapses every 401/403 into ErrForbidden and drops the response headers,
+//     so the header-gated rate-limit 403 its retryTransport recognises cannot be
+//     told apart from a permission 403 here.
+//  3. POSITIVE ROUND-TRIP EVIDENCE ONLY (approval condition N1a). The error must
+//     have come from an HTTP round trip: a classifyStatus 5xx or 429, or a
+//     *url.Error / net.Error transport fault. githubclient's LOCAL errors — a
+//     missing TokenProvider, a marshal or decode wrap, a malformed request URL,
+//     an untyped provider read wrap — are not transient unless they wrap one of
+//     those.
+//
+// Retry-After is NOT honoured by the in-apply re-settle, which waits a fixed
+// n×backoff: the header does not survive classifyStatus.
+func groomingErrorTransient(applyCtx context.Context, err error) bool {
+	if applyCtx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, forge.ErrForbidden) || errors.Is(err, forge.ErrNotFound) ||
+		errors.Is(err, forge.ErrValidation) {
+		return false
+	}
+	var unsupported *UnsupportedGroomingKindError
+	var conflict *ParentEpicConflictError
+	var unavailable *workmgmt.UnavailableError
+	var partial *workmgmt.PartialGroomingWriteError
+	if errors.As(err, &unsupported) || errors.As(err, &conflict) ||
+		errors.As(err, &unavailable) || errors.As(err, &partial) {
+		return false
+	}
+	return groomingRoundTripTransient(err)
+}
+
+// groomingStatusRE matches githubclient's classifyStatus fallthrough message,
+// `githubclient: <op>: <status>: <body>`, which is how a 5xx or 429 surfaces:
+// classifyStatus types only 401/403, 404 and 422. It is matched against the
+// START of each error on the chain, so a wrap prefix or response-body text
+// elsewhere in the message cannot satisfy it.
+var groomingStatusRE = regexp.MustCompile(`^githubclient: [a-z][a-z -]*: ([0-9]{3}):( |$)`)
+
+// groomingRoundTripTransient is groomingErrorTransient's positive-evidence arm:
+// a transport fault, or a classifyStatus 5xx/429, anywhere on err's chain.
+func groomingRoundTripTransient(err error) bool {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		// http.Client.Do reports every transport fault as a *url.Error whose Op is
+		// the request method. url.Parse's own *url.Error (Op "parse") is a
+		// request URL built locally and never sent.
+		return ue.Op != "parse"
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	return groomingChainAny(err, func(e error) bool {
+		m := groomingStatusRE.FindStringSubmatch(e.Error())
+		if m == nil {
+			return false
+		}
+		code, _ := strconv.Atoi(m[1])
+		return code >= 500 || code == 429
+	})
+}
+
+// groomingChainAny reports whether pred holds for err or any error it wraps,
+// through both single and multi-error Unwrap.
+func groomingChainAny(err error, pred func(error) bool) bool {
+	if err == nil {
+		return false
+	}
+	if pred(err) {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return groomingChainAny(u.Unwrap(), pred)
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if groomingChainAny(e, pred) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyGroomingKind dispatches one cleared mutation by kind.
+//
+// The kind switch is exhaustive over workmgmt's closed vocabulary and its
+// default arm returns *UnsupportedGroomingKindError — never a nil-error
+// no-op.
+func (p *Provider) applyGroomingKind(ctx context.Context, req workmgmt.GroomingMutationRequest,
+	repo forge.RepoRef, number int) (*workmgmt.GroomingMutationResult, error) {
 	switch req.Kind {
 	case workmgmt.GroomingKindLabelSet:
 		return p.groomingSetLabels(ctx, req, repo, number)

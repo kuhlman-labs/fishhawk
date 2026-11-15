@@ -196,6 +196,83 @@ type GroomingApplyRequest struct {
 	// still settles as already_applied. Resume fires ONLY on positive evidence,
 	// never on the absence of contrary evidence.
 	PriorSteps map[string][]GroomingMutationStep
+	// RetryPolicy bounds the in-apply re-settle of a TRANSIENT failure
+	// (#5225). nil resolves to GroomingTransientRetries retries at
+	// n×GroomingTransientRetryBackoff; tests pass a zero Backoff. See
+	// GroomingRetryPolicy.
+	RetryPolicy *GroomingRetryPolicy
+}
+
+// GroomingRetryPolicy is the in-apply transient re-settle policy (#5225).
+//
+// Retries is the number of ADDITIONAL settles after the first; {Retries: 0}
+// disables the re-settle. Backoff is the base wait: retry n waits n×Backoff, and
+// a zero Backoff means no wait. A negative value in either clamps to 0. The
+// wait is a FIXED schedule: a forge Retry-After is NOT honoured, because the
+// header does not survive githubclient's status classification.
+type GroomingRetryPolicy struct {
+	Retries int
+	Backoff time.Duration
+}
+
+// The default policy a nil GroomingApplyRequest.RetryPolicy resolves to, and
+// the per-apply cap on retried candidates.
+const (
+	// GroomingTransientRetries is the default number of re-settles after the
+	// first attempt, so a candidate is settled at most three times.
+	GroomingTransientRetries = 2
+	// GroomingTransientRetryBackoff is the default base wait: 1s, then 2s.
+	GroomingTransientRetryBackoff = time.Second
+	// GroomingTransientRetryCandidateCap is the per-apply cap (#5225, approval
+	// condition N1b): once this many candidates in ONE apply have been retried
+	// and still failed transient, the forge is treated as down for the rest of
+	// that apply. Later candidates settle on their FIRST error with no backoff
+	// and are recorded retry_suppressed, so a systemic outage costs at most
+	// cap × (1s + 2s) of backoff rather than draining the apply budget.
+	GroomingTransientRetryCandidateCap = 3
+)
+
+// resolveGroomingRetryPolicy resolves a request's policy: nil is the default,
+// and a negative member clamps to 0.
+func resolveGroomingRetryPolicy(p *GroomingRetryPolicy) GroomingRetryPolicy {
+	if p == nil {
+		return GroomingRetryPolicy{Retries: GroomingTransientRetries, Backoff: GroomingTransientRetryBackoff}
+	}
+	out := *p
+	if out.Retries < 0 {
+		out.Retries = 0
+	}
+	if out.Backoff < 0 {
+		out.Backoff = 0
+	}
+	return out
+}
+
+// groomingRetrySleep waits d before a re-settle, returning ctx.Err() when the
+// apply ctx is done first. It is a package var ONLY so an in-package test can
+// record the schedule without real time; production never reassigns it.
+var groomingRetrySleep = func(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// groomingRetryable reports whether a settled record may be re-settled: it
+// FAILED, the provider marked the failure transient (and it was not a partial
+// write), and the kind is one whose re-read observes everything its write does.
+func groomingRetryable(rec GroomingMutationRecord) bool {
+	return rec.Outcome == GroomingOutcomeFailed && rec.transient && rec.Kind.TransientRetrySafe()
 }
 
 // GroomingOutcome is what happened to one candidate.
@@ -343,6 +420,22 @@ type GroomingMutationRecord struct {
 	// other outcome leaves it empty. The outcome stays `failed`: a half-written
 	// mutation is not an applied one.
 	StepsLanded []GroomingMutationStep `json:"steps_landed,omitempty"`
+	// Attempts is the number of times the candidate was settled, set ONLY when
+	// it was settled more than once (#5225): a transient failure re-settled
+	// through the whole ladder. Absent on every single-attempt row.
+	Attempts int `json:"attempts,omitempty"`
+	// FirstError is the FIRST attempt's error text, set ONLY when the candidate
+	// was settled more than once, so a retried row that ended applied or
+	// already_applied still records what went wrong first.
+	FirstError string `json:"first_error,omitempty"`
+	// RetrySuppressed reports that this candidate's transient failure WOULD have
+	// been re-settled, but the apply had already hit
+	// GroomingTransientRetryCandidateCap, so it settled on its first error.
+	RetrySuppressed bool `json:"retry_suppressed,omitempty"`
+
+	// transient is the provider's transient mark on a non-partial failure. It
+	// is never marshalled: it only feeds groomingRetryable.
+	transient bool
 }
 
 // GroomingApplySummary is the once-per-apply audit payload: the counts and the
@@ -1096,6 +1189,11 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 
 	result := &GroomingApplyResult{}
 	var auditErrs []string
+	policy := resolveGroomingRetryPolicy(req.RetryPolicy)
+	// retriesExhausted counts candidates that were re-settled and STILL failed
+	// transient. At GroomingTransientRetryCandidateCap the re-settle is off for
+	// the rest of this apply (approval condition N1b).
+	retriesExhausted := 0
 
 	for _, c := range candidates {
 		var rec GroomingMutationRecord
@@ -1108,6 +1206,27 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 			result.Summary.BudgetExhausted++
 		} else {
 			rec = settleGroomingCandidate(ctx, c, req, decisions, mutator, reader)
+			// BOUNDED TRANSIENT RE-SETTLE (#5225). Every retry re-enters the
+			// WHOLE ladder, fresh pre-dispatch read included, so a write that
+			// landed before its error settles already_applied instead of being
+			// duplicated. A budget expiry during the backoff keeps the failed
+			// record unstamped, and the next candidate takes the budget arm.
+			if groomingRetryable(rec) && retriesExhausted >= GroomingTransientRetryCandidateCap {
+				rec.RetrySuppressed = true
+			} else {
+				firstErr := rec.Error
+				for attempt := 1; groomingRetryable(rec) && attempt <= policy.Retries; attempt++ {
+					if groomingRetrySleep(ctx, time.Duration(attempt)*policy.Backoff) != nil {
+						break
+					}
+					rec = settleGroomingCandidate(ctx, c, req, decisions, mutator, reader)
+					rec.Attempts = attempt + 1
+					rec.FirstError = firstErr
+				}
+				if rec.Attempts > 1 && groomingRetryable(rec) {
+					retriesExhausted++
+				}
+			}
 		}
 		switch rec.Outcome {
 		case GroomingOutcomeApplied:
@@ -1317,6 +1436,7 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 	}
 
 	res, err := mutator.ApplyGroomingMutation(ctx, mreq)
+	var partial *PartialGroomingWriteError
 	switch {
 	case err != nil:
 		rec.Outcome = GroomingOutcomeFailed
@@ -1327,13 +1447,16 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 		// of on an inference about tracker state. The outcome stays `failed` —
 		// the requested mutation did not happen — and Error carries the CAUSE's
 		// message so the audit reads as it did before, not as a wrapper string.
-		var partial *PartialGroomingWriteError
 		if errors.As(err, &partial) {
 			rec.StepsLanded = append([]GroomingMutationStep(nil), partial.Steps...)
 			if partial.Cause != nil {
 				rec.Error = partial.Cause.Error()
 			}
 		}
+		// A PARTIAL write is never re-settled in-apply (#5225): its ledger
+		// evidence is the next apply's resume path, and a re-dispatch here
+		// would race the very step the ledger just recorded.
+		rec.transient = partial == nil && IsGroomingTransient(err)
 	case res == nil:
 		// A provider that returns neither a result nor an error told us
 		// nothing; recording it applied would be a fabrication.
