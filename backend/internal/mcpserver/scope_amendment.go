@@ -40,7 +40,7 @@ type ScopeAmendmentItem struct {
 	// against the implement stage's max_files_changed. Absent (nil) when
 	// no cap is configured, on decided items in the list, or on payloads
 	// from older backends — absent fields must not break decode.
-	EffectiveScopeFilesAfterApproval *int `json:"effective_scope_files_after_approval,omitempty" jsonschema:"effective scope file count if this amendment is approved; compare against max_files_changed — exceeding it means the implement stage's post-implement gate may fail category-B as scoped"`
+	EffectiveScopeFilesAfterApproval *int `json:"effective_scope_files_after_approval,omitempty" jsonschema:"effective scope file count if this amendment is approved: the WHOLE-PLAN union (the approved plan's scope.files plus approval adds, approved amendments and this request), the same count the plan-approval scope-cap gate refuses on with 422 plan_violates_scope_cap. Approving the amendment is not refused when this exceeds max_files_changed. The post-implement gate counts each implement stage's OWN diff, so a decomposition child is checked against its own files and a decomposed parent's fix-up against its own increment over the consolidated head; a stage whose own diff exceeds the cap fails category-B"`
 	MaxFilesChanged                  *int `json:"max_files_changed,omitempty" jsonschema:"the implement stage's resolved max_files_changed cap; absent when no cap is configured"`
 }
 

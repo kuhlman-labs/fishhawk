@@ -1915,3 +1915,14 @@ func TestNextActions_DecompositionChildWording(t *testing.T) {
 		}
 	})
 }
+
+// TestGetGateView_Description_ScopeOverlapHold pins the #5211 R2 hold sentence
+// on the wire-visible fishhawk_get_gate_view scope_overlap bullet. Deleting it
+// reddens.
+func TestGetGateView_Description_ScopeOverlapHold(t *testing.T) {
+	desc := registeredToolDescription(t, "fishhawk_get_gate_view")
+	want := "hold that plan and revise it (fishhawk_revise_plan) after the\n    overlapping run merges"
+	if !strings.Contains(desc, want) {
+		t.Errorf("fishhawk_get_gate_view scope_overlap bullet must state %q:\n%s", want, desc)
+	}
+}
