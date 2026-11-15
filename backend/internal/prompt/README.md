@@ -48,6 +48,7 @@ The implement-stage prompt renders the issue as `Triggering issue: #N · <title>
 The plan-stage prompt still renders the body verbatim via `writeIssueContext`.
 
 `Trigger.IssueURL` is populated by `fillIssueContext` (`internal/server/prompt.go`) through a forge-neutral ladder since E45.42 / #3347: the run row's cached `IssueContext.URL` → the browse URL the forge fetch returned (`forge.Issue.HTMLURL`: GitHub `html_url` / GitLab `web_url`) → for a github-family run ONLY, the `https://github.com/<owner>/<name>/issues/<n>` format string → empty. The ladder runs on every exit, so a partial GitHub fetch still leaves the link block intact; a non-GitHub run with neither a cached nor a fetched URL renders NO `URL:` line rather than a fabricated github.com one. A prompt built with neither an issue title nor a body draws one `issue_context_unresolved` audit row + one WARN (see the server README's "Local-runner issue context" bullet).
+On a PLAN stage of a credentialed run the server first refreshes the cached `IssueContext` from the live forge and passes an in-memory copy to `fillIssueContext`, so a late steer reaches the planner and the plan review (the "Plan-stage refresh (#5219)" paragraph of that same bullet). The renderer is unchanged: live text flows through the same untrusted envelopes as cached text.
 
 ## Spec-governed agent timeout (#452) + plan-stage render (#479)
 
