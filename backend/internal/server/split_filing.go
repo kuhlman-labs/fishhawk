@@ -290,10 +290,16 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	// Reachability evidence for the contract classification (fail-open to nil).
 	evidence := s.loadReachabilityEvidence(ctx, runID)
 
+	// ParentSummary/ParentApproach carry the approved parent plan onto every
+	// child as a bounded "Parent plan context" block (#5223): a split phase
+	// declares no approach of its own, so without them each child body would be
+	// only its scope_hint and boilerplate.
 	specs := splitfiling.BuildChildSpecs(splitfiling.BuildInput{
 		Proposal:         proposal,
 		ParentIssue:      parentIssue,
 		ParentAcceptance: acceptanceCriteriaStatements(approvedPlan),
+		ParentSummary:    approvedPlan.Summary,
+		ParentApproach:   approvedPlan.Approach,
 	})
 	classification := splitfiling.Classify(proposal, evidence, capFiles)
 	capDraft := splitfiling.DraftCapException(proposal, evidence, capFiles)

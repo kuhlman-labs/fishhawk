@@ -11,7 +11,9 @@
 //   - BuildChildSpecs turns a plan.SplitProposal into an ordered []ChildSpec —
 //     one per phase, each carrying a symbol-set scope statement (prose, never a
 //     stale file list), 0-based depends_on edges, parent+design issue references,
-//     and a contract flag on the terminal phase. The contract child additionally
+//     a bounded "Parent plan context" block carrying the approved parent plan's
+//     summary and numbered approach (#5223), and a contract flag on the terminal
+//     phase. The contract child additionally
 //     carries the parent's acceptance criteria and, by construction, NO
 //     "Closes #<parent>" line (a Closes line in a child ISSUE body is functionless
 //     — GitHub auto-closes only from a PR/commit and only the enclosing issue; the
@@ -28,6 +30,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
@@ -50,11 +54,18 @@ const (
 // plan's split proposal, the parent (run) issue number every child references,
 // and the parent's acceptance criteria the terminal contract child carries.
 // DesignIssue defaults to the package DesignIssue constant when zero.
+//
+// ParentSummary and ParentApproach are the approved parent plan's summary and
+// numbered approach (#5223). Every child renders them as a bounded "Parent plan
+// context" block (see renderParentPlanContext); both empty omits the block, so
+// the Proposal is byte-identical to the pre-#5223 render.
 type BuildInput struct {
 	Proposal         plan.SplitProposal
 	ParentIssue      int
 	DesignIssue      int
 	ParentAcceptance []string
+	ParentSummary    string
+	ParentApproach   []plan.ApproachStep
 }
 
 // ChildSpec is one conventions-neutral child issue the server hook files. It
@@ -103,6 +114,8 @@ func BuildChildSpecs(in BuildInput) []ChildSpec {
 	}
 	phases := in.Proposal.Phases
 	specs := make([]ChildSpec, 0, len(phases))
+	// The parent plan context is the same for every child: render it once.
+	parentContext := renderParentPlanContext(in.ParentIssue, in.ParentSummary, in.ParentApproach)
 	last := len(phases) - 1
 	for i, ph := range phases {
 		isContract := i == last
@@ -115,7 +128,7 @@ func BuildChildSpecs(in BuildInput) []ChildSpec {
 			DesignIssue:    design,
 			IsContract:     isContract,
 		}
-		spec.Proposal = buildProposal(spec, isContract)
+		spec.Proposal = buildProposal(spec, isContract, parentContext)
 		spec.DoneMeans = buildDoneMeans(isContract)
 		if isContract {
 			spec.AcceptanceCriteria = append([]string(nil), in.ParentAcceptance...)
@@ -166,11 +179,12 @@ func uniquePackages(scope *plan.Scope) []string {
 }
 
 // buildProposal renders the child body prose. It references the parent (run)
-// issue and the design issue and embeds the symbol-set scope statement. The
+// issue and the design issue and embeds the symbol-set scope statement, followed
+// by the pre-rendered parent plan context block when it is non-empty. The
 // contract child states the parent-close deferral to #2062 WITHOUT a "Closes #"
 // line; a non-contract child states plainly that it references but does not close
 // the parent.
-func buildProposal(c ChildSpec, isContract bool) string {
+func buildProposal(c ChildSpec, isContract bool, parentContext string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Phase %d of the approved split proposal for the over-cap change tracked on #%d", c.PhaseIndex+1, c.ParentIssue)
 	if c.DesignIssue > 0 {
@@ -179,6 +193,10 @@ func buildProposal(c ChildSpec, isContract bool) string {
 	b.WriteString(".\n\n")
 	b.WriteString(c.ScopeStatement)
 	b.WriteString("\n\n")
+	if parentContext != "" {
+		b.WriteString(parentContext)
+		b.WriteString("\n\n")
+	}
 	if isContract {
 		fmt.Fprintf(&b, "This is the terminal (contract) phase and the acceptance carrier for parent #%d: it carries the parent's acceptance criteria. It does NOT close the parent — GitHub auto-closes an issue only from a PR/commit and only the enclosing issue, so a close line here would be functionless. The parent is closed when this contract child lands, automated by follow-up #%d (E50.6) once it ships.", c.ParentIssue, DeferralIssue)
 	} else {
@@ -187,6 +205,200 @@ func buildProposal(c ChildSpec, isContract bool) string {
 	b.WriteString("\n\n")
 	b.WriteString(LandabilityCaveat)
 	return b.String()
+}
+
+// MaxParentPlanContextChars bounds the rendered "Parent plan context" block
+// (#5223), counted in characters (runes) and INCLUDING its heading line and any
+// truncation note. The same block rides every one of the N child bodies, so a
+// long plan must not inflate them all. The value is a body-size judgement, not
+// a forge limit; TestBuildChildSpecs_ParentPlanContextBounded pins it.
+const MaxParentPlanContextChars = 8000
+
+// ParentPlanContextHeading opens the parent plan context block. Exported so the
+// server hook's seam test asserts on the same literal the renderer writes.
+const ParentPlanContextHeading = "**Parent plan context.**"
+
+// parentPlanElision marks every place the bounded block cut text. It is one rune
+// on purpose: a truncated description of L runes then renders as L+1 runes, so
+// the rendered length is monotone in L and the largest-fit search is exact.
+const parentPlanElision = "…"
+
+// approachLine is one parent approach step prepared for rendering: its number
+// and its description flattened onto a single line.
+type approachLine struct {
+	num  int
+	desc []rune
+}
+
+// renderParentPlanContext renders the bounded block that carries the approved
+// parent plan's summary and numbered approach onto every split child (#5223).
+//
+// WHY THE WHOLE PARENT APPROACH: plan-standard-v1 split phases declare no
+// approach of their own (plan.SplitPhase carries title, scope_hint, scope and
+// depends_on only), so "each child carries its phase's approach" is read as
+// "each child carries the whole parent approach", labelled as context beside
+// the phase's own symbol-set scope. That reading is inferred, not stated by the
+// schema; the operator accepted it at the #5223 plan gate.
+//
+// It returns "" when the summary is blank and there are no steps, so a plan
+// without either renders the pre-#5223 Proposal byte-for-byte. Otherwise the
+// block is never longer than MaxParentPlanContextChars, and it degrades in a
+// fixed order so the step list stays complete for as long as possible:
+//
+//  1. Everything fits: summary and every step in full, no note.
+//  2. Summary first: the summary is shortened (or omitted) and every step is
+//     still shown in full.
+//  3. Steps next: the summary is omitted, EVERY step number is kept, and each
+//     description longer than a common per-step limit is cut with an elision.
+//  4. Not even one line per step fits: the block says so explicitly, naming the
+//     step count, rather than listing a silently partial approach.
+//
+// Every truncated form ends with a note pointing at the parent's run plan.
+func renderParentPlanContext(parentIssue int, summary string, steps []plan.ApproachStep) string {
+	summary = strings.TrimSpace(summary)
+	lines := parentApproachLines(steps)
+	if summary == "" && len(lines) == 0 {
+		return ""
+	}
+	header := ParentPlanContextHeading + " The approved parent plan's summary and full approach, carried for context when planning this phase on its own. This phase's own scope is the symbol-set scope above: a split phase declares no approach of its own, so every child carries the whole parent approach."
+	parentRef := "the parent issue"
+	if parentIssue > 0 {
+		parentRef = fmt.Sprintf("parent #%d", parentIssue)
+	}
+	note := func(summaryPart, stepsPart string) string {
+		parts := make([]string, 0, 2)
+		for _, p := range []string{summaryPart, stepsPart} {
+			if p != "" {
+				parts = append(parts, p)
+			}
+		}
+		return fmt.Sprintf("_Parent plan context truncated to fit the %d-character bound: %s. The full approved plan is on %s's Fishhawk run._",
+			MaxParentPlanContextChars, strings.Join(parts, "; "), parentRef)
+	}
+	fullSteps := renderApproachLines(lines, -1)
+
+	// 1. Everything fits.
+	if full := assembleParentPlanContext(header, summary, fullSteps, ""); fitsParentPlanBound(full) {
+		return full
+	}
+
+	stepsFullPart := ""
+	if len(lines) > 0 {
+		stepsFullPart = "every approach step is shown in full"
+	}
+
+	// 2. Shorten the summary first, keeping every step whole.
+	if summary != "" {
+		sumRunes := []rune(summary)
+		shortenedNote := note("the summary is shortened (marked "+parentPlanElision+")", stepsFullPart)
+		render := func(k int) string {
+			cut := strings.TrimRightFunc(string(sumRunes[:k]), unicode.IsSpace) + parentPlanElision
+			return assembleParentPlanContext(header, cut, fullSteps, shortenedNote)
+		}
+		if k, ok := largestFitting(1, len(sumRunes)-1, func(k int) bool { return fitsParentPlanBound(render(k)) }); ok {
+			return render(k)
+		}
+	}
+	summaryOmittedPart := ""
+	if summary != "" {
+		summaryOmittedPart = "the summary is omitted"
+	}
+	if summary != "" {
+		if out := assembleParentPlanContext(header, "", fullSteps, note(summaryOmittedPart, stepsFullPart)); fitsParentPlanBound(out) {
+			return out
+		}
+	}
+
+	// 3. Summary gone and the full steps still overflow: keep EVERY step number
+	// and shorten each description to the largest common per-step limit that fits.
+	maxDesc := 0
+	for _, l := range lines {
+		if len(l.desc) > maxDesc {
+			maxDesc = len(l.desc)
+		}
+	}
+	stepsNote := note(summaryOmittedPart, "every approach step is kept, with long step descriptions shortened (marked "+parentPlanElision+")")
+	render := func(limit int) string {
+		return assembleParentPlanContext(header, "", renderApproachLines(lines, limit), stepsNote)
+	}
+	if limit, ok := largestFitting(0, maxDesc-1, func(limit int) bool { return fitsParentPlanBound(render(limit)) }); ok {
+		return render(limit)
+	}
+
+	// 4. Not even one line per step fits: say so rather than list a partial
+	// approach as if it were whole.
+	return header + "\n\n" + fmt.Sprintf("_The parent approach has %d steps, too many to list even one line per step within the %d-character bound, so no step is listed here. The full approved plan is on %s's Fishhawk run._",
+		len(lines), MaxParentPlanContextChars, parentRef)
+}
+
+// parentApproachLines prepares each approach step for rendering. A step's own
+// number is kept (falling back to its 1-based position when unset) and its
+// description's whitespace runs are collapsed so every step is exactly one line.
+func parentApproachLines(steps []plan.ApproachStep) []approachLine {
+	out := make([]approachLine, 0, len(steps))
+	for i, st := range steps {
+		num := st.Step
+		if num <= 0 {
+			num = i + 1
+		}
+		out = append(out, approachLine{num: num, desc: []rune(strings.Join(strings.Fields(st.Description), " "))})
+	}
+	return out
+}
+
+// renderApproachLines renders "N. description" per step. A negative limit keeps
+// every description whole; otherwise a description longer than limit runes is
+// cut to limit runes plus the elision marker.
+func renderApproachLines(lines []approachLine, limit int) []string {
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		desc := string(l.desc)
+		if limit >= 0 && len(l.desc) > limit {
+			desc = strings.TrimRightFunc(string(l.desc[:limit]), unicode.IsSpace) + parentPlanElision
+		}
+		out = append(out, strings.TrimRight(fmt.Sprintf("%d. %s", l.num, desc), " "))
+	}
+	return out
+}
+
+// assembleParentPlanContext joins the block's present sections with blank lines.
+func assembleParentPlanContext(header, summary string, stepLines []string, note string) string {
+	parts := []string{header}
+	if summary != "" {
+		parts = append(parts, "Summary: "+summary)
+	}
+	if len(stepLines) > 0 {
+		parts = append(parts, "Approach:\n\n"+strings.Join(stepLines, "\n"))
+	}
+	if note != "" {
+		parts = append(parts, note)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func fitsParentPlanBound(s string) bool {
+	return utf8.RuneCountInString(s) <= MaxParentPlanContextChars
+}
+
+// largestFitting returns the largest n in [lo, hi] for which ok(n) holds,
+// searching on the assumption that ok is true up to some n and false after it.
+// It only ever returns an n it has seen ok accept, so a predicate that is not
+// perfectly monotone can cost a little length but never the bound. It reports
+// false when ok(lo) fails or the range is empty.
+func largestFitting(lo, hi int, ok func(int) bool) (int, bool) {
+	if hi < lo || !ok(lo) {
+		return 0, false
+	}
+	best := lo
+	for lo++; lo <= hi; {
+		mid := lo + (hi-lo)/2
+		if ok(mid) {
+			best, lo = mid, mid+1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best, true
 }
 
 // LandabilityCaveat is the honest statement carried on EVERY filed child body
