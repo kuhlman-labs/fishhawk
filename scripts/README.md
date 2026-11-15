@@ -1825,7 +1825,9 @@ fails loud rather than landing a merge commit), prunes the merged local branch
 via `scripts/cleanup-merged` (reused, not reimplemented — it deletes only
 ancestors of `origin/main`, never `main`), trims the host Go build cache when its
 sampled size is past the threshold (guarded and non-fatal, #3901 — see "Go
-build-cache bound" below), optionally confirms a given issue is
+build-cache bound" below), refreshes an existing `frontend/` or `site/` install
+whose lockfile the pull changed (bounded and non-fatal, #5224 — see "Dependency
+refresh" below), optionally confirms a given issue is
 `CLOSED` via `gh issue view` (warn-only, non-fatal), then runs `reload` LAST so
 reload's `/healthz` readiness gate (#628 — non-zero exit + log tail on failure)
 and MCP-reconnect verdict are inherited and the verdict is the command's final
@@ -1837,6 +1839,72 @@ its `git pull` would strand, or a review round a restart would lose — one the
 next boot would not re-dispatch, #4077), or answers that check with an undecided
 HTTP 503 (ADR-140 D7, #5047); `--force` overrides both guards (see "Live-run guard
 for reload / post-merge" and "Restart-blocker guard for reload / post-merge" below).
+
+#### Re-exec of a pulled `scripts/dev` (#5224)
+
+`git pull` replaces `scripts/dev` with a new file, but the running zsh keeps
+executing the text it already loaded. So when the pull changes `scripts/dev`'s
+blob (`git rev-parse HEAD:scripts/dev` before and after), `post-merge` execs the
+pulled copy with its ORIGINAL arguments (`post-merge <issue> --force
+--start-deps` and so on) and the rest of the walk runs the new code. The pure
+decision is `_post_merge_reexec_decide`; the exec itself is the `_post_merge_exec`
+seam. **Kill switch:** `FISHHAWK_DEV_POST_MERGE_REEXEC=0` keeps the loaded copy and
+prints one line. A pulled `scripts/dev` that is not executable prints a warning
+and the walk continues in-process, as before.
+
+The hand-off is three exported variables, which `_post_merge_adopt_handoff`
+validates at the top of the new process, before the quiesce, and then UNSETS, so
+fishhawkd and other children never inherit them:
+
+| Variable | Carries | Honoured when |
+|---|---|---|
+| `FISHHAWK_DEV_POST_MERGE_REEXEC_PID` | the pid that exec'd | it equals the new process's own `$sysparams[pid]` (exec keeps the pid; `$$` is the top-level pid inside `$( )`). Any other value prints `post-merge: ignoring a re-exec hand-off this process did not receive` and nothing is honoured |
+| `FISHHAWK_DEV_POST_MERGE_BASE` | the pre-pull sha | it is a full 40- or 64-hex sha AND `git cat-file -e "<sha>^{commit}"` resolves it; otherwise one warning line, and the walk degrades (the MCP banner falls back to the reflog, the dependency refresh checks its stamps only) |
+| `FISHHAWK_DEV_POST_MERGE_HD_RESTORE` | the old process's "stopped the host dispatcher" flag | exactly `1`. The old process already removed the dispatcher's pid file, so the new quiesce is a no-op; this carry is what lets a guard refusal AFTER the exec still restart the dispatcher. The old process never restores before the hand-off |
+
+An honoured marker skips ONLY `git checkout main` and `git pull`, printing
+`post-merge: re-executed after the pull; not repeating checkout and pull`. A
+repeated `git checkout main` writes a `checkout: moving from main to main` reflog
+entry, which makes `HEAD@{1}==HEAD` and blanks the merge-aware diff. Instead,
+`cmd_up` reads its banner inputs through `_merge_diff_inputs`, whose base
+(`_merge_diff_base`) is the validated carried sha, or the literal `HEAD@{1}` when
+none was carried, so a standalone `up` or `reload` diffs exactly as before. The
+marker never skips a guard: the quiesce, the live-run scan and the
+restart-blocker check all run again in the new process, and a re-executed walk
+never execs a second time.
+
+#### Dependency refresh (#5224)
+
+After the Go build-cache step, `_frontend_deps_refresh <base>` refreshes an
+EXISTING `frontend/` or `site/` install (a directory without `node_modules` is
+skipped). A directory is refreshed when `git -C "$REPO_ROOT" diff --name-only
+<base> HEAD -- <dir>/pnpm-lock.yaml` names its lockfile, or when
+`<dir>/node_modules/.fishhawk-deps-stamp` exists and the lockfile is newer than
+it, which covers a walk retried after an abort past the pull. `<base>` is the
+in-process pre-pull sha, or the carried base on a re-exec; an empty base prints
+one line and checks the stamps only.
+
+Both directories run `pnpm install --frozen-lockfile --ignore-scripts`:
+**post-merge never executes dependency build or lifecycle scripts**. After a
+`site/` refresh it prints one remedy line: the allowlisted builds
+(`onlyBuiltDependencies`: esbuild, sharp) were skipped, so run
+`(cd site && pnpm install --frozen-lockfile)` by hand if a site build needs them.
+Each install is bounded by `_FRONTEND_DEPS_INSTALL_TIMEOUT` (300 s, file scope)
+through `_run_bounded_capture`, the registration probe's bounded exec, so a hung
+network install cannot hold the host dispatcher quiesced. Success writes the
+stamp. A missing `pnpm`, a failed install (the last output lines are printed) or
+a timeout prints the remedy, writes no stamp and returns 0, so the walk always
+reaches reload. Residual: a checkout that `post-merge` has never refreshed has no
+stamp, so a retry after an abort past the pull, which has no range, skips the
+refresh; run the remedy by hand.
+
+Tests: `scripts/test-dev` rows PM-RX0–PM-RX8 (the decision table and the
+sourced-library walk with a stubbed git and exec seam, including a spoofed
+marker in two sub-runs and three junk bases), PM-E2E1–PM-E2E3 (a REAL exec into a
+fixture clone whose pulled `scripts/dev` wraps a byte copy of production; a fake
+`gh` on PATH, no network) and FD1–FD9, FD-T and FD-S (a fake `pnpm` that logs
+its cwd and argv, a hung install past a 1 s bound, and a call from a
+subdirectory). The section header records each counterfactual run.
 
 `scripts/dev reload` (down-then-up) is the stack-only primitive `post-merge`
 composes: plain `scripts/dev up` no-ops when fishhawkd is already running and so
@@ -2103,9 +2171,11 @@ The next `scripts/dev up` or reload also clears it.
   `scripts/dev` passes and the dispatcher echoes in `status.json` would bind the
   proof to the spawn rather than to a pid. It needs a Go change in
   `fishhawk-mcp host-dispatch` and is a follow-up.
-- The change takes effect at the next reload. The first `post-merge` after it
-  lands runs the OLD `scripts/dev` for its own reload, so a second reload may
-  be needed. Once the campaign driver is on, campaign item runs park at
+- The change takes effect at the next reload. Since #5224 a `post-merge` whose
+  pull changes `scripts/dev` re-execs the pulled copy for the rest of its walk
+  (see "Re-exec of a pulled `scripts/dev`" above), so its own reload runs the
+  new code. Only the `post-merge` that first pulls the re-exec itself still ran
+  the older copy. Once the campaign driver is on, campaign item runs park at
   `awaiting_host_dispatch` until a dispatcher token is configured.
 
 #### Tests
@@ -2763,8 +2833,9 @@ reload-context one — the child hazard was already decided before the pull.
 | `truncated: true` | one warning line, `warning: the restart-blocker scan was truncated (run page or audit page cap reached) — runs and rounds past the cap were not checked`, then the verdict above. Either cap sets it: the 500-run state page, or a 500-row audit page whose oldest row is still inside the 24-hour lookback |
 
 **The first `post-merge` after this lands hits the OLD daemon**, which answers
-404 — the guard fails open with the hint above, and that post-merge also runs
-the already-loaded old `scripts/dev`.
+404 — the guard fails open with the hint above. At the time, that post-merge
+also ran the already-loaded old `scripts/dev`; since #5224 a post-merge whose
+pull changes `scripts/dev` re-execs the pulled copy instead.
 
 ### Wiring, scope and residuals
 
@@ -2997,8 +3068,10 @@ the post-trim size proportionally.
 - `post-merge` — `_gocache_maintain || true` runs AFTER the live-run refusal,
   the pull and `cleanup-merged`, and before the issue check and `reload`. Past
   the threshold it runs the guarded trim; a refusal prints an advisory and the
-  walk continues. The new step first fires on the post-merge AFTER the one that
-  lands it, because `post-merge` runs the old `scripts/dev`.
+  walk continues. When it landed, the step first fired on the post-merge AFTER
+  the one that pulled it, because `post-merge` then kept running the old
+  `scripts/dev`; since #5224 a pulled `scripts/dev` is re-executed in the same
+  walk.
 - `up` — `_warn_gocache_size || true` after the `.env` load: a non-fatal stderr
   advisory past the threshold (sampled estimate), silent otherwise.
 
