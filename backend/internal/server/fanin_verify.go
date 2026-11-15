@@ -252,9 +252,11 @@ func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, 
 	}
 	// LOG-ONLY divergence (#4874). The D5 hold and every parent gate bind the
 	// LIVE head; acceptance reads the ledger head (acceptanceHeadAsOf). They
-	// agree on every clean Fishhawk-recorded advance. A vouched, unrecorded or
-	// unclean head can still diverge: that is WARN-logged here and changes no
-	// answer, and no audit row records it (#4856 holds the vouch half).
+	// agree on every clean Fishhawk-recorded advance and on a server-VERIFIED
+	// vouch of the live head (#4856's walk arm, which the acceptance walk now
+	// reads), so neither WARNs. An unrecorded, unclean or unverified-vouch
+	// head can still diverge: that is WARN-logged here and changes no answer,
+	// and no audit row records it.
 	ledgerHead, ledgerErr := s.acceptanceHeadAsOf(ctx, runID, 0, false)
 	if ledgerErr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,

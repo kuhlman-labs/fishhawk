@@ -252,7 +252,10 @@ which refuses (exit 1, writes nothing) while any record check fails.
     bare-bearer HTTP mode) stand" — the ADR-018/ADR-031 partial-supersession
     precedent.
 
-  Deliberately NOT linked, because no source states an ADR supersession:
+  Deliberately NOT linked as supersessions, because no source states an ADR
+  supersession (ADR-066 → ADR-040 and ADR-073 → ADR-009/ADR-034 are amendment
+  edges since the Captain's 2026-11-14 clarification lines; see "Amendment
+  relation"):
   ADR-066's "This **supersedes** the `operator_agent.may_*` shape" names a
   grammar shape, not ADR-040; ADR-073 retires the ECS path without stating that
   it supersedes ADR-009, ADR-016 or ADR-034 (it names ADR-034 only as the local
@@ -408,7 +411,19 @@ Amendments recorded under the upkeep rule since:
 - ADR-144: no edge. Its record-metadata line declares `amends: []`: it decides the proof-of-presence mechanism and adopts it for no action, so each later adoption is an amendment of the record that governs the action.
 - ADR-145: `amends: [ADR-144]`; ADR-144 gains `amended_by: [ADR-145]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It decides the recovery and unowned-enrolment matters ADR-144 D6 reserved; it was reviewed as an in-body amendment and ratified as a new amending ADR.
 - ADR-146: no edge. Its record-metadata line declares `amends: []`: it restates ADR-121 and ADR-126 and places ADR-139's workflow without changing any of them, and it governs the product preset library, not what a repository declares.
+- ADR-147: `amends: [ADR-027, ADR-057, ADR-062, ADR-066, ADR-072, ADR-074, ADR-078, ADR-084]`; each gains `amended_by: [ADR-147]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It keeps ADR-074's invariant for hosted and customer-installed deployments with one local exception, and states what a hosted control plane holds and which tree a reviewer reads. Its beta-entry obligations are filed as #2307 and #5286 to #5290, each blocking E57 #2255.
+- ADR-148: `amends: [ADR-019, ADR-083, ADR-089, ADR-097, ADR-101, ADR-113, ADR-121, ADR-123, ADR-126, ADR-132, ADR-143]`; each gains `amended_by: [ADR-148]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It places every human-reserved action on one of three credential tiers and is the adopting amendment ADR-144 D3 requires for each tier-2 entry.
+- ADR-149: `amends: [ADR-028, ADR-029, ADR-063, ADR-101, ADR-115, ADR-119, ADR-122]`; each gains `amended_by: [ADR-149]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It makes confinement of the charter operator a prerequisite of charter operation.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
+- ADR-017, ADR-018, ADR-031, ADR-035 and ADR-080: each tracker body gained "## Amendment A1 (accepted 2026-11-14)", an in-body amendment ratified by the Captain from the 2026-11-14 coherence review (#5271 D9, D12 and D14). The bodies are re-transcribed, and no edge is added.
+- ADR-123 and ADR-020: each body gained an Amendment A1 (#5271 D10). ADR-123 A1 states that ADR-123 amends ADR-020, so ADR-123 carries `amends: [ADR-020, ADR-113]` and ADR-020 gains `amended_by: [ADR-123]`; both keep `status: accepted`. ADR-123's record-metadata line was edited in place at ratification to match (ADR-113 D3).
+- The Captain's clarification lines of 2026-11-14 (#5271 D13) are each stated in the amended record's body, and each keeps `status: accepted`:
+  - ADR-045 amends ADR-022;
+  - ADR-066 amends ADR-040's decision 2, without superseding it;
+  - ADR-073 amends ADR-009 and ADR-034;
+  - ADR-074 amends ADR-072.
+
+  The amended record gains `amended_by`, and the amending record gains `amends`.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
   not a supersession (now stated in #1140's body: "**Amends ADR-032**").
@@ -623,6 +638,9 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-144](144-proof-of-presence.md) | Proof of presence: a passkey step-up for decisions only a human may take | `accepted` | [#5239](https://github.com/kuhlman-labs/fishhawk/issues/5239) |
 | [ADR-145](145-proof-of-presence-recovery.md) | Recovery and the response to an unowned enrolment for the proof of presence (amends ADR-144) | `accepted` | [#5255](https://github.com/kuhlman-labs/fishhawk/issues/5255) |
 | [ADR-146](146-workflow-catalogue.md) | The workflow catalogue: five families, presets, and cross-cutting controls | `accepted` | [#5260](https://github.com/kuhlman-labs/fishhawk/issues/5260) |
+| [ADR-147](147-execution-and-data-boundary.md) | Execution and data boundary: where agents run, what a control plane stores, what reviewers read | `accepted` | [#5273](https://github.com/kuhlman-labs/fishhawk/issues/5273) |
+| [ADR-148](148-human-authority-ladder.md) | The human-authority ladder: three credential tiers and the first presence adoptions | `accepted` | [#5274](https://github.com/kuhlman-labs/fishhawk/issues/5274) |
+| [ADR-149](149-confinement-before-charter-operation.md) | Confinement before charter operation: a charter operator cannot reach human credentials | `accepted` | [#5275](https://github.com/kuhlman-labs/fishhawk/issues/5275) |
 
 ## Status unknown — needs captain confirmation
 

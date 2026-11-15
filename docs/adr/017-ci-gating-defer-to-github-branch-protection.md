@@ -113,3 +113,35 @@ Order roughly reflects build order: the manifest bump unblocks the backend read;
   - [GitHub Docs: Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
 Parent epic: #15 (ADRs).
+
+## Amendment A1 (accepted 2026-11-14) — the merge gate governs code-delivery gates only
+
+This amendment sets the scope of this record's merge-gate rule. It is one of three companion amendments: ADR-018 Amendment A1 and ADR-031 Amendment A1 state the same scope for review-stage approval and for verified landing.
+
+**Scope.** This record makes branch protection the merge gate and decouples Fishhawk's approval from the merge: "GitHub branch protection is the merge gate." (Recommendation 3, `:62`, adopted by the Decision). That rule governs **code-delivery gates**. A code-delivery gate authorizes a change to land on the repository: the merge gate of ADR-146's families 1 (planned change) and 2 (PR adoption) (`docs/adr/146-workflow-catalogue.md:63-64`).
+
+Other gates resolve under their own effect-specific contracts, as ADR-146 D1 names them (`:62`):
+- tracker mutations: the approval of the proposed mutations (family 3, `:65`);
+- a decision record: ratification under ADR-113 (family 4, `:66`);
+- a deployment target: the deployment approval (family 5, `:67`).
+
+This does not remove ADR-139 D9's verified-record-landing condition on `adr_change` confirmation (`docs/adr/139-adr-change-workflow.md:65`).
+
+**Verified, not asserted, on every gate.** No gate succeeds because an operator or an agent asserts that it succeeded. Each gate resolves only on what it declares and the server checks:
+- for a code-delivery gate, verified landing (ADR-031 D1, `docs/adr/031-review-gate-succeeds-only-on-verified-landing.md:28`);
+- for any other gate, its own recorded, attributed decision, checked against that gate's approval rules.
+
+A human confirmation that is the gate's declared decision, as on `backlog_grooming`'s confirm stage, is that gate's check, not an override (`.fishhawk/workflows.yaml:357-364`). No gate gains a force-succeed or manual-override path.
+
+**A merge outside Fishhawk.** Fishhawk does not block a merge made on the forge outside it: "The queue does not block external merges." (`docs/adr/093-fishhawk-owned-merge-queue.md:96`). A code-delivery gate whose pull request is merged that way still resolves by landing, through ADR-031's webhook-or-poll path and subject to the settlement checks ADR-031 Amendment A1 names.
+
+**Families explain the scope; they do not select it at runtime.** ADR-146 says of its catalogue that "no validator rule follows from it" (`docs/adr/146-workflow-catalogue.md:71`). No runtime check reads a family. A running gate is recognised by its own declaration, and this amendment does not change how.
+
+**What stands.** The rest of this record stands as decided:
+- branch protection and rulesets as the source of required checks;
+- the refusal to dispatch when no branch protection covers the target branch, which applies to every webhook-created run as today (`backend/internal/webhook/dispatcher.go:1589-1601`);
+- the approval handler's independence from check state;
+- the permission bump;
+- the `routine_change` auto-merge bullet (`:74`).
+
+- **Record metadata:** an in-body amendment of ADR-017. No new edge.

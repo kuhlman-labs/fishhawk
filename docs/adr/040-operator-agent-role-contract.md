@@ -6,7 +6,7 @@ date: 2026-06-12
 issue: https://github.com/kuhlman-labs/fishhawk/issues/997
 supersedes: []
 superseded_by: []
-amended_by: ["ADR-097", "ADR-101", "ADR-132"]
+amended_by: ["ADR-066", "ADR-097", "ADR-101", "ADR-132"]
 applies_to: ["docs/spec/operator-role.schema.json", ".fishhawk/operator.yaml"]
 ---
 
@@ -60,3 +60,5 @@ Sequencing: (1) drive mode + next-action hints (prerequisites, tracked in #996);
 3. Implementation children: #1025 (role-spec schema + shipped default + validation), #1026 (operator_agent knobs + condition evaluation + audit attribution), #1027 (operator token subject), #1028 (dogfood instantiation on this repo). Parallel: #1023 (drive mode), #1024 (next actions), #1005/#1012 (work-management config).
 4. The 2026-06 dogfood session playbook is superseded by the versioned spec once #1028 completes; agent memory entries become pointers to the spec.
 5. Accepted risks: the v0 enum may prove too coarse (a page-the-human event rubber-stamped identically 5+ times is a candidate new enum value); role-spec versioning follows major-version rules (breaking behavior change bumps to operator-role-v1).
+
+**Captain clarification (2026-11-14):** ADR-066 amends decision 2 and does not supersede this record. The `operator_agent.may_*` delegation knobs are replaced by the autonomy grammar.

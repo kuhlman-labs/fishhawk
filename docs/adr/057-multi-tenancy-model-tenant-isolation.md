@@ -5,7 +5,7 @@ status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1823
 supersedes: ["ADR-061"]
 superseded_by: []
-amended_by: ["ADR-105"]
+amended_by: ["ADR-105", "ADR-147"]
 applies_to: []
 ---
 

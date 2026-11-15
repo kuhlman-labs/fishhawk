@@ -11,6 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -27,8 +28,10 @@ import (
 // parent (integration_commit_recorded F + a clean rebase F -> P), a late
 // integration leg (fixup_pushed H then integration_commit_recorded F2 names
 // F2, then a newer fixup_pushed H2 names H2), an unclean rebase that keeps the
-// seed, and a window limited so only the rebase row is inside, where
-// expected_head_sha is absent and the command stays concrete without a SHA.
+// seed, a window limited so only the rebase row is inside, where
+// expected_head_sha is absent and the command stays concrete without a SHA,
+// a server-verified vouch S -> V (the payload shape #4856's handler writes)
+// that names V, and a legacy vouch with no advance keys that keeps S.
 func TestE2E_AcceptancePreview_NamesAdvancedHead(t *testing.T) {
 	t.Parallel()
 	fx := newFixture(t)
@@ -46,6 +49,7 @@ func TestE2E_AcceptancePreview_NamesAdvancedHead(t *testing.T) {
 		fixH   = "f1c5000000000000000000000000000000000006"
 		fanF2  = "fa12000000000000000000000000000000000007"
 		fixH2  = "f1c6000000000000000000000000000000000008"
+		vouchV = "7000000000000000000000000000000000000009"
 	)
 
 	t.Run("standalone: clean rebase S -> M names M", func(t *testing.T) {
@@ -77,6 +81,28 @@ func TestE2E_AcceptancePreview_NamesAdvancedHead(t *testing.T) {
 		appendPreviewLedger(t, ctx, auditRepo, runID, "branch_rebased", map[string]any{
 			"prior_head_sha": seedS, "merge_commit_sha": mergeM, "new_head_sha": mergeM,
 			"already_up_to_date": false, "clean_verified": false, "base_tip_sha": baseB,
+		})
+		assertPreviewHead(t, ctx, session, runID, 0, seedS)
+	})
+
+	t.Run("verified vouch S -> V names V", func(t *testing.T) {
+		runID := seedPreviewRun(t, ctx, fx.runRepo, auditRepo)
+		appendPreviewLedger(t, ctx, auditRepo, runID, "pull_request_opened", map[string]any{"head_sha": seedS})
+		appendPreviewLedger(t, ctx, auditRepo, runID, auditcomplete.CategoryOperatorCommitVouched, map[string]any{
+			"run_id": runID.String(), "reason": "operator remediation commit",
+			auditcomplete.VouchedSHAField:               vouchV,
+			auditcomplete.VouchPriorHeadSHAField:        seedS,
+			auditcomplete.VouchHeadAdvanceVerifiedField: true,
+		})
+		assertPreviewHead(t, ctx, session, runID, 0, vouchV)
+	})
+
+	t.Run("legacy vouch keeps the seed", func(t *testing.T) {
+		runID := seedPreviewRun(t, ctx, fx.runRepo, auditRepo)
+		appendPreviewLedger(t, ctx, auditRepo, runID, "pull_request_opened", map[string]any{"head_sha": seedS})
+		appendPreviewLedger(t, ctx, auditRepo, runID, auditcomplete.CategoryOperatorCommitVouched, map[string]any{
+			"run_id": runID.String(), "reason": "operator remediation commit",
+			auditcomplete.VouchedSHAField: vouchV,
 		})
 		assertPreviewHead(t, ctx, session, runID, 0, seedS)
 	})

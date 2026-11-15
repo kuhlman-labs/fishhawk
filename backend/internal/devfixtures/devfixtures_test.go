@@ -300,6 +300,85 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 			}
 		}
 	})
+	// acceptance-vouched-head (#4874): five runs, each with an acceptance stage
+	// dispatched and its audit rows in the declared order. Every verified vouch
+	// row carries exactly the key set #4856's vouch-commit handler writes, and
+	// the legacy row carries none of the advance keys, so the server walk's
+	// verified predicate is what separates them.
+	t.Run("acceptance-vouched-head", func(t *testing.T) {
+		s := mustLoad(t, "acceptance-vouched-head")
+		wantRuns := map[string][]string{
+			"vouched-run":                {"pull_request_opened", "operator_commit_vouched", "acceptance_dispatched"},
+			"vouched-then-rebased-run":   {"pull_request_opened", "operator_commit_vouched", "branch_rebased", "acceptance_dispatched"},
+			"unverified-vouch-run":       {"pull_request_opened", "operator_commit_vouched", "acceptance_dispatched"},
+			"vouched-parent":             {"integration_commit_recorded", "operator_commit_vouched", "acceptance_dispatched"},
+			"vouched-after-dispatch-run": {"pull_request_opened", "acceptance_dispatched", "operator_commit_vouched"},
+		}
+		verifiedKeys := []string{"head_advance_verified", "prior_head_sha", "reason", "run_id", "vouched_sha"}
+		legacyKeys := []string{"reason", "run_id", "vouched_sha"}
+		if len(s.Runs) != len(wantRuns) {
+			t.Fatalf("want %d runs, got %d", len(wantRuns), len(s.Runs))
+		}
+		stageType := map[string]string{}
+		stageRun := map[string]string{}
+		for _, st := range s.Stages {
+			stageType[st.Key] = st.Type
+			stageRun[st.Key] = st.Run
+			if st.Type == "acceptance" && (st.State != "dispatched" || st.ExecutorKind != "agent") {
+				t.Fatalf("acceptance stage %q must be agent/dispatched, got %+v", st.Key, st)
+			}
+		}
+		for _, r := range s.Runs {
+			want, ok := wantRuns[r.Key]
+			if !ok || r.WorkflowID != "feature_change" || r.State != "running" {
+				t.Fatalf("unexpected run %+v", r)
+			}
+			var got []string
+			for _, row := range s.Audit {
+				if row.Run != r.Key {
+					continue
+				}
+				got = append(got, row.Category)
+				if row.Category == "acceptance_dispatched" && stageType[row.Stage] != "acceptance" {
+					t.Fatalf("run %s: acceptance_dispatched must sit on the acceptance stage, got %q", r.Key, row.Stage)
+				}
+				if stageRun[row.Stage] != r.Key {
+					t.Fatalf("run %s: audit row %s names stage %q of another run", r.Key, row.Category, row.Stage)
+				}
+				if row.Category != "operator_commit_vouched" {
+					continue
+				}
+				var p map[string]any
+				if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
+					t.Fatalf("run %s: vouch payload: %v", r.Key, err)
+				}
+				keys := make([]string, 0, len(p))
+				for k := range p {
+					keys = append(keys, k)
+				}
+				slices.Sort(keys)
+				wantKeys := verifiedKeys
+				if r.Key == "unverified-vouch-run" {
+					wantKeys = legacyKeys
+				}
+				if !slices.Equal(keys, wantKeys) {
+					t.Fatalf("run %s: vouch payload keys = %v, want %v", r.Key, keys, wantKeys)
+				}
+				if v, ok := p["vouched_sha"].(string); !ok || len(v) != 40 {
+					t.Fatalf("run %s: vouched_sha must be a 40-hex sha, got %v", r.Key, p["vouched_sha"])
+				}
+				if r.Key != "unverified-vouch-run" {
+					prior, _ := p["prior_head_sha"].(string)
+					if p["head_advance_verified"] != true || len(prior) != 40 {
+						t.Fatalf("run %s: verified vouch must carry head_advance_verified true and a 40-hex prior, got %s", r.Key, row.Payload)
+					}
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("run %s: audit order = %v, want %v", r.Key, got, want)
+			}
+		}
+	})
 	t.Run("implement-running", func(t *testing.T) {
 		s := mustLoad(t, "implement-running")
 		if len(s.Runs) != 1 || s.Runs[0].WorkflowID != "feature_change" || s.Runs[0].State != "running" {

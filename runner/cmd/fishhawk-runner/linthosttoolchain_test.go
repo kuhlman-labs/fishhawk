@@ -160,7 +160,10 @@ type lintHostResult struct {
 	runLog string
 }
 
-// runRealLintLeg runs `bash <root>/scripts/test lint` under the fixture.
+// runRealLintLeg runs `bash <root>/scripts/test lint` under the fixture. It
+// pins GOLANGCI_LINT_CACHE to a t.TempDir() so scripts/test's per-checkout lint
+// cache (#5151) never creates a dir in the real checkout's git dir or the
+// user's cache dir: an explicit value is left untouched.
 func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResult {
 	t.Helper()
 	realGo, err := exec.LookPath("go")
@@ -178,13 +181,15 @@ func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResul
 		case strings.HasPrefix(kv, "FISHHAWK_TEST_LIB_ONLY="),
 			strings.HasPrefix(kv, "PATH="),
 			strings.HasPrefix(kv, "GIT_CONFIG_GLOBAL="),
-			strings.HasPrefix(kv, "GIT_CONFIG_SYSTEM="):
+			strings.HasPrefix(kv, "GIT_CONFIG_SYSTEM="),
+			strings.HasPrefix(kv, "GOLANGCI_LINT_CACHE="):
 			continue
 		}
 		env = append(env, kv)
 	}
 	env = append(env,
 		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GOLANGCI_LINT_CACHE="+t.TempDir(),
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
 		"FAKE_GL_VER="+fx.glVersion,

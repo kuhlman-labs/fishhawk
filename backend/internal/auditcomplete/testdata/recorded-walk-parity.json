@@ -1,0 +1,628 @@
+{
+  "_comment": "Shared recorded-walk parity table (#4874). Each case is one run's audit rows, every row with an explicit chain sequence, including its seed rows (pull_request_opened / fixup_pushed head_sha, integration_commit_recorded merge_sha). want_head is the unbounded acceptance head: the server resolver (backend/internal/server acceptanceHeadAsOf over walkRecordedBaseMerges) and the MCP preview mirror (backend/internal/mcpserver latestReportedHeadSHA over walkPreviewBaseMerges) must both answer it. A non-empty skip names the issue owing the fix; every case currently carries an empty skip. Both consumers assert at least 15 cases. Shas: S 5000..05 PR-open head, V 7000..07 and W 8000..08 vouched tips, M a000..01 and M2 a000..02 merge commits, F f000..01 fix-up head, I 1f00..01 integration merge, P 9000..09 a non-walked prior, X eeee..00 a foreign push.",
+  "cases": [
+    {
+      "name": "verified_vouch_advances",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "7000000000000000000000000000000000000007",
+      "skip": ""
+    },
+    {
+      "name": "legacy_vouch_is_inert",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007"
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "verified_false_is_inert",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": false
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "verified_prior_mismatch_is_inert",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "9000000000000000000000000000000000000009",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "undecodable_vouch_is_inert",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": 12345,
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "empty_vouched_sha_is_inert",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "vouch_below_seed_is_inert",
+      "rows": [
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 9,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "newer_fixup_seed_wins_over_vouch",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "fixup_pushed",
+          "sequence": 12,
+          "payload": {
+            "head_sha": "f000000000000000000000000000000000000001"
+          }
+        }
+      ],
+      "want_head": "f000000000000000000000000000000000000001",
+      "skip": ""
+    },
+    {
+      "name": "verified_vouch_then_clean_rebase_answers_merge",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "branch_rebased",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "7000000000000000000000000000000000000007",
+            "new_head_sha": "a000000000000000000000000000000000000001",
+            "merge_commit_sha": "a000000000000000000000000000000000000001",
+            "already_up_to_date": false,
+            "base_tip_sha": "baseba5e00000000000000000000000000000000",
+            "clean_verified": true
+          }
+        }
+      ],
+      "want_head": "a000000000000000000000000000000000000001",
+      "skip": ""
+    },
+    {
+      "name": "rebase_attribution_vouch_is_inert",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "branch_rebased",
+          "sequence": 11,
+          "payload": {
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "new_head_sha": "a000000000000000000000000000000000000001",
+            "merge_commit_sha": "a000000000000000000000000000000000000001",
+            "already_up_to_date": false,
+            "base_tip_sha": "baseba5e00000000000000000000000000000000",
+            "clean_verified": true
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 12,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "a000000000000000000000000000000000000001"
+          }
+        }
+      ],
+      "want_head": "a000000000000000000000000000000000000001",
+      "skip": ""
+    },
+    {
+      "name": "chained_verified_vouches",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 12,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "8000000000000000000000000000000000000008",
+            "prior_head_sha": "7000000000000000000000000000000000000007",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "8000000000000000000000000000000000000008",
+      "skip": ""
+    },
+    {
+      "name": "reset_onto_verified_vouched_sha_stays_on_chain",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "branch_reset",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "eeee000000000000000000000000000000000000",
+            "reset_to_sha": "7000000000000000000000000000000000000007",
+            "dropped_offending_sha": "eeee000000000000000000000000000000000000"
+          }
+        }
+      ],
+      "want_head": "7000000000000000000000000000000000000007",
+      "skip": ""
+    },
+    {
+      "name": "parent_integration_seed_then_verified_vouch",
+      "rows": [
+        {
+          "category": "integration_commit_recorded",
+          "sequence": 10,
+          "payload": {
+            "merge_sha": "1f00000000000000000000000000000000000001"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "8000000000000000000000000000000000000008",
+            "prior_head_sha": "1f00000000000000000000000000000000000001",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "8000000000000000000000000000000000000008",
+      "skip": ""
+    },
+    {
+      "name": "legacy_vouch_then_rebase_of_it_then_verified_revouch",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007"
+          }
+        },
+        {
+          "category": "branch_rebased",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "7000000000000000000000000000000000000007",
+            "new_head_sha": "a000000000000000000000000000000000000001",
+            "merge_commit_sha": "a000000000000000000000000000000000000001",
+            "already_up_to_date": false,
+            "base_tip_sha": "baseba5e00000000000000000000000000000000",
+            "clean_verified": true
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 13,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "7000000000000000000000000000000000000007",
+      "skip": ""
+    },
+    {
+      "name": "reset_then_verified_revouch",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007"
+          }
+        },
+        {
+          "category": "branch_reset",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "eeee000000000000000000000000000000000000",
+            "reset_to_sha": "7000000000000000000000000000000000000007",
+            "dropped_offending_sha": "eeee000000000000000000000000000000000000"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 13,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "7000000000000000000000000000000000000007",
+      "skip": ""
+    },
+    {
+      "name": "off_chain_reset_reseeds_then_clean_rebase_from_seed",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "branch_rebased",
+          "sequence": 11,
+          "payload": {
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "new_head_sha": "a000000000000000000000000000000000000001",
+            "merge_commit_sha": "a000000000000000000000000000000000000001",
+            "already_up_to_date": false,
+            "base_tip_sha": "baseba5e00000000000000000000000000000000",
+            "clean_verified": true
+          }
+        },
+        {
+          "category": "branch_reset",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "a000000000000000000000000000000000000001",
+            "reset_to_sha": "eeee000000000000000000000000000000000000",
+            "dropped_offending_sha": "a000000000000000000000000000000000000001"
+          }
+        },
+        {
+          "category": "branch_rebased",
+          "sequence": 13,
+          "payload": {
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "new_head_sha": "a000000000000000000000000000000000000002",
+            "merge_commit_sha": "a000000000000000000000000000000000000002",
+            "already_up_to_date": false,
+            "base_tip_sha": "baseba5e00000000000000000000000000000000",
+            "clean_verified": true
+          }
+        }
+      ],
+      "want_head": "a000000000000000000000000000000000000002",
+      "skip": ""
+    },
+    {
+      "name": "off_chain_reset_drops_the_vouched_chain",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "branch_reset",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "7000000000000000000000000000000000000007",
+            "reset_to_sha": "eeee000000000000000000000000000000000000",
+            "dropped_offending_sha": "7000000000000000000000000000000000000007"
+          }
+        }
+      ],
+      "want_head": "5000000000000000000000000000000000000005",
+      "skip": ""
+    },
+    {
+      "name": "undecodable_reset_reseeds_then_verified_vouch_from_seed",
+      "rows": [
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "branch_reset",
+          "sequence": 12,
+          "payload": {
+            "prior_head_sha": "7000000000000000000000000000000000000007",
+            "reset_to_sha": 7,
+            "dropped_offending_sha": "7000000000000000000000000000000000000007"
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 13,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "8000000000000000000000000000000000000008",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        }
+      ],
+      "want_head": "8000000000000000000000000000000000000008",
+      "skip": ""
+    },
+    {
+      "name": "rows_delivered_out_of_chain_order",
+      "rows": [
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 12,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "8000000000000000000000000000000000000008",
+            "prior_head_sha": "7000000000000000000000000000000000000007",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "operator_commit_vouched",
+          "sequence": 11,
+          "payload": {
+            "run_id": "parity-run",
+            "reason": "operator remediation commit",
+            "vouched_sha": "7000000000000000000000000000000000000007",
+            "prior_head_sha": "5000000000000000000000000000000000000005",
+            "head_advance_verified": true
+          }
+        },
+        {
+          "category": "pull_request_opened",
+          "sequence": 10,
+          "payload": {
+            "head_sha": "5000000000000000000000000000000000000005"
+          }
+        }
+      ],
+      "want_head": "8000000000000000000000000000000000000008",
+      "skip": ""
+    }
+  ]
+}

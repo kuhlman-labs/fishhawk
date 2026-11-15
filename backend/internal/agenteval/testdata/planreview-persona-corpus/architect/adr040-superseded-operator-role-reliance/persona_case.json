@@ -90,6 +90,7 @@
       "status": "accepted",
       "superseded_by": [],
       "amended_by": [
+        "ADR-066",
         "ADR-097",
         "ADR-101",
         "ADR-132"

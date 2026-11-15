@@ -5414,10 +5414,12 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 	// item 4): the verify command runs agent-authored code, so it must not
 	// see the installation token / API keys / MCP token.
 	gateEnv := sanitizedGateEnv()
-	// Isolate golangci-lint's path-keyed analysis cache per invocation so a
-	// concurrent local run's cached lint results can't leak into this gate's
-	// output (#1796). Degrade to the shared cache on a temp-dir failure rather
-	// than inventing a gate failure from plumbing.
+	// Isolate golangci-lint's analysis cache (content-keyed, but storing
+	// absolute positions) per invocation so a concurrent local run's cached
+	// lint results can't leak into this gate's output (#1796); host
+	// `scripts/test lint` derives its own per-checkout cache (#5151). Degrade
+	// to the shared cache on a temp-dir failure rather than inventing a gate
+	// failure from plumbing.
 	if lintCacheDir, err := os.MkdirTemp("", "fishhawk-lintcache-*"); err == nil {
 		defer func() { _ = os.RemoveAll(lintCacheDir) }()
 		gateEnv = withIsolatedLintCache(gateEnv, lintCacheDir)

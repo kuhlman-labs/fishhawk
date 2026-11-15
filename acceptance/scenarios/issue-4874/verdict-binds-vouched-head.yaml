@@ -1,0 +1,14 @@
+id: scenario:issue-4874/verdict-binds-vouched-head
+statement: A signed verdict shipped for a stage dispatched after a verified vouch is recorded against the vouched commit.
+verify_hint: 'On the fixture''s vouched-run: POST /v0/runs/{run}/acceptance/transcript?stage_id=… then POST /v0/runs/{run}/acceptance?stage_id=… (both signed via /v0/dev/sign), then GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded → head_sha equals the vouched sha.'
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-vouched-head"} and read run key vouched-run (pull_request_opened 1111…, verified vouch →2222… before acceptance_dispatched). 2) Build a transcript {criteria:[run-readable passed, stages-listed passed],target_url}; sign it via POST /v0/runs/{run}/signing-key + POST /v0/dev/sign; POST /v0/runs/{run}/acceptance/transcript?stage_id={acceptance} -> 201 {id,content_hash}. Build the verdict {verdict:passed,target_url,criteria:[...],transcript:{artifact_id,content_hash}}, sign it the same way, POST /v0/runs/{run}/acceptance?stage_id={acceptance} -> 201. 3) GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded.
+assertions:
+    expected: head_sha equals the vouched sha
+    observed_at_record: transcript 201, verdict 201; acceptance_outcome_recorded head_sha=2222222222222222222222222222222222222222, outcome accepted
+    repro_handle: GET /v0/runs/0490a0a9-6c30-4440-8c7b-d7ff0def6197/audit?category=acceptance_outcome_recorded
+origin:
+    issue: 4874
+    pr: 5293
+    run_id: 1c1b9276-fd70-419b-ac15-28e3c4158ef4
+    head_sha: f14b941b89ebb3dcc37b1394b55e094230a7513a
+    recorded_at: 2026-11-14T22:14:27Z

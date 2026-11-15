@@ -69,6 +69,76 @@ the image carries the pinned tools. It is pinned by
 `scripts/test lint` with fake tools on PATH. A direct host `gofmt -l` outside
 `scripts/test` is NOT guarded by this.
 
+**Per-checkout lint cache ([#5151](https://github.com/kuhlman-labs/fishhawk/issues/5151)).**
+After the host check, `cmd_lint` runs `_export_lint_cache`, which resolves
+`GOLANGCI_LINT_CACHE` in this order:
+
+1. A NON-EMPTY value is left untouched. The runner's `withIsolatedLintCache`
+   gates, the gate image's `/lintcache` and an operator's explicit choice all
+   win. An EMPTY value counts as unset, as golangci-lint itself treats it
+   (the pinned v2.12.2 `golangci-lint cache status` reports the default dir).
+2. `GITHUB_ACTIONS=true` leaves it unset. A hosted job has one checkout, and
+   `ci.yml`'s "Cache golangci-lint analysis cache" step restores the default
+   `~/.cache/golangci-lint`. This branch trusts the environment: a
+   self-hosted runner linting several checkouts in one job would not be
+   isolated. An explicit `GOLANGCI_LINT_CACHE` export in `ci.yml` would remove
+   the branch; that is a human-led follow-up, since `ci.yml` was out of this
+   change's scope.
+3. Otherwise `<git-dir>/fishhawk-lint-cache/<root-key>/host`, created and
+   exported. `<git-dir>` is `git rev-parse --absolute-git-dir`, the
+   PER-WORKTREE dir (`.git` for a primary checkout, `<common>/worktrees/<id>`
+   for a linked one). `<root-key>` is the `cksum` (CRC-length) of `pwd -P` of
+   `$ROOT`, so a moved (`git worktree move`, `mv`) or copied (`cp -R`) checkout
+   misses the old location's entries. The git-dir form is taken only when the
+   physical `git rev-parse --show-toplevel` equals the physical `$ROOT`.
+4. Any other `$ROOT` (no git, a bare repo, or a plain dir nested inside another
+   work tree) falls back to
+   `${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-lint-cache/<root-key>/host`. With
+   neither `XDG_CACHE_HOME` nor `HOME` set there is no private fallback, so it
+   refuses rather than use a shared `/tmp`.
+
+A dir that cannot be resolved or created REFUSES with exit 1 and names
+`GOLANGCI_LINT_CACHE` as the remedy (fail closed: falling back to the shared
+default would reopen the leak). Nothing prints on the happy path.
+
+The mechanism: golangci-lint keys its issue cache by package CONTENT
+(path-independent) but stores each finding's ABSOLUTE position. With the
+shared default `os.UserCacheDir()/golangci-lint`, a checkout whose package is
+byte-identical to another's hits that entry and inherits its paths. The result
+processors (the generated-file and nolint filters) then read the file at the
+foreign path. A removed peer logs `Can't process results by
+generated_file_filter processor: ... failed to get doc (strict) ... no such
+file or directory`, an edited one no longer carries the `//nolint`, and either
+way the suppressed finding comes back as `../<other-tree>/x.go`. The evidence is empirical, against the pinned
+golangci-lint v2.12.2: `scripts/test-lint-cache`'s R1/R2 arms go RED with the
+`_export_lint_cache` call deleted. It reproduces with and without
+`GOFLAGS=-trimpath`, so `-trimpath` is not the trigger. `GOCACHE`, `GOFLAGS`
+and `GOMODCACHE` are never touched: the Go build cache stays shared. #1796's
+fix (`withIsolatedLintCache`) covered only the runner-spawned gate
+subprocesses, and its tests assert the env those see, so an agent's own shell
+`scripts/verify-change` was never covered.
+
+The `host` and `gate-image` flavors (the latter is `--in-gate-image`'s
+`/lintcache`, § "Gate image" below) stay separate as an isolation property: a
+gate-container analysis never feeds a host lint, or the reverse. The first
+lint in a fresh checkout runs golangci-lint's analysis cold; compilation stays
+warm through the shared `GOCACHE`.
+
+Lifecycle and cleanup: the git-dir form is invisible to `git status`, and
+`git worktree remove` (or `git worktree prune` for a vanished worktree)
+deletes it with the worktree's admin dir. A primary checkout's dir, and every
+non-git fallback under `${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-lint-cache/`,
+persist until removed. `golangci-lint cache clean` from a plain shell does
+NOT reach them (it cleans the default dir), so `rm -rf` the dir instead.
+
+`scripts/test-lint-cache` (in `_verify_gate_harnesses`) pins every branch.
+Its hermetic arms source `scripts/test` lib-only and drive `cmd_lint` with a
+fake golangci-lint that models the content-keyed cache; its R arms run the
+real `scripts/test lint` against the real pinned golangci-lint in two
+diverging worktrees with `GOFLAGS=-trimpath`, and skip with a printed reason
+when the pinned toolchain is absent. `FISHHAWK_LINT_CACHE_HERMETIC_ONLY=1`
+skips the R arms for local iteration only; `_verify_gate_harnesses` unsets it.
+
 ### Leg registration: the base-delta global surface (ADR-096 D3 / [#4292](https://github.com/kuhlman-labs/fishhawk/issues/4292))
 
 `backend/internal/basedelta/verifylegs_test.go` parses this script's `cmd_verify` and `_verify_gate_harnesses` bodies and `scripts/sync-schemas`' destinations. Every code line there must be a registered leg call or an exact allow-listed plumbing line, each `_verify_*` leg's `$ROOT/scripts/<x>` calls must match its row, and every input a leg reads as data must be covered by the verdict-wide (G) or doc-check class of this repository's `verdict_transfer` declaration (ADR-124 / #4657) — `backend/internal/basedelta/testdata/fishhawk-verdict-transfer.yaml` until the operator's `.fishhawk/workflows.yaml` block lands, which the harness then reads; an inert class never covers an input. Adding a leg, a harness, an inline script call, a plumbing line or a sync mirror therefore fails verify until the table (and, for a new input, the declaration) is updated; the live declaration is operator-only, so a run flags that change rather than making it. Contract: `backend/internal/basedelta/README.md` § "Adding a verify leg".
@@ -895,8 +965,12 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
   fail and test-helm-render r9h with it; then
   `docker run` on that same ID with that passwd file mounted read-only over
   `/etc/passwd`, the checkout (and an outside git common
-  dir) mounted at its own path, `--user uid:gid`, persistent caches under
+  dir) mounted at its own path, `--user uid:gid`, persistent `gocache` and
+  `gomodcache` under
   `${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-gate}`,
+  the per-checkout `gate-image` lint cache
+  (`<git-dir>/fishhawk-lint-cache/<root-key>/gate-image`, § "Lint" above; an
+  uncreatable one refuses) mounted at `/lintcache`,
   command-scope `safe.directory=*`, and no docker socket. The exit status is
   the container's. Network on, mount read-write: CI parity, not isolation.
 - **`lint` now parses its arguments**: `--in-gate-image` is the one option and
@@ -922,7 +996,8 @@ holder with docker never invoked, released after a failing run), the full argv c
 the primary vs linked-worktree common-dir mount, exit-status propagation, a
 mismatching image never running the inner command, image resolution (pull
 fallback, failed pull, non-ID inspect output), a missing check script, an
-uncreatable cache dir, `--no-tests` skipping the test loop, the pin leg's skip
+uncreatable cache dir, the per-checkout gate-image lint cache mount (primary
+vs linked worktree) and its two refusals, `--no-tests` skipping the test loop, the pin leg's skip
 / failure / `cmd_verify` wiring, and both new harnesses' wiring. The header
 lists the counterfactual run against each control.
 

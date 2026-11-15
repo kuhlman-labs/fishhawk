@@ -1,0 +1,14 @@
+id: scenario:issue-4874/vouched-head-is-expected-head
+statement: For a run whose head moved through a verified operator vouch (pull_request_opened S, then a verified vouch S→V, then the acceptance dispatch), the acceptance prompt names the vouched commit V as acceptance_expected_head_sha, not the seed S.
+verify_hint: POST /v0/dev/fixtures {"scenario":"acceptance-vouched-head"}; sign prompt:<stage> via POST /v0/runs/{run}/signing-key + POST /v0/dev/sign; GET /v0/stages/{vouched-run acceptance}/prompt → acceptance_expected_head_sha equals the seeded vouched sha.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-vouched-head"} and read the run_id plus the *-acceptance stage id of run key vouched-run from the 201 body. 2) GET /v0/runs/{run}/audit: pull_request_opened head 1111…, operator_commit_vouched prior 1111…→vouched 2222… head_advance_verified true, then acceptance_dispatched. 3) POST /v0/runs/{run}/signing-key {} -> private_key; POST /v0/dev/sign with header X-Fishhawk-Dev-Private-Key over the raw bytes ''prompt:<acceptance stage id>'' -> signature; GET /v0/stages/{acceptance stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: acceptance_expected_head_sha equals the vouched sha V, not the seed S (1111…)
+    observed_at_record: acceptance_expected_head_sha=2222222222222222222222222222222222222222 (the vouched sha); acceptance_run_branch e97.24-vouched-run
+    repro_handle: GET /v0/stages/9609d30f-1aaa-4977-8edb-307f266c5ea1/prompt (signed prompt:<stage>)
+origin:
+    issue: 4874
+    pr: 5293
+    run_id: 1c1b9276-fd70-419b-ac15-28e3c4158ef4
+    head_sha: f14b941b89ebb3dcc37b1394b55e094230a7513a
+    recorded_at: 2026-11-14T22:14:27Z

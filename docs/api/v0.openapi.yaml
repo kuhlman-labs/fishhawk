@@ -16259,10 +16259,13 @@ paths:
         posted at an unverified sha. Without this bound an operator carrying
         `write:stages` could have this run's recomputed check state stamped
         onto any commit in the repository, including the head of an unrelated
-        pull request. WHAT DID NOT CHANGE: the record is unverified for any
-        well-formed full sha — the `operator_commit_vouched` append and the 200
-        are identical for a matching and a non-matching full sha, and the bound
-        added no error code or status code. An
+        pull request. WHAT DID NOT CHANGE: the bound added no error code or
+        status code, a vouch of any well-formed full sha is still appended and
+        answers 200, and a non-matching sha's record is never verified. The
+        appended record is NOT identical across the two: only a sha that is
+        the live pull-request head can pass the head-advance probe described
+        below and carry `prior_head_sha` / `head_advance_verified` (#4856,
+        #4874). An
         operator-pushed commit appears in no head-report audit category, so the
         publisher's normal head resolution would re-post against a stale sha and
         leave the check absent from the live merge head — the exact base-advance
@@ -16410,9 +16413,12 @@ paths:
                       failed, the probe deadline expired, not a fast-forward,
                       not ahead, the 250-commit cap, or a named intermediate
                       commit that is not run lineage) and the remedy (re-invoke
-                      once readable, re-vouch naming the live head, vouch the
-                      named commit first, or use `rebase-branch` /
-                      `reset-branch`).
+                      once readable, re-vouch naming the live head, or use
+                      `rebase-branch` / `reset-branch`; for a named
+                      intermediate commit, which can only be verified while it
+                      is the live pull-request head, vouch each commit as it is
+                      pushed, or move the branch back to it, vouch it, then
+                      push and vouch the tip).
         '400':
           description: |
             Malformed body, an empty `sha`/`reason`, or a `sha` that is not a

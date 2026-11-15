@@ -48,3 +48,47 @@ Parent epic: #389
 ## Decision
 
 **Accepted (2026-06-03).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-03).**".
+
+## Amendment A1 (accepted 2026-11-14) — verified landing governs code-delivery gates; decision 4 is the queue-owned merge plus forge approval
+
+This amendment sets the scope of the landing rule and replaces decision 4 for merges Fishhawk dispatches. It is one of three companion amendments: ADR-017 Amendment A1 and ADR-018 Amendment A1 state the same scope for the merge gate and for review-stage approval.
+
+**1. Scope of the landing rule.** The Decision's lead rule governs **code-delivery gates**: a review stage succeeds only when the change has verifiably landed. A code-delivery gate authorizes a change to land on the repository: the merge gate of ADR-146's families 1 (planned change) and 2 (PR adoption) (`docs/adr/146-workflow-catalogue.md:63-64`). For those gates the lead rule and decisions 1 to 3 stand.
+
+Other gates resolve under their own effect-specific contracts, as ADR-146 D1 names them (`:62`):
+- tracker mutations: the approval of the proposed mutations (family 3, `:65`);
+- a decision record: ratification under ADR-113 (family 4, `:66`);
+- a deployment target: the deployment approval (family 5, `:67`).
+
+This does not remove ADR-139 D9's verified-record-landing condition on `adr_change` confirmation (`docs/adr/139-adr-change-workflow.md:65`). `backlog_grooming`'s confirm stage is an example of a review-typed stage resolved under its own contract (`backend/internal/server/review_gate_admission.go:159-206`).
+
+**2. Verified, not asserted, on every gate.** No gate succeeds because an operator or an agent asserts that it succeeded. Each gate resolves only on what it declares and the server checks:
+- for a code-delivery gate, verified landing (decision 1);
+- for any other gate, its own recorded, attributed decision, checked against that gate's approval rules.
+
+A human confirmation that is the gate's declared decision, as on `backlog_grooming`'s confirm stage, is that gate's check, not an override (`.fishhawk/workflows.yaml:357-364`). No gate gains a force-succeed or manual-override path.
+
+**3. A merge outside Fishhawk.** "The queue does not block external merges." (`docs/adr/093-fishhawk-owned-merge-queue.md:96`). A code-delivery gate whose pull request is merged on the forge outside Fishhawk still resolves by landing, through decision 2's webhook-or-poll path. The checks that settle a merged gate still apply. Among them:
+- The ADR-036 implement-review hold (`backend/internal/server/merge_members.go:51-53`).
+- The members check. A review gate that declares `approvals.members` is held when no listed identity merged or approved the pull request (`backend/internal/server/merge_members.go:50-72`).
+- The reconciler's lineage re-check. A merge whose branch carries a foreign commit is held under ADR-035. That check has documented skips and fail-open cases (`backend/internal/mergereconciler/README.md:43-54`).
+
+**4. Decision 4, for a merge Fishhawk dispatches.** Decision 4 said "the merge is the approval". For a merge Fishhawk dispatches, three acts now authorize the merge:
+- **The merge intent.** This is the operator's `merge_run`, or the delegated `may_merge` arm where the declared autonomy allows it.
+- **The dispatch.** The merge is dispatched under ADR-109's queue ownership and its shared per-run dispatch ledger (`docs/adr/109-merge-queue-owns-the-merge.md:19-21`, `:42-47`).
+- **The forge approval.** A forge approval qualifying under ADR-112 R1, including its permitted clean-advance chain (`docs/adr/112-queue-merge-forge-approval-predicate.md:45-63`).
+
+Where a protected path needs more (ADR-121 D4.2), that record decides. Landing is still what resolves the gate. There is still no separate Fishhawk approve-click on a code-delivery review gate.
+
+For a merge made on the forge outside Fishhawk, decision 4 stands as written: the merge is the approval, subject to section 3.
+
+**5. Families explain the scope; they do not select it at runtime.** ADR-146 says of its catalogue that "no validator rule follows from it" (`docs/adr/146-workflow-catalogue.md:71`). No runtime check reads a family. A running gate is recognised by its own declaration, and this amendment does not change how.
+
+**6. Consequences.** "The ADR-018 `/approvals` 409 stays." now holds for code-delivery review gates (ADR-018 Amendment A1).
+
+**What stands.**
+- Decisions 1 to 3 stand within the scope above.
+- The implementation discipline, Phase 2, and the absence of a `manual` or assertion provider all stand.
+- The partial supersession of ADR-018's resolution mechanism stands.
+
+- **Record metadata:** an in-body amendment of ADR-031. No new edge. ADR-031 keeps `supersedes: ["ADR-018"]` and `status: accepted`.
