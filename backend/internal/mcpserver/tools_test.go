@@ -19433,6 +19433,179 @@ func TestStartRun_CheckoutWarnings_Wired(t *testing.T) {
 	})
 }
 
+// TestStartRun_CheckoutProbe_HTTPReconfinesAtProbeTime pins routed concern
+// 5b3c5429: over the HTTP transport the probe re-confines working_dir at PROBE
+// time and runs git on the RESOLVED path. The swap case repoints an in-root
+// symlink at an outside directory AFTER the admission check (inside the backend
+// create call, which precedes the probe), and the probe must never be reached.
+// The control proves the same HTTP fixture reaches the probe, with the resolved
+// path, when nothing is swapped; the outside case is refused at admission.
+func TestStartRun_CheckoutProbe_HTTPReconfinesAtProbeTime(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := func(t *testing.T, wd string, swap func()) ([]string, error) {
+		t.Helper()
+		dirs := stubStartRunProbe(t, checkoutState{DirtyPaths: []string{"a.go"}}, true)
+		_, fake := newFakeBackend(t)
+		// Wrap the fake so the swap lands between the admission check and the
+		// probe: startRun probes only after the create returns.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Method == http.MethodPost && req.URL.Path == "/v0/runs" && swap != nil {
+				swap()
+			}
+			fake.Config.Handler.ServeHTTP(w, req)
+		}))
+		t.Cleanup(srv.Close)
+		r := newResolver(srv, nil)
+		r.httpTransport = true
+		r.allowedRoots = []string{root}
+		_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, WorkingDir: wd,
+		})
+		return *dirs, err
+	}
+
+	t.Run("control_in_root_probes_resolved_path", func(t *testing.T) {
+		link := filepath.Join(root, "link-control")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		dirs, err := start(t, link, nil)
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		if len(dirs) != 1 || dirs[0] != real {
+			t.Fatalf("an in-root working_dir must be probed once at its RESOLVED path %q, got %v", real, dirs)
+		}
+	})
+	t.Run("swapped_after_admission_never_probes", func(t *testing.T) {
+		link := filepath.Join(root, "link-swap")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		dirs, err := start(t, link, func() {
+			if err := os.Remove(link); err != nil {
+				t.Errorf("remove link: %v", err)
+			}
+			if err := os.Symlink(outside, link); err != nil {
+				t.Errorf("swap link: %v", err)
+			}
+		})
+		if err != nil {
+			t.Fatalf("startRun must still create the run: %v", err)
+		}
+		if len(dirs) != 0 {
+			t.Fatalf("a working_dir swapped outside the allowed roots after admission must never reach the probe, got %v", dirs)
+		}
+	})
+	t.Run("outside_root_refused_before_probe", func(t *testing.T) {
+		dirs, err := start(t, outside, nil)
+		if err == nil || !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Fatalf("an outside-root working_dir must be refused %s, got %v", pathOutsideAllowedRootsCode, err)
+		}
+		if len(dirs) != 0 {
+			t.Fatalf("a refused working_dir must never reach the probe, got %v", dirs)
+		}
+	})
+}
+
+// TestStartRun_CheckoutWarnings_IdempotentReplay pins routed concern 22cca41c:
+// a replay (the fake's 200 arm) returns an EXISTING run whose spec was pinned
+// at its original creation, so W2 and W3 make no claim that this checkout's
+// bytes are what it pinned. The 201 control on the SAME fixture keeps the
+// start_run wording, so the difference is the replay arm alone.
+func TestStartRun_CheckoutWarnings_IdempotentReplay(t *testing.T) {
+	dirty := checkoutState{DirtyPaths: []string{".fishhawk/workflows.yaml"}, Branch: "feature", BaseRef: "origin/main", CountsKnown: true}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".fishhawk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".fishhawk", "workflows.yaml"), []byte(validTrivialSpec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := func(t *testing.T, status int) string {
+		t.Helper()
+		stubStartRunProbe(t, dirty, true)
+		fb, srv := newFakeBackend(t)
+		fb.createRunStatus = status
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkingDir: dir, IdempotencyKey: "k-1",
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		return rejectResultText(t, meta)
+	}
+	t.Run("fresh_create_control", func(t *testing.T) {
+		text := start(t, http.StatusCreated)
+		if !strings.Contains(text, "WORKING-TREE workflow spec bytes") || !strings.Contains(text, "read from this checkout") {
+			t.Fatalf("a fresh create keeps the start_run spec-source wording:\n%s", text)
+		}
+	})
+	t.Run("replay_drops_spec_source_claims", func(t *testing.T) {
+		text := start(t, http.StatusOK)
+		if !strings.Contains(text, w2Marker) || !strings.Contains(text, "REPLAYED an existing run") {
+			t.Fatalf("a replay must still report the .fishhawk/ edit, in the replay wording:\n%s", text)
+		}
+		for _, bad := range []string{"WORKING-TREE workflow spec bytes", "This run pinned", "read from this checkout"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("a replay must not claim %q:\n%s", bad, text)
+			}
+		}
+		if !strings.Contains(text, w3Marker) {
+			t.Errorf("W3 still reports the checkout at this call:\n%s", text)
+		}
+	})
+}
+
+// TestStartRun_CommentBudgetWarning_IdempotentReplay: on a replay the budget
+// count reads the REPLAYED run's own issue_context snapshot, not this call's
+// fresh context (routed concern 22cca41c).
+func TestStartRun_CommentBudgetWarning_IdempotentReplay(t *testing.T) {
+	over := make([]IssueComment, 8)
+	for i := range over {
+		over[i] = IssueComment{Author: "u" + strconv.Itoa(i), Body: strings.Repeat("q", 1900), CreatedAt: "2026-05-01T00:00:0" + strconv.Itoa(i) + "Z"}
+	}
+	overCtx := &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1, Comments: over}
+	smallCtx := &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1}
+	run := func(t *testing.T, status int, in, stored *IssueContext) string {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		fb.createRunStatus = status
+		fb.createRunResp = Run{IssueContext: stored}
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, IdempotencyKey: "k-1",
+			TriggerSource: string(runpkg.TriggerOnDemand), IssueContext: in,
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		return rejectResultText(t, meta)
+	}
+	const marker = "total comment budget"
+	if text := run(t, http.StatusCreated, overCtx, nil); !strings.Contains(text, marker) {
+		t.Fatalf("control: a fresh create over budget warns:\n%s", text)
+	}
+	if text := run(t, http.StatusOK, overCtx, smallCtx); strings.Contains(text, marker) {
+		t.Errorf("a replay whose stored snapshot is under budget must not warn from this call's context:\n%s", text)
+	}
+	if text := run(t, http.StatusOK, smallCtx, overCtx); !strings.Contains(text, marker) {
+		t.Errorf("a replay whose stored snapshot is over budget must warn:\n%s", text)
+	}
+}
+
 // TestStartRun_CheckoutWarnings_SpecSource pins approval condition C5 through
 // the real handler: W2 fires (start_run wording) only when the spec was
 // auto-discovered from working_dir, not when workflow_spec was passed inline

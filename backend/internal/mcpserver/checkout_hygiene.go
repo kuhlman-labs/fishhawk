@@ -11,10 +11,11 @@ import (
 	"unicode"
 )
 
-// Checkout-hygiene probe (#5214). fishhawk_start_run (and, through the same
-// helpers, the campaign-start verbs) reports a working_dir that is not a clean
-// checkout of the remote default branch: a dirty tree, uncommitted .fishhawk/
-// edits, and a HEAD that is detached, on another branch, or ahead of or behind
+// Checkout-hygiene probe (#5214). fishhawk_start_run, fishhawk_start_campaign
+// and fishhawk_start_campaign_item_run all reach it through
+// checkoutWarningsFor and report a working_dir that is not a clean checkout of
+// the remote default branch: a dirty tree, uncommitted .fishhawk/ edits, and a
+// HEAD that is detached, on another branch, or ahead of or behind
 // refs/remotes/origin/HEAD as last fetched. The probe is BEST-EFFORT and
 // OFFLINE: it never fetches, never authenticates, and every git failure
 // degrades that one check to "no finding" rather than a tool error. It reports;
@@ -36,6 +37,19 @@ const maxCheckoutDirtyPathsNamed = 5
 // execute (an fsmonitor command, a hooks directory, an ssh command) and keep
 // status from taking .git/index.lock, so the probe never contends with a
 // concurrent runner's git operations.
+//
+// These three keys are a DENY-LIST. The other repository-config command git
+// status runs is a content filter (filter.<driver>.clean / .process, selected
+// by .gitattributes) when it re-hashes a stat-dirty file. A driver name cannot
+// be wildcarded with -c, so the status call does not rely on this list for it:
+// checkoutFilterOverrides first enumerates the driver names the checkout's own
+// config declares and blanks each one, and the call passes
+// --ignore-submodules=all so status never recurses into a submodule whose own
+// config the enumeration did not read. Residual: an included config file
+// (include.path) rewritten between the enumeration and the status call could
+// name a driver the enumeration missed; the runner's own later git calls in
+// the same checkout are not hardened at all (runner/internal/gitops
+// HardeningArgs is per-pass), so a planted filter there runs at those calls.
 var checkoutGitHardeningArgs = []string{
 	"--no-optional-locks",
 	"-c", "core.fsmonitor=false",
@@ -89,6 +103,54 @@ func runCheckoutGit(ctx context.Context, dir string, args ...string) (string, er
 // Tests replace it with canned output; production uses runCheckoutGit.
 var checkoutGit = runCheckoutGit
 
+// checkoutStatusArgs is the probe's dirty-tree read. --ignore-submodules=all
+// keeps status from recursing into a submodule, whose own config could name a
+// filter driver checkoutFilterOverrides never enumerated.
+var checkoutStatusArgs = []string{"status", "--porcelain", "-z", "--ignore-submodules=all"}
+
+// checkoutConfigListArgs lists every config key name the probe's git reads: the
+// checkout's local and worktree config and any file they include (the system
+// and global files are off in checkoutGitEnv). Names only, NUL-terminated.
+var checkoutConfigListArgs = []string{"config", "--null", "--name-only", "--list"}
+
+// maxCheckoutFilterDrivers bounds how many filter drivers the probe will blank
+// before it gives up on the dirty-tree read.
+const maxCheckoutFilterDrivers = 32
+
+// checkoutFilterOverrides turns `git config --null --name-only --list` output
+// into -c overrides that blank every filter.<driver> the config names: clean
+// and process set empty (git runs neither when empty) and required=false (so a
+// required driver does not fail status). ok is false — and the caller skips
+// git status — when a driver name cannot be carried safely in a -c key (it
+// holds '=', a newline or NUL) or there are more than maxCheckoutFilterDrivers.
+func checkoutFilterOverrides(keys string) ([]string, bool) {
+	var args []string
+	seen := map[string]bool{}
+	for _, key := range strings.Split(keys, "\x00") {
+		if len(key) < len("filter.") || !strings.EqualFold(key[:len("filter.")], "filter.") {
+			continue
+		}
+		rest := key[len("filter."):]
+		dot := strings.LastIndex(rest, ".")
+		if dot < 0 {
+			continue // a bare filter.<var>: no driver subsection
+		}
+		name := rest[:dot]
+		if seen[name] {
+			continue
+		}
+		if strings.ContainsAny(name, "=\n\x00") || len(seen) == maxCheckoutFilterDrivers {
+			return nil, false
+		}
+		seen[name] = true
+		args = append(args,
+			"-c", "filter."+name+".clean=",
+			"-c", "filter."+name+".process=",
+			"-c", "filter."+name+".required=false")
+	}
+	return args, true
+}
+
 // checkoutState is what probeCheckout read from a checkout. A zero field means
 // "not observed" as much as "clean": every check degrades independently.
 type checkoutState struct {
@@ -121,8 +183,16 @@ func probeCheckout(ctx context.Context, dir string) (checkoutState, bool) {
 	}
 
 	var st checkoutState
-	if out, err := checkoutGit(ctx, dir, "status", "--porcelain", "-z"); err == nil {
-		st.DirtyPaths = parsePorcelainZ(out)
+	// The dirty-tree read runs only once every content-filter driver the
+	// checkout's config names is blanked; a config read that fails, or a driver
+	// name -c cannot carry, skips it (W1/W2 report nothing) rather than running
+	// status with a filter live.
+	if keys, err := checkoutGit(ctx, dir, checkoutConfigListArgs...); err == nil {
+		if overrides, ok := checkoutFilterOverrides(keys); ok {
+			if out, err := checkoutGit(ctx, dir, append(overrides, checkoutStatusArgs...)...); err == nil {
+				st.DirtyPaths = parsePorcelainZ(out)
+			}
+		}
 	}
 	if out, err := checkoutGit(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
 		switch b := strings.TrimSpace(out); b {
@@ -194,11 +264,56 @@ const (
 	// inline workflow_spec or a spec_file, so the checkout's .fishhawk/ is not
 	// what the run pinned and W2 does not fire.
 	checkoutSurfaceStartRunExplicitSpec
-	// checkoutSurfaceCampaign: fishhawk_start_campaign /
-	// fishhawk_start_campaign_item_run, whose runs fetch the spec from the forge
-	// at workflow_ref, never from the checkout.
+	// checkoutSurfaceCampaign: fishhawk_start_campaign (checkout_warnings on
+	// StartCampaignOutput) and fishhawk_start_campaign_item_run
+	// (checkout_warnings on StartCampaignItemRunOutput), whose runs fetch the
+	// spec from the forge at workflow_ref, never from the checkout.
 	checkoutSurfaceCampaign
+	// checkoutSurfaceStartRunReplay: fishhawk_start_run returned an EXISTING run
+	// for a repeated idempotency_key. Its spec was pinned when it was first
+	// created, so the report describes the checkout at this call and makes no
+	// claim about what the run pinned.
+	checkoutSurfaceStartRunReplay
 )
+
+// checkoutProbeTarget is the path the probe may run git on, re-confined at
+// PROBE time. Over the HTTP transport, the start verbs' confinePath check ran
+// earlier on the symlink-RESOLVED path, but git -C re-resolves the lexical path
+// at exec time, so a component swapped for a symlink in between would point git
+// outside the allowed roots. This resolves dir again, re-checks THAT against
+// the roots, and hands git the resolved path; a refusal or a resolution error
+// probes nothing. On stdio there is no root to confine to and dir is returned
+// as given.
+func (r *runResolver) checkoutProbeTarget(dir string) (string, bool) {
+	if !r.httpTransport {
+		return dir, true
+	}
+	resolved, err := resolveForConfinement(dir)
+	if err != nil || r.confinePath("working_dir", resolved) != nil {
+		return "", false
+	}
+	return resolved, true
+}
+
+// checkoutWarningsFor is the one path from a start verb to the probe: it
+// re-confines dir (checkoutProbeTarget), probes the resolved target through the
+// caller's seam and composes the warnings worded for surface. The warnings
+// name dir as the caller bound it. Nil for an empty dir, a refused target, a
+// non-checkout, or a clean checkout on its base.
+func (r *runResolver) checkoutWarningsFor(ctx context.Context, probe func(context.Context, string) (checkoutState, bool), surface checkoutSurface, dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	target, ok := r.checkoutProbeTarget(dir)
+	if !ok {
+		return nil
+	}
+	st, ok := probe(ctx, target)
+	if !ok {
+		return nil
+	}
+	return checkoutHygieneWarnings(surface, dir, st)
+}
 
 // quoteCheckoutValue renders one repository-controlled string as quoted DATA:
 // invalid UTF-8, control, format (bidi, zero-width) and line/paragraph
@@ -275,6 +390,10 @@ func checkoutHygieneWarnings(surface checkoutSurface, dir string, st checkoutSta
 		case checkoutSurfaceCampaign:
 			out = append(out, fmt.Sprintf(
 				"checkout hygiene: working_dir %s has uncommitted change(s) under .fishhawk/ (%s). A campaign run fetches its workflow spec from the forge at workflow_ref, not from this checkout, so the edit is INVISIBLE to the run until it is committed and pushed to the base branch.",
+				qdir, quotedPathList(specPaths)))
+		case checkoutSurfaceStartRunReplay:
+			out = append(out, fmt.Sprintf(
+				"checkout hygiene: working_dir %s has uncommitted change(s) under .fishhawk/ (%s) at this call. This call REPLAYED an existing run (same idempotency_key), whose workflow spec was pinned when that run was first created, so this edit may not be what it pinned. A spec change needs a new run: commit it to the base branch first, then start one with a fresh idempotency_key.",
 				qdir, quotedPathList(specPaths)))
 		}
 	}

@@ -187,7 +187,9 @@ A run captures its inputs once, at `fishhawk_start_run`, and never re-reads them
    unmerged commits. `fishhawk_start_run`'s `warnings` text reports a dirty tree,
    uncommitted `.fishhawk/` edits, and a HEAD that is detached, on another
    branch, or ahead of or behind the remote default branch as last fetched. A
-   warning never blocks the create, so read it and act on it.
+   warning never blocks the create, so read it and act on it. On an idempotent
+   replay (a repeated `idempotency_key`) it describes the checkout at that call,
+   not the spec the existing run pinned when it was first created.
 2. **The workflow spec is pinned for the run's life.** An auto-discovered spec
    is the checkout's working-tree bytes. A `.fishhawk/` edit made after the call,
    or one that was never committed to the base branch, needs a new run: commit it
@@ -615,6 +617,14 @@ Call `fishhawk_preview_campaign` with the source you will start, then read:
 Start from a clean, current checkout of the base branch, and re-run the preview
 after any tracker edit. The DAG is assembled from the tracker as it reads at
 create time, and a later status poll only ever adds edges.
+
+`checkout_warnings` on the `fishhawk_start_campaign` and
+`fishhawk_start_campaign_item_run` results reports a dirty bound checkout, or a
+HEAD that is detached, on another branch, or ahead of or behind the remote
+default branch as last fetched. An uncommitted `.fishhawk/` edit is invisible
+to the campaign's runs until it is committed and pushed to the base branch:
+they fetch the workflow spec from the forge at `workflow_ref`, not from the
+checkout. The warnings never block the create.
 
 **1. Start the campaign.** `fishhawk_start_campaign` (`repo` required, plus ONE of
 `epic_ref` / `items`; optional `pause_policy` of `pause_campaign` (default) /

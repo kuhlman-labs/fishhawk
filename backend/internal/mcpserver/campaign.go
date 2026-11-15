@@ -66,7 +66,15 @@ type StartCampaignInput struct {
 // StartCampaignOutput carries the created campaign row.
 type StartCampaignOutput struct {
 	Campaign Campaign `json:"campaign"`
+	// CheckoutWarnings is the checkout-hygiene report on the bound working_dir
+	// (#5214), in the campaign wording (checkoutSurfaceCampaign). Advisory and
+	// best-effort: it never changes whether the campaign is created.
+	CheckoutWarnings []string `json:"checkout_warnings,omitempty" jsonschema:"present only when the bound working_dir is a git checkout that is dirty, has uncommitted .fishhawk/ edits (INVISIBLE to the campaign's runs until committed and pushed to the base branch: they fetch the workflow spec from the forge at workflow_ref, not from the checkout), or whose HEAD is detached, on another branch, or ahead of or behind the remote default branch as last fetched (refs/remotes/origin/HEAD). Advisory: never changes whether the campaign is created. Absent for a clean checkout on its base, a directory that is not a git checkout, or no working_dir"`
 }
+
+// campaignCheckoutProbe is the campaign-start verbs' checkout-hygiene probe
+// seam (#5214); tests stub it.
+var campaignCheckoutProbe = probeCheckout
 
 // --- fishhawk_preview_campaign (#3647) ---
 
@@ -321,7 +329,9 @@ start alongside the work it was meant to follow; add a real edge and preview
 again. Pre-flight: start from a clean, current checkout of the base branch, and
 re-run the preview after any tracker edit, because the DAG is assembled from
 the tracker as it reads at this call (a later status poll only ever ADDS
-edges).
+edges). checkout_warnings on the result reports a dirty or off-base
+working_dir; an uncommitted .fishhawk/ edit is invisible to the campaign's runs
+until it is committed and pushed, because they fetch the spec from the forge.
 
 repo (owner/name) is required, plus ONE of epic_ref / items. pause_policy is
 optional — pause_campaign (the default, block the whole campaign at a gate
@@ -816,7 +826,12 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 		return nil, StartCampaignOutput{}, fmt.Errorf("create campaign: %w", err)
 	}
-	return nil, StartCampaignOutput{Campaign: *created}, nil
+	// Checkout hygiene (#5214), after the create so it can never change the
+	// outcome; re-confined at probe time like start_run's.
+	return nil, StartCampaignOutput{
+		Campaign:         *created,
+		CheckoutWarnings: r.checkoutWarningsFor(ctx, campaignCheckoutProbe, checkoutSurfaceCampaign, workingDir),
+	}, nil
 }
 
 // --- fishhawk_start_campaign_item_run (E26.2 / #1481) ---
@@ -856,6 +871,12 @@ type StartCampaignItemRunOutput struct {
 	// the response is reduced hardest. Null only against a backend that predates
 	// it.
 	RunnerKindResolution *campaignRunnerKindResolution `json:"runner_kind_resolution" jsonschema:"the runner kind the minted run was given and why: source 'explicit' (this call's runner_kind), 'campaign' (the campaign's recorded runner_kind), 'campaign_working_dir' (the campaign records none but binds working_dir, so local) or 'default' (neither, so github_actions). Null only against a backend that predates it"`
+	// CheckoutWarnings is the checkout-hygiene report on the minted run's bound
+	// working_dir (#5214), in the campaign wording. Deliberately NOT omitempty,
+	// for the same floor-tier reason as RunnerKindResolution: it is set before
+	// bounding, so it counts against the byte budget, and its floorCarryTable
+	// row (classComputed) itemises any reduction.
+	CheckoutWarnings []string `json:"checkout_warnings" jsonschema:"the checkout-hygiene report on the minted run's bound working_dir: a dirty tree, uncommitted .fishhawk/ edits (INVISIBLE to the run until committed and pushed to the base branch: it fetches the workflow spec from the forge at workflow_ref, not from the checkout), or a HEAD that is detached, on another branch, or ahead of or behind the remote default branch as last fetched (refs/remotes/origin/HEAD). Advisory: never changes whether the run is minted. Null for a clean checkout on its base, a directory that is not a git checkout, or no binding"`
 	// Elisions is the ADR-077 byte-bound block (#2510). This is the verb that
 	// concretely broke on 2026-08-07 at 75,963 characters — a mutating verb
 	// whose run had ALREADY been minted when the response failed to render — so
@@ -903,7 +924,10 @@ item. Pass it here only when the campaign carries no binding, or when this one
 item genuinely executes in a DIFFERENT checkout (a differing value is accepted as
 a deliberate override, and the minted run row records what actually applied).
 Whatever resolves binds the minted run, so
-run_stage/dispatch_stage/run_children/drive_run for that item all inherit it. An
+run_stage/dispatch_stage/run_children/drive_run for that item all inherit it.
+checkout_warnings on the result reports a dirty or off-base bound checkout; an
+uncommitted .fishhawk/ edit is invisible to the run until it is committed and
+pushed, because the run fetches its spec from the forge at workflow_ref. An
 item whose resolved runner_kind is local with neither a campaign binding nor a
 per-item value is refused
 working_dir_required rather than falling through to the client's cwd; a
@@ -1002,8 +1026,19 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 		}
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
 	}
+	// Checkout hygiene (#5214) on the binding the minted run actually carries,
+	// else this call's explicit value. Set BEFORE bounding (approval condition
+	// C2), so the warnings count against the byte budget and the floor tier
+	// carries them.
+	probeDir := res.Run.WorkingDir
+	if probeDir == "" {
+		probeDir = workingDir
+	}
 	bounded, berr := boundRunRowOutput(
-		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item, RunnerKindResolution: res.RunnerKindResolution}, res.Run.ID, r.responseBudget(req),
+		StartCampaignItemRunOutput{
+			Run: res.Run, Item: res.Item, RunnerKindResolution: res.RunnerKindResolution,
+			CheckoutWarnings: r.checkoutWarningsFor(ctx, campaignCheckoutProbe, checkoutSurfaceCampaign, probeDir),
+		}, res.Run.ID, r.responseBudget(req),
 		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
 		// The campaign id is not carried on the CampaignItem, so the floor's

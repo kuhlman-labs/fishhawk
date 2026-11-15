@@ -1196,6 +1196,10 @@ func campaignItemFloorFixture(runID string, dependsOn int) StartCampaignItemRunO
 			UpdatedAt: time.Date(2026, 8, 7, 12, 5, 0, 0, time.UTC),
 		},
 		RunnerKindResolution: &campaignRunnerKindResolution{RunnerKind: "local", Source: "campaign_working_dir"},
+		// The non-omitempty checkout_warnings (#5214) must survive the floor too.
+		CheckoutWarnings: []string{
+			`checkout hygiene: working_dir "/work/repo" has 1 uncommitted or untracked path(s) (git status): " M a.go".`,
+		},
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -178,6 +179,159 @@ func TestStartCampaignItemRun_SurfacesRunnerKindResolution(t *testing.T) {
 	}
 	if fb.startCampaignItemRunBody.RunnerKind != "" {
 		t.Errorf("POST body runner_kind = %q, want empty (never defaulted client-side)", fb.startCampaignItemRunBody.RunnerKind)
+	}
+}
+
+// campaignScratchCheckout is a real git checkout on main with
+// refs/remotes/origin/HEAD resolving to origin/main at HEAD, so it is clean on
+// its base. dirtySpec adds an untracked .fishhawk/workflows.yaml and moves HEAD
+// to a feature branch, so W1, W2 and W3 all fire.
+func campaignScratchCheckout(t *testing.T, dirtySpec bool) string {
+	t.Helper()
+	dir := newRealGitRepo(t)
+	realGit(t, dir, "branch", "-M", "main")
+	realGit(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+	realGit(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	if dirtySpec {
+		realGit(t, dir, "checkout", "-q", "-b", "feature")
+		if err := os.MkdirAll(filepath.Join(dir, ".fishhawk"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".fishhawk", "workflows.yaml"), []byte("version: 2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// assertCampaignCheckoutWording pins approval condition C1 on a campaign
+// surface's warnings for the dirty .fishhawk/ fixture: W2 says the edit is
+// INVISIBLE until committed and pushed, and neither W2 nor W3 claims the spec
+// was read from (or pinned out of) the checkout.
+func assertCampaignCheckoutWording(t *testing.T, ws []string) {
+	t.Helper()
+	text := strings.Join(ws, "\n")
+	for _, want := range []string{w1Marker, `".fishhawk/`, w2Marker, "INVISIBLE to the run until it is committed and pushed to the base branch", "from the forge at workflow_ref", w3Marker, `HEAD is on branch "feature", not "main"`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("campaign checkout_warnings must say %q:\n%s", want, text)
+		}
+	}
+	for _, bad := range []string{"WORKING-TREE", "This run pinned", "read from this checkout"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("campaign checkout_warnings must not claim %q:\n%s", bad, text)
+		}
+	}
+}
+
+// TestStartCampaign_CheckoutWarnings_Wired crosses startCampaign → the real
+// probe → checkout_warnings against a real scratch checkout (criterion
+// start-campaign-reports-checkout-warnings): a dirty .fishhawk/ fixture off its
+// base reports in the campaign wording, a clean checkout on its base omits the
+// field, and the campaign is created either way.
+func TestStartCampaign_CheckoutWarnings_Wired(t *testing.T) {
+	start := func(t *testing.T, wd string) StartCampaignOutput {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo: "kuhlman-labs/fishhawk", EpicRef: "#25", WorkingDir: wd,
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if out.Campaign.ID == "" || fb.createCampaignBody.WorkingDir != wd {
+			t.Fatalf("the campaign must be created with its binding regardless of hygiene: %+v / %+v", out.Campaign, fb.createCampaignBody)
+		}
+		return out
+	}
+	t.Run("dirty_fishhawk_off_base_warns_campaign_wording", func(t *testing.T) {
+		assertCampaignCheckoutWording(t, start(t, campaignScratchCheckout(t, true)).CheckoutWarnings)
+	})
+	t.Run("clean_on_base_omits_field", func(t *testing.T) {
+		out := start(t, campaignScratchCheckout(t, false))
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.CheckoutWarnings != nil || strings.Contains(string(raw), "checkout_warnings") {
+			t.Errorf("a clean checkout on its base must omit checkout_warnings: %s", raw)
+		}
+	})
+}
+
+// TestStartCampaignItemRun_CheckoutWarnings_Wired crosses startCampaignItemRun
+// → the real probe → checkout_warnings on the binding the MINTED run carries
+// (here the campaign's, with no per-item value), in the campaign wording. A
+// clean checkout leaves the non-omitempty field null (approval condition C2
+// keeps it on the wire), and the run is minted either way.
+func TestStartCampaignItemRun_CheckoutWarnings_Wired(t *testing.T) {
+	start := func(t *testing.T, bound string) StartCampaignItemRunOutput {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		runID := uuid.NewString()
+		fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+			Run:  Run{ID: runID, Repo: "x/y", State: "pending", WorkingDir: bound},
+			Item: CampaignItem{ID: uuid.NewString(), IssueRef: "issue:1", RunID: runID, State: "running"},
+		}
+		r := newResolver(srv, nil)
+		_, out, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+			CampaignID: uuid.NewString(), IssueRef: "issue:1", WorkflowID: "feature_change",
+		})
+		if err != nil {
+			t.Fatalf("startCampaignItemRun: %v", err)
+		}
+		if out.Run.ID != runID {
+			t.Fatalf("the run must be minted regardless of hygiene: %+v", out.Run)
+		}
+		return out
+	}
+	t.Run("dirty_fishhawk_off_base_warns_campaign_wording", func(t *testing.T) {
+		assertCampaignCheckoutWording(t, start(t, campaignScratchCheckout(t, true)).CheckoutWarnings)
+	})
+	t.Run("clean_on_base_null_on_the_wire", func(t *testing.T) {
+		out := start(t, campaignScratchCheckout(t, false))
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.CheckoutWarnings != nil || !strings.Contains(string(raw), `"checkout_warnings":null`) {
+			t.Errorf("a clean checkout must render checkout_warnings null (non-omitempty): %s", raw)
+		}
+	})
+}
+
+// TestStartCampaignItemRun_CheckoutWarnings_SurviveFloor pins approval
+// condition C2 at the ADR-077 floor tier: warnings set before bounding are
+// carried in reduced form (truncated to floorCarryCollectionCap, each capped),
+// never zeroed, and the reduction is itemised as a computed entry with no
+// pointer.
+func TestStartCampaignItemRun_CheckoutWarnings_SurviveFloor(t *testing.T) {
+	in := campaignItemFloorFixture(uuid.NewString(), 1)
+	in.CheckoutWarnings = nil
+	for i := 0; i < floorCarryCollectionCap+2; i++ {
+		in.CheckoutWarnings = append(in.CheckoutWarnings, fmt.Sprintf("checkout hygiene: warning %d %s", i, strings.Repeat("w", 200)))
+	}
+	out := boundCampaignItemFloor(t, in, uuid.NewString(), mcpConvergenceFloorBytes)
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("fixture must reach the floor tier: %+v", out.Elisions)
+	}
+	if len(out.CheckoutWarnings) == 0 || len(out.CheckoutWarnings) > floorCarryCollectionCap {
+		t.Fatalf("checkout_warnings must survive the floor truncated to %d, got %d", floorCarryCollectionCap, len(out.CheckoutWarnings))
+	}
+	if !strings.HasPrefix(out.CheckoutWarnings[0], "checkout hygiene: warning 0") {
+		t.Errorf("the carried warnings must be the leading originals, got %q", out.CheckoutWarnings[0])
+	}
+	var entry *ElidedField
+	for i := range out.Elisions.Fields {
+		if f := &out.Elisions.Fields[i]; f.Field == "checkout_warnings" {
+			entry = f
+		}
+	}
+	if entry == nil {
+		t.Fatalf("the floor must itemise the checkout_warnings reduction: %+v", out.Elisions.Fields)
+	}
+	if entry.Class != string(classComputed) || entry.Pointer != "" {
+		t.Errorf("checkout_warnings reduction must be computed with no pointer, got %+v", *entry)
 	}
 }
 

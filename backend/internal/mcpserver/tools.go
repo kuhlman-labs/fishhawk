@@ -3733,10 +3733,8 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// per-comment capped). This is the MCP-path visibility surface; runs with no
 	// tool result (webhook / campaign) get the server-side WARN in fillIssueContext.
 	warnings = append(warnings, overCapCommentWarnings(issueContext)...)
-	// Total-budget warning (#5214): the per-comment warning above cannot see
-	// that the comments TOGETHER exceed prompt.MaxTotalIssueCommentBytes, which
-	// silently drops the OLDEST ones from the plan prompt.
-	warnings = append(warnings, issueCommentBudgetWarnings(issueContext)...)
+	// The total-budget warning (#5214) is composed after the create, below: on
+	// an idempotent replay it must read the replayed run's own snapshot.
 
 	// (7) Validate the trigger_source / issue_context pairing.
 	// Mirrors the backend handler's check — better to fail here
@@ -3776,16 +3774,6 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 		boundWorkingDir = abs
 	}
 
-	// Checkout hygiene (#5214): best-effort, offline report of a dirty tree,
-	// uncommitted .fishhawk/ edits, or a HEAD off the remote default branch.
-	// It runs AFTER the HTTP admission and confinement checks above, so it never
-	// touches a path outside the allowed roots, and it never fails the create.
-	if boundWorkingDir != "" {
-		if st, ok := startRunCheckoutProbe(ctx, boundWorkingDir); ok {
-			warnings = append(warnings, checkoutHygieneWarnings(checkoutSurface, boundWorkingDir, st)...)
-		}
-	}
-
 	// (8) Hand off to the backend.
 	created, idempotent, err := r.api.StartRun(ctx, StartRunParams{
 		Repo:           in.Repo,
@@ -3808,6 +3796,30 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)
 	}
+
+	// Total-budget warning (#5214): the per-comment warning above cannot see
+	// that the comments TOGETHER exceed prompt.MaxTotalIssueCommentBytes, which
+	// silently drops the OLDEST ones from the plan prompt. An idempotent replay
+	// returns an EXISTING run whose prompt reads the issue_context captured at
+	// its original creation, so the count is computed from that snapshot (none
+	// on the response: no warning), not from this call's fresh fetch.
+	budgetContext := issueContext
+	if idempotent {
+		budgetContext = created.IssueContext
+	}
+	warnings = append(warnings, issueCommentBudgetWarnings(budgetContext)...)
+
+	// Checkout hygiene (#5214): best-effort, offline report of a dirty tree,
+	// uncommitted .fishhawk/ edits, or a HEAD off the remote default branch. It
+	// never fails the create. checkoutWarningsFor re-confines the path at probe
+	// time over HTTP and runs git on the RESOLVED path, so a symlink swapped in
+	// after the admission check above cannot point the probe outside the
+	// allowed roots. A replay reports the checkout at this call without
+	// claiming it is what the existing run pinned.
+	if idempotent {
+		checkoutSurface = checkoutSurfaceStartRunReplay
+	}
+	warnings = append(warnings, r.checkoutWarningsFor(ctx, startRunCheckoutProbe, checkoutSurface, boundWorkingDir)...)
 
 	out := StartRunOutput{Run: *created, Idempotent: idempotent}
 	// Best-effort periodic-budget status (#693). A parse failure on the
