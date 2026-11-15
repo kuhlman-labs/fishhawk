@@ -503,7 +503,8 @@ components:
           description: |
             The FULL rendered filing body the captain reviews: neutralized agent
             prose, the server provenance section, the comms draft marker and
-            the intake advisory section as of ingest.
+            the intake advisory section as of ingest (absent when the draft's
+            type resolves `intake_section` to `omit`, `adr` by default).
         labels:
           type: array
           items: { type: string }
@@ -1656,7 +1657,10 @@ components:
         candidates, a suggested parent epic when the filing declared none, and a provisional
         charter-anchored structural score. The same signals are also appended to the created
         item body as a rendered advisory section plus a hidden `<!-- fishhawk-intake:v1 … -->`
-        marker, so a later grooming sweep reads the analysis back instead of redoing it.
+        marker, so a later grooming sweep reads the analysis back instead of redoing it. The
+        exception is a type whose work-management `intake_section` resolves to `omit` (the
+        type keyed `adr` by default, #5223): its body carries neither, and these signals are
+        still returned.
 
         NOTHING WAS ACTED ON. No item was closed, merged, relabelled or transitioned on the
         strength of a duplicate candidate; the dedup decision stays a human/workflow action.
@@ -24431,7 +24435,8 @@ paths:
         installation resolution) and the same conventions + intake core
         (`{epic}`/`{n}` derivation, the parent-epic capacity guard, area/phase
         derivation, sequential-number discovery, the conventions Apply, the
-        intake hook and the rendered advisory section) — and returns what a
+        intake hook and the per-type rendered advisory section, which a type
+        whose `intake_section` resolves to `omit` skips) — and returns what a
         filing WOULD produce, without filing it (#3774, E81.4).
 
         **Creates and writes nothing.** The provider's File call, the only

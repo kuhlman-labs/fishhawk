@@ -318,6 +318,11 @@
           "enum": ["required", "optional", "none"],
           "default": "optional",
           "description": "Whether items of this type link to a parent epic. required = a parent epic relation must be supplied; none = epic linking does not apply."
+        },
+        "intake_section": {
+          "type": "string",
+          "enum": ["append", "omit"],
+          "description": "Whether the intake advisory section and its hidden fishhawk-intake marker are appended to a filed body of this type. append = render them when the intake signals carry findings; omit = never render them. When absent, the type keyed `adr` defaults to omit (decision records stay clean, matching the adr-keyed numbering rule) and every other type defaults to append; the default depends on the type key, so no schema default is declared. The intake signals are still computed and returned on the filing response, the work_item_filed audit entry and the preview either way."
         }
       }
     },

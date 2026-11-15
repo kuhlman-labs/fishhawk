@@ -275,18 +275,22 @@ func sortedCopy(xs []string) []string {
 // body (modulo the marker's duration_ms), labels (order-insensitive), number —
 // and its intake must equal the 201's, while the preview itself creates
 // nothing and writes no audit. The numbered (adr) subcase makes number parity
-// non-vacuous.
+// non-vacuous, and it also pins the per-type intake_section gate (#5223): the
+// shipped adr type omits the advisory section, so the preview and the filing
+// must BOTH lack it while the intake findings are still reported on each.
 func TestPreviewWorkItem_MatchesSubsequentFiling(t *testing.T) {
 	cases := map[string]struct {
 		draft      workItemRequest
 		wantNumber int
+		// wantSection is whether the advisory section appears in the body.
+		wantSection bool
 	}{
-		"chore": {draft: pvStandardDraft(), wantNumber: 0},
+		"chore": {draft: pvStandardDraft(), wantNumber: 0, wantSection: true},
 		"numbered adr": {draft: workItemRequest{
 			Repo:    "kuhlman-labs/fishhawk",
 			Type:    "adr",
 			Summary: "Add the widget endpoint",
-		}, wantNumber: 80},
+		}, wantNumber: 80, wantSection: false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -318,8 +322,11 @@ func TestPreviewWorkItem_MatchesSubsequentFiling(t *testing.T) {
 			if got := auditCount(); got != before {
 				t.Fatalf("audit entries = %d after the preview, want %d unchanged — a preview writes no audit", got, before)
 			}
-			if !pv.Intake.HasFindings() || !strings.Contains(pv.Body, intakegroom.SectionHeading) {
+			if !pv.Intake.HasFindings() {
 				t.Fatalf("the preview carries no intake findings, so the equality below would be vacuous: %+v", pv.Intake)
+			}
+			if got := strings.Contains(pv.Body, intakegroom.SectionHeading); got != tc.wantSection {
+				t.Fatalf("preview body advisory section present = %v, want %v:\n%s", got, tc.wantSection, pv.Body)
 			}
 
 			// Now FILE the same draft (run-scoped, so the filing is audited).
@@ -343,6 +350,9 @@ func TestPreviewWorkItem_MatchesSubsequentFiling(t *testing.T) {
 			}
 			if normalizeDuration(pv.Body) != normalizeDuration(got.Item.Body) {
 				t.Errorf("preview body differs from the filed body beyond duration_ms:\n--- preview\n%s\n--- filed\n%s", pv.Body, got.Item.Body)
+			}
+			if hasMarker := strings.Contains(got.Item.Body, intakegroom.MarkerPrefix); hasMarker != tc.wantSection {
+				t.Errorf("filed body intake marker present = %v, want %v:\n%s", hasMarker, tc.wantSection, got.Item.Body)
 			}
 			if a, b := sortedCopy(pv.Labels), sortedCopy(got.Item.Classification.Labels); strings.Join(a, ",") != strings.Join(b, ",") {
 				t.Errorf("preview labels = %v, filed labels = %v", a, b)

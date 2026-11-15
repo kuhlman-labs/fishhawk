@@ -13,6 +13,7 @@ Three pure operations:
   - a **symbol-set scope statement** synthesized from the phase's `scope_hint` (prose like `migrate consumers of Foo to NewFoo …`, or a package-level fallback derived from the phase's declared files — **never a stale file list**, which goes wrong as the migration proceeds),
   - the phase's 0-based `depends_on` edges copied verbatim (the hook resolves them to sibling `#N` at filing time in wave order),
   - the parent (run) issue and design issue (`#2008`) references, rendered into the body,
+  - a bounded **parent plan context** block carrying the approved parent plan's summary and numbered approach (#5223; see below),
   - `IsContract` on the **terminal** phase.
 
   The **contract child** additionally carries the parent's acceptance criteria (it is the acceptance carrier) and, **by construction, no `Closes #<parent>` line**: a `Closes` line in a child *issue* body is functionless — GitHub auto-closes an issue only from a PR/commit and only the enclosing issue. The live parent-close mechanism is deferred to follow-up **#2062** (E50.6); every child body says so and references the parent without closing it.
@@ -30,6 +31,20 @@ Three pure operations:
   Both are strings only and are **never written to disk** — they ride the `split_children_filed` audit payload and surface via `fishhawk_get_plan`.
 
 - **`PhaseCapViolations(SplitProposal, cap) []PhaseCapViolation`** (#2412) — the pure phase-cap validator behind the refusal defect #2412 reports. It compares **each phase's own** declared `scope.files` count against the resolved implement `cap` and returns one `PhaseCapViolation{Index, Title, DeclaredCount, Cap}` per phase over the cap, in phase order. It **fails open exactly like `Classify`**: `cap <= 0` (an unresolved cap) returns `nil` so an unresolved cap never manufactures a violation; a phase with a nil/empty scope is skipped defensively (`checkSplitProposal` already requires a non-empty per-phase scope). `PhaseCapViolation.String()` renders the operator-facing one-liner shared by the plan-gate advisory, the refusal audit payload, and the parent refusal comment — one phrasing, no drift. The server hook (`split_filing.go`) calls this immediately after resolving the cap and **files zero children** when any phase is over cap (the #2410 lead-phase-over-cap case), recording a `split_filing_refused` marker instead.
+
+## Parent plan context (#5223)
+
+`BuildInput.ParentSummary` and `BuildInput.ParentApproach` carry the approved parent plan's `summary` and `approach` (the server hook populates them from the loaded plan artifact). Every child `Proposal` renders them, after the scope statement, as a block opened by `ParentPlanContextHeading` (`**Parent plan context.**`): one line saying this is the parent plan's summary and full approach for context, then `Summary: …`, then each step as `N. description` in plan order. A step keeps its own number (its 1-based position when unset) and its description is flattened onto one line. A blank summary with no steps omits the block, so such a plan files byte-identical pre-#5223 bodies.
+
+**Why the whole parent approach.** plan-standard-v1 split phases declare no approach of their own (`plan.SplitPhase` carries `title`, `scope_hint`, `scope` and `depends_on` only), so "each child carries its phase's approach" is read as "each child carries the whole parent approach", labelled as context beside the phase's own symbol-set scope. That reading is inferred, not stated by the schema; the operator accepted it at the #5223 plan gate.
+
+**The bound, and the order it degrades in.** The block is at most `MaxParentPlanContextChars` (8000) characters, counted in runes and including its heading and any truncation note, because the same block rides all N children. The value is a body-size judgement, not a forge limit. When the full block overflows, `renderParentPlanContext` degrades so the step list stays complete for as long as possible:
+
+1. **Summary first.** The summary is shortened (marked `…`), or omitted, while every step stays whole.
+2. **Then step descriptions.** The summary is omitted, **every step number is kept**, and each description longer than the largest common per-step limit that fits is cut and marked `…`. Short steps stay whole.
+3. **Not even one line per step fits.** The block says so explicitly, naming the step count, instead of listing a silently partial approach.
+
+Every truncated form ends with a note naming what was cut and pointing at the parent's Fishhawk run for the full plan. Pinned by `TestBuildChildSpecs_ParentPlanContextBounded`, `TestRenderParentPlanContext_SummaryOmittedKeepsStepsWhole` and, through the server hook, `TestFileSplitProposalChildren_ChildBodiesCarryParentApproach`. Split-child adoption keys on the hidden `SplitChildKey` marker, never on body text, so the block does not affect re-approval adoption.
 
 ## Landability non-guarantee (#2412)
 

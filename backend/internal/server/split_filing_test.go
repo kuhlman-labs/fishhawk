@@ -2080,3 +2080,90 @@ func TestSplitFiling_SequentialReapprovalFilesAtMostOnce(t *testing.T) {
 		t.Errorf("parent comments = %d, want 1", len(rec.comments))
 	}
 }
+
+// splitPlanWithApproachBytes is splitPlanBytes(withProposal=true) with the
+// parent plan's summary and approach replaced, for the #5223 parent-context
+// seam test.
+func splitPlanWithApproachBytes(t *testing.T, summary string, approach []plan.ApproachStep) []byte {
+	t.Helper()
+	var p plan.Plan
+	if err := json.Unmarshal(splitPlanBytes(t, true), &p); err != nil {
+		t.Fatalf("decode base split plan: %v", err)
+	}
+	p.Summary = summary
+	p.Approach = approach
+	b, err := json.Marshal(&p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// TestFileSplitProposalChildren_ChildBodiesCarryParentApproach (C4, #5223) is
+// the cross-boundary seam: the approved plan artifact goes through
+// loadApprovedPlanForRun, splitfiling.BuildChildSpecs,
+// refinement.FilingRequestForChild, workmgmt.Apply and provider.File, and every
+// FILED child body carries the parent plan's summary and numbered approach. The
+// over-cap row (approval condition H2) asserts every step number survives the
+// bound in the filed bodies.
+//
+// COUNTERFACTUAL: deleting the ParentSummary/ParentApproach population in
+// split_filing.go's BuildInput literal reddens both rows while the splitfiling
+// unit tests stay green, so this test is the one that decides the wiring.
+func TestFileSplitProposalChildren_ChildBodiesCarryParentApproach(t *testing.T) {
+	t.Run("approach within the bound is carried whole", func(t *testing.T) {
+		approach := []plan.ApproachStep{
+			{Step: 1, Description: "OCELOT add NewFoo beside Foo"},
+			{Step: 2, Description: "MARMOT migrate the consumers"},
+			{Step: 3, Description: "TAPIR delete Foo"},
+		}
+		h := newSplitFilingHarness(t, splitFilingConfig{
+			withSpec: true, reachabilityDerived: 2,
+			planOverride: splitPlanWithApproachBytes(t, "KESTREL rename Foo to NewFoo", approach),
+		})
+		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+		if len(h.provider.reqs) != 3 {
+			t.Fatalf("filed %d children, want 3", len(h.provider.reqs))
+		}
+		for _, r := range h.provider.reqs {
+			for _, want := range []string{
+				splitfiling.ParentPlanContextHeading,
+				"Summary: KESTREL rename Foo to NewFoo",
+				"1. OCELOT add NewFoo beside Foo",
+				"2. MARMOT migrate the consumers",
+				"3. TAPIR delete Foo",
+			} {
+				if !strings.Contains(r.Item.Body, want) {
+					t.Errorf("filed child %q body is missing %q:\n%s", r.Item.Title, want, r.Item.Body)
+				}
+			}
+		}
+	})
+	t.Run("approach over the bound keeps every step number", func(t *testing.T) {
+		approach := make([]plan.ApproachStep, 0, 30)
+		for i := 1; i <= 30; i++ {
+			approach = append(approach, plan.ApproachStep{Step: i, Description: fmt.Sprintf("WOMBAT-%02d %s", i, strings.Repeat("z", 600))})
+		}
+		h := newSplitFilingHarness(t, splitFilingConfig{
+			withSpec: true, reachabilityDerived: 2,
+			planOverride: splitPlanWithApproachBytes(t, "a long rename", approach),
+		})
+		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+		if len(h.provider.reqs) != 3 {
+			t.Fatalf("filed %d children, want 3", len(h.provider.reqs))
+		}
+		for _, r := range h.provider.reqs {
+			for i := 1; i <= 30; i++ {
+				if !strings.Contains(r.Item.Body, fmt.Sprintf("\n%d. WOMBAT-%02d ", i, i)) {
+					t.Errorf("filed child %q body is missing approach step %d", r.Item.Title, i)
+				}
+			}
+			if !strings.Contains(r.Item.Body, "every approach step is kept, with long step descriptions shortened") {
+				t.Errorf("filed child %q body must carry the truncation note", r.Item.Title)
+			}
+			if strings.Contains(r.Item.Body, strings.Repeat("z", 600)) {
+				t.Errorf("filed child %q body carries an uncut over-bound step", r.Item.Title)
+			}
+		}
+	})
+}

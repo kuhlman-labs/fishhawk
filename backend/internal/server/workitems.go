@@ -555,6 +555,11 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 // TestDeferConcern_IntakeSignalsRenderedThroughSharedCore pins it behaviourally
 // through one of those secondary paths (binding approval condition L5).
 //
+// The one gate on the render is per-TYPE, not per-path (#5223): a type whose
+// intake_section resolves to omit (the type keyed adr by default) files no
+// advisory section on any path, while its signals are still computed and
+// returned. TestFileWorkItem_IntakeSectionPerType pins it.
+//
 // Since #3774 it is prepareWorkItem (every pre-File step) followed by the File
 // tail below; previewWorkItem shares the first half and never runs the second.
 func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target, owner, name string) (*workmgmt.WorkItem, *workmgmt.CreatedItem, *workItemError, *intakegroom.Signals) {
@@ -607,7 +612,7 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 
 // preparedWorkItem is everything prepareWorkItem resolves for one filing: the
 // rendered item exactly as provider.File would receive it (advisory section
-// included), the allocated sequential number (0 when the type is not
+// included unless the type's intake_section resolves to omit), the allocated sequential number (0 when the type is not
 // numbered), the resolved provider and the intake signals.
 type preparedWorkItem struct {
 	item     workmgmt.WorkItem
@@ -619,10 +624,10 @@ type preparedWorkItem struct {
 // prepareWorkItem runs every step of the filing core BEFORE provider.File
 // (#3774): the source_refs check, {epic}/{n} derivation, the parent-epic
 // capacity guard, area/phase derivation, sequential-number discovery,
-// workmgmt.Apply, provider resolution, the intake hook and RenderBody. It is
-// the half applyAndFileWorkItemWithIntake (which files) and previewWorkItem
-// (which never does) share, so a preview renders byte-for-byte what a filing
-// would send.
+// workmgmt.Apply, provider resolution, the intake hook and the per-type
+// RenderBody. It is the half applyAndFileWorkItemWithIntake (which files) and
+// previewWorkItem (which never does) share, so a preview renders byte-for-byte
+// what a filing would send.
 //
 // LOCK-RELEASE CONTRACT. The child-number and sequential-number locks taken
 // here are the ones that must span File, so on SUCCESS they are still held and
@@ -831,7 +836,17 @@ func (s *Server) prepareWorkItem(ctx context.Context, filing workmgmt.FilingRequ
 	// RenderBody is a no-op when the signals carry no findings, so a degraded
 	// hook leaves the body byte-identical to what this core produced before
 	// #2239.
-	item.Body = intakegroom.RenderBody(item.Body, signals)
+	//
+	// The render is per-type (#5223): a type whose intake_section resolves to
+	// omit — the type keyed adr by default — files a body with neither the
+	// advisory section nor the hidden fishhawk-intake marker. Only the render
+	// is gated. The signals above are still computed and returned, so the 201
+	// intake, the work_item_filed audit summary and the preview report them for
+	// every type. Gating here, at the one chokepoint every filing path and the
+	// preview share, keeps them all consistent.
+	if !conv.IntakeSectionOmitted(filing.Type) {
+		item.Body = intakegroom.RenderBody(item.Body, signals)
+	}
 
 	prepared = true
 	var once sync.Once
