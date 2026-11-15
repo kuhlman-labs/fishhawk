@@ -1373,10 +1373,16 @@ is best-effort (a failed append is WARN-logged while the stage still advances). 
 failure newer than the newest clean integration, and the newest clean `slices_integrated` not covering every child
 (`unintegrated_child_run_ids` non-empty). That covers both the single-wave case where NO record survives (#4165) and a
 multi-wave fan-out whose FINAL append was lost while an earlier between-wave record survives (#4221); the no-record
-case is the special case where nothing is covered. Every settle path integrates BEFORE stamping the parent's implement
-stage succeeded (`runConsolidation` in `server/consolidate.go`, and the `childcompletion` sweeper's `resolveParent`), so
-a succeeded stage means the terminal fan-in already ran and there is no transient window where a progressing fan-in
-reads as wedged. There the server refuses acceptance 409 `acceptance_integration_incomplete` and nothing re-integrates
+case is the special case where nothing is covered. Every settle path appends `slices_integrated` BEFORE it calls
+`SettleAwaitingChildrenStage` to stamp the parent's implement stage succeeded — `runConsolidation` in
+`server/consolidate.go`, the `childcompletion` sweeper's `resolveParent`, and the orchestrator's event-driven
+`awaiting_children` arm in `orchestrator.go` — so a succeeded stage means the terminal fan-in already ran. One read-order
+window remains, and `await_children` closes it ([#5222](https://github.com/kuhlman-labs/fishhawk/issues/5222)): it
+reads the fan-in snapshot BEFORE the parent's stage, so a settle that lands between the two reads pairs a stale
+no-record snapshot with a succeeded stage. When the wedge predicate holds, `awaitChildrenEvaluate` therefore re-reads
+the snapshot AFTER the stage read and names the recovery only if the fresh snapshot still shows the wedge; otherwise
+(the covering record landed, or the re-read failed) it keeps polling, and the next tick releases `children_settled`.
+On the wedge the server refuses acceptance 409 `acceptance_integration_incomplete` and nothing re-integrates
 automatically (`fishhawk_consolidate_slices` answers 409 `not_awaiting_children`). The old inference misread the
 no-record snapshot as authority-less and offered the dispatch the server refuses, and the pre-#4221 predicate (which
 required NO record of any kind) sent the lost-final-record snapshot to the generic arm, which advised re-driving an
