@@ -1,0 +1,14 @@
+id: scenario:issue-5224/cleanup-merged-help-is-safe
+statement: '`scripts/cleanup-merged --help` exits 0 and prints usage naming --help and --dry-run without fetching or deleting; `scripts/cleanup-merged --bogus` exits 2 naming the argument and deletes nothing.'
+verify_hint: 'CLI: run both commands inside a throwaway git repository; read the exit codes and stdout/stderr; compare `git branch` output before and after.'
+steps: Throwaway repo with local bare origin, branches main/merged1/unmerged1; ran tree scripts/cleanup-merged --help and --bogus; compared git branch; --help with origin removed under GIT_TRACE showed no fetch.
+assertions:
+    expected: as statement
+    observed_at_record: '--help exit 0 usage naming --dry-run and --help; --bogus exit 2 ''unknown argument: --bogus''; branches unchanged.'
+    repro_handle: scripts/cleanup-merged --help; scripts/cleanup-merged --bogus
+origin:
+    issue: 5224
+    pr: 5400
+    run_id: 2a293e02-92c0-4299-a0f2-c2e01b707ac9
+    head_sha: 7992ac9d079277e559cfaea4957810077a0d66dd
+    recorded_at: 2026-11-15T18:22:11Z
