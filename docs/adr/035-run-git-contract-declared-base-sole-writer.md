@@ -57,3 +57,23 @@ Parent epic: #389
 ## Decision
 
 **Accepted (2026-06-07).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-07).**".
+
+## Amendment A1 (accepted 2026-11-14) — an operator-vouched commit is an attributed exception to the sole-writer rule
+
+This amendment recognises one exception to rule 2 and states how rules 3 and 4 apply to it. It adds no verification requirement.
+
+**The rule it qualifies.** Rule 2 says "the sanctioned runner is the only writer of the run branch" and "A commit not authored by this run is a contract violation." The operator's vouch already admits a commit the runner did not write. `fishhawk_vouch_commit` records an `operator_commit_vouched` audit entry naming the run, the full commit SHA and the operator's reason (`backend/internal/server/vouch.go:21-38`, `:52-59`). The reported-head ledger then counts that SHA as run lineage (`backend/internal/server/lineage.go:653-669`). This amendment makes that exception part of the contract.
+
+**The exception.** A commit on a run branch that an operator has vouched is attributable to the run by that declaration. It is not a contract violation under rule 2, and rule 4's halt does not apply to it. The exception is **attributed**: the audit entry records the declaring subject as its actor, with the reason (`vouch.go:306-334`).
+- **Who may vouch.** A vouch is made on an operator credential that carries `write:stages`. A run-bound agent token is refused, even for its own run (`vouch.go:210-221`, `:222-236`). This amendment does not place the vouch on an ADR-148 tier, so it keeps that guard.
+- **What it proves.** A vouch attributes; it does not verify. The record is kept for any well-formed full SHA, whether or not the commit is on the branch (`vouch.go:137-147`, `:173-177`). ADR-116 says the generic vouch "verifies nothing" (`docs/adr/116-fan-in-conflict-recovered-in-place.md:114`). Rule 3 is therefore not met by a vouch. The exception relaxes rule 3 for attribution only: lineage and landing are still checked against VCS facts.
+
+**Under ADR-090 D8's conditions.** A vouch does not by itself exempt a head from merge-candidate verification. ADR-090 D8, as amended, says: "Operator-vouched heads are not gated ONLY when they bring in no base commit the newest verified head lacks." An operator base merge or conflict-resolution merge is a base advance and needs a passing merge-candidate verify (`docs/adr/090-verify-the-merge-candidate.md:224`). For a queue-dispatched merge ADR-093 governs in D8's place (`docs/adr/093-fishhawk-owned-merge-queue.md:67`): the queue merges only a head with a verified pass (`:72`). A voucher also counts as a change author wherever a forge approval is checked under ADR-112 R1(b): queue, inline and delegated merges alike (`docs/adr/112-queue-merge-forge-approval-predicate.md:65-67`, `:145`). A vouch also breaks R1's clean-advance approval chain (`:53`).
+
+**No new verification requirement.** This amendment requires no proof of authorship and no added check. ADR-090 rejected a universal rule that every live head be gate-verified, because "It would wedge existing vouch, park and held-commit flows" (`docs/adr/090-verify-the-merge-candidate.md:112`). ADR-141 D5 does not authorize automatic vouching (`docs/adr/141-forge-confirmed-push-reports.md:41`), and neither does this amendment.
+
+**PR adoption.** An ADR-146 family 2 run carries a pull request head that its own agent did not write (`docs/adr/146-workflow-catalogue.md:64`). How an adopted head's commits are attributed to the run is part of ADR-146 Direction (a): its head and base binding, and an agent's change to an adopted pull request (`:95`). This amendment does not decide it. It neither extends the vouch to adopted heads nor rules that out.
+
+**What stands.** Rule 2 stands for every commit that is not vouched. Rules 1 and 5 stand. Rules 3 and 4 stand except as this exception states: an unvouched foreign commit is still a contract violation and still halts the run. ADR-141's report-ingestion rules stand.
+
+- **Record metadata:** an in-body amendment of ADR-035. No new edge. ADR-035 keeps `amended_by: ["ADR-141"]` and `status: accepted`.

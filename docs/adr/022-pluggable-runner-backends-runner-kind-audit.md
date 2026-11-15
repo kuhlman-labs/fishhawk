@@ -5,7 +5,7 @@ status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/388
 supersedes: []
 superseded_by: []
-amended_by: ["ADR-104"]
+amended_by: ["ADR-045", "ADR-104"]
 applies_to: []
 ---
 
@@ -96,3 +96,5 @@ The agent-driven **self-retry** case (agent retries its own failed stage on a tr
 ## Decision
 
 **Accepted (date not stated).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Resolved. Decision recorded (runs.runner_kind NOT NULL DEFAULT 'github_actions', closed set…) Shipped and in daily use".
+
+**Captain clarification (2026-11-14):** ADR-045 amends this record. `runner_kind` is reconciled from the runner's report at first dispatch. This replaces "The dispatcher assigns it at run creation" and "The runner has no input on this field".

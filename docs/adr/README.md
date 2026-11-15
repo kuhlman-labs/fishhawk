@@ -252,7 +252,10 @@ which refuses (exit 1, writes nothing) while any record check fails.
     bare-bearer HTTP mode) stand" — the ADR-018/ADR-031 partial-supersession
     precedent.
 
-  Deliberately NOT linked, because no source states an ADR supersession:
+  Deliberately NOT linked as supersessions, because no source states an ADR
+  supersession (ADR-066 → ADR-040 and ADR-073 → ADR-009/ADR-034 are amendment
+  edges since the Captain's 2026-11-14 clarification lines; see "Amendment
+  relation"):
   ADR-066's "This **supersedes** the `operator_agent.may_*` shape" names a
   grammar shape, not ADR-040; ADR-073 retires the ECS path without stating that
   it supersedes ADR-009, ADR-016 or ADR-034 (it names ADR-034 only as the local
@@ -412,6 +415,15 @@ Amendments recorded under the upkeep rule since:
 - ADR-148: `amends: [ADR-019, ADR-083, ADR-089, ADR-097, ADR-101, ADR-113, ADR-121, ADR-123, ADR-126, ADR-132, ADR-143]`; each gains `amended_by: [ADR-148]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It places every human-reserved action on one of three credential tiers and is the adopting amendment ADR-144 D3 requires for each tier-2 entry.
 - ADR-149: `amends: [ADR-028, ADR-029, ADR-063, ADR-101, ADR-115, ADR-119, ADR-122]`; each gains `amended_by: [ADR-149]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3). It makes confinement of the charter operator a prerequisite of charter operation.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
+- ADR-017, ADR-018, ADR-031, ADR-035 and ADR-080: each tracker body gained "## Amendment A1 (accepted 2026-11-14)", an in-body amendment ratified by the Captain from the 2026-11-14 coherence review (#5271 D9, D12 and D14). The bodies are re-transcribed, and no edge is added.
+- ADR-123 and ADR-020: each body gained an Amendment A1 (#5271 D10). ADR-123 A1 states that ADR-123 amends ADR-020, so ADR-123 carries `amends: [ADR-020, ADR-113]` and ADR-020 gains `amended_by: [ADR-123]`; both keep `status: accepted`. ADR-123's record-metadata line was edited in place at ratification to match (ADR-113 D3).
+- The Captain's clarification lines of 2026-11-14 (#5271 D13) are each stated in the amended record's body, and each keeps `status: accepted`:
+  - ADR-045 amends ADR-022;
+  - ADR-066 amends ADR-040's decision 2, without superseding it;
+  - ADR-073 amends ADR-009 and ADR-034;
+  - ADR-074 amends ADR-072.
+
+  The amended record gains `amended_by`, and the amending record gains `amends`.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
   not a supersession (now stated in #1140's body: "**Amends ADR-032**").

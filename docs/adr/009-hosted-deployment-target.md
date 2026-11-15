@@ -6,7 +6,7 @@ date: 2026-04-30
 issue: https://github.com/kuhlman-labs/fishhawk/issues/73
 supersedes: []
 superseded_by: []
-amended_by: ["ADR-138"]
+amended_by: ["ADR-073", "ADR-138"]
 applies_to: ["backend/Dockerfile"]
 ---
 
@@ -72,3 +72,5 @@ Day 7 — **met**.
 
 ---
 Parent epic: #15
+
+**Captain clarification (2026-11-14):** ADR-073 amends this record: it displaced the ECS runtime selection.

@@ -6,7 +6,7 @@ date: 2026-10-27
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4750
 supersedes: []
 superseded_by: []
-amends: ["ADR-113"]
+amends: ["ADR-020", "ADR-113"]
 amended_by: ["ADR-132", "ADR-148"]
 applies_to: []
 ---
@@ -74,4 +74,31 @@ The decision:
 - **Ordering.**
   - **The comment-channel refusal (Decision 4)** ships first, as its own security fix.
   - **The credential leg (Decisions 1–3)** is implemented in #4633 (run c23228ac). Its PR merges once its implementation matches this v2 text.
-- **Record metadata.** amends: ["ADR-113"]; supersedes: []; applies_to: []. ADR-113 gains `amended_by: ["ADR-123"]` and keeps `status: accepted`.
+- **Record metadata.** amends: ["ADR-020", "ADR-113"]; supersedes: []; applies_to: []. ADR-113 gains `amended_by: ["ADR-123"]` and keeps `status: accepted`.
+
+## Amendment A1 (accepted 2026-11-14) — the comment-channel refusal on workflow-v2 gates is permanent
+
+This amendment changes one sentence of decision 4, and through it amends ADR-020. ADR-020 Amendment A1 states the same change from that record's side.
+
+**What it replaces.** Decision 4's first bullet contains this sentence: "Until that parity exists, comment approvals and rejections on ANY workflow-v2 gate are REFUSED with a reply naming the supported channels." That sentence now reads:
+- Comment approvals and rejections on any workflow-v2 or later gate are refused, permanently. Parity will not be built.
+- A reply comment is refused silently. The other inputs, the slash commands and forwarded reactions, get a reply naming the supported channels.
+
+**Why.** The channel never evaluated the approvals predicate; it "advances the stage directly, without the approvals predicate or quorum" (Context, `docs/adr/123-forge-verified-stage-approvals.md:22`). Building parity is not worth its cost, and the code already refuses workflow-v2 or later gates (`backend/internal/server/issue_approval.go:586-587`).
+
+**v0/v1 gates.** "Permanently" covers workflow-v2 or later gates only. Decision 4's last sentence, "A v0/v1 gate keeps its legacy `approvers` role check.", stands while those majors stay frozen (`docs/spec/workflow-v2.md:1793`). It covers only a v0/v1 gate that declares the legacy `approvers` block.
+
+Any other v0/v1 gate, one that declares the `approvals` block or neither block, is refused on this channel, as a v2 gate is, because the channel has no rule to check. This applies from the change tracked as #5300. This decision's own rule therefore holds on every gate: every channel meets the same predicate, or records nothing.
+
+**ADR-148.** ADR-148 D7 applies on every major and every channel (`docs/adr/148-human-authority-ladder.md:82`, `:144`). Where a tier-1 or tier-2 entry is enforced and its D6 does not scope the request out, the action completes only in the Web UI; no issue-comment verb completes it.
+
+**Relation to ADR-020.** Decision 4 refused a channel that ADR-020 decided: the slash-command and reaction approvals on the originating issue (`docs/adr/020-plan-review-surface-on-originating-issue.md:63`, `:67`). This record therefore amends ADR-020, as ADR-020 Amendment A1 states.
+
+**What stands.** The rest of decision 4 stands:
+- the refusal holds whether or not the gate declares `approvals`;
+- it fails closed when the cached spec cannot be read or no role resolver is configured;
+- the paths that read the forge are unchanged.
+
+Decisions 1 to 3 and 5 stand. ADR-132's exclusion of issue-comment approvals from a production-class quorum stands (`docs/adr/132-release-candidates-and-promotion.md:133`). So do the narrowings ADR-148 makes (`docs/adr/148-human-authority-ladder.md:111`).
+
+- **Record metadata:** an in-body amendment of ADR-123. With ADR-020 Amendment A1, it states that ADR-123 amends ADR-020: ADR-123's `amends` becomes `["ADR-020", "ADR-113"]`, and ADR-020 gains `amended_by: ["ADR-123"]`. Both keep `status: accepted`. The record-metadata line in Consequences is edited to match.

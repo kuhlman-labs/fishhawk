@@ -6,7 +6,7 @@ date: 2026-07-27
 issue: https://github.com/kuhlman-labs/fishhawk/issues/2296
 supersedes: []
 superseded_by: []
-amended_by: ["ADR-147"]
+amended_by: ["ADR-074", "ADR-147"]
 applies_to: []
 ---
 
@@ -113,3 +113,5 @@ Costs and new surface:
 - **Fishhawk loses direct control of model choice as a cost lever** — ADR-070's Tier 3 model-selection idea becomes advice to the customer rather than an action Fishhawk takes.
 - **Support burden shifts**: "my runs are failing" may now be a provider quota problem, and diagnosis must make that obvious.
 - Onboarding gains a step — the getting-started guide (#2262) and the partner playbook (#2257) both need it.
+
+**Captain clarification (2026-11-14):** ADR-074 amends this record: it deletes decision 1's per-account storage.
