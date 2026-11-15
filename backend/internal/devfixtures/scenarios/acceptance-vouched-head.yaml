@@ -1,0 +1,954 @@
+# acceptance-vouched-head — five feature_change runs whose acceptance stage is
+# DISPATCHED around an operator_commit_vouched row, so the acceptance prompt's
+# acceptance_expected_head_sha (unbounded) and the head a signed verdict binds
+# (bounded by the acceptance_dispatched anchor) show which vouch moves the head
+# (#4874). A SERVER-VERIFIED vouch carries the exact payload #4856's
+# vouch-commit handler writes: {run_id, vouched_sha, reason, prior_head_sha,
+# head_advance_verified: true}; it is a head edge of the shared recorded walk
+# only when its prior_head_sha is the head walked so far. A legacy vouch (no
+# advance keys) only records lineage membership. Shaped after
+# acceptance-rebased-head: every run carries an approved standard_v1 plan with
+# two drivable criteria and a pull_request artifact, so a signed verdict can
+# ship against it.
+#
+# DEV ONLY: the scenario is reachable solely through the dev fixture route
+# (POST /v0/dev/fixtures), which is registered only under fishhawkd
+# --dev-fixtures, loopback-only. Its seeded "verified" rows are fixture data,
+# never a server verification, and cannot exist on a non-dev deployment.
+#
+# Audit rows are ORDERED per run (the chain sequence is the order below). The
+# run_id inside each vouch payload is a scenario-local label: Apply mints the
+# real run id, and no reader of the walk keys on it.
+#
+#   vouched-run                 pull_request_opened(S1 1111..), a verified
+#                               vouch S1 -> V1 (2222..), then the anchor: the
+#                               prompt names V1.
+#   vouched-then-rebased-run    pull_request_opened(S2 3333..), a verified
+#                               vouch S2 -> V2 (4444..), a CLEAN
+#                               branch_rebased V2 -> M2 (5555.., base cccc..),
+#                               then the anchor: the prompt names M2.
+#   unverified-vouch-run        pull_request_opened(S3 6666..), a LEGACY vouch
+#                               of V3 (7777..) with no advance keys, then the
+#                               anchor: the prompt names S3.
+#   vouched-parent              integration_commit_recorded(F 8888..), a
+#                               verified vouch F -> W (9999..), then the
+#                               anchor: the prompt names W, and the run branch
+#                               is the server-derived
+#                               fishhawk/run-<first 8>-consolidated.
+#   vouched-after-dispatch-run  pull_request_opened(S5 aaaa..), the anchor,
+#                               THEN a verified vouch S5 -> V5 (bbbb..): the
+#                               unbounded prompt names V5, while a signed
+#                               verdict binds S5 (the vouch is after the
+#                               dispatch anchor, the same semantics as a
+#                               rebase after dispatch).
+#
+# The parent serves no acceptance_pull_request_number: devfixtures.Run has no
+# pull_request_url and this scenario does not extend the fixture schema, so the
+# field is 0 (omitted) by design, exactly as in acceptance-rebased-head.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: vouched-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-vouched-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+  - key: vouched-then-rebased-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-vouched-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+  - key: unverified-vouch-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-vouched-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+  - key: vouched-parent
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-vouched-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+  - key: vouched-after-dispatch-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-vouched-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+
+stages:
+  - key: vr-plan
+    run: vouched-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: vr-implement
+    run: vouched-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: vr-review
+    run: vouched-run
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: vr-acceptance
+    run: vouched-run
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+  - key: vb-plan
+    run: vouched-then-rebased-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: vb-implement
+    run: vouched-then-rebased-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: vb-review
+    run: vouched-then-rebased-run
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: vb-acceptance
+    run: vouched-then-rebased-run
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+  - key: uv-plan
+    run: unverified-vouch-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: uv-implement
+    run: unverified-vouch-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: uv-review
+    run: unverified-vouch-run
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: uv-acceptance
+    run: unverified-vouch-run
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+  - key: vp-plan
+    run: vouched-parent
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: vp-implement
+    run: vouched-parent
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: vp-review
+    run: vouched-parent
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: vp-acceptance
+    run: vouched-parent
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+  - key: va-plan
+    run: vouched-after-dispatch-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: va-implement
+    run: vouched-after-dispatch-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: va-review
+    run: vouched-after-dispatch-run
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: va-acceptance
+    run: vouched-after-dispatch-run
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+
+artifacts:
+  - key: vr-plan
+    stage: vr-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-vouched-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: vr-pr
+    stage: vr-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-vouched-run",
+        "head_sha": "1111111111111111111111111111111111111111",
+        "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "title": "Seeded fixture pull request (acceptance-vouched-head, vouched-run).",
+        "files_changed_count": 1
+      }
+  - key: vb-plan
+    stage: vb-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-vouched-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: vb-pr
+    stage: vb-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-vouched-then-rebased-run",
+        "head_sha": "3333333333333333333333333333333333333333",
+        "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "title": "Seeded fixture pull request (acceptance-vouched-head, vouched-then-rebased-run).",
+        "files_changed_count": 1
+      }
+  - key: uv-plan
+    stage: uv-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-vouched-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: uv-pr
+    stage: uv-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-unverified-vouch-run",
+        "head_sha": "6666666666666666666666666666666666666666",
+        "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "title": "Seeded fixture pull request (acceptance-vouched-head, unverified-vouch-run).",
+        "files_changed_count": 1
+      }
+  - key: vp-plan
+    stage: vp-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-vouched-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: vp-pr
+    stage: vp-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-vouched-parent",
+        "head_sha": "8888888888888888888888888888888888888888",
+        "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "title": "Seeded fixture pull request (acceptance-vouched-head, vouched-parent).",
+        "files_changed_count": 1
+      }
+  - key: va-plan
+    stage: va-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-vouched-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: va-pr
+    stage: va-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-vouched-after-dispatch-run",
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "title": "Seeded fixture pull request (acceptance-vouched-head, vouched-after-dispatch-run).",
+        "files_changed_count": 1
+      }
+
+approvals:
+  - stage: vr-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+  - stage: vb-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+  - stage: uv-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+  - stage: vp-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+  - stage: va-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+
+audit:
+  - run: vouched-run
+    stage: vr-implement
+    category: pull_request_opened
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"1111111111111111111111111111111111111111","branch":"e97.24-vouched-run","pr_number":4874,"pr_url":"https://github.com/kuhlman-labs/fishhawk/pull/4874"}'
+  - run: vouched-run
+    stage: vr-implement
+    category: operator_commit_vouched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"run_id":"vouched-run","vouched_sha":"2222222222222222222222222222222222222222","reason":"operator remediation commit (acceptance-vouched-head)","prior_head_sha":"1111111111111111111111111111111111111111","head_advance_verified":true}'
+  - run: vouched-run
+    stage: vr-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: vouched-then-rebased-run
+    stage: vb-implement
+    category: pull_request_opened
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"3333333333333333333333333333333333333333","branch":"e97.24-vouched-then-rebased-run","pr_number":4874,"pr_url":"https://github.com/kuhlman-labs/fishhawk/pull/4874"}'
+  - run: vouched-then-rebased-run
+    stage: vb-implement
+    category: operator_commit_vouched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"run_id":"vouched-then-rebased-run","vouched_sha":"4444444444444444444444444444444444444444","reason":"operator remediation commit (acceptance-vouched-head)","prior_head_sha":"3333333333333333333333333333333333333333","head_advance_verified":true}'
+  - run: vouched-then-rebased-run
+    stage: vb-implement
+    category: branch_rebased
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"prior_head_sha":"4444444444444444444444444444444444444444","merge_commit_sha":"5555555555555555555555555555555555555555","new_head_sha":"5555555555555555555555555555555555555555","base_tip_sha":"cccccccccccccccccccccccccccccccccccccccc","already_up_to_date":false,"clean_verified":true}'
+  - run: vouched-then-rebased-run
+    stage: vb-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: unverified-vouch-run
+    stage: uv-implement
+    category: pull_request_opened
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"6666666666666666666666666666666666666666","branch":"e97.24-unverified-vouch-run","pr_number":4874,"pr_url":"https://github.com/kuhlman-labs/fishhawk/pull/4874"}'
+  - run: unverified-vouch-run
+    stage: uv-implement
+    category: operator_commit_vouched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"run_id":"unverified-vouch-run","vouched_sha":"7777777777777777777777777777777777777777","reason":"operator remediation commit (acceptance-vouched-head)"}'
+  - run: unverified-vouch-run
+    stage: uv-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: vouched-parent
+    stage: vp-implement
+    category: integration_commit_recorded
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"merge_sha":"8888888888888888888888888888888888888888"}'
+  - run: vouched-parent
+    stage: vp-implement
+    category: operator_commit_vouched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"run_id":"vouched-parent","vouched_sha":"9999999999999999999999999999999999999999","reason":"operator remediation commit (acceptance-vouched-head)","prior_head_sha":"8888888888888888888888888888888888888888","head_advance_verified":true}'
+  - run: vouched-parent
+    stage: vp-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: vouched-after-dispatch-run
+    stage: va-implement
+    category: pull_request_opened
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"e97.24-vouched-after-dispatch-run","pr_number":4874,"pr_url":"https://github.com/kuhlman-labs/fishhawk/pull/4874"}'
+  - run: vouched-after-dispatch-run
+    stage: va-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: vouched-after-dispatch-run
+    stage: va-implement
+    category: operator_commit_vouched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"run_id":"vouched-after-dispatch-run","vouched_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","reason":"operator remediation commit (acceptance-vouched-head)","prior_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_advance_verified":true}'

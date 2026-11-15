@@ -360,6 +360,32 @@ admission after the verdict and its own corpus commit),
 `TestAcceptanceValidatedHead_FixupAfterScenarioCommit` and the `(m)` rows of
 `TestAcceptanceHeadAsOf_SeedOrderedByChainSequence`.
 
+**Verified vouch step (#4874).** `acceptanceBaseMergeRows` reads
+`acceptanceBaseMergeCategories` (`branch_rebased`, `branch_reset`,
+`operator_commit_vouched`, the fix-up walk's `fixupHeadWalkCategories`), so the
+acceptance seed advances through #4856's walk arm: a vouch row the handler
+stamped `head_advance_verified` (live PR head, fast-forward of the recorded head,
+every commit between them already run lineage) whose `prior_head_sha` is the
+walked head moves the served head, the dispatch-bounded verdict head and Option
+C's current head to the vouched commit together. Every other vouch row (legacy,
+unverified, the rebase verb's attribution row, a stale prior) is inert, and
+acceptance stays on the recorded head. A vouch-row read error fails closed like
+a rebase-row one. Option C therefore admits an operator retry after a verified
+vouch that follows a verdict (the verdict reads stale) and keeps its 422 after a
+legacy or unverified vouch. A vouch never re-opens a settled acceptance by
+itself, and a vouch after the dispatch anchor never re-binds that dispatch's
+verdict (the unbounded prompt can name the vouched head while the verdict binds
+the pre-vouch head, the same as a rebase after dispatch). The vouched code stays
+covered by the ADR-090 / ADR-142 exact-head merge-candidate verification.
+Pinned by `TestAcceptanceHeadAsOf_RecordedWalkParity` (the shared
+`backend/internal/auditcomplete/testdata/recorded-walk-parity.json` table the
+MCP preview mirror also runs), `TestAcceptanceHeadAsOf_VerifiedVouchAdvances`,
+`TestAcceptanceHeadAsOf_BaseMergeReadErrorFailsClosed/operator_commit_vouched`,
+`TestAcceptanceBaseMergeCategories_MatchFixupWalk`, the
+`TestRetryStage_AcceptanceReopen_*Vouch*` tests and the cross-boundary
+`TestAcceptanceE2E_VouchThenRedispatch_BindsVouchedHead` (real vouch handler and
+forge probe through the prompt route and verdict binding).
+
 **The #4673 determination (an INFERENCE from the pre-#5155 code, not an observed
 fact).** Before #5155 two resolvers answered one question. The SERVED head,
 `acceptance_expected_head_sha` (`prompt.go` `acceptanceHeadForRun` →
@@ -590,9 +616,11 @@ unnecessary.
     verdict now carries `head_sha` (the live consolidated head the hook
     compared). Option C's head-aware retry (`latestAcceptanceVerdictHead`) reads
     it like any validator verdict's head; where it differs from the acceptance
-    ledger head (a vouched advance, which `FanInVerifySettled` WARN-logs, #4874)
-    the retry treats the verdict as stale and admits an operator re-open, which
-    is benign. Ordinary short-circuit payloads carry no `head_sha`, unchanged.
+    ledger head (an unverified vouch or an unrecorded commit, which
+    `FanInVerifySettled` WARN-logs) the retry treats the verdict as stale and
+    admits an operator re-open, which is benign. A server-verified vouch of the
+    live head moves the ledger head with it, so it no longer diverges or WARNs
+    (#4874). Ordinary short-circuit payloads carry no `head_sha`, unchanged.
 - **Admission ↔ host-dispatch fence (#1936):** the whole read → admissibility-check
   → walk in `TryShortCircuitAcceptance` runs under a per-stage in-process mutex
   (`orchestrator.LockStageAdmission`) that `host_dispatch.go::handleHostDispatchStage`

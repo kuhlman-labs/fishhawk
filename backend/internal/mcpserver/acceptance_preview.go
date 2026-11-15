@@ -211,9 +211,13 @@ const (
 // sequence keep the old first-delivered answer. The rows above the seed's
 // sequence are then walked in sequence order applying the server's
 // walkRecordedBaseMerges rules: a CLEAN branch_rebased row whose prior head is
-// the current head advances to its merge commit, and a branch_reset to a head
-// on the walked chain moves there, while a reset off the chain returns the
-// seed. Returns "" on an empty window, a malformed payload, or no seed in the
+// the current head advances to its merge commit, a branch_reset to a head on
+// the walked chain moves there, a reset off the chain (or an undecodable one)
+// RE-SEEDS the walk and continues, and a server-VERIFIED
+// operator_commit_vouched row whose prior head is the current head advances to
+// its vouched sha (#4856's stamp; every other vouch row is inert). The shared
+// parity table (backend/internal/auditcomplete/testdata/recorded-walk-parity.json)
+// holds this mirror and the server resolver to one answer per case. Returns "" on an empty window, a malformed payload, or no seed in the
 // window (a seed aged out while a rebase row is inside degrades to ""); the
 // SHA is then omitted from the rendered command while the COMMAND itself
 // stays concrete.
@@ -284,6 +288,44 @@ func decodePreviewPayload(payload any, into any) bool {
 	return json.Unmarshal(raw, into) == nil
 }
 
+// previewVouchAdvance is the decoded slice of an operator_commit_vouched
+// payload the mirror's vouch step reads; it mirrors the server's
+// vouchAdvanceRow. verified is true only for an explicit head_advance_verified
+// true, so a legacy row (no key) and an explicit false are both inert.
+type previewVouchAdvance struct {
+	vouchedSHA   string
+	priorHeadSHA string
+	verified     bool
+}
+
+// decodePreviewVouchAdvance decodes a vouch payload BY the auditcomplete key
+// constants (no key string is re-spelled here). A non-object payload, or any
+// of the three fields present with the wrong JSON type, answers false, matching
+// the server's json.Unmarshal failure on vouchAdvanceRow.
+func decodePreviewVouchAdvance(payload any) (previewVouchAdvance, bool) {
+	var fields map[string]json.RawMessage
+	if !decodePreviewPayload(payload, &fields) {
+		return previewVouchAdvance{}, false
+	}
+	var out previewVouchAdvance
+	var verified *bool
+	for key, into := range map[string]any{
+		auditcomplete.VouchedSHAField:               &out.vouchedSHA,
+		auditcomplete.VouchPriorHeadSHAField:        &out.priorHeadSHA,
+		auditcomplete.VouchHeadAdvanceVerifiedField: &verified,
+	} {
+		raw, present := fields[key]
+		if !present {
+			continue
+		}
+		if json.Unmarshal(raw, into) != nil {
+			return previewVouchAdvance{}, false
+		}
+	}
+	out.verified = verified != nil && *verified
+	return out, true
+}
+
 // walkPreviewBaseMerges applies the server's walkRecordedBaseMerges rules to
 // rows already filtered above the seed and ordered by sequence.
 func walkPreviewBaseMerges(ordered []AuditEntry, seed string) string {
@@ -307,9 +349,23 @@ func walkPreviewBaseMerges(ordered []AuditEntry, seed string) string {
 				ResetToSHA string `json:"reset_to_sha"`
 			}
 			if !decodePreviewPayload(e.Payload, &p) || !onChain[p.ResetToSHA] {
-				return seed
+				// Re-seed and continue, exactly as the server's reset arm
+				// does (#4856): the starting state, never something more
+				// permissive, and a later row whose prior is the seed applies.
+				head = seed
+				onChain = map[string]bool{seed: true}
+				continue
 			}
 			head = p.ResetToSHA
+		case auditcomplete.CategoryOperatorCommitVouched:
+			vouch, ok := decodePreviewVouchAdvance(e.Payload)
+			if !ok {
+				continue
+			}
+			if vouch.verified && vouch.vouchedSHA != "" && vouch.priorHeadSHA == head {
+				head = vouch.vouchedSHA
+				onChain[head] = true
+			}
 		}
 	}
 	return head
