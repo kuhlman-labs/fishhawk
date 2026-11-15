@@ -5087,10 +5087,13 @@ type campaignDependencyWarning struct {
 }
 
 // campaignAdmissionScreen mirrors the backend's campaignAdmissionScreenPayload
-// (#3649). Unexported (FIELDS exported for JSON) so it stays off the frozen MCP
-// export surface, like campaignSatisfiedDependency.
+// (#3649). It rides both the create response (Campaign.AdmissionScreen) and the
+// preview report (CampaignPreview.AdmissionScreen, #5221); only the create
+// appends the campaign_admission_screened audit row. Unexported (FIELDS
+// exported for JSON) so it stays off the frozen MCP export surface, like
+// campaignSatisfiedDependency.
 type campaignAdmissionScreen struct {
-	Advisory               bool                       `json:"advisory" jsonschema:"always true: the screen reports and never blocks the create"`
+	Advisory               bool                       `json:"advisory" jsonschema:"always true: the screen reports and never blocks a create or changes a preview's valid, waves or items"`
 	Findings               []campaignAdmissionFinding `json:"findings" jsonschema:"the findings, sorted by issue then kind then path"`
 	ForbiddenPathsScreened bool                       `json:"forbidden_paths_screened" jsonschema:"whether the forbidden_path class ran; false when the repo's implement-stage forbidden_paths could not be resolved"`
 	Truncated              bool                       `json:"truncated,omitempty" jsonschema:"true when the findings were capped"`
@@ -5506,6 +5509,33 @@ type CampaignPreview struct {
 	ClosureCandidates     []string                      `json:"closure_candidates,omitempty" jsonschema:"the deduped, sorted out-of-set issue refs to ADD to items to close the set. Derived ONLY from the widenable causes (not_child, excluded_incomplete) — a closed-incomplete or unreadable target is deliberately excluded because adding it cannot satisfy the edge. ONE HOP, not a transitive closure: adding these can surface a new generation of dangling edges, so iterate until valid"`
 	Cycle                 string                        `json:"cycle,omitempty" jsonschema:"the assembler's message when the set is invalid because its depends_on edges cycle"`
 	Message               string                        `json:"message,omitempty" jsonschema:"the assembler's own message on a dangling report"`
+	// AdmissionScreen and PathOverlap are the preview's ADVISORY screens
+	// (#5221), present on the valid, dangling and cycle reports alike. Typed
+	// structs (NOT map[string]any / json.RawMessage) so the reflection-built
+	// output schema stays an object; unexported types keep them off the frozen
+	// export surface.
+	AdmissionScreen *campaignAdmissionScreen    `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen, the same #3649 screen fishhawk_start_campaign runs: items declared runnable:no, and items whose title/body names a path the repo's implement-stage forbidden_paths forbid. The preview writes no audit row; only the create appends campaign_admission_screened. Present only when the screen found something; it never changes valid, waves or items"`
+	PathOverlap     *campaignPreviewPathOverlap `json:"path_overlap,omitempty" jsonschema:"ADVISORY path overlap: pairs of items whose title or body name the same file path and that no in-set depends_on chain orders, so their plans may conflict. Lexical over issue prose. Present only when a pair exists; it never changes valid, waves or items"`
+}
+
+// campaignPreviewPathOverlap mirrors the backend's campaignPreviewPathOverlap
+// (#5221). Unexported (FIELDS exported for JSON) so it stays off the frozen MCP
+// export surface, like campaignPreviewEdge.
+type campaignPreviewPathOverlap struct {
+	Advisory   bool                             `json:"advisory" jsonschema:"always true: the block never changes valid, waves or items"`
+	Pairs      []campaignPreviewPathOverlapPair `json:"pairs" jsonschema:"the unordered item pairs, ranked by the rarest shared path first (a path few items name sorts before a hub path), then code before docs_only, then by issue number; capped"`
+	TotalPairs int                              `json:"total_pairs" jsonschema:"the uncapped pair count"`
+	Truncated  bool                             `json:"truncated,omitempty" jsonschema:"true when pairs was capped below total_pairs"`
+}
+
+// campaignPreviewPathOverlapPair mirrors the backend's
+// campaignPreviewPathOverlapPair (#5221): one unordered item pair.
+type campaignPreviewPathOverlapPair struct {
+	Items          []string `json:"items" jsonschema:"the two issue refs, lower number first, as issue:N"`
+	Paths          []string `json:"paths" jsonschema:"the shared path tokens, filtered and cleaned, sorted; capped at 10 per pair"`
+	PathsTruncated bool     `json:"paths_truncated,omitempty" jsonschema:"true when the pair shared more than 10 paths and paths lists only the first 10 sorted ones"`
+	Class          string   `json:"class" jsonschema:"code or docs_only. docs_only means every shared path is documentation (.md, .mdx, .markdown, .rst or .adoc outside docs/review, docs/spec, docs/adr and docs/compliance, and not an instruction file): parallel plans are fine. code means the plans may conflict: add a native blocked-by link or confirm they touch unrelated parts of the file"`
+	Remedy         string   `json:"remedy" jsonschema:"what to do about this pair"`
 }
 
 // PreviewCampaign runs the NON-MUTATING dry run of POST /v0/campaigns via

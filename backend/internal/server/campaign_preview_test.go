@@ -142,12 +142,18 @@ func TestPreviewCampaign_CreatesNothingAndWritesNoAudit(t *testing.T) {
 		name      string
 		result    *workmgmt.EpicChildrenResult
 		wantValid bool
+		// screens fires BOTH advisory screens (#5221): a runnable:no child,
+		// a child naming a forbidden path (with a GitHub client serving the
+		// spec) and an unordered shared code path. The create path would
+		// append a campaign_admission_screened row here; the preview must not.
+		screens bool
 	}{
-		{"valid", smallDAG(), true},
+		{"valid", smallDAG(), true, false},
 		{"invalid", &workmgmt.EpicChildrenResult{
 			Children:     []workmgmt.EpicChild{{Number: 100, Title: "a"}},
 			DroppedEdges: []workmgmt.DependsEdge{{From: 100, To: 999, Reason: workmgmt.DropNotChild}},
-		}, false},
+		}, false, false},
+		{"screens fire", previewScreensDAG(nil, nil), true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -155,7 +161,11 @@ func TestPreviewCampaign_CreatesNothingAndWritesNoAudit(t *testing.T) {
 			registerEpicProvider(t, fp)
 			repo := newFakeCampaignRepo()
 			aud := &campaignAuditRecorder{}
-			s := New(Config{CampaignRepo: repo, AuditRepo: aud})
+			cfg := Config{CampaignRepo: repo, AuditRepo: aud}
+			if tc.screens {
+				cfg.GitHub = screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))
+			}
+			s := New(cfg)
 
 			before, err := repo.ListCampaigns(context.Background(), campaign.ListCampaignsFilter{Limit: 100})
 			if err != nil {
@@ -165,6 +175,13 @@ func TestPreviewCampaign_CreatesNothingAndWritesNoAudit(t *testing.T) {
 			rep := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
 			if rep.Valid != tc.wantValid {
 				t.Fatalf("valid = %v, want %v", rep.Valid, tc.wantValid)
+			}
+			if tc.screens {
+				// Precondition: both screens fired, so the audit assertion
+				// below is not vacuous.
+				if rep.AdmissionScreen == nil || !rep.AdmissionScreen.ForbiddenPathsScreened || rep.PathOverlap == nil {
+					t.Fatalf("screens did not fire: admission=%+v overlap=%+v", rep.AdmissionScreen, rep.PathOverlap)
+				}
 			}
 
 			// (a) no campaign row exists, read back through the repository the
@@ -191,6 +208,9 @@ func TestPreviewCampaign_CreatesNothingAndWritesNoAudit(t *testing.T) {
 			aud.mu.Unlock()
 			if appended != 0 {
 				t.Errorf("preview appended %d audit entries, want 0 (categories: %v)", appended, categories)
+			}
+			if n := aud.count(categoryCampaignAdmissionScreened); n != 0 {
+				t.Errorf("%s audits = %d, want 0 (only create audits the screen)", categoryCampaignAdmissionScreened, n)
 			}
 		})
 	}
@@ -939,5 +959,153 @@ func TestPreviewEdges_KeepsOnlyInSetEdgesSorted(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("previewEdges = %+v, want %+v", got, want)
+	}
+}
+
+// --- advisory screens on the preview (#5221) ---
+
+// previewScreensDAG is a three-item set that fires both advisory screens:
+// #101 is declared runnable:no and names the forbidden `.gitlab-ci.yml`, and
+// #102 / #103 both name backend/internal/x/y.go with no edge ordering them.
+// edges and dropped shape the report path (valid, dangling or cycle).
+func previewScreensDAG(edges, dropped []workmgmt.DependsEdge) *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 101, Title: "record a decision", Body: "Update `.gitlab-ci.yml` too.", NotRunnable: true},
+			{Number: 102, Title: "b", Body: "edit backend/internal/x/y.go"},
+			{Number: 103, Title: "c", Body: "also edit backend/internal/x/y.go"},
+		},
+		Edges:        edges,
+		DroppedEdges: dropped,
+	}
+}
+
+// previewScreensCleanDAG is previewScreensDAG with both hazards removed.
+func previewScreensCleanDAG(edges []workmgmt.DependsEdge) *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 101, Title: "record a decision"},
+			{Number: 102, Title: "b", Body: "edit backend/internal/x/a.go"},
+			{Number: 103, Title: "c", Body: "edit backend/internal/x/b.go"},
+		},
+		Edges: edges,
+	}
+}
+
+// assertPreviewScreens checks both blocks ride the report, and that the server
+// adds no parallel human-led block (V1: human_led is composed MCP-side only).
+func assertPreviewScreens(t *testing.T, w *httptest.ResponseRecorder) campaignPreviewResponse {
+	t.Helper()
+	rep := decodePreview(t, w)
+	sc := rep.AdmissionScreen
+	if sc == nil || !sc.Advisory || len(sc.Findings) == 0 || sc.Findings[0].Issue != 101 ||
+		sc.Findings[0].Kind != campaignScreenKindNotRunnable {
+		t.Errorf("admission_screen = %+v, want the not_runnable_declared finding for #101", sc)
+	}
+	po := rep.PathOverlap
+	if po == nil || !po.Advisory || po.TotalPairs != 1 || len(po.Pairs) != 1 ||
+		!reflect.DeepEqual(po.Pairs[0].Items, []string{"issue:102", "issue:103"}) ||
+		po.Pairs[0].Class != previewOverlapClassCode {
+		t.Errorf("path_overlap = %+v, want one code pair [issue:102 issue:103]", po)
+	}
+	if strings.Contains(w.Body.String(), "human_led") {
+		t.Errorf("server report carries a human_led key: %s", w.Body.String())
+	}
+	return rep
+}
+
+// TestPreviewCampaign_AdmissionScreen_NotRunnableReported: with no forge client
+// the forbidden-path class degrades, and the runnable:no declaration is still
+// reported, flagged forbidden_paths_screened false.
+func TestPreviewCampaign_AdmissionScreen_NotRunnableReported(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 100, Title: "x", NotRunnable: true}},
+	}})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: class 2 degrades
+
+	rep := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if !rep.Valid {
+		t.Fatalf("valid = false, want true (the screen is advisory): %+v", rep)
+	}
+	sc := rep.AdmissionScreen
+	want := []campaignScreenFinding{{Issue: 100, Kind: campaignScreenKindNotRunnable}}
+	if sc == nil || !sc.Advisory || sc.ForbiddenPathsScreened || !reflect.DeepEqual(sc.Findings, want) {
+		t.Fatalf("admission_screen = %+v, want one not_runnable_declared, screened=false", sc)
+	}
+}
+
+// TestPreviewCampaign_AdmissionScreen_ForbiddenPathReported drives class 2:
+// a GitHub client serving a spec whose implement stage forbids
+// `.gitlab-ci.yml`, and a child whose body names it.
+func TestPreviewCampaign_AdmissionScreen_ForbiddenPathReported(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: screenForbiddenDAG()})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))})
+
+	rep := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	sc := rep.AdmissionScreen
+	want := []campaignScreenFinding{{
+		Issue: 100, Kind: campaignScreenKindForbiddenPath, Path: ".gitlab-ci.yml",
+		Location: "body", ForbiddenPattern: ".gitlab-ci.yml",
+	}}
+	if sc == nil || !sc.ForbiddenPathsScreened || !reflect.DeepEqual(sc.Findings, want) {
+		t.Fatalf("admission_screen = %+v, want the forbidden_path finding %+v", sc, want)
+	}
+}
+
+// TestPreviewCampaign_Screens_OnValidPath: both blocks ride a valid report and
+// change neither valid nor the waves.
+func TestPreviewCampaign_Screens_OnValidPath(t *testing.T) {
+	edges := []workmgmt.DependsEdge{{From: 102, To: 101}}
+	registerEpicProvider(t, &fakeEpicProvider{result: previewScreensDAG(edges, nil)})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+	rep := assertPreviewScreens(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if !rep.Valid {
+		t.Fatalf("valid = false, want true: %+v", rep)
+	}
+
+	registerEpicProvider(t, &fakeEpicProvider{result: previewScreensCleanDAG(edges)})
+	clean := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if clean.AdmissionScreen != nil || clean.PathOverlap != nil {
+		t.Fatalf("clean fixture carries screens: %+v / %+v", clean.AdmissionScreen, clean.PathOverlap)
+	}
+	if !reflect.DeepEqual(rep.Waves, clean.Waves) {
+		t.Errorf("waves = %v, want the hazard-free fixture's %v (screens are advisory)", rep.Waves, clean.Waves)
+	}
+}
+
+// TestPreviewCampaign_Screens_OnDanglingPath: both blocks ride a valid:false
+// dangling report.
+func TestPreviewCampaign_Screens_OnDanglingPath(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: previewScreensDAG(nil,
+		[]workmgmt.DependsEdge{{From: 101, To: 999, Reason: workmgmt.DropNotChild}})})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+	rep := assertPreviewScreens(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if rep.Valid || len(rep.Dangling) != 1 {
+		t.Fatalf("valid=%v dangling=%+v, want a dangling report", rep.Valid, rep.Dangling)
+	}
+}
+
+// TestPreviewCampaign_Screens_OnCyclePath: both blocks ride a valid:false
+// cycle report. The cycle (101 <-> 102) does not order 102 and 103.
+func TestPreviewCampaign_Screens_OnCyclePath(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: previewScreensDAG(
+		[]workmgmt.DependsEdge{{From: 101, To: 102}, {From: 102, To: 101}}, nil)})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+	rep := assertPreviewScreens(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if rep.Valid || rep.Cycle == "" {
+		t.Fatalf("valid=%v cycle=%q, want a cycle report", rep.Valid, rep.Cycle)
+	}
+}
+
+// TestPreviewCampaign_Screens_AbsentWhenClean: a clean set carries neither key.
+func TestPreviewCampaign_Screens_AbsentWhenClean(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+	w := postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	decodePreview(t, w)
+	for _, key := range []string{"admission_screen", "path_overlap", "human_led"} {
+		if strings.Contains(w.Body.String(), key) {
+			t.Errorf("clean report carries %q: %s", key, w.Body.String())
+		}
 	}
 }

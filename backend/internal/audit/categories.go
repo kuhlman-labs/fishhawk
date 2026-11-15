@@ -569,6 +569,8 @@ var KnownCategories = map[string]struct{}{
 	"integration_commit_recorded":             {},
 	"invariant_violation":                     {},
 	"issue_commented":                         {},
+	"issue_context_refreshed":                 {}, // #5219: a plan-stage issue-context refresh found the live issue's prompt-visible title/body/comments differ from the run's cached snapshot (surface plan_prompt), or the plan review rendered a different snapshot than the planner's newest issue_context_rendered row (surface plan_review; its refreshed flag tells a mid-window issue edit from a review-side fallback to the cache) (server/issue_context_refresh.go) — INTERNAL, not an issue-comment surface (not in issuecomment activityCategories; docs/issue-comment-surfaces.md unchanged); intended run-bound READABLE with a same-run-only payload (ids, booleans, counts, closed slugs and sha256 digests; no issue text), and takes the mandatory flag when #4599 lands. INTERIM, not ADR-106 registry option B.
+	"issue_context_rendered":                  {}, // #5219: every signed plan-stage /prompt fetch of a run with a cached issue context records the sha256 digest of the prompt-visible snapshot it rendered (refreshed or cached); not drift-gated, never deduped against older digests (only a repeat of the stage's newest digest is skipped), newest wins — the plan review's parity reference (server/issue_context_refresh.go) — INTERNAL, not an issue-comment surface; same run-bound READABLE posture and #4599 flag follow-up as issue_context_refreshed. INTERIM, not ADR-106 registry option B.
 	"issue_context_unresolved":                {},
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},

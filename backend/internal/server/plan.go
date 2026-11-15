@@ -1682,23 +1682,34 @@ func (s *Server) dispatchPlanReviews(ctx context.Context, runID, stageID uuid.UU
 		ApprovedPlan:     parsedPlan,
 		PlanGateEvidence: gateEv,
 	}
-	if runRow.IssueContext != nil {
-		trig.IssueTitle = runRow.IssueContext.Title
-		trig.IssueBody = runRow.IssueContext.Body
-		// Map the cached comments so the plan-review prompt renders the
-		// same comment-borne refinements the planner saw (#622) — identical
-		// shape to fillIssueContext branch 1.
-		for _, c := range runRow.IssueContext.Comments {
+	if runRow.TriggerRef != nil {
+		if n, ok := parseIssueRef(*runRow.TriggerRef); ok {
+			trig.IssueNumber = n
+		}
+	}
+	// Plan-stage refresh (#5219): the review maps the same refreshed snapshot
+	// the planner's signed prompt fetch rendered — the live issue for a
+	// credentialed run, else the cached snapshot. It is exact when the issue
+	// did not change between the two fetches and the review's own fetch
+	// succeeded; a difference (a mid-window edit, or a review-side fallback to
+	// the cache) is RECORDED as an issue_context_refreshed row with surface
+	// plan_review and its refreshed flag, not prevented.
+	// Exact parity would need a stored per-stage snapshot (deferred;
+	// runs.issue_context stays immutable). Comments map in fillIssueContext
+	// branch 1's shape (#622).
+	reviewRun := runRow
+	if trig.IssueNumber > 0 {
+		reviewRun = s.planReviewIssueContext(ctx, runRow, stageID, trig.IssueNumber)
+	}
+	if reviewRun.IssueContext != nil {
+		trig.IssueTitle = reviewRun.IssueContext.Title
+		trig.IssueBody = reviewRun.IssueContext.Body
+		for _, c := range reviewRun.IssueContext.Comments {
 			trig.IssueComments = append(trig.IssueComments, prompt.IssueComment{
 				Author:    c.Author,
 				Body:      c.Body,
 				CreatedAt: c.CreatedAt,
 			})
-		}
-	}
-	if runRow.TriggerRef != nil {
-		if n, ok := parseIssueRef(*runRow.TriggerRef); ok {
-			trig.IssueNumber = n
 		}
 	}
 
