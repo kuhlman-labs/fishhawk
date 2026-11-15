@@ -24,6 +24,21 @@ rules condense the former AGENTS.md test traps; linked package docs own details.
   (module-relative under `-trimpath`). [testanchor](../../backend/internal/testanchor/README.md)
   enforces this (#4179).
 
+## Repository-dependent behaviour and wire states
+
+- A behaviour that interprets repository data needs a non-Fishhawk fixture run
+  through the production resolver and consumer. Assert that the behaviour
+  changes when the declaration changes; renaming the repository is not enough
+  (ADR-110, #5211).
+- Test the missing-declaration path. A required control refuses with a named
+  reason; an advisory feature may degrade only under its documented policy,
+  with the reason audited. Neither falls back to this repository's values.
+- Never assert byte-verbatim output through JSONB: Postgres re-encodes it (key
+  order, whitespace). Assert JSON-equal, and cover the store with a Postgres-path
+  test.
+- Absent, JSON `null` and empty are three states. Test each from the raw wire
+  bytes, not from a decoded struct that folds them together.
+
 ## Timing and concurrency
 
 - Every deadline-competing duration uses `timescale.D(base)`: context deadlines,
