@@ -1568,6 +1568,23 @@ the start-error path too, since testcontainers-go hands back a non-nil running
 container ALONGSIDE a start error and with ryuk disabled nothing else reaps it
 (#3122).
 
+Raw migration fixtures bound concurrent Docker startup and mapped-port inspection
+with a package-local admission limit (#5428). The slot is released once the
+fixture URL is resolved, before migration assertions run; every test retains
+its own container and cleanup. Admission and startup have separate bounded
+budgets, so a queued fixture keeps its full startup window. Their base budgets
+and the readiness limit live in `postgres_test.go` and use `timescale.D`.
+Admission cancellation/deadline is reported as `raw postgres startup admission`,
+distinct from a Docker start, connection-string lookup or SQL failure. A slow
+successful admission logs its wait and the limit. This bounds one test binary's
+startup pressure; it is not a daemon-wide quota or proof that Docker cannot stall.
+
+`raw_start_test.go` drives the shipped starter with a fake Docker constructor and
+virtual-time synchronization: it bounds starts through port inspection, retains
+distinct fixtures, releases slots before cleanup and on errors/panic/Goexit, and
+checks that queueing cannot consume the startup budget. External-server fixtures
+continue using fresh raw databases without entering the Docker admission path.
+
 With the N-container start storm gone, `scripts/test` (default and `coverage`)
 restored `go test -p "${FISHHAWK_TEST_P:-4}"` (the 2→4 bump was gated on a -p 4
 run proving a single shared container via `docker ps`); lower it on a
