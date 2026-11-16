@@ -62,6 +62,18 @@ pnpm test         # vitest, jsdom
 pnpm build        # tsc -b + vite build → dist/
 ```
 
+### Lint dependency override
+
+ESLint 10.15 uses minimatch 11 directly. TypeScript-ESLint 8.72.2 still
+declares minimatch 10, so `pnpm.overrides` pins only
+`@typescript-eslint/typescript-estree>minimatch` to 11.0.8. The parser uses
+the named `minimatch` export with `{ dot: true }` to match project-service
+allowlist paths; `dependency-chain.test.ts` exercises that consumer with
+matching, dotfile, and excluded paths. The override fits the existing Node
+22+ baseline. Remove it once an upstream TypeScript-ESLint release resolves
+minimatch 11.0.1 or newer without the override, then regenerate the lockfile
+and run the frontend checks.
+
 For backend talkback, run `fishhawkd serve` in another terminal; the
 Vite dev server proxies `/v0/*` to `http://localhost:8080` so the
 session cookie set by `/v0/auth/github/callback` is same-origin from
