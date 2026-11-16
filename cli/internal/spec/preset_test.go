@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // allPresets is the closed set of autonomy tiers the generator ships.

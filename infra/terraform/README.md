@@ -1,17 +1,17 @@
 # Fishhawk infra (Terraform)
 
-Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. Terraform 1.5+ with the AWS provider 5.x. This directory has, as of E13.7.4:
+Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. Terraform 1.17.2 is the tested CLI, with AWS provider 6.73.0 pinned exactly. This directory has, as of E13.7.4:
 
 - **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + 2-AZ subnets + IGW + single NAT, security groups (ALB → app → RDS chain), IAM (ECS task / execution roles + GitHub Actions OIDC role), Secrets Manager skeletons, CloudWatch log group.
 - **ECS service + ALB** (E13.7.2 / [#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate cluster + task definition pointing at `ghcr.io/kuhlman-labs/fishhawkd:<image_tag>`, ECS service across both private subnets with rolling-deploy + circuit-breaker rollback, ALB + target group with `/healthz` health checks, HTTP listener (forward-only when no domain set, redirect-to-HTTPS otherwise), optional ACM cert + Route 53 alias + HTTPS listener gated on `var.domain_name`.
-- **RDS Postgres + migration task** (E13.7.3 / [#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with `rds.force_ssl=1` and the master password RDS-managed; Terraform reads it via `aws_db_instance.master_user_secret` and assembles the libpq URL into the existing `database_url` Secrets Manager entry. Dedicated `<project>-<env>-migrate` task definition for `fishhawkd migrate up`.
+- **RDS Postgres + migration task** (E13.7.3 / [#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16.15 in the private subnets with `rds.force_ssl=1` and the master password RDS-managed; Terraform reads it via `aws_db_instance.master_user_secret` and assembles the libpq URL into the existing `database_url` Secrets Manager entry. Dedicated `<project>-<env>-migrate` task definition for `fishhawkd migrate up`.
 - **CI deploy workflow** ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168)) — **removed** under [ADR-073](https://github.com/kuhlman-labs/fishhawk/issues/2298). `.github/workflows/backend-deploy.yml` never ran (its `workflow_run` trigger named `backend-build`/`backend-release`, not the real `Backend Build`/`Backend Release` workflow names) and was deleted rather than fixed: fixing the names would have deployed a release candidate to prod. Kubernetes + Helm (`deploy/helm/fishhawk/`) is the single deployment substrate; the ECS-specific resources below await retirement under the same ADR.
 
 There is no CI deploy path into this stack any more; an ECS deploy is a manual `terraform apply` with an explicit `image_tag`.
 
 ## Prerequisites
 
-- Terraform `~> 1.5` (Homebrew: `brew install terraform`)
+- Terraform 1.17.2 (the version pinned by the CI workflows)
 - An AWS account with admin access for the bootstrap (the deploy workflow uses a narrowly-scoped OIDC role created here, but the *bootstrap* needs IAM + S3 + DynamoDB write access)
 - AWS CLI configured (`aws configure`) for the bootstrap commands below
 

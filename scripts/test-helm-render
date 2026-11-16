@@ -2224,7 +2224,7 @@ while IFS= read -r -d '' doc; do
 done < <(docs_of_kind "$out" Job)
 if [ -n "$r18_job" ]; then
   pass "r18b the rustfs-bucket hook Job (<fullname>-rustfs-bucket) is rendered"
-  assert_contains "r18b bootstrap Job image is amazon/aws-cli:2.36.44 (rustfs.bootstrapImage)" "$r18_job" 'image: "amazon/aws-cli:2.36.44"'
+  assert_contains "r18b bootstrap Job image is amazon/aws-cli:2.40.3 (rustfs.bootstrapImage)" "$r18_job" 'image: "amazon/aws-cli:2.40.3"'
   assert_contains "r18b bootstrap Job stays a post-install/post-upgrade hook" "$r18_job" '"helm.sh/hook": post-install,post-upgrade'
   r18_cmd="$(yaml_block "$r18_job" command)"
   assert_equals "r18b bootstrap Job command begins with /bin/sh (a k8s command overrides the aws ENTRYPOINT)" \
@@ -2825,7 +2825,7 @@ else
   # failure (-> indeterminate) deterministically testable. 127.0.0.1:1 refuses,
   # so the token is empty and the probe short-circuits to indeterminate.
   assert_equals "r15a probe unreachable token endpoint -> indeterminate" \
-    "$(FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 _registry_probe rustfs/rustfs:1.0.0-rc.6)" "indeterminate"
+    "$(FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 _registry_probe rustfs/rustfs:1.0.6)" "indeterminate"
   # The MANIFEST-HEAD failure branch (the token twin): with the default auth
   # endpoint the token fetch succeeds, then FISHHAWK_REGISTRY_URL=http://127.0.0.1:1
   # refuses the HEAD, so `curl -I` reports 000 and the probe maps to indeterminate
@@ -2834,7 +2834,7 @@ else
   # fetch itself fails first, still yielding indeterminate, so the assertion holds
   # either way.
   assert_equals "r15a probe reachable auth + unreachable manifest endpoint -> indeterminate" \
-    "$(FISHHAWK_REGISTRY_URL=http://127.0.0.1:1 _registry_probe rustfs/rustfs:1.0.0-rc.6)" "indeterminate"
+    "$(FISHHAWK_REGISTRY_URL=http://127.0.0.1:1 _registry_probe rustfs/rustfs:1.0.6)" "indeterminate"
 
   # r15a STALL + DETERMINISTIC-MANIFEST branches (high + low untested-path, #2913).
   # The 127.0.0.1:1 cases above REFUSE immediately, so they never exercise the
@@ -2848,7 +2848,7 @@ else
     if ! command -v python3 >/dev/null 2>&1; then
       echo "scripts/test-helm-render: python3 absent — SKIPPING the r15a stall/deterministic-manifest tests (curl timeouts UNEXERCISED on this host)"
     else
-      _r15_good_ref="amazon/aws-cli:2.36.44"
+      _r15_good_ref="amazon/aws-cli:2.40.3"
       # (1) TOKEN-curl stall: a blackhole auth endpoint that ACCEPTS but never
       # responds. With --max-time the probe returns ~2s; without it, ~20s.
       if _r15_bh="$(_r15_mock_server blackhole)"; then

@@ -73,17 +73,17 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27.4'
           cache: false
 
       - name: Install golangci-lint
         run: |
-          # Pin install.sh to the v2.12.2 tag, NOT master: the master script
+          # Pin install.sh to the v2.15.0 tag, NOT master: the master script
           # is unpinned and an upstream change to it broke CI (exit 1 right
           # after resolving v2.12.2) with no change on our side. The tagged
           # script matches the version it installs and is reproducible.
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.12.2/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.15.0/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.15.0
 
       - name: Verify the tagged commit passes lint + tests
         run: |
@@ -192,7 +192,10 @@ jobs:
           name: mcp-release-files
           path: dist
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.3
+        with:
+          # Preserve the published .sig/.pem verification contract.
+          cosign-release: v2.6.5
 
       - name: Sign checksums (keyless)
         run: |

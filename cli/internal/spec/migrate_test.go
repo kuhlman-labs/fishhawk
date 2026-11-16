@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // updateGolden regenerates the committed v2 golden fixture from the v1

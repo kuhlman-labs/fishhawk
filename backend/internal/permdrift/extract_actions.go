@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // defaultTokenValue is the Value of the entry a job with NO permissions block

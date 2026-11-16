@@ -645,7 +645,7 @@ _reap_shared_container() {
   _prune_dead_leases
   if rmdir "$LEASE_DIR" 2>/dev/null; then
     # `-v` removes the anonymous volumes of THIS REMOVED CONTAINER only
-    # (postgres:16-alpine declares `VOLUME /var/lib/postgresql/data`, so every
+    # (postgres:16.16-alpine declares `VOLUME /var/lib/postgresql/data`, so every
     # container we create gets one). Without it each invocation leaked one
     # volume (#3710). `-v` CANNOT reach a NAMED volume, so compose-managed state
     # such as `fishhawk_fishhawk-postgres-data` is untouchable by construction.
@@ -1072,7 +1072,7 @@ cmd_coverage() {
 
 # Fail CLOSED if golangci-lint is missing: the verify gate must never silently
 # skip lint and re-open the gofmt/lint-drift-to-CI gap (#1064). Name the v2.x
-# install pin (the v2.12.2 install.sh tag CI uses, per AGENTS.md / ci.yml) so the
+# install pin (the v2.15.0 install.sh tag CI uses, per AGENTS.md / ci.yml) so the
 # error is actionable. A v1 binary rejects this repo's v2-format .golangci.yml,
 # so v2.x is required.
 _require_golangci_lint() {
@@ -1080,8 +1080,8 @@ _require_golangci_lint() {
     cat >&2 <<'EOF'
 scripts/test: golangci-lint not found on PATH (required for `lint`/`verify`).
 Install golangci-lint v2.x (this repo's .golangci.yml is v2-format; v1 rejects it):
-  curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.12.2/install.sh \
-    | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+  curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.15.0/install.sh \
+    | sh -s -- -b "$(go env GOPATH)/bin" v2.15.0
 EOF
     exit 1
   fi
@@ -1126,7 +1126,7 @@ EOF
 # at that FOREIGN path. A removed peer logs `Can't process results by
 # generated_file_filter processor: ... failed to get doc (strict) ... no such
 # file or directory` and an edited one no longer carries the //nolint, and
-# either way the suppressed finding is reported as `../<other-tree>/x.go`. The evidence is empirical, against the pinned
+# either way the suppressed finding is reported as `../<other-tree>/x.go`. The original evidence was measured against
 # golangci-lint v2.12.2: scripts/test-lint-cache's R1/R2 arms go RED with the
 # _export_lint_cache call deleted. It reproduces with and without
 # GOFLAGS=-trimpath, so -trimpath is not the trigger and the Go build cache
@@ -1178,7 +1178,7 @@ EOF
 #   (a) a NON-EMPTY value is left untouched: the runner's withIsolatedLintCache
 #       gates, the gate image's /lintcache and an operator's explicit choice win.
 #       An EMPTY value is treated as unset, as golangci-lint itself treats it
-#       (the pinned v2.12.2 `cache status` reports the default dir for it).
+#       (the pinned v2.15.0 `cache status` reports the default dir for it).
 #   (b) GITHUB_ACTIONS=true leaves it unset: a hosted job has one checkout, and
 #       ci.yml's 'Cache golangci-lint analysis cache' step restores the default
 #       ~/.cache/golangci-lint. This trusts the environment; an explicit ci.yml

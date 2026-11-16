@@ -30,7 +30,7 @@ Consolidated from the resolved ADRs (#65–#73, #78). Each row links to the issu
 
 | Layer | Choice | ADR |
 |---|---|---|
-| Backend language | Go 1.22+ | MVP_SPEC §10 #1 |
+| Backend language | Go 1.27+ | MVP_SPEC §10 #1 |
 | HTTP server / router | stdlib `net/http` + Go 1.22 method-aware `ServeMux` | session decision (CLAUDE.md) |
 | Logger | `log/slog` (stdlib) with JSON handler | (E3.2 #42) |
 | DB driver / access | `pgx/v5` + `sqlc` codegen; queries in `*.sql`, generated Go in `internal/<feature>/db/` | #66 |
@@ -39,8 +39,8 @@ Consolidated from the resolved ADRs (#65–#73, #78). Each row links to the issu
 | Trace bundle format | JSON Lines + gzip (`*.jsonl.gz`); one event per line with manifest + trailer | #71 |
 | Trace signing | Ed25519 over `sha256(raw_bundle_bytes)`; per-run ephemeral keys, 30-min TTL | #72 |
 | Cloud | AWS (RDS Postgres, S3, ECS Fargate, ALB, Secrets Manager, CloudWatch) | #65, #73 |
-| Frontend framework | Vite 6 + React 19 + React Router 7 (SPA); pnpm 10 | session decision (CLAUDE.md) |
-| Frontend test runner | Vitest 3 + @testing-library/react + jsdom | E7.1 (#37) |
+| Frontend framework | Vite 8 + React 19 + React Router 8 (SPA); pnpm 12 | session decision (CLAUDE.md) |
+| Frontend test runner | Vitest 5 + @testing-library/react + jsdom | E7.1 (#37) |
 | Frontend styling | Tailwind CSS v4 + shadcn/ui (copied components) + Radix primitives + lucide-react icons | #68 |
 | Browser auth | HTTP-only `fishhawk_session` cookie (server-side state); CSRF token in `__Host-csrf` cookie for state-changing endpoints | #69 |
 | CLI / API auth | Scoped opaque bearer tokens; revocable; audit-logged on issue/use/revoke | #69 (E4.5 #51) |

@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 //go:embed presets/workflow-preset-low.yaml presets/workflow-preset-medium.yaml presets/workflow-preset-high.yaml presets/workflow-preset-low-config-only.yaml presets/workflow-preset-medium-config-only.yaml presets/workflow-preset-high-config-only.yaml

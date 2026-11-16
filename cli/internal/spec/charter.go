@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // The STATIC half of the mandatory-charter rule (E54.11 / #2801).

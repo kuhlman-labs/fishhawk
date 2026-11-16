@@ -343,7 +343,7 @@ func startRawContainer(t *testing.T) string {
 	defer cancel()
 	return startContainerWith(t, t.Cleanup, ctx, func(ctx context.Context) (testcontainers.Container, connStringFunc, error) {
 		c, err := tcpostgres.Run(ctx,
-			"postgres:16-alpine",
+			"postgres:16.16-alpine",
 			tcpostgres.WithDatabase("fishhawk"),
 			tcpostgres.WithUsername("fishhawk"),
 			tcpostgres.WithPassword("fishhawk"),

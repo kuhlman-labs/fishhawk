@@ -463,7 +463,7 @@ empirical and one from source:
 
 1. **Empirical.** Rendering a probe chart calling
    `lookup "v1" "Secret" .Release.Namespace "definitely-absent-secret"`
-   under `helm template` with no cluster connection (helm v4.2.4)
+   under `helm template` with no cluster connection (helm v4.3.2)
    returned an **empty but non-nil** map: `isNil=false`, `isEmpty=true`,
    `len=0`, exit 0. So a lookup-based presence guard fails on EVERY
    dry-run render — including `scripts/test-helm-render` and every
@@ -754,8 +754,8 @@ An out-of-tree values file written against 0.3.0 must be updated:
 | 0.3.0 (`minio.*`) | 0.4.0 (`rustfs.*`) |
 |---|---|
 | `minio.enabled` | `rustfs.enabled` |
-| `minio.image` | `rustfs.image` (`rustfs/rustfs:1.0.0-rc.6`) |
-| `minio.mcImage` | `rustfs.bootstrapImage` (`amazon/aws-cli:2.36.44`) |
+| `minio.image` | `rustfs.image` (`rustfs/rustfs:1.0.6`) |
+| `minio.mcImage` | `rustfs.bootstrapImage` (`amazon/aws-cli:2.40.3`) |
 | `minio.rootUser` / `minio.rootPassword` | `rustfs.accessKey` / `rustfs.secretKey` |
 | `minio.{pullPolicy,apiPort,consolePort,bucket,createBucket,persistence,resources}` | same keys under `rustfs.` |
 | Service / PVC / Deployment `<fullname>-minio` | `<fullname>-rustfs` (`config.s3Endpoint` must follow) |
@@ -955,7 +955,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
-          version: v4.2.4
+          version: v4.3.2
 
       - name: helm version
         run: helm version

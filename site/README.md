@@ -21,7 +21,7 @@ convention, so the split cannot decay into "some of `docs/` is also public":
 
 ## Why Astro + Starlight
 
-The repository already requires Node 22+ and pnpm 10+ for `frontend/`, so this
+The repository already requires Node 22.23.4+ and pinned pnpm 12.21.0 for `frontend/`, so this
 adds no new language runtime. Starlight emits a plain static bundle that GitHub
 Pages serves directly, and it ships the sidebar, search, and page structure the
 information architecture needs without hand-rolling them. A Python-based
@@ -99,8 +99,8 @@ Exact versions, no floating majors, per the executable-tooling pin rule in
 
 | Package | Pin | Why this version |
 |---|---|---|
-| `astro` | `7.4.7` | Declares `engines.node >= 22.23.4`, which is why this package's `engines.node` is `>=22.23.4` — **tighter than `frontend/`'s `>=22`**, and honest about what the toolchain needs. |
-| `@astrojs/starlight` | `0.42.9` | Peers `astro: ^7.2.10`, satisfied by the pin above. |
+| `astro` | `7.4.12` | Declares `engines.node >= 22.23.4`, which is why this package's `engines.node` is `>=22.23.4` — **tighter than `frontend/`'s `>=22`**, and honest about what the toolchain needs. |
+| `@astrojs/starlight` | `0.43.1` | Peers `astro: ^7.2.10`, satisfied by the pin above. |
 | `@astrojs/check` | `0.9.12` | Backs the `check` script. `astro check` is a thin front for this **separate** package; without it the script fails at runtime. |
 | `typescript` | `6.0.3` | **Not the latest.** `@astrojs/check@0.9.12` peers `typescript: ^5.0.0 \|\| ^6.0.0`, so a 7.x pin is an unmet peer and a failing `check`. `6.0.3` is the latest 6.x and the version `frontend/` already floats on (`^6.0.3`), so the two pnpm projects agree without being coupled. |
 
@@ -110,7 +110,10 @@ the other leaves `pnpm --dir site check` failing, and the verify gate does not
 run it.
 
 `pnpm-lock.yaml` is committed. That is what makes the deploy reproducible via
-`pnpm install --frozen-lockfile`.
+`pnpm install --frozen-lockfile`. Settings live in `pnpm-workspace.yaml`.
+`pmOnFail: ignore` keeps the lockfile to one YAML document so GitHub can read
+its dependency graph and emit security alerts; `engines.pnpm` still rejects
+an install with a pnpm version other than the exact `packageManager` pin.
 
 ## Local loop
 
@@ -223,7 +226,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '26'
           cache: 'pnpm'
           cache-dependency-path: site/pnpm-lock.yaml
 
@@ -272,7 +275,7 @@ mint. The block above instead defaults to `permissions: {}` and grants per job:
 scopes and runs no dependency code. `actions/upload-pages-artifact` needs no
 `permissions` grant — artifact upload authenticates with the Actions runtime
 token, not `GITHUB_TOKEN` — which is what makes the split work without breaking
-the handoff. `site/package.json`'s `pnpm.onlyBuiltDependencies` narrows the
+the handoff. `site/pnpm-workspace.yaml`'s `allowBuilds` narrows the
 install-time half further, to `esbuild` and `sharp`.
 
 Action refs stay on **floating major tags** — that is the deliberate carve-out

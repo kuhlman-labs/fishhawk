@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // This file walks a JSON Schema (parsed as YAML so declaration order is

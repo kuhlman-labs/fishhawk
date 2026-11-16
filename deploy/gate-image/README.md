@@ -20,7 +20,7 @@ toolchain. It has two consumers:
 | Property | Value |
 |---|---|
 | Base | `golang:${GO_VERSION}-bookworm` (official multi-arch image) |
-| Build context | `deploy/gate-image/`, plus named context `frontend=./frontend`; only package.json and pnpm-lock.yaml are copied |
+| Build context | `deploy/gate-image/`, plus named context `frontend=./frontend`; only package.json, pnpm-lock.yaml and pnpm-workspace.yaml are copied |
 | Entrypoint / user | none / none — callers pass `--entrypoint ''` and `--user uid:gid` |
 | Runtime env | works as an arbitrary uid with `HOME=/tmp`, except that such a uid has no `/etc/passwd` entry in the image (`whoami` fails, so test-helm-render r9h fails); both callers SUPPLY one: `--in-gate-image` mounts one (step 6), and the runner's container path mounts a runner-generated read-only `/etc/passwd` on every exec (#2137; when that read or write degrades, `gate_passwd_unavailable`, the gap returns for that exec); `GOTOOLCHAIN=local` is baked in |
 | Docker | none: no engine, CLI, plugin or socket, enforced in both check modes |
@@ -34,7 +34,7 @@ from apt `zsh`, `jq`, `python3` (+ `python3-venv`), `lsof`, `netcat-openbsd`
 `diffutils`, `file`, `ca-certificates`; fetched and checksum-verified
 `golangci-lint`, `helm`, `check-jsonschema` (in a venv at
 `/opt/check-jsonschema`, because bookworm's python is PEP 668
-externally-managed). Node 22.21.1 (official multi-arch image) and pnpm 10.33.3 support the frontend gate. Deliberately absent: `docker`, `kubectl`, `kind`.
+externally-managed). Node 26.13.1 (official multi-arch image) and pnpm 12.21.0 support the frontend gate. Deliberately absent: `docker`, `kubectl`, `kind`.
 
 **git version (#4767).** Debian bookworm's `git`, 2.39.5 today
 (`docker run --rm --entrypoint git fishhawk-gate:local --version`). It is
@@ -54,7 +54,7 @@ covers whatever it ships. No Dockerfile change, so no image rebuild.
 |---|---|
 | `GO_VERSION` (exact `MAJOR.MINOR.PATCH`) | MAJOR.MINOR of every `go.work` / `go.mod` `go` directive and every workflow `go-version:` literal; no `go` / `toolchain` directive may EXCEED it in full (`GOTOOLCHAIN=local` refuses a newer one) |
 | `GOLANGCI_LINT_VERSION` | EXACTLY the golangci-lint `install.sh` tag in every `.github/workflows/*` file and in `scripts/test`'s install hint; on the HOST (`--host`, #4245), EXACTLY the `golangci-lint version` on PATH, whose binary must also be `built with` a Go of `GO_VERSION`'s MAJOR.MINOR (its gofmt/goimports formatters follow the Go that built it). A bump that pairs a golangci-lint release built with another Go minor therefore makes `scripts/test lint` refuse everywhere, CI included, so bump both together |
-| `HELM_VERSION` (exact `vMAJOR.MINOR.PATCH`, currently `v4.2.4`) | MAJOR ≥ 4, because `scripts/test-helm-render` r9 renders `NOTES.txt` with `helm install --dry-run`, which Helm v3 (`--dry-run=client` too) refuses without a reachable cluster and the image has none. The helm render gate's documented CI half (`deploy/helm/fishhawk/README.md`, `setup-helm` `version:`) carries the same `v4.2.4`; nothing checks that pair, so bump both together |
+| `HELM_VERSION` (exact `vMAJOR.MINOR.PATCH`, currently `v4.3.2`) | MAJOR ≥ 4, because `scripts/test-helm-render` r9 renders `NOTES.txt` with `helm install --dry-run`, which Helm v3 (`--dry-run=client` too) refuses without a reachable cluster and the image has none. The helm render gate's documented CI half (`deploy/helm/fishhawk/README.md`, `setup-helm` `version:`) carries the same `v4.3.2`; nothing checks that pair, so bump both together |
 | `CHECK_JSONSCHEMA_VERSION` | the `check-jsonschema` validator `AGENTS.md` names for `docs/spec/` |
 
 The chain closes in two halves:
@@ -78,7 +78,7 @@ The chain closes in two halves:
   Long form: `scripts/README.md` § "Lint".
 
 Go parity with CI is MAJOR.MINOR only, because CI itself floats the patch
-(`go-version: '1.26'`); the Dockerfile's `GO_VERSION` is the repo's one exact
+(`go-version: '1.27'`); the Dockerfile's `GO_VERSION` is the repo's one exact
 patch pin.
 
 ## Local build
@@ -268,7 +268,7 @@ operator-validated (the workflow above).
 
 ## Offline frontend gate
 
-Build from the repository root with the named context shown above. The frontend context contributes only `package.json` and `pnpm-lock.yaml`; no source, host node_modules or credentials are baked into the image. Node's exact version and pnpm's exact version are Dockerfile ARGs. The build checks the pnpm pin against `packageManager`, then fetches the lockfile packages without executing install scripts into `/opt/fishhawk-pnpm-store` for the target architecture.
+Build from the repository root with the named context shown above. The frontend context contributes only `package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml`; no source, host node_modules or credentials are baked into the image. Node's exact version and pnpm's exact version are Dockerfile ARGs. The build checks the pnpm pin against `packageManager`, then fetches the lockfile packages without executing install scripts into `/opt/fishhawk-pnpm-store` for the target architecture. The build also performs a frozen install with scripts disabled and saves public registry metadata in `/opt/fishhawk-pnpm-cache`. pnpm 12 needs publication times for its default release-age checks even offline. The gate copies both caches into its private scratch directory before installation; the image contains no host credentials or project node_modules.
 
 `scripts/check-frontend` copies this store into a disposable writable directory, installs with `--offline --frozen-lockfile --ignore-scripts`, then executes all five frontend CI checks. It works under the gate's arbitrary uid and `--network=none`. Missing cache/tooling returns infrastructure exit 75, never a successful skip. Rebuild the local image after frontend lockfile/package-manager changes as well as gate-tool changes, using the candidate checkout when it adds dependencies; published images rebuild on either manifest change. Do not replace a live run's selected image mid-stage.
 

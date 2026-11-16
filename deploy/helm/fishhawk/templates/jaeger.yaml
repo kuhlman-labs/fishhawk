@@ -41,11 +41,6 @@ spec:
         - name: jaeger
           image: {{ .Values.jaeger.image | quote }}
           imagePullPolicy: {{ .Values.jaeger.pullPolicy }}
-          env:
-            # OTLP is on by default since v1.35, but set defensively so an older
-            # pinned tag still accepts it (mirrors docker-compose.yml).
-            - name: COLLECTOR_OTLP_ENABLED
-              value: "true"
           ports:
             - name: ui
               containerPort: 16686

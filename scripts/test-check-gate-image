@@ -355,7 +355,7 @@ run_static "$r"
 expect "s9n: \$BUILDPLATFORM and GOARCH=\${TARGETARCH} are not literals" 0 "check-gate-image: ok"
 
 run_static "$REPO_ROOT"
-expect "s10: the SHIPPED repo (deploy/gate-image/Dockerfile vs the real go.work, go.mods, workflows, scripts/test) passes" 0 "check-gate-image: ok" "GO_VERSION 1.26.9"
+expect "s10: the SHIPPED repo (deploy/gate-image/Dockerfile vs the real go.work, go.mods, workflows, scripts/test) passes" 0 "check-gate-image: ok" "GO_VERSION 1.27.4"
 
 r="$(mkfix s11a)"
 edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.7#'
@@ -631,7 +631,7 @@ lacks "h13: no tool is reported ok against an uncomparable pin" "ok host"
 
 run_host "$REPO_ROOT" "$HB_ALL"
 expect "h14: --host reads the pins from the SHIPPED Dockerfile at run time (fixture tools disagree with them)" 1 \
-  "GOLANGCI_LINT_VERSION v2.12.2" "GO_VERSION 1.26.9"
+  "GOLANGCI_LINT_VERSION v2.15.0" "GO_VERSION 1.27.4"
 
 echo
 echo "test-check-gate-image: $PASS passed, $FAIL failed"

@@ -16,13 +16,16 @@ actual="$(pnpm --version)" || unavailable 'cannot read pnpm version'
 [ "$actual" = "$expected" ] || unavailable "pnpm $actual does not match packageManager $expected"
 if [ "${FISHHAWK_GATE_CONTAINER:-}" = 1 ]; then
   [ -d /opt/fishhawk-pnpm-store ] || unavailable 'offline pnpm store is missing'
+  [ -d /opt/fishhawk-pnpm-cache ] || unavailable 'offline pnpm registry metadata is missing'
   store="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-pnpm.XXXXXX")"
   trap 'rm -rf "$store"' EXIT
   cp -R /opt/fishhawk-pnpm-store/. "$store/"
+  # pnpm 12 verifies publication times against registry metadata, even offline.
+  cp -R /opt/fishhawk-pnpm-cache "$store/cache"
   # No project/ dependency lifecycle scripts at installation. Vite/esbuild use
   # their pinned platform packages directly. Test/build run explicitly below.
   rc=0
-  pnpm install --offline --frozen-lockfile --ignore-scripts --store-dir "$store" >"$store/install.log" 2>&1 || rc=$?
+  pnpm install --offline --frozen-lockfile --ignore-scripts --store-dir "$store" --cache-dir "$store/cache" >"$store/install.log" 2>&1 || rc=$?
   cat "$store/install.log"
   if [ "$rc" != 0 ]; then
     if grep -Eq 'ERR_PNPM_NO_OFFLINE_(TARBALL|META)' "$store/install.log"; then

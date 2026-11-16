@@ -14,7 +14,7 @@ Fishhawk develops itself through Fishhawk: since Day 22 of the v0 build (2026-05
 
 Local setup brings up the backend against a Postgres + RustFS stack and validates a workflow.
 
-**Prerequisites:** [Go 1.25+](https://go.dev/dl/), [Docker](https://www.docker.com/), and — only for the Web UI — [Node 22+](https://nodejs.org/) with [pnpm 10+](https://pnpm.io/).
+**Prerequisites:** [Go 1.27+](https://go.dev/dl/), [Docker](https://www.docker.com/), and — only for the Web UI — [Node 26 LTS](https://nodejs.org/) with [pnpm 12.21.0](https://pnpm.io/).
 
 The [`Makefile`](Makefile) wraps the common loops (`make help` lists every target):
 
