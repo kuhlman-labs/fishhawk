@@ -717,6 +717,8 @@ var runStatusPathTable = []pathClassification{
 	// skeleton-ledger entry, so it neither bypasses the budget nor perturbs the
 	// diagnosis-skeleton size the floor assertions pin.
 	{Path: "stages[].agent_timeout_seconds", Tier: tierNever},
+	// Workflow-derived routing is computed; a skeleton omission is itemised.
+	{Path: "stages[].review_gate_admission", Tier: "skeleton", Class: classComputed},
 	// progress (#2541) is a redundant decode-mirror of the authoritative
 	// operator-facing values carried on the three *_stage_wait_status blocks
 	// (last_event / turns_this_attempt / tokens_this_attempt / elapsed_seconds),

@@ -294,6 +294,12 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			)
 			return
 		}
+		// A linked PR cannot supply the decision of a non-PR human gate
+		// (ADR-018/031 Amendment A1). Its own operator confirmation still owns it.
+		if reviewStage != nil && reviewGateAdmissionForRun(reviewStage, target) == reviewGateAdmitOK {
+			s.cfg.Logger.Info("pull_request merged: operator confirmation gate remains open", "run_id", target.ID.String(), "stage_id", reviewStage.ID.String())
+			return
+		}
 		// ADR-036 (#876) implement-review / merge completion gate. When
 		// the run has a review stage AND a configured agent implement
 		// review (ADR-027) is still in-flight, refuse to resolve the
@@ -330,6 +336,16 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		if reviewStage != nil && !s.mergeSettledMembersAdmit(ctx, target, reviewStage, meta) {
 			return
 		}
+		// Older review-first runs may still be pending despite a recorded PR.
+		// Only after the forge/member checks above may they take the ordinary
+		// human-stage walk; completion below still requires the observed merge.
+		if humanReviewFirstUninitialized(reviewStage) {
+			if err := s.initializeHumanReviewAfterPR(ctx, target.ID, reviewStage, meta.prURL); err != nil {
+				s.cfg.Logger.Warn("merged review-first initialization failed", "run_id", target.ID.String(), "error", err.Error())
+				return
+			}
+		}
+
 		// Audit row first — if the transition fails (state-machine
 		// reject) we still want the merge recorded.
 		s.writePRMergedAudit(ctx, target.ID, stageID, meta)

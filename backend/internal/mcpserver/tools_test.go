@@ -17217,14 +17217,15 @@ func overrideGoldenKey(t *testing.T, golden map[string]any, key string, value an
 }
 
 // groomingApplyStatusRun is a backlog_grooming-shaped run: no implement stage,
-// a human review gate parked at awaiting_approval, no PR — so the classifier's
+// a human review gate parked at awaiting_approval, with workflow-derived
+// operator-confirmation metadata — so the classifier's
 // human_review_gate_parked arm leads with approve_review_gate, which is exactly
 // the action the in-flight advisory must displace from actions[0].
 func groomingApplyStatusRun(fb *fakeBackend, runID uuid.UUID) {
 	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "backlog_grooming", State: "running"}
 	fb.stagesByRun[runID] = []Stage{
 		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
-		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "review", State: "awaiting_approval", Executor: StageExecutor{Kind: "human"}},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "review", State: "awaiting_approval", Executor: StageExecutor{Kind: "human"}, ReviewGateAdmission: "admitted"},
 	}
 }
 

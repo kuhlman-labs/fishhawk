@@ -18,8 +18,8 @@ import (
 // (with key params), its precondition, what it consumes, and a one-line
 // reason. The classifier is a pure function over data the tools already
 // fetch (run row, stage rows, review statuses, the computed
-// review_action_hint, and the drive read view) — no backend endpoint or
-// schema is involved. DISPLAY-ONLY, never gates a run: like the
+// review_action_hint, workflow-derived review routing, and the drive read
+// view) — classification performs no extra backend requests. DISPLAY-ONLY, never gates a run: like the
 // periodic-budget block and the hint it generalizes, it is advisory.
 //
 // Structural invariant (the "done means" condition): nextActionsFor NEVER
@@ -1205,29 +1205,8 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 		}
 	}
 
-	// Human-executor review-gate arm (E54.52 / #3014). Placed AFTER the
-	// implement arm and BEFORE the release/deploy arms and the unclassified
-	// fallback: a backlog_grooming run parked at its `confirm` gate has NO
-	// implement stage, so it fell through every arm above and read as
-	// unclassified while drive_status pointed at an implement stage the
-	// workflow never declared.
-	//
-	// Both of humanReviewGateNextActions' extra guards are LOAD-BEARING, and
-	// neither is redundant with this placement:
-	//
-	//   - impl == nil: feature_change ALSO declares a human-executor review
-	//     stage (.fishhawk/workflows.yaml), which implementStageNextActions
-	//     already owns. The ORDERING above makes the implement arm win for a
-	//     run that reaches it, but implementStageNextActions may return nil and
-	//     fall through — the guard is what keeps this arm from picking up that
-	//     fall-through and re-labelling a feature_change run.
-	//   - no pull_request_url: a PR-INPUT human review gate (human_led_change,
-	//     routine_change) is ADR-018 PR-merge-managed, and pointing the
-	//     operator at approve-review-gate there names a call the backend
-	//     refuses 409 review_stage_managed_by_github / pull_request_managed.
-	//
-	// The drive fold contributes nothing here: drive.RulePlanApprovedHumanGate
-	// stamps NO next_action, so there is no duplicate entry to de-duplicate.
+	// Review-first routes use workflow-derived admission metadata, never the
+	// absence of a PR URL as permission to submit an operator approval.
 	if a := humanReviewGateNextActions(run, stages); a != nil {
 		return a
 	}
@@ -1274,31 +1253,39 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	return unclassifiedNextActions(run, stages)
 }
 
-// humanReviewGateNextActions classifies a run parked at a HUMAN-executor
-// review gate that its workflow reaches with no implement stage at all — the
-// backlog_grooming `confirm` gate (E54.52 / #3014). Returns nil unless ALL
-// THREE hold, each guard named in the classifyNextActions comment above:
-// the run declares no implement stage, a review stage sits at
-// awaiting_approval with executor kind human, and the run carries no pull
-// request.
-//
-// The no-pull_request_url guard is a PROXY for the server-side
-// pull_request_managed admission leg, which this layer cannot evaluate: the
-// classifier is a pure function over the wire DTO and holds no workflow spec.
-// Residual, stated plainly: a PR-input human review gate on a run whose row
-// carries no pull_request_url WOULD be classified here and would then be
-// refused 409 pull_request_managed at the CLI. The action's precondition names
-// that outcome, so the failure is a refused call the operator was warned about
-// rather than a wrong write.
+// humanReviewGateNextActions handles human review workflows without an
+// implement stage. Routing metadata comes from the same server predicate as
+// approval admission. Missing/unknown metadata never grants direct approval.
 func humanReviewGateNextActions(run *Run, stages []Stage) *NextActions {
 	if stageByType(stages, "implement") != nil {
 		return nil
 	}
-	if run.PullRequestURL != nil && *run.PullRequestURL != "" {
+	review := stageByType(stages, "review")
+	if review == nil || review.Executor.Kind != "human" ||
+		(review.State != "pending" && review.State != "dispatched" && review.State != "running" && review.State != "awaiting_approval") {
 		return nil
 	}
-	review := stageByType(stages, "review")
-	if review == nil || review.State != "awaiting_approval" || review.Executor.Kind != "human" {
+	if review.ReviewGateAdmission == "pull_request_managed" {
+		if run.PullRequestURL == nil || *run.PullRequestURL == "" || review.State != "awaiting_approval" {
+			return &NextActions{State: "human_review_awaiting_pull_request", Actions: []SuggestedAction{{
+				Action: "attach_pull_request", Params: map[string]string{"run_id": run.ID, "stage_id": review.ID},
+				Precondition: "publish the operator-authored PR, then attach its validated pull_request artifact; retry an identical upload to heal interrupted initialization",
+				Consumes:     consumesNone,
+				Reason:       "the workflow declares a PR-managed human review gate; POST the pull_request artifact to /v0/runs/" + run.ID + "/pull-request?stage_id=" + review.ID + " — this initializes review and never approves it",
+			}}}
+		}
+		return &NextActions{State: "human_review_pull_request", Actions: []SuggestedAction{{
+			Action: "review_pull_request", Params: map[string]string{"run_id": run.ID, "pr_url": *run.PullRequestURL},
+			Precondition: "a human reviews on the forge under the workflow's approver constraints; verified landing, not an in-Fishhawk approval, completes this gate",
+			Consumes:     consumesNone, Reason: "review the attached PR; after forge approval and green checks use fishhawk_merge_run to merge it",
+		}}}
+	}
+	if review.ReviewGateAdmission != "admitted" {
+		return &NextActions{State: "human_review_gate_unresolved", Actions: []SuggestedAction{pollAction(run,
+			suggestedStageWaitPollIntervalSeconds,
+			"human review routing is unresolved ("+review.ReviewGateAdmission+"); inspect the cached workflow and server version — missing metadata is not approval permission")}}
+	}
+	if review.State != "awaiting_approval" {
 		return nil
 	}
 	return &NextActions{

@@ -22,6 +22,7 @@ import (
 // Field types align with the json:"" tags in run.Stage but the
 // envelope is built explicitly so we never accidentally leak an
 // internal representation change through to the wire format.
+// CROSS-MODULE WIRE CONTRACT: stage_read_api (#5419), decoded by mcpserver.Stage.
 type stageResponse struct {
 	ID        uuid.UUID     `json:"id"`
 	RunID     uuid.UUID     `json:"run_id"`
@@ -68,6 +69,12 @@ type stageResponse struct {
 	// observability read handlers (handleGetStage, handleListRunStages); the
 	// action endpoints that build a stageResponse leave it at the zero default.
 	AgentTimeoutSeconds int `json:"agent_timeout_seconds"`
+	// Workflow-derived approval routing, only on human review observability
+	// reads. "admitted" means operator confirmation; "pull_request_managed"
+	// means forge approval/landing. Other values name a resolution failure.
+	// Absent on older servers and action responses; never infer consent from it.
+	ReviewGateAdmission string `json:"review_gate_admission,omitempty"`
+
 	// Progress is the runner's mid-execution stage_progress heartbeat projected
 	// onto the stage row (#2541): last_event / turns_this_attempt /
 	// tokens_this_attempt / reported_at, plus the optional #4023 phase fields,
@@ -256,6 +263,9 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 	for _, st := range stages {
 		resp := toStageResponse(st)
 		resp.ResolvedModel = s.resolvedModelForStage(r.Context(), st)
+		if st.Type == run.StageTypeReview && st.ExecutorKind == run.ExecutorHuman {
+			resp.ReviewGateAdmission = reviewGateAdmissionForRun(st, runRow).String()
+		}
 		if runRow != nil {
 			resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, st.Type)
 		}
@@ -296,10 +306,14 @@ func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := toStageResponse(got)
 	resp.ResolvedModel = s.resolvedModelForStage(r.Context(), got)
-	// Spec-resolved agent wall clock (#2540), fetched by the stage's run id.
-	// Fail open to 0 on a run-fetch error or unparseable spec.
-	if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), got.RunID); gerr == nil {
+	// Reuse the run read for both the budget and review-routing metadata.
+	var runRow *run.Run
+	if rr, err := s.cfg.RunRepo.GetRun(r.Context(), got.RunID); err == nil {
+		runRow = rr
 		resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, got.Type)
+	}
+	if got.Type == run.StageTypeReview && got.ExecutorKind == run.ExecutorHuman {
+		resp.ReviewGateAdmission = reviewGateAdmissionForRun(got, runRow).String()
 	}
 	// Mid-execution heartbeat (#2541), best-effort: nil on a store-assertion
 	// miss or read error, matching the resolved_model / agent_timeout posture.

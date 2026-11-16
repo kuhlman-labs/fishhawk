@@ -2,6 +2,21 @@
 
 Stage orchestrator: next-stage dispatch after approve. Called from the approval handler on approve; dispatches the next pending stage (or transitions the Run to terminal when all stages are done) — unless that stage sits behind a `deploy` stage that has not succeeded (see "Post-deploy hold"). Agent stages fire `workflow_dispatch`; human stages walk to `awaiting_approval` directly.
 
+## Review-first human initialization (#5419)
+
+The server starts review-first human runs at creation through the bounded
+`InitializeHumanReviewFirst` entrypoint. Its fresh selection can target only
+the first review, so a concurrent publisher parking that gate cannot cause
+initialization to dispatch a later stage. `Advance` keeps a
+PR-managed first review pending until its declared PR input arrives, while the
+run is running. An unavailable first-review declaration holds with a named
+input-resolution error. PR attachment resumes the ordinary human-stage walk; an
+interruption in dispatched/running resumes from that persisted state. The walk
+parks at awaiting_approval and supplies no approval. An already parked gate is
+not a reason to initialize again or dispatch later work. Workflow inputs, not
+repository/workflow names, choose the PR wait. The lifecycle and replay contract
+is owned by server/docs/review.md § Review-first human lifecycle.
+
 ## Credential-scope resolution in `triggerParams` (E45.22 / #2043)
 
 `triggerParams` maps a run + its next stage onto the forge-neutral `runnerbackend.TriggerParams`. Its `Scope` comes from `runCredentialScope`, which is a LADDER, not a switch:
