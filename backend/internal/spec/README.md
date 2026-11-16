@@ -6,6 +6,10 @@ The parser uses the YAML organization’s maintained `go.yaml.in/yaml/v3`
 package. Dependency updates must preserve the v0/v1/v2 parsing and rejection
 fixtures in this package and its CLI mirror.
 
+`StageDeclaresPullRequestInput` recognizes both external PR source inputs and
+PR artifact handoffs. Review initialization and approval admission share this
+predicate (#5419), so either spelling selects a landing-managed gate.
+
 ## Version routing (ADR-046 / ADR-067)
 
 `parse.go` embeds the `workflow-v0`, `workflow-v1`, and `workflow-v2` schemas and compiles each at package init. `ParseBytes` reads the spec's `version`, parses its **major** component, and validates against the schema for that major via the `embeddedSchemas` routing table:

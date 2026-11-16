@@ -3764,3 +3764,17 @@ detail is absent.
 - **`schedules` is never null.** `ListSchedules` normalizes a null/absent array to `[]` because the reflected output schema types it as an array (`TestListSchedulesTool_NullSchedulesNormalized`); `TestListSchedulesTool_WireRoundTrip_RealSession` drives the registered tool over a real client session so the SDK's output-schema validation runs on both a populated and an `enabled:false` body.
 - **Bounded (ADR-077).** `boundListSchedulesOutput`: B1 caps `spec_error` and each `last_outcome.message` to 256 encoded bytes (an `oversized_capable` elision); B2 halves `schedules` from the TAIL of the `workflow_id`-ascending list (a `stored` elision). Both name `GET /v0/schedules?repo=…`. `TestListSchedulesTool_BoundsEveryTier` drives each tier at the 4 KiB floor, B2 over a real session.
 - **Authorization.** The `/mcp` gate row (`backend/internal/server/mcpscopes.go`) is `mcpScopeAuthenticatedOnly`, mirroring the handler: authenticated, no scope, the point-read repo-visibility DENY applied before the scheduler is consulted; no run-bound subject.
+
+## Human review routing (#5419)
+
+`next_actions` consumes the stage read's optional `review_gate_admission`,
+resolved by the backend's approval-admission predicate. A PR-managed review-first
+run with missing input or interrupted initialization offers `attach_pull_request`
+(the documented PR-artifact upload); a parked review with its PR attached offers
+`review_pull_request` on the forge. Only `admitted` metadata offers the existing
+operator-confirmation action. Missing/empty/unknown metadata reports unresolved
+routing, including against an older backend. No action supplies human approval.
+The routing fact is classified as computed in the response-budget table; any
+skeleton omission is itemised rather than silently discarded.
+The shared `human_review_first_wire.json` fixture is emitted by real server
+handlers and decoded through the production MCP wire types.

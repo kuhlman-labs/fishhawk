@@ -7365,6 +7365,17 @@ components:
             — the adapter-default spawn, and every stage of a run
             approved before per-stage model selection landed.
           example: claude-opus-4-8
+        review_gate_admission:
+          type: string
+          description: |
+            Workflow-derived routing for a human-executor review stage (#5419),
+            using the same predicate as approval admission. `admitted` means
+            operator confirmation; `pull_request_managed` means forge approval
+            and verified landing. Other values name a resolution failure.
+            Present on stage observability reads for human review stages;
+            omitted on other stages, action responses and older backends.
+            Missing, empty or unknown metadata must never authorize approval.
+          example: pull_request_managed
         agent_timeout_seconds:
           type: integer
           description: |

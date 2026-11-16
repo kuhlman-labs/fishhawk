@@ -2581,3 +2581,35 @@ A `conflict_resolution_pushed` report starts an ordinary FULL-DIFF implement-rev
 **Classification and the skip row.** A report is `docs_only` only when the path list is non-empty and not truncated, the run spec parsed, and every path (canonicalised with `path.Clean` first, so `./`, `.` and empty segments cannot hide a prefix) ends case-sensitively in `.md`/`.mdx`/`.markdown`/`.rst`/`.adoc`, is not an instruction path, has no `.github`/`.fishhawk` segment, no `docs/review/`, `docs/spec/`, `docs/adr/` or `docs/compliance/` prefix, and is not a declared review-convention path (all EqualFold). Before skipping, the forge compare's changed-file list for `base...merge-head` must be readable, untruncated, and claimed in full by the runner's list, rename SOURCES included, so moving a review-governing file out of its tree is never skipped on the destination's claim; a rename whose source the forge did not name also fails toward review (E5). Otherwise the round starts. A skip appends `conflict_resolution_review_skipped` (`resolution_docs_only`); when that append fails the handler ERROR-logs and reviews instead. A decomposed parent records the same row with `decomposed_parent` and starts no round (E7). With no reviewer configured the dispatch still reaches `runImplementReviews`, which writes `implement_review_skipped` `reviewer_not_configured` (E9).
 
 **Trust.** A docs-only skip rests on an UNVERIFIED runner claim about the resolved paths, narrowed by the compare cross-check and bounded by ADR-090's merge-candidate verify, which still gates merge of a `conflict_resolution` head. The skip is a cost optimisation only; the operator re-run arm ignores the class.
+
+## Review-first human lifecycle (#5419)
+
+A workflow whose first stage is a human review has no runner entry to start
+it. Creation enters the ordinary orchestrator: the run becomes `running`,
+while a PR-managed first review stays `pending` until its PR input is attached.
+The declaration selects this route; there is no repository or workflow-name
+allow-list. Both PR input spellings use `spec.StageDeclaresPullRequestInput`.
+
+A validated `POST /v0/runs/{run_id}/pull-request?stage_id=...` initializes that
+review through the normal `dispatched` → `running` → `awaiting_approval` walk.
+The governance record and branch-lineage check precede initialization.
+Identical uploads heal interrupted URL backfills and mechanical transitions
+without creating another artifact. The bounded orchestrator initializer never
+selects a later stage, even when another publisher parks the review between
+the replay eligibility check and the orchestrator read. The forge merge-settlement path can initialize
+an older review-first run still pending, after its existing review/member checks.
+
+Stage observability reads expose optional `review_gate_admission`, derived from
+the same predicate as approval admission. `admitted` identifies an operator
+confirmation; `pull_request_managed` identifies forge review and verified
+landing. Other values name a resolution failure. MCP routes missing PR input to
+artifact attachment and attached PRs to forge review. Absent, empty or unknown
+metadata is unresolved; it never suggests an operator approval. Older servers
+need upgrading to supply this advisory routing fact.
+
+A linked PR never settles an operator-confirmation gate; its own recorded
+human decision still owns that effect.
+
+These transitions supply no approval. Required-PR review approvals through
+Fishhawk remain refused, and the existing forge identity and landing checks
+still decide settlement. The guided publication interface is tracked in #5444.
