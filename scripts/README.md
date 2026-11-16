@@ -5,6 +5,23 @@ Operator/dev tooling. This file holds the long-form contracts for
 § "Build, test, lint" carries the rules an agent needs up front and points
 here for the mechanism, residuals and issue history.
 
+## Makefile verification targets
+
+The convenience targets delegate to the maintained repository commands:
+
+| Make target | Command / contract |
+| --- | --- |
+| `test-go` | `scripts/test test`: every module, race detection, repository timeout, container leases and aggregated failures |
+| `lint-go` | `scripts/test lint`: pinned host-toolchain preflight and per-checkout lint cache |
+| `coverage` | `scripts/test coverage`: every module, aggregate threshold and generated-`/db/` exclusion owned by the wrapper |
+| `test-frontend` | Frozen install with lifecycle scripts disabled, then `pnpm test` |
+| `lint-frontend` | The same install policy, then `pnpm lint` and `pnpm typecheck` |
+
+`make coverage` always uses the repository's aggregate coverage policy. The
+Makefile keeps no separate threshold or backend-only coverage calculation.
+`make test` and `make lint` compose their Go and frontend targets; full final
+verification remains `scripts/verify-change`.
+
 ## `scripts/test verify`: the lint and schema-sync legs (#1064 / #1772)
 
 `cmd_verify` takes the verify lock (see "Scoped verify + the per-repository
