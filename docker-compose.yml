@@ -14,7 +14,7 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.16-alpine
     container_name: fishhawk-postgres
     restart: unless-stopped
     environment:
@@ -38,10 +38,10 @@ services:
     # with path-style addressing; production points the same SDK at
     # AWS S3.
     #
-    # rustfs/rustfs:1.0.0-rc.6 is a 1.0.0 release candidate (Apache-2.0),
+    # rustfs/rustfs:1.0.6 is a 1.0.0 release candidate (Apache-2.0),
     # verified pullable on 2026-09-13 (#3386). No `command:` override: the
     # image Cmd is `rustfs` and RUSTFS_VOLUMES defaults to /data.
-    image: rustfs/rustfs:1.0.0-rc.6
+    image: rustfs/rustfs:1.0.6
     container_name: fishhawk-rustfs
     restart: unless-stopped
     environment:
@@ -77,7 +77,7 @@ services:
     # list means an EXISTING bucket exits 0 with no create attempted, an
     # absent bucket is created (exit 0), and a create that genuinely fails
     # exits NON-ZERO — the trailing echo never masks a failed create.
-    image: amazon/aws-cli:2.36.44
+    image: amazon/aws-cli:2.40.3
     profiles: ["init"]
     depends_on:
       rustfs:
@@ -110,15 +110,12 @@ services:
     # view the per-run trace tree at http://localhost:16686.
     #
     # Pinned to an immutable tag per CLAUDE.md's image-pinning rule; a
-    # floating tag could change ports/behaviour under us. OTLP is on by
-    # default since v1.35, but COLLECTOR_OTLP_ENABLED is set defensively
-    # so older tags still accept it.
-    image: jaegertracing/all-in-one:1.62.0
+    # floating tag could change ports/behaviour under us. Jaeger v2 starts
+    # its in-memory all-in-one configuration with OTLP enabled by default.
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.23.0
     container_name: fishhawk-jaeger
     restart: unless-stopped
     profiles: ["otel"]
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
     ports:
       - "16686:16686"  # Jaeger UI
       - "4318:4318"    # OTLP HTTP receiver (the runner's otlptracehttp target)

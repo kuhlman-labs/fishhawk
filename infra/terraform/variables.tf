@@ -156,7 +156,7 @@ variable "hosted_zone_id" {
 variable "db_engine_version" {
   description = "Postgres major.minor for the RDS instance. AWS gates instance class availability on engine version; bump deliberately when AWS publishes a new minor."
   type        = string
-  default     = "16.4"
+  default     = "16.15"
 }
 
 variable "db_instance_class" {

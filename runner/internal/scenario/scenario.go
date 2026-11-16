@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // IDPrefix distinguishes a replayed-scenario verdict row from a criterion

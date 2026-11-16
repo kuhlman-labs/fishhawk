@@ -71,17 +71,17 @@
 # and the runner's container path mounts a runner-generated one on every exec
 # (#2137).
 
-ARG GO_VERSION=1.26.9
-ARG NODE_VERSION=22.21.1
+ARG GO_VERSION=1.27.4
+ARG NODE_VERSION=26.13.1
 FROM node:${NODE_VERSION}-bookworm-slim AS frontend_tools
 
 FROM golang:${GO_VERSION}-bookworm
 
 ARG TARGETARCH
-ARG GOLANGCI_LINT_VERSION=v2.12.2
-ARG HELM_VERSION=v4.2.4
-ARG CHECK_JSONSCHEMA_VERSION=0.38.0
-ARG PNPM_VERSION=10.33.3
+ARG GOLANGCI_LINT_VERSION=v2.15.0
+ARG HELM_VERSION=v4.3.2
+ARG CHECK_JSONSCHEMA_VERSION=0.39.0
+ARG PNPM_VERSION=12.21.0
 
 LABEL org.opencontainers.image.source="https://github.com/kuhlman-labs/fishhawk" \
       org.opencontainers.image.description="Fishhawk verify gate toolchain (deploy/gate-image)"
@@ -159,8 +159,11 @@ COPY --from=frontend_tools /usr/local/bin/node /usr/local/bin/node
 COPY --from=frontend_tools /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && npm install --global --ignore-scripts "pnpm@${PNPM_VERSION}"
-COPY --from=frontend package.json pnpm-lock.yaml /opt/fishhawk-frontend/
+COPY --from=frontend package.json pnpm-lock.yaml pnpm-workspace.yaml /opt/fishhawk-frontend/
 RUN cd /opt/fishhawk-frontend \
  && test "$(node -p "require('./package.json').packageManager")" = "pnpm@${PNPM_VERSION}" \
  && pnpm fetch --frozen-lockfile --ignore-scripts --store-dir /opt/fishhawk-pnpm-store \
- && chmod -R a+rX /opt/fishhawk-pnpm-store
+ && pnpm install --frozen-lockfile --ignore-scripts --store-dir /opt/fishhawk-pnpm-store \
+ && cp -R /root/.cache/pnpm /opt/fishhawk-pnpm-cache \
+ && rm -rf /opt/fishhawk-frontend/node_modules \
+ && chmod -R a+rX /opt/fishhawk-pnpm-store /opt/fishhawk-pnpm-cache

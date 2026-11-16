@@ -9,6 +9,8 @@ GitHub's queue property (not yet recognized by actionlint 1.7.12).
 import copy
 import fnmatch
 import importlib.util
+import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,50 @@ SPEC.loader.exec_module(GUARD)
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_service_images_match_across_manifests_and_go_helpers(self):
+        compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
+        values = yaml.safe_load((ROOT / "deploy/helm/fishhawk/values.yaml").read_text())
+        pairs = {
+            "postgres": values["postgres"]["image"],
+            "rustfs": values["rustfs"]["image"],
+            "s3-init": values["rustfs"]["bootstrapImage"],
+            "jaeger": values["jaeger"]["image"],
+        }
+        for service, image in pairs.items():
+            with self.subTest(service=service):
+                self.assertEqual(compose[service]["image"], image)
+
+        # Dependabot updates manifests; these Go consumers must move with them.
+        helpers = {
+            "postgres": ["backend/internal/pgtest/pgtest.go",
+                         "backend/internal/postgres/postgres_test.go",
+                         "directory/internal/store/testdb_test.go",
+                         "runner/internal/gateiso/service.go"],
+            "rustfs": ["backend/internal/tracestore/s3_test.go"],
+        }
+        for service, paths in helpers.items():
+            expected = compose[service]["image"]
+            prefix = expected.rsplit(":", 1)[0]
+            for path in paths:
+                with self.subTest(service=service, path=path):
+                    images = re.findall(r'"(' + re.escape(prefix) + r':[A-Za-z0-9_][A-Za-z0-9_.-]*)"', (ROOT / path).read_text())
+                    self.assertTrue(images, f"{path}: service image missing")
+                    self.assertEqual(set(images), {expected})
+
+    def test_pnpm_lockfiles_preserve_security_graph(self):
+        # GitHub cannot detect dependencies in pnpm's two-document lockfiles:
+        # https://docs.github.com/en/code-security/reference/supply-chain-security/supported-ecosystems-and-repositories#pnpm
+        for project in ("frontend", "site"):
+            with self.subTest(project=project):
+                directory = ROOT / project
+                manifest = json.loads((directory / "package.json").read_text())
+                settings = yaml.safe_load((directory / "pnpm-workspace.yaml").read_text())
+                documents = list(yaml.safe_load_all((directory / "pnpm-lock.yaml").read_text()))
+                self.assertEqual(len(documents), 1, "GitHub alerts require a single-document lockfile")
+                self.assertTrue(documents[0]["importers"]["."]["dependencies"])
+                self.assertEqual(settings["pmOnFail"], "ignore")
+                self.assertEqual(manifest["engines"]["pnpm"], manifest["packageManager"].removeprefix("pnpm@"))
+
     def test_validation_is_required_and_publication_is_downstream(self):
         self.assertIn("github.run_id", CI["concurrency"]["group"])
         self.assertIn("pull_request", CI["concurrency"]["group"])
@@ -65,6 +111,7 @@ class WorkflowContracts(unittest.TestCase):
             "infra": ["infra/terraform/iam.tf", ".github/workflows/infra-apply.yml"],
             "gate-image": ["deploy/gate-image/Dockerfile", ".github/workflows/gate-image-publish.yml",
                            "frontend/package.json", "frontend/pnpm-lock.yaml",
+                           "frontend/pnpm-workspace.yaml",
                            "scripts/check-frontend", "scripts/verify-change"],
         }
         for lane, paths in cases.items():

@@ -628,7 +628,7 @@ func (*supervisor) drainOldChild(c childTransport) {
 		for {
 			select {
 			case <-c.Frames():
-			case <-c.Exited():
+			case <-c.Exited(): //nolint:errcheck // Termination is intentional; only the death notification matters.
 				return
 			}
 		}

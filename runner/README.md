@@ -51,7 +51,7 @@ E5.1 (#52) shipped the scaffold. E5.2 (#29) wired the Claude Code invocation har
 
 The agent API key is sourced per provider from the host environment: `claude-code` reads `ANTHROPIC_API_KEY`, `codex` reads `OPENAI_API_KEY`. Customers populate these from their GitHub Secrets. v0.x will replace this with a Fishhawk-issued ephemeral key (MVP_SPEC §5.3).
 
-The composite action installs the CLI matching the selected `agent` via Node 22 — `@anthropic-ai/claude-code` (the `claude` binary) for `claude-code`, or `@openai/codex` (the `codex` binary) for `codex`. Hosted Actions runners don't ship with either, and each adapter invokes its binary by name. Cold-cache install adds ~15s; pinning a version is deferred (v1+).
+The composite action installs the CLI matching the selected `agent` via Node 26 — `@anthropic-ai/claude-code@2.1.325` (the `claude` binary) for `claude-code`, or `@openai/codex@0.169.0` (the `codex` binary) for `codex`. Hosted Actions runners don't ship with either, and each adapter invokes its binary by name. Both executable versions are pinned in `action.yml`.
 
 For implement stages the runner additionally commits the agent's edits, pushes a fresh branch, opens a PR, and ships a `pull_request` artifact to the backend. **Push and PR creation use the Fishhawk App's installation token** (fetched from `POST /v0/runs/{run_id}/installation-token` per #197) — installing the App is the only repo-side dependency. The workflow's `GITHUB_TOKEN` doesn't need elevated permissions, and the customer doesn't need to enable "Allow Actions to create and approve pull requests" in repo settings. Branch name is `fishhawk/run-<short>/stage-<short>`. A clean working tree (agent decided no changes were needed) skips push + PR cleanly without failing the stage; the trace records an `implement_no_changes` event so the approver can see why.
 
@@ -190,7 +190,7 @@ To verify against the real OpenAI CLI on a hosted Actions runner:
 1. Add the repo secret `OPENAI_API_KEY`.
 2. Pass `agent: codex` and `openai-api-key: ${{ secrets.OPENAI_API_KEY }}` to the action.
 
-The composite action's `Install Codex CLI` step installs the pinned `@openai/codex@0.137.0` (a specific immutable version per CLAUDE.md's run-time-tool pinning rule — never a floating tag) via Node 22 and invokes the `codex` binary by name.
+The composite action's `Install Codex CLI` step installs the pinned `@openai/codex@0.169.0` (a specific immutable version per CLAUDE.md's run-time-tool pinning rule — never a floating tag) via Node 26 and invokes the `codex` binary by name.
 
 ### Migration note
 
@@ -299,7 +299,7 @@ services the container path provisions beside each gate exec,
 [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137); ignored with a
 `gate_services_ignored` log line on every other path; the future spec mapping
 is the reserved workflow-v2 `gate_container.services` key),
-`FISHHAWK_GATE_POSTGRES_IMAGE` (default `postgres:16-alpine`; pin it by
+`FISHHAWK_GATE_POSTGRES_IMAGE` (default `postgres:16.16-alpine`; pin it by
 DIGEST),
 `FISHHAWK_DEPLOYMENT_PROFILE` (`local` default | `self-hosted` | `hosted`),
 `FISHHAWK_GATE_IMAGE_ALLOWLIST` (empty default; the operator image allowlist a

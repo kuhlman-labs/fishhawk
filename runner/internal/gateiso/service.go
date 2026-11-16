@@ -67,7 +67,7 @@ func ParseServices(raw string) ([]Service, error) {
 // digest. An override MUST be PostgreSQL 16 or newer: the gate role holds
 // CREATEROLE, which only 16 bounds, so BootstrapArgv refuses an older server
 // (postgresMinVersionGuard).
-const DefaultPostgresImage = "postgres:16-alpine"
+const DefaultPostgresImage = "postgres:16.16-alpine"
 
 // Service container layout and the in-gate contract.
 const (

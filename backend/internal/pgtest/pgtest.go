@@ -419,7 +419,7 @@ func startSharedContainer() (string, error) {
 
 	container, err := attachWithRetry(attachAttempts, attachRetryDelay, func() (*tcpostgres.PostgresContainer, error) {
 		return tcpostgres.Run(ctx,
-			"postgres:16-alpine",
+			"postgres:16.16-alpine",
 			tcpostgres.WithDatabase(baseDB),
 			tcpostgres.WithUsername(baseUser),
 			tcpostgres.WithPassword(basePass),

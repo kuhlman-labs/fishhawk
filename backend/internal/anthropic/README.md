@@ -5,6 +5,15 @@ wraps it as `server.PlanReviewer`. Production constructs it in
 `backend/cmd/fishhawkd/serve.go`; the operator-run `backend/internal/agenteval`
 live arms construct it too, and are the only consumer of `Config.AuthToken`.
 
+## SDK and wire compatibility
+
+The client uses Anthropic Go SDK v2.9.0. Both Messages and the model-listing
+fetcher explicitly send `anthropic-version: 2023-06-01`, preserving the
+established API contract for regional Anthropic-compatible endpoints. This
+pin is independent of the SDK’s default API version; request-capture tests
+check it while the existing credential, output-schema and token-accounting
+fixtures exercise the SDK adapter.
+
 ## Credential contract (E83.96 / #4223)
 
 `NewClient` takes exactly one credential, or none. Its signature is unchanged, so
@@ -12,13 +21,14 @@ no caller changed.
 
 | `APIKey` | `AuthToken` | On the wire | SDK environment autoloader |
 |---|---|---|---|
-| set | empty | `X-Api-Key: <APIKey>` | **on** (unchanged) |
+| set | empty | `X-Api-Key: <APIKey>`, no `Authorization` header | **off** (SDK v2 explicit-credential selection) |
 | empty | set | `Authorization: Bearer <AuthToken>`, no `X-Api-Key` header at all | **off** |
 | empty | empty | no credential (an empty `X-Api-Key:` header) — the #2108 withhold posture | **off** |
 | set | set | nothing: `NewClient` returns a `Client` carrying `ErrConflictingCredentials`; `Messages` returns it before any network I/O | n/a (no SDK client is built) |
 
-- The `AuthToken` row never applies `option.WithAPIKey`. Even `WithAPIKey("")`
-  puts a present-but-empty `X-Api-Key` header on the wire beside the bearer.
+- The `AuthToken` row never applies the API-key defaults. On the API-key path,
+  the adapter sets `X-Api-Key` explicitly and removes `Authorization`: SDK v2
+  would otherwise serialize even `WithAPIKey("")` as a bare bearer header.
 - The autoloader (`ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_PROFILE`
   → env federation → fallback profile) is switched off with
   `option.WithoutEnvironmentDefaults()` whenever `APIKey` is empty, so a token is
@@ -39,21 +49,18 @@ credential from reaching the configured regional endpoint.
 
 `TestNewClient_EmptyKeyNeutralizesAmbientCredentials` pins it, and asserts that
 every observed request carries EMPTY `X-Api-Key` / `Authorization` values (values,
-not presence: the explicit `WithAPIKey("")` leaves an empty `X-Api-Key:` header,
-which is unchanged).
+not presence: the adapter leaves an empty `X-Api-Key:` header, as before).
 
-**Counterfactual caveat.** The "ANTHROPIC_AUTH_TOKEN only" subcase is the vehicle
-that goes RED when the `WithoutEnvironmentDefaults()` append is deleted. The
-"both ambient sources" subcase is MASKED and stays green: the autoloader takes
-`ANTHROPIC_API_KEY` first and returns, and the explicit `WithAPIKey("")` then
-overwrites it. Do not read that subcase as a control.
+**Historical counterfactual.** Under SDK v1, the `ANTHROPIC_AUTH_TOKEN only`
+subcase went red when `WithoutEnvironmentDefaults()` was removed, while the
+both-sources case was masked by API-key precedence. That measurement does not
+transfer to SDK v2: explicit credential selection and header cleanup now add
+independent protection. The tests continue to assert the observable wire
+contract for every credential combination.
 
-## Known residual (out of scope here)
-
-On the **API-key path** the autoloader stays on, so an ambient
-`ANTHROPIC_AUTH_TOKEN` in the process environment adds a second `Authorization:
-Bearer` header beside `X-Api-Key`. That is pre-existing production behaviour and
-is left unchanged; it is tracked separately.
+The former SDK-v1 API-key-path residual (an ambient bearer riding beside an
+explicit API key) is removed by SDK v2's explicit credential selection and the
+adapter's authorization-header cleanup.
 
 ## BaseURL precedence
 
