@@ -1942,7 +1942,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-verify-change test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep test-agent-context test-lint-cache; do
+  for h in test-verify-change test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep test-agent-context test-skill-facts test-lint-cache; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1957,6 +1957,19 @@ _verify_gate_harnesses() {
     printf '>>> scripts/%s\n' "$h"
     ( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER FISHHAWK_LINT_CACHE_HERMETIC_ONLY; "$ROOT/scripts/$h" )
   done
+}
+
+# Skill drift is operator repair work: warn in the runner/local gate so a
+# protected-file prohibition cannot strand an implement stage. CI separately
+# invokes the strict checker before its required repository check can pass.
+# Missing checker or malformed source data is an error even in warning mode.
+_verify_skill_facts() {
+  if [ ! -x "$ROOT/scripts/check-skill-facts" ]; then
+    echo "scripts/test: scripts/check-skill-facts missing or not executable — refusing an unchecked skill-fact pass" >&2
+    return 1
+  fi
+  printf '>>> scripts/check-skill-facts --warn-only\n'
+  "$ROOT/scripts/check-skill-facts" --root "$ROOT" --warn-only
 }
 
 # Instruction budgets, local navigation and skill mirror integrity (#4886).
@@ -2638,6 +2651,7 @@ cmd_verify() {
   _verify_gate_image_pins
   _verify_pipefail_grep
   _verify_agent_context
+  _verify_skill_facts
   # --no-tests (E51.17 / #3966): the legs above need no Docker daemon, so they
   # are what the gate image can run. The test loop below needs testcontainers
   # Postgres, which the image path reaches only with full gate isolation.

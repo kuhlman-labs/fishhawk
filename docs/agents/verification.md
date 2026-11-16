@@ -86,7 +86,11 @@ Pin tools downloaded and executed by CI/release run steps to immutable versions
 or tags, including shell installers and npx packages. GitHub Actions major refs
 are the exception, managed by Dependabot. Keep CI/tool documentation/gate-image
 pins consistent; search skills for repeated facts and update them together.
-The separate repeated-fact checker proposal remains #3943.
+`scripts/check-skill-facts` checks repeated skill literals offline (#3943).
+Local/runner verify warns on drift so an implement stage can hand protected-file
+repairs to the operator; required CI runs the strict check. Missing/malformed
+canonical inputs fail both modes. Resolve warnings in the same operator PR
+before CI passes; do not retry an implement stage on a forbidden skill file.
 
 Helm render tests skip when helm is absent; report that gap. Registry probes
 have their own reachability/sentinel skip conditions. Review-prompt evidence is

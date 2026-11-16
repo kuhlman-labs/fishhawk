@@ -176,6 +176,8 @@ jobs:
           command -v zsh
       - name: Verify repository contracts and gate harnesses
         run: scripts/test verify --no-tests
+      - name: Check skill facts (strict)
+        run: scripts/check-skill-facts
       - name: Check recorded review-prompt evidence
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

@@ -30,13 +30,62 @@ doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
 gate, the site IA gate, the ADR record gate, the gate-image pin check
 (`_verify_gate_image_pins`, E51.17), the pipefail grep guard
 (`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), the agent-context
-gate (`_verify_agent_context`, #4886), and finally
+gate (`_verify_agent_context`, #4886), the offline skill-fact warning check
+(`_verify_skill_facts`, #3943), and finally
 the test loop (scoped, or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
 coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
 loop). `verify --no-tests` stops before the test loop; see "Gate image" below.
 The legs stay inline in `cmd_verify`: `scripts/test-patch-coverage` (a) and
 `scripts/test-schema-sync-verify` (a) assert their order by reading that
 function's body with `declare -f`.
+
+### Repeated skill facts (#3943)
+
+`scripts/check-skill-facts` compares exact literals in
+`.agents/skills/*/SKILL.md` with an explicit table in that script. It uses only
+Python's standard library and local source files: no tool execution, package
+installation, registry lookup, credentials or network. `--root PATH` selects a
+fixture or checkout. Literal-free references to canonical files remain valid.
+This is a bounded inventory, not a generic numerical or natural-language scan.
+
+| Fact | Canonical extraction | Skill literal context |
+| --- | --- | --- |
+| Go toolchain | `GO_VERSION` in `deploy/gate-image/Dockerfile` | `goM.m.p` or `go-version` |
+| Go workspace directive | `go` directive in `go.work` | `go.work` followed by `go M.m.p` on the same line |
+| golangci-lint | `GOLANGCI_LINT_VERSION` in the gate Dockerfile | exact command, URL or named version/pin |
+| Helm | `HELM_VERSION` in the gate Dockerfile | `helm vM.m.p` (case-insensitive) |
+| check-jsonschema | `CHECK_JSONSCHEMA_VERSION` in the gate Dockerfile | command/version or `check-jsonschema==M.m.p` |
+| pnpm | `packageManager` in `frontend/package.json` | `pnpm@M.m.p` or named version |
+| Redocly CLI | `@redocly/cli@M.m.p` in `.github/workflows/ci.yml` | the same package/version form |
+| actionlint | `actionlint@vM.m.p` in `.github/workflows/ci.yml` | command/version or install form |
+| Patch coverage | `FISHHAWK_PATCH_COVERAGE_THRESHOLD` default in `scripts/test` | patch-coverage percentage or `--diff-threshold` |
+| Aggregate coverage | `check-coverage.py --threshold` invocation in `scripts/test` | aggregate-coverage percentage |
+
+Each source must yield one distinct value, even when no skill repeats that
+fact. Missing, unreadable, external or ambiguous inputs fail. Skill diagnostics
+name the path, line, observed value, expected value and source, and identify the
+repair as operator-authored: implement stages cannot edit `.agents/**`.
+Concrete examples and fenced commands are checked too; use canonical references
+for historical or illustrative versions rather than embedding stale pins.
+Minor-family descriptions such as `golangci-lint v2.x` are not exact pins.
+
+Enforcement is explicit: `scripts/test verify` (including the runner gate and
+`--no-tests`) calls `--warn-only`, which relaxes **skill drift only**. A missing
+checker or malformed canonical input still fails. The always-on required CI
+`repository-checks` job also runs the default strict command; stale skill facts
+cannot pass `CI Pass`. An implementer seeing a warning files the operator
+follow-up, and the operator updates the protected skill in the pin-change PR
+before CI passes. Do not retry a run merely to repair a forbidden skill file.
+This ordering prevents a blocking local gate from stranding an implement stage.
+
+The catch table, harness registration and enforcement policy are ADR-121 Tier-I
+judge inputs, reviewed/adopted through the human-led route. New facts need source
+and skill fixtures, leg-input registration and documentation in this table.
+`test-skill-facts` exercises every binding, source changes, strict/warning modes,
+real verify wiring and a counterfactual with one catch rule removed. Existing
+`check-gate-image` keeps executable CI/image pins consistent; this checker adds
+skill drift only. Release-ref existence is an online CI/preflight concern and
+is not claimed by this offline check. Bootstrap work remains #5442.
 
 ### Lint
 
@@ -844,7 +893,7 @@ fi
 ## Required GitHub Actions validation (#4885)
 
 `ci.yml` owns the required `CI Pass` rollup. Its always-on
-`repository-checks` job runs `scripts/test verify --no-tests`, the recorded
+`repository-checks` job runs `scripts/test verify --no-tests`, strict `scripts/check-skill-facts`, the recorded
 review-prompt evidence check, actionlint, and `test-ci-workflows.py`.
 All hosted workflows pin Ubuntu 24.04 (`ubuntu-24.04-arm` for native ARM).
 The `ubuntu-latest` migration to 26.04 (actions/runner-images#14748) must not
