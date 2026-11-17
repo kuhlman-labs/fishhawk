@@ -286,3 +286,67 @@ updates:
       - autonomy:high
     commit-message:
       prefix: ci
+
+  # Dockerfile toolchains and runtime base images. Gate-image changes must keep
+  # the workspace, CI pins and frontend packageManager synchronized.
+  - package-ecosystem: docker
+    directories:
+      - /backend
+      - /deploy/gate-image
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 3
+    labels: [type:chore, area:infra, autonomy:high]
+    groups:
+      dockerfiles:
+        patterns: ["*"]
+
+  # The Compose and chart image references are mirrored; review them together.
+  # Database major upgrades need the populated-data migration in #5425.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 3
+    labels: [type:chore, area:infra, autonomy:high]
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+    groups:
+      local-services:
+        patterns: ["*"]
+
+  - package-ecosystem: helm
+    directory: /deploy/helm/fishhawk
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 3
+    labels: [type:chore, area:infra, autonomy:high]
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+    groups:
+      chart-images:
+        patterns: ["*"]
+
+  - package-ecosystem: terraform
+    directory: /infra/terraform
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 3
+    labels: [type:chore, area:infra, autonomy:high]
+    groups:
+      providers:
+        patterns: ["*"]

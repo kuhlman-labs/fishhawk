@@ -1,0 +1,7 @@
+# Keep a single-document lockfile visible to GitHub dependency alerts.
+# CI installs packageManager exactly; engines.pnpm rejects mismatched installs.
+pmOnFail: ignore
+
+allowBuilds:
+  esbuild: true
+  sharp: true

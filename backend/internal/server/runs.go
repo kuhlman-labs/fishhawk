@@ -2364,6 +2364,16 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		}
 	}
 
+	if len(createdStages) > 0 && humanReviewFirstUninitialized(createdStages[0]) {
+		if err := s.initializeHumanReviewFirst(ctx, created, createdStages); err != nil {
+			s.cfg.Logger.Warn("review-first creation initialization failed", "run_id", created.ID.String(), "error", err.Error())
+		}
+		// Return the initialized state, not the pre-Advance creation snapshot.
+		if initialized, err := s.cfg.RunRepo.GetRun(ctx, created.ID); err == nil {
+			created = initialized
+		}
+	}
+
 	// Emit the run_started board transition for the just-created run
 	// (#1123) — the local-runner / API / campaign-driver run-creation emit
 	// point that parallels the webhook dispatcher's run_started emit. Without

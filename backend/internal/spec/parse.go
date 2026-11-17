@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 //go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json schemas/workflow-v2.schema.json

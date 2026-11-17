@@ -238,6 +238,19 @@ fishhawkd oauth client register \
 `fishhawkd oauth client remove --client-id <id>` deletes one. Full flag and
 exit-code contract: `backend/cmd/fishhawkd/README.md`.
 
+A `client_id` that is NOT registered falls through to a CIMD fetch, and those
+resolutions are rate limited per source and globally (#2441). A pre-registered
+client resolves from the store and never reaches the limiter. The refusal is
+`429 temporarily_unavailable` with `Retry-After`, and its `error_description`
+names the configured refill rates and this remedy (#5224); at the defaults:
+`client resolution is temporarily rate limited (CIMD fetch limit: one per 10s
+per source, burst 5; one per 1s globally, burst 30); retry after the interval
+in Retry-After, or pre-register the client with fishhawkd oauth client
+register so it resolves without a CIMD fetch`. The `--oauth-cimd-rate-*` and
+`--oauth-cimd-global-rate-*` flags set the policy
+(`backend/internal/server/docs/auth.md` § "CIMD amplification limiter +
+loopback gate").
+
 ## Non-goal — no http-issuer escape hatch
 
 There is deliberately **no** dev-only http-issuer mode. It would bypass the

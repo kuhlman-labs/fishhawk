@@ -44,7 +44,7 @@ func TestParseServices(t *testing.T) {
 
 // fixedService is a deterministic PostgresService for argv goldens.
 func fixedService() PostgresService {
-	return PostgresService{Name: "fishhawk-gate-svc-0a1b2c3d4e5f", Image: "postgres:16-alpine", superPassword: "s3cret"}
+	return PostgresService{Name: "fishhawk-gate-svc-0a1b2c3d4e5f", Image: "postgres:16.16-alpine", superPassword: "s3cret"}
 }
 
 var dockerRT = Runtime{Kind: KindDocker, Safe: true, SocketPath: testSock}
@@ -63,7 +63,7 @@ func TestPostgresServiceArgv_Golden(t *testing.T) {
 			"--label", "org.fishhawk.gate-service=postgres", "--tmpfs", "/var/lib/postgresql/data",
 			"-e", "PGDATA=/var/lib/postgresql/data/pgdata", "-e", "POSTGRES_USER=postgres", "-e", "POSTGRES_PASSWORD=s3cret",
 			"-e", "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256",
-			"-v", s.Name + ":/var/run/postgresql", "postgres:16-alpine"}},
+			"-v", s.Name + ":/var/run/postgresql", "postgres:16.16-alpine"}},
 		{"logs", s.LogsArgv, []string{"logs", s.Name}},
 		{"ready", s.ReadyArgv, []string{"exec", s.Name, "pg_isready", "-h", "/var/run/postgresql", "-U", "postgres", "-d", "postgres"}},
 		{"bootstrap", s.BootstrapArgv, []string{"exec", "-e", "PGPASSWORD=s3cret", s.Name,

@@ -96,6 +96,7 @@
         },
         "id": "00000000-0000-0000-0000-000000000003",
         "resolved_model": "",
+        "review_gate_admission": "admitted",
         "run_id": "00000000-0000-0000-0000-000000000001",
         "sequence": 1,
         "started_at": null,

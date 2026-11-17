@@ -18,6 +18,12 @@ import (
 func TestAnthropicFetcher_CollectsIDsAcrossPages(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Errorf("Anthropic-Version = %q, want the established wire version", got)
+		}
+		if r.Header.Get("X-Api-Key") != "test-key" || r.Header.Get("Authorization") != "" {
+			t.Error("model-list request must retain API-key-only authentication")
+		}
 		// Page two is requested with ?after_id=<last id of page one>.
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Query().Get("after_id") == "claude-sonnet-4-6" {

@@ -41,7 +41,7 @@ State the classification to the user before editing.
 ## 3. REST API changes
 
 - **Source of truth:** `docs/api/v0.openapi.yaml`. Update the human companion `docs/api/v0.md` with it.
-- **Lint with the pinned version:** `npx -y @redocly/cli@2.31.5 lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml`
+- **Lint with the pinned version:** `npx -y @redocly/cli@2.78.0 lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml`
 - Re-run `scripts/gen-site-reference`; `reference/api.md` is generated from it.
 - A tightened auth check also needs the PR-body Auth change checklist (`fishhawkd token migrate` dry-run inventory). See [change checklists](../../../docs/agents/change-checklists.md).
 

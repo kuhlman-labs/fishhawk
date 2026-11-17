@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Exercise skill-fact sources, diagnostics, enforcement and negative controls."""
+
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+SOURCE = Path(__file__).resolve().with_name("check-skill-facts")
+loader = importlib.machinery.SourceFileLoader("skill_facts", str(SOURCE))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+checker = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = checker
+loader.exec_module(checker)
+
+
+class SkillFacts(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.write("deploy/gate-image/Dockerfile", """ARG GO_VERSION=1.27.4
+ARG GOLANGCI_LINT_VERSION=v2.15.0
+ARG HELM_VERSION=v4.3.2
+ARG CHECK_JSONSCHEMA_VERSION=0.39.0
+""")
+        self.write("go.work", "go 1.27.0\n")
+        self.write("frontend/package.json", '{"packageManager":"pnpm@12.21.0"}\n')
+        self.write(".github/workflows/ci.yml", "npx -y @redocly/cli@2.78.0 lint\ngo install actionlint@v1.7.12\n")
+        self.write("scripts/test", 'check-coverage.py" --threshold 80\n${FISHHAWK_PATCH_COVERAGE_THRESHOLD:-85}\n')
+        self.skill = ".agents/skills/verify/SKILL.md"
+        self.write(self.skill, "Read the repository pins; run golangci-lint.\n")
+        self.copy_checker()
+
+    def write(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def copy_checker(self):
+        shutil.copy2(SOURCE, self.root / "scripts/check-skill-facts")
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable, str(self.root / "scripts/check-skill-facts"), "--root", str(self.root), *args],
+                              capture_output=True, text=True, timeout=20)
+
+    def test_clean_current_and_literal_free_skills(self):
+        self.assertEqual(([], []), checker.check(self.root))
+        self.assertEqual(0, self.cli().returncode)
+        lines = ["go1.27.4; go.work's `go 1.27.0`", "golangci-lint v2.15.0", "helm v4.3.2",
+                 "check-jsonschema==0.39.0", "pnpm@12.21.0", "npx -y @redocly/cli@2.78.0 lint",
+                 "actionlint v1.7.12", "patch coverage below 85%", "The 80% aggregate coverage gate"]
+        self.write(self.skill, "\n".join(lines))
+        self.assertEqual(([], []), checker.check(self.root))
+
+    def test_every_fact_rejects_a_stale_literal_with_line_source_and_remedy(self):
+        stale = [("Go toolchain", "use go1.25.6"), ("Go workspace directive", "go.work's `go 1.25.0`"),
+                 ("golangci-lint", "golangci-lint/v2.8.0/install.sh"), ("Helm", "helm v4.0.0"),
+                 ("check-jsonschema", "check-jsonschema==0.30.0"), ("pnpm", "pnpm@10.0.0"),
+                 ("Redocly CLI", "npx @redocly/cli@2.31.5 lint"), ("actionlint", "actionlint v1.7.0"),
+                 ("patch coverage", "patch coverage below 84%"), ("aggregate coverage", "79% aggregate coverage")]
+        self.assertEqual({f.name for f in checker.FACTS}, {name for name, _ in stale})
+        for name, line in stale:
+            with self.subTest(fact=name):
+                self.write(self.skill, "# Procedure\n" + line + "\n")
+                drift, errors = checker.check(self.root)
+                self.assertEqual([], errors)
+                self.assertEqual(1, len(drift), drift)
+                self.assertIn(f"{self.skill}:2: {name}", drift[0])
+                self.assertIn("expected", drift[0])
+                self.assertIn("operator-authored", drift[0])
+                self.assertIn(next(f.source for f in checker.FACTS if f.name == name), drift[0])
+                self.assertEqual(1, self.cli().returncode)
+
+    def test_prose_pins_and_command_thresholds_are_checked(self):
+        for line in ["golangci-lint CI pin `v2.8.0`", "Helm v4.0.0", "--diff-threshold 84"]:
+            with self.subTest(line=line):
+                self.write(self.skill, line)
+                self.assertEqual(1, len(checker.check(self.root)[0]))
+
+    def test_real_verify_leg_warns_on_drift_but_refuses_broken_inputs(self):
+        command = ["bash", "-c",
+                   'FISHHAWK_TEST_LIB_ONLY=1 source "$1"; ROOT="$2"; _verify_skill_facts',
+                   "skill-facts-test", str(SOURCE.with_name("test")), str(self.root)]
+        def run():
+            return subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(0, run().returncode)
+        self.write(self.skill, "patch coverage below 84%")
+        warning = run()
+        self.assertEqual(0, warning.returncode, warning.stderr)
+        self.assertIn("WARNING:", warning.stderr)
+        self.write("go.work", "go invalid")
+        self.assertNotEqual(0, run().returncode)
+        (self.root / "scripts/check-skill-facts").unlink()
+        missing = run()
+        self.assertNotEqual(0, missing.returncode)
+        self.assertIn("refusing an unchecked", missing.stderr)
+
+    def test_verify_wiring_runs_before_tests_and_registers_harness(self):
+        wrapper = SOURCE.with_name("test")
+        result = subprocess.run(["bash", "-c",
+                                 'FISHHAWK_TEST_LIB_ONLY=1 source "$1"; declare -f cmd_verify; declare -f _verify_gate_harnesses',
+                                 "skill-facts-wiring", str(wrapper)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("_verify_skill_facts", result.stdout)
+        self.assertLess(result.stdout.index("_verify_skill_facts"), result.stdout.index("VERIFY_NO_TESTS"))
+        self.assertIn("test-skill-facts", result.stdout)
+
+    def test_source_values_drive_the_check_not_remembered_versions(self):
+        self.write(self.skill, "npx @redocly/cli@2.78.0 lint\n")
+        self.write(".github/workflows/ci.yml", "npx @redocly/cli@2.79.0 lint\ngo install actionlint@v1.7.12\n")
+        self.assertIn("expected 2.79.0", checker.check(self.root)[0][0])
+        self.write(self.skill, "npx @redocly/cli@2.79.0 lint\n")
+        self.assertEqual(([], []), checker.check(self.root))
+
+    def test_warning_mode_only_relaxes_skill_drift(self):
+        self.write(self.skill, "patch coverage below 84%\n")
+        warning = self.cli("--warn-only")
+        self.assertEqual(0, warning.returncode, warning.stderr)
+        self.assertIn("WARNING:", warning.stderr)
+        self.assertIn("skill facts: WARNING", warning.stdout)
+        self.assertEqual(1, self.cli().returncode)
+        self.write("go.work", "go invalid\n")
+        self.assertEqual(1, self.cli("--warn-only").returncode)
+
+    def test_missing_ambiguous_or_external_inputs_fail_even_without_repeated_values(self):
+        for source, text in [("go.work", ""), ("go.work", "go 1.27.0\ngo 1.28.0\n"),
+                             (".github/workflows/ci.yml", "npx @redocly/cli@latest lint\n")]:
+            with self.subTest(source=source, text=text):
+                path = self.root / source
+                old = path.read_text()
+                path.write_text(text)
+                self.assertTrue(checker.check(self.root)[1])
+                self.assertEqual(1, self.cli("--warn-only").returncode)
+                path.write_text(old)
+        (self.root / "go.work").unlink()
+        self.assertEqual(1, self.cli("--warn-only").returncode)
+        self.write("go.work", "go 1.27.0\n")
+        skill = self.root / self.skill
+        skill.unlink()
+        self.assertEqual(1, self.cli().returncode)
+        skill.symlink_to(SOURCE)
+        self.assertIn("target leaves repository", "\n".join(checker.check(self.root)[1]))
+
+    def test_version_free_references_and_unrelated_numbers_are_not_facts(self):
+        self.write(self.skill, "# 85 examples\naggregate coverage has 8 examples\ngolangci-lint v2.x\nGo 1.27 describes a minor family\nhelm v4\n10% of tests are slow\n")
+        self.assertEqual(([], []), checker.check(self.root))
+
+    def test_counterfactual_removing_redocly_binding_makes_detection_fixture_fail(self):
+        self.write(self.skill, "npx @redocly/cli@2.31.5 lint\n")
+        self.assertEqual(1, self.cli().returncode)
+        path = self.root / "scripts/check-skill-facts"
+        original = path.read_text()
+        # Omit the concrete skill binding, keeping canonical extraction and all
+        # other checks alive. The stale fixture must now be incorrectly green.
+        mutated = original.replace('rf"@redocly/cli@({VERSION})\\b",)),', 'r"(?!)",)),')
+        self.assertNotEqual(original, mutated)
+        path.write_text(mutated)
+        control = self.cli()
+        self.assertEqual(0, control.returncode, control.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

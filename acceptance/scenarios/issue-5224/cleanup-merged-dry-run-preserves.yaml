@@ -1,0 +1,14 @@
+id: scenario:issue-5224/cleanup-merged-dry-run-preserves
+statement: 'In a git repository whose origin is a local path, `scripts/cleanup-merged --dry-run` exits 0, prints ''would delete (merged): <branch>'' for every branch already merged into origin/main and for no unmerged branch, and leaves every local branch in place.'
+verify_hint: 'CLI: run the PR''s scripts/cleanup-merged --dry-run inside the throwaway repository; read the exit code and stdout; compare `git branch` output before and after.'
+steps: In the same throwaway repo (local bare origin; merged1 merged into origin/main, unmerged1 not merged), ran <sanctioned checkout>/scripts/cleanup-merged --dry-run, then diffed `git branch` against the before-list.
+assertions:
+    expected: 'exit 0, ''would delete (merged): <branch>'' for merged branches only, all branches preserved'
+    observed_at_record: 'exit 0; stdout ''would delete (merged): merged1'' then ''would clean 1 branch(es)''; unmerged1 and main not listed; branches main, merged1 and unmerged1 all still present'
+    repro_handle: cd <repo>; scripts/cleanup-merged --dry-run; echo $?; git branch
+origin:
+    issue: 5224
+    pr: 5400
+    run_id: 2a293e02-92c0-4299-a0f2-c2e01b707ac9
+    head_sha: 1e37d5070f325032fdd5a87a1a8fd467384e70f1
+    recorded_at: 2026-11-15T19:33:43Z

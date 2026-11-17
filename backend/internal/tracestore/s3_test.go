@@ -30,9 +30,8 @@ const (
 	rustfsUser = "fishhawk-test"
 	rustfsPass = "fishhawk-test-secret-key"
 	// rustfs/rustfs replaced the MinIO image after it was deleted from
-	// Docker Hub (#3386). 1.0.0-rc.6 is a release candidate, verified pullable
-	// by the operator on 2026-09-13.
-	rustfsImage = "rustfs/rustfs:1.0.0-rc.6"
+	// Docker Hub (#3386). Keep this stable release aligned with Compose and Helm.
+	rustfsImage = "rustfs/rustfs:1.0.6"
 	rustfsPort  = "9000/tcp"
 )
 

@@ -33,6 +33,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // fataler is the subset of *testing.T that startContainerWith needs. Isolating
@@ -339,33 +340,81 @@ func retryObjectInUse(attempts int, delay time.Duration, create func() error) er
 // the error-branch leak fix (#3122).
 func startRawContainer(t *testing.T) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(rawContainerStartBudget))
 	defer cancel()
-	return startContainerWith(t, t.Cleanup, ctx, func(ctx context.Context) (testcontainers.Container, connStringFunc, error) {
-		c, err := tcpostgres.Run(ctx,
-			"postgres:16-alpine",
-			tcpostgres.WithDatabase("fishhawk"),
-			tcpostgres.WithUsername("fishhawk"),
-			tcpostgres.WithPassword("fishhawk"),
-			testcontainers.WithWaitStrategy(
-				wait.ForAll(
-					wait.ForLog("database system is ready to accept connections").
-						WithOccurrence(2).
-						WithStartupTimeout(60*time.Second),
-					wait.ForListeningPort("5432/tcp"),
-				),
+	return startRawContainerAdmitted(t, t.Cleanup, ctx, rawContainerStartSlots, runRawPostgres)
+}
+
+const (
+	rawContainerStartLimit  = 4
+	rawContainerStartBudget = 90 * time.Second
+	rawContainerReadyBudget = 60 * time.Second
+)
+
+// Limit Docker startup/port-inspection pressure, not parallel migration work.
+// Every test still owns a separate container. A slot leaves before the test
+// starts its SQL assertions, and admission has a separate bounded deadline.
+var rawContainerStartSlots = make(chan struct{}, rawContainerStartLimit)
+
+func startRawContainerAdmitted(
+	f fataler,
+	cleanup func(func()),
+	admissionCtx context.Context,
+	slots chan struct{},
+	run func(context.Context) (testcontainers.Container, connStringFunc, error),
+) string {
+	f.Helper()
+	queuedAt := time.Now()
+	if err := admissionCtx.Err(); err != nil {
+		f.Fatalf("raw postgres startup admission: %v", err)
+		return ""
+	}
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-admissionCtx.Done():
+		f.Fatalf("raw postgres startup admission: %v", admissionCtx.Err())
+		return ""
+	}
+	if err := admissionCtx.Err(); err != nil {
+		f.Fatalf("raw postgres startup admission: %v", err)
+		return ""
+	}
+	if waited := time.Since(queuedAt); waited >= timescale.D(2*time.Second) {
+		f.Logf("raw postgres startup admission: waited %s (limit %d)", waited, cap(slots))
+	}
+	// Queueing cannot spend the Docker startup budget. The slot covers both
+	// the ready wait and ConnectionString's mapped-port inspection.
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(rawContainerStartBudget))
+	defer cancel()
+	return startContainerWith(f, cleanup, ctx, run)
+}
+
+// Mutable only in non-parallel hermetic tests, before parallel migration tests
+// start. This seam lets those tests exercise the shipped admission call site.
+var runRawPostgres = func(ctx context.Context) (testcontainers.Container, connStringFunc, error) {
+	c, err := tcpostgres.Run(ctx,
+		"postgres:16.16-alpine",
+		tcpostgres.WithDatabase("fishhawk"),
+		tcpostgres.WithUsername("fishhawk"),
+		tcpostgres.WithPassword("fishhawk"),
+		testcontainers.WithWaitStrategy(
+			wait.ForAll(
+				wait.ForLog("database system is ready to accept connections").
+					WithOccurrence(2).
+					WithStartupTimeout(timescale.D(rawContainerReadyBudget)),
+				wait.ForListeningPort("5432/tcp").WithStartupTimeout(timescale.D(rawContainerReadyBudget)),
 			),
-		)
-		if err != nil {
-			// c is non-nil (or a typed-nil *PostgresContainer) even on error —
-			// testcontainers-go's generic.go returns the handle alongside the
-			// error so the caller can Destroy it. Hand it back for termination.
-			return c, nil, err
-		}
-		return c, func(ctx context.Context) (string, error) {
-			return c.ConnectionString(ctx, "sslmode=disable")
-		}, nil
-	})
+		),
+	)
+	if err != nil {
+		// The module may return a handle alongside a start error. Preserve it
+		// so startContainerWith terminates the partially started container.
+		return c, nil, err
+	}
+	return c, func(ctx context.Context) (string, error) {
+		return c.ConnectionString(ctx, "sslmode=disable")
+	}, nil
 }
 
 // startContainerWith is the injectable seam under startContainer. It runs the

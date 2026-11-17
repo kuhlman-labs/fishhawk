@@ -2652,6 +2652,9 @@ func runServe(args []string, logSink io.Writer) int {
 			return exitFailure
 		}
 		defer pool.Close()
+		// GET /readyz pings through the pool (#5224 G7); without this line
+		// /readyz answers 503 not_configured on a database-backed daemon.
+		cfg.DBPing = pool.Ping
 		cfg.RunRepo = runpkg.NewPostgresRepository(pool)
 		// Local stage concurrency groups (#3964 / ADR-087): the host-dispatch
 		// marker's slot store. Dropping this line reverts the marker to a bare

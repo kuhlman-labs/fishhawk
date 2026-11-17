@@ -852,8 +852,8 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		// with BOTH the artifact and its governance record. The helper
 		// fails closed on a read error (caller 500s; a further retry can
 		// re-heal) rather than returning a possibly-gapped 200. Only the
-		// primary governance entry is healed; the best-effort supplemental
-		// rows and the pull_request_url backfill remain create-path-only.
+		// primary governance entry is healed. Supplemental rows remain create-path-
+		// only; review-first replays also heal URL backfill and initialization below.
 		if _, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
 			"pull_request_opened", existing.ID.String(), func() error {
 				auditPayload, _ := json.Marshal(map[string]any{
@@ -938,6 +938,16 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 				if !s.applyEdgeResult(w, r, runID, stage, &pr, edgeKey, healErr, existing.ID, respondIdempotent) {
 					return
 				}
+			}
+		}
+		if humanReviewFirstUninitialized(stage) {
+			if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, pr.PRNumber) {
+				respondIdempotent()
+				return
+			}
+			if err := s.initializeHumanReviewAfterPR(r.Context(), runID, stage, pr.PRURL); err != nil {
+				s.writeError(w, r, http.StatusInternalServerError, "review_initialization_failed", "initialize human review failed", map[string]any{"error": err.Error()})
+				return
 			}
 		}
 		respondIdempotent()
@@ -1129,6 +1139,11 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// advancing to the review gate.
 	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, pr.PRNumber) {
 		respondCreated()
+		return
+	}
+
+	if err := s.initializeHumanReviewAfterPR(r.Context(), runID, stage, pr.PRURL); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "review_initialization_failed", "initialize human review failed", map[string]any{"error": err.Error()})
 		return
 	}
 

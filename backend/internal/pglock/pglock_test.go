@@ -650,15 +650,15 @@ func (c *deadlineWriteConn) Write(b []byte) (int, error) {
 }
 
 // TestWithSessionLock_WriteTimeoutAtDeadline: the waiter's deadline fires
-// while the try-lock statement is being WRITTEN, which pgx v5.11.0 returns as
-// "write failed: ... i/o timeout" without attributing it to ctx (#5159). The
+// while the try-lock statement is being WRITTEN (#5159). The
 // pool's connections are wrapped so that write trips the waiter's ctx and
-// fails with a net deadline error. One subtest per un-normalized pgx write
+// fails with a net deadline error. One subtest per pgx write
 // path: the first try-lock on a connection flushes Prepare, every later one
 // (a polling waiter's second and subsequent attempts) flushes Bind/Execute of
-// the cached statement. Counterfactuals: ctxTimeoutErr returning err, or the
-// call site passing err unwrapped, is RED; running fn before the error return
-// is RED on `ran`.
+// the cached statement. pgx v5.12 normalizes these errors to the context error
+// before returning them, discarding the socket cause. TestCtxTimeoutErr pins
+// normalization and cause preservation when the helper receives a raw timeout;
+// this test pins deadline attribution and that fn never runs on either path.
 func TestWithSessionLock_WriteTimeoutAtDeadline(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -724,9 +724,6 @@ func TestWithSessionLock_WriteTimeoutAtDeadline(t *testing.T) {
 			}
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("waiter whose deadline fired mid-write = %v, want it to wrap context.DeadlineExceeded", err)
-			}
-			if !errors.Is(err, os.ErrDeadlineExceeded) {
-				t.Fatalf("waiter whose deadline fired mid-write = %v, want the original os.ErrDeadlineExceeded kept", err)
 			}
 			if ran {
 				t.Fatal("fn ran although the try-lock write failed")

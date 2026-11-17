@@ -313,6 +313,7 @@ g15_out="$(
   _verify_doc_line_budget() { :; }
   _verify_schema_sync() { :; }
   _verify_gate_harnesses() { :; }
+  _verify_skill_facts() { :; }
   _verify_site_voice() { :; }
   _verify_site_ia() { :; }
   _verify_adr_records() { :; }

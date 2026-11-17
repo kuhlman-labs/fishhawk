@@ -37,6 +37,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// below are left as-is. The tier of each write route encodes the
 	// operator's admin-vs-member founder decision, visible here for review.
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	// Readiness (#5224 G7): public like /healthz, but it pings the database
+	// (coalesced and cached, readyz.go) and answers 503 when it is down or
+	// not configured. /healthz stays liveness-only.
+	mux.HandleFunc("GET /readyz", s.handleReady)
 	// The MCP surface (ADR-076 slice 2, #2390). All three streamable-HTTP
 	// legs are registered — POST (client->server messages), GET (the
 	// server->client stream) and DELETE (session termination) — so every

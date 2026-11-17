@@ -372,14 +372,14 @@ func (s *Server) fanInVerifyGateRun(ctx context.Context, runID uuid.UUID, headSH
 		return nil, nil
 	}
 	return &prompt.GateVerifyRun{
-			Command:    verdict.VerifyCommand,
-			ExitCode:   0,
-			HeadSHA:    headSHA,
-			Outcome:    mergeCandidateResultPassed,
-			OutputTail: verdict.OutputTail,
-		}, &prompt.GateVerifySummary{
-			Outcome:       mergeCandidateResultPassed,
-			Iterations:    1,
-			MaxIterations: 1,
-		}
+		Command:    verdict.VerifyCommand,
+		ExitCode:   0,
+		HeadSHA:    headSHA,
+		Outcome:    mergeCandidateResultPassed,
+		OutputTail: verdict.OutputTail,
+	}, &prompt.GateVerifySummary{
+		Outcome:       mergeCandidateResultPassed,
+		Iterations:    1,
+		MaxIterations: 1,
+	}
 }

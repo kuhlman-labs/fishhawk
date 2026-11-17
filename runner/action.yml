@@ -111,25 +111,25 @@ runs:
   using: 'composite'
   steps:
     - name: Set up Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
-        go-version: '1.25'
+        go-version: '1.27.4'
         cache: false
 
     # Claude Code is an npm-distributed CLI. Hosted Actions runners
     # don't ship with it, and the runner adapter (claudecode.go)
     # invokes the `claude` binary by name. Install it before the Go
-    # entrypoint runs. v0 pulls latest; pinning is a v1+ concern.
+    # entrypoint runs. Pin the CLI so hosted runs use a reviewable version.
     - name: Set up Node.js
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
-        node-version: '22'
+        node-version: '26.13.1'
 
     - name: Install Claude Code CLI
       if: ${{ inputs.agent == 'claude-code' }}
       shell: bash
       run: |
-        npm install -g @anthropic-ai/claude-code
+        npm install -g @anthropic-ai/claude-code@2.1.325
         claude --version
 
     # The Codex CLI is the OpenAI-distributed `codex` binary the codex
@@ -137,15 +137,15 @@ runs:
     # The version is pinned to an immutable tag per CLAUDE.md §Build,
     # test,lint — a run-time tool fetched by a workflow MUST NOT float on
     # latest (cf. the golangci-lint master/install.sh break in #607/#608).
-    # This pin (0.137.0) matches the codex-cli version the adapter's flag
-    # shape + JSONL event schema were validated against (see codex.go).
+    # The adapter documents its flag and JSONL contracts in codex.go;
+    # validate CLI help and adapter fixtures when updating this pin.
     # Not yet Dependabot-tracked (npx/npm-in-run-step pins are bumped by
     # hand, same as the @redocly/cli pin) — bump deliberately.
     - name: Install Codex CLI
       if: ${{ inputs.agent == 'codex' }}
       shell: bash
       run: |
-        npm install -g @openai/codex@0.137.0
+        npm install -g @openai/codex@0.169.0
         codex --version
 
     - name: Run fishhawk-runner

@@ -49,7 +49,7 @@ import (
 	"strconv"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // The ten refusal branches. Each is a stable identifier so a caller (and

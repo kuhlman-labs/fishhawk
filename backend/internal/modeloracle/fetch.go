@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	anthropicsdk "github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/option"
 )
 
 // Fetcher fetches the set of model ids a single provider currently serves.
@@ -56,7 +56,11 @@ func NewAnthropicFetcher(apiKey, baseURL string, client *http.Client) *Anthropic
 // prior snapshot).
 func (f *AnthropicFetcher) Fetch(ctx context.Context) ([]string, error) {
 	opts := []option.RequestOption{
+		// Match the established model-listing API, independent of SDK defaults.
+		option.WithHeader("anthropic-version", "2023-06-01"),
 		option.WithAPIKey(f.apiKey),
+		option.WithHeader("x-api-key", f.apiKey),
+		option.WithHeaderDel("Authorization"),
 		option.WithHTTPClient(f.client),
 	}
 	if f.baseURL != "" {

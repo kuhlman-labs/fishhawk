@@ -6557,6 +6557,7 @@ func (c *apiClient) ReportProductIssue(ctx context.Context, runID uuid.UUID, kin
 // what's happening" view: type/state for the lifecycle, sequence
 // for ordering, executor + timestamps + failure fields for the
 // agent's context.
+// CROSS-MODULE WIRE CONTRACT: stage_read_api (#5419), emitted by server.stageResponse.
 type Stage struct {
 	ID        string        `json:"id"`
 	RunID     string        `json:"run_id"`
@@ -6586,7 +6587,8 @@ type Stage struct {
 	// older backend that omits the key — the derivation then reports no deadline
 	// (nil), the mixed-version degrade. The json tag MUST byte-match the backend
 	// or the field silently decodes to zero — the #371-class wire-mirror trap.
-	AgentTimeoutSeconds int `json:"agent_timeout_seconds,omitempty"`
+	AgentTimeoutSeconds int    `json:"agent_timeout_seconds,omitempty"`
+	ReviewGateAdmission string `json:"review_gate_admission,omitempty" jsonschema:"workflow-derived human review routing from the backend; admitted means operator confirmation, pull_request_managed means forge approval/landing; absent or any other value must never suggest direct approval"`
 	// Progress mirrors the backend stageResponse.progress (#2541): the runner's
 	// mid-execution stage_progress heartbeat, so a mid-stage poll projects real
 	// activity (last_event / turns / tokens) onto the stage-wait status instead

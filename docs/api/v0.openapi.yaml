@@ -880,6 +880,26 @@ components:
         pending_reason: { type: string, enum: [review_finding_source, agent_recorded, credential_not_forge_verified] }
         source_event_key: { type: string, description: 'A birth''s dedupe key: `concern:<uuid>` or `idempotency_key:<key>`.' }
         supersedes_sequence: { type: string, description: 'A closure''s target birth sequence (base-10).' }
+    ReadinessResponse:
+      type: object
+      description: GET /readyz body, the same shape for 200 and 503 (#5224).
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+          description: ok exactly when every check is ok.
+        checks:
+          type: object
+          required: [database]
+          properties:
+            database:
+              type: string
+              enum: [ok, unreachable, not_configured]
+              description: |
+                The database ping's result: `ok`, `unreachable` (the ping
+                failed or exceeded its 2s bound) or `not_configured` (no
+                database URL).
     Error:
       type: object
       required: [error]
@@ -2187,8 +2207,11 @@ components:
           description: |
             The executing implement stage's remaining agent wall clock
             (seconds) at request time (#2540): the spec-resolved
-            `agent_timeout_seconds` budget minus the stage's elapsed
-            time. OBSERVABILITY-ONLY — surfaced beside
+            `agent_timeout_seconds` budget minus the current attempt's
+            elapsed time (from its dispatch, so a re-dispatched fix-up
+            pass or retry reports its own per-attempt remainder; #5226). A legacy row
+            with no dispatch clock falls back to the stage's `started_at`.
+            OBSERVABILITY-ONLY — surfaced beside
             `amendment_poll_window_seconds` so an operator can see whether
             a race against the deadline is already lost; it is never a
             refusal (a computed "too short" can be a false positive
@@ -2196,9 +2219,10 @@ components:
             kill a winnable amendment — #2540 approval condition 1).
             Present on the REQUEST response only, and only when the
             deadline derivation did not fail open (unresolvable spec
-            budget, a never-started stage, a non-positive remainder, or a
-            self-retried stage whose cumulative `started_at` understates
-            the remainder); absent otherwise.
+            budget, a stage with no dispatch or start clock, a
+            non-positive remainder, or a self-retried legacy stage with no
+            dispatch clock, whose cumulative `started_at` understates the
+            remainder); absent otherwise.
         amendment_poll_window_seconds:
           type: integer
           description: |
@@ -7341,6 +7365,17 @@ components:
             — the adapter-default spawn, and every stage of a run
             approved before per-stage model selection landed.
           example: claude-opus-4-8
+        review_gate_admission:
+          type: string
+          description: |
+            Workflow-derived routing for a human-executor review stage (#5419),
+            using the same predicate as approval admission. `admitted` means
+            operator confirmation; `pull_request_managed` means forge approval
+            and verified landing. Other values name a resolution failure.
+            Present on stage observability reads for human review stages;
+            omitted on other stages, action responses and older backends.
+            Missing, empty or unknown metadata must never authorize approval.
+          example: pull_request_managed
         agent_timeout_seconds:
           type: integer
           description: |
@@ -13487,6 +13522,61 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe
+      description: |
+        Readiness check for load balancers and orchestrators (#5224). Unlike
+        `/healthz`, which reports liveness only and never touches the
+        database, `/readyz` pings the database and answers 503 when it is
+        unreachable, the ping times out, or no database is configured.
+
+        Public like `/healthz`, and built to stay cheap under anonymous
+        load: concurrent requests share ONE in-flight ping, bounded at 2s,
+        and its result (success or failure) answers every request for 1s.
+        Readiness therefore holds at most one database connection at a time
+        and reaches the database at most about once per second. The driver
+        error is never echoed. Implemented in
+        `backend/internal/server/readyz.go`.
+      security: []
+      tags: [diagnostics]
+      responses:
+        '200':
+          description: The database answered the ping.
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessResponse' }
+              example: { status: ok, checks: { database: ok } }
+        '403':
+          description: |
+            A host-dispatcher bearer was presented (`host_dispatcher_route_forbidden`);
+            the route is not on that profile's allowlist. Probe anonymously.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Not ready. `checks.database` is `unreachable` (the ping failed or
+            timed out) or `not_configured` (the daemon runs without a
+            database URL, the posture in which every repository route already
+            answers 503). Probe anonymously: a probe that presents a bearer
+            token or session cookie while the database is unreachable is
+            answered 503 by the authentication middleware before this handler
+            runs, with the generic `service_unavailable` `Error` envelope
+            instead of this body (no `checks.database`, no `no-store`), the
+            same as `/healthz`.
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessResponse' }
+              example: { status: unavailable, checks: { database: unreachable } }
 
   # ---------------------------------------------------------------------
   # Auth — sign in via GitHub OAuth, manage scoped tokens
