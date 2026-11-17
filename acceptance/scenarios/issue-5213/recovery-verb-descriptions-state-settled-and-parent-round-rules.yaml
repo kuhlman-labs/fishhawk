@@ -1,0 +1,14 @@
+id: scenario:issue-5213/recovery-verb-descriptions-state-settled-and-parent-round-rules
+statement: Over MCP, the fishhawk_reconcile_merge description says that a run the merge webhook already settled answering reconcile_merge_not_applicable is not an error. The fishhawk_rebase_run_branch description says that a decomposed parent's head move starts a fresh consolidated review round to await before merging. The fishhawk_drive_run description says that a settled acceptance stage is never re-dispatched.
+verify_hint: 'MCP tool result: the three served descriptions from the preview''s tools/list.'
+steps: Seed trace-upload-target, mint fhm_ bearer, POST /mcp tools/list; read fishhawk_reconcile_merge, fishhawk_rebase_run_branch, fishhawk_drive_run descriptions.
+assertions:
+    expected: all three rules
+    observed_at_record: 'reconcile_merge: ''A run the merge webhook already settled ... answers either this 409 or an empty-list 200. Neither is an error when fishhawk_get_run_status shows the run already succeeded; otherwise follow the server message''; rebase: DECOMPOSED PARENT head move starts a fresh consolidated implement-review round, await before fishhawk_merge_run; drive_run: ''never re-dispatches a stage that already settled, so a succeeded acceptance stage is not re-run'''
+    repro_handle: POST http://localhost:8090/mcp tools/list with a fhm_ bearer minted from a trace-upload-target seed
+origin:
+    issue: 5213
+    pr: 5418
+    run_id: 078deff3-bc86-4ec7-8611-33a306612ca8
+    head_sha: 121a1be2087732ea1c4cf45c7683a8aae086101a
+    recorded_at: 2026-11-17T23:45:30Z

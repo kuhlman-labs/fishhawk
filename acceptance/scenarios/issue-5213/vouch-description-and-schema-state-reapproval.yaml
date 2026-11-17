@@ -1,0 +1,14 @@
+id: scenario:issue-5213/vouch-description-and-schema-state-reapproval
+statement: The fishhawk_vouch_commit tool description served over MCP says that the vouched push can dismiss the existing PR approval and must be followed by a re-approval, gives the order push, vouch, checks green, approve, merge, and its served output schema carries an approval_note property.
+verify_hint: 'MCP tool result: the preview''s tools/list entry for fishhawk_vouch_commit — description text and the outputSchema properties.'
+steps: Seed trace-upload-target, mint fhm_ bearer, POST /mcp tools/list; read fishhawk_vouch_commit description and outputSchema.properties.
+assertions:
+    expected: dismiss + re-approve, order, approval_note in schema
+    observed_at_record: 'APPROVAL AND ORDER section: push can dismiss existing approval, re-approve vouched head, forge_approval_required, order ''push, vouch, wait for checks green, approve, then fishhawk_merge_run''; outputSchema keys [approval_note, result], approval_note is a conditional constant'
+    repro_handle: POST http://localhost:8090/mcp tools/list with a fhm_ bearer minted from a trace-upload-target seed
+origin:
+    issue: 5213
+    pr: 5418
+    run_id: 078deff3-bc86-4ec7-8611-33a306612ca8
+    head_sha: 121a1be2087732ea1c4cf45c7683a8aae086101a
+    recorded_at: 2026-11-17T23:45:30Z
