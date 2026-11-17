@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Check concrete facts repeated in skills against repository sources, offline."""
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+import re
+import sys
+
+VERSION = r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?"
+
+
+@dataclass(frozen=True)
+class Fact:
+    name: str
+    source: str
+    source_pattern: str
+    skill_patterns: tuple[str, ...]
+
+
+def gate_tool(name, arg, patterns):
+    return Fact(name, "deploy/gate-image/Dockerfile",
+                rf"^ARG {arg}=v?({VERSION})[ \t]*(?:#.*)?$", patterns)
+
+
+# Explicit, operator-owned catch rules (ADR-121 tier I). Do not infer pins from
+# arbitrary numbers in prose. Capture only exact versions/thresholds in the
+# named command or fact context; references without a literal remain valid.
+FACTS = (
+    gate_tool("Go toolchain", "GO_VERSION", (
+        rf"\bgo({VERSION})\b", rf"\bgo-version[ :=`\"']+({VERSION})\b")),
+    Fact("Go workspace directive", "go.work", rf"^go ({VERSION})[ \t]*$", (
+        rf"\bgo\.work\b[^\n]*?\bgo[ `]+({VERSION})\b",)),
+    gate_tool("golangci-lint", "GOLANGCI_LINT_VERSION", (
+        rf"\bgolangci-lint(?:/|@|[ `:=]+(?:(?:CI[ `]+)?(?:pin|version|tag)[ `:=]+)?)v?({VERSION})\b",)),
+    gate_tool("Helm", "HELM_VERSION", (
+        rf"(?i)\bhelm(?:@|[ `:=]+)v?({VERSION})\b",)),
+    gate_tool("check-jsonschema", "CHECK_JSONSCHEMA_VERSION", (
+        rf"\bcheck-jsonschema(?:==|@|[ `:=]+)v?({VERSION})\b",)),
+    Fact("pnpm", "frontend/package.json", rf'"packageManager"\s*:\s*"pnpm@({VERSION})"', (
+        rf"\bpnpm(?:@|[ `:=]+)v?({VERSION})\b",)),
+    Fact("Redocly CLI", ".github/workflows/ci.yml", rf"@redocly/cli@({VERSION})\b", (
+        rf"@redocly/cli@({VERSION})\b",)),
+    Fact("actionlint", ".github/workflows/ci.yml", rf"actionlint@v({VERSION})\b", (
+        rf"\bactionlint(?:@|[ `:=]+)v?({VERSION})\b",)),
+    Fact("patch coverage", "scripts/test", r"FISHHAWK_PATCH_COVERAGE_THRESHOLD:-([0-9]+(?:\.[0-9]+)?)", (
+        r"(?i)\bpatch[ -]coverage[^\n%]*?([0-9]+(?:\.[0-9]+)?)%",
+        r"(?i)\b([0-9]+(?:\.[0-9]+)?)%[ `-]+patch[ -]coverage\b",
+        r"--diff-threshold[ =]+([0-9]+(?:\.[0-9]+)?)\b")),
+    Fact("aggregate coverage", "scripts/test", r'check-coverage\.py" --threshold ([0-9]+(?:\.[0-9]+)?)', (
+        r"(?i)\baggregate[ -]coverage[^\n%]*?([0-9]+(?:\.[0-9]+)?)%",
+        r"(?i)\b([0-9]+(?:\.[0-9]+)?)%[ `-]+aggregate[ -]coverage\b")),
+)
+
+
+class SourceError(ValueError):
+    pass
+
+
+def read(root, relative):
+    path = root / relative
+    try:
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("target leaves repository")
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SourceError(f"{relative}: cannot read fact input: {exc}") from exc
+
+
+def check(root):
+    """Return drift and structural errors separately; only drift may warn."""
+    drift, errors = [], []
+    expected = {}
+    for fact in FACTS:
+        try:
+            values = set(re.findall(fact.source_pattern, read(root, fact.source), re.M))
+            if len(values) != 1:
+                raise SourceError(f"{fact.source}: {fact.name}: expected one canonical value, found {sorted(values)}")
+            expected[fact.name] = values.pop()
+        except SourceError as exc:
+            errors.append(str(exc))
+    skills = sorted((root / ".agents/skills").glob("*/SKILL.md"))
+    if not skills:
+        errors.append(".agents/skills: no SKILL.md files found")
+    for path in skills:
+        relative = path.relative_to(root)
+        try:
+            lines = read(root, relative).splitlines()
+        except SourceError as exc:
+            errors.append(str(exc))
+            continue
+        for number, line in enumerate(lines, 1):
+            for fact in FACTS:
+                if fact.name not in expected:
+                    continue
+                values = {match[1] for pattern in fact.skill_patterns for match in re.finditer(pattern, line)}
+                for value in sorted(values):
+                    want = expected[fact.name]
+                    equal = float(value) == float(want) if fact.name.endswith("coverage") else value == want
+                    if not equal:
+                        drift.append(f"{relative}:{number}: {fact.name} is {value}; expected {want} from {fact.source}. "
+                                     "Repair is operator-authored: implement stages cannot edit .agents/**; "
+                                     "update the skill with the pin change or file an operator follow-up before CI.")
+    return drift, errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--warn-only", action="store_true", help="warn on skill drift; malformed/missing inputs still fail")
+    args = parser.parse_args()
+    drift, errors = check(args.root.resolve())
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    for item in drift:
+        print(f"{'WARNING' if args.warn_only else 'ERROR'}: {item}", file=sys.stderr)
+    if errors or (drift and not args.warn_only):
+        return 1
+    print(f"skill facts: {'WARNING' if drift else 'PASS'} ({len(FACTS)} explicit facts, offline)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

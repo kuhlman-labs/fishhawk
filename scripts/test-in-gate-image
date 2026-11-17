@@ -528,6 +528,7 @@ drive_verify() {
     _verify_doc_line_budget() { echo LEG:doc; }
     _verify_schema_sync() { echo LEG:sync; }
     _verify_gate_harnesses() { echo LEG:harnesses; }
+    _verify_skill_facts() { :; }
     _verify_site_voice() { echo LEG:voice; }
     _verify_site_ia() { echo LEG:ia; }
     _verify_adr_records() { echo LEG:adr; }

@@ -261,6 +261,7 @@ cmd_lint() { :; }
 _verify_doc_line_budget() { :; }
 _verify_schema_sync() { :; }
 _verify_gate_harnesses() { :; }
+_verify_skill_facts() { :; }
 _verify_site_voice() { :; }
 _verify_site_ia() { :; }
 cmd_test() { : > "$fake/markers/nested"; echo "NESTED_LOCK:\$VERIFY_LOCK_HELD"; echo "NESTED_KIND:\$(_verify_lock_kind)"; }
@@ -688,6 +689,7 @@ _verify_schema_sync() { :; }
 # MUST be stubbed: the real one re-executes THIS harness (cmd_verify runs both
 # gate harnesses), which would recurse without bound.
 _verify_gate_harnesses() { :; }
+_verify_skill_facts() { :; }
 cmd_test_with_patch_coverage() { echo "COV_TEST:$1"; }
 _verify_patch_coverage() { echo "COV_GATE:$1"; }
 

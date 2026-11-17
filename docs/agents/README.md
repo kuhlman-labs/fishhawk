@@ -39,8 +39,11 @@ Do not change those protections as a side effect of documentation cleanup.
 When a cited contract, pin or scripts/dev/test behavior changes, search the
 skills for that term and update affected procedures in the same operator PR.
 A run unable to write them files an operator follow-up. Prefer reading pins from
-canonical files/checkers over duplicating version literals. The separate
-repeated-fact drift-check proposal is #3943.
+canonical files/checkers over duplicating version literals.
+`scripts/check-skill-facts` checks the explicit repeated-fact inventory offline:
+local verify warns on skill drift and required CI fails until the operator
+updates it. Missing or malformed canonical inputs fail both paths. The fact
+table and repair contract live in [scripts](../../scripts/README.md#repeated-skill-facts-3943).
 
 ## Loading inventory
 

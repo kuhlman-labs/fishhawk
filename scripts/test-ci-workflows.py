@@ -88,6 +88,11 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn("if", jobs["repository-checks"])
         commands = "\n".join(step.get("run", "") for step in jobs["repository-checks"]["steps"])
         self.assertIn("scripts/test verify --no-tests", commands)
+        fact_steps = [step for step in jobs["repository-checks"]["steps"]
+                      if step.get("run") == "scripts/check-skill-facts"]
+        self.assertEqual(1, len(fact_steps), "strict skill-fact check must feed required CI")
+        self.assertNotIn("if", fact_steps[0])
+        self.assertNotIn("continue-on-error", fact_steps[0])
         self.assertIn("command -v zsh", commands)
         self.assertIn('scripts/check-review-prompt-eval --base "$BASE_SHA"', commands)
         for job in ["publish-backend", "publish-gate"]:
