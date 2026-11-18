@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2498,5 +2499,124 @@ func TestAwaitChildren_CampaignProbeErrorDoesNotFailTheWait(t *testing.T) {
 	}
 	if got := campaignAmendmentReads(fb, parent); got < 2 {
 		t.Errorf("campaign reads = %d, want >= 2 (the failing probe kept being attempted)", got)
+	}
+}
+
+// --- #5215 (R2): the fully-integrated children_settled release is conditional
+// on the parent's implement stage ---
+
+// seedSettledFanOut seeds four succeeded children, the parent's implement stage
+// at parentState, and a slices_integrated record covering every child, so the
+// await reaches the fully-integrated children_settled release.
+func seedSettledFanOut(t *testing.T, fb *fakeBackend, parent uuid.UUID, parentState string) {
+	t.Helper()
+	kids := seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, parentState)
+	all := make([]string, 0, len(kids))
+	for _, k := range kids {
+		all = append(all, k.String())
+	}
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", all)
+}
+
+// TestAwaitChildren_Settled_ParentAwaitingChildren_Consolidates: while the
+// parent's implement stage is still awaiting_children, next_step and message are
+// byte-identical to the pre-#5215 release.
+func TestAwaitChildren_Settled_ParentAwaitingChildren_Consolidates(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	seedSettledFanOut(t, fb, parent, "awaiting_children")
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_settled" {
+		t.Fatalf("status = %q, want children_settled", out.Status)
+	}
+	want := SuggestedAction{
+		Action:       "fishhawk_consolidate_slices",
+		Params:       map[string]string{"run_id": parent.String()},
+		Precondition: "every decomposed child succeeded and the newest slices_integrated record covers every child",
+		Consumes:     "none",
+		Reason:       "the fan-out is complete; consolidate the slices into the parent's consolidated branch and PR",
+	}
+	if out.NextStep == nil || !reflect.DeepEqual(*out.NextStep, want) {
+		t.Errorf("next_step = %+v, want byte-identical %+v", out.NextStep, want)
+	}
+	if wantMsg := "all 4 children succeeded and the consolidated branch carries every slice. Consolidate with fishhawk_consolidate_slices."; out.Message != wantMsg {
+		t.Errorf("message = %q, want byte-identical %q", out.Message, wantMsg)
+	}
+}
+
+// TestAwaitChildren_Settled_ParentAdvanced_RoutesThroughRunStatus: once the
+// server's event-driven fan-in has moved the parent's implement stage out of
+// awaiting_children (settled, re-opened for the fan-in verify-only pass, or
+// failed), consolidate would answer 409 not_awaiting_children, so next_step is
+// fishhawk_get_run_status on the PARENT and the message names the conditional
+// dispatch. Each fixture differs from the awaiting_children twin above ONLY in
+// the parent stage state, so deleting the conditional reddens every row.
+func TestAwaitChildren_Settled_ParentAdvanced_RoutesThroughRunStatus(t *testing.T) {
+	for _, state := range []string{"succeeded", "awaiting_host_dispatch", "pending", "failed"} {
+		t.Run(state, func(t *testing.T) {
+			fb, r := newAwaitResolver(t)
+			parent := uuid.New()
+			seedSettledFanOut(t, fb, parent, state)
+
+			_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+			if err != nil {
+				t.Fatalf("awaitChildren: %v", err)
+			}
+			if out.Status != "children_settled" {
+				t.Fatalf("status = %q, want children_settled", out.Status)
+			}
+			if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != parent.String() {
+				t.Fatalf("next_step = %+v, want fishhawk_get_run_status on the parent %s", out.NextStep, parent)
+			}
+			if !strings.Contains(out.NextStep.Reason, "not_awaiting_children") {
+				t.Errorf("next_step reason %q does not name not_awaiting_children", out.NextStep.Reason)
+			}
+			for _, want := range []string{
+				"not_awaiting_children",
+				"pending or awaiting_host_dispatch",
+				"fishhawk_dispatch_stage",
+				"fishhawk_drive_run",
+				"fan-in verify-only pass",
+				"(now " + state + ")",
+			} {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message %q lacks %q", out.Message, want)
+				}
+			}
+			if strings.Contains(out.Message, "Consolidate with") {
+				t.Errorf("message %q still tells the operator to consolidate an advanced parent", out.Message)
+			}
+		})
+	}
+}
+
+// TestAwaitChildren_Settled_ParentStagesUnreadable_Consolidates: an unreadable
+// parent stage list reads "" and keeps today's consolidate step — whose 409
+// refusal now carries its own remedy — rather than guessing an advanced parent.
+func TestAwaitChildren_Settled_ParentStagesUnreadable_Consolidates(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	seedSettledFanOut(t, fb, parent, "succeeded")
+	fb.mu.Lock()
+	fb.stagesStatusByRun[parent] = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_settled" {
+		t.Fatalf("status = %q, want children_settled", out.Status)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_consolidate_slices" {
+		t.Errorf("next_step = %+v, want fishhawk_consolidate_slices on an unreadable parent stage list", out.NextStep)
+	}
+	if !strings.Contains(out.Message, "Consolidate with fishhawk_consolidate_slices.") {
+		t.Errorf("message = %q, want today's consolidate message", out.Message)
 	}
 }

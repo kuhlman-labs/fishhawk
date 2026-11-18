@@ -1,0 +1,15 @@
+id: scenario:issue-5215/await-children-description-conditional-settled-step
+statement: The fishhawk_await_children description states that the children_settled next_step is fishhawk_consolidate_slices only while the parent's implement stage is awaiting_children, and fishhawk_get_run_status on the parent once the server has moved it out of that state.
+verify_hint: 'MCP tool result: the served fishhawk_await_children description''s children_settled bullet names both steps and the awaiting_children condition.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list. Read the children_settled bullet of the fishhawk_await_children description.
+steps_carried_from: head 5e2b695bf59b15b5971093328388377ae5473489 recorded_at 2026-11-18T17:11:24Z
+assertions:
+    expected: both steps and the awaiting_children condition
+    observed_at_record: next_step is fishhawk_consolidate_slices only while the implement stage is still awaiting_children (or unreadable); otherwise fishhawk_get_run_status on the parent.
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 5215
+    pr: 5465
+    run_id: 6b703cc0-07ef-4ce4-a2c8-06a4f24d5df6
+    head_sha: 81a819c5032088f91fac523476f5bc719c94f4b8
+    recorded_at: 2026-11-18T17:56:58Z

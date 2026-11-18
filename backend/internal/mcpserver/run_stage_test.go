@@ -4777,3 +4777,82 @@ func TestRunStage_ExplicitBaseBranch_OverridesRunDefault(t *testing.T) {
 		})
 	}
 }
+
+// TestRunStage_NextActions_BindingAssertionAndFanInVerifyFolds is the
+// run_stage.go call-site pin for the two #5215 folds: it drives the REAL
+// runStage handler with audit rows served by the package fake backend, so the
+// crossing audit row → fold → tool result is what is under test. Deleting
+// either fold call in run_stage.go reddens its row.
+func TestRunStage_NextActions_BindingAssertionAndFanInVerifyFolds(t *testing.T) {
+	t.Run("binding_assertion_failed_category_b", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		captureArgv(t)
+		runID, implID := uuid.New(), uuid.New()
+		category, reason := "B", "scope completeness failed by the operator"
+		implStage := implID.String()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", WorkflowID: "feature_change", RunnerKind: "local"}
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: implStage, RunID: runID.String(), Sequence: 2, Type: "implement", State: "failed", FailureCategory: &category, FailureReason: &reason},
+		}
+		fb.auditByRun[runID] = []AuditEntry{
+			{ID: uuid.NewString(), Sequence: 6, RunID: runID.String(), StageID: &implStage, Category: auditCategoryScopeCompletenessFailed, Payload: baAssertions},
+			{ID: uuid.NewString(), Sequence: 5, RunID: runID.String(), StageID: &implStage, Category: auditCategoryScopeCompletenessParked, Payload: baAssertions},
+		}
+		fb.mu.Unlock()
+		_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+			RunID: runID.String(), StageID: implStage, Workflow: "feature_change", Stage: "implement", GitHubRepo: "x/y",
+		})
+		if err != nil {
+			t.Fatalf("runStage(implement): %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "implement_failed_category_b" {
+			t.Fatalf("next_actions = %+v, want implement_failed_category_b", out.NextActions)
+		}
+		a := findAction(t, out.NextActions, "fishhawk_resume_run")
+		if a.Params["reason"] != bindingAssertionResumeReasonPlaceholder || !strings.Contains(a.Reason, "parks again or fails") {
+			t.Errorf("served resume action = %+v, want the binding-assertion recovery fold applied", a)
+		}
+	})
+	// The post-stage snapshot is read after a stage settles, so this row drives
+	// the run's settled plan stage (the host-dispatch marker the fake applies
+	// flips THAT stage) and serves the parent implement stage re-opened at
+	// awaiting_host_dispatch for the fan-in verify-only pass.
+	t.Run("fan_in_verify_pass_pending_parent", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		captureArgv(t)
+		runID, implID, planID := uuid.New(), uuid.New(), uuid.New()
+		implStage := implID.String()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", WorkflowID: "feature_change", RunnerKind: "local"}
+		fb.stagesByRun[runID] = []Stage{
+			{ID: planID.String(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: implStage, RunID: runID.String(), Sequence: 2, Type: "implement", State: "awaiting_host_dispatch"},
+		}
+		fb.auditByRun[runID] = []AuditEntry{
+			{ID: uuid.NewString(), Sequence: 7, RunID: runID.String(), StageID: &implStage, Category: categoryStageMergeCandidateVerifyTriggered, Payload: map[string]any{"cause": "fan_in"}},
+		}
+		fb.mu.Unlock()
+		_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+			RunID: runID.String(), StageID: planID.String(), Workflow: "feature_change", Stage: "plan", GitHubRepo: "x/y",
+		})
+		if err != nil {
+			t.Fatalf("runStage(plan): %v", err)
+		}
+		if out.NextActions == nil {
+			t.Fatal("next_actions absent")
+		}
+		var found bool
+		for _, a := range out.NextActions.Actions {
+			if a.Action == "fishhawk_await_stage" && a.Params["stage_id"] == implStage && strings.Contains(a.Reason, "fan-in verify-only pass") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("served next_actions %v carry no fan-in verify-pass await (state %s)", actionNames(out.NextActions), out.NextActions.State)
+		}
+	})
+}

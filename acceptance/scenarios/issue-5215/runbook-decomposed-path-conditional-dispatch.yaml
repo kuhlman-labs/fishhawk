@@ -1,0 +1,15 @@
+id: scenario:issue-5215/runbook-decomposed-path-conditional-dispatch
+statement: The fishhawk://runbook resource's decomposed-parent path says consolidate runs only while the parent is awaiting_children, routes a 409 not_awaiting_children to fishhawk_get_run_status, tells the operator to dispatch a re-opened fan-in verify implement stage (pending or awaiting_host_dispatch) on a local runner before the consolidated review, and warns against hand-pushing a union merge onto the consolidated branch.
+verify_hint: 'MCP tool result: read the fishhawk://runbook resource and find the conditional dispatch step, the 409 routing and the union-merge warning in the decomposed-parent section.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp resources/read {uri:fishhawk://runbook} with Mcp-Method resources/read and Mcp-Name fishhawk://runbook. Read the decomposed-parent steps.
+steps_carried_from: head 5e2b695bf59b15b5971093328388377ae5473489 recorded_at 2026-11-18T17:11:24Z
+assertions:
+    expected: conditional consolidate, 409 routing, fan-in verify dispatch, union-merge warning
+    observed_at_record: Consolidate only while awaiting_children; the 409 not_awaiting_children goes to fishhawk_get_run_status; dispatch the re-opened fan-in verify-only pass (pending or awaiting_host_dispatch) on a local runner and await it before the consolidated review; 'Never hand-push a union merge of slice branches onto the consolidated branch and vouch it.'
+    repro_handle: POST http://localhost:8090/mcp resources/read fishhawk://runbook
+origin:
+    issue: 5215
+    pr: 5465
+    run_id: 6b703cc0-07ef-4ce4-a2c8-06a4f24d5df6
+    head_sha: 81a819c5032088f91fac523476f5bc719c94f4b8
+    recorded_at: 2026-11-18T17:56:58Z

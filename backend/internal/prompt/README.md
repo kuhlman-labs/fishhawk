@@ -115,6 +115,11 @@ The second paragraph (lock-held refusal is a fast failure; do not poll or retry)
 
 Pinned by `TestBuild_Implement_RunContextVerifyRule_*`, `TestBuild_ImplementFixup_RunContextVerifyRule_*`, `TestBuild_ImplementFixup_SelfReport_GateConfigured_ProductionShaped`, `TestBuild_ImplementFixup_SelfReport_GateUnconfigured`, `TestBuild_ConcurrentVerifyRule_StaysRepoAgnostic` and the extended `TestBuild_ImplementReview_GateEvidence_RendersFixupSelfReportDivergence` here, and by the handler tests `TestGetStagePromptRender_RunContextVerifyRule_*`, `TestGetStagePrompt_RunContextVerifyRule_SignedGateConfigured` and `TestGetStagePrompt_RunContextVerifyRule_ConflictResolutionFailsClosed` in `backend/internal/server/prompt_test.go`.
 
+## Implement-prompt deferral and test-amendment routes (#5215)
+
+- **No tracker writes.** The full implement prompt's PR-description list carries `implementNoTrackerWritesBullet` directly after the `## Notes` bullet: the agent does not create, edit or comment on tracker issues, and lists deferred work, follow-ups and out-of-scope findings in `## Notes`, from which the operator files every follow-up. Pinned by `TestBuild_Implement_NoTrackerWrites`.
+- **Out-of-scope tests take the amendment route.** The shared `writeScopeAmendments` block (full implement and slim fix-up prompts) carries `scopeAmendmentOutOfScopeTestRoute` after its numbered steps: a test file outside the effective `scope.files` that pins behavior the change deliberately alters is requested by amendment, and the production change is never reverted, weakened or special-cased to make it pass. Pinned by `TestBuild_ScopeAmendments_OutOfScopeTestRoute`; `TestBuild_Issue5215Paragraphs_StayRepoAgnostic` holds all three #5215 paragraphs to ADR-110.
+
 ## Decomposition fan-out prompt resolution (#541/#676/#677)
 
 A decomposed child run (`runs.decomposed_from` set) is implement-only — no plan stage and no human approval gate of its own — so three plan-derived implement-prompt inputs resolve against the parent's approved plan/gate.
@@ -122,6 +127,8 @@ A decomposed child run (`runs.decomposed_from` set) is implement-only — no pla
 ### (a) Scope constraint (#541)
 
 `resolveDecomposedScopeConstraint` matches the child's `IssueContext.Body` prefix to a `decomposition.sub_plans[]` entry (`matchDecomposedSubPlan`) and injects a `SCOPE CONSTRAINT` block carrying this slice's `scope_hint` + the siblings' hints.
+
+The block ends in ONE step-zero instruction (`scopeConstraintStepZero`, #5215 rule 7): list the files to modify, check the slice and any binding approval condition against the owned files, and file ONE batched mid-stage scope amendment for every path outside them. The child prompt carries no sibling file lists or `depends_on` edges, so the agent is not asked to judge sibling ownership: the server refuses a path a non-ancestor slice owns with `amendment_path_owned_by_sibling_slice` (`server/slice_ownership.go`). On that refusal, a denial, an expiry with no in-scope adaptation or a spent request cap, the agent fails closed and does not signal completion. The retired "STOP and surface that the boundary is wrong" and "STOP and signal completion instead" sentences contradicted that and are gone. `TestBuild_Implement_ScopeConstraint_StepZeroSingleInstruction` pins the single instruction and their absence.
 
 ### (b) scope_files (#676)
 

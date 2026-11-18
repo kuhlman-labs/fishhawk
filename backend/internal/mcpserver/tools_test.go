@@ -594,6 +594,16 @@ type fakeBackend struct {
 	integrateWaveStatus   int
 	integrateWaveCalledBy map[uuid.UUID]int
 
+	// consolidate fixtures: POST /v0/runs/{run_id}/consolidate (#1238). The
+	// #5215 refusal-hint tests drive the refusal codes through the REAL
+	// handler: consolidateStatus is the status code (0 → 200 with an
+	// integrated result) and consolidateCode the error envelope's code on a
+	// status >= 400 (e.g. 409 not_awaiting_children, 502
+	// slice_integration_error). consolidateCalledBy counts calls per run id.
+	consolidateStatus   int
+	consolidateCode     string
+	consolidateCalledBy map[uuid.UUID]int
+
 	// E25.8 fixtures: the campaign endpoints (#1447).
 	// createCampaignBody captures the last decoded POST /v0/campaigns body so
 	// tests can assert repo/epic_ref/pause_policy round-trip. createCampaignResp
@@ -825,6 +835,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		latencyStatus:                 http.StatusOK,
 		integrateWaveResp:             map[uuid.UUID]IntegrateWaveResult{},
 		integrateWaveStatus:           http.StatusOK,
+		consolidateCalledBy:           map[uuid.UUID]int{},
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
 		createCampaignStatus:          http.StatusCreated,
 		previewCampaignStatus:         http.StatusOK,
@@ -1007,6 +1018,27 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/consolidate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.consolidateCalledBy[id]++
+		status, code := fb.consolidateStatus, fb.consolidateCode
+		fb.mu.Unlock()
+		if status >= 400 {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": "consolidate refused by the fake"}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ConsolidateResult{
+			RunID: id.String(), Outcome: "integrated", ResolvedToState: "succeeded",
+			ConsolidatedBranch: "fishhawk/run-" + id.String()[:8] + "-consolidated",
+		})
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -4220,6 +4252,36 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 				tool.Name, triggerTokens)
 		}
 	}
+}
+
+// TestRetryStage_DescriptionNamesCheckpointRef pins the #5215 rule 1
+// CHECKPOINT REFS paragraph on the SERVED fishhawk_retry_stage description: a
+// failed implement stage's named checkpoint ref is read before retrying,
+// because a retry re-runs from the branch. Anchors are flattened so a hard
+// wrap does not redden it while removing the rule does.
+func TestRetryStage_DescriptionNamesCheckpointRef(t *testing.T) {
+	desc := fixupGuidanceFlatten(registeredToolDescription(t, "fishhawk_retry_stage"))
+	for _, want := range []string{
+		"refs/fishhawk/checkpoints/",
+		"before you retry",
+		"inspect_checkpoint_ref",
+		"params.ref",
+		"a retry re-runs from the branch",
+		"held gate-verified checkpoint",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_retry_stage description lacks %q", want)
+		}
+	}
+	start := strings.Index(desc, "checkpoint refs (#5215)")
+	if start < 0 {
+		t.Fatalf("fishhawk_retry_stage description lacks the CHECKPOINT REFS paragraph")
+	}
+	end := strings.Index(desc[start:], "returns the updated stage row")
+	if end < 0 {
+		t.Fatalf("CHECKPOINT REFS paragraph is not followed by the returns paragraph")
+	}
+	mergeGuidanceADR110(t, "fishhawk_retry_stage CHECKPOINT REFS", desc[start:start+end])
 }
 
 // TestRetryStageDescription_DocumentsAcceptanceReopenArm pins the #1567

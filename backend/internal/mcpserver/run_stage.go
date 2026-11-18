@@ -936,6 +936,11 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// ceiling-of-one budget is spent. Fail-open like every other derivation
 		// here: an un-fetched recent slice degrades to silence.
 		foldConflictResolutionAdvisory(&runView.Run, recentAudit, nextActions)
+		// #5215: the binding-assertion recovery and fan-in verify-pass folds,
+		// in the same order getRunStatus applies them, off the SAME postStages
+		// + recentAudit slices. Display-only and fail-open to silence.
+		foldBindingAssertionRecoveryAdvisory(&runView.Run, postStages, recentAudit, nextActions)
+		foldFanInVerifyPassAdvisory(&runView.Run, postStages, recentAudit, nextActions)
 		// E68.43 (#3321): the same display-only acceptance-preview fold
 		// getRunStatus applies, off the SAME recentAudit slice, so the
 		// post-stage snapshot and the status snapshot cannot diverge on whether

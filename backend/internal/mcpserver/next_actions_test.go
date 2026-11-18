@@ -8884,3 +8884,474 @@ func TestPlanStageNextActions_AdvisoryReject_NamesArbitration(t *testing.T) {
 		})
 	}
 }
+
+// --- #5215: checkpoint-ref, binding-assertion and fan-in verify advisories ---
+
+// cpRunID / cpStageID are the ids the checkpoint-ref arms are built on.
+const (
+	cpRunID   = "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904"
+	cpStageID = "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203"
+	cpBase    = "refs/fishhawk/checkpoints/" + cpRunID + "/" + cpStageID
+)
+
+// cpTruncate mirrors the runner's upload.TruncateReason output shape: a head, the
+// "\n… [truncated N bytes] …\n" marker, and a tail.
+func cpTruncate(head, tail string, elided int) string {
+	return head + fmt.Sprintf("\n… [truncated %d bytes] …\n", elided) + tail
+}
+
+func TestCheckpointRefIn(t *testing.T) {
+	sp := func(s string) *string { return &s }
+	fixupRef := cpBase + "-fixup-0123456789ab"
+	type row struct {
+		name           string
+		reason         *string
+		runID, stageID string
+		want           string
+	}
+	rows := []row{
+		// (a) each real clause shape for this run and stage.
+		{"a/held", sp("commit+push: push rejected; gate-verified work pinned at " + cpBase + "; fishhawk_retry_stage resumes it without re-running the agent"), cpRunID, cpStageID, cpBase},
+		{"a/stash", sp("commit+push: x; stashed agent edits pinned at " + cpBase + "-stash (recover with `git stash apply " + cpBase + "-stash`)"), cpRunID, cpStageID, cpBase + "-stash"},
+		{"a/verify", sp("verify failed; verified head 0123456789abcdef0123456789abcdef01234567 pinned at " + cpBase + "-verify"), cpRunID, cpStageID, cpBase + "-verify"},
+		{"a/timeout", sp("agent timeout after 1h0m0s; uncommitted agent work pinned at " + cpBase + "-timeout-1 (commit abc)"), cpRunID, cpStageID, cpBase + "-timeout-1"},
+		{"a/killed", sp("agent loop detected; uncommitted agent work pinned at " + cpBase + "-killed-1 (commit abc)"), cpRunID, cpStageID, cpBase + "-killed-1"},
+		{"a/fixup", sp("commit+push: x; fix-up commit abc never reached the PR branch; its work is pinned at " + fixupRef + " (inspect with `git show abc`)"), cpRunID, cpStageID, fixupRef},
+		// (b) the last of two accepted refs wins.
+		{"b/last_wins", sp("pinned at " + cpBase + "; and pinned at " + cpBase + "-stash"), cpRunID, cpStageID, cpBase + "-stash"},
+		// (c) surrounding delimiters are trimmed.
+		{"c/semicolon", sp("at " + cpBase + "-verify;"), cpRunID, cpStageID, cpBase + "-verify"},
+		{"c/paren_comma", sp("(" + cpBase + "-verify),"), cpRunID, cpStageID, cpBase + "-verify"},
+		{"c/backtick_dot", sp("`" + cpBase + "-verify`."), cpRunID, cpStageID, cpBase + "-verify"},
+		// (d) empty inputs.
+		{"d/nil", nil, cpRunID, cpStageID, ""},
+		{"d/empty", sp(""), cpRunID, cpStageID, ""},
+		{"d/no_ref", sp("commit+push: push rejected"), cpRunID, cpStageID, ""},
+		{"d/empty_run", sp("at " + cpBase), "", cpStageID, ""},
+		{"d/empty_stage", sp("at " + cpBase), cpRunID, "", ""},
+		// (e) a clause after a 2000-byte head is still found.
+		{"e/long_head", sp(strings.Repeat("x ", 1000) + "; verified head abc pinned at " + cpBase + "-verify"), cpRunID, cpStageID, cpBase + "-verify"},
+		// (f) hostile tokens on this run's and stage's base.
+		{"f/dollar_paren", sp("at " + cpBase + "$(id)"), cpRunID, cpStageID, ""},
+		{"f/pipe", sp("at " + cpBase + "-timeout-1|sh"), cpRunID, cpStageID, ""},
+		{"f/andand", sp("at " + cpBase + "&&y"), cpRunID, cpStageID, ""},
+		{"f/backtick", sp("at " + cpBase + "`y`"), cpRunID, cpStageID, ""},
+		{"f/dotdot_suffix", sp("at " + cpBase + "-x/../y"), cpRunID, cpStageID, ""},
+		// (f') hostile ids: only checkpointRefPattern separates these from an
+		// accepted ref (prefix and suffix both match the ids passed in).
+		{"f/hostile_run_id", sp("at refs/fishhawk/checkpoints/r$(id)/" + cpStageID), "r$(id)", cpStageID, ""},
+		// (g) a well-formed ref for another run or stage.
+		{"g/other_run", sp("at refs/fishhawk/checkpoints/00000000-0000-4000-8000-000000000000/" + cpStageID), cpRunID, cpStageID, ""},
+		{"g/other_stage", sp("at refs/fishhawk/checkpoints/" + cpRunID + "/00000000-0000-4000-8000-000000000000-verify"), cpRunID, cpStageID, ""},
+		// Q3: truncation artifacts and git-illegal shapes.
+		{"q3/cut_suffix", sp("at " + cpBase + "-fixup-0123456"), cpRunID, cpStageID, ""},
+		{"q3/cut_by_truncate_reason", sp(cpTruncate("commit+push: x; stashed agent edits pinned at "+cpBase, "-stash`)", 400)), cpRunID, cpStageID, ""},
+		{"q3/tail_adjacent_to_marker", sp(cpTruncate("commit+push: x", cpBase+"-verify trailing", 400)), cpRunID, cpStageID, ""},
+		{"q3/leading_dash_segment", sp("at refs/fishhawk/checkpoints/-r/" + cpStageID), "-r", cpStageID, ""},
+		{"q3/dot_segment", sp("at refs/fishhawk/checkpoints/./" + cpStageID), ".", cpStageID, ""},
+		{"q3/dotdot_in_id", sp("at refs/fishhawk/checkpoints/a..b/" + cpStageID), "a..b", cpStageID, ""},
+		{"q3/trailing_dot_segment", sp("at refs/fishhawk/checkpoints/r./" + cpStageID), "r.", cpStageID, ""},
+		{"q3/lock_ending", sp("at refs/fishhawk/checkpoints/" + cpRunID + "/s.lock"), cpRunID, "s.lock", ""},
+		// A complete ref that is NOT adjacent to the marker survives truncation.
+		{"q3/tail_ref_survives", sp(cpTruncate("commit+push: x", "y; verified head abc pinned at "+cpBase+"-verify", 400)), cpRunID, cpStageID, cpBase + "-verify"},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := checkpointRefIn(tc.reason, tc.runID, tc.stageID); got != tc.want {
+				t.Errorf("checkpointRefIn = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// cpArms builds the implementFailedNextActions inputs for each arm, with the
+// implement stage carrying the given reason.
+func cpArms(reason string) map[string]func() *NextActions {
+	mk := func(category string) (*Run, *Stage) {
+		run := &Run{ID: cpRunID, Repo: "x/y", WorkflowID: "feature_change", State: "failed"}
+		impl := naFailedImplement(category, reason)
+		impl.ID = cpStageID
+		return run, &impl
+	}
+	plan := naStage("plan", "succeeded")
+	return map[string]func() *NextActions{
+		"A": func() *NextActions {
+			run, impl := mk("A")
+			return implementFailedNextActions(run, &plan, nil, impl)
+		},
+		"B_top_level": func() *NextActions {
+			run, impl := mk("B")
+			return implementFailedNextActions(run, &plan, nil, impl)
+		},
+		"B_decomposition_child": func() *NextActions {
+			run, impl := mk("B")
+			parent := uuid.NewString()
+			run.ParentRunID = &parent
+			return implementFailedNextActions(run, nil, nil, impl)
+		},
+		"C_nonterminal_park": func() *NextActions {
+			run, impl := mk("C")
+			run.State = "running"
+			return implementFailedNextActions(run, &plan, nil, impl)
+		},
+		"D_default_terminal": func() *NextActions {
+			run, impl := mk("D")
+			return implementFailedNextActions(run, &plan, nil, impl)
+		},
+	}
+}
+
+// TestImplementFailed_CheckpointRefAdvisory: a reason ending in a checkpoint
+// clause appends inspect_checkpoint_ref LAST on every arm, and the same arm with
+// the clause stripped is deep-equal to the pre-#5215 arm output.
+func TestImplementFailed_CheckpointRefAdvisory(t *testing.T) {
+	const lead = "commit+push: push rejected"
+	clause := "; verified head 0123456789abcdef0123456789abcdef01234567 pinned at " + cpBase + "-verify"
+	with := cpArms(lead + clause)
+	without := cpArms(lead)
+	for name, build := range with {
+		t.Run(name, func(t *testing.T) {
+			na := build()
+			if len(na.Actions) == 0 {
+				t.Fatal("no actions")
+			}
+			last := na.Actions[len(na.Actions)-1]
+			if last.Action != "inspect_checkpoint_ref" {
+				t.Fatalf("last action = %q, want inspect_checkpoint_ref (actions %v)", last.Action, actionNames(na))
+			}
+			wantParams := map[string]string{"run_id": cpRunID, "stage_id": cpStageID, "ref": cpBase + "-verify"}
+			if !reflect.DeepEqual(last.Params, wantParams) {
+				t.Errorf("params = %v, want %v", last.Params, wantParams)
+			}
+			if last.Consumes != consumesNone {
+				t.Errorf("consumes = %q, want none", last.Consumes)
+			}
+			stripped := without[name]()
+			trimmed := &NextActions{State: na.State, Actions: na.Actions[:len(na.Actions)-1]}
+			if !reflect.DeepEqual(stripped, trimmed) {
+				t.Errorf("clause-stripped arm differs from the clause-bearing arm minus the advisory:\n got %+v\nwant %+v", stripped, trimmed)
+			}
+			if nextActionOffered(stripped, "inspect_checkpoint_ref") {
+				t.Error("clause-stripped arm offers inspect_checkpoint_ref")
+			}
+		})
+	}
+}
+
+// TestImplementFailed_CheckpointRefNeverInProse: the ref travels only in
+// params.ref; neither the reason nor the precondition interpolates it or any
+// part of the failure reason.
+func TestImplementFailed_CheckpointRefNeverInProse(t *testing.T) {
+	const lead = "commit+push: zebra-unique-lead-token"
+	ref := cpBase + "-stash"
+	na := cpArms(lead + "; stashed agent edits pinned at " + ref)["B_top_level"]()
+	a := findAction(t, na, "inspect_checkpoint_ref")
+	for _, prose := range []string{a.Reason, a.Precondition} {
+		for _, leak := range []string{ref, cpRunID, cpStageID, "zebra-unique-lead-token", "refs/fishhawk/checkpoints/"} {
+			if strings.Contains(prose, leak) {
+				t.Errorf("advisory prose %q leaks %q", prose, leak)
+			}
+		}
+	}
+	for _, want := range []string{"params.ref", "git show", "fishhawk_retry_stage", "cherry-pick"} {
+		if !strings.Contains(a.Reason+" "+a.Precondition, want) {
+			t.Errorf("advisory prose missing %q", want)
+		}
+	}
+}
+
+// TestImplementFailureReasonClauses_WireFixture is the backend end of the R3
+// seam: the runner's TestCheckpointRefClauses_MatchWireFixture pins the same
+// fixture against the real producers.
+func TestImplementFailureReasonClauses_WireFixture(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(wd, "..", "..", "..", "testdata", "wire", "implement_failure_reason_clauses.json")) //nolint:gosec // fixed workspace-relative path
+	if err != nil {
+		t.Fatalf("reading the shared fixture: %v", err)
+	}
+	var fx struct {
+		ExampleSHA        string `json:"example_sha"`
+		CheckpointClauses []struct {
+			Kind           string `json:"kind"`
+			RunID          string `json:"run_id"`
+			StageID        string `json:"stage_id"`
+			Ref            string `json:"ref"`
+			ClauseTemplate string `json:"clause_template"`
+		} `json:"checkpoint_clauses"`
+		AssertionCompoundFragment string   `json:"assertion_compound_fragment"`
+		AssertionSoleSentinel     string   `json:"assertion_sole_sentinel"`
+		HostileReasons            []string `json:"hostile_reasons"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("fixture is not JSON: %v", err)
+	}
+	render := func(s string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(s, "<sha12>", fx.ExampleSHA[:12]), "<sha>", fx.ExampleSHA)
+	}
+	if len(fx.CheckpointClauses) < 6 {
+		t.Fatalf("fixture carries %d checkpoint clauses, want 6", len(fx.CheckpointClauses))
+	}
+	for _, c := range fx.CheckpointClauses {
+		if !strings.HasPrefix(c.Ref, checkpointRefNamespace) {
+			t.Errorf("%s: ref %q is outside checkpointRefNamespace", c.Kind, c.Ref)
+		}
+		reason := "commit+push: push rejected" + render(c.ClauseTemplate)
+		if got := checkpointRefIn(&reason, c.RunID, c.StageID); got != render(c.Ref) {
+			t.Errorf("%s: checkpointRefIn = %q, want %q", c.Kind, got, render(c.Ref))
+		}
+	}
+	for _, h := range fx.HostileReasons {
+		if got := checkpointRefIn(&h, cpRunID, cpStageID); got != "" {
+			t.Errorf("hostile reason %q yielded %q, want \"\"", h, got)
+		}
+	}
+	if fx.AssertionCompoundFragment != assertionCompoundFragment {
+		t.Errorf("fixture compound fragment %q != assertionCompoundFragment %q", fx.AssertionCompoundFragment, assertionCompoundFragment)
+	}
+	if strings.Contains(fx.AssertionSoleSentinel, assertionCompoundFragment) {
+		t.Errorf("sole-assertion sentinel %q is detected as compound", fx.AssertionSoleSentinel)
+	}
+}
+
+// --- binding-assertion recovery (R1, Q2) ---
+
+func baEntry(seq int64, category, stageID string, payload any) AuditEntry {
+	return AuditEntry{ID: uuid.NewString(), Sequence: seq, Category: category, StageID: &stageID, Payload: payload}
+}
+
+var baAssertions = map[string]any{"unsatisfied_assertions": []any{map[string]any{"type": "file_contains", "path": "a.go"}}}
+
+func baParkNA(runID string) *NextActions {
+	return &NextActions{
+		State: "implement_awaiting_scope_decision",
+		Actions: []SuggestedAction{{
+			Action: "fishhawk_decide_scope_completeness", Params: map[string]string{"run_id": runID, "decision": "exempt|amend|fail"},
+			Consumes: consumesNone, Reason: "decide in-band",
+		}, {Action: "fishhawk_get_run_status", Reason: "read"}},
+	}
+}
+
+func baFailedNA(runID string) *NextActions {
+	return &NextActions{
+		State: "implement_failed_category_b",
+		Actions: []SuggestedAction{{
+			Action: "fishhawk_resume_run", Params: map[string]string{"parent_run_id": runID},
+			Consumes: consumesNewRun, Reason: "category-B (scope/constraint) failure",
+		}},
+	}
+}
+
+func cloneNA(na *NextActions) *NextActions {
+	out := &NextActions{State: na.State}
+	for _, a := range na.Actions {
+		a.Params = maps.Clone(a.Params)
+		out.Actions = append(out.Actions, a)
+	}
+	return out
+}
+
+func TestFoldBindingAssertionRecoveryAdvisory(t *testing.T) {
+	run := naRun("running")
+	impl := naStage("implement", "awaiting_scope_decision")
+	stages := []Stage{naStage("plan", "succeeded"), impl}
+	emptyAssertions := map[string]any{"unsatisfied_assertions": []any{}, "missing_paths": []any{"b.go"}}
+
+	t.Run("a/park_with_assertions_appends_sentence", func(t *testing.T) {
+		na := baParkNA(run.ID)
+		foldBindingAssertionRecoveryAdvisory(run, stages, []AuditEntry{baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions)}, na)
+		if len(na.Actions) != 2 {
+			t.Fatalf("actions = %v, want the list length kept", actionNames(na))
+		}
+		got := na.Actions[0].Reason
+		for _, want := range []string{"decide in-band", "parks again or fails", "binding_assertions", "reconcil", "exempt only when"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("decide reason missing %q: %q", want, got)
+			}
+		}
+	})
+	noop := func(t *testing.T, na *NextActions, stgs []Stage, recent []AuditEntry) {
+		t.Helper()
+		before := cloneNA(na)
+		foldBindingAssertionRecoveryAdvisory(run, stgs, recent, na)
+		if !reflect.DeepEqual(before, na) {
+			t.Errorf("fold acted; want deep-equal no-op:\n got %+v\nwant %+v", na, before)
+		}
+	}
+	t.Run("b/park_with_empty_assertions_noop", func(t *testing.T) {
+		noop(t, baParkNA(run.ID), stages, []AuditEntry{baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, emptyAssertions)})
+	})
+	t.Run("c/failed_with_assertions_sets_resume_reason", func(t *testing.T) {
+		failedImpl := naFailedImplement("B", "operator failed it")
+		failedImpl.ID = impl.ID
+		na := baFailedNA(run.ID)
+		foldBindingAssertionRecoveryAdvisory(run, []Stage{naStage("plan", "succeeded"), failedImpl},
+			[]AuditEntry{baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions), baEntry(6, auditCategoryScopeCompletenessFailed, impl.ID, baAssertions)}, na)
+		a := na.Actions[0]
+		if a.Params["reason"] != bindingAssertionResumeReasonPlaceholder || a.Params["parent_run_id"] != run.ID {
+			t.Errorf("resume params = %v, want parent_run_id kept and the reason placeholder set", a.Params)
+		}
+		for _, want := range []string{"inherits the same binding_assertions", "parks again or fails", "injected", "fishhawk_start_run", "fishhawk_start_campaign_item_run"} {
+			if !strings.Contains(a.Reason, want) {
+				t.Errorf("resume reason missing %q: %q", want, a.Reason)
+			}
+		}
+	})
+	t.Run("d/newer_exempted_row_noop", func(t *testing.T) {
+		noop(t, baFailedNA(run.ID), stages, []AuditEntry{
+			baEntry(6, auditCategoryScopeCompletenessFailed, impl.ID, baAssertions),
+			baEntry(7, auditCategoryScopeCompletenessExempted, impl.ID, map[string]any{"unsatisfied_assertions": []any{}}),
+		})
+	})
+	t.Run("e/row_for_other_stage_noop", func(t *testing.T) {
+		noop(t, baParkNA(run.ID), stages, []AuditEntry{baEntry(5, auditCategoryScopeCompletenessParked, uuid.NewString(), baAssertions)})
+	})
+	t.Run("f/aged_out_window_noop", func(t *testing.T) {
+		noop(t, baParkNA(run.ID), stages, nil)
+	})
+	t.Run("g/nil_inputs_no_panic", func(t *testing.T) {
+		recent := []AuditEntry{baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions)}
+		foldBindingAssertionRecoveryAdvisory(nil, stages, recent, baParkNA(run.ID))
+		foldBindingAssertionRecoveryAdvisory(run, stages, recent, nil)
+		noop(t, baParkNA(run.ID), nil, recent)
+	})
+	t.Run("q2/earlier_attempt_row_never_relabels_later_failure", func(t *testing.T) {
+		// An assertion park, a fail decision, then an OverrideB retry re-opens the
+		// stage and that new attempt fails category B for a different reason.
+		noop(t, baFailedNA(run.ID), stages, []AuditEntry{
+			baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions),
+			baEntry(6, auditCategoryScopeCompletenessFailed, impl.ID, baAssertions),
+			baEntry(7, categoryStageOverrideRetried, impl.ID, map[string]any{"reason": "operator override"}),
+		})
+	})
+	t.Run("q2/retry_reopen_bounds_park", func(t *testing.T) {
+		noop(t, baParkNA(run.ID), stages, []AuditEntry{
+			baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions),
+			baEntry(8, categoryStageRetried, impl.ID, nil),
+		})
+	})
+	t.Run("q2/fixup_reopen_bounds_park", func(t *testing.T) {
+		noop(t, baParkNA(run.ID), stages, []AuditEntry{
+			baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions),
+			baEntry(8, categoryStageFixupTriggered, impl.ID, nil),
+		})
+	})
+	t.Run("other_state_noop", func(t *testing.T) {
+		na := baParkNA(run.ID)
+		na.State = "implement_running"
+		noop(t, na, stages, []AuditEntry{baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions)})
+	})
+}
+
+// TestImplementFailed_CompoundAssertionCategoryB: the compound abort's text gets
+// the reconciling reason; the sole-assertion sentinel and a plain scope reason
+// keep today's reason byte-identical.
+func TestImplementFailed_CompoundAssertionCategoryB(t *testing.T) {
+	const generic = "category-B (scope/constraint) failure: mint a recovery run re-executing the approved plan without replanning; name missing paths via add_scope_files"
+	compound := "commit+push: gitops: declared scope file(s) not touched: compound committed-tree gate failure — 1 missing declared scope file(s) (b.txt) AND 1 unsatisfied binding assertion(s) (file_contains a.txt). A park is reserved for a SOLE gate shortfall"
+	longMissing := strings.Repeat("dir/missing_file.go, ", 40)
+	rows := []struct {
+		name, reason string
+		compound     bool
+	}{
+		{"compound", compound, true},
+		{"compound_truncated_fragment_in_head", cpTruncate(compound[:200], "tail of the verify summary", 5000), true},
+		{"compound_truncated_fragment_elided_fails_open", cpTruncate("commit+push: compound committed-tree gate failure — 40 missing declared scope file(s) ("+longMissing[:120], "tail", 5000), false},
+		{"sole_sentinel", "commit+push: gitops: declared binding assertion(s) not satisfied by the committed tree: 1 of 1", false},
+		{"plain_scope", "commit+push: gitops: declared scope file(s) not touched: b.txt", false},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "compound_truncated_fragment_in_head" && !strings.Contains(compound[:200], assertionCompoundFragment) {
+				t.Fatal("fixture precondition: fragment must sit inside the kept head")
+			}
+			impl := naFailedImplement("B", tc.reason)
+			plan := naStage("plan", "succeeded")
+			na := implementFailedNextActions(naRun("failed"), &plan, nil, &impl)
+			a := findAction(t, na, "fishhawk_resume_run")
+			if !tc.compound {
+				if a.Reason != generic {
+					t.Errorf("reason = %q, want today's generic reason byte-identical", a.Reason)
+				}
+				return
+			}
+			for _, want := range []string{"reconcil", "binding_assertions", "parks again or fails", "add_scope_files"} {
+				if !strings.Contains(a.Reason, want) {
+					t.Errorf("compound reason missing %q: %q", want, a.Reason)
+				}
+			}
+			if strings.Contains(a.Reason, "a.txt") || strings.Contains(a.Reason, "b.txt") {
+				t.Errorf("compound reason echoes failure text: %q", a.Reason)
+			}
+		})
+	}
+}
+
+// --- fan-in verify-only pass (rule 6) ---
+
+func TestFoldFanInVerifyPassAdvisory(t *testing.T) {
+	type row struct {
+		name   string
+		mutate func(run *Run, impl *Stage, recent *[]AuditEntry)
+		acts   bool
+	}
+	rows := []row{
+		{"a/live_fan_in_trigger_appends", func(*Run, *Stage, *[]AuditEntry) {}, true},
+		{"a/pending_appends", func(_ *Run, impl *Stage, _ *[]AuditEntry) { impl.State = "pending" }, true},
+		{"b/newer_verified_noop", func(_ *Run, impl *Stage, recent *[]AuditEntry) {
+			*recent = append(*recent, baEntry(9, categoryMergeCandidateVerified, impl.ID, map[string]any{"cause": "fan_in", "result": "passed"}))
+		}, false},
+		{"c/cause_base_advance_noop", func(_ *Run, _ *Stage, recent *[]AuditEntry) {
+			(*recent)[0].Payload = map[string]any{"cause": "base_advance"}
+		}, false},
+		{"d/github_actions_noop", func(run *Run, _ *Stage, _ *[]AuditEntry) { run.RunnerKind = "github_actions" }, false},
+		{"d/gitlab_ci_noop", func(run *Run, _ *Stage, _ *[]AuditEntry) { run.RunnerKind = "gitlab_ci" }, false},
+		{"e/implement_running_noop", func(_ *Run, impl *Stage, _ *[]AuditEntry) { impl.State = "running" }, false},
+		{"f/trigger_on_other_stage_noop", func(_ *Run, _ *Stage, recent *[]AuditEntry) {
+			other := uuid.NewString()
+			(*recent)[0].StageID = &other
+		}, false},
+		{"g/terminal_run_noop", func(run *Run, _ *Stage, _ *[]AuditEntry) { run.State = "succeeded" }, false},
+		{"older_verified_still_acts", func(_ *Run, impl *Stage, recent *[]AuditEntry) {
+			*recent = append(*recent, baEntry(3, categoryMergeCandidateVerified, impl.ID, map[string]any{"cause": "fan_in"}))
+		}, true},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naRun("running")
+			run.RunnerKind = "local"
+			impl := naStage("implement", "awaiting_host_dispatch")
+			impl.Sequence = 2
+			recent := []AuditEntry{baEntry(7, categoryStageMergeCandidateVerifyTriggered, impl.ID, map[string]any{"cause": "fan_in"})}
+			tc.mutate(run, &impl, &recent)
+			stages := []Stage{naStage("plan", "succeeded"), impl}
+			na := &NextActions{State: "implement_pending", Actions: []SuggestedAction{{Action: "fishhawk_dispatch_stage", Params: map[string]string{"stage_id": impl.ID}}}}
+			before := cloneNA(na)
+			foldFanInVerifyPassAdvisory(run, stages, recent, na)
+			if !tc.acts {
+				if !reflect.DeepEqual(before, na) {
+					t.Errorf("fold acted; want deep-equal no-op: %v", actionNames(na))
+				}
+				return
+			}
+			if len(na.Actions) != 2 || na.State != before.State || na.Actions[0].Action != "fishhawk_dispatch_stage" {
+				t.Fatalf("actions = %v state %s, want the dispatch kept and one action appended", actionNames(na), na.State)
+			}
+			a := na.Actions[1]
+			if a.Action != "fishhawk_await_stage" || a.Params["run_id"] != run.ID || a.Params["stage_id"] != impl.ID {
+				t.Errorf("appended = %+v, want fishhawk_await_stage {run_id, stage_id}", a)
+			}
+			for _, want := range []string{"fan-in verify", "dispatch", "fishhawk_drive_run", "fishhawk_get_gate_view"} {
+				if !strings.Contains(a.Reason, want) {
+					t.Errorf("reason missing %q: %q", want, a.Reason)
+				}
+			}
+		})
+	}
+	t.Run("h/nil_inputs_no_panic", func(t *testing.T) {
+		foldFanInVerifyPassAdvisory(nil, nil, nil, &NextActions{})
+		foldFanInVerifyPassAdvisory(naRun("running"), nil, nil, nil)
+	})
+}

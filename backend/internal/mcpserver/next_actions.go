@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1949,7 +1950,29 @@ func reviveRunAction(run *Run) SuggestedAction {
 // except on a category-C failure whose run is still NON-terminal: that is the
 // server's implement infrastructure park (#4426), revive is inapplicable to a
 // running run, and the retry's precondition names the park and its budget.
+//
+// Every arm is computed by implementFailedArmNextActions; this wrapper then
+// APPENDS one inspect_checkpoint_ref action when the failure reason names a
+// checkpoint ref the runner pinned for THIS run's and stage's failed attempt
+// (#5215 rule 1). A reason that yields no accepted ref leaves every arm
+// byte-identical to its pre-#5215 output.
 func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextActions {
+	na := implementFailedArmNextActions(run, plan, review, impl)
+	if ref := checkpointRefIn(impl.FailureReason, run.ID, impl.ID); ref != "" {
+		na.Actions = append(na.Actions, SuggestedAction{
+			Action:       "inspect_checkpoint_ref",
+			Params:       map[string]string{"run_id": run.ID, "stage_id": impl.ID, "ref": ref},
+			Precondition: inspectCheckpointRefPrecondition,
+			Consumes:     consumesNone,
+			Reason:       inspectCheckpointRefReason,
+		})
+	}
+	return na
+}
+
+// implementFailedArmNextActions is the per-category arm logic
+// implementFailedNextActions wraps.
+func implementFailedArmNextActions(run *Run, plan, review, impl *Stage) *NextActions {
 	category := ""
 	if impl.FailureCategory != nil {
 		category = *impl.FailureCategory
@@ -2030,6 +2053,15 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 			}
 		}
 		if plan != nil && plan.State == "succeeded" {
+			reason := "category-B (scope/constraint) failure: mint a recovery run re-executing the approved plan without replanning; name missing paths via add_scope_files"
+			// #5215 rule 11: the compound missing-scope-plus-assertion abort is
+			// the ONE assertion failure that reaches a category-B reason as text
+			// (a sole assertion shortfall parks and is read from its structured
+			// audit row instead). The reason is constant and echoes nothing.
+			if impl.FailureReason != nil && strings.Contains(*impl.FailureReason, assertionCompoundFragment) {
+				reason = "a compound committed-tree gate failure (missing declared scope files AND an unsatisfied binding assertion) failed this stage category B. " +
+					bindingAssertionResumeTail + "; name the missing paths via add_scope_files"
+			}
 			return &NextActions{
 				State: "implement_failed_category_b",
 				Actions: []SuggestedAction{{
@@ -2037,7 +2069,7 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 					Params:       map[string]string{"parent_run_id": run.ID},
 					Precondition: "the plan stage succeeded and the implement stage failed category-B; clean the working tree (git status) before dispatching the recovery run's implement stage",
 					Consumes:     consumesNewRun,
-					Reason:       "category-B (scope/constraint) failure: mint a recovery run re-executing the approved plan without replanning; name missing paths via add_scope_files",
+					Reason:       reason,
 				}},
 			}
 		}
@@ -4374,4 +4406,287 @@ func relabelConflictResolutionState(na *NextActions, state string) {
 	if na.State != stateCICancelled {
 		na.State = state
 	}
+}
+
+// --- #5215: checkpoint-ref, binding-assertion and fan-in verify advisories ---
+
+// checkpointRefNamespace mirrors the runner's checkpointRefPrefix
+// (runner/cmd/fishhawk-runner/childpushresume.go). KEEP IN SYNC: the runner
+// and this package are separate modules, so
+// testdata/wire/implement_failure_reason_clauses.json pins both sides.
+const checkpointRefNamespace = "refs/fishhawk/checkpoints/"
+
+// checkpointRefPattern is the whole-token grammar a checkpoint ref must match:
+// the namespace, then slash-separated segments of ref-safe characters that each
+// start with a letter or digit (so no segment leads with '-' or '.').
+var checkpointRefPattern = regexp.MustCompile(`^refs/fishhawk/checkpoints/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$`)
+
+// checkpointRefSuffixPattern is the set of COMPLETE leaf suffixes the runner
+// appends to refs/fishhawk/checkpoints/<run>/<stage>: none (the held
+// gate-verified pin), -stash, -verify, -timeout-<n> (an agent timeout kill),
+// -killed-<n> (a loop, budget or cancellation kill) and -fixup-<12 hex> (a
+// stranded fix-up commit). A token cut short by truncation does not match, so
+// it is never returned.
+var checkpointRefSuffixPattern = regexp.MustCompile(`^(-stash|-verify|-timeout-[1-9][0-9]*|-killed-[1-9][0-9]*|-fixup-[0-9a-f]{12})?$`)
+
+// checkpointTruncatedToken / checkpointTruncatedBytesToken are the inner
+// fields of the runner's upload.TruncateReason elision marker
+// "\n… [truncated N bytes] …\n". KEEP IN SYNC with runner/internal/upload.
+const (
+	checkpointElisionToken        = "…"
+	checkpointTruncatedToken      = "[truncated"
+	checkpointTruncatedBytesToken = "bytes]"
+)
+
+// checkpointRefIn returns the checkpoint ref a failure reason names for THIS
+// run's and stage's failed attempt, or "" (#5215 rule 1, R5). The reason is
+// untrusted display text, so a token is accepted only when it
+//
+//   - is not adjacent to a TruncateReason elision marker (it may be cut);
+//   - after trimming surrounding punctuation, fully matches checkpointRefPattern;
+//   - contains no "..", and no segment ends in "." or ".lock";
+//   - starts with refs/fishhawk/checkpoints/<runID>/<stageID>; and
+//   - ends, after that base, in a complete known suffix shape.
+//
+// The LAST accepted token wins: the runner appends its pin clause last and
+// TruncateReason keeps the tail. A ref for another run or stage is never
+// returned.
+func checkpointRefIn(reason *string, runID, stageID string) string {
+	if reason == nil || *reason == "" || runID == "" || stageID == "" {
+		return ""
+	}
+	base := checkpointRefNamespace + runID + "/" + stageID
+	fields := strings.Fields(*reason)
+	adjacent := map[int]bool{}
+	for i := 0; i+4 < len(fields); i++ {
+		if fields[i] == checkpointElisionToken && fields[i+1] == checkpointTruncatedToken &&
+			fields[i+3] == checkpointTruncatedBytesToken && fields[i+4] == checkpointElisionToken {
+			adjacent[i-1] = true
+			adjacent[i+5] = true
+		}
+	}
+	found := ""
+	for i, f := range fields {
+		if adjacent[i] {
+			continue
+		}
+		tok := strings.TrimRight(strings.TrimLeft(f, "(`'\""), ";,.)`'\"")
+		if !checkpointRefPattern.MatchString(tok) {
+			continue
+		}
+		if strings.Contains(tok, "..") || checkpointRefBadSegment(tok) {
+			continue
+		}
+		if !strings.HasPrefix(tok, base) {
+			continue
+		}
+		if !checkpointRefSuffixPattern.MatchString(tok[len(base):]) {
+			continue
+		}
+		found = tok
+	}
+	return found
+}
+
+// checkpointRefBadSegment reports whether any slash-separated segment of ref
+// ends in "." or ".lock", which git refuses as a ref name.
+func checkpointRefBadSegment(ref string) bool {
+	for _, seg := range strings.Split(ref, "/") {
+		if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, ".lock") {
+			return true
+		}
+	}
+	return false
+}
+
+// inspectCheckpointRefPrecondition / inspectCheckpointRefReason are CONSTANT:
+// the ref travels only in params.ref, and no reason text is interpolated.
+const (
+	inspectCheckpointRefPrecondition = "the failed implement stage's failure reason names a checkpoint ref the runner pinned for this run's and stage's failed attempt (params.ref); it lives in the runner host's local repository, and a hosted CI job does not keep it"
+	inspectCheckpointRefReason       = "read the pinned work with git show on params.ref before retrying, resuming or restarting, so finished work is recovered rather than redone. A held gate-verified pin is resumed by fishhawk_retry_stage itself; uncommitted agent work pinned after a kill, a stash pin and a stranded fix-up commit come back only when you apply or cherry-pick them"
+)
+
+// assertionCompoundFragment is the fragment of the runner's compound
+// missing-scope-plus-assertion abort (runner main.go openPRAndShipArtifact).
+// KEEP IN SYNC: testdata/wire/implement_failure_reason_clauses.json pins it
+// against the real emitter. The sole-assertion sentinel deliberately does not
+// contain it.
+const assertionCompoundFragment = "unsatisfied binding assertion(s)"
+
+// bindingAssertionResumeTail is the shared reconciling wording for a
+// binding-assertion recovery (#5215 rule 11).
+const bindingAssertionResumeTail = "fishhawk_resume_run mints a recovery run that inherits the same binding_assertions and re-checks them on its committed tree, so it parks again or fails unless the resume reason reconciles each unsatisfied assertion with the plan and the approval conditions (the reason is injected into the recovery agent's binding conditions). An assertion that cannot be satisfied needs a replan and re-approval with corrected binding_assertions: restart with fishhawk_start_run, or fishhawk_start_campaign_item_run for a campaign item"
+
+// bindingAssertionParkSentence is appended to the decide action's reason on an
+// assertion park.
+const bindingAssertionParkSentence = "This park is an unsatisfied binding assertion: exempt only when the assertion is wrong for a tree that meets the plan's done-means; amend when satisfying it needs a path outside scope. A fail followed by " + bindingAssertionResumeTail
+
+// bindingAssertionResumeReasonPlaceholder is the params.reason placeholder on
+// the resume action of a failed assertion park.
+const bindingAssertionResumeReasonPlaceholder = "<reconcile each unsatisfied binding assertion (scope_completeness_failed.unsatisfied_assertions) with the plan and the approval conditions>"
+
+const (
+	// auditCategoryScopeCompleteness* MUST match
+	// backend/internal/server.CategoryScopeCompletenessParked / _Failed /
+	// _Exempted / _Amended (server/scope_completeness.go). Duplicated, not
+	// imported: mcpserver reads them off the wire.
+	auditCategoryScopeCompletenessParked   = "scope_completeness_parked"
+	auditCategoryScopeCompletenessFailed   = "scope_completeness_failed"
+	auditCategoryScopeCompletenessExempted = "scope_completeness_exempted"
+	auditCategoryScopeCompletenessAmended  = "scope_completeness_amended"
+)
+
+// scopeCompletenessSignal is the newest scope-completeness row of the CURRENT
+// attempt of one stage.
+type scopeCompletenessSignal struct {
+	Category      string
+	HasAssertions bool
+}
+
+// scopeCompletenessSignalIn returns the newest scope_completeness_parked /
+// _failed / _exempted / _amended row for stageID (newest by Sequence across all
+// four) and whether its unsatisfied_assertions is a non-empty array. Only the
+// CURRENT attempt counts: a row at or below the stage's latest re-open
+// (stage_retried, stage_override_retried or stage_fixup_triggered) belongs to
+// an earlier attempt and is ignored, so it can never relabel a later,
+// unrelated failure. Fails open to a zero signal on an empty window, a row with
+// no stage id, or an undecodable payload.
+func scopeCompletenessSignalIn(recent []AuditEntry, stageID string) scopeCompletenessSignal {
+	var newest *AuditEntry
+	var reopen int64
+	for i := range recent {
+		e := &recent[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		switch e.Category {
+		case categoryStageRetried, categoryStageOverrideRetried, categoryStageFixupTriggered:
+			if e.Sequence > reopen {
+				reopen = e.Sequence
+			}
+		case auditCategoryScopeCompletenessParked, auditCategoryScopeCompletenessFailed,
+			auditCategoryScopeCompletenessExempted, auditCategoryScopeCompletenessAmended:
+			if newest == nil || e.Sequence > newest.Sequence {
+				newest = e
+			}
+		}
+	}
+	if newest == nil || newest.Sequence <= reopen {
+		return scopeCompletenessSignal{}
+	}
+	var p struct {
+		UnsatisfiedAssertions []json.RawMessage `json:"unsatisfied_assertions"`
+	}
+	if !decodeAuditPayloadInto(newest.Payload, &p) {
+		return scopeCompletenessSignal{}
+	}
+	return scopeCompletenessSignal{Category: newest.Category, HasAssertions: len(p.UnsatisfiedAssertions) > 0}
+}
+
+// foldBindingAssertionRecoveryAdvisory names binding-assertion recovery off the
+// STRUCTURED scope-completeness rows, never failure text (#5215 rule 11, R1).
+// Display-only: it never removes an action or relabels a state.
+//
+//   - implement_awaiting_scope_decision with a parked row carrying assertions:
+//     APPENDS bindingAssertionParkSentence to the decide action's reason.
+//   - implement_failed_category_b whose action is fishhawk_resume_run, with a
+//     failed row carrying assertions: sets params.reason to a placeholder and
+//     replaces that action's reason with the reconciling wording.
+//
+// Every other state, an aged-out window, or a row from an earlier attempt
+// leaves na deep-equal.
+func foldBindingAssertionRecoveryAdvisory(run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
+	if run == nil || na == nil {
+		return
+	}
+	impl := newestStageByType(stages, "implement")
+	if impl == nil {
+		return
+	}
+	sig := scopeCompletenessSignalIn(recent, impl.ID)
+	if !sig.HasAssertions {
+		return
+	}
+	switch {
+	case na.State == "implement_awaiting_scope_decision" && sig.Category == auditCategoryScopeCompletenessParked:
+		for i := range na.Actions {
+			if na.Actions[i].Action == "fishhawk_decide_scope_completeness" {
+				na.Actions[i].Reason += ". " + bindingAssertionParkSentence
+			}
+		}
+	case na.State == "implement_failed_category_b" && sig.Category == auditCategoryScopeCompletenessFailed:
+		for i := range na.Actions {
+			a := &na.Actions[i]
+			if a.Action != "fishhawk_resume_run" {
+				continue
+			}
+			params := make(map[string]string, len(a.Params)+1)
+			for k, v := range a.Params {
+				params[k] = v
+			}
+			params["reason"] = bindingAssertionResumeReasonPlaceholder
+			a.Params = params
+			a.Reason = "an unsatisfied binding assertion failed this stage category B at the scope-completeness decision. " + bindingAssertionResumeTail
+		}
+	}
+}
+
+// categoryMergeCandidateVerified mirrors backend
+// server.CategoryMergeCandidateVerified (server/merge_candidate_verify.go).
+// KEEP IN SYNC: it settles a stage_merge_candidate_verify_triggered pass.
+const categoryMergeCandidateVerified = "merge_candidate_verified"
+
+// mergeCandidateCauseFanIn mirrors server mergeCandidateCauseFanIn.
+const mergeCandidateCauseFanIn = "fan_in"
+
+// foldFanInVerifyPassAdvisory names a decomposed parent's fan-in verify-only
+// pass on a local runner (#5215 rule 6). Display-only, additive, fail-open. It
+// appends a wait-shaped fishhawk_await_stage only when the run is non-terminal
+// and not on a hosted runner, the newest implement stage is pending or
+// awaiting_host_dispatch, and the newest stage_merge_candidate_verify_triggered
+// row for that stage has cause fan_in with no newer merge_candidate_verified
+// row. Distinct from foldFanInVerifyUnavailableAdvisory (acceptance released
+// with no verify consulted).
+func foldFanInVerifyPassAdvisory(run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
+	if run == nil || na == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	if run.RunnerKind == "github_actions" || run.RunnerKind == "gitlab_ci" {
+		return
+	}
+	impl := newestStageByType(stages, "implement")
+	if impl == nil || (impl.State != "pending" && impl.State != "awaiting_host_dispatch") {
+		return
+	}
+	var trigger *AuditEntry
+	var verified int64
+	for i := range recent {
+		e := &recent[i]
+		if e.StageID == nil || *e.StageID != impl.ID {
+			continue
+		}
+		switch e.Category {
+		case categoryStageMergeCandidateVerifyTriggered:
+			if trigger == nil || e.Sequence > trigger.Sequence {
+				trigger = e
+			}
+		case categoryMergeCandidateVerified:
+			if e.Sequence > verified {
+				verified = e.Sequence
+			}
+		}
+	}
+	if trigger == nil || verified > trigger.Sequence {
+		return
+	}
+	if acceptancePayloadString(trigger.Payload, "cause") != mergeCandidateCauseFanIn {
+		return
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "fishhawk_await_stage",
+		Params:       map[string]string{"run_id": run.ID, "stage_id": impl.ID},
+		Precondition: "the decomposed parent's implement stage was re-opened for the fan-in verify-only pass and has not settled",
+		Consumes:     consumesNone,
+		Reason:       "this is the decomposed parent's fan-in verify-only pass on the consolidated head (the declared verify command, no agent), which the server starts only for an unverified head when a verify command is declared. On a local runner nothing dispatches it: dispatch it first with the fishhawk_dispatch_stage action this block already carries (or let fishhawk_drive_run dispatch it), then await it. The consolidated review and acceptance stay held until it settles; a failed pass means the verify command is red on the integrated tree, so read fishhawk_get_gate_view",
+	})
 }

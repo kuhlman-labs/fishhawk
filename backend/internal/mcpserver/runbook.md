@@ -531,6 +531,13 @@ the run row could not be read, so the decomposition-child check was skipped and
 `next_step` names `fishhawk_dispatch_stage` — prefer `fishhawk_run_children` if
 the stage belongs to a decomposed child.
 
+Before retrying a failed implement stage, read any checkpoint ref its
+`failure_reason` names (also the `inspect_checkpoint_ref` `next_actions` entry's
+`params.ref`, a `refs/fishhawk/checkpoints/<run>/<stage>...` ref in the runner
+host's local repository) with `git show`: a retry re-runs from the branch, so
+work pinned only at that ref is redone unless you apply or cherry-pick it —
+except a held gate-verified checkpoint, which the runner resumes itself.
+
 ### Decomposed-parent native path (`fishhawk_run_children` / `fishhawk_consolidate_slices`)
 
 When a plan is **decomposed** into child slices, the parent's implement stage
@@ -549,13 +556,37 @@ failed` is a legal sweeper edge). Drive the native path instead:
    child bases on the wave-0 integration commit, so a producer→consumer slice pair
    typechecks against the already-integrated symbol. Re-invocation is idempotent
    (in-flight and terminal children are reported as-is, only pending ones spawn).
-3. **`fishhawk_consolidate_slices` (parent run_id)** — once **every** child is
-   terminal, run the fan-in that merges each slice branch onto the consolidated
-   branch and opens the consolidated PR. The 60s child-completion sweeper backstop
-   is OFF by default in `fishhawkd` (`--enable-child-completion-sweeper`), so on
-   the local loop this operator verb **is** the fan-in. The endpoint refuses a
-   partial set — a failed child must be resolved or re-driven first.
-4. **Review the consolidated PR.**
+3. **Let the fan-in settle, then read `fishhawk_get_run_status` (parent
+   run_id).** The server's event-driven fan-in normally merges each slice branch
+   onto the consolidated branch, opens the consolidated PR and settles the
+   parent's implement stage as the last child succeeds. Call
+   **`fishhawk_consolidate_slices`** only while that stage is **still
+   `awaiting_children`** after every child succeeded (the event-driven path
+   WARN-swallows a non-conflict integration error and can leave it parked). A
+   `409 not_awaiting_children` means the stage left that state — settled,
+   re-opened, or failed on a slice conflict or a failed child — so it does not
+   by itself mean success: read `fishhawk_get_run_status` and follow its
+   `next_actions`. A `502 slice_integration_error` leaves the parent
+   `awaiting_children` and the fan-in is idempotent, so re-invoke once the cause
+   clears. The endpoint refuses a partial set — a failed child must be resolved
+   or re-driven first.
+4. **Dispatch the fan-in verify-only pass when the parent was re-opened for
+   it.** On a local runner, when the parent's implement stage reads `pending` or
+   `awaiting_host_dispatch` after the fan-in, the server re-opened it for the
+   fan-in verify-only pass (an unverified consolidated head and a declared verify
+   command; no agent runs). Nothing dispatches it on its own: dispatch it with
+   `fishhawk_dispatch_stage` (or let `fishhawk_drive_run` do it) and await it
+   before the consolidated review. A failed pass means the verify command is red
+   on the integrated tree — read `fishhawk_get_gate_view`.
+5. **Review the consolidated PR.**
+
+**Never hand-push a union merge of slice branches onto the consolidated branch
+and vouch it.** A vouched head that brings in no base commit takes the vouch
+exemption, which the merge gate checks before its fan-in rule, so no fan-in
+verify is asked for at it; the vouch starts no review round and dispatches no
+acceptance stage, so the merged tree reaches the merge gate unverified,
+unreviewed and unaccepted. Route slice work through the loop: re-drive or resume
+the child, or run `fishhawk_fixup_stage` on the parent.
 
 The parent's own human gates are unchanged around the implement fan-out:
 **pre(plan)** before the children run and **post(review)** on the consolidated

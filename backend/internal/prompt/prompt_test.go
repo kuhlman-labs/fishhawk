@@ -3031,7 +3031,7 @@ func TestBuild_Implement_ScopeConstraint_Rendered(t *testing.T) {
 		"Implement the foo helper in pkg/bar.",
 		"Step zero",
 		"list the files you intend to modify",
-		"STOP and surface that the boundary is wrong",
+		"file ONE mid-stage scope amendment",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -3060,6 +3060,186 @@ func TestBuild_Implement_ScopeConstraint_SiblingHints(t *testing.T) {
 	}
 	if !strings.Contains(got, "do NOT modify code in sibling scope") {
 		t.Errorf("prompt missing sibling prohibition notice\n---\n%s", got)
+	}
+}
+
+// stepZeroHead is the stable opening of the decomposed child's step-zero
+// instruction; its presence and its count are what the single-instruction
+// test keys on.
+const stepZeroHead = "Step zero — before writing any code: list the files you intend to modify"
+
+// TestBuild_Implement_ScopeConstraint_StepZeroSingleInstruction pins #5215
+// rule 7 (R4 + approval condition Q1): a decomposed child's step zero is ONE
+// instruction — check the slice and conditions against the owned files, file
+// ONE batched amendment for any outside path (the agent does not judge sibling
+// ownership; the server refuses a non-ancestor sibling's path with
+// amendment_path_owned_by_sibling_slice), and fail closed on any refusal,
+// denial, undecided expiry or spent cap without signalling completion. The
+// retired contradictory sentences must be ABSENT, so re-inserting either one
+// reddens this test. A non-decomposed prompt carries no step zero at all.
+func TestBuild_Implement_ScopeConstraint_StepZeroSingleInstruction(t *testing.T) {
+	child, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		ScopeConstraint: &ScopeConstraint{
+			ScopeHint:    "Implement Part A in pkg/a.",
+			ParentRunID:  "00000000-0000-0000-0000-000000000003",
+			ScopeFiles:   []string{"pkg/a/a.go"},
+			SiblingHints: []string{"Implement Part B in pkg/b."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build(child): %v", err)
+	}
+	if n := strings.Count(child, stepZeroHead); n != 1 {
+		t.Fatalf("step-zero instruction rendered %d time(s), want exactly 1\n---\n%s", n, child)
+	}
+	start := strings.Index(child, stepZeroHead)
+	end := strings.Index(child[start:], "\n\n")
+	if end < 0 {
+		t.Fatalf("step-zero paragraph is not terminated by a blank line")
+	}
+	stepZero := child[start : start+end]
+	for _, want := range []string{
+		// The conditions check against the owned files.
+		"check your slice and any binding approval condition below against the files you own",
+		// ONE batched amendment for an outside path.
+		"file ONE mid-stage scope amendment",
+		"batches every such path",
+		// The agent does not judge sibling ownership (Q1); the server does.
+		"do not try to work out yourself whether another slice owns it",
+		"`amendment_path_owned_by_sibling_slice`",
+		"unless this child depends on that slice",
+		// Fail closed, and never signal completion on a refusal (Q1).
+		"On that refusal, a denial, an expiry with no in-scope adaptation, or a spent request cap",
+		"fail closed",
+		"do NOT signal completion",
+	} {
+		if !strings.Contains(stepZero, want) {
+			t.Errorf("step-zero instruction missing %q\n---\n%s", want, stepZero)
+		}
+	}
+	// R4: the contradictory retired sentences are gone from the WHOLE prompt.
+	for _, retired := range []string{
+		"STOP and signal completion instead",
+		"rather than expanding scope",
+		"STOP and surface that the boundary is wrong",
+		"wanting to work in a sibling's area",
+	} {
+		if strings.Contains(child, retired) {
+			t.Errorf("decomposed child prompt still carries the retired step-zero wording %q (R4)", retired)
+		}
+	}
+	// The consistent sibling prohibition stays.
+	if !strings.Contains(child, "do NOT modify code in sibling scope") {
+		t.Errorf("sibling prohibition line was dropped; it is consistent with step zero and must stay")
+	}
+
+	// A non-decomposed implement prompt renders no step zero.
+	plain, err := Build("implement", Trigger{Repo: "o/r", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(plain): %v", err)
+	}
+	for _, absent := range []string{stepZeroHead, "amendment_path_owned_by_sibling_slice"} {
+		if strings.Contains(plain, absent) {
+			t.Errorf("non-decomposed implement prompt carries step-zero text %q", absent)
+		}
+	}
+}
+
+// TestBuild_Implement_NoTrackerWrites pins #5215 rule 2: the full implement
+// prompt's PR-description format list tells the agent it writes no tracker
+// state and routes deferrals through `## Notes`, directly after the `## Notes`
+// bullet and inside the PR-description block (not elsewhere in the prompt).
+func TestBuild_Implement_NoTrackerWrites(t *testing.T) {
+	got, err := Build("implement", Trigger{Repo: "o/r", IssueNumber: 5215, ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	const (
+		blockStart = "write a pull-request description to `"
+		blockEnd   = "- Don't add other top-level sections."
+		notesLine  = "  - `## Notes` — optional. Use only when there's something deferred, surprising, or non-obvious worth flagging.\n"
+		tracker    = "- Do not create, edit or comment on tracker issues yourself."
+		routeNotes = "List deferred work, follow-ups and out-of-scope findings in `## Notes` instead; the operator files every follow-up from there."
+	)
+	start := strings.Index(got, blockStart)
+	if start < 0 {
+		t.Fatalf("PR-description block absent\n---\n%s", got)
+	}
+	end := strings.Index(got[start:], blockEnd)
+	if end < 0 {
+		t.Fatalf("PR-description block has no top-level-sections bullet")
+	}
+	block := got[start : start+end]
+	for _, want := range []string{tracker, routeNotes} {
+		if !strings.Contains(block, want) {
+			t.Errorf("PR-description block missing the no-tracker instruction %q\n---\n%s", want, block)
+		}
+	}
+	if !strings.Contains(block, notesLine+tracker) {
+		t.Errorf("no-tracker bullet does not directly follow the `## Notes` bullet\n---\n%s", block)
+	}
+	if n := strings.Count(got, tracker); n != 1 {
+		t.Errorf("no-tracker bullet rendered %d time(s), want exactly 1", n)
+	}
+}
+
+// TestBuild_ScopeAmendments_OutOfScopeTestRoute pins #5215 rule 8: the shared
+// scope-amendment block (full implement AND slim fix-up prompts) routes an
+// out-of-scope test that pins deliberately-changed behavior to an amendment on
+// that test file, and forbids bending the production change to satisfy it.
+func TestBuild_ScopeAmendments_OutOfScopeTestRoute(t *testing.T) {
+	impl, err := Build("implement", Trigger{Source: "cli", Repo: "o/r"})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+	fixup, err := Build("implement", Trigger{
+		Source: "cli", Repo: "o/r",
+		FixupConcerns: []FixupConcern{{Text: "resolve the reviewer's concern"}},
+	})
+	if err != nil {
+		t.Fatalf("Build(implement fix-up): %v", err)
+	}
+	for name, got := range map[string]string{"implement": impl, "fix-up": fixup} {
+		start := strings.Index(got, "### Mid-stage scope amendments")
+		if start < 0 {
+			t.Fatalf("%s prompt has no scope-amendment block", name)
+		}
+		block := got[start:]
+		if end := strings.Index(block, "You may file at most 2 amendment requests"); end >= 0 {
+			block = block[:end]
+		}
+		for _, want := range []string{
+			"A test file outside the effective scope.files that pins behavior this change deliberately alters is the same case",
+			"request an amendment naming that test file",
+			"never revert, weaken or special-case the production change to make the out-of-scope test pass",
+		} {
+			if !strings.Contains(block, want) {
+				t.Errorf("%s prompt's scope-amendment block missing %q", name, want)
+			}
+		}
+	}
+}
+
+// TestBuild_Issue5215Paragraphs_StayRepoAgnostic is the ADR-110 check on the
+// three #5215 prompt paragraphs: none names an org, a repository script path
+// or a fixed duration.
+func TestBuild_Issue5215Paragraphs_StayRepoAgnostic(t *testing.T) {
+	duration := regexp.MustCompile(`(?i)\b\d+\s*-?\s*(second|minute|hour|day)s?\b`)
+	for name, text := range map[string]string{
+		"step zero":          scopeConstraintStepZero,
+		"no tracker writes":  implementNoTrackerWritesBullet,
+		"out-of-scope tests": scopeAmendmentOutOfScopeTestRoute,
+	} {
+		for _, banned := range []string{"kuhlman-labs", "pandion-labs", "scripts/", "golangci-lint"} {
+			if strings.Contains(text, banned) {
+				t.Errorf("%s paragraph names the repository-specific token %q (ADR-110)", name, banned)
+			}
+		}
+		if m := duration.FindString(text); m != "" {
+			t.Errorf("%s paragraph names a fixed duration %q (ADR-110)", name, m)
+		}
 	}
 }
 
