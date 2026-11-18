@@ -14,12 +14,15 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 )
 
 // SurfacesVersion is the version of the product's permission-surface list
 // (DefaultSurfaces). Bump it whenever a surface is added, removed or re-keyed,
 // so an audit entry recording it says which list a check ran against.
-const SurfacesVersion = 1
+// Version 2 added diff-secrets-allowlist (#5230).
+const SurfacesVersion = 2
 
 // Kind selects a surface's extractor.
 type Kind string
@@ -41,6 +44,7 @@ const (
 	KindSpecAutonomy         Kind = "fishhawk_spec_autonomy"
 	KindSpecStagePermissions Kind = "fishhawk_spec_stage_permissions"
 	KindSurfaceDeclarations  Kind = "surface_declarations"
+	KindDiffSecretsAllowlist Kind = "diff_secrets_allowlist"
 )
 
 // surfaceDeclarationsPrefix is the key prefix of a surface declaration.
@@ -76,8 +80,9 @@ type Surface struct {
 
 // The product surface ids the server and tests name.
 const (
-	SurfaceIDForbiddenPaths      = "fishhawk-spec-forbidden-paths"
-	SurfaceIDSurfaceDeclarations = "permission-surface-declarations"
+	SurfaceIDForbiddenPaths       = "fishhawk-spec-forbidden-paths"
+	SurfaceIDSurfaceDeclarations  = "permission-surface-declarations"
+	SurfaceIDDiffSecretsAllowlist = "diff-secrets-allowlist"
 )
 
 // RepoSurfacesPath is where a repository extends the surface list. The server
@@ -135,6 +140,9 @@ func DefaultSurfaces() []Surface {
 		{ID: SurfaceIDSurfaceDeclarations, Kind: KindSurfaceDeclarations, Severity: SeverityHigh,
 			Paths:       []string{RepoSurfacesPath},
 			Description: "the repository's own permission-surface declarations"},
+		{ID: SurfaceIDDiffSecretsAllowlist, Kind: KindDiffSecretsAllowlist, Severity: SeverityHigh,
+			Paths:       []string{diffsecrets.AllowlistPath},
+			Description: "the diff-secrets allowlist entries and fixture-marker scopes"},
 	}
 }
 
@@ -144,7 +152,7 @@ var knownKinds = map[Kind]bool{
 	KindAppPermissionsGo: true, KindAppEventsGo: true, KindMCPToolScopes: true,
 	KindRunTokenScopes: true, KindEnvAllowList: true, KindSpecForbiddenPaths: true,
 	KindSpecEscalations: true, KindSpecAutonomy: true, KindSpecStagePermissions: true,
-	KindSurfaceDeclarations: true,
+	KindSurfaceDeclarations: true, KindDiffSecretsAllowlist: true,
 }
 
 // MatchSurfaces returns the surfaces (in list order) one of whose globs
@@ -306,6 +314,8 @@ func extractorFor(k Kind) (func([]byte) (Grants, error), string, bool) {
 		return ExtractSpecStagePermissions, "", true
 	case KindSurfaceDeclarations:
 		return ExtractSurfaceDeclarations, "", true
+	case KindDiffSecretsAllowlist:
+		return ExtractDiffSecretsAllowlist, "", true
 	}
 	return nil, "", false
 }

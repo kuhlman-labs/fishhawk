@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -659,4 +660,140 @@ func TestRenderPRStatusBody_AcceptanceHeadLine(t *testing.T) {
 			}
 		})
 	}
+}
+
+// diffSecretsEntry builds a diff_secrets_detected entry by marshalling the
+// SHARED wire type, so the reader is pinned to the writer's contract.
+func diffSecretsEntry(t *testing.T, seq int64, sum diffsecrets.SuppressionSummary) *audit.Entry {
+	t.Helper()
+	body, err := json.Marshal(struct {
+		Check string `json:"check"`
+		diffsecrets.SuppressionSummary
+	}{"diff_secrets", sum})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &audit.Entry{Sequence: seq, Category: "diff_secrets_detected", Payload: body, Timestamp: time.Unix(seq, 0).UTC()}
+}
+
+func renderDiffSecretsPR(t *testing.T, entries ...*audit.Entry) string {
+	t.Helper()
+	return RenderPRStatusBody(PRStatusInput{Run: prStatusRun(), Audit: entries, Now: time.Unix(1000, 0).UTC()})
+}
+
+// TestRenderPRStatus_DiffSecretsSuppressed (#5230 C3): the section shows the
+// totals, by-rule attribution (SafeRuleID + short fingerprint), marker
+// locations, the admission short SHA and the rejected count; it is absent with
+// nothing suppressed or rejected; it caps marker locations; it sanitizes
+// paths; it survives degradation level 2; a corrupted rule_id never renders.
+//
+// COUNTERFACTUAL: render x.RuleID raw instead of through SafeRuleID — the
+// "corrupted row" arm's rule_id is a runtime-built slug-shaped credential
+// that the fold and the location list would then print verbatim, RED.
+func TestRenderPRStatus_DiffSecretsSuppressed(t *testing.T) {
+	const admit = "abcdef0123456789abcdef0123456789abcdef01"
+	status := &diffsecrets.AllowlistStatusRecord{Path: diffsecrets.AllowlistPath, Ref: admit, Status: diffsecrets.StatusLoaded, RejectedCount: 2}
+	fpE, fpM := "1111111111111111", "2222222222222222"
+	sum := diffsecrets.SuppressionSummary{
+		Allowlist: status, SuppressedHitCount: 3, EntrySuppressedHitCount: 2, MarkerSuppressedHitCount: 1,
+		Suppressed: []diffsecrets.SuppressionRecord{
+			{Path: "docs/p.md", Lines: []int{3, 7}, Pattern: "github-pat-classic", By: diffsecrets.ByEntry, RuleID: "docs-example", RuleFingerprint: fpE},
+			{Path: "fix/a.go", Lines: []int{2}, Pattern: "github-pat-classic", By: diffsecrets.ByMarker, RuleID: "fixtures", RuleFingerprint: fpM, CheckKey: "k1"},
+		},
+	}
+	t.Run("renders totals, rules, locations, ref and rejected", func(t *testing.T) {
+		body := renderDiffSecretsPR(t, diffSecretsEntry(t, 4, sum))
+		for _, want := range []string{
+			"**Diff secrets suppressed**",
+			"3 hits suppressed: 2 by allowlist entries, 1 by fixture marker.",
+			"admission commit `abcdef012345`", "2 rules rejected",
+			"- entry rule `docs-example` (`11111111`): 2 hits",
+			"- marker rule `fixtures` (`22222222`): 1 hit",
+			"- `fix/a.go:2` (github-pat-classic) - scope `fixtures`",
+			"low, human-only concern",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("body missing %q:\n%s", want, body)
+			}
+		}
+		if strings.Contains(body, fpE) || strings.Contains(body, "docs/p.md:3") {
+			t.Errorf("full fingerprint or an entry-suppressed location rendered:\n%s", body)
+		}
+	})
+	t.Run("union across rounds takes the newest lines", func(t *testing.T) {
+		newer := sum
+		newer.Suppressed = []diffsecrets.SuppressionRecord{
+			{Path: "fix/a.go", Lines: []int{5}, Pattern: "github-pat-classic", By: diffsecrets.ByMarker, RuleID: "fixtures", RuleFingerprint: fpM, CheckKey: "k1"},
+		}
+		body := renderDiffSecretsPR(t, diffSecretsEntry(t, 9, newer), diffSecretsEntry(t, 4, sum))
+		if !strings.Contains(body, "`fix/a.go:5`") || strings.Contains(body, "`fix/a.go:2`") ||
+			!strings.Contains(body, "3 hits suppressed: 2 by allowlist entries, 1 by fixture marker.") {
+			t.Errorf("union wrong:\n%s", body)
+		}
+	})
+	t.Run("absent with nothing suppressed or rejected", func(t *testing.T) {
+		empty := diffsecrets.SuppressionSummary{Allowlist: &diffsecrets.AllowlistStatusRecord{Status: diffsecrets.StatusAbsent}, Suppressed: []diffsecrets.SuppressionRecord{}}
+		for name, entries := range map[string][]*audit.Entry{
+			"no entries":      nil,
+			"nothing":         {diffSecretsEntry(t, 1, empty)},
+			"pre-#5230 shape": {prAuditEntry(1, "diff_secrets_detected", map[string]any{"hit_count": 2, "groups": []any{}})},
+			"undecodable":     {{Sequence: 1, Category: "diff_secrets_detected", Payload: []byte("{not json")}},
+		} {
+			if body := renderDiffSecretsPR(t, entries...); strings.Contains(body, "Diff secrets suppressed") {
+				t.Errorf("%s: section rendered:\n%s", name, body)
+			}
+		}
+	})
+	t.Run("rejected only renders", func(t *testing.T) {
+		rej := diffsecrets.SuppressionSummary{Allowlist: &diffsecrets.AllowlistStatusRecord{Status: diffsecrets.StatusLoaded, RejectedCount: 1}}
+		if body := renderDiffSecretsPR(t, diffSecretsEntry(t, 1, rej)); !strings.Contains(body, "1 rule rejected") {
+			t.Errorf("rejected-only section missing:\n%s", body)
+		}
+	})
+	t.Run("caps marker locations", func(t *testing.T) {
+		many := diffsecrets.SuppressionSummary{Allowlist: status}
+		for i := 0; i < prMarkerLocationCap+3; i++ {
+			many.Suppressed = append(many.Suppressed, diffsecrets.SuppressionRecord{
+				Path: "fix/f" + string(rune('a'+i)) + ".go", Lines: []int{1}, Pattern: "github-pat-classic",
+				By: diffsecrets.ByMarker, RuleID: "fixtures", RuleFingerprint: fpM, CheckKey: "k" + string(rune('a'+i))})
+		}
+		body := renderDiffSecretsPR(t, diffSecretsEntry(t, 1, many))
+		if !strings.Contains(body, "- and 3 more") || strings.Count(body, " - scope `fixtures`") != prMarkerLocationCap {
+			t.Errorf("cap wrong:\n%s", body)
+		}
+	})
+	t.Run("sanitizes paths", func(t *testing.T) {
+		evil := diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{
+			{Path: "fix/a`b\n## injected.go", Lines: []int{1}, Pattern: "github-pat-classic", By: diffsecrets.ByMarker, RuleID: "fixtures", RuleFingerprint: fpM, CheckKey: "k"},
+		}}
+		body := renderDiffSecretsPR(t, diffSecretsEntry(t, 1, evil))
+		if strings.Contains(body, "a`b") || strings.Contains(body, "\n## injected") || !strings.Contains(body, "`fix/a'b ## injected.go:1`") {
+			t.Errorf("path not sanitized:\n%s", body)
+		}
+	})
+	t.Run("corrupted rule id renders invalid", func(t *testing.T) {
+		cred := "glpat-" + strings.Repeat("n", 20)
+		bad := diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{
+			{Path: "fix/a.go", Lines: []int{1}, Pattern: "github-pat-classic", By: diffsecrets.ByMarker, RuleID: cred, RuleFingerprint: "ghp_" + strings.Repeat("Q", 36), CheckKey: "k"},
+		}}
+		body := renderDiffSecretsPR(t, diffSecretsEntry(t, 1, bad))
+		if strings.Contains(body, cred) || strings.Contains(body, "ghp_") || !strings.Contains(body, diffsecrets.InvalidRuleID) {
+			t.Errorf("corrupted row leaks:\n%s", body)
+		}
+	})
+	t.Run("kept at degradation level 2", func(t *testing.T) {
+		// Enough fix-up passes that only level 2 (which drops the fix-up
+		// history) fits under the cap.
+		entries := []*audit.Entry{diffSecretsEntry(t, 1, sum)}
+		for i := 0; i < 3000; i++ {
+			entries = append(entries, prAuditEntry(int64(10+i), "fixup_pushed", map[string]any{"head_sha": "1111111111112222", "files_changed_count": 1, "apply_path": "git_apply"}))
+		}
+		body := renderDiffSecretsPR(t, entries...)
+		if len(body) > MaxIssueCommentBodyBytes || strings.Contains(body, "**Fix-up history**") {
+			t.Fatalf("not at level 2: %d bytes, fix-ups present=%v", len(body), strings.Contains(body, "**Fix-up history**"))
+		}
+		if !strings.Contains(body, "**Diff secrets suppressed**") || !strings.Contains(body, "`fix/a.go:2`") {
+			t.Errorf("section dropped at level 2:\n%s", body)
+		}
+	})
 }

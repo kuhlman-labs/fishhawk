@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -1862,4 +1863,143 @@ func TestPermissionDrift_ConflictIntersectAbsentBaseBranchSide(t *testing.T) {
 			t.Errorf("rows = %+v, want both forbidden_paths restrictions and the agent_instruction_paths restriction raised", rows)
 		}
 	})
+}
+
+// The diff-secrets allowlist surface (#5230, SurfacesVersion 2), pinned end to
+// end BEFORE any suppression exists: permdrift → forge fake → concern store →
+// audit.
+
+const driftAllowlistBase = `version: 1
+entries:
+  - id: docs-example
+    paths: ["docs/*.md"]
+    patterns: ["github-pat-classic"]
+    reason: "documented placeholders"
+`
+
+// driftAllowlistRule renders one allowlist rule under a list.
+func driftAllowlistRule(id, glob string) string {
+	return "  - id: " + id + "\n    paths: [\"" + glob + "\"]\n    patterns: [\"github-pat-classic\"]\n    reason: \"r\"\n"
+}
+
+// allowlistChange seeds the allowlist at driftBase/driftHead and lists it as
+// the only changed file.
+func (f *driftFixture) allowlistChange(base, head string) {
+	f.gh.put(driftBase, diffsecrets.AllowlistPath, base)
+	f.gh.put(driftHead, diffsecrets.AllowlistPath, head)
+	f.gh.changed = []string{diffsecrets.AllowlistPath}
+}
+
+// assertNoNeedleBytes (K5 of the #5230 plan gate) is the needle-taking
+// sibling of assertNoKeyBytes: it fails if any needle — a runtime-built
+// credential, a sentinel — appears in any concern row, any audit payload (all
+// categories), the log buffer, or any rendered body (prompts, a gate-view
+// body, a PR status body) the caller names.
+func assertNoNeedleBytes(t *testing.T, cr *fakeConcernRepo, au *auditFake, logs string, bodies map[string]string, needles ...string) {
+	t.Helper()
+	for _, needle := range needles {
+		if needle == "" {
+			t.Fatal("assertNoNeedleBytes: empty needle matches everything")
+		}
+		cr.mu.Lock()
+		for _, c := range cr.rows {
+			raw, _ := json.Marshal(c)
+			if strings.Contains(string(raw), needle) {
+				t.Errorf("concern row %s carries %q", c.ID, needle)
+			}
+		}
+		cr.mu.Unlock()
+		au.mu.Lock()
+		for _, ap := range au.appended {
+			if strings.Contains(string(ap.Payload), needle) {
+				t.Errorf("audit %s payload carries %q", ap.Category, needle)
+			}
+		}
+		au.mu.Unlock()
+		if strings.Contains(logs, needle) {
+			t.Errorf("log buffer carries %q", needle)
+		}
+		for name, body := range bodies {
+			if strings.Contains(body, needle) {
+				t.Errorf("%s carries %q", name, needle)
+			}
+		}
+	}
+}
+
+// TestPermissionDrift_DiffSecretsAllowlistWideningRaises: a PR-opened compare
+// listing the allowlist, base one entry, head adds a marker scope → exactly
+// one high server_check row keyed under the surface plus one
+// permission_drift_detected entry.
+//
+// COUNTERFACTUAL: delete the diff-secrets-allowlist literal from
+// permdrift.DefaultSurfaces — the compare's only changed file then matches no
+// surface, so zero rows exist against want 1, RED.
+func TestPermissionDrift_DiffSecretsAllowlistWideningRaises(t *testing.T) {
+	const prefix = "permission_drift|" + permdrift.SurfaceIDDiffSecretsAllowlist + "|"
+	t.Run("added marker scope raises", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.allowlistChange(driftAllowlistBase, driftAllowlistBase+"markers:\n"+driftAllowlistRule("fixtures", "fix/**"))
+		f.run(f.req(permissionDriftTriggerPROpened))
+		rows := rowsWithPrefix(f.rows(t), prefix)
+		if len(rows) != 1 || len(f.rows(t)) != 1 {
+			t.Fatalf("rows = %d (all %d), want exactly 1 under %q", len(rows), len(f.rows(t)), prefix)
+		}
+		if rows[0].Severity != "high" || !strings.Contains(rows[0].CheckKey, "diff_secrets_allowlist.markers.fixtures.") {
+			t.Errorf("row severity/check_key = %q/%q", rows[0].Severity, rows[0].CheckKey)
+		}
+		if f.count(permissionDriftDetectedCategory) != 1 {
+			t.Errorf("%s entries = %d, want 1", permissionDriftDetectedCategory, f.count(permissionDriftDetectedCategory))
+		}
+		if p := f.detected(t); p[0].SurfacesVersion != 2 {
+			t.Errorf("surfaces_version = %d, want 2", p[0].SurfacesVersion)
+		}
+	})
+	t.Run("reason-only edit raises none", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.allowlistChange(driftAllowlistBase, strings.Replace(driftAllowlistBase, "documented placeholders", "reworded", 1))
+		f.run(f.req(permissionDriftTriggerPROpened))
+		if rows := f.rows(t); len(rows) != 0 || f.count(permissionDriftDetectedCategory) != 0 {
+			t.Errorf("rows = %d, detected = %d; want none", len(rows), f.count(permissionDriftDetectedCategory))
+		}
+	})
+	t.Run("id rename raises", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.allowlistChange(driftAllowlistBase, strings.Replace(driftAllowlistBase, "docs-example", "docs-renamed", 1))
+		f.run(f.req(permissionDriftTriggerPROpened))
+		if rows := rowsWithPrefix(f.rows(t), prefix); len(rows) != 1 {
+			t.Errorf("rows = %d, want 1 (an id rename reads as add + remove)", len(rows))
+		}
+	})
+}
+
+// TestPermissionDrift_AllowlistBytesNeverPersisted (C1): head adds a
+// SENTINEL-glob entry (runtime-built, not credential-shaped) and a
+// CREDENTIAL-glob entry (runtime-built). Exactly one widening is raised, for
+// the sentinel rule; the credential rule is refused (redaction_hit) and raises
+// nothing in drift. Neither string reaches a check_key, a note, any audit
+// payload or the log buffer.
+//
+// COUNTERFACTUAL: key the extractor by keySegment(glob) instead of the
+// fingerprint ("copy the glob verbatim") — the sentinel then lands in the
+// check_key and the note, RED. Disabling the redaction-hit check as well puts
+// the credential there too.
+func TestPermissionDrift_AllowlistBytesNeverPersisted(t *testing.T) {
+	sentinel := "sentinel-" + strings.Repeat("z9", 8)
+	cred := "ghp_" + strings.Repeat("A1b2C3d4E5", 4)[:36]
+	f := newDriftFixture(t)
+	logs := captureLogger(f.s)
+	f.allowlistChange(driftAllowlistBase, driftAllowlistBase+
+		driftAllowlistRule("sentinel-rule", sentinel+"/**")+
+		driftAllowlistRule("cred-rule", "fixtures/"+cred+"/**"))
+	f.run(f.req(permissionDriftTriggerPROpened))
+	rows := f.rows(t)
+	if len(rows) != 1 || !strings.Contains(rows[0].CheckKey, "diff_secrets_allowlist.entries.sentinel-rule.") {
+		t.Fatalf("rows = %+v, want exactly the sentinel rule's widening", rows)
+	}
+	p := f.detected(t)
+	if len(p) != 1 || len(p[0].Widenings) != 1 {
+		t.Fatalf("detected = %+v, want one widening", p)
+	}
+	assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, logs.String(), nil, sentinel, cred)
 }
