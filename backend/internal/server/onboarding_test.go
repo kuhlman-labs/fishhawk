@@ -20,7 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -1036,6 +1039,118 @@ func TestOnboardingReadiness_CookieSessionScopeBypass(t *testing.T) {
 	}
 	if len(resp.Scopes.Missing) != 0 {
 		t.Errorf("Scopes.Missing = %v, want empty", resp.Scopes.Missing)
+	}
+}
+
+// TestProbeScopes_ReportsSubjectAndCredentialKind pins #5227 gap 1 on the
+// server: scopes.subject and scopes.credential_kind name the identity the
+// presented credential resolves to, across the bearer postures AND the
+// cookie-session early return. Each fixture subject is a distinct non-empty
+// string and each credential kind differs, so deleting either assignment in
+// probeScopes leaves the zero value and the equality fails. The raw-JSON leg
+// pins the wire key names the CLI and MCP doctors decode.
+func TestProbeScopes_ReportsSubjectAndCredentialKind(t *testing.T) {
+	s := newOnboardingServer(t, nil, nil)
+	runID := uuid.New()
+	cases := []struct {
+		name     string
+		id       Identity
+		subject  string
+		kind     string
+		adequate bool
+	}{
+		{
+			name:    "static operator token",
+			id:      Identity{Subject: "github:alice", TokenID: "tok-static", AuthMethod: "static", Scopes: []string{"read:runs"}},
+			subject: "github:alice",
+			kind:    "static",
+		},
+		{
+			name:     "device-flow token",
+			id:       Identity{Subject: "github:bob", TokenID: "tok-oauth", AuthMethod: "oauth", Scopes: requiredRunScopes},
+			subject:  "github:bob",
+			kind:     "oauth",
+			adequate: true,
+		},
+		{
+			name:    "run-bound mcp token",
+			id:      Identity{Subject: "mcp:run:" + runID.String(), TokenID: "tok-mcp", Scopes: []string{"mcp:run"}},
+			subject: "mcp:run:" + runID.String(),
+			kind:    "mcp_run",
+		},
+		{
+			name:     "cookie session (early return)",
+			id:       testOperatorIdentity(),
+			subject:  "github:test-operator",
+			kind:     "session",
+			adequate: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := tc.id
+			w := httptest.NewRecorder()
+			s.handleGetOnboardingReadiness(w, onboardingReq("x/y", &id))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var raw struct {
+				Scopes map[string]any `json:"scopes"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got := raw.Scopes["subject"]; got != tc.subject {
+				t.Errorf("scopes.subject = %v, want %q", got, tc.subject)
+			}
+			if got := raw.Scopes["credential_kind"]; got != tc.kind {
+				t.Errorf("scopes.credential_kind = %v, want %q", got, tc.kind)
+			}
+			if got := raw.Scopes["adequate"]; got != tc.adequate {
+				t.Errorf("scopes.adequate = %v, want %v (subject/kind must not change adequacy)", got, tc.adequate)
+			}
+			if _, ok := raw.Scopes["token_id"]; ok {
+				t.Errorf("scopes carries token_id; no credential material may reach readiness")
+			}
+		})
+	}
+}
+
+// TestOnboardingReadiness_BodyHasNoBearerBytes drives the readiness handler
+// behind the REAL bearerAuth middleware with a sentinel bearer, so the identity
+// the handler reports is the one the auth path resolved from that credential.
+// The body must name the resolved subject and kind and must carry neither the
+// bearer plaintext nor the token's row id.
+func TestOnboardingReadiness_BodyHasNoBearerBytes(t *testing.T) {
+	s := newOnboardingServer(t, nil, nil)
+	const sentinel = "fhk_SENTINEL5227readinessXYZ"
+	tokID := uuid.New()
+	auth := stubAPITokenAuth{tok: &apitoken.Token{
+		ID:         tokID,
+		Subject:    "github:alice-fixture",
+		Scopes:     requiredRunScopes,
+		AuthMethod: "static",
+	}}
+	h := s.bearerAuth(auth, nil, nil)(http.HandlerFunc(s.handleGetOnboardingReadiness))
+	req := httptest.NewRequest(http.MethodGet, "/v0/onboarding/readiness?repo=x%2Fy", nil)
+	req.Header.Set("Authorization", "Bearer "+sentinel)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	var resp onboardingReadinessResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Scopes.Subject != "github:alice-fixture" || resp.Scopes.CredentialKind != "static" {
+		t.Errorf("scopes = %+v, want subject github:alice-fixture / credential_kind static", resp.Scopes)
+	}
+	for _, leak := range []string{sentinel, "SENTINEL5227", tokID.String()} {
+		if strings.Contains(body, leak) {
+			t.Errorf("readiness body contains credential material %q:\n%s", leak, body)
+		}
 	}
 }
 

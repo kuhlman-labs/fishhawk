@@ -10989,7 +10989,8 @@ components:
           description: |
             Whether the caller's token holds the run-driving scope subset.
             Cookie-session (OAuth) callers bypass scope enforcement and are
-            adequate by construction.
+            adequate by construction. `subject` and `credential_kind` name
+            who the credential acts as (#5227).
           required: [adequate, required, missing]
           properties:
             adequate:
@@ -11004,6 +11005,26 @@ components:
                 type: string
             note:
               type: string
+            subject:
+              type: string
+              description: |
+                The identity subject the presented credential resolves to
+                (#5227), e.g. `github:alice` or `operator-agent/operator-role-v0`.
+                Reported on every posture, cookie sessions included. Not a
+                credential value: no token, token id or prefix is ever
+                returned. Optional: a pre-#5227 fishhawkd omits it.
+            credential_kind:
+              type: string
+              enum: [session, static, oauth, oauth_as, mcp_run, unrecorded, unknown]
+              description: |
+                The kind of credential the caller presented (#5227),
+                classified the same way as the `approvals.members` credential
+                leg (ADR-123): a cookie `session`, an operator-minted
+                `static` token, a device-flow `oauth` token, an
+                authorization-server `oauth_as` token, a run-bound `mcp_run`
+                token, `unrecorded` (a token row predating `auth_method`) or
+                `unknown`. Not a credential value. Optional: a pre-#5227
+                fishhawkd omits it.
         merge_gate:
           type: object
           description: |
@@ -28058,8 +28079,8 @@ paths:
             Three distinct outcomes share this status (#986, #1709):
 
             - **Approval recorded; stage state advanced.** The body is
-              the bare `Stage` shape; the three duplicate fields are
-              omitted.
+              the `Stage` shape plus the acting-identity echo below; the
+              three duplicate fields are omitted.
             - **Approval recorded; quorum pending** (E39.4 / #1709) —
               when the stage's gate declares a forge-neutral `approvals`
               block, an `approve` transitions the stage only once
@@ -28087,6 +28108,14 @@ paths:
               `duplicate_submission: true` plus `prior_decision` and
               `prior_submitted_at` from the EXISTING approval row
               (authentic provenance, not echoes of the new request).
+
+            Every outcome also echoes WHO the decision was recorded as
+            (#5227): `approver_subject`, `credential_kind` and
+            `on_behalf_of`. None of them is a credential value; no token,
+            token id or prefix is ever returned. On a duplicate submission
+            they describe the PRIOR recorded row: `approver_subject` is
+            that row's subject, and `credential_kind` and `on_behalf_of`
+            are omitted because the approval row does not record them.
           content:
             application/json:
               schema:
@@ -28094,6 +28123,44 @@ paths:
                   - $ref: '#/components/schemas/Stage'
                   - type: object
                     properties:
+                      approver_subject:
+                        type: string
+                        description: |
+                          The subject the approval row was RECORDED under:
+                          the same value the `approval_submitted` audit row
+                          carries as `actor_subject`. A `delegated: true`
+                          approval echoes the distinct delegated identity
+                          `operator-agent/delegated`, not the caller's own
+                          subject (#2381). On a duplicate submission it is
+                          the prior row's subject. Not a credential value.
+                      credential_kind:
+                        type: string
+                        enum: [session, static, oauth, oauth_as, mcp_run, unrecorded, unknown]
+                        description: |
+                          The kind of credential that produced the recorded
+                          row, classified the same way as the
+                          `approvals.members` credential leg (ADR-123): a
+                          cookie `session`, an operator-minted `static`
+                          token, a device-flow `oauth` token, an
+                          authorization-server `oauth_as` token, a
+                          run-bound `mcp_run` token, `unrecorded` (a token
+                          row predating `auth_method`) or `unknown`. On a
+                          first submission it classifies this request's
+                          credential. OMITTED on a duplicate submission: the
+                          prior approval row does not record the credential
+                          that wrote it, and this request's credential would
+                          describe a different submission. Not a credential
+                          value.
+                      on_behalf_of:
+                        type: string
+                        description: |
+                          Present only when a `delegated: true` approval
+                          was recorded under the delegated identity: the
+                          caller's own subject, the operator the delegated
+                          row acts for. Omitted on a non-delegated approval
+                          and on every duplicate submission (the shared
+                          delegated row does not record which caller wrote
+                          it).
                       duplicate_submission:
                         type: boolean
                         description: |
@@ -28186,6 +28253,21 @@ paths:
               `action`, `condition`, and `unmet_reason` naming the exact
               failed predicate (e.g. `clean_dual_approval: 1 of 2
               reviewer verdicts received`).
+
+              Both delegation codes (#5227) additionally carry
+              `details.delegated_identity` (`operator-agent/operator-role-v0`,
+              the operator-agent token subject), `details.next_actions`
+              and, on this approve path, `details.recorded_as`
+              (`operator-agent/delegated`, the identity a delegated
+              approval is recorded under). `next_actions` says that
+              delegation is granted by the workflow spec (the workflow-v2
+              `autonomy` tier or `actions.<class>.mode`; `operator_agent.may_*`
+              on v0/v1), not by a token; that a human operator issues the
+              operator-agent token with
+              `fishhawkd token issue --subject operator-agent/operator-role-v0`
+              and an agent never requests or mints it; and that without
+              delegation the action is taken without `delegated: true`
+              under a human credential.
             - `approver_predicate_unmet` — E39.5 / #1710: the stage's
               gate declares an `approvals` block with `min_permission`
               and/or `member_of`, and the submitter's forge-resolved
