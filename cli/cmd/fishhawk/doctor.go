@@ -96,23 +96,47 @@ func classifyCredential(token string) string {
 	}
 }
 
+// Credential source labels for the token rung (#5227). The flag and the
+// environment variable are named apart: bindCommonFlags folds
+// $FISHHAWK_TOKEN into the --token default, so without the split an operator
+// cannot tell which of the two is in play.
+const (
+	doctorSourceFlag = "--token"
+	doctorSourceEnv  = "$FISHHAWK_TOKEN"
+)
+
+// doctorTokenSource names where a non-empty folded --token value came from.
+// Provenance is decided by whether the flag was SET on the command line
+// (flagSet, from flag.FlagSet.Visit — the stdlib counterpart of cobra's
+// Flags().Changed), never by comparing the value with $FISHHAWK_TOKEN: an
+// operator who passes --token with the same value as the environment still
+// passed the flag.
+func doctorTokenSource(flagSet bool) string {
+	if flagSet {
+		return doctorSourceFlag
+	}
+	return doctorSourceEnv
+}
+
 // resolveDoctorCredential mirrors newClient's ladder (run.go): an explicit
 // --token / $FISHHAWK_TOKEN (already folded into flagToken by
 // bindCommonFlags) wins; when empty, fall back to the stored credential
 // minted by `fishhawk token login` and keyed by the backend URL. Returns a
 // zero doctorCredential (empty token) when no tier resolves one — the token
-// rung degrades that to a warn, never a hard fail.
+// rung degrades that to a warn, never a hard fail. flagSet reports whether
+// --token was given on the command line, so the source names `--token` or
+// `$FISHHAWK_TOKEN` (doctorTokenSource).
 //
 // A refreshable stored credential inside its derived skew is refreshed
 // first (doctorCredRefresh) and the source detail says so, so the
 // operator can see a rotation happened. A refresh failure, or an
 // expired credential that cannot be refreshed, is carried as
 // resolveErr and reported on the token rung — visible, not silent.
-func resolveDoctorCredential(backendURL, flagToken string) doctorCredential {
+func resolveDoctorCredential(backendURL, flagToken string, flagSet bool) doctorCredential {
 	if flagToken != "" {
 		return doctorCredential{
 			token:  flagToken,
-			source: "--token / $FISHHAWK_TOKEN",
+			source: doctorTokenSource(flagSet),
 			class:  classifyCredential(flagToken),
 		}
 	}
@@ -152,9 +176,34 @@ func resolveDoctorCredential(backendURL, flagToken string) doctorCredential {
 // READ field, not dead scaffolding that would invite a false belief scope
 // adequacy is being consulted locally. It never drives the downgrade decision,
 // which keys ONLY on answered (binding condition 1).
+//
+// subject and credentialKind are the server's scopes.subject /
+// scopes.credential_kind (#5227): WHO the credential acts as and what kind
+// of credential it is. Both are display-only, and both are empty when
+// readiness did not answer or the backend predates the fields.
 type readinessOutcome struct {
 	answered       bool
 	scopesAdequate bool
+	subject        string
+	credentialKind string
+}
+
+// identityNote renders the acting identity for the token rung detail:
+// `acts as <subject> (<kind>)` when readiness answered with a subject, and a
+// named unknown otherwise. It never carries credential bytes — the subject
+// and kind are the server's own classification, not the token.
+func (r readinessOutcome) identityNote() string {
+	if !r.answered {
+		return "subject unknown: readiness did not answer (pass --repo)"
+	}
+	if r.subject == "" {
+		return "subject unknown: readiness reported no subject (an anonymous caller, or a fishhawkd that predates scopes.subject)"
+	}
+	kind := r.credentialKind
+	if kind == "" {
+		kind = "credential kind not reported"
+	}
+	return fmt.Sprintf("acts as %s (%s)", r.subject, kind)
 }
 
 // runDoctor implements `fishhawk doctor`.
@@ -184,6 +233,15 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	// Whether --token was SET on the command line, as opposed to defaulted
+	// from $FISHHAWK_TOKEN by bindCommonFlags (S5 / #5227). Visit walks only
+	// the flags that were set.
+	tokenFlagSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "token" {
+			tokenFlagSet = true
+		}
+	})
 
 	// --spec-only: the three rungs that read only local bytes (no docker,
 	// network, backend, token, MCP, or git state). This is the fresh-repo
@@ -217,7 +275,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		// uses) and probe onboarding readiness FIRST, so the authoritative
 		// server-side verdict is in hand before the local token rung decides
 		// and the two can never disagree about which credential is in play.
-		cred := resolveDoctorCredential(*cf.backendURL, *cf.token)
+		cred := resolveDoctorCredential(*cf.backendURL, *cf.token, tokenFlagSet)
 		readinessChecks, readiness := checkOnboardingReadiness(*cf.backendURL, cred.token, resolvedRepo)
 
 		checks = []checkResult{
@@ -245,6 +303,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			checkGoToolchainPin(*workingDir),
 			checkHostLoad(),
 			checkOrphanedShells(),
+			checkLocalCATrust(*cf.backendURL),
 		}
 		// Append the readiness rungs LAST so the printed rung ORDER is
 		// unchanged (they still render after the local rungs).
@@ -410,7 +469,46 @@ func checkBackend(backendURL string) checkResult {
 //	    and `token scope adequate` (server-side) is the authority on scope. An
 //	    OAuth/cookie-class identity carries no explicit scope list and can
 //	    legitimately 403 on /v0/runs while being fully adequate per readiness.
+//
+// The ok and (d) warn details name the source (`--token`, `$FISHHAWK_TOKEN`
+// or the stored login), the prefix class, and the subject and credential
+// kind readiness reported (readinessOutcome.identityNote, #5227). Every
+// branch also carries the $FISHHAWK_API_TOKEN shadow hint when that variable
+// is set (fishhawkAPITokenShadowHint). No branch prints the token.
 func checkToken(backendURL string, cred doctorCredential, readiness readinessOutcome) checkResult {
+	r := checkTokenProbe(backendURL, cred, readiness)
+	if hint := fishhawkAPITokenShadowHint(); hint != "" {
+		if r.remediate == "" {
+			r.remediate = hint
+		} else {
+			r.remediate += "; " + hint
+		}
+	}
+	return r
+}
+
+// doctorAPITokenEnv is the variable fishhawk-mcp's credential ladder reads
+// FIRST (backend/cmd/fishhawk-mcp loadConfig rung 1): when it is non-empty
+// the MCP server uses it and never consults the stored login.
+const doctorAPITokenEnv = "FISHHAWK_API_TOKEN"
+
+// fishhawkAPITokenShadowHint returns the shadow hint when $FISHHAWK_API_TOKEN
+// is set in doctor's environment, and "" otherwise. It reads PRESENCE only:
+// the value is never printed, classified or probed. The CLI itself never
+// reads that variable, so a green token rung here says nothing about which
+// credential a fishhawk-mcp launched from this shell acts as.
+func fishhawkAPITokenShadowHint() string {
+	if os.Getenv(doctorAPITokenEnv) == "" {
+		return ""
+	}
+	return "$" + doctorAPITokenEnv + " is set in this shell: a fishhawk-mcp launched from it acts as that token, " +
+		"not as the stored `fishhawk token login` credential, and this CLI rung does not probe it; " +
+		"fishhawk_doctor's `credential` rung reports which credential the MCP server uses " +
+		"(unset " + doctorAPITokenEnv + " before launching claude to act as the stored login)"
+}
+
+// checkTokenProbe is checkToken's probe ladder, without the shadow hint.
+func checkTokenProbe(backendURL string, cred doctorCredential, readiness readinessOutcome) checkResult {
 	label := "token valid"
 	// (e) a stored credential that could not be made usable (refresh
 	// failed, or expired with nothing to refresh with) -> FAIL naming
@@ -438,7 +536,8 @@ func checkToken(backendURL string, cred doctorCredential, readiness readinessOut
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusOK {
 		return checkResult{label: label,
-			detail: fmt.Sprintf("accepted — %s via %s", cred.class, cred.source), status: "ok"}
+			detail: fmt.Sprintf("accepted — %s via %s; %s", cred.class, cred.source, readiness.identityNote()),
+			status: "ok"}
 	}
 	// (d) The cascade break: a non-200 is downgraded to warn ONLY when the
 	// authoritative readiness endpoint returned a decodable 200 for the SAME
@@ -453,8 +552,8 @@ func checkToken(backendURL string, cred doctorCredential, readiness readinessOut
 			scopeNote = "readiness reports scopes NOT adequate — see the `token scope adequate` rung"
 		}
 		return checkResult{label: label,
-			detail: fmt.Sprintf("HTTP %d on /v0/runs, but the readiness endpoint authenticated this credential (%s)",
-				resp.StatusCode, scopeNote),
+			detail: fmt.Sprintf("HTTP %d on /v0/runs, but the readiness endpoint authenticated this credential (%s); %s via %s; %s",
+				resp.StatusCode, scopeNote, cred.class, cred.source, readiness.identityNote()),
 			status: "warn",
 			remediate: "the backend authenticated this credential on the authoritative readiness endpoint; " +
 				"`token scope adequate` (server-side) is the authority on scope"}
@@ -644,11 +743,23 @@ func checkRunnerBinary(flagVal, workingDir string) checkResult {
 //   - `claude mcp list` errors but the `get` fallback resolves -> ok.
 //   - the `claude` CLI is absent or erroring entirely -> WARN, never fail: the
 //     operator may drive from another MCP client (binding condition 4).
+//   - a `list` match on an HTTP/SSE registration whose URL is https on a
+//     loopback host, while NODE_EXTRA_CA_CERTS is unset or names no file ->
+//     WARN with the local-CA hint (#5227): the registration exists, but a
+//     claude launched from this environment fails its MCP calls with
+//     `unable to verify the first certificate`. A `get`-fallback match
+//     carries no parseable URL, so it is not CA-checked.
 func checkMCPRegistration(backendURL string) checkResult {
 	label := "MCP registered"
 	out, listErr := doctorRunOutput("claude", "mcp", "list")
 	if listErr == nil {
 		if detail, ok := matchMCPRegistration(out, backendURL); ok {
+			if regURL, isURL := matchedMCPRegistrationURL(out, backendURL); isURL {
+				if ca := localCATrust(regURL); ca.applies && !ca.usable {
+					return checkResult{label: label, detail: detail + "; " + ca.detail, status: "warn",
+						remediate: localCATrustRemediation}
+				}
+			}
 			return checkResult{label: label, detail: detail, status: "ok"}
 		}
 		// list answered but no match — try the get fallback before declaring
@@ -675,6 +786,36 @@ func checkMCPRegistration(backendURL string) checkResult {
 // each line on the FIRST ": " (names may contain spaces), strip a trailing
 // " - <status>" and any " (HTTP)" / " (SSE)" transport marker.
 func matchMCPRegistration(listOutput, backendURL string) (string, bool) {
+	reg, ok := findMCPRegistration(listOutput, backendURL)
+	if !ok {
+		return "", false
+	}
+	return reg.detail, true
+}
+
+// matchedMCPRegistrationURL returns the target URL of the registration
+// matchMCPRegistration matches, and whether that registration is a network
+// (HTTP or SSE) transport. A stdio registration's target is a local path, so
+// it reports false. It shares findMCPRegistration with matchMCPRegistration,
+// so the two can never disagree about WHICH registration matched.
+func matchedMCPRegistrationURL(listOutput, backendURL string) (string, bool) {
+	reg, ok := findMCPRegistration(listOutput, backendURL)
+	if !ok || reg.transport == "stdio" {
+		return "", false
+	}
+	return reg.target, true
+}
+
+// mcpRegistration is one parsed, matched `claude mcp list` row.
+type mcpRegistration struct {
+	detail    string // the human detail matchMCPRegistration returns
+	target    string // the target with status and transport marker stripped
+	transport string // "stdio", "HTTP" or "SSE"
+}
+
+// findMCPRegistration is the shared parse behind matchMCPRegistration and
+// matchedMCPRegistrationURL: the first qualifying row, by name or by URL.
+func findMCPRegistration(listOutput, backendURL string) (mcpRegistration, bool) {
 	backendHostPort := ""
 	if u, err := url.Parse(backendURL); err == nil {
 		backendHostPort = u.Host
@@ -706,17 +847,18 @@ func matchMCPRegistration(listOutput, backendURL string) (string, bool) {
 		// (i) name match — covers both the stdio `fishhawk` and the HTTP
 		// `fishhawk-http` registrations.
 		if name == "fishhawk" || strings.HasPrefix(name, "fishhawk-") {
-			return fmt.Sprintf("%s (%s)", name, transport), true
+			return mcpRegistration{detail: fmt.Sprintf("%s (%s)", name, transport), target: target, transport: transport}, true
 		}
 		// (ii) backend-URL match — a name-agnostic "points at this backend".
 		if backendHostPort != "" {
 			if u, uErr := url.Parse(target); uErr == nil && (u.Scheme == "http" || u.Scheme == "https") &&
 				u.Host == backendHostPort && strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/mcp") {
-				return fmt.Sprintf("%s (%s, matches backend URL)", name, transport), true
+				return mcpRegistration{detail: fmt.Sprintf("%s (%s, matches backend URL)", name, transport),
+					target: target, transport: transport}, true
 			}
 		}
 	}
-	return "", false
+	return mcpRegistration{}, false
 }
 
 // mcpGetFallback probes `claude mcp get <name>` for BOTH the stdio and HTTP

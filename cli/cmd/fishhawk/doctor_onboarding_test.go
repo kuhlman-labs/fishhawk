@@ -342,7 +342,7 @@ func TestCheckOnboardingReadiness_NonAuthoritative200(t *testing.T) {
 			if len(readinessChecks) != 1 || readinessChecks[0].status != "warn" {
 				t.Fatalf("want a single warn for body %s, got %+v", tc.body, readinessChecks)
 			}
-			cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+			cred := doctorCredential{token: "fho_x", source: doctorSourceFlag, class: classifyCredential("fho_x")}
 			r := checkToken("http://localhost:8080", cred, outcome)
 			if r.status != "fail" {
 				t.Errorf("checkToken status = %q for body %s, want fail (a non-authoritative readiness 200 must not suppress a 403)", r.status, tc.body)
@@ -374,7 +374,7 @@ func TestCheckOnboardingReadiness_AuthoritativeMatchingRepoAnswers(t *testing.T)
 	if !outcome.answered {
 		t.Fatalf("outcome.answered = false for a matching-repo payload; want true")
 	}
-	cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+	cred := doctorCredential{token: "fho_x", source: doctorSourceFlag, class: classifyCredential("fho_x")}
 	r := checkToken("http://localhost:8080", cred, outcome)
 	if r.status != "warn" {
 		t.Errorf("checkToken status = %q, want warn (an authoritative 200 downgrades a 403)", r.status)
@@ -1484,5 +1484,32 @@ func TestDoctorOnboarding_WorkItemProviderUnregistered_MovesTheAggregate(t *test
 		`{"status": "registered", "provider": "github_projects", "registered": ["github_projects"]}`)))
 	if okF != absentF {
 		t.Errorf("a REGISTERED verdict moved the aggregate: fails %d -> %d, want unchanged", absentF, okF)
+	}
+}
+
+// TestCheckOnboardingReadiness_DecodesSubject: scopes.subject and
+// scopes.credential_kind (#5227) reach the readinessOutcome the token rung
+// reads; an older fishhawkd that serves neither key leaves both empty.
+func TestCheckOnboardingReadiness_DecodesSubject(t *testing.T) {
+	for _, tc := range []struct {
+		name, scopes, wantSubject, wantKind string
+	}{
+		{"served", `{"adequate":true,"required":["read:runs"],"missing":[],"subject":"github:alice","credential_kind":"static"}`,
+			"github:alice", "static"},
+		{"older backend", `{"adequate":true,"required":["read:runs"],"missing":[]}`, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"repo":"kuhlman-labs/fishhawk","app":{"installed":true},"spec":{"source":"fetched","valid":true},"scopes":` + tc.scopes + `}`
+			withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+				return fakeHTTPResponse(http.StatusOK, body), nil
+			})
+			_, outcome := checkOnboardingReadiness("http://localhost:8080", "fhk_x", "kuhlman-labs/fishhawk")
+			if !outcome.answered {
+				t.Fatal("answered = false on an authoritative 200")
+			}
+			if outcome.subject != tc.wantSubject || outcome.credentialKind != tc.wantKind {
+				t.Errorf("outcome = (%q, %q), want (%q, %q)", outcome.subject, outcome.credentialKind, tc.wantSubject, tc.wantKind)
+			}
+		})
 	}
 }

@@ -46,6 +46,12 @@ type onboardingReadiness struct {
 		Required []string `json:"required"`
 		Missing  []string `json:"missing"`
 		Note     string   `json:"note"`
+		// Subject and CredentialKind name WHO the presented credential acts
+		// as and what kind it is (#5227). Neither is a credential value. An
+		// older fishhawkd serves neither key; both then decode to "" and the
+		// token rung says the subject is unknown rather than guessing.
+		Subject        string `json:"subject"`
+		CredentialKind string `json:"credential_kind"`
 	} `json:"scopes"`
 	// MergeGate is the #3161 merge-gate reconciliation. It is a POINTER on
 	// purpose: an older fishhawkd serves no `merge_gate` key at all, and the
@@ -174,7 +180,8 @@ type mergeGateSource struct {
 //
 // It also returns a readinessOutcome carrying whether the endpoint answered an
 // AUTHORITATIVE 200 (HTTP 200 AND a decodable body whose echoed `repo` is
-// non-empty AND equals the requested repo) plus the server's own scope verdict,
+// non-empty AND equals the requested repo) plus the server's own scope verdict
+// and the acting subject / credential kind it reports (#5227),
 // threaded into the token rung so a server-authenticated credential is not
 // failed by the local /v0/runs heuristic. A decode that succeeds is NOT proof
 // the body is a readiness verdict — `{}`, `null`, and a verdict for a DIFFERENT
@@ -243,7 +250,12 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 
 	// 200, a decodable body, AND an echoed repo that matches the request: this
 	// is the authoritative answer.
-	outcome := readinessOutcome{answered: true, scopesAdequate: body.Scopes.Adequate}
+	outcome := readinessOutcome{
+		answered:       true,
+		scopesAdequate: body.Scopes.Adequate,
+		subject:        body.Scopes.Subject,
+		credentialKind: body.Scopes.CredentialKind,
+	}
 
 	var out []checkResult
 
