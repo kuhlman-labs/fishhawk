@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +20,9 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/redaction"
@@ -375,7 +381,7 @@ func TestDiffSecrets_FailureModes(t *testing.T) {
 	t.Run("nil concern repo is a no-op", func(t *testing.T) {
 		au := newAuditFake()
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
-		if got := s.raiseDiffSecretConcerns(ctx, uuid.New(), uuid.New(), keyDiff(), "h"); got != nil {
+		if got := s.raiseDiffSecretConcerns(ctx, uuid.New(), uuid.New(), keyDiff(), "h"); got.PersonaGroups != nil || got.FreshGroups != nil {
 			t.Errorf("groups = %+v, want nil", got)
 		}
 		if p, _ := diffSecretsEntries(t, au); len(p) != 0 {
@@ -386,7 +392,7 @@ func TestDiffSecrets_FailureModes(t *testing.T) {
 		cr := newFakeConcernRepo()
 		s := New(Config{Addr: "127.0.0.1:0", ConcernRepo: cr})
 		runID := uuid.New()
-		if got := s.raiseDiffSecretConcerns(ctx, runID, uuid.New(), keyDiff(), "h"); got != nil {
+		if got := s.raiseDiffSecretConcerns(ctx, runID, uuid.New(), keyDiff(), "h"); got.PersonaGroups != nil || got.FreshGroups != nil {
 			t.Errorf("groups = %+v, want nil", got)
 		}
 		if n := len(serverCheckRows(t, cr, runID)); n != 0 {
@@ -424,7 +430,7 @@ func TestDiffSecrets_FailureModes(t *testing.T) {
 		s, au, cr := diffSecretsServer()
 		runID := uuid.New()
 		d := policy.Diff{Patch: "diff --git a/a.go b/a.go\n@@ -0,0 +1 @@\n+clean := 1\n"}
-		if got := s.raiseDiffSecretConcerns(ctx, runID, uuid.New(), d, "h"); got != nil {
+		if got := s.raiseDiffSecretConcerns(ctx, runID, uuid.New(), d, "h"); got.PersonaGroups != nil || got.FreshGroups != nil {
 			t.Errorf("groups = %+v, want nil", got)
 		}
 		if n := len(serverCheckRows(t, cr, runID)); n != 0 {
@@ -711,4 +717,648 @@ func TestRedactReviewPatch(t *testing.T) {
 	if !strings.Contains(logs.String(), "github-pat-classic=2") || strings.Contains(logs.String(), diffSecretsKey()) {
 		t.Errorf("log = %s", logs.String())
 	}
+}
+
+// ---- Reviewed allowlist and fixture markers (ADR-084 A2, #5230), slice 1 ----
+//
+// Every credential below is BUILT AT RUNTIME. The allowlist is served by the
+// same-package driftGH fake at the run's ADMISSION commit (alAdmit, 40 hex).
+// K6: each counterfactual names the fixture state that makes its deletion
+// observable.
+
+const (
+	alAdmit = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	alHead  = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+)
+
+// alKey is a runtime-built github-pat-classic-shaped value; a distinct fill
+// rune gives distinct matched bytes (and so a distinct per-hit fingerprint).
+func alKey(fill string) string { return "ghp_" + strings.Repeat(fill, 36) }
+
+// alAllowlist is the admission allowlist: entry docs-placeholder covers
+// docs/p.md, marker scope fixture-scope covers fix/**, both for
+// github-pat-classic.
+const alAllowlist = `version: 1
+entries:
+  - id: docs-placeholder
+    paths: ["docs/p.md"]
+    patterns: ["github-pat-classic"]
+    reason: "documented placeholder"
+markers:
+  - id: fixture-scope
+    paths: ["fix/**"]
+    patterns: ["github-pat-classic"]
+    reason: "synthetic fixture keys"
+`
+
+// alPermissive suppresses every github-pat-classic hit anywhere: a fixture
+// rung that wrongly loaded it would suppress the hit, so the raise reads 0.
+const alPermissive = `version: 1
+entries:
+  - id: everything
+    paths: ["**"]
+    patterns: ["github-pat-classic"]
+    reason: "permissive fixture"
+`
+
+// alFile is one file's added lines.
+type alFile struct {
+	path  string
+	lines []string
+}
+
+// alPatch renders a unified diff adding each file's lines from new-side 1.
+func alPatch(files ...alFile) string {
+	var b strings.Builder
+	for _, f := range files {
+		b.WriteString("diff --git a/" + f.path + " b/" + f.path + "\n--- a/" + f.path + "\n+++ b/" + f.path + "\n")
+		b.WriteString("@@ -0,0 +1," + strconv.Itoa(len(f.lines)) + " @@\n")
+		for _, l := range f.lines {
+			b.WriteString("+" + l + "\n")
+		}
+	}
+	return b.String()
+}
+
+func alLine(key string) string        { return `const k = "` + key + `"` }
+func alMarked(key string) string      { return `const k = "` + key + `" // ` + diffsecrets.MarkerToken }
+func alDiff(patch string) policy.Diff { return policy.Diff{Patch: patch} }
+
+// alStandardPatch: (1) docs/p.md entry-suppressed, (2) fix/m.go marked inside
+// the marker scope, (3) fix/a.go UNMARKED inside the scope (kept), (4) src/b.go
+// outside everything (kept).
+func alStandardPatch() string {
+	return alPatch(
+		alFile{"docs/p.md", []string{alLine(alKey("A"))}},
+		alFile{"fix/m.go", []string{alMarked(alKey("B"))}},
+		alFile{"fix/a.go", []string{alLine(alKey("C"))}},
+		alFile{"src/b.go", []string{alLine(alKey("D"))}},
+	)
+}
+
+func alNeedles() []string {
+	return []string{alKey("A"), alKey("B"), alKey("C"), alKey("D"), alKey("E")}
+}
+
+// alFixture is the drift fixture with a 40-hex admission commit and a
+// captured log buffer.
+type alFixture struct {
+	*driftFixture
+	logs *bytes.Buffer
+}
+
+func newALFixture(t *testing.T) *alFixture {
+	t.Helper()
+	f := newDriftFixture(t)
+	admit := alAdmit
+	f.runRow.DocumentBaseCommit = &admit
+	logs := captureLogger(f.s)
+	return &alFixture{driftFixture: f, logs: logs}
+}
+
+func (f *alFixture) raise(patch, head string) diffSecretsRound {
+	return f.s.raiseDiffSecretConcerns(context.Background(), f.runRow.ID, f.stage.ID, alDiff(patch), head)
+}
+
+func (f *alFixture) rows(t *testing.T) []*concern.Concern {
+	return serverCheckRows(t, f.cr.fakeConcernRepo, f.runRow.ID)
+}
+
+func (f *alFixture) entries(t *testing.T) []diffSecretsDetectedPayload {
+	p, _ := diffSecretsEntries(t, f.au.auditFake)
+	return p
+}
+
+func (f *alFixture) allowlistReads() int { return len(f.gh.readRefs(diffsecrets.AllowlistPath)) }
+
+// byCategory splits server_check rows into high security and low marker rows.
+func byCategory(rows []*concern.Concern) (high, marker []*concern.Concern) {
+	for _, r := range rows {
+		switch r.Category {
+		case "security":
+			high = append(high, r)
+		case diffSecretsMarkerConcernCategory:
+			marker = append(marker, r)
+		}
+	}
+	return high, marker
+}
+
+func rowPaths(rows []*concern.Concern) []string {
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.CheckKey[strings.LastIndex(r.CheckKey, "|")+1:])
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestDiffSecrets_AllowlistSuppressesAtAdmissionCommit: the admission
+// allowlist suppresses the entry hit (counted only) and the marked in-scope
+// hit (listed, plus ONE low marker concern); the unmarked in-scope hit and the
+// out-of-scope hit still raise high.
+//
+// COUNTERFACTUAL: delete the Partition call (raise over every hit) — this
+// fixture's docs/p.md hit is covered by the entry, so it then raises a third
+// high row and the high-path assertion reads [docs/p.md fix/a.go fix/m.go
+// src/b.go] → RED.
+func TestDiffSecrets_AllowlistSuppressesAtAdmissionCommit(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	f.raise(alStandardPatch(), alHead)
+
+	high, marker := byCategory(f.rows(t))
+	if got := rowPaths(high); strings.Join(got, ",") != "fix/a.go,src/b.go" {
+		t.Errorf("high rows = %v, want fix/a.go and src/b.go only", got)
+	}
+	for _, r := range high {
+		if r.Severity != "high" || r.Provenance != concern.ProvenanceServerCheck {
+			t.Errorf("high row = %+v", r)
+		}
+	}
+	if len(marker) != 1 {
+		t.Fatalf("marker rows = %d, want 1: %+v", len(marker), marker)
+	}
+	m := marker[0]
+	if m.Severity != "low" || m.Provenance != concern.ProvenanceServerCheck || m.State != concern.StateRaised {
+		t.Errorf("marker row = %+v, want low/server_check/raised", m)
+	}
+	ps := f.entries(t)
+	if len(ps) != 1 {
+		t.Fatalf("entries = %d, want 1", len(ps))
+	}
+	p := ps[0]
+	if p.Allowlist == nil || p.Allowlist.Status != diffsecrets.StatusLoaded || p.Allowlist.Ref != alAdmit || p.Allowlist.Path != diffsecrets.AllowlistPath {
+		t.Errorf("allowlist status = %+v, want loaded at the admission commit", p.Allowlist)
+	}
+	if p.SuppressedHitCount != 2 || p.EntrySuppressedHitCount != 1 || p.MarkerSuppressedHitCount != 1 || len(p.Suppressed) != 2 {
+		t.Errorf("summary = %+v, want 2 suppressed (1 entry, 1 marker)", p.SuppressionSummary)
+	}
+	if p.HitCount != 2 || len(p.Groups) != 2 {
+		t.Errorf("hit_count/groups = %d/%d, want the 2 fresh raised groups", p.HitCount, len(p.Groups))
+	}
+	for _, rec := range p.Suppressed {
+		switch rec.By {
+		case diffsecrets.ByEntry:
+			if rec.Path != "docs/p.md" || rec.RuleID != "docs-placeholder" ||
+				rec.RuleFingerprint != diffsecrets.RuleFingerprint(diffsecrets.ListEntries, "docs/p.md", "github-pat-classic") || rec.CheckKey != "" {
+				t.Errorf("entry record = %+v", rec)
+			}
+		case diffsecrets.ByMarker:
+			if rec.Path != "fix/m.go" || rec.RuleID != "fixture-scope" ||
+				rec.RuleFingerprint != diffsecrets.RuleFingerprint(diffsecrets.ListMarkers, "fix/**", "github-pat-classic") || rec.CheckKey != m.CheckKey {
+				t.Errorf("marker record = %+v (row check_key %q)", rec, m.CheckKey)
+			}
+			if !strings.HasPrefix(m.CheckKey, diffsecrets.MarkerCheckName+"|github-pat-classic|fixture-scope@") {
+				t.Errorf("marker check_key = %q", m.CheckKey)
+			}
+		default:
+			t.Errorf("record by = %q", rec.By)
+		}
+	}
+	if refs := f.gh.readRefs(diffsecrets.AllowlistPath); len(refs) != 1 || refs[0] != alAdmit {
+		t.Errorf("allowlist read at %v, want once at the admission commit", refs)
+	}
+	assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(), nil, alNeedles()...)
+}
+
+// TestDiffSecrets_MarkerConcernNonBlockingHumanOnly: the marker concern does
+// not block the human merge verb (low severity) and only a human can clear it
+// (server_check provenance).
+//
+// COUNTERFACTUALS: (1) raise it at severity high — ledgerBlockingConcernIDs
+// returns every open high/first_officer row, so the marker id then appears →
+// RED. (2) insert it with Provenance "" — the human-only guard keys on
+// server_check provenance, and this operator-agent token passes every other
+// waive check, so the waive succeeds and the row reads back WAIVED → RED.
+func TestDiffSecrets_MarkerConcernNonBlockingHumanOnly(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	f.raise(alStandardPatch(), alHead)
+	high, marker := byCategory(f.rows(t))
+	if len(high) != 2 || len(marker) != 1 {
+		t.Fatalf("rows = %d high / %d marker, want 2/1", len(high), len(marker))
+	}
+	ids, err := f.s.ledgerBlockingConcernIDs(context.Background(), f.runRow.ID)
+	if err != nil {
+		t.Fatalf("ledgerBlockingConcernIDs: %v", err)
+	}
+	for _, r := range high {
+		if !slices.Contains(ids, r.ID.String()) {
+			t.Errorf("blocking ids %v lack the high row %s", ids, r.ID)
+		}
+	}
+	if slices.Contains(ids, marker[0].ID.String()) {
+		t.Errorf("blocking ids %v carry the low marker concern", ids)
+	}
+
+	ws := New(Config{Addr: "127.0.0.1:0", AuditRepo: newAuditFake(), ConcernRepo: f.cr.fakeConcernRepo})
+	w := postWaiveAs(t, ws, marker[0].ID.String(), waiveConcernRequest{Reason: "agent says it is a fixture"}, withOperatorAgentAuth)
+	assertRequiresHuman(t, w, marker[0], clearVerbWaive, refusedActorAgentToken)
+	assertState(t, f.cr.fakeConcernRepo, marker[0].ID, concern.StateRaised)
+}
+
+// TestDiffSecrets_PersonaSeam pins the A2 persona rule on the round's return.
+//
+// COUNTERFACTUALS: (1) return the kept groups only — the fixture's fix/m.go
+// hit is marker-suppressed, so fix/m.go is then missing → RED. (2) return
+// every group — the docs/p.md hit is entry-suppressed, so docs/p.md is then
+// present → RED.
+func TestDiffSecrets_PersonaSeam(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	round := f.raise(alStandardPatch(), alHead)
+	var paths []string
+	for _, g := range round.PersonaGroups {
+		paths = append(paths, g.Path)
+	}
+	if strings.Join(paths, ",") != "fix/a.go,fix/m.go,src/b.go" {
+		t.Errorf("persona groups = %v, want fix/a.go, fix/m.go, src/b.go (never the entry-suppressed docs/p.md)", paths)
+	}
+	if round.SuppressedHitCount != 2 || len(round.FreshGroups) != 2 {
+		t.Errorf("round = suppressed %d fresh %d, want 2/2", round.SuppressedHitCount, len(round.FreshGroups))
+	}
+}
+
+// TestDiffSecrets_AllowlistHeadEditIgnored: a permissive allowlist served ONLY
+// at the run's head (404 at the admission commit) suppresses nothing.
+//
+// COUNTERFACTUAL: change the FetchFile ref to headSHA — this fixture serves the
+// permissive file at alHead, so the hit is then suppressed and zero rows exist
+// → RED.
+func TestDiffSecrets_AllowlistHeadEditIgnored(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alHead, diffsecrets.AllowlistPath, alPermissive)
+	f.raise(alPatch(alFile{"docs/p.md", []string{alLine(alKey("A"))}}), alHead)
+	if high, _ := byCategory(f.rows(t)); len(high) != 1 {
+		t.Fatalf("high rows = %d, want 1 (a head-only allowlist must not suppress)", len(high))
+	}
+	ps := f.entries(t)
+	if len(ps) != 1 || ps[0].Allowlist == nil || ps[0].Allowlist.Status != diffsecrets.StatusAbsent || ps[0].SuppressedHitCount != 0 {
+		t.Errorf("payloads = %+v, want one with status absent and nothing suppressed", ps)
+	}
+}
+
+// TestDiffSecrets_AllowlistFailureModes: one subtest per rung of the
+// fail-closed ladder. Each fixture serves the PERMISSIVE allowlist wherever a
+// read could succeed (the admission commit, and the malformed commit value
+// itself), so a rung that wrongly loaded it would suppress the hit and the
+// raised-row count would read 0 → RED.
+func TestDiffSecrets_AllowlistFailureModes(t *testing.T) {
+	patch := alPatch(alFile{"docs/p.md", []string{alLine(alKey("A"))}})
+	cases := []struct {
+		name, status, detail string
+		setup                func(f *alFixture)
+	}{
+		{"no run repo", diffsecrets.StatusUnavailable, diffSecretsAllowlistRunRepoUnwired, func(f *alFixture) { f.s.cfg.RunRepo = nil }},
+		{"get run error", diffsecrets.StatusUnavailable, diffSecretsAllowlistRunUnreadable, func(f *alFixture) { f.s.cfg.RunRepo = &getRunErrRepo{f.rr} }},
+		{"admission commit nil", diffsecrets.StatusUnavailable, diffSecretsAllowlistBaseUnrecorded, func(f *alFixture) { f.runRow.DocumentBaseCommit = nil }},
+		{"admission commit not 40-hex", diffsecrets.StatusUnavailable, diffSecretsAllowlistBaseUnrecorded, func(f *alFixture) {
+			bad := "base0000"
+			f.runRow.DocumentBaseCommit = &bad
+			f.gh.put(bad, diffsecrets.AllowlistPath, alPermissive)
+		}},
+		{"github client unwired", diffsecrets.StatusUnavailable, diffSecretsAllowlistForgeNotWired, func(f *alFixture) { f.s.cfg.GitHub = nil }},
+		{"fetch 500", diffsecrets.StatusFetchFailed, "", func(f *alFixture) {
+			f.gh.mu.Lock()
+			f.gh.contentStatus[alAdmit+"|"+diffsecrets.AllowlistPath] = http.StatusInternalServerError
+			f.gh.mu.Unlock()
+		}},
+		{"404 absent", diffsecrets.StatusAbsent, "", func(f *alFixture) {
+			f.gh.mu.Lock()
+			delete(f.gh.files[alAdmit], diffsecrets.AllowlistPath)
+			f.gh.mu.Unlock()
+			f.gh.put(alHead, diffsecrets.AllowlistPath, alPermissive)
+		}},
+		{"unparseable", diffsecrets.StatusParseError, "", func(f *alFixture) {
+			f.gh.put(alAdmit, diffsecrets.AllowlistPath, "version: 1\nentries: [\n  token: "+alKey("E")+"\n")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newALFixture(t)
+			f.gh.put(alAdmit, diffsecrets.AllowlistPath, alPermissive)
+			tc.setup(f)
+			f.raise(patch, alHead)
+			if high, _ := byCategory(f.rows(t)); len(high) != 1 {
+				t.Fatalf("high rows = %d, want 1 (the ladder fails closed: nothing suppressed)", len(high))
+			}
+			ps := f.entries(t)
+			if len(ps) != 1 || ps[0].Allowlist == nil {
+				t.Fatalf("payloads = %+v, want one with an allowlist status", ps)
+			}
+			if st := ps[0].Allowlist; st.Status != tc.status || st.Detail != tc.detail || ps[0].SuppressedHitCount != 0 {
+				t.Errorf("allowlist = %+v suppressed %d, want %s/%q and 0", st, ps[0].SuppressedHitCount, tc.status, tc.detail)
+			}
+			assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(), nil, alKey("A"), alKey("E"))
+		})
+	}
+}
+
+// TestDiffSecrets_AllowlistReadMemoizedPerHead pins C4c.
+//
+// COUNTERFACTUALS: (1) bypass the memo lookup — the first pair of rounds at
+// one head then reads twice → RED. (2) memoize fetch_failed — the head3 retry
+// then reads once in total instead of twice → RED.
+func TestDiffSecrets_AllowlistReadMemoizedPerHead(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	patch := alPatch(alFile{"src/b.go", []string{alLine(alKey("D"))}})
+	f.raise(patch, "head-1")
+	f.raise(patch, "head-1")
+	if n := f.allowlistReads(); n != 1 {
+		t.Errorf("reads after two rounds at one head = %d, want 1", n)
+	}
+	f.raise(patch, "head-2")
+	if n := f.allowlistReads(); n != 2 {
+		t.Errorf("reads after a new head = %d, want 2", n)
+	}
+	f.gh.mu.Lock()
+	f.gh.contentStatus[alAdmit+"|"+diffsecrets.AllowlistPath] = http.StatusInternalServerError
+	f.gh.mu.Unlock()
+	f.raise(patch, "head-3")
+	f.raise(patch, "head-3")
+	if n := f.allowlistReads(); n != 4 {
+		t.Errorf("reads after two failed rounds at head-3 = %d, want 4 (fetch_failed is never memoized)", n)
+	}
+}
+
+// TestDiffSecretsAllowlistMemo_Cap: the memo stays bounded and evicts oldest
+// first. COUNTERFACTUAL: delete the eviction loop — 200 inserts then leave 200
+// entries → RED.
+func TestDiffSecretsAllowlistMemo_Cap(t *testing.T) {
+	m := newDiffSecretsAllowlistMemo(diffSecretsAllowlistMemoCap)
+	for i := 0; i < 200; i++ {
+		m.put("k"+strconv.Itoa(i), diffSecretsAllowlistRead{})
+	}
+	if n := m.len(); n > diffSecretsAllowlistMemoCap {
+		t.Errorf("memo size = %d, want <= %d", n, diffSecretsAllowlistMemoCap)
+	}
+	if _, ok := m.get("k0"); ok {
+		t.Error("oldest key survived; want oldest-first eviction")
+	}
+	if _, ok := m.get("k199"); !ok {
+		t.Error("newest key evicted")
+	}
+}
+
+// TestDiffSecrets_SuppressedDedupe pins the C4a append rule and K1's per-hit
+// marker key.
+func TestDiffSecrets_SuppressedDedupe(t *testing.T) {
+	entryOnly := alPatch(alFile{"docs/p.md", []string{alLine(alKey("A"))}})
+
+	// COUNTERFACTUAL: delete the same-head subset check (append whenever
+	// anything was suppressed) — the second round at the SAME head has nothing
+	// fresh but a suppressed set, so two entries are appended → RED.
+	t.Run("suppressed-only repeat at one head appends once", func(t *testing.T) {
+		f := newALFixture(t)
+		f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+		f.raise(entryOnly, alHead)
+		f.raise(entryOnly, alHead)
+		if n := len(f.entries(t)); n != 1 {
+			t.Errorf("entries = %d, want 1", n)
+		}
+	})
+	// COUNTERFACTUAL: delete the empty-head guard — both rounds' entries then
+	// carry head_sha "" and match each other, so only one entry is appended → RED.
+	t.Run("an empty head never reads as on record", func(t *testing.T) {
+		f := newALFixture(t)
+		f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+		f.raise(entryOnly, "")
+		f.raise(entryOnly, "")
+		if n := len(f.entries(t)); n != 2 {
+			t.Errorf("entries = %d, want 2 (no head, no identity)", n)
+		}
+	})
+	t.Run("a new head re-appends", func(t *testing.T) {
+		f := newALFixture(t)
+		f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+		f.raise(entryOnly, alHead)
+		f.raise(entryOnly, "other-head")
+		if n := len(f.entries(t)); n != 2 {
+			t.Errorf("entries = %d, want 2", n)
+		}
+	})
+	// COUNTERFACTUAL: make the list error return "on record" (no append) — the
+	// second round's same-head lookup fails, so no second entry → RED.
+	t.Run("an audit list error fails open to appending", func(t *testing.T) {
+		f := newALFixture(t)
+		f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+		f.raise(entryOnly, alHead)
+		f.au.listByCategoryErrCategory = diffSecretsDetectedCategory
+		f.raise(entryOnly, alHead)
+		f.au.listByCategoryErrCategory = ""
+		if n := len(f.entries(t)); n != 2 {
+			t.Errorf("entries = %d, want 2 (a lost record is silent)", n)
+		}
+	})
+	// COUNTERFACTUAL: drop freshMarkers from the append condition — the
+	// superseded marker row is not on record but the suppressed set IS (same
+	// head), so no entry and no concern → RED.
+	t.Run("a superseded marker concern is re-raised with a new entry", func(t *testing.T) {
+		f := newALFixture(t)
+		f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+		patch := alPatch(alFile{"fix/m.go", []string{alMarked(alKey("B"))}})
+		f.raise(patch, alHead)
+		_, marker := byCategory(f.rows(t))
+		if len(marker) != 1 {
+			t.Fatalf("marker rows = %d, want 1", len(marker))
+		}
+		if _, err := f.cr.ApplyResolution(context.Background(), marker[0].ID, concern.StateSuperseded, "stage retried"); err != nil {
+			t.Fatal(err)
+		}
+		f.raise(patch, alHead)
+		if _, marker = byCategory(f.rows(t)); len(marker) != 2 {
+			t.Errorf("marker rows = %d, want 2", len(marker))
+		}
+		if n := len(f.entries(t)); n != 2 {
+			t.Errorf("entries = %d, want 2", n)
+		}
+	})
+	// K1. COUNTERFACTUAL: drop the per-hit fingerprint from MarkerCheckKey —
+	// the second marked line (different bytes, same file, scope and pattern)
+	// then shares the WAIVED row's key, so no second concern → RED.
+	t.Run("a new marked line raises after a waive; a repeat does not", func(t *testing.T) {
+		f := newALFixture(t)
+		f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+		f.raise(alPatch(alFile{"fix/m.go", []string{alMarked(alKey("B"))}}), "head-1")
+		_, marker := byCategory(f.rows(t))
+		if len(marker) != 1 {
+			t.Fatalf("marker rows = %d, want 1", len(marker))
+		}
+		if _, err := f.cr.ApplyResolution(context.Background(), marker[0].ID, concern.StateWaived, "human: a fixture"); err != nil {
+			t.Fatal(err)
+		}
+		both := alPatch(alFile{"fix/m.go", []string{alMarked(alKey("B")), alMarked(alKey("E"))}})
+		f.raise(both, "head-2")
+		_, marker = byCategory(f.rows(t))
+		if len(marker) != 2 {
+			t.Fatalf("marker rows after a second marked line = %d, want 2", len(marker))
+		}
+		f.raise(both, "head-3")
+		if _, marker = byCategory(f.rows(t)); len(marker) != 2 {
+			t.Errorf("marker rows after a repeat round = %d, want 2 (no duplicate)", len(marker))
+		}
+		assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(), nil, alKey("B"), alKey("E"))
+	})
+}
+
+// TestDiffSecrets_AllSuppressedAppendsSummaryOnly: an entry-only round records
+// one summary entry with groups [] and raises no concern.
+//
+// COUNTERFACTUAL: restore the old `len(fresh) == 0` early return — every hit
+// in this fixture is entry-suppressed, so nothing is appended → RED.
+func TestDiffSecrets_AllSuppressedAppendsSummaryOnly(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	f.raise(alPatch(alFile{"docs/p.md", []string{alLine(alKey("A"))}}), alHead)
+	if n := len(f.rows(t)); n != 0 {
+		t.Errorf("rows = %d, want 0", n)
+	}
+	_, params := diffSecretsEntries(t, f.au.auditFake)
+	if len(params) != 1 {
+		t.Fatalf("entries = %d, want 1", len(params))
+	}
+	if raw := string(params[0].Payload); !strings.Contains(raw, `"groups":[]`) || !strings.Contains(raw, `"suppressed_hit_count":1`) {
+		t.Errorf("payload = %s, want groups [] and suppressed_hit_count 1", raw)
+	}
+}
+
+// TestDiffSecrets_CleanDiffMakesNoAllowlistRead: no hit, no forge call.
+// COUNTERFACTUAL: move the read above the no-hit return — the clean diff then
+// makes one contents call → RED.
+func TestDiffSecrets_CleanDiffMakesNoAllowlistRead(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	f.raise(alPatch(alFile{"src/b.go", []string{"clean := 1"}}), alHead)
+	if n := f.gh.callCount(); n != 0 {
+		t.Errorf("forge calls = %d, want 0", n)
+	}
+}
+
+// alSentinel is a runtime-built, non-credential-shaped unique string.
+func alSentinel() string { return "zzsentinel" + strings.Repeat("q", 9) }
+
+// alCredGlob is a runtime-built credential-shaped glob (never a literal).
+func alCredGlob() string { return "ghp_" + strings.Repeat("A1b2C3d4E5", 4)[:36] }
+
+// TestDiffSecrets_AllowlistBytesNeverPersisted (C1): a credential-glob rule is
+// rejected (redaction_hit, no rule_id); a sentinel-glob rule suppresses the
+// docs/p.md hit through a brace alternative, so the sentinel is in the GLOB and
+// never in a path. Neither string reaches any payload, row, log line, gate-view
+// body or PR status body.
+//
+// COUNTERFACTUAL: attribute suppression records by the matched glob instead of
+// the fingerprint (RuleFingerprint → g in matchRules) — the matched glob
+// carries the sentinel, so it lands in the payload → RED.
+func TestDiffSecrets_AllowlistBytesNeverPersisted(t *testing.T) {
+	f := newALFixture(t)
+	file := "version: 1\nentries:\n" +
+		"  - id: cred-rule\n    paths: [\"" + alCredGlob() + "\"]\n    patterns: [\"github-pat-classic\"]\n    reason: \"bad\"\n" +
+		"  - id: sentinel-rule\n    paths: [\"{docs/p.md," + alSentinel() + "}\"]\n    patterns: [\"github-pat-classic\"]\n    reason: \"placeholder\"\n"
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, file)
+	f.raise(alPatch(alFile{"docs/p.md", []string{alLine(alKey("A"))}}), alHead)
+
+	ps := f.entries(t)
+	if len(ps) != 1 || ps[0].Allowlist == nil {
+		t.Fatalf("payloads = %+v", ps)
+	}
+	st := ps[0].Allowlist
+	if st.Status != diffsecrets.StatusLoaded || st.RejectedCount != 1 || len(st.Rejected) != 1 ||
+		st.Rejected[0] != (diffsecrets.RejectionRecord{List: diffsecrets.ListEntries, Index: 0, Reason: diffsecrets.RejectRedactionHit}) {
+		t.Errorf("allowlist = %+v, want one rejected {entries 0 redaction_hit} with no rule_id", st)
+	}
+	if ps[0].EntrySuppressedHitCount != 1 || len(ps[0].Suppressed) != 1 || ps[0].Suppressed[0].RuleID != "sentinel-rule" {
+		t.Errorf("summary = %+v, want the sentinel rule's one suppression", ps[0].SuppressionSummary)
+	}
+	gv := getGateView(t, f.s, f.runRow.ID, "")
+	if gv.Code != http.StatusOK {
+		t.Fatalf("gate view = %d: %s", gv.Code, gv.Body.String())
+	}
+	if !strings.Contains(gv.Body.String(), `"diff_secrets_suppressed"`) {
+		t.Errorf("gate view lacks the diff_secrets_suppressed block: %s", gv.Body.String())
+	}
+	entries, _ := f.au.ListForRun(context.Background(), f.runRow.ID)
+	prBody := issuecomment.RenderPRStatusBody(issuecomment.PRStatusInput{Run: f.runRow, Audit: entries})
+	if !strings.Contains(prBody, "Diff secrets suppressed") {
+		t.Errorf("PR status body lacks the section:\n%s", prBody)
+	}
+	assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(),
+		map[string]string{"gate-view body": gv.Body.String(), "PR status body": prBody},
+		alSentinel(), alCredGlob(), alKey("A"))
+}
+
+// TestDiffSecrets_TraceUploadAllowlistSuppression is the CROSS-BOUNDARY e2e: a
+// raw implement bundle travels handleShipTrace → runImplementReviewsForTree →
+// diffsecrets → the forge fake (allowlist at the admission commit) → concern
+// store → audit → the gate-view handler → issuecomment renderer → reviewer
+// prompt.
+//
+// COUNTERFACTUAL: delete the diffSecretsAllowlist call (nil allowlist) — the
+// docs/p.md hit is then raised high, so the high-path set reads [docs/p.md
+// fix/a.go src/b.go], no marker row exists and the gate view has no block →
+// RED.
+func TestDiffSecrets_TraceUploadAllowlistSuppression(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	gh := newDriftGH()
+	gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	s.cfg.GitHub = gh.client(t)
+	inst := int64(55)
+	admit := alAdmit
+	runRow.InstallationID = &inst
+	runRow.DocumentBaseCommit = &admit
+	logs := captureLogger(s)
+	priv, _ := sf.issue(t, runRow.ID)
+	_ = rr
+
+	bundle := implementDiffBundleWithPatch(t, []map[string]string{
+		{"path": "docs/p.md", "status": "A"}, {"path": "fix/m.go", "status": "A"},
+		{"path": "fix/a.go", "status": "A"}, {"path": "src/b.go", "status": "A"},
+	}, alStandardPatch())
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundle, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("ship status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	high, marker := byCategory(serverCheckRows(t, cr, runRow.ID))
+	if got := rowPaths(high); strings.Join(got, ",") != "fix/a.go,src/b.go" {
+		t.Errorf("high rows = %v, want fix/a.go and src/b.go", got)
+	}
+	if len(marker) != 1 || marker[0].Severity != "low" {
+		t.Errorf("marker rows = %+v, want one low row", marker)
+	}
+
+	gv := getGateView(t, s, runRow.ID, "")
+	var resp gateViewResponse
+	if err := json.Unmarshal(gv.Body.Bytes(), &resp); err != nil || gv.Code != http.StatusOK {
+		t.Fatalf("gate view = %d: %s", gv.Code, gv.Body.String())
+	}
+	b := resp.DiffSecretsSuppressed
+	if b == nil || b.SuppressedHitCount != 2 || b.EntrySuppressedHitCount != 1 || b.MarkerSuppressedHitCount != 1 ||
+		len(b.ByRule) != 2 || len(b.MarkerLocations) != 1 || b.AllowlistStatus != diffsecrets.StatusLoaded || b.AllowlistRef != alAdmit {
+		t.Errorf("diff_secrets_suppressed = %+v", b)
+	}
+	entries, _ := au.ListForRun(context.Background(), runRow.ID)
+	prBody := issuecomment.RenderPRStatusBody(issuecomment.PRStatusInput{Run: runRow, Audit: entries})
+	if !strings.Contains(prBody, "Diff secrets suppressed") || !strings.Contains(prBody, "fix/m.go") {
+		t.Errorf("PR status body lacks the suppression section:\n%s", prBody)
+	}
+
+	reviewer.mu.Lock()
+	prompts := append([]string(nil), reviewer.calls...)
+	reviewer.mu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("reviewer invocations = %d, want 1", len(prompts))
+	}
+	if n := strings.Count(prompts[0], "[REDACTED:github-pat-classic]"); n < 4 {
+		t.Errorf("prompt carries %d redaction markers, want every one of the 4 hits redacted", n)
+	}
+	bodies := map[string]string{"gate-view body": gv.Body.String(), "PR status body": prBody, "reviewer prompt": prompts[0]}
+	assertNoNeedleBytes(t, cr, au, logs.String(), bodies, alNeedles()...)
 }

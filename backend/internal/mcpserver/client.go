@@ -933,6 +933,13 @@ type GateView struct {
 	// byte-match the backend's gateViewResponse or the field silently decodes to
 	// nil — the mixed-version degrade.
 	ReviewDiffTruncated *gateViewReviewDiffTruncated `json:"review_diff_truncated,omitempty"`
+	// DiffSecretsSuppressed is what the reviewed diff-secrets allowlist
+	// suppressed on the run (ADR-084 A2, #5230). Omitted (nil) when nothing was
+	// suppressed or rejected, when the read failed (a diff_secrets_suppressed
+	// history_gaps entry), or against an older backend. The json tag MUST
+	// byte-match the backend's gateViewResponse or the field silently decodes to
+	// nil — the mixed-version degrade.
+	DiffSecretsSuppressed *gateViewDiffSecretsSuppressed `json:"diff_secrets_suppressed,omitempty" jsonschema:"what the reviewed diff-secrets allowlist suppressed: totals, per-rule attribution by id plus fingerprint, and every marker-suppressed location (each raised a low, human-only concern); omitted when nothing was suppressed or rejected"`
 	// ReviewHeadMismatch surfaces that the open implement-review round judged a
 	// tree the PR does not carry (#3655). Omitted (nil) when no un-superseded
 	// review_head_mismatch was recorded or against an older backend. The json tag
@@ -1347,6 +1354,44 @@ type gateViewReviewDiffTruncated struct {
 	OmittedFilesResidual int      `json:"omitted_files_residual,omitempty" jsonschema:"how many omitted files the reviewer's capped PROMPT list dropped past the cap"`
 	DeltaReReview        bool     `json:"delta_re_review,omitempty" jsonschema:"true when the truncated diff was a post-fix-up delta re-review rather than the full diff"`
 	BestEffort           bool     `json:"best_effort,omitempty" jsonschema:"true for a forge truncation whose file inventory is itself capped, so the omitted set may itself be incomplete"`
+}
+
+// gateViewDiffSecretsSuppressed mirrors the backend's
+// gateViewDiffSecretsSuppressed (ADR-084 A2, #5230). The json tags MUST
+// byte-match the backend or each field silently decodes to its zero value (the
+// #371 hand-maintained-wire-mirror trap; TestDiffSecretsSuppressed_WireShape
+// pins it against a real server). Deliberately UNEXPORTED, like
+// gateViewReviewDiffTruncated: the MCP schema reflection walks it through the
+// exported DiffSecretsSuppressed field, and exportBaseline is not widened.
+type gateViewDiffSecretsSuppressed struct {
+	SuppressedHitCount       int                                 `json:"suppressed_hit_count" jsonschema:"every hit the allowlist suppressed on this run, folded across rounds"`
+	EntrySuppressedHitCount  int                                 `json:"entry_suppressed_hit_count" jsonschema:"hits suppressed by an allowlist entry (counted only, no concern raised)"`
+	MarkerSuppressedHitCount int                                 `json:"marker_suppressed_hit_count" jsonschema:"hits suppressed by an in-scope fishhawk:allow-secret marker (each raised a low, human-only concern)"`
+	ByRule                   []gateViewDiffSecretsRule           `json:"by_rule" jsonschema:"per-rule attribution: by (entry|marker), the rule id, its fingerprint and its hit count; a glob is never rendered"`
+	MarkerLocations          []gateViewDiffSecretsMarkerLocation `json:"marker_locations" jsonschema:"every marker-suppressed location, capped at 50"`
+	MarkerLocationsTruncated bool                                `json:"marker_locations_truncated,omitempty" jsonschema:"true when marker_locations hit its cap; the totals still count every hit"`
+	AllowlistStatus          string                              `json:"allowlist_status,omitempty" jsonschema:"the newest allowlist read's outcome: loaded, absent, unavailable, fetch_failed or parse_error (every status but loaded suppressed nothing)"`
+	AllowlistRef             string                              `json:"allowlist_ref,omitempty" jsonschema:"the admission commit the allowlist was read at"`
+	RejectedCount            int                                 `json:"rejected_count" jsonschema:"allowlist rules the server refused (each suppresses nothing)"`
+	NewestSequence           int64                               `json:"newest_sequence" jsonschema:"audit sequence of the newest diff_secrets_detected entry folded"`
+}
+
+// gateViewDiffSecretsRule mirrors the backend's gateViewDiffSecretsRule.
+type gateViewDiffSecretsRule struct {
+	By              string `json:"by" jsonschema:"entry or marker"`
+	RuleID          string `json:"rule_id" jsonschema:"the rule's id, or '(invalid id)' when the persisted value fails validation"`
+	RuleFingerprint string `json:"rule_fingerprint" jsonschema:"16-hex fingerprint of the matched (list, glob, pattern) tuple"`
+	HitCount        int    `json:"hit_count" jsonschema:"hits this rule suppressed"`
+}
+
+// gateViewDiffSecretsMarkerLocation mirrors the backend's
+// gateViewDiffSecretsMarkerLocation.
+type gateViewDiffSecretsMarkerLocation struct {
+	Path     string `json:"path" jsonschema:"the file of the marker-suppressed hit"`
+	Lines    []int  `json:"lines" jsonschema:"new-side line numbers (0 when unknown)"`
+	Pattern  string `json:"pattern" jsonschema:"the credential pattern class"`
+	RuleID   string `json:"rule_id" jsonschema:"the marker scope's id"`
+	CheckKey string `json:"check_key,omitempty" jsonschema:"the low, human-only concern's check key"`
 }
 
 // GateViewConcern is one OPEN concern with full decision context. Note carries

@@ -2888,7 +2888,7 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 	// The conflict-resolved head's implement review (#4795): a full-diff
 	// conflict_resolution round, or a named skip row. After the replay dedup,
 	// the forge check and the live-trigger guard, so a replay never re-fires it.
-	s.maybeDispatchConflictResolutionReview(r.Context(), runID, stage, pr, summary.secretGroups)
+	s.maybeDispatchConflictResolutionReview(r.Context(), runID, stage, pr, summary.secretGroups, summary.suppressedHitCount)
 
 	// Permission-drift check (E80.4 / #3761): a conflict-resolution merge
 	// commit is agent-authored, so it is checked like any other push. Its

@@ -17,12 +17,14 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
 
 // gateViewResponse is GET /v0/runs/{run_id}/gate-view (#1960): the
@@ -68,6 +70,14 @@ type gateViewResponse struct {
 	// when the run carried none. Carries the COMPLETE omitted-file list (unlike the
 	// prompt, which is capped). Same best-effort read as LiveValidation.
 	ReviewDiffTruncated *gateViewReviewDiffTruncated `json:"review_diff_truncated,omitempty"`
+	// DiffSecretsSuppressed is what the reviewed diff-secrets allowlist
+	// suppressed on this run (ADR-084 A2, #5230): the totals, the per-rule
+	// attribution (SafeRuleID plus fingerprint, never a glob) and every
+	// marker-suppressed location, folded across every diff_secrets_detected
+	// entry exactly as the sticky PR status comment folds them. Omitted (nil)
+	// when nothing was suppressed or rejected; omitted with a
+	// diff_secrets_suppressed history_gaps entry when the read fails.
+	DiffSecretsSuppressed *gateViewDiffSecretsSuppressed `json:"diff_secrets_suppressed,omitempty"`
 	// ReviewHeadMismatch surfaces that the open implement-review round judged a
 	// tree the PR does not carry (#3655): the newest review_head_mismatch audit
 	// entry, recorded by the success PR ship when the round's reviewed tree
@@ -1811,6 +1821,9 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// diff" in the one call. Omitted (nil) when the run carried no truncation
 	// entry or the read fails.
 	resp.ReviewDiffTruncated = s.reviewDiffTruncatedForRun(ctx, runID)
+	// Diff-secrets suppression surface (ADR-084 A2, #5230): what the reviewed
+	// allowlist suppressed, so a human sees every suppression at the gate.
+	resp.DiffSecretsSuppressed = s.diffSecretsSuppressedForRun(ctx, runID, &resp)
 	// Stale-review surface (#3655): the same best-effort single-read, so the
 	// gate view answers "did the open review judge the tree the PR carries" in
 	// the one call. Omitted (nil) when no un-superseded mismatch was recorded.
@@ -2064,6 +2077,182 @@ func (s *Server) reviewDiffTruncatedForRun(ctx context.Context, runID uuid.UUID)
 		DeltaReReview:        p.DeltaReReview,
 		BestEffort:           p.BestEffort,
 	}
+}
+
+// gateViewGapDiffSecretsSuppressed is the history_gaps entry the
+// diff_secrets_suppressed block records when its read or a decode fails.
+const gateViewGapDiffSecretsSuppressed = "diff_secrets_suppressed"
+
+// gateViewDiffSecretsMarkerCap bounds marker_locations; the remainder is
+// flagged by marker_locations_truncated and still counted in the totals.
+const gateViewDiffSecretsMarkerCap = 50
+
+// gateViewDiffSecretsSuppressed is the gate-view diff_secrets_suppressed block
+// (ADR-084 A2, #5230). Counts are folded lines per suppression kind; by_rule
+// attributes them by SafeRuleID and SafeFingerprint (re-validated on READ, so
+// a corrupted row renders "(invalid id)"); marker_locations lists every
+// marker-suppressed hit (each raised a low, human-only concern), capped at
+// gateViewDiffSecretsMarkerCap. allowlist_status / allowlist_ref /
+// rejected_count come from the newest entry carrying an allowlist status;
+// newest_sequence is the newest diff_secrets_detected entry folded.
+type gateViewDiffSecretsSuppressed struct {
+	SuppressedHitCount       int                                 `json:"suppressed_hit_count"`
+	EntrySuppressedHitCount  int                                 `json:"entry_suppressed_hit_count"`
+	MarkerSuppressedHitCount int                                 `json:"marker_suppressed_hit_count"`
+	ByRule                   []gateViewDiffSecretsRule           `json:"by_rule"`
+	MarkerLocations          []gateViewDiffSecretsMarkerLocation `json:"marker_locations"`
+	MarkerLocationsTruncated bool                                `json:"marker_locations_truncated,omitempty"`
+	AllowlistStatus          string                              `json:"allowlist_status,omitempty"`
+	AllowlistRef             string                              `json:"allowlist_ref,omitempty"`
+	RejectedCount            int                                 `json:"rejected_count"`
+	NewestSequence           int64                               `json:"newest_sequence"`
+}
+
+// gateViewDiffSecretsRule is one rule's suppression attribution.
+type gateViewDiffSecretsRule struct {
+	By              string `json:"by"`
+	RuleID          string `json:"rule_id"`
+	RuleFingerprint string `json:"rule_fingerprint"`
+	HitCount        int    `json:"hit_count"`
+}
+
+// gateViewDiffSecretsMarkerLocation is one marker-suppressed hit. CheckKey is
+// the low concern's check key, omitted when the persisted value fails the
+// read-side redaction check.
+type gateViewDiffSecretsMarkerLocation struct {
+	Path     string `json:"path"`
+	Lines    []int  `json:"lines"`
+	Pattern  string `json:"pattern"`
+	RuleID   string `json:"rule_id"`
+	CheckKey string `json:"check_key,omitempty"`
+}
+
+// diffSecretsSuppressedForRun builds the diff_secrets_suppressed block from
+// every diff_secrets_detected entry, in the reviewDiffTruncatedForRun posture:
+// nil AuditRepo -> nil; a list error -> nil plus a history_gaps entry; an
+// undecodable entry is skipped and records the same gap while the others
+// still render. Records fold by (path, pattern, by, rule id, fingerprint,
+// check key), lines from the NEWEST entry — the PR status comment's fold.
+// Present iff something was suppressed or a rule was rejected.
+func (s *Server) diffSecretsSuppressedForRun(ctx context.Context, runID uuid.UUID, resp *gateViewResponse) *gateViewDiffSecretsSuppressed {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	gap := func() {
+		resp.HistoryIncomplete = true
+		if !slices.Contains(resp.HistoryGaps, gateViewGapDiffSecretsSuppressed) {
+			resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapDiffSecretsSuppressed)
+		}
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, diffSecretsDetectedCategory)
+	if err != nil {
+		s.cfg.Logger.Warn("gate-view: list diff_secrets_detected failed; omitting diff_secrets_suppressed block",
+			"run_id", runID.String(), "error", err.Error())
+		gap()
+		return nil
+	}
+	type foldKey struct{ path, pattern, by, id, fp, check string }
+	folded := map[foldKey]diffsecrets.SuppressionRecord{}
+	var order []foldKey
+	var status *diffsecrets.AllowlistStatusRecord
+	var newest int64
+	for _, e := range entries { // sequence-ascending
+		if e == nil {
+			continue
+		}
+		var sum diffsecrets.SuppressionSummary
+		if len(e.Payload) == 0 || json.Unmarshal(e.Payload, &sum) != nil {
+			s.cfg.Logger.Warn("gate-view: decode diff_secrets_detected payload failed; skipping the entry",
+				"run_id", runID.String(), "sequence", e.Sequence)
+			gap()
+			continue
+		}
+		newest = e.Sequence
+		if sum.Allowlist != nil {
+			status = sum.Allowlist
+		}
+		for _, x := range sum.Suppressed {
+			k := foldKey{x.Path, x.Pattern, x.By, x.RuleID, x.RuleFingerprint, x.CheckKey}
+			if _, ok := folded[k]; !ok {
+				order = append(order, k)
+			}
+			folded[k] = x // newest entry wins
+		}
+	}
+	rejected := 0
+	if status != nil {
+		rejected = status.RejectedCount
+	}
+	if len(folded) == 0 && rejected == 0 {
+		return nil
+	}
+	out := &gateViewDiffSecretsSuppressed{
+		ByRule:          []gateViewDiffSecretsRule{},
+		MarkerLocations: []gateViewDiffSecretsMarkerLocation{},
+		RejectedCount:   rejected,
+		NewestSequence:  newest,
+	}
+	if status != nil {
+		out.AllowlistStatus = status.Status
+		if isHexSHA(status.Ref, diffSecretsAllowlistAdmissionCommit) {
+			out.AllowlistRef = status.Ref
+		}
+	}
+	ruleIdx := map[[3]string]int{}
+	for _, k := range order {
+		x := folded[k]
+		n := len(x.Lines)
+		id, fp := diffsecrets.SafeRuleID(x.RuleID), diffsecrets.SafeFingerprint(x.RuleFingerprint)
+		by := diffsecrets.ByEntry
+		if x.By == diffsecrets.ByMarker {
+			by = diffsecrets.ByMarker
+			out.MarkerSuppressedHitCount += n
+			if len(out.MarkerLocations) == gateViewDiffSecretsMarkerCap {
+				out.MarkerLocationsTruncated = true
+			} else {
+				loc := gateViewDiffSecretsMarkerLocation{
+					Path: gateViewSafeText(x.Path), Lines: x.Lines, Pattern: gateViewSafeText(x.Pattern), RuleID: id,
+				}
+				if strings.HasPrefix(x.CheckKey, diffsecrets.MarkerCheckName+"|") && gateViewSafeText(x.CheckKey) == x.CheckKey {
+					loc.CheckKey = x.CheckKey
+				}
+				out.MarkerLocations = append(out.MarkerLocations, loc)
+			}
+		} else {
+			out.EntrySuppressedHitCount += n
+		}
+		rk := [3]string{by, id, fp}
+		i, ok := ruleIdx[rk]
+		if !ok {
+			i = len(out.ByRule)
+			ruleIdx[rk] = i
+			out.ByRule = append(out.ByRule, gateViewDiffSecretsRule{By: by, RuleID: id, RuleFingerprint: fp})
+		}
+		out.ByRule[i].HitCount += n
+	}
+	out.SuppressedHitCount = out.EntrySuppressedHitCount + out.MarkerSuppressedHitCount
+	sort.SliceStable(out.ByRule, func(i, j int) bool {
+		a, b := out.ByRule[i], out.ByRule[j]
+		if a.By != b.By {
+			return a.By < b.By
+		}
+		if a.RuleID != b.RuleID {
+			return a.RuleID < b.RuleID
+		}
+		return a.RuleFingerprint < b.RuleFingerprint
+	})
+	return out
+}
+
+// gateViewSafeText passes a persisted, scan-derived string (a path, a pattern
+// name, a check key) back through redaction.RedactDefault on READ: defence in
+// depth against a corrupted row, so the block never echoes credential bytes.
+func gateViewSafeText(v string) string {
+	out, hits := redaction.RedactDefault([]byte(v))
+	if len(hits) == 0 {
+		return v
+	}
+	return string(out)
 }
 
 // gateViewHistory holds the sorted, decoded audit joins the concern loop reads.
