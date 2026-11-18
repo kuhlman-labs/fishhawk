@@ -8915,6 +8915,7 @@ func TestCheckpointRefIn(t *testing.T) {
 		{"a/stash", sp("commit+push: x; stashed agent edits pinned at " + cpBase + "-stash (recover with `git stash apply " + cpBase + "-stash`)"), cpRunID, cpStageID, cpBase + "-stash"},
 		{"a/verify", sp("verify failed; verified head 0123456789abcdef0123456789abcdef01234567 pinned at " + cpBase + "-verify"), cpRunID, cpStageID, cpBase + "-verify"},
 		{"a/timeout", sp("agent timeout after 1h0m0s; uncommitted agent work pinned at " + cpBase + "-timeout-1 (commit abc)"), cpRunID, cpStageID, cpBase + "-timeout-1"},
+		{"a/killed", sp("agent loop detected; uncommitted agent work pinned at " + cpBase + "-killed-1 (commit abc)"), cpRunID, cpStageID, cpBase + "-killed-1"},
 		{"a/fixup", sp("commit+push: x; fix-up commit abc never reached the PR branch; its work is pinned at " + fixupRef + " (inspect with `git show abc`)"), cpRunID, cpStageID, fixupRef},
 		// (b) the last of two accepted refs wins.
 		{"b/last_wins", sp("pinned at " + cpBase + "; and pinned at " + cpBase + "-stash"), cpRunID, cpStageID, cpBase + "-stash"},
@@ -9090,8 +9091,8 @@ func TestImplementFailureReasonClauses_WireFixture(t *testing.T) {
 	render := func(s string) string {
 		return strings.ReplaceAll(strings.ReplaceAll(s, "<sha12>", fx.ExampleSHA[:12]), "<sha>", fx.ExampleSHA)
 	}
-	if len(fx.CheckpointClauses) < 5 {
-		t.Fatalf("fixture carries %d checkpoint clauses, want 5", len(fx.CheckpointClauses))
+	if len(fx.CheckpointClauses) < 6 {
+		t.Fatalf("fixture carries %d checkpoint clauses, want 6", len(fx.CheckpointClauses))
 	}
 	for _, c := range fx.CheckpointClauses {
 		if !strings.HasPrefix(c.Ref, checkpointRefNamespace) {
@@ -9225,10 +9226,16 @@ func TestFoldBindingAssertionRecoveryAdvisory(t *testing.T) {
 			baEntry(7, categoryStageOverrideRetried, impl.ID, map[string]any{"reason": "operator override"}),
 		})
 	})
-	t.Run("q2/fixup_reopen_bounds_park", func(t *testing.T) {
+	t.Run("q2/retry_reopen_bounds_park", func(t *testing.T) {
 		noop(t, baParkNA(run.ID), stages, []AuditEntry{
 			baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions),
 			baEntry(8, categoryStageRetried, impl.ID, nil),
+		})
+	})
+	t.Run("q2/fixup_reopen_bounds_park", func(t *testing.T) {
+		noop(t, baParkNA(run.ID), stages, []AuditEntry{
+			baEntry(5, auditCategoryScopeCompletenessParked, impl.ID, baAssertions),
+			baEntry(8, categoryStageFixupTriggered, impl.ID, nil),
 		})
 	})
 	t.Run("other_state_noop", func(t *testing.T) {

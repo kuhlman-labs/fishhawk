@@ -88,11 +88,17 @@ func TestCheckpointRefClauses_MatchWireFixture(t *testing.T) {
 				if got, want := verifyHeadFailureSuffix(fx.ExampleSHA, ref), renderClause(c.ClauseTemplate, fx.ExampleSHA); got != want {
 					t.Errorf("verifyHeadFailureSuffix = %q\nwant fixture %q", got, want)
 				}
-			case "agent_kill_timeout":
+			case "agent_kill_timeout", "agent_kill_killed":
+				// A timeout pins under -timeout-<n>; every other kill kind (here a
+				// loop kill, a non-timeout invoke error) pins under -killed-<n>.
+				invokeErr, failure := agent.ErrTimeout, "agent timeout after 1h0m0s"
+				if c.Kind == "agent_kill_killed" {
+					invokeErr, failure = agent.ErrLoopDetected, "agent loop detected"
+				}
 				repo, _ := agentKillRepo(t)
 				cfg := config{runID: c.RunID, stageID: c.StageID, workingDir: repo}
-				res := agent.Result{OK: false, FailureCategory: "A", FailureReason: "agent timeout after 1h0m0s"}
-				checkpointKilledAgentTree(context.Background(), cfg, "implement", &res, agent.ErrTimeout, io.Discard)
+				res := agent.Result{OK: false, FailureCategory: "A", FailureReason: failure}
+				checkpointKilledAgentTree(context.Background(), cfg, "implement", &res, invokeErr, io.Discard)
 				sha, ok := refTarget(repo, c.Ref)
 				if !ok {
 					t.Fatalf("fixture ref %q was not pinned by checkpointKilledAgentTree (reason %q)", c.Ref, res.FailureReason)
@@ -119,7 +125,7 @@ func TestCheckpointRefClauses_MatchWireFixture(t *testing.T) {
 			}
 		})
 	}
-	for _, k := range []string{"held", "stash", "verify", "agent_kill_timeout", "fixup"} {
+	for _, k := range []string{"held", "stash", "verify", "agent_kill_timeout", "agent_kill_killed", "fixup"} {
 		if !seen[k] {
 			t.Errorf("fixture is missing the %s checkpoint clause", k)
 		}

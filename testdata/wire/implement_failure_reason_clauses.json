@@ -31,6 +31,13 @@
       "clause_template": "; uncommitted agent work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-timeout-1 (commit <sha>)"
     },
     {
+      "kind": "agent_kill_killed",
+      "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+      "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-killed-1",
+      "clause_template": "; uncommitted agent work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-killed-1 (commit <sha>)"
+    },
+    {
       "kind": "fixup",
       "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
       "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",

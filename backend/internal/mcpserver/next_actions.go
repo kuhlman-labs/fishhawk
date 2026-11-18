@@ -4423,10 +4423,11 @@ var checkpointRefPattern = regexp.MustCompile(`^refs/fishhawk/checkpoints/[A-Za-
 
 // checkpointRefSuffixPattern is the set of COMPLETE leaf suffixes the runner
 // appends to refs/fishhawk/checkpoints/<run>/<stage>: none (the held
-// gate-verified pin), -stash, -verify, -timeout-<n> (agent kill) and
-// -fixup-<12 hex> (a stranded fix-up commit). A token cut short by truncation
-// does not match, so it is never returned.
-var checkpointRefSuffixPattern = regexp.MustCompile(`^(-stash|-verify|-timeout-[1-9][0-9]*|-fixup-[0-9a-f]{12})?$`)
+// gate-verified pin), -stash, -verify, -timeout-<n> (an agent timeout kill),
+// -killed-<n> (a loop, budget or cancellation kill) and -fixup-<12 hex> (a
+// stranded fix-up commit). A token cut short by truncation does not match, so
+// it is never returned.
+var checkpointRefSuffixPattern = regexp.MustCompile(`^(-stash|-verify|-timeout-[1-9][0-9]*|-killed-[1-9][0-9]*|-fixup-[0-9a-f]{12})?$`)
 
 // checkpointTruncatedToken / checkpointTruncatedBytesToken are the inner
 // fields of the runner's upload.TruncateReason elision marker
