@@ -3,6 +3,7 @@ package decisionindex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 )
@@ -87,6 +90,8 @@ func TestIndexingRepository_ForwardsEveryOptionalCapability(t *testing.T) {
 			_, ok = dec.(audit.FamilyWindowAppender)
 		case "GroomingWindowAppender":
 			_, ok = dec.(audit.GroomingWindowAppender)
+		case "GuardedChainAppender":
+			_, ok = dec.(audit.GuardedChainAppender)
 		case "RetryBudgetAppender":
 			_, ok = dec.(audit.RetryBudgetAppender)
 		case "UpkeepWindowAppender":
@@ -278,6 +283,77 @@ func TestIndexingRepository_CapabilityPathsIndex(t *testing.T) {
 			t.Fatalf("batch appended %d entries, want 1", len(es))
 		}
 		indexed(t, es[0], ClassGroomingDisposition)
+	})
+
+	// GuardedChainAppender (E80.28 / #5229): the ONLY path a proposal-linked
+	// concern_waived (a human's confirm of an agent's waive proposal) reaches
+	// the chain. Both subtests reach the capability by TYPE ASSERTION, as the
+	// server does, so a dropped forward fails here at run time rather than at
+	// compile time.
+	//
+	// Counterfactual H8 (performed): delete only r.index(ctx, e) from
+	// IndexingRepository.AppendChainedGuarded's BODY. The fixture state that
+	// makes it observable: the appended row is concern_waived (IsDecisionBearing
+	// true) and the resolver is the real pool resolver over a run/stage that
+	// exists, so the ONLY thing between the commit and a decision_index row is
+	// that call — RED with "concern_waived entry N committed but NOT indexed".
+	// Counterfactual H7 (performed): delete the audit.GuardedChainAppender line
+	// from FullRepository AND the AppendChainedGuarded override — RED here on
+	// the type assertion, and in TestIndexingRepository_ForwardsEveryOptionalCapability
+	// with "decorator does not satisfy audit.GuardedChainAppender".
+	t.Run("GuardedChainAppender/admit-indexes", func(t *testing.T) {
+		g, ok := any(d).(audit.GuardedChainAppender)
+		if !ok {
+			t.Fatal("decorator does not forward audit.GuardedChainAppender: every waive-proposal verb would answer 503 and a confirmed waive would never be indexed")
+		}
+		guardRan := false
+		e, err := g.AppendChainedGuarded(ctx, params("concern_waived", map[string]any{
+			"concern_id": uuid.NewString(), "reason": "confirmed agent waive proposal", "severity": "high", "category": "diff_secrets_detected",
+			"proposal_sequence": 7, "proposed_by": "operator-agent/1", "proposed_by_actor_kind": "agent", "proposal_head_sha": "aaaa",
+		}), func(ctx context.Context, read audit.ChainReader) error {
+			guardRan = true
+			_, rerr := read.ListForRunByCategory(ctx, f.runA, "concern_waive_proposed")
+			return rerr
+		})
+		if err != nil {
+			t.Fatalf("AppendChainedGuarded: %v", err)
+		}
+		if !guardRan {
+			t.Fatal("the guard was never evaluated")
+		}
+		indexed(t, e, ClassConcernWaive)
+	})
+
+	t.Run("GuardedChainAppender/refusal-writes-and-indexes-nothing", func(t *testing.T) {
+		g, ok := any(d).(audit.GuardedChainAppender)
+		if !ok {
+			t.Fatal("decorator does not forward audit.GuardedChainAppender")
+		}
+		var before, beforeIdx int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_entries WHERE run_id = $1`, f.runA).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		beforeIdx = countIndexRows(t, f)
+		sentinel := errors.New("guard refused: proposal no longer live")
+		e, err := g.AppendChainedGuarded(ctx, params("concern_waived", map[string]any{
+			"concern_id": uuid.NewString(), "reason": "r", "proposal_sequence": 8,
+		}), func(context.Context, audit.ChainReader) error { return sentinel })
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v, want the guard's sentinel returned unwrapped-reachable", err)
+		}
+		if e != nil {
+			t.Fatalf("a refused guarded append returned an entry %+v", e)
+		}
+		var after int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_entries WHERE run_id = $1`, f.runA).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if after != before {
+			t.Fatalf("audit entries %d -> %d: a refused guarded append wrote a row", before, after)
+		}
+		if n := countIndexRows(t, f); n != beforeIdx {
+			t.Fatalf("decision_index rows %d -> %d: a refused guarded append was indexed", beforeIdx, n)
+		}
 	})
 
 	t.Run("DedupedChainAppender", func(t *testing.T) {

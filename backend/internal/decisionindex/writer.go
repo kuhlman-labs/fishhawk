@@ -28,6 +28,10 @@ const IndexTimeout = 5 * time.Second
 // returns ok=false) and silently stop indexing a decision class. The generic
 // FamilyWindowAppender is a THIRD path to grooming_disposition_recorded
 // (family grooming), so its batch forward indexes exactly as the typed one.
+// GuardedChainAppender (E80.28 / #5229) is the ONLY path a proposal-linked
+// concern_waived (a human's confirm of an agent's waive proposal) reaches the
+// chain, so dropping it would both 503 every waive-proposal verb and lose
+// those concern_waive rows from the index.
 //
 // capabilities_test.go scans package audit's source for every exported
 // *Appender interface and fails when one is not satisfied by the decorator, so
@@ -38,6 +42,7 @@ type FullRepository interface {
 	audit.DedupedChainAppender
 	audit.FamilyWindowAppender
 	audit.GroomingWindowAppender
+	audit.GuardedChainAppender
 	audit.RetryBudgetAppender
 	audit.UpkeepWindowAppender
 }
@@ -72,7 +77,7 @@ var _ FullRepository = (*IndexingRepository)(nil)
 func NewIndexingRepository(inner audit.Repository, store *Store, resolver ContextResolver, logger *slog.Logger) (*IndexingRepository, error) {
 	full, ok := inner.(FullRepository)
 	if !ok {
-		return nil, fmt.Errorf("%w: %T must implement audit.AnchoredChainAppender, audit.DedupedChainAppender, audit.FamilyWindowAppender, audit.GroomingWindowAppender, audit.RetryBudgetAppender and audit.UpkeepWindowAppender", ErrMissingCapability, inner)
+		return nil, fmt.Errorf("%w: %T must implement audit.AnchoredChainAppender, audit.DedupedChainAppender, audit.FamilyWindowAppender, audit.GroomingWindowAppender, audit.GuardedChainAppender, audit.RetryBudgetAppender and audit.UpkeepWindowAppender", ErrMissingCapability, inner)
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -126,6 +131,21 @@ func (r *IndexingRepository) AppendChainedAnchored(ctx context.Context, p audit.
 // indexed when IT was appended) and is returned as-is.
 func (r *IndexingRepository) AppendChainedDeduped(ctx context.Context, p audit.ChainAppendParams, spec audit.DedupeSpec) (*audit.Entry, error) {
 	e, err := r.FullRepository.AppendChainedDeduped(ctx, p, spec)
+	if err == nil {
+		r.index(ctx, e)
+	}
+	return e, err
+}
+
+// AppendChainedGuarded forwards the GuardedChainAppender capability — the
+// ONLY path a proposal-linked concern_waived (E80.28 / #5229, ADR-143 A1)
+// reaches the chain — then indexes the entry. The lock-scoped guarantee is the
+// inner repository's: the decorator adds no transaction and indexes only after
+// the inner append committed. A guard refusal wrote nothing, so it is returned
+// UNWRAPPED and unindexed, and the caller's errors.As on its typed refusal
+// keeps working.
+func (r *IndexingRepository) AppendChainedGuarded(ctx context.Context, p audit.ChainAppendParams, guard audit.AppendGuard) (*audit.Entry, error) {
+	e, err := r.FullRepository.AppendChainedGuarded(ctx, p, guard)
 	if err == nil {
 		r.index(ctx, e)
 	}
