@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,11 +17,13 @@ import (
 	"time"
 )
 
-// Host-environment rungs (E83.55 / #4088). Five advisories about the HOST the
-// local loop runs on, each a cause of a red verify that has nothing to do with
-// the diff: an iCloud-synced checkout, a golangci-lint that differs from the CI
-// pin, a Go toolchain that differs from the go.work pin, an overloaded host,
-// and busy shells orphaned to pid 1. Every rung here is WARN-ONLY — none
+// Host-environment rungs (E83.55 / #4088). Six advisories about the HOST the
+// local loop runs on. Five are causes of a red verify that has nothing to do
+// with the diff: an iCloud-synced checkout, a golangci-lint that differs from
+// the CI pin, a Go toolchain that differs from the go.work pin, an overloaded
+// host, and busy shells orphaned to pid 1. The sixth, local CA trust (#5227),
+// is the cause of an MCP client that fails TLS against an https loopback
+// backend while already authenticated. Every rung here is WARN-ONLY — none
 // returns status "fail" — because each is a dev-host heuristic, not a
 // precondition the loop cannot run without. A rung that does not apply returns
 // ok with a detail beginning "skipped — " (the checkBackendSHADrift
@@ -754,4 +758,92 @@ func checkOrphanedShells() checkResult {
 		remediate: "a shell re-parented to pid 1 sits outside every run's process tree, so the runner's stage-exit sweep cannot reach it " +
 			"and it starves later verifies — confirm no live run owns it (`pgrep -fl 'fishhawk-runner --run-id'`) then `kill " +
 			strings.Join(pids, " ") + "`"}
+}
+
+// ---------------------------------------------------------------------------
+// local CA trust (#5227)
+// ---------------------------------------------------------------------------
+
+// doctorCAEnv is the variable the Node / Claude Code runtime reads for extra
+// CA certificates (docs/local-tls.md § Client trust).
+const doctorCAEnv = "NODE_EXTRA_CA_CERTS"
+
+// localCATrustRemediation is the shared hint for the `local CA trust` rung and
+// the `MCP registered` rung's https-loopback downgrade. It names the symptom
+// an operator actually sees, because that message reads like an auth fault
+// and is not one.
+const localCATrustRemediation = "a claude session that fails MCP calls with `unable to verify the first certificate` " +
+	"while already authenticated is missing the local CA, not a credential: the stored Fishhawk token is shared " +
+	"across repositories on one host, but each project's MCP registration and launch environment are separate; " +
+	"export " + doctorCAEnv + "=<fishhawk checkout>/.fishhawk/cache/tls/ca.pem before launching claude " +
+	"(see docs/local-tls.md § Second repository on the same host)"
+
+// localCATrustResult is the verdict of localCATrust.
+type localCATrustResult struct {
+	// applies is true only for an https URL on a loopback host: the local
+	// TLS front end's self-signed CA (docs/local-tls.md). Plain http needs
+	// no CA, and a non-loopback https host is assumed publicly trusted.
+	applies bool
+	// usable is true when NODE_EXTRA_CA_CERTS names an existing regular
+	// file. Meaningful only when applies.
+	usable bool
+	// detail is the human detail for the rung.
+	detail string
+}
+
+// localCATrust decides whether a client reaching rawURL from this
+// environment needs the local dev CA, and whether NODE_EXTRA_CA_CERTS
+// supplies a usable one. It reads only doctor's OWN environment, which can
+// differ from the environment claude is launched with, so callers treat a
+// miss as a warn-only heuristic. The CA path is a filesystem location, not
+// a secret, so it is safe to print.
+func localCATrust(rawURL string) localCATrustResult {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" {
+		return localCATrustResult{detail: "skipped — not an https URL (no TLS to trust)"}
+	}
+	host := u.Hostname()
+	if !isLoopbackHost(host) {
+		return localCATrustResult{detail: "skipped — https host " + host + " is not loopback (a publicly-trusted certificate needs no local CA)"}
+	}
+	path := os.Getenv(doctorCAEnv)
+	if path == "" {
+		return localCATrustResult{applies: true,
+			detail: doctorCAEnv + " is unset for https loopback " + u.Host}
+	}
+	fi, statErr := os.Stat(path)
+	switch {
+	case statErr != nil:
+		return localCATrustResult{applies: true,
+			detail: doctorCAEnv + "=" + path + " does not exist or cannot be read"}
+	case !fi.Mode().IsRegular():
+		return localCATrustResult{applies: true,
+			detail: doctorCAEnv + "=" + path + " is not a regular file"}
+	}
+	return localCATrustResult{applies: true, usable: true, detail: doctorCAEnv + "=" + path}
+}
+
+// isLoopbackHost reports whether host is `localhost` or a loopback IP
+// literal (127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// checkLocalCATrust warns when --backend-url is https on a loopback host and
+// NODE_EXTRA_CA_CERTS is unset or names no file. Plain http and a non-loopback
+// https backend are skipped with ok. Warn-only, like every rung in this file.
+func checkLocalCATrust(backendURL string) checkResult {
+	label := "local CA trust"
+	ca := localCATrust(backendURL)
+	if !ca.applies {
+		return checkResult{label: label, detail: ca.detail, status: "ok"}
+	}
+	if !ca.usable {
+		return checkResult{label: label, detail: ca.detail, status: "warn", remediate: localCATrustRemediation}
+	}
+	return checkResult{label: label, detail: ca.detail, status: "ok"}
 }

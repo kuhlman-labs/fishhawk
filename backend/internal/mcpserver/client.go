@@ -2059,6 +2059,12 @@ type OnboardingScopes struct {
 	Required []string `json:"required" jsonschema:"the run-driving scope subset the check requires"`
 	Missing  []string `json:"missing" jsonschema:"the required scopes the caller lacks; empty when adequate"`
 	Note     string   `json:"note,omitempty" jsonschema:"context, e.g. a cookie-session caller bypasses scope enforcement"`
+	// Subject and CredentialKind (#5227) name WHO the presented credential
+	// acts as and what kind it is. Neither is a credential value. An older
+	// fishhawkd serves neither key; both then decode empty and stay absent on
+	// re-emission (omitempty), never rendered as an empty subject.
+	Subject        string `json:"subject,omitempty" jsonschema:"the identity subject the presented credential resolves to on fishhawkd (e.g. github:alice); this is who approvals and other writes are recorded as. Absent against an older fishhawkd"`
+	CredentialKind string `json:"credential_kind,omitempty" jsonschema:"the kind of the presented credential: session, static, oauth, oauth_as, mcp_run, unrecorded or unknown. A static token cannot satisfy an approvals.members leg; oauth, oauth_as and session are forge-verified. Absent against an older fishhawkd"`
 }
 
 // OnboardingReadiness fetches a repo's first-run readiness report via
@@ -2245,11 +2251,21 @@ type approvalRequest struct {
 // stands, the stage state is unchanged, and the backend ran NO gates
 // and emitted NO audit entries; PriorDecision/PriorSubmittedAt carry
 // the EXISTING approval row's provenance.
+//
+// ApproverSubject, CredentialKind and OnBehalfOf (#5227) are the
+// acting-identity echo: the RECORDED row's subject (the approval_submitted
+// actor_subject; operator-agent/delegated on a delegated approve), the request
+// credential's kind, and the caller's real subject when a delegated approve
+// was remapped. On a duplicate the backend sets only ApproverSubject (the
+// prior row's). An older fishhawkd serves none of them, so they decode empty.
 type approvalResult struct {
 	Stage
 	DuplicateSubmission bool   `json:"duplicate_submission"`
 	PriorDecision       string `json:"prior_decision"`
 	PriorSubmittedAt    string `json:"prior_submitted_at"`
+	ApproverSubject     string `json:"approver_subject"`
+	CredentialKind      string `json:"credential_kind"`
+	OnBehalfOf          string `json:"on_behalf_of"`
 }
 
 // SubmitApproval posts an approve or reject decision against the

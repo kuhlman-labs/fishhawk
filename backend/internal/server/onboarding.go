@@ -519,11 +519,21 @@ type reviewerReadiness struct {
 // subset. Missing lists the required scopes the caller lacks (empty when
 // adequate). Cookie-session callers bypass scope enforcement and are adequate
 // by construction, recorded in Note.
+//
+// Subject and CredentialKind name WHO the presented credential acts as and
+// what kind of credential it is (#5227): Subject is the resolved identity
+// subject the auth middleware set, and CredentialKind is the same
+// identity.CredentialKind classification the approvals.members leg uses
+// (session, static, oauth, oauth_as, mcp_run, unrecorded or unknown). Neither
+// is a credential value: no token id, prefix or plaintext ever reaches this
+// struct. Both are omitted when empty (an anonymous caller has no subject).
 type scopeReadiness struct {
-	Adequate bool     `json:"adequate"`
-	Required []string `json:"required"`
-	Missing  []string `json:"missing"`
-	Note     string   `json:"note,omitempty"`
+	Adequate       bool     `json:"adequate"`
+	Required       []string `json:"required"`
+	Missing        []string `json:"missing"`
+	Note           string   `json:"note,omitempty"`
+	Subject        string   `json:"subject,omitempty"`
+	CredentialKind string   `json:"credential_kind,omitempty"`
 }
 
 // mergeGateReadiness reports whether the `fishhawk_audit_complete` Check Run
@@ -1492,9 +1502,17 @@ func appendUnpricedNote(hint string) string {
 // probeScopes runs readiness check (4): caller-token scope adequacy against
 // the run-driving subset. Cookie-session callers (TokenID == "") authenticate
 // via OAuth, carry no explicit scope list, and bypass scope enforcement
-// (requireWriteScope), so they are adequate by construction.
+// (requireWriteScope), so they are adequate by construction. Every posture,
+// the cookie-session early return included, names the acting subject and
+// credential kind (#5227) so a caller can see which identity its credential
+// resolves to without the response carrying any credential material.
 func probeScopes(ident Identity) scopeReadiness {
-	out := scopeReadiness{Required: requiredRunScopes, Missing: []string{}}
+	out := scopeReadiness{
+		Required:       requiredRunScopes,
+		Missing:        []string{},
+		Subject:        ident.Subject,
+		CredentialKind: approvalCredentialKind(ident),
+	}
 	if ident.TokenID == "" {
 		out.Adequate = true
 		out.Note = "cookie-session caller: scope enforcement is bypassed for OAuth sessions"

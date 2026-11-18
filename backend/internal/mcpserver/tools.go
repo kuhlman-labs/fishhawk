@@ -111,6 +111,25 @@ type runResolver struct {
 	// cadence. Zero falls back to defaultSpecialistJobPollInterval; tests
 	// inject a sub-millisecond value.
 	specialistJobPollInterval time.Duration
+
+	// credentialSource names where this registry's bearer came from (#5227):
+	// Config.CredentialSource, threaded in NewServer. Never a credential value.
+	credentialSource string
+
+	// storedLoginPresent is Config.StoredLoginPresent: the lazy, presence-only
+	// stored-login probe the doctor credential rung calls to detect an env
+	// token shadowing a stored login (#5227). Nil means not checked.
+	storedLoginPresent func() (bool, error)
+
+	// localHostRungs is Config.LocalHostRungs: true only in the operator's own
+	// stdio fishhawk-mcp process, where the doctor's credential and
+	// model_credential rungs may read this host (#5227).
+	localHostRungs bool
+
+	// runBoundToken is true when this registry's bearer is a run-bound
+	// in-runner agent token (fhm_). Computed once in NewServer from the prefix
+	// alone; the host-local doctor rungs report not_applicable for it (#5227).
+	runBoundToken bool
 }
 
 // resolveWorkingDir is the single shared working_dir resolver every
@@ -4758,6 +4777,14 @@ type ApprovePlanOutput struct {
 	// same subject already submitted a decision for this stage.
 	DuplicateSubmission bool   `json:"duplicate_submission,omitempty" jsonschema:"true when this submission was a no-op duplicate: the same subject already decided this stage, the prior decision stands, the stage state is unchanged, and NO gates re-ran and NO audit entries were emitted"`
 	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
+	// Acting-identity echo (#5227). acting_subject, credential_kind and
+	// on_behalf_of are SERVED by fishhawkd (the recorded approval row);
+	// credential_source is this MCP server's own local fact. None is a
+	// credential value.
+	ActingSubject    string `json:"acting_subject,omitempty" jsonschema:"the subject the approval was RECORDED as (equal to the approval_submitted audit actor_subject; operator-agent/delegated on a delegated approve). On a duplicate, the prior row's subject. Absent against an older fishhawkd"`
+	CredentialKind   string `json:"credential_kind,omitempty" jsonschema:"the kind of the credential that recorded the approval: session, static, oauth, oauth_as, mcp_run, unrecorded or unknown. Absent on a duplicate (the prior row does not record it) and against an older fishhawkd"`
+	OnBehalfOf       string `json:"on_behalf_of,omitempty" jsonschema:"on a delegated approve, the caller's real subject the delegated row was recorded on behalf of. Absent otherwise"`
+	CredentialSource string `json:"credential_source,omitempty" jsonschema:"computed LOCALLY by this MCP server: where its bearer came from (env:FISHHAWK_API_TOKEN, stored_login, stored_login_refreshed, mcp_route_request_bearer). fishhawk_doctor's credential rung reports the same source"`
 }
 
 // RejectPlanInput mirrors `fishhawk plan reject <run-id> [--reason
@@ -4895,7 +4922,28 @@ Common error shapes (surfaced as tool errors):
   - "plan stage not awaiting approval" — the stage is already
     terminal or in a non-approvable state
   - role-based 403 from the backend when the caller's subject
-    isn't in the gate's approver list
+    isn't in the gate's approver list (passed through led by the
+    backend's own code and message, as is every other 403 not named
+    below)
+  - 403 insufficient_scope — the error names the cause: the acting
+    credential lacks write:approvals (a run-bound mcp:run / fhm_ token
+    never carries it)
+  - 403 approver_predicate_unmet with reason
+    credential_not_forge_verified — the error names the cause: a static
+    API token where the gate needs a forge-verified credential
+    (approve with a ` + "`fishhawk token login`" + ` login, an OAuth /mcp
+    login, or the Web UI)
+  Both named causes also carry this server's credential_source and
+  point to fishhawk_doctor for the subject.
+
+Acting identity (#5227): the output echoes acting_subject (the subject
+the approval was RECORDED as, equal to the approval_submitted audit
+actor_subject; operator-agent/delegated on a delegated approve),
+credential_kind (static, oauth, oauth_as, session, ...), on_behalf_of
+(the real caller on a delegated approve) and credential_source (where
+this server's bearer came from, a local fact). On a duplicate only
+acting_subject is echoed, from the prior row. None is a credential
+value.
 
 Duplicate labeling (#986, NOT an error — a 200): when the same
 subject already submitted a decision for this stage, the call is a
@@ -5155,7 +5203,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 				"agent_review_pending: %s. Poll fishhawk_get_plan or fishhawk_await_review until the plan review reaches a terminal state (complete/skipped/failed), then retry fishhawk_approve_plan",
 				countPhrase)
 		}
-		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
+		return nil, ApprovePlanOutput{}, approveForbiddenError(err, r.credentialSource)
 	}
 	// LAYER 1 (#2512): warn — never refuse — when the reason carries
 	// plan-artifact vocabulary. Computed AFTER the submission on purpose: the
@@ -5167,7 +5215,43 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 		StageID:             updated.ID,
 		DuplicateSubmission: updated.DuplicateSubmission,
 		PriorDecision:       updated.PriorDecision,
+		ActingSubject:       updated.ApproverSubject,
+		CredentialKind:      updated.CredentialKind,
+		OnBehalfOf:          updated.OnBehalfOf,
+		CredentialSource:    r.credentialSource,
 	}, nil
+}
+
+// approveForbiddenError wraps a SubmitApproval failure for
+// fishhawk_approve_plan (#5227). It names a cause for exactly two backend
+// 403 codes and passes every other error through as before:
+//
+//   - insufficient_scope: the acting credential lacks write:approvals.
+//   - approver_predicate_unmet with details.reason credential_not_forge_verified:
+//     a static API token was presented where the gate needs a forge-verified
+//     credential.
+//
+// Every other 403 (a principal not on approvals.members, the forge permission
+// predicate, delegation_*) is NOT relabelled: it stays led by the backend's
+// own code and message. The wrap never reads or prints the bearer; it names
+// only this server's credential source.
+func approveForbiddenError(err error, credentialSource string) error {
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusForbidden {
+		return fmt.Errorf("submit approval: %w", err)
+	}
+	source := credentialSource
+	if source == "" {
+		source = "unrecorded"
+	}
+	tail := " This server's credential source is " + source + "; fishhawk_doctor reports the subject it acts as (report.scopes.subject) and its credential_kind."
+	switch {
+	case ae.Code == "insufficient_scope":
+		return fmt.Errorf("submit approval: %w. Cause: the acting credential lacks the write:approvals scope (a run-bound mcp:run / fhm_ token never carries it). Re-mint an operator credential with `fishhawk token login`, or have a human issue one with `fishhawkd token issue ... --scopes ...,write:approvals`.%s", err, tail)
+	case ae.Code == "approver_predicate_unmet" && ae.Details["reason"] == "credential_not_forge_verified":
+		return fmt.Errorf("submit approval: %w. Cause: a static API token was presented where this gate's approvals.members leg needs a forge-verified credential. Approve with a `fishhawk token login` device-flow login, an OAuth /mcp login, or the Web UI.%s", err, tail)
+	}
+	return fmt.Errorf("submit approval: %w", err)
 }
 
 // rejectPlan is the tool handler.

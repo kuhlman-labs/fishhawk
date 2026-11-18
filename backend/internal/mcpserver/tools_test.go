@@ -19946,3 +19946,170 @@ func TestGetPlan_ScopeOverlap_HoldText(t *testing.T) {
 		}
 	})
 }
+
+// --- fishhawk_approve_plan acting identity (#5227) ---
+
+// TestApprovePlan_EchoesActingSubject_E2E drives fishhawk_approve_plan
+// through a REAL NewServer against a REAL server.New (Postgres-backed) with
+// a static operator token. It crosses handler -> wire JSON -> client decode
+// -> tool output: acting_subject must equal both the token subject and the
+// approval_submitted audit actor_subject, credential_kind is static,
+// credential_source is the Config value, and no token bytes reach the output.
+func TestApprovePlan_EchoesActingSubject_E2E(t *testing.T) {
+	const subject = "github:alice-fixture"
+	h := newAdE2EHarness(t, adE2EPlanSpecYAML)
+	h.spawner.emulate["implement"] = h.emulateImplementRunning
+	runID, _ := h.driveToPlanGate()
+	bearer := h.mint(subject, []string{"read:runs", "read:audit", "write:approvals"})
+	withFakeGhMissing(t)
+
+	res := callToolViaNewServer(t, Config{BackendURL: h.ts.URL, APIToken: bearer, CredentialSource: credentialSourceEnv},
+		"fishhawk_approve_plan", map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("fishhawk_approve_plan errored: %s", toolResultText(t, res))
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	var out ApprovePlanOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode ApprovePlanOutput: %v", err)
+	}
+	if out.ActingSubject != subject {
+		t.Errorf("acting_subject = %q, want %q", out.ActingSubject, subject)
+	}
+	entries, err := h.audit.ListForRun(h.ctx, runID)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	var actor string
+	for _, e := range entries {
+		if e.Category == "approval_submitted" && e.ActorSubject != nil {
+			actor = *e.ActorSubject
+		}
+	}
+	if actor == "" || out.ActingSubject != actor {
+		t.Errorf("acting_subject = %q, audit approval_submitted actor_subject = %q; want them equal", out.ActingSubject, actor)
+	}
+	if out.CredentialKind != "static" {
+		t.Errorf("credential_kind = %q, want static", out.CredentialKind)
+	}
+	if out.CredentialSource != credentialSourceEnv {
+		t.Errorf("credential_source = %q, want the Config value %q", out.CredentialSource, credentialSourceEnv)
+	}
+	if out.OnBehalfOf != "" {
+		t.Errorf("on_behalf_of = %q on a non-delegated approve, want absent", out.OnBehalfOf)
+	}
+	if strings.Contains(string(raw), bearer) || strings.Contains(toolResultText(t, res), bearer) {
+		t.Errorf("approve output carries the token plaintext:\n%s", raw)
+	}
+}
+
+// TestApprovePlan_EchoesDelegatedAndDuplicateFields pins the client mirror
+// for the fields the E2E cannot reach on a static token: on_behalf_of on a
+// delegated row, and a duplicate echoing only the prior row's subject.
+func TestApprovePlan_EchoesDelegatedAndDuplicateFields(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGhMissing(t)
+	fb.approvalsRespBody = fmt.Sprintf(`{"id":%q,"run_id":%q,"type":"plan","state":"succeeded","approver_subject":"operator-agent/delegated","credential_kind":"static","on_behalf_of":"github:op-real"}`, stageID, runID)
+	res := callToolViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "fhk_x", CredentialSource: credentialSourceStoredLogin},
+		"fishhawk_approve_plan", map[string]any{"run_id": runID.String()})
+	raw, _ := json.Marshal(res.StructuredContent)
+	var out ApprovePlanOutput
+	_ = json.Unmarshal(raw, &out)
+	if out.ActingSubject != "operator-agent/delegated" || out.OnBehalfOf != "github:op-real" || out.CredentialKind != "static" || out.CredentialSource != credentialSourceStoredLogin {
+		t.Errorf("delegated echo = %+v, want acting_subject operator-agent/delegated, on_behalf_of github:op-real, static, stored_login", out)
+	}
+
+	fb.approvalsRespBody = fmt.Sprintf(`{"id":%q,"run_id":%q,"type":"plan","state":"succeeded","duplicate_submission":true,"prior_decision":"approve","approver_subject":"github:prior"}`, stageID, runID)
+	res = callToolViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "fhk_x"}, "fishhawk_approve_plan", map[string]any{"run_id": runID.String()})
+	raw, _ = json.Marshal(res.StructuredContent)
+	if !strings.Contains(string(raw), `"acting_subject":"github:prior"`) {
+		t.Errorf("duplicate output lacks the prior row's acting_subject:\n%s", raw)
+	}
+	for _, k := range []string{"credential_kind", "on_behalf_of", "credential_source"} {
+		if strings.Contains(string(raw), `"`+k+`"`) {
+			t.Errorf("duplicate output carries %s, want it absent (omitempty):\n%s", k, raw)
+		}
+	}
+}
+
+// TestApprovePlan_Forbidden_NamesBothCauses pins condition S2. The two named
+// 403 causes are wrapped with a cause and the credential source; every other
+// 403 passes through led by the backend's own code and message. No wrapped
+// result carries token bytes.
+func TestApprovePlan_Forbidden_NamesBothCauses(t *testing.T) {
+	t.Run("insufficient_scope_real_server", func(t *testing.T) {
+		h := newAdE2EHarness(t, adE2EPlanSpecYAML)
+		runID, _ := h.driveToPlanGate()
+		bearer := h.mint("github:alice-fixture", []string{"read:runs"})
+		withFakeGhMissing(t)
+		res := callToolViaNewServer(t, Config{BackendURL: h.ts.URL, APIToken: bearer, CredentialSource: credentialSourceEnv},
+			"fishhawk_approve_plan", map[string]any{"run_id": runID.String()})
+		msg := toolResultText(t, res)
+		if !res.IsError {
+			t.Fatalf("approve with a token lacking write:approvals succeeded: %s", msg)
+		}
+		for _, want := range []string{"insufficient_scope", "Cause:", "lacks the write:approvals scope", "fishhawk token login", credentialSourceEnv, "fishhawk_doctor"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error lacks %q:\n%s", want, msg)
+			}
+		}
+		if strings.Contains(msg, bearer) {
+			t.Errorf("error carries the token plaintext:\n%s", msg)
+		}
+	})
+
+	const sentinel = "fhk_SENTINEL_APPROVE_TOKEN_5227"
+	forbidden := func(t *testing.T, body string) string {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedPlanStage(fb, runID)
+		withFakeGhMissing(t)
+		fb.approvalsStatus = http.StatusForbidden
+		fb.approvalsErrBody = body
+		res := callToolViaNewServer(t, Config{BackendURL: srv.URL, APIToken: sentinel, CredentialSource: credentialSourceStoredLogin},
+			"fishhawk_approve_plan", map[string]any{"run_id": runID.String()})
+		if !res.IsError {
+			t.Fatal("expected a tool error on a 403")
+		}
+		msg := toolResultText(t, res)
+		if strings.Contains(msg, sentinel) {
+			t.Errorf("error carries the token plaintext:\n%s", msg)
+		}
+		return msg
+	}
+
+	t.Run("credential_not_forge_verified", func(t *testing.T) {
+		msg := forbidden(t, `{"error":{"code":"approver_predicate_unmet","message":"the approver is on the gate's approvals.members allow-list, but the credential that authenticated this request is not forge-verified","details":{"reason":"credential_not_forge_verified","credential_kind":"static"}}}`)
+		for _, want := range []string{"approver_predicate_unmet", "Cause:", "static API token", "forge-verified", "fishhawk token login", "Web UI", credentialSourceStoredLogin} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error lacks %q:\n%s", want, msg)
+			}
+		}
+	})
+
+	// Negative arms: these 403s are NOT relabelled.
+	for name, body := range map[string]string{
+		"members_not_listed":        `{"error":{"code":"approver_predicate_unmet","message":"the approver is not on the gate's approvals.members allow-list","details":{"predicate":"members","result":"rejected"}}}`,
+		"delegation_not_configured": `{"error":{"code":"delegation_not_configured","message":"the effective operator_agent block does not delegate this action (fail-closed)"}}`,
+	} {
+		t.Run(name+"_unchanged", func(t *testing.T) {
+			msg := forbidden(t, body)
+			var env struct {
+				Error struct{ Code, Message string } `json:"error"`
+			}
+			_ = json.Unmarshal([]byte(body), &env)
+			lead := "submit approval: fishhawk: HTTP 403 (" + env.Error.Code + "): " + env.Error.Message
+			if !strings.HasPrefix(msg, lead) {
+				t.Errorf("error = %q, want it led by the backend's own code and message %q", msg, lead)
+			}
+			for _, banned := range []string{"Cause:", "write:approvals", "forge-verified credential", "credential source"} {
+				if strings.Contains(msg, banned) {
+					t.Errorf("unrelated 403 was relabelled (contains %q):\n%s", banned, msg)
+				}
+			}
+		})
+	}
+}

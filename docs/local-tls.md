@@ -119,6 +119,10 @@ Per-path behavior (observed on Claude Code 2.1.222 — check whether
   `SDK auth failed: unable to verify the first certificate`; falls back to the
   global `Bun.fetch` with no CA override.
 
+The same message seen while you are **already authenticated** is a different
+fault, usually a second repository: see
+[Second repository on the same host](#second-repository-on-the-same-host).
+
 **One-time bootstrap** for first-time OAuth against the local dev CA:
 
 ```sh
@@ -140,6 +144,45 @@ at the front proxy — so swapping the self-signed leaf for a publicly-trusted
 certificate removes this problem entirely, with no code change on our side.
 See the next section for the recipe, and #2301 above for the deployed-posture
 answer.
+
+### Second repository on the same host
+
+**Symptom.** Fishhawk works from one repository. In a second repository on the
+same host, MCP calls fail with `unable to verify the first certificate`, yet
+`fishhawk token login` is done, the token is valid, and no OAuth prompt
+appears. This is **a missing CA, not an auth fault**: re-authenticating does
+not fix it.
+
+**Why the token works while TLS fails.** Authentication is per host and trust
+is per launch. The stored Fishhawk credential is keyed by backend URL, so
+every repository on the host shares it. `NODE_EXTRA_CA_CERTS`, by contrast, is
+read from the environment `claude` is launched with, and each project has its
+own MCP registration and launch environment. A shell, IDE terminal or launcher
+that exported the CA for the first repository does not carry it to the
+second, so the second session presents a valid token over a TLS connection it
+cannot verify.
+
+**Remedy.** Before launching `claude` in the second repository, export the CA
+from the Fishhawk checkout that runs the TLS front end (not from the second
+repository — it has no `.fishhawk/cache/tls/`):
+
+```sh
+export NODE_EXTRA_CA_CERTS=<fishhawk checkout>/.fishhawk/cache/tls/ca.pem
+claude
+```
+
+To make it stick, set it wherever that project's sessions are launched (the
+shell profile, or the IDE's terminal environment). This is the same CA every
+repository uses; nothing per-repository is generated.
+
+**What flags it.** `fishhawk doctor` run in the second repository reports
+both: the host-environment **local CA trust** rung warns when an https
+loopback `--backend-url` has no usable `NODE_EXTRA_CA_CERTS` (unset, or not
+an existing regular file), and the **MCP registered** rung downgrades to warn
+when the matched HTTP registration is https on a loopback host with the same
+gap. Both read doctor's *own* environment, which can differ from the one
+`claude` is launched with, so they are warn-only heuristics. Contract:
+`cli/README.md` § "Host-environment rungs".
 
 ### Publicly-trusted certificate via a tunnel
 

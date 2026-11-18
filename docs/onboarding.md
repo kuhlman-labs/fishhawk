@@ -20,7 +20,7 @@ Beyond the local-loop rungs (Docker stack, backend reachability, token
 acceptance, spec presence, runner binary, MCP registration, git remote/tree,
 `gh` auth, version/schema drift) and the host-environment rungs (iCloud
 checkout location, golangci-lint and Go toolchain pins, host load, orphaned
-shells), `doctor` runs the **onboarding preflight**:
+shells, local CA trust), `doctor` runs the **onboarding preflight**:
 the per-repo prerequisites that make a repo *look* onboarded but wedge on the
 first run.
 
@@ -36,12 +36,16 @@ below name which context they apply to:
 - **token valid** accepts any credential class the backend accepts (`fhk_`
   operator, `fhm_` machine, `fho_` OAuth) — the backend, not a prefix table,
   decides validity — and *warns* rather than fails when no CLI credential is
-  configured, because an MCP/OAuth-driven loop needs none.
+  configured, because an MCP/OAuth-driven loop needs none. It names the
+  subject the credential acts as and its credential kind, as the readiness
+  endpoint reports them (#5227).
 - **runner binary found** and **backend SHA drift** are dev-loop rungs: an
   external repo has no runner binary beside it and no commit that fishhawkd was
   built from, so they *warn* / *skip* rather than fail there.
 - **MCP registered** matches an HTTP-transport registration (the primary
-  external-repo path) as well as the stdio shim.
+  external-repo path) as well as the stdio shim. An https loopback
+  registration with no usable `NODE_EXTRA_CA_CERTS` warns (the local dev TLS
+  front end only; see [local TLS](local-tls.md)).
 
 The overriding invariant: a repo whose **GitHub App is not installed still
 FAILS** (non-zero exit). Every relaxation below is scoped by a positive
@@ -65,7 +69,8 @@ admit or reject it. Branches:
 - **no credential** in any tier → **warn** (`fishhawk token login`, or
   `--token` / `$FISHHAWK_TOKEN`; an MCP/OAuth loop needs none) — never a fail.
 - credential the backend **accepts** (200 on `/v0/runs`) → **ok**, naming the
-  class and source.
+  source, the class, and the acting subject and credential kind, e.g.
+  `accepted — operator token (fhk_) via $FISHHAWK_TOKEN; acts as github:alice (static)`.
 - credential the backend **rejects** (401/403/other) AND the readiness endpoint
   did NOT answer an authoritative 200 → **fail**.
 - credential rejected on `/v0/runs` BUT the readiness endpoint answered an
@@ -73,6 +78,28 @@ admit or reject it. Branches:
   OAuth/cookie identity carries no explicit scope list and can legitimately 403
   on `/v0/runs` while being adequate per readiness. **token scope adequate**
   (server-side, below) remains the authority on scope.
+
+**Source, subject and credential kind (#5227).** The source is `--token` when
+the flag was set on the command line (even with the same value as the
+environment), `$FISHHAWK_TOKEN` when the value came only from the environment,
+or the stored login (`stored credential (fishhawk token login)`, or
+`stored credential (refreshed at <token endpoint>)` after a refresh). The subject and credential kind come from the readiness
+response's `scopes.subject` / `scopes.credential_kind` — the server's own view
+of who the credential acts as and whether it is a `session`, `static`, `oauth`
+(device flow), `oauth_as`, `mcp_run`, `unrecorded` or `unknown` credential.
+Neither is a credential value. The subject is therefore known only when
+readiness answers (a resolvable `--repo` or git origin); otherwise the detail
+says `subject unknown: readiness did not answer (pass --repo)`; when readiness
+answered without a subject (an anonymous caller, or a fishhawkd that predates
+the fields) it says readiness reported no subject.
+The **token scope adequate** verdict is about that same subject.
+
+**`$FISHHAWK_API_TOKEN` shadow hint.** The CLI never reads `$FISHHAWK_API_TOKEN`,
+but `fishhawk-mcp` reads it FIRST and then never consults the stored login. When
+it is set in doctor's environment, the token rung adds a hint on every branch:
+a `fishhawk-mcp` launched from this shell acts as that token, not as the stored
+login, and `fishhawk_doctor`'s `credential` rung reports which credential the
+MCP server uses. The hint reads presence only; no rung prints any token.
 
 A successful readiness probe therefore **outranks** the local token rung — but
 "successful" means HTTP 200 **and** a body that decoded into a readiness
@@ -101,6 +128,15 @@ to **warn** ("cannot determine") — never a fail and never a false ok — becau
 the operator may drive from another MCP client entirely. A `claude mcp get`
 fallback (probing BOTH the stdio and HTTP names) covers the corner where
 `list` errors but `get` succeeds.
+
+A `list` match on an HTTP or SSE registration whose URL is https on a loopback
+host (`localhost`, `127.0.0.0/8`, `::1`) is also checked for client trust: when
+`NODE_EXTRA_CA_CERTS` is unset or names no regular file, the rung downgrades
+to **warn** with the same hint as the host-environment **local CA trust** rung.
+The registration exists, but a `claude` launched from this environment fails
+its MCP calls with `unable to verify the first certificate` — a missing CA,
+not an auth fault. See [local TLS](local-tls.md) § "Second repository on the
+same host". A `get`-fallback match has no parseable URL and is not CA-checked.
 
 ### Runner binary rung
 
@@ -257,7 +293,7 @@ exists on GitLab:
 | **app installed** | the Fishhawk GitHub App is not installed on the target repo | install the App: `https://github.com/apps/fishhawk/installations/new` |
 | **reviewer available: `<provider>`** (one per spec-declared reviewer) | the reviewer's backend is not wired on this deployment, OR the resolved model was authoritatively rejected against the deployment's model snapshot (#3578) | the adapter's missing-env hint (e.g. set `FISHHAWKD_ANTHROPIC_API_KEY`), or — for a rejected model — the did-you-mean naming a served model |
 | **reviewer available: `<provider>`** (warn) | the resolved model is `unverifiable` (no live snapshot to check against) or `unpriced` (its family is unknown to the pricing table, so usage books at $0) (#3578) | the `model_hint` sentence; the detail is marked `(unverified)` / `(unpriced)`. A legacy backend serving neither field renders `ok` |
-| **token scope adequate** | the caller token lacks a run-driving scope | reissue with the named missing scope(s) via `fishhawkd token issue --subject <login> --scopes …` |
+| **token scope adequate** | the caller token lacks a run-driving scope. The verdict is for the subject and credential kind the **token valid** rung names (`scopes.subject` / `scopes.credential_kind`, #5227) | reissue with the named missing scope(s) via `fishhawkd token issue --subject <login> --scopes …` |
 | **workflow spec (committed) valid** | the spec on the repo's default branch fails to parse/validate (`source==fetched && !valid`); **warns** when the spec is unavailable (App not installed / no spec on the default branch) | run `fishhawk validate` for details |
 | **work-item provider registered** (#3646) | the work-item provider this repo's `.fishhawk/work-management.yaml` conventions resolve to is **not registered** on the deployment — so campaigns, `fishhawk_file_issue` and the backlog-grooming loop all respond `501 provider_unimplemented`. **Warns** (never fails, never passes) when the conventions could not be resolved at all: that is read FAIL-CLOSED and is *not* evidence the provider is unregistered. Draws **no rung** against a fishhawkd that does not serve the key | configure the named provider's credentials on the fishhawkd deployment and **restart** it — a provider registers only when its client is configured at startup, so a credential set after boot changes nothing until the restart. The rung's `missing_hint` names the actual variables (`FISHHAWKD_GITHUB_APP_ID` + `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE`, `FISHHAWKD_GITLAB_BASE_URL` + `FISHHAWKD_GITLAB_TOKEN`, or the three `FISHHAWKD_JIRA_*`), or says no provider is wired at all |
 

@@ -302,3 +302,45 @@ func TestNewServer_StdioTransportResolvesOmittedWorkingDir(t *testing.T) {
 		t.Errorf("resolved_working_dir = %q, want the absolute cwd %q", out.ResolvedWorkingDir, cwd)
 	}
 }
+
+// callToolViaNewServer builds a REAL server via NewServer(cfg), connects an
+// in-memory MCP client session and calls the named tool. It is the generic
+// form of callDispatchViaNewServer (#5227): the Config -> config ->
+// runResolver -> handler -> tool result seam, so a field NewServer forgets to
+// thread reddens the caller's assertion.
+func callToolViaNewServer(t *testing.T, cfg Config, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	ctx := context.Background()
+	server := NewServer(cfg)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { clientSession.Close() })
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool %s: %v", name, err)
+	}
+	return res
+}
+
+// TestConfigInternal_PlumbsHostRungFields pins the #5227 bridge: the
+// credential source, presence seam and LocalHostRungs reach config, and the
+// run-bound flag is derived from the bearer prefix alone.
+func TestConfigInternal_PlumbsHostRungFields(t *testing.T) {
+	probe := func() (bool, error) { return true, nil }
+	c := Config{CredentialSource: "stored_login", StoredLoginPresent: probe, LocalHostRungs: true}.internal()
+	if c.credentialSource != "stored_login" || c.storedLoginPresent == nil || !c.localHostRungs {
+		t.Errorf("internal() = source %q, probe set %v, localHostRungs %v; want all threaded", c.credentialSource, c.storedLoginPresent != nil, c.localHostRungs)
+	}
+	if !isRunBoundToken("fhm_abc") || isRunBoundToken("fhk_abc") || isRunBoundToken("") {
+		t.Error("isRunBoundToken must be true for fhm_ only")
+	}
+}

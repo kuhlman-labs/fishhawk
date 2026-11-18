@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -329,7 +330,7 @@ func TestDoctorCheck_Token401(t *testing.T) {
 	})
 
 	r := checkToken("http://localhost:8080",
-		doctorCredential{token: "fhk_invalid", source: "--token / $FISHHAWK_TOKEN", class: "operator token (fhk_)"},
+		doctorCredential{token: "fhk_invalid", source: doctorSourceFlag, class: "operator token (fhk_)"},
 		readinessOutcome{})
 	if r.status != "fail" {
 		t.Errorf("status = %q, want fail", r.status)
@@ -347,7 +348,7 @@ func TestDoctorCheck_TokenMalformed(t *testing.T) {
 		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
 	})
 	r := checkToken("http://localhost:8080",
-		doctorCredential{token: "badtoken", source: "--token / $FISHHAWK_TOKEN", class: "unrecognized prefix"},
+		doctorCredential{token: "badtoken", source: doctorSourceFlag, class: "unrecognized prefix"},
 		readinessOutcome{})
 	if r.status != "ok" {
 		t.Errorf("status = %q, want ok (a non-fhk_ token is probed, not prefix-rejected); detail: %s", r.status, r.detail)
@@ -387,7 +388,7 @@ func TestCheckToken_OAuthTokenAccepted(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
 	})
-	cred := doctorCredential{token: "fho_abc", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_abc")}
+	cred := doctorCredential{token: "fho_abc", source: doctorSourceFlag, class: classifyCredential("fho_abc")}
 	r := checkToken("http://localhost:8080", cred, readinessOutcome{})
 	if r.status != "ok" {
 		t.Fatalf("status = %q, want ok; detail: %s", r.status, r.detail)
@@ -410,7 +411,7 @@ func TestCheckToken_StoredCredentialUsed(t *testing.T) {
 		seenAuth = req.Header.Get("Authorization")
 		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
 	})
-	cred := resolveDoctorCredential("http://localhost:8080", "")
+	cred := resolveDoctorCredential("http://localhost:8080", "", false)
 	if cred.token != "fhk_stored_only" {
 		t.Fatalf("resolved token = %q, want the stored credential", cred.token)
 	}
@@ -434,7 +435,7 @@ func TestCheckToken_401WithoutReadinessFails(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusUnauthorized, `{"error":{"code":"unauthorized"}}`), nil
 	})
-	cred := doctorCredential{token: "fho_bad", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_bad")}
+	cred := doctorCredential{token: "fho_bad", source: doctorSourceFlag, class: classifyCredential("fho_bad")}
 	r := checkToken("http://localhost:8080", cred, readinessOutcome{answered: false})
 	if r.status != "fail" {
 		t.Errorf("status = %q, want fail (readiness did not answer, so the token rung is the authority)", r.status)
@@ -449,7 +450,7 @@ func TestCheckToken_403WithReadinessAnsweredWarns(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusForbidden, `{"error":{"code":"forbidden"}}`), nil
 	})
-	cred := doctorCredential{token: "fho_ok", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_ok")}
+	cred := doctorCredential{token: "fho_ok", source: doctorSourceFlag, class: classifyCredential("fho_ok")}
 	r := checkToken("http://localhost:8080", cred, readinessOutcome{answered: true, scopesAdequate: true})
 	if r.status != "warn" {
 		t.Errorf("status = %q, want warn (readiness answered 200 for this credential)", r.status)
@@ -479,7 +480,7 @@ func TestCheckToken_MalformedReadiness200DoesNotSuppressFail(t *testing.T) {
 	if len(readinessChecks) != 1 || readinessChecks[0].status != "warn" {
 		t.Fatalf("want a single warn on the malformed 200, got %+v", readinessChecks)
 	}
-	cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+	cred := doctorCredential{token: "fho_x", source: doctorSourceFlag, class: classifyCredential("fho_x")}
 	r := checkToken("http://localhost:8080", cred, outcome)
 	if r.status != "fail" {
 		t.Errorf("status = %q, want fail (a malformed readiness 200 must not suppress the token failure)", r.status)
@@ -498,7 +499,7 @@ func TestCheckToken_WarnDetailReflectsScopeVerdict(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusForbidden, `{"error":{"code":"forbidden"}}`), nil
 	})
-	cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+	cred := doctorCredential{token: "fho_x", source: doctorSourceFlag, class: classifyCredential("fho_x")}
 
 	adequate := checkToken("http://localhost:8080", cred, readinessOutcome{answered: true, scopesAdequate: true})
 	if adequate.status != "warn" {
@@ -583,6 +584,9 @@ func TestRunDoctor_EnvOnlyTokenReachesProbe(t *testing.T) {
 // TestCheckMCP_HTTPRegistrationByName: an HTTP registration named fishhawk-http
 // on a DIFFERENT port than --backend-url matches by NAME. Detail names HTTP.
 func TestCheckMCP_HTTPRegistrationByName(t *testing.T) {
+	// The registration is https loopback, so a usable CA keeps it ok
+	// (TestCheckMCPRegistration_HTTPSLoopbackWithoutCAWarns pins the miss).
+	t.Setenv("NODE_EXTRA_CA_CERTS", writeTempCA(t))
 	withFakeDoctorRunOutput(t, func(_ string, args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "mcp" && args[1] == "list" {
 			return "fishhawk-http: https://localhost:8443/mcp (HTTP) - ✔ Connected", nil
@@ -1686,8 +1690,8 @@ func TestRunDoctor_SpecOnlyExcludesVerifyRung(t *testing.T) {
 
 // --- host-environment rungs (doctor_env.go, #4088) ---------------------------
 
-// hostEnvRungLabels are the five host-environment rung labels.
-var hostEnvRungLabels = []string{"checkout location", "golangci-lint pin", "go toolchain pin", "host load", "orphaned shells"}
+// hostEnvRungLabels are the six host-environment rung labels.
+var hostEnvRungLabels = []string{"checkout location", "golangci-lint pin", "go toolchain pin", "host load", "orphaned shells", "local CA trust"}
 
 // TestRunDoctor_HostEnvRungsWarnNeverFail drives runDoctor itself on the
 // all-green external-repo fixture with the env seams stubbed so EVERY
@@ -1716,6 +1720,8 @@ func TestRunDoctor_HostEnvRungsWarnNeverFail(t *testing.T) {
 
 	withFakeDoctorGOOS(t, "darwin")
 	withFakeDoctorNumCPU(t, 10)
+	// local CA trust trips on an https loopback --backend-url with no CA.
+	t.Setenv("NODE_EXTRA_CA_CERTS", "")
 	withFakeDoctorReadFile(t, func(path string) ([]byte, error) {
 		if path == "/proc/loadavg" {
 			return nil, os.ErrNotExist
@@ -1749,7 +1755,7 @@ func TestRunDoctor_HostEnvRungsWarnNeverFail(t *testing.T) {
 	var stdout, stderr strings.Builder
 	got := run([]string{
 		"doctor",
-		"--backend-url", "http://localhost:8080",
+		"--backend-url", "https://localhost:8443",
 		"--repo", "acme/widgets",
 		"--working-dir", dir,
 		"--runner-binary", "/usr/local/bin/fishhawk-runner",
@@ -1833,7 +1839,7 @@ func TestResolveDoctorCredential_RefreshedSourceIsVisible(t *testing.T) {
 		fresh.ExpiresAt = &exp
 		return fresh, nil
 	})
-	cred := resolveDoctorCredential("http://localhost:8080", "")
+	cred := resolveDoctorCredential("http://localhost:8080", "", false)
 	if cred.resolveErr != nil {
 		t.Fatalf("resolveErr = %v, want nil", cred.resolveErr)
 	}
@@ -1860,7 +1866,7 @@ func TestResolveDoctorCredential_OutsideSkewNotRefreshed(t *testing.T) {
 		t.Fatal("refresh must not run outside the skew")
 		return credstore.Credential{}, nil
 	})
-	cred := resolveDoctorCredential("http://localhost:8080", "")
+	cred := resolveDoctorCredential("http://localhost:8080", "", false)
 	if cred.token != "fho_stale" || cred.resolveErr != nil {
 		t.Fatalf("got %+v, want the stored token unrefreshed", cred)
 	}
@@ -1882,7 +1888,7 @@ func TestResolveDoctorCredential_RefreshFailureFailsTokenRung(t *testing.T) {
 		probed = true
 		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
 	})
-	cred := resolveDoctorCredential("http://localhost:8080", "")
+	cred := resolveDoctorCredential("http://localhost:8080", "", false)
 	if cred.resolveErr == nil {
 		t.Fatalf("resolveErr = nil, want the refresh failure; cred=%+v", cred)
 	}
@@ -1914,7 +1920,7 @@ func TestResolveDoctorCredential_ExpiredNotRefreshableFailsTokenRung(t *testing.
 		t.Fatal("a non-refreshable credential must never be refreshed")
 		return credstore.Credential{}, nil
 	})
-	cred := resolveDoctorCredential("http://localhost:8080", "")
+	cred := resolveDoctorCredential("http://localhost:8080", "", false)
 	if cred.resolveErr == nil || cred.token != "" {
 		t.Fatalf("got %+v, want resolveErr set and no token", cred)
 	}
@@ -2025,5 +2031,382 @@ func TestCheckCharter_RejectsEscapingPath(t *testing.T) {
 		if r := checkCharter(dir); r.status != "fail" || !strings.Contains(r.detail, "escapes the repository") {
 			t.Errorf("charter.path %q: checkCharter = %+v, want fail", p, r)
 		}
+	}
+}
+
+// --- token rung: source, acting subject and shadow hint (#5227) -------------
+
+// writeTempCA writes a placeholder CA file and returns its path. The CA
+// rungs check only that NODE_EXTRA_CA_CERTS names a regular file.
+func writeTempCA(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(p, []byte("-----BEGIN CERTIFICATE-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestCheckToken_NamesSourceAndSubject: an accepted credential's detail
+// names the source, the prefix class, and the subject and credential kind
+// readiness reported; the readiness-answered warn branch names them too.
+// The subject is a distinct non-empty fixture, so deleting identityNote's
+// subject rendering leaves the detail without it and the arm goes red.
+func TestCheckToken_NamesSourceAndSubject(t *testing.T) {
+	t.Setenv("FISHHAWK_API_TOKEN", "")
+	readiness := readinessOutcome{answered: true, scopesAdequate: true, subject: "github:alice", credentialKind: "static"}
+	cred := doctorCredential{token: "fhk_x", source: doctorSourceEnv, class: classifyCredential("fhk_x")}
+
+	t.Run("ok", func(t *testing.T) {
+		withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+		})
+		r := checkToken("http://localhost:8080", cred, readiness)
+		want := "accepted — operator token (fhk_) via $FISHHAWK_TOKEN; acts as github:alice (static)"
+		if r.status != "ok" || r.detail != want {
+			t.Errorf("got (%q, %q), want (ok, %q)", r.status, r.detail, want)
+		}
+		if r.remediate != "" {
+			t.Errorf("remediate = %q, want empty with $FISHHAWK_API_TOKEN unset", r.remediate)
+		}
+	})
+	t.Run("readiness-answered warn", func(t *testing.T) {
+		withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+			return fakeHTTPResponse(http.StatusForbidden, `{"error":{"code":"forbidden"}}`), nil
+		})
+		r := checkToken("http://localhost:8080", cred, readiness)
+		if r.status != "warn" {
+			t.Fatalf("status = %q, want warn", r.status)
+		}
+		for _, want := range []string{"operator token (fhk_) via $FISHHAWK_TOKEN", "acts as github:alice (static)"} {
+			if !strings.Contains(r.detail, want) {
+				t.Errorf("detail = %q, want it to contain %q", r.detail, want)
+			}
+		}
+	})
+}
+
+// TestCheckToken_SubjectUnknownWhenReadinessSilent: each way the subject can
+// be missing is named, never rendered as an `acts as` claim.
+func TestCheckToken_SubjectUnknownWhenReadinessSilent(t *testing.T) {
+	t.Setenv("FISHHAWK_API_TOKEN", "")
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+	})
+	cred := doctorCredential{token: "fho_x", source: doctorSourceFlag, class: classifyCredential("fho_x")}
+	for _, tc := range []struct {
+		name      string
+		readiness readinessOutcome
+		want      string
+		wantActs  bool
+	}{
+		{"readiness did not answer", readinessOutcome{}, "subject unknown: readiness did not answer (pass --repo)", false},
+		{"older backend, no subject", readinessOutcome{answered: true, scopesAdequate: true},
+			"subject unknown: readiness reported no subject", false},
+		{"subject without kind", readinessOutcome{answered: true, subject: "github:bob"},
+			"acts as github:bob (credential kind not reported)", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := checkToken("http://localhost:8080", cred, tc.readiness)
+			if r.status != "ok" {
+				t.Fatalf("status = %q, want ok", r.status)
+			}
+			if !strings.Contains(r.detail, tc.want) {
+				t.Errorf("detail = %q, want it to contain %q", r.detail, tc.want)
+			}
+			if got := strings.Contains(r.detail, "acts as"); got != tc.wantActs {
+				t.Errorf("detail = %q: contains `acts as` = %v, want %v", r.detail, got, tc.wantActs)
+			}
+		})
+	}
+}
+
+// TestCheckToken_HintsFishhawkAPITokenShadow: $FISHHAWK_API_TOKEN set in
+// doctor's environment adds the shadow hint on every branch — appended to an
+// existing remediation, or as the only hint on an ok rung — and never prints
+// its value. The env var is the ONLY difference between the arms.
+func TestCheckToken_HintsFishhawkAPITokenShadow(t *testing.T) {
+	const sentinel = "fhk_SENTINEL_API_TOKEN_5227"
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+	})
+	accepted := doctorCredential{token: "fhk_x", source: doctorSourceFlag, class: classifyCredential("fhk_x")}
+	for _, tc := range []struct {
+		name     string
+		env      string
+		cred     doctorCredential
+		wantHint bool
+	}{
+		{"ok, env set", sentinel, accepted, true},
+		{"ok, env unset", "", accepted, false},
+		{"no credential warn, env set", sentinel, doctorCredential{}, true},
+		{"no credential warn, env unset", "", doctorCredential{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FISHHAWK_API_TOKEN", tc.env)
+			r := checkToken("http://localhost:8080", tc.cred, readinessOutcome{})
+			got := strings.Contains(r.remediate, "$FISHHAWK_API_TOKEN is set in this shell") &&
+				strings.Contains(r.remediate, "`credential` rung")
+			if got != tc.wantHint {
+				t.Errorf("shadow hint present = %v, want %v; remediate = %q", got, tc.wantHint, r.remediate)
+			}
+			if tc.cred.token == "" && !strings.Contains(r.remediate, "token login") {
+				t.Errorf("remediate = %q, lost the no-credential hint", r.remediate)
+			}
+			if strings.Contains(r.detail+r.remediate, sentinel) {
+				t.Errorf("rung printed the $FISHHAWK_API_TOKEN value: %+v", r)
+			}
+		})
+	}
+}
+
+// doctorTokenRungStubs stubs every seam runDoctor reaches so a test can read
+// the rendered token rung without touching the host: HTTP (readiness serves
+// readinessJSON, /v0/runs answers runsCode), exec, the credstore (empty) and
+// the host-environment exec seam (every command errors, so those rungs skip).
+func doctorTokenRungStubs(t *testing.T, readinessJSON string, runsCode int, seenRunsAuth *string) string {
+	t.Helper()
+	withFakeDoctorCredLoad(t, func(_ string) (credstore.Credential, error) {
+		return credstore.Credential{}, errors.New("no stored credential")
+	})
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/healthz"):
+			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		case strings.HasSuffix(req.URL.Path, "/v0/onboarding/readiness"):
+			if runsCode != http.StatusOK {
+				return fakeHTTPResponse(runsCode, `{"error":{"code":"unauthorized"}}`), nil
+			}
+			return fakeHTTPResponse(http.StatusOK, readinessJSON), nil
+		case strings.Contains(req.URL.Path, "/v0/runs"):
+			if seenRunsAuth != nil {
+				*seenRunsAuth = req.Header.Get("Authorization")
+			}
+			return fakeHTTPResponse(runsCode, `{"items":[]}`), nil
+		default:
+			return fakeHTTPResponse(http.StatusOK, `{}`), nil
+		}
+	})
+	withFakeDoctorLookPath(t, func(_ string) (string, error) { return "/usr/local/bin/fishhawk-runner", nil })
+	withFakeDoctorRunOutput(t, func(name string, _ ...string) (string, error) { return name + " ok", nil })
+	withFakeDoctorEnvRunOutput(t, func(_ time.Duration, _ string, name string, _ ...string) (string, error) {
+		return "", errors.New("stubbed: " + name)
+	})
+	dir := initCleanGitRepo(t)
+	writeValidSpec(t, dir)
+	return dir
+}
+
+// tokenRungLine returns the rendered `token valid` line from doctor output.
+func tokenRungLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "token valid ") {
+			return line
+		}
+	}
+	t.Fatalf("token valid rung not rendered:\n%s", out)
+	return ""
+}
+
+// subjectReadinessJSON is allGreenReadinessJSON plus the #5227 identity keys.
+const subjectReadinessJSON = `{
+  "repo": "kuhlman-labs/fishhawk",
+  "app": {"installed": true, "installation_id": 42},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [{"provider": "anthropic", "model": "claude-opus-4-8", "available": true}],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": [],
+             "subject": "github:alice", "credential_kind": "static"}
+}`
+
+// TestResolveDoctorCredential_DistinguishesFlagFromEnv drives runDoctor so the
+// provenance comes from the parsed FlagSet (S5): --token SET names `--token`,
+// a value defaulted from $FISHHAWK_TOKEN names `$FISHHAWK_TOKEN`, and the
+// equal-values arm — the same value in both — still names `--token`, which
+// value equality could not decide. The probe carries the token in every arm.
+func TestResolveDoctorCredential_DistinguishesFlagFromEnv(t *testing.T) {
+	t.Setenv("FISHHAWK_API_TOKEN", "")
+	for _, tc := range []struct {
+		name       string
+		env        string
+		flag       string
+		wantSource string
+		wantToken  string
+	}{
+		{"env only", "fhk_env_5227", "", "via $FISHHAWK_TOKEN;", "fhk_env_5227"},
+		{"flag only", "", "fhk_flag_5227", "via --token;", "fhk_flag_5227"},
+		{"flag and env, equal values", "fhk_same_5227", "fhk_same_5227", "via --token;", "fhk_same_5227"},
+		{"flag and env, different values", "fhk_env_5227", "fhk_flag_5227", "via --token;", "fhk_flag_5227"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FISHHAWK_TOKEN", tc.env)
+			var runsAuth string
+			dir := doctorTokenRungStubs(t, subjectReadinessJSON, http.StatusOK, &runsAuth)
+			args := []string{"--backend-url", "http://localhost:8080", "--repo", "kuhlman-labs/fishhawk",
+				"--working-dir", dir, "--runner-binary", "/usr/local/bin/fishhawk-runner"}
+			if tc.flag != "" {
+				args = append(args, "--token", tc.flag)
+			}
+			var stdout, stderr strings.Builder
+			runDoctor(args, &stdout, &stderr)
+			line := tokenRungLine(t, stdout.String())
+			if !strings.Contains(line, tc.wantSource) {
+				t.Errorf("token rung = %q, want source %q", line, tc.wantSource)
+			}
+			if !strings.Contains(line, "acts as github:alice (static)") {
+				t.Errorf("token rung = %q, want the readiness subject", line)
+			}
+			if runsAuth != "Bearer "+tc.wantToken {
+				t.Errorf("/v0/runs Authorization = %q, want the %q credential", runsAuth, tc.wantToken)
+			}
+		})
+	}
+	// The unit seam agrees with the runDoctor wiring.
+	if got := resolveDoctorCredential("http://localhost:8080", "fhk_x", true).source; got != doctorSourceFlag {
+		t.Errorf("flagSet=true source = %q, want %q", got, doctorSourceFlag)
+	}
+	if got := resolveDoctorCredential("http://localhost:8080", "fhk_x", false).source; got != doctorSourceEnv {
+		t.Errorf("flagSet=false source = %q, want %q", got, doctorSourceEnv)
+	}
+}
+
+// TestRunDoctor_NeverPrintsTokenBytes: with a sentinel --token and a sentinel
+// $FISHHAWK_API_TOKEN, no doctor output — accepted or rejected — carries
+// either value.
+func TestRunDoctor_NeverPrintsTokenBytes(t *testing.T) {
+	const flagSentinel = "fhk_SENTINEL_FLAG_TOKEN_5227"
+	const apiSentinel = "fhk_SENTINEL_API_TOKEN_5227"
+	for _, code := range []int{http.StatusOK, http.StatusUnauthorized} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			t.Setenv("FISHHAWK_TOKEN", "")
+			t.Setenv("FISHHAWK_API_TOKEN", apiSentinel)
+			var runsAuth string
+			dir := doctorTokenRungStubs(t, subjectReadinessJSON, code, &runsAuth)
+			var stdout, stderr strings.Builder
+			runDoctor([]string{"--backend-url", "http://localhost:8080", "--repo", "kuhlman-labs/fishhawk",
+				"--working-dir", dir, "--runner-binary", "/usr/local/bin/fishhawk-runner",
+				"--token", flagSentinel}, &stdout, &stderr)
+			if runsAuth != "Bearer "+flagSentinel {
+				t.Fatalf("/v0/runs Authorization = %q: the sentinel never reached the probe, so absence proves nothing", runsAuth)
+			}
+			all := stdout.String() + stderr.String()
+			for _, s := range []string{flagSentinel, apiSentinel} {
+				if strings.Contains(all, s) {
+					t.Errorf("doctor output carries token bytes %q:\n%s", s, all)
+				}
+			}
+			if !strings.Contains(all, "$FISHHAWK_API_TOKEN is set in this shell") {
+				t.Errorf("shadow hint not rendered:\n%s", all)
+			}
+		})
+	}
+}
+
+// TestDoctorTokenRung_RealHTTPClientDecodesReadinessSubject is the CLI half
+// of the cross-boundary check (S4): the PRODUCTION doctorHTTPDo
+// (http.DefaultClient) reads a readiness response from a real HTTP server
+// carrying the scopes.subject / scopes.credential_kind keys fishhawkd serves,
+// and the decoded outcome — not a hand-built readinessOutcome — reaches the
+// rendered token rung. The cli module cannot import backend/internal/server
+// (a separate module's internal package), so the server half of S4 is the
+// MCP slice's server.New test; this one pins the CLI decode over the wire.
+func TestDoctorTokenRung_RealHTTPClientDecodesReadinessSubject(t *testing.T) {
+	t.Setenv("FISHHAWK_API_TOKEN", "")
+	const token = "fhk_SENTINEL_WIRE_5227"
+	var readinessAuth, runsAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/onboarding/readiness":
+			readinessAuth = r.Header.Get("Authorization")
+			if r.URL.Query().Get("repo") != "acme/widgets" {
+				http.Error(w, "wrong repo", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"repo":"acme/widgets","app":{"installed":true,"installation_id":7},`+
+				`"spec":{"source":"fetched","valid":true},"reviewers":[],`+
+				`"scopes":{"adequate":true,"required":["read:runs","read:audit","write:runs","write:approvals","write:stages"],`+
+				`"missing":[],"subject":"github:alice-fixture","credential_kind":"static"}}`)
+		case "/v0/runs":
+			runsAuth = r.Header.Get("Authorization")
+			_, _ = io.WriteString(w, `{"items":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	_, outcome := checkOnboardingReadiness(srv.URL, token, "acme/widgets")
+	cred := doctorCredential{token: token, source: doctorSourceFlag, class: classifyCredential(token)}
+	r := checkToken(srv.URL, cred, outcome)
+
+	if readinessAuth != "Bearer "+token || runsAuth != "Bearer "+token {
+		t.Fatalf("server saw Authorization readiness=%q runs=%q, want the bearer on both", readinessAuth, runsAuth)
+	}
+	want := "accepted — operator token (fhk_) via --token; acts as github:alice-fixture (static)"
+	if r.status != "ok" || r.detail != want {
+		t.Errorf("token rung = (%q, %q), want (ok, %q)", r.status, r.detail, want)
+	}
+	if strings.Contains(r.detail+r.remediate, token) {
+		t.Errorf("token rung carries token bytes: %+v", r)
+	}
+}
+
+// TestCheckMCPRegistration_HTTPSLoopbackWithoutCAWarns: a matched HTTP/SSE
+// registration whose URL is https on a loopback host warns, with the local-CA
+// hint, when NODE_EXTRA_CA_CERTS is unset or names no file; everything else
+// keeps the rung's prior verdict.
+func TestCheckMCPRegistration_HTTPSLoopbackWithoutCAWarns(t *testing.T) {
+	usable := writeTempCA(t)
+	dangling := filepath.Join(t.TempDir(), "never-created", "ca.pem")
+	for _, tc := range []struct {
+		name, list, backend, ca, wantStatus string
+	}{
+		{"https localhost, CA unset", "fishhawk-http: https://localhost:8443/mcp (HTTP) - ✔ Connected", "http://localhost:8080", "", "warn"},
+		{"https 127.0.0.1, CA unset", "fishhawk-http: https://127.0.0.1:8443/mcp (HTTP) - ✔ Connected", "http://localhost:8080", "", "warn"},
+		{"https localhost, CA dangling", "fishhawk-http: https://localhost:8443/mcp (HTTP) - ✔ Connected", "http://localhost:8080", dangling, "warn"},
+		{"https by backend URL, CA unset", "my-mcp: https://localhost:8443/mcp (HTTP) - ✔ Connected", "https://localhost:8443", "", "warn"},
+		{"https localhost, CA usable", "fishhawk-http: https://localhost:8443/mcp (HTTP) - ✔ Connected", "http://localhost:8080", usable, "ok"},
+		{"https non-loopback, CA unset", "fishhawk-http: https://fishhawk.example.com/mcp (HTTP) - ✔ Connected", "http://localhost:8080", "", "ok"},
+		{"http loopback, CA unset", "fishhawk-http: http://localhost:8080/mcp (HTTP) - ✔ Connected", "http://localhost:8080", "", "ok"},
+		{"stdio, CA unset", "fishhawk: /Users/x/bin/fishhawk-mcp-shim  - ✔ Connected", "https://localhost:8443", "", "ok"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NODE_EXTRA_CA_CERTS", tc.ca)
+			withFakeDoctorRunOutput(t, func(_ string, args ...string) (string, error) {
+				if len(args) >= 2 && args[1] == "list" {
+					return tc.list, nil
+				}
+				return "", errors.New("unexpected call")
+			})
+			r := checkMCPRegistration(tc.backend)
+			if r.status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q; detail: %s", r.status, tc.wantStatus, r.detail)
+			}
+			if tc.wantStatus != "warn" {
+				return
+			}
+			for _, want := range []string{"unable to verify the first certificate", "docs/local-tls.md", "NODE_EXTRA_CA_CERTS"} {
+				if !strings.Contains(r.remediate+r.detail, want) {
+					t.Errorf("warn = %+v, want it to name %q", r, want)
+				}
+			}
+		})
+	}
+}
+
+// TestMatchedMCPRegistrationURL_AgreesWithMatch: the URL helper reports the
+// SAME registration matchMCPRegistration matched (the first qualifying row),
+// and no URL for a stdio match.
+func TestMatchedMCPRegistrationURL_AgreesWithMatch(t *testing.T) {
+	list := "other: https://example.com/x (HTTP)\nfishhawk-http: https://localhost:8443/mcp (HTTP) - ✔ Connected\nfishhawk-b: https://localhost:9999/mcp (HTTP)"
+	if detail, ok := matchMCPRegistration(list, "http://localhost:8080"); !ok || detail != "fishhawk-http (HTTP)" {
+		t.Fatalf("matchMCPRegistration = (%q, %v)", detail, ok)
+	}
+	if u, ok := matchedMCPRegistrationURL(list, "http://localhost:8080"); !ok || u != "https://localhost:8443/mcp" {
+		t.Errorf("matchedMCPRegistrationURL = (%q, %v), want the first matched row's URL", u, ok)
+	}
+	if _, ok := matchedMCPRegistrationURL("fishhawk: /bin/fishhawk-mcp", "http://localhost:8080"); ok {
+		t.Error("a stdio registration reported a URL")
 	}
 }

@@ -1,0 +1,14 @@
+id: scenario:issue-5227/cli-doctor-ca-trust-warns
+statement: Running fishhawk doctor with --backend-url pointing at an https://localhost URL and NODE_EXTRA_CA_CERTS unset prints a warn on the local CA trust rung. Its hint names the symptom `unable to verify the first certificate` and docs/local-tls.md. The same run with a plain http backend URL reports that rung as skipped.
+verify_hint: 'CLI stdout: run fishhawk doctor twice (https://localhost:8443 with NODE_EXTRA_CA_CERTS unset, then http://localhost:<preview port>) and read the `local CA trust` line and its hint.'
+steps: 'Built fishhawk from the sanctioned checkout (cd cli && go build -o /tmp/acc5227w/fishhawk ./cmd/fishhawk). Ran it in throwaway git repo /tmp/acc5227w/chk: `env -u NODE_EXTRA_CA_CERTS fishhawk doctor --working-dir chk --backend-url https://localhost:8443 --token <fhm_> --repo kuhlman-labs/fishhawk --timeout 5s`, then the same with --backend-url http://localhost:8090. Read the ''local CA trust'' line and its hint.'
+assertions:
+    expected: warn with a hint naming the symptom and docs/local-tls.md over https; skipped over http
+    observed_at_record: 'https: ''local CA trust  NODE_EXTRA_CA_CERTS is unset for https loopback localhost:8443  warn'', with a hint naming `unable to verify the first certificate` and ''see docs/local-tls.md § Second repository on the same host''. http: ''local CA trust  skipped — not an https URL (no TLS to trust)  ok''.'
+    repro_handle: env -u NODE_EXTRA_CA_CERTS fishhawk doctor --working-dir <repo> --backend-url https://localhost:8443 --token <fhm_> --repo kuhlman-labs/fishhawk --timeout 5s
+origin:
+    issue: 5227
+    pr: 5457
+    run_id: af3c3eee-67a3-4257-b08d-1a0d502413b8
+    head_sha: 7a2610226609014c3f319aa1711703ff908e230a
+    recorded_at: 2026-11-18T11:52:04Z

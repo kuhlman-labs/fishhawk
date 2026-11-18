@@ -1070,3 +1070,86 @@ func TestIsShellComm(t *testing.T) {
 		}
 	}
 }
+
+// --- local CA trust (#5227) --------------------------------------------------
+
+// assertCAWarn checks a `local CA trust` warn carries the shared hint.
+func assertCAWarn(t *testing.T, r checkResult) {
+	t.Helper()
+	if r.status != "warn" {
+		t.Fatalf("status = %q, want warn; detail: %s", r.status, r.detail)
+	}
+	for _, want := range []string{"unable to verify the first certificate", "docs/local-tls.md",
+		"export NODE_EXTRA_CA_CERTS=<fishhawk checkout>/.fishhawk/cache/tls/ca.pem", "shared across repositories"} {
+		if !strings.Contains(r.remediate, want) {
+			t.Errorf("remediate = %q, want it to contain %q", r.remediate, want)
+		}
+	}
+}
+
+// TestCheckLocalCATrust_HTTPSkipped: plain http needs no CA, even with the
+// variable unset.
+func TestCheckLocalCATrust_HTTPSkipped(t *testing.T) {
+	t.Setenv("NODE_EXTRA_CA_CERTS", "")
+	r := checkLocalCATrust("http://localhost:8080")
+	if r.status != "ok" || !strings.HasPrefix(r.detail, "skipped — ") {
+		t.Errorf("got (%q, %q), want an ok skip", r.status, r.detail)
+	}
+}
+
+// TestCheckLocalCATrust_NonLoopbackSkipped: a non-loopback https backend is
+// assumed publicly trusted.
+func TestCheckLocalCATrust_NonLoopbackSkipped(t *testing.T) {
+	t.Setenv("NODE_EXTRA_CA_CERTS", "")
+	r := checkLocalCATrust("https://fishhawk.example.com")
+	if r.status != "ok" || !strings.HasPrefix(r.detail, "skipped — ") {
+		t.Errorf("got (%q, %q), want an ok skip", r.status, r.detail)
+	}
+}
+
+// TestCheckLocalCATrust_UnsetWarns: an https loopback backend with the
+// variable unset is the ONLY input, for every loopback spelling.
+func TestCheckLocalCATrust_UnsetWarns(t *testing.T) {
+	t.Setenv("NODE_EXTRA_CA_CERTS", "")
+	for _, u := range []string{"https://localhost:8443", "https://127.0.0.1:8443", "https://[::1]:8443", "https://LOCALHOST:8443"} {
+		t.Run(u, func(t *testing.T) {
+			r := checkLocalCATrust(u)
+			assertCAWarn(t, r)
+			if !strings.Contains(r.detail, "unset") {
+				t.Errorf("detail = %q, want it to say the variable is unset", r.detail)
+			}
+		})
+	}
+}
+
+// TestCheckLocalCATrust_DanglingPathWarns: a path that was never created.
+func TestCheckLocalCATrust_DanglingPathWarns(t *testing.T) {
+	dangling := filepath.Join(t.TempDir(), "never-created", "ca.pem")
+	t.Setenv("NODE_EXTRA_CA_CERTS", dangling)
+	r := checkLocalCATrust("https://localhost:8443")
+	assertCAWarn(t, r)
+	if !strings.Contains(r.detail, dangling) || !strings.Contains(r.detail, "does not exist") {
+		t.Errorf("detail = %q, want it to name the dangling path", r.detail)
+	}
+}
+
+// TestCheckLocalCATrust_DirectoryWarns: a directory is not a CA file.
+func TestCheckLocalCATrust_DirectoryWarns(t *testing.T) {
+	t.Setenv("NODE_EXTRA_CA_CERTS", t.TempDir())
+	r := checkLocalCATrust("https://localhost:8443")
+	assertCAWarn(t, r)
+	if !strings.Contains(r.detail, "not a regular file") {
+		t.Errorf("detail = %q, want it to say the path is not a regular file", r.detail)
+	}
+}
+
+// TestCheckLocalCATrust_PresentOK: a usable path is ok and named.
+func TestCheckLocalCATrust_PresentOK(t *testing.T) {
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	mustWrite(t, ca, "-----BEGIN CERTIFICATE-----\n")
+	t.Setenv("NODE_EXTRA_CA_CERTS", ca)
+	r := checkLocalCATrust("https://localhost:8443")
+	if r.status != "ok" || r.detail != "NODE_EXTRA_CA_CERTS="+ca || r.remediate != "" {
+		t.Errorf("got %+v, want ok naming %s", r, ca)
+	}
+}

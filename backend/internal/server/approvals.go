@@ -258,28 +258,68 @@ type approvalRequest struct {
 
 // approvalSubmitResponse is the 200 body for POST /v0/stages/{stage_id}/
 // approvals (#986). On a first submission the three duplicate fields are
-// omitted and the body is byte-identical to the bare Stage shape existing
-// clients decode. On a duplicate submission — same (stage, subject) pair —
-// they label the no-op honestly: the prior decision stands, the stage state
-// is unchanged, and no gates re-ran. prior_decision/prior_submitted_at come
-// from the EXISTING approval row, so they are authentic provenance, not
-// echoes of the new request.
+// omitted and the body is the bare Stage shape existing clients decode plus
+// the additive acting-identity echo below. On a duplicate submission — same
+// (stage, subject) pair — they label the no-op honestly: the prior decision
+// stands, the stage state is unchanged, and no gates re-ran.
+// prior_decision/prior_submitted_at come from the EXISTING approval row, so
+// they are authentic provenance, not echoes of the new request.
+//
+// The acting-identity echo (#5227) names who the decision was recorded as,
+// without any credential value:
+//
+//   - ApproverSubject is the RECORDED approval row's subject — the same value
+//     the approval_submitted audit row carries as actor_subject. A delegated
+//     approve therefore echoes operatorrole.DelegatedApprovalActorSubject, not
+//     the caller's own subject. On a duplicate it is the PRIOR row's subject.
+//   - CredentialKind classifies the credential that produced the recorded row
+//     (identity.CredentialKind: session, static, oauth, oauth_as, mcp_run,
+//     unrecorded, unknown). On a first submission that is this request's
+//     credential. On a duplicate it is OMITTED: the approval row does not
+//     record the credential that wrote it, and this request's credential would
+//     describe the wrong row.
+//   - OnBehalfOf names the caller's own subject when a delegated approve was
+//     recorded under the delegated identity. It is OMITTED on a duplicate for
+//     the same reason: the shared delegated row does not record which caller
+//     wrote it.
 type approvalSubmitResponse struct {
 	stageResponse
 	DuplicateSubmission bool   `json:"duplicate_submission,omitempty"`
 	PriorDecision       string `json:"prior_decision,omitempty"`
 	PriorSubmittedAt    string `json:"prior_submitted_at,omitempty"`
+	ApproverSubject     string `json:"approver_subject,omitempty"`
+	CredentialKind      string `json:"credential_kind,omitempty"`
+	OnBehalfOf          string `json:"on_behalf_of,omitempty"`
 }
 
 // duplicateApprovalResponse labels a duplicate submission's 200 body with
-// the prior approval row's decision and timestamp.
+// the prior approval row's decision, timestamp and recorded subject. It sets
+// no credential_kind or on_behalf_of: the prior row records neither, and the
+// current request's values would describe a different submission.
 func duplicateApprovalResponse(stage *run.Stage, prior *approval.Approval) approvalSubmitResponse {
 	return approvalSubmitResponse{
 		stageResponse:       toStageResponse(stage),
 		DuplicateSubmission: true,
 		PriorDecision:       string(prior.Decision),
 		PriorSubmittedAt:    prior.SubmittedAt.UTC().Format(time.RFC3339),
+		ApproverSubject:     prior.ApproverSubject,
 	}
+}
+
+// firstApprovalResponse is the first-submission 200 body: the advanced (or
+// unchanged, below quorum) stage plus the acting-identity echo taken from the
+// RECORDED approval row (#5227). credentialKind is the classification of the
+// request identity that wrote that row.
+func firstApprovalResponse(result *approveActionResult, credentialKind string) approvalSubmitResponse {
+	out := approvalSubmitResponse{
+		stageResponse:  toStageResponse(result.Stage),
+		CredentialKind: credentialKind,
+		OnBehalfOf:     result.OnBehalfOf,
+	}
+	if result.Recorded != nil {
+		out.ApproverSubject = result.Recorded.ApproverSubject
+	}
+	return out
 }
 
 // validateApprovalComment enforces the approve-only binding-conditions byte cap
@@ -1017,7 +1057,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.recordDelegationShadow(r.Context(), shadow, &stage.ID, string(decision), "approval_submitted", nil)
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(result.Stage))
+	s.writeJSON(w, r, http.StatusOK, firstApprovalResponse(result, approvalCredentialKind(ident)))
 }
 
 // gateActionStage names where in approveStageAs a failure occurred, so the
@@ -1146,9 +1186,28 @@ type approveActionParams struct {
 // advanced stage, or — when the (stage, subject) approval already existed —
 // the prior approval row labelling a duplicate submission (no audit, no
 // advance; the first decision stands).
+//
+// On a first submission Recorded is the approval row this call inserted and
+// OnBehalfOf the caller's real subject when a delegated approve was remapped
+// to the delegated identity (#2381); the HTTP handler echoes both in the 200
+// (#5227). Both are unset on the duplicate outcome.
 type approveActionResult struct {
-	Stage     *run.Stage
-	Duplicate *approval.Approval
+	Stage      *run.Stage
+	Duplicate  *approval.Approval
+	Recorded   *approval.Approval
+	OnBehalfOf string
+}
+
+// recorded stamps a first-submission result with the inserted approval row
+// and the on-behalf-of subject, so every non-duplicate return of
+// approveStageAs carries the recorded identity. A nil result (an error
+// return) passes through.
+func (r *approveActionResult) recorded(app *approval.Approval, onBehalfOf string) *approveActionResult {
+	if r != nil {
+		r.Recorded = app
+		r.OnBehalfOf = onBehalfOf
+	}
+	return r
 }
 
 // approveStageAs performs the gate-action core of POST
@@ -1277,7 +1336,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// about the effective requirement is known to snapshot.
 				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, p.RejectClass, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
-				return &approveActionResult{Stage: p.Stage}, nil
+				return (&approveActionResult{Stage: p.Stage}).recorded(res.Approval, onBehalfOf), nil
 			}
 		}
 		// Legacy / no-approvals path: first vote advances, unchanged from
@@ -1286,7 +1345,8 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
 		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, p.RejectClass, nil)
-		return s.finishApprovalAdvance(ctx, p, res)
+		out, err := s.finishApprovalAdvance(ctx, p, res)
+		return out.recorded(res.Approval, onBehalfOf), err
 	}
 
 	// Quorum path. Resolve the change author UNCONDITIONALLY (fail-open:
@@ -1465,9 +1525,10 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// stage stays awaiting_approval until approvals.count distinct
 		// eligible approvers vote.
 		s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
-		return &approveActionResult{Stage: p.Stage}, nil
+		return (&approveActionResult{Stage: p.Stage}).recorded(res.Approval, onBehalfOf), nil
 	}
-	return s.finishApprovalAdvance(ctx, p, res)
+	out, err := s.finishApprovalAdvance(ctx, p, res)
+	return out.recorded(res.Approval, onBehalfOf), err
 }
 
 // finishApprovalAdvance performs the post-audit tail shared by the legacy
@@ -5227,6 +5288,37 @@ func (s *Server) appendPlanReviewBackstopElapsed(ctx context.Context, stage *run
 	}
 }
 
+// operatorAgentTokenSubject is the subject an operator-agent token carries
+// (ADR-040 D4): the operatorrole prefix plus the shipped role-spec version,
+// built from the operatorrole constants so it tracks the role contract.
+var operatorAgentTokenSubject = operatorrole.TokenSubjectPrefix + operatorrole.Default().SpecVersion
+
+// delegationRefusalNextActions is the guidance every delegation_* 403 carries
+// (#5227). It separates the two things a refused caller tends to conflate:
+// delegation is AUTHORITY granted by the workflow spec, and the operator-agent
+// token is only the agent's IDENTITY. The token is issued by a human operator;
+// it is never requested or minted by an agent, so none of these steps is an
+// agent action.
+var delegationRefusalNextActions = []string{
+	"Delegation is not issued as a token: it is granted by this run's workflow spec — the workflow-v2 `autonomy` tier or `actions.<class>.mode` (the `operator_agent.may_*` knobs on v0/v1 specs). A human edits .fishhawk/workflows.yaml to change it.",
+	"The operator agent's own credential is an operator-agent token (subject " + operatorAgentTokenSubject + "). A human operator issues it with `fishhawkd token issue --subject " + operatorAgentTokenSubject + "` (ADR-040 D4); an agent never requests or mints it.",
+	"Without delegation, take the action without delegated:true under a human credential.",
+}
+
+// delegationRefusalDetails adds the #5227 guidance keys to a delegation_*
+// 403's details: delegated_identity (the operator-agent token subject),
+// next_actions, and — on the approve path, where a delegated approval is
+// recorded under a distinct identity (#2381) — recorded_as. The existing keys
+// pass through unchanged; checkDelegation's messages are untouched.
+func delegationRefusalDetails(action string, details map[string]any) map[string]any {
+	details["delegated_identity"] = operatorAgentTokenSubject
+	details["next_actions"] = delegationRefusalNextActions
+	if action == delegation.ActionApprove {
+		details["recorded_as"] = operatorrole.DelegatedApprovalActorSubject
+	}
+	return details
+}
+
 // checkDelegation enforces the ADR-040 delegated-action path (#1026),
 // shared by the approval, fix-up, retry, and waive handlers. When a
 // request opts in with delegated:true, the named action must be
@@ -5243,14 +5335,16 @@ func (s *Server) appendPlanReviewBackstopElapsed(ctx context.Context, stage *run
 // a configured knob whose condition is unmet refuses with 403
 // delegation_condition_unmet, details naming the exact failed
 // predicate. Repository read failures are 500 internal_error — still a
-// refusal, reported honestly. Returns the met condition name (the rule
-// the caller stamps into its audit payload as `delegated: "<rule>"`)
-// and true to proceed.
+// refusal, reported honestly. Every delegation_* 403 also carries the
+// delegationRefusalDetails guidance keys (#5227): delegated_identity,
+// next_actions and, on the approve path, recorded_as. Returns the met
+// condition name (the rule the caller stamps into its audit payload as
+// `delegated: "<rule>"`) and true to proceed.
 func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID uuid.UUID, action string) (string, bool) {
 	if s.cfg.RunRepo == nil || s.cfg.ConcernRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
 			"delegated actions require run, concern, and audit repositories; nothing is delegated on this deployment (fail-closed)",
-			map[string]any{"action": action})
+			delegationRefusalDetails(action, map[string]any{"action": action}))
 		return "", false
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
@@ -5262,21 +5356,21 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 	if len(runRow.WorkflowSpec) == 0 {
 		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
 			"the run carries no cached workflow spec, so no operator_agent block can govern it; nothing is delegated (fail-closed)",
-			map[string]any{"action": action, "run_id": runID.String()})
+			delegationRefusalDetails(action, map[string]any{"action": action, "run_id": runID.String()}))
 		return "", false
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
 		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
 			"the run's cached workflow spec does not parse, so no operator_agent block can be resolved; nothing is delegated (fail-closed)",
-			map[string]any{"action": action, "error": err.Error()})
+			delegationRefusalDetails(action, map[string]any{"action": action, "error": err.Error()}))
 		return "", false
 	}
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
 		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
 			"the run's workflow is not in its cached spec, so no operator_agent block can be resolved; nothing is delegated (fail-closed)",
-			map[string]any{"action": action, "workflow_id": runRow.WorkflowID})
+			delegationRefusalDetails(action, map[string]any{"action": action, "workflow_id": runRow.WorkflowID}))
 		return "", false
 	}
 	// The escalation resolver is REQUIRED at construction (E53.4 / #2227): a
@@ -5303,7 +5397,7 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 	if res == nil {
 		s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
 			"the run's workflow declares no effective operator_agent block; nothing is delegated (fail-closed)",
-			map[string]any{"action": action})
+			delegationRefusalDetails(action, map[string]any{"action": action}))
 		return "", false
 	}
 	for _, d := range res.Actions {
@@ -5313,18 +5407,18 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 		if !d.Met {
 			s.writeError(w, r, http.StatusForbidden, "delegation_condition_unmet",
 				"the delegated action's condition is not satisfied by current run state",
-				map[string]any{
+				delegationRefusalDetails(action, map[string]any{
 					"action":       action,
 					"condition":    string(d.Condition),
 					"unmet_reason": d.UnmetReason,
-				})
+				}))
 			return "", false
 		}
 		return string(d.Condition), true
 	}
 	s.writeError(w, r, http.StatusForbidden, "delegation_not_configured",
 		"the effective operator_agent block does not delegate this action (fail-closed)",
-		map[string]any{"action": action})
+		delegationRefusalDetails(action, map[string]any{"action": action}))
 	return "", false
 }
 
