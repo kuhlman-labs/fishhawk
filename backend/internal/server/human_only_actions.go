@@ -46,11 +46,18 @@ type humanOnlyExclusion struct {
 }
 
 // serverCheckClearAction is the single D2 entry (ADR-143 D2; ADR-084 rule 5
-// and Amendment A1). Its enabling change is #5228.
+// and Amendment A1). Its enabling change is #5228. ADR-143 Amendment A1
+// (#5229) adds the two waive-proposal decisions, confirm and reject, enforced
+// from the change that adds them. Neither has an MCP or CLI tool: only a human
+// on a Web UI session decides a proposal. Proposing is NOT a D2 verb, because
+// an agent may propose (it clears nothing).
 var serverCheckClearAction = humanOnlyAction{
 	ID:    humanOnlyActionServerCheckClear,
-	Basis: "ADR-143 D2; ADR-084 rule 5 and Amendment A1",
-	Verbs: []string{clearVerbWaive, clearVerbBulkWaive, clearVerbDefer, clearVerbResolve},
+	Basis: "ADR-143 D2 and Amendment A1; ADR-084 rule 5 and Amendment A1",
+	Verbs: []string{
+		clearVerbWaive, clearVerbBulkWaive, clearVerbDefer, clearVerbResolve,
+		clearVerbConfirmWaiveProposal, clearVerbRejectWaiveProposal,
+	},
 	Sites: []string{
 		"server.refuseNonHumanServerCheckClear",
 		"server.handleResolveConcerns",

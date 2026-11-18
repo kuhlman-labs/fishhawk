@@ -25,7 +25,39 @@ const (
 	clearVerbBulkWaive = "bulk_waive"
 	clearVerbDefer     = "defer"
 	clearVerbResolve   = "resolve_with_evidence"
+	// The two waive-proposal decisions (E80.28 / #5229, ADR-143 A1). Confirm is
+	// a clear; reject clears nothing but is the paired human decision on the
+	// same concern, so it takes the same channel. Neither has an MCP or CLI
+	// tool (webOnlyClearVerbs in the MCP parity test).
+	clearVerbConfirmWaiveProposal = "confirm_waive_proposal"
+	clearVerbRejectWaiveProposal  = "reject_waive_proposal"
 )
+
+// agentAlternativeProposeWaive is the details.agent_alternative pointer the
+// four DIRECT clear verbs' refusals carry (ADR-143 A1, V3): an agent cannot
+// clear a server-check concern, but it can propose the waive for a human to
+// confirm. The confirm and reject refusals carry no pointer: an agent cannot
+// decide its own proposal.
+const agentAlternativeProposeWaive = "fishhawk_propose_waive"
+
+// agentAlternativeSentence is the one sentence the direct verbs' refusals add.
+const agentAlternativeSentence = ". An agent may instead propose the waive (fishhawk_propose_waive) " +
+	"for a human to confirm in the Fishhawk Web UI"
+
+// isWaiveProposalDecision reports whether verb decides a waive proposal
+// (confirm or reject) rather than clearing the concern directly.
+func isWaiveProposalDecision(verb string) bool {
+	return verb == clearVerbConfirmWaiveProposal || verb == clearVerbRejectWaiveProposal
+}
+
+// waiveProposalDecisionAction renders a proposal-decision verb for a refusal
+// message.
+func waiveProposalDecisionAction(verb string) string {
+	if verb == clearVerbRejectWaiveProposal {
+		return "reject a waive proposal on"
+	}
+	return "confirm a waive proposal on"
+}
 
 // refused_actor values on the concern_requires_human refusal: which arm of the
 // guard fired. agent_token wins when both hold — the identity is the stronger
@@ -78,9 +110,15 @@ const (
 //
 // Exactly ONE call site per verb — handleWaiveConcern, handleBulkWaiveConcerns
 // and handleResolveConcerns (per row in pre-validation, so any server_check
-// row refuses the whole batch) and handleDeferConcern — each placed before the
-// first audit append, delegation evaluation, work-item filing or state
-// transition. Every verb passed here is in serverCheckClearAction.Verbs.
+// row refuses the whole batch), handleDeferConcern, and the waive-proposal
+// decisions handleConfirmWaiveProposal and handleRejectWaiveProposal (ADR-143
+// A1) — each placed before the first proposal read, audit append, delegation
+// evaluation, work-item filing or state transition. Every verb passed here is
+// in serverCheckClearAction.Verbs.
+//
+// The four DIRECT clear verbs' refusals (both codes) carry the additive
+// details.agent_alternative = fishhawk_propose_waive and one sentence naming
+// it; the confirm and reject refusals do not.
 func (s *Server) refuseNonHumanServerCheckClear(w http.ResponseWriter, r *http.Request, row *concern.Concern, subject string, delegated bool, verb string) bool {
 	if row == nil || !row.IsServerCheck() {
 		return false
@@ -94,21 +132,31 @@ func (s *Server) refuseNonHumanServerCheckClear(w http.ResponseWriter, r *http.R
 	default:
 		return s.refuseServerCheckClearOffSession(w, r, row, verb)
 	}
-	action := verb
-	if verb == clearVerbBulkWaive {
-		action = clearVerbWaive
+	details := map[string]any{
+		"concern_id":    row.ID.String(),
+		"provenance":    row.Provenance,
+		"verb":          verb,
+		"refused_actor": refused,
 	}
-	s.writeError(w, r, http.StatusForbidden, errCodeConcernRequiresHuman,
-		fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer; "+
+	var msg string
+	if isWaiveProposalDecision(verb) {
+		msg = fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer; "+
+			"an agent token or a delegated request cannot %s it. Only a human signed in to the Fishhawk Web UI decides a "+
+			"waive proposal, from the attention queue's decision panel; otherwise remove the flagged change, "+
+			"and rotate any credential it exposed",
+			row.ID, row.Provenance, waiveProposalDecisionAction(verb))
+	} else {
+		action := verb
+		if verb == clearVerbBulkWaive {
+			action = clearVerbWaive
+		}
+		msg = fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer; "+
 			"an agent token or a delegated request cannot %s it. A human operator must %s it with a reason, "+
 			"or remove the flagged change, and rotate any credential it exposed",
-			row.ID, row.Provenance, action, action),
-		map[string]any{
-			"concern_id":    row.ID.String(),
-			"provenance":    row.Provenance,
-			"verb":          verb,
-			"refused_actor": refused,
-		})
+			row.ID, row.Provenance, action, action) + agentAlternativeSentence
+		details["agent_alternative"] = agentAlternativeProposeWaive
+	}
+	s.writeError(w, r, http.StatusForbidden, errCodeConcernRequiresHuman, msg, details)
 	return true
 }
 
@@ -126,18 +174,28 @@ func (s *Server) refuseServerCheckClearOffSession(w http.ResponseWriter, r *http
 	if kind == identity.CredentialSession {
 		return false
 	}
-	s.writeError(w, r, http.StatusForbidden, errCodeConcernRequiresSession,
-		fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer, and only a human "+
+	details := map[string]any{
+		"concern_id":      row.ID.String(),
+		"provenance":      row.Provenance,
+		"verb":            verb,
+		"credential_kind": kind,
+		"remedy":          "web_ui_session",
+	}
+	var msg string
+	if isWaiveProposalDecision(verb) {
+		msg = fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer, and only a human "+
+			"signed in to the Fishhawk Web UI can %s it; a request on the %s credential kind cannot, whatever its subject (ADR-143 D1, A1). "+
+			"Sign in to the Fishhawk Web UI through the forge and use Confirm or Reject on the proposed waive in the attention queue's decision panel, "+
+			"or remove the flagged change, and rotate any credential it exposed. No CLI or MCP path exists (ADR-143 D3)",
+			row.ID, row.Provenance, waiveProposalDecisionAction(verb), kind)
+	} else {
+		msg = fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer, and only a human "+
 			"signed in to the Fishhawk Web UI can clear it; a request on the %s credential kind cannot, whatever its subject (ADR-143 D1). "+
 			"Sign in to the Fishhawk Web UI through the forge and waive or defer it from the attention queue's decision panel, "+
 			"or remove the flagged change, and rotate any credential it exposed. No CLI or MCP path exists (ADR-143 D3)",
-			row.ID, row.Provenance, kind),
-		map[string]any{
-			"concern_id":      row.ID.String(),
-			"provenance":      row.Provenance,
-			"verb":            verb,
-			"credential_kind": kind,
-			"remedy":          "web_ui_session",
-		})
+			row.ID, row.Provenance, kind) + agentAlternativeSentence
+		details["agent_alternative"] = agentAlternativeProposeWaive
+	}
+	s.writeError(w, r, http.StatusForbidden, errCodeConcernRequiresSession, msg, details)
 	return true
 }

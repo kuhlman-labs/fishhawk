@@ -37,7 +37,9 @@ func TestHumanOnlyActions_EnforcedSetPinned(t *testing.T) {
 	if humanOnlyActionEnforced("no_such_action") {
 		t.Errorf("humanOnlyActionEnforced(unknown id) = true, want false")
 	}
-	wantVerbs := []string{clearVerbWaive, clearVerbBulkWaive, clearVerbDefer, clearVerbResolve}
+	// ADR-143 A1 (#5229) adds the two waive-proposal decisions.
+	wantVerbs := []string{clearVerbWaive, clearVerbBulkWaive, clearVerbDefer, clearVerbResolve,
+		clearVerbConfirmWaiveProposal, clearVerbRejectWaiveProposal}
 	if !reflect.DeepEqual(serverCheckClearAction.Verbs, wantVerbs) {
 		t.Errorf("server_check_clear verbs = %v, want %v", serverCheckClearAction.Verbs, wantVerbs)
 	}
@@ -203,6 +205,8 @@ func TestHumanOnlyActions_CompletenessOverAgentRefusals(t *testing.T) {
 	for _, v := range []struct{ name, val string }{
 		{"clearVerbWaive", clearVerbWaive}, {"clearVerbBulkWaive", clearVerbBulkWaive},
 		{"clearVerbDefer", clearVerbDefer}, {"clearVerbResolve", clearVerbResolve},
+		{"clearVerbConfirmWaiveProposal", clearVerbConfirmWaiveProposal},
+		{"clearVerbRejectWaiveProposal", clearVerbRejectWaiveProposal},
 	} {
 		for _, ev := range serverCheckClearAction.Verbs {
 			if ev == v.val {
@@ -210,8 +214,8 @@ func TestHumanOnlyActions_CompletenessOverAgentRefusals(t *testing.T) {
 			}
 		}
 	}
-	if len(verbsPassed) != 4 {
-		t.Errorf("refuseNonHumanServerCheckClear call sites = %d (%v), want 4 (waive, bulk waive, defer, resolve)", len(verbsPassed), verbsPassed)
+	if len(verbsPassed) != 6 {
+		t.Errorf("refuseNonHumanServerCheckClear call sites = %d (%v), want 6 (waive, bulk waive, defer, resolve, confirm and reject a waive proposal)", len(verbsPassed), verbsPassed)
 	}
 	for _, vp := range verbsPassed {
 		verb := vp[strings.LastIndex(vp, "=")+1:]
@@ -351,18 +355,22 @@ func calleeName(fun ast.Expr) string {
 	return ""
 }
 
-// d2ClearRoutes are the four REST routes of the ADR-143 D2 server_check_clear
-// action, keyed by the handler handlers.go registers them on.
+// d2ClearRoutes are the six REST routes of the ADR-143 D2 server_check_clear
+// action, keyed by the handler handlers.go registers them on. ADR-143 A1
+// (#5229) adds the waive-proposal confirm and reject; the propose route is NOT
+// a D2 route, because an agent may propose (it clears nothing).
 var d2ClearRoutes = map[string]string{
-	"handleWaiveConcern":      "POST /v0/concerns/{concern_id}/waive",
-	"handleBulkWaiveConcerns": "POST /v0/runs/{run_id}/concerns/waive",
-	"handleDeferConcern":      "POST /v0/concerns/{concern_id}/defer",
-	"handleResolveConcerns":   "POST /v0/runs/{run_id}/concerns/resolve",
+	"handleWaiveConcern":         "POST /v0/concerns/{concern_id}/waive",
+	"handleBulkWaiveConcerns":    "POST /v0/runs/{run_id}/concerns/waive",
+	"handleDeferConcern":         "POST /v0/concerns/{concern_id}/defer",
+	"handleResolveConcerns":      "POST /v0/runs/{run_id}/concerns/resolve",
+	"handleConfirmWaiveProposal": "POST /v0/concerns/{concern_id}/waive-proposal/confirm",
+	"handleRejectWaiveProposal":  "POST /v0/concerns/{concern_id}/waive-proposal/reject",
 }
 
 // TestHumanOnlyActions_NoCLIClearVerb pins ADR-143 D3: the CLI is not a human
 // channel for the D2 actions, so no `fishhawk` command clears a concern. It
-// pins the four D2 routes in handlers.go (every one carries a "concerns" path
+// pins the six D2 routes in handlers.go (every one carries a "concerns" path
 // segment), then fails if any non-test Go file under cli/ holds a string
 // literal that could address one ("concerns/", "/concerns" or "concerns"), or
 // if the CLI command registry (cli/internal/cmdinfo, which the CLI's own

@@ -345,6 +345,14 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/divergence/{sequence}/answer", s.requireRunAccount(memberWrite, s.handleAnswerDivergence))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.requireConcernAccount(memberWrite, s.handleWaiveConcern))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", s.requireConcernAccount(memberWrite, s.handleDeferConcern))
+	// E80.28 / #5229 (ADR-143 A1): propose-and-confirm for a server_check
+	// concern. An operator agent records an advisory proposal (it clears
+	// nothing; a run-bound token is refused). Confirm and reject are ADR-143 D2
+	// verbs: only a human on a Web UI session decides, and both sit under the
+	// same CSRF middleware with no exemption (waive_proposal_decide.go).
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive-proposal", s.requireConcernAccount(memberWrite, s.handleProposeWaive))
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive-proposal/confirm", s.requireConcernAccount(memberWrite, s.handleConfirmWaiveProposal))
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive-proposal/reject", s.requireConcernAccount(memberWrite, s.handleRejectWaiveProposal))
 	// E94.8 / #4841 (ADR-117 D1 phase 3): a HUMAN relabels a concern's judgement
 	// or marks it duplicate_of an earlier concern of its run (label_concern.go).
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/label", s.requireConcernAccount(memberWrite, s.handleLabelConcern))
