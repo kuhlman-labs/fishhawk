@@ -2509,6 +2509,11 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// disagree about a spent budget. Fail-open: an un-fetched or aged-out
 	// recent slice degrades to silence, never to a false advisory.
 	foldConflictResolutionAdvisory(runRow, recent, nextActions)
+	// #5215: the binding-assertion recovery and fan-in verify-pass folds, in
+	// the same order run_stage.go applies them, off the SAME stages + recent
+	// slices — no extra round-trip. Display-only and fail-open to silence.
+	foldBindingAssertionRecoveryAdvisory(runRow, stages, recent, nextActions)
+	foldFanInVerifyPassAdvisory(runRow, stages, recent, nextActions)
 	// E68.43 (#3321): name the acceptance-preview bring-up immediately BEFORE
 	// the acceptance dispatch it is a precondition for, so the ritual stops
 	// living in operator memory. Off the SAME recent slice already fetched — no
@@ -4162,12 +4167,15 @@ func registerConsolidateSlices(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_consolidate_slices",
 		Description: strings.TrimSpace(`
-Use this when a decomposed parent run is stuck in awaiting_children after all
-its children have finished on the LOCAL runner — run the E24.2 fan-in on
-demand to merge the slice branches into the consolidated branch and open the
-consolidated PR. The 60s child-completion sweeper is the automatic backstop
-that normally does this, but it is OFF by default in the local dev stack, so
-locally a settled parent stays parked until you call this verb.
+Use this when a decomposed parent's implement stage is STILL awaiting_children
+after every child succeeded — run the E24.2 fan-in on demand to merge the
+slice branches into the consolidated branch and open the consolidated PR. The
+server's event-driven fan-in normally integrates the slices and settles the
+parent as the last child terminates, so most parents never need this verb;
+it is for one the event-driven path left parked (it WARN-swallows a
+non-conflict integration error). Before calling it, read
+fishhawk_get_run_status on the parent: call it only while the implement
+stage reads awaiting_children.
 
 Distinct from fishhawk_cancel_run (abandon a run) and fishhawk_retry_stage
 (re-run one failed stage): this resolves a HEALTHY parent whose children all
@@ -4192,12 +4200,44 @@ integration error, this SURFACES it (slice_integration_error) so you can
 diagnose a stuck local fan-in. Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - not_a_decomposed_parent (400)
-  - not_awaiting_children (409 — already resolved or not a decomposition)
+  - not_awaiting_children (409 — the implement stage is no longer
+    awaiting_children. This does NOT by itself mean the fan-in succeeded:
+    the same 409 answers after a category-B slice-conflict failure or a
+    category-C failed child. Read fishhawk_get_run_status on the parent and
+    follow its next_actions. Dispatch its implement stage
+    (fishhawk_dispatch_stage, or let fishhawk_drive_run do it) only when that
+    stage is pending or awaiting_host_dispatch, which on a local runner is
+    the fan-in verify-only pass the server re-opens for an unverified head
+    when a verify command is declared)
   - children_in_flight (409 — a child is still non-terminal)
   - children_failed (409 — a child failed; resolve it first)
-  - slice_integration_error (502 — the fan-in failed; the cause is surfaced)
+  - slice_integration_error (502 — the fan-in failed and the cause is
+    surfaced. The parent stays awaiting_children and the fan-in is
+    idempotent, so re-invoke once the cause clears; a transient forge error
+    needs only a re-invoke)
+
+Both refusals carry their remedy in the tool error text.
 `),
 	}, resolver.consolidateSlices)
+}
+
+// consolidateRefusalHint returns the one-sentence remedy for a consolidate
+// refusal whose next move is not obvious from the code alone (#5215 rules 4
+// and 9, R2): not_awaiting_children, which does not prove a successful
+// settle, and slice_integration_error, which is safe to re-invoke. It returns
+// "" for every other error, including a transport error with no *apiError.
+func consolidateRefusalHint(err error) string {
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		return ""
+	}
+	switch ae.Code {
+	case "not_awaiting_children":
+		return "the parent's implement stage is no longer awaiting_children, which does not by itself mean the fan-in succeeded (a slice conflict or a failed child answers the same 409): read fishhawk_get_run_status on the parent and follow its next_actions, and dispatch its implement stage (fishhawk_dispatch_stage or fishhawk_drive_run) only when it is pending or awaiting_host_dispatch, the fan-in verify-only pass on a local runner"
+	case "slice_integration_error":
+		return "the parent stays awaiting_children and the fan-in is idempotent, so re-invoke fishhawk_consolidate_slices once the cause clears; a transient forge error needs only a re-invoke"
+	}
+	return ""
 }
 
 // consolidateSlices is the tool handler. All precondition checks, the fan-in
@@ -4210,6 +4250,9 @@ func (r *runResolver) consolidateSlices(ctx context.Context, _ *mcp.CallToolRequ
 	}
 	res, err := r.api.ConsolidateRun(ctx, runID)
 	if err != nil {
+		if hint := consolidateRefusalHint(err); hint != "" {
+			return nil, ConsolidateSlicesOutput{}, fmt.Errorf("consolidate slices: %w — %s", err, hint)
+		}
 		return nil, ConsolidateSlicesOutput{}, fmt.Errorf("consolidate slices: %w", err)
 	}
 	return nil, ConsolidateSlicesOutput{Result: *res}, nil
@@ -4629,6 +4672,14 @@ carries that follow-on call pre-filled (absent when the orchestrator
 genuinely dispatched, when the stage re-opened at a gate, or when the
 state is unrecognised) — so the park is never discovered by polling for
 a dispatch that will not come.
+
+CHECKPOINT REFS (#5215). A failed implement stage's failure_reason, and the
+inspect_checkpoint_ref next_actions entry's params.ref, may name a
+refs/fishhawk/checkpoints/<run>/<stage>... ref pinning the failed attempt's
+work in the runner host's local repository. Read it (git show <ref>) before
+you retry: a retry re-runs from the branch, so work pinned only at that ref is
+redone unless you apply or cherry-pick it, except where the runner resumes a
+held gate-verified checkpoint itself.
 
 Returns the updated Stage row plus parked / next_step / warnings on
 retry. Returns a tool error on:

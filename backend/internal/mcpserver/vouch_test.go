@@ -282,3 +282,41 @@ func TestVouchCommit_SurfacesHeadAdvanceAndRepublishFields(t *testing.T) {
 		}
 	}
 }
+
+// TestVouchCommit_DescriptionWarnsConsolidatedUnionMerge pins the #5215 rule 10
+// CONSOLIDATED BRANCHES paragraph on the SERVED fishhawk_vouch_commit
+// description: a hand-pushed union merge of slice branches on a decomposed
+// parent's consolidated branch, vouched, skips the fan-in verify, the review
+// round and acceptance, so slice work routes through the loop instead.
+func TestVouchCommit_DescriptionWarnsConsolidatedUnionMerge(t *testing.T) {
+	desc := fixupGuidanceFlatten(registeredToolDescription(t, "fishhawk_vouch_commit"))
+	start := strings.Index(desc, "consolidated branches (#5215)")
+	if start < 0 {
+		t.Fatalf("fishhawk_vouch_commit description lacks the CONSOLIDATED BRANCHES paragraph")
+	}
+	end := strings.Index(desc[start:], "returns the recorded declaration")
+	if end < 0 {
+		t.Fatalf("CONSOLIDATED BRANCHES paragraph is not followed by the returns paragraph")
+	}
+	section := desc[start : start+end]
+	for _, want := range []string{
+		"union merge",
+		"consolidated branch",
+		"vouch exemption",
+		"before its fan-in rule",
+		"fan-in verify",
+		"review round",
+		"acceptance",
+		"re-drive or resume the child",
+		"fishhawk_fixup_stage",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("CONSOLIDATED BRANCHES paragraph lacks %q:\n%s", want, section)
+		}
+	}
+	// The paragraph follows APPROVAL AND ORDER (#5213) rather than replacing it.
+	if ao := strings.Index(desc, "approval and order."); ao < 0 || ao > start {
+		t.Errorf("CONSOLIDATED BRANCHES must follow the APPROVAL AND ORDER paragraph (approval-and-order at %d, consolidated at %d)", ao, start)
+	}
+	mergeGuidanceADR110(t, "fishhawk_vouch_commit CONSOLIDATED BRANCHES", section)
+}
