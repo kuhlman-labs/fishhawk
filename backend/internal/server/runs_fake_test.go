@@ -256,6 +256,12 @@ func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.R
 		if fil.AccountID != "" && r.AccountID != "" && r.AccountID != fil.AccountID {
 			continue
 		}
+		// NonTerminal arm (#5225): mirrors the SQL's
+		// `NOT non_terminal OR state NOT IN (terminal)` and, like it, runs
+		// BEFORE the sort and limit below.
+		if fil.NonTerminal && r.State.IsTerminal() {
+			continue
+		}
 		matched = append(matched, r)
 	}
 	// Order matches the SQL: created_at DESC, id DESC.

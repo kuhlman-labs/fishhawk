@@ -47,6 +47,12 @@ SELECT * FROM runs
 -- skip; pass a value to match exactly. They're indexed (partial,
 -- WHERE NOT NULL) so an equality match on either is cheap. Used by
 -- the threaded-runs view (#216) to render "every run on this PR."
+--
+-- non_terminal (#5225): TRUE keeps only rows whose state is not terminal.
+-- The literal set tracks run.State.IsTerminal (succeeded, failed,
+-- cancelled), pinned by TestPostgres_ListRuns_NonTerminalFilter. It is
+-- applied BEFORE the LIMIT so an open run behind newer terminal runs is
+-- still returned.
 SELECT * FROM runs
  WHERE (sqlc.arg('repo')::text = '' OR repo = sqlc.arg('repo'))
    AND (sqlc.arg('workflow_id')::text = '' OR workflow_id = sqlc.arg('workflow_id'))
@@ -57,6 +63,7 @@ SELECT * FROM runs
    AND (sqlc.narg('decomposed_from')::uuid IS NULL OR decomposed_from = sqlc.narg('decomposed_from'))
    AND (sqlc.narg('parent_run_id')::uuid IS NULL OR parent_run_id = sqlc.narg('parent_run_id'))
    AND (sqlc.narg('account_id')::uuid IS NULL OR account_id = sqlc.narg('account_id') OR account_id IS NULL)
+   AND (NOT sqlc.arg('non_terminal')::boolean OR state NOT IN ('succeeded', 'failed', 'cancelled'))
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 

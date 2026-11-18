@@ -136,6 +136,13 @@ var groomingApplyBudget = 3 * time.Minute
 // can zero it and make the floor the whole budget.
 var groomingApplyPerCandidateBudget = 3 * time.Second
 
+// groomingApplyRetryPolicy is the transient re-settle policy the detached apply
+// passes to workmgmt.ApplyGrooming (#5225). nil, the production value, takes the
+// workmgmt default (2 retries at n×1s, capped per apply). A var ONLY so a test
+// can zero the backoff, as groomingApplyBudget is shrunk; production never
+// reassigns it.
+var groomingApplyRetryPolicy *workmgmt.GroomingRetryPolicy
+
 // groomingApplyPrelaunchBudget bounds the SYNCHRONOUS half of the hook — the
 // part still on the operator's approve request: ratification, window
 // settlement, input resolution and the grooming_apply_started append. A
@@ -764,6 +771,9 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		// every sibling in this block — an unreadable scan degrades to NO
 		// evidence, which reproduces pre-#2810 refuse/skip behaviour exactly.
 		PriorSteps: priorSteps,
+		// RetryPolicy bounds the in-apply re-settle of a transient forge failure
+		// (#5225). nil in production: the workmgmt default.
+		RetryPolicy: groomingApplyRetryPolicy,
 		// IceboxColumn stays empty: no conventions source declares one, and the
 		// issue forbids touching the work-management schema — so an approved
 		// decomposition entry records GroomingSkipIceboxColumnUnavailable rather

@@ -645,8 +645,9 @@ SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, 
    AND ($7::uuid IS NULL OR decomposed_from = $7)
    AND ($8::uuid IS NULL OR parent_run_id = $8)
    AND ($9::uuid IS NULL OR account_id = $9 OR account_id IS NULL)
+   AND (NOT $10::boolean OR state NOT IN ('succeeded', 'failed', 'cancelled'))
  ORDER BY created_at DESC, id DESC
- LIMIT $11 OFFSET $10
+ LIMIT $12 OFFSET $11
 `
 
 type ListRunsParams struct {
@@ -659,6 +660,7 @@ type ListRunsParams struct {
 	DecomposedFrom *uuid.UUID `json:"decomposed_from"`
 	ParentRunID    *uuid.UUID `json:"parent_run_id"`
 	AccountID      *uuid.UUID `json:"account_id"`
+	NonTerminal    bool       `json:"non_terminal"`
 	Off            int32      `json:"off"`
 	Lim            int32      `json:"lim"`
 }
@@ -671,6 +673,12 @@ type ListRunsParams struct {
 // skip; pass a value to match exactly. They're indexed (partial,
 // WHERE NOT NULL) so an equality match on either is cheap. Used by
 // the threaded-runs view (#216) to render "every run on this PR."
+//
+// non_terminal (#5225): TRUE keeps only rows whose state is not terminal.
+// The literal set tracks run.State.IsTerminal (succeeded, failed,
+// cancelled), pinned by TestPostgres_ListRuns_NonTerminalFilter. It is
+// applied BEFORE the LIMIT so an open run behind newer terminal runs is
+// still returned.
 func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, error) {
 	rows, err := q.db.Query(ctx, listRuns,
 		arg.Repo,
@@ -682,6 +690,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 		arg.DecomposedFrom,
 		arg.ParentRunID,
 		arg.AccountID,
+		arg.NonTerminal,
 		arg.Off,
 		arg.Lim,
 	)
