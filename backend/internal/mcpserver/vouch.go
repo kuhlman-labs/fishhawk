@@ -22,7 +22,17 @@ type VouchCommitInput struct {
 // VouchCommitOutput surfaces the recorded declaration.
 type VouchCommitOutput struct {
 	Result VouchCommitResult `json:"result"`
+	// ApprovalNote is the constant vouchApprovalNote on every successful vouch
+	// (E106.28 / #5213, rules 3 and 5). MCP-side only: the backend result is
+	// unchanged.
+	ApprovalNote string `json:"approval_note" jsonschema:"set on every successful vouch to one constant: if this pull request is headed for merge, the vouched commit moves its head, so CI restarts and, where the repository's branch protection dismisses stale approvals, the existing approval is dismissed — re-approve the vouched head after checks are green, then call fishhawk_merge_run (order: push, vouch, checks green, approve, merge). A vouch also serves a fix-up head advance, so the note does not apply to a run that is not headed for merge"`
 }
+
+// vouchApprovalNote is the one constant every successful vouch carries as
+// approval_note. Its wording is conditional ("if this pull request is headed
+// for merge") because a vouch also serves fix-up head advance, where no
+// approval is involved; the handler does not read the run to decide.
+const vouchApprovalNote = "If this pull request is headed for merge, the vouched commit moves its head: CI restarts and, where the repository's branch protection dismisses stale approvals, the existing approval is dismissed. Re-approve the vouched head once checks are green at it, then call fishhawk_merge_run (fishhawk_merge_run answers forge_approval_required on an approval-gated run until you do). The waste-free order is push, vouch, wait for checks green, approve, merge."
 
 // registerVouchCommit wires the fishhawk_vouch_commit tool (ADR-035
 // remediation, #1044).
@@ -83,6 +93,18 @@ Inputs:
   - run_id : the run whose branch carries the commit.
   - sha    : the FULL commit SHA to vouch.
   - reason : required operator rationale, recorded on the audit entry.
+
+APPROVAL AND ORDER. The commit you vouch was pushed to the run's pull request,
+so the push moves the PR head: CI restarts and, where the repository's branch
+protection dismisses stale approvals, the existing PR approval is dismissed.
+fishhawk_get_gate_view merge_readiness then reports approval_dismissed (with
+dismissing_cause vouch_commit), and fishhawk_merge_run answers
+forge_approval_required on an approval-gated run until you re-approve the
+vouched head. The waste-free order is: push, vouch, wait for checks green at the
+vouched head, approve, then fishhawk_merge_run. Every successful vouch carries
+this as approval_note, one constant worded for a pull request headed for merge:
+a vouch also serves a fix-up head advance, and the note does not apply to a run
+that is not headed for merge.
 
 Returns the recorded declaration (run_id, vouched_sha, reason) plus the
 audit-check re-post outcome: audit_check_republished, and
@@ -163,7 +185,7 @@ func (r *runResolver) vouchCommit(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, VouchCommitOutput{}, fmt.Errorf("vouch commit: %w", err)
 	}
-	return nil, VouchCommitOutput{Result: *res}, nil
+	return nil, VouchCommitOutput{Result: *res, ApprovalNote: vouchApprovalNote}, nil
 }
 
 // isFullObjectName reports whether s is a full git object name: exactly 40

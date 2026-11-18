@@ -337,7 +337,11 @@ evidence signal that review evidence is terminal and required checks are green
 while only the human review row still sits awaiting_approval, so a parked human
 review row no longer strands a mechanical acceptance dispatch), so a
 fresh run whose stages are all created pending never dispatches implement or
-acceptance while the plan runner still holds the lineage lock. A
+acceptance while the plan runner still holds the lineage lock. The loop never
+re-dispatches a stage that already settled, so a succeeded acceptance stage is
+not re-run by re-invoking the drive: to re-validate, re-open acceptance through
+the verb its next_actions name (for example the acceptance_stale next_step),
+then re-invoke the drive. A
 decision_required stop always corresponds to a next_actions entry that names an
 operator judgment (a plan gate without may_approve, a split verdict / open
 concerns / undelegated merge, a pending scope amendment) — never a state whose

@@ -1,0 +1,14 @@
+id: scenario:issue-5213/arbitration-description-names-retire-scenario-lever
+statement: The fishhawk_arbitrate_acceptance tool description served over MCP names retiring a stale replay scenario at plan approval through fishhawk_approve_plan's retire_scenario amendment, and contrasts it with a hand-edited retired.yaml pull request.
+verify_hint: 'MCP tool result: the served fishhawk_arbitrate_acceptance description from the preview''s tools/list.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list (2026-07-28 headers and _meta). Read the fishhawk_arbitrate_acceptance description.
+assertions:
+    expected: retire_scenario lever contrasted with a retired.yaml PR
+    observed_at_record: '''The cheaper lever is retiring the stale scenario at a plan approval (fishhawk_approve_plan amend_acceptance_criteria action retire_scenario ...); a hand edit of retired.yaml is an operator pull request on the default branch that can need an admin merge.'''
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5213
+    pr: 5418
+    run_id: 078deff3-bc86-4ec7-8611-33a306612ca8
+    head_sha: d5de46641fe614c04852f0d5aa0713693215c5b1
+    recorded_at: 2026-11-18T01:08:55Z

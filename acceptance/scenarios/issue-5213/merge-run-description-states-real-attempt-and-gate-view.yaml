@@ -1,0 +1,14 @@
+id: scenario:issue-5213/merge-run-description-states-real-attempt-and-gate-view
+statement: The fishhawk_merge_run tool description served over MCP states that every call is a real merge attempt, that it must not be called with a placeholder verdict to see a refusal, and names fishhawk_get_gate_view merge_readiness as the side-effect-free readiness check.
+verify_hint: 'MCP tool result: list the tools on the preview''s MCP endpoint and read the fishhawk_merge_run description for ''real merge attempt'', ''placeholder'' and ''merge_readiness''.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> fhm_; POST /mcp tools/list with Bearer, Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list and params._meta (protocolVersion, clientCapabilities, clientInfo). Read the fishhawk_merge_run description.
+assertions:
+    expected: real attempt; no placeholder verdict; gate view merge_readiness
+    observed_at_record: '''EVERY CALL IS A REAL MERGE ATTEMPT ... do not call it with a placeholder verdict to see which refusal comes back. To check readiness without recording a verdict, read fishhawk_get_gate_view merge_readiness ... queues nothing.'''
+    repro_handle: POST /mcp tools/list as described in steps_taken
+origin:
+    issue: 5213
+    pr: 5418
+    run_id: 078deff3-bc86-4ec7-8611-33a306612ca8
+    head_sha: d5de46641fe614c04852f0d5aa0713693215c5b1
+    recorded_at: 2026-11-18T01:08:55Z

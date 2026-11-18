@@ -243,6 +243,23 @@ webhook-settled terminal run state, and surfaces the operator post-merge
 dev-host step (E48.7 / #1954). It replaces the four-step hand ceremony
 (approve → merge → post-merge) with one verb.
 
+EVERY CALL IS A REAL MERGE ATTEMPT. When the gates pass this verb records your
+verdict and queues the merge; it is never a dry run, so do not call it with a
+placeholder verdict to see which refusal comes back. To check readiness without
+recording a verdict, read fishhawk_get_gate_view merge_readiness: it runs the
+merge endpoint's acceptance and review-coverage checks (plus an advisory approval
+check) and queues nothing. It is a subset of what this verb can refuse, so an
+empty blockers[] does not predict a clean merge: the merge-candidate, overlap,
+conflict and forge-approval statuses below come only from a real call.
+
+BEFORE YOU APPROVE. Read the pre-approval checklist on fishhawk_get_gate_view
+(merge_readiness and merge_candidate_verdict) first. An acceptance stage can
+push a scenario commit after its verdict is recorded, which moves the pull
+request head and restarts CI, so re-read the PR head once acceptance settles and
+approve THAT head. The waste-free order is: push, vouch (fishhawk_vouch_commit),
+wait for checks green at that head, approve, then call this verb. An approval
+given before a push can be dismissed by it.
+
 Records a chained merge_verdict_recorded audit entry (your verdict verbatim)
 and dispatches the merge. The tool always re-POSTs on resume with NO
 client-side skip, and the endpoint's idempotence has TWO halves worth stating
@@ -284,7 +301,12 @@ Statuses:
                      deliberately so consumers switching on it keep working.
   - "timeout"       — nothing settled within the window; resumable — re-invoke
                      to resume (no duplicate verdict row, and the re-dispatch
-                     is guarded by the endpoint's observe rung).
+                     is guarded by the endpoint's observe rung). If the merge
+                     stays queued while the pull request is BLOCKED, read the
+                     fishhawk_audit_complete check output on the pull request
+                     (its summary names the missing item, where the repository's
+                     branch protection makes that check gate the merge) or
+                     fishhawk_get_gate_view merge_readiness.
   - "run_terminal"  — the run reached failed/cancelled while waiting; the
                      merge will most likely never settle — check
                      fishhawk_get_run_status.
@@ -297,6 +319,9 @@ Statuses:
                      PR instead of waiting. This is a STATUS, not a tool error: an
                      immediate re-POST cannot succeed, so the tool waits within its
                      timeout budget rather than surfacing a remedy that would fail.
+                     Bound the wait: set timeout_seconds, never watch the checks
+                     unbounded, and read the check status between calls instead of
+                     polling indefinitely.
   - "conflicting"   — the pull request has a merge conflict against its base, so
                      GitHub can NEVER queue the merge. UNLIKE checks_pending this
                      is NOT resumable by waiting — the tool returns it IMMEDIATELY
@@ -317,7 +342,12 @@ Statuses:
                      next_action names fishhawk_await_stage (a pass is in flight
                      on the named stage — dispatch it with fishhawk_dispatch_stage
                      on a local runner) or fishhawk_rebase_run_branch (whose
-                     already-up-to-date arm triggers the pass).
+                     already-up-to-date arm triggers the pass). A pass that
+                     settled not_executed (for example the runner could not
+                     fetch the branch) leaves the head unverified: re-trigger it
+                     with fishhawk_rebase_run_branch, then, on a local runner,
+                     dispatch the re-opened stage with fishhawk_dispatch_stage
+                     and await it.
   - "merge_candidate_held" — the run's merge-candidate verify pass is HELD in its
                      base's ADR-092 queue behind the pass holding the line.
                      Immediate, no verdict row. It clears ON ITS OWN: when the
@@ -377,7 +407,15 @@ Statuses:
                      parent's first consolidated round) or
                      fishhawk_await_review (a round is in flight, the PR is not
                      open yet, or a gating parent has no round — the message
-                     then names fishhawk_fixup_stage).
+                     then names fishhawk_fixup_stage). After
+                     fishhawk_rebase_run_branch on a decomposed parent, where the
+                     workflow declares a verify command a fresh consolidated
+                     round starts on the new head once the verify-only pass
+                     passes: await it before re-invoking, because the earlier
+                     round judged a tree the PR no longer carries. A head with
+                     no verify pass (no declared verify command, or a verdict
+                     transferred across a clean base advance) starts no round: if
+                     none appears, start one with fishhawk_rerun_review.
   - "queued"        — ADR-093 slice 1 (E87.4 / #4295): the run is merge-queue
                      ELIGIBLE (review gate approved with a LIVE forge
                      approval, acceptance merge-eligible and not stale,
@@ -426,8 +464,12 @@ Statuses:
                      next_action names fishhawk_await_stage without a run or
                      stage. With read:audit next_action names
                      fishhawk_await_stage on the blocking stage — re-invoke
-                     once it settles, or pass allow_overlap with
-                     overlap_reason to merge deliberately.
+                     as soon as it settles, or pass allow_overlap with
+                     overlap_reason to merge deliberately. Once a merge intent
+                     is queued the merge queue re-runs this overlap guard at
+                     merge-on-pass (with no override on that path), so a live
+                     overlap that appears later holds the queued merge instead of
+                     moving the base under that agent.
   - "overlap_undetermined" — the guard could not rule an overlap out while a
                      live implement exists elsewhere and FAILS CLOSED:
                      overlap.reason is changed_files_capped (the forge
@@ -1077,7 +1119,7 @@ func mergeOverlapOutput(ae *apiError, status string, runID uuid.UUID, start time
 			Params:       params,
 			Precondition: "another live run's implement stage scopes a path this pull request changes (overlapping_implement_in_flight)",
 			Consumes:     consumesNone,
-			Reason:       "wait for the overlapping stage to settle, then re-invoke fishhawk_merge_run (or pass allow_overlap with overlap_reason to merge deliberately)",
+			Reason:       "wait for the overlapping stage to settle, then re-invoke fishhawk_merge_run the moment it does (or pass allow_overlap with overlap_reason to merge deliberately). Once a merge intent is queued the merge queue re-runs this overlap guard at merge-on-pass, so a later overlap holds that queued merge instead of moving the base",
 		}
 	} else {
 		reason := ov.Reason
@@ -1156,6 +1198,19 @@ func mergeVerdictSequenceFrom(details map[string]any) int64 {
 	return 0
 }
 
+// mergeChecksPendingBoundedWaitHint is the bounded-wait sentence appended to the
+// checks_pending message (E106.28 / #5213, rule 9). It names the mechanism (a
+// timeout_seconds budget and a status read) and no repository-specific number.
+const mergeChecksPendingBoundedWaitHint = " Bound the wait: re-invoke with a timeout_seconds budget, never watch the checks unbounded, and read the check status between calls instead of polling indefinitely."
+
+// mergeTimeoutBlockedPRHint is the BLOCKED-pull-request read appended to the
+// timeout message (E106.28 / #5213, rule 15). It is conditional on the
+// repository's branch protection, because Fishhawk publishes the
+// fishhawk_audit_complete check but does not make it required, and it must not
+// contain the phrase the timeout control in merge_run_test.go forbids in the
+// no-advisory base message.
+const mergeTimeoutBlockedPRHint = " If the merge stays queued while the pull request is BLOCKED, read the fishhawk_audit_complete check output on the pull request (its summary names the missing item, where the repository's branch protection makes that check gate the merge) or fishhawk_get_gate_view merge_readiness."
+
 // checksPendingOutput builds the resumable checks_pending checkpoint returned
 // when the shared deadline expires while GitHub still refuses to queue the merge
 // (E67.56 / #2717). Per binding condition 4 it does NOT infer provenance the
@@ -1179,7 +1234,7 @@ func checksPendingOutput(seq int64, start time.Time, details map[string]any) Mer
 		VerdictSequence: seq,
 		WaitedSeconds:   time.Since(start).Seconds(),
 		Note:            mergeRunNote,
-		Message: "the merge verdict is recorded and durable, but GitHub will not queue the merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." +
+		Message: "the merge verdict is recorded and durable, but GitHub will not queue the merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." + mergeChecksPendingBoundedWaitHint +
 			auditCompleteDetailSuffix(details),
 	}
 }
@@ -1591,7 +1646,7 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 		out.NextAction = &step
 	case "timeout":
 		out.Message = appendAcceptanceAdvisory(
-			fmt.Sprintf("no pr_merged / post_merge_observed entry landed within %ds. The merge is queued; re-invoke fishhawk_merge_run to resume the wait (the endpoint is idempotent — the re-POST records no duplicate verdict row), or poll fishhawk_get_run_status.", clampAwaitTimeout(in.TimeoutSeconds)),
+			fmt.Sprintf("no pr_merged / post_merge_observed entry landed within %ds. The merge is queued; re-invoke fishhawk_merge_run to resume the wait (the endpoint is idempotent — the re-POST records no duplicate verdict row), or poll fishhawk_get_run_status."+mergeTimeoutBlockedPRHint, clampAwaitTimeout(in.TimeoutSeconds)),
 			r.acceptanceBlockerAdvisoryFor(ctx, runID))
 	case "run_terminal":
 		out.Message = fmt.Sprintf("run %s reached terminal state %q while awaiting the merge and no pr_merged / post_merge_observed entry landed — the merge will most likely never settle. Check fishhawk_get_run_status before re-invoking.", runID, runState)
