@@ -1,0 +1,14 @@
+id: scenario:issue-5216/gate-view-states-head-verification
+statement: The fishhawk_get_gate_view description tells the operator to read the committed code at the PR head rather than the fix-up self-report or PR body, and to grep the run's head before acting on a finding that claims something does not exist in the tree.
+verify_hint: 'MCP tool result: POST /mcp tools/list; read the fishhawk_get_gate_view description.'
+steps: Seed trace-upload-target; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list. Read the fishhawk_get_gate_view description.
+assertions:
+    expected: both rules present
+    observed_at_record: '''The fix-up agent''s self-report and the PR body are its own claims too: read the committed code at the PR head before trusting that a fix converged.'' Also: ''Before acting on ANY finding that claims a symbol or control does not exist in the tree ... grep the run''s head (merge_candidate_verdict.head_sha)''.'
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5216
+    pr: 5467
+    run_id: c6829727-10cb-4258-9943-f7ceecd7be35
+    head_sha: c19bbe53e8638f59b98f6fac400e4dbab76faecb
+    recorded_at: 2026-11-18T20:00:52Z

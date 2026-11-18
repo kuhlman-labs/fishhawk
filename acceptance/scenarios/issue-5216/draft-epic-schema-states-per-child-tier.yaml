@@ -1,0 +1,14 @@
+id: scenario:issue-5216/draft-epic-schema-states-per-child-tier
+statement: The fishhawk_draft_epic input schema for a child's labels states that each child is tiered individually rather than every child at the most sensitive member's tier.
+verify_hint: 'MCP tool result: POST /mcp tools/list; read the fishhawk_draft_epic inputSchema draft.children[].labels description.'
+steps: Seed trace-upload-target; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list. Read fishhawk_draft_epic inputSchema properties.draft.properties.children.items.properties.labels.description.
+assertions:
+    expected: per-child tiering stated
+    observed_at_record: '''Tier each child individually on the repository''s delegation-tier criteria ... do not blanket every child at the most sensitive member''s tier''.'
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5216
+    pr: 5467
+    run_id: c6829727-10cb-4258-9943-f7ceecd7be35
+    head_sha: c19bbe53e8638f59b98f6fac400e4dbab76faecb
+    recorded_at: 2026-11-18T20:00:52Z

@@ -1,0 +1,14 @@
+id: scenario:issue-5216/approve-plan-binding-assertions-state-vacuity
+statement: The fishhawk_approve_plan binding_assertions input schema states that security tests need error-identity assertions and a delete-the-control counterfactual, and that a test named after a condition is not a met condition.
+verify_hint: 'MCP tool result: POST /mcp tools/list; read fishhawk_approve_plan inputSchema properties.binding_assertions.description.'
+steps: Seed trace-upload-target; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list. Read fishhawk_approve_plan inputSchema.properties.binding_assertions.description.
+assertions:
+    expected: error-identity, delete-the-control counterfactual, named-test caveat
+    observed_at_record: '''Agent-written security tests default to vacuity: require error-IDENTITY assertions (the specific refusal, not any error) and a delete-the-control counterfactual observed RED; a test named after a condition is not evidence the condition is met''.'
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5216
+    pr: 5467
+    run_id: c6829727-10cb-4258-9943-f7ceecd7be35
+    head_sha: c19bbe53e8638f59b98f6fac400e4dbab76faecb
+    recorded_at: 2026-11-18T20:00:52Z

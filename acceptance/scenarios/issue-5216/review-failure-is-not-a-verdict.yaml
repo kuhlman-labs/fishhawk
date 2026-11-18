@@ -1,0 +1,14 @@
+id: scenario:issue-5216/review-failure-is-not-a-verdict
+statement: The fishhawk_await_review description states that a failed review (including one caused by quota exhaustion) is not a verdict and is re-run with fishhawk_rerun_review once the provider recovers.
+verify_hint: 'MCP tool result: POST /mcp tools/list; read the fishhawk_await_review description.'
+steps: Seed trace-upload-target; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list. Read the fishhawk_await_review description.
+assertions:
+    expected: not-a-verdict, including quota; rerun scoped per W1
+    observed_at_record: '''A failed review is NOT a verdict ... (a provider outage, quota exhaustion or a timeout ...); never count it as an approve or a reject. Read the failure reason ... no separate provider or quota label.'' fishhawk_rerun_review is eligible ONLY for an IMPLEMENT round of ADVISORY authority with ZERO verdicts. A failed PLAN review goes to approve/reject or fishhawk_revise_plan. A GATING or partial round is not re-runnable; follow get_run_status next_actions.'
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5216
+    pr: 5467
+    run_id: c6829727-10cb-4258-9943-f7ceecd7be35
+    head_sha: c19bbe53e8638f59b98f6fac400e4dbab76faecb
+    recorded_at: 2026-11-18T20:00:52Z
