@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -16,10 +17,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scaffold"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -2300,6 +2304,270 @@ func TestDoctorToolDescription_DescribesHostLabel(t *testing.T) {
 		"host_label", hostLabelEnv, "local-implement:<label>",
 		"override (", "persisted (", "hostname (", "none (",
 		"spec-named concurrency group is repo-scoped",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
+
+// --- credential and model_credential host-local rungs (#5227) ---
+
+// Sentinels the rung output must never carry.
+const (
+	doctorSentinelBearer = "fhk_SENTINEL_DOCTOR_BEARER_5227"
+	doctorSentinelStored = "fhk_SENTINEL_STORED_LOGIN_5227"
+)
+
+// stubHostLabel pins processHostLabel so a NewServer-built doctor never
+// touches the host-id file (non-parallel: package state).
+func stubHostLabel(t *testing.T) {
+	t.Helper()
+	saved := processHostLabel
+	t.Cleanup(func() { processHostLabel = saved })
+	processHostLabel = func() hostLabelResolution { return hostLabelResolution{Source: hostLabelSourceNone} }
+}
+
+// doctorViaNewServer calls fishhawk_doctor through a REAL NewServer(cfg) and
+// returns the decoded output plus its raw JSON.
+func doctorViaNewServer(t *testing.T, cfg Config, repo string) (DoctorOutput, string) {
+	t.Helper()
+	stubHostLabel(t)
+	res := callToolViaNewServer(t, cfg, "fishhawk_doctor", map[string]any{"repo": repo})
+	if res.IsError {
+		t.Fatalf("fishhawk_doctor errored: %s", toolResultText(t, res))
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out DoctorOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode DoctorOutput: %v", err)
+	}
+	return out, string(raw)
+}
+
+// countingProbe is a StoredLoginPresent seam that records its calls.
+func countingProbe(present bool, err error) (func() (bool, error), *int) {
+	calls := 0
+	return func() (bool, error) {
+		calls++
+		return present, err
+	}, &calls
+}
+
+// TestDoctor_HostRungs_StdioOperator is the S1 stdio-operator posture: the
+// rungs run, the presence seam answers, and the model CLI is exec'd.
+func TestDoctor_HostRungs_StdioOperator(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	execCalls := withFakeClaude(t, nil, `{"loggedIn":true,"authMethod":"claude.ai","loginExpiresAt":"2026-12-30T00:00:00.000Z"}`, nil)
+	probe, probeCalls := countingProbe(true, nil)
+	out, raw := doctorViaNewServer(t, Config{
+		BackendURL: srv.URL, APIToken: doctorSentinelBearer,
+		CredentialSource: credentialSourceEnv, StoredLoginPresent: probe, LocalHostRungs: true,
+	}, "kuhlman-labs/fishhawk")
+
+	c := out.Credential
+	if c == nil || c.Status != credentialRungWarn || c.ShadowedStoredLogin == nil || !*c.ShadowedStoredLogin {
+		t.Fatalf("credential = %+v, want warn with shadowed_stored_login true", c)
+	}
+	if c.Source != credentialSourceEnv || c.Variable != "FISHHAWK_API_TOKEN" {
+		t.Errorf("credential source/variable = %q/%q, want env:FISHHAWK_API_TOKEN/FISHHAWK_API_TOKEN", c.Source, c.Variable)
+	}
+	if !strings.Contains(c.Remediation, "unset FISHHAWK_API_TOKEN") || !strings.Contains(c.Remediation, "/mcp") {
+		t.Errorf("remediation = %q, want it to name unsetting FISHHAWK_API_TOKEN and reconnecting (/mcp)", c.Remediation)
+	}
+	if *probeCalls != 1 {
+		t.Errorf("presence seam called %d times, want 1", *probeCalls)
+	}
+	if m := out.ModelCredential; m == nil || m.Status != modelCredentialOK {
+		t.Errorf("model_credential = %+v, want ok", m)
+	}
+	if *execCalls != 1 {
+		t.Errorf("claude auth status exec'd %d times, want 1", *execCalls)
+	}
+	if strings.Contains(raw, doctorSentinelBearer) {
+		t.Errorf("doctor output carries the bearer:\n%s", raw)
+	}
+}
+
+// TestDoctor_HostRungs_MCPRoute is the S1 /mcp-route posture: LocalHostRungs
+// is off, so both rungs are not_applicable and nothing is read or exec'd.
+func TestDoctor_HostRungs_MCPRoute(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	execCalls := withFakeClaude(t, nil, `{"loggedIn":true}`, nil)
+	probe, probeCalls := countingProbe(true, nil)
+	out, _ := doctorViaNewServer(t, Config{
+		BackendURL: srv.URL, APIToken: doctorSentinelBearer, HTTPTransport: true,
+		CredentialSource: credentialSourceRouteBearer, StoredLoginPresent: probe,
+	}, "kuhlman-labs/fishhawk")
+	assertHostRungsNotApplicable(t, out, hostRungNotLocalStdio)
+	if out.Credential.Source != credentialSourceRouteBearer {
+		t.Errorf("credential source = %q, want mcp_route_request_bearer echoed", out.Credential.Source)
+	}
+	if *probeCalls != 0 || *execCalls != 0 {
+		t.Errorf("presence seam called %d, exec %d times on the route; want 0 and 0", *probeCalls, *execCalls)
+	}
+}
+
+// TestDoctor_HostRungs_RunBoundToken is the S1 run-bound posture: even with
+// LocalHostRungs on, an fhm_ bearer reports not_applicable and the store is
+// never read, so the in-runner agent cannot learn whether an operator login
+// exists.
+func TestDoctor_HostRungs_RunBoundToken(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	execCalls := withFakeClaude(t, nil, `{"loggedIn":true}`, nil)
+	probe, probeCalls := countingProbe(true, nil)
+	out, raw := doctorViaNewServer(t, Config{
+		BackendURL: srv.URL, APIToken: "fhm_SENTINEL_RUN_BOUND_5227",
+		CredentialSource: credentialSourceEnv, StoredLoginPresent: probe, LocalHostRungs: true,
+	}, "kuhlman-labs/fishhawk")
+	assertHostRungsNotApplicable(t, out, hostRungRunBoundToken)
+	if *probeCalls != 0 || *execCalls != 0 {
+		t.Errorf("presence seam called %d, exec %d times for a run-bound token; want 0 and 0", *probeCalls, *execCalls)
+	}
+	if strings.Contains(raw, "shadowed_stored_login") || strings.Contains(raw, "SENTINEL_RUN_BOUND") {
+		t.Errorf("run-bound doctor output leaks shadow state or the bearer:\n%s", raw)
+	}
+}
+
+func assertHostRungsNotApplicable(t *testing.T, out DoctorOutput, reason string) {
+	t.Helper()
+	if c := out.Credential; c == nil || c.Status != credentialRungNotApplicable || c.Reason != reason || c.ShadowedStoredLogin != nil || c.Note == "" {
+		t.Errorf("credential = %+v, want not_applicable reason %s with a note and no shadow field", c, reason)
+	}
+	if m := out.ModelCredential; m == nil || m.Status != modelCredentialNotApplicable || m.Reason != reason || m.LoggedIn != nil || m.Note == "" {
+		t.Errorf("model_credential = %+v, want not_applicable reason %s with a note", m, reason)
+	}
+}
+
+// TestDoctor_CredentialRung_Sources covers each source on the stdio posture.
+func TestDoctor_CredentialRung_Sources(t *testing.T) {
+	cases := []struct {
+		name       string
+		source     string
+		probe      func() (bool, error)
+		wantStatus string
+		wantShadow *bool
+		wantVar    string
+	}{
+		{"EnvSourceNoStoredLogin", credentialSourceEnv, func() (bool, error) { return false, nil }, credentialRungOK, boolPtr(false), "FISHHAWK_API_TOKEN"},
+		{"EnvSourceNoProbe", credentialSourceEnv, nil, credentialRungOK, nil, "FISHHAWK_API_TOKEN"},
+		{"StoredLogin", credentialSourceStoredLogin, nil, credentialRungOK, nil, ""},
+		{"StoredLoginRefreshed", credentialSourceStoredLoginRefreshed, nil, credentialRungOK, nil, ""},
+		{"Unset", "", nil, credentialRungUnknown, nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, srv := newDoctorFakeBackend(t)
+			withFakeClaude(t, nil, `{"loggedIn":true}`, nil)
+			out, _ := doctorViaNewServer(t, Config{
+				BackendURL: srv.URL, APIToken: "fhk_x",
+				CredentialSource: tc.source, StoredLoginPresent: tc.probe, LocalHostRungs: true,
+			}, "kuhlman-labs/fishhawk")
+			c := out.Credential
+			if c == nil || c.Status != tc.wantStatus || c.Source != tc.source || c.Variable != tc.wantVar {
+				t.Fatalf("credential = %+v, want status %s source %q variable %q", c, tc.wantStatus, tc.source, tc.wantVar)
+			}
+			if (c.ShadowedStoredLogin == nil) != (tc.wantShadow == nil) || (c.ShadowedStoredLogin != nil && *c.ShadowedStoredLogin != *tc.wantShadow) {
+				t.Errorf("shadowed_stored_login = %v, want %v", c.ShadowedStoredLogin, tc.wantShadow)
+			}
+			if !strings.Contains(c.Note, "report.scopes.subject") {
+				t.Errorf("note = %q, want it to name report.scopes.subject", c.Note)
+			}
+		})
+	}
+}
+
+// TestDoctor_CredentialRung_EnvShadowsStoredLogin pins the shadow branch and
+// the three-state rule: a presence-seam error leaves shadowed_stored_login
+// ABSENT, never false.
+func TestDoctor_CredentialRung_EnvShadowsStoredLogin(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	withFakeClaude(t, nil, `{"loggedIn":true}`, nil)
+	out, _ := doctorViaNewServer(t, Config{
+		BackendURL: srv.URL, APIToken: "fhk_x", CredentialSource: credentialSourceEnv, LocalHostRungs: true,
+		StoredLoginPresent: func() (bool, error) { return true, nil },
+	}, "kuhlman-labs/fishhawk")
+	if c := out.Credential; c.ShadowedStoredLogin == nil || !*c.ShadowedStoredLogin || c.Status != credentialRungWarn || c.Remediation == "" {
+		t.Errorf("credential = %+v, want shadowed true, warn and a remediation", c)
+	}
+
+	out, raw := doctorViaNewServer(t, Config{
+		BackendURL: srv.URL, APIToken: "fhk_x", CredentialSource: credentialSourceEnv, LocalHostRungs: true,
+		StoredLoginPresent: func() (bool, error) { return false, errors.New("corrupt store") },
+	}, "kuhlman-labs/fishhawk")
+	if c := out.Credential; c.ShadowedStoredLogin != nil || c.Status != credentialRungOK || !strings.Contains(c.Note, "undetermined") {
+		t.Errorf("credential = %+v, want shadowed absent, ok and an undetermined note", c)
+	}
+	if strings.Contains(raw, "shadowed_stored_login") {
+		t.Errorf("a store read error rendered shadowed_stored_login (must be absent, not false):\n%s", raw)
+	}
+}
+
+// TestDoctor_NeverEmitsCredentialBytes: neither the bearer nor a stored
+// token the presence seam saw reaches the marshaled output.
+func TestDoctor_NeverEmitsCredentialBytes(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	withFakeClaude(t, nil, `{"loggedIn":true}`, nil)
+	stored := func() (bool, error) {
+		tok := doctorSentinelStored // what a real seam loads, then drops
+		return tok != "", nil
+	}
+	_, raw := doctorViaNewServer(t, Config{
+		BackendURL: srv.URL, APIToken: doctorSentinelBearer, CredentialSource: credentialSourceEnv,
+		StoredLoginPresent: stored, LocalHostRungs: true,
+	}, "kuhlman-labs/fishhawk")
+	for _, s := range []string{doctorSentinelBearer, doctorSentinelStored, "SENTINEL"} {
+		if strings.Contains(raw, s) {
+			t.Errorf("doctor output carries %q:\n%s", s, raw)
+		}
+	}
+}
+
+// TestDoctor_IdentityFields_E2E_ThroughRealServer is condition S4's MCP leg:
+// a REAL server.New readiness response, through the real MCP client decode,
+// into fishhawk_doctor's rendered report.scopes.subject / credential_kind and
+// the credential rung's note. Nothing is hand-built between the handler and
+// the tool output.
+func TestDoctor_IdentityFields_E2E_ThroughRealServer(t *testing.T) {
+	const subject = "github:alice-fixture"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: subject, Scopes: []string{"read:runs", "write:runs"},
+		PlainText: doctorSentinelBearer, AuthMethod: "static",
+	}}
+	s := server.New(server.Config{APITokenRepo: tokRepo})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	withFakeClaude(t, nil, `{"loggedIn":true}`, nil)
+
+	out, raw := doctorViaNewServer(t, Config{
+		BackendURL: ts.URL, APIToken: doctorSentinelBearer, CredentialSource: credentialSourceEnv,
+		StoredLoginPresent: func() (bool, error) { return false, nil }, LocalHostRungs: true,
+	}, "kuhlman-labs/fishhawk")
+	if out.Report.Scopes.Subject != subject {
+		t.Errorf("report.scopes.subject = %q, want %q from the real readiness handler", out.Report.Scopes.Subject, subject)
+	}
+	if out.Report.Scopes.CredentialKind != "static" {
+		t.Errorf("report.scopes.credential_kind = %q, want static", out.Report.Scopes.CredentialKind)
+	}
+	if out.Credential == nil || !strings.Contains(out.Credential.Note, subject) {
+		t.Errorf("credential note = %+v, want it to name the served subject %q", out.Credential, subject)
+	}
+	if strings.Contains(raw, doctorSentinelBearer) {
+		t.Errorf("doctor output carries the bearer:\n%s", raw)
+	}
+}
+
+// TestDoctorToolDescription_DescribesHostRungs pins the shipped description's
+// #5227 claims.
+func TestDoctorToolDescription_DescribesHostRungs(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"four rungs", "credential —", "model_credential —", "env:FISHHAWK_API_TOKEN", "mcp_route_request_bearer",
+		"shadowed_stored_login", "report.scopes.subject", "claude auth status --json", "within 72h",
+		"not_applicable", "run_bound_token", "not_local_stdio_process", "no expiry reported",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)

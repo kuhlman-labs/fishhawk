@@ -25,9 +25,11 @@ package mcpserver
 
 import (
 	"os"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
@@ -68,6 +70,12 @@ type config struct {
 	// test-built config{} literal leaves it nil, which is no label (the
 	// server's `unknown` host).
 	hostLabel func() hostLabelResolution
+
+	// credentialSource, storedLoginPresent and localHostRungs are the
+	// package-private mirrors of the Config fields of the same names (#5227).
+	credentialSource   string
+	storedLoginPresent func() (bool, error)
+	localHostRungs     bool
 }
 
 // Config is the exported construction input for NewServer. Its two fields
@@ -110,6 +118,32 @@ type Config struct {
 	// --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS or fishhawk-mcp's
 	// --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS.
 	AllowedRoots []string
+
+	// CredentialSource names WHERE the bearer this registry authenticates with
+	// came from (#5227), never the bearer itself. fishhawk-mcp sets
+	// env:FISHHAWK_API_TOKEN, stored_login or stored_login_refreshed from its
+	// loadConfig ladder; fishhawkd's /mcp route sets mcp_route_request_bearer.
+	// fishhawk_doctor's credential rung and fishhawk_approve_plan's
+	// credential_source echo it. Empty means the embedder did not say.
+	CredentialSource string
+
+	// StoredLoginPresent is the optional PRESENCE-only seam the credential rung
+	// uses to tell whether an env token is shadowing a stored login (#5227). It
+	// answers whether a usable stored credential exists for this backend URL and
+	// must never return or retain the credential itself. It is called lazily,
+	// at doctor time, and only when LocalHostRungs is true and the bearer is not
+	// run-bound. Nil means presence is not checked.
+	StoredLoginPresent func() (bool, error)
+
+	// LocalHostRungs enables fishhawk_doctor's two host-local rungs, credential
+	// and model_credential (#5227). Only the operator's own stdio fishhawk-mcp
+	// process sets it (backend/cmd/fishhawk-mcp/main.go). It is false by default
+	// and false on fishhawkd's /mcp route, where this process's host and
+	// credential store are the daemon's, not the caller's. When false, both
+	// rungs report not_applicable and nothing is exec'd or read. A run-bound
+	// bearer (an fhm_ in-runner agent token) also reports not_applicable, so an
+	// agent never learns whether an operator login exists.
+	LocalHostRungs bool
 }
 
 // internal bridges the exported Config into the package-private config the
@@ -121,7 +155,18 @@ func (c Config) internal() config {
 		httpTransport: c.HTTPTransport,
 		allowedRoots:  c.AllowedRoots,
 		hostLabel:     processHostLabel,
+
+		credentialSource:   c.CredentialSource,
+		storedLoginPresent: c.StoredLoginPresent,
+		localHostRungs:     c.LocalHostRungs,
 	}
+}
+
+// isRunBoundToken reports whether bearer is a run-bound in-runner agent token
+// (the fhm_ prefix mcptoken mints per stage). Only the prefix is read; the
+// value is never retained.
+func isRunBoundToken(bearer string) bool {
+	return strings.HasPrefix(bearer, mcptoken.TokenPrefix)
 }
 
 // handshakeVersion returns the version string advertised on the MCP
@@ -163,6 +208,11 @@ func NewServer(cfg Config) *mcp.Server {
 		getenv:        os.Getenv,
 		httpTransport: c.httpTransport,
 		allowedRoots:  c.allowedRoots,
+
+		credentialSource:   c.credentialSource,
+		storedLoginPresent: c.storedLoginPresent,
+		localHostRungs:     c.localHostRungs,
+		runBoundToken:      isRunBoundToken(c.apiToken),
 	})
 	registerOnboardingResources(srv)
 	return srv
