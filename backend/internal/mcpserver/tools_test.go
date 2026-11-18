@@ -50,6 +50,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // fakeBackend is a thin httptest server that records the last
@@ -17367,7 +17368,9 @@ func TestGetRunStatus_GroomingApplyStatus_InFlight(t *testing.T) {
 
 // TestGetRunStatus_GroomingApplyStatus_Completed: a completed row after the
 // anchor → completed, counts taken from the writer's own summary (the golden:
-// failed 1, skipped 3, budget_exhausted 3), remaining 0, and NO advisory.
+// failed 1, skipped 3, budget_exhausted 3), remaining 0, and NO in-flight
+// advisory. The golden's budget_exhausted 3 APPENDS the completed-apply
+// advisory (#5216 R20), so approve_review_gate still leads.
 func TestGetRunStatus_GroomingApplyStatus_Completed(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
@@ -17402,6 +17405,10 @@ func TestGetRunStatus_GroomingApplyStatus_Completed(t *testing.T) {
 	}
 	if out.NextActions.Actions[0].Action != "approve_review_gate" {
 		t.Errorf("next_actions[0].action = %q, want approve_review_gate to lead once the apply completed", out.NextActions.Actions[0].Action)
+	}
+	last := out.NextActions.Actions[len(out.NextActions.Actions)-1]
+	if last.Action != "fishhawk_list_audit" || !strings.Contains(last.Reason, "3 entr(ies) recorded apply_budget_exhausted") {
+		t.Errorf("last action = %+v, want the appended completed-apply advisory naming the 3-entry budget tail", last)
 	}
 }
 
@@ -20173,5 +20180,211 @@ func TestApprovePlan_Forbidden_NamesBothCauses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #5216 slice 2: delegation-tier refusal tally (R1/R20) and binding_assertions
+// vacuity guidance (R21)
+// ---------------------------------------------------------------------------
+
+// seedGroomingTierRefusalRows appends one grooming_mutation_applied row per
+// entry id, each the golden with outcome skipped and skip_reason overridden to
+// the delegation-tier refusal (keys from the golden, never hand-authored).
+func seedGroomingTierRefusalRows(t *testing.T, fb *fakeBackend, runID uuid.UUID, entryIDs ...string) {
+	t.Helper()
+	golden := loadGroomingApplyGolden(t, auditCategoryGroomingMutationApplied)
+	for _, id := range entryIDs {
+		row := overrideGoldenKey(t, golden, "outcome", "skipped")
+		row = overrideGoldenKey(t, row, "skip_reason", groomingSkipReasonDelegationTierNotAuthorized)
+		row = overrideGoldenKey(t, row, "entry_id", id)
+		seedRawReviewAudit(fb, runID, auditCategoryGroomingMutationApplied, row)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_TalliesTierRefusals is the cross-layer
+// test for #5216 R1: audit rows -> grooming_apply_status -> next_actions on ONE
+// fishhawk_get_run_status response. The completed summary is the golden with
+// budget_exhausted overridden to 0 (approval condition W5a), so the appended
+// advisory depends on the tier tally alone; the summary carries no tier count,
+// so the count can only come from the per-entry rows.
+func TestGetRunStatus_GroomingApplyStatus_TalliesTierRefusals(t *testing.T) {
+	const idA = "hygiene:github/x/y#11:missing_label_namespace"
+	const idB = "hygiene:github/x/y#12:missing_label_namespace"
+
+	t.Run("completed", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		groomingApplyStatusRun(fb, runID)
+		seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+		seedGroomingMutationRows(t, fb, runID, 1, "applied")
+		seedGroomingTierRefusalRows(t, fb, runID, idA, idB)
+		completed := overrideGoldenKey(t, loadGroomingApplyGolden(t, auditCategoryGroomingApplyCompleted), "budget_exhausted", 0)
+		seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyCompleted, completed)
+
+		out := groomingStatusFor(t, srv, runID)
+		st := out.GroomingApplyStatus
+		if st == nil || st.State != groomingApplyStateCompleted {
+			t.Fatalf("GroomingApplyStatus = %+v, want the completed block", st)
+		}
+		if st.BudgetExhausted != 0 {
+			t.Fatalf("precondition: budget_exhausted = %d, want 0 so the advisory depends on the tier tally alone", st.BudgetExhausted)
+		}
+		if st.TierNotAuthorized != 2 {
+			t.Errorf("tier_not_authorized = %d, want 2 (tallied from the per-entry rows; the summary carries none)", st.TierNotAuthorized)
+		}
+		if !slices.Equal(st.TierNotAuthorizedEntries, []string{idA, idB}) {
+			t.Errorf("tier_not_authorized_entries = %v, want [%s %s]", st.TierNotAuthorizedEntries, idA, idB)
+		}
+
+		na := out.NextActions
+		if na == nil || len(na.Actions) == 0 {
+			t.Fatalf("next_actions = %+v", na)
+		}
+		if na.Actions[0].Action != "approve_review_gate" {
+			t.Errorf("next_actions[0] = %q, want approve_review_gate still leading (the advisory is APPENDED)", na.Actions[0].Action)
+		}
+		last := na.Actions[len(na.Actions)-1]
+		if last.Action != "fishhawk_list_audit" || last.Params["category"] != auditCategoryGroomingMutationApplied || last.Params["run_id"] != runID.String() {
+			t.Fatalf("last action = %+v, want the appended fishhawk_list_audit(grooming_mutation_applied) advisory", last)
+		}
+		for _, want := range []string{"2 entr(ies) refused delegation_tier_not_authorized", idA, idB, "applied nothing", "by hand on the tracker", "do not re-approve this run's plan gate"} {
+			if !strings.Contains(last.Reason, want) {
+				t.Errorf("advisory reason missing %q: %q", want, last.Reason)
+			}
+		}
+		if strings.Contains(last.Reason, "apply_budget_exhausted") {
+			t.Errorf("advisory names a budget tail with budget_exhausted 0: %q", last.Reason)
+		}
+	})
+
+	// In flight: the tally is live from the rows too, and no completed
+	// advisory is appended before the apply settles.
+	t.Run("in_flight", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		groomingApplyStatusRun(fb, runID)
+		started := loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted)
+		seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, overrideGoldenKey(t, started, "candidate_count", 5))
+		seedGroomingTierRefusalRows(t, fb, runID, idA)
+
+		out := groomingStatusFor(t, srv, runID)
+		st := out.GroomingApplyStatus
+		if st == nil || st.State != groomingApplyStateInFlight {
+			t.Fatalf("GroomingApplyStatus = %+v, want in_flight", st)
+		}
+		if st.TierNotAuthorized != 1 || !slices.Equal(st.TierNotAuthorizedEntries, []string{idA}) || st.Skipped != 1 || st.BudgetExhausted != 0 {
+			t.Errorf("tally = tier %d entries %v skipped %d budget %d, want 1 [%s] 1 0", st.TierNotAuthorized, st.TierNotAuthorizedEntries, st.Skipped, st.BudgetExhausted, idA)
+		}
+		for _, a := range out.NextActions.Actions {
+			if a.Action == "fishhawk_list_audit" && strings.Contains(a.Reason, "grooming apply completed") {
+				t.Errorf("in-flight apply carries the completed advisory: %+v", a)
+			}
+		}
+	})
+
+	// A zero tally stays OFF the wire (omitempty), so an apply with no tier
+	// proposal is byte-identical to before.
+	t.Run("zero_omitted", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		groomingApplyStatusRun(fb, runID)
+		seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+		seedGroomingMutationRows(t, fb, runID, 1, "applied")
+
+		raw, _ := json.Marshal(groomingStatusFor(t, srv, runID).GroomingApplyStatus)
+		for _, key := range []string{`"tier_not_authorized"`, `"tier_not_authorized_entries"`} {
+			if strings.Contains(string(raw), key) {
+				t.Errorf("zero tally put %s on the wire: %s", key, raw)
+			}
+		}
+	})
+}
+
+// TestGetRunStatus_GroomingApplyStatus_TierRefusalEntriesCapped: the entries
+// list is bounded at groomingTierRefusalEntriesCap while the count stays full,
+// and the advisory says how many more there are.
+func TestGetRunStatus_GroomingApplyStatus_TierRefusalEntriesCapped(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+	total := groomingTierRefusalEntriesCap + 3
+	ids := make([]string, total)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("hygiene:github/x/y#%d:missing_label_namespace", 100+i)
+	}
+	seedGroomingTierRefusalRows(t, fb, runID, ids...)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyCompleted, overrideGoldenKey(t, loadGroomingApplyGolden(t, auditCategoryGroomingApplyCompleted), "budget_exhausted", 0))
+
+	out := groomingStatusFor(t, srv, runID)
+	st := out.GroomingApplyStatus
+	if st == nil || st.TierNotAuthorized != total || len(st.TierNotAuthorizedEntries) != groomingTierRefusalEntriesCap {
+		t.Fatalf("GroomingApplyStatus = %+v, want count %d with %d entries", st, total, groomingTierRefusalEntriesCap)
+	}
+	if !slices.Equal(st.TierNotAuthorizedEntries, ids[:groomingTierRefusalEntriesCap]) {
+		t.Errorf("entries = %v, want the first %d in ledger order", st.TierNotAuthorizedEntries, groomingTierRefusalEntriesCap)
+	}
+	last := out.NextActions.Actions[len(out.NextActions.Actions)-1]
+	if !strings.Contains(last.Reason, "(and 3 more;") {
+		t.Errorf("advisory reason = %q, want the overflow named", last.Reason)
+	}
+}
+
+// TestGroomingSkipReasonDelegationTierNotAuthorized_MirrorsWorkmgmt pins the
+// literal mirror: mcpserver must not import workmgmt in production code (the
+// board read guard), so the skip reason is duplicated and pinned here.
+func TestGroomingSkipReasonDelegationTierNotAuthorized_MirrorsWorkmgmt(t *testing.T) {
+	if groomingSkipReasonDelegationTierNotAuthorized != workmgmt.GroomingSkipDelegationTierNotAuthorized {
+		t.Errorf("groomingSkipReasonDelegationTierNotAuthorized = %q, workmgmt.GroomingSkipDelegationTierNotAuthorized = %q: the mirror drifted", groomingSkipReasonDelegationTierNotAuthorized, workmgmt.GroomingSkipDelegationTierNotAuthorized)
+	}
+	if groomingSkipReasonApplyBudgetExhausted != workmgmt.GroomingSkipApplyBudgetExhausted {
+		t.Errorf("groomingSkipReasonApplyBudgetExhausted = %q, workmgmt.GroomingSkipApplyBudgetExhausted = %q: the mirror drifted", groomingSkipReasonApplyBudgetExhausted, workmgmt.GroomingSkipApplyBudgetExhausted)
+	}
+}
+
+// TestApprovePlan_BindingAssertionsStateVacuityRule pins #5216 R21 on the
+// SERVED fishhawk_approve_plan surface: both the description's
+// binding_assertions paragraph and the binding_assertions input-schema
+// property carry the vacuity rule, and the added text is repository-agnostic
+// (ADR-110).
+func TestApprovePlan_BindingAssertionsStateVacuityRule(t *testing.T) {
+	tools := fixupGuidanceTools(t)
+	desc := fixupGuidanceDescription(t, tools, "fishhawk_approve_plan")
+
+	raw, err := json.Marshal(tools["fishhawk_approve_plan"].InputSchema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode input schema: %v", err)
+	}
+	prop, ok := schema.Properties["binding_assertions"]
+	if !ok {
+		t.Fatalf("fishhawk_approve_plan input schema has no binding_assertions property: %s", raw)
+	}
+	propDesc := fixupGuidanceFlatten(prop.Description)
+
+	for surface, text := range map[string]string{"description": desc, "binding_assertions schema": propDesc} {
+		for _, want := range []string{
+			"agent-written security tests default to vacuity",
+			"require error-identity assertions (the specific refusal, not any error)",
+			"a delete-the-control counterfactual observed red",
+			"a test named after a condition is not evidence the condition is met",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s missing R21 anchor %q", surface, want)
+			}
+		}
+		for _, banned := range []string{"kuhlman-labs", "https://github.com/", "scripts/", "backend/internal/"} {
+			if strings.Contains(text, strings.ToLower(banned)) {
+				t.Errorf("%s carries repository-specific %q (ADR-110)", surface, banned)
+			}
+		}
 	}
 }

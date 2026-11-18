@@ -683,7 +683,9 @@ and inherited by `fishhawk_run_stage`); omit them for a `github_actions` run.
 Whether an anchor issue is needed is decided by YOUR declaration, not by the
 loop: where its propose stage declares a required `github_issue` input, the
 **anchor issue supplies the request** — open or reuse an issue whose BODY
-states what you want groomed, because the body IS the request. Where the stage
+states what you want groomed, because the body IS the request. A stale anchor
+body steers the groom wrong, so re-read it before each start and whenever the
+charter is amended. Where the stage
 declares no such input, omit `issue`; the request comes from whatever inputs
 that declaration does take.
 
@@ -1299,6 +1301,81 @@ normal and expected: one reviewer rejecting while the other approves does
 A reviewer marked external/OOM-failed is usually a misclassified adapter error
 and is non-blocking; do not treat it as a real rejection without checking the
 underlying error.
+
+### Review arbitration, filing and grooming judgement
+
+These rules are operator judgement rather than a mechanical next step, so no
+verb enforces them. `next_actions` and the tool descriptions carry the
+mechanical half.
+
+**Adjudicate a split on the tree, not on the prose.** When two reviewers
+disagree, or one rejects, check the rejecting reviewer's claim against the
+tree: run the code, grep the cited symbol, read the cited line. Do not weigh
+the two verdicts' prose against each other or average them. Before acting on a
+finding that claims a symbol or control does not exist, grep the run's head
+(`merge_candidate_verdict.head_sha` on the gate view) for it. The plan-gate
+arbitration reasons and the merge-with-follow-up precondition in `next_actions`
+carry the same rule.
+
+**A failed review is not a verdict.** A review status `failed`, or a
+`reviews[]` row whose verdict is `failed`, means the reviewer errored, for
+example on a provider outage, quota exhaustion or a timeout; read the failure
+reason for the cause. Never count it as an approve or a reject. Recover by the
+round's shape, never by a blanket re-run: `fishhawk_rerun_review` re-runs only
+an implement-review round of advisory authority that recorded zero verdicts. A
+failed plan review is answered by `fishhawk_revise_plan` or by your approve or
+reject decision itself. For a gating review, or a round where another reviewer
+succeeded, take the legal next step `fishhawk_get_run_status` names in
+`next_actions`.
+
+**An all-red counterfactual battery proves only the controls it mutates.** It
+says nothing about a control nobody wrote. At plan approval, list the
+cross-entity eligibility cases separately (parent and child, run and stage,
+scan and apply: does a check made on one entity also hold for the other?) and
+condition each one the plan leaves uncovered.
+
+**Defer a real but non-blocking hardening; waive only what is wrong.**
+`fishhawk_defer_concern` keeps a real finding alive as a tracked issue, and its
+reason is shown verbatim to every later re-review of the stage, so make it
+self-contained: what is deferred, and why it does not block. A waive is for a
+finding that is wrong or an accepted tradeoff. A false-positive reason starts
+with `false_positive:`, gives the evidence that disproves the finding
+(file:line, a test, or a tree SHA), and names who authorized the waive when you
+act on delegated authority.
+
+**Search before filing.** Before `fishhawk_file_issue`, search the tracker
+yourself by a code symbol or path from the change, not only by title words. The
+intake duplicate scan is lexical over a bounded window. A degraded intake is
+not always a skipped scan: a `degrade_reason` that starts with `charter_` (the
+charter or its rubric could not be read) leaves the duplicate candidates valid,
+while
+`reader_unavailable`, `reader_error` or `budget_exceeded` means the scan did not
+complete. The scan does not read a running campaign's
+item list, so while a campaign runs, read the items from
+`fishhawk_get_campaign_status` too. Before filing a decision record or an epic,
+search the existing decision records and epics by topic.
+
+**Create the successor epic before the parent fills.** The child cap counts the
+parent's actual sub-issues and is refused before anything is created
+(`details.parent_epic_full`). The child ordinal in a returned title is the next
+number after the highest matched title, gaps allowed, so it is not the parent's
+child count: count the sub-issues and file the successor epic before the cap.
+
+**Tier each epic child on its own.** Apply the repository's tier criteria to
+each child of a drafted epic; do not blanket every child at the most sensitive
+member's tier. The tier label a filing receives by default is a namespace
+default, not a triage decision: set the lowest tier explicitly when the item
+touches a path the workflow forbids to an agent or a human-only surface.
+
+**After a completed grooming apply, relabel refused tier proposals by hand.**
+An entry refused `delegation_tier_not_authorized` applied nothing, not even the
+clerical labels beside the tier; `grooming_apply_status.tier_not_authorized_entries`
+names them, so apply the ones you agree with by hand on the tracker. An
+`apply_budget_exhausted` tail was never evaluated and resurfaces on the next
+grooming run, so approve that run. Do not re-approve this run's plan gate for
+either: a plan re-approval launches a fresh apply and changes neither outcome.
+Attesting the confirm gate (`approve_review_gate`) is unaffected and is the
+legal next step.
 
 ### Post-failure clean-tree discipline
 

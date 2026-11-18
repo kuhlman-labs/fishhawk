@@ -57,7 +57,9 @@ Two failure modes that look like product bugs and are not:
 
 The anchor issue supplies the request — the `groom` stage declares
 `inputs: [{source: github_issue, required: true}]`. Reuse #3112, the standing anchor, or
-open a new issue whose body states what you want groomed; the body IS the request.
+open a new issue whose body states what you want groomed; the body IS the request. A
+stale anchor body steers the groom wrong: re-read #3112 before each start, and re-check it
+whenever the charter is amended, editing the body to match before the next run (#5216).
 
 **Scheduled runs.** `.fishhawk/workflows.yaml` also schedules the workflow weekly, Tuesday
 09:00 UTC, anchored to #3112 (`schedule: {cron: "0 9 * * 2", issue: 3112}`). It fires only
@@ -138,7 +140,10 @@ candidate in flight is recorded `failed` and every candidate after it is recorde
 `skipped` with `skip_reason: apply_budget_exhausted` — never dialed — and the completed
 row's `budget_exhausted` count names the tail. Those entries are NOT suppressed by the
 churn guard, so they RESURFACE on the next grooming run; approve that run rather than
-hand-applying them.
+hand-applying them. Do not re-approve this run's PLAN gate for the tail: a plan
+re-approval launches a fresh apply. Attesting the confirm gate (§5,
+`approve_review_gate`) is unaffected and is the legal next step. Once the apply completes,
+`next_actions` appends a read-only `fishhawk_list_audit` advisory saying so (#5216).
 
 **A transient write failure is re-settled in the apply, not handed to you (#5225).** A
 `depends_on_add`, `label_set`, `close_duplicate` or `close_not_planned` write that fails
@@ -331,6 +336,12 @@ under `mode: auto` and under a whole-report approval alike. What you still have 
   ingest census gains a `delegation_tier_proposals` count so you can see at the gate how
   many entries propose a tier. Apply the ones you agree with **by hand**, or wait for the
   per-entry disposition surface (#2843) to carry the decision.
+- After the apply, `fishhawk_get_run_status` names them: `grooming_apply_status.tier_not_authorized`
+  counts the refused entries and `tier_not_authorized_entries` lists their `entry_id`s
+  (first 20), and a completed apply's `next_actions` appends a read-only
+  `fishhawk_list_audit` advisory with the by-hand relabel remedy (#5216). Re-approving the
+  plan gate does not apply them: a plan re-approval launches a fresh apply, which refuses
+  them again. Attesting the confirm gate is unaffected.
 - The entry is not suppressed: a refused proposal never enters the churn baseline, so it
   resurfaces next run rather than disappearing.
 
