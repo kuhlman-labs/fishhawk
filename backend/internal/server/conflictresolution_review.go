@@ -162,10 +162,13 @@ func truncateUTF8(s string, n int) string {
 
 // conflictResolutionSummaryResult is what recordConflictResolutionSummary
 // hands the report handler: the row payload additions and the report-time
-// secret-scan group count.
+// secret-scan counts. secretGroups is the FRESH groups the scan raised (#5230
+// C4b): groups the allowlist suppressed and groups already on record for the
+// stage are excluded. suppressedHitCount is the hits the allowlist suppressed.
 type conflictResolutionSummaryResult struct {
-	payload      map[string]any
-	secretGroups int
+	payload            map[string]any
+	secretGroups       int
+	suppressedHitCount int
 }
 
 // recordConflictResolutionSummary persists a conflict_resolution_pushed
@@ -193,8 +196,9 @@ func (s *Server) recordConflictResolutionSummary(ctx context.Context, runID uuid
 		for _, p := range paths {
 			changed = append(changed, policy.ChangedFile{Path: p, Status: policy.StatusModified})
 		}
-		groups := s.raiseDiffSecretConcerns(ctx, runID, stage.ID, policy.Diff{Patch: pr.ResolutionPatch, ChangedFiles: changed}, pr.HeadSHA)
-		res.secretGroups = len(groups)
+		round := s.raiseDiffSecretConcerns(ctx, runID, stage.ID, policy.Diff{Patch: pr.ResolutionPatch, ChangedFiles: changed}, pr.HeadSHA)
+		res.secretGroups = len(round.FreshGroups)
+		res.suppressedHitCount = round.SuppressedHitCount
 	}
 
 	redactedPatch, _ := redaction.RedactDefault([]byte(pr.ResolutionPatch))
@@ -492,8 +496,10 @@ func (s *Server) docsOnlyConfirmedByCompare(ctx context.Context, runRow *run.Run
 // parent records a skip (decomposed_parent); a confirmed docs-only report
 // records a skip (resolution_docs_only), falling through to review when the
 // skip row cannot be appended; every other report starts a full-diff round on
-// a detached context tracked by bgReviews.
-func (s *Server) maybeDispatchConflictResolutionReview(ctx context.Context, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, secretGroups int) {
+// a detached context tracked by bgReviews. secretGroups and suppressedHitCount
+// are the report-time scan's counts (conflictResolutionSummaryResult), carried
+// on a skip row.
+func (s *Server) maybeDispatchConflictResolutionReview(ctx context.Context, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, secretGroups, suppressedHitCount int) {
 	if conflictReviewDispatchObserved != nil {
 		conflictReviewDispatchObserved(runID, stage.ID, pr.HeadSHA)
 	}
@@ -505,7 +511,7 @@ func (s *Server) maybeDispatchConflictResolutionReview(ctx context.Context, runI
 		}
 	}
 	if runRow != nil && s.isDecomposedParentRun(ctx, runRow) {
-		if err := s.recordConflictResolutionReviewSkipped(ctx, runID, stageID, pr, conflictResolutionSkipDecomposedParent, secretGroups); err != nil {
+		if err := s.recordConflictResolutionReviewSkipped(ctx, runID, stageID, pr, conflictResolutionSkipDecomposedParent, secretGroups, suppressedHitCount); err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelError, "conflict-resolution review: decomposed-parent skip row not recorded",
 				slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()))
 		}
@@ -515,7 +521,7 @@ func (s *Server) maybeDispatchConflictResolutionReview(ctx context.Context, runI
 	declared, specErr := declaredConventionsForRun(runRow)
 	if classifyConflictResolution(pr.ResolvedPaths, pr.ResolvedPathsTruncated, declared, specErr) == conflictResolutionClassDocsOnly &&
 		s.docsOnlyConfirmedByCompare(ctx, runRow, base, pr.HeadSHA, pr.ResolvedPaths) {
-		err := s.recordConflictResolutionReviewSkipped(ctx, runID, stageID, pr, conflictResolutionSkipDocsOnly, secretGroups)
+		err := s.recordConflictResolutionReviewSkipped(ctx, runID, stageID, pr, conflictResolutionSkipDocsOnly, secretGroups, suppressedHitCount)
 		if err == nil {
 			return
 		}
@@ -536,8 +542,10 @@ func (s *Server) maybeDispatchConflictResolutionReview(ctx context.Context, runI
 }
 
 // recordConflictResolutionReviewSkipped appends the skip row and RETURNS the
-// append error, so the docs-only caller can fail toward review.
-func (s *Server) recordConflictResolutionReviewSkipped(ctx context.Context, runID, stageID uuid.UUID, pr *pullRequestBody, reason string, secretGroups int) error {
+// append error, so the docs-only caller can fail toward review. The row
+// carries diff_secret_groups (FRESH groups the report-time scan raised) when
+// >0 and suppressed_hit_count (hits the allowlist suppressed) when >0.
+func (s *Server) recordConflictResolutionReviewSkipped(ctx context.Context, runID, stageID uuid.UUID, pr *pullRequestBody, reason string, secretGroups, suppressedHitCount int) error {
 	if s.cfg.AuditRepo == nil {
 		return errors.New("audit repo not wired")
 	}
@@ -551,6 +559,9 @@ func (s *Server) recordConflictResolutionReviewSkipped(ctx context.Context, runI
 	}
 	if secretGroups > 0 {
 		payload["diff_secret_groups"] = secretGroups
+	}
+	if suppressedHitCount > 0 {
+		payload["suppressed_hit_count"] = suppressedHitCount
 	}
 	body, _ := json.Marshal(payload)
 	systemKind := audit.ActorKind("system")

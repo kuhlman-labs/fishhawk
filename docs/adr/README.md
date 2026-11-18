@@ -377,7 +377,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-084 is recorded with this batch because ADR-118 amends it. Its tracker body is transcribed after removing the automatically appended "Intake signals" section, as for ADR-113 and ADR-114.
 - ADR-112: `amends: [ADR-093]` ("it **amends ADR-093** (D4, D6, D7, and the mechanics of Q1(a)…)"; "It does not supersede either"); ADR-093 gains `amended_by: [ADR-112]`. Its in-body "Amendment A1" (2026-10-23) is part of the transcribed body, and adds no edge.
 - ADR-113: `amends: [ADR-055]` (Record metadata); ADR-055 `amended_by: [ADR-113]`.
-- ADR-084: no edge added. Its in-body "Amendment A1: server-check concerns are refused on agent-drivable channels" (2026-11-12) is part of the transcribed body.
+- ADR-084: no edge added. Its in-body "Amendment A1: server-check concerns are refused on agent-drivable channels" (2026-11-12) and "Amendment A2: reviewed allowlist and in-scope fixture markers suppress diff-secret hits" (ratified by the Captain 2026-11-17 on the #5230 comment, recorded with #5230; final text confirmed at merge) are part of the body; neither changes a front-matter field, so `index.json` is unchanged.
 - ADR-114: no edge. Its in-body "Amendment A1: token callers" (2026-10-23) is part of the transcribed body.
 - ADR-115: `amends: [ADR-063, ADR-092, ADR-093, ADR-094, ADR-112]` (Record metadata). Each gains `amended_by: [ADR-115]`. ADR-092 keeps `superseded_by: [ADR-093]`, and ADR-094 keeps `amended_by` ADR-100.
 - ADR-116: `amends: [ADR-041, ADR-115]` ("It amends ADR-041 decision 4 … and ADR-115 D5"); both gain `amended_by: [ADR-116]`.

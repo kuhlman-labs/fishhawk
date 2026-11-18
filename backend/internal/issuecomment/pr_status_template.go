@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -56,8 +57,11 @@ type prStatusSections struct {
 	reviews         string
 	acceptanceFull  string
 	acceptanceTally string
-	fixups          string
-	footer          string
+	// diffSecrets is the bounded diff-secrets suppression section (#5230):
+	// kept at every degradation level.
+	diffSecrets string
+	fixups      string
+	footer      string
 }
 
 // RenderPRStatusBody assembles the sticky PR status comment body from the run's
@@ -66,7 +70,8 @@ type prStatusSections struct {
 // MaxIssueCommentBodyBytes via a degradation ladder that drops the acceptance
 // per-criterion table first (collapsing to the tally line), then the fix-up
 // history, always preserving the header, the current-round reviews, the
-// acceptance outcome, and the footer. A still-oversized floor falls through to
+// acceptance outcome, the bounded diff-secrets suppression section (#5230) and
+// the footer. A still-oversized floor falls through to
 // truncateForGitHubComment.
 func RenderPRStatusBody(in PRStatusInput) string {
 	if in.Run == nil {
@@ -87,14 +92,15 @@ func RenderPRStatusBody(in PRStatusInput) string {
 		reviews:         renderStageReviews("implement", in.Audit),
 		acceptanceFull:  renderPRAcceptance(acc, true),
 		acceptanceTally: renderPRAcceptance(acc, false),
+		diffSecrets:     renderPRDiffSecretsSuppressed(in.Audit),
 		fixups:          renderPRFixupHistory(in.Audit),
 		footer:          renderPRStatusFooter(in.Run, externalURL),
 	}
 
 	// Degradation ladder: level 0 is everything; level 1 collapses the
 	// acceptance criteria table to the tally line; level 2 also drops the
-	// fix-up history. Header / reviews / acceptance-outcome / footer are never
-	// dropped.
+	// fix-up history. Header / reviews / acceptance-outcome / diff-secrets
+	// suppression / footer are never dropped.
 	for level := 0; level <= 2; level++ {
 		body := assemblePRStatus(s, level)
 		if len(body) <= MaxIssueCommentBodyBytes {
@@ -122,6 +128,9 @@ func assemblePRStatus(s prStatusSections, level int) string {
 		}
 	} else if s.acceptanceTally != "" {
 		parts = append(parts, s.acceptanceTally)
+	}
+	if s.diffSecrets != "" {
+		parts = append(parts, s.diffSecrets)
 	}
 	if level < 2 && s.fixups != "" {
 		parts = append(parts, s.fixups)
@@ -610,6 +619,173 @@ func decodeFixupPush(payload []byte) prFixupPass {
 		return prFixupPass{}
 	}
 	return prFixupPass{headSHA: p.HeadSHA, filesChanged: p.FilesChangedCount, applyPath: p.ApplyPath}
+}
+
+// ---------------------------------------------------------------------
+// Diff secrets suppressed (#5230, ADR-084 A2).
+// ---------------------------------------------------------------------
+
+// diffSecretsDetectedCategory is the server's diff-secrets origin entry
+// (server/diff_secrets.go diffSecretsDetectedCategory); a literal here, as
+// renderPRFixupHistory names fixup_pushed, to keep the import graph one-way.
+const diffSecretsDetectedCategory = "diff_secrets_detected"
+
+// prMarkerLocationCap bounds the marker-suppressed locations listed; the
+// remainder is counted.
+const prMarkerLocationCap = 10
+
+// prShortFingerprintLen is how much of a rule fingerprint the section shows.
+const prShortFingerprintLen = 8
+
+// renderPRDiffSecretsSuppressed renders the **Diff secrets suppressed**
+// section from every diff_secrets_detected payload's
+// diffsecrets.SuppressionSummary, decoded tolerantly (an undecodable or
+// pre-#5230 entry contributes nothing). Records are folded across entries by
+// (path, pattern, by, rule id, fingerprint, check key), lines taken from the
+// NEWEST entry. Totals count the folded lines per By; the allowlist status,
+// admission ref and rejected count come from the newest entry carrying an
+// allowlist status. Every allowlist-derived string renders through
+// diffsecrets.SafeRuleID / SafeFingerprint and every path through prCodeSpan,
+// so a corrupted row cannot echo bytes. Empty unless something was
+// suppressed or rejected.
+func renderPRDiffSecretsSuppressed(entries []*audit.Entry) string {
+	type foldKey struct{ path, pattern, by, id, fp, check string }
+	type entryRec struct {
+		seq int64
+		sum diffsecrets.SuppressionSummary
+	}
+	var recs []entryRec
+	for _, e := range entries {
+		if e.Category != diffSecretsDetectedCategory || len(e.Payload) == 0 {
+			continue
+		}
+		var sum diffsecrets.SuppressionSummary
+		if err := json.Unmarshal(e.Payload, &sum); err != nil {
+			continue
+		}
+		recs = append(recs, entryRec{seq: e.Sequence, sum: sum})
+	}
+	sort.SliceStable(recs, func(i, j int) bool { return recs[i].seq < recs[j].seq })
+	folded := map[foldKey]diffsecrets.SuppressionRecord{}
+	var order []foldKey
+	var status *diffsecrets.AllowlistStatusRecord
+	for _, r := range recs {
+		if r.sum.Allowlist != nil {
+			status = r.sum.Allowlist
+		}
+		for _, x := range r.sum.Suppressed {
+			k := foldKey{x.Path, x.Pattern, x.By, x.RuleID, x.RuleFingerprint, x.CheckKey}
+			if _, ok := folded[k]; !ok {
+				order = append(order, k)
+			}
+			folded[k] = x // newest entry wins
+		}
+	}
+	rejected := 0
+	if status != nil {
+		rejected = status.RejectedCount
+	}
+	if len(folded) == 0 && rejected == 0 {
+		return ""
+	}
+	type ruleKey struct{ by, id, fp string }
+	ruleHits := map[ruleKey]int{}
+	var rules []ruleKey
+	var markers []diffsecrets.SuppressionRecord
+	entryHits, markerHits := 0, 0
+	for _, k := range order {
+		x := folded[k]
+		n := len(x.Lines)
+		rk := ruleKey{x.By, diffsecrets.SafeRuleID(x.RuleID), diffsecrets.SafeFingerprint(x.RuleFingerprint)}
+		if _, ok := ruleHits[rk]; !ok {
+			rules = append(rules, rk)
+		}
+		ruleHits[rk] += n
+		if x.By == diffsecrets.ByMarker {
+			markerHits += n
+			markers = append(markers, x)
+		} else {
+			entryHits += n
+		}
+	}
+	sort.SliceStable(rules, func(i, j int) bool {
+		if rules[i].by != rules[j].by {
+			return rules[i].by < rules[j].by
+		}
+		if rules[i].id != rules[j].id {
+			return rules[i].id < rules[j].id
+		}
+		return rules[i].fp < rules[j].fp
+	})
+	var b strings.Builder
+	b.WriteString("**Diff secrets suppressed**\n\n")
+	fmt.Fprintf(&b, "%d hit%s suppressed: %d by allowlist entr%s, %d by fixture marker%s.\n",
+		entryHits+markerHits, plural(entryHits+markerHits), entryHits, pluralY(entryHits), markerHits, plural(markerHits))
+	if status != nil {
+		line := fmt.Sprintf("Allowlist `%s` · %s", prCodeSpan(status.Path), prCodeSpan(status.Status))
+		if status.Ref != "" {
+			line += fmt.Sprintf(" at admission commit `%s`", prCodeSpan(shortSHA(status.Ref)))
+		}
+		if rejected > 0 {
+			line += fmt.Sprintf(" · %d rule%s rejected", rejected, plural(rejected))
+		}
+		b.WriteString(line + "\n")
+	}
+	if len(rules) > 0 {
+		b.WriteString("\n")
+		for _, rk := range rules {
+			fp := rk.fp
+			if len(fp) > prShortFingerprintLen && fp != diffsecrets.InvalidFingerprint {
+				fp = fp[:prShortFingerprintLen]
+			}
+			fmt.Fprintf(&b, "- %s rule `%s` (`%s`): %d hit%s\n", prCodeSpan(rk.by), rk.id, fp, ruleHits[rk], plural(ruleHits[rk]))
+		}
+	}
+	if len(markers) > 0 {
+		b.WriteString("\nMarker-suppressed lines (each raised a low, human-only concern a human must confirm):\n\n")
+		for i, x := range markers {
+			if i == prMarkerLocationCap {
+				fmt.Fprintf(&b, "- and %d more\n", len(markers)-prMarkerLocationCap)
+				break
+			}
+			fmt.Fprintf(&b, "- `%s:%s` (%s) - scope `%s`\n", prCodeSpan(x.Path), prLines(x.Lines),
+				prCodeSpan(x.Pattern), diffsecrets.SafeRuleID(x.RuleID))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// prCodeSpan sanitizes a value for a single-backtick code span: one line
+// (oneLine: whitespace collapsed, capped), backticks replaced with "'", and
+// control runes dropped, so no value can close the span or break the line.
+func prCodeSpan(s string) string {
+	s = strings.ReplaceAll(oneLine(s), "`", "'")
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// prLines renders new-side lines comma-separated, "?" for an unknown line.
+func prLines(lines []int) string {
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if l == diffsecrets.UnknownLine {
+			out = append(out, "?")
+			continue
+		}
+		out = append(out, fmt.Sprint(l))
+	}
+	return strings.Join(out, ",")
+}
+
+func pluralY(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }
 
 // shortSHA truncates a git SHA to 12 chars for compact display; returns the

@@ -7,6 +7,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 )
 
 func side(s string) FileSide { return FileSide{Content: []byte(s), Exists: true} }
@@ -28,8 +30,8 @@ func detectAll(surfaces []Surface, path string, base, head FileSide) (widened, n
 }
 
 func TestDefaultSurfaces(t *testing.T) {
-	if SurfacesVersion != 1 {
-		t.Errorf("SurfacesVersion = %d, want 1", SurfacesVersion)
+	if SurfacesVersion != 2 {
+		t.Errorf("SurfacesVersion = %d, want 2", SurfacesVersion)
 	}
 	seen := map[string]bool{}
 	for _, s := range DefaultSurfaces() {
@@ -57,8 +59,8 @@ func TestDefaultSurfaces(t *testing.T) {
 			}
 		}
 	}
-	if len(seen) != 13 {
-		t.Errorf("DefaultSurfaces has %d surfaces, want 13", len(seen))
+	if len(seen) != 14 {
+		t.Errorf("DefaultSurfaces has %d surfaces, want 14", len(seen))
 	}
 	// A fresh slice per call: a caller's append never reaches the next caller.
 	a := DefaultSurfaces()
@@ -84,8 +86,9 @@ func TestMatchSurfaces(t *testing.T) {
 		"docs/github-app/manifest.template.json": {"github-app-permissions-template", "github-app-events-template"},
 		".fishhawk/workflows.yaml": {"fishhawk-spec-forbidden-paths", "fishhawk-spec-escalations",
 			"fishhawk-spec-autonomy", "fishhawk-spec-stage-permissions"},
-		RepoSurfacesPath: {SurfaceIDSurfaceDeclarations},
-		"README.md":      nil,
+		RepoSurfacesPath:          {SurfaceIDSurfaceDeclarations},
+		diffsecrets.AllowlistPath: {SurfaceIDDiffSecretsAllowlist},
+		"README.md":               nil,
 	}
 	for path, want := range cases {
 		if got := ids(MatchSurfaces(DefaultSurfaces(), path)); !reflect.DeepEqual(got, want) {
@@ -650,4 +653,78 @@ func TestNote(t *testing.T) {
 	if u := NoteUnevaluable(s, "p\n## injected\u202e", ReasonFetchFailed); strings.ContainsFunc(u, isDisplayHostile) {
 		t.Errorf("NoteUnevaluable carries a control/format rune: %q", u)
 	}
+}
+
+const allowlistBase = `version: 1
+entries:
+  - id: docs-example
+    paths: ["docs/*.md"]
+    patterns: ["github-pat-classic"]
+    reason: "documented placeholders"
+`
+
+// TestDetect_DiffSecretsAllowlistWidening is the #5230 protection: the
+// allowlist file is a high-severity surface, so every edit that would
+// suppress MORE raises. The surface is resolved ONLY through
+// MatchSurfaces(DefaultSurfaces(), diffsecrets.AllowlistPath), never a
+// Surface literal, so deleting it from DefaultSurfaces is not masked.
+//
+// COUNTERFACTUAL 1: delete the diff-secrets-allowlist literal from
+// DefaultSurfaces (kind and extractor stay, so it compiles) — no surface then
+// matches the path, every widening arm sees zero widenings against want >= 1,
+// RED. COUNTERFACTUAL 2: flip the extractor's Polarity to Restriction — the
+// added-glob arm's new key then reads as a narrowing, RED.
+func TestDetect_DiffSecretsAllowlistWidening(t *testing.T) {
+	path := diffsecrets.AllowlistPath
+	surfaces := MatchSurfaces(DefaultSurfaces(), path)
+	for _, s := range surfaces {
+		if s.ID != SurfaceIDDiffSecretsAllowlist || s.Severity != SeverityHigh {
+			t.Errorf("surface %s severity %s", s.ID, s.Severity)
+		}
+	}
+	widen := map[string]string{
+		"adds a glob":    strings.Replace(allowlistBase, `["docs/*.md"]`, `["docs/*.md", "examples/**"]`, 1),
+		"adds a pattern": strings.Replace(allowlistBase, `["github-pat-classic"]`, `["github-pat-classic", "aws-access-key-id"]`, 1),
+		"adds a marker scope": allowlistBase + "markers:\n  - id: fixtures\n    paths: [\"fix/**\"]\n" +
+			"    patterns: [\"github-pat-classic\"]\n    reason: \"tests\"\n",
+		"adds a rule":    allowlistBase + "  - id: second\n    paths: [\"b/**\"]\n    patterns: [\"github-pat-classic\"]\n    reason: \"r\"\n",
+		"renames the id": strings.Replace(allowlistBase, "docs-example", "docs-examples", 1),
+		"from absent":    "",
+	}
+	for name, head := range widen {
+		t.Run(name, func(t *testing.T) {
+			base, h := side(allowlistBase), side(head)
+			if name == "from absent" {
+				base, h = absentSide, side(allowlistBase)
+			}
+			w, _, u := detectAll(DefaultSurfaces(), path, base, h)
+			if len(w) < 1 || len(u) != 0 {
+				t.Fatalf("widened=%+v unevaluable=%v, want >= 1 widening", w, u)
+			}
+			for _, c := range w {
+				if !strings.HasPrefix(c.Key, DiffSecretsAllowlistPrefix) {
+					t.Errorf("widening key %q lacks the allowlist prefix", c.Key)
+				}
+			}
+		})
+	}
+	t.Run("removing the rule is a narrowing only", func(t *testing.T) {
+		w, n, u := detectAll(DefaultSurfaces(), path, side(allowlistBase), side("version: 1\n"))
+		if len(w) != 0 || len(n) != 1 || len(u) != 0 {
+			t.Errorf("widened=%+v narrowed=%+v unevaluable=%v", w, n, u)
+		}
+	})
+	t.Run("a reason-only edit is no change", func(t *testing.T) {
+		w, n, u := detectAll(DefaultSurfaces(), path, side(allowlistBase),
+			side(strings.Replace(allowlistBase, "documented placeholders", "reworded", 1)))
+		if len(w)+len(n)+len(u) != 0 {
+			t.Errorf("widened=%+v narrowed=%+v unevaluable=%v", w, n, u)
+		}
+	})
+	t.Run("an unparseable head is parse_error", func(t *testing.T) {
+		w, _, u := detectAll(DefaultSurfaces(), path, side(allowlistBase), side("version: 1\nbogus: true\n"))
+		if len(w) != 0 || !reflect.DeepEqual(u, []string{SurfaceIDDiffSecretsAllowlist + ":" + ReasonParseError}) {
+			t.Errorf("widened=%+v unevaluable=%v, want parse_error", w, u)
+		}
+	})
 }

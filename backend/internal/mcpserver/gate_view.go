@@ -93,6 +93,15 @@ Response (gate_view):
     file inventory is itself capped, so the omitted set may itself be
     incomplete). Omitted when no review ran on a truncated diff. A HIGH finding
     that a control is "missing" against a truncated review deserves scrutiny.
+  - diff_secrets_suppressed — present when the reviewed diff-secrets allowlist
+    suppressed a hit or refused a rule on this run. Carries
+    suppressed_hit_count with its entry / marker split, by_rule[] (by,
+    rule_id, rule_fingerprint, hit_count — a glob is never rendered),
+    marker_locations[] (path, lines, pattern, rule_id, check_key; capped at
+    50, marker_locations_truncated past the cap), allowlist_status,
+    allowlist_ref (the admission commit), rejected_count and newest_sequence.
+    Each marker location raised a low, human-only concern a human must
+    confirm. Omitted when nothing was suppressed or rejected.
   - review_head_mismatch — present when the open implement-review round judged
     a tree the PR does NOT carry (e.g. a base-rebase re-invoke shipped a new
     tree after the review round was dispatched from the first attempt's

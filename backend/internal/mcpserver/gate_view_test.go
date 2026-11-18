@@ -1926,3 +1926,107 @@ func TestGetGateView_Description_ScopeOverlapHold(t *testing.T) {
 		t.Errorf("fishhawk_get_gate_view scope_overlap bullet must state %q:\n%s", want, desc)
 	}
 }
+
+// TestDiffSecretsSuppressed_WireShape pins the hand-maintained
+// gateViewDiffSecretsSuppressed mirror (ADR-084 A2, #5230; the #371 trap)
+// against a REAL server.New over Postgres: a diff_secrets_detected entry
+// carrying an entry and a marker suppression is served by GET gate-view, and
+// (a) every key the server emits in the block, its by_rule rows and its
+// marker_locations rows is a mirror field; (b) the block decodes through
+// GetGateView with the counts intact. COUNTERFACTUAL: rename one mirror tag
+// (e.g. suppressed_hit_count) — (a) reports the key and (b) decodes it 0 → RED.
+func TestDiffSecretsSuppressed_WireShape(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	concernRepo := concern.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	impl, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: row.ID, Sequence: 1, Type: runpkg.StageTypeImplement, ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "implement",
+	})
+	if err != nil {
+		t.Fatalf("create implement stage: %v", err)
+	}
+	admit := strings.Repeat("e", 40)
+	fpE, fpM := strings.Repeat("1", 16), strings.Repeat("2", 16)
+	payload := map[string]any{
+		"check": "diff_secrets", "head_sha": "h", "patch_truncated": false, "hit_count": 0, "groups": []any{},
+		"allowlist": map[string]any{"path": ".fishhawk/diff-secrets-allowlist.yaml", "ref": admit, "status": "loaded", "rejected_count": 1,
+			"rejected": []any{map[string]any{"list": "entries", "index": 2, "reason": "redaction_hit"}}},
+		"suppressed_hit_count": 2, "entry_suppressed_hit_count": 1, "marker_suppressed_hit_count": 1,
+		"suppressed": []any{
+			map[string]any{"path": "docs/p.md", "lines": []int{1}, "pattern": "github-pat-classic", "by": "entry", "rule_id": "docs-rule", "rule_fingerprint": fpE},
+			map[string]any{"path": "fix/m.go", "lines": []int{3}, "pattern": "github-pat-classic", "by": "marker", "rule_id": "fix-scope", "rule_fingerprint": fpM,
+				"check_key": "diff_secrets_marker|github-pat-classic|fix-scope@" + fpM + "|" + strings.Repeat("3", 16) + "|fix/m.go"},
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: row.ID, StageID: &impl.ID, Timestamp: time.Now().UTC(), Category: "diff_secrets_detected", Payload: raw,
+	}); err != nil {
+		t.Fatalf("seed diff_secrets_detected: %v", err)
+	}
+
+	const bearer = "fhk_diff_secrets_wire"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{RunRepo: runRepo, ConcernRepo: concernRepo, AuditRepo: auditRepo, APITokenRepo: tokRepo})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+row.ID.String()+"/gate-view", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET gate-view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET gate-view = %d: %s", resp.StatusCode, body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(top["diff_secrets_suppressed"], &block); err != nil {
+		t.Fatalf("server emitted no diff_secrets_suppressed block:\n%s", body)
+	}
+	check := func(what string, keys map[string]json.RawMessage, typ reflect.Type) {
+		fields := jsonFieldNames(typ)
+		for k := range keys {
+			if !fields[k] {
+				t.Errorf("server %s key %q has no field on the %s mirror (tag drift)", what, k, typ.Name())
+			}
+		}
+	}
+	check("diff_secrets_suppressed", block, reflect.TypeOf(gateViewDiffSecretsSuppressed{}))
+	for name, typ := range map[string]reflect.Type{
+		"by_rule":          reflect.TypeOf(gateViewDiffSecretsRule{}),
+		"marker_locations": reflect.TypeOf(gateViewDiffSecretsMarkerLocation{}),
+	} {
+		var rows []map[string]json.RawMessage
+		if err := json.Unmarshal(block[name], &rows); err != nil || len(rows) == 0 {
+			t.Fatalf("server emitted no %s rows:\n%s", name, body)
+		}
+		check(name, rows[0], typ)
+	}
+
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	gv, err := client.GetGateView(ctx, row.ID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	b := gv.DiffSecretsSuppressed
+	if b == nil || b.SuppressedHitCount != 2 || b.EntrySuppressedHitCount != 1 || b.MarkerSuppressedHitCount != 1 ||
+		b.RejectedCount != 1 || b.AllowlistStatus != "loaded" || b.AllowlistRef != admit || b.NewestSequence == 0 ||
+		len(b.ByRule) != 2 || b.ByRule[0].HitCount != 1 || len(b.MarkerLocations) != 1 || b.MarkerLocations[0].CheckKey == "" {
+		t.Errorf("decoded diff_secrets_suppressed = %+v", b)
+	}
+}
