@@ -245,9 +245,12 @@ dev-host step (E48.7 / #1954). It replaces the four-step hand ceremony
 
 EVERY CALL IS A REAL MERGE ATTEMPT. When the gates pass this verb records your
 verdict and queues the merge; it is never a dry run, so do not call it with a
-placeholder verdict to see which refusal comes back. For a side-effect-free
-readiness check read fishhawk_get_gate_view merge_readiness, which runs the same
-checks and records nothing.
+placeholder verdict to see which refusal comes back. To check readiness without
+recording a verdict, read fishhawk_get_gate_view merge_readiness: it runs the
+merge endpoint's acceptance and review-coverage checks (plus an advisory approval
+check) and queues nothing. It is a subset of what this verb can refuse, so an
+empty blockers[] does not predict a clean merge: the merge-candidate, overlap,
+conflict and forge-approval statuses below come only from a real call.
 
 BEFORE YOU APPROVE. Read the pre-approval checklist on fishhawk_get_gate_view
 (merge_readiness and merge_candidate_verdict) first. An acceptance stage can
@@ -405,11 +408,14 @@ Statuses:
                      fishhawk_await_review (a round is in flight, the PR is not
                      open yet, or a gating parent has no round — the message
                      then names fishhawk_fixup_stage). After
-                     fishhawk_rebase_run_branch on a decomposed parent a fresh
-                     consolidated round starts on the new head (behind the
-                     verify-only pass when the workflow declares a verify
-                     command): await it before re-invoking, because the earlier
-                     round judged a tree the PR no longer carries.
+                     fishhawk_rebase_run_branch on a decomposed parent, where the
+                     workflow declares a verify command a fresh consolidated
+                     round starts on the new head once the verify-only pass
+                     passes: await it before re-invoking, because the earlier
+                     round judged a tree the PR no longer carries. A head with
+                     no verify pass (no declared verify command, or a verdict
+                     transferred across a clean base advance) starts no round: if
+                     none appears, start one with fishhawk_rerun_review.
   - "queued"        — ADR-093 slice 1 (E87.4 / #4295): the run is merge-queue
                      ELIGIBLE (review gate approved with a LIVE forge
                      approval, acceptance merge-eligible and not stale,

@@ -1196,16 +1196,21 @@ HTTP or MCP surface; a prompt, script, struct or PR-text observable is expected
 to all-skip. A settled acceptance stage is not re-run by re-invoking
 `fishhawk_drive_run`; re-open it through the verb its `next_actions` name.
 
-**A rebase on a decomposed parent means waiting for the new round.**
-`fishhawk_rebase_run_branch` moves the parent's head, and a fresh consolidated
-implement-review round starts on it (behind the verify-only pass when the
-workflow declares a verify command). Await it (`fishhawk_await_review`) before
-`fishhawk_merge_run`: the earlier round judged a tree the PR no longer carries.
+**A rebase on a decomposed parent: wait for the new round, if one starts.**
+Where the workflow declares a verify command, `fishhawk_rebase_run_branch`
+authorizes a verify-only pass, and once it passes a fresh consolidated
+implement-review round starts on the new head. Await it
+(`fishhawk_await_review`) before `fishhawk_merge_run`: the earlier round judged a
+tree the PR no longer carries. A head with no verify pass (no declared verify
+command, or a verdict transferred across a clean base advance) starts no pass
+and so no round; if none appears, start one with `fishhawk_rerun_review`.
 
 **Never probe `fishhawk_merge_run`.** Every call is a real merge attempt; with a
 placeholder verdict it records the verdict and queues the merge as soon as the
-gates pass. For a readiness check that records nothing, read `merge_readiness`
-on the gate view.
+gates pass. To check readiness without recording a verdict, read
+`merge_readiness` on the gate view; it covers the acceptance and review-coverage
+checks (plus an advisory approval check) and not every refusal, so an empty
+`blockers[]` does not predict a clean merge.
 
 **Parallel items that collide on shared registration files.** Recommended, not
 required: resolve the collision as a union of both sides, then re-run the

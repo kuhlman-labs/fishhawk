@@ -75,6 +75,8 @@ func TestMergeRun_DescriptionStatesMergeGuidance(t *testing.T) {
 		{"16", "every call is a real merge attempt"},
 		{"16", "placeholder verdict"},
 		{"16", "fishhawk_get_gate_view merge_readiness"},
+		{"16", "to check readiness without recording a verdict"},
+		{"16", "it is a subset of what this verb can refuse, so an empty blockers[] does not predict a clean merge"},
 		{"1", "re-read the pr head once acceptance settles"},
 		{"1", "scenario commit"},
 		{"3", "push, vouch (fishhawk_vouch_commit), wait for checks green at that head, approve, then call this verb"},
@@ -85,13 +87,22 @@ func TestMergeRun_DescriptionStatesMergeGuidance(t *testing.T) {
 		{"15", "where the repository's branch protection makes that check gate the merge"},
 		{"10", "a pass that settled not_executed"},
 		{"10", "re-trigger it with fishhawk_rebase_run_branch, then, on a local runner, dispatch the re-opened stage"},
-		{"6", "a fresh consolidated round starts on the new head"},
+		{"6", "where the workflow declares a verify command a fresh consolidated round starts on the new head once the verify-only pass passes"},
 		{"6", "await it before re-invoking"},
+		{"6", "starts no round: if none appears, start one with fishhawk_rerun_review"},
 		{"13", "re-invoke as soon as it settles"},
 		{"13", "the merge queue re-runs this overlap guard at merge-on-pass"},
 		// R4: the new wording must not contradict the refusal's own text.
 		{"13", "nothing merged or queued"},
 	})
+
+	// The gate view covers a SUBSET of the refusals and is not "the same
+	// checks": the old overclaims must not return (#5213 review).
+	for _, banned := range []string{"runs the same checks and records nothing", "side-effect-free"} {
+		if strings.Contains(desc, banned) {
+			t.Errorf("fishhawk_merge_run description overclaims merge_readiness with %q", banned)
+		}
+	}
 
 	mergeGuidanceADR110(t, "fishhawk_merge_run", fixupGuidanceSlice(t, desc, "every call is a real merge attempt", "records a chained"))
 	mergeGuidanceADR110(t, "fishhawk_merge_run timeout", fixupGuidanceSlice(t, desc, "if the merge stays queued while the pull request is blocked", "\"run_terminal\""))
@@ -327,12 +338,19 @@ func TestGetGateView_DescriptionStatesPreApprovalChecklist(t *testing.T) {
 		{"2", "control_unpinned"},
 		{"2", "the acceptance outcome is known"},
 		{"3", "approve after any vouch or hardening push, never before it"},
-		{"16", "side-effect-free readiness read"},
+		{"16", "the readiness read that records no verdict and queues no merge"},
+		{"16", "a surfaced precedent is still recorded once, as precedent_surfaced"},
+		{"16", "an empty blockers[] does not rule out the merge-candidate, overlap, conflict or forge-approval refusals"},
 		{"16", "never call fishhawk_merge_run with a placeholder verdict to probe"},
 	})
+	// merge_readiness is a subset of the merge endpoint's refusals, and a
+	// surfaced precedent is recorded on the chain: "side-effect-free" overclaims.
+	if strings.Contains(desc, "side-effect-free") {
+		t.Errorf("fishhawk_get_gate_view description still calls merge_readiness side-effect-free")
+	}
 	section := fixupGuidanceSlice(t, desc, "pre-approval checklist.", "approve after any vouch or hardening push, never before it")
 	mergeGuidanceNoUndeterminedDemand(t, "fishhawk_get_gate_view checklist", section)
-	mergeGuidanceADR110(t, "fishhawk_get_gate_view", fixupGuidanceSlice(t, desc, "this is the side-effect-free readiness read", "approve after any vouch or hardening push"))
+	mergeGuidanceADR110(t, "fishhawk_get_gate_view", fixupGuidanceSlice(t, desc, "this is the readiness read that records no verdict", "approve after any vouch or hardening push"))
 }
 
 // TestRebaseRunBranch_DescriptionStatesParentReviewRound pins rule 6 on the
@@ -351,6 +369,8 @@ func TestRebaseRunBranch_DescriptionStatesParentReviewRound(t *testing.T) {
 		{"6", "before fishhawk_merge_run"},
 		{"6", "judged a tree the pr no longer carries"},
 		{"6", "review_coverage_incomplete"},
+		{"6", "a head with no verify pass (no declared verify command, or a verdict transferred across a clean base advance) starts no pass and so no new round"},
+		{"6", "start one with fishhawk_rerun_review"},
 	})
 	mergeGuidanceADR110(t, "fishhawk_rebase_run_branch", fixupGuidanceSlice(t, desc, "decomposed parent.", "verify-only re-run of a failed head"))
 }
@@ -499,7 +519,7 @@ func TestMergeRitualActions_ApprovePRCarriesPreApprovalChecklist(t *testing.T) {
 			mp := fixupGuidanceFlatten(merge.Precondition)
 			mergeGuidanceRequire(t, "fishhawk_merge_run precondition", mp, []struct{ rule, anchor string }{
 				{"16", "every call is a real merge attempt"},
-				{"16", "use fishhawk_get_gate_view merge_readiness to check readiness without side effects"},
+				{"16", "use fishhawk_get_gate_view merge_readiness to check acceptance and review-coverage readiness without recording a verdict"},
 				{"R5c", "merge_gate"},
 				{"R5c", "fishhawk_audit_complete"},
 			})
@@ -614,7 +634,9 @@ func TestRunbook_MergeAndAcceptanceSubsection(t *testing.T) {
 		{"12", "a prompt, script, struct or pr-text observable is expected to all-skip"},
 		{"12", "bind a preview or target only when a criterion drives a runtime http or mcp surface"},
 		{"11", "a settled acceptance stage is not re-run by re-invoking fishhawk_drive_run"},
-		{"6", "a rebase on a decomposed parent means waiting for the new round."},
+		{"6", "a rebase on a decomposed parent: wait for the new round, if one starts."},
+		{"6", "starts no pass and so no round; if none appears, start one with fishhawk_rerun_review"},
+		{"16", "an empty blockers[] does not predict a clean merge"},
 		{"16", "never probe fishhawk_merge_run."},
 		{"7", "recommended, not required"},
 		{"7", "union of both sides, then re-run the repository's generators"},
