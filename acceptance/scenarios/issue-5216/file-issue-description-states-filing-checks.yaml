@@ -1,14 +1,14 @@
 id: scenario:issue-5216/file-issue-description-states-filing-checks
 statement: The fishhawk_file_issue tool description served by tools/list states that a degraded intake (or scanned_items 0) means duplicate detection was not performed and the operator must search manually, names fishhawk_get_campaign_status for a running campaign's items, tells the operator to search existing decision records and epics before filing an adr or epic, says to create the successor epic before the parent reaches the child cap, and says the default delegation-tier label is not a triage decision.
 verify_hint: 'MCP tool result: POST /mcp tools/list; read the fishhawk_file_issue description.'
-steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> fhm_; POST /mcp tools/list (2026-07-28 headers and _meta). Read the fishhawk_file_issue description.
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> fhm_ bearer; POST http://localhost:8090/mcp tools/list (2026-07-28 headers and _meta). Read tools[name=fishhawk_file_issue].description.
 assertions:
-    expected: All five rules stated, with the degraded wording as refined by W2
-    observed_at_record: '''degraded:true does NOT by itself mean duplicate detection was skipped: read degrade_reason.'' charter_* degrades leave the candidates valid. reader_unavailable or reader_error means the scan did not complete, as does budget_exceeded or hook_panic with scanned_items 0: ''no duplicate check was performed: search the tracker yourself ... by a code symbol or path''. It names fishhawk_get_campaign_status items for a running campaign, and says ''before filing an adr or an epic, search the existing decision records and epics by topic''. It says ''Create the successor epic before the parent fills'', with the cap counting actual sub-issues and {n} not a capacity reading. A default tier label ''is a conventions default, not a triage decision''.'
-    repro_handle: POST /mcp tools/list -> fishhawk_file_issue.description
+    expected: All five rules, degraded wording refined by W2
+    observed_at_record: 'degraded:true is not by itself a skipped scan. reader_unavailable/reader_error (and budget_exceeded/hook_panic with scanned_items 0), or absent intake, means no duplicate check was performed: search the tracker yourself by code symbol. Names fishhawk_get_campaign_status items for a running campaign. ''before filing an adr or an epic, search the existing decision records and epics by topic''. ''Create the successor epic before the parent fills''. A defaulted tier label ''is a conventions default, not a triage decision''.'
+    repro_handle: POST /mcp tools/list
 origin:
     issue: 5216
     pr: 5467
     run_id: c6829727-10cb-4258-9943-f7ceecd7be35
-    head_sha: c19bbe53e8638f59b98f6fac400e4dbab76faecb
-    recorded_at: 2026-11-18T20:00:52Z
+    head_sha: 2c1dcb46d3bfef87feaf0b72da41fa2025a6d1e1
+    recorded_at: 2026-11-18T20:47:16Z
