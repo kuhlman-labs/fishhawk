@@ -930,3 +930,69 @@ func TestConflictResolutionSummary_SecretCounts(t *testing.T) {
 		t.Errorf("allowlisted skip row = %v, want suppressed_hit_count 1 and no diff_secret_groups", p)
 	}
 }
+
+// TestConflictResolutionReview_SkipRowCarriesSuppressedHitCount (K2 of the
+// #5230 plan gate): an allowlist served at the run's admission commit
+// suppresses the report's only diff-secret hit (docs/p.md, the
+// docs-placeholder entry), and BOTH skip branches of
+// maybeDispatchConflictResolutionReview carry that count onto the recorded
+// conflict_resolution_review_skipped row.
+//
+// COUNTERFACTUAL: pass 0 instead of suppressedHitCount in either branch's
+// recordConflictResolutionReviewSkipped call — the hit is suppressed (no fresh
+// group), so suppressed_hit_count is the ONLY count on the row and it then
+// vanishes, RED on that arm.
+func TestConflictResolutionReview_SkipRowCarriesSuppressedHitCount(t *testing.T) {
+	key := "ghp_" + strings.Repeat("S", 36)
+	patch := "diff --git a/docs/p.md b/docs/p.md\n--- a/docs/p.md\n+++ b/docs/p.md\n@@ -1 +1 @@\n-x\n+k := \"" + key + "\"\n"
+	for _, tc := range []struct {
+		name       string
+		decomposed bool
+		reason     string
+	}{
+		{"resolution_docs_only", false, conflictResolutionSkipDocsOnly},
+		{"decomposed_parent", true, conflictResolutionSkipDecomposedParent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := newDriftGH()
+			gh.changed = []string{"docs/p.md"}
+			gh.headSHA = crrHead
+			gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+			rf := newRedispatchFixture(t, redispatchFixtureOpts{github: gh.client(t)})
+			rf.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
+			rf.appendAt(t, rf.implStage.ID, time.Now().UTC(), CategoryStageConflictResolutionTriggered, conflictResolutionTrigger{
+				Branch: "fishhawk/run", BaseRef: crrBase, ExpectedHeadSHA: crrPreMerge, Pass: 1,
+			})
+			f := &crrFixture{redispatchFixture: rf, paths: func() []string { return nil }}
+			admit := alAdmit
+			f.runRow.DocumentBaseCommit = &admit
+			cr := newFakeConcernRepo()
+			f.s.cfg.ConcernRepo = cr
+			if tc.decomposed {
+				parentID := f.runRow.ID
+				f.rr.seedRun().DecomposedFrom = &parentID
+			}
+
+			pr := crrReport([]string{"docs/p.md"}, patch)
+			_, res := f.report(t, pr)
+			if res.secretGroups != 0 || res.suppressedHitCount != 1 {
+				t.Fatalf("report = %+v, want 0 fresh groups and 1 suppressed hit (the allowlist must load)", res)
+			}
+			f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
+			f.s.waitBackgroundReviews()
+
+			skips := redispatchEntries(t, f.au, f.runRow.ID, CategoryConflictResolutionReviewSkipped)
+			if len(skips) != 1 {
+				t.Fatalf("skip rows = %d, want 1", len(skips))
+			}
+			var p map[string]any
+			if err := json.Unmarshal(skips[0].Payload, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p["reason"] != tc.reason || p["suppressed_hit_count"] != float64(1) || p["diff_secret_groups"] != nil {
+				t.Errorf("skip row = %v, want reason %s, suppressed_hit_count 1 and no diff_secret_groups", p, tc.reason)
+			}
+			assertNoNeedleBytes(t, cr, f.au, "", nil, key)
+		})
+	}
+}

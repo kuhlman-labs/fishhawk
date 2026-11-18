@@ -282,8 +282,9 @@ type Suppression struct {
 // Partition splits hits into those still raised (kept) and those the
 // allowlist suppresses. A nil or empty allowlist keeps everything. A hit is
 // NEVER suppressed when its path is UnresolvedPath, was redacted
-// (PathRedacted), or is AllowlistPath itself — a credential added to the
-// allowlist file always raises. Otherwise entries are checked first, in file
+// (PathRedacted), cannot be trusted (PathAmbiguous: a spoofable section
+// header), or is AllowlistPath itself — a credential added to the allowlist
+// file always raises. Otherwise entries are checked first, in file
 // order (By=entry); then, only for a Marked hit, marker scopes (By=marker). A
 // rule matches when one of its globs matches the path AND its pattern list
 // names the hit's pattern.
@@ -292,7 +293,7 @@ func (a *Allowlist) Partition(hits []Hit) (kept []Hit, suppressed []Suppression)
 		return hits, nil
 	}
 	for _, h := range hits {
-		if h.Path == UnresolvedPath || h.PathRedacted || h.Path == AllowlistPath {
+		if h.Path == UnresolvedPath || h.PathRedacted || h.PathAmbiguous || h.Path == AllowlistPath {
 			kept = append(kept, h)
 			continue
 		}

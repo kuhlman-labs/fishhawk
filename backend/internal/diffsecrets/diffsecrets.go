@@ -73,13 +73,22 @@ const noteLineCap = 20
 // hashed in memory and dropped; the digest is the per-hit identity
 // MarkerCheckKey de-duplicates on, so a NEW self-marked line raises its own
 // concern while a re-review of the same line raises nothing new.
+//
+// PathAmbiguous is true when the section's path cannot be trusted as an
+// allowlist input (#5230 implement review): Partition never suppresses such a
+// hit. Scan sets it from the first header whose path is ambiguous (see
+// gitHeaderPath / plusPath / AmbiguousPath) to the END of the patch, because a
+// file name carrying a newline can plant a clean-looking header after the
+// anomalous one. The server also sets it on every hit when a changed path the
+// patch was rebuilt from is itself ambiguous.
 type Hit struct {
-	Path         string
-	Line         int
-	Pattern      string
-	Marked       bool
-	PathRedacted bool
-	Fingerprint  string
+	Path          string
+	Line          int
+	Pattern       string
+	Marked        bool
+	PathRedacted  bool
+	PathAmbiguous bool
+	Fingerprint   string
 }
 
 // Result is the outcome of one Scan.
@@ -116,7 +125,9 @@ const (
 // The walk is a header/hunk state machine:
 //   - `diff --git` opens a section and resets to header state, seeding the
 //     section's path from the header's b-side (GitHub compare-reconstructed
-//     patches carry no ---/+++ lines, so this is their only path source);
+//     patches carry no ---/+++ lines, so this is their only path source); a
+//     header (or `+++` path) that resolves ambiguously sets PathAmbiguous on
+//     every later hit in the patch;
 //   - `+++ <path>` in header state overrides that path (unquoting a git
 //     C-quoted name and stripping the `b/` prefix); `+++ /dev/null` (a
 //     deletion) keeps the git-header path;
@@ -140,10 +151,16 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 	// `diff --git` needs no reset: header state discards every line until
 	// the next `@@`, which sets the flag afresh.
 	lineKnown := false
+	// ambiguous is sticky: once one header resolves ambiguously, no later
+	// section's path is trusted (a newline in a forge-reported file name can
+	// inject a well-formed header after the malformed one).
+	ambiguous := false
 	for _, line := range strings.Split(patch, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
 			state = stateHeader
-			path = gitHeaderPath(strings.TrimPrefix(line, "diff --git "))
+			p, trusted := gitHeaderPath(strings.TrimPrefix(line, "diff --git "))
+			path = p
+			ambiguous = ambiguous || !trusted
 			newLine = 0
 			continue
 		}
@@ -159,9 +176,11 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 		}
 		if state == stateHeader {
 			if strings.HasPrefix(line, "+++ ") {
-				if p, ok := plusPath(strings.TrimPrefix(line, "+++ ")); ok {
+				p, ok, trusted := plusPath(strings.TrimPrefix(line, "+++ "))
+				if ok {
 					path = p
 				}
+				ambiguous = ambiguous || !trusted
 			}
 			continue
 		}
@@ -178,11 +197,12 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 				if p.Regex != nil && p.Regex.MatchString(content) {
 					shown, redacted := displayPath(path, patterns)
 					h := Hit{
-						Path:         shown,
-						Line:         at,
-						Pattern:      p.Name,
-						Marked:       marked,
-						PathRedacted: redacted,
+						Path:          shown,
+						Line:          at,
+						Pattern:       p.Name,
+						Marked:        marked,
+						PathRedacted:  redacted,
+						PathAmbiguous: ambiguous,
 					}
 					if marked {
 						h.Fingerprint = hitFingerprint(shown, p.Name, p.Regex.FindAllString(content, -1))
@@ -247,24 +267,47 @@ func hunkNewStart(line string) (int, bool) {
 	return n, true
 }
 
-// plusPath resolves a `+++ ` header's path. ok is false for /dev/null (a
-// deleted file — the git header's path stays) and for an empty value.
-func plusPath(v string) (string, bool) {
-	if strings.HasPrefix(v, `"`) {
-		p, _, ok := unquoteC(v)
-		if !ok {
-			return "", false
+// AmbiguousPath reports whether p cannot be trusted as the path of a diff
+// section: it holds " b/" (so a `diff --git a/<x> b/<y>` header naming it has
+// more than one split) or a control byte (a newline in a forge-reported name
+// injects lines into a rebuilt patch). An empty p is not ambiguous.
+func AmbiguousPath(p string) bool {
+	if strings.Contains(p, " b/") {
+		return true
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return true
 		}
-		return strings.TrimPrefix(p, "b/"), p != ""
+	}
+	return false
+}
+
+// plusPath resolves a `+++ ` header's path. ok is false for /dev/null (a
+// deleted file — the git header's path stays) and for an empty or malformed
+// value. trusted is false when the value is malformed, carries text after a
+// closing quote, or names an AmbiguousPath.
+func plusPath(v string) (path string, ok, trusted bool) {
+	if strings.HasPrefix(v, `"`) {
+		p, n, ok := unquoteC(v)
+		if !ok || p == "" {
+			return "", false, false
+		}
+		p = strings.TrimPrefix(p, "b/")
+		return p, true, n == len(v) && !AmbiguousPath(p)
 	}
 	// A plain `diff -u` appends "\t<timestamp>"; git never does.
 	if tab := strings.IndexByte(v, '\t'); tab >= 0 {
 		v = v[:tab]
 	}
-	if v == "" || v == "/dev/null" {
-		return "", false
+	if v == "/dev/null" {
+		return "", false, true
 	}
-	return strings.TrimPrefix(v, "b/"), true
+	if v == "" {
+		return "", false, false
+	}
+	p := strings.TrimPrefix(v, "b/")
+	return p, true, !AmbiguousPath(p)
 }
 
 // gitHeaderPath resolves the b-side path of a `diff --git a/<p> b/<p>` header
@@ -273,44 +316,54 @@ func plusPath(v string) (string, bool) {
 // form: for a non-rename both sides name the same path, so the header is
 // exactly "a/" + p + " b/" + p and p is recovered by length; otherwise the
 // LAST " b/" separates the sides. Returns "" when nothing resolves.
-func gitHeaderPath(rest string) string {
+//
+// trusted is false when the split is not unique or the header is not one git
+// emits: nothing resolves, text follows a closing quote, an unquoted side
+// holds " b/" (a rename whose path holds " b/" resolves by the last-" b/"
+// rule to a TAIL an attacker chooses), or the path is an AmbiguousPath.
+func gitHeaderPath(rest string) (path string, trusted bool) {
 	if strings.HasPrefix(rest, `"`) {
 		// Quoted a-side: skip it, then read the b-side (quoted or not).
 		_, n, ok := unquoteC(rest)
 		if !ok {
-			return ""
+			return "", false
 		}
 		b := strings.TrimPrefix(rest[n:], " ")
 		if strings.HasPrefix(b, `"`) {
-			p, _, ok := unquoteC(b)
+			p, m, ok := unquoteC(b)
 			if !ok {
-				return ""
+				return "", false
 			}
-			return strings.TrimPrefix(p, "b/")
+			p = strings.TrimPrefix(p, "b/")
+			return p, m == len(b) && p != "" && !AmbiguousPath(p)
 		}
-		return strings.TrimPrefix(b, "b/")
+		p := strings.TrimPrefix(b, "b/")
+		return p, strings.HasPrefix(b, "b/") && p != "" && !AmbiguousPath(p)
 	}
 	if strings.HasSuffix(rest, `"`) {
 		// Unquoted a-side, quoted b-side.
 		if i := strings.LastIndex(rest, ` "b/`); i >= 0 {
-			p, _, ok := unquoteC(rest[i+1:])
+			p, m, ok := unquoteC(rest[i+1:])
 			if ok {
-				return strings.TrimPrefix(p, "b/")
+				p = strings.TrimPrefix(p, "b/")
+				return p, m == len(rest)-i-1 && !strings.Contains(rest[:i], " b/") && p != "" && !AmbiguousPath(p)
 			}
 		}
-		return ""
+		return "", false
 	}
 	if n := len(rest); n >= 5 && (n-5)%2 == 0 && strings.HasPrefix(rest, "a/") {
 		lp := (n - 5) / 2
 		p := rest[2 : 2+lp]
 		if rest[2+lp:2+lp+3] == " b/" && rest[2+lp+3:] == p {
-			return p
+			return p, p != "" && !AmbiguousPath(p)
 		}
 	}
 	if i := strings.LastIndex(rest, " b/"); i >= 0 {
-		return rest[i+3:]
+		p := rest[i+3:]
+		// A rename: trusted only when " b/" occurs once, so the split is unique.
+		return p, strings.HasPrefix(rest, "a/") && strings.Count(rest, " b/") == 1 && p != "" && !AmbiguousPath(p)
 	}
-	return ""
+	return "", false
 }
 
 // unquoteC decodes a git C-quoted string starting at s[0] == '"'. It returns

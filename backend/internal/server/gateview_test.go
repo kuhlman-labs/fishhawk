@@ -5624,8 +5624,15 @@ func TestGateView_DiffSecretsSuppressed(t *testing.T) {
 	// COUNTERFACTUAL: skip SafeRuleID / gateViewSafeText on read — the
 	// corrupted row's rule_id, path and check_key carry a runtime credential,
 	// so the body then carries it → RED.
+	//
+	// K5: the no-bytes check goes through the needle-taking
+	// assertNoNeedleBytes over the gate-view body, the concern rows and the
+	// read's logs. The audit argument is an EMPTY fake: the seeded entry is
+	// this subtest's corrupted INPUT and carries the credential by
+	// construction, so it is not an output under test.
 	t.Run("a corrupted row renders no bytes", func(t *testing.T) {
 		s, repo, au, cr := gateViewServer(t)
+		logs := captureLogger(s)
 		runID := seedGateRun(t, repo)
 		cred := "ghp_" + strings.Repeat("Z", 36)
 		bad := markerRec("fix/"+cred+".go", 1)
@@ -5636,10 +5643,7 @@ func TestGateView_DiffSecretsSuppressed(t *testing.T) {
 		if b == nil || len(b.ByRule) != 1 || b.ByRule[0].RuleID != diffsecrets.InvalidRuleID || b.MarkerLocations[0].CheckKey != "" {
 			t.Errorf("block = %+v, want (invalid id) and no check_key", b)
 		}
-		if strings.Contains(body, cred) {
-			t.Errorf("gate-view body carries the credential:\n%s", body)
-		}
-		_ = cr
+		assertNoNeedleBytes(t, cr, newAuditFake(), logs.String(), map[string]string{"gate-view body": body}, cred)
 	})
 	// COUNTERFACTUAL: delete the gap append on a list error — the response
 	// then reads history_incomplete false with no diff_secrets_suppressed gap

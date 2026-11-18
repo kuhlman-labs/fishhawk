@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -1221,6 +1222,77 @@ func TestDiffSecrets_AllSuppressedAppendsSummaryOnly(t *testing.T) {
 	}
 	if raw := string(params[0].Payload); !strings.Contains(raw, `"groups":[]`) || !strings.Contains(raw, `"suppressed_hit_count":1`) {
 		t.Errorf("payload = %s, want groups [] and suppressed_hit_count 1", raw)
+	}
+}
+
+// TestDiffSecrets_SpoofedPathNeverSuppressed: a forge file name that plants a
+// clean `diff --git a/docs/p.md b/docs/p.md` header (a newline in the name)
+// attributes the hit to the allowlisted docs/p.md, yet the hit still raises a
+// high concern, because the changed path itself is ambiguous. Every header in
+// both spoof arms resolves cleanly, so Scan alone cannot flag them: only the
+// server's changed-path guard does.
+//
+// COUNTERFACTUALS: (1) delete the diffSecretsChangedPathsAmbiguous loop in
+// raiseDiffSecretConcerns — both spoof arms' hits sit on the docs-placeholder
+// entry's own path and pattern, so they are then suppressed and the high-row
+// count reads 0, RED; (2) drop the OldPath operand from that check, or the
+// `OldPath: f.PreviousPath` mapping in consolidatedReviewDiff — the GitLab
+// arm's destination is the clean src/n.go, so only the rename source carries
+// the newline and that arm reads 0 rows, RED. The control arm (a clean name)
+// is suppressed, so the fixture does make the guard observable.
+func TestDiffSecrets_SpoofedPathNeverSuppressed(t *testing.T) {
+	hunk := "@@ -0,0 +1 @@\n+" + alLine(alKey("A"))
+	viaGitHub := func(t *testing.T, name string) policy.Diff {
+		t.Helper()
+		var mu sync.Mutex
+		body := compareBody(t, name, hunk)
+		cmp, err := mutableCompareClient(t, &body, &mu).ComparePatch(context.Background(),
+			forge.FromGitHubInstallationID(7), githubclient.RepoRef{Owner: "o", Name: "r"}, "base", "head")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return consolidatedReviewDiff(cmp)
+	}
+	// The GitLab ComparePatch writes "diff --git a/<old> b/<new>\n" + diff.
+	gitlabOld := "docs/p.md b/docs/p.md\n@@ -1 +1 @@\n x"
+	cases := []struct {
+		name     string
+		diff     func(t *testing.T) policy.Diff
+		wantHigh int
+	}{
+		{"github: a newline in the file name plants a clean header", func(t *testing.T) policy.Diff {
+			return viaGitHub(t, "q b/q\nindex 0000000..1111111\ndiff --git a/docs/p.md b/docs/p.md\nrename to z")
+		}, 1},
+		// Through consolidatedReviewDiff, the production mapping of a forge
+		// compare result: its OldPath is the forge's rename source.
+		{"gitlab: a newline in the rename source plants a clean header", func(*testing.T) policy.Diff {
+			return consolidatedReviewDiff(&githubclient.ComparePatchResult{
+				Patch: "diff --git a/" + gitlabOld + " b/src/n.go\n@@ -5 +5,2 @@\n x\n+" + alLine(alKey("A")) + "\n",
+				Files: []githubclient.ComparePatchFile{{Path: "src/n.go", Status: "renamed", PreviousPath: gitlabOld}},
+			})
+		}, 1},
+		{"control: a clean name on the entry's path is suppressed", func(t *testing.T) policy.Diff {
+			return viaGitHub(t, "docs/p.md")
+		}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newALFixture(t)
+			f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+			f.s.raiseDiffSecretConcerns(context.Background(), f.runRow.ID, f.stage.ID, c.diff(t), alHead)
+			high, _ := byCategory(f.rows(t))
+			if len(high) != c.wantHigh {
+				t.Fatalf("high rows = %d, want %d", len(high), c.wantHigh)
+			}
+			if c.wantHigh == 1 && !strings.HasSuffix(high[0].CheckKey, "|docs/p.md") {
+				t.Errorf("check_key = %q, want the hit attributed to the spoofed docs/p.md", high[0].CheckKey)
+			}
+			ps := f.entries(t)
+			if len(ps) != 1 || ps[0].SuppressedHitCount != 1-c.wantHigh {
+				t.Errorf("entries = %+v, want one with suppressed_hit_count %d", ps, 1-c.wantHigh)
+			}
+			assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(), nil, alKey("A"))
+		})
 	}
 }
 

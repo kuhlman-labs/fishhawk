@@ -135,6 +135,15 @@ func (s *Server) raiseDiffSecretConcerns(ctx context.Context, runID, stageID uui
 	if len(res.Hits) == 0 {
 		return diffSecretsRound{}
 	}
+	// A forge compare patch is rebuilt from the forge's file names
+	// (`diff --git a/<name> b/<name>`). A name carrying a newline or " b/" can
+	// plant a well-formed header for an allowlisted path, so when any changed
+	// path is ambiguous no hit's path is trusted and Partition keeps them all.
+	if diffSecretsChangedPathsAmbiguous(diff.ChangedFiles) {
+		for i := range res.Hits {
+			res.Hits[i].PathAmbiguous = true
+		}
+	}
 	// The allowlist read is a forge call: it runs BEFORE diffSecretsRaiseMu, so
 	// a slow forge never serializes other runs' rounds.
 	al, status := s.diffSecretsAllowlist(ctx, runID, headSHA)
@@ -292,6 +301,17 @@ func (s *Server) raiseDiffSecretConcerns(ctx context.Context, runID, stageID uui
 // diffSecretsPersonaGroups is the A2 persona rule: the kept hits plus the
 // marker-suppressed hits, grouped; an entry-suppressed hit never attaches the
 // security persona. nil when neither exists.
+// diffSecretsChangedPathsAmbiguous reports whether any changed path, or
+// rename source, is a diffsecrets.AmbiguousPath.
+func diffSecretsChangedPathsAmbiguous(files []policy.ChangedFile) bool {
+	for _, f := range files {
+		if diffsecrets.AmbiguousPath(f.Path) || diffsecrets.AmbiguousPath(f.OldPath) {
+			return true
+		}
+	}
+	return false
+}
+
 func diffSecretsPersonaGroups(kept []diffsecrets.Hit, suppressed []diffsecrets.Suppression) []diffsecrets.Group {
 	hits := append([]diffsecrets.Hit(nil), kept...)
 	for _, x := range suppressed {

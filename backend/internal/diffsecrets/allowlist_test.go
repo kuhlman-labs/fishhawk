@@ -231,6 +231,10 @@ func TestAllowlist_Partition(t *testing.T) {
 		// matches the allowlist file, RED.
 		{"the allowlist file itself is never suppressed", &Allowlist{Entries: []Rule{everything}, Markers: []Rule{everything}},
 			Hit{Path: AllowlistPath, Line: 1, Pattern: pA, Marked: true}, nil},
+		// (m) COUNTERFACTUAL: delete the PathAmbiguous guard — `**` matches,
+		// RED.
+		{"ambiguous path is never suppressed", &Allowlist{Entries: []Rule{everything}, Markers: []Rule{everything}},
+			Hit{Path: "docs/p.md", Line: 1, Pattern: pA, Marked: true, PathAmbiguous: true}, nil},
 		// (k) COUNTERFACTUAL: check markers before entries — the hit is
 		// covered by both, so it then reads By=marker, RED.
 		{"entry wins over a scope covering the same marked hit",
