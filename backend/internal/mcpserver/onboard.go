@@ -619,9 +619,10 @@ and NOT served by fishhawkd:
               are never held). status is ok | warn (signed out, expired, or
               expiring within 72h; remediation names ` + "`claude auth login`" + `
               on the host — local runners fail until then) | unknown (the CLI
-              failed, printed undecodable output, or omitted loggedIn — NOT a
-              finding that it is signed out) | not_available (claude is not on
-              PATH). Signed in with no or an unparseable expiry is ok, noting
+              failed or timed out, printed undecodable output, or omitted
+              loggedIn — NOT a finding that it is signed out) | not_available
+              (claude is not on PATH). A non-zero exit that prints
+              loggedIn:false is the signed-out answer and reads warn. Signed in with no or an unparseable expiry is ok, noting
               no expiry reported.
               Both credential and model_credential are HOST-LOCAL: they run
               only in the operator's own stdio fishhawk-mcp process. On

@@ -46,7 +46,8 @@ const modelCredentialLoginRemediation = "Run `claude auth login` on this host. L
 
 // Package-level exec seams, swapped by tests (the issue_fetch.go ghLookPath
 // pattern). claudeLookPath resolves the binary; claudeAuthStatusOutput runs
-// `<path> auth status --json` and returns its stdout; modelCredentialNow is
+// `<path> auth status --json` and returns its stdout, which on a non-zero exit
+// arrives together with the *exec.ExitError; modelCredentialNow is
 // the clock the expiry comparison reads.
 var (
 	claudeLookPath         = exec.LookPath
@@ -109,7 +110,16 @@ func modelCredential(ctx context.Context) *modelCredentialRung {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			note = "`claude auth status --json` did not answer within " + modelCredentialTimeout.String() + ", so the sign-in state could not be read."
 		} else if errors.As(err, &exitErr) {
-			note = "`claude auth status --json` exited " + exitErr.String() + ", so the sign-in state could not be read. This is not a finding that it is signed out."
+			// The CLI exits non-zero when signed out, and Output returns
+			// stdout alongside the ExitError, so the signed-out answer
+			// arrives on this path. Only loggedIn:false agrees with a
+			// non-zero exit; loggedIn:true or an unreadable body stays
+			// unknown rather than claiming a sign-in the exit contradicts.
+			var st claudeAuthStatus
+			if json.Unmarshal(out, &st) == nil && st.LoggedIn != nil && !*st.LoggedIn {
+				return modelCredentialFromStatus(st, modelCredentialNow())
+			}
+			note = "`claude auth status --json` exited " + exitErr.String() + " without reporting loggedIn:false, so the sign-in state could not be read. This is not a finding that it is signed out."
 		}
 		return &modelCredentialRung{Status: modelCredentialUnknown, Note: note}
 	}

@@ -74,6 +74,65 @@ func TestModelCredential_CommandError(t *testing.T) {
 	}
 }
 
+// realExitError returns a genuine *exec.ExitError from a process that exits
+// 1, the shape exec's Output returns beside stdout on a non-zero exit.
+func realExitError(t *testing.T) error {
+	t.Helper()
+	err := exec.Command("sh", "-c", "exit 1").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("sh exit 1 returned %v (%T), want *exec.ExitError", err, err)
+	}
+	return err
+}
+
+// TestModelCredential_LoggedOutNonZeroExit is the shape the real CLI
+// produces signed out: exit 1 with {"loggedIn":false} on stdout. Dropping the
+// ExitError decode reads unknown and goes RED.
+func TestModelCredential_LoggedOutNonZeroExit(t *testing.T) {
+	withFakeClaude(t, nil, authStatusJSON(t, map[string]any{"loggedIn": false, "authMethod": "none"}), realExitError(t))
+	rung := modelCredential(context.Background())
+	if rung.Status != modelCredentialWarn {
+		t.Errorf("status = %q (note %q), want warn for a signed-out exit 1", rung.Status, rung.Note)
+	}
+	if rung.LoggedIn == nil || *rung.LoggedIn {
+		t.Errorf("logged_in = %v, want false", rung.LoggedIn)
+	}
+	assertLoginRemediation(t, rung)
+}
+
+// TestModelCredential_NonZeroExitNotSignedOut: a non-zero exit whose stdout
+// is empty, undecodable, or claims loggedIn:true stays unknown; only a
+// loggedIn:false body agrees with the exit.
+func TestModelCredential_NonZeroExitNotSignedOut(t *testing.T) {
+	for name, out := range map[string]string{
+		"empty":       "",
+		"undecodable": "error: not a json body",
+		"logged_in":   authStatusJSON(t, map[string]any{"loggedIn": true, "loginExpiresAt": fixedModelNow.Add(30 * 24 * time.Hour).Format(time.RFC3339)}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			withFakeClaude(t, nil, out, realExitError(t))
+			rung := modelCredential(context.Background())
+			if rung.Status != modelCredentialUnknown || !strings.Contains(rung.Note, "exited exit status 1") {
+				t.Errorf("rung = %+v, want unknown naming the exit status", rung)
+			}
+			if rung.LoggedIn != nil {
+				t.Errorf("logged_in = %v, want absent", *rung.LoggedIn)
+			}
+		})
+	}
+}
+
+// TestModelCredential_Timeout: a deadline-exceeded exec stays unknown and
+// names the timeout, even when partial stdout reads signed out.
+func TestModelCredential_Timeout(t *testing.T) {
+	withFakeClaude(t, nil, authStatusJSON(t, map[string]any{"loggedIn": false}), context.DeadlineExceeded)
+	rung := modelCredential(context.Background())
+	if rung.Status != modelCredentialUnknown || !strings.Contains(rung.Note, "did not answer within "+modelCredentialTimeout.String()) {
+		t.Errorf("rung = %+v, want unknown naming the %s timeout", rung, modelCredentialTimeout)
+	}
+}
+
 func TestModelCredential_Undecodable(t *testing.T) {
 	withFakeClaude(t, nil, "Logged in as someone (text mode)", nil)
 	rung := modelCredential(context.Background())
