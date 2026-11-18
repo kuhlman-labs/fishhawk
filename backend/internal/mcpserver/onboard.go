@@ -32,11 +32,131 @@ type DoctorInput struct {
 // computed LOCALLY by this MCP process about its OWN environment. Folding it
 // into `report` would render a locally-computed fact as something the daemon
 // answered, which is a false claim about provenance. HostLabel (#4212) is the
-// second such locally-computed sibling, under the same rule.
+// second such locally-computed sibling, under the same rule, and Credential
+// and ModelCredential (#5227) are the third and fourth.
 type DoctorOutput struct {
 	Report            OnboardingReadinessReport `json:"report"`
 	RunnerCredentials *runnerCredentialsRung    `json:"runner_credentials,omitempty" jsonschema:"computed LOCALLY by this MCP server about its OWN process environment (NOT served by fishhawkd): whether the RUNNER-held GitLab push credential a local runner would inherit is present; reports PRESENCE only and says nothing about a gitlab_ci runner"`
 	HostLabel         *hostLabelRung            `json:"host_label,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): the host label this process sends on the host-dispatch marker, which keys the default local-implement:<label> concurrency group, and which rung of the resolution ladder answered it"`
+	// Credential and ModelCredential (#5227) are the third and fourth
+	// locally-computed siblings, under the same provenance rule. Both are
+	// HOST-LOCAL: they run only when Config.LocalHostRungs is set and the
+	// bearer is not run-bound, and otherwise report not_applicable.
+	Credential      *credentialSourceRung `json:"credential,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): where this server's bearer came from (env:FISHHAWK_API_TOKEN, stored_login, stored_login_refreshed, mcp_route_request_bearer) and whether an env token is shadowing a stored login. Never a credential value. The subject the bearer acts as is report.scopes.subject"`
+	ModelCredential *modelCredentialRung  `json:"model_credential,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): whether the claude model CLI a local runner execs is signed in on this host, from claude auth status --json (loggedIn, authMethod and loginExpiresAt only)"`
+}
+
+// Credential source labels (#5227). They are duplicated as literals in
+// backend/cmd/fishhawk-mcp/main.go (the three loadConfig rungs) and
+// backend/cmd/fishhawkd/serve.go (the /mcp route); each side's tests assert the
+// literal so a rename on one side reddens the other.
+const (
+	credentialSourceEnv                  = "env:FISHHAWK_API_TOKEN"
+	credentialSourceStoredLogin          = "stored_login"
+	credentialSourceStoredLoginRefreshed = "stored_login_refreshed"
+	credentialSourceRouteBearer          = "mcp_route_request_bearer"
+)
+
+// apiTokenEnv is the env var fishhawk-mcp's loadConfig rung 1 reads.
+const apiTokenEnv = "FISHHAWK_API_TOKEN"
+
+// credentialSourceRung statuses.
+const (
+	credentialRungOK            = "ok"
+	credentialRungWarn          = "warn"
+	credentialRungUnknown       = "unknown"
+	credentialRungNotApplicable = "not_applicable"
+)
+
+// credentialSourceRung is the LOCALLY-computed doctor rung naming where this
+// server's bearer came from (#5227). It never carries the bearer, its prefix,
+// or the stored credential: shadowed_stored_login is a presence answer only.
+// Unexported for the export-surface reason runnerCredentialsRung documents.
+type credentialSourceRung struct {
+	Status              string `json:"status" jsonschema:"ok, warn (an env token is shadowing a stored login), unknown (the embedder recorded no source), or not_applicable (not the operator's stdio fishhawk-mcp process, or a run-bound token: the credential store is not read)"`
+	Reason              string `json:"reason,omitempty" jsonschema:"on not_applicable: not_local_stdio_process or run_bound_token"`
+	Source              string `json:"source,omitempty" jsonschema:"where the bearer came from: env:FISHHAWK_API_TOKEN, stored_login, stored_login_refreshed or mcp_route_request_bearer"`
+	Variable            string `json:"variable,omitempty" jsonschema:"FISHHAWK_API_TOKEN when the source is the env rung"`
+	ShadowedStoredLogin *bool  `json:"shadowed_stored_login,omitempty" jsonschema:"set only when the source is env and the stored-login presence check answered: true means a stored login exists and the env token wins over it. Absent (never false) when the check did not run or could not read the store"`
+	Note                string `json:"note" jsonschema:"the human sentence, naming report.scopes.subject as the subject this bearer acts as"`
+	Remediation         string `json:"remediation,omitempty" jsonschema:"on a shadow: how to act as the stored login instead"`
+}
+
+// credentialSubjectNote names the subject the bearer resolves to. The subject
+// is read from the served report, never derived locally.
+func credentialSubjectNote(subject string) string {
+	if strings.TrimSpace(subject) == "" {
+		return "The subject this bearer acts as is report.scopes.subject; this fishhawkd did not report one."
+	}
+	return "This bearer acts as " + subject + " (report.scopes.subject, resolved by fishhawkd)."
+}
+
+// credentialRung renders the credential rung. In a posture it does not run in
+// it returns not_applicable before the presence seam is consulted, so the
+// credential store is never read there.
+func (r *runResolver) credentialRung(subject string) *credentialSourceRung {
+	rung := &credentialSourceRung{Source: r.credentialSource}
+	if r.credentialSource == credentialSourceEnv {
+		rung.Variable = apiTokenEnv
+	}
+	if reason := r.hostRungNotApplicableReason(); reason != "" {
+		rung.Status = credentialRungNotApplicable
+		rung.Reason = reason
+		rung.Note = notApplicableNote(reason, "the credential store is not read")
+		return rung
+	}
+	note := credentialSubjectNote(subject)
+	switch r.credentialSource {
+	case credentialSourceEnv:
+		rung.Status = credentialRungOK
+		note = "The bearer comes from " + apiTokenEnv + " in this process's environment. " + note
+		if r.storedLoginPresent == nil {
+			rung.Note = note + " Whether it shadows a stored login was not checked."
+			return rung
+		}
+		present, err := r.storedLoginPresent()
+		if err != nil {
+			rung.Note = note + " The credential store could not be read, so whether this env token shadows a stored login is undetermined."
+			return rung
+		}
+		rung.ShadowedStoredLogin = &present
+		if !present {
+			rung.Note = note + " No stored login exists for this backend, so nothing is shadowed."
+			return rung
+		}
+		rung.Status = credentialRungWarn
+		rung.Note = note + " A stored login also exists for this backend, and the env token wins over it, so this server does not act as the stored login."
+		rung.Remediation = "To act as the stored login, unset " + apiTokenEnv + " in the environment that LAUNCHES fishhawk-mcp (the MCP registration's env block or the launching shell), then reconnect the MCP server (/mcp)."
+	case credentialSourceStoredLogin, credentialSourceStoredLoginRefreshed:
+		rung.Status = credentialRungOK
+		rung.Note = "The bearer is the stored `fishhawk token login` credential for this backend. " + note
+	default:
+		rung.Status = credentialRungUnknown
+		rung.Note = "This server's embedder recorded no credential source. " + note
+	}
+	return rung
+}
+
+// hostRungNotApplicableReason returns why the host-local rungs do not run, or
+// "" when they do: off unless Config.LocalHostRungs is set, and off for a
+// run-bound bearer whatever the posture.
+func (r *runResolver) hostRungNotApplicableReason() string {
+	if !r.localHostRungs {
+		return hostRungNotLocalStdio
+	}
+	if r.runBoundToken {
+		return hostRungRunBoundToken
+	}
+	return ""
+}
+
+// modelCredentialRung renders the model_credential rung, exec'ing the model
+// CLI only in a posture the host-local rungs run in.
+func (r *runResolver) modelCredentialRung(ctx context.Context) *modelCredentialRung {
+	if reason := r.hostRungNotApplicableReason(); reason != "" {
+		return newModelCredentialNotApplicable(reason)
+	}
+	return modelCredential(ctx)
 }
 
 // hostLabelRung is the LOCALLY-computed doctor rung reporting this process's
@@ -438,9 +558,10 @@ work_item_provider rung (see below):
               fishhawkd; absence means the backend cannot answer, which is
               NOT the same claim as unregistered.
 
-Alongside the report key the output carries two rungs, each a SIBLING key,
-never a field inside it: runner_credentials and host_label, computed LOCALLY
-by this MCP server about its own process and NOT served by fishhawkd:
+Alongside the report key the output carries four rungs, each a SIBLING key,
+never a field inside it: runner_credentials, host_label, credential and
+model_credential, computed LOCALLY by this MCP server about its own process
+and NOT served by fishhawkd:
 
   - runner_credentials — a GitLab run needs TWO credentials: fishhawkd's
               FISHHAWKD_GITLAB_TOKEN (what the app rung covers) and the RUNNER
@@ -479,6 +600,35 @@ by this MCP server about its own process and NOT served by fishhawkd:
               carry the label, so default_group applies only to stages
               without one. Resolved once per process, on the first doctor or
               host-dispatch call.
+  - credential — where this server's bearer came from: source is
+              env:FISHHAWK_API_TOKEN (variable names it) | stored_login |
+              stored_login_refreshed (the stored ` + "`fishhawk token login`" + `
+              credential, refreshed at startup) | mcp_route_request_bearer
+              (fishhawkd's /mcp route). The subject the bearer acts as is
+              report.scopes.subject, with report.scopes.credential_kind
+              naming its kind (static, oauth, oauth_as, session, mcp_run, ...).
+              On the env source, shadowed_stored_login:true with status warn
+              means a stored login also exists and the env token wins over it;
+              remediation says to unset FISHHAWK_API_TOKEN in the launch
+              environment and reconnect (/mcp). shadowed_stored_login is
+              ABSENT, never false, when the store could not be read. Never a
+              credential value: presence only.
+  - model_credential — is the claude model CLI a local runner execs signed in
+              on this host? Read from ` + "`claude auth status --json`" + `
+              (loggedIn, authMethod and loginExpiresAt only; account fields
+              are never held). status is ok | warn (signed out, expired, or
+              expiring within 72h; remediation names ` + "`claude auth login`" + `
+              on the host — local runners fail until then) | unknown (the CLI
+              failed, printed undecodable output, or omitted loggedIn — NOT a
+              finding that it is signed out) | not_available (claude is not on
+              PATH). Signed in with no or an unparseable expiry is ok, noting
+              no expiry reported.
+              Both credential and model_credential are HOST-LOCAL: they run
+              only in the operator's own stdio fishhawk-mcp process. On
+              fishhawkd's /mcp route, on --transport http, and for a run-bound
+              in-runner agent token they report status not_applicable with
+              reason not_local_stdio_process or run_bound_token, and nothing is
+              exec'd or read.
 
 The report's forge field names the family that answered (github|gitlab). repo
 is owner/name on GitHub, or a namespace/project path on GitLab — nested groups
@@ -620,7 +770,7 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 		return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w", err)
 	}
 	out := DoctorOutput{Report: *report}
-	// The one LOCALLY-computed rung (E45.82 / #3617): keyed on the family the
+	// The first LOCALLY-computed rung (E45.82 / #3617): keyed on the family the
 	// backend reported, answered from this process's own environment. It is
 	// attached AFTER the report is copied verbatim, so `report` stays the
 	// byte-mirror of what fishhawkd served.
@@ -628,6 +778,11 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 	// The second LOCALLY-computed rung (#4212): this process's host label,
 	// resolved lazily (the first doctor or host-dispatch call resolves it).
 	out.HostLabel = newHostLabelRung(r.api.hostLabelResolution())
+	// The host-local rungs (#5227): the bearer's source and the model CLI
+	// sign-in. Each reports not_applicable outside the operator's stdio
+	// process or for a run-bound bearer, before anything is read or exec'd.
+	out.Credential = r.credentialRung(report.Scopes.Subject)
+	out.ModelCredential = r.modelCredentialRung(ctx)
 	return nil, out, nil
 }
 

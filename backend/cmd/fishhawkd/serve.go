@@ -1771,14 +1771,25 @@ func resolveBudgetLocation(name string, logger *slog.Logger) *time.Location {
 // OS-path-list every path-taking MCP input must resolve inside (E66.63 /
 // #3589). An EMPTY list is the FAIL-CLOSED posture, not "unrestricted": the
 // route then refuses every path-taking verb with path_outside_allowed_roots.
+//
+// CredentialSource is mcp_route_request_bearer (#5227): the route builds one
+// registry per request around that request's own bearer. LocalHostRungs stays
+// false (and StoredLoginPresent nil): this daemon's host and credential store
+// are not the caller's, so fishhawk_doctor's credential and model_credential
+// rungs report not_applicable here and nothing is read or exec'd.
 func mcpRouteServerConfig(backendURL, apiToken, allowedRootsRaw string) mcpserver.Config {
 	return mcpserver.Config{
-		BackendURL:    backendURL,
-		APIToken:      apiToken,
-		HTTPTransport: true,
-		AllowedRoots:  splitMCPAllowedRoots(allowedRootsRaw),
+		BackendURL:       backendURL,
+		APIToken:         apiToken,
+		HTTPTransport:    true,
+		AllowedRoots:     splitMCPAllowedRoots(allowedRootsRaw),
+		CredentialSource: mcpRouteCredentialSource,
 	}
 }
+
+// mcpRouteCredentialSource is the /mcp route's credential source label
+// (#5227), mirroring backend/internal/mcpserver's credentialSourceRouteBearer.
+const mcpRouteCredentialSource = "mcp_route_request_bearer"
 
 // splitMCPAllowedRoots parses an OS path-list (filepath.SplitList: ':' on unix,
 // ';' on Windows) into the allow-list, dropping blank entries so a trailing or

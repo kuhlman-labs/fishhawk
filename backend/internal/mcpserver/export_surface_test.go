@@ -719,7 +719,8 @@ func TestEntryPointsExist(t *testing.T) {
 		}
 	}
 	sort.Strings(fields)
-	want := []string{"APIToken", "AllowedRoots", "BackendURL", "HTTPTransport"}
+	// #5227 adds CredentialSource, StoredLoginPresent and LocalHostRungs.
+	want := []string{"APIToken", "AllowedRoots", "BackendURL", "CredentialSource", "HTTPTransport", "LocalHostRungs", "StoredLoginPresent"}
 	mismatch := len(fields) != len(want)
 	for i := range want {
 		if i >= len(fields) || fields[i] != want[i] {

@@ -704,3 +704,120 @@ func TestParseFlags_AllowedRoots(t *testing.T) {
 		t.Errorf("--allowed-roots = %q, want /repos", tf.allowedRoots)
 	}
 }
+
+// TestLoadConfig_RecordsCredentialSource pins the #5227 source label per
+// ladder rung. The refreshed row is the counterfactual for a constant
+// source: rung 2b must relabel, not keep stored_login.
+func TestLoadConfig_RecordsCredentialSource(t *testing.T) {
+	stale := expiringRefreshable("http://localhost:8080/v0/oauth/token")
+	refresh := func(string) (credstore.Credential, error) {
+		fresh := stale
+		fresh.Token = "fho_fresh"
+		exp := time.Now().Add(15 * time.Minute)
+		fresh.ExpiresAt = &exp
+		return fresh, nil
+	}
+	cases := []struct {
+		name    string
+		env     map[string]string
+		load    func(string) (credstore.Credential, error)
+		refresh func(string) (credstore.Credential, error)
+		want    string
+		probe   bool
+	}{
+		{"env", map[string]string{"FISHHAWK_API_TOKEN": "tok_env"}, noCred(t), noRefresh(t), "env:FISHHAWK_API_TOKEN", true},
+		{"stored", map[string]string{}, credFunc(credstore.Credential{Token: "fhk_stored"}, nil), noRefresh(t), "stored_login", false},
+		{"refreshed", ladderEnv(), credFunc(stale, nil), refresh, "stored_login_refreshed", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(envFunc(tc.env), tc.load, tc.refresh)
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if cfg.credentialSource != tc.want {
+				t.Errorf("credentialSource = %q, want %q", cfg.credentialSource, tc.want)
+			}
+			if got := cfg.storedLoginPresent != nil; got != tc.probe {
+				t.Errorf("storedLoginPresent set = %v, want %v (only rung 1 can be shadowing a stored login)", got, tc.probe)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_EnvRungPresenceProbeIsLazy pins that rung 1 still never
+// touches the store at STARTUP (#5227): loadConfig returns without calling
+// loadCred, and only invoking the probe reads it. Each read outcome maps to
+// presence: a token is true, not-found is (false, nil), and any other read
+// error is returned so the rung leaves shadowed_stored_login absent.
+func TestLoadConfig_EnvRungPresenceProbeIsLazy(t *testing.T) {
+	var calls int
+	var gotURL string
+	var next struct {
+		cred credstore.Credential
+		err  error
+	}
+	load := func(u string) (credstore.Credential, error) {
+		calls++
+		gotURL = u
+		return next.cred, next.err
+	}
+	cfg, err := loadConfig(envFunc(map[string]string{"FISHHAWK_API_TOKEN": "tok_env", "FISHHAWK_BACKEND_URL": "http://h:1/"}), load, noRefresh(t))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("loadCred called %d times during loadConfig, want 0: rung 1 must not touch the store at startup", calls)
+	}
+	if cfg.storedLoginPresent == nil {
+		t.Fatal("storedLoginPresent is nil on rung 1")
+	}
+
+	next.cred = credstore.Credential{Token: "fhk_STORED_SENTINEL"}
+	if present, err := cfg.storedLoginPresent(); err != nil || !present {
+		t.Errorf("stored token: present=%v err=%v, want true, nil", present, err)
+	}
+	if gotURL != "http://h:1" {
+		t.Errorf("probe looked up %q, want the normalized backend URL http://h:1", gotURL)
+	}
+	next.cred, next.err = credstore.Credential{}, credstore.ErrNotFound
+	if present, err := cfg.storedLoginPresent(); err != nil || present {
+		t.Errorf("not found: present=%v err=%v, want false, nil", present, err)
+	}
+	next.cred, next.err = credstore.Credential{}, nil
+	if present, err := cfg.storedLoginPresent(); err != nil || present {
+		t.Errorf("empty stored token: present=%v err=%v, want false, nil", present, err)
+	}
+	readErr := errors.New("corrupt store")
+	next.err = readErr
+	if _, err := cfg.storedLoginPresent(); !errors.Is(err, readErr) {
+		t.Errorf("read error: err=%v, want the store read error returned (shadow undetermined, not false)", err)
+	}
+}
+
+// TestMCPServerConfig_LocalHostRungsOnlyOnStdio pins condition S1: only the
+// stdio default enables the host-local doctor rungs; --transport http does
+// not. The source and presence seam pass through on both.
+func TestMCPServerConfig_LocalHostRungsOnlyOnStdio(t *testing.T) {
+	probe := func() (bool, error) { return true, nil }
+	cfg := config{backendURL: "http://127.0.0.1:9090", apiToken: "fhk_y", credentialSource: credentialSourceEnv, storedLoginPresent: probe}
+	stdio := mcpServerConfig(cfg, false, "")
+	if !stdio.LocalHostRungs {
+		t.Error("stdio: LocalHostRungs = false, want true (the operator's own process)")
+	}
+	httpCfg := mcpServerConfig(cfg, true, "")
+	if httpCfg.LocalHostRungs {
+		t.Error("--transport http: LocalHostRungs = true, want false")
+	}
+	for name, c := range map[string]struct {
+		src     string
+		present func() (bool, error)
+	}{"stdio": {stdio.CredentialSource, stdio.StoredLoginPresent}, "http": {httpCfg.CredentialSource, httpCfg.StoredLoginPresent}} {
+		if c.src != "env:FISHHAWK_API_TOKEN" {
+			t.Errorf("%s: CredentialSource = %q, want env:FISHHAWK_API_TOKEN", name, c.src)
+		}
+		if c.present == nil {
+			t.Errorf("%s: StoredLoginPresent not passed through", name)
+		}
+	}
+}

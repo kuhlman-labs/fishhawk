@@ -203,6 +203,16 @@ func mcpServerConfig(cfg config, httpTransport bool, allowedRootsFlag string) mc
 		APIToken:      cfg.apiToken,
 		HTTPTransport: httpTransport,
 		AllowedRoots:  roots,
+
+		// #5227: the credential source and the lazy stored-login presence
+		// seam feed fishhawk_doctor's credential rung. LocalHostRungs is set
+		// ONLY on the stdio default — the operator's own client-spawned
+		// process — so `--transport http` (a long-lived loopback daemon, like
+		// fishhawkd's /mcp route) never reads this host's credential store or
+		// execs the model CLI on a caller's behalf.
+		CredentialSource:   cfg.credentialSource,
+		StoredLoginPresent: cfg.storedLoginPresent,
+		LocalHostRungs:     !httpTransport,
 	}
 }
 
@@ -251,6 +261,45 @@ type config struct {
 	// OVERRIDES it when supplied. Inert on the stdio default. EMPTY over HTTP
 	// is FAIL CLOSED — every path-taking verb is refused until a root is set.
 	allowedRoots []string
+
+	// credentialSource names the loadConfig rung that produced apiToken
+	// (#5227): env:FISHHAWK_API_TOKEN (rung 1), stored_login (rung 2) or
+	// stored_login_refreshed (rung 2b). Never the token. The literals mirror
+	// backend/internal/mcpserver's credentialSource* constants.
+	credentialSource string
+
+	// storedLoginPresent is the LAZY presence-only probe fishhawk_doctor's
+	// credential rung calls to tell whether an env token is shadowing a stored
+	// login (#5227). Set on rung 1 only. It reads the store when CALLED — at
+	// doctor time, never in loadConfig — so rung 1 still never touches the
+	// store at startup. It returns a bool and drops the credential at once.
+	storedLoginPresent func() (bool, error)
+}
+
+// Credential source labels recorded by loadConfig (#5227). Duplicated from
+// backend/internal/mcpserver, which does not export them; TestLoadConfig_
+// RecordsCredentialSource pins each literal.
+const (
+	credentialSourceEnv                  = "env:FISHHAWK_API_TOKEN"
+	credentialSourceStoredLogin          = "stored_login"
+	credentialSourceStoredLoginRefreshed = "stored_login_refreshed"
+)
+
+// storedLoginPresence returns the lazy presence probe for backendURL over
+// loadCred. A not-found store answers (false, nil); any other read error is
+// returned so the rung leaves shadowed_stored_login absent rather than false.
+// The loaded credential never leaves this function.
+func storedLoginPresence(backendURL string, loadCred func(string) (credstore.Credential, error)) func() (bool, error) {
+	return func() (bool, error) {
+		cred, err := loadCred(backendURL)
+		if err != nil {
+			if errors.Is(err, credstore.ErrNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		return cred.Token != "", nil
+	}
 }
 
 // loadConfig validates the env and resolves the bearer token through
@@ -311,10 +360,14 @@ func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Cre
 		c.backendURL = "http://localhost:8080"
 	}
 	// Rung 1: an explicit env token wins outright; the store is never
-	// consulted.
+	// consulted here. The presence probe is attached unevaluated: it reads
+	// the store only if fishhawk_doctor calls it later (#5227).
 	if c.apiToken != "" {
+		c.credentialSource = credentialSourceEnv
+		c.storedLoginPresent = storedLoginPresence(c.backendURL, loadCred)
 		return c, nil
 	}
+	c.credentialSource = credentialSourceStoredLogin
 
 	// Rung 2: fall back to the credential stored for this backend URL.
 	// The URL default + trailing-slash trim above are applied BEFORE
@@ -350,6 +403,7 @@ func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Cre
 			return config{}, fmt.Errorf("the refreshed Fishhawk credential for %s has an empty token: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
 		}
 		cred = fresh
+		c.credentialSource = credentialSourceStoredLoginRefreshed
 	}
 	// Rung 3c: an expired credential that could NOT be refreshed —
 	// reached only when rung 2b did not fire (nothing to refresh with,

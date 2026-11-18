@@ -8695,3 +8695,20 @@ func TestCampaignDriver_AutoStartLocal_EndToEnd(t *testing.T) {
 		})
 	}
 }
+
+// TestMCPRouteServerConfig_SetsRequestBearerSource pins the #5227 route
+// posture: the source names the request bearer, and the host-local doctor
+// rungs stay OFF with no presence seam, so the daemon's host and credential
+// store are never read on a caller's behalf (condition S1).
+func TestMCPRouteServerConfig_SetsRequestBearerSource(t *testing.T) {
+	cfg := mcpRouteServerConfig("u", "t", "")
+	if cfg.CredentialSource != "mcp_route_request_bearer" {
+		t.Errorf("CredentialSource = %q, want mcp_route_request_bearer", cfg.CredentialSource)
+	}
+	if cfg.LocalHostRungs {
+		t.Error("LocalHostRungs = true on the /mcp route, want false")
+	}
+	if cfg.StoredLoginPresent != nil {
+		t.Error("StoredLoginPresent set on the /mcp route, want nil")
+	}
+}
