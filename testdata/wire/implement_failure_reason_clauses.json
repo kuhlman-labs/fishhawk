@@ -1,0 +1,53 @@
+{
+  "_comment": "Shared wire fixture (#5215, R3): the failure-reason clauses the runner appends when it pins a failed implement attempt's work under refs/fishhawk/checkpoints/, and the binding-assertion text the backend detectors key on. runner/cmd/fishhawk-runner/checkpointref_wire_test.go pins every entry against its REAL producer; backend/internal/mcpserver TestImplementFailureReasonClauses_WireFixture runs the backend extractor and detector over the same entries. <sha> is the pinned 40-hex commit and <sha12> its 12-character prefix: the runner side substitutes the real pinned SHA, the backend side substitutes example_sha.",
+  "example_sha": "0123456789abcdef0123456789abcdef01234567",
+  "checkpoint_clauses": [
+    {
+      "kind": "held",
+      "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+      "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "clause_template": "; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203; fishhawk_retry_stage resumes it without re-running the agent"
+    },
+    {
+      "kind": "stash",
+      "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+      "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-stash",
+      "clause_template": "; stashed agent edits pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-stash (recover with `git stash apply refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-stash`)"
+    },
+    {
+      "kind": "verify",
+      "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+      "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify",
+      "clause_template": "; verified head <sha> pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify"
+    },
+    {
+      "kind": "agent_kill_timeout",
+      "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+      "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-timeout-1",
+      "clause_template": "; uncommitted agent work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-timeout-1 (commit <sha>)"
+    },
+    {
+      "kind": "fixup",
+      "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+      "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+      "ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-fixup-<sha12>",
+      "clause_template": "; fix-up commit <sha> never reached the PR branch; its work is pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-fixup-<sha12> (inspect with `git show <sha>`, recover with `git cherry-pick <sha>`)"
+    }
+  ],
+  "assertion_compound_fragment": "unsatisfied binding assertion(s)",
+  "assertion_sole_sentinel": "declared binding assertion(s) not satisfied by the committed tree",
+  "hostile_reasons": [
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203$(id)",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-timeout-1|sh",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203&&y",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203`y`",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-x/../y",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-fixup-0123456",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/00000000-0000-4000-8000-000000000000/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+    "commit+push: failed; gate-verified work pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/00000000-0000-4000-8000-000000000000-verify"
+  ]
+}
