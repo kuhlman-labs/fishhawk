@@ -2030,3 +2030,26 @@ func TestDiffSecretsSuppressed_WireShape(t *testing.T) {
 		t.Errorf("decoded diff_secrets_suppressed = %+v", b)
 	}
 }
+
+// TestGetGateViewDescribesClaimVerification is the DONE-MEANS pin for #4745 R4
+// and R19 on the SERVED fishhawk_get_gate_view description: a fix-up agent's
+// self-report and the PR body are claims to check against the committed code
+// (R4), and a "this symbol/control does not exist" finding is grepped for at
+// the run's head before acting on it (R19).
+func TestGetGateViewDescribesClaimVerification(t *testing.T) {
+	desc := fixupGuidanceDescription(t, fixupGuidanceTools(t), "fishhawk_get_gate_view")
+	for _, tc := range []struct{ rule, anchor string }{
+		{"R4", "the fix-up agent's self-report and the pr body are its own claims too"},
+		{"R4", "read the committed code at the pr head before trusting that a fix converged"},
+		{"R19", "before acting on any finding that claims a symbol or control does not exist in the tree"},
+		{"R19", "grep the run's head (merge_candidate_verdict.head_sha) for it"},
+	} {
+		if !strings.Contains(desc, tc.anchor) {
+			t.Errorf("%s: fishhawk_get_gate_view description lacks %q:\n%s", tc.rule, tc.anchor, desc)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_get_gate_view R4 guidance",
+		fixupGuidanceSlice(t, desc, "the fix-up agent's self-report", "suppressed_relitigations[]"))
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_get_gate_view R19 guidance",
+		fixupGuidanceSlice(t, desc, "before acting on any finding", "diff_secrets_suppressed"))
+}

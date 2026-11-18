@@ -79,7 +79,10 @@ Response (gate_view):
                                  opinion over the diff,
                                  not an executed reproduction: re-run your own
                                  reproduction at the fix-up head before
-                                 relying on it.
+                                 relying on it. The fix-up agent's self-report
+                                 and the PR body are its own claims too: read
+                                 the committed code at the PR head before
+                                 trusting that a fix converged.
   - suppressed_relitigations[] — settled concerns a reviewer tried to re-raise.
   - history_incomplete + history_gaps[] — set when an audit-derived join could
     not be built (the concerns stay intact; only cross-references may be
@@ -93,6 +96,10 @@ Response (gate_view):
     file inventory is itself capped, so the omitted set may itself be
     incomplete). Omitted when no review ran on a truncated diff. A HIGH finding
     that a control is "missing" against a truncated review deserves scrutiny.
+    Before acting on ANY finding that claims a symbol or control does not exist
+    in the tree (truncated or not, and on a review_head_mismatch round), grep
+    the run's head (merge_candidate_verdict.head_sha) for it: a reviewer that
+    saw a prefix or a stale tree can report as missing what the head carries.
   - diff_secrets_suppressed — present when the reviewed diff-secrets allowlist
     suppressed a hit or refused a rule on this run. Carries
     suppressed_hit_count with its entry / marker split, by_rule[] (by,

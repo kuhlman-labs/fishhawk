@@ -40,7 +40,7 @@ type EpicDraftChild struct {
 	Proposal           string   `json:"proposal" jsonschema:"the child's proposal prose"`
 	DoneMeans          string   `json:"done_means" jsonschema:"the child's definition of done"`
 	AcceptanceCriteria []string `json:"acceptance_criteria" jsonschema:"the child's acceptance criteria"`
-	Labels             []string `json:"labels" jsonschema:"the child's labels"`
+	Labels             []string `json:"labels" jsonschema:"the child's labels. Tier each child individually on the repository's delegation-tier criteria: a child gets the lowest tier only when its own scope warrants it, never because a sibling does, so do not blanket every child at the most sensitive member's tier"`
 	DependsOn          []int    `json:"depends_on" jsonschema:"1-based sibling ordinals into this children list this child depends on (not issue numbers); a dangling or cyclic edge fails the edit 422"`
 }
 
@@ -383,6 +383,12 @@ func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 	return withConventionsNote(guidanceForApprovalState(sess), sess.ConventionsSource)
 }
 
+// epicChildTierGuidance is the per-child tier rule (#4745 R3) appended to the
+// awaiting_approval decide/edit and approved file guidance: a draft that
+// blankets every child at its most sensitive member's tier hands an agent-safe
+// child to a human and hides which child really needs the lower tier.
+const epicChildTierGuidance = "Before deciding or filing, check each child's delegation-tier label on its own scope against the repository's tier criteria; do not blanket every child at the most sensitive member's tier"
+
 // guidanceForApprovalState is guidanceForSession's approval-state arm for a
 // session that is neither filed, drifted nor mid-filing.
 func guidanceForApprovalState(sess *RefinementSession) []SessionGuidance {
@@ -399,7 +405,7 @@ func guidanceForApprovalState(sess *RefinementSession) []SessionGuidance {
 			State:     "approved",
 			Arm:       "file",
 			Arguments: map[string]string{"session_id": sess.SessionID, "repo": repo},
-			Reason:    reason,
+			Reason:    reason + ". " + epicChildTierGuidance,
 		}}
 	case "rejected":
 		return []SessionGuidance{{
@@ -425,13 +431,13 @@ func guidanceForApprovalState(sess *RefinementSession) []SessionGuidance {
 				State:     "awaiting_approval",
 				Arm:       "decide",
 				Arguments: map[string]string{"session_id": sess.SessionID, "decision": "approved|rejected", "reason": "why"},
-				Reason:    decideReason,
+				Reason:    decideReason + ". " + epicChildTierGuidance,
 			},
 			{
 				State:     "awaiting_approval",
 				Arm:       "edit",
 				Arguments: map[string]string{"session_id": sess.SessionID, "brief_amendment": "amendment, OR draft: a direct EpicDraft edit"},
-				Reason:    "alternatively, edit the draft first (brief_amendment or draft); either appends a new revision and re-gates to awaiting_approval",
+				Reason:    "alternatively, edit the draft first (brief_amendment or draft); either appends a new revision and re-gates to awaiting_approval. " + epicChildTierGuidance,
 			},
 		}
 	}

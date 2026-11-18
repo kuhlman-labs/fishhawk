@@ -60,7 +60,7 @@ import (
 // block over the same poll.
 type ReviewStatus struct {
 	Stage               string       `json:"stage" jsonschema:"the reviewed stage type: 'plan' or 'implement'"`
-	Status              string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
+	Status              string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed. failed — like a reviews[] row whose verdict is failed — is NOT a verdict: the reviewer errored (a provider outage, quota exhaustion or a timeout, for example) and never counts as an approve or a reject. Read the failure reason to learn which: it is the reviewer's own error text, with no separate provider or quota label. fishhawk_rerun_review applies only to an implement round of advisory authority that recorded zero verdicts; otherwise take the legal next step from next_actions"`
 	Reviews             []PlanReview `json:"reviews" jsonschema:"ALWAYS present, one shape on every status: decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed; an EMPTY array (never absent, never null) for none/pending"`
 	PollIntervalSeconds int          `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status=pending; present only on pending, omitted on terminal/none. Poll get_run_status on this cadence as the authoritative path to a terminal status"`
 }
@@ -1321,6 +1321,24 @@ re-admitted with fishhawk_revive_run to progress past the gate. A SUCCEEDED
 run (e.g. a decomposition child whose slice was already integrated) needs
 nothing re-admitted — re-call to keep waiting. A CANCELLED run cannot be
 re-admitted by an operator verb; its verdict lands as a record only.
+
+A failed review is NOT a verdict. Status "failed", or a reviews[] row with
+verdict failed (which can sit beside real verdicts in a complete round), means
+that reviewer errored (a provider outage, quota exhaustion or a timeout, for
+example); never count it as an approve or a reject. Read the failure reason to
+learn which: it is the reviewer's own error text, with no separate provider or
+quota label. The recovery depends on the round, so take the legal next step
+from fishhawk_get_run_status next_actions rather than a blanket rerun:
+
+  - fishhawk_rerun_review is eligible ONLY for an IMPLEMENT review round of
+    ADVISORY authority that recorded ZERO verdicts (every reviewer failed or
+    was skipped); re-run it once the provider recovers.
+  - a failed PLAN review is not re-run by that verb: decide on the reviews
+    that did land (fishhawk_approve_plan or fishhawk_reject_plan), or call
+    fishhawk_revise_plan, which re-enters plan review.
+  - a GATING review, or a round where some reviewers succeeded, is not
+    re-runnable either: the failure is still not a verdict, and
+    get_run_status next_actions names the legal next step.
 
 A "confirmed" concern resolution in a post-fix-up round is the reviewer's
 reading of the diff, not an executed reproduction: when a defect still
