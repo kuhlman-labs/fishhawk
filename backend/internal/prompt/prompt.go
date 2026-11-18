@@ -2447,10 +2447,13 @@ func buildImplement(t Trigger) string {
 			}
 			b.WriteString("\n")
 		}
-		b.WriteString("Step zero — before writing any code: list the files you intend to modify. " +
-			"If any file falls outside your scope above, STOP and surface that the boundary is wrong " +
-			"rather than expanding scope. If you find yourself wanting to work in a sibling's area, " +
-			"STOP and signal completion instead.\n\n")
+		// Step zero is ONE instruction (#5215 rule 7): the child prompt carries
+		// no sibling file lists or depends_on edges, so the agent is never asked
+		// to judge sibling ownership — it files the amendment and the server
+		// decides (amendment_path_owned_by_sibling_slice for a non-ancestor
+		// owner). Every refusal path fails closed; the retired "STOP and signal
+		// completion instead" sentence contradicted that and is gone.
+		b.WriteString(scopeConstraintStepZero)
 	}
 
 	// Approval conditions (#557): when the operator approved the plan with
@@ -2613,6 +2616,7 @@ func buildImplement(t Trigger) string {
 	b.WriteString("  - `## Summary` — 1–3 bullets covering the motivation and the load-bearing changes. Don't restate the diff line-by-line.\n")
 	b.WriteString("  - `## Test plan` — a checklist of how a reviewer should verify the change, written as `- [ ] …` items (unchecked; the reviewer ticks them).\n")
 	b.WriteString("  - `## Notes` — optional. Use only when there's something deferred, surprising, or non-obvious worth flagging.\n")
+	b.WriteString(implementNoTrackerWritesBullet)
 	b.WriteString("- Don't add other top-level sections. Don't open the body with prose that floats above the first heading; everything narrative goes under `## Summary`.\n")
 
 	// A PARTIAL-delivery plan (E83.52 / #4085) must not close its issue, so
@@ -3857,9 +3861,42 @@ func writeScopeAmendments(b *strings.Builder) {
 	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope ONLY if the adaptation still satisfies the issue's done-means. A change that keeps `verify` green but leaves the done-means unsatisfied — a comment-only or otherwise no-op touch of an in-scope file substituted for the real edit — is a silent wrong-fix and is FORBIDDEN. If the correct change is genuinely impossible without the denied path, STOP and fail loud: surface it in your final response and commit NO done-means-violating implementation, rather than shipping a green-but-wrong workaround of the boundary (run 5aaf89fa / #1170).\n")
 	b.WriteString("5. On EXPIRY (still `pending` at the ~15-minute cap — no decision was made; this is NOT a denial and there is no `decision_reason` to read): take exactly one of two paths, and never a third. (i) If an adaptation within the original scope exists that FULLY satisfies the issue's done-means, take it AND DISCLOSE it: state in your final response that you adapted under a scope amendment that was never decided, naming the amendment id and the requested paths, so the reviewer and the operator can see the request went unanswered. (ii) Otherwise STOP IMMEDIATELY — do not keep iterating against the un-amended scope, do not attempt the edit, and commit NO done-means-violating implementation — and state in your final response that the amendment expired undecided, naming the amendment id and the requested paths. A change that keeps `verify` green but leaves the done-means unsatisfied — a comment-only or otherwise no-op touch of an in-scope file substituted for the real edit — is a silent wrong-fix and is FORBIDDEN under an expiry exactly as it is under an explicit denial (run 5aaf89fa / #1170). Never describe an expiry as a denial or as the operator having refused: your request remains `pending`, so a decision that arrives after this stage ends is still honored — an approval folds into the effective scope when the operator re-runs this stage with `fishhawk_retry_stage`.\n")
 	b.WriteString("\n")
+	b.WriteString(scopeAmendmentOutOfScopeTestRoute)
+	b.WriteString("\n")
 	b.WriteString("You may file at most 2 amendment requests for this stage (denied requests count). Batch every needed path into one request rather than dribbling them. NEVER edit or create a requested file before the approval lands.\n")
 	b.WriteString("\n")
 }
+
+// scopeAmendmentOutOfScopeTestRoute is the #5215 rule-8 paragraph of the shared
+// scope-amendment block (full implement AND slim fix-up prompts): an
+// out-of-scope test that pins behavior the change deliberately alters is a
+// missing scope path like any other, so it goes through the amendment channel.
+// It sits after the numbered request/decision steps, not between the intro's
+// colon and step 1. Repository-agnostic (ADR-110).
+const scopeAmendmentOutOfScopeTestRoute = "A test file outside the effective scope.files that pins behavior this change deliberately alters is the same case: " +
+	"request an amendment naming that test file so you can update its assertion, and never revert, weaken or special-case " +
+	"the production change to make the out-of-scope test pass.\n"
+
+// implementNoTrackerWritesBullet is the #5215 rule-2 bullet of the full
+// implement prompt's PR-description format list: the implement agent writes no
+// tracker state, and every deferral reaches the operator through `## Notes`.
+const implementNoTrackerWritesBullet = "- Do not create, edit or comment on tracker issues yourself. " +
+	"List deferred work, follow-ups and out-of-scope findings in `## Notes` instead; the operator files every follow-up from there.\n"
+
+// scopeConstraintStepZero is the decomposed child's single step-zero
+// instruction (#5215 rule 7, R4). It names no sibling ownership the agent must
+// judge: the server's amendment handler refuses a path a non-ancestor slice
+// owns, and every refusal, denial, undecided expiry or spent cap that leaves the
+// slice or a condition unmet fails closed. Repository-agnostic (ADR-110).
+const scopeConstraintStepZero = "Step zero — before writing any code: list the files you intend to modify, and check your slice " +
+	"and any binding approval condition below against the files you own. Do not edit a path outside them unless a scope " +
+	"amendment for it is approved. If your slice or a condition needs such a path, file ONE mid-stage scope amendment " +
+	"(see Mid-stage scope amendments below) that batches every such path; do not try to work out yourself whether another " +
+	"slice owns it. The server refuses a path that another slice owns, unless this child depends on that slice, with " +
+	"`amendment_path_owned_by_sibling_slice`. On that refusal, a denial, an expiry with no in-scope adaptation, or a spent " +
+	"request cap, while the slice or a condition still needs the path, fail closed: commit nothing that leaves a condition " +
+	"unmet, do NOT signal completion, and say in your final response which path was refused or left undecided and why the " +
+	"slice cannot finish without it.\n\n"
 
 // consultChannelHeading opens the plan prompt's TRUSTED crew-consult
 // instruction section (E77.5 / #3739). A constant so the presence and absence
