@@ -83,3 +83,25 @@ Adopt the Recommendation as binding: D1 (b) a persona is a separate reviewer inv
 **Decision.** Option B. A request to clear a server-synthesized concern is refused when it arrives over an agent-drivable channel (any MCP transport), regardless of the subject its credential carries; a human clears it through the Web UI session or the CLI. The existing subject and delegated tests stay. Rule 5 is otherwise unchanged, and no agent path is added.
 
 **Consequences.** Implemented in #5228 for the waive, bulk-waive and defer verbs. A human keeps a cheap path through propose-and-confirm (#5229). This amendment does not decide whether the same test applies to other human-only actions, what makes a CLI call human, or whether a deployment that gives an agent session a human-bound credential is supported; ADR-143 (#5231) proposes those. No reviewer saw this text before ratification.
+
+## Amendment A2: reviewed allowlist and in-scope fixture markers suppress diff-secret hits (ratified by the Captain, 2026-11-17 (issue #5230 comment))
+
+Ratification: Captain, 2026-11-17 (issue #5230 comment); final text confirmed by the Captain at merge.
+
+**Context.** Rule 5's diff secrets check (E80.3, #3760) raises every credential-shaped added line as a high concern that only a human can clear. Test fixtures and documented placeholders produce most of these, so humans spend waives on known non-secrets (#5230). A suppression arm must not create a path by which a change hides its own credential, and must not render the bytes it suppresses.
+
+**Options.**
+- **A.** Keep raising every hit and rely on human waives.
+- **B.** A reviewed allowlist file plus a per-line fixture marker honoured only inside a declared marker scope, read only at the run's admission commit, with the file itself a permission-drift surface.
+- **C.** Let an agent waive a hit it judges to be a fixture. That contradicts rule 5 and is not taken.
+
+**Decision.** Option B, under seven points.
+1. **Suppression arm.** `.fishhawk/diff-secrets-allowlist.yaml` (version 1) declares `entries` (path globs × pattern classes × reason) and `markers` (marker scopes, the same shape). An added line carrying `fishhawk:allow-secret` is suppressed only when it lies inside a declared marker scope for that pattern class. The marker is per line: a token on another line, a context line or a removed line marks nothing.
+2. **Trust boundary.** The server reads the file only at the run's admission commit (`run.DocumentBaseCommit`), never at a head or pass base, and fails closed: every read, configuration or parse failure suppresses nothing. The file is the high-severity `diff-secrets-allowlist` permission-drift surface, keyed per rule by validated id plus fingerprint, so a widening raises a human-only concern.
+3. **Never the bytes.** No allowlist-derived string is rendered verbatim. A rule is attributed by its validated id and a fingerprint (truncated SHA-256 of list, glob and pattern); globs are never rendered. A rule whose id, glob or reason matches the redaction pattern set is refused (`redaction_hit`). A hit whose path is unresolved, redacted, ambiguous (a section header that can be spoofed, or a changed path holding a newline or ` b/`), or the allowlist file itself is never suppressed.
+4. **Reporting.** Entry-suppressed hits are counted and attributed only. Marker-suppressed hits are listed by location, and each distinct hit raises a low, non-blocking, human-only `server_check` concern (category `diff_secrets_marker_suppressed`), de-duplicated per hit. This answers the self-marking path: adding a marker line is a suppression event a human sees.
+5. **Persona.** An entry-suppressed hit does NOT attach the security persona. A marker-suppressed hit DOES; the raise path's return seam carries it for #3762.
+6. **No agent settlement.** Suppressed hits and marker concerns are never waivable or settable by an agent. No verb records or clears a suppression; a marker concern clears only per A1 and ADR-143; and the run cannot edit the allowlist in effect, because it is read at the admission commit.
+7. **Staleness.** A long run, or a decomposed child that inherits `DocumentBaseCommit`, keeps the allowlist as admitted. A widening never takes effect inside the run that makes it, and a narrowing takes effect only for a fresh run, which is fail-safe.
+
+**Consequences.** Implemented by #5230 in two slices: the format, the drift surface (`SurfacesVersion` 2), the shared summary wire types and the PR status section first; the server read, the raise path, the gate-view block and the conflict-resolution counts second. The audit category stays `diff_secrets_detected`; `diff_secrets_marker_suppressed` is a concern category, not an audit category. A low marker concern does not block the human merge verb, but like every open concern it holds delegated settlement until a human dispositions it. Releasing delegated settlement for it would be a separate decision.

@@ -1,6 +1,7 @@
 package diffsecrets
 
 import (
+	"encoding/json"
 	"reflect"
 	"strconv"
 	"strings"
@@ -443,33 +444,58 @@ func TestUnquoteC_GitEscapes(t *testing.T) {
 	}
 }
 
-// TestHeaderPaths pins the two header path resolvers' edge forms.
+// TestHeaderPaths pins the two header path resolvers' edge forms, and which
+// of them are trusted. COUNTERFACTUALS: drop the `Count(rest, " b/") == 1`
+// clause — the GitLab-rename arm `a/src/real.go b/evil b/docs/p.md` then
+// resolves trusted, RED; drop the trailing-text check on the quoted b-side —
+// the `"b/docs/p.md" b/z` arm then reads trusted, RED.
 func TestHeaderPaths(t *testing.T) {
-	for in, want := range map[string]string{
-		`a/x.go b/x.go`:             "x.go",
-		`a/old.go b/new.go`:         "new.go",
-		`"a/q\"1.go" "b/q\"1.go"`:   `q"1.go`,
-		`"a/q\"1.go" b/plain.go`:    "plain.go",
-		`"a/unterminated`:           "",
-		`"a/ok.go" "b/unterminated`: "",
-		`a/x.go "b/unterminated`:    "",
-		`nothing-to-split`:          "",
+	type res struct {
+		path    string
+		trusted bool
+	}
+	for in, want := range map[string]res{
+		`a/x.go b/x.go`:     {"x.go", true},
+		`a/old.go b/new.go`: {"new.go", true},
+		`a/dir with space/x.go b/dir with space/x.go`: {"dir with space/x.go", true},
+		`"a/q\"1.go" "b/q\"1.go"`:                     {`q"1.go`, true},
+		`"a/q\"1.go" b/plain.go`:                      {"plain.go", true},
+		`a/plain.go "b/q\"1.go"`:                      {`q"1.go`, true},
+		`"a/unterminated`:                             {"", false},
+		`"a/ok.go" "b/unterminated`:                   {"", false},
+		`a/x.go "b/unterminated`:                      {"", false},
+		`nothing-to-split`:                            {"", false},
+		// A GitLab rename (gitlab.go writes a/<old> b/<new>) to a path holding
+		// " b/": the last-" b/" rule returns an attacker-chosen tail.
+		`a/src/real.go b/evil b/docs/p.md`: {"docs/p.md", false},
+		// Equal halves whose path itself holds " b/".
+		`a/x b/y b/x b/y`: {"x b/y", false},
+		// An unquoted a-side holding " b/" before a quoted b-side.
+		`a/docs/p.md b/docs/p.md b/x "b/y"`: {"y", false},
+		// Text after the closing quote is not git's output.
+		`"a/x" "b/docs/p.md" b/z`: {"docs/p.md", false},
+		// A C-quoted newline decodes into the path.
+		`"a/q\n1.go" "b/q\n1.go"`: {"q\n1.go", false},
+		// The first line of a GitHub-rebuilt header for a name carrying a newline.
+		`a/evil`: {"", false},
 	} {
-		if got := gitHeaderPath(in); got != want {
-			t.Errorf("gitHeaderPath(%q) = %q, want %q", in, got, want)
+		if p, ok := gitHeaderPath(in); p != want.path || ok != want.trusted {
+			t.Errorf("gitHeaderPath(%q) = (%q, %v), want %+v", in, p, ok, want)
 		}
 	}
-	for in, want := range map[string][2]any{
-		"b/x.go":                 {"x.go", true},
-		"x.go\t2026-01-01 00:00": {"x.go", true},
-		"/dev/null":              {"", false},
-		"":                       {"", false},
-		`"b/sp ace.go"`:          {"sp ace.go", true},
-		`"b/unterminated`:        {"", false},
+	for in, want := range map[string][3]any{
+		"b/x.go":                 {"x.go", true, true},
+		"x.go\t2026-01-01 00:00": {"x.go", true, true},
+		"/dev/null":              {"", false, true},
+		"":                       {"", false, false},
+		`"b/sp ace.go"`:          {"sp ace.go", true, true},
+		`"b/unterminated`:        {"", false, false},
+		"b/x b/y":                {"x b/y", true, false},
+		`"b/docs/p.md" b/z`:      {"docs/p.md", true, false},
 	} {
-		got, ok := plusPath(in)
-		if got != want[0] || ok != want[1] {
-			t.Errorf("plusPath(%q) = (%q, %v), want %v", in, got, ok, want)
+		got, ok, trusted := plusPath(in)
+		if got != want[0] || ok != want[1] || trusted != want[2] {
+			t.Errorf("plusPath(%q) = (%q, %v, %v), want %v", in, got, ok, trusted, want)
 		}
 	}
 	if _, ok := hunkNewStart("@@ -1 @@"); ok {
@@ -477,5 +503,230 @@ func TestHeaderPaths(t *testing.T) {
 	}
 	if n, ok := hunkNewStart("@@ -1 +7 @@"); !ok || n != 7 {
 		t.Errorf("hunkNewStart(+7) = %d, %v", n, ok)
+	}
+}
+
+// githubRebuilt renders one file exactly as githubclient.ComparePatch does
+// (client.go: "diff --git a/%s b/%s\n%s\n" with the raw filename twice).
+func githubRebuilt(name, patch string) string {
+	return "diff --git a/" + name + " b/" + name + "\n" + patch + "\n"
+}
+
+// gitlabRebuilt renders one file exactly as the GitLab ComparePatch does
+// (gitlab.go: "diff --git a/%s b/%s\n" with the raw old and new paths).
+func gitlabRebuilt(oldPath, newPath, diff string) string {
+	return "diff --git a/" + oldPath + " b/" + newPath + "\n" + diff
+}
+
+// TestScan_SpoofedHeaderPathAmbiguous: a forge-rebuilt patch whose file name
+// spoofs an allowlisted path sets PathAmbiguous, so Partition keeps the hit.
+// One arm per route named by the #5230 implement review, plus legitimate
+// controls that stay trusted.
+//
+// COUNTERFACTUALS: (1) make the flag non-sticky (`ambiguous = !trusted`) —
+// the GitHub arm's LAST header is a clean `diff --git a/docs/p.md
+// b/docs/p.md`, so the hit then reads trusted and is suppressed, RED; (2)
+// delete Partition's PathAmbiguous guard — both route arms' hits sit on the
+// entry's own path and pattern, so they are then suppressed, RED.
+func TestScan_SpoofedHeaderPathAmbiguous(t *testing.T) {
+	key := "@@ -0,0 +1 @@\n+k := \"" + classicPAT() + "\""
+	al := &Allowlist{Entries: []Rule{{ID: "docs-p", Paths: []string{"docs/p.md"}, Patterns: []string{"github-pat-classic"}, Reason: "r"}}}
+	cases := []struct {
+		name      string
+		patch     string
+		ambiguous bool
+	}{
+		{"github: a newline in the file name injects a clean header",
+			githubRebuilt("evil\ndiff --git a/docs/p.md b/docs/p.md", key), true},
+		{"gitlab: a rename to a path holding \" b/\" resolves by the last \" b/\"",
+			gitlabRebuilt("src/real.go", "evil b/docs/p.md", key+"\n"), true},
+		{"later clean sections stay ambiguous after one spoofed header",
+			gitlabRebuilt("src/real.go", "evil b/x.go", "@@ -0,0 +1 @@\n+ok\n") + githubRebuilt("docs/p.md", key), true},
+		{"control: a clean GitHub section is trusted", githubRebuilt("docs/p.md", key), false},
+		{"control: a clean GitLab rename is trusted", gitlabRebuilt("docs/old.md", "docs/p.md", key+"\n"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			hits := Scan(c.patch, redaction.DefaultPatterns).Hits
+			if len(hits) != 1 || hits[0].Path != "docs/p.md" {
+				t.Fatalf("hits = %+v, want one hit attributed to docs/p.md", hits)
+			}
+			if hits[0].PathAmbiguous != c.ambiguous {
+				t.Fatalf("PathAmbiguous = %v, want %v", hits[0].PathAmbiguous, c.ambiguous)
+			}
+			kept, sup := al.Partition(hits)
+			if c.ambiguous && (len(kept) != 1 || len(sup) != 0) {
+				t.Errorf("kept=%+v suppressed=%+v, want the spoofed hit kept", kept, sup)
+			}
+			if !c.ambiguous && (len(kept) != 0 || len(sup) != 1) {
+				t.Errorf("kept=%+v suppressed=%+v, want the trusted hit suppressed", kept, sup)
+			}
+		})
+	}
+}
+
+// TestScan_NewlineNameWithCleanHeadersNeedsChangedPaths documents why the
+// server also checks the changed-path list: a GitHub file name whose every
+// injected header resolves cleanly leaves Scan's flag false, and only
+// AmbiguousPath over the forge's own file name (the newline) catches it.
+// COUNTERFACTUAL: make AmbiguousPath ignore control bytes — the name arm then
+// reads false, RED.
+func TestScan_NewlineNameWithCleanHeadersNeedsChangedPaths(t *testing.T) {
+	name := "q b/q\nindex 0000000..1111111\ndiff --git a/docs/p.md b/docs/p.md\nrename to z"
+	hits := Scan(githubRebuilt(name, "@@ -0,0 +1 @@\n+k := \""+classicPAT()+"\""), redaction.DefaultPatterns).Hits
+	if len(hits) != 1 || hits[0].Path != "docs/p.md" || hits[0].PathAmbiguous {
+		t.Fatalf("hits = %+v, want one docs/p.md hit Scan cannot flag on its own", hits)
+	}
+	if !AmbiguousPath(name) {
+		t.Errorf("AmbiguousPath(name with a newline) = false, want true")
+	}
+	for _, p := range []string{"", "docs/p.md", "dir with space/x.go", `q"uote.go`, "spéc.go"} {
+		if AmbiguousPath(p) {
+			t.Errorf("AmbiguousPath(%q) = true, want false", p)
+		}
+	}
+	for _, p := range []string{"evil b/docs/p.md", "a\tb", "a\rb", "a\x7fb"} {
+		if !AmbiguousPath(p) {
+			t.Errorf("AmbiguousPath(%q) = false, want true", p)
+		}
+	}
+}
+
+// TestScan_MarkerFlag: Marked is true only on the ADDED line carrying
+// MarkerToken. COUNTERFACTUAL: scan the whole hunk (or the previous line) for
+// the token — the "previous added line" arm carries the token one line ABOVE
+// an unmarked key line, so the key line then reads Marked and the arm goes RED.
+func TestScan_MarkerFlag(t *testing.T) {
+	key := "k := \"" + classicPAT() + "\""
+	cases := map[string]struct {
+		hunk string
+		want []bool
+	}{
+		"token on the key line":            {"@@ -0,0 +1 @@\n+" + key + " // " + MarkerToken + "\n", []bool{true}},
+		"token on the previous added line": {"@@ -0,0 +1,2 @@\n+// " + MarkerToken + "\n+" + key + "\n", []bool{false}},
+		"token on a context line":          {"@@ -1,1 +1,2 @@\n // " + MarkerToken + "\n+" + key + "\n", []bool{false}},
+		"token on a removed line":          {"@@ -1,1 +1,1 @@\n-// " + MarkerToken + "\n+" + key + "\n", []bool{false}},
+		"marked then unmarked":             {"@@ -0,0 +1,2 @@\n+" + key + " " + MarkerToken + "\n+" + key + "\n", []bool{true, false}},
+	}
+	for name, c := range cases {
+		hits := Scan(section("fix/a.go", c.hunk), redaction.DefaultPatterns).Hits
+		if len(hits) != len(c.want) {
+			t.Fatalf("%s: hits = %+v", name, hits)
+		}
+		for i, h := range hits {
+			if h.Marked != c.want[i] {
+				t.Errorf("%s: hit %d Marked = %v, want %v", name, i, h.Marked, c.want[i])
+			}
+			if (h.Fingerprint != "") != h.Marked {
+				t.Errorf("%s: hit %d Fingerprint %q set iff Marked violated", name, i, h.Fingerprint)
+			}
+		}
+	}
+}
+
+// TestScan_MarkedHitFingerprint (K1): the per-hit fingerprint is 16 hex over
+// (path, pattern, matched bytes). The same bytes on another line keep it (a
+// re-review of a moved line raises nothing new); different bytes, another
+// path or another pattern change it; the bytes never appear in it.
+func TestScan_MarkedHitFingerprint(t *testing.T) {
+	other := "ghp_" + strings.Repeat("Z", 36)
+	fp := func(path, line string, at int) string {
+		hunk := "@@ -0,0 +" + strconv.Itoa(at) + " @@\n+" + line + " " + MarkerToken + "\n"
+		hits := Scan(section(path, hunk), redaction.DefaultPatterns).Hits
+		if len(hits) != 1 {
+			t.Fatalf("hits = %+v", hits)
+		}
+		return hits[0].Fingerprint
+	}
+	base := fp("fix/a.go", classicPAT(), 3)
+	if !fingerprintPattern.MatchString(base) || strings.Contains(base, classicPAT()) {
+		t.Fatalf("fingerprint %q", base)
+	}
+	if got := fp("fix/a.go", classicPAT(), 40); got != base {
+		t.Errorf("same bytes on another line: %q != %q", got, base)
+	}
+	for name, got := range map[string]string{
+		"other bytes": fp("fix/a.go", other, 3),
+		"other path":  fp("fix/b.go", classicPAT(), 3),
+	} {
+		if got == base {
+			t.Errorf("%s: fingerprint unchanged %q", name, got)
+		}
+	}
+	if hitFingerprint("p", "github-pat-classic", []string{"x"}) == hitFingerprint("p", "aws-access-key-id", []string{"x"}) {
+		t.Error("pattern does not enter the fingerprint")
+	}
+}
+
+// TestScan_PathRedactedFlag: a credential-shaped file name sets PathRedacted
+// and a normal one does not. COUNTERFACTUAL: hard-code displayPath's bool to
+// false — the first arm's path IS rewritten by the pattern set, so the flag
+// then reads false, RED.
+func TestScan_PathRedactedFlag(t *testing.T) {
+	key := "@@ -0,0 +1 @@\n+k := \"" + classicPAT() + "\"\n"
+	if h := Scan(section("fixtures/"+classicPAT()+".txt", key), redaction.DefaultPatterns).Hits; len(h) != 1 || !h[0].PathRedacted {
+		t.Errorf("credential-shaped name: %+v, want PathRedacted", h)
+	}
+	if h := Scan(section("fixtures/plain.txt", key), redaction.DefaultPatterns).Hits; len(h) != 1 || h[0].PathRedacted {
+		t.Errorf("plain name: %+v, want not PathRedacted", h)
+	}
+	if h := Scan("@@ -0,0 +1 @@\n+k := \""+classicPAT()+"\"\n", redaction.DefaultPatterns).Hits; len(h) != 1 || h[0].PathRedacted {
+		t.Errorf("unresolved path: %+v, want not PathRedacted (its own guard)", h)
+	}
+}
+
+func TestMarkerNote_LocationOnly(t *testing.T) {
+	rec := SuppressionRecord{Path: "fix/a.go", Lines: []int{2, UnknownLine}, Pattern: "github-pat-classic", By: ByMarker,
+		RuleID: "fixture-tests", RuleFingerprint: "0123456789abcdef"}
+	note := MarkerNote(rec)
+	for _, want := range []string{"fix/a.go:2", "fix/a.go:(line unknown)", "github-pat-classic", "fixture-tests", "0123456789abcdef",
+		MarkerToken, "added in this change", "a human must confirm", "low severity", "Only a human can waive"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note missing %q:\n%s", want, note)
+		}
+	}
+	// A corrupted record's id and fingerprint are never echoed.
+	rec.RuleID, rec.RuleFingerprint = slugCredential(), classicPAT()
+	note = MarkerNote(rec)
+	if strings.Contains(note, slugCredential()) || strings.Contains(note, classicPAT()) ||
+		!strings.Contains(note, InvalidRuleID) || !strings.Contains(note, InvalidFingerprint) {
+		t.Errorf("corrupted record leaks into the note:\n%s", note)
+	}
+	for _, p := range redaction.DefaultPatterns {
+		if p.Regex.MatchString(note) {
+			t.Errorf("note matches pattern %q", p.Name)
+		}
+	}
+}
+
+// TestSuppression_CarriesNoBytes extends TestHit_CarriesNoBytes to
+// Suppression, SuppressionRecord, MarkerCheckKey and MarkerNote over every
+// default pattern's sample, every hit marked and suppressed by a `**` scope.
+func TestSuppression_CarriesNoBytes(t *testing.T) {
+	var b strings.Builder
+	var all []string
+	for name, v := range samples() {
+		b.WriteString(section(name+".go", "@@ -0,0 +1 @@\n+v := "+v+" "+MarkerToken+"\n"))
+	}
+	for _, p := range redaction.DefaultPatterns {
+		all = append(all, p.Name)
+	}
+	al := &Allowlist{Markers: []Rule{{ID: "all", Paths: []string{"**"}, Patterns: all, Reason: "r"}}}
+	kept, sup := al.Partition(Scan(b.String(), redaction.DefaultPatterns).Hits)
+	if len(kept) != 0 || len(sup) < len(redaction.DefaultPatterns) {
+		t.Fatalf("kept=%d suppressed=%d", len(kept), len(sup))
+	}
+	raw, _ := json.Marshal(struct {
+		S []Suppression
+		R []SuppressionRecord
+	}{sup, GroupSuppressions(sup)})
+	var notes strings.Builder
+	for _, r := range GroupSuppressions(sup) {
+		notes.WriteString(MarkerNote(r) + r.CheckKey)
+	}
+	for name, secret := range samples() {
+		if strings.Contains(string(raw), secret) || strings.Contains(notes.String(), secret) {
+			t.Errorf("%s: suppression output carries the credential bytes", name)
+		}
 	}
 }

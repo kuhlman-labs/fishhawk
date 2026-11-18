@@ -4157,8 +4157,9 @@ func consolidatedReviewDiff(cmp *githubclient.ComparePatchResult) policy.Diff {
 	diff.ChangedFiles = make([]policy.ChangedFile, 0, len(cmp.Files))
 	for _, f := range cmp.Files {
 		diff.ChangedFiles = append(diff.ChangedFiles, policy.ChangedFile{
-			Path:   f.Path,
-			Status: githubStatusToPolicy(f.Status),
+			Path:    f.Path,
+			Status:  githubStatusToPolicy(f.Status),
+			OldPath: f.PreviousPath,
 		})
 	}
 	return diff

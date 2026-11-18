@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -140,7 +141,7 @@ func TestConflictResolutionReview_CodeResolutionStartsFullDiffRound(t *testing.T
 	}
 	_ = res
 
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 
 	// (c) the started row.
@@ -189,7 +190,7 @@ func TestConflictResolutionReview_NoSummaryStillStartsFullDiffRound(t *testing.T
 			t.Errorf("pre-change row gained key %s", k)
 		}
 	}
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 	if n := len(f.started(t)); n != 1 {
 		t.Fatalf("started rows = %d, want 1", n)
@@ -240,7 +241,7 @@ func TestConflictResolutionReview_DocsOnlySkipsWithReason(t *testing.T) {
 			}
 			pr := crrReport(claims, "")
 			_, res := f.report(t, pr)
-			f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+			f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 			f.s.waitBackgroundReviews()
 			skips := redispatchEntries(t, f.au, f.runRow.ID, CategoryConflictResolutionReviewSkipped)
 			if tc.wantSkip {
@@ -270,7 +271,7 @@ func TestConflictResolutionReview_TruncatedPathsDispatch(t *testing.T) {
 	pr := crrReport([]string{"docs/a.md"}, "")
 	pr.ResolvedPathsTruncated = true
 	_, res := f.report(t, pr)
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 	if n := countAfter(t, f.au, f.runRow.ID, CategoryConflictResolutionReviewSkipped, 0); n != 0 {
 		t.Errorf("skip rows = %d, want 0", n)
@@ -290,7 +291,7 @@ func TestConflictResolutionReview_SkipRowAppendFailureFallsBackToReview(t *testi
 	f.au.mu.Lock()
 	f.au.appendErrCategory = CategoryConflictResolutionReviewSkipped
 	f.au.mu.Unlock()
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "skip row not recorded — reviewing instead") {
 		t.Errorf("no ERROR record for the failed skip append:\n%s", logs.String())
@@ -308,7 +309,7 @@ func TestConflictResolutionReview_DecomposedParentRecordsSkip(t *testing.T) {
 	child.DecomposedFrom = &parentID
 	pr := crrReport([]string{"backend/x.go"}, "")
 	_, res := f.report(t, pr)
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 	skips := redispatchEntries(t, f.au, f.runRow.ID, CategoryConflictResolutionReviewSkipped)
 	if len(skips) != 1 || !strings.Contains(string(skips[0].Payload), `"reason":"decomposed_parent"`) {
@@ -326,7 +327,7 @@ func TestConflictResolutionReview_NoReviewerWritesSkippedRow(t *testing.T) {
 	f := newCRRFixture(t, crrCompareBody(), redispatchFixtureOpts{reviewerUnwired: true})
 	pr := crrReport([]string{"backend/x.go"}, "")
 	_, res := f.report(t, pr)
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 	rows := redispatchEntries(t, f.au, f.runRow.ID, "implement_review_skipped")
 	if len(rows) != 1 || !strings.Contains(string(rows[0].Payload), planreview.ReasonReviewerNotConfigured) {
@@ -428,7 +429,7 @@ func TestConflictResolutionReview_RawPatchScannedForSecrets(t *testing.T) {
 	f.s.cfg.ConcernRepo = cr
 	pr := crrReport([]string{"docs/a.md"}, "diff --git a/docs/a.md b/docs/a.md\n--- a/docs/a.md\n+++ b/docs/a.md\n@@ -1 +1 @@\n-x\n+token: "+secret+"\n")
 	_, res := f.report(t, pr)
-	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups)
+	f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
 	f.s.waitBackgroundReviews()
 	skips := redispatchEntries(t, f.au, f.runRow.ID, CategoryConflictResolutionReviewSkipped)
 	if len(skips) != 1 {
@@ -867,4 +868,131 @@ func TestKnownCategories_ConflictResolutionReviewSkipped(t *testing.T) {
 func redactDefaultForTest(s string) (string, int) {
 	out, hits := redaction.RedactDefault([]byte(s))
 	return string(out), len(hits)
+}
+
+// TestConflictResolutionSummary_SecretCounts (#5230 C4b): diff_secret_groups
+// counts the FRESH groups the report-time scan raised; an allowlisted hit is
+// counted as suppressed_hit_count beside it on the skip row.
+//
+// COUNTERFACTUAL: restore res.secretGroups = len(round.PersonaGroups) — the
+// repeat report's group is already on record, so it then reads 1 → RED.
+func TestConflictResolutionSummary_SecretCounts(t *testing.T) {
+	ctx := context.Background()
+	key := "ghp_" + strings.Repeat("R", 36)
+	patchAt := func(path string) string {
+		return "diff --git a/" + path + " b/" + path + "\n--- a/" + path + "\n+++ b/" + path + "\n@@ -1 +1 @@\n-x\n+k := \"" + key + "\"\n"
+	}
+	skipRow := func(t *testing.T, f *alFixture, res conflictResolutionSummaryResult) map[string]any {
+		t.Helper()
+		pr := &pullRequestBody{HeadSHA: alHead, BaseSHA: alAdmit, ResolvedPaths: []string{"x"}}
+		if err := f.s.recordConflictResolutionReviewSkipped(ctx, f.runRow.ID, f.stage.ID, pr, conflictResolutionSkipDocsOnly, res.secretGroups, res.suppressedHitCount); err != nil {
+			t.Fatalf("skip row: %v", err)
+		}
+		var p map[string]any
+		f.au.mu.Lock()
+		defer f.au.mu.Unlock()
+		for _, ap := range f.au.appended {
+			if ap.Category == CategoryConflictResolutionReviewSkipped {
+				p = nil
+				_ = json.Unmarshal(ap.Payload, &p)
+			}
+		}
+		return p
+	}
+	report := func(f *alFixture, path string) conflictResolutionSummaryResult {
+		return f.s.recordConflictResolutionSummary(ctx, f.runRow.ID, f.stage, &pullRequestBody{
+			HeadSHA: alHead, BaseSHA: alAdmit, ResolvedPaths: []string{path}, ResolutionPatch: patchAt(path),
+		})
+	}
+
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	if res := report(f, "backend/x.go"); res.secretGroups != 1 || res.suppressedHitCount != 0 {
+		t.Errorf("fresh report = %+v, want 1 group, 0 suppressed", res)
+	} else if p := skipRow(t, f, res); p["diff_secret_groups"] != float64(1) {
+		t.Errorf("fresh skip row = %v, want diff_secret_groups 1", p)
+	}
+	res := report(f, "backend/x.go")
+	if res.secretGroups != 0 {
+		t.Errorf("repeat report secretGroups = %d, want 0 (the group is already on record)", res.secretGroups)
+	}
+	if p := skipRow(t, f, res); p["diff_secret_groups"] != nil || p["suppressed_hit_count"] != nil {
+		t.Errorf("repeat skip row = %v, want neither count", p)
+	}
+
+	g := newALFixture(t)
+	g.gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+	res = report(g, "docs/p.md")
+	if res.secretGroups != 0 || res.suppressedHitCount != 1 {
+		t.Errorf("allowlisted report = %+v, want 0 groups, 1 suppressed", res)
+	}
+	if p := skipRow(t, g, res); p["diff_secret_groups"] != nil || p["suppressed_hit_count"] != float64(1) {
+		t.Errorf("allowlisted skip row = %v, want suppressed_hit_count 1 and no diff_secret_groups", p)
+	}
+}
+
+// TestConflictResolutionReview_SkipRowCarriesSuppressedHitCount (K2 of the
+// #5230 plan gate): an allowlist served at the run's admission commit
+// suppresses the report's only diff-secret hit (docs/p.md, the
+// docs-placeholder entry), and BOTH skip branches of
+// maybeDispatchConflictResolutionReview carry that count onto the recorded
+// conflict_resolution_review_skipped row.
+//
+// COUNTERFACTUAL: pass 0 instead of suppressedHitCount in either branch's
+// recordConflictResolutionReviewSkipped call — the hit is suppressed (no fresh
+// group), so suppressed_hit_count is the ONLY count on the row and it then
+// vanishes, RED on that arm.
+func TestConflictResolutionReview_SkipRowCarriesSuppressedHitCount(t *testing.T) {
+	key := "ghp_" + strings.Repeat("S", 36)
+	patch := "diff --git a/docs/p.md b/docs/p.md\n--- a/docs/p.md\n+++ b/docs/p.md\n@@ -1 +1 @@\n-x\n+k := \"" + key + "\"\n"
+	for _, tc := range []struct {
+		name       string
+		decomposed bool
+		reason     string
+	}{
+		{"resolution_docs_only", false, conflictResolutionSkipDocsOnly},
+		{"decomposed_parent", true, conflictResolutionSkipDecomposedParent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := newDriftGH()
+			gh.changed = []string{"docs/p.md"}
+			gh.headSHA = crrHead
+			gh.put(alAdmit, diffsecrets.AllowlistPath, alAllowlist)
+			rf := newRedispatchFixture(t, redispatchFixtureOpts{github: gh.client(t)})
+			rf.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
+			rf.appendAt(t, rf.implStage.ID, time.Now().UTC(), CategoryStageConflictResolutionTriggered, conflictResolutionTrigger{
+				Branch: "fishhawk/run", BaseRef: crrBase, ExpectedHeadSHA: crrPreMerge, Pass: 1,
+			})
+			f := &crrFixture{redispatchFixture: rf, paths: func() []string { return nil }}
+			admit := alAdmit
+			f.runRow.DocumentBaseCommit = &admit
+			cr := newFakeConcernRepo()
+			f.s.cfg.ConcernRepo = cr
+			if tc.decomposed {
+				parentID := f.runRow.ID
+				f.rr.seedRun().DecomposedFrom = &parentID
+			}
+
+			pr := crrReport([]string{"docs/p.md"}, patch)
+			_, res := f.report(t, pr)
+			if res.secretGroups != 0 || res.suppressedHitCount != 1 {
+				t.Fatalf("report = %+v, want 0 fresh groups and 1 suppressed hit (the allowlist must load)", res)
+			}
+			f.s.maybeDispatchConflictResolutionReview(context.Background(), f.runRow.ID, f.implStage, pr, res.secretGroups, res.suppressedHitCount)
+			f.s.waitBackgroundReviews()
+
+			skips := redispatchEntries(t, f.au, f.runRow.ID, CategoryConflictResolutionReviewSkipped)
+			if len(skips) != 1 {
+				t.Fatalf("skip rows = %d, want 1", len(skips))
+			}
+			var p map[string]any
+			if err := json.Unmarshal(skips[0].Payload, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p["reason"] != tc.reason || p["suppressed_hit_count"] != float64(1) || p["diff_secret_groups"] != nil {
+				t.Errorf("skip row = %v, want reason %s, suppressed_hit_count 1 and no diff_secret_groups", p, tc.reason)
+			}
+			assertNoNeedleBytes(t, cr, f.au, "", nil, key)
+		})
+	}
 }
