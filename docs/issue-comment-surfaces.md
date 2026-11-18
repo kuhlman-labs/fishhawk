@@ -238,7 +238,7 @@ Notes:
   (reusing the anchor's `renderStageReviews` / current-round isolation), the
   acceptance outcome with a **per-criterion table** (id, pass/fail/skip, basis)
   + validated target URL + head SHA (see the head-line rule below) + triage
-  disposition, and fix-up history
+  disposition, the diff-secrets suppression section (below), and fix-up history
   (one line per `fixup_pushed` pass). It carries **NO plan / scope / approach
   dump** — that material is issue-locus and stays on the anchor. Rendered by the
   pure `RenderPRStatusBody` (`pr_status_template.go`) and maintained by a
@@ -280,10 +280,29 @@ Notes:
     the consolidated head whose fan-in verify released the hold, so it names
     the head it covers without certifying it. An absent `head_sha` renders
     neither line. Pinned by `TestRenderPRStatusBody_AcceptanceHeadLine`.
+  - **Diff secrets suppressed (#5230, ADR-084 A2).**
+    `renderPRDiffSecretsSuppressed` decodes every `diff_secrets_detected`
+    payload tolerantly into the shared `diffsecrets.SuppressionSummary` (an
+    undecodable or pre-#5230 entry contributes nothing) and folds the union by
+    (path, pattern, by, rule id, fingerprint, check key), taking lines from the
+    NEWEST entry. The **Diff secrets suppressed** section shows the totals
+    (allowlist entries vs fixture markers), one line per rule as
+    `SafeRuleID(id)` plus the 8-hex short fingerprint with its hit count, the
+    allowlist status with the admission commit's short SHA and the rejected
+    rule count, then the marker-suppressed locations
+    ``- `path:lines` (pattern) - scope `<id>` `` (capped at 10, then
+    `- and N more`), each of which raised a low, human-only concern. Globs are
+    never rendered; ids and fingerprints are re-validated on read
+    (`SafeRuleID` / `SafeFingerprint`), and paths go through `prCodeSpan`
+    (one line, backticks replaced, control runes dropped). The section is
+    empty unless something was suppressed or rejected, and is inert until the
+    server writes the summary. Pinned by
+    `TestRenderPRStatus_DiffSecretsSuppressed`.
   - **Body cap.** Capped at `MaxIssueCommentBodyBytes` by a degradation ladder
     that drops the acceptance criteria table detail first (collapsing to the
     tally line), then the fix-up history, always preserving the header, the
-    reviews, the acceptance outcome, and the footer.
+    reviews, the acceptance outcome, the bounded diff-secrets suppression
+    section, and the footer.
   - `pr_status_comment_posted` is a distinct category from
     `status_comment_posted` so the two comments never collide on comment-id
     lookup; it is deliberately NOT added to the anchor timeline's
@@ -2101,7 +2120,11 @@ Notes:
   The report then starts a full-diff `conflict_resolution` implement-review round,
   or appends the INTERNAL `conflict_resolution_review_skipped` row
   `{run_id, stage_id, head_sha, base_sha, reason (resolution_docs_only |
-  decomposed_parent), resolved_paths, diff_secret_groups?}` (no issue comment); a report with no live trigger answers `409
+  decomposed_parent), resolved_paths, diff_secret_groups?, suppressed_hit_count?}`
+  (no issue comment; `diff_secret_groups` counts only the FRESH diff-secret
+  groups this report raised — groups already on record and suppressed hits are
+  excluded — and `suppressed_hit_count`, beside it when > 0, counts the hits
+  the allowlist suppressed, #5230); a report with no live trigger answers `409
   conflict_resolution_not_live` and writes NO audit row (WARN only). The recorded
   entry ALSO consumes the trigger, exactly as the failure entry does: either terminal outcome settles the pass, so a later ordinary
   fix-up on the stage is served `conflict_resolution=false` whether the pass was refused

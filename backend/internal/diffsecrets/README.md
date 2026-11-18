@@ -10,6 +10,9 @@ The deterministic half of the diff secrets check (ADR-084 D5 / rule 5, E80.3 / [
 | `GroupHits(hits) []Group` | Folds by (path, pattern); lines sorted and de-duplicated; groups ordered by path then pattern. |
 | `CheckKey(pattern, path)` / `Group.Key()` | `diff_secrets\|<pattern>\|<path>` — the server's de-duplication key. |
 | `Note(group)` | The concern note: pattern class + `path:line` list (capped at 20 locations, remainder counted; an `UnknownLine` renders `path:(line unknown)`), the provenance sentence, and the clearing instruction (remove/rotate, or a human waive with a reason). |
+| `Hit.Marked` / `Hit.PathRedacted` / `Hit.Fingerprint` | `Marked`: the ADDED line itself carries `MarkerToken` (`fishhawk:allow-secret`) — per line; context and removed lines are never consulted (`TestScan_MarkerFlag`). `PathRedacted`: the pattern set changed the path (`TestScan_PathRedactedFlag`). `Fingerprint`: set ONLY on a marked hit — the first 16 hex of SHA-256 over (path, pattern, every match on the line); the matches are hashed in memory and dropped (`TestScan_MarkedHitFingerprint`). |
+| `MarkerCheckKey(pattern, ruleID, ruleFP, hitFP, path)` | `diff_secrets_marker\|<pattern>\|<rule_id>@<rule_fp>\|<hit_fp>\|<path>` — the marker concern's key, per HIT (#5230 K1): a new marked line raises again after an earlier one in the same file, scope and pattern was waived; the same line on a later round does not. Injective (slug ids, hex fingerprints, path last) and never equal to a `CheckKey` (`TestMarkerCheckKey_Injective`). |
+| `MarkerNote(record)` | The marker concern note: `path:lines` (same cap), pattern class, `SafeRuleID(id)` and `SafeFingerprint(fp)`, that the marker was added in this change so a human must confirm each line is a fixture, and that the concern is low, non-blocking and human-only. |
 
 ## Parse rules
 
@@ -23,15 +26,40 @@ A header/hunk state machine, one line at a time:
 
 ## What never carries bytes
 
-`Hit` and `Group` have no field that can hold matched bytes, and the path itself is passed through the same pattern set (`displayPath`), so a file NAMED like a credential is recorded redacted rather than carrying the value onto a note, an audit payload or a log line. `Note` takes only a `Group`. Pinned by `TestHit_CarriesNoBytes` and `TestScan_CredentialShapedFileNameIsRedacted`.
+`Hit`, `Group`, `Suppression` and `SuppressionRecord` have no field that can hold matched bytes (`Hit.Fingerprint` is a truncated digest), and the path itself is passed through the same pattern set (`displayPath`), so a file NAMED like a credential is recorded redacted rather than carrying the value onto a note, an audit payload or a log line. `Note` takes only a `Group`. Pinned by `TestHit_CarriesNoBytes`, `TestSuppression_CarriesNoBytes` and `TestScan_CredentialShapedFileNameIsRedacted`.
 
 ## Grouping and the de-duplication trade
 
 The key is (pattern, path) — line numbers are deliberately NOT part of it, because they shift between fix-up passes and would re-raise every concern a human already waived. The cost, stated plainly: once a human waives a pattern class in a file (a known test fixture), a later DIFFERENT credential of the SAME class in the SAME file is not re-raised. `CheckKey` is injective because no pattern `Name` contains `|`; `TestCheckKey_Injective` pins that fact over `DefaultPatterns`, so a future pattern named with a `|` fails the test rather than silently colliding keys.
+
+## Allowlist (`allowlist.go`, ADR-084 A2 / #5230)
+
+`AllowlistPath` is `.fishhawk/diff-secrets-allowlist.yaml`. The server reads it only at the run's admission commit and fails closed (`backend/internal/server/docs/review.md` § Diff secrets check); this package owns the format, the partition and the shared wire types.
+
+```yaml
+version: 1
+entries:          # suppress these pattern classes on these paths
+  - id: docs-example-pat
+    paths: ["docs/examples/*.md"]
+    patterns: ["github-pat-classic"]
+    reason: "documented placeholder tokens"
+markers:          # honour an in-line fishhawk:allow-secret only here
+  - id: fixture-tests
+    paths: ["backend/**/testdata/**"]
+    patterns: ["github-pat-classic"]
+    reason: "synthetic keys in test fixtures"
+```
+
+- **`ParseAllowlist(content, patterns)`** decodes STRICTLY (unknown keys anywhere, a missing or non-1 `version`, or undecodable YAML fail the whole file with `ErrAllowlistInvalid`, whose text is a fixed class and never quotes content). Empty or comment-only content is no rules. A rule is REJECTED (dropped, others still load) for, in order: `redaction_hit` (the id, any glob or the reason matches the FULL supplied pattern set), `bad_id` (not `^[a-z0-9][a-z0-9-]{0,62}$`), `duplicate_id` (unique across both lists), `empty_paths`, `bad_path` (`doublestar.ValidatePattern`), `empty_patterns`, `unknown_pattern` (not in the supplied set), `empty_reason` (whitespace counts as empty). `Rejection.RuleID` is empty for `bad_id` and `redaction_hit`, so a malformed or credential-bearing id is never echoed.
+- **`RuleFingerprint(list, glob, pattern)`** — first 16 hex of SHA-256 over `list\0glob\0pattern` — is the ONE identity every surface attributes a rule by (the drift key, the payload, the gate view, the PR comment). Globs are never rendered anywhere. A fingerprint is an identity, not a secret: a credential-shaped glob is refused before it can be fingerprinted.
+- **`SafeRuleID(id)`** is the only renderer of an allowlist-derived string: the id when it is a slug with no `DefaultPatterns` hit, else `(invalid id)`. **`SafeFingerprint(fp)`** renders only 16 lowercase hex. Readers apply both again to every PERSISTED value, as defence in depth against a corrupted row.
+- **`(*Allowlist).Partition(hits)`** → `(kept, suppressed)`. A nil or empty allowlist keeps everything. A hit is NEVER suppressed when its path is `UnresolvedPath`, `PathRedacted` is set, or its path is `AllowlistPath` itself (a credential added to the allowlist always raises). Otherwise entries are checked first, in file order (`By=entry`), then — only for a `Marked` hit — marker scopes (`By=marker`). A rule matches when a glob matches the path AND its pattern list names the hit's pattern; the suppression carries the rule id and the fingerprint of the exact (list, glob, pattern) that matched. One arm per guard in `TestAllowlist_Partition`.
+- **Wire types** (one home for the server writer and both readers): `SuppressionRecord{path, lines, pattern, by, rule_id, rule_fingerprint, check_key (marker only)}`, `RejectionRecord{list, index, reason, rule_id?}`, `AllowlistStatusRecord{path, ref, status (loaded | absent | unavailable | fetch_failed | parse_error), detail?, rejected_count, rejected? (≤ 50, RejectionRecords)}`, `SuppressionSummary{allowlist?, suppressed_hit_count, entry_suppressed_hit_count, marker_suppressed_hit_count, suppressed}` (pinned by `TestSuppressionSummary_JSONShape`). `GroupSuppressions` folds by (path, pattern, by, rule id, fingerprint) — and the per-hit fingerprint for markers — with sorted, de-duplicated lines, a deterministic order and `check_key` on marker records; `NewSuppressionSummary` adds the counts.
 
 ## Residuals
 
 - **Detection is the pattern set.** A credential format outside `redaction.DefaultPatterns` passes. `json-password-field` matches any JSON-shaped `password`/`secret`/`token`/`api_key` key with a string value, including Go map literals in test code — each hit is a high concern only a human can clear. Tuning is a follow-up decision, not a change here.
 - **Per-line matching.** A credential split across two added lines is not matched (the `authorization-bearer` regex's `\s*` cannot span the newline here).
 - **A truncated patch is scanned only up to the cut.** The server records `patch_truncated` on its audit entry.
+- **A marker scope is a trust grant.** Inside a scope, any added line can mark itself; each marked hit still raises a low human-only concern, so the self-marking path is seen, not blocked.
 - **Test fixtures build synthetic keys at runtime** (`"ghp_" + strings.Repeat(…)`), never as literals: a literal would be flagged by this very check on this repository's own runs and could trip forge push protection.

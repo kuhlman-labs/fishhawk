@@ -13,6 +13,8 @@
 package diffsecrets
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +39,20 @@ const UnknownLine = 0
 // server's diff_secrets_detected audit payload.
 const CheckName = "diff_secrets"
 
+// MarkerToken is the in-line fixture marker (ADR-084 A2, #5230). An ADDED
+// line carrying it sets Hit.Marked; Allowlist.Partition honours the marker
+// only inside a declared marker scope, and every marker-suppressed hit still
+// raises a low, human-only concern (MarkerCheckKey / MarkerNote).
+const MarkerToken = "fishhawk:allow-secret"
+
+// MarkerCheckName prefixes every marker-suppressed concern's check key. It
+// differs from CheckName+"|", so a MarkerCheckKey never equals a CheckKey.
+const MarkerCheckName = "diff_secrets_marker"
+
+// fingerprintHexLen is the truncated hex length of every fingerprint this
+// package mints (RuleFingerprint and the per-hit fingerprint): 64 bits.
+const fingerprintHexLen = 16
+
 // noteLineCap bounds how many path:line locations one concern note lists; the
 // remainder is summarized as a count so a file with hundreds of hits cannot
 // produce an unbounded note.
@@ -47,10 +63,23 @@ const noteLineCap = 20
 // through the pattern set, so a credential-shaped FILE NAME is recorded
 // redacted), Line is the new-side line number (UnknownLine under a malformed
 // hunk header), Pattern is the pattern's Name.
+//
+// Marked is true when the ADDED line itself carries MarkerToken: it is per
+// line, and context or removed lines are never consulted. PathRedacted is true
+// when the pattern set changed the path (a credential-shaped FILE NAME):
+// Partition never suppresses such a hit. Fingerprint is set ONLY on a Marked
+// hit (K1 of the #5230 plan gate): the first 16 hex of SHA-256 over (path,
+// pattern, every match of the pattern on the line). The matched bytes are
+// hashed in memory and dropped; the digest is the per-hit identity
+// MarkerCheckKey de-duplicates on, so a NEW self-marked line raises its own
+// concern while a re-review of the same line raises nothing new.
 type Hit struct {
-	Path    string
-	Line    int
-	Pattern string
+	Path         string
+	Line         int
+	Pattern      string
+	Marked       bool
+	PathRedacted bool
+	Fingerprint  string
 }
 
 // Result is the outcome of one Scan.
@@ -144,13 +173,21 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 			if lineKnown {
 				at = newLine
 			}
+			marked := strings.Contains(content, MarkerToken)
 			for _, p := range patterns {
 				if p.Regex != nil && p.Regex.MatchString(content) {
-					res.Hits = append(res.Hits, Hit{
-						Path:    displayPath(path, patterns),
-						Line:    at,
-						Pattern: p.Name,
-					})
+					shown, redacted := displayPath(path, patterns)
+					h := Hit{
+						Path:         shown,
+						Line:         at,
+						Pattern:      p.Name,
+						Marked:       marked,
+						PathRedacted: redacted,
+					}
+					if marked {
+						h.Fingerprint = hitFingerprint(shown, p.Name, p.Regex.FindAllString(content, -1))
+					}
+					res.Hits = append(res.Hits, h)
 				}
 			}
 			newLine++
@@ -165,13 +202,29 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 
 // displayPath resolves the placeholder for an unresolved path and passes the
 // path through the pattern set, so a credential-shaped file NAME never rides a
-// hit (and from there a note, an audit payload or a log line) verbatim.
-func displayPath(path string, patterns []redaction.Pattern) string {
+// hit (and from there a note, an audit payload or a log line) verbatim. The
+// bool reports whether the pattern set changed the path.
+func displayPath(path string, patterns []redaction.Pattern) (string, bool) {
 	if path == "" {
-		return UnresolvedPath
+		return UnresolvedPath, false
 	}
 	out, _ := redaction.Redact([]byte(path), patterns)
-	return string(out)
+	return string(out), string(out) != path
+}
+
+// hitFingerprint is the per-hit identity of a marked hit: the truncated
+// SHA-256 over (path, pattern, matches), NUL-separated. The matches never
+// leave this function.
+func hitFingerprint(path, pattern string, matches []string) string {
+	h := sha256.New()
+	h.Write([]byte(path))
+	h.Write([]byte{0})
+	h.Write([]byte(pattern))
+	for _, m := range matches {
+		h.Write([]byte{0})
+		h.Write([]byte(m))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:fingerprintHexLen]
 }
 
 // hunkNewStart parses the new-side start line out of a hunk header
@@ -370,8 +423,18 @@ func (g Group) Key() string { return CheckKey(g.Pattern, g.Path) }
 // locations only. The matched value is never an input, so it cannot be an
 // output.
 func Note(g Group) string {
-	locs := make([]string, 0, len(g.Lines))
-	for i, l := range g.Lines {
+	return "Diff secrets check: an added line matches the credential pattern " + g.Pattern +
+		" at " + locations(g.Path, g.Lines) + ". This concern was raised by the server's deterministic diff secrets check, not by a model reviewer; " +
+		"the matched value is deliberately not recorded. Remove the credential (and rotate it if it was ever live), " +
+		"or have a human waive this concern with a reason (for example, a known test fixture). " +
+		"Agents and delegated actions cannot waive or defer it."
+}
+
+// locations renders path:line for at most noteLineCap lines, the remainder
+// counted, an UnknownLine as "(line unknown)".
+func locations(path string, lines []int) string {
+	locs := make([]string, 0, len(lines))
+	for i, l := range lines {
 		if i == noteLineCap {
 			break
 		}
@@ -379,15 +442,36 @@ func Note(g Group) string {
 		if l == UnknownLine {
 			at = "(line unknown)"
 		}
-		locs = append(locs, g.Path+":"+at)
+		locs = append(locs, path+":"+at)
 	}
 	where := strings.Join(locs, ", ")
-	if extra := len(g.Lines) - len(locs); extra > 0 {
+	if extra := len(lines) - len(locs); extra > 0 {
 		where += " and " + strconv.Itoa(extra) + " more line(s) in the same file"
 	}
-	return "Diff secrets check: an added line matches the credential pattern " + g.Pattern +
-		" at " + where + ". This concern was raised by the server's deterministic diff secrets check, not by a model reviewer; " +
-		"the matched value is deliberately not recorded. Remove the credential (and rotate it if it was ever live), " +
-		"or have a human waive this concern with a reason (for example, a known test fixture). " +
-		"Agents and delegated actions cannot waive or defer it."
+	return where
+}
+
+// MarkerCheckKey is the de-duplication key of a marker-suppressed concern:
+// "diff_secrets_marker|<pattern>|<rule_id>@<rule_fingerprint>|<hit_fingerprint>|<path>".
+// It is injective: pattern names carry no '|' (TestCheckKey_Injective), rule
+// ids are [a-z0-9-] slugs, both fingerprints are hex, and the path is last.
+// The distinct MarkerCheckName prefix keeps it apart from every CheckKey. The
+// per-hit fingerprint (K1) makes the key per HIT, not per (pattern, rule,
+// path): a new marked line raises again after an earlier one was waived.
+func MarkerCheckKey(pattern, ruleID, ruleFingerprint, hitFingerprint, path string) string {
+	return MarkerCheckName + "|" + pattern + "|" + ruleID + "@" + ruleFingerprint + "|" + hitFingerprint + "|" + path
+}
+
+// MarkerNote renders a marker-suppressed concern's note. It is location-only
+// (path:lines, capped like Note) and names the pattern class, the scope's
+// SafeRuleID and its fingerprint; the matched value is never an input.
+func MarkerNote(rec SuppressionRecord) string {
+	return "Diff secrets check: an added line carrying the fixture marker " + MarkerToken +
+		" matches the credential pattern " + rec.Pattern + " at " + locations(rec.Path, rec.Lines) +
+		", inside the allowlist marker scope " + SafeRuleID(rec.RuleID) + " (rule " + SafeFingerprint(rec.RuleFingerprint) + "). " +
+		"The marker was added in this change, so the hit was suppressed instead of raised as a high concern; " +
+		"a human must confirm each marked line is a test fixture and not a live credential. " +
+		"This concern is low severity and does not block the human merge verb. It was raised by the server's deterministic " +
+		"diff secrets check, not by a model reviewer, and the matched value is deliberately not recorded. " +
+		"Only a human can waive it, with a reason; agents and delegated actions cannot waive or defer it."
 }

@@ -13,7 +13,7 @@ The deterministic permission-drift check (ADR-084 D5 / rule 5, E80.4 / #3761). P
 
 ## Surfaces (`surfaces.go`)
 
-`SurfacesVersion = 1`. `DefaultSurfaces()` (severity map ratified at the E80.4 plan gate: high everywhere, medium for GitHub App events):
+`SurfacesVersion = 2` (2 added `diff-secrets-allowlist`, #5230). `DefaultSurfaces()` (severity map ratified at the E80.4 plan gate: high everywhere, medium for GitHub App events):
 
 | id | kind | paths | severity |
 |---|---|---|---|
@@ -30,6 +30,7 @@ The deterministic permission-drift check (ADR-084 D5 / rule 5, E80.4 / #3761). P
 | `fishhawk-spec-autonomy` | `fishhawk_spec_autonomy` | `.fishhawk/workflows.yaml` | high |
 | `fishhawk-spec-stage-permissions` | `fishhawk_spec_stage_permissions` | `.fishhawk/workflows.yaml` | high |
 | `permission-surface-declarations` | `surface_declarations` | `.fishhawk/permission-surfaces.yaml` | high |
+| `diff-secrets-allowlist` | `diff_secrets_allowlist` | `.fishhawk/diff-secrets-allowlist.yaml` (`diffsecrets.AllowlistPath`) | high |
 
 Bump `SurfacesVersion` when a surface is added, removed or re-keyed. `MatchSurfaces(surfaces, path)` returns every surface (in list order) one of whose doublestar globs matches; one file can belong to several surfaces.
 
@@ -48,6 +49,7 @@ Bump `SurfacesVersion` when a surface is added, removed or re-keyed. `MatchSurfa
 | run_token_scopes | `run_token.<scope>@<stage>` (`@any_stage` when unguarded or negated) | Grant |
 | env_allowlist | `env_allow.<Var>.<NAME>` | Grant |
 | surface_declarations | `surfaces[<id>]`, `…paths[<glob>]`, `…kind[<kind>]`, `…severity` (negated rank) | Restriction |
+| diff_secrets_allowlist (`extract_allowlist.go`, ADR-084 A2) | `diff_secrets_allowlist.<entries\|markers>.<id>.<fp>` per ACCEPTED rule and (glob, pattern), where `<fp>` is `diffsecrets.RuleFingerprint(list, glob, pattern)`; parsed by `diffsecrets.ParseAllowlist` over `redaction.DefaultPatterns` (a whole-file error → `parse_error`). The glob never enters a key, a value or a note. A new glob, pattern or rule widens and a removed one narrows; a reason-only edit is no change; an id rename reads as add + remove (raised). A rejected rule (including `redaction_hit`) suppresses nothing, so it emits nothing — a credential-shaped glob is still raised by the diff secrets scan of the added line, which `Partition` never suppresses on the allowlist file. Pinned by `TestDetect_DiffSecretsAllowlistWidening` and `TestExtractDiffSecretsAllowlist_NoGlobBytesInKeys` | Grant (presence) |
 
 The spec extractors read the RESOLVED document from `spec.ParseBytes` (`defaults`/`extends`, `permissions.network`); none invents a rank for an absent declaration (pinned by `TestExtractSpecAutonomy`).
 

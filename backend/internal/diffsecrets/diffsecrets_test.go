@@ -1,6 +1,7 @@
 package diffsecrets
 
 import (
+	"encoding/json"
 	"reflect"
 	"strconv"
 	"strings"
@@ -477,5 +478,144 @@ func TestHeaderPaths(t *testing.T) {
 	}
 	if n, ok := hunkNewStart("@@ -1 +7 @@"); !ok || n != 7 {
 		t.Errorf("hunkNewStart(+7) = %d, %v", n, ok)
+	}
+}
+
+// TestScan_MarkerFlag: Marked is true only on the ADDED line carrying
+// MarkerToken. COUNTERFACTUAL: scan the whole hunk (or the previous line) for
+// the token — the "previous added line" arm carries the token one line ABOVE
+// an unmarked key line, so the key line then reads Marked and the arm goes RED.
+func TestScan_MarkerFlag(t *testing.T) {
+	key := "k := \"" + classicPAT() + "\""
+	cases := map[string]struct {
+		hunk string
+		want []bool
+	}{
+		"token on the key line":            {"@@ -0,0 +1 @@\n+" + key + " // " + MarkerToken + "\n", []bool{true}},
+		"token on the previous added line": {"@@ -0,0 +1,2 @@\n+// " + MarkerToken + "\n+" + key + "\n", []bool{false}},
+		"token on a context line":          {"@@ -1,1 +1,2 @@\n // " + MarkerToken + "\n+" + key + "\n", []bool{false}},
+		"token on a removed line":          {"@@ -1,1 +1,1 @@\n-// " + MarkerToken + "\n+" + key + "\n", []bool{false}},
+		"marked then unmarked":             {"@@ -0,0 +1,2 @@\n+" + key + " " + MarkerToken + "\n+" + key + "\n", []bool{true, false}},
+	}
+	for name, c := range cases {
+		hits := Scan(section("fix/a.go", c.hunk), redaction.DefaultPatterns).Hits
+		if len(hits) != len(c.want) {
+			t.Fatalf("%s: hits = %+v", name, hits)
+		}
+		for i, h := range hits {
+			if h.Marked != c.want[i] {
+				t.Errorf("%s: hit %d Marked = %v, want %v", name, i, h.Marked, c.want[i])
+			}
+			if (h.Fingerprint != "") != h.Marked {
+				t.Errorf("%s: hit %d Fingerprint %q set iff Marked violated", name, i, h.Fingerprint)
+			}
+		}
+	}
+}
+
+// TestScan_MarkedHitFingerprint (K1): the per-hit fingerprint is 16 hex over
+// (path, pattern, matched bytes). The same bytes on another line keep it (a
+// re-review of a moved line raises nothing new); different bytes, another
+// path or another pattern change it; the bytes never appear in it.
+func TestScan_MarkedHitFingerprint(t *testing.T) {
+	other := "ghp_" + strings.Repeat("Z", 36)
+	fp := func(path, line string, at int) string {
+		hunk := "@@ -0,0 +" + strconv.Itoa(at) + " @@\n+" + line + " " + MarkerToken + "\n"
+		hits := Scan(section(path, hunk), redaction.DefaultPatterns).Hits
+		if len(hits) != 1 {
+			t.Fatalf("hits = %+v", hits)
+		}
+		return hits[0].Fingerprint
+	}
+	base := fp("fix/a.go", classicPAT(), 3)
+	if !fingerprintPattern.MatchString(base) || strings.Contains(base, classicPAT()) {
+		t.Fatalf("fingerprint %q", base)
+	}
+	if got := fp("fix/a.go", classicPAT(), 40); got != base {
+		t.Errorf("same bytes on another line: %q != %q", got, base)
+	}
+	for name, got := range map[string]string{
+		"other bytes": fp("fix/a.go", other, 3),
+		"other path":  fp("fix/b.go", classicPAT(), 3),
+	} {
+		if got == base {
+			t.Errorf("%s: fingerprint unchanged %q", name, got)
+		}
+	}
+	if hitFingerprint("p", "github-pat-classic", []string{"x"}) == hitFingerprint("p", "aws-access-key-id", []string{"x"}) {
+		t.Error("pattern does not enter the fingerprint")
+	}
+}
+
+// TestScan_PathRedactedFlag: a credential-shaped file name sets PathRedacted
+// and a normal one does not. COUNTERFACTUAL: hard-code displayPath's bool to
+// false — the first arm's path IS rewritten by the pattern set, so the flag
+// then reads false, RED.
+func TestScan_PathRedactedFlag(t *testing.T) {
+	key := "@@ -0,0 +1 @@\n+k := \"" + classicPAT() + "\"\n"
+	if h := Scan(section("fixtures/"+classicPAT()+".txt", key), redaction.DefaultPatterns).Hits; len(h) != 1 || !h[0].PathRedacted {
+		t.Errorf("credential-shaped name: %+v, want PathRedacted", h)
+	}
+	if h := Scan(section("fixtures/plain.txt", key), redaction.DefaultPatterns).Hits; len(h) != 1 || h[0].PathRedacted {
+		t.Errorf("plain name: %+v, want not PathRedacted", h)
+	}
+	if h := Scan("@@ -0,0 +1 @@\n+k := \""+classicPAT()+"\"\n", redaction.DefaultPatterns).Hits; len(h) != 1 || h[0].PathRedacted {
+		t.Errorf("unresolved path: %+v, want not PathRedacted (its own guard)", h)
+	}
+}
+
+func TestMarkerNote_LocationOnly(t *testing.T) {
+	rec := SuppressionRecord{Path: "fix/a.go", Lines: []int{2, UnknownLine}, Pattern: "github-pat-classic", By: ByMarker,
+		RuleID: "fixture-tests", RuleFingerprint: "0123456789abcdef"}
+	note := MarkerNote(rec)
+	for _, want := range []string{"fix/a.go:2", "fix/a.go:(line unknown)", "github-pat-classic", "fixture-tests", "0123456789abcdef",
+		MarkerToken, "added in this change", "a human must confirm", "low severity", "Only a human can waive"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note missing %q:\n%s", want, note)
+		}
+	}
+	// A corrupted record's id and fingerprint are never echoed.
+	rec.RuleID, rec.RuleFingerprint = slugCredential(), classicPAT()
+	note = MarkerNote(rec)
+	if strings.Contains(note, slugCredential()) || strings.Contains(note, classicPAT()) ||
+		!strings.Contains(note, InvalidRuleID) || !strings.Contains(note, InvalidFingerprint) {
+		t.Errorf("corrupted record leaks into the note:\n%s", note)
+	}
+	for _, p := range redaction.DefaultPatterns {
+		if p.Regex.MatchString(note) {
+			t.Errorf("note matches pattern %q", p.Name)
+		}
+	}
+}
+
+// TestSuppression_CarriesNoBytes extends TestHit_CarriesNoBytes to
+// Suppression, SuppressionRecord, MarkerCheckKey and MarkerNote over every
+// default pattern's sample, every hit marked and suppressed by a `**` scope.
+func TestSuppression_CarriesNoBytes(t *testing.T) {
+	var b strings.Builder
+	var all []string
+	for name, v := range samples() {
+		b.WriteString(section(name+".go", "@@ -0,0 +1 @@\n+v := "+v+" "+MarkerToken+"\n"))
+	}
+	for _, p := range redaction.DefaultPatterns {
+		all = append(all, p.Name)
+	}
+	al := &Allowlist{Markers: []Rule{{ID: "all", Paths: []string{"**"}, Patterns: all, Reason: "r"}}}
+	kept, sup := al.Partition(Scan(b.String(), redaction.DefaultPatterns).Hits)
+	if len(kept) != 0 || len(sup) < len(redaction.DefaultPatterns) {
+		t.Fatalf("kept=%d suppressed=%d", len(kept), len(sup))
+	}
+	raw, _ := json.Marshal(struct {
+		S []Suppression
+		R []SuppressionRecord
+	}{sup, GroupSuppressions(sup)})
+	var notes strings.Builder
+	for _, r := range GroupSuppressions(sup) {
+		notes.WriteString(MarkerNote(r) + r.CheckKey)
+	}
+	for name, secret := range samples() {
+		if strings.Contains(string(raw), secret) || strings.Contains(notes.String(), secret) {
+			t.Errorf("%s: suppression output carries the credential bytes", name)
+		}
 	}
 }
