@@ -1,9 +1,72 @@
 package mcpserver
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// reviewFilingServedSchemaDescription walks the SERVED tools/list schema of
+// toolName (its outputSchema when output is true, else its inputSchema) down
+// the property path and returns the leaf's description. A "[]" segment
+// descends into an array's items; a local "$ref": "#/$defs/<Name>" is followed
+// at every node. It reads the schema an agent receives, not the Go struct tag,
+// so it reddens when the registered tool stops serving the field (#5216).
+func reviewFilingServedSchemaDescription(t *testing.T, tools map[string]*mcp.Tool, toolName string, output bool, path ...string) string {
+	t.Helper()
+	tool, ok := tools[toolName]
+	if !ok {
+		t.Fatalf("%s not registered over ListTools", toolName)
+	}
+	served := tool.InputSchema
+	if output {
+		served = tool.OutputSchema
+	}
+	if served == nil {
+		t.Fatalf("%s: no schema on the wire (output=%v)", toolName, output)
+	}
+	raw, err := json.Marshal(served)
+	if err != nil {
+		t.Fatalf("%s: marshal schema: %v", toolName, err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("%s: decode schema: %v", toolName, err)
+	}
+	defs, _ := root["$defs"].(map[string]any)
+	resolve := func(node map[string]any) map[string]any {
+		ref, _ := node["$ref"].(string)
+		if ref == "" {
+			return node
+		}
+		def, _ := defs[strings.TrimPrefix(ref, "#/$defs/")].(map[string]any)
+		if def == nil {
+			t.Fatalf("%s: unresolvable $ref %q in served schema", toolName, ref)
+		}
+		return def
+	}
+	node := resolve(root)
+	for _, seg := range path {
+		var next map[string]any
+		if seg == "[]" {
+			next, _ = node["items"].(map[string]any)
+		} else {
+			props, _ := node["properties"].(map[string]any)
+			next, _ = props[seg].(map[string]any)
+		}
+		if next == nil {
+			t.Fatalf("%s: served schema has no %q along %v", toolName, seg, path)
+		}
+		node = resolve(next)
+	}
+	desc, _ := node["description"].(string)
+	if desc == "" {
+		t.Fatalf("%s: served schema property %v carries no description", toolName, path)
+	}
+	return desc
+}
 
 // reviewFilingRunbookHeading is the exact heading the #5216 review, filing and
 // grooming judgement section ships under.
@@ -53,8 +116,9 @@ func TestRunbook_ReviewFilingSection_StatesJudgementRules(t *testing.T) {
 		{"R17 false-positive shape", "a false-positive reason starts with false_positive:, gives the evidence that disproves the finding"},
 		{"R17 authorization", "names who authorized the waive when you act on delegated authority"},
 		{"R14 search by symbol", "search the tracker yourself by a code symbol or path from the change"},
-		{"R14 charter degrade keeps candidates (W2)", "a degrade_reason that starts with charter_ (the charter or its rubric could not be read) leaves the duplicate candidates valid"},
-		{"R14 incomplete scan (W2)", "reader_unavailable, reader_error or budget_exceeded means the scan did not complete"},
+		{"R14 charter degrade keeps candidates (W2)", "a charter-side degrade_reason (charter_undeclared, charter_unresolved, charter_rubric_unparsed or seam_unwired: the charter or its rubric could not be read) leaves the duplicate candidates valid"},
+		{"R14 incomplete scan (W2)", "reader_unavailable or reader_error means the scan did not complete"},
+		{"R14 budget or panic keyed on scanned_items (W2)", "budget_exceeded or hook_panic when scanned_items is 0 (either can also come from the charter read, which leaves the scan intact)"},
 		{"R15 campaign items", "the scan does not read a running campaign's item list"},
 		{"R15 campaign status", "fishhawk_get_campaign_status"},
 		{"R5 decision records", "search the existing decision records and epics by topic"},
@@ -126,5 +190,29 @@ func TestRunbook_ReviewFilingSectionIsRepoAgnostic(t *testing.T) {
 		if strings.Contains(section, banned) {
 			t.Errorf("review/filing runbook section contains repository-specific string %q; describe the product mechanism instead", banned)
 		}
+	}
+}
+
+// TestGroomingApplyStatus_ServedSchemaNamesPlanGateNotConfirmGate pins
+// approval condition W4 on the SERVED fishhawk_get_run_status outputSchema:
+// both grooming_apply_status counts that warn against re-approving name the
+// PLAN gate re-approval that launches a fresh apply, and say attesting the
+// confirm gate (approve_review_gate) is unaffected and is the legal next step.
+// A bare "re-approving does not apply them" leaves the gate ambiguous.
+func TestGroomingApplyStatus_ServedSchemaNamesPlanGateNotConfirmGate(t *testing.T) {
+	tools := fixupGuidanceTools(t)
+	for _, field := range []string{"tier_not_authorized", "budget_exhausted"} {
+		desc := fixupGuidanceFlatten(reviewFilingServedSchemaDescription(t, tools, "fishhawk_get_run_status", true, "grooming_apply_status", field))
+		for _, want := range []string{
+			"do not re-approve this run's plan gate",
+			"a plan re-approval launches a fresh apply",
+			"attesting this run's confirm gate (approve_review_gate) is unaffected",
+			"legal next step",
+		} {
+			if !strings.Contains(desc, want) {
+				t.Errorf("W4: served grooming_apply_status.%s schema lacks %q:\n%s", field, want, desc)
+			}
+		}
+		reviewFilingAssertRepoAgnostic(t, "grooming_apply_status."+field+" schema", desc)
 	}
 }

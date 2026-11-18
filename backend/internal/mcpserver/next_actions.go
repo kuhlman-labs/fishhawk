@@ -1432,8 +1432,10 @@ const (
 // verifyRejectingClaimOnTreeClause is the ONE shared wording of the #5216
 // R11/R16 rule: when reviewers split or a reviewer rejects, the operator checks
 // the rejecting claim against the tree instead of weighing two verdicts'
-// prose. Shared by the plan-gate arbitration reasons above and the
-// merge_and_file_follow_up precondition (review_action_hint.go).
+// prose. Used by the plan-gate arbitration reasons above, which are gated on
+// planReviewRejected; the merge_and_file_follow_up precondition, reached with
+// or without a reject, carries the general verifyOpenConcernsOnTreeClause
+// (review_action_hint.go).
 const verifyRejectingClaimOnTreeClause = "decide by checking the rejecting reviewer's claim against the tree (run the code, grep the cited symbol), not by weighing the two verdicts' prose"
 
 // planReviewRejected reports whether any settled plan-review verdict is a

@@ -466,6 +466,14 @@ func (h *ReviewActionHint) acceptanceUnsettledActions(run *Run, implementStageID
 // #4801 design.
 const acceptanceDispatchRouteFixupsFirstClause = "; if you will route any of the %d open concern(s) back with fishhawk_fixup_stage, route them first, because a fix-up push re-opens the acceptance stage and an acceptance pass dispatched before it runs again; read run.concerns.by_state for a late reject before dispatching"
 
+// verifyOpenConcernsOnTreeClause ends the merge_and_file_follow_up
+// precondition (#5216 R11/R16). It is the general form of
+// verifyRejectingClaimOnTreeClause: this arm is reached on ANY round with open
+// concerns — an approve_with_concerns round, a single-reviewer round — where
+// there may be no rejecting reviewer and no second verdict, so it names each
+// open concern's claim rather than a rejecter's.
+const verifyOpenConcernsOnTreeClause = "decide by checking each open concern's claim against the tree (run the code, grep the cited symbol), not by weighing the reviewers' prose"
+
 // acceptanceUnsettledLeadReason is the lead acceptance action's reason on the
 // #4801 arm, single-sourced with the other acceptance-blocker surfaces.
 func acceptanceUnsettledLeadReason(acceptance *Stage) string {
@@ -500,7 +508,7 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 	mergeWithFollowUp := SuggestedAction{
 		Action:       "merge_and_file_follow_up",
 		Params:       prParams(run),
-		Precondition: "the remaining concerns are acceptable to land; " + verifyRejectingClaimOnTreeClause,
+		Precondition: "the remaining concerns are acceptable to land; " + verifyOpenConcernsOnTreeClause,
 		Consumes:     consumesNone,
 		Reason:       fmt.Sprintf("%d open concern(s) — approve the PR with an operator verdict, merge, and file a follow-up issue for what was not routed back", h.Concerns),
 	}

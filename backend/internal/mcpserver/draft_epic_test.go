@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 )
 
@@ -1444,19 +1443,13 @@ func TestGuidanceForSession_TiersEachEpicChildIndividually(t *testing.T) {
 	}
 	reviewFilingAssertRepoAgnostic(t, "fishhawk_draft_epic per-child tier guidance", epicChildTierGuidance)
 
-	// The served per-child labels schema.
-	schema, err := jsonschema.For[EpicDraftChild](nil)
-	if err != nil {
-		t.Fatalf("infer EpicDraftChild schema: %v", err)
-	}
-	labels, ok := schema.Properties["labels"]
-	if !ok || labels == nil {
-		t.Fatal("EpicDraftChild schema has no labels property")
-	}
+	// The served per-child labels schema: draft.children[].labels in the
+	// fishhawk_draft_epic inputSchema an agent receives over tools/list.
+	labels := reviewFilingServedSchemaDescription(t, fixupGuidanceTools(t), "fishhawk_draft_epic", false, "draft", "children", "[]", "labels")
 	for _, want := range []string{"Tier each child individually", "never because a sibling does", "do not blanket every child at the most sensitive member's tier"} {
-		if !strings.Contains(labels.Description, want) {
-			t.Errorf("R3: EpicDraftChild.labels schema lacks %q: %q", want, labels.Description)
+		if !strings.Contains(labels, want) {
+			t.Errorf("R3: served fishhawk_draft_epic draft.children[].labels schema lacks %q: %q", want, labels)
 		}
 	}
-	reviewFilingAssertRepoAgnostic(t, "EpicDraftChild.labels schema", labels.Description)
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_draft_epic draft.children[].labels schema", labels)
 }

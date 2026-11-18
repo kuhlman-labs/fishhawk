@@ -2128,7 +2128,7 @@ type GroomingApplyStatus struct {
 	// delegation-tier label applies NOTHING. The completed summary carries no
 	// such count, so it is ALWAYS tallied from the per-entry rows (both
 	// states). omitempty keeps an apply with no tier proposal byte-identical.
-	TierNotAuthorized int `json:"tier_not_authorized,omitempty" jsonschema:"skipped rows carrying skip_reason delegation_tier_not_authorized: an entry that proposed a delegation-tier label, refused whole — it applied NOTHING, not even the clerical labels beside the tier. Re-approving does not apply them; relabel the ones you agree with by hand on the tracker. Tallied from the per-entry rows in both states; omitted when zero"`
+	TierNotAuthorized int `json:"tier_not_authorized,omitempty" jsonschema:"skipped rows carrying skip_reason delegation_tier_not_authorized: an entry that proposed a delegation-tier label, refused whole — it applied NOTHING, not even the clerical labels beside the tier. Do not re-approve THIS run's plan gate for them: a plan re-approval launches a fresh apply, which refuses them again; relabel the ones you agree with by hand on the tracker. Attesting this run's confirm gate (approve_review_gate) is unaffected and remains the legal next step. Tallied from the per-entry rows in both states; omitted when zero"`
 	// TierNotAuthorizedEntries names the refused entries (entry_id), capped at
 	// groomingTierRefusalEntriesCap so a pathological report cannot bloat the
 	// snapshot; TierNotAuthorized stays the full count.

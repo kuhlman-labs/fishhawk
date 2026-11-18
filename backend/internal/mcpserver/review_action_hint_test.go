@@ -1648,13 +1648,15 @@ func TestReviewActionHint_RefundShape_UnrefundedAndCeilingArms(t *testing.T) {
 // TestReviewActionHint_MergeFollowUpPreconditionVerifiesOnTree pins #5216
 // R11/R16 on the merge_and_file_follow_up precondition in ALL THREE budget arms
 // (remaining, override, ceiling): before landing over open concerns, the
-// operator checks the rejecting claim against the tree. The original
-// acceptability wording still leads.
+// operator checks each open concern's claim against the tree. The arm is
+// reached on any round with open concerns (approve_with_concerns, a single
+// reviewer), so the clause names no rejecting reviewer and no second verdict.
+// The original acceptability wording still leads.
 func TestReviewActionHint_MergeFollowUpPreconditionVerifiesOnTree(t *testing.T) {
 	r := naRun("running")
 	prURL := "https://example.test/pull/42"
 	r.PullRequestURL = &prURL
-	const clause = "decide by checking the rejecting reviewer's claim against the tree (run the code, grep the cited symbol), not by weighing the two verdicts' prose"
+	const clause = "decide by checking each open concern's claim against the tree (run the code, grep the cited symbol), not by weighing the reviewers' prose"
 	for name, h := range map[string]*ReviewActionHint{
 		"remaining": {Concerns: 2, RemainingFixupBudget: 1},
 		"override":  {Concerns: 2, OverrideAvailable: true},
@@ -1676,6 +1678,11 @@ func TestReviewActionHint_MergeFollowUpPreconditionVerifiesOnTree(t *testing.T) 
 			}
 			if !strings.Contains(merge.Precondition, clause) {
 				t.Errorf("precondition missing the tree-verification clause: %q", merge.Precondition)
+			}
+			for _, rejectOnly := range []string{"rejecting reviewer", "two verdicts"} {
+				if strings.Contains(merge.Precondition, rejectOnly) {
+					t.Errorf("precondition presumes a reject/split (%q) on an arm reached without one: %q", rejectOnly, merge.Precondition)
+				}
 			}
 		})
 	}

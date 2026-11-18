@@ -5534,6 +5534,38 @@ func TestFoldGroomingApplyAdvisory_CompletedBudgetExhaustedAppend(t *testing.T) 
 	}
 }
 
+// TestFoldGroomingApplyAdvisory_CompletedTierAndBudgetAppendOne: the ordinary
+// over-budget apply that ALSO refused tier proposals appends ONE advisory whose
+// reason carries both parts, joined, ending with the shared plan-gate clause.
+func TestFoldGroomingApplyAdvisory_CompletedTierAndBudgetAppendOne(t *testing.T) {
+	r := naRun("running")
+	na := &NextActions{State: "human_review_gate_parked", Actions: []SuggestedAction{{Action: "approve_review_gate"}}}
+	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{
+		State: groomingApplyStateCompleted, CandidateCount: 12, Recorded: 12, Skipped: 4, BudgetExhausted: 3,
+		TierNotAuthorized: 1, TierNotAuthorizedEntries: []string{"entry-a"},
+	}, na)
+
+	if len(na.Actions) != 2 || na.Actions[0].Action != "approve_review_gate" {
+		t.Fatalf("actions = %v, want approve_review_gate first and ONE appended advisory", actionNames(na))
+	}
+	got := na.Actions[1]
+	if got.Action != "fishhawk_list_audit" {
+		t.Fatalf("appended action = %q, want fishhawk_list_audit", got.Action)
+	}
+	tier := "1 entr(ies) refused delegation_tier_not_authorized [entry-a]"
+	budget := "3 entr(ies) recorded apply_budget_exhausted were never evaluated"
+	ti, bi := strings.Index(got.Reason, tier), strings.Index(got.Reason, budget)
+	if ti < 0 || bi < 0 {
+		t.Fatalf("reason missing a part (tier at %d, budget at %d): %q", ti, bi, got.Reason)
+	}
+	if ti > bi || !strings.Contains(got.Reason, "by hand on the tracker; "+budget) {
+		t.Errorf("parts not joined tier-then-budget with \"; \": %q", got.Reason)
+	}
+	if !strings.HasSuffix(got.Reason, "; "+groomingApplyNoReapproveClause) {
+		t.Errorf("reason does not end with the shared plan-gate clause: %q", got.Reason)
+	}
+}
+
 // TestFoldGroomingApplyAdvisory_NilNoop: an omitted block (an ordinary run, or
 // a read error), a nil run and a nil next_actions are each a silent no-op —
 // never a panic, never a false advisory.

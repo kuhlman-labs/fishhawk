@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -3996,28 +3995,24 @@ func TestAwaitReviewDescribesFailedReviewIsNotAVerdict(t *testing.T) {
 	reviewFilingAssertRepoAgnostic(t, "fishhawk_await_review failed-review guidance",
 		fixupGuidanceSlice(t, desc, "a failed review is not a verdict", "a \"confirmed\" concern resolution"))
 
-	// The ReviewStatus.Status tag (served inside fishhawk_get_run_status's
-	// review_status blocks) carries the same rule.
-	schema, err := jsonschema.For[ReviewStatus](nil)
-	if err != nil {
-		t.Fatalf("infer ReviewStatus schema: %v", err)
-	}
-	prop, ok := schema.Properties["status"]
-	if !ok || prop == nil {
-		t.Fatal("ReviewStatus schema has no status property")
-	}
-	status := fixupGuidanceFlatten(prop.Description)
-	for _, anchor := range []string{
-		"is not a verdict",
-		"never counts as an approve or a reject",
-		"read the failure reason",
-		"with no separate provider or quota label",
-		"fishhawk_rerun_review applies only to an implement round of advisory authority that recorded zero verdicts",
-		"otherwise take the legal next step from next_actions",
-	} {
-		if !strings.Contains(status, anchor) {
-			t.Errorf("R18: ReviewStatus.status schema lacks %q:\n%s", anchor, status)
+	// The ReviewStatus.Status tag carries the same rule, read from the SERVED
+	// fishhawk_get_run_status outputSchema (both review_status blocks), not
+	// inferred from the Go type.
+	tools := fixupGuidanceTools(t)
+	for _, block := range []string{"plan_review_status", "implement_review_status"} {
+		status := fixupGuidanceFlatten(reviewFilingServedSchemaDescription(t, tools, "fishhawk_get_run_status", true, block, "status"))
+		for _, anchor := range []string{
+			"is not a verdict",
+			"never counts as an approve or a reject",
+			"read the failure reason",
+			"with no separate provider or quota label",
+			"fishhawk_rerun_review applies only to an implement round of advisory authority that recorded zero verdicts",
+			"otherwise take the legal next step from next_actions",
+		} {
+			if !strings.Contains(status, anchor) {
+				t.Errorf("R18: served fishhawk_get_run_status %s.status schema lacks %q:\n%s", block, anchor, status)
+			}
 		}
+		reviewFilingAssertRepoAgnostic(t, "fishhawk_get_run_status "+block+".status schema", status)
 	}
-	reviewFilingAssertRepoAgnostic(t, "ReviewStatus.status schema", status)
 }

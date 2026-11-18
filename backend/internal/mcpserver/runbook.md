@@ -1346,11 +1346,12 @@ act on delegated authority.
 **Search before filing.** Before `fishhawk_file_issue`, search the tracker
 yourself by a code symbol or path from the change, not only by title words. The
 intake duplicate scan is lexical over a bounded window. A degraded intake is
-not always a skipped scan: a `degrade_reason` that starts with `charter_` (the
-charter or its rubric could not be read) leaves the duplicate candidates valid,
-while
-`reader_unavailable`, `reader_error` or `budget_exceeded` means the scan did not
-complete. The scan does not read a running campaign's
+not always a skipped scan: a charter-side `degrade_reason` (`charter_undeclared`,
+`charter_unresolved`, `charter_rubric_unparsed` or `seam_unwired`: the charter or
+its rubric could not be read) leaves the duplicate candidates valid, while
+`reader_unavailable` or `reader_error` means the scan did not complete, and so
+does `budget_exceeded` or `hook_panic` when `scanned_items` is 0 (either can also
+come from the charter read, which leaves the scan intact). The scan does not read a running campaign's
 item list, so while a campaign runs, read the items from
 `fishhawk_get_campaign_status` too. Before filing a decision record or an epic,
 search the existing decision records and epics by topic.
