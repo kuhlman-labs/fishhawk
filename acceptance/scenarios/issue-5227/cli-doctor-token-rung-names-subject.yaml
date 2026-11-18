@@ -1,0 +1,14 @@
+id: scenario:issue-5227/cli-doctor-token-rung-names-subject
+statement: fishhawk doctor --repo <repo> against the preview prints a token valid rung naming the credential source and, when readiness answers, the subject and credential kind. Stdout never contains the token value.
+verify_hint: 'CLI stdout: run fishhawk doctor with --token <preview bearer> --repo <repo>; read the `token valid` line; search stdout for the token string (must be absent).'
+steps: 'Posture B binary: fishhawk CLI from the sanctioned checkout, against the running preview. Ran fishhawk doctor --working-dir /tmp/acc5227/chk --backend-url http://localhost:8090 --token <fhm_> --repo kuhlman-labs/fishhawk. Repeated with FISHHAWK_TOKEN=<fhm_> and no flag, and with an equal value in both the flag and the env var (approval condition S5). Grepped stdout for the full token and its secret part.'
+assertions:
+    expected: token valid line names the credential source and, when readiness answers, subject and credential kind; no token value
+    observed_at_record: '''token valid ... machine token (fhm_) via --token; acts as mcp:run:61e8bea2-acf7-4b3e-b7eb-1b6a11099b1b (mcp_run) warn''. With the env var only, it says ''via $FISHHAWK_TOKEN''. With equal values in flag and env, it says ''via --token'' (provenance is taken from the flag). Token occurrences in stdout: 0 in every run. The rung is warn because the fhm_ token lacks the doctor scopes; it still names source, subject and kind.'
+    repro_handle: fishhawk doctor --backend-url http://localhost:8090 --token <bearer> --repo kuhlman-labs/fishhawk
+origin:
+    issue: 5227
+    pr: 5457
+    run_id: af3c3eee-67a3-4257-b08d-1a0d502413b8
+    head_sha: 863b14d54c753de6b58fb06efad0cd864c497fce
+    recorded_at: 2026-11-18T11:01:07Z
