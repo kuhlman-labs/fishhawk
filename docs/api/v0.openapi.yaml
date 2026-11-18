@@ -3846,6 +3846,8 @@ components:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
           $ref: '#/components/schemas/GateViewReviewDiffTruncated'
+        diff_secrets_suppressed:
+          $ref: '#/components/schemas/GateViewDiffSecretsSuppressed'
         review_head_mismatch:
           $ref: '#/components/schemas/GateViewReviewHeadMismatch'
         gate_isolation:
@@ -4764,6 +4766,73 @@ components:
             incomplete and a changed file may appear in neither the hunks nor this
             list. False for the runner path, whose name-status inventory is
             complete.
+
+    GateViewDiffSecretsSuppressed:
+      type: object
+      description: |
+        What the reviewed diff-secrets allowlist (`.fishhawk/diff-secrets-allowlist.yaml`,
+        read only at the run's admission commit) suppressed on this run (ADR-084
+        A2, #5230), folded across every `diff_secrets_detected` audit entry the
+        same way the sticky PR status comment folds them. Entry-suppressed hits
+        are counted only; each marker-suppressed hit (an added line carrying
+        `fishhawk:allow-secret` inside a declared marker scope) raised a low,
+        human-only `server_check` concern. No allowlist glob is ever rendered:
+        rules are attributed by id plus fingerprint, and a persisted id that
+        fails validation renders `(invalid id)`. Omitted when nothing was
+        suppressed or rejected; omitted with a `diff_secrets_suppressed`
+        `history_gaps` entry when the audit read fails (an undecodable entry is
+        skipped and records the same gap).
+      required: [suppressed_hit_count, entry_suppressed_hit_count, marker_suppressed_hit_count, by_rule, marker_locations, rejected_count, newest_sequence]
+      properties:
+        suppressed_hit_count:
+          type: integer
+          description: Every suppressed hit (entry plus marker).
+        entry_suppressed_hit_count:
+          type: integer
+          description: Hits suppressed by an allowlist entry.
+        marker_suppressed_hit_count:
+          type: integer
+          description: Hits suppressed by an in-scope fixture marker.
+        by_rule:
+          type: array
+          description: Per-rule attribution, ordered by kind, id, then fingerprint.
+          items:
+            type: object
+            required: [by, rule_id, rule_fingerprint, hit_count]
+            properties:
+              by: { type: string, enum: [entry, marker] }
+              rule_id: { type: string, description: "The rule id, or `(invalid id)`." }
+              rule_fingerprint: { type: string, description: "16 hex: SHA-256 over the matched (list, glob, pattern) tuple." }
+              hit_count: { type: integer }
+        marker_locations:
+          type: array
+          description: Every marker-suppressed hit, capped at 50.
+          items:
+            type: object
+            required: [path, lines, pattern, rule_id]
+            properties:
+              path: { type: string }
+              lines: { type: array, items: { type: integer }, description: "New-side lines; 0 when unknown." }
+              pattern: { type: string, description: The credential pattern class. }
+              rule_id: { type: string, description: "The marker scope id, or `(invalid id)`." }
+              check_key: { type: string, description: The low concern's check key; omitted when the persisted value fails the read-side redaction check. }
+        marker_locations_truncated:
+          type: boolean
+          description: True when `marker_locations` reached its cap; the counts still include every hit.
+        allowlist_status:
+          type: string
+          enum: [loaded, absent, unavailable, fetch_failed, parse_error]
+          description: The newest recorded read outcome. Every status but `loaded` suppressed nothing (fail closed).
+        allowlist_ref:
+          type: string
+          description: The admission commit the allowlist was read at.
+        rejected_count:
+          type: integer
+          description: Allowlist rules the server refused (each suppresses nothing).
+        newest_sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the newest `diff_secrets_detected` entry folded.
 
     GateViewGateIsolation:
       type: object

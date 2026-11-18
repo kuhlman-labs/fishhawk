@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/diffsecrets"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -5522,6 +5524,147 @@ func TestGateView_MergeReadiness_BlockingConcern(t *testing.T) {
 		}
 		if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
 			t.Errorf("history_incomplete=%v gaps=%v, want the merge_readiness gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+	})
+}
+
+// gvDiffSecretsEntry seeds one diff_secrets_detected entry carrying sum.
+func gvDiffSecretsEntry(au *auditFake, runID uuid.UUID, seq int64, sum diffsecrets.SuppressionSummary) {
+	raw, _ := json.Marshal(diffSecretsDetectedPayload{Check: diffsecrets.CheckName, Groups: []diffSecretsGroupPayload{}, SuppressionSummary: sum})
+	rid := runID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &rid, Sequence: seq, Category: diffSecretsDetectedCategory, Payload: raw})
+	au.mu.Unlock()
+}
+
+func gvDiffSecretsBlock(t *testing.T, s *Server, runID uuid.UUID) (*gateViewDiffSecretsSuppressed, gateViewResponse, string) {
+	t.Helper()
+	w := getGateView(t, s, runID, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("gate view = %d: %s", w.Code, w.Body.String())
+	}
+	var resp gateViewResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp.DiffSecretsSuppressed, resp, w.Body.String()
+}
+
+// TestGateView_DiffSecretsSuppressed pins the diff_secrets_suppressed block
+// (ADR-084 A2, #5230).
+func TestGateView_DiffSecretsSuppressed(t *testing.T) {
+	admit := strings.Repeat("c", 40)
+	status := &diffsecrets.AllowlistStatusRecord{Path: diffsecrets.AllowlistPath, Ref: admit, Status: diffsecrets.StatusLoaded}
+	fpE := diffsecrets.RuleFingerprint(diffsecrets.ListEntries, "docs/*.md", "github-pat-classic")
+	fpM := diffsecrets.RuleFingerprint(diffsecrets.ListMarkers, "fix/**", "github-pat-classic")
+	entryRec := func(path string, lines ...int) diffsecrets.SuppressionRecord {
+		return diffsecrets.SuppressionRecord{Path: path, Lines: lines, Pattern: "github-pat-classic", By: diffsecrets.ByEntry, RuleID: "docs-rule", RuleFingerprint: fpE}
+	}
+	markerRec := func(path string, line int) diffsecrets.SuppressionRecord {
+		return diffsecrets.SuppressionRecord{Path: path, Lines: []int{line}, Pattern: "github-pat-classic", By: diffsecrets.ByMarker,
+			RuleID: "fix-scope", RuleFingerprint: fpM, CheckKey: diffsecrets.MarkerCheckKey("github-pat-classic", "fix-scope", fpM, strings.Repeat("d", 16), path)}
+	}
+
+	// COUNTERFACTUAL: delete the diffSecretsSuppressedForRun call — the block
+	// is then absent although two rounds suppressed hits → RED.
+	t.Run("union across two rounds", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		gvDiffSecretsEntry(au, runID, 3, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{entryRec("docs/a.md", 1), markerRec("fix/m.go", 2)}})
+		gvDiffSecretsEntry(au, runID, 7, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{entryRec("docs/a.md", 1, 4), entryRec("docs/b.md", 2)}})
+		b, _, _ := gvDiffSecretsBlock(t, s, runID)
+		if b == nil {
+			t.Fatal("block absent")
+		}
+		if b.SuppressedHitCount != 4 || b.EntrySuppressedHitCount != 3 || b.MarkerSuppressedHitCount != 1 || b.NewestSequence != 7 ||
+			b.AllowlistStatus != diffsecrets.StatusLoaded || b.AllowlistRef != admit || b.RejectedCount != 0 {
+			t.Errorf("block = %+v", b)
+		}
+		if len(b.ByRule) != 2 || b.ByRule[0] != (gateViewDiffSecretsRule{By: "entry", RuleID: "docs-rule", RuleFingerprint: fpE, HitCount: 3}) ||
+			b.ByRule[1] != (gateViewDiffSecretsRule{By: "marker", RuleID: "fix-scope", RuleFingerprint: fpM, HitCount: 1}) {
+			t.Errorf("by_rule = %+v", b.ByRule)
+		}
+		if len(b.MarkerLocations) != 1 || b.MarkerLocations[0].Path != "fix/m.go" || b.MarkerLocations[0].CheckKey == "" {
+			t.Errorf("marker_locations = %+v", b.MarkerLocations)
+		}
+	})
+	t.Run("omitted with no suppression or rejection", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		gvDiffSecretsEntry(au, runID, 1, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{}})
+		if b, resp, body := gvDiffSecretsBlock(t, s, runID); b != nil || strings.Contains(body, "diff_secrets_suppressed") || resp.HistoryIncomplete {
+			t.Errorf("block = %+v, history_incomplete %v; want omitted", b, resp.HistoryIncomplete)
+		}
+	})
+	t.Run("a rejection alone shows the block", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		rej := *status
+		rej.RejectedCount = 2
+		gvDiffSecretsEntry(au, runID, 1, diffsecrets.SuppressionSummary{Allowlist: &rej, Suppressed: []diffsecrets.SuppressionRecord{}})
+		if b, _, _ := gvDiffSecretsBlock(t, s, runID); b == nil || b.RejectedCount != 2 || b.SuppressedHitCount != 0 {
+			t.Errorf("block = %+v, want rejected_count 2", b)
+		}
+	})
+	// COUNTERFACTUAL: delete the cap check — 60 marker records then render 60
+	// locations → RED.
+	t.Run("marker locations cap at 50", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		var recs []diffsecrets.SuppressionRecord
+		for i := 0; i < 60; i++ {
+			recs = append(recs, markerRec("fix/f"+strconv.Itoa(i)+".go", 1))
+		}
+		gvDiffSecretsEntry(au, runID, 1, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: recs})
+		b, _, _ := gvDiffSecretsBlock(t, s, runID)
+		if b == nil || len(b.MarkerLocations) != gateViewDiffSecretsMarkerCap || !b.MarkerLocationsTruncated || b.MarkerSuppressedHitCount != 60 {
+			t.Errorf("block = locations %d truncated %v count %d, want 50/true/60", len(b.MarkerLocations), b.MarkerLocationsTruncated, b.MarkerSuppressedHitCount)
+		}
+	})
+	// COUNTERFACTUAL: skip SafeRuleID / gateViewSafeText on read — the
+	// corrupted row's rule_id, path and check_key carry a runtime credential,
+	// so the body then carries it → RED.
+	t.Run("a corrupted row renders no bytes", func(t *testing.T) {
+		s, repo, au, cr := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		cred := "ghp_" + strings.Repeat("Z", 36)
+		bad := markerRec("fix/"+cred+".go", 1)
+		bad.RuleID = cred
+		bad.CheckKey = diffsecrets.MarkerCheckName + "|github-pat-classic|" + cred
+		gvDiffSecretsEntry(au, runID, 1, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{bad}})
+		b, _, body := gvDiffSecretsBlock(t, s, runID)
+		if b == nil || len(b.ByRule) != 1 || b.ByRule[0].RuleID != diffsecrets.InvalidRuleID || b.MarkerLocations[0].CheckKey != "" {
+			t.Errorf("block = %+v, want (invalid id) and no check_key", b)
+		}
+		if strings.Contains(body, cred) {
+			t.Errorf("gate-view body carries the credential:\n%s", body)
+		}
+		_ = cr
+	})
+	// COUNTERFACTUAL: delete the gap append on a list error — the response
+	// then reads history_incomplete false with no diff_secrets_suppressed gap
+	// → RED.
+	t.Run("a list error records a gap and omits the block", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		gvDiffSecretsEntry(au, runID, 1, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{entryRec("docs/a.md", 1)}})
+		au.listByCategoryErrCategory = diffSecretsDetectedCategory
+		b, resp, _ := gvDiffSecretsBlock(t, s, runID)
+		if b != nil || !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapDiffSecretsSuppressed) {
+			t.Errorf("block = %+v gaps %v incomplete %v, want no block and the gap", b, resp.HistoryGaps, resp.HistoryIncomplete)
+		}
+	})
+	// COUNTERFACTUAL: return nil on the first undecodable entry — the good
+	// entry's suppression then never renders → RED.
+	t.Run("an undecodable entry records the gap while others render", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		rid := runID
+		au.seeded = append(au.seeded, &audit.Entry{RunID: &rid, Sequence: 1, Category: diffSecretsDetectedCategory, Payload: json.RawMessage(`{"suppressed":"not-a-list"}`)})
+		gvDiffSecretsEntry(au, runID, 2, diffsecrets.SuppressionSummary{Allowlist: status, Suppressed: []diffsecrets.SuppressionRecord{entryRec("docs/a.md", 1)}})
+		b, resp, _ := gvDiffSecretsBlock(t, s, runID)
+		if b == nil || b.EntrySuppressedHitCount != 1 || !slices.Contains(resp.HistoryGaps, gateViewGapDiffSecretsSuppressed) {
+			t.Errorf("block = %+v gaps %v, want the good entry plus the gap", b, resp.HistoryGaps)
 		}
 	})
 }
