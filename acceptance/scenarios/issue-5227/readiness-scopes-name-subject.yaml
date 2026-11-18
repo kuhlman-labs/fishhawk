@@ -1,14 +1,14 @@
 id: scenario:issue-5227/readiness-scopes-name-subject
 statement: GET /v0/onboarding/readiness?repo=<repo> returns 200, and its scopes object carries subject equal to the authenticated caller's subject and a credential_kind. The response body does not contain the bearer token's value.
 verify_hint: 'HTTP: call GET /v0/onboarding/readiness on the preview with the available bearer; read scopes.subject and scopes.credential_kind; search the raw body for the bearer string (must be absent).'
-steps: POST /v0/dev/fixtures plan-gate-parked -> run 61e8bea2-...; minted a run-bound fhm_ bearer (signing-key, dev/sign '{}', mcp-token). GET http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk with that bearer, then grepped the raw body for the full token and for its secret part. Repeated with a second fhm_ bearer minted for run 5681bc1a-... (trace-upload-target seed). Also called it unauthenticated.
+steps: 'POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} gave run 979031e0-92c1-420b-9b74-621d944b7631. POST /v0/runs/{run}/signing-key {}, then POST /v0/dev/sign over ''{}'' with X-Fishhawk-Dev-Private-Key, then POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature, giving fhm_ bearer. GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk with Authorization: Bearer <fhm_>. Grepped the raw body for the full token and for its secret part after ''fhm_''.'
 assertions:
-    expected: 200; scopes.subject = caller's subject; credential_kind present; no bearer bytes in the body
-    observed_at_record: '200. scopes.subject = ''mcp:run:61e8bea2-acf7-4b3e-b7eb-1b6a11099b1b'' and scopes.credential_kind = ''mcp_run''. The second bearer yields subject ''mcp:run:5681bc1a-...'', so the subject tracks the caller (docs/api/v0.md documents fhm_ subjects as mcp:run:<uuid>). Token string occurrences in the body: 0. Unauthenticated: 401 authentication_required.'
-    repro_handle: 'curl -s ''http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk'' -H ''Authorization: Bearer <fhm_>'''
+    expected: 200; scopes.subject equals the authenticated caller's subject; credential_kind present; bearer value absent
+    observed_at_record: HTTP 200; scopes = {adequate:false, required:[...], missing:[...], subject:'mcp:run:979031e0-92c1-420b-9b74-621d944b7631', credential_kind:'mcp_run'}. The subject is the run-bound caller's subject. 0 matches for either token string in the body.
+    repro_handle: 'curl -H ''Authorization: Bearer <fhm_>'' ''http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk'''
 origin:
     issue: 5227
     pr: 5457
     run_id: af3c3eee-67a3-4257-b08d-1a0d502413b8
-    head_sha: 863b14d54c753de6b58fb06efad0cd864c497fce
-    recorded_at: 2026-11-18T11:01:07Z
+    head_sha: 7a2610226609014c3f319aa1711703ff908e230a
+    recorded_at: 2026-11-18T11:52:04Z
