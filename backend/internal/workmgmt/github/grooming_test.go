@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -1559,6 +1561,13 @@ func countOp(ops []string, want string) int {
 type dependsOnForge struct {
 	bodies  map[int]string
 	patches []string
+
+	// Failure injectors for the #5225 transient re-settle. patch502 is the
+	// number of PATCHes still to answer 502 WITHOUT applying (negative: every
+	// PATCH). patch502AfterLanding is one-shot: the next PATCH APPLIES the body
+	// and then answers 502, the write-landed-before-its-error shape.
+	patch502             int
+	patch502AfterLanding bool
 }
 
 // newDependsOnForge stands up the client + fake for a depends_on apply over one
@@ -1566,6 +1575,16 @@ type dependsOnForge struct {
 func newDependsOnForge(t *testing.T, number int, body string) (*githubclient.Client, *dependsOnForge) {
 	t.Helper()
 	fx := &dependsOnForge{bodies: map[int]string{number: body}}
+	c := serveDependsOnForge(t, fx)
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	return c, fx
+}
+
+// serveDependsOnForge serves fx and returns a client built by githubclient.New
+// with its PRODUCTION http.Client, retryTransport included (#5225 approval
+// condition N3), so a PATCH count proves the transport did not also retry.
+func serveDependsOnForge(t *testing.T, fx *dependsOnForge) *githubclient.Client {
+	t.Helper()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
@@ -1584,8 +1603,22 @@ func newDependsOnForge(t *testing.T, number int, body string) (*githubclient.Cli
 		raw, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(raw, &params)
 		fx.patches = append(fx.patches, string(raw))
+		if fx.patch502 != 0 {
+			if fx.patch502 > 0 {
+				fx.patch502--
+			}
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "bad gateway")
+			return
+		}
 		if params.Body != nil {
 			fx.bodies[n] = *params.Body
+		}
+		if fx.patch502AfterLanding {
+			fx.patch502AfterLanding = false
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "bad gateway")
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, fmt.Sprintf(`{"number":%d,"state":"open","labels":[{"name":"type:feature"}]}`, n))
@@ -1595,8 +1628,7 @@ func newDependsOnForge(t *testing.T, number int, body string) (*githubclient.Cli
 	t.Cleanup(srv.Close)
 	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
 	c.BaseURL = srv.URL
-	c.HTTP = &http.Client{Timeout: 5 * time.Second}
-	return c, fx
+	return c
 }
 
 // dependsOnApplyRequest builds a whole-report apply for ONE approved
@@ -2031,6 +2063,10 @@ type partialWriteForge struct {
 	// mutation. Each fires at most once, so apply 2 runs against a healthy forge.
 	failSetField bool
 	failPatch    bool
+	// failSubIssueAfterLanding is one-shot (#5225): AddSubIssue RECORDS the
+	// structural parent and then answers 502, an edge that landed before its
+	// error.
+	failSubIssueAfterLanding bool
 
 	// dropOption, when non-empty, OMITS that column from every subsequent
 	// ProjectFields response — the renamed/removed-option induction the
@@ -2046,6 +2082,15 @@ type partialWriteForge struct {
 // newPartialWriteForge stands up the REST + GraphQL surface both multi-step
 // grooming mutations touch, over mutable state.
 func newPartialWriteForge(t *testing.T, fx *partialWriteForge) *githubclient.Client {
+	t.Helper()
+	c := servePartialWriteForge(t, fx)
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	return c
+}
+
+// servePartialWriteForge serves fx through a client keeping githubclient.New's
+// PRODUCTION http.Client, retryTransport included (#5225 approval condition N3).
+func servePartialWriteForge(t *testing.T, fx *partialWriteForge) *githubclient.Client {
 	t.Helper()
 	mux := http.NewServeMux()
 	// The board options the two board tests use, and the reverse map SetField
@@ -2147,6 +2192,12 @@ func newPartialWriteForge(t *testing.T, fx *partialWriteForge) *githubclient.Cli
 			if v, ok := body.Variables["issueId"].(string); ok {
 				fx.structuralParent = "#" + strings.TrimPrefix(v, "NODE_")
 			}
+			if fx.failSubIssueAfterLanding {
+				fx.failSubIssueAfterLanding = false
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = io.WriteString(w, "bad gateway")
+				return
+			}
 			_, _ = io.WriteString(w, `{"data":{"addSubIssue":{"issue":{"id":"NODE_389"}}}}`)
 		default:
 			fx.graphql = append(fx.graphql, "unknown")
@@ -2157,7 +2208,6 @@ func newPartialWriteForge(t *testing.T, fx *partialWriteForge) *githubclient.Cli
 	t.Cleanup(srv.Close)
 	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
 	c.BaseURL = srv.URL
-	c.HTTP = &http.Client{Timeout: 5 * time.Second}
 	c.ProjectsToken = "pat_projects"
 	return c
 }
@@ -2729,5 +2779,364 @@ func TestApplyGrooming_EpicLinkResumeWriteFailureStillConverges(t *testing.T) {
 	}
 	if got := countOp(fx.graphql, "AddSubIssue"); got != links {
 		t.Errorf("AddSubIssue calls = %d, want %d (no resume may re-link an existing edge)", got, links)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Transient classification (#5225)
+// ---------------------------------------------------------------------------
+
+// transportFault is the *url.Error http.Client.Do returns for a request that
+// never got a response.
+func transportFault() error {
+	return &url.Error{Op: "Patch", URL: "https://api.github.com/x", Err: errors.New("connection reset by peer")}
+}
+
+// TestApplyGroomingMutation_ServerErrorIsMarkedTransient: a classifyStatus 5xx
+// or 429 on each retry-safe kind's write is marked transient, and the mark
+// leaves the error text unchanged.
+func TestApplyGroomingMutation_ServerErrorIsMarkedTransient(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   workmgmt.GroomingMutationKind
+		after  workmgmt.GroomingValue
+		break_ func(*fakeAPI, error)
+		cause  string
+	}{
+		{"depends_on 502", workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"},
+			func(a *fakeAPI, e error) { a.updateIssueErr = e }, "githubclient: update issue: 502: bad gateway"},
+		{"label 429", workmgmt.GroomingKindLabelSet, workmgmt.GroomingValue{List: []string{"area:api"}},
+			func(a *fakeAPI, e error) { a.addLabelsErr = e }, "githubclient: add issue labels: 429: slow down"},
+		{"close 503", workmgmt.GroomingKindCloseNotPlanned, workmgmt.GroomingValue{Scalar: "closed"},
+			func(a *fakeAPI, e error) { a.updateIssueErr = e }, "githubclient: update issue: 503: "},
+		{"depends_on read 500", workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"},
+			func(a *fakeAPI, e error) { a.getIssueErr = e }, "githubclient: get issue: 500: oops"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := groomingAPI("Backlog", true)
+			tc.break_(api, errors.New(tc.cause))
+			_, err := New(api).ApplyGroomingMutation(context.Background(), groomingRequest(tc.kind, tc.after))
+			if err == nil || !workmgmt.IsGroomingTransient(err) {
+				t.Fatalf("err = %v, transient = %v; want a transient-marked failure", err, workmgmt.IsGroomingTransient(err))
+			}
+			if !strings.HasSuffix(err.Error(), tc.cause) || strings.Contains(err.Error(), "transient") {
+				t.Errorf("err text = %q, want the provider's unchanged wrap of %q", err.Error(), tc.cause)
+			}
+		})
+	}
+}
+
+// TestApplyGroomingMutation_ValidationErrorIsNotTransient: an ErrValidation
+// (422) is deterministic, and the deny-list wins even when the chain ALSO
+// wraps a transport fault.
+func TestApplyGroomingMutation_ValidationErrorIsNotTransient(t *testing.T) {
+	for name, e := range map[string]error{
+		"plain 422":              fmt.Errorf("%w: update issue: body is too long", githubclient.ErrValidation),
+		"422 beside a url fault": fmt.Errorf("%w: update issue: %w", githubclient.ErrValidation, transportFault()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := groomingAPI("Backlog", true)
+			api.updateIssueErr = e
+			_, err := New(api).ApplyGroomingMutation(context.Background(),
+				groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
+			if err == nil || workmgmt.IsGroomingTransient(err) {
+				t.Fatalf("err = %v transient=%v, want a NON-transient failure", err, workmgmt.IsGroomingTransient(err))
+			}
+		})
+	}
+}
+
+// TestApplyGroomingMutation_DeterministicErrorsAreNotTransient: every 403
+// (including a secondary-rate-limit 403, which classifyStatus cannot tell from
+// a permission 403) and every 404 is denied, as are the typed refusals — each
+// also paired with a transport fault so the deny arm, not the missing
+// round-trip evidence, is what decides.
+func TestApplyGroomingMutation_DeterministicErrorsAreNotTransient(t *testing.T) {
+	cases := map[string]error{
+		"403 permission":                fmt.Errorf("%w: update issue: 403: Resource not accessible by integration", githubclient.ErrForbidden),
+		"403 secondary rate limit":      fmt.Errorf("%w: update issue: 403: You have exceeded a secondary rate limit", githubclient.ErrForbidden),
+		"403 beside a url fault":        fmt.Errorf("%w: update issue: %w", githubclient.ErrForbidden, transportFault()),
+		"404":                           fmt.Errorf("%w: update issue: Not Found", githubclient.ErrNotFound),
+		"404 beside a url fault":        fmt.Errorf("%w: update issue: %w", githubclient.ErrNotFound, transportFault()),
+		"parent conflict beside fault":  fmt.Errorf("%w: %w", &ParentEpicConflictError{Number: 1, Current: "#2", Proposed: "#3"}, transportFault()),
+		"unsupported kind beside fault": fmt.Errorf("%w: %w", &UnsupportedGroomingKindError{Kind: "x"}, transportFault()),
+		"unavailable with a url cause":  groomingUnavailable(workmgmt.ReasonForbidden, "refused", transportFault()),
+		"partial write with a 502 cause": &workmgmt.PartialGroomingWriteError{
+			Steps: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepEpicEdgeAdded},
+			Cause: errors.New("githubclient: update issue: 502: bad gateway")},
+	}
+	for name, e := range cases {
+		t.Run(name, func(t *testing.T) {
+			if groomingErrorTransient(context.Background(), e) {
+				t.Errorf("groomingErrorTransient(%v) = true, want false", e)
+			}
+		})
+	}
+	t.Run("through the provider", func(t *testing.T) {
+		api := groomingAPI("Backlog", true)
+		api.updateIssueErr = cases["403 secondary rate limit"]
+		_, err := New(api).ApplyGroomingMutation(context.Background(),
+			groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
+		if err == nil || workmgmt.IsGroomingTransient(err) {
+			t.Fatalf("err = %v transient=%v, want a NON-transient 403", err, workmgmt.IsGroomingTransient(err))
+		}
+	})
+}
+
+// TestApplyGroomingMutation_LocalClientErrorsAreNotTransient pins approval
+// condition N1a: only an HTTP round trip is transient. githubclient's LOCAL
+// failures — and non-5xx/429 statuses — are not, unless they wrap a transport
+// fault.
+func TestApplyGroomingMutation_LocalClientErrorsAreNotTransient(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"missing token provider", errors.New("githubclient: client missing TokenProvider"), false},
+		{"marshal wrap", fmt.Errorf("githubclient: marshal issue update: %w", errors.New("json: unsupported value")), false},
+		{"token mint refusal", fmt.Errorf("githubclient: get token: %w", errors.New("installation suspended")), false},
+		{"build request (url.Parse)", fmt.Errorf("githubclient: build request: %w",
+			&url.Error{Op: "parse", URL: "::bad", Err: errors.New("missing protocol scheme")}), false},
+		{"decode after a 2xx", fmt.Errorf("githubclient: decode issue update: %w", errors.New("unexpected EOF")), false},
+		{"untyped 400", errors.New("githubclient: update issue: 400: bad request"), false},
+		{"untyped 409", errors.New("githubclient: update issue: 409: conflict"), false},
+		{"502 text not at a link start", errors.New("workmgmt: wrapped githubclient: update issue: 502: x"), false},
+		{"token mint over a transport fault", fmt.Errorf("githubclient: get token: %w", transportFault()), true},
+		{"net.Error transport fault", fmt.Errorf("githubclient: update issue: %w", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("refused")}), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := groomingAPI("Backlog", true)
+			api.updateIssueErr = tc.err
+			_, err := New(api).ApplyGroomingMutation(context.Background(),
+				groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
+			if err == nil {
+				t.Fatal("err = nil, want the injected failure")
+			}
+			if got := workmgmt.IsGroomingTransient(err); got != tc.want {
+				t.Errorf("transient = %v, want %v for %v", got, tc.want, err)
+			}
+		})
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkErrorIsNotMarkedTransient: the provider's
+// OWN kind gate never marks an epic_link failure, even a 502 the round-trip
+// arm alone would call transient.
+func TestApplyGroomingMutation_EpicLinkErrorIsNotMarkedTransient(t *testing.T) {
+	for name, brk := range map[string]func(*fakeAPI){
+		"sub-issue 502":   func(a *fakeAPI) { a.subErr = errors.New("githubclient: graphql: 502: bad gateway") },
+		"node id 502":     func(a *fakeAPI) { a.nodeIDErr = errors.New("githubclient: get issue: 502: bad gateway") },
+		"sub-issue fault": func(a *fakeAPI) { a.subErr = fmt.Errorf("githubclient: graphql request: %w", transportFault()) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := groomingAPI("Backlog", true)
+			brk(api)
+			_, err := New(api).ApplyGroomingMutation(context.Background(),
+				groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+			if err == nil || workmgmt.IsGroomingTransient(err) {
+				t.Fatalf("err = %v transient=%v, want an UNMARKED epic_link failure", err, workmgmt.IsGroomingTransient(err))
+			}
+		})
+	}
+}
+
+// TestApplyGroomingMutation_BoardAndFieldErrorsAreNotMarkedTransient: board and
+// field kinds are never marked either.
+func TestApplyGroomingMutation_BoardAndFieldErrorsAreNotMarkedTransient(t *testing.T) {
+	for _, tc := range []struct {
+		kind    workmgmt.GroomingMutationKind
+		after   string
+		onBoard bool
+		brk     func(*fakeAPI)
+	}{
+		{workmgmt.GroomingKindBoardPlace, "Backlog", false, func(a *fakeAPI) { a.fieldsErr = errors.New("githubclient: graphql: 502: bad gateway") }},
+		{workmgmt.GroomingKindIcebox, "Icebox", true, func(a *fakeAPI) { a.fieldsErr = errors.New("githubclient: graphql: 502: bad gateway") }},
+		{workmgmt.GroomingKindRankSet, "3", true, func(a *fakeAPI) { a.setErr = errors.New("githubclient: graphql: 502: bad gateway") }},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			api := groomingAPI("Backlog", tc.onBoard)
+			tc.brk(api)
+			_, err := New(api).ApplyGroomingMutation(context.Background(),
+				groomingRequest(tc.kind, workmgmt.GroomingValue{Scalar: tc.after}))
+			if err == nil || workmgmt.IsGroomingTransient(err) {
+				t.Fatalf("err = %v transient=%v, want an UNMARKED %s failure", err, workmgmt.IsGroomingTransient(err), tc.kind)
+			}
+		})
+	}
+}
+
+// clientTimeout is the shape of a per-request client timeout: a *url.Error
+// whose chain satisfies errors.Is(context.DeadlineExceeded), as net/http's
+// timeoutError does, while the APPLY ctx is still live.
+func clientTimeout() error {
+	return &url.Error{Op: "Patch", URL: "https://api.github.com/x", Err: context.DeadlineExceeded}
+}
+
+// TestApplyGroomingMutation_ClientTimeoutIsTransientWhileApplyCtxLive pins M3:
+// the classifier keys on the APPLY ctx, never on the error's DeadlineExceeded,
+// so a per-request timeout under a live budget stays retryable.
+func TestApplyGroomingMutation_ClientTimeoutIsTransientWhileApplyCtxLive(t *testing.T) {
+	fixture := clientTimeout()
+	if !errors.Is(fixture, context.DeadlineExceeded) {
+		t.Fatal("fixture precondition: errors.Is(err, context.DeadlineExceeded) must hold")
+	}
+	api := groomingAPI("Backlog", true)
+	api.updateIssueErr = fmt.Errorf("githubclient: update issue: %w", fixture)
+	_, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
+	if err == nil || !workmgmt.IsGroomingTransient(err) {
+		t.Fatalf("err = %v transient=%v, want transient while the apply ctx is live", err, workmgmt.IsGroomingTransient(err))
+	}
+}
+
+// TestApplyGroomingMutation_ExpiredApplyCtxIsNotTransient: the same error under
+// an already-cancelled APPLY ctx is not transient — the budget arm owns it.
+func TestApplyGroomingMutation_ExpiredApplyCtxIsNotTransient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	api := groomingAPI("Backlog", true)
+	api.updateIssueErr = fmt.Errorf("githubclient: update issue: %w", clientTimeout())
+	_, err := New(api).ApplyGroomingMutation(ctx,
+		groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
+	if err == nil || workmgmt.IsGroomingTransient(err) {
+		t.Fatalf("err = %v transient=%v, want NOT transient under an expired apply ctx", err, workmgmt.IsGroomingTransient(err))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Transient re-settle END TO END (#5225): real ApplyGrooming -> real Provider ->
+// real githubclient with its PRODUCTION retryTransport -> httptest forge.
+// ---------------------------------------------------------------------------
+
+// zeroBackoff is the RetryPolicy the end-to-end tests run under, so no real
+// time is spent between re-settles.
+var zeroBackoff = &workmgmt.GroomingRetryPolicy{Retries: 2, Backoff: 0}
+
+// TestApplyGrooming_DependsOn502OnceIsAppliedOnRetryEndToEnd: the first PATCH
+// answers 502 without applying; the re-settle re-reads, re-dispatches and
+// applies. Exactly 2 PATCHes reach the forge, which also proves the production
+// retryTransport did not retry the PATCH itself.
+func TestApplyGrooming_DependsOn502OnceIsAppliedOnRetryEndToEnd(t *testing.T) {
+	fx := &dependsOnForge{bodies: map[int]string{1642: "## Summary\n"}, patch502: 1}
+	provider := New(serveDependsOnForge(t, fx))
+	req, entryID := dependsOnApplyRequest(1642, "kuhlman-labs/fishhawk#2032")
+	req.RetryPolicy = zeroBackoff
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeApplied || rec.Attempts != 2 || !strings.Contains(rec.FirstError, "502") {
+		t.Fatalf("record = %q attempts=%d first_error=%q, want applied / 2 / naming 502", rec.Outcome, rec.Attempts, rec.FirstError)
+	}
+	if len(fx.patches) != 2 {
+		t.Errorf("PATCHes = %d, want 2 — one per settle, none from the transport", len(fx.patches))
+	}
+	if !strings.Contains(fx.bodies[1642], "Depends on:") {
+		t.Errorf("forge body = %q, want the depends_on marker", fx.bodies[1642])
+	}
+}
+
+// TestApplyGrooming_DependsOn502AfterWriteLandedSettlesAlreadyAppliedEndToEnd:
+// the first PATCH APPLIES and then answers 502; the re-settle's fresh read sees
+// the marker and settles already_applied with no second PATCH.
+func TestApplyGrooming_DependsOn502AfterWriteLandedSettlesAlreadyAppliedEndToEnd(t *testing.T) {
+	fx := &dependsOnForge{bodies: map[int]string{1642: "## Summary\n"}, patch502AfterLanding: true}
+	provider := New(serveDependsOnForge(t, fx))
+	req, entryID := dependsOnApplyRequest(1642, "kuhlman-labs/fishhawk#2032")
+	req.RetryPolicy = zeroBackoff
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeSkipped || rec.SkipReason != workmgmt.GroomingSkipAlreadyApplied || rec.Attempts != 2 {
+		t.Fatalf("record = %q/%q attempts=%d, want skipped/already_applied / 2", rec.Outcome, rec.SkipReason, rec.Attempts)
+	}
+	if len(fx.patches) != 1 {
+		t.Errorf("PATCHes = %d, want exactly 1 — a landed write is never duplicated", len(fx.patches))
+	}
+}
+
+// TestApplyGrooming_EpicLinkEdgeLandedThen502IsNotSettledAlreadyApplied (M2):
+// AddSubIssue records the edge and answers 502. The epic_link is NOT
+// re-settled, so it stays failed rather than re-reading as already_applied
+// with no `Parent epic:` marker ever written.
+func TestApplyGrooming_EpicLinkEdgeLandedThen502IsNotSettledAlreadyApplied(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failSubIssueAfterLanding: true}
+	provider := New(servePartialWriteForge(t, fx))
+	req, entryID := epicLinkApply(1, "#389", nil)
+	req.RetryPolicy = zeroBackoff
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeFailed || rec.Attempts != 0 {
+		t.Fatalf("record = %q/%q attempts=%d, want failed with no retry — never already_applied", rec.Outcome, rec.SkipReason, rec.Attempts)
+	}
+	if !strings.Contains(rec.Error, "502") {
+		t.Errorf("error = %q, want it naming the 502", rec.Error)
+	}
+	if n := countOp(fx.graphql, "AddSubIssue"); n != 1 {
+		t.Errorf("AddSubIssue calls = %d, want 1", n)
+	}
+	if fx.structuralParent != "#389" {
+		t.Errorf("structural parent = %q, want #389 — the edge landed", fx.structuralParent)
+	}
+	if strings.Contains(fx.body, "Parent epic:") {
+		t.Errorf("body = %q, want no marker", fx.body)
+	}
+}
+
+// TestApplyGrooming_ForgeOutageHitsThePerApplyRetryCapEndToEnd pins approval
+// condition N1b through the real stack: every PATCH answers 502 across five
+// retry-safe candidates. The first GroomingTransientRetryCandidateCap are
+// re-settled 3 times; the rest settle on their first error, recorded
+// retry_suppressed, and nothing is apply_budget_exhausted.
+func TestApplyGrooming_ForgeOutageHitsThePerApplyRetryCapEndToEnd(t *testing.T) {
+	fx := &dependsOnForge{bodies: map[int]string{}, patch502: -1}
+	var edges []plan.DependencyEdge
+	for n := 1; n <= 5; n++ {
+		fx.bodies[n] = "## Summary\n"
+		from, to := groomingItemRef(n), plan.ItemRef{Type: "github_issue", ID: "kuhlman-labs/fishhawk#99"}
+		edges = append(edges, plan.DependencyEdge{ID: plan.GroomingEntryID(plan.GroomingClassDependency, "", from, to),
+			From: from, To: to, Basis: "shared seam", Kind: "depends_on"})
+	}
+	provider := New(serveDependsOnForge(t, fx))
+	report := &plan.GroomingReport{DependencyEdges: edges}
+	var decisions []workmgmt.GroomingDecision
+	for _, e := range edges {
+		decisions = append(decisions, workmgmt.GroomingDecision{EntryID: e.ID, Verdict: workmgmt.GroomingApproved})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := workmgmt.ApplyGrooming(ctx, provider, provider, &recordingSink{}, workmgmt.GroomingApplyRequest{
+		Target:      workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Report:      report,
+		Decisions:   decisions,
+		Modes:       map[string]workmgmt.GroomingMode{"hygiene": workmgmt.GroomingModeAuto},
+		States:      groomingStates,
+		RetryPolicy: zeroBackoff,
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if res.Summary.BudgetExhausted != 0 || res.Summary.Failed != len(edges) {
+		t.Fatalf("summary = %+v, want every candidate failed and none budget-exhausted", res.Summary)
+	}
+	for i, e := range edges {
+		rec := dependsOnRecord(t, res, e.ID)
+		retried := i < workmgmt.GroomingTransientRetryCandidateCap
+		if retried && (rec.Attempts != 3 || rec.RetrySuppressed) {
+			t.Errorf("edge %d attempts=%d suppressed=%v, want 3 / false", i, rec.Attempts, rec.RetrySuppressed)
+		}
+		if !retried && (rec.Attempts != 0 || !rec.RetrySuppressed) {
+			t.Errorf("edge %d attempts=%d suppressed=%v, want 0 / true", i, rec.Attempts, rec.RetrySuppressed)
+		}
+	}
+	if want := 3*workmgmt.GroomingTransientRetryCandidateCap + (len(edges) - workmgmt.GroomingTransientRetryCandidateCap); len(fx.patches) != want {
+		t.Errorf("PATCHes = %d, want %d", len(fx.patches), want)
 	}
 }

@@ -241,3 +241,63 @@ func TestGroomingMutationResult_RefusedCarriesItsOwnReasonField(t *testing.T) {
 		t.Errorf("RefuseReason = %q", res.RefuseReason)
 	}
 }
+
+// TestMarkGroomingTransient_PreservesMessageAndCause pins the #5225 marker: nil
+// passes through, the marked error's text is BYTE-IDENTICAL to its cause (so
+// marking never changes an audit row's error), the cause stays reachable
+// through errors.Is, and IsGroomingTransient tells marked from unmarked.
+func TestMarkGroomingTransient_PreservesMessageAndCause(t *testing.T) {
+	if MarkGroomingTransient(nil) != nil {
+		t.Fatal("MarkGroomingTransient(nil) != nil, want nil passthrough")
+	}
+	if IsGroomingTransient(nil) {
+		t.Error("IsGroomingTransient(nil) = true, want false")
+	}
+	cause := errors.New("githubclient: update issue: 502: bad gateway")
+	marked := MarkGroomingTransient(cause)
+	if marked.Error() != cause.Error() {
+		t.Errorf("marked.Error() = %q, want the cause's text unchanged %q", marked.Error(), cause.Error())
+	}
+	if !errors.Is(marked, cause) {
+		t.Error("errors.Is(marked, cause) = false, want the cause reachable through the mark")
+	}
+	if !IsGroomingTransient(marked) {
+		t.Error("IsGroomingTransient(marked) = false, want true")
+	}
+	if IsGroomingTransient(cause) {
+		t.Error("IsGroomingTransient(unmarked) = true, want false")
+	}
+	wrapped := &PartialGroomingWriteError{Steps: []GroomingMutationStep{GroomingStepEpicEdgeAdded}, Cause: marked}
+	if !IsGroomingTransient(wrapped) {
+		t.Error("IsGroomingTransient(partial wrapping a mark) = false, want true — the core's partial==nil gate is what excludes it")
+	}
+}
+
+// TestGroomingMutationKind_TransientRetrySafe pins the EXACT retry-safe set
+// (#5225): the four single-request kinds whose re-read observes their whole
+// write, and no other. A new kind lands here as a deliberate decision.
+func TestGroomingMutationKind_TransientRetrySafe(t *testing.T) {
+	want := map[GroomingMutationKind]bool{
+		GroomingKindLabelSet:        true,
+		GroomingKindFieldSet:        false,
+		GroomingKindBoardPlace:      false,
+		GroomingKindEpicLink:        false,
+		GroomingKindPrioritySet:     false,
+		GroomingKindRankSet:         false,
+		GroomingKindDependsOnAdd:    true,
+		GroomingKindCloseDuplicate:  true,
+		GroomingKindCloseNotPlanned: true,
+		GroomingKindIcebox:          false,
+	}
+	if len(want) != len(allGroomingKinds) {
+		t.Fatalf("table covers %d kinds, vocabulary has %d — classify the new kind", len(want), len(allGroomingKinds))
+	}
+	for _, k := range allGroomingKinds {
+		if got := k.TransientRetrySafe(); got != want[k] {
+			t.Errorf("%s.TransientRetrySafe() = %v, want %v", k, got, want[k])
+		}
+	}
+	if GroomingMutationKind("").TransientRetrySafe() {
+		t.Error(`"".TransientRetrySafe() = true, want false`)
+	}
+}

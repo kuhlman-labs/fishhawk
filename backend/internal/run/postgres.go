@@ -284,6 +284,7 @@ func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, 
 		DecomposedFrom: f.DecomposedFrom,
 		ParentRunID:    f.ParentRunID,
 		AccountID:      accountIDArg(f.AccountID),
+		NonTerminal:    f.NonTerminal,
 		Lim:            int32(f.Limit),
 		Off:            int32(f.Offset),
 	})

@@ -14889,6 +14889,57 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `grooming_run_parked` (#5225): the resolved workflow is a
+            backlog-grooming workflow (a stage produces the
+            `grooming_report` artifact, the same STRUCTURAL predicate as
+            `charter_required`) and a NON-TERMINAL run of the same repo
+            and workflow, visible to the caller's tenant, has a stage
+            parked at `awaiting_approval` — an unconfirmed groom at its
+            groom gate (plan stage) or its confirm gate (human review
+            stage). No run row is created. `details` carries
+            `workflow_id`, `parked_run_id`, `parked_stage_id`,
+            `parked_stage_type` (`plan` or `review`) and
+            `later_gates_not_evaluated`. The message names the remedy:
+            decide the groom gate (`fishhawk_approve_plan` /
+            `fishhawk_reject_plan`), approve the confirm gate from the
+            operator host with `fishhawk approve-review-gate <run-id>
+            --attest "..."` (human-only), or cancel the parked run
+            (`fishhawk_cancel_run` / `POST /v0/runs/{run_id}/cancel`),
+            then start the groom again.
+
+            Placement: checked directly AFTER the `Idempotency-Key`
+            replay (a replay still returns its run with 200) and BEFORE
+            every other admission gate, so a refused groom appends no
+            `run_admitted_budget_override` /
+            `run_admitted_applies_to_override` grant. The later gates
+            (plan-review capability, blocking budget, `applies_to`,
+            charter) are NOT evaluated for a refused request, so a
+            request they would also refuse gets this code and no
+            `run_rejected_missing_charter` / `run_rejected_misconfigured`
+            entry. An on-demand refusal writes NO audit entry; a
+            scheduled window refused this way is recorded by the
+            scheduler as `scheduled_run_refused`.
+
+            Visibility: the caller's own tenant plus untenanted runs.
+            For an untenanted caller (the scheduler) this is
+            deliberately NARROWER than `GET /v0/runs`: untenanted runs
+            only, so another tenant's parked groom never blocks it or
+            appears in its 409. Runs are currently untenanted at
+            creation, so the tenancy rule is defence in depth today.
+
+            The scan is bounded: at most 50 non-terminal runs, with the
+            terminal filter applied in the store before the limit. A
+            full window with no parked stage, a run-list error and a
+            per-run stage-list error all fail OPEN (the run is admitted
+            and a warning is logged). The check is NOT atomic: two
+            simultaneous starts can both pass it, so it is hygiene
+            against a silent pile-up of parked grooms, not a uniqueness
+            guarantee. There is no override flag.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: |
             Returned when the GitHub-fetch fallback can't resolve

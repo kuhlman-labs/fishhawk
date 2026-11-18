@@ -143,6 +143,15 @@ each scheduled workflow, its cron, the current due window, the next due time
 and the last outcome. When the scheduler is off it answers `enabled: false`
 rather than an error.
 
+`POST /v0/runs` refuses a new backlog-grooming run with 409
+`grooming_run_parked` while an earlier run of the same repo and workflow is
+still open with a stage awaiting approval at its groom or confirm gate. The
+refusal names the parked run in `details.parked_run_id`. To clear it, decide
+the groom gate, approve the confirm gate with `fishhawk approve-review-gate`,
+or cancel the parked run, then start the groom again. A scheduled grooming
+window refused this way shows as a refused outcome on `GET /v0/schedules`. The
+check is not atomic, so two simultaneous starts can both pass it.
+
 A run's `trigger_source` can also be `alert`. Only the alert ingress
 (`POST /v0/triggers/alert`) creates such a run, and only for an alert source
 configured with `auto_start: true`; the setting defaults to `false`. The

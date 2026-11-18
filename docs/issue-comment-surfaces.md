@@ -2681,7 +2681,12 @@ Notes:
   applied, failed AND skipped alike, so one category filter returns the whole
   apply — carrying `{entry_id, class, report_class, kind, item_ref, before,
   after, outcome, skip_reason | refuse_reason | error, provider_response,
-  idempotence_checked, steps_landed}`. **`steps_landed` (E54.15 / #2810)** is the
+  idempotence_checked, steps_landed}`, plus three omitempty retry keys (#5225):
+  `attempts` (how many times the candidate was settled, present only when it
+  was re-settled after a transient failure), `first_error` (the first attempt's
+  error text on such a re-settled row) and `retry_suppressed` (true when a
+  transient failure was NOT re-settled because the apply had reached its
+  per-apply retry cap). **`steps_landed` (E54.15 / #2810)** is the
   PARTIAL-WRITE LEDGER: on a `failed` record for a MULTI-step mutation whose
   FIRST step landed, it names that step (`board_item_added` for a board_place
   whose card was added but whose column write failed; `epic_edge_added` for an
