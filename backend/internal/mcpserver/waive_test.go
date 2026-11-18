@@ -500,3 +500,41 @@ func TestConcernClearTools_SessionRefusalSurfaced(t *testing.T) {
 		}
 	}
 }
+
+// TestWaiveToolsDescribeFalsePositiveReasonShape is the DONE-MEANS pin for
+// #4745 R17 on the SERVED waive surfaces: the reason input schema of BOTH
+// fishhawk_waive_concern and fishhawk_waive_concerns, and the single tool's
+// description, state the expected false-positive reason shape (prefix, then
+// disproving evidence, then the authorizer under delegated authority). The
+// existing reason-prefix rules (R9, already present) stay intact.
+func TestWaiveToolsDescribeFalsePositiveReasonShape(t *testing.T) {
+	for _, tool := range []string{"fishhawk_waive_concern", "fishhawk_waive_concerns"} {
+		reason := fixupGuidanceFlatten(toolInputPropertyDescription(t, tool, "reason"))
+		for _, anchor := range []string{
+			"expected false-positive shape: start with false_positive:",
+			"the evidence that disproves the finding (a file:line, a test name, or a tree sha)",
+			"who authorized the waive when you act on delegated authority",
+		} {
+			if !strings.Contains(reason, anchor) {
+				t.Errorf("R17: %s reason schema lacks %q:\n%s", tool, anchor, reason)
+			}
+		}
+		reviewFilingAssertRepoAgnostic(t, tool+" reason schema", reason)
+	}
+
+	desc := fixupGuidanceDescription(t, fixupGuidanceTools(t), "fishhawk_waive_concern")
+	for _, anchor := range []string{
+		"reason shape for a false positive: start with false_positive:",
+		"then who authorized the waive when you act on delegated authority",
+		"prefer fishhawk_defer_concern so the work stays tracked",
+		// R9 (already present): the prefix rules are unchanged.
+		"reason-prefix rules (waive only)",
+		"a judgement contradicting the prefix is refused",
+	} {
+		if !strings.Contains(desc, anchor) {
+			t.Errorf("R17: fishhawk_waive_concern description lacks %q:\n%s", anchor, desc)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_waive_concern reason-shape guidance",
+		fixupGuidanceSlice(t, desc, "reason shape for a false positive", "reason-prefix rules"))
+}

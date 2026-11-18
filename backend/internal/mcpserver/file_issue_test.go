@@ -569,3 +569,89 @@ func TestFileIssueToolDescribesParentEpicCapRefusal(t *testing.T) {
 		}
 	}
 }
+
+// reviewFilingBannedStrings are the repository-specific values the #4745
+// review/filing folds must never carry in product text (ADR-110): tool
+// descriptions and input schemas are served to every repository.
+var reviewFilingBannedStrings = []string{"kuhlman-labs", "https://github.com/", "scripts/", "backend/internal/"}
+
+// reviewFilingAssertRepoAgnostic fails when text, a newly folded span of a
+// served surface, names a repository-specific value (ADR-110). It also fails on
+// an empty span so an anchor drift cannot make the check pass vacuously.
+func reviewFilingAssertRepoAgnostic(t *testing.T, surface, text string) {
+	t.Helper()
+	if strings.TrimSpace(text) == "" {
+		t.Fatalf("ADR-110 check for %s ran over an empty span", surface)
+	}
+	for _, banned := range reviewFilingBannedStrings {
+		if strings.Contains(text, banned) {
+			t.Errorf("ADR-110: %s names the repository-specific value %q:\n%s", surface, banned, text)
+		}
+	}
+}
+
+// TestFileIssueToolDescribesSearchBeforeFiling is the DONE-MEANS pin for the
+// #4745 filing rules folded into the SERVED fishhawk_file_issue description:
+// R14 (what a degraded intake does and does not mean for duplicate detection,
+// per binding condition W2), R5 (lexical, bounded, every type incl. adr/epic),
+// R15 (a running campaign's items are not scanned), R7 (the cap counts actual
+// sub-issues and {n} is not a capacity reading, per W3) and R13 (a defaulted
+// tier label is not a triage decision). A comment-only or no-op touch of
+// file_issue.go passes a scope check and fails here.
+func TestFileIssueToolDescribesSearchBeforeFiling(t *testing.T) {
+	desc := fixupGuidanceDescription(t, fixupGuidanceTools(t), "fishhawk_file_issue")
+
+	for _, tc := range []struct{ rule, anchor string }{
+		// R14 / W2: degraded is not "no duplicate detection"; the reasons split.
+		{"R14", "degraded:true does not by itself mean duplicate detection was skipped"},
+		{"R14", "a charter-side degrade (charter_undeclared, charter_unresolved, charter_rubric_unparsed, seam_unwired) affects only the structural score"},
+		{"R14", "the duplicate scan still ran and its candidates stay valid"},
+		{"R14", "reader_unavailable or reader_error means the duplicate scan did not complete"},
+		{"R14", "budget_exceeded or hook_panic when scanned_items is 0"},
+		{"R14", "search the tracker yourself before relying on the filing being unique"},
+		{"R14", "by a code symbol or path from the change rather than only by title words"},
+		// R5: lexical, bounded, every type.
+		{"R5", "lexical over a bounded window of the tracker"},
+		{"R5", "it runs for every type, adr and epic included"},
+		{"R5", "search the existing decision records and epics by topic"},
+		// R15: the campaign item list is outside the scan.
+		{"R15", "never a running campaign's item list"},
+		{"R15", "read fishhawk_get_campaign_status items first"},
+		// R7 / W3: the cap counts actual sub-issues; {n} is max+1, not a count.
+		{"R7", "the child cap counts the parent's actual sub-issues"},
+		{"R7", "refused only once the parent is full (details.parent_epic_full, before anything is created)"},
+		{"R7", "is not a capacity reading"},
+		{"R7", "gaps allowed"},
+		{"R7", "create the successor epic before the parent fills"},
+		// R13: a defaulted tier is not triage.
+		{"R13", "is a conventions default, not a triage decision"},
+		{"R13", "set the lowest tier explicitly"},
+		{"R13", "a path the workflow forbids to an agent"},
+	} {
+		if !strings.Contains(desc, tc.anchor) {
+			t.Errorf("%s: fishhawk_file_issue description lacks %q:\n%s", tc.rule, tc.anchor, desc)
+		}
+	}
+
+	// W2: the charter-side sentence must keep the candidates valid, never claim
+	// the scan did not complete; and no sentence may equate degraded:true with
+	// "duplicate detection was not performed".
+	section := fixupGuidanceSlice(t, desc, "search before you file", "epic capacity:")
+	for _, sentence := range strings.Split(section, ". ") {
+		if strings.Contains(sentence, "charter-side degrade") && strings.Contains(sentence, "did not complete") {
+			t.Errorf("W2: the charter-side degrade sentence claims the scan did not complete: %q", sentence)
+		}
+	}
+	for _, wrong := range []string{"degraded:true means duplicate detection", "degraded intake or scanned_items 0 means duplicate detection"} {
+		if strings.Contains(desc, wrong) {
+			t.Errorf("W2: description equates a degraded intake with skipped duplicate detection (%q)", wrong)
+		}
+	}
+	// W3: the ordinal is never presented as tracking the child count.
+	if strings.Contains(desc, "tracks how many children") {
+		t.Errorf("W3: description presents the {n} ordinal as a child count:\n%s", desc)
+	}
+
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_file_issue search/capacity/tier guidance",
+		fixupGuidanceSlice(t, desc, "search before you file", "board placement"))
+}

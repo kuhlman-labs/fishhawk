@@ -23,7 +23,7 @@ type DeferConcernInput struct {
 	N            string   `json:"n,omitempty" jsonschema:"OPTIONAL child number for the [E<epic>.<n>] title (e.g. '4'). The backend now discovers it server-side from the parent epic's existing children (open and closed) and allocates the next one, so you no longer have to guess it (#1958). Pass n only to override that discovery"`
 	Type         string   `json:"type,omitempty" jsonschema:"optional override of the auto-selected work-item type (bug for a defect category, else chore)"`
 	Labels       []string `json:"labels,omitempty" jsonschema:"optional labels merged on top of the type's default labels"`
-	Note         string   `json:"note,omitempty" jsonschema:"optional operator addendum folded into the follow-up body and the concern's state_reason"`
+	Note         string   `json:"note,omitempty" jsonschema:"optional operator addendum folded into the follow-up body and the concern's state_reason. The state_reason reads 'deferred to #N: <note, else the concern's own note>' and later re-reviews of the stage read it VERBATIM as your deferral reason, so make the note self-contained: what is deferred and why it does not block this change"`
 	Judgement    string   `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. No reason-prefix derivation applies to a defer. Missing or invalid: 400 validation_failed, refused before any follow-up is filed"`
 	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement (at most 4000 bytes; refused with rule tradeoff_cost_too_long, never truncated): REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
 }
@@ -78,6 +78,15 @@ The defer:
   - is orphan-issue-safe: an already-resolved concern is rejected before
     any issue is filed, and a filing failure leaves the concern OPEN so
     you can retry.
+
+Defer or waive: prefer defer over waive for a REAL but non-blocking
+finding (a hardening, a missing edge case worth its own change), so the
+work stays tracked; waive is for a finding that warrants no change at all.
+The deferral reason is read by later re-reviews: the concern's state_reason
+('deferred to #N: <note, else the concern's own note>') is shown VERBATIM to
+every later re-review of the stage as the operator's deferral reason, so
+make note self-contained (what is deferred, and why it does not block this
+change) rather than relying on the concern note to explain itself.
 
 You supply only the epic placement the concern cannot carry: parent_epic
 (the epic the follow-up rolls up to). The {n} child number is discovered

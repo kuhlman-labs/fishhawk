@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -3947,4 +3948,76 @@ func TestReviewStatusFor_Implement_CompleteAfterConfirmedSupersession(t *testing
 	if st.Status != "complete" || len(st.Reviews) != 2 {
 		t.Errorf("status = %q with %d reviews, want complete with the 2 round-1 verdicts", st.Status, len(st.Reviews))
 	}
+}
+
+// TestAwaitReviewDescribesFailedReviewIsNotAVerdict is the DONE-MEANS pin for
+// #4745 R18 as refined by binding condition W1 on the SERVED surfaces: a failed
+// review is not a verdict, its reason is the reviewer's own error text (no quota
+// label is promised, W5d), and fishhawk_rerun_review is offered ONLY with its
+// real eligibility (implement round, advisory authority, zero verdicts) — never
+// for a failed plan review or a gating / partly-succeeded round.
+func TestAwaitReviewDescribesFailedReviewIsNotAVerdict(t *testing.T) {
+	desc := fixupGuidanceDescription(t, fixupGuidanceTools(t), "fishhawk_await_review")
+	for _, anchor := range []string{
+		"a failed review is not a verdict",
+		"never count it as an approve or a reject",
+		"read the failure reason to learn which",
+		"with no separate provider or quota label",
+		"take the legal next step from fishhawk_get_run_status next_actions rather than a blanket rerun",
+	} {
+		if !strings.Contains(desc, anchor) {
+			t.Errorf("R18: fishhawk_await_review description lacks %q:\n%s", anchor, desc)
+		}
+	}
+
+	// W1: rerun_review is named exactly once, inside its eligibility bullet.
+	if n := strings.Count(desc, "rerun_review"); n != 1 {
+		t.Errorf("W1: fishhawk_await_review names rerun_review %d times, want exactly 1 (its eligibility bullet):\n%s", n, desc)
+	}
+	rerun := fixupGuidanceSlice(t, desc, "fishhawk_rerun_review is eligible only", "a failed plan review")
+	for _, want := range []string{"implement review round", "advisory authority", "zero verdicts"} {
+		if !strings.Contains(rerun, want) {
+			t.Errorf("W1: the rerun_review bullet does not state its eligibility %q:\n%s", want, rerun)
+		}
+	}
+	plan := fixupGuidanceSlice(t, desc, "a failed plan review", "a gating review")
+	if !strings.Contains(plan, "fishhawk_revise_plan") || !strings.Contains(plan, "fishhawk_approve_plan") {
+		t.Errorf("W1: the failed-plan-review bullet does not route to revise_plan / the approve-or-reject decision:\n%s", plan)
+	}
+	gating := fixupGuidanceSlice(t, desc, "a gating review, or a round where some reviewers succeeded", "a \"confirmed\" concern resolution")
+	if !strings.Contains(gating, "next_actions") {
+		t.Errorf("W1: the gating / partial-round bullet does not name next_actions:\n%s", gating)
+	}
+	for name, span := range map[string]string{"plan": plan, "gating": gating} {
+		if strings.Contains(span, "rerun_review") {
+			t.Errorf("W1: the %s failure bullet offers rerun_review:\n%s", name, span)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_await_review failed-review guidance",
+		fixupGuidanceSlice(t, desc, "a failed review is not a verdict", "a \"confirmed\" concern resolution"))
+
+	// The ReviewStatus.Status tag (served inside fishhawk_get_run_status's
+	// review_status blocks) carries the same rule.
+	schema, err := jsonschema.For[ReviewStatus](nil)
+	if err != nil {
+		t.Fatalf("infer ReviewStatus schema: %v", err)
+	}
+	prop, ok := schema.Properties["status"]
+	if !ok || prop == nil {
+		t.Fatal("ReviewStatus schema has no status property")
+	}
+	status := fixupGuidanceFlatten(prop.Description)
+	for _, anchor := range []string{
+		"is not a verdict",
+		"never counts as an approve or a reject",
+		"read the failure reason",
+		"with no separate provider or quota label",
+		"fishhawk_rerun_review applies only to an implement round of advisory authority that recorded zero verdicts",
+		"otherwise take the legal next step from next_actions",
+	} {
+		if !strings.Contains(status, anchor) {
+			t.Errorf("R18: ReviewStatus.status schema lacks %q:\n%s", anchor, status)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "ReviewStatus.status schema", status)
 }

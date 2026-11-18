@@ -218,3 +218,35 @@ func TestDeferConcern_NoLocalJudgementPreCheck(t *testing.T) {
 		t.Errorf("backend defer called %d times, want 1 (no local judgement pre-check)", fb.deferCalledByID[concernID])
 	}
 }
+
+// TestDeferConcernToolDescribesSelfContainedDeferral is the DONE-MEANS pin for
+// #4745 R6 on the SERVED fishhawk_defer_concern surface: the description and
+// the note input schema both say the state_reason reaches later re-reviews
+// verbatim as the deferral reason (so the note must be self-contained), and the
+// description prefers defer over waive for a real but non-blocking finding.
+func TestDeferConcernToolDescribesSelfContainedDeferral(t *testing.T) {
+	desc := fixupGuidanceDescription(t, fixupGuidanceTools(t), "fishhawk_defer_concern")
+	for _, anchor := range []string{
+		"prefer defer over waive for a real but non-blocking finding",
+		"('deferred to #n: <note, else the concern's own note>')",
+		"is shown verbatim to every later re-review of the stage as the operator's deferral reason",
+		"make note self-contained (what is deferred, and why it does not block this change)",
+	} {
+		if !strings.Contains(desc, anchor) {
+			t.Errorf("R6: fishhawk_defer_concern description lacks %q:\n%s", anchor, desc)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_defer_concern defer-or-waive guidance",
+		fixupGuidanceSlice(t, desc, "defer or waive:", "you supply only"))
+
+	note := fixupGuidanceFlatten(toolInputPropertyDescription(t, "fishhawk_defer_concern", "note"))
+	for _, anchor := range []string{
+		"later re-reviews of the stage read it verbatim as your deferral reason",
+		"make the note self-contained",
+	} {
+		if !strings.Contains(note, anchor) {
+			t.Errorf("R6: fishhawk_defer_concern note schema lacks %q:\n%s", anchor, note)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_defer_concern note schema", note)
+}
