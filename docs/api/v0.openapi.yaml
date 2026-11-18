@@ -2207,8 +2207,11 @@ components:
           description: |
             The executing implement stage's remaining agent wall clock
             (seconds) at request time (#2540): the spec-resolved
-            `agent_timeout_seconds` budget minus the stage's elapsed
-            time. OBSERVABILITY-ONLY — surfaced beside
+            `agent_timeout_seconds` budget minus the current attempt's
+            elapsed time (from its dispatch, so a re-dispatched fix-up
+            pass or retry reports its own per-attempt remainder; #5226). A legacy row
+            with no dispatch clock falls back to the stage's `started_at`.
+            OBSERVABILITY-ONLY — surfaced beside
             `amendment_poll_window_seconds` so an operator can see whether
             a race against the deadline is already lost; it is never a
             refusal (a computed "too short" can be a false positive
@@ -2216,9 +2219,10 @@ components:
             kill a winnable amendment — #2540 approval condition 1).
             Present on the REQUEST response only, and only when the
             deadline derivation did not fail open (unresolvable spec
-            budget, a never-started stage, a non-positive remainder, or a
-            self-retried stage whose cumulative `started_at` understates
-            the remainder); absent otherwise.
+            budget, a stage with no dispatch or start clock, a
+            non-positive remainder, or a self-retried legacy stage with no
+            dispatch clock, whose cumulative `started_at` understates the
+            remainder); absent otherwise.
         amendment_poll_window_seconds:
           type: integer
           description: |
@@ -7361,6 +7365,17 @@ components:
             — the adapter-default spawn, and every stage of a run
             approved before per-stage model selection landed.
           example: claude-opus-4-8
+        review_gate_admission:
+          type: string
+          description: |
+            Workflow-derived routing for a human-executor review stage (#5419),
+            using the same predicate as approval admission. `admitted` means
+            operator confirmation; `pull_request_managed` means forge approval
+            and verified landing. Other values name a resolution failure.
+            Present on stage observability reads for human review stages;
+            omitted on other stages, action responses and older backends.
+            Missing, empty or unknown metadata must never authorize approval.
+          example: pull_request_managed
         agent_timeout_seconds:
           type: integer
           description: |

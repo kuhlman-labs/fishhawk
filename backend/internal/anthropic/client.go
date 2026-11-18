@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"time"
 
-	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	anthropicsdk "github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/option"
 )
 
 // ErrConflictingCredentials is what a Client built with BOTH Config.APIKey and
@@ -96,13 +96,13 @@ type Client struct {
 // Credential contract (E83.96 / #4223) — exactly one credential, or none:
 //
 //	APIKey   AuthToken  wire                              SDK autoloader
-//	set      empty      X-Api-Key: <APIKey>               ON  (unchanged)
+//	set      empty      X-Api-Key: <APIKey>               OFF (explicit SDK v2 credential)
 //	empty    set        Authorization: Bearer <AuthToken> OFF
 //	empty    empty      no credential (#2108)             OFF
 //	set      set        refused: ErrConflictingCredentials, no SDK client, no I/O
 //
-// The AuthToken row never applies option.WithAPIKey: even WithAPIKey("") puts a
-// present-but-empty X-Api-Key header on the wire beside the bearer.
+// The AuthToken row never applies the API-key defaults. The API-key path
+// explicitly sets X-Api-Key and removes the bearer header emitted by SDK v2.
 //
 // Empty-key boundary invariant (#2108): when cfg.APIKey == "" the client
 // appends option.WithoutEnvironmentDefaults(), which makes anthropicsdk.NewClient
@@ -142,6 +142,17 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 			option.WithHTTPClient(&http.Client{Timeout: cfg.Timeout}),
 		}
 	}
+	if cfg.AuthToken == "" {
+		// SDK v2 serializes API keys as bearer credentials. Keep the existing
+		// API-key wire contract, including its empty-key withhold posture.
+		defaults = append(defaults,
+			option.WithHeader("x-api-key", cfg.APIKey),
+			option.WithHeaderDel("Authorization"),
+		)
+	}
+	// Keep the existing wire contract for regional Anthropic-compatible endpoints;
+	// SDK v2 otherwise changes its default API version to 2026-10-21.
+	defaults = append(defaults, option.WithHeader("anthropic-version", "2023-06-01"))
 	if cfg.BaseURL != "" {
 		defaults = append(defaults, option.WithBaseURL(cfg.BaseURL))
 	}

@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -4950,19 +4950,12 @@ func TestNextActions_HumanReviewGate_FeatureChangeUnaffected(t *testing.T) {
 	}
 }
 
-// TestNextActions_HumanReviewGate_PRManagedNotClassified pins the
-// no-pull_request_url guard: the SAME shape carrying a PR is ADR-018
-// PR-merge-managed, where approve-review-gate would be refused 409
-// review_stage_managed_by_github / pull_request_managed — so the arm declines
-// and the run falls through rather than naming a call the backend refuses.
-//
-// COUNTERFACTUAL (executed, #3014): deleting the PullRequestURL guard turns
-// this RED with `state = human_review_gate_parked, want the arm to decline on a
-// PR-managed review gate`. Restored byte-identically afterwards.
+// PR routing follows the declared input, never URL absence as permission.
 func TestNextActions_HumanReviewGate_PRManagedNotClassified(t *testing.T) {
 	run, stages := humanReviewGateWire(t)
 	pr := "https://github.com/x/y/pull/7"
 	run.PullRequestURL = &pr
+	stageByType(stages, "review").ReviewGateAdmission = "pull_request_managed"
 
 	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
 	if na.State == "human_review_gate_parked" {
@@ -5005,7 +4998,7 @@ func TestHumanReviewGateNextActions_ReviewStateGuard(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			stages := []Stage{
 				naStage("plan", "succeeded"),
-				{ID: uuid.NewString(), Type: "review", State: state, Executor: StageExecutor{Kind: "human"}},
+				{ID: uuid.NewString(), Type: "review", State: state, Executor: StageExecutor{Kind: "human"}, ReviewGateAdmission: "admitted"},
 			}
 			if got := humanReviewGateNextActions(run, stages); got != nil {
 				t.Errorf("humanReviewGateNextActions = %+v, want nil for a review stage in %q", got, state)

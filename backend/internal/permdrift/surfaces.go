@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // SurfacesVersion is the version of the product's permission-surface list

@@ -39,7 +39,7 @@ confusing failure rather than as a missing dependency.
 | You need | Why | Confirm with |
 |---|---|---|
 | Git | You clone the Fishhawk repository to build from, and Fishhawk drives git in your repository | `git --version` |
-| [Go](https://go.dev/dl/) 1.25.0 or newer | Every module in the workspace declares `go 1.25`/`go 1.25.0`; an older toolchain refuses the build outright | `go version` |
+| [Go](https://go.dev/dl/) 1.27.0 or newer | Every module in the workspace declares `go 1.27.0`; an older toolchain refuses the build outright | `go version` |
 | A container runtime with Compose v2 | `make up` shells to `docker compose up -d` for Postgres and RustFS | `docker compose version` |
 | `make` | The repository's loops are Makefile targets | `make --version` |
 | The [Claude Code](https://claude.com/claude-code) CLI on `PATH` as `claude`, with `ANTHROPIC_API_KEY` exported | The runner spawns that binary for the default `claude-code` executor and reads that variable for the key | `claude --version` |

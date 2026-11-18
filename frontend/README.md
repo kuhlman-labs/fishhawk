@@ -1,7 +1,7 @@
 # Fishhawk Web UI
 
 The browser surface for plan review, approval, audit log search, and
-run visualization. Vite + React 19 + React Router 7 + TypeScript,
+run visualization. Vite + React 19 + React Router 8 + TypeScript,
 styled with Tailwind CSS v4 + shadcn/ui (per
 [ADR-004](https://github.com/kuhlman-labs/fishhawk/issues/68)).
 
@@ -51,7 +51,11 @@ changes don't pay the install/test cost.
 
 ## Develop
 
-Requires Node 22+ and pnpm 10+.
+Requires Node 22 (22.23.4+), 24 (24.15+), or 26+ and the pinned pnpm 12.21.0.
+CI and the gate image use Node 26.13.1. Settings live in `pnpm-workspace.yaml`:
+`allowBuilds` preserves the install-script allowlist. `pmOnFail: ignore` keeps
+the lockfile to one YAML document for GitHub dependency alerts, while
+`engines.pnpm` rejects an install with a version other than `packageManager`.
 
 ```sh
 pnpm install
@@ -61,6 +65,18 @@ pnpm lint
 pnpm test         # vitest, jsdom
 pnpm build        # tsc -b + vite build → dist/
 ```
+
+### Lint dependency override
+
+ESLint 10.15 uses minimatch 11 directly. TypeScript-ESLint 8.72.2 still
+declares minimatch 10, so `overrides` in `pnpm-workspace.yaml` pins only
+`@typescript-eslint/typescript-estree>minimatch` to 11.0.8. The parser uses
+the named `minimatch` export with `{ dot: true }` to match project-service
+allowlist paths; `dependency-chain.test.ts` exercises that consumer with
+matching, dotfile, and excluded paths. The override fits the existing Node
+22.23.4+ baseline. Remove it once an upstream TypeScript-ESLint release resolves
+minimatch 11.0.1 or newer without the override, then regenerate the lockfile
+and run the frontend checks.
 
 For backend talkback, run `fishhawkd serve` in another terminal; the
 Vite dev server proxies `/v0/*` to `http://localhost:8080` so the

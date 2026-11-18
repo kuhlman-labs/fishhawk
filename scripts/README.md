@@ -5,6 +5,23 @@ Operator/dev tooling. This file holds the long-form contracts for
 § "Build, test, lint" carries the rules an agent needs up front and points
 here for the mechanism, residuals and issue history.
 
+## Makefile verification targets
+
+The convenience targets delegate to the maintained repository commands:
+
+| Make target | Command / contract |
+| --- | --- |
+| `test-go` | `scripts/test test`: every module, race detection, repository timeout, container leases and aggregated failures |
+| `lint-go` | `scripts/test lint`: pinned host-toolchain preflight and per-checkout lint cache |
+| `coverage` | `scripts/test coverage`: every module, aggregate threshold and generated-`/db/` exclusion owned by the wrapper |
+| `test-frontend` | Frozen install with lifecycle scripts disabled, then `pnpm test` |
+| `lint-frontend` | The same install policy, then `pnpm lint` and `pnpm typecheck` |
+
+`make coverage` always uses the repository's aggregate coverage policy. The
+Makefile keeps no separate threshold or backend-only coverage calculation.
+`make test` and `make lint` compose their Go and frontend targets; full final
+verification remains `scripts/verify-change`.
+
 ## `scripts/test verify`: the lint and schema-sync legs (#1064 / #1772)
 
 `cmd_verify` takes the verify lock (see "Scoped verify + the per-repository
@@ -13,13 +30,62 @@ doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
 gate, the site IA gate, the ADR record gate, the gate-image pin check
 (`_verify_gate_image_pins`, E51.17), the pipefail grep guard
 (`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), the agent-context
-gate (`_verify_agent_context`, #4886), and finally
+gate (`_verify_agent_context`, #4886), the offline skill-fact warning check
+(`_verify_skill_facts`, #3943), and finally
 the test loop (scoped, or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
 coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
 loop). `verify --no-tests` stops before the test loop; see "Gate image" below.
 The legs stay inline in `cmd_verify`: `scripts/test-patch-coverage` (a) and
 `scripts/test-schema-sync-verify` (a) assert their order by reading that
 function's body with `declare -f`.
+
+### Repeated skill facts (#3943)
+
+`scripts/check-skill-facts` compares exact literals in
+`.agents/skills/*/SKILL.md` with an explicit table in that script. It uses only
+Python's standard library and local source files: no tool execution, package
+installation, registry lookup, credentials or network. `--root PATH` selects a
+fixture or checkout. Literal-free references to canonical files remain valid.
+This is a bounded inventory, not a generic numerical or natural-language scan.
+
+| Fact | Canonical extraction | Skill literal context |
+| --- | --- | --- |
+| Go toolchain | `GO_VERSION` in `deploy/gate-image/Dockerfile` | `goM.m.p` or `go-version` |
+| Go workspace directive | `go` directive in `go.work` | `go.work` followed by `go M.m.p` on the same line |
+| golangci-lint | `GOLANGCI_LINT_VERSION` in the gate Dockerfile | exact command, URL or named version/pin |
+| Helm | `HELM_VERSION` in the gate Dockerfile | `helm vM.m.p` (case-insensitive) |
+| check-jsonschema | `CHECK_JSONSCHEMA_VERSION` in the gate Dockerfile | command/version or `check-jsonschema==M.m.p` |
+| pnpm | `packageManager` in `frontend/package.json` | `pnpm@M.m.p` or named version |
+| Redocly CLI | `@redocly/cli@M.m.p` in `.github/workflows/ci.yml` | the same package/version form |
+| actionlint | `actionlint@vM.m.p` in `.github/workflows/ci.yml` | command/version or install form |
+| Patch coverage | `FISHHAWK_PATCH_COVERAGE_THRESHOLD` default in `scripts/test` | patch-coverage percentage or `--diff-threshold` |
+| Aggregate coverage | `check-coverage.py --threshold` invocation in `scripts/test` | aggregate-coverage percentage |
+
+Each source must yield one distinct value, even when no skill repeats that
+fact. Missing, unreadable, external or ambiguous inputs fail. Skill diagnostics
+name the path, line, observed value, expected value and source, and identify the
+repair as operator-authored: implement stages cannot edit `.agents/**`.
+Concrete examples and fenced commands are checked too; use canonical references
+for historical or illustrative versions rather than embedding stale pins.
+Minor-family descriptions such as `golangci-lint v2.x` are not exact pins.
+
+Enforcement is explicit: `scripts/test verify` (including the runner gate and
+`--no-tests`) calls `--warn-only`, which relaxes **skill drift only**. A missing
+checker or malformed canonical input still fails. The always-on required CI
+`repository-checks` job also runs the default strict command; stale skill facts
+cannot pass `CI Pass`. An implementer seeing a warning files the operator
+follow-up, and the operator updates the protected skill in the pin-change PR
+before CI passes. Do not retry a run merely to repair a forbidden skill file.
+This ordering prevents a blocking local gate from stranding an implement stage.
+
+The catch table, harness registration and enforcement policy are ADR-121 Tier-I
+judge inputs, reviewed/adopted through the human-led route. New facts need source
+and skill fixtures, leg-input registration and documentation in this table.
+`test-skill-facts` exercises every binding, source changes, strict/warning modes,
+real verify wiring and a counterfactual with one catch rule removed. Existing
+`check-gate-image` keeps executable CI/image pins consistent; this checker adds
+skill drift only. Release-ref existence is an online CI/preflight concern and
+is not claimed by this offline check. Bootstrap work remains #5442.
 
 ### Lint
 
@@ -76,7 +142,7 @@ After the host check, `cmd_lint` runs `_export_lint_cache`, which resolves
 1. A NON-EMPTY value is left untouched. The runner's `withIsolatedLintCache`
    gates, the gate image's `/lintcache` and an operator's explicit choice all
    win. An EMPTY value counts as unset, as golangci-lint itself treats it
-   (the pinned v2.12.2 `golangci-lint cache status` reports the default dir).
+   (the pinned v2.15.0 `golangci-lint cache status` reports the default dir).
 2. `GITHUB_ACTIONS=true` leaves it unset. A hosted job has one checkout, and
    `ci.yml`'s "Cache golangci-lint analysis cache" step restores the default
    `~/.cache/golangci-lint`. This branch trusts the environment: a
@@ -110,7 +176,7 @@ foreign path. A removed peer logs `Can't process results by
 generated_file_filter processor: ... failed to get doc (strict) ... no such
 file or directory`, an edited one no longer carries the `//nolint`, and either
 way the suppressed finding comes back as `../<other-tree>/x.go`. The evidence is empirical, against the pinned
-golangci-lint v2.12.2: `scripts/test-lint-cache`'s R1/R2 arms go RED with the
+golangci-lint v2.15.0: `scripts/test-lint-cache`'s R1/R2 arms go RED with the
 `_export_lint_cache` call deleted. It reproduces with and without
 `GOFLAGS=-trimpath`, so `-trimpath` is not the trigger. `GOCACHE`, `GOFLAGS`
 and `GOMODCACHE` are never touched: the Go build cache stays shared. #1796's
@@ -827,7 +893,7 @@ fi
 ## Required GitHub Actions validation (#4885)
 
 `ci.yml` owns the required `CI Pass` rollup. Its always-on
-`repository-checks` job runs `scripts/test verify --no-tests`, the recorded
+`repository-checks` job runs `scripts/test verify --no-tests`, strict `scripts/check-skill-facts`, the recorded
 review-prompt evidence check, actionlint, and `test-ci-workflows.py`.
 All hosted workflows pin Ubuntu 24.04 (`ubuntu-24.04-arm` for native ARM).
 The `ubuntu-latest` migration to 26.04 (actions/runner-images#14748) must not
@@ -1413,7 +1479,7 @@ LEASE GENERATION:
 
 ### Anonymous volumes ([#3710](https://github.com/kuhlman-labs/fishhawk/issues/3710))
 
-`postgres:16-alpine` declares `VOLUME /var/lib/postgresql/data`, so every
+`postgres:16.16-alpine` declares `VOLUME /var/lib/postgresql/data`, so every
 container `scripts/test` creates gets a fresh ANONYMOUS volume. `docker rm -f`
 without `-v` leaves that volume behind, and with ryuk disabled nothing else
 reaped it — one leaked volume per invocation, which reached ~1,150 volumes
@@ -1550,6 +1616,23 @@ starts its OWN anonymous containers with a `t.Cleanup` that terminates each on
 the start-error path too, since testcontainers-go hands back a non-nil running
 container ALONGSIDE a start error and with ryuk disabled nothing else reaps it
 (#3122).
+
+Raw migration fixtures bound concurrent Docker startup and mapped-port inspection
+with a package-local admission limit (#5428). The slot is released once the
+fixture URL is resolved, before migration assertions run; every test retains
+its own container and cleanup. Admission and startup have separate bounded
+budgets, so a queued fixture keeps its full startup window. Their base budgets
+and the readiness limit live in `postgres_test.go` and use `timescale.D`.
+Admission cancellation/deadline is reported as `raw postgres startup admission`,
+distinct from a Docker start, connection-string lookup or SQL failure. A slow
+successful admission logs its wait and the limit. This bounds one test binary's
+startup pressure; it is not a daemon-wide quota or proof that Docker cannot stall.
+
+`raw_start_test.go` drives the shipped starter with a fake Docker constructor and
+virtual-time synchronization: it bounds starts through port inspection, retains
+distinct fixtures, releases slots before cleanup and on errors/panic/Goexit, and
+checks that queueing cannot consume the startup budget. External-server fixtures
+continue using fresh raw databases without entering the Docker admission path.
 
 With the N-container start storm gone, `scripts/test` (default and `coverage`)
 restored `go test -p "${FISHHAWK_TEST_P:-4}"` (the 2→4 bump was gated on a -p 4
@@ -4553,7 +4636,7 @@ still renders what the docs claim. It drives the REAL chart through
 | r15 | REGISTRY EXISTENCE of every third-party image the chart RENDERS (#2913). A rendered-output gate structurally CANNOT catch a nonexistent tag — the manifest is valid YAML and the rustfs bucket-bootstrap Job is a Helm HOOK, so a bad pin surfaces only as a `helm upgrade` timeout. r15a is the PURE classifier table (`_registry_verdict`: 200→exists, 404→missing, else→indeterminate) plus the probe degrades (non-Docker-Hub / digest / tagless →unsupported, unreachable token endpoint →indeterminate, AND — the manifest-HEAD twin — a reachable-auth-but-unreachable-registry `FISHHAWK_REGISTRY_URL=http://127.0.0.1:1` →indeterminate, exercising the `curl -I` 000 branch live rather than only via the pure classifier — the `FISHHAWK_REGISTRY_AUTH_URL` / `FISHHAWK_REGISTRY_URL` overrides make both skip branches testable). BOTH curls in `_registry_probe` carry `--connect-timeout` + `--max-time` (overridable via `FISHHAWK_REGISTRY_CONNECT_TIMEOUT` / `FISHHAWK_REGISTRY_MAX_TIME`) so an endpoint that ACCEPTS a connection but never responds cannot block verify indefinitely (high untested-path, #2913): a python3-guarded localhost mock (`_r15_mock_server`, TEST-ONLY, skipped-with-reason when python3 is absent) drives the accept-but-never-respond STALL on both the token curl (blackhole endpoint) and the manifest HEAD (token-ok endpoint that stalls non-token requests), and each assertion checks the probe RETURNS within a bound (a MISSING `--max-time` shows as a ~20s stall, the deletion-observed control); the same token-ok mock, pointed at a REFUSING registry, deterministically exercises the manifest-HEAD 000 branch (token fetched OK first, unlike the offline-fragile twin above). These stall tests are gated out of the r15e self-exec child so it stays cheap. r15b is the anti-vacuity SENTINEL: it probes `rustfs/rustfs:RELEASE.2025-01-20T14-49-07Z` — a MinIO-style date tag that cannot exist in rustfs's semver-tagged repository (operator-verified 404 on 2026-09-13) — and requires `missing`, else it SKIPS the live probes so an unreachable/rate-limited registry can never green r15c. **The sentinel MUST be a missing TAG in an EXISTING repository (#3386):** Docker Hub answers a manifest HEAD for a nonexistent REPOSITORY with 401, which classifies `indeterminate`, so when `minio/mc` was deleted repository-wide the original `minio/mc:…` sentinel stopped classifying `missing` and r15 silently skipped every live probe — the gate was vacuous with no signal until the sentinel moved. r15c renders `values-local`, sanity-checks that BOTH `rustfs/rustfs:` and `amazon/aws-cli:` were extracted, and requires every third-party image to probe `exists` (`missing` FAILS naming the ref; `indeterminate`/`unsupported` skips) AND requires at least one ref to have positively probed `exists` — `_r15_probe_refs` emits a trailing `__r15_exists__ <n>` count so r15c's return-0 pass branch cannot collapse "every ref verified exists" into "every ref was SKIPPED indeterminate" (a per-ref 429 storm landing after the sentinel passed); zero-exists here FAILS rather than vacuously passing (low untested-path, #2913). r15d is the COUNTERFACTUAL: render with the sentinel's nonexistent tag as `rustfs.bootstrapImage` (the #2913 shape) and require the same detector to report it missing. r15e is the END-TO-END degraded-network run: it re-execs the whole harness with `FISHHAWK_HELM_RENDER_SELFTEST=1 FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1` (the self-test flag makes the child skip r1–r14 and re-enter only r15, so it is cheap and does not recurse), driving the sentinel to `indeterminate` so the r15b skip branch fires, and asserts the complete harness still exits 0 while printing the skip reason — proving the degraded-network path never red-lines verify. **SECURITY (ADR-029 / #650): the `FISHHAWK_REGISTRY_AUTH_URL` / `FISHHAWK_REGISTRY_URL` overrides exist for local skip-path testing only; the probe carries NO credentials beyond the anonymous, short-lived, pull-scoped Docker Hub token it fetches per-ref, so an override that redirects that token to another host discloses nothing sensitive.** **Two residuals, both deliberate.** (1) The `helm`/`curl`-absent AND registry-unreachable/rate-limited cases SKIP with a printed reason and exit 0 — the chart's image pins are UNGUARDED there, the same honest residual shape as the helm-absent skip. (2) SHARED DEPENDENCE (binding condition 4, #2913): r15b's sentinel and r15d's counterfactual both hinge on a live 404 for that one tag, so if Docker Hub ever PUBLISHES it, r15b skips and r15d skips WITH it — the counterfactual guard quietly disables itself. Named here rather than mitigated; a second never-published sentinel ref would be the fix if it ever fires |
 | r16 | the GitHub App OFF posture (E69.3 / #2914): `values-local` ships the App off because a placeholder PEM cannot parse and fishhawkd parses it EAGERLY at boot, so a committed placeholder crashloops the pod. r16a asserts the rendered ConfigMap carries NEITHER `FISHHAWKD_GITHUB_APP_ID` NOR `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE` (`assert_field_absent`, KEY position); r16b asserts the rendered Secret carries no dotted `github-app-private-key.pem` key AND no `BEGIN RSA PRIVATE KEY` / `DEV-PLACEHOLDER` body appears anywhere in the release (the placeholder is GONE, not relocated); r16c asserts the Deployment has no `github-app-private-key` volume and no mount at the PEM path; r16d is the POSITIVE anti-vacuity case — `values-local` PLUS the README's documented enable overrides renders BOTH env keys and the volume + mount, so r16a–c cannot be greened by a chart that dropped the App path entirely; r16e is CROSS-BOUNDARY — greps `backend/cmd/fishhawkd/` for the joint-requirement text (`both --github-app-id and --github-app-private-key-file required`) and the App-absent warn text (`webhook dispatch and GitHub-side actions will be disabled`), both copied VERBATIM from `serve.go`, so a `serve.go` change that makes the App mandatory reddens this gate instead of silently reinstating the crashloop |
 | r17 | SELECTOR INTEGRITY (E69.5 / #2916): the allInOne fishhawkd Service + Deployment carry an `app.kubernetes.io/component: server` discriminator so they select ONLY the fishhawkd pod, not the postgres/rustfs/jaeger pods or the migrate/rustfs-bucket hook Job pods (all sharing the same bare `name`+`instance` labels). Four named assertions, ALL run in BOTH allInOne and split renders over a pod universe that INCLUDES the two Job pod templates (they satisfy today's buggy bare `svc/fishhawk` selector, so they are part of the shipped defect, not a hypothetical): r17a — every rendered Service selects EXACTLY ONE workload pod set (a pod satisfies a selector when every selector `key:value` is in the pod labels); r17b — `svc/fishhawk`'s selector is the FULL `{name,instance,component}` set (`server` allInOne, `api` split), a discriminator-only check would prove the discriminator not the selector; r17c — every Deployment's `spec.selector.matchLabels` identity set EQUALS its pod-template identity set (equality, not subset, so a dropped component reddens it), and the primary Deployment carries the full expected set; r17d — no pod set satisfies two DISTINCT Deployment selectors. A Job's OWN selector is controller-generated from a controller-uid and is never rendered by the chart, so Jobs enter r17a/r17d as candidate PODS only, never as an overlapping selector; the harness asserts the Job pods' component values (`migrate`, `rustfs-bucket`) by rendered output. Parsing is `awk`-only (no yq/PyYAML): `docs_of_kind` splits the render on `---` into per-kind documents, `identity_labels`/`identity_lines` extract the `app.kubernetes.io/{name,instance,component}` set at KEY position (dropping `helm.sh/chart`/`version`/`managed-by`/`pod-template-hash`, so a sibling label cannot perturb the set) for r17b/r17c/r17d, `all_labels` extracts the COMPLETE label set that r17a matches over (so a Service selector carrying an extra key absent from the pod — which would select zero pods — reddens r17a rather than being silently ignored, high/test_vacuity #2916), and `selector_matches` tests the subset relation. The COUNTERFACTUAL RECORD is the M0–M4 mutation-to-verdict matrix in the r17 header comment of `scripts/test-helm-render`: M0 control a/b/c/d GREEN; M1 (drop component from the Deployment selector) c+d RED; M2 (drop from the pod labels) a+c RED; M3 (drop from the Service selector arm) a+b RED — a reports the observed count `!= 1`, not a hardcoded six; M4 (role `server`→`api` in both selector+pod, Service still `server`) a RED plus the r17c full-expected-set pin RED (a condition-2 strengthening beyond the plan's pre-condition matrix). Every assertion is reddened by at least one mutation |
-| r18 | RUSTFS DONE-MEANS + BOOTSTRAP-SCRIPT BEHAVIOUR (#3386). MinIO's images were deleted from Docker Hub, so the in-cluster store moved to `rustfs/rustfs` (`minio.*` → `rustfs.*`, chart 0.4.0) and the bucket-bootstrap hook Job was re-implemented on the AWS CLI; both are YAML + an inline shell script no compiler checks. r18a asserts from the rendered rustfs Deployment: `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` env (without them the container falls back to built-in credentials and fishhawkd's static-cred client is refused), readinessProbe `path: /health` (rustfs answers 503 on `/`), and pod `fsGroup: 10001` (the image uid; an un-writable PVC mount fails readiness). r18b asserts the rustfs-bucket Job renders `amazon/aws-cli:2.36.44`, a `/bin/sh` command (a k8s `command` overrides the image's `aws` ENTRYPOINT), and a script carrying `set -e`, the `s3api list-buckets` readiness retry, `head-bucket`, `create-bucket`, and `addressing_style = path` (with a custom `--endpoint-url` the CLI would otherwise address `<bucket>.<service>:9000`, unresolvable in cluster DNS). r18c asserts no `minio/` image ref survives the values-local render. r18d asserts the renamed dev-only guard fails closed (`profile=prod` + `rustfs.enabled` + default secretKey → non-zero naming `rustfs.secretKey`; an overridden key renders). **r18e is BEHAVIOURAL (approval condition 1 on #3386): a render assertion reads the command TEXT and cannot observe its exit status, so `_r18_job_script` EXTRACTS the script from the rendered Job and `_r18_run_script` RUNS it under a stubbed `aws` (injected head-bucket / create-bucket exit codes, an injected count of initially-failing list-buckets probes) plus a no-op `sleep`:** (a) bucket absent + create succeeds → exit 0, create attempted, the path-style config file written; (b) bucket exists → exit 0 and NO create attempted (a rerun is idempotent); (c) bucket absent + create FAILS → NON-ZERO exit with stderr naming the failure and no "ready" line — the case the pre-condition `head-bucket \|\| create-bucket; echo` script passed silently, masking a missing bucket behind a clean `helm install`; (d) two failing list-buckets probes → the retry loop runs three probes and exits 0. COUNTERFACTUALS (observed): deleting `set -e` + the `\|\| { …; exit 1; }` handler from `rustfs-bucket-job.yaml` reddens r18e-c (exit 0 via the trailing echo) and the `set -e` pin; deleting the guard clause in `_helpers.tpl` reddens r18d; dropping fsGroup / the secret env / the `/health` path reddens each r18a pin; renaming the Job pod component reddens r17 in both modes |
+| r18 | RUSTFS DONE-MEANS + BOOTSTRAP-SCRIPT BEHAVIOUR (#3386). MinIO's images were deleted from Docker Hub, so the in-cluster store moved to `rustfs/rustfs` (`minio.*` → `rustfs.*`, chart 0.4.0) and the bucket-bootstrap hook Job was re-implemented on the AWS CLI; both are YAML + an inline shell script no compiler checks. r18a asserts from the rendered rustfs Deployment: `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` env (without them the container falls back to built-in credentials and fishhawkd's static-cred client is refused), readinessProbe `path: /health` (rustfs answers 503 on `/`), and pod `fsGroup: 10001` (the image uid; an un-writable PVC mount fails readiness). r18b asserts the rustfs-bucket Job renders `amazon/aws-cli:2.40.3`, a `/bin/sh` command (a k8s `command` overrides the image's `aws` ENTRYPOINT), and a script carrying `set -e`, the `s3api list-buckets` readiness retry, `head-bucket`, `create-bucket`, and `addressing_style = path` (with a custom `--endpoint-url` the CLI would otherwise address `<bucket>.<service>:9000`, unresolvable in cluster DNS). r18c asserts no `minio/` image ref survives the values-local render. r18d asserts the renamed dev-only guard fails closed (`profile=prod` + `rustfs.enabled` + default secretKey → non-zero naming `rustfs.secretKey`; an overridden key renders). **r18e is BEHAVIOURAL (approval condition 1 on #3386): a render assertion reads the command TEXT and cannot observe its exit status, so `_r18_job_script` EXTRACTS the script from the rendered Job and `_r18_run_script` RUNS it under a stubbed `aws` (injected head-bucket / create-bucket exit codes, an injected count of initially-failing list-buckets probes) plus a no-op `sleep`:** (a) bucket absent + create succeeds → exit 0, create attempted, the path-style config file written; (b) bucket exists → exit 0 and NO create attempted (a rerun is idempotent); (c) bucket absent + create FAILS → NON-ZERO exit with stderr naming the failure and no "ready" line — the case the pre-condition `head-bucket \|\| create-bucket; echo` script passed silently, masking a missing bucket behind a clean `helm install`; (d) two failing list-buckets probes → the retry loop runs three probes and exits 0. COUNTERFACTUALS (observed): deleting `set -e` + the `\|\| { …; exit 1; }` handler from `rustfs-bucket-job.yaml` reddens r18e-c (exit 0 via the trailing echo) and the `set -e` pin; deleting the guard clause in `_helpers.tpl` reddens r18d; dropping fsGroup / the secret env / the `/health` path reddens each r18a pin; renaming the Job pod component reddens r17 in both modes |
 | r19 | CONFIG/SECRET CHECKSUM ANNOTATIONS (E69.71 / #3577). Every `FISHHAWKD_*` value reaches the container via `envFrom`, read ONCE at container start, so a values change touching only the ConfigMap or only the Secret left the Deployment manifest byte-identical — `helm upgrade` exited 0, `kubectl rollout status` reported success, and the pod kept serving the OLD configuration (the dangerous case being a credential rotation). The chart now hashes the rendered ConfigMap/Secret into the pod template via ONE `fishhawk.configChecksumAnnotations` define at FOUR call sites. r19a asserts the allInOne `fishhawk` Deployment AND the `fishhawk-migrate` hook Job each carry `checksum/config` + `checksum/secret` matching `^[0-9a-f]{64}$` (the hex SHAPE, so a template typo rendering an empty or error string is caught, not mere presence); r19b asserts the same for split mode's `-api` and `-worker` Deployments — together all four workloads, which is what goes red when three templates are wired and one is missed. **r19c is the DONE-MEANS case:** two renders differing only in `secrets.values.anthropicApiKey`, asserting `checksum/secret` DIFFERS while `checksum/config` is IDENTICAL — the exact property #3577 reports as missing, and what a comment-only touch of the four templates cannot satisfy. r19d is its mirror over `config.s3Region` (config moves, secret held identical); the PAIR is what proves each annotation tracks its OWN object, since a single annotation hashing both would pass r19c alone. r19e pins idempotence — identical inputs produce identical checksums, so the fix cannot degrade into restarting the pod on EVERY upgrade. r19f/r19g are the two named modes of the `chartManaged` guard (`existing`, `externalSecrets`): the render SUCCEEDS, `checksum/config` is present and 64-hex, and `checksum/secret` is ABSENT at YAML KEY position (`assert_field_absent`) — under those modes the chart does not own the Secret's contents, so a constant `sha256 ""` would falsely imply an out-of-band rotation is tracked. r19h lints the chartManaged and split renders. Parsing is STRUCTURAL (`pod_template_annotations` scopes to `spec.template` FIRST): the migrate Job carries an `annotations:` block at JOB-metadata level too (the `helm.sh/hook` keys), so a document-wide `grep -F checksum/config` over a multi-workload render is satisfied by ONE workload while another silently lost the annotation. COUNTERFACTUALS (observed, recorded as the C1/C2 matrix in the r19 header): C1 deleting the `checksum/config` line from the define → 8 FAILs (r19a, r19b, r19d, and the `checksum/config` hex arms of r19f/r19g); C2 deleting the `{{- if eq .Values.secrets.mode "chartManaged" }}` guard so `checksum/secret` is emitted unconditionally → r19f + r19g RED on `assert_field_absent`, the bad state seeded BY CONSTRUCTION since the non-chartManaged modes render no Secret at all |
 
 Every failure case asserts BOTH a non-zero exit AND the expected
@@ -4810,7 +4893,7 @@ visible sooner. The base ref goes through `env:`, not an inline
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
           cache-dependency-path: '**/go.sum'
 
@@ -4870,6 +4953,12 @@ guards stay exit 2 under deletion (a downstream redirect or ref-resolution
 failure also exits 2), so c19 and c23 assert the guard's own message.
 
 ## Workflow verification (`scripts/verify-change`)
+
+The frontend's pnpm 12 offline install uses both the image's package store and
+public registry metadata cache. Publication-time checks remain enabled. Keep
+`frontend/pnpm-workspace.yaml` in the gate-image build inputs, and preserve a
+single-document pnpm lockfile so GitHub dependency alerts remain available.
+
 
 The repository's feature, hotfix and routine implement stages execute `scripts/verify-change`, which runs `scripts/check-frontend` when the merge-base-to-worktree diff or untracked paths touch `frontend/`, the wrapper/check script, the gate image, or frontend CI. Deletions and both rename sides count; NUL-delimited paths preserve whitespace/newlines. An unavailable base or failed path inventory widens to frontend checking. The base defaults to `origin/main`; `FISHHAWK_DIFF_BASE` is the existing development-only override. Scoped Go verification never narrows the frontend leg.
 

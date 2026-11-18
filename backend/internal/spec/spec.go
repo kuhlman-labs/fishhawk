@@ -25,7 +25,7 @@ import (
 	"sort"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Duration wraps time.Duration so YAML/JSON values like "30m" or "10m"

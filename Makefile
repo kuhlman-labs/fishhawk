@@ -15,7 +15,6 @@ export
 endif
 
 DATABASE_URL ?= $(or $(FISHHAWKD_DATABASE_URL),postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable)
-COVERAGE_THRESHOLD ?= 80
 
 GO_MODULES := $(shell go work edit -json | jq -r '.Use[].DiskPath')
 
@@ -107,20 +106,16 @@ build-frontend: ## Type-check and build the Web UI for production.
 test: test-go test-frontend ## Run every Go module's tests and the Web UI tests.
 
 .PHONY: test-go
-test-go: ## Run `go test -race ./...` across every module in go.work.
-	@for m in $(GO_MODULES); do \
-		echo ">>> test $$m"; \
-		(cd $$m && go test -race ./...) || exit 1; \
-	done
+test-go: ## Run the repository's Go test wrapper across every module.
+	scripts/test test
 
 .PHONY: test-frontend
 test-frontend: ## Run vitest in the Web UI.
-	cd frontend && pnpm install && pnpm test
+	cd frontend && pnpm install --frozen-lockfile --ignore-scripts && pnpm test
 
 .PHONY: coverage
-coverage: ## Reproduce the CI coverage gate (>= 80%, excluding sqlc-generated db).
-	(cd backend && go test -race -coverprofile=coverage.out -covermode=atomic ./...)
-	python3 scripts/check-coverage.py --threshold $(COVERAGE_THRESHOLD) --exclude internal/run/db backend/coverage.out
+coverage: ## Run the repository's aggregate coverage gate across every Go module.
+	scripts/test coverage
 
 # ----- lint / format -------------------------------------------------------
 
@@ -128,15 +123,12 @@ coverage: ## Reproduce the CI coverage gate (>= 80%, excluding sqlc-generated db
 lint: lint-go lint-frontend ## Run all linters.
 
 .PHONY: lint-go
-lint-go: ## Run golangci-lint v2 across every Go module.
-	@for m in $(GO_MODULES); do \
-		echo ">>> lint $$m"; \
-		(cd $$m && golangci-lint run ./...) || exit 1; \
-	done
+lint-go: ## Run the repository's guarded Go lint wrapper.
+	scripts/test lint
 
 .PHONY: lint-frontend
 lint-frontend: ## Run eslint + tsc --noEmit in the Web UI.
-	cd frontend && pnpm install && pnpm lint && pnpm typecheck
+	cd frontend && pnpm install --frozen-lockfile --ignore-scripts && pnpm lint && pnpm typecheck
 
 .PHONY: fmt
 fmt: ## Format Go (gofmt) and frontend (prettier) sources.

@@ -109,7 +109,7 @@ func startContainer() (string, func(), error) {
 	defer cancel()
 
 	container, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
+		"postgres:16.16-alpine",
 		tcpostgres.WithDatabase("fishhawk_directory"),
 		tcpostgres.WithUsername("fishhawk"),
 		tcpostgres.WithPassword("fishhawk"),

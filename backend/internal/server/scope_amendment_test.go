@@ -384,13 +384,17 @@ func requireDeadlineFieldsAbsent(t *testing.T, w *httptest.ResponseRecorder, au 
 // refusal, so a misfire costs at most a hidden number, never a killed amendment.
 // It is the counterfactual vehicle for the selfRetryCount and
 // non-positive-remainder clauses: deleting either fail-open clause makes its row
-// return a positive remainder with ok=true and reddens.
+// return a positive remainder with ok=true and reddens. The dispatchedAt column
+// pins the per-attempt anchor (#5226 gap 3): elapsed is measured from the
+// current attempt's dispatch clock when set, else from the cumulative
+// startedAt, and (d) applies only on that legacy startedAt fallback.
 func TestAmendmentDeadlineRemaining(t *testing.T) {
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 	ago := func(sec int) *time.Time { tt := now.Add(-time.Duration(sec) * time.Second); return &tt }
 	for _, tc := range []struct {
 		name          string
 		budget        int
+		dispatchedAt  *time.Time
 		startedAt     *time.Time
 		selfRetry     int
 		wantOK        bool
@@ -412,9 +416,22 @@ func TestAmendmentDeadlineRemaining(t *testing.T) {
 		// (d) self-retried stage → fail open EVEN with a tight remainder (a
 		// cumulative started_at understates it); proves the clause is load-bearing.
 		{name: "fail-open (d) self-retried tight-looking", budget: 3600, startedAt: ago(3540), selfRetry: 1, wantOK: false},
+		// Per-attempt anchor (#5226 gap 3): a fix-up pass whose cumulative
+		// startedAt predates the whole budget still reports the current
+		// attempt's remainder, measured from dispatchedAt.
+		{name: "fix-up pass anchors on dispatchedAt", budget: 3600, dispatchedAt: ago(30), startedAt: ago(7200), wantOK: true, wantRemaining: 3570},
+		// dispatchedAt alone (no startedAt yet) is a usable clock.
+		{name: "dispatched not yet started", budget: 3600, dispatchedAt: ago(30), startedAt: nil, wantOK: true, wantRemaining: 3570},
+		// A self-retried stage with a dispatch clock is NOT (d): the retry
+		// re-entered dispatched, which re-stamped dispatchedAt.
+		{name: "self-retried with dispatchedAt", budget: 3600, dispatchedAt: ago(30), startedAt: ago(3540), selfRetry: 1, wantOK: true, wantRemaining: 3570},
+		// (d) is retained on the legacy fallback: no dispatch clock, self-retried.
+		{name: "fail-open (d) legacy nil dispatchedAt self-retried", budget: 3600, dispatchedAt: nil, startedAt: ago(60), selfRetry: 1, wantOK: false},
+		// (c) also fires on a stale dispatchedAt whose elapsed exceeds the budget.
+		{name: "fail-open (c) stale dispatchedAt", budget: 3600, dispatchedAt: ago(3700), startedAt: ago(60), wantOK: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gotRemaining, gotOK := amendmentDeadlineRemaining(tc.budget, tc.startedAt, tc.selfRetry, now)
+			gotRemaining, gotOK := amendmentDeadlineRemaining(tc.budget, tc.dispatchedAt, tc.startedAt, tc.selfRetry, now)
 			if gotOK != tc.wantOK {
 				t.Fatalf("ok = %v, want %v (remaining=%d)", gotOK, tc.wantOK, gotRemaining)
 			}
@@ -444,6 +461,10 @@ func TestRequestScopeAmendment_TightRemainderNeverRefuses(t *testing.T) {
 	}
 	started := time.Now().UTC().Add(-time.Duration(budget-60) * time.Second)
 	stage.StartedAt = &started
+	// A post-0072 first attempt: dispatched_at is the attempt clock. Set it
+	// explicitly — the fake's seedStage stamps a 2026-01-01 DispatchedAt that
+	// would otherwise drive the derivation.
+	stage.DispatchedAt = &started
 
 	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
 		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
@@ -501,6 +522,7 @@ func TestRequestScopeAmendment_DeadlineAmpleRemainder(t *testing.T) {
 	}
 	started := time.Now().UTC().Add(-60 * time.Second) // remaining ~ budget-60 >> window
 	stage.StartedAt = &started
+	stage.DispatchedAt = &started // post-0072 row; overrides the fake's 2026-01-01 stamp
 
 	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
 		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
@@ -523,9 +545,12 @@ func TestRequestScopeAmendment_DeadlineAmpleRemainder(t *testing.T) {
 // TestRequestScopeAmendment_DeadlineFailOpen drives each of the FOUR fail-open
 // modes through the real handler and asserts the response omits both deadline
 // numbers AND the audit key set stays exactly today's. Mode (d) is the
-// end-to-end counterfactual for the selfRetryCount clause: with a tight remainder
-// that a cumulative started_at understates, only the clause keeps it fail-open —
-// delete the clause and this row reddens by surfacing the two deadline numbers.
+// end-to-end counterfactual for the selfRetryCount clause on the legacy
+// started_at fallback (DispatchedAt nil): with a tight remainder that a
+// cumulative started_at understates, only the clause keeps it fail-open —
+// disable the clause and this row reddens by surfacing the two deadline numbers.
+// Each subtest sets DispatchedAt explicitly, because the fake's seedStage stamps
+// a 2026-01-01 DispatchedAt on a running stage that would otherwise drive it.
 func TestRequestScopeAmendment_DeadlineFailOpen(t *testing.T) {
 	agent := func(runID uuid.UUID) func(*http.Request) *http.Request {
 		return func(r *http.Request) *http.Request {
@@ -537,11 +562,13 @@ func TestRequestScopeAmendment_DeadlineFailOpen(t *testing.T) {
 		runRow.WorkflowSpec = []byte("this: is: not: valid: yaml: {[") // parse error → resolveAgentTimeout 0
 		started := time.Now().UTC().Add(-60 * time.Second)
 		stage.StartedAt = &started
+		stage.DispatchedAt = &started
 		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
 	})
-	t.Run("(b) never-started stage", func(t *testing.T) {
+	t.Run("(b) never-dispatched, never-started stage", func(t *testing.T) {
 		s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
 		stage.StartedAt = nil
+		stage.DispatchedAt = nil // both clocks absent
 		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
 	})
 	t.Run("(c) non-positive remainder", func(t *testing.T) {
@@ -549,16 +576,109 @@ func TestRequestScopeAmendment_DeadlineFailOpen(t *testing.T) {
 		budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
 		started := time.Now().UTC().Add(-time.Duration(budget+120) * time.Second) // elapsed > budget
 		stage.StartedAt = &started
+		stage.DispatchedAt = &started // the attempt clock itself exceeds the budget
 		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
 	})
-	t.Run("(d) self-retried stage with tight-looking remainder", func(t *testing.T) {
+	t.Run("(d) legacy self-retried stage with no dispatch clock", func(t *testing.T) {
 		s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
 		budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
 		started := time.Now().UTC().Add(-time.Duration(budget-60) * time.Second) // tight, but cumulative
 		stage.StartedAt = &started
-		stage.SelfRetryCount = 1 // but the self-retry clause fails open
+		stage.DispatchedAt = nil // a pre-0072 row: the started_at fallback is taken
+		stage.SelfRetryCount = 1 // and the self-retry clause fails open on it
 		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
 	})
+}
+
+// requirePerAttemptDeadline asserts the request surfaced
+// stage_deadline_seconds_remaining within [budget-120, budget-30] — a remainder
+// measured from a DispatchedAt ~30s ago, not from a cumulative StartedAt — and
+// returns the response value for further checks.
+func requirePerAttemptDeadline(t *testing.T, w *httptest.ResponseRecorder, budget int) int {
+	t.Helper()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StageDeadlineSecondsRemaining == nil {
+		t.Fatalf("stage_deadline_seconds_remaining absent, want ~%d (measured from the current attempt's dispatched_at):\n%s", budget-30, w.Body.String())
+	}
+	rem := *resp.StageDeadlineSecondsRemaining
+	if rem < budget-120 || rem > budget-30 {
+		t.Errorf("stage_deadline_seconds_remaining = %d, want in [%d, %d] (per-attempt, from dispatched_at)", rem, budget-120, budget-30)
+	}
+	if resp.AmendmentPollWindowSeconds == nil || *resp.AmendmentPollWindowSeconds != AmendmentPollWindowSeconds {
+		t.Errorf("amendment_poll_window_seconds = %v, want %d", resp.AmendmentPollWindowSeconds, AmendmentPollWindowSeconds)
+	}
+	return rem
+}
+
+// TestRequestScopeAmendment_FixupPassReportsPerAttemptDeadline pins #5226 gap
+// 3: a fix-up pass whose cumulative StartedAt predates the whole budget, but
+// whose current attempt dispatched 30s ago, reports the per-attempt remainder
+// (~budget-30) on BOTH the response and the scope_amendment_requested audit.
+// Counterfactual: with the call site passing nil for dispatchedAt (the
+// pre-change started_at anchor), remaining = budget - 2*budget < 0, rule (c)
+// fails open, and the field is ABSENT from both surfaces — this test reddens.
+func TestRequestScopeAmendment_FixupPassReportsPerAttemptDeadline(t *testing.T) {
+	s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
+	budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
+	if budget <= 120 {
+		t.Fatalf("test precondition: resolved budget %d must exceed 120s", budget)
+	}
+	now := time.Now().UTC()
+	started := now.Add(-time.Duration(2*budget) * time.Second) // cumulative: the first pass began two budgets ago
+	dispatched := now.Add(-30 * time.Second)                   // the fix-up pass re-dispatched 30s ago
+	stage.StartedAt = &started
+	stage.DispatchedAt = &dispatched
+	stage.SelfRetryCount = 0
+
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	rem := requirePerAttemptDeadline(t, w, budget)
+
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryScopeAmendmentRequested {
+		t.Fatalf("audit = %+v, want one scope_amendment_requested entry", au.appended)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	got, ok := payload["stage_deadline_seconds_remaining"]
+	if !ok {
+		t.Fatalf("audit missing stage_deadline_seconds_remaining: %v", payload)
+	}
+	if got != float64(rem) {
+		t.Errorf("audit stage_deadline_seconds_remaining = %v, want %d (equal to the response value)", got, rem)
+	}
+}
+
+// TestRequestScopeAmendment_SelfRetriedStageReportsPerAttemptDeadline pins the
+// rule (d) narrowing: a self-retried stage that re-entered dispatched carries a
+// fresh DispatchedAt, so its remainder is the current attempt's and is shown.
+// Counterfactual: with (d) un-narrowed (`if selfRetryCount > 0`), this stage
+// fails open and the field is absent — this test reddens on presence.
+func TestRequestScopeAmendment_SelfRetriedStageReportsPerAttemptDeadline(t *testing.T) {
+	s, _, _, runRow, stage := scopeAmendmentServerWithBudget(t)
+	budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
+	if budget <= 120 {
+		t.Fatalf("test precondition: resolved budget %d must exceed 120s", budget)
+	}
+	now := time.Now().UTC()
+	started := now.Add(-time.Duration(budget-60) * time.Second) // tight, cumulative across the retry
+	dispatched := now.Add(-30 * time.Second)                    // the retry re-dispatched 30s ago
+	stage.StartedAt = &started
+	stage.DispatchedAt = &dispatched
+	stage.SelfRetryCount = 1
+
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	requirePerAttemptDeadline(t, w, budget)
 }
 
 // TestRequestScopeAmendment_FiresPageClassHook is one of the four

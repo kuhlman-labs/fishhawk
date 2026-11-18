@@ -173,7 +173,7 @@ EOF
 
   # --- sub-gate stubs -----------------------------------------------------
   local g
-  for g in sync-schemas check-site-voice check-site-ia check-adr \
+  for g in sync-schemas check-site-voice check-site-ia check-adr check-skill-facts \
            test-check-coverage test-patch-coverage test-container-lease \
            test-dev test-site-voice test-site-ia test-helm-render \
            test-site-reference test-verify-scope test-adr test-is-run-agent; do

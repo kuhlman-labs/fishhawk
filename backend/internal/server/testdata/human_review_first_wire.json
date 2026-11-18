@@ -1,0 +1,139 @@
+{
+  "reviewing": {
+    "run": {
+      "capabilities": {
+        "product_feedback_providers": [
+          "github_projects"
+        ],
+        "slice_integration": {
+          "available": false,
+          "reason": "GitHub not configured"
+        }
+      },
+      "completion_blocked": {
+        "reason": "the run cannot complete while stage review is parked at \"awaiting_approval\", and this run's pull request merge has not been observed yet; POST /v0/runs/{run_id}/record-merge-observation records it off the forge, after which reconcile-merge completes the run",
+        "recovery": "record-merge-observation",
+        "stage_id": "00000000-0000-0000-0000-000000000002",
+        "stage_state": "awaiting_approval",
+        "stage_type": "review"
+      },
+      "cost_usd_total": 0,
+      "created_at": "2026-01-01T00:00:00Z",
+      "default_branch_unresolved_reason": "resolver_unconfigured",
+      "drive": false,
+      "forge": "github",
+      "id": "00000000-0000-0000-0000-000000000001",
+      "lineage_complete": false,
+      "max_retries_snapshot": 1,
+      "pull_request_url": "https://github.com/other/widgets/pull/42",
+      "repo": "other/widgets",
+      "requires_charter": false,
+      "resolved_model": "",
+      "retry_attempt": 0,
+      "runner_kind": "local",
+      "runner_kind_resolved": false,
+      "state": "running",
+      "trigger_ref": null,
+      "trigger_source": "cli",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "workflow_id": "outside_review",
+      "workflow_sha": "fixture"
+    },
+    "stages": {
+      "items": [
+        {
+          "agent_timeout_seconds": 900,
+          "created_at": "2026-01-01T00:00:00Z",
+          "dispatched_at": "2026-01-01T00:00:00Z",
+          "ended_at": null,
+          "executor": {
+            "kind": "human",
+            "ref": "human"
+          },
+          "failure_category": null,
+          "failure_reason": null,
+          "gate": {
+            "type": "approval"
+          },
+          "id": "00000000-0000-0000-0000-000000000002",
+          "resolved_model": "",
+          "review_gate_admission": "pull_request_managed",
+          "run_id": "00000000-0000-0000-0000-000000000001",
+          "sequence": 0,
+          "started_at": "2026-01-01T00:00:00Z",
+          "state": "awaiting_approval",
+          "type": "review",
+          "updated_at": "2026-01-01T00:00:00Z"
+        }
+      ]
+    }
+  },
+  "waiting": {
+    "run": {
+      "capabilities": {
+        "product_feedback_providers": [
+          "github_projects"
+        ],
+        "slice_integration": {
+          "available": false,
+          "reason": "GitHub not configured"
+        }
+      },
+      "completion_blocked": {
+        "reason": "the run cannot complete while stage review is in state \"pending\": \"pending\" is not a merge-supersedable park, so the stage must run, settle or be cancelled",
+        "recovery": "none",
+        "stage_id": "00000000-0000-0000-0000-000000000002",
+        "stage_state": "pending",
+        "stage_type": "review"
+      },
+      "cost_usd_total": 0,
+      "created_at": "2026-01-01T00:00:00Z",
+      "default_branch_unresolved_reason": "resolver_unconfigured",
+      "drive": false,
+      "forge": "github",
+      "id": "00000000-0000-0000-0000-000000000001",
+      "lineage_complete": false,
+      "max_retries_snapshot": 1,
+      "repo": "other/widgets",
+      "requires_charter": false,
+      "resolved_model": "",
+      "retry_attempt": 0,
+      "runner_kind": "local",
+      "runner_kind_resolved": false,
+      "state": "running",
+      "trigger_ref": null,
+      "trigger_source": "cli",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "workflow_id": "outside_review",
+      "workflow_sha": "fixture"
+    },
+    "stages": {
+      "items": [
+        {
+          "agent_timeout_seconds": 900,
+          "created_at": "2026-01-01T00:00:00Z",
+          "dispatched_at": null,
+          "ended_at": null,
+          "executor": {
+            "kind": "human",
+            "ref": "human"
+          },
+          "failure_category": null,
+          "failure_reason": null,
+          "gate": {
+            "type": "approval"
+          },
+          "id": "00000000-0000-0000-0000-000000000002",
+          "resolved_model": "",
+          "review_gate_admission": "pull_request_managed",
+          "run_id": "00000000-0000-0000-0000-000000000001",
+          "sequence": 0,
+          "started_at": null,
+          "state": "pending",
+          "type": "review",
+          "updated_at": "2026-01-01T00:00:00Z"
+        }
+      ]
+    }
+  }
+}

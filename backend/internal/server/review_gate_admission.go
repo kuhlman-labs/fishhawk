@@ -136,15 +136,7 @@ func soleReviewSpecStage(wf spec.Workflow) (spec.Stage, reviewGateAdmitReason) {
 // true`. Checking only one form would admit the other workflow's PR-merge
 // gate.
 func specStageDeclaresPullRequestInput(st spec.Stage) bool {
-	for _, in := range st.Inputs {
-		if in.Source == spec.InputSourcePullRequest {
-			return true
-		}
-		if in.Artifact == string(spec.ArtifactPullRequest) {
-			return true
-		}
-	}
-	return false
+	return spec.StageDeclaresPullRequestInput(st)
 }
 
 // resolveReviewGateAdmission is the ONE predicate deciding whether a review
@@ -168,16 +160,23 @@ func specStageDeclaresPullRequestInput(st spec.Stage) bool {
 // Every resolution failure returns a non-OK reason, which the caller answers
 // with today's 409 — so the fail-closed direction preserves current behavior.
 func (s *Server) resolveReviewGateAdmission(ctx context.Context, stage *run.Stage) reviewGateAdmitReason {
-	if stage == nil || stage.ExecutorKind != run.ExecutorHuman {
-		// LEG 1. The unambiguous leg: mapExecutor persisted this at
-		// stage-create from that spec stage's own executor.
-		return reviewGateAdmitNotHumanRow
-	}
-	if s.cfg.RunRepo == nil {
-		return reviewGateAdmitRunUnavailable
+	if stage == nil || stage.ExecutorKind != run.ExecutorHuman || s.cfg.RunRepo == nil {
+		return reviewGateAdmissionForRun(stage, nil)
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
 	if err != nil {
+		return reviewGateAdmissionForRun(stage, nil)
+	}
+	return reviewGateAdmissionForRun(stage, runRow)
+}
+
+// Shared by approval admission, review-first initialization and read metadata.
+// Reads already holding a run row avoid another lookup per stage.
+func reviewGateAdmissionForRun(stage *run.Stage, runRow *run.Run) reviewGateAdmitReason {
+	if stage == nil || stage.ExecutorKind != run.ExecutorHuman {
+		return reviewGateAdmitNotHumanRow
+	}
+	if runRow == nil {
 		return reviewGateAdmitRunUnavailable
 	}
 	if len(runRow.WorkflowSpec) == 0 {

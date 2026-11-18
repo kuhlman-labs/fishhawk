@@ -30,7 +30,7 @@ Consolidated from the resolved ADRs (#65–#73, #78). Each row links to the issu
 
 | Layer | Choice | ADR |
 |---|---|---|
-| Backend language | Go 1.22+ | MVP_SPEC §10 #1 |
+| Backend language | Go 1.27+ | MVP_SPEC §10 #1 |
 | HTTP server / router | stdlib `net/http` + Go 1.22 method-aware `ServeMux` | session decision (CLAUDE.md) |
 | Logger | `log/slog` (stdlib) with JSON handler | (E3.2 #42) |
 | DB driver / access | `pgx/v5` + `sqlc` codegen; queries in `*.sql`, generated Go in `internal/<feature>/db/` | #66 |
@@ -39,8 +39,8 @@ Consolidated from the resolved ADRs (#65–#73, #78). Each row links to the issu
 | Trace bundle format | JSON Lines + gzip (`*.jsonl.gz`); one event per line with manifest + trailer | #71 |
 | Trace signing | Ed25519 over `sha256(raw_bundle_bytes)`; per-run ephemeral keys, 30-min TTL | #72 |
 | Cloud | AWS (RDS Postgres, S3, ECS Fargate, ALB, Secrets Manager, CloudWatch) | #65, #73 |
-| Frontend framework | Vite 6 + React 19 + React Router 7 (SPA); pnpm 10 | session decision (CLAUDE.md) |
-| Frontend test runner | Vitest 3 + @testing-library/react + jsdom | E7.1 (#37) |
+| Frontend framework | Vite 8 + React 19 + React Router 8 (SPA); pnpm 12 | session decision (CLAUDE.md) |
+| Frontend test runner | Vitest 5 + @testing-library/react + jsdom | E7.1 (#37) |
 | Frontend styling | Tailwind CSS v4 + shadcn/ui (copied components) + Radix primitives + lucide-react icons | #68 |
 | Browser auth | HTTP-only `fishhawk_session` cookie (server-side state); CSRF token in `__Host-csrf` cookie for state-changing endpoints | #69 |
 | CLI / API auth | Scoped opaque bearer tokens; revocable; audit-logged on issue/use/revoke | #69 (E4.5 #51) |
@@ -685,6 +685,7 @@ Resolution is PER RUN FORGE (#3466): the run row's `InstallationRef` → `observ
 | Outside-only verify flake absorption ([#4229](https://github.com/kuhlman-labs/fishhawk/issues/4229)) | `runner/cmd/fishhawk-runner/verifyabsorb.go` — at the fix loop's terminal failure, one scoped re-run of untouched failing packages, gated by `scripts/test`'s `FISHHAWK_VERIFY_ABSORB_NONCE` attest; recorded as the `verify_flake_absorbed` audit row. Details: `runner/cmd/fishhawk-runner/README.md`. |
 | Gate isolation for untrusted gate commands (ADR-063 / [#2134](https://github.com/kuhlman-labs/fishhawk/issues/2134)) | `runner/internal/gateiso/` — safe-runtime detection, mode × profile selection and the endpoint-bound `--network=none` container argv, wired at the runner's ONE gate-exec seam (`runner/cmd/fishhawk-runner/gateisolation.go`); refusal is category C. Details: [`runner/internal/gateiso/README.md`](../runner/internal/gateiso/README.md), [`runner/README.md`](../runner/README.md) § "Gate isolation". |
 | Gate-isolation deployment posture (ADR-063 / [#2138](https://github.com/kuhlman-labs/fishhawk/issues/2138)) | [`docs/deploy/self-hosted.md`](deploy/self-hosted.md) § "Runner gate isolation (ADR-063)" and [`docs/deploy/hosted-regional.md`](deploy/hosted-regional.md) — a safe local runtime plus an image for the container path, never the host Docker socket, the fallbacks' reduced isolation (macOS egress gap included), and `hosted` refusing instead of falling back. |
+| Repeated skill facts (#3943) | `scripts/check-skill-facts` — offline canonical-source drift check; warning in local verify and strict in required CI; contract: `scripts/README.md`. |
 | Pinned gate image (E51.17 / [#3966](https://github.com/kuhlman-labs/fishhawk/issues/3966)) | `deploy/gate-image/` — multi-arch image carrying the repo's exact verify toolchain, pin-checked by `scripts/check-gate-image` (a `scripts/test verify` leg) and run via `scripts/test lint\|verify --in-gate-image` for CI parity; this repo's `FISHHAWK_GATE_IMAGE`, set only with `FISHHAWK_GATE_SERVICES=postgres` (#2137) after the operator walk. Details: `deploy/gate-image/README.md`. |
 | Scope-amendment settle wait before the verify gates (E68.42 / #3320) | `runner/cmd/fishhawk-runner/scopeamendwait.go` — bounded fail-open long-poll immediately before the mid-stage amendment fold, so an approval landing seconds after agent exit is folded before the committed-tree verify gates run (#3320). Details: `runner/cmd/fishhawk-runner/README.md`. |
 | Approved-grant delivery into the verify-fix loop + unused-grant fail-loud (E64 / #3390) | `runner/cmd/fishhawk-runner/scopeamendgrant.go` — unused-approved-grant detection (`scope_amendment_grant_unused` log line + policy_event, per-grant `disposition` not_modified / not_staged via `gitops.StagedPaths`, #3434) and the failure-reason attribution `amendment <id> granted <path> (<op>); file not modified`, alongside the verify-fix prompt's effective-scope / GRANTED MID-STAGE rendering in `main.go::verifyFixPrompt` (#3390). `verifyfixscope.go` adds the OUT-OF-SCOPE PATHS detector (verify-output paths that exist on disk but are outside the effective scope) and the always-on compact scope-amendment recipe in the fix prompt (#3410). Details: `runner/cmd/fishhawk-runner/README.md`. |

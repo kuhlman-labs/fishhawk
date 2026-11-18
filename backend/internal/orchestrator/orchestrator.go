@@ -476,6 +476,17 @@ const (
 // orchestrator is intended to be called from a request handler,
 // not from a background loop.
 func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, error) {
+	return o.advance(ctx, runID, false)
+}
+
+// InitializeHumanReviewFirst only initializes the first human review. Unlike
+// Advance, it cannot dispatch a later stage if another publisher parks the
+// review between the caller's eligibility check and this fresh repository read.
+func (o *Orchestrator) InitializeHumanReviewFirst(ctx context.Context, runID uuid.UUID) (Outcome, error) {
+	return o.advance(ctx, runID, true)
+}
+
+func (o *Orchestrator) advance(ctx context.Context, runID uuid.UUID, firstHumanReviewOnly bool) (Outcome, error) {
 	if o.Runs == nil {
 		return OutcomeNoOp, errors.New("orchestrator: Runs is nil")
 	}
@@ -492,6 +503,18 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	stages, err := o.Runs.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return OutcomeNoOp, fmt.Errorf("orchestrator: list stages: %w", err)
+	}
+
+	if firstHumanReviewOnly {
+		if len(stages) == 0 {
+			return OutcomeNoOp, nil
+		}
+		first := stages[0]
+		if first.Sequence != 0 || first.Type != run.StageTypeReview || first.ExecutorKind != run.ExecutorHuman ||
+			(first.State != run.StageStatePending && first.State != run.StageStateDispatched && first.State != run.StageStateRunning) {
+			return OutcomeNoOp, nil
+		}
+		stages = stages[:1]
 	}
 
 	// Walk pending → running before any stage transitions so the
@@ -550,7 +573,11 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 			}
 			return o.completeRun(ctx, r, stages)
 		}
-		if s.State == run.StageStatePending {
+		// A human review-first initializer can be interrupted between its
+		// mechanical transitions. Resume that walk, never an agent execution.
+		resumeHumanReview := s.Sequence == 0 && s.Type == run.StageTypeReview && s.ExecutorKind == run.ExecutorHuman &&
+			(s.State == run.StageStateDispatched || s.State == run.StageStateRunning)
+		if s.State == run.StageStatePending || resumeHumanReview {
 			next = s
 			break
 		}
@@ -562,6 +589,9 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		}
 	}
 
+	if firstHumanReviewOnly && next == nil {
+		return OutcomeNoOp, nil
+	}
 	if next == nil {
 		// #968: a run must never roll up succeeded while a gate is still
 		// open or a stage is in flight. With nothing pending but a
@@ -579,6 +609,24 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		// Every stage has terminated successfully. completeRun
 		// transitions the run to succeeded.
 		return o.completeRun(ctx, r, stages)
+	}
+
+	// Review-first human gates have no preceding runner to provide their PR.
+	// Keep the run live but the gate undispatched until that declared input
+	// arrives. A missing URL is never evidence of operator-approval consent.
+	if next.Sequence == 0 && next.Type == run.StageTypeReview && next.ExecutorKind == run.ExecutorHuman &&
+		(r.PullRequestURL == nil || *r.PullRequestURL == "") {
+		parsed, err := spec.ParseBytes(r.WorkflowSpec)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: resolve review-first inputs: %w", err)
+		}
+		wf, ok := parsed.Workflows[r.WorkflowID]
+		if !ok || len(wf.Stages) == 0 || wf.Stages[0].Type != spec.StageTypeReview || !wf.Stages[0].Executor.Human {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: review-first workflow declaration unavailable")
+		}
+		if spec.StageDeclaresPullRequestInput(wf.Stages[0]) {
+			return OutcomeNoOp, nil
+		}
 	}
 
 	// E35.1 (#1598, ADR-053): post-deploy hold. The walk above records a
@@ -4331,18 +4379,22 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 		return out, false, err
 	}
 	if next.ExecutorKind == run.ExecutorHuman {
-		// Human stages don't need workflow_dispatch — they go to
-		// awaiting_approval and wait for someone to click. Walk
-		// pending → dispatched → running → awaiting_approval
-		// because the state machine doesn't allow a direct
-		// pending → awaiting_approval transition. Each step is
-		// idempotent at the state machine, so a redelivered
-		// approval that lands here twice doesn't fault.
-		for _, to := range []run.StageState{
-			run.StageStateDispatched,
-			run.StageStateRunning,
-			run.StageStateAwaitingApproval,
-		} {
+		// Resume at the persisted state after an interrupted human-stage walk.
+		// No runner is dispatched and no approval is supplied by these steps.
+		steps := []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateAwaitingApproval}
+		start := 0
+		switch next.State {
+		case run.StageStatePending:
+		case run.StageStateDispatched:
+			start = 1
+		case run.StageStateRunning:
+			start = 2
+		case run.StageStateAwaitingApproval:
+			return OutcomeNoOp, false, nil
+		default:
+			return OutcomeNoOp, false, fmt.Errorf("orchestrator: cannot initialize human stage from %s", next.State)
+		}
+		for _, to := range steps[start:] {
 			if _, err := o.Runs.TransitionStage(ctx, next.ID, to, nil); err != nil {
 				return OutcomeNoOp, false, fmt.Errorf("orchestrator: transition human stage to %s: %w", to, err)
 			}

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/v2/option"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
@@ -24,6 +24,9 @@ func captureSchemaServer(t *testing.T) (*httptest.Server, *[]byte) {
 	t.Helper()
 	var captured []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Errorf("Anthropic-Version = %q, want the established wire version", got)
+		}
 		captured, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(okResp(`{"ok":true}`))

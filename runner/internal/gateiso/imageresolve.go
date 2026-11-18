@@ -640,7 +640,7 @@ func streamBlobs(ctx context.Context, git GitFunc, blobs []gitTreeEntry, fn func
 	if err != nil {
 		cancel()
 		_ = pr.CloseWithError(err)
-		<-errc
+		<-errc //nolint:errcheck // Preserve the consumer error after waiting for the canceled writer.
 		return err
 	}
 	return <-errc

@@ -396,12 +396,12 @@ migrate:
 # the prod baseline points fishhawkd at an external managed database via the
 # existingSecret's FISHHAWKD_DATABASE_URL. Turned on by values-local.yaml for a
 # self-contained Docker-Desktop stack. Mirrors docker-compose.yml
-# (postgres:16-alpine, fishhawk/fishhawk/fishhawk). When enabled, the fishhawkd
+# (postgres:16.16-alpine, fishhawk/fishhawk/fishhawk). When enabled, the fishhawkd
 # Deployment gets an explicit FISHHAWKD_DATABASE_URL env (overriding the secret)
 # pointing at the in-cluster Service.
 postgres:
   enabled: false
-  image: postgres:16-alpine
+  image: postgres:16.16-alpine
   pullPolicy: IfNotPresent
   auth:
     user: fishhawk
@@ -424,16 +424,16 @@ postgres:
 
 # Optional in-cluster RustFS (S3-compatible trace store), gated by
 # rustfs.enabled. Default false so the prod baseline points at external S3.
-# Mirrors docker-compose.yml (rustfs/rustfs:1.0.0-rc.6, path-style). When
+# Mirrors docker-compose.yml (rustfs/rustfs:1.0.6, path-style). When
 # enabled, set config.s3Endpoint/s3Bucket to the in-cluster Service (see
 # values-local.yaml). createBucket runs a post-install/upgrade Job that creates
 # the bucket via the AWS CLI (bootstrapImage). RustFS replaced MinIO after the
 # MinIO server and mc images were deleted from Docker Hub (#3386).
 rustfs:
   enabled: false
-  # rustfs/rustfs is Apache-2.0; 1.0.0-rc.6 is a 1.0.0 release candidate.
+  # rustfs/rustfs is Apache-2.0; 1.0.6 is a stable 1.0 release.
   # Verified pullable by the operator on 2026-09-13 (#3386).
-  image: rustfs/rustfs:1.0.0-rc.6
+  image: rustfs/rustfs:1.0.6
   # Image for the bucket-bootstrap hook Job (rustfs-bucket-job.yaml). Pinned
   # INDEPENDENTLY of rustfs.image and MUST be a tag that actually EXISTS in the
   # registry: the bucket Job is a Helm HOOK, so a nonexistent tag ships silently
@@ -442,7 +442,7 @@ rustfs:
   # tag, and `scripts/dev k8s` dumps hook pod state on a helm failure. Verify a
   # new pin is pullable before bumping, per CLAUDE.md's run-time image-pinning
   # rule.
-  bootstrapImage: amazon/aws-cli:2.36.44
+  bootstrapImage: amazon/aws-cli:2.40.3
   pullPolicy: IfNotPresent
   # RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY. The default secretKey is DEV-ONLY:
   # fishhawk.validateSecrets fails the render outside profile: local.
@@ -476,7 +476,7 @@ rustfs:
 # docker-compose.yml jaeger service).
 jaeger:
   enabled: false
-  image: jaegertracing/all-in-one:1.62.0
+  image: cr.jaegertracing.io/jaegertracing/jaeger:2.23.0
   pullPolicy: IfNotPresent
   # Service ports (container ports are fixed at the Jaeger defaults 16686/4318/4317).
   uiPort: 16686

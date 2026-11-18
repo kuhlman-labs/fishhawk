@@ -100,6 +100,16 @@ const (
 func SeedManifest() Manifest {
 	return Manifest{
 		Pairs: []Pair{
+			{
+				Name: "stage_read_api", Anchor: "#5419",
+				Emitter:  Endpoint{File: "backend/internal/server/reads.go", Type: "stageResponse"},
+				Consumer: Endpoint{File: "backend/internal/mcpserver/client.go", Type: "Stage"},
+				Mode:     ModeSubset,
+				AllowedEmitterOnly: []Allowance{
+					{JSONName: "gate", Reason: "the MCP stage DTO does not consume gate rendering"},
+					{JSONName: "resolved_model", Reason: "the MCP stage DTO does not consume model rendering"},
+				},
+			},
 			// ---- ModeExact leaf pairs (round-trip both ways) ----
 			{
 				Name: "scope_file", Anchor: "#824",
@@ -423,6 +433,8 @@ func SeedManifest() Manifest {
 			},
 		},
 		CoveredFiles: []string{
+			"backend/internal/server/reads.go",
+			"backend/internal/mcpserver/client.go",
 			promptFile,
 			bindingsFile,
 			pullRequestGo,
