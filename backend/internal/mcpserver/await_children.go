@@ -257,7 +257,19 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               children_settled instead.
   - "children_settled"      — every child succeeded AND the newest
                               slices_integrated record covers every child.
-                              next_step is fishhawk_consolidate_slices. On a
+                              next_step is fishhawk_consolidate_slices only
+                              while the parent's implement stage is still
+                              awaiting_children (or unreadable). The server's
+                              event-driven fan-in normally settles the parent
+                              first, so once the stage has left
+                              awaiting_children consolidate would answer 409
+                              not_awaiting_children and next_step is
+                              fishhawk_get_run_status on the parent instead:
+                              follow its next_actions, and dispatch the
+                              implement stage (fishhawk_dispatch_stage or
+                              fishhawk_drive_run) only when it is pending or
+                              awaiting_host_dispatch — on a local runner, the
+                              fan-in verify-only pass. On a
                               deployment with no slice-integration authority
                               (the run's capabilities.slice_integration says
                               available false — the server gate's own
@@ -569,7 +581,11 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 		}
 		return awaitChildrenIntegrationPendingOutput(base, parentUUID, cs, parentImplementState), true, nil
 	}
-	return awaitChildrenSettledOutput(base, parentUUID, cs), true, nil
+	// #5215 (R2): the fully-integrated release names consolidate only while the
+	// parent's implement stage is still awaiting_children. The server's
+	// event-driven fan-in normally settles the parent as the last child
+	// terminates, and consolidate then answers 409 not_awaiting_children.
+	return awaitChildrenSettledOutput(base, parentUUID, cs, r.parentImplementStageState(ctx, parentUUID)), true, nil
 }
 
 // awaitChildrenNoAuthorityOutput builds the C3 children_settled release for a
@@ -582,7 +598,7 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 // comes next. The message names the server's own reason when the backend
 // surfaced it (#4165), otherwise the inference it fell back to.
 func awaitChildrenNoAuthorityOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) AwaitChildrenOutput {
-	out := awaitChildrenSettledOutput(base, parentUUID, cs)
+	out := awaitChildrenSettledOutput(base, parentUUID, cs, parentImplementState)
 	if parentImplementState == "awaiting_children" {
 		out.NextStep = &SuggestedAction{
 			Action:       "fishhawk_consolidate_slices",
@@ -639,10 +655,30 @@ func awaitChildrenFanInRecordLostOutput(base AwaitChildrenOutput, parentUUID uui
 	return out
 }
 
-// awaitChildrenSettledOutput builds the children_settled release.
-func awaitChildrenSettledOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus) AwaitChildrenOutput {
+// awaitChildrenSettledOutput builds the children_settled release. next_step is
+// CONDITIONAL on the parent's implement stage (#5215 rules 4 and 9, R2):
+// fishhawk_consolidate_slices while it is awaiting_children, or when it is
+// unreadable ("" — today's step, whose refusal now carries its own remedy);
+// otherwise fishhawk_get_run_status on the PARENT, because the server already
+// integrated the slices and moved the stage on, so consolidate would answer
+// 409 not_awaiting_children.
+func awaitChildrenSettledOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus, parentImplementState string) AwaitChildrenOutput {
 	out := base
 	out.Status = "children_settled"
+	if parentImplementState != "" && parentImplementState != "awaiting_children" {
+		out.NextStep = &SuggestedAction{
+			Action:       "fishhawk_get_run_status",
+			Params:       map[string]string{"run_id": parentUUID.String()},
+			Precondition: "every decomposed child succeeded, the newest slices_integrated record covers every child, and the parent's implement stage is no longer awaiting_children",
+			Consumes:     "none",
+			Reason:       "the server already integrated the slices and moved the parent's implement stage out of awaiting_children, so fishhawk_consolidate_slices would answer 409 not_awaiting_children; the parent's next_actions name its next move",
+		}
+		out.Message = fmt.Sprintf(
+			"all %d children succeeded and the consolidated branch carries every slice. The server already integrated the slices and moved the parent's implement stage out of awaiting_children (now %s), so fishhawk_consolidate_slices would answer 409 not_awaiting_children. "+
+				"Read fishhawk_get_run_status on the parent (next_step) and follow its next_actions. Dispatch the implement stage (fishhawk_dispatch_stage or fishhawk_drive_run) only when it is pending or awaiting_host_dispatch, which on a local runner is the fan-in verify-only pass the server re-opens for an unverified head when a verify command is declared.",
+			cs.Total, parentImplementState)
+		return out
+	}
 	out.NextStep = &SuggestedAction{
 		Action:       "fishhawk_consolidate_slices",
 		Params:       map[string]string{"run_id": parentUUID.String()},

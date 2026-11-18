@@ -106,6 +106,15 @@ this as approval_note, one constant worded for a pull request headed for merge:
 a vouch also serves a fix-up head advance, and the note does not apply to a run
 that is not headed for merge.
 
+CONSOLIDATED BRANCHES (#5215). Do not hand-push a union merge of slice
+branches onto a decomposed parent's consolidated branch and vouch it. A
+vouched head that brings in no base commit takes the vouch exemption, which
+the merge gate checks before its fan-in rule, so it asks for no fan-in verify
+at that head. The vouch itself starts no review round and dispatches no
+acceptance stage, so the merged tree reaches the merge gate unverified,
+unreviewed and unaccepted. Route slice work through the loop instead: re-drive
+or resume the child, or run fishhawk_fixup_stage on the parent.
+
 Returns the recorded declaration (run_id, vouched_sha, reason) plus the
 audit-check re-post outcome: audit_check_republished, and
 audit_check_republish_warning when it did not land — a publish that errored,
