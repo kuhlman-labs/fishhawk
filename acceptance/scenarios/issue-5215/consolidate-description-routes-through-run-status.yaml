@@ -2,13 +2,14 @@ id: scenario:issue-5215/consolidate-description-routes-through-run-status
 statement: The fishhawk_consolidate_slices description says the server's event-driven fan-in normally settles the parent. It says a 409 not_awaiting_children does not by itself mean the fan-in succeeded (a slice-conflict failure returns it too), and tells the operator to read fishhawk_get_run_status and dispatch the parent implement stage only when it is pending or awaiting_host_dispatch, naming fishhawk_drive_run as an alternative. It also says a 502 slice_integration_error leaves the parent awaiting_children and is safe to re-invoke.
 verify_hint: 'MCP tool result: the served fishhawk_consolidate_slices description carries ''not_awaiting_children'', ''fishhawk_get_run_status'', ''awaiting_host_dispatch'', ''fishhawk_drive_run'' and ''re-invoke'' beside ''slice_integration_error''.'
 steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list (2026-07-28 headers and io.modelcontextprotocol _meta). Read the fishhawk_consolidate_slices description.
+steps_carried_from: head 5e2b695bf59b15b5971093328388377ae5473489 recorded_at 2026-11-18T17:11:24Z
 assertions:
     expected: all named elements present
-    observed_at_record: The description says the server's event-driven fan-in normally integrates and settles the parent. It says not_awaiting_children (409) 'does NOT by itself mean the fan-in succeeded' because a slice-conflict failure returns it too, followed by 'Read fishhawk_get_run_status on the parent'. It says to dispatch the implement stage (fishhawk_dispatch_stage, or let fishhawk_drive_run do it) only when it is pending or awaiting_host_dispatch. On slice_integration_error (502) it says the parent stays awaiting_children and to re-invoke.
+    observed_at_record: 'Contains: the event-driven fan-in normally settles the parent; not_awaiting_children does NOT by itself mean the fan-in succeeded (slice-conflict too); fishhawk_get_run_status; pending or awaiting_host_dispatch; fishhawk_drive_run; slice_integration_error (502) leaves the parent awaiting_children; re-invoke.'
     repro_handle: POST http://localhost:8090/mcp tools/list
 origin:
     issue: 5215
     pr: 5465
     run_id: 6b703cc0-07ef-4ce4-a2c8-06a4f24d5df6
-    head_sha: 5e2b695bf59b15b5971093328388377ae5473489
-    recorded_at: 2026-11-18T17:11:24Z
+    head_sha: 81a819c5032088f91fac523476f5bc719c94f4b8
+    recorded_at: 2026-11-18T17:56:58Z

@@ -1,14 +1,14 @@
 id: scenario:issue-5215/vouch-description-warns-consolidated-union-merge
 statement: The fishhawk_vouch_commit description warns against hand-pushing and vouching a union merge on a decomposed parent's consolidated branch, and names the fan-in verify, review round and acceptance it skips.
 verify_hint: 'MCP tool result: the served fishhawk_vouch_commit description carries ''union merge'', ''consolidated branch'' and ''fan-in verify''.'
-steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list. Read the fishhawk_vouch_commit description.
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token to get an fhm_ bearer; POST /mcp tools/list. Read the fishhawk_vouch_commit description.
 assertions:
-    expected: union merge, consolidated branch, fan-in verify, review round and acceptance named
-    observed_at_record: '''CONSOLIDATED BRANCHES (#5215). Do not hand-push a union merge of slice branches onto a decomposed parent''s consolidated branch and vouch it ... asks for no fan-in verify at that head. The vouch itself starts no review round and dispatches no acceptance stage, so the merged tree reaches the merge gate unverified, unreviewed and unaccepted.'''
+    expected: '''union merge'', ''consolidated branch'', ''fan-in verify'', review round and acceptance'
+    observed_at_record: 'CONSOLIDATED BRANCHES paragraph: do not hand-push a union merge onto a decomposed parent''s consolidated branch and vouch it. It skips the fan-in verify, starts no review round and dispatches no acceptance stage.'
     repro_handle: POST http://localhost:8090/mcp tools/list
 origin:
     issue: 5215
     pr: 5465
     run_id: 6b703cc0-07ef-4ce4-a2c8-06a4f24d5df6
-    head_sha: 5e2b695bf59b15b5971093328388377ae5473489
-    recorded_at: 2026-11-18T17:11:24Z
+    head_sha: 81a819c5032088f91fac523476f5bc719c94f4b8
+    recorded_at: 2026-11-18T17:56:58Z
