@@ -12372,3 +12372,258 @@ func TestSubmitApproval_ModelResolvedCarriesReasoningEffort(t *testing.T) {
 		}
 	})
 }
+
+// --- Acting-identity echo and delegation refusal guidance (#5227) ---
+
+// decodeApprovalBodyMap decodes a 200 approval body into a raw map so absent
+// keys are distinguishable from empty values.
+func decodeApprovalBodyMap(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode approval body: %v\n%s", err, w.Body.String())
+	}
+	return m
+}
+
+// approvalSubmittedActorSubjects returns the actor_subject of every
+// approval_submitted entry the fake recorded, in append order.
+func approvalSubmittedActorSubjects(au *approvalAuditFake) []string {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []string
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" && e.ActorSubject != nil {
+			out = append(out, *e.ActorSubject)
+		}
+	}
+	return out
+}
+
+// TestSubmitApproval_ResponseEchoesApproverSubject pins #5227 gap 2 on the
+// first-submission and duplicate arms of a non-delegated approve.
+//
+// First submission: approver_subject equals the request subject AND the
+// actor_subject the approval_submitted audit row recorded (committed state,
+// read after the call), and credential_kind names the request credential.
+//
+// Duplicate (approval condition S6(b)): the SAME subject re-submits under a
+// DIFFERENT credential kind (a cookie session). approver_subject is the prior
+// row's subject; credential_kind and on_behalf_of are ABSENT, because the
+// prior row records neither and the current request's "session" would
+// describe the wrong submission.
+func TestSubmitApproval_ResponseEchoesApproverSubject(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	const subject = "github:alice-fixture"
+	static := Identity{Subject: subject, TokenID: "tok-alice", AuthMethod: "static", Scopes: []string{"write:approvals"}}
+	w := submitApprovalWithIdentity(t, s, stage.ID, &static, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	first := decodeApprovalBodyMap(t, w)
+	if first["approver_subject"] != subject {
+		t.Errorf("approver_subject = %v, want %q", first["approver_subject"], subject)
+	}
+	actors := approvalSubmittedActorSubjects(au)
+	if len(actors) != 1 || first["approver_subject"] != actors[0] {
+		t.Errorf("approver_subject = %v, audit actor_subjects = %v; want the echo to equal the recorded actor_subject", first["approver_subject"], actors)
+	}
+	if first["credential_kind"] != "static" {
+		t.Errorf("credential_kind = %v, want static", first["credential_kind"])
+	}
+	if _, ok := first["on_behalf_of"]; ok {
+		t.Errorf("on_behalf_of present on a non-delegated approve: %v", first["on_behalf_of"])
+	}
+	if first["state"] != string(run.StageStateSucceeded) {
+		t.Errorf("state = %v, want succeeded (the stage shape is unchanged)", first["state"])
+	}
+	if strings.Contains(w.Body.String(), "tok-alice") {
+		t.Errorf("approval body carries the token id:\n%s", w.Body.String())
+	}
+
+	session := Identity{Subject: subject, UserID: "u-1", SessionID: "sess-1"}
+	w = submitApprovalWithIdentity(t, s, stage.ID, &session, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("duplicate status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	dup := decodeApprovalBodyMap(t, w)
+	if dup["duplicate_submission"] != true {
+		t.Fatalf("duplicate_submission = %v, want true", dup["duplicate_submission"])
+	}
+	if dup["approver_subject"] != subject {
+		t.Errorf("duplicate approver_subject = %v, want the prior row's %q", dup["approver_subject"], subject)
+	}
+	for _, k := range []string{"credential_kind", "on_behalf_of"} {
+		if v, ok := dup[k]; ok {
+			t.Errorf("duplicate %s = %v, want absent (the prior row does not record it)", k, v)
+		}
+	}
+}
+
+// TestSubmitApproval_DelegatedResponseEchoesRecordedIdentity pins the
+// delegated arm: a delegated approve is RECORDED under the distinct
+// operatorrole.DelegatedApprovalActorSubject (#2381), so approver_subject
+// echoes THAT subject (equal to the audit actor_subject), on_behalf_of names
+// the caller's real subject, and credential_kind names the request
+// credential. The re-submitted delegated approve is a duplicate whose
+// approver_subject is the shared delegated row's subject (NOT the caller's)
+// and which omits on_behalf_of and credential_kind.
+func TestSubmitApproval_DelegatedResponseEchoesRecordedIdentity(t *testing.T) {
+	s, repo, au, _, _ := newDelegatedApprovalServer(t)
+	runID, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegatedQuorumSpecYAML,
+	})
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	const real = "github:op-real"
+	id := Identity{Subject: real, TokenID: "tok-op", AuthMethod: "static", Scopes: []string{"write:approvals"}}
+	w := submitApprovalWithIdentity(t, s, planStage.ID, &id, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got := decodeApprovalBodyMap(t, w)
+	if got["approver_subject"] != operatorrole.DelegatedApprovalActorSubject {
+		t.Errorf("approver_subject = %v, want %q (the recorded delegated identity)", got["approver_subject"], operatorrole.DelegatedApprovalActorSubject)
+	}
+	e, _ := approvalAuditBySubject(t, au, operatorrole.DelegatedApprovalActorSubject)
+	if e.ActorSubject == nil || got["approver_subject"] != *e.ActorSubject {
+		t.Errorf("approver_subject = %v, want the audit actor_subject %v", got["approver_subject"], e.ActorSubject)
+	}
+	if got["on_behalf_of"] != real {
+		t.Errorf("on_behalf_of = %v, want %q", got["on_behalf_of"], real)
+	}
+	if got["credential_kind"] != "static" {
+		t.Errorf("credential_kind = %v, want static", got["credential_kind"])
+	}
+
+	w = submitApprovalWithIdentity(t, s, planStage.ID, &id, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("duplicate status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	dup := decodeApprovalBodyMap(t, w)
+	if dup["duplicate_submission"] != true {
+		t.Fatalf("duplicate_submission = %v, want true", dup["duplicate_submission"])
+	}
+	if dup["approver_subject"] != operatorrole.DelegatedApprovalActorSubject {
+		t.Errorf("duplicate approver_subject = %v, want the prior delegated row's %q", dup["approver_subject"], operatorrole.DelegatedApprovalActorSubject)
+	}
+	for _, k := range []string{"credential_kind", "on_behalf_of"} {
+		if v, ok := dup[k]; ok {
+			t.Errorf("duplicate %s = %v, want absent (the shared delegated row does not record it)", k, v)
+		}
+	}
+}
+
+// assertDelegationRefusalGuidance checks the #5227 guidance keys on a
+// delegation_* 403: delegated_identity names the operator-agent token
+// subject, and next_actions names the human-issued token command, says an
+// agent never requests or mints it, and says delegation lives in the spec.
+func assertDelegationRefusalGuidance(t *testing.T, errBody errorBody) {
+	t.Helper()
+	if got := errBody.Details["delegated_identity"]; got != "operator-agent/operator-role-v0" {
+		t.Errorf("details.delegated_identity = %v, want operator-agent/operator-role-v0", got)
+	}
+	raw, ok := errBody.Details["next_actions"].([]any)
+	if !ok || len(raw) == 0 {
+		t.Fatalf("details.next_actions = %#v, want a non-empty list", errBody.Details["next_actions"])
+	}
+	var joined strings.Builder
+	for _, a := range raw {
+		s, _ := a.(string)
+		joined.WriteString(s)
+		joined.WriteString("\n")
+	}
+	text := joined.String()
+	for _, want := range []string{
+		"fishhawkd token issue --subject operator-agent/operator-role-v0",
+		"A human operator issues it",
+		"an agent never requests or mints it",
+		"workflow spec",
+		".fishhawk/workflows.yaml",
+		"without delegated:true under a human credential",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("next_actions missing %q:\n%s", want, text)
+		}
+	}
+}
+
+// TestCheckDelegation_RefusalNamesDelegatedIdentity pins #5227 gap 3 on both
+// delegation codes of the APPROVE path, plus the waive path (approval
+// condition S6(c)). Each arm also pins that the pre-existing message and keys
+// are unchanged.
+func TestCheckDelegation_RefusalNamesDelegatedIdentity(t *testing.T) {
+	t.Run("approve not configured", func(t *testing.T) {
+		s, repo, _, _, _ := newDelegatedApprovalServer(t)
+		_, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+			"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+			"trigger_source": "cli", "workflow_spec": gatedSpecYAML,
+		})
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+		}
+		errBody := decodeErrorEnvelope(t, w)
+		if errBody.Code != "delegation_not_configured" {
+			t.Fatalf("code = %q, want delegation_not_configured", errBody.Code)
+		}
+		if errBody.Details["action"] != "approve" {
+			t.Errorf("details.action = %v, want approve (existing key unchanged)", errBody.Details["action"])
+		}
+		assertDelegationRefusalGuidance(t, errBody)
+		if got := errBody.Details["recorded_as"]; got != operatorrole.DelegatedApprovalActorSubject {
+			t.Errorf("details.recorded_as = %v, want %q", got, operatorrole.DelegatedApprovalActorSubject)
+		}
+	})
+
+	t.Run("approve condition unmet", func(t *testing.T) {
+		s, repo, _, _, _ := newDelegatedApprovalServer(t)
+		_, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+			"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+			"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+		})
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+		}
+		errBody := decodeErrorEnvelope(t, w)
+		if errBody.Code != "delegation_condition_unmet" {
+			t.Fatalf("code = %q, want delegation_condition_unmet", errBody.Code)
+		}
+		if errBody.Message != "the delegated action's condition is not satisfied by current run state" {
+			t.Errorf("message = %q, want the existing message byte-identical", errBody.Message)
+		}
+		if errBody.Details["condition"] != "clean_dual_approval" {
+			t.Errorf("details.condition = %v, want clean_dual_approval (existing key unchanged)", errBody.Details["condition"])
+		}
+		if reason, _ := errBody.Details["unmet_reason"].(string); reason == "" {
+			t.Errorf("details.unmet_reason empty, want the existing named predicate")
+		}
+		assertDelegationRefusalGuidance(t, errBody)
+		if got := errBody.Details["recorded_as"]; got != operatorrole.DelegatedApprovalActorSubject {
+			t.Errorf("details.recorded_as = %v, want %q", got, operatorrole.DelegatedApprovalActorSubject)
+		}
+	})
+
+	t.Run("waive path carries guidance, no recorded_as", func(t *testing.T) {
+		s, _, cr := waiveServer(t)
+		row := seedLowConcernRow(t, cr, uuid.New(), uuid.New())
+		w := postWaive(t, s, row.ID.String(), waiveConcernRequest{Reason: "nit", Delegated: true})
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+		}
+		errBody := decodeErrorEnvelope(t, w)
+		if errBody.Code != "delegation_not_configured" {
+			t.Fatalf("code = %q, want delegation_not_configured", errBody.Code)
+		}
+		assertDelegationRefusalGuidance(t, errBody)
+		if v, ok := errBody.Details["recorded_as"]; ok {
+			t.Errorf("details.recorded_as = %v on the waive path, want absent (only a delegated approve is recorded under a distinct identity)", v)
+		}
+	})
+}
