@@ -439,6 +439,10 @@ func (h *ReviewActionHint) acceptanceUnsettledActions(run *Run, implementStageID
 				params["stage_id"] = acceptance.ID
 				a.Params = params
 				a.Reason = acceptanceUnsettledLeadReason(acceptance)
+				// #5216 R8: the clause rides the PRECONDITION only — the
+				// Reason is single-sourced with
+				// runpkg.AcceptanceBlockerAdvisory and must stay so.
+				a.Precondition += fmt.Sprintf(acceptanceDispatchRouteFixupsFirstClause, h.Concerns)
 			}
 			lead = append(lead, a)
 		}
@@ -453,6 +457,14 @@ func (h *ReviewActionHint) acceptanceUnsettledActions(run *Run, implementStageID
 	}
 	return lead
 }
+
+// acceptanceDispatchRouteFixupsFirstClause is appended to the #4801 arm's lead
+// acceptance-dispatch PRECONDITION (#5216 R8; %d is the open-concern count). A
+// fix-up push re-opens the acceptance stage, so an acceptance pass dispatched
+// before the route-back runs again. Conditional on the operator's intent
+// rather than a reorder of the arm: leading with the acceptance move is the
+// #4801 design.
+const acceptanceDispatchRouteFixupsFirstClause = "; if you will route any of the %d open concern(s) back with fishhawk_fixup_stage, route them first, because a fix-up push re-opens the acceptance stage and an acceptance pass dispatched before it runs again; read run.concerns.by_state for a late reject before dispatching"
 
 // acceptanceUnsettledLeadReason is the lead acceptance action's reason on the
 // #4801 arm, single-sourced with the other acceptance-blocker surfaces.
@@ -488,7 +500,7 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 	mergeWithFollowUp := SuggestedAction{
 		Action:       "merge_and_file_follow_up",
 		Params:       prParams(run),
-		Precondition: "the remaining concerns are acceptable to land",
+		Precondition: "the remaining concerns are acceptable to land; " + verifyRejectingClaimOnTreeClause,
 		Consumes:     consumesNone,
 		Reason:       fmt.Sprintf("%d open concern(s) — approve the PR with an operator verdict, merge, and file a follow-up issue for what was not routed back", h.Concerns),
 	}

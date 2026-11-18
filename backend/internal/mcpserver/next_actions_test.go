@@ -5436,8 +5436,10 @@ func TestFoldGroomingApplyAdvisory_InFlightPrepends(t *testing.T) {
 	}
 }
 
-// TestFoldGroomingApplyAdvisory_CompletedNoop: a completed apply leaves the
-// actions byte-identical — the advisory is for a PARTIAL ledger only.
+// TestFoldGroomingApplyAdvisory_CompletedNoop: a completed apply with zero
+// tier refusals and zero budget tail leaves the actions byte-identical — the
+// in-flight advisory is for a PARTIAL ledger only, and the completed advisory
+// (#5216) only for an apply that left the operator something to do.
 func TestFoldGroomingApplyAdvisory_CompletedNoop(t *testing.T) {
 	r := naRun("running")
 	na := &NextActions{State: "human_review_gate_parked", Actions: []SuggestedAction{{Action: "approve_review_gate"}}}
@@ -5446,6 +5448,89 @@ func TestFoldGroomingApplyAdvisory_CompletedNoop(t *testing.T) {
 	after, _ := json.Marshal(na)
 	if string(before) != string(after) {
 		t.Errorf("completed apply changed next_actions:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// TestFoldGroomingApplyAdvisory_CompletedTierRefusalsAppend: a completed apply
+// that refused delegation-tier proposals APPENDS one read-only
+// fishhawk_list_audit advisory naming the refused entry ids and the by-hand
+// relabel remedy (#5216 R1); the existing actions are unchanged and first.
+func TestFoldGroomingApplyAdvisory_CompletedTierRefusalsAppend(t *testing.T) {
+	r := naRun("running")
+	orig := []SuggestedAction{{Action: "approve_review_gate"}, {Action: "fishhawk_list_audit", Params: map[string]string{"run_id": r.ID}}}
+	na := &NextActions{State: "human_review_gate_parked", Actions: slices.Clone(orig)}
+	beforeHead, _ := json.Marshal(na.Actions)
+	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{
+		State: groomingApplyStateCompleted, CandidateCount: 12, Recorded: 12,
+		TierNotAuthorized: 2, TierNotAuthorizedEntries: []string{"entry-a", "entry-b"},
+	}, na)
+
+	if len(na.Actions) != len(orig)+1 {
+		t.Fatalf("actions = %v, want the original %d plus ONE appended advisory", actionNames(na), len(orig))
+	}
+	afterHead, _ := json.Marshal(na.Actions[:len(orig)])
+	if string(beforeHead) != string(afterHead) {
+		t.Errorf("existing actions changed:\nbefore %s\nafter  %s", beforeHead, afterHead)
+	}
+	got := na.Actions[len(orig)]
+	if got.Action != "fishhawk_list_audit" || got.Params["run_id"] != r.ID || got.Params["category"] != auditCategoryGroomingMutationApplied {
+		t.Errorf("appended = %+v, want fishhawk_list_audit(run_id, category=grooming_mutation_applied)", got)
+	}
+	if got.Consumes != consumesNone || got.Precondition != "always legal (read-only); the grooming apply completed" {
+		t.Errorf("appended consumes/precondition = %q / %q", got.Consumes, got.Precondition)
+	}
+	for _, want := range []string{
+		"grooming apply completed",
+		"2 entr(ies) refused delegation_tier_not_authorized [entry-a, entry-b]",
+		"the refusal applied nothing in those entries, not even the clerical labels beside the tier",
+		"apply the ones you agree with by hand on the tracker",
+		"a plan re-approval launches a fresh apply",
+	} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason missing %q: %q", want, got.Reason)
+		}
+	}
+	if strings.Contains(got.Reason, "apply_budget_exhausted") {
+		t.Errorf("reason names a budget tail with BudgetExhausted 0: %q", got.Reason)
+	}
+	if na.State != "human_review_gate_parked" {
+		t.Errorf("state = %q, want unchanged", na.State)
+	}
+}
+
+// TestFoldGroomingApplyAdvisory_CompletedBudgetExhaustedAppend: a completed
+// apply with an over-budget tail APPENDS the advisory saying the tail
+// resurfaces on the next groom and the PLAN gate must not be re-approved
+// (#5216 R20), while attesting the confirm gate is unaffected and is the legal
+// next step (approval condition W4). The existing actions are unchanged and
+// first.
+func TestFoldGroomingApplyAdvisory_CompletedBudgetExhaustedAppend(t *testing.T) {
+	r := naRun("running")
+	na := &NextActions{State: "human_review_gate_parked", Actions: []SuggestedAction{{Action: "approve_review_gate"}}}
+	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{State: groomingApplyStateCompleted, CandidateCount: 12, Recorded: 12, Skipped: 3, BudgetExhausted: 3}, na)
+
+	if len(na.Actions) != 2 || na.Actions[0].Action != "approve_review_gate" {
+		t.Fatalf("actions = %v, want approve_review_gate first and ONE appended advisory", actionNames(na))
+	}
+	got := na.Actions[1]
+	if got.Action != "fishhawk_list_audit" {
+		t.Fatalf("appended action = %q, want fishhawk_list_audit", got.Action)
+	}
+	for _, want := range []string{
+		"3 entr(ies) recorded apply_budget_exhausted were never evaluated",
+		"they resurface on the next grooming run, so approve that run",
+		// W4: the PLAN re-approval is named, and it is the one that launches a fresh apply.
+		"do not re-approve this run's plan gate",
+		"a plan re-approval launches a fresh apply",
+		// W4: the confirm-gate attestation is unaffected and is the legal next step.
+		"attesting the confirm gate (approve_review_gate), where it is still parked, is unaffected and is the legal next step",
+	} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason missing %q: %q", want, got.Reason)
+		}
+	}
+	if strings.Contains(got.Reason, "delegation_tier_not_authorized") {
+		t.Errorf("reason names tier refusals with TierNotAuthorized 0: %q", got.Reason)
 	}
 }
 
@@ -8808,8 +8893,11 @@ func TestPlanStageNextActions_AdvisoryReject_NamesArbitration(t *testing.T) {
 		}
 		return rs
 	}
-	approvePhrases := []string{"localized defect", "approve over the reject with a surgical condition"}
-	rejectPhrases := []string{"reject and replan", "wrong approach"}
+	// #5216 R11/R16: both arbitration reasons end with the shared
+	// tree-verification clause.
+	treeClause := "decide by checking the rejecting reviewer's claim against the tree (run the code, grep the cited symbol), not by weighing the two verdicts' prose"
+	approvePhrases := []string{"localized defect", "approve over the reject with a surgical condition", treeClause}
+	rejectPhrases := []string{"reject and replan", "wrong approach", treeClause}
 	actionText := func(a SuggestedAction) string { return a.Precondition + " | " + a.Reason }
 
 	cases := []struct {

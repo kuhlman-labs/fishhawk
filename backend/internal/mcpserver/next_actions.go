@@ -1421,11 +1421,20 @@ const planGateApprovePreconditionRules = "; a plan that does not declare deliver
 
 // planGateApproveOverRejectReason and planGateRejectOnRejectReason name the
 // R40 arbitration (#5211) on the plan_gate_parked approve and reject reasons
-// when a settled plan review returned reject.
+// when a settled plan review returned reject. Both end with
+// verifyRejectingClaimOnTreeClause (#5216 R11/R16): a split is decided on the
+// tree, not on the verdicts' prose.
 const (
-	planGateApproveOverRejectReason = " — a plan reviewer returned reject, so arbitrate: when the approach is sound and the reviewer found a localized defect, approve over the reject with a surgical condition that fixes that defect"
-	planGateRejectOnRejectReason    = " — a plan reviewer returned reject: reject and replan when the reviewer showed a wrong approach; a localized defect in a sound approach is an approve with a surgical condition instead"
+	planGateApproveOverRejectReason = " — a plan reviewer returned reject, so arbitrate: when the approach is sound and the reviewer found a localized defect, approve over the reject with a surgical condition that fixes that defect; " + verifyRejectingClaimOnTreeClause
+	planGateRejectOnRejectReason    = " — a plan reviewer returned reject: reject and replan when the reviewer showed a wrong approach; a localized defect in a sound approach is an approve with a surgical condition instead; " + verifyRejectingClaimOnTreeClause
 )
+
+// verifyRejectingClaimOnTreeClause is the ONE shared wording of the #5216
+// R11/R16 rule: when reviewers split or a reviewer rejects, the operator checks
+// the rejecting claim against the tree instead of weighing two verdicts'
+// prose. Shared by the plan-gate arbitration reasons above and the
+// merge_and_file_follow_up precondition (review_action_hint.go).
+const verifyRejectingClaimOnTreeClause = "decide by checking the rejecting reviewer's claim against the tree (run the code, grep the cited symbol), not by weighing the two verdicts' prose"
 
 // planReviewRejected reports whether any settled plan-review verdict is a
 // reject. It is read only on the plan_gate_parked arm, which the pending
@@ -3458,12 +3467,26 @@ const driveNextActionMergePR = "merge_pr"
 // snapshot right after fishhawk_approve_plan sees a partial ledger; attesting
 // the confirm gate on that partial apply is the mistake this fold names. It
 // is a FOLD off the already-derived status block (no extra round-trip, no new
-// classifyNextActions parameter — the ~118 call sites are untouched) and a
-// no-op unless the block exists and is in_flight: a completed apply, an
-// omitted block or a nil next_actions leave the actions byte-identical.
+// classifyNextActions parameter — the ~118 call sites are untouched).
 // Prepended, not appended, so it is the suggested default (actions[0]).
+//
+// A COMPLETED apply APPENDS one read-only advisory, and only when it left the
+// operator something to do (#5216 R1/R20): entries refused
+// delegation_tier_not_authorized (applied nothing; relabel by hand) or an
+// apply_budget_exhausted tail (resurfaces on the next groom; never re-approve
+// this run's plan gate for it). A completed apply with both counts zero, an
+// omitted block or a nil next_actions leave the actions byte-identical. The
+// fold keys on the block alone, not the run state, so the advisory persists
+// on a terminal run: the relabel is still owed after the run ends.
 func foldGroomingApplyAdvisory(run *Run, status *GroomingApplyStatus, na *NextActions) {
-	if run == nil || na == nil || status == nil || status.State != groomingApplyStateInFlight {
+	if run == nil || na == nil || status == nil {
+		return
+	}
+	if status.State == groomingApplyStateCompleted {
+		foldGroomingApplyCompletedAdvisory(run, status, na)
+		return
+	}
+	if status.State != groomingApplyStateInFlight {
 		return
 	}
 	reason := fmt.Sprintf("grooming apply in flight: %d/%d recorded — re-poll until grooming_apply_status.state is completed, or fishhawk_await_audit on grooming_apply_completed; do not attest the confirm gate on a partial apply (an over-budget tail is recorded apply_budget_exhausted and resurfaces on the next grooming run)", status.Recorded, status.CandidateCount)
@@ -3475,6 +3498,41 @@ func foldGroomingApplyAdvisory(run *Run, status *GroomingApplyStatus, na *NextAc
 		Reason:       reason,
 	}
 	na.Actions = append([]SuggestedAction{advisory}, na.Actions...)
+}
+
+// groomingApplyNoReapproveClause is the shared "do not re-approve" wording of
+// the completed-apply advisory (#5216 R20, approval condition W4): it names the
+// PLAN re-approval that launches a fresh apply, and says the confirm-gate
+// attestation is unaffected.
+const groomingApplyNoReapproveClause = "do not re-approve this run's plan gate for them: a plan re-approval launches a fresh apply, which changes neither outcome; attesting the confirm gate (approve_review_gate), where it is still parked, is unaffected and is the legal next step"
+
+// foldGroomingApplyCompletedAdvisory APPENDS the completed-apply advisory when
+// the apply refused delegation-tier proposals or ran out of budget. Appended,
+// not prepended: the run's own next step (typically approve_review_gate) stays
+// the suggested default.
+func foldGroomingApplyCompletedAdvisory(run *Run, status *GroomingApplyStatus, na *NextActions) {
+	if status.TierNotAuthorized <= 0 && status.BudgetExhausted <= 0 {
+		return
+	}
+	var parts []string
+	if status.TierNotAuthorized > 0 {
+		ids := strings.Join(status.TierNotAuthorizedEntries, ", ")
+		if status.TierNotAuthorized > len(status.TierNotAuthorizedEntries) {
+			ids += fmt.Sprintf(" (and %d more; list them from the grooming_mutation_applied rows)", status.TierNotAuthorized-len(status.TierNotAuthorizedEntries))
+		}
+		parts = append(parts, fmt.Sprintf("%d entr(ies) refused delegation_tier_not_authorized [%s]: the refusal applied nothing in those entries, not even the clerical labels beside the tier, so apply the ones you agree with by hand on the tracker", status.TierNotAuthorized, ids))
+	}
+	if status.BudgetExhausted > 0 {
+		parts = append(parts, fmt.Sprintf("%d entr(ies) recorded apply_budget_exhausted were never evaluated: they resurface on the next grooming run, so approve that run rather than hand-applying them", status.BudgetExhausted))
+	}
+	reason := "grooming apply completed: " + strings.Join(parts, "; ") + "; " + groomingApplyNoReapproveClause
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "fishhawk_list_audit",
+		Params:       map[string]string{"run_id": run.ID, "category": auditCategoryGroomingMutationApplied},
+		Precondition: "always legal (read-only); the grooming apply completed",
+		Consumes:     consumesNone,
+		Reason:       reason,
+	})
 }
 
 // pollAction is the re-poll entry: always legal (read-only), carrying
