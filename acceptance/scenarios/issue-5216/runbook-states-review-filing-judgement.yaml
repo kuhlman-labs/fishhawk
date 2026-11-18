@@ -1,0 +1,14 @@
+id: scenario:issue-5216/runbook-states-review-filing-judgement
+statement: The MCP runbook resource carries a review, filing and grooming judgement section stating that split reviewers are adjudicated on the tree, that an all-red counterfactual battery proves only the controls it mutates so cross-entity eligibility cases are listed separately, and its backlog grooming loop says to re-read the anchor issue body before each start.
+verify_hint: 'MCP resource read: POST /mcp resources/read fishhawk://runbook; read the new judgement section and the Backlog grooming loop section.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; POST /v0/dev/sign over '{}'; mcp-token -> fhm_ bearer; POST http://localhost:8090/mcp resources/read {uri:'fishhawk://runbook'} with Mcp-Method resources/read, Mcp-Name fishhawk://runbook and _meta. Read the '### Review arbitration, filing and grooming judgement' section and '### Backlog grooming loop (non-diff)'.
+assertions:
+    expected: all elements
+    observed_at_record: 'The judgement section is present: a split is adjudicated on the tree, and an all-red battery proves only the controls it mutates, so cross-entity eligibility cases are listed separately. Grooming loop: ''A stale anchor body steers the groom wrong, so re-read it before each start and whenever the charter is amended.'''
+    repro_handle: POST /mcp resources/read fishhawk://runbook
+origin:
+    issue: 5216
+    pr: 5467
+    run_id: c6829727-10cb-4258-9943-f7ceecd7be35
+    head_sha: 2c1dcb46d3bfef87feaf0b72da41fa2025a6d1e1
+    recorded_at: 2026-11-18T20:47:16Z
