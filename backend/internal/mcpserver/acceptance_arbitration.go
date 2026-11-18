@@ -57,7 +57,11 @@ so your merge verdict still lands on the chain. When the discharged verdict
 recorded failed replayed scenarios, the entry also records them as
 failed_scenario_ids, so a scenario-only page discharged on the reason alone
 stays auditable; retire a stale scenario in acceptance/scenarios/retired.yaml on
-the default branch. For a GENUINE scenario-only regression the alternative is
+the default branch. The cheaper lever is retiring the stale scenario at a plan
+approval (fishhawk_approve_plan amend_acceptance_criteria action
+retire_scenario, which the acceptance runner merges into retired.yaml); a hand
+edit of retired.yaml is an operator pull request on the default branch that can
+need an admin merge. For a GENUINE scenario-only regression the alternative is
 fishhawk_fixup_stage with operator_concern on the implement stage, admitted only
 while the review stage is awaiting_approval (refused once review succeeded or is
 terminal, and before the review gate opens).

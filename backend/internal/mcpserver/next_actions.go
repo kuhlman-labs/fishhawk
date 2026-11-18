@@ -2380,7 +2380,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 			}
 		}
 		// pending | awaiting_host_dispatch (#1912): the operator host dispatches.
-		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance", acceptance)}
+		return &NextActions{State: "acceptance_pending", Actions: withAcceptanceAllSkipExpectation(dispatchOrPollActions(run, "acceptance", acceptance))}
 	}
 
 	// #4356: a FAILED acceptance stage shipped no verdict for its current
@@ -2970,12 +2970,43 @@ func mergeRitualActions(run *Run, why string) []SuggestedAction {
 		{
 			Action:       "approve_pr",
 			Params:       prParams(run),
-			Precondition: "the implement review is terminal and the diff is reviewed",
+			Precondition: approvePRPreApprovalChecklist,
 			Consumes:     consumesNone,
-			Reason:       why + " — record an operator verdict (gh pr review --approve) under your own GitHub identity before merging",
+			Reason:       why + " — record an operator verdict (gh pr review --approve) under your own GitHub identity before merging. Approve after any vouch or hardening push, never before it: a push moves the PR head and, where branch protection dismisses stale approvals, dismisses the approval",
 		},
 		mergeRunAction(run),
 	}
+}
+
+// approvePRPreApprovalChecklist is the approve_pr action's Precondition: the
+// compact pre-approval checklist (E106.28 / #5213, rules 1, 2, 3 and 9). It
+// names product mechanisms only (ADR-110). merge_readiness.blockers must be
+// empty EXCEPT approval_dismissed, which approving clears; a non-empty
+// undetermined[] is informational and never blocks approval, because a healthy
+// unblocked PR reports undetermined (its approval check is not the thing
+// holding the merge).
+const approvePRPreApprovalChecklist = "the implement review is terminal and the diff is reviewed; before approving, confirm in fishhawk_get_gate_view: the PR head is unmoved since the evidence (compare merge_candidate_verdict.head_sha against the PR head, and re-read the PR head after acceptance settles because an acceptance scenario commit moves it); required checks are green at that head (bound the wait with a timeout, never watch unbounded); reviews are settled with no open blocking concern; declared counterfactuals were observed RED, so no control_unpinned concern is open; the acceptance outcome is named in your merge verdict; merge_readiness.blockers is empty except approval_dismissed, which approving clears (a non-empty undetermined[] is informational and does not block approval)"
+
+// acceptanceAllSkipExpectation is appended to the acceptance dispatch action's
+// Reason (E106.28 / #5213, rule 12). It is scoped to the acceptance dispatch
+// only: the plan and implement dispatch reasons, and dispatchOrPollActions'
+// shared text, stay unchanged.
+const acceptanceAllSkipExpectation = "; a plan whose every criterion is skip_expected with a basis settles not_validated with no runner, so bind a preview or target only when a criterion drives a runtime HTTP or MCP surface — a prompt, script, struct or PR-text observable is expected to all-skip"
+
+// withAcceptanceAllSkipExpectation returns actions with the all-skip
+// expectation appended to the fishhawk_dispatch_stage action's Reason. It
+// copies the slice, so the shared dispatchOrPollActions result is never
+// mutated. A github_actions run returns only a poll action, which carries no
+// dispatch and so no note.
+func withAcceptanceAllSkipExpectation(actions []SuggestedAction) []SuggestedAction {
+	out := make([]SuggestedAction, len(actions))
+	copy(out, actions)
+	for i := range out {
+		if out[i].Action == "fishhawk_dispatch_stage" {
+			out[i].Reason += acceptanceAllSkipExpectation
+		}
+	}
+	return out
 }
 
 // mergeRunAction is the fishhawk_merge_run SuggestedAction (E48.7 / #1954):
@@ -2987,7 +3018,7 @@ func mergeRunAction(run *Run) SuggestedAction {
 	return SuggestedAction{
 		Action:       "fishhawk_merge_run",
 		Params:       map[string]string{"run_id": run.ID, "verdict": "<operator merge verdict>"},
-		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the published fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied). Fishhawk publishes that check but does not make it required: whether it gates the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports",
+		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the published fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied). Fishhawk publishes that check but does not make it required: whether it gates the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports. Every call is a real merge attempt: use fishhawk_get_gate_view merge_readiness to check acceptance and review-coverage readiness without recording a verdict",
 		Consumes:     consumesNone,
 		Reason:       "records your operator merge verdict as a chained audit entry, queues the forge merge (the repository's declared merge method, default squash) through the same seam drive_run's may_merge arm uses, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
 	}

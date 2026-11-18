@@ -1,0 +1,14 @@
+id: scenario:issue-5213/gate-view-description-carries-pre-approval-checklist
+statement: The fishhawk_get_gate_view description carries the pre-approval checklist. Before approving, merge_readiness.blockers must be empty apart from approval_dismissed, which approving clears. A non-empty undetermined list is informational, not a refusal to approve; a healthy unblocked PR reports one. The checklist names what to do about each remaining blocker.
+verify_hint: 'MCP tool result: the served fishhawk_get_gate_view description from the preview''s tools/list.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list (2026-07-28 headers and _meta). Read the fishhawk_get_gate_view description.
+assertions:
+    expected: checklist per R1 with an action for each blocker
+    observed_at_record: 'PRE-APPROVAL CHECKLIST: head_sha matches the PR head; review_head_mismatch absent; ''merge_readiness.blockers[] is empty EXCEPT approval_dismissed, which approving clears''; no open blocking or control_unpinned concern; acceptance outcome known; ''A non-empty undetermined[] is informational and does not block approval: a healthy PR that is not blocked reports its approval check as undetermined''. The blockers list gives next_steps: acceptance_stale -> dispatch/await/retry_stage; approval_dismissed -> approve_pr; review_coverage_incomplete -> await_review/fixup_stage.'
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5213
+    pr: 5418
+    run_id: 078deff3-bc86-4ec7-8611-33a306612ca8
+    head_sha: d5de46641fe614c04852f0d5aa0713693215c5b1
+    recorded_at: 2026-11-18T01:08:55Z

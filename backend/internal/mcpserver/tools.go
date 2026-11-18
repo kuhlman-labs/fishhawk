@@ -4397,6 +4397,16 @@ Sibling verb: fishhawk_reset_run_branch is the right verb for a FOREIGN
 COMMIT pushed ON TOP of the run's commits — a different problem. This one
 is for a BASE ADVANCE.
 
+DECOMPOSED PARENT. Where the workflow declares a verify command, the rebase
+authorizes a verify-only merge-candidate pass; once it passes, the parent's
+review stage is re-walked and a fresh consolidated implement-review round starts
+on the new head. Await that round with fishhawk_await_review (or read
+fishhawk_get_gate_view) before fishhawk_merge_run, because the earlier round
+judged a tree the PR no longer carries; until it settles fishhawk_merge_run can
+answer review_coverage_incomplete. A head with no verify pass (no declared
+verify command, or a verdict transferred across a clean base advance) starts no
+pass and so no new round: if none appears, start one with fishhawk_rerun_review.
+
 VERIFY-ONLY RE-RUN of a FAILED head (#4391): pass rerun_failed_verify:true
 with a non-blank reason (the reason is REQUIRED — it is recorded as your
 attestation that the failure was infrastructure, not the change). On the

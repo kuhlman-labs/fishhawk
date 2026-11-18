@@ -1,0 +1,14 @@
+id: scenario:issue-5213/merge-run-description-states-approval-order-and-waits
+statement: The fishhawk_merge_run tool description served over MCP states the push, vouch, green checks, approve, merge order, says to re-read the PR head after an acceptance scenario commit, says to bound the checks wait with a timeout, and says that a merge left queued with the pull request BLOCKED is diagnosed from the fishhawk_audit_complete check output.
+verify_hint: 'MCP tool result: the served fishhawk_merge_run description from the preview''s tools/list.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; signing-key; dev/sign '{}'; mcp-token -> fhm_; POST /mcp tools/list (2026-07-28 headers and _meta). Read the fishhawk_merge_run description.
+assertions:
+    expected: order, head re-read, bounded wait, BLOCKED diagnosis
+    observed_at_record: 'order ''push, vouch (fishhawk_vouch_commit), wait for checks green at that head, approve, then call this verb''; a scenario commit moves the head, so ''re-read the PR head once acceptance settles''; checks_pending ''Bound the wait: set timeout_seconds, never watch the checks unbounded''; timeout ''If the merge stays queued while the pull request is BLOCKED, read the fishhawk_audit_complete check output'''
+    repro_handle: POST /mcp tools/list
+origin:
+    issue: 5213
+    pr: 5418
+    run_id: 078deff3-bc86-4ec7-8611-33a306612ca8
+    head_sha: d5de46641fe614c04852f0d5aa0713693215c5b1
+    recorded_at: 2026-11-18T01:08:55Z
