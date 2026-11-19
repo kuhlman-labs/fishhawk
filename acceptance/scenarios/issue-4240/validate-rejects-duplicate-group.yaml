@@ -1,0 +1,13 @@
+id: scenario:issue-4240/validate-rejects-duplicate-group
+statement: '`fishhawk validate` rejects a `concurrency.groups` list that names the same (scope, group) pair twice, exiting non-zero with an error naming the duplicated group.'
+verify_hint: 'CLI: `fishhawk validate <file>` with two {group: deploy-target, scope: repository} entries; check the non-zero exit and stderr naming deploy-target.'
+steps: 'Ran `fishhawk validate dup.yaml`. Its concurrency.groups holds two {group: deploy-target, scope: repository} entries. Also sent it to the preview''s MCP fishhawk_validate.'
+assertions:
+    expected: Non-zero exit, with an error naming deploy-target.
+    observed_at_record: 'Exit 1. stderr reads ''.../concurrency/groups/1: concurrency.groups lists (scope "repository", group "deploy-target") twice (also at entry 0); a stage holds each group once, so declare it once''. The preview returns the same.'
+origin:
+    issue: 4240
+    pr: 5479
+    run_id: 3fd75737-959c-47f9-a418-4a983e327e4c
+    head_sha: ef6d3a6f91aa6df1f8b022fd5a8bffcc5b886c6f
+    recorded_at: 2026-11-19T20:47:32Z
