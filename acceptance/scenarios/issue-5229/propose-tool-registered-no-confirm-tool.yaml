@@ -1,0 +1,14 @@
+id: scenario:issue-5229/propose-tool-registered-no-confirm-tool
+statement: An MCP tools/list call lists fishhawk_propose_waive, whose description says it clears nothing and that only a human signed in to the Fishhawk Web UI can confirm or reject the proposal. No MCP tool that confirms or rejects a waive proposal is listed.
+verify_hint: 'MCP tool result: as in acceptance/scenarios/issue-5228, POST /v0/dev/fixtures {"scenario":"trace-upload-target"}, mint an fhm_ run bearer, then POST /mcp tools/list. Read the tool names (87 tools) and the fishhawk_propose_waive description.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. POST /mcp tools/list with Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list and _meta. Listed every tool name containing waive, propos, confirm or reject, and read the fishhawk_propose_waive description.
+assertions:
+    expected: propose tool listed with clears-nothing and Web-UI-human-only wording; no confirm/reject-proposal MCP tool
+    observed_at_record: '87 tools. fishhawk_propose_waive is listed, and its description says ''It clears nothing.'' and ''Only a human signed in to the Fishhawk Web UI confirms or rejects it ... There is no MCP or CLI confirm or reject.'' The matching names were fishhawk_delegation_confirm, fishhawk_propose_waive, fishhawk_reject_deploy, fishhawk_reject_plan, fishhawk_waive_concern and fishhawk_waive_concerns. None of them confirms or rejects a waive proposal: delegation_confirm covers workflow delegation after a captain handover.'
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 5229
+    pr: 5474
+    run_id: f99b4fdf-338f-4852-baac-71270981bde5
+    head_sha: 6eebb38fae4d8beca8d6b1883b52032219a6b44c
+    recorded_at: 2026-11-19T02:02:04Z
