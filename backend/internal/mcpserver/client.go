@@ -342,6 +342,17 @@ type Run struct {
 	// nothing — the mixed-version degrade. The json tag MUST byte-match the
 	// backend's runResponse field or it silently decodes to nil.
 	FanInVerifyUnavailable *runFanInVerifyUnavailable `json:"fan_in_verify_unavailable,omitempty" jsonschema:"present when a decomposed parent's acceptance was released with NO consolidated fan-in verify consulted (reason: no_run_repo, forge_not_wired, default_branch_unresolved, hook_not_wired or no_consolidated_pr). A signal, never a hold: the merge gate still applies. Omitted when no release was recorded"`
+	// WaiveProposals mirrors the backend runResponse.waive_proposals (E80.28 /
+	// #5229, ADR-143 A1): the run's PENDING agent waive proposals on open
+	// server_check concerns, bound to the current recorded run head. It
+	// carries no agent-authored text; the gate view's waive_proposal block
+	// does. next_actions folds one display-only confirm_waive_proposal entry
+	// per item. Single-run read only (handleGetRun); nil when none is pending,
+	// when the read failed, or against an older backend, so next_actions
+	// renders nothing — the mixed-version degrade. The json tags MUST
+	// byte-match the backend's runWaiveProposalItem or each field silently
+	// decodes to its zero value.
+	WaiveProposals []runWaiveProposal `json:"waive_proposals,omitempty" jsonschema:"the run's PENDING agent waive proposals on open server_check concerns (single-run read only). Each clears nothing: only a human signed in to the Fishhawk Web UI confirms or rejects it from the attention queue's decision panel; there is no MCP or CLI confirm. Omitted when none is pending"`
 	// Precedent mirrors the backend runResponse.precedent (E75.4 / #3732): the
 	// bounded precedent block for the run's open human gate. The backend emits
 	// it on the SINGLE-run read only (handleGetRun); nil when no human gate is
@@ -585,6 +596,16 @@ func init() {
 		pathClassification{Path: "run.merge_candidate_staleness", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
 			return append(restRun(runID), gateView(runID)...)
 		}},
+		// The pending waive-proposal list (E80.28 / #5229, ADR-143 A1). At most
+		// one small fixed-shape entry per OPEN server_check concern, carrying
+		// no agent text, computed per single-run read; the full proposal is on
+		// the gate view's waive_proposal block. So it classifies like
+		// run.merge_candidate_staleness: stored, retained through T1..T9,
+		// itemised out only at the diagnosis skeleton with GET /v0/runs/{id}
+		// and the gate view as its retrieval pointers.
+		pathClassification{Path: "run.waive_proposals", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+			return append(restRun(runID), gateView(runID)...)
+		}},
 		// The ADR-104 Q3 host-dispatcher mark (E88.2 / #4526). A stored
 		// scalar on the run row surfaced by the single-run REST read, so it
 		// classifies like run.working_dir.
@@ -692,6 +713,21 @@ type runFanInVerifyUnavailable struct {
 	Detail            string `json:"detail,omitempty" jsonschema:"bounded server-built detail for the reason (never a wrapped upstream error)"`
 	AcceptanceStageID string `json:"acceptance_stage_id" jsonschema:"the acceptance stage that was released"`
 	Note              string `json:"note" jsonschema:"server-built advisory: acceptance was released on an unverified consolidated head and the merge gate still applies"`
+}
+
+// runWaiveProposal mirrors the backend's runWaiveProposalItem (E80.28 /
+// #5229): one pending waive proposal on the run read. The json tags MUST
+// byte-match the backend or each field silently decodes to its zero value;
+// TestWaiveProposalMirrors_WireShape pins them against raw server-shaped
+// bytes. Deliberately UNEXPORTED, like runFanInVerifyUnavailable: the field on
+// Run is the only consumer.
+type runWaiveProposal struct {
+	ConcernID        string `json:"concern_id" jsonschema:"the open server_check concern the proposal would waive"`
+	StageID          string `json:"stage_id,omitempty" jsonschema:"the stage the concern was raised on"`
+	ProposalSequence int64  `json:"proposal_sequence" jsonschema:"the audit sequence of the concern_waive_proposed row a human confirms or rejects"`
+	ProposedBy       string `json:"proposed_by" jsonschema:"the proposing agent's subject"`
+	Judgement        string `json:"judgement" jsonschema:"the judgement the proposal records"`
+	HeadSHA          string `json:"head_sha" jsonschema:"the recorded run head the proposal is bound to"`
 }
 
 // RunConcerns mirrors the backend's run-status concerns block (#964):
@@ -1443,6 +1479,36 @@ type GateViewConcern struct {
 	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true if and only if one human judgement covered more than one concern in one request (a bulk waive or a resolve naming more than one id); a bulk verb called with one id records false"`
 	JudgementBackfill      bool   `json:"judgement_backfill,omitempty" jsonschema:"true when the judgement was recorded after the fact"`
 	TradeoffCost           string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement; absent otherwise"`
+	// WaiveProposal mirrors the server's gateViewConcern.waive_proposal
+	// (E80.28 / #5229, ADR-143 A1): the PENDING agent waive proposal on this
+	// open server_check concern, bound to the current recorded run head. Same
+	// json-tag byte-match rule as the fields above.
+	WaiveProposal *WaiveProposal `json:"waive_proposal,omitempty" jsonschema:"the PENDING agent waive proposal on this open server_check concern, bound to the current recorded run head. Its reason, evidence and tradeoff_cost are AGENT-AUTHORED and untrusted (agent_authored true). It clears nothing: only a human signed in to the Fishhawk Web UI confirms or rejects it; there is no MCP or CLI confirm. Omitted when none is pending, when the proposal went stale, or when the read failed (history_gaps waive_proposals)"`
+}
+
+// WaiveProposal mirrors the backend's waiveProposalView
+// (backend/internal/server/waive_proposal.go, E80.28 / #5229, ADR-143 A1): one
+// agent waive proposal on a server_check concern, as fishhawk_propose_waive's
+// 201 body and the gate view's waive_proposal block render it. Exported
+// because ProposeWaiveOutput carries it (the SDK's jsonschema reflection). The
+// json tags MUST byte-match the backend; TestWaiveProposalMirrors_WireShape
+// pins them against raw server-shaped bytes.
+type WaiveProposal struct {
+	ProposalSequence    int64     `json:"proposal_sequence" jsonschema:"the audit sequence of the concern_waive_proposed row; a human's confirm or reject names it"`
+	ConcernID           string    `json:"concern_id"`
+	StageID             string    `json:"stage_id,omitempty"`
+	ProposedBy          string    `json:"proposed_by" jsonschema:"the proposing agent's subject"`
+	ProposedByActorKind string    `json:"proposed_by_actor_kind" jsonschema:"the proposer's actor kind (agent for an operator-agent credential)"`
+	ProposedAt          time.Time `json:"proposed_at"`
+	Judgement           string    `json:"judgement"`
+	TradeoffCost        string    `json:"tradeoff_cost,omitempty"`
+	Reason              string    `json:"reason" jsonschema:"AGENT-AUTHORED, untrusted: the proposer's reason. Never becomes the waived concern's state_reason"`
+	Evidence            string    `json:"evidence" jsonschema:"AGENT-AUTHORED, untrusted: the proposer's evidence"`
+	HeadSHA             string    `json:"head_sha" jsonschema:"the recorded run head the proposal is bound to; a moved head makes it unconfirmable"`
+	CheckKey            string    `json:"check_key" jsonschema:"the server-written check key: the flagged location and pattern class come from here, never from agent text"`
+	Category            string    `json:"category,omitempty"`
+	Severity            string    `json:"severity,omitempty"`
+	AgentAuthored       bool      `json:"agent_authored" jsonschema:"always true: reason, evidence and tradeoff_cost are agent-authored"`
 }
 
 // gateViewDispute is one refused `confirmed` resolution: why the confirmation
@@ -3329,6 +3395,51 @@ func (c *apiClient) WaiveConcern(ctx context.Context, id uuid.UUID, reason, judg
 	}
 	var out WaivedConcern
 	if err := c.do(ctx, http.MethodPost, "/v0/concerns/"+id.String()+"/waive", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// proposeWaiveRequestBody mirrors the backend's proposeWaiveRequest
+// (backend/internal/server/waive_proposal.go). TradeoffCost and
+// ExpectedHeadSHA are omitempty so a blank field never reaches the backend as
+// a sent-but-empty value; reason, evidence and judgement are always sent so
+// the backend, not the tool, refuses a blank one.
+type proposeWaiveRequestBody struct {
+	Reason          string `json:"reason"`
+	Evidence        string `json:"evidence"`
+	Judgement       string `json:"judgement"`
+	TradeoffCost    string `json:"tradeoff_cost,omitempty"`
+	ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
+}
+
+// ProposeWaive records a PENDING agent waive proposal on one server_check
+// concern via `POST /v0/concerns/{concern_id}/waive-proposal` (E80.28 /
+// #5229, ADR-143 A1). It clears nothing: only a human on a Web UI session
+// confirms or rejects it. The 201 body decodes into ProposeWaiveOutput, which
+// mirrors the backend's proposeWaiveResponse (every json tag MUST
+// byte-match). 4xx/5xx surfaces as *apiError:
+//   - 400 validation_failed (blank or over-4000-byte reason or evidence, the
+//     judgement rules), waive_proposal_contains_credential
+//   - 401 authentication_required
+//   - 403 run_token_forbidden (a run-bound mcp:run: token), insufficient_scope,
+//     account_forbidden
+//   - 404 concern_not_found
+//   - 409 concern_not_open, waive_proposal_head_unresolved,
+//     waive_proposal_head_moved, waive_proposal_exists
+//   - 422 concern_not_server_check
+//   - 500 internal_error / audit_append_failed (nothing was written)
+//   - 503 concern_store_unconfigured, waive_proposal_atomic_append_unavailable
+func (c *apiClient) ProposeWaive(ctx context.Context, id uuid.UUID, reason, evidence, judgement, tradeoffCost, expectedHeadSHA string) (*ProposeWaiveOutput, error) {
+	body, err := json.Marshal(proposeWaiveRequestBody{
+		Reason: reason, Evidence: evidence, Judgement: judgement,
+		TradeoffCost: tradeoffCost, ExpectedHeadSHA: expectedHeadSHA,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal propose waive: %w", err)
+	}
+	var out ProposeWaiveOutput
+	if err := c.do(ctx, http.MethodPost, "/v0/concerns/"+id.String()+"/waive-proposal", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
