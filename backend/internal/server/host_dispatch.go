@@ -609,15 +609,26 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	from := stage.State
 	var updated *run.Stage
 	var slot *hostDispatchConcurrency
-	group, limit, grouped := "", 0, false
+	var groups []concurrency.GroupRequest
+	grouped := false
 	if s.cfg.Concurrency != nil {
-		group, limit, grouped = s.resolveStageConcurrency(r.Context(), runRow, stage, host)
+		var rerr error
+		groups, grouped, rerr = s.resolveStageConcurrency(r.Context(), runRow, stage, host)
+		if rerr != nil {
+			// Unreachable for a validated spec (ADR-094 A1 keys admit no ':'
+			// in a host label, repository or group name). Fail closed: no
+			// admission, no CAS.
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not resolve the stage's concurrency groups",
+				map[string]any{"stage_id": stageID.String(), "error": rerr.Error()})
+			return
+		}
 	}
 	liveCAS, isLiveCAS := s.cfg.RunRepo.(run.StageLiveRunCASTransitioner)
 	switch cas, isCAS := s.cfg.RunRepo.(run.StageCASTransitioner); {
 	case grouped:
 		var queued bool
-		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, group, limit, host, nonce, expedited)
+		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, groups, host, nonce, expedited)
 		if queued {
 			return
 		}

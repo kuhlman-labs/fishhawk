@@ -7725,15 +7725,65 @@ components:
     HostDispatchConcurrency:
       description: |
         The host-dispatch 200 body's `concurrency` block (#3964): present only
-        when the stage was ADMITTED into a concurrency group.
+        when the stage was ADMITTED into its concurrency group set (ADR-094
+        D2, #4240: all-or-nothing across the set). `group` and `limit`
+        describe the BINDING group, the first of the set in canonical key
+        order; they are retained for one release for pre-#4240 clients, and
+        `groups` lists the whole set.
       type: object
-      required: [group, limit, queued_before, waited_seconds]
+      required: [group, limit, queued_before, waited_seconds, groups]
       properties:
-        group: { type: string, description: 'The group key (`local-implement:<host>`, `local-verify:<host>` for a merge-candidate verify-only pass, or `spec:<repo>:<name>`).' }
+        group: { type: string, description: 'The binding group''s key (see `ConcurrencyGroupRef.group` for the canonical key table).' }
         limit: { type: integer, minimum: 1, maximum: 64 }
+        groups:
+          type: array
+          minItems: 1
+          description: Every group the stage was admitted into, in canonical key order. A single-group stage lists one entry equal to `group`/`limit`.
+          items: { $ref: '#/components/schemas/ConcurrencyGroupRef' }
         queued_before: { type: boolean, description: True when the stage waited in the queue during this episode. }
         waited_seconds: { type: integer, minimum: 0, description: Seconds from enqueue to admission (0 when it did not queue). }
         admission_nonce: { type: string, description: 'The request''s `admission_nonce` echoed back; omitted when it carried none.' }
+    ConcurrencyGroupRef:
+      description: |
+        One group of a stage's concurrency group set (ADR-094 D2/D3, #4240).
+      type: object
+      required: [group, limit]
+      properties:
+        group:
+          type: string
+          description: |
+            The canonical group key (ADR-094 Amendment A1: the legacy strings
+            stay canonical). `local-implement:<host>` is the host's implement
+            group (the default for a local implement stage, and a declared
+            `{group: implement, scope: host}`); `local-verify:<host>` is the
+            host's verify group (limit 1: a merge-candidate verify-only pass,
+            ADR-092 / #4200, or a declared `{group: verify, scope: host}`);
+            `spec:<repo>:<name>` is a repository-scoped group; and
+            `host:<host>:<name>` is any other host-scoped group (limit 1).
+        scope:
+          type: string
+          enum: [host, repository, account]
+          description: The group's scope, parsed from `group`; omitted when the key does not parse.
+        limit: { type: integer, minimum: 1, maximum: 64 }
+    ConcurrencyGroupState:
+      description: |
+        One group of a stage's concurrency group set with its live state
+        (ADR-094 D2, #4240): the 409 `concurrency_slot_queued` details'
+        and the Stage `concurrency` block's `groups` entries.
+      type: object
+      required: [group, limit, holders]
+      properties:
+        group: { type: string, description: 'The canonical group key (the `ConcurrencyGroupRef.group` table).' }
+        scope:
+          type: string
+          enum: [host, repository, account]
+          description: The group's scope, parsed from `group`; omitted when the key does not parse.
+        limit: { type: integer, minimum: 1, maximum: 64 }
+        position: { type: integer, minimum: 1, description: 1-based queue position in this group; omitted while holding. }
+        holders:
+          type: array
+          description: This group's live holders; always a list (`[]` when none).
+          items: { $ref: '#/components/schemas/ConcurrencyHolder' }
     ConcurrencyHolder:
       type: object
       required: [run_id, stage_id, since]
@@ -7750,9 +7800,14 @@ components:
         `GET /v0/runs/{run_id}/stages` and
         `GET /v0/runs/{run_id}/stages/{stage_id}`; best-effort (omitted on a
         read error). Holders in another account are neither counted nor
-        listed.
+        listed. A stage holds or waits for its whole group SET at once
+        (ADR-094 D2, #4240): `groups` lists every group, and the top-level
+        `group`, `limit`, `position` and `holders` describe the BINDING
+        group (while queued, the highest position, ties broken in canonical
+        key order; while holding, the first group in canonical key order),
+        retained for one release for pre-#4240 clients.
       type: object
-      required: [status, group, limit, holders, enqueued_at, waiter_live]
+      required: [status, group, limit, holders, enqueued_at, waiter_live, groups]
       properties:
         status:
           type: string
@@ -7763,18 +7818,25 @@ components:
         group:
           type: string
           description: |
-            `local-implement:<host>` (the default for a local implement
-            stage), `local-verify:<host>` (limit 1: an implement stage
-            re-opened for an ADR-090 merge-candidate verify-only pass,
-            ADR-092 / #4200 — never a `local-implement` slot), or
-            `spec:<repo>:<name>` (a spec-declared group, which never captures
-            a verify-only pass).
+            The binding group's key: `local-implement:<host>` (the default
+            for a local implement stage), `local-verify:<host>` (limit 1: an
+            implement stage re-opened for an ADR-090 merge-candidate
+            verify-only pass, ADR-092 / #4200 — never a `local-implement`
+            slot), `spec:<repo>:<name>` (a repository-scoped group, which
+            never captures a verify-only pass), or `host:<host>:<name>` (any
+            other declared host-scoped group). The legacy strings stay
+            canonical (ADR-094 Amendment A1).
         limit: { type: integer, minimum: 1, maximum: 64 }
-        position: { type: integer, minimum: 1, description: 1-based queue position; omitted while holding. }
+        position: { type: integer, minimum: 1, description: 1-based queue position in the binding group; omitted while holding. }
         holders:
           type: array
-          description: The group's live holders; always a list (`[]` when none).
+          description: The binding group's live holders; always a list (`[]` when none).
           items: { $ref: '#/components/schemas/ConcurrencyHolder' }
+        groups:
+          type: array
+          minItems: 1
+          description: Every group of the stage's set, in canonical key order. A single-group stage lists one entry equal to the top-level fields.
+          items: { $ref: '#/components/schemas/ConcurrencyGroupState' }
         enqueued_at: { type: string, format: date-time }
         acquired_at: { type: string, format: date-time, description: When the slot was acquired; holding only. }
         waiter_live:
@@ -19751,8 +19813,18 @@ paths:
         optional request body's `host` label (`unknown` when absent or empty).
         A workflow-v2 stage `concurrency: {group, limit}` overrides it: an
         omitted group joins the host default group with the declared limit; a
-        named group is repository-scoped. Every other undeclared stage type is
-        ungrouped and unchanged. On the `pending|awaiting_host_dispatch` arm a
+        named group is repository-scoped. A `concurrency.groups` list
+        (ADR-094 D2/D3, #4240) replaces that default with a group SET, and
+        the stage is admitted into every group at once or queued in all of
+        them (strict per-group FIFO; no partial hold): `{group: implement,
+        scope: host}` is `local-implement:<host>` at the host default limit,
+        `{group: verify, scope: host}` is `local-verify:<host>`, any other
+        host-scoped group is `host:<host>:<name>` at limit 1 (a spec never
+        sizes a host-scoped group), and a repository-scoped group is
+        `spec:<repo>:<name>` at its declared limit. The 200 block, the 409
+        details and both audit rows list the set as `groups`; their
+        top-level group fields describe the binding group. Every other
+        undeclared stage type is ungrouped and unchanged. On the `pending|awaiting_host_dispatch` arm a
         grouped stage is either ADMITTED (the same CAS to `dispatched`, plus a
         `concurrency` block on the 200) or QUEUED FIFO behind the group's live
         holders (FIFO except a waiter an operator promoted with
@@ -19900,7 +19972,13 @@ paths:
               than a holder), `enqueued_at`, `contended` (another admission
               held the group lock, so this call queued without deciding),
               `queue_ttl_seconds` (60) and `poll_interval_seconds` (5). Holders
-              in another account are neither counted nor listed.
+              in another account are neither counted nor listed. `groups`
+              (#4240) lists every group of the stage's set
+              (`ConcurrencyGroupState`: `group`, `scope`, `limit`, `position`,
+              `holders`); the top-level `group`, `limit`, `position` and
+              `holders` describe the binding group (the highest position, ties
+              broken in canonical key order). A set of more than one group
+              appends `; group set: [...]` to the message.
             - `dispatch_not_admissible` — the stage is in a `running`,
               terminal, or `awaiting_*` gate state, its run is terminal
               (`details.run_state`), a run locked to a non-local
