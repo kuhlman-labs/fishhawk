@@ -670,8 +670,8 @@ func TestRerunQueuedFixup_ConvertsInPlace(t *testing.T) {
 			impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, state)
 			ctx := context.Background()
 			runRow := sd.rr.getRuns[sd.runID]
-			if g, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); g != "local-implement:h1" {
-				t.Fatalf("fixture: group before = %q, want local-implement:h1", g)
+			if groups, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); len(groups) != 1 || groups[0].Key != "local-implement:h1" {
+				t.Fatalf("fixture: groups before = %+v, want [local-implement:h1]", groups)
 			}
 			before := chainLen(sd.au)
 
@@ -713,8 +713,8 @@ func TestRerunQueuedFixup_ConvertsInPlace(t *testing.T) {
 			if !strings.Contains(resp.MergeCandidateVerifyNote, "keeps its place") || !strings.Contains(resp.MergeCandidateVerifyNote, "refunded") {
 				t.Errorf("note = %q, want the in-place conversion named", resp.MergeCandidateVerifyNote)
 			}
-			if g, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); g != "local-verify:h1" {
-				t.Errorf("group after = %q, want local-verify:h1", g)
+			if groups, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); len(groups) != 1 || groups[0].Key != "local-verify:h1" {
+				t.Errorf("groups after = %+v, want [local-verify:h1]", groups)
 			}
 		})
 	}

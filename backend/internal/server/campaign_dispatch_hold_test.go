@@ -1005,6 +1005,29 @@ func TestCampaignHotfix_PromotedHotfixAdmittedFirst_PG(t *testing.T) {
 	f.admitted(hot, hostBody("h1"))
 }
 
+// TestCampaignHotfix_AutoPromoteCarriesGroupPositions_PG (R4, CF-R4): the
+// auto-promote copies the promotion's per-group positions and holders into
+// the 409 details.groups, so the set view agrees with the top-level fields:
+// the hotfix reads position 1 (pre-promote 2) behind holder A, and a
+// re-POST keeps position 1.
+func TestCampaignHotfix_AutoPromoteCarriesGroupPositions_PG(t *testing.T) {
+	f := newHoldPG(t, pgStore)
+	a, b, hot := f.impl(), f.impl(), f.impl()
+	f.admitted(a, hostBody("h1"))
+	f.queued(b, hostBody("h1"))
+	f.campaignWith(nil, hot, "", false)
+	for i := range 2 {
+		d, _, raw := f.queued(hot, hostBody("h1"))
+		gs := queuedGroups(t, raw)
+		if d.Position != 1 || len(gs) != 1 || gs[0].Group != "local-implement:h1" || gs[0].Position != 1 || !sameStageIDs(holderIDs(gs[0].Holders), a.ID) {
+			t.Fatalf("POST %d: details = %+v, groups %+v; want position 1 behind A in local-implement:h1", i+1, d, gs)
+		}
+	}
+	if rows := f.promotedRows(); len(rows) != 1 || rows[0].payload["old_position"] != float64(2) {
+		t.Errorf("promoted rows = %+v, want one auto-promote from position 2", rows)
+	}
+}
+
 // statusErrStore fails StatusForStages; everything else is the real store.
 type statusErrStore struct{ concurrency.Store }
 
