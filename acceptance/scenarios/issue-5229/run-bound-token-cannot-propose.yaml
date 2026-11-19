@@ -1,14 +1,14 @@
 id: scenario:issue-5229/run-bound-token-cannot-propose
 statement: A run-bound (fhm_) token that asks to propose a waive is refused with 403 run_token_forbidden. The refusal comes before the handler's own scope check and concern read; the route's account middleware resolves the concern's run first, and a cross-account caller gets 403 account_forbidden there. The run's audit chain records no concern_waive_proposed entry.
 verify_hint: 'HTTP response: with the fhm_ bearer from the criterion above, POST /v0/concerns/{a random UUID}/waive-proposal with a JSON body {reason, evidence, judgement}. The account middleware cannot resolve the random concern and falls through, so the response is 403 with error code run_token_forbidden, not 404. Persisted audit row: GET /v0/runs/{run_id}/audit on the fixture run carries no concern_waive_proposed entry. The cross-account arm is decided in-repo by TestWaiveProposalPropose_CrossAccountRefused in backend/internal/server/waive_proposal_test.go.'
-steps: Seed trace-upload-target and mint an fhm_ bearer (signing-key, dev/sign over '{}', mcp-token). POST /v0/concerns/{random uuid4}/waive-proposal with the bearer and body {"reason":"fixture false positive","evidence":"checked the fixture file","judgement":"no_defect"}. Then GET /v0/runs/{run_id}/audit and GET /v0/runs/{run_id}/audit?category=concern_waive_proposed.
+steps: Seeded trace-upload-target and minted an fhm_ bearer (signing-key, dev/sign over '{}', mcp-token). Sent POST /v0/concerns/{random uuid4}/waive-proposal with the bearer and body {"reason":"fixture false positive","evidence":"checked the fixture file","judgement":"no_defect"}. Then GET /v0/runs/{run_id}/audit and GET /v0/runs/{run_id}/audit?category=concern_waive_proposed.
 assertions:
     expected: 403 run_token_forbidden before the concern read; no concern_waive_proposed entry
-    observed_at_record: '403 {"error":{"code":"run_token_forbidden","message":"a run-bound token cannot propose a waive: the run''s own agent is the party the server check guards (ADR-143 A1)..."}}, not 404. The audit holds only cost_recorded x4 and mcp_token_issued x1. The concern_waive_proposed filter returns 200 with items []. The cross-account arm, TestWaiveProposalPropose_CrossAccountRefused, passed in the sanctioned checkout.'
-    repro_handle: 'curl -XPOST http://localhost:8090/v0/concerns/<uuid>/waive-proposal -H ''Authorization: Bearer <fhm_>'' -d ''{"reason":"x","evidence":"y","judgement":"no_defect"}'''
+    observed_at_record: '403 {"error":{"code":"run_token_forbidden","message":"a run-bound token cannot propose a waive: the run''s own agent is the party the server check guards (ADR-143 A1). An operator agent or a human proposes it"}}, not 404. The run audit holds cost_recorded x4 and mcp_token_issued x1 only. The concern_waive_proposed filter returns 200 with items []. The cross-account arm is left to the in-repo TestWaiveProposalPropose_CrossAccountRefused, a pgtest-backed test the sandbox cannot run.'
+    repro_handle: 'curl -XPOST http://localhost:8090/v0/concerns/<uuid>/waive-proposal -H ''Authorization: Bearer <fhm_>'' -H ''Content-Type: application/json'' -d ''{"reason":"x","evidence":"y","judgement":"no_defect"}'''
 origin:
     issue: 5229
     pr: 5474
     run_id: f99b4fdf-338f-4852-baac-71270981bde5
-    head_sha: 6eebb38fae4d8beca8d6b1883b52032219a6b44c
-    recorded_at: 2026-11-19T02:02:04Z
+    head_sha: 6007704bc6d6c366bd7fdf7eeb590d64dcee4f4b
+    recorded_at: 2026-11-19T03:13:17Z
