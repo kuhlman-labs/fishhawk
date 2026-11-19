@@ -62,6 +62,40 @@ func TestHostDispatch_RequiresAllowedRoots(t *testing.T) {
 	}
 }
 
+// TestHostDispatch_NoDailyCapByDefault pins the flag-to-config hop of ADR-104
+// A1: no --daily-cap hands the loop DailyCap 0 (no daily cap), a positive value
+// is the explicit opt-in, and 0 is accepted as the same "no cap".
+func TestHostDispatch_NoDailyCapByDefault(t *testing.T) {
+	rec := &hostDispatchRecorder{}
+	deps := testHostDispatchDeps(rec, nil, time.Now())
+	if code, _, stderr := runHD(t, deps, "--allowed-roots", "/r", "--state-dir", "/sd"); code != exitOK || rec.calls != 1 {
+		t.Fatalf("no --daily-cap: code=%d stderr=%q calls=%d; want the loop started", code, stderr, rec.calls)
+	}
+	if rec.cfg.DailyCap != 0 {
+		t.Fatalf("no --daily-cap: loop DailyCap = %d; want 0 (no daily cap)", rec.cfg.DailyCap)
+	}
+	if code, _, stderr := runHD(t, deps, "--allowed-roots", "/r", "--state-dir", "/sd", "--daily-cap", "3"); code != exitOK || rec.calls != 2 {
+		t.Fatalf("--daily-cap 3: code=%d stderr=%q calls=%d", code, stderr, rec.calls)
+	}
+	if rec.cfg.DailyCap != 3 {
+		t.Fatalf("--daily-cap 3: loop DailyCap = %d; want 3", rec.cfg.DailyCap)
+	}
+	if code, _, stderr := runHD(t, deps, "--allowed-roots", "/r", "--state-dir", "/sd", "--daily-cap", "0"); code != exitOK || rec.calls != 3 {
+		t.Fatalf("--daily-cap 0: code=%d stderr=%q calls=%d; want accepted", code, stderr, rec.calls)
+	}
+	if rec.cfg.DailyCap != 0 {
+		t.Fatalf("--daily-cap 0: loop DailyCap = %d; want 0", rec.cfg.DailyCap)
+	}
+}
+
+func TestHostDispatch_RefusesNegativeDailyCap(t *testing.T) {
+	rec := &hostDispatchRecorder{}
+	code, _, stderr := runHD(t, testHostDispatchDeps(rec, nil, time.Now()), "--allowed-roots", "/r", "--state-dir", "/sd", "--daily-cap", "-1")
+	if code != exitUsage || !strings.Contains(stderr, "--daily-cap") || rec.calls != 0 {
+		t.Fatalf("--daily-cap -1: code=%d stderr=%q calls=%d; want exit 2 naming --daily-cap and no loop", code, stderr, rec.calls)
+	}
+}
+
 func TestHostDispatch_RefusesLongInterval(t *testing.T) {
 	rec := &hostDispatchRecorder{}
 	deps := testHostDispatchDeps(rec, nil, time.Now())
@@ -95,6 +129,18 @@ func TestHostDispatch_Status(t *testing.T) {
 	writeStatus(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-60 * time.Second), IntervalSeconds: 30, LastRefusalCode: "cap_reached:daily"})
 	if code, out, _ := runHD(t, deps, "--status", "--state-dir", dir); code != exitOK || !strings.Contains(out, "state=live") || !strings.Contains(out, "last_refusal=cap_reached:daily") {
 		t.Fatalf("live: code=%d out=%q; want 0 state=live", code, out)
+	}
+	// A status without an opt-in daily cap reports spawns_today as an
+	// observation and names no daily limit; with one set, daily_cap=N shows. Both
+	// fixtures are the real HostDispatcherStatus the loop writes, so the
+	// daily_cap tag round-trips from writer to renderer.
+	writeStatus(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-60 * time.Second), IntervalSeconds: 30, SpawnsToday: 50})
+	if code, out, _ := runHD(t, deps, "--status", "--state-dir", dir); code != exitOK || !strings.Contains(out, "spawns_today=50") || strings.Contains(out, "daily_cap") {
+		t.Fatalf("no daily cap: code=%d out=%q; want spawns_today=50 and no daily_cap token", code, out)
+	}
+	writeStatus(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-60 * time.Second), IntervalSeconds: 30, SpawnsToday: 2, DailyCap: 3})
+	if code, out, _ := runHD(t, deps, "--status", "--state-dir", dir); code != exitOK || !strings.Contains(out, "spawns_today=2") || !strings.Contains(out, "daily_cap=3") {
+		t.Fatalf("daily cap 3: code=%d out=%q; want spawns_today=2 daily_cap=3", code, out)
 	}
 	writeStatus(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-60 * time.Second), IntervalSeconds: 30, Paused: true})
 	if code, out, _ := runHD(t, deps, "--status", "--state-dir", dir); code != exitOK || !strings.Contains(out, "state=paused") {

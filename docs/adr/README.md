@@ -362,6 +362,10 @@ Amendments recorded under the upkeep rule since:
   ADR-024 each carry `amended_by: [ADR-104]`. ADR-022 kept its status (then
   `unknown`): an amendment does not change the amended record's status.
   ADR-022 is `accepted` since the Captain's 2026-10-23 status rulings.
+  Its in-body "Amendment A1: the daily spawn cap is removed" (ratified by the
+  Captain 2026-11-18 on #5472, recorded with #5472; final text confirmed at
+  merge) drops the daily cap from Q6's enforced stopgap set. It changes no
+  front-matter field, so `index.json` is unchanged.
 - ADR-105: `amends: [ADR-057, ADR-061]` ("Amends ADR-057 (the repo-ACL key)
   and ADR-061 (workspace ↔ installation, the two-sided adopt)"); ADR-057 and
   ADR-061 each carry `amended_by: [ADR-105]` and kept their status (then

@@ -103,3 +103,16 @@ The `docs/adr/104-*.md` record (with `amends: ["ADR-024"]` and ADR-024's `amende
   - **Reload window.** A new long-lived spawner widens the reload TOCTOU; the Q5 drain order closes it.
 - **Amends:** ADR-024 (Q4, Q5) and the ADR-022 addendum (a third identity: host dispatcher). **Preserves:** ADR-074. **Related:** ADR-047, ADR-087, ADR-090, ADR-093, ADR-094, ADR-101. **Epic:** E88 #4523.
 - **Review history:** revised 2026-10-16 after an independent fable review. It corrected the constraint citation (ADR-074, not ADR-024), replaced the claimed marker-CAS race mitigation with the stated residual, made the retry boundary explicit, widened eligibility to a starter-stamped mark, and added Q6 and Q7.
+
+## Amendment A1: the daily spawn cap is removed (ratified by the Captain, 2026-11-18 (issue #5472))
+
+Ratification: Captain, 2026-11-18 (this issue, #5472); final text confirmed by the Captain at merge.
+
+**Context.** Q6 names a daily spawn cap (default 48) beside max in-flight and the per-tick cap. The daily cap is neither a throughput control nor a spend control: it counts spawns, not concurrent load, and it does not weigh a cheap stage against an expensive one. On 2026-11-15 an ordinary heavy campaign day reached it, and auto-drive stalled silently for about five hours behind `cap_reached:daily` (#5402).
+
+**Decision.**
+1. Q6 drops the daily spawn cap from the enforced stopgap set. Max in-flight (default 2) and the per-tick cap remain until #4241 replaces them with host-declared capacity.
+2. `--daily-cap N` remains an explicit operator opt-in. `0` or absent means unlimited, and a cap that is set still refuses with `cap_reached:daily`, persisted and rolling over at 00:00:00Z. A negative value is a usage error.
+3. Q7's `--status` keeps `spawns_today` as an observation. The status file and `--status` name a daily limit (`daily_cap`) only when one is set.
+
+**Consequences.** Host capacity is bounded by max in-flight and the per-tick cap. Per-stage loops are bounded server-side by the fix-up ceiling, the retry budget and Q2's one re-spawn per marker epoch. The ledger format is unchanged: `spawns_today` was always persisted, and the new status field is omitempty, so a reverted binary reads every state dir and status file as before. A spend-based backstop, such as pausing at the weekly budget's exceeded tier, is a separate decision this amendment does not make. Q1–Q5, the rest of Q6 and Q7, and the Decision text above stand unchanged.
