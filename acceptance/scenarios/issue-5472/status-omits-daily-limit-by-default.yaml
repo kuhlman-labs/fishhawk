@@ -1,0 +1,14 @@
+id: scenario:issue-5472/status-omits-daily-limit-by-default
+statement: '`fishhawk-mcp host-dispatch --status --state-dir <dir>`, over a fresh status file (last_tick_at within 3 × interval_seconds of now, written without a daily cap), exits 0 and prints a line carrying `spawns_today=` and no `daily_cap` token. Over an equally fresh status file recording daily_cap 3, it prints `daily_cap=3`.'
+verify_hint: CLI stdout and exit code of `fishhawk-mcp host-dispatch --status --state-dir <dir>` against a fresh 0700 dir holding a status.json with and without a daily_cap field
+steps: Built fishhawk-mcp from the sanctioned checkout (cd <tree>/backend && go build -o /tmp/fhacc/bin/fishhawk-mcp ./cmd/fishhawk-mcp). Created two 0700 dirs, each holding a 0600 status.json with last_tick_at=now, interval_seconds 30, spawns_today 5 and spawns_day today, written per the HostDispatcherStatus json tags. One omitted daily_cap; the other set "daily_cap":3. Ran fishhawk-mcp host-dispatch --status --state-dir <dir> on each.
+assertions:
+    expected: exit 0, spawns_today= present and no daily_cap token by default; daily_cap=3 when recorded
+    observed_at_record: 'No cap: exit 0, ''state=live pid=... host=acc last_tick_at=... paused=false in_flight=0 spawns_today=5 (2026-11-19)'', with no daily_cap token. Cap 3: exit 0, the same line ending ''daily_cap=3''.'
+    repro_handle: fishhawk-mcp host-dispatch --status --state-dir /tmp/fhacc/sd-none (and /tmp/fhacc/sd-cap3)
+origin:
+    issue: 5472
+    pr: 5478
+    run_id: a2e94cfd-df34-45d6-84d6-7355bf6b9276
+    head_sha: 5346a7cc9dc13b6ee0df5a3d13c874daead95a59
+    recorded_at: 2026-11-19T15:05:54Z

@@ -1,0 +1,14 @@
+id: scenario:issue-5472/negative-daily-cap-refused
+statement: '`fishhawk-mcp host-dispatch --allowed-roots /tmp --daily-cap -1` exits 2 and names --daily-cap on stderr, without starting the loop.'
+verify_hint: CLI exit code and stderr of `fishhawk-mcp host-dispatch --allowed-roots /tmp --daily-cap -1`
+steps: Ran fishhawk-mcp host-dispatch --allowed-roots /tmp --daily-cap -1.
+assertions:
+    expected: exit 2, names --daily-cap, loop not started
+    observed_at_record: 'Exited 2 immediately with no loop output on stdout. stderr: ''fishhawk-mcp host-dispatch: --max-in-flight and --per-tick-cap must be positive, --daily-cap and --stale-after not negative''.'
+    repro_handle: fishhawk-mcp host-dispatch --allowed-roots /tmp --daily-cap -1
+origin:
+    issue: 5472
+    pr: 5478
+    run_id: a2e94cfd-df34-45d6-84d6-7355bf6b9276
+    head_sha: 5346a7cc9dc13b6ee0df5a3d13c874daead95a59
+    recorded_at: 2026-11-19T15:05:54Z
