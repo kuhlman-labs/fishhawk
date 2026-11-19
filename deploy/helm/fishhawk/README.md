@@ -91,8 +91,10 @@ applied, and the upgrade restores their replica counts on the new image.
 With the `post-upgrade` hook the new pods start before the Job, so the
 window lasts until the Job completes. Rolling back is the mirror image: scale
 to 0, migrate down through 0118, then `helm rollback`. Before rolling back,
-(1) drain or confirm that no multi-group stage is held (0118's down migration
-refuses, naming the stage, while one is), and (2) confirm that no non-terminal
+(1) drain every multi-group stage the header's query lists (0118's down
+migration refuses, naming one such stage, while any is held; a refused attempt
+leaves the version dirty at 117, so clear it with `migrate force 118`, not
+117, before retrying), and (2) confirm that no non-terminal
 run's captured workflow spec declares `concurrency.groups`, or cancel those
 runs, because a reverted binary cannot parse such a spec and falls back to the
 default group. The queries for both are in the header of

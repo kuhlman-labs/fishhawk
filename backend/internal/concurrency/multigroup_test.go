@@ -488,3 +488,76 @@ func TestAdmitSet_SetGrowthRestartsAtTail(t *testing.T) {
 	}
 	f.mustQueueSet(later, 1, gr(mg1, 1))
 }
+
+// stageInRepo is f.stage for a run of another repository.
+func (f *fixture) stageInRepo(repo string) *run.Stage {
+	f.t.Helper()
+	ctx := context.Background()
+	r, err := f.repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: repo, WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		f.t.Fatalf("create run: %v", err)
+	}
+	st, err := f.repo.CreateStage(ctx, run.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		f.t.Fatalf("create stage: %v", err)
+	}
+	if st, err = f.repo.TransitionStage(ctx, st.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
+		f.t.Fatalf("park stage: %v", err)
+	}
+	return st
+}
+
+// TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs pins what a
+// spec-declared {group: verify, scope: host} entry does to the host verify
+// group's other users (README § "Verify group"). The server maps that entry
+// to local-verify:<host>, the group every merge-candidate verify pass and
+// specialist job of the account on the host uses. D, an ordinary stage,
+// declares {local-verify:h1, a long-held repository group}. While D waits
+// there it holds nothing, yet (1) a merge-candidate pass from ANOTHER
+// repository queues behind it with no holder in the group, and (2)
+// GroupOccupancyTx reports a fresh stage waiter, so specialistjob.AdmitJob
+// (which admits only at FreshStageWaiters == 0) refuses every job. Once D
+// holds the group, the pass waits behind D for D's whole stage.
+func TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	verify := VerifyGroupKey("h1")
+	long, d := f.stage(), f.stage()
+	f.mustAdmitSet(long, gr(mg1, 1))
+	f.mustQueueSet(d, 1, gr(verify, DefaultVerifyLimit), gr(mg1, 1))
+	occupancy := func() Occupancy {
+		t.Helper()
+		tx, err := f.pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if hit, err := TryGroupLockTx(ctx, tx, nil, verify); err != nil || !hit {
+			t.Fatalf("TryGroupLockTx = %v, %v", hit, err)
+		}
+		occ, err := GroupOccupancyTx(ctx, tx, nil, verify)
+		if err != nil {
+			t.Fatalf("GroupOccupancyTx: %v", err)
+		}
+		return occ
+	}
+	if occ := occupancy(); occ != (Occupancy{FreshStageWaiters: 1}) {
+		t.Fatalf("local-verify:h1 occupancy while D waits = %+v, want one fresh stage waiter and no holder (a specialist job is refused)", occ)
+	}
+	pass := f.stageInRepo("other-org/other-repo")
+	q := f.mustQueueSet(pass, 2, gr(verify, DefaultVerifyLimit))
+	if len(q.Holders) != 0 {
+		t.Fatalf("pass holders = %v, want none: D holds nothing yet blocks the pass", holderIDs(q.Holders))
+	}
+	f.to(long.ID, run.StageStateRunning, run.StageStateSucceeded)
+	f.mustAdmitSet(d, gr(verify, DefaultVerifyLimit), gr(mg1, 1))
+	if q := f.mustQueueSet(pass, 1, gr(verify, DefaultVerifyLimit)); len(q.Holders) != 1 || q.Holders[0].StageID != d.ID {
+		t.Fatalf("pass holders after D is admitted = %v, want [D]", holderIDs(q.Holders))
+	}
+	f.to(d.ID, run.StageStateRunning, run.StageStateSucceeded)
+	f.mustAdmitSet(pass, gr(verify, DefaultVerifyLimit))
+}

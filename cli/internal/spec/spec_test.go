@@ -3897,25 +3897,21 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 			if err == nil {
 				t.Fatal("ValidateBytes accepted the document, want it refused")
 			}
-			msg := err.Error()
-			if !strings.Contains(msg, tc.wantPath) {
-				t.Errorf("error = %q, want it to name %s", msg, tc.wantPath)
-			}
-			if tc.wantMsg == "" {
-				return
-			}
 			var ve *spec.ValidationError
 			if !errors.As(err, &ve) {
 				t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
 			}
+			// Match the ENTRY path exactly: base+"/group" is a string prefix of
+			// every base+"/groups..." pointer, so a substring match would accept
+			// an error naming groups instead of the conflicting field.
 			found := false
 			for _, e := range ve.Errors {
-				if e.Path == tc.wantPath && e.Message == tc.wantMsg {
+				if e.Path == tc.wantPath && (tc.wantMsg == "" || e.Message == tc.wantMsg) {
 					found = true
 				}
 			}
 			if !found {
-				t.Errorf("entries = %+v, want {%s: %s}", ve.Errors, tc.wantPath, tc.wantMsg)
+				t.Errorf("entries = %+v, want one at exactly %s (message %q)", ve.Errors, tc.wantPath, tc.wantMsg)
 			}
 		})
 	}

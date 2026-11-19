@@ -289,20 +289,31 @@ replica), migrate down through 0118, and start the reverted binary.
 
 1. No stage holds a multi-group set. 0118.down is fail-closed: while any
    stage has more than one row and holds them, it RAISES an exception naming
-   that stage and changes nothing, because collapsing the rows would drop
-   real holds and the reverted binary would see those groups free. Drain
-   the stage (let it settle), or confirm the query returns no rows:
+   ONE such stage and changes no table, because collapsing the rows would
+   drop real holds and the reverted binary would see those groups free.
+   Before the first attempt, run this query and drain EVERY stage it lists:
+   let the stage settle, then delete its rows. Nothing else deletes a
+   settled multi-group stage's held rows, so they stay until you do.
 
    ```sql
    SELECT stage_id FROM stage_concurrency_slots
    GROUP BY stage_id HAVING count(*) > 1 AND bool_or(state = 'held');
    ```
 
+   A refused attempt still leaves the database dirty. golang-migrate records
+   the step's target version (117) as dirty before it runs the step, and
+   `MigrateDown` returns that error without the up path's recovery text.
+   0118 is still applied, so run `migrate -path <migrations> -database <url>
+   force 118`, not 117: forcing 117 records the widened key under 117. Every
+   later migrate, up or down, refuses until the marker is cleared. Then
+   re-run the query, drain what it lists, and retry.
+
    A QUEUED-only multi-row stage collapses to its canonical-first row
    (`COLLATE "C"`, the order the store sorts keys in) and restarts at the
    tail on its next poll with the single group the reverted binary asks for.
    `TestMigrate_StageConcurrencySlotsMultiGroup`
-   (`backend/internal/postgres/postgres_test.go`) pins both arms.
+   (`backend/internal/postgres/postgres_test.go`) pins both arms and the
+   dirty marker a refusal leaves.
 2. No non-terminal run's captured workflow spec declares
    `concurrency.groups`, or those runs are cancelled. A reverted binary
    cannot parse such a spec and falls back to the default group. The match
@@ -492,6 +503,19 @@ so the implement row is deleted and a verify row starts at the verify group's
 tail (`TestAdmit_RekeysQueuedRowIntoNewGroup`). The actual verify run still
 serialises against implement-stage verifies on the per-repository verify lock
 (#3315); the group only stops a pass waiting for an agent slot.
+
+**A spec may declare this group.** A workflow-v2 `groups` entry `{group:
+verify, scope: host}` resolves to the same `local-verify:<host>` key, at
+`DefaultVerifyLimit`, on any stage type (A1's canonical keys). Before #4240
+only the pass arm reached it. Such a stage is an ordinary stage waiter or
+holder of the group in its account: while it holds the group, or waits on it
+holding nothing behind a busy group elsewhere in its set, every pass of the
+account on the host queues behind it, whichever repository the pass is
+from, and `specialistjob.AdmitJob` refuses every job: it admits only at
+`FreshStageWaiters == 0` and with a slot free
+(`TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs`). The effect is
+availability-only and fail-closed: nothing runs beside the pass that should
+not. Host-declared capacity (#4241) owns any further restriction.
 
 ## Specialist-job holders (ADR-097 D6)
 

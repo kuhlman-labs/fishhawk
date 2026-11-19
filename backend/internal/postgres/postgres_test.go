@@ -9390,6 +9390,18 @@ VALUES ($1, $2, 'spec:o/r:a', 1, 'held', now(), now()), ($1, $2, 'spec:o/r:b', 1
 	if downErr == nil || !strings.Contains(downErr.Error(), multiHeld.String()) || !strings.Contains(downErr.Error(), "rollback of 0118 refused") {
 		t.Fatalf("MigrateDown with a held multi-group stage = %v, want the 0118 refusal naming stage %s", downErr, multiHeld)
 	}
+	// The recovery rides in DETAIL: golang-migrate appends the rendered DETAIL
+	// to the message after ", " and drops HINT. Its error also dumps the raw
+	// migration body, so match only text the server renders: the ", " DETAIL
+	// join and the DELETE with the stage id filled in.
+	for _, want := range []string{
+		", This attempt left the database dirty at version 117; 0118 is still applied, so clear it with migrate force 118 (not 117).",
+		"DELETE FROM stage_concurrency_slots WHERE stage_id = '" + multiHeld.String() + "'",
+	} {
+		if !strings.Contains(downErr.Error(), want) {
+			t.Errorf("MigrateDown refusal = %v, want its rendered DETAIL to contain %q", downErr, want)
+		}
+	}
 	// Read the STATE, not just the error: the refusal changed nothing.
 	if got := pkColumns(); got != "stage_id,group_key" {
 		t.Errorf("primary key after the refused rollback = %q, want stage_id,group_key", got)
@@ -9397,8 +9409,21 @@ VALUES ($1, $2, 'spec:o/r:a', 1, 'held', now(), now()), ($1, $2, 'spec:o/r:b', 1
 	if n := slotCount(); n != 5 {
 		t.Errorf("slot rows after the refused rollback = %d, want 5 (nothing collapsed)", n)
 	}
-	// golang-migrate marked the version dirty before the refused step; the
-	// DDL rolled back, so 0118 is genuinely still applied (`migrate force`).
+	// golang-migrate marked the step's TARGET version dirty before the refused
+	// step; the DDL rolled back, so 0118 is genuinely still applied. The
+	// documented recovery is `migrate force 118`, never the reported 117.
+	var dirtyVersion int64
+	var dirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&dirtyVersion, &dirty); err != nil {
+		t.Fatalf("read schema_migrations after the refused rollback: %v", err)
+	}
+	if cleanVersion != 118 || cleanDirty || dirtyVersion != 117 || !dirty {
+		t.Fatalf("schema_migrations before/after the refused rollback = %d dirty=%v / %d dirty=%v, want 118 clean / 117 dirty; "+
+			"if this moved, update the force-118 recovery in the 0118.down header and HINT, the 0118.up header, "+
+			"backend/internal/concurrency/README.md § \"Migration 0118\" and deploy/helm/fishhawk/README.md",
+			cleanVersion, cleanDirty, dirtyVersion, dirty)
+	}
+	// The documented recovery: `migrate force 118` clears the marker.
 	if _, err := pool.Exec(ctx, `UPDATE schema_migrations SET version = $1, dirty = $2`, cleanVersion, cleanDirty); err != nil {
 		t.Fatalf("force schema_migrations back after the refused rollback: %v", err)
 	}

@@ -22,8 +22,9 @@
 --
 -- ROLLBACK order: stop the new binary, migrate down through 0118, then start
 -- the reverted binary. Before rolling back:
---   1. Drain, or confirm that no multi-row stage is held; 0118.down REFUSES
---      (RAISE EXCEPTION naming the stage) while one is:
+--   1. Drain EVERY stage this query lists; 0118.down REFUSES (RAISE
+--      EXCEPTION naming one stage) while one is held, and a refused attempt
+--      leaves the version dirty (0118.down gives the force-118 recovery):
 --        SELECT stage_id FROM stage_concurrency_slots
 --        GROUP BY stage_id HAVING count(*) > 1 AND bool_or(state = 'held');
 --   2. Confirm that no non-terminal run's captured workflow spec declares

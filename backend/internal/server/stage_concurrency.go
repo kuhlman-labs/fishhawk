@@ -167,8 +167,10 @@ func validHostLabel(h string) bool {
 // verify trigger is a verify-only pass (no agent), so it resolves to the host
 // verify group local-verify:<host> at DefaultVerifyLimit BEFORE the declared
 // lookup — a spec-declared implement group or limit never captures a pass,
-// and a pass never queues behind full implements. See
-// isMergeCandidateVerifyPass for the fallback on an unreadable trigger.
+// and a pass never queues behind full implements in local-implement:<host>.
+// A stage that DECLARES {verify, host} is the one exception: it waits in the
+// pass's own group (declaredGroupRequests). See isMergeCandidateVerifyPass
+// for the fallback on an unreadable trigger.
 //
 // A non-nil err (an entry with no canonical key, unreachable for a validated
 // spec) fails closed: the marker answers 500 and admits nothing.
@@ -217,6 +219,14 @@ const hostScopedGroupLimit = 1
 // DefaultVerifyLimit, and every other host entry takes hostScopedGroupLimit.
 // A scope other than host or repository, or an identity ScopedGroupKey
 // refuses, answers an error and no set.
+//
+// A declared {verify, host} entry puts ANY stage type in the group that
+// merge-candidate verify passes and specialist jobs use. While the stage holds
+// or waits there, every pass of its account on the host queues behind it, and
+// specialistjob.AdmitJob refuses every job (a fresh stage waiter, or the
+// group's one slot taken). That is availability-only and fail-closed;
+// concurrency/README.md § "Verify group" and
+// TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs pin it.
 func declaredGroupRequests(decl *spec.StageConcurrency, repo, host string) ([]concurrency.GroupRequest, error) {
 	out := make([]concurrency.GroupRequest, 0, len(decl.Groups))
 	for i, e := range decl.Groups {
