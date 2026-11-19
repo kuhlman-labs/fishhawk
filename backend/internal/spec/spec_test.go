@@ -8440,6 +8440,128 @@ func TestParse_StageConcurrency_SchemaRejections(t *testing.T) {
 	}
 }
 
+// TestParse_StageConcurrencyGroups_RoundTrip pins that the ADR-094 set form
+// survives the strict typed decode (#4240): a scope-host entry without a
+// limit and a scope-repository entry with one.
+func TestParse_StageConcurrencyGroups_RoundTrip(t *testing.T) {
+	parsed, err := spec.ParseBytes([]byte(stageConcurrencyDoc(`
+          groups:
+            - {group: implement, scope: host}
+            - {group: deploy-target, scope: repository, limit: 1}`)))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	c := parsed.Workflows["wf"].Stages[0].Concurrency
+	if c == nil {
+		t.Fatal("Stage.Concurrency is nil; the declared groups were dropped by the typed decode")
+	}
+	want := []spec.StageConcurrencyGroup{
+		{Group: "implement", Scope: spec.ConcurrencyScopeHost},
+		{Group: "deploy-target", Scope: spec.ConcurrencyScopeRepository, Limit: 1},
+	}
+	if c.Group != "" || c.Limit != 0 || len(c.Groups) != len(want) {
+		t.Fatalf("Stage.Concurrency = %+v, want only Groups = %+v", *c, want)
+	}
+	for i := range want {
+		if c.Groups[i] != want[i] {
+			t.Errorf("Groups[%d] = %+v, want %+v", i, c.Groups[i], want[i])
+		}
+	}
+	if got := c.Groups[0].EffectiveLimit(); got != 1 {
+		t.Errorf("host entry EffectiveLimit() = %d, want 1 (absent)", got)
+	}
+}
+
+// TestParse_StageConcurrencyGroups_Rejections is the per-failure-mode table
+// for the `groups` set form (#4240): one subtest per schema rule and per
+// semantic refusal, each asserting the pointer that names the offending
+// field. Every semantic row is schema-valid on its own, so only its rule can
+// refuse it.
+func TestParse_StageConcurrencyGroups_Rejections(t *testing.T) {
+	const base = "/workflows/wf/stages/0/concurrency"
+	nine := "\n          groups:"
+	for i := 0; i < 9; i++ {
+		nine += fmt.Sprintf("\n            - {group: g%d, scope: repository}", i)
+	}
+	cases := []struct {
+		name     string
+		body     string
+		wantPath string
+		wantMsg  string
+		semantic bool
+	}{
+		{name: "group_and_groups", body: "\n          group: deploy\n          groups:\n            - {group: deploy, scope: repository}", wantPath: base + "/group", wantMsg: "false schema"},
+		{name: "limit_and_groups", body: "\n          limit: 2\n          groups:\n            - {group: deploy, scope: repository}", wantPath: base + "/limit", wantMsg: "false schema"},
+		{name: "scope_account", body: "\n          groups:\n            - {group: review, scope: account}", wantPath: base + "/groups/0/scope", wantMsg: "value must be one of"},
+		{name: "scope_missing", body: "\n          groups:\n            - {group: deploy}", wantPath: base + "/groups/0", wantMsg: "missing property 'scope'"},
+		{name: "group_missing", body: "\n          groups:\n            - {scope: repository}", wantPath: base + "/groups/0", wantMsg: "missing property 'group'"},
+		{name: "empty_list", body: "\n          groups: []", wantPath: base + "/groups", wantMsg: "got 0, want 1"},
+		{name: "nine_entries", body: nine, wantPath: base + "/groups", wantMsg: "got 9, want 8"},
+		{name: "limit_zero", body: "\n          groups:\n            - {group: deploy, scope: repository, limit: 0}", wantPath: base + "/groups/0/limit", wantMsg: "got 0, want 1"},
+		{name: "limit_65", body: "\n          groups:\n            - {group: deploy, scope: repository, limit: 65}", wantPath: base + "/groups/0/limit", wantMsg: "got 65, want 64"},
+		{name: "bad_name", body: "\n          groups:\n            - {group: Deploy, scope: repository}", wantPath: base + "/groups/0/group", wantMsg: "does not match pattern"},
+		{name: "unknown_entry_key", body: "\n          groups:\n            - {group: deploy, scope: repository, weight: 2}", wantPath: base + "/groups/0", wantMsg: "additional properties 'weight' not allowed"},
+		{name: "duplicate_scope_group", semantic: true,
+			body:     "\n          groups:\n            - {group: deploy-target, scope: repository, limit: 1}\n            - {group: deploy-target, scope: repository, limit: 2}",
+			wantPath: base + "/groups/1", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyGroupDuplicate, "repository", "deploy-target", 0)},
+		{name: "host_implement_limit", semantic: true,
+			body:     "\n          groups:\n            - {group: implement, scope: host, limit: 2}",
+			wantPath: base + "/groups/0/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "implement")},
+		{name: "host_verify_limit", semantic: true,
+			body:     "\n          groups:\n            - {group: verify, scope: host, limit: 1}",
+			wantPath: base + "/groups/0/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "verify")},
+		// H1: the refusal covers EVERY host-scoped name, not only the legacy two.
+		{name: "host_non_legacy_limit", semantic: true,
+			body:     "\n          groups:\n            - {group: deploy-target, scope: repository}\n            - {group: preview-target, scope: host, limit: 1}",
+			wantPath: base + "/groups/1/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "preview-target")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(stageConcurrencyDoc(tc.body)))
+			if tc.semantic {
+				var ve *spec.ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+				}
+				if ve.Path != tc.wantPath || ve.Message != tc.wantMsg {
+					t.Errorf("ValidationError = %q: %q, want %q: %q", ve.Path, ve.Message, tc.wantPath, tc.wantMsg)
+				}
+				return
+			}
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %T %v, want *spec.SchemaError", err, err)
+			}
+			if se.Path != tc.wantPath {
+				t.Errorf("SchemaError.Path = %q, want %q (msg: %s)", se.Path, tc.wantPath, se.Message)
+			}
+			if !strings.Contains(se.Message, tc.wantMsg) {
+				t.Errorf("SchemaError.Message = %q, want it to contain %q", se.Message, tc.wantMsg)
+			}
+		})
+	}
+
+	// Controls: the host-limit refusal is scoped to scope host (a repository
+	// entry named implement keeps its limit), and a host entry without a
+	// limit, including a non-legacy name, parses.
+	accepted := []struct {
+		name string
+		body string
+	}{
+		{name: "repository_implement_limit", body: "\n          groups:\n            - {group: implement, scope: repository, limit: 2}"},
+		{name: "host_non_legacy_no_limit", body: "\n          groups:\n            - {group: preview-target, scope: host}"},
+		{name: "same_name_two_scopes", body: "\n          groups:\n            - {group: deploy, scope: host}\n            - {group: deploy, scope: repository, limit: 64}"},
+		{name: "eight_entries", body: strings.Join(strings.Split(nine, "\n")[:10], "\n")}, // "", "groups:", g0..g7
+	}
+	for _, tc := range accepted {
+		t.Run("accepts_"+tc.name, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(stageConcurrencyDoc(tc.body))); err != nil {
+				t.Fatalf("ParseBytes: %v, want accepted", err)
+			}
+		})
+	}
+}
+
 // TestStageConcurrency_NotInheritableThroughDefaults pins the stage-level-only
 // rule: `concurrency` is deliberately absent from the `defaults` blocks, so a
 // file-level default declaring it is refused rather than silently inherited.

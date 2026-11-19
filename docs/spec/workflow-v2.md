@@ -468,7 +468,7 @@ stages:
     reviewers: {...}          # optional; agent + human review policy
     egress: {...}             # optional; egress allowance (enforced on an acceptance stage)
     permissions: {...}        # optional; declared network/write/shell (declaration-only)
-    concurrency: {...}        # optional; dispatch concurrency group (host-dispatched agent stages)
+    concurrency: {...}        # optional; dispatch concurrency group or group set (host-dispatched agent stages)
     gate_container: {...}     # optional; the image this stage's gates run in (overrides the workflow's)
 ```
 
@@ -660,7 +660,7 @@ The declaration is surfaced on the run-status read (`permissions[]`, each entry 
 
 ## Concurrency
 
-The optional per-stage `concurrency` block (#3964 / ADR-087) places a stage in a **concurrency group**: at most `limit` stages of one group hold a dispatch slot at once. Admission happens at the host-dispatch spawn marker (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). A dispatch that cannot get a slot is **queued FIFO, never refused**: the stage stays `awaiting_host_dispatch`, its stage reads carry a `concurrency` block with `status: awaiting_concurrency_slot`, the queue position and the current holders, and it is admitted when a holder settles, parks, or is released by the liveness backstop.
+The optional per-stage `concurrency` block (#3964 / ADR-087; group sets ADR-094 D2/D3, #4240) places a stage in one or more **concurrency groups**: at most `limit` stages of one group hold a dispatch slot at once. Admission happens at the host-dispatch spawn marker (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). A dispatch that cannot get a slot is **queued, never refused**: the stage stays `awaiting_host_dispatch`, its stage reads carry a `concurrency` block with `status: awaiting_concurrency_slot`, the queue position and the current holders, and it is admitted when a holder settles, parks, or is released by the liveness backstop.
 
 ```yaml
 - id: apply
@@ -677,14 +677,33 @@ The optional per-stage `concurrency` block (#3964 / ADR-087) places a stage in a
   concurrency:
     group: deploy-target      # repository-scoped named group
     limit: 1
+
+- id: apply-and-deploy
+  type: implement
+  executor:
+    agent: claude-code
+  concurrency:
+    groups:                   # a group SET, admitted all-or-nothing
+      - group: implement      # the host implement group (no limit: host default)
+        scope: host
+      - group: deploy-target
+        scope: repository
+        limit: 1
 ```
 
 - **The shipped default needs no declaration.** Every host-dispatched (`runner_kind: local`) `implement` stage is in the host group `local-implement:<host>` with limit 1, so two local implement stages on one host never run at once. Every other stage type is in **no group** unless it declares one. `<host>` is the label the dispatching client sends; a client that sends none lands in `local-implement:unknown`.
-- **One group per stage.** A stage that omits `group` joins the host default group with the declared `limit` — the way to widen or narrow it. A stage that names a `group` is in that group **instead of** the host default group.
+- **Two forms, mutually exclusive.** The single-group shorthand `group`/`limit`: a stage that omits `group` joins the host default group with the declared `limit` — the way to widen or narrow it; a stage that names a `group` is in that group **instead of** the host default group. The set form `groups` lists every group the stage holds; declaring `groups` beside `group` or `limit` is a schema error naming the conflicting field.
+- **`groups`** is a list of 1–8 entries `{group, scope, limit}`. `group` takes the `group` pattern; `scope` is `host` or `repository` (required); `limit` is `1`–`64`, absent `1`, and is allowed on `repository` entries only.
+  - **All-or-nothing.** A stage with a set holds a slot in every group at once or in none: if any group is full it queues in all of them and holds nothing.
+  - **Strict per-group FIFO.** In each group G, a later waiter is refused while (i) an earlier live waiter on G belongs to a multi-group set, or (ii) no slot of G remains after reserving one per earlier live waiter. A single-group earlier waiter at limit 2 or more with a free unreserved slot blocks nobody, as before; head-of-line blocking is accepted over starving multi-group stages (ADR-094 Q2).
+  - **Replaces the default set (provisional).** A `groups` list is the stage's whole set: list `{group: implement, scope: host}` to keep the host implement group. ADR-094 slice 3 (#4241) changes this to D5's add-only rule.
+  - **Canonical keys (ADR-094 Amendment A1).** Host `implement` is `local-implement:<host>` and host `verify` is `local-verify:<host>` (the same groups the shipped defaults use); repository `<name>` is `spec:<owner/repo>:<name>` (the same group the shorthand `group` names); any other host group is `host:<host>:<name>`.
+  - **Host-scoped groups are shared by every repository on the host.** That is a cross-repository trust boundary, so a repository's spec cannot set their limit: a `scope: host` entry carrying `limit` is refused, for any name, by `fishhawk validate` and by fishhawkd. The host implement and verify groups take the host default limits; any other host-scoped group is held at limit 1 until host-declared capacity (#4241). The shorthand `concurrency: {limit: N}` still sets the host implement group's limit, unchanged.
+  - A duplicate `(scope, group)` pair in one set is refused.
 - **Merge-candidate verify-only passes (ADR-092 D3, #4200).** Under ADR-092, a stage carrying a live merge-candidate verify-only pass is admitted through `local-verify:<host>` (limit 1) regardless of a declared group.
 - **`group`** names a **repository-scoped** group: two stages naming the same group in the same repository share its slots across runs, and the same name in another repository is a different group. It matches `^[a-z0-9][a-z0-9._-]{0,62}$` (lowercase alphanumerics plus `.`, `_`, `-`; at most 63 characters).
 - **`limit`** is an integer `1`–`64`; absent means `1`. When stages of one group declare different limits, the **admitting** stage's `limit` governs.
-- An empty `concurrency: {}` is an authoring error (the schema requires at least one of `group`, `limit`).
+- An empty `concurrency: {}` is an authoring error (the schema requires at least one of `group`, `limit`, `groups`).
 - **Scope of effect.** The block is honoured only for host-dispatched agent stages; on a stage dispatched any other way it is inert. It is **stage-level only** — it is not a `defaults` key, so it is never inherited from a file- or workflow-level `defaults` block.
 
 ## Gate container (`gate_container`)
@@ -1727,6 +1746,9 @@ merge_method: merge
 | `budget.enforcement`, `budgets[].enforcement` | `advisory` \| `blocking` | advisory warns; blocking refuses a new run at admission |
 | `concurrency.group` | `^[a-z0-9][a-z0-9._-]{0,62}$` | repository-scoped; absent = the host default group `local-implement:<host>` |
 | `concurrency.limit` | integer 1–64 (default `1`) | the admitting stage's limit governs |
+| `concurrency.groups` | 1–8 entries `{group, scope, limit}` | mutually exclusive with `group`/`limit`; all-or-nothing; replaces the default set (provisional, #4241) |
+| `concurrency.groups[].scope` | `host` \| `repository` | required; host groups are shared by every repository on the host |
+| `concurrency.groups[].limit` | integer 1–64 (default `1`) | `repository` entries only; refused on a `host` entry |
 | `budgets[].period` | `weekly` \| `monthly` | calendar reset cadence |
 | `budgets[].warn_at` | fraction `[0,1]` | early advisory threshold |
 | `decomposition.max_parallel` | integer `>= 0` | `0` = unlimited |
