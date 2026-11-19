@@ -147,6 +147,38 @@ budget_exceeded, hook_panic, seam_unwired), that is NORMAL and not an error:
 grooming is best-effort, bounded by its own deadline, and never blocks, slows
 past its budget, or fails a filing. The item was filed either way.
 
+Search before you file — what the duplicate scan did and did not cover.
+degraded:true does NOT by itself mean duplicate detection was skipped: read
+degrade_reason. A charter-side degrade (charter_undeclared,
+charter_unresolved, charter_rubric_unparsed, seam_unwired) affects only the
+structural score; the duplicate scan still ran and its candidates stay valid.
+reader_unavailable or reader_error means the duplicate scan did NOT complete,
+and so does budget_exceeded or hook_panic when scanned_items is 0 (either can
+also come from the charter read, which leaves the scan intact). When the scan
+did not complete, or intake is absent, no duplicate check was performed:
+search the tracker yourself before relying on the filing being unique, by a
+code symbol or path from the change rather than only by title words. Even a
+completed scan is LEXICAL over a bounded window of the tracker
+(window_truncated reports a cut), and it runs for every type, adr and epic
+included: before filing an adr or an epic, search the existing decision
+records and epics by topic. The scan reads the tracker only, never a running
+campaign's item list: while a campaign is running, read
+fishhawk_get_campaign_status items first, since an item already queued there
+may cover the same change.
+
+Epic capacity: the child cap counts the parent's ACTUAL sub-issues and is
+refused only once the parent is FULL (details.parent_epic_full, before
+anything is created). The auto-derived {n} in a returned [E{epic}.{n}] title
+is NOT a capacity reading: it is allocated one past the highest matching
+child number, gaps allowed, so it can run ahead of the real child count.
+Create the successor epic before the parent fills, judging headroom from the
+parent's sub-issue count rather than from {n}.
+
+Delegation tier: a tier label the filing receives as a namespace default
+(reported in defaulted_labels) is a conventions default, not a triage
+decision. Set the lowest tier explicitly in labels when the item touches a
+path the workflow forbids to an agent, or a surface only a human may change.
+
 Board placement / epic linking are best-effort and no
 longer fail the filing; work_item_filing_failed (502) is reserved for a
 create-issue or installation-resolution failure (no durable issue exists),

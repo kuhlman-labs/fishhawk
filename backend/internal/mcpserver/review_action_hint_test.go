@@ -1644,3 +1644,98 @@ func TestReviewActionHint_RefundShape_UnrefundedAndCeilingArms(t *testing.T) {
 		}
 	})
 }
+
+// TestReviewActionHint_MergeFollowUpPreconditionVerifiesOnTree pins #5216
+// R11/R16 on the merge_and_file_follow_up precondition in ALL THREE budget arms
+// (remaining, override, ceiling): before landing over open concerns, the
+// operator checks each open concern's claim against the tree. The arm is
+// reached on any round with open concerns (approve_with_concerns, a single
+// reviewer), so the clause names no rejecting reviewer and no second verdict.
+// The original acceptability wording still leads.
+func TestReviewActionHint_MergeFollowUpPreconditionVerifiesOnTree(t *testing.T) {
+	r := naRun("running")
+	prURL := "https://example.test/pull/42"
+	r.PullRequestURL = &prURL
+	const clause = "decide by checking each open concern's claim against the tree (run the code, grep the cited symbol), not by weighing the reviewers' prose"
+	for name, h := range map[string]*ReviewActionHint{
+		"remaining": {Concerns: 2, RemainingFixupBudget: 1},
+		"override":  {Concerns: 2, OverrideAvailable: true},
+		"ceiling":   {Concerns: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var merge *SuggestedAction
+			actions := h.suggestedActions(r, uuid.NewString())
+			for i := range actions {
+				if actions[i].Action == "merge_and_file_follow_up" {
+					merge = &actions[i]
+				}
+			}
+			if merge == nil {
+				t.Fatalf("actions = %+v, want merge_and_file_follow_up", actions)
+			}
+			if !strings.HasPrefix(merge.Precondition, "the remaining concerns are acceptable to land") {
+				t.Errorf("precondition lost its leading acceptability rule: %q", merge.Precondition)
+			}
+			if !strings.Contains(merge.Precondition, clause) {
+				t.Errorf("precondition missing the tree-verification clause: %q", merge.Precondition)
+			}
+			for _, rejectOnly := range []string{"rejecting reviewer", "two verdicts"} {
+				if strings.Contains(merge.Precondition, rejectOnly) {
+					t.Errorf("precondition presumes a reject/split (%q) on an arm reached without one: %q", rejectOnly, merge.Precondition)
+				}
+			}
+		})
+	}
+}
+
+// TestAcceptanceUnsettledActions_DispatchPreconditionRoutesFixupsFirst pins
+// #5216 R8 on the #4801 arm: the lead acceptance dispatch's PRECONDITION says
+// to route intended fix-ups first and to read run.concerns.by_state, naming
+// the open-concern count, while its REASON stays byte-identical to the
+// single-sourced acceptance-blocker advisory. An in-flight acceptance (no
+// dispatch offered) carries no such clause on its poll, and the arm is not
+// reordered.
+func TestAcceptanceUnsettledActions_DispatchPreconditionRoutesFixupsFirst(t *testing.T) {
+	h := &ReviewActionHint{Concerns: 3, RemainingFixupBudget: 1}
+	implID := uuid.NewString()
+	for _, accState := range []string{"pending", "awaiting_host_dispatch"} {
+		t.Run(accState, func(t *testing.T) {
+			r := naRun("running")
+			_, acc := naUnsettledStages(accState)
+			actions := h.acceptanceUnsettledActions(r, implID, &acc)
+			lead := actions[0]
+			if lead.Action != "fishhawk_dispatch_stage" || lead.Params["stage"] != "acceptance" {
+				t.Fatalf("lead = %s %v, want the acceptance dispatch still leading (no reorder)", lead.Action, lead.Params)
+			}
+			for _, want := range []string{
+				"if you will route any of the 3 open concern(s) back with fishhawk_fixup_stage, route them first",
+				"a fix-up push re-opens the acceptance stage and an acceptance pass dispatched before it runs again",
+				"read run.concerns.by_state for a late reject before dispatching",
+			} {
+				if !strings.Contains(lead.Precondition, want) {
+					t.Errorf("dispatch precondition missing %q: %q", want, lead.Precondition)
+				}
+			}
+			if !strings.HasPrefix(lead.Precondition, "the implement review is settled") {
+				t.Errorf("dispatch precondition lost its original lead: %q", lead.Precondition)
+			}
+			if lead.Reason != acceptanceUnsettledLeadReason(&acc) {
+				t.Errorf("dispatch reason = %q, want it byte-identical to the single-sourced advisory %q", lead.Reason, acceptanceUnsettledLeadReason(&acc))
+			}
+			for _, a := range actions[1:] {
+				if strings.Contains(a.Precondition, "route them first") {
+					t.Errorf("%s precondition carries the R8 clause; only the lead dispatch should: %q", a.Action, a.Precondition)
+				}
+			}
+		})
+	}
+	t.Run("in_flight", func(t *testing.T) {
+		r := naRun("running")
+		_, acc := naUnsettledStages("running")
+		for _, a := range h.acceptanceUnsettledActions(r, implID, &acc) {
+			if strings.Contains(a.Precondition, "route them first") {
+				t.Errorf("%s precondition carries the R8 clause with no dispatch offered: %q", a.Action, a.Precondition)
+			}
+		}
+	})
+}

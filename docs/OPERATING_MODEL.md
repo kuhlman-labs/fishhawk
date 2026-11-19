@@ -295,6 +295,16 @@ The MCP runbook's *Merge and acceptance: approve, wait and recover* section and 
 4. **Resolve registration collisions as a union.** Recommended where parallel items collide on a shared registration file: keep both sides, then regenerate the site reference with `scripts/gen-site-reference`. This is a recommendation, not a confirmed rule of the tooling.
 5. **`verified=false` is a halt.** `fishhawk_verify_run` answering `verified=false` stops the merge and is an incident: do not approve over it, and do not retry it as a routine step.
 
+## 10. Review, filing and grooming
+
+The MCP runbook's *Review arbitration, filing and grooming judgement* section and the review, concern, filing and grooming tool descriptions carry the repository-agnostic judgement. Five rules apply on this repository (#5216):
+
+1. **Tier at triage by surface.** A ticket that touches CI (`.github/workflows/**`), anything cryptographic, the policy engine, audit-log integrity or GitHub App authentication is labelled `autonomy:low`, per the low-autonomy list in [`METHODOLOGY.md`](METHODOLOGY.md). The tier label a filing receives by default is a namespace default, not that decision. Tier each epic child on its own; do not blanket an epic at its most sensitive child's tier.
+2. **Check cross-entity eligibility at plan approval.** An all-red counterfactual battery proves only the controls it mutates. For a plan that adds an eligibility check, list the cross-entity cases separately (parent and child run, run and stage, grooming scan and apply) and add a condition for each one the plan leaves uncovered.
+3. **Verify the rejecter's claim against the tree.** When the two reviewers split, check the rejecting claim against the code at the run's head (run it, grep the cited symbol) instead of weighing the two verdicts. A failed review is not a verdict: route it from `next_actions`, never as an approve or a reject.
+4. **Search before filing.** Search the tracker by a code symbol or path from the change, the running campaign's items (`fishhawk_get_campaign_status`), and the existing ADRs and epics by topic before filing an ADR or an epic. File a successor epic before the current catch-all epic reaches its sub-issue cap.
+5. **Grooming apply leftovers.** Re-read the anchor issue (#3112) before each groom and whenever the charter is amended. After a completed apply, relabel the `delegation_tier_not_authorized` entries by hand; never re-approve the plan gate for them or for a `budget_exhausted` tail, which resurfaces on the next groom: a plan re-approval launches a fresh apply, which refuses the tier entries again and changes neither outcome. Attesting the confirm gate (`approve_review_gate`) is unaffected and is the legal next step. [`GROOMING_RUNBOOK.md`](GROOMING_RUNBOOK.md) §4 and §8 carry the detail.
+
 ## Sources
 
 | Topic | Canonical file |

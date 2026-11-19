@@ -2045,7 +2045,7 @@ type GetRunStatusOutput struct {
 	// one. Cost-gated on a started row existing — a run without one issues
 	// exactly one small category read and stays byte-identical. Best-effort:
 	// a read/decode error leaves it nil, never failing the snapshot.
-	GroomingApplyStatus *GroomingApplyStatus `json:"grooming_apply_status,omitempty" jsonschema:"progress of the detached on-approval grooming apply (E54.77 / #3232), derived from the grooming_apply_started / grooming_mutation_applied / grooming_apply_completed audit rows anchored on the NEWEST started row. state is in_flight until a grooming_apply_completed row lands after the anchor, then completed. recorded is the number of per-entry grooming_mutation_applied rows seen (capped at 10 pages of 500 — a larger apply reports a partial count); remaining = candidate_count - recorded while in flight, 0 once completed. budget_exhausted counts skipped rows carrying skip_reason apply_budget_exhausted — the never-evaluated tail of an over-budget apply, which RESURFACES on the next grooming run. Omitted when the run carries no grooming_apply_started row (an ordinary run, or a grooming apply that degraded before launch — that degrade is on recent_audit as grooming_apply_completed)"`
+	GroomingApplyStatus *GroomingApplyStatus `json:"grooming_apply_status,omitempty" jsonschema:"progress of the detached on-approval grooming apply (E54.77 / #3232), derived from the grooming_apply_started / grooming_mutation_applied / grooming_apply_completed audit rows anchored on the NEWEST started row. state is in_flight until a grooming_apply_completed row lands after the anchor, then completed. recorded is the number of per-entry grooming_mutation_applied rows seen (capped at 10 pages of 500 — a larger apply reports a partial count); remaining = candidate_count - recorded while in flight, 0 once completed. budget_exhausted counts skipped rows carrying skip_reason apply_budget_exhausted — the never-evaluated tail of an over-budget apply, which RESURFACES on the next grooming run. tier_not_authorized / tier_not_authorized_entries count and name the entries refused delegation_tier_not_authorized, which applied nothing and need a by-hand relabel; once completed, either count above zero appends a read-only fishhawk_list_audit advisory to next_actions. Omitted when the run carries no grooming_apply_started row (an ordinary run, or a grooming apply that degraded before launch — that degrade is on recent_audit as grooming_apply_completed)"`
 	// Elisions records what the response byte budget removed (ADR-077 /
 	// #2508). omitempty, so an UNDER-budget response is byte-identical to the
 	// pre-#2508 wire and the block never appears on the happy path. See
@@ -2126,10 +2126,20 @@ type GroomingApplyStatus struct {
 	// BudgetExhausted is the over-budget tail: skipped rows whose skip_reason
 	// is apply_budget_exhausted were never evaluated (no mutator, no reader)
 	// and resurface on the next grooming run — the resume path.
-	BudgetExhausted int    `json:"budget_exhausted" jsonschema:"skipped rows carrying skip_reason apply_budget_exhausted — the never-evaluated tail of an over-budget apply; each resurfaces on the next grooming run, so no hand-apply is needed"`
-	Remaining       int    `json:"remaining" jsonschema:"candidate_count - recorded while in flight (floored at 0); 0 once completed"`
-	StartedAt       string `json:"started_at,omitempty" jsonschema:"RFC 3339 timestamp from the started row"`
-	DegradeReason   string `json:"degrade_reason,omitempty" jsonschema:"set only when the completed row is a server-authored degrade (the apply did not run); names why"`
+	BudgetExhausted int `json:"budget_exhausted" jsonschema:"skipped rows carrying skip_reason apply_budget_exhausted — the never-evaluated tail of an over-budget apply; each resurfaces on the next grooming run, so no hand-apply is needed. Do not re-approve THIS run's plan gate for the tail: a plan re-approval launches a fresh apply; approve the next grooming run instead. Attesting this run's confirm gate (approve_review_gate) is unaffected and remains the legal next step"`
+	// TierNotAuthorized counts the per-entry rows refused with skip_reason
+	// delegation_tier_not_authorized (#2855): a hygiene entry proposing a
+	// delegation-tier label applies NOTHING. The completed summary carries no
+	// such count, so it is ALWAYS tallied from the per-entry rows (both
+	// states). omitempty keeps an apply with no tier proposal byte-identical.
+	TierNotAuthorized int `json:"tier_not_authorized,omitempty" jsonschema:"skipped rows carrying skip_reason delegation_tier_not_authorized: an entry that proposed a delegation-tier label, refused whole — it applied NOTHING, not even the clerical labels beside the tier. Do not re-approve THIS run's plan gate for them: a plan re-approval launches a fresh apply, which refuses them again; relabel the ones you agree with by hand on the tracker. Attesting this run's confirm gate (approve_review_gate) is unaffected and remains the legal next step. Tallied from the per-entry rows in both states; omitted when zero"`
+	// TierNotAuthorizedEntries names the refused entries (entry_id), capped at
+	// groomingTierRefusalEntriesCap so a pathological report cannot bloat the
+	// snapshot; TierNotAuthorized stays the full count.
+	TierNotAuthorizedEntries []string `json:"tier_not_authorized_entries,omitempty" jsonschema:"entry_id of each delegation_tier_not_authorized row, in ledger order, capped at 20 (tier_not_authorized is the full count); each needs a by-hand relabel"`
+	Remaining                int      `json:"remaining" jsonschema:"candidate_count - recorded while in flight (floored at 0); 0 once completed"`
+	StartedAt                string   `json:"started_at,omitempty" jsonschema:"RFC 3339 timestamp from the started row"`
+	DegradeReason            string   `json:"degrade_reason,omitempty" jsonschema:"set only when the completed row is a server-authored degrade (the apply did not run); names why"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -2840,6 +2850,13 @@ const (
 	// groomingSkipReasonApplyBudgetExhausted MUST match
 	// workmgmt.GroomingSkipApplyBudgetExhausted.
 	groomingSkipReasonApplyBudgetExhausted = "apply_budget_exhausted"
+	// groomingSkipReasonDelegationTierNotAuthorized MUST match
+	// workmgmt.GroomingSkipDelegationTierNotAuthorized (pinned by
+	// TestGroomingSkipReasonDelegationTierNotAuthorized_MirrorsWorkmgmt).
+	groomingSkipReasonDelegationTierNotAuthorized = "delegation_tier_not_authorized"
+	// groomingTierRefusalEntriesCap bounds
+	// GroomingApplyStatus.TierNotAuthorizedEntries.
+	groomingTierRefusalEntriesCap = 20
 	// groomingApplyStateInFlight / groomingApplyStateCompleted are the closed
 	// GroomingApplyStatus.State vocabulary.
 	groomingApplyStateInFlight  = "in_flight"
@@ -2862,8 +2879,10 @@ const (
 // and grooming_apply_completed are each read with SinceSequence = anchor and
 // WALKED by cursor (bounded pages), because a large apply exceeds one page.
 // Counts come from the completed summary once it lands (the writer's own
-// tally) and are tallied from the per-entry rows while in flight. Best-effort:
-// any read/decode error → nil, never failing the snapshot.
+// tally) and are tallied from the per-entry rows while in flight; the
+// delegation-tier refusal count is tallied from the rows in both states (the
+// summary carries none). Best-effort: any read/decode error → nil, never
+// failing the snapshot.
 func (r *runResolver) groomingApplyStatusFor(ctx context.Context, runID uuid.UUID) *GroomingApplyStatus {
 	started, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: auditCategoryGroomingApplyStarted,
@@ -2896,6 +2915,7 @@ func (r *runResolver) groomingApplyStatusFor(ctx context.Context, runID uuid.UUI
 	}
 	for _, e := range rows {
 		var rec struct {
+			EntryID    string `json:"entry_id"`
 			Outcome    string `json:"outcome"`
 			SkipReason string `json:"skip_reason"`
 		}
@@ -2915,6 +2935,16 @@ func (r *runResolver) groomingApplyStatusFor(ctx context.Context, runID uuid.UUI
 			}
 		case "refused":
 			status.Refused++
+		}
+		// The tier refusal is tallied on the skip_reason alone (any outcome)
+		// and in BOTH states: the completed summary below overwrites the
+		// outcome counts but carries no tier count, so this row tally is the
+		// only source (#5216 R1).
+		if rec.SkipReason == groomingSkipReasonDelegationTierNotAuthorized {
+			status.TierNotAuthorized++
+			if len(status.TierNotAuthorizedEntries) < groomingTierRefusalEntriesCap {
+				status.TierNotAuthorizedEntries = append(status.TierNotAuthorizedEntries, rec.EntryID)
+			}
 		}
 	}
 
@@ -4766,7 +4796,7 @@ type ApprovePlanInput struct {
 	// post-implement against the committed scope-only tree; an unsatisfied
 	// assertion fails the implement stage category-B (park for re-scope/
 	// re-plan). Deterministic substring matching only — never parses prose.
-	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty" jsonschema:"optional list of deterministic binding-assertion checks the operator declares so an explicit approval condition becomes machine-checkable post-implement. Each check has type ('file_contains' or 'test_asserts'), path (repo-relative; must end in _test.go for test_asserts), and literal (a substring that must appear in the committed file). Evaluated by the runner against the committed scope-only tree; any unsatisfied assertion fails the implement stage category-B. Substring matching only — choose a literal specific enough to be meaningful. Bind test-only behaviour with test_asserts naming the test function, and require a RED counterfactual (delete the behaviour, see the test fail). Point file_contains at the file that DEFINES the literal: a condition that centralizes a value into a constant leaves the literal only at its definition site"`
+	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty" jsonschema:"optional list of deterministic binding-assertion checks the operator declares so an explicit approval condition becomes machine-checkable post-implement. Each check has type ('file_contains' or 'test_asserts'), path (repo-relative; must end in _test.go for test_asserts), and literal (a substring that must appear in the committed file). Evaluated by the runner against the committed scope-only tree; any unsatisfied assertion fails the implement stage category-B. Substring matching only — choose a literal specific enough to be meaningful. Bind test-only behaviour with test_asserts naming the test function, and require a RED counterfactual (delete the behaviour, see the test fail). Point file_contains at the file that DEFINES the literal: a condition that centralizes a value into a constant leaves the literal only at its definition site. Agent-written security tests default to vacuity: require error-IDENTITY assertions (the specific refusal, not any error) and a delete-the-control counterfactual observed RED; a test named after a condition is not evidence the condition is met"`
 	// ClaimsConcernIDs is the OPTIONAL list of plan-stage concern ids this
 	// approval's binding condition answers (#1956). Each claimed concern
 	// auto-resolves to the terminal addressed_by_condition state once ONE
@@ -5041,7 +5071,10 @@ against the committed scope-only tree; any unsatisfied assertion
 fails the implement stage category-B (park for re-scope/re-plan).
 Use this when an approval condition can be expressed as "file X must
 contain literal Y" so the condition is enforced rather than merely
-restated. A malformed declaration (unknown type, empty literal, a
+restated. Agent-written security tests default to vacuity: require
+error-IDENTITY assertions (the specific refusal, not any error) and a
+delete-the-control counterfactual observed RED; a test named after a
+condition is not evidence the condition is met. A malformed declaration (unknown type, empty literal, a
 test_asserts path not ending in _test.go) is rejected 400
 validation_failed before any approval row is recorded.
 

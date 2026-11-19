@@ -1390,3 +1390,66 @@ func TestDraftEpic_Guidance_ConventionsSource(t *testing.T) {
 		})
 	}
 }
+
+// TestGuidanceForSession_TiersEachEpicChildIndividually is the DONE-MEANS pin
+// for #4745 R3: the guidance the operator reads at the decide, edit and file
+// arms says to tier each child on its own scope rather than blanketing the
+// draft at its most sensitive member's tier, and the per-child labels schema
+// says the same. The flagged-ordinal advisory wording stays intact beside it.
+func TestGuidanceForSession_TiersEachEpicChildIndividually(t *testing.T) {
+	const anchor1 = "check each child's delegation-tier label on its own scope against the repository's tier criteria"
+	const anchor2 = "do not blanket every child at the most sensitive member's tier"
+	hasTierRule := func(where, reason string) {
+		t.Helper()
+		if !strings.Contains(reason, anchor1) || !strings.Contains(reason, anchor2) {
+			t.Errorf("R3: %s guidance lacks the per-child tier rule: %q", where, reason)
+		}
+	}
+
+	// awaiting_approval, clean pre-check: decide + edit both carry the rule.
+	clean := guidanceForSession(&RefinementSession{SessionID: testSessionID, State: "awaiting_approval"})
+	if len(clean) != 2 || clean[0].Arm != "decide" || clean[1].Arm != "edit" {
+		t.Fatalf("awaiting_approval guidance = %+v, want decide then edit", clean)
+	}
+	hasTierRule("awaiting_approval decide", clean[0].Reason)
+	hasTierRule("awaiting_approval edit", clean[1].Reason)
+
+	// awaiting_approval with a flagged child: the advisory survives verbatim.
+	flagged := guidanceForSession(&RefinementSession{
+		SessionID: testSessionID,
+		State:     "awaiting_approval",
+		CriteriaPrecheck: CriteriaPrecheck{NeedsAttention: true, Children: []ChildCriteriaCheck{
+			{Ordinal: 1}, {Ordinal: 2, NeedsAttention: true},
+		}},
+	})
+	if len(flagged) == 0 || flagged[0].Arm != "decide" {
+		t.Fatalf("flagged awaiting_approval guidance = %+v, want decide first", flagged)
+	}
+	if !strings.Contains(flagged[0].Reason, "Advisory: the acceptance-criteria pre-check flagged child 2 (no_blocking_criterion); approval is still legal, or edit the child(ren) first") {
+		t.Errorf("R3 must not disturb the flagged-ordinal advisory: %q", flagged[0].Reason)
+	}
+	hasTierRule("flagged awaiting_approval decide", flagged[0].Reason)
+
+	// approved, with and without a scoped repo: the file arm carries the rule.
+	for _, sess := range []*RefinementSession{
+		{SessionID: testSessionID, State: "approved"},
+		{SessionID: testSessionID, State: "approved", ConventionsSource: &refinementConventionsSource{Repo: "acme/widgets"}},
+	} {
+		g := guidanceForSession(sess)
+		if len(g) != 1 || g[0].Arm != "file" {
+			t.Fatalf("approved guidance = %+v, want one file arm", g)
+		}
+		hasTierRule("approved file", g[0].Reason)
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_draft_epic per-child tier guidance", epicChildTierGuidance)
+
+	// The served per-child labels schema: draft.children[].labels in the
+	// fishhawk_draft_epic inputSchema an agent receives over tools/list.
+	labels := reviewFilingServedSchemaDescription(t, fixupGuidanceTools(t), "fishhawk_draft_epic", false, "draft", "children", "[]", "labels")
+	for _, want := range []string{"Tier each child individually", "never because a sibling does", "do not blanket every child at the most sensitive member's tier"} {
+		if !strings.Contains(labels, want) {
+			t.Errorf("R3: served fishhawk_draft_epic draft.children[].labels schema lacks %q: %q", want, labels)
+		}
+	}
+	reviewFilingAssertRepoAgnostic(t, "fishhawk_draft_epic draft.children[].labels schema", labels)
+}
