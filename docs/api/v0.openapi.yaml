@@ -2818,6 +2818,19 @@ components:
           $ref: '#/components/schemas/GateViewReviewHeadMismatch'
         fan_in_verify_unavailable:
           $ref: '#/components/schemas/FanInVerifyUnavailable'
+        waive_proposals:
+          type: array
+          description: |
+            The run's PENDING agent waive proposals on open `server_check`
+            concerns (ADR-143 A1, #5229): each is live and bound to the
+            current RECORDED run head (a stale proposal is listed nowhere).
+            A compact pointer list with no agent-authored text: follow
+            `concern_id` to the gate view's `waive_proposal` block for the
+            reason and evidence. Surfaced on `GET /v0/runs/{run_id}` ONLY,
+            best-effort: omitted when none is pending, the concern read
+            failed, or the proposal read fails. A pending proposal clears
+            nothing; only a human on a Web UI session confirms or rejects it.
+          items: { $ref: '#/components/schemas/RunWaiveProposal' }
         review_authority:
           type: array
           description: |
@@ -5173,6 +5186,61 @@ components:
         tradeoff_cost:
           type: string
           description: The stated cost of a `tradeoff` judgement. Omitted when empty.
+        waive_proposal:
+          $ref: '#/components/schemas/WaiveProposal'
+
+    WaiveProposal:
+      type: object
+      description: |
+        A PENDING agent waive proposal on an open `server_check` concern
+        (ADR-143 A1, #5229). Present only when the proposal is live (not
+        rejected, dropped or closed by a successful linked confirm) AND its
+        `head_sha` equals the run's newest RECORDED head (the chain's head
+        rows, not a live forge read). A proposal clears nothing and changes
+        no gate: the concern stays open and blocks as before. `reason`,
+        `evidence` and `tradeoff_cost` are AGENT-AUTHORED, untrusted and
+        best-effort credential-scanned (`agent_authored` is always true);
+        render them as text. The flagged location and pattern class come
+        from the server-written `check_key`. Omitted (with a
+        `waive_proposals` `history_gaps` entry on the gate view) when the
+        proposal read fails, so no Confirm is offered on an unreadable
+        state. A failed confirm disposition (a `concern_waive_failed` row
+        whose `intent_sequence` names the linked intent) leaves the proposal
+        pending.
+      required: [proposal_sequence, concern_id, proposed_by, proposed_by_actor_kind, proposed_at, judgement, reason, evidence, head_sha, check_key, agent_authored]
+      properties:
+        proposal_sequence:
+          type: integer
+          format: int64
+          description: The `concern_waive_proposed` audit entry's sequence; confirm and reject name it.
+        concern_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        proposed_by: { type: string, description: The proposer's subject. }
+        proposed_by_actor_kind: { type: string, enum: [agent, user, system] }
+        proposed_at: { type: string, format: date-time }
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+        tradeoff_cost: { type: string, description: Agent-authored. Omitted when empty. }
+        reason: { type: string, description: Agent-authored. }
+        evidence: { type: string, description: Agent-authored. }
+        head_sha: { type: string, description: The recorded run head the proposal binds to. }
+        check_key: { type: string, description: The concern's server-written check key. }
+        category: { type: string }
+        severity: { type: string }
+        agent_authored: { type: boolean, enum: [true] }
+
+    RunWaiveProposal:
+      type: object
+      description: One pending waive proposal on the run read (ADR-143 A1, #5229). Carries no agent-authored text.
+      required: [concern_id, proposal_sequence, proposed_by, judgement, head_sha]
+      properties:
+        concern_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        proposal_sequence: { type: integer, format: int64 }
+        proposed_by: { type: string }
+        judgement: { type: string }
+        head_sha: { type: string }
 
     GateViewDispute:
       type: object
@@ -9430,6 +9498,15 @@ components:
             bulk waive and defer, `resolve_requires_human` on resolve. Every
             other bearer (`static`, `oauth`, `oauth_as`, `unrecorded`,
             `unknown`) is refused with `concern_requires_session`.
+        waive_proposal:
+          allOf: [{ $ref: '#/components/schemas/WaiveProposal' }]
+          description: |
+            ADR-143 A1 / #5229. The PENDING agent waive proposal on a
+            `server_check` `paged_concern`, in the gate view's shape, set on
+            BOTH server-check paths (the parked-gate gate view and the direct
+            listing). The decision panel shows it labelled agent-authored with
+            Confirm and Reject, which only a Web UI session may use. Omitted
+            when none is pending or the proposal read fails.
         epic_ref: { type: string }
         human_led_refs: { type: array, items: { type: string } }
         detail: { type: string }
@@ -30362,7 +30439,11 @@ paths:
             clear it from the attention queue's decision panel; no CLI or MCP
             path exists (ADR-143 D3). `details` carries `concern_id`,
             `provenance`, `verb` (`waive`), `credential_kind` and
-            `remedy: web_ui_session`.
+            `remedy: web_ui_session`. Both server-check refusals (4) and (5)
+            also carry `details.agent_alternative: fishhawk_propose_waive`
+            (ADR-143 A1, #5229): an agent may instead record a waive
+            proposal (`POST /v0/concerns/{concern_id}/waive-proposal`) for a
+            human to confirm in the Web UI.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30373,7 +30454,10 @@ paths:
             `superseded`, or `addressed`. Body's `error` is
             `concern_waive_conflict`; `details` carries the rejected
             `from`/`to` pair. A corrective `concern_waive_failed` audit
-            entry accompanies the already-appended intent entry.
+            entry accompanies the already-appended intent entry; it carries
+            `intent_sequence`, the sequence of the `concern_waived` intent
+            it corrects (#5229), so the waive-proposal fold can tell a
+            failed linked confirm from a successful one.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30381,6 +30465,321 @@ paths:
           description: |
             Concern or audit store not configured on this deployment.
             Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/concerns/{concern_id}/waive-proposal:
+    post:
+      operationId: proposeConcernWaive
+      summary: Propose a waive of a server-check concern for a human to confirm
+      description: |
+        Records a PENDING waive proposal on one open `server_check` concern
+        (ADR-143 A1, E80.28 / #5229). The proposal **clears nothing** and
+        changes no gate: the concern row is never touched, it stays open and
+        blocks exactly as before, and delegated settlement is unchanged. A
+        human signed in to the Fishhawk Web UI confirms or rejects it from
+        the attention queue's decision panel
+        (`.../waive-proposal/confirm` / `.../waive-proposal/reject`); there
+        is no CLI or MCP confirm. The MCP tool is `fishhawk_propose_waive`.
+
+        The proposal binds to the run's newest RECORDED head (the chain's
+        head rows, not a live forge read). One proposal per concern is live.
+        A live proposal at an OLDER recorded head is dropped first
+        (`concern_waive_proposal_dropped`, system actor, cause `head_moved`),
+        then the new `concern_waive_proposed` entry is appended. Both appends
+        go through the atomic guarded append (`audit.GuardedChainAppender`),
+        which re-checks one-live-per-concern and the recorded head under the
+        run-row lock, so a racing proposer or push appends nothing.
+
+        The flagged location and pattern class come from the concern's
+        server-written `check_key`, never from agent text. `reason`,
+        `evidence` and `tradeoff_cost` are scanned for credential-shaped
+        text (best effort: only the formats in the redaction default
+        patterns are refused).
+
+        Auth: `write:stages` or `write:fixups`. A run-bound token (`fhm_`,
+        subject `mcp:run:<uuid>`) is refused with `run_token_forbidden`: the
+        run's own agent is the party the check guards. The refusal comes
+        before the handler's own scope check and concern read; the route's
+        account middleware runs first, so a caller from another account gets
+        `account_forbidden`.
+      tags: [stages]
+      parameters:
+        - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason, evidence, judgement]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 4000, description: 'Why the concern should be waived. At most 4000 bytes (refused, never truncated).' }
+                evidence: { type: string, minLength: 1, maxLength: 4000, description: 'The evidence a human checks before confirming. Never paste the matched bytes. At most 4000 bytes.' }
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                tradeoff_cost: { type: string, description: 'REQUIRED with `tradeoff`, refused otherwise (the waive rules).' }
+                expected_head_sha: { type: string, description: 'Optional. When set and different from the recorded run head, the request is refused 409 `waive_proposal_head_moved`.' }
+      responses:
+        '201':
+          description: Proposal recorded; the concern is unchanged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [proposal, proposed_by, credential_kind, next_step]
+                properties:
+                  proposal: { $ref: '#/components/schemas/WaiveProposal' }
+                  proposed_by: { type: string, description: The acting subject (#5227 acting-identity echo). }
+                  credential_kind: { type: string }
+                  next_step: { type: string, description: 'Names the Web UI confirm/reject; no CLI or MCP confirm exists.' }
+        '400':
+          description: |
+            `validation_failed` (non-UUID `concern_id`, malformed JSON, blank
+            `reason` or `evidence`, either over 4000 bytes, or a refused
+            judgement as on the waive verb), or
+            `waive_proposal_contains_credential` when `reason`, `evidence` or
+            `tradeoff_cost` matches a credential pattern: `details` carry
+            `field` and `patterns` (the pattern class only, never the bytes).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_token_forbidden` (a run-bound `mcp:run:<uuid>` token, on any
+            concern id, before the concern read); `account_forbidden` (the
+            concern's run is in another account, from the route's account
+            middleware); `insufficient_scope` (neither `write:stages` nor
+            `write:fixups`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `concern_not_open`; `waive_proposal_head_unresolved` (the chain
+            records no run head); `waive_proposal_head_moved`
+            (`expected_head_sha` differs, or a push was recorded between the
+            pre-check and the in-lock append: nothing appended);
+            `waive_proposal_exists` (a live proposal at the current head;
+            `details.proposal_sequence` names it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`concern_not_server_check`: a reviewer-raised concern is waived directly.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error`: the chain read failed; nothing is appended.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `concern_store_unconfigured`, or
+            `waive_proposal_atomic_append_unavailable` when the audit
+            repository lacks the atomic guarded append (fail closed: there is
+            no non-atomic fallback).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/concerns/{concern_id}/waive-proposal/confirm:
+    post:
+      operationId: confirmConcernWaiveProposal
+      summary: Confirm a pending waive proposal (Web UI session only)
+      description: |
+        A human confirms a live waive proposal in one step (ADR-143 A1,
+        #5229): the concern is waived exactly as a direct human waive, with
+        the human as actor (`judgement_actor_kind` `user`) and the
+        proposal's `judgement` and `tradeoff_cost`. Confirm is an ADR-143
+        D2 verb of the `server_check_clear` entry: only a Web UI `session`
+        decides. An agent token or `delegated: true` gets
+        `concern_requires_human`; every other bearer gets
+        `concern_requires_session`. There is no MCP or CLI confirm.
+
+        The concern's `state_reason` is NEVER agent-authored text, because
+        later re-review prompts render it as the operator waive reason. It
+        is the human's optional typed `reason`, or else the fixed server
+        template `confirmed agent waive proposal (audit seq <n>) by <human
+        subject>; see the proposal for the agent's reasoning`. The agent's
+        reason and evidence stay on the proposal row.
+
+        The `concern_waived` intent carries `proposal_sequence`,
+        `proposed_by`, `proposed_by_actor_kind` and `proposal_head_sha`, and
+        is appended through the atomic guarded append, which re-reads the
+        proposal state and the RECORDED run head under the run-row lock. A
+        head that moved after the pre-check refuses with nothing appended
+        (409 `waive_proposal_stale`, `dropped_recorded: false`). A head that
+        had already moved at the pre-check records
+        `concern_waive_proposal_dropped` and answers 409
+        `waive_proposal_stale` with `dropped_recorded: true`. A failed
+        disposition writes a `concern_waive_failed` row whose
+        `intent_sequence` names the intent, returns an error, and leaves the
+        proposal live for a retry. The confirm also records the E82.1
+        delegation shadow (`delegation_shadow_evaluated`) as a direct waive
+        does.
+      tags: [stages]
+      parameters:
+        - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [proposal_sequence]
+              properties:
+                proposal_sequence: { type: integer, format: int64, minimum: 1 }
+                reason: { type: string, maxLength: 4000, description: "Optional HUMAN-typed reason, stored as `state_reason`. Credential-scanned." }
+                delegated: { type: boolean, description: 'Parsed only so the guard refuses it (`concern_requires_human`).' }
+      responses:
+        '200':
+          description: Concern waived.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/WaivedConcern' }
+                  - type: object
+                    required: [proposal_sequence, decided_by, credential_kind]
+                    properties:
+                      proposal_sequence: { type: integer, format: int64 }
+                      decided_by: { type: string }
+                      credential_kind: { type: string, enum: [session] }
+        '400':
+          description: '`validation_failed`, or `waive_proposal_contains_credential` on the human `reason`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope`; `account_forbidden` (route middleware);
+            `concern_requires_human` (an agent token, including a run-bound
+            `mcp:run:<uuid>` token, or `delegated: true`);
+            `concern_requires_session` (any non-session bearer). Both refusals
+            come before any proposal read or append; their remedy names the
+            decision panel's Confirm/Reject and carries no
+            `agent_alternative`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`concern_not_found`, or `waive_proposal_not_found` (no live proposal).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `concern_not_open`; `waive_proposal_not_live` (the named sequence
+            is not the live proposal, or it closed under the lock);
+            `waive_proposal_stale` (`details`: `proposal_head_sha`,
+            `current_head_sha`, `dropped_recorded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`concern_not_server_check` or `concern_waive_conflict`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` (a chain read failed; nothing appended) or `audit_append_failed`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`concern_store_unconfigured` or `waive_proposal_atomic_append_unavailable`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/concerns/{concern_id}/waive-proposal/reject:
+    post:
+      operationId: rejectConcernWaiveProposal
+      summary: Reject a pending waive proposal (Web UI session only)
+      description: |
+        A human rejects a live waive proposal (ADR-143 A1, #5229). Reject
+        clears nothing, but it is the paired human decision on the same
+        concern, so it takes the same channel as confirm: a D2 verb of the
+        `server_check_clear` entry, Web UI `session` only, with the same
+        `concern_requires_human` / `concern_requires_session` refusals and
+        no MCP or CLI path. A live proposal can be rejected whether or not
+        its head moved. `concern_waive_proposal_rejected` is appended
+        through the atomic guarded append, whose in-lock guard requires the
+        proposal still live, so the loser of a confirm-versus-reject race
+        appends nothing and gets `waive_proposal_not_live`. The concern
+        stays open, and a new proposal may follow.
+      tags: [stages]
+      parameters:
+        - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [proposal_sequence, reason]
+              properties:
+                proposal_sequence: { type: integer, format: int64, minimum: 1 }
+                reason: { type: string, minLength: 1, maxLength: 4000, description: 'REQUIRED. Credential-scanned like propose.' }
+                delegated: { type: boolean, description: 'Parsed only so the guard refuses it.' }
+      responses:
+        '200':
+          description: Proposal rejected; the concern is unchanged and open.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [concern_id, proposal_sequence, state, decided_by, credential_kind]
+                properties:
+                  concern_id: { $ref: '#/components/schemas/UUID' }
+                  proposal_sequence: { type: integer, format: int64 }
+                  state: { type: string, enum: [rejected] }
+                  decided_by: { type: string }
+                  credential_kind: { type: string, enum: [session] }
+        '400':
+          description: '`validation_failed` (including a blank or over-4000-byte `reason`) or `waive_proposal_contains_credential`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope`, `account_forbidden`, `concern_requires_human` or `concern_requires_session`, as on confirm.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`concern_not_found` or `waive_proposal_not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`concern_not_open` or `waive_proposal_not_live`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`concern_not_server_check`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` or `audit_append_failed`; nothing appended on a read failure.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`concern_store_unconfigured` or `waive_proposal_atomic_append_unavailable`.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

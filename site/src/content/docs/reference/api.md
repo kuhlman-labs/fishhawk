@@ -214,7 +214,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **185 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **188 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -368,6 +368,9 @@ The v0 REST API exposes **185 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/merge-queue/withdraw` | Withdraw the merge intent of a yielded merge-queue entry |
 | `POST` | `/v0/stages/{stage_id}/concurrency/promote` | Promote a queued waiter to the front of its concurrency group |
 | `POST` | `/v0/concerns/{concern_id}/waive` | Waive an open review concern with an audited reason |
+| `POST` | `/v0/concerns/{concern_id}/waive-proposal` | Propose a waive of a server-check concern for a human to confirm |
+| `POST` | `/v0/concerns/{concern_id}/waive-proposal/confirm` | Confirm a pending waive proposal (Web UI session only) |
+| `POST` | `/v0/concerns/{concern_id}/waive-proposal/reject` | Reject a pending waive proposal (Web UI session only) |
 | `GET` | `/v0/runs/{run_id}/concerns` | List a run's review concerns, optionally with its decomposition children's |
 | `POST` | `/v0/runs/{run_id}/concerns/waive` | Waive several of one run's open concerns with one audited reason |
 | `POST` | `/v0/runs/{run_id}/concerns/resolve` | Resolve routed concerns as addressed on the operator's evidence (human-only) |

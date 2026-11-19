@@ -282,6 +282,11 @@ func (f *attnFixture) seedAllSixKinds(t *testing.T) {
 		Provenance: concern.ProvenanceServerCheck,
 		State:      concern.StateRaised, CreatedAt: attnT0.Add(6*time.Hour + 30*time.Minute),
 	})
+	// A pending agent waive proposal on that concern at the run's recorded
+	// head (ADR-143 A1, #5229): the item carries context.waive_proposal, and
+	// the SPA's decision-panel 'Proposed waive' tests consume THIS golden item.
+	f.audit.seeded = append(f.audit.seeded, attnHeadEntry(amRun, 40, "pull_request_opened", attnProposalHead, attnT0.Add(6*time.Hour+10*time.Minute)))
+	f.audit.seeded = append(f.audit.seeded, attnWaiveProposalEntry(amRun, amStage, attnID(24), 41, attnProposalHead, attnT0.Add(6*time.Hour+45*time.Minute)))
 
 	// Plan gate (priority 1) — the NEWEST, on a PENDING run.
 	planRun := attnID(10)
@@ -915,6 +920,43 @@ func attnServerCheckRow(id, runID, stageID uuid.UUID, created time.Time) *concer
 	}
 }
 
+// attnProposalHead is the recorded run head the attention fixtures' waive
+// proposals bind to.
+const attnProposalHead = "5229a5229a5229a5229a5229a5229a5229a5229a"
+
+// attnHeadEntry is a seeded head-recording chain row naming head.
+func attnHeadEntry(runID uuid.UUID, seq int64, category, head string, at time.Time) *audit.Entry {
+	rid := runID
+	payload, _ := json.Marshal(map[string]any{"head_sha": head})
+	return &audit.Entry{RunID: &rid, Sequence: seq, Timestamp: at, Category: category, Payload: payload}
+}
+
+// attnWaiveProposalEntry is a seeded concern_waive_proposed row for concernID
+// at head, proposed by an operator agent (ADR-143 A1, #5229).
+func attnWaiveProposalEntry(runID, stageID, concernID uuid.UUID, seq int64, head string, at time.Time) *audit.Entry {
+	rid, sid := runID, stageID
+	kind := audit.ActorAgent
+	subject := "operator-agent/1.0"
+	payload, _ := json.Marshal(map[string]any{
+		"concern_id":    concernID.String(),
+		"stage_id":      stageID.String(),
+		"stage_kind":    concern.StageKindImplement,
+		"provenance":    concern.ProvenanceServerCheck,
+		"check_key":     "diff_secrets|github-pat-classic|backend/internal/x/fixture.go",
+		"category":      "security",
+		"severity":      "high",
+		"reason":        "The matched string is the documented placeholder from the README, not a live token.",
+		"judgement":     "tradeoff",
+		"tradeoff_cost": "none: the fixture never reaches a forge",
+		"evidence":      "fixture.go:12 assigns the README example token; the forge refuses it.",
+		"head_sha":      head,
+	})
+	return &audit.Entry{
+		RunID: &rid, StageID: &sid, Sequence: seq, Timestamp: at, Category: CategoryConcernWaiveProposed,
+		ActorKind: &kind, ActorSubject: &subject, Payload: payload,
+	}
+}
+
 // attnReviewerRow is an open reviewer-raised concern (no provenance).
 func attnReviewerRow(id, runID, stageID uuid.UUID, created time.Time) *concern.Concern {
 	model := "claude-opus"
@@ -1101,5 +1143,104 @@ func TestAttention_ScanCapsHoldWithPerRunConcernRead(t *testing.T) {
 	got = decodeAttention(t, getAttention(t, New(cfg), attnReader(""), "?limit=10"))
 	if len(got.Items) != 10 || !got.Truncated {
 		t.Errorf("items = %d truncated = %v, want 10 + truncated (?limit cuts the list)", len(got.Items), got.Truncated)
+	}
+}
+
+// TestAttention_ServerCheckCarriesWaiveProposal pins criterion
+// attention-item-carries-waive-proposal (ADR-143 A1, #5229): a server-check
+// paged_concern carries context.waive_proposal on BOTH server-check paths,
+// the parked-gate gate view and the direct listing, and a reviewer-raised row
+// and a stale proposal carry none.
+func TestAttention_ServerCheckCarriesWaiveProposal(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stageState run.StageState
+	}{
+		{"parked_gate_view", run.StageStateAwaitingApproval},
+		{"direct", run.StageStateRunning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAttnFixture()
+			runID, stageID := attnID(1), attnID(2)
+			f.runs.seed(runID, "acme/app", run.StateRunning, attnT0, "")
+			f.runs.addStage(runID, stageID, run.StageTypeImplement, tc.stageState, attnT0)
+			f.concerns.rows = append(f.concerns.rows,
+				attnServerCheckRow(attnID(3), runID, stageID, attnT0.Add(time.Minute)),
+				attnServerCheckRow(attnID(5), runID, stageID, attnT0.Add(time.Minute)),
+				attnReviewerRow(attnID(4), runID, stageID, attnT0.Add(2*time.Minute)),
+			)
+			f.audit.seeded = append(f.audit.seeded,
+				attnHeadEntry(runID, 10, "pull_request_opened", attnProposalHead, attnT0),
+				attnWaiveProposalEntry(runID, stageID, attnID(3), 11, attnProposalHead, attnT0.Add(3*time.Minute)),
+				// A proposal at an older head is stale: pending nowhere.
+				attnWaiveProposalEntry(runID, stageID, attnID(5), 12, "0ld0ld0ld0ld0ld0ld0ld0ld0ld0ld0ld0ld0ld0", attnT0.Add(3*time.Minute)),
+			)
+			got := decodeAttention(t, getAttention(t, New(f.config()), attnReader(""), ""))
+			sc := attnFindConcernItem(got.Items, attnID(3))
+			if sc == nil || sc.Context.WaiveProposal == nil {
+				t.Fatalf("server-check item = %+v, want context.waive_proposal", sc)
+			}
+			p := sc.Context.WaiveProposal
+			if p.ProposalSequence != 11 || p.HeadSHA != attnProposalHead || p.ProposedBy != "operator-agent/1.0" ||
+				p.ProposedByActorKind != string(audit.ActorAgent) || !p.AgentAuthored || p.Reason == "" || p.Evidence == "" ||
+				p.CheckKey == "" || p.ConcernID != attnID(3).String() {
+				t.Errorf("waive_proposal = %+v, want sequence 11 at the recorded head, agent-authored", p)
+			}
+			if stale := attnFindConcernItem(got.Items, attnID(5)); stale == nil || stale.Context.WaiveProposal != nil {
+				t.Errorf("stale-proposal item = %+v, want listed with no waive_proposal", stale)
+			}
+			if rv := attnFindConcernItem(got.Items, attnID(4)); rv != nil && rv.Context.WaiveProposal != nil {
+				t.Errorf("reviewer item carries a waive_proposal: %+v", rv)
+			}
+			if len(got.Degraded) != 0 {
+				t.Errorf("degraded = %+v, want none", got.Degraded)
+			}
+		})
+	}
+}
+
+// TestAttention_ServerCheckCarriesWaiveProposal_ReadFailureOmits: when the
+// proposal fold's read fails, the item is still listed but carries NO
+// waive_proposal, so the panel never offers Confirm on an unreadable state.
+// On the gate-view path the failure also surfaces as a
+// gate_view_history_incomplete degraded entry naming waive_proposals.
+func TestAttention_ServerCheckCarriesWaiveProposal_ReadFailureOmits(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stageState run.StageState
+		wantGap    bool
+	}{
+		{"parked_gate_view", run.StageStateAwaitingApproval, true},
+		{"direct", run.StageStateRunning, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAttnFixture()
+			runID, stageID := attnID(1), attnID(2)
+			f.runs.seed(runID, "acme/app", run.StateRunning, attnT0, "")
+			f.runs.addStage(runID, stageID, run.StageTypeImplement, tc.stageState, attnT0)
+			f.concerns.rows = append(f.concerns.rows, attnServerCheckRow(attnID(3), runID, stageID, attnT0.Add(time.Minute)))
+			f.audit.seeded = append(f.audit.seeded,
+				attnHeadEntry(runID, 10, "pull_request_opened", attnProposalHead, attnT0),
+				attnWaiveProposalEntry(runID, stageID, attnID(3), 11, attnProposalHead, attnT0.Add(3*time.Minute)),
+			)
+			f.audit.listByCategoryErrCategory = CategoryConcernWaiveProposed
+			got := decodeAttention(t, getAttention(t, New(f.config()), attnReader(""), ""))
+			sc := attnFindConcernItem(got.Items, attnID(3))
+			if sc == nil {
+				t.Fatalf("server-check item not listed on a proposal read failure: %v", attnKinds(got.Items))
+			}
+			if sc.Context.WaiveProposal != nil {
+				t.Errorf("waive_proposal = %+v, want omitted on a read failure", sc.Context.WaiveProposal)
+			}
+			gap := false
+			for _, d := range got.Degraded {
+				if d.Reason == attentionDegradedGateViewHistoryIncomplete && strings.Contains(d.Detail, gateViewGapWaiveProposals) {
+					gap = true
+				}
+			}
+			if gap != tc.wantGap {
+				t.Errorf("waive_proposals degraded entry = %v, want %v (degraded %+v)", gap, tc.wantGap, got.Degraded)
+			}
+		})
 	}
 }

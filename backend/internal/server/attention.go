@@ -170,6 +170,14 @@ type attentionContext struct {
 	// absent for a reviewer-raised one. A server-check concern can be cleared
 	// only from a Web UI session (ADR-143 D1), so the panel marks it.
 	Provenance string `json:"provenance,omitempty"`
+	// WaiveProposal is the PENDING agent waive proposal on a server-check
+	// paged_concern (ADR-143 A1, #5229), the gate view's waive_proposal
+	// shape: present only when the proposal is live at the current recorded
+	// run head. It is set on BOTH server-check paths (the parked-gate gate
+	// view and the direct listing). A read failure omits it, so the panel
+	// never offers Confirm on an unreadable proposal state. Its reason,
+	// evidence and tradeoff cost are agent-authored and rendered as text.
+	WaiveProposal *waiveProposalView `json:"waive_proposal,omitempty"`
 	// attend_human_led_campaign
 	EpicRef      string   `json:"epic_ref,omitempty"`
 	HumanLedRefs []string `json:"human_led_refs,omitempty"`
@@ -428,7 +436,7 @@ func (s *Server) collectRunAttention(ctx context.Context, ru *run.Run, col *atte
 			}
 		}
 	}
-	collectServerCheckConcerns(ru, title, open, col)
+	s.collectServerCheckConcerns(ctx, ru, title, open, col)
 }
 
 // collectGateViewConcerns emits the split_verdict / paged_concern items of a
@@ -483,6 +491,9 @@ func (s *Server) collectGateViewConcerns(ctx context.Context, ru *run.Run, revie
 				DisputeReasons:   reasons,
 				ConfirmationNote: confirmation,
 				Provenance:       provenance[c.ID],
+				// The gate view's own pending-proposal fold (ADR-143 A1,
+				// #5229); nil when none is pending or its read failed.
+				WaiveProposal: c.WaiveProposal,
 			},
 		})
 	}
@@ -491,12 +502,25 @@ func (s *Server) collectGateViewConcerns(ctx context.Context, ru *run.Run, revie
 // collectServerCheckConcerns lists each open server_check row directly, with
 // no gate view: the path for a run with no parked implement/review gate, or a
 // parked run past the gate-view budget. The item points at the row's own
-// stage. Reviewer-raised rows are skipped (the parked-gate rule).
-func collectServerCheckConcerns(ru *run.Run, title string, open []*concern.Concern, col *attentionCollector) {
+// stage. Reviewer-raised rows are skipped (the parked-gate rule). Each item
+// carries its pending waive proposal (ADR-143 A1, #5229) from one
+// pendingWaiveProposals read, which reads the chain only when an open
+// server_check row exists; a read failure WARN-logs and omits every block.
+func (s *Server) collectServerCheckConcerns(ctx context.Context, ru *run.Run, title string, open []*concern.Concern, col *attentionCollector) {
 	runID := ru.ID.String()
+	proposals, perr := s.pendingWaiveProposals(ctx, ru.ID, open)
+	if perr != nil {
+		s.cfg.Logger.WarnContext(ctx, "attention: waive proposal read failed; omitting waive_proposal",
+			"run_id", runID, "err", perr)
+	}
 	for _, c := range open {
 		if !c.IsServerCheck() {
 			continue
+		}
+		var proposal *waiveProposalView
+		if p := proposals[c.ID]; p != nil {
+			v := p.view()
+			proposal = &v
 		}
 		col.add(attentionItem{
 			ID:         c.ID.String(),
@@ -509,12 +533,13 @@ func collectServerCheckConcerns(ru *run.Run, title string, open []*concern.Conce
 			DetailPath: "/runs/" + runID + "/stages/" + c.StageID.String(),
 			Since:      c.CreatedAt,
 			Context: attentionContext{
-				StageKind:   c.StageKind,
-				Severity:    c.Severity,
-				Category:    c.Category,
-				Note:        c.Note,
-				NewEvidence: c.NewEvidence,
-				Provenance:  c.Provenance,
+				StageKind:     c.StageKind,
+				Severity:      c.Severity,
+				Category:      c.Category,
+				Note:          c.Note,
+				NewEvidence:   c.NewEvidence,
+				Provenance:    c.Provenance,
+				WaiveProposal: proposal,
 			},
 		})
 	}
