@@ -1,13 +1,14 @@
 id: scenario:issue-4240/validate-rejects-group-and-groups
 statement: '`fishhawk validate` on a workflow-v2 file whose stage `concurrency` block declares both `group` and `groups` (and, separately, both `limit` and `groups`) exits non-zero, and its error output names that stage''s concurrency block and the conflicting field.'
 verify_hint: 'CLI: write two v2 workflow files (group+groups; limit+groups), run `fishhawk validate <file>` on each, and check the non-zero exit code and the stderr naming /concurrency and group or limit.'
-steps: 'Built fishhawk from the sanctioned checkout. Wrote two v2 files, each with workflows.wf and an implement stage ''apply'' (executor agent claude-code). The first has concurrency {group: deploy, groups: [{group: deploy, scope: repository}]}; the second has concurrency {limit: 2, groups: [{group: deploy, scope: repository}]}. Ran `fishhawk validate <file>` on each. Cross-checked both against the preview via MCP fishhawk_validate {workflow_spec}.'
+steps: 'Built fishhawk from the sanctioned checkout (cd <tree>/cli && go build ./cmd/fishhawk). Wrote gg.yaml (v2, stage apply implement/claude-code, concurrency {group: deploy, groups: [{group: deploy, scope: repository}]}) and lg.yaml (concurrency {limit: 2, groups: [{group: deploy, scope: repository}]}). Ran `fishhawk validate` on each; cross-checked through the preview''s MCP fishhawk_validate using an fhm_ bearer minted from trace-upload-target.'
 assertions:
-    expected: Non-zero exit, with stderr naming the stage's concurrency block and the conflicting field.
-    observed_at_record: 'group+groups: exit 1, stderr ''group_groups.yaml/workflows/wf/stages/0/concurrency/group: false schema''. limit+groups: exit 1, stderr ''.../stages/0/concurrency/limit: false schema''. stdout is empty for both. The preview''s validator returns the same pointers.'
+    expected: Non-zero exit naming the concurrency block and the conflicting field.
+    observed_at_record: 'gg: exit 1, ''gg.yaml/workflows/wf/stages/0/concurrency/group: false schema''. lg: exit 1, ''lg.yaml/workflows/wf/stages/0/concurrency/limit: false schema''. The preview agreed.'
+    repro_handle: fishhawk validate gg.yaml; fishhawk validate lg.yaml
 origin:
     issue: 4240
     pr: 5479
     run_id: 3fd75737-959c-47f9-a418-4a983e327e4c
-    head_sha: ef6d3a6f91aa6df1f8b022fd5a8bffcc5b886c6f
-    recorded_at: 2026-11-19T20:47:32Z
+    head_sha: fbda43cf22a560d57420142b4a8a336d82ba0177
+    recorded_at: 2026-11-19T21:46:52Z

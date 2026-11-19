@@ -1,13 +1,14 @@
 id: scenario:issue-4240/validate-rejects-host-key-limit
 statement: '`fishhawk validate` rejects a `concurrency.groups` entry `{group: implement, scope: host, limit: 2}` (and, separately, `{group: verify, scope: host, limit: 1}`): it exits non-zero, naming the entry and stating that the host default limit governs that group. The same file without the `limit` on that entry validates.'
 verify_hint: 'CLI: `fishhawk validate <file>`; check the non-zero exit and stderr naming .../concurrency/groups/0 and the host default limit; then remove the limit and check exit 0.'
-steps: 'Ran `fishhawk validate` on single-entry groups files: {group: implement, scope: host, limit: 2}, {group: verify, scope: host, limit: 1}, and, per condition H1, {group: preview-target, scope: host, limit: 1}. Then ran the implement and verify files with the limit removed. Cross-checked against the preview''s MCP fishhawk_validate.'
+steps: 'Built the CLI from the sanctioned checkout. Wrote v2 files (stage apply, implement, claude-code) with concurrency.groups set to: [{group: implement, scope: host, limit: 2}], [{group: verify, scope: host, limit: 1}], [{group: preview-target, scope: host, limit: 1}] (H1), [{group: implement, scope: host}] and [{group: verify, scope: host}]. Ran `fishhawk validate` on each; cross-checked through the preview''s MCP fishhawk_validate.'
 assertions:
-    expected: Non-zero exit naming the entry, stating the host default limit governs, and passing once the limit is removed. H1 extends the rule to non-legacy host names.
-    observed_at_record: 'All three limit-bearing files: exit 1, with stderr ''.../concurrency/groups/0/limit: concurrency.groups entry (scope "host", group "<name>") declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator ...; the host''s implement and verify groups take the host default limits and any other host-scoped group is held at limit 1 until host-declared capacity (#4241). Remove limit, or declare the group with scope repository''. Without the limit: exit 0, OK. The preview returns the same messages.'
+    expected: Non-zero exit naming the entry and the host default limit; exit 0 without the limit.
+    observed_at_record: 'The three limit files: exit 1 at .../concurrency/groups/0/limit, ''declares a limit: a host-scoped group is shared by every repository on the host ... the host''s implement and verify groups take the host default limits and any other host-scoped group is held at limit 1 ...''. The no-limit files: exit 0. The preview agreed.'
+    repro_handle: fishhawk validate himpl.yaml
 origin:
     issue: 4240
     pr: 5479
     run_id: 3fd75737-959c-47f9-a418-4a983e327e4c
-    head_sha: ef6d3a6f91aa6df1f8b022fd5a8bffcc5b886c6f
-    recorded_at: 2026-11-19T20:47:32Z
+    head_sha: fbda43cf22a560d57420142b4a8a336d82ba0177
+    recorded_at: 2026-11-19T21:46:52Z
