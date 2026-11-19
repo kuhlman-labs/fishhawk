@@ -368,6 +368,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// E94.8 / #4841 (ADR-117 D1 phase 3): the human-only relabel and
 	// duplicate_of verb, adjacent to the judgement-recording verbs it corrects.
 	registerLabelConcern(srv, resolver)
+	// E80.28 / #5229 (ADR-143 A1): the agent half of propose-and-confirm for
+	// server-check concerns. It clears nothing; there is deliberately no
+	// confirm or reject tool (both are Web UI session-only D2 verbs).
+	registerProposeWaive(srv, resolver)
 	// E94.3 / #4694 (ADR-117 D3 + A1): record an escaped defect on its run,
 	// or close a pending one with a human, forge-verified attestation.
 	registerRecordEscape(srv, resolver)

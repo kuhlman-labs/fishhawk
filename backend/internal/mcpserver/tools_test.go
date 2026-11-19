@@ -3682,7 +3682,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// refuses a run-bound token, and refuses a live, unmarked, no-intent or
 	// dispatch-claimed entry. Its own tool, not a promote mode: it settles the
 	// entry instead of reordering it. 85 -> 86.
-	const wantToolCount = 86
+	//
+	// E80.28 / #5229 (ADR-143 A1) adds exactly ONE tool —
+	// fishhawk_propose_waive, the wrapper over POST
+	// /v0/concerns/{concern_id}/waive-proposal. WHEN: an open server_check
+	// concern is a false positive or accepted trade-off and the direct
+	// waive/defer refused the agent. ELIGIBILITY: write:stages or
+	// write:fixups on a NON-run-bound credential (run_token_forbidden
+	// otherwise). It clears nothing; there is NO confirm or reject tool —
+	// both are Web UI session-only (TestProposeWaive_NoConfirmOrRejectTool).
+	// 86 -> 87.
+	const wantToolCount = 87
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

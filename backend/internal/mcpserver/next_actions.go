@@ -116,6 +116,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldFanInVerifyUnavailableAdvisory(run, na)
+		foldWaiveProposalAdvisory(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -139,6 +140,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldFanInVerifyUnavailableAdvisory(run, na)
+		foldWaiveProposalAdvisory(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -160,6 +162,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldFanInVerifyUnavailableAdvisory(run, na)
+		foldWaiveProposalAdvisory(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -193,6 +196,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldMergeQueueOrphanedClaim(run, na)
 	foldMergeCandidateRerunAlternative(run, na)
 	foldFanInVerifyUnavailableAdvisory(run, na)
+	foldWaiveProposalAdvisory(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
 	return na
@@ -995,6 +999,46 @@ func foldFanInVerifyUnavailableAdvisory(run *Run, na *NextActions) {
 		Consumes:     consumesNone,
 		Reason:       fmt.Sprintf("acceptance was released on an unverified consolidated head (%s%s): %s", b.Reason, detailSuffix(b.Detail), remedy),
 	})
+}
+
+// actionConfirmWaiveProposal is the display-only next_actions entry for a
+// pending agent waive proposal (E80.28 / #5229, ADR-143 A1). It names a human
+// ritual step outside the MCP surface, like approve_pr: there is NO MCP or CLI
+// confirm.
+const actionConfirmWaiveProposal = "confirm_waive_proposal"
+
+// foldWaiveProposalAdvisory APPENDS one DISPLAY-ONLY confirm_waive_proposal
+// action per pending agent waive proposal on the run read (E80.28 / #5229,
+// ADR-143 A1). A proposal clears nothing, and confirming it is a Web UI
+// session-only D2 verb, so the entry consumes nothing, offers no MCP verb, and
+// only INSERTS at the end: every existing action keeps its place and order.
+// The params name the run, concern, stage and proposal_sequence the human's
+// confirm or reject names. A TERMINAL run adds nothing. An absent block —
+// including an older backend that omits the field, or a backend read failure
+// — appends nothing and leaves every surface byte-identical. na is mutated in
+// place; a nil run or na is a no-op.
+func foldWaiveProposalAdvisory(run *Run, na *NextActions) {
+	if na == nil || run == nil || len(run.WaiveProposals) == 0 || runStateIsTerminal(run.State) {
+		return
+	}
+	for _, p := range run.WaiveProposals {
+		params := map[string]string{
+			"run_id":            run.ID,
+			"concern_id":        p.ConcernID,
+			"proposal_sequence": strconv.FormatInt(p.ProposalSequence, 10),
+		}
+		if p.StageID != "" {
+			params["stage_id"] = p.StageID
+		}
+		na.Actions = append(na.Actions, SuggestedAction{
+			Action:       actionConfirmWaiveProposal,
+			Params:       params,
+			Precondition: "an agent waive proposal is pending on an open server_check concern at the current recorded run head",
+			Consumes:     consumesNone,
+			Reason: fmt.Sprintf("%s proposed waiving server-check concern %s (judgement %s, proposal_sequence %d); it clears nothing until a human signed in to the Fishhawk Web UI confirms or rejects it from the attention queue's decision panel. There is no MCP or CLI confirm; the concern stays open and still holds the merge gate",
+				orUnknown(p.ProposedBy), p.ConcernID, orUnknown(p.Judgement), p.ProposalSequence),
+		})
+	}
 }
 
 // detailSuffix renders ": <detail>" for a non-empty detail, else nothing.
