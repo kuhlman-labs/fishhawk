@@ -374,6 +374,53 @@ func TestTick_DailyCapRollsOverAtUTCMidnight(t *testing.T) {
 	}
 }
 
+// ADR-104 A1: with no daily cap configured (DailyCap 0) the dispatcher spawns
+// past the old default of 48. The ledger is seeded at exactly 48 for the
+// current UTC day, so a restored default would refuse the first candidate;
+// spawns_today stays an observation and the status file names no daily limit.
+func TestTick_NoDailyCapSpawnsPast48(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	first := lh.add(0, nil)
+	second := lh.add(time.Second, nil)
+	l := lh.loop(func(c *HostDispatcherConfig) { c.DailyCap = 0 })
+	seed, err := json.Marshal(hdLedger{
+		Day:         lh.clock.UTC().Format(time.DateOnly),
+		SpawnsToday: 48,
+		InFlight:    map[string]hdLedgerEntry{},
+		Respawns:    map[string]bool{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lh.dir, hostDispatchLedgerFile), seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lh.tick(l)
+	if lh.spawner.n() != 2 {
+		t.Fatalf("spawns = %d; want both runs spawned with no daily cap", lh.spawner.n())
+	}
+	for _, r := range []*hdRun{first, second} {
+		o, ok := outcomeFor(l, r.ID)
+		if !ok || o.Refusal == hdRefuseCapDaily {
+			t.Fatalf("run %s outcome = %+v (found %v); want no %s", r.ID, o, ok, hdRefuseCapDaily)
+		}
+	}
+	st, err := ReadHostDispatcherStatus(lh.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SpawnsToday != 50 || st.DailyCap != 0 {
+		t.Fatalf("status spawns_today=%d daily_cap=%d; want 50 and 0", st.SpawnsToday, st.DailyCap)
+	}
+	raw, err := os.ReadFile(filepath.Join(lh.dir, hostDispatchStatusFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "daily_cap") {
+		t.Fatalf("status.json names a daily limit with none set: %s", raw)
+	}
+}
+
 // S3.7: the stale re-spawn counter survives a restart; a new marker epoch
 // allows one more.
 func TestTick_StaleRespawnPersistedAcrossRestart(t *testing.T) {
@@ -499,6 +546,16 @@ func TestStatusFile_ReportsTickFields(t *testing.T) {
 	}
 	if st.LastRefusalCode != hdRefuseCapDaily || st.LastRefusalRunID != blocked.ID || st.PID != os.Getpid() {
 		t.Fatalf("status refusal = %q run=%s pid=%d; want %s for %s", st.LastRefusalCode, st.LastRefusalRunID, st.PID, hdRefuseCapDaily, blocked.ID)
+	}
+	if st.DailyCap != 1 {
+		t.Fatalf("status daily_cap = %d; want the opt-in cap 1", st.DailyCap)
+	}
+	raw, err := os.ReadFile(filepath.Join(lh.dir, hostDispatchStatusFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"daily_cap":1`) {
+		t.Fatalf("status.json lacks the daily_cap key: %s", raw)
 	}
 	if st.Stale(lh.clock.Add(89*time.Second)) || !st.Stale(lh.clock.Add(91*time.Second)) {
 		t.Fatal("staleness is not 3 x the 30s interval")

@@ -90,7 +90,8 @@ through the same `loadConfig` ladder as the server modes.
 are `--allowed-roots` (falls back to `FISHHAWK_MCP_ALLOWED_ROOTS`; leaving both
 empty exits 2), `--interval` (default 30s; above 45s exits 2),
 `--max-in-flight` (default 2, ADR-104 Q6), `--per-tick-cap` (default 4),
-`--daily-cap` (default 48), `--state-dir` (default
+`--daily-cap` (opt-in, no default: 0 or absent is no daily cap, ADR-104
+A1), `--state-dir` (default
 `$TMPDIR/fishhawk-host-dispatch`), `--stale-after`, `--runner-binary`,
 `--pause` / `--resume`, and `--status` (exit 0 when live or paused, 1 when
 absent or stale, where stale means the last tick is older than 3 intervals,
@@ -116,7 +117,8 @@ proceeds only when the run is unlinked, or linked with every campaign
 `running`. A read error is `campaign_link_unavailable` and an unresolved
 ancestry is `campaign_link_unresolved`, both fail closed. Any other campaign
 state is `campaign_not_running`. (2) The loop's gate (`hostDispatchLoop.Admit`)
-checks the pause file, max in-flight and the daily cap, then reserves the
+checks the pause file, max in-flight and, when an operator set one, the daily
+cap, then reserves the
 ledger entry and persists it. (3) `run_auto_driven` is recorded with
 `source: host_dispatcher`, fail closed, once per dispatch attempt. The attempt
 is the stage's `dispatched_at` (re-stamped on every transition into
@@ -140,8 +142,8 @@ admission path, and `concurrency_slot.go` is untouched. A 409
 `parent_unreadable`,
 `nothing_dispatchable`, `in_flight`, `stale_runner_live`,
 `stale_runner_unknown`, `stale_respawn_cap_reached`, the three campaign codes,
-`paused`, `cap_reached:max_in_flight`, `cap_reached:daily`,
-`ledger_write_failed`, `record_act_failed`, `concurrency_slot_queued`,
+`paused`, `cap_reached:max_in_flight`, `cap_reached:daily` (only possible when
+an operator set `--daily-cap`), `ledger_write_failed`, `record_act_failed`, `concurrency_slot_queued`,
 `host_memory_pressure`, `marker_not_transitioned`, `spawn_failed`, and the
 server's own code for any other marker refusal (for example
 `dependency_not_satisfied`, `wave_not_integrated`, `campaign_dispatch_held`). Per tick:
@@ -166,8 +168,10 @@ evaluation. Older held runs therefore cannot spend every tick's budget: a newer
 admissible run is reached on the next tick. Finally it evaluates candidates until the
 per-tick cap of candidates that reached the campaign-link read is spent. That
 cap therefore bounds both the campaign-link reads and the marker POSTs per tick.
-The daily count is persisted and rolls over at 00:00:00Z, so a restart does
-not reset it.
+The daily count is always persisted and rolls over at 00:00:00Z, so a restart
+does not reset it. The status file and `--status` report it as `spawns_today`;
+it is enforced only when `--daily-cap` is set. `daily_cap=N` (status file field
+`daily_cap`) appears only when an operator set `--daily-cap`.
 
 **Queue fairness (forgone FIFO).** A re-POST within the server's 60s QueueTTL
 keeps the queue row's `enqueued_at` (`backend/internal/concurrency/README.md`

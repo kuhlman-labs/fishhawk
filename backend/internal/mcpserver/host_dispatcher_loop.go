@@ -28,8 +28,9 @@ import (
 //   - the persisted 0600 ledger in a 0700, owner-checked, flock-locked state dir
 //     (daily spawn count, in-flight set, the once-per-marker-epoch stale
 //     re-spawn counter);
-//   - the caps (max in-flight, per tick, per UTC day) and the pause file,
-//     checked by the hostDispatchGate the core calls last before any POST;
+//   - the caps (max in-flight, per tick, and an opt-in per-UTC-day cap) and the
+//     pause file, checked by the hostDispatchGate the core calls last before any
+//     POST;
 //   - deterministic candidate order, cancel reaping and the status file.
 //
 // A 409 concurrency_slot_queued leaves a stage parked; the next tick re-POSTs
@@ -41,13 +42,13 @@ import (
 // admitted at that moment anyway.
 
 // Loop defaults. Max in-flight 2 is ADR-104 Q6; the rest are this delivery's
-// documented choices.
+// documented choices. There is no daily-cap default: ADR-104 amendment A1
+// removed it, and a DailyCap of 0 means no daily cap.
 const (
 	hostDispatchDefaultInterval    = 30 * time.Second
 	hostDispatchMaxInterval        = 45 * time.Second
 	hostDispatchDefaultMaxInFlight = 2
 	hostDispatchDefaultPerTick     = 4
-	hostDispatchDefaultDaily       = 48
 	// hostDispatchStatusStaleTicks: --status reports a dispatcher stale when its
 	// last tick is older than this many intervals (a chosen default, not an
 	// ADR value).
@@ -107,8 +108,9 @@ type HostDispatcherConfig struct {
 	// StateDir holds the ledger, status, pause and lock files (mode 0700,
 	// owned by the current user, never a symlink).
 	StateDir string
-	// Zero values take the defaults (30s, 2, 4, 48, drive_run's liveness
-	// threshold). Interval above 45s is refused.
+	// Zero values take the defaults (30s, 2, 4, drive_run's liveness
+	// threshold) except DailyCap, where 0 means no daily cap (ADR-104 A1).
+	// Interval above 45s is refused.
 	Interval    time.Duration
 	MaxInFlight int
 	PerTickCap  int
@@ -136,7 +138,10 @@ type HostDispatcherStatus struct {
 	LastRefusalAt      time.Time `json:"last_refusal_at,omitzero"`
 	SpawnsToday        int       `json:"spawns_today"`
 	SpawnsDay          string    `json:"spawns_day"`
-	InFlight           int       `json:"in_flight"`
+	// DailyCap is the opt-in daily spawn limit (--daily-cap); absent when none
+	// is set (ADR-104 A1).
+	DailyCap int `json:"daily_cap,omitempty"`
+	InFlight int `json:"in_flight"`
 }
 
 // Stale reports whether the status is older than hostDispatchStatusStaleTicks
@@ -247,9 +252,6 @@ func (cfg HostDispatcherConfig) withDefaults() (HostDispatcherConfig, error) {
 	}
 	if cfg.PerTickCap == 0 {
 		cfg.PerTickCap = hostDispatchDefaultPerTick
-	}
-	if cfg.DailyCap == 0 {
-		cfg.DailyCap = hostDispatchDefaultDaily
 	}
 	if cfg.MaxInFlight < 0 || cfg.PerTickCap < 0 || cfg.DailyCap < 0 || cfg.StaleAfter < 0 {
 		return cfg, errors.New("caps and --stale-after must not be negative")
@@ -525,6 +527,7 @@ func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string
 		PID:             os.Getpid(),
 		Host:            r.api.hostLabelResolution().Label,
 		IntervalSeconds: cfg.Interval.Seconds(),
+		DailyCap:        cfg.DailyCap,
 	}
 	return l
 }
@@ -858,7 +861,7 @@ func (l *hostDispatchLoop) Admit(_ context.Context, c hostDispatchCandidate) (fu
 	if inFlight >= l.cfg.MaxInFlight {
 		return nil, hdRefuseCapInFlight, nil
 	}
-	if l.ledger.SpawnsToday >= l.cfg.DailyCap {
+	if l.cfg.DailyCap > 0 && l.ledger.SpawnsToday >= l.cfg.DailyCap {
 		return nil, hdRefuseCapDaily, nil
 	}
 	prevEntry := l.ledger.InFlight[c.StageID]

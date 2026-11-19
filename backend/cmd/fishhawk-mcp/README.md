@@ -144,7 +144,7 @@ The go-sdk's own DNS-rebinding protection (rejecting a non-loopback `Host` heade
 | `--interval` | `30s` | Tick interval. Above `45s` exits 2, so a queued stage is re-POSTed inside the server's 60 s queue TTL. |
 | `--max-in-flight` | `2` | Stages this dispatcher keeps `dispatched` or `running` (ADR-104 Q6). |
 | `--per-tick-cap` | `4` | Candidates per tick that reach the campaign-link read; bounds reads and marker POSTs. |
-| `--daily-cap` | `48` | Spawns per UTC day, persisted, rolling over at 00:00:00Z. |
+| `--daily-cap` | none (`0`) | Opt-in spawns per UTC day, persisted, rolling over at 00:00:00Z. `0` or absent is no daily cap (ADR-104 A1); a negative value exits 2. |
 | `--stale-after` | `0` (the `drive_run` default) | How long a `dispatched` stage this process is not running may sit before its runner's liveness is probed. |
 | `--runner-binary` | `FISHHAWK_RUNNER_BIN`, then beside this binary, then `PATH` | The `fishhawk-runner` to spawn. |
 | `--pause` / `--resume` | off | Create or remove `<state-dir>/pause` and exit. A running dispatcher re-checks the file before every marker POST; any entry under that name, even a symlink, counts as paused. |

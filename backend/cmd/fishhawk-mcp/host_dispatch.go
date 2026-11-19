@@ -82,7 +82,7 @@ func runHostDispatch(ctx context.Context, args []string, stdout, stderr io.Write
 	fs.DurationVar(&f.interval, "interval", 30*time.Second, "tick interval (at most 45s, so a queued stage is re-POSTed inside the server's 60s queue TTL)")
 	fs.IntVar(&f.maxInFlight, "max-in-flight", 2, "maximum stages this dispatcher keeps dispatched or running (ADR-104 Q6)")
 	fs.IntVar(&f.perTickCap, "per-tick-cap", 4, "maximum candidates per tick that reach the campaign-link read (bounds reads and marker POSTs)")
-	fs.IntVar(&f.dailyCap, "daily-cap", 48, "maximum spawns per UTC day (persisted; rolls over at 00:00:00Z)")
+	fs.IntVar(&f.dailyCap, "daily-cap", 0, "maximum spawns per UTC day (persisted; rolls over at 00:00:00Z); 0 or absent is no daily cap (ADR-104 A1)")
 	fs.StringVar(&f.stateDir, "state-dir", defaultHostDispatchStateDir(), "dispatcher state dir (ledger, status, pause and lock files; 0700, owned by you, never a symlink)")
 	fs.DurationVar(&f.staleAfter, "stale-after", 0, "how long a dispatched stage this process is not running may sit before its runner's liveness is probed (0: the drive_run default)")
 	fs.StringVar(&f.runnerBinary, "runner-binary", "", "fishhawk-runner path (default: FISHHAWK_RUNNER_BIN, beside this binary, then PATH)")
@@ -129,8 +129,8 @@ func runHostDispatch(ctx context.Context, args []string, stdout, stderr io.Write
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp host-dispatch: --interval %s is outside (0, %s]: a queued stage must be re-POSTed within the server's 60s queue TTL\n", f.interval, hostDispatchMaxInterval)
 		return exitUsage
 	}
-	if f.maxInFlight <= 0 || f.perTickCap <= 0 || f.dailyCap <= 0 || f.staleAfter < 0 {
-		_, _ = fmt.Fprintln(stderr, "fishhawk-mcp host-dispatch: --max-in-flight, --per-tick-cap and --daily-cap must be positive, --stale-after not negative")
+	if f.maxInFlight <= 0 || f.perTickCap <= 0 || f.dailyCap < 0 || f.staleAfter < 0 {
+		_, _ = fmt.Fprintln(stderr, "fishhawk-mcp host-dispatch: --max-in-flight and --per-tick-cap must be positive, --daily-cap and --stale-after not negative")
 		return exitUsage
 	}
 	roots := splitAllowedRoots(f.allowedRoots)
@@ -187,6 +187,9 @@ func hostDispatchStatus(stateDir string, stdout, stderr io.Writer, now time.Time
 	}
 	_, _ = fmt.Fprintf(stdout, "state=%s pid=%d host=%s last_tick_at=%s paused=%v in_flight=%d spawns_today=%d (%s)",
 		state, st.PID, st.Host, st.LastTickAt.Format(time.RFC3339), st.Paused, st.InFlight, st.SpawnsToday, st.SpawnsDay)
+	if st.DailyCap > 0 {
+		_, _ = fmt.Fprintf(stdout, " daily_cap=%d", st.DailyCap)
+	}
 	if st.LastRefusalCode != "" {
 		_, _ = fmt.Fprintf(stdout, " last_refusal=%s run=%s stage=%s at=%s", st.LastRefusalCode, st.LastRefusalRunID, st.LastRefusalStageID, st.LastRefusalAt.Format(time.RFC3339))
 	}

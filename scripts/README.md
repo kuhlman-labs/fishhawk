@@ -2071,8 +2071,8 @@ What it runs:
   --state-dir <checkout>/.fishhawk/cache/host-dispatch`. `<roots>` is
   `FISHHAWK_MCP_ALLOWED_ROOTS` when set, else the checkout root (the
   `working_dir` local runs bind). The other flags keep their defaults
-  (`--interval` 30s, `--max-in-flight` 2, `--per-tick-cap` 4, `--daily-cap`
-  48).
+  (`--interval` 30s, `--max-in-flight` 2, `--per-tick-cap` 4). There is no
+  daily cap by default (ADR-104 A1).
 - **Scrubbed environment (approval condition G3).** It is spawned with an
   explicit allowlist and nothing else: `_host_dispatch_exec_scrubbed`, in a
   subshell, un-exports every exported variable, exports the allowlist and
@@ -2230,7 +2230,8 @@ The next `scripts/dev up` or reload also clears it.
 - **Status.** `bin/fishhawk-mcp host-dispatch --status --state-dir
   .fishhawk/cache/host-dispatch` prints one line, `state=<live|paused|stale>
   pid=… host=… last_tick_at=… paused=… in_flight=… spawns_today=…`, plus the
-  latest refusal when there is one.
+  latest refusal when there is one. `daily_cap=N` (status file field
+  `daily_cap`) appears only when an operator set `--daily-cap`.
   It exits 0 when live or paused, and 1 when the status is absent or stale.
   Pass the `--state-dir`: the binary's default is
   `$TMPDIR/fishhawk-host-dispatch`, not the `scripts/dev` one.

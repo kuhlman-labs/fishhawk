@@ -1,0 +1,14 @@
+id: scenario:issue-5472/daily-cap-flag-has-no-default
+statement: '`fishhawk-mcp host-dispatch -h` exits 0. Its --daily-cap usage on stderr shows no `(default 48)` and states that 0 or absent means no daily cap.'
+verify_hint: CLI stderr and exit code of `fishhawk-mcp host-dispatch -h`
+steps: Ran fishhawk-mcp host-dispatch -h (binary built from the sanctioned checkout), capturing stdout and stderr separately.
+assertions:
+    expected: no (default 48); states 0 or absent means no daily cap
+    observed_at_record: 'exit 0. stderr: ''-daily-cap int / maximum spawns per UTC day (persisted; rolls over at 00:00:00Z); 0 or absent is no daily cap (ADR-104 A1)''. No ''(default 48)''.'
+    repro_handle: fishhawk-mcp host-dispatch -h
+origin:
+    issue: 5472
+    pr: 5478
+    run_id: a2e94cfd-df34-45d6-84d6-7355bf6b9276
+    head_sha: 5346a7cc9dc13b6ee0df5a3d13c874daead95a59
+    recorded_at: 2026-11-19T15:05:54Z
