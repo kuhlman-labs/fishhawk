@@ -58,6 +58,7 @@ const CONTEXT_KEYS = new Set([
   'dispute_reasons',
   'confirmation_note',
   'provenance',
+  'waive_proposal',
   'epic_ref',
   'human_led_refs',
   'detail',

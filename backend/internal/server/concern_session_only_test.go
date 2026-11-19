@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -62,8 +63,12 @@ import (
 // real middleware: a cookie session store, the api-token store, the run-bound
 // MCP token store and an enabled OAuth AS with an access-token store.
 type sessionOnlyFixture struct {
-	s       *Server
-	runs    *approvalRunRepo
+	s    *Server
+	runs *approvalRunRepo
+	// gau is the fixture's AuditRepo: the guarded test wrapper (#5229), so the
+	// waive-proposal decisions reach audit.GuardedChainAppender. au is its
+	// embedded fake, which every existing verb and assertion reads.
+	gau     *guardedAuditWrapper
 	au      *auditFake
 	cr      *fakeConcernRepo
 	fp      *fakeWorkProvider
@@ -82,9 +87,11 @@ func newSessionOnlyFixture(t *testing.T) *sessionOnlyFixture {
 	t.Helper()
 	fp := &fakeWorkProvider{}
 	registerFakeProvider(t, fp)
+	gau := newGuardedAuditWrapper()
 	fx := &sessionOnlyFixture{
 		runs:   newApprovalRunRepo(),
-		au:     newAuditFake(),
+		gau:    gau,
+		au:     gau.auditFake,
 		cr:     newFakeConcernRepo(),
 		fp:     fp,
 		tokens: newFakeTokenRepo(),
@@ -95,7 +102,7 @@ func newSessionOnlyFixture(t *testing.T) *sessionOnlyFixture {
 	fx.s = New(Config{
 		Addr:             "127.0.0.1:0",
 		RunRepo:          fx.runs,
-		AuditRepo:        fx.au,
+		AuditRepo:        fx.gau,
 		ConcernRepo:      fx.cr,
 		GitHub:           newEpicGitHubClient(t, 7788, "[E22] The parent epic"),
 		APITokenRepo:     fx.tokens,
@@ -170,7 +177,9 @@ func (fx *sessionOnlyFixture) bearerFor(t *testing.T, kind string, runID uuid.UU
 	return ""
 }
 
-// clearVerbCase is one of the four D2 verbs driven over HTTP.
+// clearVerbCase is one of the D2 verbs driven over HTTP: the four direct
+// clears plus the waive-proposal confirm (ADR-143 A1, #5229). Reject clears
+// nothing, so it has no case here; waive_proposal_decide_test.go drives it.
 type clearVerbCase struct {
 	verb     string
 	category string
@@ -196,6 +205,29 @@ func seedRoutedServerCheck(t *testing.T, fx *sessionOnlyFixture, runID uuid.UUID
 		t.Fatalf("route concern: %v", err)
 	}
 	return row
+}
+
+// confirmProposalSeqs keeps, per seeded concern id, the proposal sequence the
+// confirm case's request builder names.
+var confirmProposalSeqs sync.Map
+
+// seedProposedServerCheck seeds a raised server_check row, a
+// pull_request_opened row naming head A and a concern_waive_proposed row at
+// that head (actor: the operator agent), so a session confirm is admitted.
+func seedProposedServerCheck(t *testing.T, fx *sessionOnlyFixture, runID uuid.UUID) *concern.Concern {
+	t.Helper()
+	row := seedRaisedServerCheck(t, fx, runID)
+	fx.gau.seed(t, runID, "pull_request_opened", map[string]any{"head_sha": proposalHeadA})
+	p := seedAgentProposal(t, fx.gau, row, proposalHeadA)
+	confirmProposalSeqs.Store(row.ID, p.Sequence)
+	return row
+}
+
+// confirmProposalSeq returns the proposal sequence seeded for row.
+func confirmProposalSeq(row *concern.Concern) int64 {
+	v, _ := confirmProposalSeqs.Load(row.ID)
+	seq, _ := v.(int64)
+	return seq
 }
 
 func jsonBody(v map[string]any) string {
@@ -234,6 +266,14 @@ var clearVerbCases = []clearVerbCase{
 		request: func(row *concern.Concern, _ bool) (string, string) {
 			return "/v0/runs/" + row.RunID.String() + "/concerns/resolve",
 				jsonBody(map[string]any{"concern_ids": []string{row.ID.String()}, "evidence": "re-ran the reproduction", "judgement": "defect"})
+		},
+	},
+	{
+		verb: clearVerbConfirmWaiveProposal, category: CategoryConcernWaived, before: concern.StateRaised, cleared: concern.StateWaived,
+		seed: seedProposedServerCheck,
+		request: func(row *concern.Concern, delegated bool) (string, string) {
+			return "/v0/concerns/" + row.ID.String() + "/waive-proposal/confirm",
+				jsonBody(map[string]any{"proposal_sequence": confirmProposalSeq(row), "delegated": delegated})
 		},
 	},
 }

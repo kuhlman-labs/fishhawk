@@ -298,18 +298,29 @@ func (s *Server) concernJudgementFromRequest(w http.ResponseWriter, r *http.Requ
 // concern_waived intent entry. Best-effort/warn-only: the 4xx/5xx response
 // already tells the operator the waive did not land; this entry exists so
 // the audit chain never shows an intent without its outcome.
-func (s *Server) writeConcernWaiveFailedAudit(ctx context.Context, row *concern.Concern, cause error) {
+//
+// intent is the concern_waived intent entry it corrects. Its sequence is
+// stamped as the additive intent_sequence key on EVERY corrective row (E80.28
+// / #5229, V2), direct and bulk waives included: the waive-proposal fold reads
+// it to keep a proposal live when its confirm's disposition failed. A nil
+// intent (no entry returned) omits the key, and the fold falls back to the
+// nearest preceding intent for the concern.
+func (s *Server) writeConcernWaiveFailedAudit(ctx context.Context, row *concern.Concern, cause error, intent *audit.Entry) {
 	actual := string(row.State)
 	var bad concern.InvalidTransitionError
 	if errors.As(cause, &bad) {
 		actual = string(bad.From)
 	}
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"concern_id":     row.ID.String(),
 		"intended_state": string(concern.StateWaived),
 		"actual_state":   actual,
 		"error":          cause.Error(),
-	})
+	}
+	if intent != nil {
+		fields[waiveFailedKeyIntentSequence] = intent.Sequence
+	}
+	payload, _ := json.Marshal(fields)
 	systemKind := audit.ActorSystem
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     row.RunID,
@@ -367,6 +378,37 @@ func (e concernWaiveAuditAppendError) Unwrap() error { return e.err }
 // concern), so a bulk verb called with one id stamps bulk_waive:true and
 // records judgement_bulk false.
 func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, reason, subject string, actorKind audit.ActorKind, delegatedRule string, bulk, judgementBulk bool, judgement concern.Judgement, tradeoffCost string) (*concern.Concern, error) {
+	return s.applyConcernWaiveLinked(ctx, row, reason, subject, actorKind, delegatedRule, bulk, judgementBulk, judgement, tradeoffCost, nil, nil)
+}
+
+// applyConcernWaiveLinked is applyConcernWaive's body with two additions for
+// the waive-proposal confirm (E80.28 / #5229, ADR-143 A1):
+//
+//   - link, when non-nil, stamps proposal_sequence, proposed_by,
+//     proposed_by_actor_kind and proposal_head_sha on the concern_waived
+//     payload, binding the intent to the proposal it confirms. A nil link adds
+//     nothing, so a direct or bulk waive's payload is byte-identical.
+//   - guard, when non-nil, appends the intent through
+//     audit.GuardedChainAppender, so the guard runs under the run-row lock in
+//     the append's own transaction (V1). The repository must carry the
+//     capability: without it the call returns errGuardedAppendUnavailable and
+//     appends NOTHING (no non-atomic fallback). A guard refusal returns the
+//     guard's own error unwrapped, with no intent and therefore no corrective
+//     entry and no disposition. A nil guard uses AppendChained exactly as
+//     before.
+//
+// reason is recorded as the payload reason and the concern's state_reason, so
+// a caller confirming a proposal passes HUMAN text or a server template, never
+// the agent's proposal reason (Y1). The durable-record-first order is shared
+// with every other waive.
+func (s *Server) applyConcernWaiveLinked(ctx context.Context, row *concern.Concern, reason, subject string, actorKind audit.ActorKind, delegatedRule string, bulk, judgementBulk bool, judgement concern.Judgement, tradeoffCost string, link *waiveProposalLink, guard audit.AppendGuard) (*concern.Concern, error) {
+	var ga audit.GuardedChainAppender
+	if guard != nil {
+		var ok bool
+		if ga, ok = s.guardedAppender(); !ok {
+			return nil, errGuardedAppendUnavailable
+		}
+	}
 	waivedFields := map[string]any{
 		"concern_id":  row.ID.String(),
 		"prior_state": string(row.State),
@@ -391,8 +433,14 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 	if row.Provenance != "" {
 		waivedFields["provenance"] = row.Provenance
 	}
+	if link != nil {
+		waivedFields[waiveProposalKeySequence] = link.ProposalSequence
+		waivedFields[waiveProposalKeyProposedBy] = link.ProposedBy
+		waivedFields[waiveProposalKeyProposedByKind] = link.ProposedByActorKind
+		waivedFields[waiveProposalKeyHeadSHA] = link.ProposalHeadSHA
+	}
 	payload, _ := json.Marshal(waivedFields)
-	waived, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	params := audit.ChainAppendParams{
 		RunID:        row.RunID,
 		StageID:      &row.StageID,
 		Timestamp:    time.Now().UTC(),
@@ -400,7 +448,23 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 		ActorKind:    &actorKind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	})
+	}
+	var waived *audit.Entry
+	var aerr error
+	if guard == nil {
+		waived, aerr = s.cfg.AuditRepo.AppendChained(ctx, params)
+	} else {
+		// Remember the guard's own refusal so it is told apart from a store
+		// failure: a refusal is returned unwrapped for the caller's errors.As.
+		var refusal error
+		waived, aerr = ga.AppendChainedGuarded(ctx, params, func(ctx context.Context, read audit.ChainReader) error {
+			refusal = guard(ctx, read)
+			return refusal
+		})
+		if aerr != nil && refusal != nil && errors.Is(aerr, refusal) {
+			return nil, aerr
+		}
+	}
 	if aerr != nil {
 		return nil, concernWaiveAuditAppendError{err: aerr}
 	}
@@ -416,7 +480,7 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 	if err != nil {
 		// The intent entry is already durable; keep the chain truthful with a
 		// corrective entry naming the actual outcome (warn-only).
-		s.writeConcernWaiveFailedAudit(ctx, row, err)
+		s.writeConcernWaiveFailedAudit(ctx, row, err, waived)
 		return nil, err
 	}
 	// Divergence (E75.5 / #3733): the waiver is durable; the hook is

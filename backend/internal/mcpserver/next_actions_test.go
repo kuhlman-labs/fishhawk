@@ -9475,3 +9475,141 @@ func TestFoldFanInVerifyPassAdvisory(t *testing.T) {
 		foldFanInVerifyPassAdvisory(naRun("running"), nil, nil, nil)
 	})
 }
+
+// TestNextActions_WaiveProposalPendingAdvisory (E80.28 / #5229, ADR-143 A1):
+// a run carrying pending waive proposals gets ONE display-only
+// confirm_waive_proposal action per proposal APPENDED on every nextActionsFor
+// return path (general, ci_failed, ci_cancelled, review_coverage_incomplete),
+// consuming nothing, with params run_id, concern_id, stage_id and
+// proposal_sequence, and a reason naming the proposer, the Web UI and the
+// absence of an MCP or CLI confirm. Every pre-existing action stays present,
+// in order and untouched. COUNTERFACTUAL: delete the fold call from a sequence
+// → that arm's subtest goes RED.
+func TestNextActions_WaiveProposalPendingAdvisory(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	proposals := []runWaiveProposal{
+		{ConcernID: "concern-a", StageID: "stage-impl", ProposalSequence: 41, ProposedBy: "operator-agent/1.0", Judgement: "no_defect", HeadSHA: "aaaa"},
+		{ConcernID: "concern-b", ProposalSequence: 57, ProposedBy: "operator-agent/1.0", Judgement: "tradeoff", HeadSHA: "aaaa"},
+	}
+	mkRun := func(state string) *Run {
+		r := naRun(state)
+		r.PullRequestURL = &prURL
+		return r
+	}
+	withProposals := func(r *Run, p []runWaiveProposal) *Run {
+		c := *r
+		c.WaiveProposals = p
+		return &c
+	}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implComplete := naReviewStatus("implement", "complete")
+
+	arms := []struct {
+		name  string
+		drive *DriveStatus
+		run   *Run
+	}{
+		{name: "general", run: mkRun("running")},
+		{name: "ci_failed", drive: &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}, run: mkRun("running")},
+		{name: "ci_cancelled", drive: naCICancelledDrive(true), run: naCICancelledRun(false, "", "")},
+		{name: "review_coverage_incomplete", drive: &DriveStatus{Drive: true, DerivedStatus: stateReviewCoverageIncomplete}, run: mkRun("running")},
+	}
+	for _, arm := range arms {
+		t.Run("appends on the "+arm.name+" arm", func(t *testing.T) {
+			without := nextActionsFor(withProposals(arm.run, nil), stages, nil, implComplete, nil, arm.drive, false, false, false, "", "", releaseSignals{})
+			with := nextActionsFor(withProposals(arm.run, proposals), stages, nil, implComplete, nil, arm.drive, false, false, false, "", "", releaseSignals{})
+			if len(without.Actions) == 0 {
+				t.Fatalf("fixture must produce pre-existing actions on the %s arm", arm.name)
+			}
+			if len(with.Actions) != len(without.Actions)+2 {
+				t.Fatalf("actions = %v, want two confirm_waive_proposal entries appended to %v", actionNames(with), actionNames(without))
+			}
+			if !reflect.DeepEqual(with.Actions[:len(without.Actions)], without.Actions) {
+				t.Fatalf("actions = %v, want the pre-existing actions %v unchanged and in order", actionNames(with), actionNames(without))
+			}
+			for i, p := range proposals {
+				act := with.Actions[len(without.Actions)+i]
+				if act.Action != "confirm_waive_proposal" {
+					t.Fatalf("action %d = %q, want confirm_waive_proposal (%v)", i, act.Action, actionNames(with))
+				}
+				if act.Consumes != consumesNone {
+					t.Errorf("consumes = %q, want none (display-only)", act.Consumes)
+				}
+				wantParams := map[string]string{
+					"run_id": arm.run.ID, "concern_id": p.ConcernID,
+					"proposal_sequence": strconv.FormatInt(p.ProposalSequence, 10),
+				}
+				if p.StageID != "" {
+					wantParams["stage_id"] = p.StageID
+				}
+				if !reflect.DeepEqual(act.Params, wantParams) {
+					t.Errorf("params = %v, want %v", act.Params, wantParams)
+				}
+				for _, want := range []string{p.ProposedBy, "Fishhawk Web UI", "There is no MCP or CLI confirm", "clears nothing", p.Judgement} {
+					if !strings.Contains(act.Reason, want) {
+						t.Errorf("reason %q does not name %q", act.Reason, want)
+					}
+				}
+			}
+			for _, a := range with.Actions {
+				if strings.HasPrefix(a.Action, "fishhawk_") && strings.Contains(a.Action, "confirm") {
+					t.Errorf("action %q offers an MCP confirm; a waive proposal has none", a.Action)
+				}
+			}
+		})
+	}
+	t.Run("nil guards", func(t *testing.T) {
+		foldWaiveProposalAdvisory(withProposals(mkRun("running"), proposals), nil)
+		na := &NextActions{State: "x"}
+		foldWaiveProposalAdvisory(nil, na)
+		if len(na.Actions) != 0 {
+			t.Errorf("nil run folded %v, want nothing", na.Actions)
+		}
+	})
+}
+
+// TestNextActions_WaiveProposalAbsentByteIdentical: a run read without the
+// waive_proposals field (none pending, a read failure, or an older backend)
+// leaves every next_actions surface byte-identical, including an EMPTY
+// non-nil slice.
+func TestNextActions_WaiveProposalAbsentByteIdentical(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	base := naRun("running")
+	base.PullRequestURL = &prURL
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implComplete := naReviewStatus("implement", "complete")
+	without := nextActionsFor(base, stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+	empty := *base
+	empty.WaiveProposals = []runWaiveProposal{}
+	got := nextActionsFor(&empty, stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+	if !reflect.DeepEqual(without, got) {
+		t.Errorf("an empty waive_proposals changed the actions: %v vs %v", actionNames(without), actionNames(got))
+	}
+	for _, n := range actionNames(without) {
+		if n == "confirm_waive_proposal" {
+			t.Errorf("actions = %v, want no confirm_waive_proposal without a pending proposal", actionNames(without))
+		}
+	}
+}
+
+// TestNextActions_WaiveProposalTerminalRunNone: a terminal run adds no
+// confirm_waive_proposal entry even when the read carries one.
+// COUNTERFACTUAL: drop the runStateIsTerminal guard → RED.
+func TestNextActions_WaiveProposalTerminalRunNone(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implComplete := naReviewStatus("implement", "complete")
+	for _, state := range []string{"succeeded", "failed", "cancelled"} {
+		t.Run(state, func(t *testing.T) {
+			base := naRun(state)
+			base.PullRequestURL = &prURL
+			without := nextActionsFor(base, stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+			with := *base
+			with.WaiveProposals = []runWaiveProposal{{ConcernID: "concern-a", ProposalSequence: 9, ProposedBy: "operator-agent/1.0", Judgement: "no_defect", HeadSHA: "aaaa"}}
+			got := nextActionsFor(&with, stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+			if !reflect.DeepEqual(without, got) {
+				t.Errorf("terminal run actions = %v, want %v unchanged", actionNames(got), actionNames(without))
+			}
+		})
+	}
+}

@@ -64,13 +64,32 @@ var concernClearTools = []concernClearTool{
 	}},
 }
 
+// webOnlyClearVerbs are the D2 verbs with NO MCP tool (ADR-143 A1, #5229):
+// the waive-proposal decisions. Only a human on a Web UI session confirms or
+// rejects a proposal, so no tool exists to pass a refusal through.
+var webOnlyClearVerbs = map[string]bool{
+	clearVerbConfirmWaiveProposal: true,
+	clearVerbRejectWaiveProposal:  true,
+}
+
 func TestConcernClearTools_TableCoversEveryVerb(t *testing.T) {
-	if len(concernClearTools) != len(serverCheckClearAction.Verbs) {
-		t.Fatalf("MCP clear tools = %d, want one per D2 verb %v", len(concernClearTools), serverCheckClearAction.Verbs)
+	// The web-only set is pinned: growing it removes a verb from this
+	// MCP-refusal coverage, so it is a visible change here.
+	if len(webOnlyClearVerbs) != 2 || !webOnlyClearVerbs[clearVerbConfirmWaiveProposal] || !webOnlyClearVerbs[clearVerbRejectWaiveProposal] {
+		t.Fatalf("webOnlyClearVerbs = %v, want exactly {%s, %s}", webOnlyClearVerbs, clearVerbConfirmWaiveProposal, clearVerbRejectWaiveProposal)
+	}
+	var toolVerbs []string
+	for _, v := range serverCheckClearAction.Verbs {
+		if !webOnlyClearVerbs[v] {
+			toolVerbs = append(toolVerbs, v)
+		}
+	}
+	if len(concernClearTools) != len(toolVerbs) {
+		t.Fatalf("MCP clear tools = %d, want one per D2 verb with an MCP tool %v", len(concernClearTools), toolVerbs)
 	}
 	for i, ct := range concernClearTools {
-		if ct.vc.verb != serverCheckClearAction.Verbs[i] {
-			t.Errorf("tool %s drives verb %q, want %q", ct.tool, ct.vc.verb, serverCheckClearAction.Verbs[i])
+		if ct.vc.verb != toolVerbs[i] {
+			t.Errorf("tool %s drives verb %q, want %q", ct.tool, ct.vc.verb, toolVerbs[i])
 		}
 	}
 }

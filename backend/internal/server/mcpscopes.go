@@ -305,6 +305,11 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// label_concern.go handleLabelConcern (E94.8 / #4841) — the waive
 	// predicate; the handler additionally refuses every agent subject.
 	"fishhawk_label_concern": {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	// waive_proposal.go handleProposeWaive (E80.28 / #5229, ADR-143 A1) — the
+	// waive predicate; the handler additionally refuses a run-bound token
+	// (run_token_forbidden). Confirm and reject have NO tool: they are Web UI
+	// session-only D2 verbs.
+	"fishhawk_propose_waive": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 	// divergence_answer.go handleAnswerDivergence (E75.5 / #3733) — the waive/defer posture.
 	"fishhawk_answer_divergence": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 

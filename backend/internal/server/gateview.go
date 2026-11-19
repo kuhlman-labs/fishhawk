@@ -678,36 +678,11 @@ var gateViewCurrentHeadSources = []struct{ category, field string }{
 // by the highest-sequence row across gateViewCurrentHeadSources, or "" when
 // the chain records none. A read error is returned (the caller records a gap).
 // A push Fishhawk did not record (an out-of-band operator push the operator
-// never vouched) is not seen; the merge gate itself reads the forge head.
+// never vouched) is not seen; the merge gate itself reads the forge head. It
+// delegates to recordedRunHead, the ONE head derivation the waive-proposal
+// fold also binds to (ADR-143 A1, #5229).
 func (s *Server) gateViewCurrentHead(ctx context.Context, runID uuid.UUID) (string, error) {
-	var head string
-	var best int64 = -1
-	for _, src := range gateViewCurrentHeadSources {
-		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, src.category)
-		if err != nil {
-			return "", err
-		}
-		for _, e := range entries {
-			var p map[string]any
-			if json.Unmarshal(e.Payload, &p) != nil {
-				continue
-			}
-			if src.category == CategoryBranchRebased {
-				if up, _ := p["already_up_to_date"].(bool); up {
-					continue
-				}
-			}
-			sha, _ := p[src.field].(string)
-			if sha == "" && src.category == CategoryBranchRebased {
-				sha, _ = p["merge_commit_sha"].(string)
-			}
-			if sha == "" || e.Sequence < best {
-				continue
-			}
-			head, best = sha, e.Sequence
-		}
-	}
-	return head, nil
+	return recordedRunHead(ctx, s.cfg.AuditRepo, runID)
 }
 
 // gateViewMergeCandidateQueueFor builds the gate view's merge_candidate_queue
@@ -1002,6 +977,14 @@ type gateViewConcern struct {
 	// (reopen_without_named_concern), which do NOT set Disputed — a refused
 	// reopen is not a confirmation that failed to settle the concern.
 	Disputes []gateViewDispute `json:"disputes,omitempty"`
+	// WaiveProposal is the PENDING agent waive proposal on an open
+	// server_check concern (ADR-143 A1, #5229): present only when the
+	// proposal is live and bound to the current RECORDED run head, so a stale
+	// proposal shows nowhere. Its reason, evidence and tradeoff cost are
+	// agent-authored (agent_authored: true) and a client renders them as
+	// text. Omitted, with a waive_proposals history_gaps entry, when the read
+	// fails, so no Confirm is offered on an unreadable state.
+	WaiveProposal *waiveProposalView `json:"waive_proposal,omitempty"`
 	concernJudgementView
 }
 
@@ -1779,6 +1762,9 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// stage_kind filter, so a duplicate whose root is a concern of the other
 	// stage kind still inherits (E94.2 / #4693).
 	judgements := concern.ResolveJudgements(rows)
+	// Pending waive proposals (ADR-143 A1, #5229): one fold over the run's
+	// chain, read only when an open server_check row exists.
+	proposals := s.gateViewWaiveProposals(ctx, runID, rows, &resp)
 
 	for _, c := range rows {
 		if stageKind != "" && c.StageKind != stageKind {
@@ -1787,6 +1773,10 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 		if c.State.IsOpen() {
 			open := gateViewOpenConcern(c, history)
 			open.concernJudgementView = newConcernJudgementView(c, judgements)
+			if p := proposals[c.ID]; p != nil {
+				v := p.view()
+				open.WaiveProposal = &v
+			}
 			resp.Open = append(resp.Open, open)
 			continue
 		}
@@ -2077,6 +2067,25 @@ func (s *Server) reviewDiffTruncatedForRun(ctx context.Context, runID uuid.UUID)
 		DeltaReReview:        p.DeltaReReview,
 		BestEffort:           p.BestEffort,
 	}
+}
+
+// gateViewGapWaiveProposals is the history_gaps entry recorded when the
+// pending waive-proposal read fails (ADR-143 A1, #5229).
+const gateViewGapWaiveProposals = "waive_proposals"
+
+// gateViewWaiveProposals returns the pending waive proposal per open
+// server_check row, or nil plus a waive_proposals history_gaps entry when the
+// read fails: the blocks are omitted rather than built from a partial fold.
+func (s *Server) gateViewWaiveProposals(ctx context.Context, runID uuid.UUID, rows []*concern.Concern, resp *gateViewResponse) map[uuid.UUID]*waiveProposal {
+	proposals, err := s.pendingWaiveProposals(ctx, runID, rows)
+	if err != nil {
+		s.cfg.Logger.WarnContext(ctx, "gate view: waive proposal read failed; omitting waive_proposal blocks",
+			"run_id", runID, "err", err)
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapWaiveProposals)
+		return nil
+	}
+	return proposals
 }
 
 // gateViewGapDiffSecretsSuppressed is the history_gaps entry the

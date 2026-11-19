@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { api } from '@/api/client';
-import type { AttentionItem, ConcernJudgement } from '@/api/types';
+import { api, ApiClientError } from '@/api/client';
+import type { AttentionItem, AttentionWaiveProposal, ConcernJudgement } from '@/api/types';
+import { Button } from '@/components/ui/button';
 import { DECISION_VERBS } from './decision-verbs';
 import {
   AcknowledgeCheckbox,
@@ -17,8 +18,11 @@ import { PlanGateDecision } from './plan-gate-decision';
  * The per-kind decision panel wired into each attention-queue card
  * (E40.2 / #1717). `onResolved` removes the item from the live list on a
  * successful write; `onCancel` collapses the disclosure. Every submit button
- * label is read from DECISION_VERBS so the queue's verb-equality control has
- * a single source to hold to account.
+ * label for the item's own decision is read from DECISION_VERBS so the
+ * queue's verb-equality control has a single source to hold to account. The
+ * one exception is the server-check 'Proposed waive' block (ADR-143 A1,
+ * #5229): its Confirm/Reject decide an agent's proposal, are not drive-plane
+ * verbs, and deliberately sit outside DECISION_VERBS (WaiveProposalBlock).
  *
  * Exhaustive over AttentionItemKind (the `never` assignment): a seventh kind
  * fails typecheck here rather than rendering a blank panel.
@@ -206,6 +210,13 @@ function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
           (concern_requires_session, or concern_requires_human for an agent token).
         </p>
       )}
+      {item.context.waive_proposal && (
+        <WaiveProposalBlock
+          concernId={concernId}
+          proposal={item.context.waive_proposal}
+          onResolved={onResolved}
+        />
+      )}
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         Waive resolves the concern with your reason. Defer files a follow-up issue under the parent
         epic and consumes no fix-up budget — both are terminal, and both record your judgement (a
@@ -261,6 +272,210 @@ function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
       />
       {error && <DecisionError message={error} />}
     </div>
+  );
+}
+
+/*
+ * The 'Proposed waive' block (ADR-143 A1, #5229): an operator agent's PENDING
+ * waive proposal on a server-check concern, decided here by the signed-in
+ * human in one step. The proposal itself cleared nothing.
+ *
+ * - Every agent-authored field (reason, evidence, tradeoff cost) is rendered
+ *   as React text, never markup, under the 'agent-authored' label. The
+ *   check_key (flagged location and pattern class) is server-written.
+ * - Confirm sends the proposal_sequence and ONLY a reason the human typed
+ *   here. It never forwards the agent's reason: the server records a fixed
+ *   template as the concern's state_reason when none is typed (Y1).
+ * - Reject requires a human reason and leaves the concern OPEN, so it does
+ *   not resolve the queue item: the block collapses to a note and the
+ *   Waive/Defer controls below stay available.
+ * - Confirm and Reject are NOT DECISION_VERBS entries and carry no
+ *   data-decision-verb attribute (Y3). They are session-only decisions on a
+ *   proposal, not drive-plane verbs, and their labels are distinct from every
+ *   DECISION_VERBS label.
+ */
+type ProposalPhase =
+  | { kind: 'idle' }
+  | { kind: 'submitting' }
+  | { kind: 'rejected' }
+  | { kind: 'errored'; error: unknown };
+
+function shortSha(sha: string | undefined): string {
+  return (sha ?? '').slice(0, 12);
+}
+
+function WaiveProposalError({ error }: { error: unknown }) {
+  if (error instanceof ApiClientError && error.body?.error === 'waive_proposal_stale') {
+    const details = error.body.details ?? {};
+    const proposed = typeof details.proposal_head_sha === 'string' ? details.proposal_head_sha : '';
+    const current = typeof details.current_head_sha === 'string' ? details.current_head_sha : '';
+    return (
+      <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
+        The PR head moved since this proposal was made
+        {proposed && current ? ` (${shortSha(proposed)} → ${shortSha(current)})` : ''}, so the
+        proposal is no longer confirmable. Waive or defer the concern directly, or wait for a new
+        proposal at the current head.
+      </p>
+    );
+  }
+  let message = 'unknown error';
+  if (error instanceof ApiClientError) {
+    const code = error.body?.error ?? error.message;
+    const text = error.body?.message;
+    message = `${error.status} · ${code}${text && text !== code ? ` — ${text}` : ''}`;
+  } else if (error instanceof Error) {
+    message = error.message;
+  }
+  return (
+    <p role="alert" className="font-mono text-xs text-rose-700 dark:text-rose-300">
+      {message}
+    </p>
+  );
+}
+
+function WaiveProposalBlock({
+  concernId,
+  proposal,
+  onResolved,
+}: {
+  concernId: string;
+  proposal: AttentionWaiveProposal;
+  onResolved: () => void;
+}) {
+  const [confirmReason, setConfirmReason] = useState('');
+  const [rejectReason, setRejectReason] = useState('');
+  const [phase, setPhase] = useState<ProposalPhase>({ kind: 'idle' });
+  const submitting = phase.kind === 'submitting';
+
+  if (phase.kind === 'rejected') {
+    return (
+      <p
+        data-testid="waive-proposal-rejected"
+        role="status"
+        className="rounded border border-neutral-300 px-2 py-1.5 text-xs text-neutral-700 dark:border-neutral-700 dark:text-neutral-300"
+      >
+        Proposal rejected. The concern stays open: waive or defer it below.
+      </p>
+    );
+  }
+
+  async function decide(run: () => Promise<unknown>, after: () => void) {
+    setPhase({ kind: 'submitting' });
+    try {
+      await run();
+      after();
+    } catch (err) {
+      setPhase({ kind: 'errored', error: err });
+    }
+  }
+
+  const confirm = () =>
+    decide(
+      () =>
+        api.confirmWaiveProposal(concernId, {
+          proposal_sequence: proposal.proposal_sequence,
+          reason: confirmReason.trim() || undefined,
+        }),
+      // A confirm waives the concern: the item leaves the queue.
+      () => {
+        onResolved();
+        setPhase({ kind: 'idle' });
+      },
+    );
+
+  const reject = () => {
+    // Fail closed: a blank reason sends nothing (the button is also disabled).
+    if (!rejectReason.trim()) return;
+    return decide(
+      () =>
+        api.rejectWaiveProposal(concernId, {
+          proposal_sequence: proposal.proposal_sequence,
+          reason: rejectReason.trim(),
+        }),
+      // A reject leaves the concern open: keep the item, drop the block.
+      () => setPhase({ kind: 'rejected' }),
+    );
+  };
+
+  return (
+    <section
+      data-testid="waive-proposal"
+      aria-label="Proposed waive"
+      className="flex flex-col gap-2 rounded border border-sky-300 bg-sky-50 px-2 py-2 text-xs text-neutral-800 dark:border-sky-800 dark:bg-sky-950/40 dark:text-neutral-200"
+    >
+      <h4 className="text-xs font-semibold tracking-wide uppercase">Proposed waive</h4>
+      <p
+        data-testid="waive-proposal-agent-label"
+        className="font-medium text-amber-800 dark:text-amber-300"
+      >
+        agent-authored: verify before confirming
+      </p>
+      <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1">
+        <dt className="text-neutral-500">Proposed by</dt>
+        <dd data-testid="waive-proposal-proposer" className="font-mono break-all">
+          {proposal.proposed_by} ({proposal.proposed_by_actor_kind})
+        </dd>
+        <dt className="text-neutral-500">Judgement</dt>
+        <dd data-testid="waive-proposal-judgement" className="font-mono">
+          {proposal.judgement}
+        </dd>
+        {proposal.tradeoff_cost && (
+          <>
+            <dt className="text-neutral-500">Tradeoff cost</dt>
+            <dd data-testid="waive-proposal-tradeoff-cost" className="whitespace-pre-wrap">
+              {proposal.tradeoff_cost}
+            </dd>
+          </>
+        )}
+        <dt className="text-neutral-500">Reason</dt>
+        <dd data-testid="waive-proposal-reason" className="whitespace-pre-wrap">
+          {proposal.reason}
+        </dd>
+        <dt className="text-neutral-500">Evidence</dt>
+        <dd data-testid="waive-proposal-evidence" className="whitespace-pre-wrap">
+          {proposal.evidence}
+        </dd>
+        <dt className="text-neutral-500">Check</dt>
+        <dd data-testid="waive-proposal-check-key" className="font-mono break-all">
+          {proposal.check_key}
+        </dd>
+        <dt className="text-neutral-500">Head</dt>
+        <dd data-testid="waive-proposal-head" className="font-mono" title={proposal.head_sha}>
+          {shortSha(proposal.head_sha)}
+        </dd>
+      </dl>
+      <p className="text-neutral-500 dark:text-neutral-400">
+        Confirm waives the concern with this judgement, recorded as your decision; the agent&apos;s
+        text stays on the proposal and is not used as your reason. Reject records your reason and
+        leaves the concern open.
+      </p>
+      <ReasonField
+        label="Confirm reason (optional)"
+        value={confirmReason}
+        onChange={setConfirmReason}
+        disabled={submitting}
+      />
+      <ReasonField
+        label="Reject reason"
+        value={rejectReason}
+        onChange={setRejectReason}
+        disabled={submitting}
+      />
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void reject()}
+          disabled={submitting || !rejectReason.trim()}
+        >
+          Reject proposal
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => void confirm()} disabled={submitting}>
+          Confirm waive
+        </Button>
+      </div>
+      {phase.kind === 'errored' && <WaiveProposalError error={phase.error} />}
+    </section>
   );
 }
 

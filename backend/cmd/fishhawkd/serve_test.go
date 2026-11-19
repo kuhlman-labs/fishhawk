@@ -352,6 +352,103 @@ func TestNewAuditRepository_WiredRepoKeepsEveryCapability(t *testing.T) {
 	if _, ok := repo.(audit.RetryBudgetAppender); !ok {
 		t.Error("wired audit repository lost audit.RetryBudgetAppender")
 	}
+	// E80.28 / #5229 (ADR-143 A1): every waive-proposal state write requires
+	// the atomic guarded append and FAILS CLOSED without it — there is no
+	// non-atomic fallback. Counterfactual H7 (performed): drop the forward from
+	// decisionindex.FullRepository and its override → RED here.
+	if _, ok := repo.(audit.GuardedChainAppender); !ok {
+		t.Error("wired audit repository lost audit.GuardedChainAppender (waive-proposal propose/confirm/reject would answer 503)")
+	}
+}
+
+// TestNewAuditRepository_GuardedWaiveIndexes drives the wired repository's
+// guarded append (E80.28 / #5229) against a real migrated database: a
+// proposal-linked concern_waived appended through the value runServe installs,
+// with an admitting guard that reads the chain through the tx-bound reader,
+// lands exactly one concern_waive decision_index row naming that entry's
+// sequence, and a refusing guard on a second append lands nothing. It is the
+// seam the confirm verb crosses: the guarded path is the ONLY one a confirmed
+// waive proposal reaches the chain through.
+//
+// Counterfactual H8 (performed): delete only r.index(ctx, e) from
+// decisionindex.IndexingRepository.AppendChainedGuarded's body → RED with 0
+// rows. H7 (performed): drop the forward → RED on the type assertion.
+func TestNewAuditRepository_GuardedWaiveIndexes(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+	repo, err := newAuditRepository(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("newAuditRepository: %v", err)
+	}
+	g, ok := repo.(audit.GuardedChainAppender)
+	if !ok {
+		t.Fatalf("wired audit repository %T lost audit.GuardedChainAppender", repo)
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		VALUES ($1, 'acme/widgets', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		VALUES ($1, $2, 0, 'implement', 'agent', 'claude-code', 'pending')`, stageID, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runID, StageID: &stageID, Timestamp: time.Now().UTC(),
+		Category: "pull_request_opened", Payload: json.RawMessage(`{"head_sha":"aaaa"}`),
+	}); err != nil {
+		t.Fatalf("append pull_request_opened: %v", err)
+	}
+	kind, subject := audit.ActorUser, "github:human"
+	waive := func(salt string) audit.ChainAppendParams {
+		return audit.ChainAppendParams{
+			RunID: runID, StageID: &stageID, Timestamp: time.Now().UTC(), Category: "concern_waived",
+			ActorKind: &kind, ActorSubject: &subject,
+			Payload: json.RawMessage(`{"concern_id":"` + uuid.NewString() + `","reason":"confirmed agent waive proposal ` + salt +
+				`","severity":"high","category":"diff_secrets_detected","proposal_sequence":2,"proposed_by":"operator-agent/1","proposed_by_actor_kind":"agent","proposal_head_sha":"aaaa"}`),
+		}
+	}
+	headIsA := func(ctx context.Context, read audit.ChainReader) error {
+		es, err := read.ListForRunByCategory(ctx, runID, "pull_request_opened")
+		if err != nil {
+			return err
+		}
+		if len(es) != 1 {
+			return errors.New("head not recorded")
+		}
+		return nil
+	}
+	e, err := g.AppendChainedGuarded(ctx, waive("a"), headIsA)
+	if err != nil {
+		t.Fatalf("guarded concern_waived: %v", err)
+	}
+	var n int
+	var class string
+	var src int64
+	if err := pool.QueryRow(ctx, `SELECT count(*), coalesce(max(decision_class),''), coalesce(max(source_sequence),0) FROM decision_index WHERE run_id = $1`, runID).Scan(&n, &class, &src); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || class != "concern_waive" || src != e.Sequence {
+		t.Fatalf("decision_index for the run: %d rows, class %q, source_sequence %d; want exactly 1 concern_waive row for entry %d", n, class, src, e.Sequence)
+	}
+
+	refused := errors.New("proposal no longer live")
+	if _, err := g.AppendChainedGuarded(ctx, waive("b"), func(context.Context, audit.ChainReader) error { return refused }); !errors.Is(err, refused) {
+		t.Fatalf("refusing guard: err = %v, want the guard's refusal", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM decision_index WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("decision_index rows after a refused guarded append = %d, want still 1", n)
+	}
+	var waived int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_entries WHERE run_id = $1 AND category = 'concern_waived'`, runID).Scan(&waived); err != nil {
+		t.Fatal(err)
+	}
+	if waived != 1 {
+		t.Fatalf("committed concern_waived rows = %d, want 1 (the refused append wrote nothing)", waived)
+	}
 }
 
 // TestNewAuditRepository_IndexesDecisionsEndToEnd drives the wired repository

@@ -1,0 +1,15 @@
+id: scenario:issue-5229/propose-tool-registered-no-confirm-tool
+statement: An MCP tools/list call lists fishhawk_propose_waive, whose description says it clears nothing and that only a human signed in to the Fishhawk Web UI can confirm or reject the proposal. No MCP tool that confirms or rejects a waive proposal is listed.
+verify_hint: 'MCP tool result: as in acceptance/scenarios/issue-5228, POST /v0/dev/fixtures {"scenario":"trace-upload-target"}, mint an fhm_ run bearer, then POST /mcp tools/list. Read the tool names (87 tools) and the fishhawk_propose_waive description.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. POST /mcp tools/list with Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list and _meta. Listed every tool name containing waive, propos, confirm or reject, and read the fishhawk_propose_waive description.
+steps_carried_from: head 6eebb38fae4d8beca8d6b1883b52032219a6b44c recorded_at 2026-11-19T02:02:04Z
+assertions:
+    expected: propose tool listed with clears-nothing and Web-UI-human-only wording; no confirm/reject-proposal MCP tool
+    observed_at_record: 87 tools are listed, including fishhawk_propose_waive. Its description says 'It clears nothing.' and 'Only a human signed in to the Fishhawk Web UI confirms or rejects it, from the attention queue's decision panel. There is no MCP or CLI confirm or reject.' The other matches (fishhawk_delegation_confirm, reject_deploy, reject_plan, waive_concern, waive_concerns) do not confirm or reject a waive proposal. delegation_confirm covers workflow delegation after a captain handover.
+    repro_handle: POST http://localhost:8090/mcp tools/list (Bearer fhm_…, Mcp-Protocol-Version 2026-07-28)
+origin:
+    issue: 5229
+    pr: 5474
+    run_id: f99b4fdf-338f-4852-baac-71270981bde5
+    head_sha: 6007704bc6d6c366bd7fdf7eeb590d64dcee4f4b
+    recorded_at: 2026-11-19T03:13:17Z

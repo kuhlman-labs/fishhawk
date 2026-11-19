@@ -353,6 +353,10 @@ var exportBaseline = []string{
 	"PromoteQueuedStageInput",
 	"PromoteQueuedStageOutput",
 	"PromoteQueuedStageResult",
+	// E80.28 / #5229 (ADR-143 A1): fishhawk_propose_waive's I/O, exported for
+	// the SDK's jsonschema reflection like every DTO.
+	"ProposeWaiveInput",
+	"ProposeWaiveOutput",
 	"ReadCrewMessagesInput",
 	"ReadCrewMessagesOutput",
 	"ReadHostDispatcherStatus", // E88.2 / #4526
@@ -566,6 +570,10 @@ var exportBaseline = []string{
 	// as every other tool I/O type in this baseline.
 	"WaiveConcernsInput",
 	"WaiveConcernsOutput",
+	// E80.28 / #5229: the client mirror of the backend waiveProposalView, carried
+	// by ProposeWaiveOutput and GateViewConcern.waive_proposal; exported for the
+	// SDK's jsonschema reflection.
+	"WaiveProposal",
 	"WaivedConcern",
 	// #3774: the decode-only mirror of POST /v0/work-items/preview's 200,
 	// embedded in PreviewIssueOutput (local for the ADR-064 reason above).

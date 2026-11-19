@@ -416,6 +416,26 @@ import "sort"
 // an INTERIM registration under ADR-106's existing audit-category mechanism —
 // not ADR-106 registry option B, and no new ADR is needed; both take the
 // mandatory run-bound flag when #4599 / E89 #4537 lands.
+// E80.28 / #5229 (ADR-143 Amendment A1) added the three waive-proposal rows,
+// each appended through audit.GuardedChainAppender under the run-row lock
+// (server/waive_proposal.go, server/waive_proposal_decide.go):
+// concern_waive_proposed (actor = the proposing operator agent),
+// concern_waive_proposal_rejected (actor = the human who rejected it on a Web
+// UI session) and concern_waive_proposal_dropped (actor system, cause
+// head_moved: the recorded run head moved off the proposal's head). All three
+// are INTERNAL, not issue-comment activity, like concern_labelled. They are
+// INTENDED run-bound READABLE, so server/reads.go's
+// withholdScopeOverlapFromRunBound carries no deny-list entry for them: the
+// payload names only this run's concern id, proposal and entry sequences, head
+// SHAs, the server-written check_key, category and severity, and the operator
+// agent's reason, evidence and tradeoff text. That text is credential-scanned
+// on write but the scan is BEST EFFORT (redaction.RedactDefault refuses only
+// its DefaultPatterns), and the run's own agent can read the operator agent's
+// reasoning about its flagged diff. That is the same posture as
+// concern_waived and concern_labelled, which carry the same class of reason
+// text and are not withheld. This comment is an INTERIM registration under
+// ADR-106's existing audit-category mechanism, not ADR-106 registry option B;
+// all three take the mandatory run-bound flag when #4599 / E89 #4537 lands.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -503,6 +523,9 @@ var KnownCategories = map[string]struct{}{
 	"concern_resolve_failed":                  {}, // E83.53 / #4086: corrective after a failed resolve transition (server/resolve_concerns.go)
 	"concern_resolved_with_evidence":          {}, // E83.53 / #4086: a human operator resolved a routed concern as addressed on operator evidence (server/resolve_concerns.go)
 	"concern_waive_failed":                    {},
+	"concern_waive_proposal_dropped":          {}, // E80.28 / #5229 (ADR-143 A1): a pending waive proposal went stale (cause head_moved) and was dropped by a later confirm pre-check or proposal (server/waive_proposal.go) — INTERNAL, actor system, run-bound readable (INTERIM, see header)
+	"concern_waive_proposal_rejected":         {}, // E80.28 / #5229 (ADR-143 A1): a human on a Web UI session rejected a pending waive proposal; the concern stays open (server/waive_proposal_decide.go) — INTERNAL, run-bound readable (INTERIM, see header)
+	"concern_waive_proposed":                  {}, // E80.28 / #5229 (ADR-143 A1): an operator agent proposed a waive of a server_check concern for a human to confirm; clears nothing (server/waive_proposal.go) — INTERNAL, not issue-comment activity, run-bound readable (INTERIM, see header)
 	"concern_waived":                          {},
 	"consolidated_pr_opened":                  {},
 	"consolidated_review_diff_truncated":      {},
