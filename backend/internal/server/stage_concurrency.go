@@ -168,12 +168,13 @@ func validHostLabel(h string) bool {
 // verify group local-verify:<host> at DefaultVerifyLimit BEFORE the declared
 // lookup — a spec-declared implement group or limit never captures a pass,
 // and a pass never queues behind full implements in local-implement:<host>.
-// A stage that DECLARES {verify, host} is the one exception: it waits in the
-// pass's own group (declaredGroupRequests). See isMergeCandidateVerifyPass
-// for the fallback on an unreadable trigger.
+// No declared stage shares the pass's group: declaredGroupRequests refuses an
+// entry for local-verify:<host>. See isMergeCandidateVerifyPass for the
+// fallback on an unreadable trigger.
 //
-// A non-nil err (an entry with no canonical key, unreachable for a validated
-// spec) fails closed: the marker answers 500 and admits nothing.
+// A non-nil err (an entry with no canonical key, or one for the reserved host
+// verify group; both unreachable for a validated spec) fails closed: the
+// marker answers 500 and admits nothing.
 func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, stage *run.Stage, host string) (groups []concurrency.GroupRequest, grouped bool, err error) {
 	one := func(key string, limit int) ([]concurrency.GroupRequest, bool, error) {
 		return []concurrency.GroupRequest{{Key: key, Limit: limit}}, true, nil
@@ -215,18 +216,17 @@ const hostScopedGroupLimit = 1
 // reads its own Limit, unconditionally, so a stored spec (one captured under
 // an older validator, or decoded around validation) can never size a group
 // shared with other repositories: the entry canonicalising to
-// local-implement:<host> takes DefaultLimit, local-verify:<host> takes
-// DefaultVerifyLimit, and every other host entry takes hostScopedGroupLimit.
-// A scope other than host or repository, or an identity ScopedGroupKey
-// refuses, answers an error and no set.
+// local-implement:<host> takes DefaultLimit, and every other host entry takes
+// hostScopedGroupLimit. A scope other than host or repository, or an identity
+// ScopedGroupKey refuses, answers an error and no set.
 //
-// A declared {verify, host} entry puts ANY stage type in the group that
-// merge-candidate verify passes and specialist jobs use. While the stage holds
-// or waits there, every pass of its account on the host queues behind it, and
-// specialistjob.AdmitJob refuses every job (a fresh stage waiter, or the
-// group's one slot taken). That is availability-only and fail-closed;
-// concurrency/README.md § "Verify group" and
-// TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs pin it.
+// An entry canonicalising to concurrency.VerifyGroupKey(host) also answers an
+// error and no set: local-verify:<host> is reserved for server-decided
+// merge-candidate verify passes and specialist jobs (ADR-094 A1 decision 6).
+// Both validators refuse {verify, host}, and spec.ParseBytes runs the
+// backend's, so a captured spec carrying it takes the unparseable-spec
+// fallback; this refusal keeps a declaration that skipped validation out of
+// that group too.
 func declaredGroupRequests(decl *spec.StageConcurrency, repo, host string) ([]concurrency.GroupRequest, error) {
 	out := make([]concurrency.GroupRequest, 0, len(decl.Groups))
 	for i, e := range decl.Groups {
@@ -243,13 +243,14 @@ func declaredGroupRequests(decl *spec.StageConcurrency, repo, host string) ([]co
 		if err != nil {
 			return nil, fmt.Errorf("concurrency.groups[%d]: %w", i, err)
 		}
+		if key == concurrency.VerifyGroupKey(host) {
+			return nil, fmt.Errorf("concurrency.groups[%d]: %s is reserved for merge-candidate verify passes and specialist jobs", i, key)
+		}
 		limit := e.EffectiveLimit()
 		if e.Scope == spec.ConcurrencyScopeHost {
 			switch key {
 			case concurrency.DefaultGroupKey(host):
 				limit = concurrency.DefaultLimit
-			case concurrency.VerifyGroupKey(host):
-				limit = concurrency.DefaultVerifyLimit
 			default:
 				limit = hostScopedGroupLimit
 			}

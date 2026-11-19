@@ -511,12 +511,14 @@ func (f *fixture) stageInRepo(repo string) *run.Stage {
 	return st
 }
 
-// TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs pins what a
-// spec-declared {group: verify, scope: host} entry does to the host verify
-// group's other users (README § "Verify group"). The server maps that entry
-// to local-verify:<host>, the group every merge-candidate verify pass and
-// specialist job of the account on the host uses. D, an ordinary stage,
-// declares {local-verify:h1, a long-held repository group}. While D waits
+// TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs is a STORE-level test of
+// how the store treats an ordinary stage whose set includes local-verify:<host>,
+// the group every merge-candidate verify pass and specialist job of the
+// account on the host uses. No spec can put a stage there: both validators
+// refuse {group: verify, scope: host} and the server's declaredGroupRequests
+// refuses an entry for local-verify:<host> (README § "Verify group"); the
+// store itself does not enforce that reservation, which is what this pins.
+// D declares {local-verify:h1, a long-held repository group}. While D waits
 // there it holds nothing, yet (1) a merge-candidate pass from ANOTHER
 // repository queues behind it with no holder in the group, and (2)
 // GroupOccupancyTx reports a fresh stage waiter, so specialistjob.AdmitJob

@@ -946,8 +946,8 @@ const (
 // StageConcurrencyGroup is one entry of StageConcurrency.Groups.
 type StageConcurrencyGroup struct {
 	// Group is the group name (the Group pattern). With scope host,
-	// "implement" and "verify" name the host's legacy groups
-	// local-implement:<host> and local-verify:<host> (ADR-094 A1).
+	// "implement" names the host's legacy group local-implement:<host>;
+	// "verify" (local-verify:<host>) is reserved and refused (ADR-094 A1).
 	Group string `json:"group" yaml:"group"`
 	// Scope is ConcurrencyScopeHost or ConcurrencyScopeRepository.
 	Scope string `json:"scope" yaml:"scope"`

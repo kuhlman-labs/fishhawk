@@ -996,15 +996,22 @@ func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 const MsgFmtConcurrencyGroupDuplicate = "concurrency.groups lists (scope %q, group %q) twice (also at entry %d); a stage holds each group once, so declare it once"
 
 // MsgFmtConcurrencyHostGroupLimit rejects a limit on any scope-host groups entry.
-const MsgFmtConcurrencyHostGroupLimit = "concurrency.groups entry (scope \"host\", group %q) declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository's spec; the host's implement and verify groups take the host default limits and any other host-scoped group is held at limit 1 until host-declared capacity (#4241). Remove limit, or declare the group with scope repository"
+const MsgFmtConcurrencyHostGroupLimit = "concurrency.groups entry (scope \"host\", group %q) declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository's spec; the host's implement group takes the host default limit and any other host-scoped group is held at limit 1 until host-declared capacity (#4241). Remove limit, or declare the group with scope repository"
+
+// MsgConcurrencyHostVerifyReserved rejects a scope-host entry naming the host verify group.
+const MsgConcurrencyHostVerifyReserved = "concurrency.groups entry (scope \"host\", group \"verify\") is reserved: local-verify:<host> is reserved for server-decided merge-candidate verify passes and specialist jobs, so a spec cannot declare it. Remove the entry, or declare a group with scope repository"
 
 // checkStageConcurrencyGroups mirrors the backend's
 // validateStageConcurrencyGroups over the raw yaml.v3 tree: per entry in
-// declaration order, a scope-host entry carrying `limit` is refused (host
-// groups are shared by every repository on the host), then a (scope, group)
-// pair already seen is refused. The backend returns the first refusal; this
-// sweep reports every one. Shape mismatches are skipped, as everywhere in this
-// file — the schema already rejected them.
+// declaration order, a scope-host entry naming `verify` is refused at the
+// entry's pointer (local-verify:<host> is reserved for server-decided
+// merge-candidate verify passes and specialist jobs) and the entry's other
+// checks are skipped, as the backend returns on it; otherwise a scope-host
+// entry carrying `limit` is refused (host groups are shared by every
+// repository on the host), then a (scope, group) pair already seen is
+// refused. The backend returns the first refusal; this sweep reports every
+// one. Shape mismatches are skipped, as everywhere in this file — the schema
+// already rejected them.
 func checkStageConcurrencyGroups(stage map[string]any, base string, errs *[]ValidationErrorEntry) {
 	conc, ok := stage["concurrency"].(map[string]any)
 	if !ok {
@@ -1023,6 +1030,10 @@ func checkStageConcurrencyGroups(stage map[string]any, base string, errs *[]Vali
 		scope, _ := entry["scope"].(string)
 		name, _ := entry["group"].(string)
 		ptr := fmt.Sprintf("%s/concurrency/groups/%d", base, j)
+		if scope == "host" && name == "verify" {
+			*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: MsgConcurrencyHostVerifyReserved})
+			continue
+		}
 		if _, hasLimit := entry["limit"]; hasLimit && scope == "host" {
 			*errs = append(*errs, ValidationErrorEntry{
 				Path:    ptr + "/limit",

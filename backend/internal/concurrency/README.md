@@ -172,7 +172,7 @@ k` for every accepted key (`TestGroupKey_RoundTrip`).
 | Identity (scope / scope-id / name) | Canonical key |
 |---|---|
 | host / `<host>` / `implement` | `local-implement:<host>` (`DefaultGroupKey`) |
-| host / `<host>` / `verify` | `local-verify:<host>` (`VerifyGroupKey`) |
+| host / `<host>` / `verify` | `local-verify:<host>` (`VerifyGroupKey`; reserved for merge-candidate verify passes and specialist jobs, so no spec declares it: § "Verify group") |
 | repository / `<owner/repo>` / `<name>` | `spec:<owner/repo>:<name>` (`NamedGroupKey`) |
 | host / `<host>` / any other name | `host:<host>:<name>` |
 | account / `<id>` / `<name>` | `account:<id>:<name>` (reserved for review capacity, #4242; no spec declares it) |
@@ -504,18 +504,20 @@ tail (`TestAdmit_RekeysQueuedRowIntoNewGroup`). The actual verify run still
 serialises against implement-stage verifies on the per-repository verify lock
 (#3315); the group only stops a pass waiting for an agent slot.
 
-**A spec may declare this group.** A workflow-v2 `groups` entry `{group:
-verify, scope: host}` resolves to the same `local-verify:<host>` key, at
-`DefaultVerifyLimit`, on any stage type (A1's canonical keys). Before #4240
-only the pass arm reached it. Such a stage is an ordinary stage waiter or
-holder of the group in its account: while it holds the group, or waits on it
-holding nothing behind a busy group elsewhere in its set, every pass of the
-account on the host queues behind it, whichever repository the pass is
-from, and `specialistjob.AdmitJob` refuses every job: it admits only at
-`FreshStageWaiters == 0` and with a slot free
-(`TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs`). The effect is
-availability-only and fail-closed: nothing runs beside the pass that should
-not. Host-declared capacity (#4241) owns any further restriction.
+**No spec may declare this group** (ADR-094 A1 decision 6).
+`local-verify:<host>` is reserved for server-decided merge-candidate verify
+passes and specialist jobs. A workflow-v2 `groups` entry `{group: verify,
+scope: host}` canonicalises to it, so both validators refuse that entry at
+its pointer (`MsgConcurrencyHostVerifyReserved`). The server's parse runs the
+same validator, so a captured spec carrying the entry takes the
+unparseable-spec fallback (the default group). `declaredGroupRequests` also
+refuses any entry for `local-verify:<host>`, so a declaration that reaches
+it unvalidated fails closed: the marker answers 500 and admits nothing
+(`TestDeclaredGroupRequests_HostVerifyReserved`). `{group: implement, scope:
+host}` stays declarable. The store does not enforce the reservation; it
+would treat a declared stage as an ordinary waiter or holder of the group
+(`TestAdmitSet_DeclaredHostVerifyBlocksPassesAndJobs` pins that store
+behaviour).
 
 ## Specialist-job holders (ADR-097 D6)
 

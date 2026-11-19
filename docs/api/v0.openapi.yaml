@@ -7757,7 +7757,7 @@ components:
             group (the default for a local implement stage, and a declared
             `{group: implement, scope: host}`); `local-verify:<host>` is the
             host's verify group (limit 1: a merge-candidate verify-only pass,
-            ADR-092 / #4200, or a declared `{group: verify, scope: host}`);
+            ADR-092 / #4200; reserved, so no spec declares it);
             `spec:<repo>:<name>` is a repository-scoped group; and
             `host:<host>:<name>` is any other host-scoped group (limit 1).
         scope:
@@ -19818,7 +19818,8 @@ paths:
         the stage is admitted into every group at once or queued in all of
         them (strict per-group FIFO; no partial hold): `{group: implement,
         scope: host}` is `local-implement:<host>` at the host default limit,
-        `{group: verify, scope: host}` is `local-verify:<host>`, any other
+        `{group: verify, scope: host}` is refused (`local-verify:<host>` is
+        reserved for merge-candidate verify passes and specialist jobs), any other
         host-scoped group is `host:<host>:<name>` at limit 1 (a spec never
         sizes a host-scoped group), and a repository-scoped group is
         `spec:<repo>:<name>` at its declared limit. The 200 block, the 409

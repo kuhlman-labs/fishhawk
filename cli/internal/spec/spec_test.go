@@ -3853,7 +3853,7 @@ func concurrencyGroupsCLIDoc(body string) []byte {
 // TestValidateBytes_StageConcurrencyGroups is the CLI's per-failure-mode
 // table for the ADR-094 `groups` set form (#4240), mirroring the backend's
 // TestParse_StageConcurrencyGroups_Rejections row for row: each row is
-// refused naming its pointer, the two semantic rows carry the byte-identical
+// refused naming its pointer, the semantic rows carry the byte-identical
 // backend message, and the controls (including a valid two-group document)
 // validate clean.
 func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
@@ -3867,6 +3867,7 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 		body     string
 		wantPath string
 		wantMsg  string
+		onlyMsg  bool // wantMsg is the document's ONLY error entry
 	}{
 		{name: "group_and_groups", body: "\n          group: deploy\n          groups:\n            - {group: deploy, scope: repository}", wantPath: base + "/group"},
 		{name: "limit_and_groups", body: "\n          limit: 2\n          groups:\n            - {group: deploy, scope: repository}", wantPath: base + "/limit"},
@@ -3884,9 +3885,12 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 		{name: "host_implement_limit",
 			body:     "\n          groups:\n            - {group: implement, scope: host, limit: 2}",
 			wantPath: base + "/groups/0/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "implement")},
-		{name: "host_verify_limit",
+		{name: "host_verify_reserved",
+			body:     "\n          groups:\n            - {group: implement, scope: host}\n            - {group: verify, scope: host}",
+			wantPath: base + "/groups/1", wantMsg: spec.MsgConcurrencyHostVerifyReserved},
+		{name: "host_verify_limit_reserved",
 			body:     "\n          groups:\n            - {group: verify, scope: host, limit: 1}",
-			wantPath: base + "/groups/0/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "verify")},
+			wantPath: base + "/groups/0", wantMsg: spec.MsgConcurrencyHostVerifyReserved, onlyMsg: true},
 		{name: "host_non_legacy_limit",
 			body:     "\n          groups:\n            - {group: deploy-target, scope: repository}\n            - {group: preview-target, scope: host, limit: 1}",
 			wantPath: base + "/groups/1/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "preview-target")},
@@ -3913,6 +3917,11 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 			if !found {
 				t.Errorf("entries = %+v, want one at exactly %s (message %q)", ve.Errors, tc.wantPath, tc.wantMsg)
 			}
+			// A reserved entry is refused whole, as the backend returns on it:
+			// no second entry for its limit.
+			if tc.onlyMsg && len(ve.Errors) != 1 {
+				t.Errorf("entries = %+v, want only the %s refusal", ve.Errors, tc.wantPath)
+			}
 		})
 	}
 	accepted := []struct {
@@ -3923,6 +3932,7 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 		{name: "repository_implement_limit", body: "\n          groups:\n            - {group: implement, scope: repository, limit: 2}"},
 		{name: "host_non_legacy_no_limit", body: "\n          groups:\n            - {group: preview-target, scope: host}"},
 		{name: "same_name_two_scopes", body: "\n          groups:\n            - {group: deploy, scope: host}\n            - {group: deploy, scope: repository, limit: 64}"},
+		{name: "repository_verify", body: "\n          groups:\n            - {group: verify, scope: repository, limit: 2}"},
 	}
 	for _, tc := range accepted {
 		t.Run("accepts_"+tc.name, func(t *testing.T) {
@@ -3933,7 +3943,7 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 	}
 }
 
-// TestConcurrencyGroupsMessageParity is the MECHANICAL drift guard for the two
+// TestConcurrencyGroupsMessageParity is the MECHANICAL drift guard for the three
 // hand-duplicated concurrency.groups messages (#4240): the modules cannot
 // share a constant, so parity is asserted by reading both source files and
 // requiring the identical declaration line in each.
@@ -3941,6 +3951,7 @@ func TestConcurrencyGroupsMessageParity(t *testing.T) {
 	wants := []string{
 		`const MsgFmtConcurrencyGroupDuplicate = ` + strconv.Quote(spec.MsgFmtConcurrencyGroupDuplicate),
 		`const MsgFmtConcurrencyHostGroupLimit = ` + strconv.Quote(spec.MsgFmtConcurrencyHostGroupLimit),
+		`const MsgConcurrencyHostVerifyReserved = ` + strconv.Quote(spec.MsgConcurrencyHostVerifyReserved),
 	}
 	for _, path := range []string{
 		"../../../backend/internal/spec/validate.go",

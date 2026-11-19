@@ -8507,9 +8507,15 @@ func TestParse_StageConcurrencyGroups_Rejections(t *testing.T) {
 		{name: "host_implement_limit", semantic: true,
 			body:     "\n          groups:\n            - {group: implement, scope: host, limit: 2}",
 			wantPath: base + "/groups/0/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "implement")},
-		{name: "host_verify_limit", semantic: true,
+		// The host verify group is reserved (ADR-094 A1 decision 6): refused at
+		// the ENTRY pointer, here the second entry after a declarable host
+		// implement, and ahead of the limit rule when it also carries a limit.
+		{name: "host_verify_reserved", semantic: true,
+			body:     "\n          groups:\n            - {group: implement, scope: host}\n            - {group: verify, scope: host}",
+			wantPath: base + "/groups/1", wantMsg: spec.MsgConcurrencyHostVerifyReserved},
+		{name: "host_verify_limit_reserved", semantic: true,
 			body:     "\n          groups:\n            - {group: verify, scope: host, limit: 1}",
-			wantPath: base + "/groups/0/limit", wantMsg: fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "verify")},
+			wantPath: base + "/groups/0", wantMsg: spec.MsgConcurrencyHostVerifyReserved},
 		// H1: the refusal covers EVERY host-scoped name, not only the legacy two.
 		{name: "host_non_legacy_limit", semantic: true,
 			body:     "\n          groups:\n            - {group: deploy-target, scope: repository}\n            - {group: preview-target, scope: host, limit: 1}",
@@ -8543,12 +8549,16 @@ func TestParse_StageConcurrencyGroups_Rejections(t *testing.T) {
 
 	// Controls: the host-limit refusal is scoped to scope host (a repository
 	// entry named implement keeps its limit), and a host entry without a
-	// limit, including a non-legacy name, parses.
+	// limit, including a non-legacy name, parses. The verify reservation is
+	// scoped to scope host: a repository group named verify, and host
+	// implement, stay declarable.
 	accepted := []struct {
 		name string
 		body string
 	}{
 		{name: "repository_implement_limit", body: "\n          groups:\n            - {group: implement, scope: repository, limit: 2}"},
+		{name: "host_implement_no_limit", body: "\n          groups:\n            - {group: implement, scope: host}"},
+		{name: "repository_verify", body: "\n          groups:\n            - {group: verify, scope: repository, limit: 2}"},
 		{name: "host_non_legacy_no_limit", body: "\n          groups:\n            - {group: preview-target, scope: host}"},
 		{name: "same_name_two_scopes", body: "\n          groups:\n            - {group: deploy, scope: host}\n            - {group: deploy, scope: repository, limit: 64}"},
 		{name: "eight_entries", body: strings.Join(strings.Split(nine, "\n")[:10], "\n")}, // "", "groups:", g0..g7

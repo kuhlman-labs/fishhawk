@@ -326,13 +326,13 @@ func TestConcurrencyQueuedMessage_KeepsSubstrings(t *testing.T) {
 
 // TestDeclaredGroupRequests_HostKeyLimitOverrideUnconditional (S4 + H1,
 // CF-S4-override): a hand-built declaration, never validated, carries limits
-// on host entries. The host's legacy groups take the host defaults, every
+// on host entries. The host implement group takes the host default, every
 // other host group takes hostScopedGroupLimit, and only a repository entry
-// keeps its own limit.
+// keeps its own limit. (Host verify is refused outright:
+// TestDeclaredGroupRequests_HostVerifyReserved.)
 func TestDeclaredGroupRequests_HostKeyLimitOverrideUnconditional(t *testing.T) {
 	decl := &spec.StageConcurrency{Groups: []spec.StageConcurrencyGroup{
 		{Group: "implement", Scope: spec.ConcurrencyScopeHost, Limit: 2},
-		{Group: "verify", Scope: spec.ConcurrencyScopeHost, Limit: 3},
 		{Group: "preview-target", Scope: spec.ConcurrencyScopeHost, Limit: 2},
 		{Group: "deploy-target", Scope: spec.ConcurrencyScopeRepository, Limit: 2},
 		{Group: "docs", Scope: spec.ConcurrencyScopeRepository},
@@ -343,13 +343,48 @@ func TestDeclaredGroupRequests_HostKeyLimitOverrideUnconditional(t *testing.T) {
 	}
 	want := []concurrency.GroupRequest{
 		{Key: "local-implement:h1", Limit: concurrency.DefaultLimit},
-		{Key: "local-verify:h1", Limit: concurrency.DefaultVerifyLimit},
 		{Key: "host:h1:preview-target", Limit: 1},
 		{Key: "spec:o/r:deploy-target", Limit: 2},
 		{Key: "spec:o/r:docs", Limit: 1},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("declaredGroupRequests =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+// TestDeclaredGroupRequests_HostVerifyReserved (ADR-094 A1 decision 6): a
+// hand-built declaration, never validated, names {verify, host}, which
+// canonicalises to local-verify:<host>, the group reserved for server-decided
+// merge-candidate verify passes and specialist jobs. declaredGroupRequests
+// answers an error and no set wherever the entry sits, with or without a
+// limit, so the marker fails closed (500, nothing admitted) instead of
+// admitting a declared stage into that group. Host implement in the same set
+// is declarable and resolves on its own.
+func TestDeclaredGroupRequests_HostVerifyReserved(t *testing.T) {
+	implement := spec.StageConcurrencyGroup{Group: "implement", Scope: spec.ConcurrencyScopeHost}
+	verify := spec.StageConcurrencyGroup{Group: "verify", Scope: spec.ConcurrencyScopeHost}
+	limited := verify
+	limited.Limit = 3
+	for _, tc := range []struct {
+		name    string
+		entries []spec.StageConcurrencyGroup
+		index   int
+	}{
+		{"alone", []spec.StageConcurrencyGroup{verify}, 0},
+		{"after host implement", []spec.StageConcurrencyGroup{implement, verify}, 1},
+		{"with a limit", []spec.StageConcurrencyGroup{implement, limited}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := declaredGroupRequests(&spec.StageConcurrency{Groups: tc.entries}, "o/r", "h1")
+			want := fmt.Sprintf("concurrency.groups[%d]: local-verify:h1 is reserved", tc.index)
+			if err == nil || got != nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("declaredGroupRequests = %+v, %v; want no set and an error containing %q", got, err, want)
+			}
+		})
+	}
+	got, err := declaredGroupRequests(&spec.StageConcurrency{Groups: []spec.StageConcurrencyGroup{implement}}, "o/r", "h1")
+	if err != nil || !slices.Equal(got, []concurrency.GroupRequest{{Key: "local-implement:h1", Limit: concurrency.DefaultLimit}}) {
+		t.Errorf("declaredGroupRequests({implement, host}) = %+v, %v; want local-implement:h1 at DefaultLimit", got, err)
 	}
 }
 
