@@ -25,11 +25,15 @@ import type {
   CampaignStatus,
   ConcernDeferRequest,
   ConcernWaiveRequest,
+  ConfirmedWaiveProposal,
+  ConfirmWaiveProposalRequest,
   DeferredConcernResult,
   GateView,
   GateViewStageKind,
   HealthStatus,
   PaginatedList,
+  RejectedWaiveProposal,
+  RejectWaiveProposalRequest,
   RepoEconomicsResponse,
   RepoHealth,
   RepoPostureResponse,
@@ -563,6 +567,36 @@ export const api = {
     body: AcceptanceArbitrationRequest,
   ): Promise<AcceptanceArbitrationResult> {
     return request(`/v0/runs/${encodeURIComponent(runId)}/acceptance-arbitration`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  /*
+   * Decide an agent's pending waive proposal on a server-check concern
+   * (ADR-143 A1, #5229). Unlike the E40.2 wrappers above, these ride routes
+   * added with the proposal flow (documented in docs/api/v0.openapi.yaml).
+   * Both are session-only (D2): a bearer token is refused server-side, so
+   * these exist only in the Web UI, with the CSRF header `request` attaches.
+   * Neither is a drive-plane verb.
+   */
+  confirmWaiveProposal(
+    concernId: string,
+    body: ConfirmWaiveProposalRequest,
+  ): Promise<ConfirmedWaiveProposal> {
+    return request(`/v0/concerns/${encodeURIComponent(concernId)}/waive-proposal/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  rejectWaiveProposal(
+    concernId: string,
+    body: RejectWaiveProposalRequest,
+  ): Promise<RejectedWaiveProposal> {
+    return request(`/v0/concerns/${encodeURIComponent(concernId)}/waive-proposal/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

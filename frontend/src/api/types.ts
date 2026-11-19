@@ -415,10 +415,43 @@ export interface AttentionContext {
    * a concern (ADR-143 D1); the card and decision panel mark it.
    */
   provenance?: 'server_check';
+  /**
+   * The PENDING agent waive proposal on a server-check paged_concern
+   * (ADR-143 A1, #5229), present only while it is live at the run's recorded
+   * head. Its reason, evidence and tradeoff text are agent-authored: render
+   * them as text, never as markup.
+   */
+  waive_proposal?: AttentionWaiveProposal;
   // attend_human_led_campaign
   epic_ref?: string;
   human_led_refs?: string[];
   detail?: string;
+}
+
+/**
+ * Mirrors backend waiveProposalView (server/waive_proposal.go): an operator
+ * agent's pending waive proposal on a server-check concern (ADR-143 A1). The
+ * proposal clears nothing; only a human on a Web UI session confirms or
+ * rejects it. `check_key` (the flagged location and pattern class) is
+ * server-written; `reason`, `evidence` and `tradeoff_cost` are not.
+ */
+export interface AttentionWaiveProposal {
+  proposal_sequence: number;
+  concern_id: string;
+  stage_id?: string;
+  proposed_by: string;
+  proposed_by_actor_kind: string;
+  proposed_at: string;
+  judgement: string;
+  tradeoff_cost?: string;
+  reason: string;
+  evidence: string;
+  head_sha: string;
+  check_key: string;
+  category?: string;
+  severity?: string;
+  /** Always true: the reason, evidence and tradeoff text are agent-authored. */
+  agent_authored: boolean;
 }
 
 export interface AttentionItem {
@@ -856,6 +889,43 @@ export interface ConcernDeferRequest {
   type?: string;
   labels?: string[];
   note?: string;
+}
+
+/**
+ * Body of POST /v0/concerns/{id}/waive-proposal/confirm (ADR-143 A1, #5229).
+ * `proposal_sequence` names the live proposal. `reason` is the human's
+ * OPTIONAL typed reason: when absent the server records a fixed template as
+ * the concern's state_reason, never the agent's proposal text. The panel
+ * never pre-fills it from the proposal.
+ */
+export interface ConfirmWaiveProposalRequest {
+  proposal_sequence: number;
+  reason?: string;
+}
+
+/** The confirm's 200 body: the waived concern row plus the acting-identity echo. */
+export interface ConfirmedWaiveProposal extends ConcernRow {
+  proposal_sequence: number;
+  decided_by: string;
+  credential_kind: string;
+}
+
+/**
+ * Body of POST /v0/concerns/{id}/waive-proposal/reject. `reason` is
+ * REQUIRED. A reject leaves the concern open.
+ */
+export interface RejectWaiveProposalRequest {
+  proposal_sequence: number;
+  reason: string;
+}
+
+/** The reject's 200 body. */
+export interface RejectedWaiveProposal {
+  concern_id: string;
+  proposal_sequence: number;
+  state: 'rejected';
+  decided_by: string;
+  credential_kind: string;
 }
 
 /** Mirrors DeferredConcernResult — the filed follow-up issue + deferred concern. */

@@ -114,6 +114,370 @@ describe('DecisionPanel — server-check concern (ADR-143 D1)', () => {
   });
 });
 
+/*
+ * The 'Proposed waive' block (ADR-143 A1, #5229), driven over the wire
+ * golden's server-check paged_concern, whose context carries a pending
+ * waive_proposal (sequence 41). Every case crosses
+ * component → api/client.ts → URL/method/body/CSRF header.
+ *
+ * COUNTERFACTUALS (run by hand 2026-11-18, each observed RED, then restored
+ * byte-identically and re-checked by hash):
+ * - render the block with the proposal absent (`true && (`): "an item without
+ *   a proposal renders no Confirm or Reject" and every other concern-panel
+ *   case go RED (TypeError reading the absent proposal);
+ * - send `reason: confirmReason.trim() || proposal.reason` on Confirm (Y1):
+ *   "Confirm sends only the proposal_sequence" goes RED (the body carries the
+ *   agent's reason);
+ * - drop `|| !rejectReason.trim()` from the Reject button's disabled prop:
+ *   "Reject is inert until a reason is typed" goes RED. The in-function blank
+ *   guard in reject() is defense in depth: deleted ALONE it stays green
+ *   because the disabled button masks it (the submitJudged pattern);
+ * - match the stale branch against another code: "a stale proposal explains
+ *   the moved head" goes RED;
+ * - call onResolved() after a reject: "Reject ... leaves the item open" goes
+ *   RED;
+ * - add data-decision-verb="" to the Confirm button: the Y3 pin goes RED;
+ * - render the evidence via dangerouslySetInnerHTML: "agent text renders as
+ *   text" goes RED (textContent is 'bold', the markup was parsed);
+ * - drop the server message from the generic error line: "another refusal
+ *   surfaces its status, code and server message" goes RED;
+ * - set the Confirm button's disabled to false: "an in-flight decision
+ *   disables both buttons" goes RED (a second POST);
+ * - skip the `instanceof Error` arm: "a network failure surfaces the thrown
+ *   message" goes RED;
+ * - blank the 'unknown error' default: "a non-Error rejection" goes RED;
+ * - render the head arrow unconditionally: "a stale refusal without head
+ *   details" goes RED.
+ */
+const CONFIRM_LABEL = 'Confirm waive';
+const REJECT_LABEL = 'Reject proposal';
+const CSRF_TOKEN = 'csrf-tok-5229';
+
+function setCsrfCookie(value: string) {
+  document.cookie = `__Host-csrf=${value}; path=/; Secure`;
+}
+function clearCsrfCookie() {
+  document.cookie = '__Host-csrf=; path=/; Secure; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+}
+
+function headerOf(call: unknown[], name: string): string | undefined {
+  const headers = (call[1] as RequestInit)?.headers as Record<string, string> | undefined;
+  return headers?.[name];
+}
+
+/** The golden server-check item with its pending waive proposal (asserted present). */
+function proposalItem(): AttentionItem {
+  const item = serverCheckItem();
+  if (!item.context.waive_proposal)
+    throw new Error('golden server-check item carries no waive_proposal');
+  return item;
+}
+
+describe('DecisionPanel — proposed waive on a server-check concern (ADR-143 A1)', () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    setCsrfCookie(CSRF_TOKEN);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearCsrfCookie();
+  });
+
+  it('the golden proposal renders every field under the agent-authored label', () => {
+    const item = proposalItem();
+    const p = item.context.waive_proposal!;
+    renderPanel(item);
+
+    const block = screen.getByTestId('waive-proposal');
+    expect(block).toHaveTextContent(/proposed waive/i);
+    expect(screen.getByTestId('waive-proposal-agent-label')).toHaveTextContent(
+      'agent-authored: verify before confirming',
+    );
+    expect(screen.getByTestId('waive-proposal-proposer')).toHaveTextContent(
+      `${p.proposed_by} (${p.proposed_by_actor_kind})`,
+    );
+    expect(screen.getByTestId('waive-proposal-judgement')).toHaveTextContent(p.judgement);
+    expect(screen.getByTestId('waive-proposal-tradeoff-cost')).toHaveTextContent(p.tradeoff_cost!);
+    expect(screen.getByTestId('waive-proposal-reason')).toHaveTextContent(p.reason);
+    expect(screen.getByTestId('waive-proposal-evidence')).toHaveTextContent(p.evidence);
+    expect(screen.getByTestId('waive-proposal-check-key')).toHaveTextContent(p.check_key);
+    const head = screen.getByTestId('waive-proposal-head');
+    expect(head).toHaveTextContent(p.head_sha.slice(0, 12));
+    expect(head).not.toHaveTextContent(p.head_sha); // the SHORT sha
+    // The #5228 server-check notice still renders, and Waive/Defer remain.
+    expect(screen.getByTestId('server-check-notice')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Waive' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Defer' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: CONFIRM_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: REJECT_LABEL })).toBeInTheDocument();
+  });
+
+  it('agent text renders as text, never as markup', () => {
+    const item = proposalItem();
+    const markup = '<img src=x data-agent-injected="1"><b>bold</b>';
+    item.context.waive_proposal!.evidence = markup;
+    item.context.waive_proposal!.reason = markup;
+    renderPanel(item);
+    const block = screen.getByTestId('waive-proposal');
+    expect(screen.getByTestId('waive-proposal-evidence').textContent).toBe(markup);
+    expect(screen.getByTestId('waive-proposal-reason').textContent).toBe(markup);
+    expect(block.querySelector('img')).toBeNull();
+    expect(block.querySelector('b')).toBeNull();
+    expect(block.querySelector('[data-agent-injected]')).toBeNull();
+  });
+
+  it('Confirm sends only the proposal_sequence (never the agent reason), with CSRF, and resolves', async () => {
+    const item = proposalItem();
+    const p = item.context.waive_proposal!;
+    const fetchMock = stubFetch(() => ({ status: 200, body: { id: item.concern_id } }));
+    const { onResolved } = renderPanel(item);
+
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+    const calls = postCalls(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(String(calls[0][0])).toBe(`/v0/concerns/${item.concern_id}/waive-proposal/confirm`);
+    expect(bodyOf(calls[0])).toEqual({ proposal_sequence: p.proposal_sequence });
+    expect(headerOf(calls[0], 'X-CSRF-Token')).toBe(CSRF_TOKEN);
+    // Y1: no agent-authored text rides the confirm request.
+    const raw = String((calls[0][1] as RequestInit).body);
+    expect(raw).not.toContain(p.reason);
+    expect(raw).not.toContain(p.evidence);
+    expect(raw).not.toContain(p.tradeoff_cost!);
+  });
+
+  it('Confirm forwards a reason the human typed', async () => {
+    const item = proposalItem();
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    const { onResolved } = renderPanel(item);
+
+    fireEvent.change(screen.getByLabelText('Confirm reason (optional)'), {
+      target: { value: '  checked the fixture myself  ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+    expect(bodyOf(postCalls(fetchMock)[0])).toEqual({
+      proposal_sequence: item.context.waive_proposal!.proposal_sequence,
+      reason: 'checked the fixture myself',
+    });
+  });
+
+  it('Reject is inert until a reason is typed (ZERO fetches)', () => {
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(proposalItem());
+    const reject = screen.getByRole('button', { name: REJECT_LABEL });
+    expect(reject).toBeDisabled();
+    fireEvent.click(reject);
+    fireEvent.change(screen.getByLabelText('Reject reason'), { target: { value: '   ' } });
+    expect(reject).toBeDisabled();
+    fireEvent.click(reject);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('Reject POSTs the proposal_sequence and reason with CSRF, and leaves the item open', async () => {
+    const item = proposalItem();
+    const fetchMock = stubFetch(() => ({
+      status: 200,
+      body: {
+        concern_id: item.concern_id,
+        proposal_sequence: 41,
+        state: 'rejected',
+        decided_by: 'github:someone',
+        credential_kind: 'session',
+      },
+    }));
+    const { onResolved } = renderPanel(item);
+
+    fireEvent.change(screen.getByLabelText('Reject reason'), {
+      target: { value: ' the token is live ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: REJECT_LABEL }));
+
+    await screen.findByTestId('waive-proposal-rejected');
+    const calls = postCalls(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(String(calls[0][0])).toBe(`/v0/concerns/${item.concern_id}/waive-proposal/reject`);
+    expect(bodyOf(calls[0])).toEqual({
+      proposal_sequence: item.context.waive_proposal!.proposal_sequence,
+      reason: 'the token is live',
+    });
+    expect(headerOf(calls[0], 'X-CSRF-Token')).toBe(CSRF_TOKEN);
+    // The concern stays open: the item is NOT resolved, the proposal block is
+    // gone, and Waive/Defer remain.
+    expect(onResolved).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('waive-proposal')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: CONFIRM_LABEL })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Waive' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Defer' })).toBeInTheDocument();
+  });
+
+  it('a stale proposal explains the moved head, no resolve', async () => {
+    stubFetch(() => ({
+      status: 409,
+      body: {
+        error: 'waive_proposal_stale',
+        message: 'the run head moved since the proposal was recorded',
+        details: {
+          proposal_head_sha: '5229a5229a5229a5229a5229a5229a5229a5229a',
+          current_head_sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          dropped_recorded: true,
+        },
+      },
+    }));
+    const { onResolved } = renderPanel(proposalItem());
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/PR head moved/);
+    expect(alert).toHaveTextContent(/no longer confirmable/);
+    expect(alert).toHaveTextContent('5229a5229a52 → bbbbbbbbbbbb');
+    expect(onResolved).not.toHaveBeenCalled();
+    // The Confirm control stays rendered for a retry against a fresh read.
+    expect(screen.getByRole('button', { name: CONFIRM_LABEL })).not.toBeDisabled();
+  });
+
+  it('another refusal surfaces its status, code and server message, no resolve', async () => {
+    stubFetch(() => ({
+      status: 403,
+      body: {
+        error: 'concern_requires_session',
+        message: 'confirm a waive proposal on a server-check concern needs a Web UI session',
+      },
+    }));
+    const { onResolved } = renderPanel(proposalItem());
+    fireEvent.change(screen.getByLabelText('Reject reason'), { target: { value: 'no' } });
+    fireEvent.click(screen.getByRole('button', { name: REJECT_LABEL }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/403 · concern_requires_session/);
+    expect(alert).toHaveTextContent(/needs a Web UI session/);
+    expect(alert).not.toHaveTextContent(/no longer confirmable/);
+    expect(onResolved).not.toHaveBeenCalled();
+    expect(screen.getByTestId('waive-proposal')).toBeInTheDocument();
+  });
+
+  it('a stale refusal without head details still explains, with no arrow', async () => {
+    stubFetch(() => ({ status: 409, body: { error: 'waive_proposal_stale' } }));
+    renderPanel(proposalItem());
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/no longer confirmable/);
+    expect(alert).not.toHaveTextContent('→');
+  });
+
+  it('a code-only refusal renders exactly status · code', async () => {
+    stubFetch(() => ({ status: 409, body: { error: 'waive_proposal_not_live' } }));
+    const { onResolved } = renderPanel(proposalItem());
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toBe('409 · waive_proposal_not_live');
+    expect(onResolved).not.toHaveBeenCalled();
+  });
+
+  it('a network failure surfaces the thrown message, no resolve', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('Failed to fetch');
+      }),
+    );
+    const { onResolved } = renderPanel(proposalItem());
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toBe('Failed to fetch');
+    expect(onResolved).not.toHaveBeenCalled();
+  });
+
+  it('a non-Error rejection surfaces "unknown error", no resolve', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw 'boom';
+      }),
+    );
+    const { onResolved } = renderPanel(proposalItem());
+    fireEvent.click(screen.getByRole('button', { name: CONFIRM_LABEL }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toBe('unknown error');
+    expect(onResolved).not.toHaveBeenCalled();
+  });
+
+  it('an in-flight decision disables both buttons (one POST for a double click)', async () => {
+    let release: (r: Response) => void = () => {};
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const { onResolved } = renderPanel(proposalItem());
+    fireEvent.change(screen.getByLabelText('Reject reason'), { target: { value: 'no' } });
+    const confirm = screen.getByRole('button', { name: CONFIRM_LABEL });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(confirm).toBeDisabled());
+    expect(screen.getByRole('button', { name: REJECT_LABEL })).toBeDisabled();
+    fireEvent.click(confirm);
+    fireEvent.click(screen.getByRole('button', { name: REJECT_LABEL }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    release(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+  });
+
+  it('an item without a proposal renders no Confirm or Reject; Waive is unchanged', async () => {
+    const item = proposalItem();
+    delete item.context.waive_proposal;
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    const { onResolved } = renderPanel(item);
+
+    expect(screen.queryByTestId('waive-proposal')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: CONFIRM_LABEL })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: REJECT_LABEL })).not.toBeInTheDocument();
+    expect(screen.getByTestId('server-check-notice')).toBeInTheDocument();
+
+    chooseJudgement('no_defect');
+    fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'fp' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+    expect(String(postCalls(fetchMock)[0][0])).toBe(`/v0/concerns/${item.concern_id}/waive`);
+    expect(bodyOf(postCalls(fetchMock)[0])).toEqual({ reason: 'fp', judgement: 'no_defect' });
+  });
+
+  it('a reviewer-raised concern renders no proposal block', () => {
+    renderPanel(itemOf('paged_concern'));
+    expect(screen.queryByTestId('waive-proposal')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: CONFIRM_LABEL })).not.toBeInTheDocument();
+  });
+
+  // Y3: Confirm and Reject are NOT drive-plane verbs and live OUTSIDE
+  // DECISION_VERBS; neither button carries data-decision-verb.
+  it('Confirm and Reject are outside DECISION_VERBS and carry no data-decision-verb', () => {
+    stubFetch(() => ({ status: 200, body: {} }));
+    const { container } = render(
+      <MemoryRouter>
+        <DecisionPanel item={proposalItem()} onResolved={vi.fn()} onCancel={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const allDecisionVerbs = Object.values(DECISION_VERBS).flat();
+    for (const label of [CONFIRM_LABEL, REJECT_LABEL]) {
+      const button = screen.getByRole('button', { name: label });
+      expect(button).not.toHaveAttribute('data-decision-verb');
+      expect(allDecisionVerbs).not.toContain(label);
+      expect(isDrivePlaneVerb(label)).toBe(false);
+    }
+    // The submit-verb set is still exactly the paged_concern verbs.
+    const verbLabels = Array.from(container.querySelectorAll('[data-decision-verb]'))
+      .map((el) => (el.textContent ?? '').trim())
+      .sort();
+    expect(verbLabels).toEqual([...DECISION_VERBS.paged_concern].sort());
+    for (const el of [...screen.queryAllByRole('button'), ...screen.queryAllByRole('link')]) {
+      expect(isDrivePlaneVerb(el.textContent ?? '')).toBe(false);
+    }
+  });
+});
+
 describe('DecisionPanel — happy paths (one per kind)', () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(() => vi.unstubAllGlobals());
