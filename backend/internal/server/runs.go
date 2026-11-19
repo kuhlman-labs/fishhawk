@@ -342,6 +342,14 @@ type runResponse struct {
 	// extra read; omitted (nil) when no row was recorded or the read fails. It
 	// is a signal, never a hold: the ADR-090 merge gate still applies.
 	FanInVerifyUnavailable *runFanInVerifyUnavailablePayload `json:"fan_in_verify_unavailable,omitempty"`
+	// WaiveProposals lists the run's PENDING agent waive proposals on open
+	// server_check concerns (ADR-143 A1, #5229): live and bound to the current
+	// recorded run head. A compact pointer list; the full agent-authored text
+	// is on the gate view's waive_proposal block. Populated by handleGetRun
+	// ONLY (same posture as FanInVerifyUnavailable), from the concern rows the
+	// concerns block already read; omitted when none is pending, the concern
+	// read failed, or the proposal read fails (best-effort, warn and omit).
+	WaiveProposals []runWaiveProposalItem `json:"waive_proposals,omitempty"`
 	// ReviewAuthority is the per-stage resolved review authority (E53.2 /
 	// #2225): for each stage of the run's workflow that declares a reviewers
 	// block, the resolved mode (advisory | gating | gateless) and its
@@ -854,6 +862,49 @@ type runAutoAdvancePayload struct {
 	To        string    `json:"to"`
 	Parked    bool      `json:"parked,omitempty"`
 	Timestamp time.Time `json:"ts"`
+}
+
+// runWaiveProposalItem is one pending waive proposal on the run read (ADR-143
+// A1, #5229). It carries no agent-authored text: a client follows concern_id
+// to the gate view's waive_proposal block for the reason and evidence.
+type runWaiveProposalItem struct {
+	ConcernID        string `json:"concern_id"`
+	StageID          string `json:"stage_id,omitempty"`
+	ProposalSequence int64  `json:"proposal_sequence"`
+	ProposedBy       string `json:"proposed_by"`
+	Judgement        string `json:"judgement"`
+	HeadSHA          string `json:"head_sha"`
+}
+
+// waiveProposalsForRun distills the pending waive proposals over rows, ordered
+// by proposal sequence. nil (field omitted) when none is pending or the read
+// fails (warn-logged): a read failure never fails the run read.
+func (s *Server) waiveProposalsForRun(ctx context.Context, runID uuid.UUID, rows []*concern.Concern) []runWaiveProposalItem {
+	proposals, err := s.pendingWaiveProposals(ctx, runID, rows)
+	if err != nil {
+		s.cfg.Logger.Warn("read waive proposals failed; omitting waive_proposals",
+			"run_id", runID.String(), "error", err.Error())
+		return nil
+	}
+	if len(proposals) == 0 {
+		return nil
+	}
+	out := make([]runWaiveProposalItem, 0, len(proposals))
+	for _, p := range proposals {
+		item := runWaiveProposalItem{
+			ConcernID:        p.ConcernID.String(),
+			ProposalSequence: p.Sequence,
+			ProposedBy:       p.ProposedBy,
+			Judgement:        p.Judgement,
+			HeadSHA:          p.HeadSHA,
+		}
+		if p.StageID != nil {
+			item.StageID = p.StageID.String()
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ProposalSequence < out[j].ProposalSequence })
+	return out
 }
 
 // runConcernsPayload summarizes a run's OPEN review concerns (#964).
@@ -2675,6 +2726,9 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// posture — nil (field omitted) when no un-superseded mismatch exists.
 	resp.ReviewHeadMismatch = s.reviewHeadMismatchForRun(r.Context(), runID)
 	resp.FanInVerifyUnavailable = s.fanInVerifyUnavailableForRun(r.Context(), runID)
+	if concernsRead {
+		resp.WaiveProposals = s.waiveProposalsForRun(r.Context(), runID, runConcerns)
+	}
 	// Review-authority surface (E53.2 / #2225): single-run read ONLY (same
 	// posture as Concerns / Delegation — no per-row spec parse on the list
 	// endpoint). A pure projection of the run's cached workflow spec; nil

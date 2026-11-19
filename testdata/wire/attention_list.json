@@ -125,7 +125,24 @@
         "severity": "high",
         "category": "security",
         "note": "The diff adds a string that matches a GitHub token pattern (backend/internal/x/fixture.go:12).",
-        "provenance": "server_check"
+        "provenance": "server_check",
+        "waive_proposal": {
+          "proposal_sequence": 41,
+          "concern_id": "00000000-0000-4000-8000-000000000024",
+          "stage_id": "00000000-0000-4000-8000-000000000021",
+          "proposed_by": "operator-agent/1.0",
+          "proposed_by_actor_kind": "agent",
+          "proposed_at": "2026-09-01T18:45:00Z",
+          "judgement": "tradeoff",
+          "tradeoff_cost": "none: the fixture never reaches a forge",
+          "reason": "The matched string is the documented placeholder from the README, not a live token.",
+          "evidence": "fixture.go:12 assigns the README example token; the forge refuses it.",
+          "head_sha": "5229a5229a5229a5229a5229a5229a5229a5229a",
+          "check_key": "diff_secrets|github-pat-classic|backend/internal/x/fixture.go",
+          "category": "security",
+          "severity": "high",
+          "agent_authored": true
+        }
       },
       "detail_path": "/runs/00000000-0000-4000-8000-000000000020/stages/00000000-0000-4000-8000-000000000021",
       "since": "2026-09-01T18:30:00Z"
