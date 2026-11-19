@@ -30,11 +30,13 @@ package server
 //
 // Y2 / V2: a failed disposition after the linked intent is followed by a
 // concern_waive_failed naming the intent (intent_sequence), so the fold keeps
-// the proposal live and the human can retry. The handler then returns the
-// error and never reports success. RESIDUAL: if that corrective write fails
-// too, the fold closes the proposal while the row stays open (see
-// waive_proposal.go); a concern_waive decision row can exist for a concern
-// that stayed open, and the remedy is a direct human waive or a new proposal.
+// the proposal live and the human can retry, unless a newer proposal was
+// recorded in that interval, which then stays live in its place. The handler
+// then returns the error and never reports success. RESIDUAL: the intent is
+// indexed as a concern_waive decision row when it commits, so every failed
+// disposition leaves a decision row for a concern that stayed open; if the
+// corrective write fails too, the fold also closes the proposal (see
+// waive_proposal.go). The remedy is a direct human waive or a new proposal.
 
 import (
 	"context"
@@ -180,8 +182,10 @@ func (s *Server) refuseConcernNotOpen(w http.ResponseWriter, r *http.Request, ro
 
 // decodeDecisionBody decodes a decision body and validates proposal_sequence
 // and the optional (or, when required, mandatory) human reason: at most
-// maxOperatorConcernBytes (refused, not truncated). A required reason is also
-// credential-scanned like a proposal's text.
+// maxOperatorConcernBytes (refused, not truncated). Any non-empty reason,
+// the confirm's optional one included, is also credential-scanned like a
+// proposal's text, because a confirm reason becomes state_reason, which later
+// re-review prompts render.
 func (s *Server) decodeDecisionBody(w http.ResponseWriter, r *http.Request, dst any, seq *int64, reason *string, reasonRequired bool) bool {
 	if r.Body != nil {
 		if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
@@ -209,7 +213,7 @@ func (s *Server) decodeDecisionBody(w http.ResponseWriter, r *http.Request, dst 
 			map[string]any{"field": "reason", "bytes": len(*reason), "max": maxOperatorConcernBytes})
 		return false
 	}
-	if reasonRequired {
+	if *reason != "" {
 		if _, hits := redaction.RedactDefault([]byte(*reason)); len(hits) > 0 {
 			patterns := make([]string, 0, len(hits))
 			for _, h := range hits {
@@ -425,7 +429,8 @@ func (s *Server) writeConfirmError(w http.ResponseWriter, r *http.Request, row *
 		s.writeError(w, r, http.StatusNotFound, "concern_not_found", "no concern with that id", nil)
 	default:
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"confirm waive proposal failed; the proposal stays live", map[string]any{"error": err.Error()})
+			"confirm waive proposal failed; the proposal stays live unless a newer proposal was recorded meanwhile",
+			map[string]any{"error": err.Error()})
 	}
 }
 

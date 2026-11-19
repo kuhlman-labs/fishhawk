@@ -29,9 +29,18 @@ package server
 //     `return nil, errGuardedAppendUnavailable` replaced by a nil-guard
 //     fallback. Bare fake, no wrapper: _NoGuardedAppenderFailsClosed/fresh-head
 //     RED (200, one concern_waived row).
-//   - H6 (V2 failed-intent exclusion, waive_proposal.go): `!failedIntents[...]`
-//     replaced by `true`. _RetryAfterFailedDisposition RED (second confirm 404
-//     waive_proposal_not_found, row raised).
+//   - H6 (V2 failed-intent reopen, waive_proposal.go): the fold's
+//     `st.live[p.ConcernID] = p` replaced by `_ = p`.
+//     _RetryAfterFailedDisposition RED ("a failed disposition closed the
+//     proposal (V2)").
+//   - H7 (acknowledged proposal keeps its place): the fold's reopen condition
+//     `st.live[p.ConcernID] == nil` replaced by `true`. The hook proposes Q
+//     between P's committed intent and its corrective row:
+//     _ProposeDuringFailedDispositionKeepsNewer RED (live = P seq 2, want Q).
+//   - C1 (confirm reason credential scan): decodeDecisionBody's
+//     `*reason != ""` restored to `reasonRequired`.
+//     _CredentialReasonRefused RED (200, row waived, state_reason carries the
+//     credential bytes, the response echoes them).
 //   - Y1 (state_reason never agent text): stateReason seeded from live.Reason.
 //     _StateReasonNeverAgentText RED (state_reason, the concern_waived reason
 //     and the settled-concerns review ledger carry the agent's marker).
@@ -334,6 +343,87 @@ func TestWaiveProposalConfirm_RetryAfterFailedDisposition(t *testing.T) {
 		t.Fatalf("retry status = %d, want 200: %s", w.Code, w.Body.String())
 	}
 	fx.assertCommitted(t, row, concern.StateWaived, CategoryConcernWaived, 2)
+}
+
+// TestWaiveProposalConfirm_ProposeDuringFailedDispositionKeepsNewer: a confirm
+// of P commits its linked intent, its disposition fails, and BEFORE its
+// corrective concern_waive_failed row lands the operator agent proposes Q
+// (the hook on that row's append: the intent is committed, so the fold reads
+// P closed and the propose answers 201). The acknowledged Q must stay live and
+// decidable; P stays closed (superseded), and a retry of P names Q.
+func TestWaiveProposalConfirm_ProposeDuringFailedDispositionKeepsNewer(t *testing.T) {
+	fx := newSessionOnlyFixture(t)
+	row := seedProposedServerCheck(t, fx, uuid.New())
+	p := confirmProposalSeq(row)
+	fx.cr.applyHumanDispositionErr = errNoCapStub("transient store failure")
+	var q int64
+	fx.gau.beforeAppend(CategoryConcernWaiveFailed, func() {
+		w := fx.do(t, "/v0/concerns/"+row.ID.String()+"/waive-proposal", jsonBody(validProposeBody()), fx.operatorAgentBearer(t), false, nil)
+		if w.Code != http.StatusCreated {
+			t.Errorf("propose during the failed confirm = %d, want 201: %s", w.Code, w.Body.String())
+			return
+		}
+		q = int64(decodeJSON(t, w)["proposal"].(map[string]any)["proposal_sequence"].(float64))
+	})
+
+	if w := fx.do(t, confirmPath(row), wpConfirmBody(p), "", true, nil); w.Code != http.StatusInternalServerError {
+		t.Fatalf("confirm of P status = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	if q == 0 {
+		t.Fatal("the hook did not record Q")
+	}
+	if n := fx.gau.count(CategoryConcernWaiveFailed); n != 1 {
+		t.Fatalf("concern_waive_failed rows = %d, want 1 (the corrective row landed after Q)", n)
+	}
+	st, err := loadWaiveProposalState(context.Background(), fx.gau, row.RunID)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if live := st.Live(row.ID); live == nil || live.Sequence != q {
+		t.Fatalf("live proposal = %+v, want the acknowledged Q (seq %d), not P (seq %d)", live, q, p)
+	}
+	if n := st.inert[row.ID]; n != 0 {
+		t.Errorf("inert proposals = %d, want 0 (an acknowledged proposal never turns inert)", n)
+	}
+	assertState(t, fx.cr, row.ID, concern.StateRaised)
+
+	fx.cr.applyHumanDispositionErr = nil
+	env := assertErrCode(t, fx.do(t, confirmPath(row), wpConfirmBody(p), "", true, nil), http.StatusConflict, "waive_proposal_not_live")
+	if env.Details["live_proposal_sequence"] != float64(q) {
+		t.Errorf("retry of P: details.live_proposal_sequence = %v, want %d", env.Details["live_proposal_sequence"], q)
+	}
+	if w := fx.do(t, confirmPath(row), wpConfirmBody(q), "", true, nil); w.Code != http.StatusOK {
+		t.Fatalf("confirm of Q status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	fx.assertCommitted(t, row, concern.StateWaived, CategoryConcernWaived, 2)
+}
+
+// TestWaiveProposalConfirm_CredentialReasonRefused: the confirm's optional
+// human reason becomes state_reason, which re-review prompts render, so a
+// credential-shaped reason is refused before any append and the bytes are not
+// echoed.
+func TestWaiveProposalConfirm_CredentialReasonRefused(t *testing.T) {
+	fx := newSessionOnlyFixture(t)
+	row := seedProposedServerCheck(t, fx, uuid.New())
+	secret := generatedPAT(t)
+	body := jsonBody(map[string]any{"proposal_sequence": confirmProposalSeq(row), "reason": "the value " + secret + " is inert"})
+
+	w := fx.do(t, confirmPath(row), body, "", true, nil)
+
+	env := assertErrCode(t, w, http.StatusBadRequest, "waive_proposal_contains_credential")
+	if env.Details["field"] != "reason" {
+		t.Errorf("details.field = %v, want reason", env.Details["field"])
+	}
+	if strings.Contains(w.Body.String(), secret) {
+		t.Error("the response echoes the credential-shaped bytes")
+	}
+	fx.assertCommitted(t, row, concern.StateRaised, CategoryConcernWaived, 0)
+	if got := readConcern(t, fx.cr, row.ID).StateReason; strings.Contains(got, secret) {
+		t.Errorf("state_reason carries the credential-shaped bytes: %q", got)
+	}
+	if fx.live(t, row) == nil {
+		t.Error("the proposal is no longer live after a refused confirm")
+	}
 }
 
 // TestWaiveProposalConfirm_CorrectiveWriteFailureNotSuccess (Y2): when the

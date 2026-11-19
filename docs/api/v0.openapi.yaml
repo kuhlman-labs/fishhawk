@@ -30622,7 +30622,8 @@ paths:
         `waive_proposal_stale` with `dropped_recorded: true`. A failed
         disposition writes a `concern_waive_failed` row whose
         `intent_sequence` names the intent, returns an error, and leaves the
-        proposal live for a retry. The confirm also records the E82.1
+        proposal live for a retry, unless a newer proposal was recorded
+        before that row (it stays live instead). The confirm also records the E82.1
         delegation shadow (`delegation_shadow_evaluated`) as a direct waive
         does.
       tags: [stages]

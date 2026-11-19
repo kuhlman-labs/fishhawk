@@ -11,11 +11,17 @@ package server
 //
 // COUNTERFACTUALS (hand-run; each mutation restored byte-identically):
 //
-//   - H6 (V2 failed-intent exclusion, waive_proposal.go): `!failedIntents[r.entry.Sequence]`
-//     replaced by `true` in pass 2. Fixture: intent concern_waived{proposal_sequence:P}
-//     then concern_waive_failed{intent_sequence: that intent}. Observed RED:
+//   - H6 (V2 failed-intent reopen, waive_proposal.go): the concern_waive_failed
+//     case's `st.live[p.ConcernID] = p` replaced by `_ = p` in pass 2. Fixture:
+//     intent concern_waived{proposal_sequence:P} then
+//     concern_waive_failed{intent_sequence: that intent}. Observed RED:
 //     TestWaiveProposalFold_FailedIntentLeavesLive "live proposal = <nil>, want P"
 //     and TestWaiveProposalFold_LegacyFailedMatchesNearestIntent.
+//   - H7 (acknowledged proposal keeps its place, waive_proposal.go): the reopen's
+//     `st.live[p.ConcernID] == nil` replaced by `true`. Fixture: P, intent(P),
+//     Q, concern_waive_failed(intent). Observed RED:
+//     TestWaiveProposalFold_ProposalDuringFailedIntentStaysLive "live proposal =
+//     P (seq 2), want Q (seq 4)".
 //   - run-bound refusal (handleProposeWaive): the runBoundTokenRunID branch made
 //     unreachable. The token names the concern's OWN run and holds write:fixups,
 //     so nothing else refuses: _RunBoundTokenRefused RED (201, one proposed row).
@@ -353,6 +359,35 @@ func TestWaiveProposalFold_FailedIntentLeavesLive(t *testing.T) {
 	f.au.seed(t, f.runID, CategoryConcernWaiveFailed, map[string]any{"concern_id": f.row.ID.String(), "intent_sequence": intent.Sequence})
 	if live := foldState(t, f).Live(f.row.ID); live == nil || live.Sequence != p.Sequence {
 		t.Fatalf("live proposal = %+v, want seq %d (a failed intent must leave the proposal live)", live, p.Sequence)
+	}
+}
+
+// TestWaiveProposalFold_ProposalDuringFailedIntentStaysLive: a proposal Q
+// recorded between P's linked intent and the corrective row naming that intent
+// keeps its place; P stays closed and Q never turns inert. A rejection of Q
+// before the corrective row lets P reopen.
+func TestWaiveProposalFold_ProposalDuringFailedIntentStaysLive(t *testing.T) {
+	f := newProposeFixture(t)
+	p := f.seedProposal(t, f.row.ID, proposalHeadA)
+	intent := f.au.seed(t, f.runID, CategoryConcernWaived, map[string]any{"concern_id": f.row.ID.String(), "proposal_sequence": p.Sequence})
+	q := f.seedProposal(t, f.row.ID, proposalHeadA)
+	f.au.seed(t, f.runID, CategoryConcernWaiveFailed, map[string]any{"concern_id": f.row.ID.String(), "intent_sequence": intent.Sequence})
+	st := foldState(t, f)
+	if live := st.Live(f.row.ID); live == nil || live.Sequence != q.Sequence {
+		t.Fatalf("live proposal = %+v, want Q (seq %d), not P (seq %d)", live, q.Sequence, p.Sequence)
+	}
+	if n := st.inert[f.row.ID]; n != 0 {
+		t.Errorf("inert = %d, want 0", n)
+	}
+
+	g := newProposeFixture(t)
+	p2 := g.seedProposal(t, g.row.ID, proposalHeadA)
+	intent2 := g.au.seed(t, g.runID, CategoryConcernWaived, map[string]any{"concern_id": g.row.ID.String(), "proposal_sequence": p2.Sequence})
+	q2 := g.seedProposal(t, g.row.ID, proposalHeadA)
+	g.au.seed(t, g.runID, CategoryConcernWaiveProposalRejected, map[string]any{"concern_id": g.row.ID.String(), "proposal_sequence": q2.Sequence})
+	g.au.seed(t, g.runID, CategoryConcernWaiveFailed, map[string]any{"concern_id": g.row.ID.String(), "intent_sequence": intent2.Sequence})
+	if live := foldState(t, g).Live(g.row.ID); live == nil || live.Sequence != p2.Sequence {
+		t.Fatalf("live proposal = %+v, want P reopened (seq %d) once Q was rejected", live, p2.Sequence)
 	}
 }
 

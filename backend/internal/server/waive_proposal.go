@@ -20,24 +20,35 @@ package server
 //
 // THE FOLD (two passes, ascending sequence):
 //
-//  1. failedIntents: every concern_waive_failed row names the concern_waived
-//     intent it corrects, through its intent_sequence key, or, for a legacy
-//     row written before that key existed, the newest concern_waived for the
-//     same concern that precedes it.
-//  2. Per concern_id: a concern_waive_proposed row becomes LIVE only when none
-//     is live, otherwise it is INERT and counted (the guarded propose already
-//     serializes; this is defense in depth). A concern_waive_proposal_rejected
-//     or _dropped row naming the live sequence closes it. A concern_waived row
-//     whose proposal_sequence names the live sequence closes it ONLY when its
-//     own sequence is not in failedIntents (V2): a failed waive disposition
-//     leaves the proposal live, so the human can retry the confirm.
+//  1. correctedIntent: every concern_waive_failed row names the
+//     concern_waived intent it corrects, through its intent_sequence key, or,
+//     for a legacy row written before that key existed, the newest
+//     concern_waived for the same concern that precedes it.
+//  2. Per concern_id, replayed in sequence order: a concern_waive_proposed row
+//     becomes LIVE only when none is live, otherwise it is INERT and counted
+//     (the guarded propose already serializes; this is defense in depth). A
+//     concern_waive_proposal_rejected or _dropped row naming the live sequence
+//     closes it. A concern_waived row whose proposal_sequence names the live
+//     sequence closes it, and a LATER concern_waive_failed naming that intent
+//     reopens it (V2): a failed waive disposition leaves the proposal live, so
+//     the human can retry the confirm. The reopen happens only when the
+//     concern has no live proposal at the corrective row: a proposal recorded
+//     between the confirm's intent and its corrective row was acknowledged
+//     (201) and keeps its place, so the failed confirm's proposal stays closed
+//     (superseded) and a retry of it answers 409 waive_proposal_not_live
+//     naming the newer sequence. No acknowledged proposal becomes inert.
 //
-// RESIDUAL (Y2): the corrective concern_waive_failed write is best effort. If
-// it fails too, the chain holds a linked intent with no recorded failure, the
-// fold closes the proposal and the concern row stays open; the confirm handler
-// still returned an error, never success. A concern_waive decision row can
-// therefore exist for a concern that stayed open. The remedy is a direct human
-// waive or a new proposal; nothing is waived by mistake.
+// RESIDUAL (Y2): the concern_waived intent commits, and the decision-index
+// decorator indexes it as a concern_waive decision row, BEFORE the
+// disposition runs. So whenever a confirm's disposition fails, a concern_waive
+// decision row exists for a concern that stayed open (a successful retry adds
+// a second row for the same concern); the index does not read
+// concern_waive_failed. The corrective concern_waive_failed write is best
+// effort: when it lands the fold keeps the proposal live as above; when it
+// fails too, the chain holds a linked intent with no recorded failure and the
+// fold also closes the proposal. The confirm handler returns an error either
+// way, never success. The remedy is a direct human waive or a new proposal;
+// nothing is waived by mistake.
 
 import (
 	"context"
@@ -200,28 +211,36 @@ func loadWaiveProposalState(ctx context.Context, read audit.ChainReader, runID u
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].entry.Sequence < rows[j].entry.Sequence })
 
-	// Pass 1: the intents a concern_waive_failed row corrects.
-	failedIntents := map[int64]bool{}
+	// Pass 1: the intent each concern_waive_failed row corrects, keyed by the
+	// corrective row's own sequence.
+	correctedIntent := map[int64]int64{}
 	for i, r := range rows {
 		if r.entry.Category != CategoryConcernWaiveFailed {
 			continue
 		}
 		if r.payload.IntentSequence != nil {
-			failedIntents[*r.payload.IntentSequence] = true
+			correctedIntent[r.entry.Sequence] = *r.payload.IntentSequence
 			continue
 		}
 		// Legacy corrective row: the nearest preceding intent for the concern.
 		for j := i - 1; j >= 0; j-- {
 			prev := rows[j]
 			if prev.entry.Category == CategoryConcernWaived && prev.concernID == r.concernID {
-				failedIntents[prev.entry.Sequence] = true
+				correctedIntent[r.entry.Sequence] = prev.entry.Sequence
 				break
 			}
 		}
 	}
 
-	// Pass 2: per-concern live proposal.
+	// Pass 2: per-concern live proposal, replayed in sequence order. A linked
+	// concern_waived intent closes the live proposal and parks it under the
+	// intent's sequence; a later concern_waive_failed naming that intent
+	// restores it ONLY when the concern has no live proposal at that point.
+	// A proposal recorded while the intent awaited its outcome was
+	// acknowledged (201) against a closed state, so it keeps its place and
+	// the failed confirm's proposal stays closed (superseded).
 	st := &waiveProposalState{live: map[uuid.UUID]*waiveProposal{}, inert: map[uuid.UUID]int{}}
+	closedByIntent := map[int64]*waiveProposal{}
 	for _, r := range rows {
 		live := st.live[r.concernID]
 		switch r.entry.Category {
@@ -236,9 +255,22 @@ func loadWaiveProposalState(ctx context.Context, read audit.ChainReader, runID u
 				delete(st.live, r.concernID)
 			}
 		case CategoryConcernWaived:
-			if live != nil && r.payload.ProposalSequence != nil && *r.payload.ProposalSequence == live.Sequence &&
-				!failedIntents[r.entry.Sequence] {
+			if live != nil && r.payload.ProposalSequence != nil && *r.payload.ProposalSequence == live.Sequence {
 				delete(st.live, r.concernID)
+				closedByIntent[r.entry.Sequence] = live
+			}
+		case CategoryConcernWaiveFailed:
+			intent, ok := correctedIntent[r.entry.Sequence]
+			if !ok {
+				continue
+			}
+			p := closedByIntent[intent]
+			if p == nil {
+				continue
+			}
+			delete(closedByIntent, intent)
+			if st.live[p.ConcernID] == nil {
+				st.live[p.ConcernID] = p
 			}
 		}
 	}
