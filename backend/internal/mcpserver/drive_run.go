@@ -182,8 +182,18 @@ const (
 	// spawn (#1912): the marker is the core 'dispatched' signal on the
 	// code-execution path, so an unmarked spawn would recreate the ambiguity #1912
 	// removes. NO runner is spawned — the operator re-invokes once the transient
-	// clears.
+	// clears. A 409 concurrency_slot_queued is NOT this stop: it is
+	// stoppedAwaitingConcurrencySlot.
 	stoppedHostDispatchFailed = "host_dispatch_failed"
+	// stoppedAwaitingConcurrencySlot is the stop when the host-dispatch marker
+	// QUEUES the dispatchable stage for this host's local concurrency slot (409
+	// concurrency_slot_queued, ADR-087 / ADR-094 D1, #3969). It is not a
+	// failure: NO runner is spawned by the drive, the stage stays
+	// awaiting_host_dispatch, and this session's slot waiter spawns it through
+	// the drive's own spawn closure exactly once on admission. next_actions
+	// (driveSlotQueuedActions) lead with fishhawk_await_stage on the queued
+	// stage, then fishhawk_drive_run to resume once it settles.
+	stoppedAwaitingConcurrencySlot = "awaiting_concurrency_slot"
 	// stoppedForgeUnresolved is the fail-CLOSED stop when the pre-loop forge
 	// target read (resolveRunForgeTarget, E45.46 / #3463) refuses: the run row
 	// was unreadable, carried an unknown forge, or is a gitlab run with no
@@ -297,7 +307,7 @@ type DriveStep struct {
 type DriveRunOutput struct {
 	RunID              string       `json:"run_id"`
 	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
-	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | base_branch_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | implement_stage_failed | executor_agent_unsupported | context_cancelled"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | awaiting_concurrency_slot | forge_unresolved | base_branch_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | implement_stage_failed | executor_agent_unsupported | context_cancelled"`
 	RunState           string       `json:"run_state"`
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -388,6 +398,17 @@ the failure this prevents); only an UNPROBEABLE result (pgrep absent / errored /
 timed out) hands the manual verify-first re-dispatch to the operator.
 A fresh manual fishhawk_dispatch_stage marks a new spawn so a re-invoked drive
 reads it as live and polls to convergence rather than re-reporting stale.
+
+A dispatch the host-dispatch marker QUEUES for this host's local concurrency
+slot (409 concurrency_slot_queued, ADR-087; #3969) is not a failure, for a
+plan, implement or acceptance stage alike: the drive spawns nothing, hands the
+stage to this session's slot waiter, and stops awaiting_concurrency_slot. The
+waiter keeps the queue row live and, once the stage is admitted, spawns its
+runner DETACHED exactly once through the drive's own spawn path, with the
+runner binary, argv and token resolved at admission. next_actions lead with
+fishhawk_await_stage on the queued stage, then fishhawk_drive_run to resume once
+it settles. Any other marker failure still stops host_dispatch_failed with no
+spawn.
 
 A refused or errored tool call mid-drive (this verb's own error, or a 409 from a
 verb you call between drives) is a STATE signal, not a stop condition: re-read
@@ -1002,18 +1023,48 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			// (already 'dispatched') proceeds; the guard above already handled the
 			// unspawned-this-invocation dispatched case, so reaching here means a
 			// pending/awaiting_host_dispatch stage the marker flips forward.
-			if _, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID); hderr != nil {
+			//
+			// A 409 concurrency_slot_queued (#3969 / ADR-094 D1) is NOT a marker
+			// failure: the stage was queued for this host's local concurrency
+			// slot and left at awaiting_host_dispatch. This one site serves plan,
+			// implement and acceptance dispatches alike. Spawn nothing; hand the
+			// stage to this session's slot waiter and stop
+			// awaiting_concurrency_slot.
+			_, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
+			report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
+				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
+				return e
+			}
+			probe := r.stageStateProbe(runUUID, disp.ID)
+			if q, queued := asConcurrencySlotQueued(hderr); queued {
+				prepare := r.driveQueuedPrepare(RunStageInput{
+					RunID:      in.RunID,
+					Workflow:   runRow.WorkflowID,
+					Stage:      disp.Type,
+					WorkingDir: in.WorkingDir,
+					GitHubRepo: repo,
+					BaseBranch: baseBranch,
+				}, *disp, repo, baseBranch, forgeTarget, in.RunnerBinary)
+				spec := newQueuedSlotSpec(runUUID, stageUUID, q, r.api, prepare, detachedSpawnFunc(spawn), report, probe)
+				slot, queuedWarning := startQueuedSlotWaiter(q, spec, "fishhawk_drive_run")
+				out.StepsTaken = append(out.StepsTaken, DriveStep{
+					Kind: "dispatch", Stage: recordName, Delegated: false,
+					Note: fmt.Sprintf(
+						"queued for the local concurrency slot (group %q, limit %d, position %d; waiter %s); NO runner spawned by the drive — the slot waiter spawns it on admission",
+						slot.Group, slot.Limit, slot.Position, slot.Waiter),
+				})
+				out.StoppedReason = stoppedAwaitingConcurrencySlot
+				out.Warnings = append(out.Warnings, queuedWarning)
+				out.NextActions = driveSlotQueuedActions(runUUID, disp.ID, disp.Type, in.WorkingDir)
+				return nil, out, nil
+			}
+			if hderr != nil {
 				out.StoppedReason = stoppedHostDispatchFailed
 				out.Warnings = append(out.Warnings, fmt.Sprintf(
 					"host-dispatch marker for %s failed; NOT spawning (fail-closed): %v", recordName, hderr))
 				return nil, out, nil
 			}
 			env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
-			report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
-				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
-				return e
-			}
-			probe := r.stageStateProbe(runUUID, disp.ID)
 			if _, spwErr := spawn(binary, argv, env, runUUID.String(), disp.ID, report, probe); spwErr != nil {
 				out.StoppedReason = stoppedStageFailed
 				out.Warnings = append(out.Warnings,
@@ -1575,6 +1626,55 @@ func (r *runResolver) driveHasPriorGateMergeRow(ctx context.Context, runID uuid.
 // (not imported) per the thin local-copy rule — import direction is cli →
 // backend, not the reverse.
 const CategoryRunAutoDriven = "run_auto_driven"
+
+// driveQueuedPrepare is the slot waiter's prepare closure for a dispatch the
+// marker queued (#3969). It runs AT ADMISSION, never at queue time (ADR-087,
+// approval condition Q3): it re-resolves the runner binary from runnerBinary
+// (the drive's runner_binary input) through resolveRunnerBinary, re-composes
+// the argv exactly as the immediate path does (the same RunStageInput, stage
+// row, repo, base branch and forge target, push-and-open-PR on), and rebuilds
+// the env with the token CURRENT at that moment. So a binary or token change
+// while the stage is queued is picked up. Unlike the loop, it re-resolves the
+// binary even under an injected driveSpawn seam: the waiter's spawn is
+// deferred, and only an admission-time read is fresh. The admitting response
+// is not read: the drive's base branch is the input or the run's default
+// branch, as on an immediate admission.
+func (r *runResolver) driveQueuedPrepare(argvIn RunStageInput, disp Stage, repo, baseBranch string, forgeTarget runForgeTarget, runnerBinary string) func(*HostDispatchResult) (slotSpawnInputs, error) {
+	return func(*HostDispatchResult) (slotSpawnInputs, error) {
+		binary, err := r.resolveRunnerBinary(runnerBinary)
+		if err != nil {
+			return slotSpawnInputs{}, err
+		}
+		argv, err := r.composeStageRunnerArgv(argvIn, disp, repo, baseBranch, true, forgeTarget)
+		if err != nil {
+			return slotSpawnInputs{}, err
+		}
+		return slotSpawnInputs{binary: binary, argv: argv, env: append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)}, nil
+	}
+}
+
+// driveSlotQueuedActions is the next-actions pointer for an
+// awaiting_concurrency_slot stop (#3969): first fishhawk_await_stage on the
+// queued stage, which holds through the queue while this session's slot
+// waiter keeps the queue row live and spawns the runner on admission; then
+// fishhawk_drive_run to resume the drive once the stage settles.
+func driveSlotQueuedActions(runID uuid.UUID, stageID, stage, workingDir string) *NextActions {
+	params := map[string]string{"run_id": runID.String()}
+	if workingDir != "" {
+		params["working_dir"] = workingDir
+	}
+	return &NextActions{State: stoppedAwaitingConcurrencySlot, Actions: []SuggestedAction{
+		*queuedAwaitStageNextStep(runID.String(), stageID, stage),
+		{
+			Action:       "fishhawk_drive_run",
+			Params:       params,
+			Precondition: "the queued stage has settled (fishhawk_await_stage released on a terminal or parked state)",
+			Consumes:     consumesNone,
+			Reason: "resume the drive from the settled stage. Re-invoking while the stage is still queued records one more dispatch act, " +
+				"re-queues it (the waiter reports already_waiting) and stops awaiting_concurrency_slot again",
+		},
+	}}
+}
 
 // driveDecisionActions builds the drive verb's own next-actions pointer for a
 // decision / paged / stalled stop. It is a focused pointer at the decision
