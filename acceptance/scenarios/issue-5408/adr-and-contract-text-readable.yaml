@@ -1,0 +1,13 @@
+id: scenario:issue-5408/adr-and-contract-text-readable
+statement: In the checkout, docs/adr/102-verify-exit-code-contract.md contains an '## Amendment A1' section stating that a container-path verify whose launch marker never appears is not_executed (verify_gate_launch_failed) and routes no fix-up, and that a command exit 125/126/127 after the marker stays verify_failed. docs/spec/workflow-v2.md's Verify exit-code contract section states the same.
+steps: Posture B, reading the sanctioned checkout at HEAD 8c18f1325 (equal to the target git_sha). Read docs/adr/102-verify-exit-code-contract.md '## Amendment A1' (line 35) and docs/spec/workflow-v2.md '#### Verify exit-code contract' (line 814), bullets at lines 826 and 829.
+assertions:
+    expected: An Amendment A1 section and the contract section both stating the launch-marker rule.
+    observed_at_record: 'In ADR-102 A1, A1.2 says exit 125/126/127 with no marker line is not a verdict. It reports not_executed / verify_gate_launch_failed at the merge-candidate verify, ends category C at the implement gates, including the strict re-verify per L1, and is never handed to the fix agent. A1.5 adds that this is never a fix-up and that not_executed is never merge-eligible. A1.3 says the same codes after the marker stay ''the change failed''. The ratification line matches L7. workflow-v2.md:826 states the same rule: the merge-candidate verify reports not_executed / verify_gate_launch_failed and routes no fix-up, and the same codes after the marker mean the change failed.'
+    repro_handle: awk '/^## Amendment A1/{f=1} f' docs/adr/102-verify-exit-code-contract.md; grep -n 'Container launch failure' docs/spec/workflow-v2.md
+origin:
+    issue: 5408
+    pr: 5491
+    run_id: 903b93f8-23c3-44bf-a877-0ae7aeb8887c
+    head_sha: 8c18f132585464095e17c6f540f5c1d86187a999
+    recorded_at: 2026-11-20T23:40:09Z
