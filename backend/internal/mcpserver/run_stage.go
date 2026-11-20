@@ -153,7 +153,7 @@ type RunStageOutput struct {
 	// when the post-run stage fetch failed.
 	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"stage-execution wait status on the durable (run_id, stage_id) handle: status is one of pending, running, succeeded, failed, cancelled, superseded (superseded is TERMINAL: a merge made the stage unreachable, #3083). On a synchronous return the stage is normally already terminal (interval omitted); poll fishhawk_get_run_status on the advertised poll_interval_seconds to await a non-terminal stage. Omitted when the post-run stage fetch failed"`
 
-	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed | short_circuited | needs_target) from the runner_completed event, or a pre-spawn server/verb resolution: short_circuited when the acceptance-admission endpoint settled the stage with no runner, needs_target when the verb-side acceptance target probe refused to spawn; empty when the runner never reported one"`
+	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed | short_circuited | needs_target | awaiting_concurrency_slot) from the runner_completed event, or a pre-spawn server/verb resolution: short_circuited when the acceptance-admission endpoint settled the stage with no runner, needs_target when the verb-side acceptance target probe refused to spawn, awaiting_concurrency_slot when the dispatch was QUEUED for a local concurrency slot (NON-terminal: no runner spawned yet, this session's slot waiter spawns it DETACHED on admission — follow next_step fishhawk_await_stage); empty when the runner never reported one"`
 	Turns          int    `json:"turns,omitempty" jsonschema:"agent turn count from the last stage_progress heartbeat"`
 	TokensUsed     int    `json:"tokens_used,omitempty" jsonschema:"tokens consumed; from runner_completed when present, else the last heartbeat's running total"`
 	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
@@ -169,6 +169,16 @@ type RunStageOutput struct {
 	// marker) so re-dispatch is clean once the operator brings up the target at
 	// the named head SHA. Omitted on every spawn path.
 	NeedsTarget *AcceptanceNeedsTarget `json:"needs_target,omitempty" jsonschema:"present only when outcome==needs_target: the acceptance target is unreachable or stale, so no runner was spawned. Names the target_host and expected_head_sha to provision (remediation), then re-dispatch. The stage remains awaiting_host_dispatch"`
+
+	// ConcurrencySlot and NextStep are set only on a QUEUED dispatch (#3969):
+	// the host-dispatch marker answered 409 concurrency_slot_queued, so the
+	// call returned early with Outcome awaiting_concurrency_slot, holding
+	// nothing, and this session's slot waiter spawns the runner DETACHED on
+	// admission. The live-waiter arm (transitioned:false while this process's
+	// waiter held the stage) returns the same shape with only waiter
+	// already_waiting set. Omitted on every other return.
+	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"present only when outcome==awaiting_concurrency_slot: the stage is QUEUED behind this host's slot holders (status awaiting_concurrency_slot, group, limit, position, holders) and NO runner was spawned. waiter is started (this session's slot waiter spawns the runner DETACHED on admission) or already_waiting (one already is, and ITS spawn inputs govern: this call's are dropped). When the marker answered transitioned:false while this session's waiter held the stage, only waiter already_waiting is set: that waiter may own the spawn, but it may also have exited without admission (cap expiry, a terminal refusal, or another session dispatched the stage), so re-invoke after it exits if no runner appears"`
+	NextStep        *SuggestedAction  `json:"next_step,omitempty" jsonschema:"present only when outcome==awaiting_concurrency_slot: the fishhawk_await_stage call, params pre-filled, that holds through the queue and releases when the stage settles. This call returns no events for the queued stage: read them from the audit log or the signed trace"`
 
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort after the stage runs. Omitted when
@@ -356,6 +366,26 @@ unavailable):
                       new_run), and a one-line reason. Same classifier as
                       fishhawk_get_run_status; display-only, never gates.
 
+Queued dispatch (#3969 / ADR-094): when this host's local concurrency slot
+is full, the host-dispatch marker QUEUES the stage instead of admitting it.
+This call then returns EARLY, holding nothing and spawning nothing: outcome
+awaiting_concurrency_slot (NON-terminal), concurrency_slot (position, holders,
+waiter) and next_step fishhawk_await_stage. This session's slot waiter
+re-polls the marker and spawns the runner DETACHED on admission, so call
+next_step to wait for the stage to settle; this call returns no events for
+it, so read the event stream from the audit log or the signed trace. It
+covers plan, implement, acceptance and review stages alike. An acceptance
+stage's pre-marker gates (admission short-circuit, target probe) ran at queue
+time and are not re-run at admission, matching fishhawk_dispatch_stage. When
+this MCP process already had a waiter for the stage (waiter already_waiting),
+that FIRST waiter's spawn inputs (its push_and_open_pr, its spawn path) govern
+and this call's are dropped. A call whose marker answers transitioned:false
+while this process's waiter held the stage spawns nothing either and returns
+the same awaiting_concurrency_slot shape with waiter already_waiting: that
+waiter may own the spawn, but it may also have exited without admission (cap
+expiry, a terminal refusal, or another session dispatched the stage). If no
+runner appears, re-invoke after the waiter exits.
+
 Cancellation: cancelling the tool call sends SIGTERM (then SIGKILL
 after a 30s grace) to the runner. Graceful cleanup requires the
 runner-side SIGTERM handler (#435) — until it lands, cancellation
@@ -381,6 +411,10 @@ host; this tool is local-only by design (ADR-024 Q5).
 //  6. on context cancellation, SIGTERM + grace + SIGKILL the child.
 //  7. wait for exit; fetch the post-run stage state for the result.
 func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in RunStageInput) (*mcp.CallToolResult, RunStageOutput, error) {
+	// Open this invocation's live-waiter window first (#3969): a slot waiter
+	// in this process that holds the stage at any point from here to the
+	// host-dispatch marker's answer owns its spawn (liveWaiterOwnsSpawn below).
+	waiterMark := slotWaiters.mark()
 	// (1) Input validation. stage_id is optional: when omitted it is
 	// resolved tool-side from (run_id, stage type) below.
 	if in.RunID == "" || in.Workflow == "" || in.Stage == "" {
@@ -673,10 +707,28 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// unambiguously means a spawn attempt exists. FAIL CLOSED — a transport error
 	// or 4xx means NO spawn (an unmarked spawn would recreate the ambiguity #1912
 	// removes). transitioned:false (already 'dispatched') proceeds: the manual
-	// dead-runner re-dispatch.
-	if _, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID); hderr != nil {
+	// dead-runner re-dispatch — unless a slot waiter in this process held the
+	// stage during this invocation. That waiter may own the spawn (or may have
+	// exited without admission), so this call returns awaiting_concurrency_slot
+	// instead of risking a SECOND runner (#3969, liveWaiterHeldNote).
+	//
+	// A 409 concurrency_slot_queued (#3969 / ADR-094 D1) is NOT a failure: the
+	// stage was queued for this host's local concurrency slot and left at
+	// awaiting_host_dispatch. Spawn nothing blocking; hand the dispatch to this
+	// process's slot waiter, which spawns the runner DETACHED on admission, and
+	// return at once. The marker site is shared, so this covers plan,
+	// implement, acceptance and review stages alike.
+	hdRes, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
+	if q, queued := asConcurrencySlotQueued(hderr); queued {
+		return r.queueRunStageForSlot(in, resolvedStage, runUUID, stageUUID, repo, baseBranch, pushAndOpenPR, forgeTarget, q, warnings)
+	}
+	if hderr != nil {
 		return nil, RunStageOutput{}, fmt.Errorf(
 			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
+	}
+	if liveWaiterOwnsSpawn(hdRes, stageUUID, waiterMark) {
+		warnings = append(warnings, liveWaiterHeldNote("fishhawk_run_stage"))
+		return r.runStageQueuedOutput(in, runUUID, stageUUID, &StageConcurrency{Waiter: slotWaiterAlreadyWaiting}, warnings)
 	}
 
 	// (5)+(6)+(7) Spawn the runner in its own process group, parse its
@@ -1152,6 +1204,88 @@ func acceptanceShortCircuitWarning(res *AcceptanceAdmissionResult, noSpawnEviden
 		msg += "; no spawn evidence recorded"
 	}
 	return msg + "."
+}
+
+// queueRunStageForSlot is fishhawk_run_stage's queued arm (#3969 / ADR-094
+// D1): the marker answered 409 concurrency_slot_queued, so NO runner is
+// spawned and the blocking spawnRunnerStage is never reached. It starts this
+// process's slot waiter (or finds the one already running) and returns early
+// with outcome awaiting_concurrency_slot, the queue block and a
+// fishhawk_await_stage next step.
+//
+// The waiter spawns DETACHED through dispatchSpawnDetached, captured here
+// synchronously: the blocking spawnRunnerStage is bound to this call's
+// context and progress token, neither of which outlives the return. prepare
+// runs AT ADMISSION (ADR-087): it re-resolves the runner binary, re-composes
+// the argv and rebuilds the env with the token current at that moment, so a
+// binary or token change while queued is picked up. The acceptance pre-marker
+// gates ran at queue time and are not re-run, matching fishhawk_dispatch_stage.
+func (r *runResolver) queueRunStageForSlot(in RunStageInput, resolvedStage Stage, runUUID, stageUUID uuid.UUID, repo, baseBranch string, pushAndOpenPR bool, forgeTarget runForgeTarget, q *concurrencySlotQueuedError, warnings []string) (*mcp.CallToolResult, RunStageOutput, error) {
+	stageID := stageUUID.String()
+	prepare := func(*HostDispatchResult) (slotSpawnInputs, error) {
+		binary, err := r.resolveRunnerBinary(in.RunnerBinary)
+		if err != nil {
+			return slotSpawnInputs{}, err
+		}
+		argv, err := r.composeStageRunnerArgv(in, resolvedStage, repo, baseBranch, pushAndOpenPR, forgeTarget)
+		if err != nil {
+			return slotSpawnInputs{}, err
+		}
+		return slotSpawnInputs{binary: binary, argv: argv, env: append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)}, nil
+	}
+	report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
+		_, rerr := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
+		return rerr
+	}
+	spec := newQueuedSlotSpec(runUUID, stageUUID, q, r.api, prepare, dispatchSpawnDetached, report, r.stageStateProbe(runUUID, stageID))
+	slot, queuedWarning := startQueuedSlotWaiter(q, spec, "fishhawk_run_stage")
+	warnings = append(warnings, queuedWarning)
+	return r.runStageQueuedOutput(in, runUUID, stageUUID, slot, warnings)
+}
+
+// runStageQueuedOutput is the awaiting_concurrency_slot return shared by the
+// queued arm and the live-waiter arm (#3969): one best-effort stage read for
+// the stage's state and wait status, slot as concurrency_slot, and the
+// fishhawk_await_stage next step.
+func (r *runResolver) runStageQueuedOutput(in RunStageInput, runUUID, stageUUID uuid.UUID, slot *StageConcurrency, warnings []string) (*mcp.CallToolResult, RunStageOutput, error) {
+	stageID := stageUUID.String()
+	// One best-effort stage fetch for the queued stage's state and wait status.
+	stageState := ""
+	var stageWaitStatus *StageWaitStatus
+	if fetchErr := func() error {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
+		if ferr != nil {
+			return ferr
+		}
+		for _, s := range stages {
+			if s.ID == stageID {
+				stageState = s.State
+			}
+		}
+		// The run row is not in hand here, so the predicted-runtime input is 0
+		// (the elapsed-based branch, as postDispatchStageWaitStatus).
+		stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
+		if stageWaitStatus == nil {
+			return fmt.Errorf("stage %s not found in run %s stage list", stageID, runUUID)
+		}
+		return nil
+	}(); fetchErr != nil {
+		warnings = append(warnings,
+			fmt.Sprintf("post-queue stage fetch failed (stage_wait_status omitted): %v", fetchErr))
+	}
+	return nil, RunStageOutput{
+		StageState:         stageState,
+		Events:             []RunnerEvent{},
+		Warnings:           warnings,
+		RunURL:             r.api.baseURL + "/runs/" + runUUID.String(),
+		ResolvedWorkingDir: in.WorkingDir,
+		StageWaitStatus:    stageWaitStatus,
+		Outcome:            concurrencyStatusAwaitingSlot,
+		ConcurrencySlot:    slot,
+		NextStep:           queuedAwaitStageNextStep(runUUID.String(), stageID, in.Stage),
+	}, nil
 }
 
 // resolveRunnerBinary resolves the fishhawk-runner binary path shared by every

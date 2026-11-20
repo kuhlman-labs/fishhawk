@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -106,6 +107,16 @@ type driveFakeBackend struct {
 	// test can assert the marker fired before the spawn.
 	hostDispatchStatus  int
 	hostDispatchCalledN int
+	// hostDispatchQueued scripts the #3969 queued marker: while true, every
+	// marker POST answers 409 concurrency_slot_queued (slotQueuedBody) and
+	// leaves the stage untouched; admitQueued clears it, so the next POST (the
+	// slot waiter's) takes the 200 CAS-flip arm below. hostDispatchQueuedN
+	// counts the 409 answers.
+	hostDispatchQueued  bool
+	hostDispatchQueuedN int
+	// reapFailures records every POST .../reap-failure body (the slot
+	// waiter's release after a failed prepare or spawn).
+	reapFailures []reapFailureRequest
 
 	onGate  func(f *driveFakeBackend) AutoDriveOutcome
 	onSpawn func(f *driveFakeBackend, stageType string)
@@ -260,6 +271,12 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.hostDispatchCalledN++
+			if f.hostDispatchQueued {
+				f.hostDispatchQueuedN++
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(slotQueuedBody))
+				return
+			}
 			if f.hostDispatchStatus != 0 && f.hostDispatchStatus != http.StatusOK {
 				w.WriteHeader(f.hostDispatchStatus)
 				_, _ = w.Write([]byte(`{"error":{"code":"dispatch_not_admissible","message":"host-dispatch boom"}}`))
@@ -284,6 +301,14 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				state = f.stages[i].State
 			}
 			_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: transitioned, StageState: state})
+
+		case r.Method == http.MethodPost && strings.HasSuffix(path, "/reap-failure"):
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			var body reapFailureRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.reapFailures = append(f.reapFailures, body)
+			_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
 
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/acceptance-admission"):
 			f.mu.Lock()
@@ -5287,5 +5312,407 @@ func TestDriveRun_Description_ErrorIsStateSignal(t *testing.T) {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_drive_run description missing %q:\n%s", want, desc)
 		}
+	}
+}
+
+// --- queued dispatch (#3969 / ADR-094 D1) -----------------------------------
+
+// admitQueued ends the scripted queue: the next marker POST takes the 200
+// CAS-flip arm. It locks: it runs on the test goroutine with no lock held.
+func (f *driveFakeBackend) admitQueued() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hostDispatchQueued = false
+}
+
+// queuedDriveSeams prepares a queued fishhawk_drive_run. It shrinks the slot
+// waiter's poll interval and cap BEFORE the drive call, because the queued arm
+// reads them synchronously (approval condition Q6), and stubs
+// dispatchSpawnDetached to a recorder that fails the test: the drive's waiter
+// must spawn through the drive's OWN spawn closure, never the dispatch_stage
+// seam. Its last cleanup, which runs first, waits for every waiter to exit
+// before the seams are restored. It returns the dispatchSpawnDetached call
+// counter.
+func queuedDriveSeams(t *testing.T) *queuedSpawnLog {
+	t.Helper()
+	wrong := &queuedSpawnLog{}
+	savedSpawn := dispatchSpawnDetached
+	savedPoll, savedCap := concurrencySlotPollInterval, concurrencyWaiterCap
+	dispatchSpawnDetached = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
+		t.Errorf("dispatchSpawnDetached called for stage %s: a queued drive's waiter must spawn through the drive's own spawn closure", stageID)
+		return wrong.spawn(binary, argv, env, runID, stageID, report, probe)
+	}
+	concurrencySlotPollInterval = 5 * time.Millisecond
+	concurrencyWaiterCap = 20 * time.Second
+	t.Cleanup(func() {
+		dispatchSpawnDetached = savedSpawn
+		concurrencySlotPollInterval, concurrencyWaiterCap = savedPoll, savedCap
+	})
+	t.Cleanup(func() { waitSlotWaitersDrained(t) })
+	return wrong
+}
+
+// driveRunnerBinEnv is an r.getenv that resolves FISHHAWK_RUNNER_BIN to bin():
+// the queued arm's prepare re-resolves the runner binary at admission even
+// under an injected driveSpawn seam (approval condition Q3).
+func driveRunnerBinEnv(bin func() string) func(string) string {
+	return func(k string) string {
+		if k == "FISHHAWK_RUNNER_BIN" {
+			return bin()
+		}
+		return ""
+	}
+}
+
+// TestDriveRun_QueuedDispatchStopsAwaitingSlot (#3969): a 409
+// concurrency_slot_queued marker answer at the drive's shared marker site is
+// not a host_dispatch_failed stop, for a plan, implement or acceptance stage
+// (approval condition Q5: the acceptance row is unconditional). The drive
+// spawns nothing, stops awaiting_concurrency_slot with fishhawk_await_stage
+// on the queued stage as its first next action, and on admission the slot
+// waiter spawns the runner exactly ONCE through the drive's injected
+// driveSpawn recorder: only the drive's own spawn closure reaches it, because
+// dispatchSpawnDetached is stubbed to fail the test.
+func TestDriveRun_QueuedDispatchStopsAwaitingSlot(t *testing.T) {
+	reviewID := uuid.NewSHA1(uuid.Nil, []byte("review")).String()
+	for _, tc := range []struct {
+		stage   string
+		stageID string
+		stages  []Stage
+	}{
+		{stage: "plan", stageID: drivePlanID, stages: []Stage{
+			stg(drivePlanID, "plan", "awaiting_host_dispatch", 0),
+			stg(driveImplID, "implement", "blocked", 1),
+		}},
+		{stage: "implement", stageID: driveImplID, stages: []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+		}},
+		{stage: "acceptance", stageID: driveAccID, stages: []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			stg(driveImplID, "implement", "succeeded", 1),
+			stg(driveAccID, "acceptance", "awaiting_host_dispatch", 2),
+			stg(reviewID, "review", "succeeded", 3),
+		}},
+	} {
+		t.Run(tc.stage, func(t *testing.T) {
+			f := newDriveFake("running", tc.stages)
+			f.hostDispatchQueued = true
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			// Cleanups run LIFO: admit (so a test that fails while queued
+			// still lets its waiter exit), drain the waiters, restore the
+			// seams, then close the fake.
+			t.Cleanup(srv.Close)
+			wrong := queuedDriveSeams(t)
+			t.Cleanup(f.admitQueued)
+			r.getenv = driveRunnerBinEnv(func() string { return "/fake/fishhawk-runner" })
+			r.driveMaxWallclock = 5 * time.Second
+			workingDir := t.TempDir()
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), WorkingDir: workingDir, GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun on a queued marker: %v (a queued dispatch is not a failure)", err)
+			}
+			if out.StoppedReason != stoppedAwaitingConcurrencySlot || out.StoppedReason == stoppedHostDispatchFailed {
+				t.Fatalf("stopped_reason = %q, want awaiting_concurrency_slot (not host_dispatch_failed); warnings: %v", out.StoppedReason, out.Warnings)
+			}
+			if got := rec.list(); len(got) != 0 {
+				t.Fatalf("drive spawned %v at return, want nothing while the stage is queued", got)
+			}
+			na := out.NextActions
+			if na == nil || na.State != stoppedAwaitingConcurrencySlot || len(na.Actions) != 2 {
+				t.Fatalf("next_actions = %+v, want the awaiting_concurrency_slot pointer with two actions", na)
+			}
+			first, second := na.Actions[0], na.Actions[1]
+			if first.Action != "fishhawk_await_stage" || first.Params["stage_id"] != tc.stageID || first.Params["run_id"] != f.runID.String() ||
+				first.Params["stage"] != tc.stage || !strings.Contains(first.Precondition, "QUEUED") {
+				t.Fatalf("first next action = %+v, want fishhawk_await_stage on the queued %s stage", first, tc.stage)
+			}
+			if second.Action != "fishhawk_drive_run" || second.Params["run_id"] != f.runID.String() || second.Params["working_dir"] != workingDir {
+				t.Fatalf("second next action = %+v, want fishhawk_drive_run {run_id, working_dir} to resume", second)
+			}
+			if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Kind != "dispatch" || out.StepsTaken[n-1].Stage != tc.stage ||
+				!strings.Contains(out.StepsTaken[n-1].Note, "queued for the local concurrency slot") || !strings.Contains(out.StepsTaken[n-1].Note, slotWaiterStarted) {
+				t.Fatalf("steps_taken = %+v, want a final dispatch step noting the queue and the started waiter", out.StepsTaken)
+			}
+			joined := strings.Join(out.Warnings, "\n")
+			for _, want := range []string{"NO runner was spawned", "DETACHED", "re-invoke fishhawk_drive_run"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warnings missing %q: %s", want, joined)
+				}
+			}
+			f.mu.Lock()
+			acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+			queuedN := f.hostDispatchQueuedN
+			f.mu.Unlock()
+			if len(acts) != 1 || acts[0].Stage != tc.stage {
+				t.Errorf("recorded acts = %+v, want exactly one %s dispatch (record-before-dispatch)", acts, tc.stage)
+			}
+			if queuedN < 1 {
+				t.Errorf("queued marker answers = %d, want >= 1", queuedN)
+			}
+			if st := f.stateOfLocked(tc.stage); st != "awaiting_host_dispatch" {
+				t.Fatalf("%s state = %q at return, want awaiting_host_dispatch while queued", tc.stage, st)
+			}
+
+			f.admitQueued()
+			slotWaitFor(t, "the waiter's spawn after admission", func() bool { return len(rec.list()) > 0 })
+			waitSlotWaitersDrained(t)
+			if got := rec.list(); len(got) != 1 || got[0] != tc.stage {
+				t.Fatalf("spawns after admission = %v, want exactly [%s] through the drive's spawn closure", got, tc.stage)
+			}
+			if argv := rec.argvFor(tc.stage); !argvHasPair(argv, "--stage-id", tc.stageID) || !argvHasPair(argv, "--stage", tc.stage) {
+				t.Errorf("spawn argv = %v, want the %s stage's argv", argv, tc.stage)
+			}
+			if n := len(wrong.snapshot()); n != 0 {
+				t.Fatalf("dispatchSpawnDetached calls = %d, want 0", n)
+			}
+			if st := f.stateOfLocked(tc.stage); st != "dispatched" {
+				t.Fatalf("%s state = %q after admission, want dispatched", tc.stage, st)
+			}
+		})
+	}
+}
+
+// stateOfLocked is stateOf for the test goroutine: it takes f.mu.
+func (f *driveFakeBackend) stateOfLocked(typ string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stateOf(typ)
+}
+
+// TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse (#3969, concern
+// 86b55541): the drive reads the implement stage awaiting_host_dispatch, then
+// this process's slot waiter is admitted inside the window before the drive's
+// own marker POST (the marker hook flips the stage to dispatched), so the
+// drive's marker answers 200 transitioned:false. With a waiter held in the
+// window — live through the marker, or spawned and exited inside it — the
+// drive spawns NOTHING and stops awaiting_concurrency_slot. With no waiter,
+// transitioned:false keeps today's proceed and the drive spawns once.
+func TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		hold, exitAtMarker bool
+		wantSpawns         int
+	}{
+		{name: "waiter live through the marker", hold: true, wantSpawns: 0},
+		{name: "waiter exits inside the window", hold: true, exitAtMarker: true, wantSpawns: 0},
+		{name: "no waiter proceeds", wantSpawns: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDriveFake("running", []Stage{
+				stg(drivePlanID, "plan", "succeeded", 0),
+				stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+			})
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+			// A spawned implement fails at once, so the proceed row stops.
+			f.setOnSpawn(func(f *driveFakeBackend, typ string) { f.setState(typ, "failed") })
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			t.Cleanup(srv.Close)
+			release := func() {}
+			if tc.hold {
+				release = holdSlotWaiter(t, uuid.MustParse(driveImplID))
+			}
+			inner := srv.Config.Handler
+			wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/host-dispatch") {
+					// The waiter's admission lands first: the drive's marker
+					// then finds the stage already dispatched.
+					f.mu.Lock()
+					f.setState("implement", "dispatched")
+					f.mu.Unlock()
+					if tc.exitAtMarker {
+						release()
+					}
+				}
+				inner.ServeHTTP(w, req)
+			}))
+			t.Cleanup(wrapped.Close)
+			r.api = newAPIClient(config{backendURL: wrapped.URL, apiToken: "tok"})
+			r.getenv = driveRunnerBinEnv(func() string { return "/fake/fishhawk-runner" })
+			r.driveMaxWallclock = 2 * time.Second
+			workingDir := t.TempDir()
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), WorkingDir: workingDir, GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if got := rec.list(); len(got) != tc.wantSpawns {
+				t.Fatalf("drive spawns = %v, want %d (stopped_reason %q)", got, tc.wantSpawns, out.StoppedReason)
+			}
+			if tc.wantSpawns != 0 {
+				if out.StoppedReason == stoppedAwaitingConcurrencySlot {
+					t.Fatalf("stopped_reason = %q with no waiter, want the ordinary proceed", out.StoppedReason)
+				}
+				return
+			}
+			if out.StoppedReason != stoppedAwaitingConcurrencySlot {
+				t.Fatalf("stopped_reason = %q, want awaiting_concurrency_slot; warnings: %v", out.StoppedReason, out.Warnings)
+			}
+			na := out.NextActions
+			if na == nil || len(na.Actions) != 2 || na.Actions[0].Action != "fishhawk_await_stage" || na.Actions[0].Params["stage_id"] != driveImplID {
+				t.Fatalf("next_actions = %+v, want fishhawk_await_stage on the implement stage first", na)
+			}
+			if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Kind != "dispatch" || !strings.Contains(out.StepsTaken[n-1].Note, "the waiter may own the spawn") {
+				t.Fatalf("steps_taken = %+v, want a final dispatch step naming the existing waiter", out.StepsTaken)
+			}
+			joined := strings.Join(out.Warnings, "\n")
+			for _, want := range []string{"spawned NO runner", "exited without admission", "re-invoke fishhawk_drive_run", "fishhawk_drive_run call are DROPPED"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warnings missing %q: %s", want, joined)
+				}
+			}
+		})
+	}
+}
+
+// TestDriveRun_QueuedPrepareUsesAdmissionTimeInputs (approval condition Q3,
+// ADR-087): the drive's queued-arm prepare re-resolves the runner binary and
+// rebuilds the env with the token CURRENT at admission. The binary and token
+// change after the drive returns and before the waiter is admitted; the spawn
+// through the drive's own closure carries the new values, not the
+// queue-time ones.
+func TestDriveRun_QueuedPrepareUsesAdmissionTimeInputs(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+	})
+	f.hostDispatchQueued = true
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	t.Cleanup(srv.Close) // after the waiter drain (LIFO)
+	queuedDriveSeams(t)
+	runnerBin := "/old/fishhawk-runner"
+	r.getenv = driveRunnerBinEnv(func() string { return runnerBin })
+	type spawnCall struct {
+		binary    string
+		argv, env []string
+	}
+	var mu sync.Mutex
+	var calls []spawnCall
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, spawnCall{binary: binary, argv: append([]string(nil), argv...), env: append([]string(nil), env...)})
+		return "/tmp/log", nil
+	}
+	var captured []slotWaiterSpec
+	saved := startSlotWaiter
+	startSlotWaiter = func(spec slotWaiterSpec) (string, <-chan struct{}) {
+		captured = append(captured, spec)
+		return slotWaiterStarted, nil
+	}
+	t.Cleanup(func() { startSlotWaiter = saved })
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), WorkingDir: t.TempDir(), GitHubRepo: "x/y"})
+	if err != nil || out.StoppedReason != stoppedAwaitingConcurrencySlot || len(captured) != 1 {
+		t.Fatalf("driveRun = %q, %v, waiter starts %d; want one queued waiter", out.StoppedReason, err, len(captured))
+	}
+	spec := captured[0]
+	if spec.verb != "fishhawk_drive_run" || spec.stageID.String() != driveImplID || spec.runID != f.runID || len(spec.nonce) != 36 ||
+		spec.poll != 5*time.Millisecond || spec.spawn == nil || spec.report == nil || spec.probe == nil {
+		t.Fatalf("waiter spec = %+v, want the implement stage, a nonce, the shrunk poll and the spawn/report/probe", spec)
+	}
+
+	// Between queue and admission: a new runner binary and a rotated token.
+	runnerBin = "/new/fishhawk-runner"
+	r.api.token = "tok-rotated"
+	f.admitQueued()
+	_, done := slotWaiters.start(spec) // the real waiter, started after the change
+	waitDone(t, done)
+	mu.Lock()
+	got := append([]spawnCall(nil), calls...)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("spawns = %d, want exactly one on admission through the drive's spawn closure", len(got))
+	}
+	if got[0].binary != "/new/fishhawk-runner" {
+		t.Errorf("spawned binary = %q, want the admission-time /new/fishhawk-runner", got[0].binary)
+	}
+	// Never print the env: the process environment may carry a real token.
+	hasRotated, hasQueueTime := envHas(got[0].env, "FISHHAWK_API_TOKEN=tok-rotated"), envHas(got[0].env, "FISHHAWK_API_TOKEN=tok")
+	if !hasRotated || hasQueueTime {
+		t.Errorf("spawn env: admission-time token present = %v, queue-time token present = %v; want only the admission-time FISHHAWK_API_TOKEN=tok-rotated", hasRotated, hasQueueTime)
+	}
+	if !argvHasPair(got[0].argv, "--stage-id", driveImplID) {
+		t.Errorf("spawn argv = %v, want the implement stage's argv", got[0].argv)
+	}
+}
+
+// TestDriveRun_QueuedPrepareFailureReleasesSlot: when the runner binary no
+// longer resolves at admission, the queued arm's prepare fails, so the waiter
+// spawns NOTHING and releases the admitted slot through the reap-failure path
+// (expected_state dispatched, category C).
+func TestDriveRun_QueuedPrepareFailureReleasesSlot(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+	})
+	f.hostDispatchQueued = true
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	t.Cleanup(srv.Close) // after the waiter drain (LIFO)
+	queuedDriveSeams(t)
+	t.Cleanup(f.admitQueued)
+	var mu sync.Mutex
+	runnerBin := "/fake/fishhawk-runner"
+	r.getenv = driveRunnerBinEnv(func() string { mu.Lock(); defer mu.Unlock(); return runnerBin })
+	savedLook, savedExe := runStageLookPath, runStageExecutable
+	runStageLookPath = func(string) (string, error) { return "", errStub("not on PATH") }
+	runStageExecutable = func() (string, error) { return "", errStub("no executable") }
+	t.Cleanup(func() { runStageLookPath, runStageExecutable = savedLook, savedExe })
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), WorkingDir: t.TempDir(), GitHubRepo: "x/y"})
+	if err != nil || out.StoppedReason != stoppedAwaitingConcurrencySlot {
+		t.Fatalf("driveRun = %q, %v; want awaiting_concurrency_slot", out.StoppedReason, err)
+	}
+	mu.Lock()
+	runnerBin = "" // the binary stops resolving while the stage is queued
+	mu.Unlock()
+	f.admitQueued()
+	slotWaitFor(t, "the waiter's slot release", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return len(f.reapFailures) > 0
+	})
+	waitSlotWaitersDrained(t)
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawns = %v, want none when prepare fails at admission", got)
+	}
+	f.mu.Lock()
+	reaps := append([]reapFailureRequest(nil), f.reapFailures...)
+	f.mu.Unlock()
+	if len(reaps) != 1 || reaps[0].Category != "C" || reaps[0].ExpectedState == nil || *reaps[0].ExpectedState != "dispatched" ||
+		!strings.Contains(reaps[0].Reason, "fishhawk-runner not on PATH") {
+		t.Fatalf("reap-failure reports = %+v, want one category-C release pinned to dispatched naming the unresolved binary", reaps)
+	}
+}
+
+// TestDriveRun_Description_QueuedDispatch pins the tool text and the
+// stopped_reason schema for the queued arm (#3969).
+func TestDriveRun_Description_QueuedDispatch(t *testing.T) {
+	desc := strings.Join(strings.Fields(listToolDescriptions(t)["fishhawk_drive_run"]), " ")
+	for _, want := range []string{
+		"QUEUES for this host's local concurrency slot",
+		"for a plan, implement or acceptance stage alike",
+		"stops awaiting_concurrency_slot",
+		"spawns its runner DETACHED exactly once through the drive's own spawn path",
+		"next_actions lead with fishhawk_await_stage on the queued stage",
+		"Any other marker failure still stops host_dispatch_failed",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_drive_run description missing %q", want)
+		}
+	}
+	schema, err := jsonschema.For[DriveRunOutput](nil)
+	if err != nil {
+		t.Fatalf("infer DriveRunOutput schema: %v", err)
+	}
+	if prop := schema.Properties["stopped_reason"]; prop == nil || !strings.Contains(prop.Description, "| awaiting_concurrency_slot |") {
+		t.Errorf("stopped_reason schema does not list awaiting_concurrency_slot: %+v", prop)
 	}
 }

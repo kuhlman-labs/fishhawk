@@ -1008,6 +1008,31 @@ func TestAdmitSet_CapacityReservationCountsAsFull(t *testing.T) {
 	check("a fifth stage queued", 3)
 }
 
+// TestAdmitSet_StaleCapacityReservationEnds (#3969 carry-forward item 1): a
+// queued capacity reservation lasts only while its waiter refreshes the row
+// within QueueTTL. At capacity 3 with implement limit 2, I1 and I2 hold and I3
+// queues on {capacity, implement}, so I3 reserves the third capacity slot
+// while its row is fresh (TestAdmitSet_CapacityReservationCountsAsFull). Once
+// ONLY I3's row ages past QueueTTL (its waiter died), a NEW capacity-only
+// stage is admitted at once: nothing else is queued, so the staleness filter
+// is the only thing between it and a queue.
+func TestAdmitSet_StaleCapacityReservationEnds(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG, implG := gr(capKey, 3), gr(DefaultGroupKey("h1"), 2)
+	i1, i2, i3 := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(i1, capG, implG)
+	f.mustAdmitSet(i2, capG, implG)
+	f.mustQueueSet(i3, 1, capG, implG)
+	f.staleQueued(i3.ID)
+	if a := f.admitSet(f.stage(), capG); !a.Admitted {
+		t.Fatalf("new capacity-only stage = queued (groups %+v), want admitted: I3's stale row (past QueueTTL) must not reserve a capacity slot", a.Groups)
+	}
+	if n := f.liveHeld(capKey); n != 3 {
+		t.Fatalf("held %s rows = %d, want 3 (I1, I2 and the new stage)", capKey, n)
+	}
+}
+
 // TestAdmitSet_RacingCapacityAcrossTypes races {capacity, implement},
 // {capacity, acceptance}, {capacity, verify} and {capacity} sets on one host
 // (modelled on TestAdmitSet_RacingOverlappingSets, #5480). After every round

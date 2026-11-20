@@ -68,9 +68,10 @@ type AwaitStageInput struct {
 // One settled read does NOT release (#3964 / ADR-087): an awaiting_host_dispatch
 // stage QUEUED for a local concurrency slot whose waiter is live (concurrency
 // status awaiting_concurrency_slot, waiter_live true) is held — the waiter
-// spawns it on admission, so the wait keeps polling on its ticker. With no live
-// waiter it releases as "settled" carrying Concurrency and a re-dispatch
-// Message. See stageWaitHeldForSlot.
+// spawns it on admission, so the wait keeps polling on its ticker. The waiter
+// may come from any host-spawn verb (#3969). With no live waiter it releases
+// as "settled" carrying Concurrency and a Message naming the verb to re-invoke
+// (fishhawk_run_children for a fan-out child). See stageWaitHeldForSlot.
 //
 // Settledness WINS over amendment_pending, and the guarantee is enforced rather
 // than asserted: the amendment probe re-reads the stage before resolving and
@@ -134,7 +135,7 @@ type AwaitStageOutput struct {
 	FailureReason       string           `json:"failure_reason,omitempty" jsonschema:"the failed stage's reason, when the settled state is failed"`
 	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority. On a settled implement stage it may carry fixup_recovered (#3081) — the marker that the latest fix-up pass FAILED and was recovered, so no fix-up commit landed. On the 'timeout' status it carries the best-effort health read behind timeout_kind (#3626) — agent_timeout_seconds / deadline_seconds_remaining — and is ABSENT when that read failed, in which case stage health is UNKNOWN"`
 	WaitedSeconds       float64          `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
-	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up — AND on a SETTLED awaiting_host_dispatch stage queued for a local concurrency slot with NO live waiter (#3964), telling you to re-dispatch it with fishhawk_dispatch_stage, AND on a SETTLED succeeded acceptance stage with no confirmed verdict (#4072): verdict_pending (the verdict may still land — wait, do not retry), a confirmed absence past the in-flight window (the settled-outcome-unknown shape — confirm with fishhawk_list_audit, then fishhawk_retry_stage), or a named acceptance_verdict_unshipped / acceptance_skipped_out_of_scope disposition"`
+	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up — AND on a SETTLED awaiting_host_dispatch stage queued for a local concurrency slot with NO live waiter (#3964), telling you to re-invoke the host-spawn verb that queued it (fishhawk_run_children for a fan-out child, otherwise fishhawk_dispatch_stage, fishhawk_run_stage or fishhawk_drive_run), AND on a SETTLED succeeded acceptance stage with no confirmed verdict (#4072): verdict_pending (the verdict may still land — wait, do not retry), a confirmed absence past the in-flight window (the settled-outcome-unknown shape — confirm with fishhawk_list_audit, then fishhawk_retry_stage), or a named acceptance_verdict_unshipped / acceptance_skipped_out_of_scope disposition"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
 	// Heartbeat reports whether the CLIENT supplied a progressToken and a
 	// per-tick keep-alive was therefore emitted (#2490). Present on every return
@@ -167,7 +168,7 @@ type AwaitStageOutput struct {
 	// ADR-087), carried when the read had one. On a settled
 	// awaiting_host_dispatch stage it is how a queued stage whose waiter is
 	// gone (waiter_live false) is told apart from one simply never dispatched.
-	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot block on a settled read (#3964), when it has one: status awaiting_concurrency_slot with waiter_live false means the stage is queued for a slot but NO waiter will spawn it — re-dispatch with fishhawk_dispatch_stage"`
+	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot block on a settled read (#3964), when it has one: status awaiting_concurrency_slot with waiter_live false means the stage is queued for a slot but NO waiter will spawn it. The waiter may have come from any host-spawn verb (#3969); re-invoke the one that queued it: fishhawk_run_children for a fan-out child, otherwise re-dispatch with fishhawk_dispatch_stage (or re-invoke fishhawk_run_stage or fishhawk_drive_run)"`
 	// AcceptanceVerdict / VerdictPending are the E72.56 / #4072 acceptance
 	// verdict hold's result, set only on a settled `succeeded` ACCEPTANCE stage:
 	// the recorded verdict for the stage's latest attempt, or — when the wait
@@ -250,14 +251,18 @@ recovery (fishhawk_list_audit, then fishhawk_retry_stage). A live
 acceptance_verdict_unshipped or acceptance_skipped_out_of_scope marker releases
 at once with a message naming it.
 
-Local concurrency queue (#3964): a local implement stage that could not get
-this host's concurrency slot stays awaiting_host_dispatch, QUEUED
-(concurrency.status awaiting_concurrency_slot). While a live waiter refreshes
-its queue row (concurrency.waiter_live true — fishhawk_dispatch_stage started
-one) that is NOT treated as settled: the wait keeps polling until the waiter
-spawns the stage and it settles for real. With no live waiter it releases as
+Local concurrency queue (#3964, #3969): a host-dispatched stage that could not
+get this host's concurrency slot (its local-implement group or the host
+capacity group) stays awaiting_host_dispatch, QUEUED (concurrency.status
+awaiting_concurrency_slot). While a live waiter refreshes its queue row
+(concurrency.waiter_live true) that is NOT treated as settled: the wait keeps
+polling until the waiter spawns the stage and it settles for real. The waiter
+may come from any host-spawn verb: fishhawk_dispatch_stage, fishhawk_run_stage,
+fishhawk_drive_run or fishhawk_run_children. With no live waiter it releases as
 "settled" with state awaiting_host_dispatch, the concurrency block, and a
-message telling you to re-dispatch with fishhawk_dispatch_stage.
+message naming the verb to re-invoke: fishhawk_run_children for a fan-out
+child, otherwise re-dispatch with fishhawk_dispatch_stage (or re-invoke
+fishhawk_run_stage or fishhawk_drive_run).
 
 A pending scope amendment does NOT park the stage: it stays 'running' — there
 is no awaiting_scope_decision transition on this path, and that state now
@@ -872,12 +877,18 @@ func awaitStageSettledOutput(stageType string, sw *RunStageWait, start time.Time
 		out.Concurrency = sw.Concurrency
 		// Released while queued: stageWaitSettled only lets a queued
 		// awaiting_host_dispatch read through when no live waiter refreshes
-		// the queue row, so nothing will spawn the stage (#3964).
+		// the queue row, so nothing will spawn the stage (#3964). The waiter
+		// may have come from any host-spawn verb (#3969), so the message names
+		// each recovery: re-invoking fishhawk_run_children for a fan-out child
+		// (it rebuilds the child's isolated argv and admitting base branch),
+		// otherwise a re-dispatch.
 		if sw.State == "awaiting_host_dispatch" && sw.Concurrency.Status == concurrencyStatusAwaitingSlot && !sw.Concurrency.waiterLive() {
 			out.Message = fmt.Sprintf("stage %q is queued for local concurrency slot group %q (position %d) at awaiting_host_dispatch, "+
-				"but NO live waiter is refreshing its queue row (waiter_live false) — the dispatch waiter exited (MCP process "+
+				"but NO live waiter is refreshing its queue row (waiter_live false) — the slot waiter exited (MCP process "+
 				"restart, /mcp, or its cap) — so nothing will spawn it and its stale row no longer holds its place. "+
-				"Re-dispatch it with fishhawk_dispatch_stage, which re-queues it and starts a waiter.",
+				"Re-invoke the host-spawn verb that queued it, which re-queues it and starts a waiter: for a fan-out "+
+				"(decomposed) child, re-invoke fishhawk_run_children on the parent, not a bare fishhawk_dispatch_stage; "+
+				"otherwise re-dispatch with fishhawk_dispatch_stage (or re-invoke fishhawk_run_stage or fishhawk_drive_run).",
 				stageType, sw.Concurrency.Group, sw.Concurrency.Position)
 		}
 	}

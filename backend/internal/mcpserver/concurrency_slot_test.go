@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -162,7 +163,7 @@ func testSlotSpec(m *seqMarker, rec *slotSpawnRecorder) slotWaiterSpec {
 		stageID: uuid.New(),
 		nonce:   testSlotNonce,
 		marker:  m,
-		prepare: func() (slotSpawnInputs, error) { return slotSpawnInputs{binary: "/bin/runner"}, nil },
+		prepare: func(*HostDispatchResult) (slotSpawnInputs, error) { return slotSpawnInputs{binary: "/bin/runner"}, nil },
 		spawn:   rec.spawn,
 		cap:     time.Minute,
 		poll:    time.Millisecond,
@@ -436,7 +437,7 @@ func TestSlotWaiter_RebuildsSpawnInputsAtAdmission(t *testing.T) {
 	var mu sync.Mutex
 	binary := "/old/fishhawk-runner"
 	prepared := 0
-	spec.prepare = func() (slotSpawnInputs, error) {
+	spec.prepare = func(*HostDispatchResult) (slotSpawnInputs, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		prepared++
@@ -459,6 +460,241 @@ func TestSlotWaiter_RebuildsSpawnInputsAtAdmission(t *testing.T) {
 	}
 	if rec.binaries[0] != "/new/fishhawk-runner" {
 		t.Fatalf("spawned binary = %q, want the binary current at admission", rec.binaries[0])
+	}
+}
+
+// TestSlotWaiter_PrepareReceivesAdmittingResponse (#3969): prepare is handed
+// the 200 marker response that ADMITTED the stage, so a fan-out child spawns
+// against the admitting response's base_branch (#2363). The queue-time answer
+// is a 409 with no base_branch, so only the admitting 200 can supply it: the
+// transitioned:true answer, or on the own-lost-admission arm the
+// transitioned:false answer that followed the lost request.
+func TestSlotWaiter_PrepareReceivesAdmittingResponse(t *testing.T) {
+	enq := time.Now().UTC()
+	cases := []struct {
+		name      string
+		answers   []markerAnswer
+		stageWait *RunStageWait
+		wantBase  string
+	}{
+		{
+			name:     "admitted",
+			answers:  []markerAnswer{queuedAnswer(enq), {res: &HostDispatchResult{Transitioned: true, StageState: "dispatched", BaseBranch: "fan/consolidated"}}},
+			wantBase: "fan/consolidated",
+		},
+		{
+			name:    "own lost admission",
+			answers: []markerAnswer{transportAnswer, {res: &HostDispatchResult{Transitioned: false, StageState: "dispatched", BaseBranch: "fan/b2"}}},
+			stageWait: &RunStageWait{State: "dispatched", Concurrency: &StageConcurrency{
+				Status: concurrencyStatusHolding, Host: "h1", HeldDispatchedAt: &enq, AdmissionNonce: testSlotNonce,
+			}},
+			wantBase: "fan/b2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &seqMarker{answers: tc.answers, stageWait: tc.stageWait}
+			rec := &slotSpawnRecorder{}
+			spec := testSlotSpec(m, rec)
+			var mu sync.Mutex
+			var got []string
+			spec.prepare = func(admit *HostDispatchResult) (slotSpawnInputs, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				base := "<nil admit>"
+				if admit != nil {
+					base = admit.BaseBranch
+				}
+				got = append(got, base)
+				return slotSpawnInputs{binary: "/bin/runner", argv: []string{"--base-branch", base}}, nil
+			}
+			_, done := slotWaiters.start(spec)
+			waitDone(t, done)
+			mu.Lock()
+			defer mu.Unlock()
+			if len(got) != 1 || got[0] != tc.wantBase {
+				t.Fatalf("prepare saw base branches %q, want exactly [%q] (the admitting response's)", got, tc.wantBase)
+			}
+			if argvs := rec.spawnedArgvs(); len(argvs) != 1 || !argvHasPair(argvs[0], "--base-branch", tc.wantBase) {
+				t.Fatalf("spawned argvs = %v, want one spawn against %s", argvs, tc.wantBase)
+			}
+		})
+	}
+}
+
+// TestStartQueuedSlotWaiter_NamesTheVerb: the shared queued-dispatch helper
+// (#3969) starts the waiter through the startSlotWaiter seam, projects the
+// queued answer with the waiter status, and names the verb that queued the
+// stage in its warning and in the waiter's cap-expiry log, so a fan-out child
+// is recovered by fishhawk_run_children rather than a bare dispatch_stage.
+func TestStartQueuedSlotWaiter_NamesTheVerb(t *testing.T) {
+	enq := time.Now()
+	q, ok := asConcurrencySlotQueued(queuedAnswerContended(enq, true).err)
+	if !ok {
+		t.Fatal("queuedAnswer is not a typed queued error")
+	}
+	savedPoll, savedCap := concurrencySlotPollInterval, concurrencyWaiterCap
+	concurrencySlotPollInterval, concurrencyWaiterCap = 7*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { concurrencySlotPollInterval, concurrencyWaiterCap = savedPoll, savedCap })
+
+	m := &seqMarker{answers: []markerAnswer{queuedAnswer(enq)}}
+	rec := &slotSpawnRecorder{}
+	spec := newQueuedSlotSpec(uuid.New(), uuid.New(), q, m, func(*HostDispatchResult) (slotSpawnInputs, error) {
+		return slotSpawnInputs{binary: "/bin/runner"}, nil
+	}, rec.spawn, nil, nil)
+	if len(spec.nonce) != 36 || !spec.contended || spec.poll != 7*time.Millisecond || spec.cap != 50*time.Millisecond ||
+		spec.jitter == nil || spec.logf == nil || spec.marker != m {
+		t.Fatalf("spec = %+v, want a fresh nonce, the contended flag and the knobs read synchronously", spec)
+	}
+	var lmu sync.Mutex
+	var logged []string
+	spec.logf = func(f string, a ...any) {
+		lmu.Lock()
+		defer lmu.Unlock()
+		logged = append(logged, fmt.Sprintf(f, a...))
+	}
+	var started []slotWaiterSpec
+	var done <-chan struct{}
+	saved := startSlotWaiter
+	startSlotWaiter = func(s slotWaiterSpec) (string, <-chan struct{}) {
+		started = append(started, s)
+		var status string
+		status, done = slotWaiters.start(s)
+		return status, done
+	}
+	t.Cleanup(func() { startSlotWaiter = saved })
+
+	slot, warning := startQueuedSlotWaiter(q, spec, "fishhawk_run_children")
+	if len(started) != 1 || started[0].verb != "fishhawk_run_children" {
+		t.Fatalf("started = %+v, want one waiter carrying the verb", started)
+	}
+	if slot == nil || slot.Status != concurrencyStatusAwaitingSlot || slot.Waiter != slotWaiterStarted || slot.Group != "local-implement:h1" {
+		t.Fatalf("slot = %+v, want the queued projection with waiter started", slot)
+	}
+	for _, want := range []string{"NO runner was spawned", "DETACHED", "re-invoke fishhawk_run_children"} {
+		if !strings.Contains(warning, want) {
+			t.Errorf("warning missing %q: %s", want, warning)
+		}
+	}
+	waitDone(t, done)
+	lmu.Lock()
+	defer lmu.Unlock()
+	if len(logged) != 1 || !strings.Contains(logged[0], "cap") || !strings.Contains(logged[0], "re-invoke fishhawk_run_children") {
+		t.Fatalf("cap-expiry log = %q, want one line naming fishhawk_run_children as the recovery", logged)
+	}
+	if got := rec.spawned(); len(got) != 0 {
+		t.Fatalf("spawns = %v, want none (always queued)", got)
+	}
+	// A spec with no verb names every host-spawn verb.
+	if got := (slotWaiterSpec{}).recoveryVerb(); !strings.Contains(got, "fishhawk_run_children for a fan-out child") {
+		t.Errorf("recoveryVerb() = %q, want every host-spawn verb named", got)
+	}
+}
+
+// TestStartQueuedSlotWaiter_AlreadyWaitingKeepsFirstCallersInputs (#3969,
+// the cross-verb dedupe residual): one per-stage registry serves every
+// host-spawn verb, so a second verb queuing a stage that already has a waiter
+// gets already_waiting, its warning says the FIRST caller's spawn inputs
+// govern and this call's are dropped, and on admission only the first
+// caller's prepare and spawn run.
+func TestStartQueuedSlotWaiter_AlreadyWaitingKeepsFirstCallersInputs(t *testing.T) {
+	q, ok := asConcurrencySlotQueued(queuedAnswer(time.Now()).err)
+	if !ok {
+		t.Fatal("queuedAnswer is not a typed queued error")
+	}
+	gate := make(chan struct{})
+	m := &seqMarker{answers: []markerAnswer{admittedAnswer}}
+	first, second := &slotSpawnRecorder{}, &slotSpawnRecorder{}
+	specA := testSlotSpec(m, first)
+	specA.marker = gatedMarker{slotMarker: m, gate: gate}
+	specA.prepare = func(*HostDispatchResult) (slotSpawnInputs, error) {
+		return slotSpawnInputs{binary: "/first/runner"}, nil
+	}
+	specB := specA
+	specB.prepare = func(*HostDispatchResult) (slotSpawnInputs, error) {
+		return slotSpawnInputs{binary: "/second/runner"}, nil
+	}
+	specB.spawn = second.spawn
+	var done <-chan struct{}
+	saved := startSlotWaiter
+	startSlotWaiter = func(s slotWaiterSpec) (string, <-chan struct{}) {
+		var status string
+		status, done = slotWaiters.start(s)
+		return status, done
+	}
+	t.Cleanup(func() { startSlotWaiter = saved })
+
+	slotA, warnA := startQueuedSlotWaiter(q, specA, "fishhawk_run_stage")
+	slotB, warnB := startQueuedSlotWaiter(q, specB, "fishhawk_drive_run")
+	if slotA.Waiter != slotWaiterStarted || slotB.Waiter != slotWaiterAlreadyWaiting {
+		t.Fatalf("waiters = %q, %q; want started, already_waiting", slotA.Waiter, slotB.Waiter)
+	}
+	if strings.Contains(warnA, "DROPPED") {
+		t.Errorf("started warning claims dropped inputs: %s", warnA)
+	}
+	for _, want := range []string{"ALREADY waiting", "ITS spawn inputs govern", "push_and_open_pr", "--parallel-isolate", "fishhawk_drive_run call are DROPPED"} {
+		if !strings.Contains(warnB, want) {
+			t.Errorf("already_waiting warning missing %q: %s", want, warnB)
+		}
+	}
+	close(gate)
+	waitDone(t, done)
+	first.mu.Lock()
+	binaries := append([]string(nil), first.binaries...)
+	first.mu.Unlock()
+	if len(binaries) != 1 || binaries[0] != "/first/runner" {
+		t.Fatalf("first caller's spawns = %v, want exactly one with its own /first/runner", binaries)
+	}
+	if got := second.spawned(); len(got) != 0 {
+		t.Fatalf("second caller's spawns = %v, want none: its inputs are dropped", got)
+	}
+}
+
+// holdSlotWaiter registers a live waiter for stageID in the process-wide
+// registry, as slotWaiters.start does, with no poll goroutine. release exits
+// it through the production exit path; it is idempotent and also runs at
+// cleanup.
+func holdSlotWaiter(t *testing.T, stageID uuid.UUID) (release func()) {
+	t.Helper()
+	ch := make(chan struct{})
+	slotWaiters.mu.Lock()
+	if _, ok := slotWaiters.active[stageID]; ok {
+		slotWaiters.mu.Unlock()
+		t.Fatalf("stage %s already has a live waiter", stageID)
+	}
+	slotWaiters.active[stageID] = ch
+	slotWaiters.mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { slotWaiters.exit(stageID, ch) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// TestSlotWaiterRegistry_HeldSince (#3969): heldSince is true while a waiter
+// is live and, for a window opened before it exited, after it exits; a window
+// opened after the exit sees nothing.
+func TestSlotWaiterRegistry_HeldSince(t *testing.T) {
+	stageID := uuid.New()
+	before := slotWaiters.mark()
+	if slotWaiters.heldSince(stageID, before) {
+		t.Fatal("heldSince = true with no waiter ever registered")
+	}
+	release := holdSlotWaiter(t, stageID)
+	if !slotWaiters.heldSince(stageID, before) || !slotWaiters.heldSince(stageID, slotWaiters.mark()) {
+		t.Fatal("heldSince = false while the waiter is live")
+	}
+	release()
+	if !slotWaiters.heldSince(stageID, before) {
+		t.Fatal("heldSince = false for a window opened before the waiter exited")
+	}
+	if slotWaiters.heldSince(stageID, slotWaiters.mark()) {
+		t.Fatal("heldSince = true for a window opened after the waiter exited")
+	}
+	if liveWaiterOwnsSpawn(&HostDispatchResult{Transitioned: true}, stageID, before) {
+		t.Fatal("liveWaiterOwnsSpawn = true on transitioned:true: the verb's own admission spawns")
+	}
+	if !liveWaiterOwnsSpawn(&HostDispatchResult{Transitioned: false}, stageID, before) {
+		t.Fatal("liveWaiterOwnsSpawn = false on transitioned:false with a waiter held in the window")
 	}
 }
 
@@ -550,7 +786,7 @@ func TestSlotWaiter_SpawnFailureReleasesSlot(t *testing.T) {
 	for name, mutate := range map[string]func(*slotWaiterSpec, *slotSpawnRecorder){
 		"spawn error": func(_ *slotWaiterSpec, rec *slotSpawnRecorder) { rec.err = errors.New("boom") },
 		"prepare error": func(s *slotWaiterSpec, _ *slotSpawnRecorder) {
-			s.prepare = func() (slotSpawnInputs, error) { return slotSpawnInputs{}, errors.New("no runner") }
+			s.prepare = func(*HostDispatchResult) (slotSpawnInputs, error) { return slotSpawnInputs{}, errors.New("no runner") }
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -682,11 +918,13 @@ func (f *e2eSlotFixture) session() *apiClient {
 func (f *e2eSlotFixture) waiterSpec(st *runpkg.Stage, marker slotMarker, nonce string) slotWaiterSpec {
 	return slotWaiterSpec{
 		runID: st.RunID, stageID: st.ID, nonce: nonce, marker: marker,
-		prepare: func() (slotSpawnInputs, error) { return slotSpawnInputs{binary: "/fake/fishhawk-runner"}, nil },
-		spawn:   f.rec.spawn,
-		cap:     concurrencyWaiterCap,
-		poll:    concurrencySlotPollInterval,
-		logf:    func(string, ...any) {},
+		prepare: func(*HostDispatchResult) (slotSpawnInputs, error) {
+			return slotSpawnInputs{binary: "/fake/fishhawk-runner"}, nil
+		},
+		spawn: f.rec.spawn,
+		cap:   concurrencyWaiterCap,
+		poll:  concurrencySlotPollInterval,
+		logf:  func(string, ...any) {},
 	}
 }
 
@@ -897,6 +1135,70 @@ func TestConcurrencySlot_E2E_TwoFakeRunners(t *testing.T) {
 		defer slotWaiters.mu.Unlock()
 		return len(slotWaiters.active) == 0
 	})
+}
+
+// TestConcurrencySlot_E2E_RunStageQueuesThenSpawnsDetached is the
+// cross-boundary proof for #3969 on fishhawk_run_stage: the MCP verb, the
+// client wire, the real server.New marker handler, the Postgres concurrency
+// store and the stage rows. A is admitted through dispatch_stage; run_stage on
+// B is QUEUED and returns early with outcome awaiting_concurrency_slot, a
+// started waiter and an await_stage next step, spawning nothing (the blocking
+// runStageCommand fails the test if it is ever called). When A settles, B's
+// waiter is admitted and spawns B exactly once through the detached seam, and
+// B reads dispatched from the store.
+func TestConcurrencySlot_E2E_RunStageQueuesThenSpawnsDetached(t *testing.T) {
+	f := newE2ESlotFixture(t)
+	a, b := f.park(t, nil), f.park(t, nil)
+	if f.dispatch(t, a); !slotContains(f.rec.spawned(), a.ID.String()) {
+		t.Fatalf("A spawns = %v, want A admitted and spawned", f.rec.spawned())
+	}
+	var blocking atomic.Int32
+	savedCmd := runStageCommand
+	runStageCommand = func(name string, args ...string) *exec.Cmd {
+		blocking.Add(1)
+		t.Errorf("runStageCommand(%s) called: a queued fishhawk_run_stage must never spawn the blocking runner", name)
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	t.Cleanup(func() { runStageCommand = savedCmd })
+
+	_, out, err := f.r.runStage(f.ctx, nil, RunStageInput{
+		RunID: b.RunID.String(), StageID: b.ID.String(), Workflow: "feature_change", Stage: "implement",
+		WorkingDir: t.TempDir(), GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runStage(B): %v (a queued dispatch is not a failure)", err)
+	}
+	slot := out.ConcurrencySlot
+	if out.Outcome != "awaiting_concurrency_slot" || slot == nil || slot.Status != concurrencyStatusAwaitingSlot ||
+		slot.Waiter != slotWaiterStarted || len(slot.Holders) != 1 || slot.Holders[0].StageID != a.ID.String() {
+		t.Fatalf("B = outcome %q slot %+v, want queued behind A with a started waiter", out.Outcome, slot)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_await_stage" || out.NextStep.Params["stage_id"] != b.ID.String() {
+		t.Fatalf("B next_step = %+v, want fishhawk_await_stage on B", out.NextStep)
+	}
+	if f.spawnCount(b) != 0 {
+		t.Fatal("B spawned while queued")
+	}
+	if got := f.stageState(t, b); got != "awaiting_host_dispatch" {
+		t.Fatalf("B committed state = %s, want awaiting_host_dispatch while queued", got)
+	}
+
+	f.settle(t, a)
+	slotWaitFor(t, "B's detached spawn after A settled", func() bool { return f.spawnCount(b) > 0 })
+	slotWaitFor(t, "every waiter exited", func() bool {
+		slotWaiters.mu.Lock()
+		defer slotWaiters.mu.Unlock()
+		return len(slotWaiters.active) == 0
+	})
+	if n := f.spawnCount(b); n != 1 {
+		t.Fatalf("B spawns = %d, want exactly 1", n)
+	}
+	if got := f.stageState(t, b); got != "dispatched" {
+		t.Fatalf("B committed state = %s, want dispatched", got)
+	}
+	if n := blocking.Load(); n != 0 {
+		t.Fatalf("runStageCommand calls = %d, want 0", n)
+	}
 }
 
 // TestConcurrencySlot_E2E_PersistedLabelSharesOneGroup is the cross-boundary

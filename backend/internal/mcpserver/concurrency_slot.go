@@ -14,8 +14,10 @@ import (
 
 // The local concurrency-slot waiter (#3964 / ADR-087), the MCP half of the
 // host-dispatch queue. When the host-dispatch marker answers 409
-// concurrency_slot_queued, fishhawk_dispatch_stage spawns nothing and hands
-// the dispatch to ONE in-process waiter per stage. The waiter re-POSTs the
+// concurrency_slot_queued, every host-spawn verb (fishhawk_dispatch_stage,
+// fishhawk_run_stage, fishhawk_drive_run and fishhawk_run_children, #3969)
+// spawns nothing and hands the dispatch to ONE in-process waiter per stage,
+// through newQueuedSlotSpec and startQueuedSlotWaiter. The waiter re-POSTs the
 // marker every concurrencySlotPollInterval ±20% (each POST refreshes the queue
 // row's last_seen_at, which is what keeps the stage's place in the FIFO),
 // retries once at once after a contended answer, and spawns the runner only
@@ -89,8 +91,13 @@ type slotWaiterSpec struct {
 	contended bool
 	marker    slotMarker
 	// prepare rebuilds the spawn inputs AT ADMISSION (never at queue time),
-	// so a runner binary or token change while queued is picked up.
-	prepare func() (slotSpawnInputs, error)
+	// so a runner binary or token change while queued is picked up. admit is
+	// the 200 marker response that admitted the stage (#3969): the
+	// transitioned:true answer, or on the own-lost-admission arm the
+	// transitioned:false answer that followed the lost request. Both carry
+	// the server's base_branch, so a fan-out child spawns against the
+	// ADMITTING response's per-wave re-base (#2363), not its queue-time one.
+	prepare func(admit *HostDispatchResult) (slotSpawnInputs, error)
 	spawn   detachedSpawnFunc
 	report  detachedFailureReporter
 	probe   detachedStageStateProbe
@@ -100,16 +107,162 @@ type slotWaiterSpec struct {
 	jitter func(time.Duration) time.Duration
 	// logf writes the waiter's one-line diagnostics (stderr in production).
 	logf func(format string, args ...any)
+	// verb is the host-spawn verb that queued the stage, named as the
+	// recovery when the waiter stops without admission (startQueuedSlotWaiter
+	// sets it). Empty names every host-spawn verb.
+	verb string
 }
 
-// slotWaiterRegistry dedupes one waiter per stage per process.
+// recoveryVerb names the call that re-queues the stage after this waiter
+// stops without admission: the verb that queued it, or every host-spawn verb
+// when it is unknown. A fan-out child is re-queued by re-invoking
+// fishhawk_run_children, never by a bare fishhawk_dispatch_stage.
+func (spec slotWaiterSpec) recoveryVerb() string {
+	if spec.verb != "" {
+		return "re-invoke " + spec.verb
+	}
+	return "re-invoke the host-spawn verb that queued it (fishhawk_dispatch_stage, fishhawk_run_stage or fishhawk_drive_run; fishhawk_run_children for a fan-out child)"
+}
+
+// newQueuedSlotSpec is the waiter spec every host-spawn verb's queued arm
+// builds (#3969). It reads the package knobs (the waiter cap, the poll
+// interval) SYNCHRONOUSLY, in the dispatch call, so the waiter goroutine never
+// reads a package seam a test may swap; mints the waiter's admission nonce;
+// and carries the queued answer's contended flag so the first poll is the one
+// immediate retry. prepare runs at admission with the admitting response.
+func newQueuedSlotSpec(runID, stageID uuid.UUID, q *concurrencySlotQueuedError, marker slotMarker,
+	prepare func(admit *HostDispatchResult) (slotSpawnInputs, error), spawn detachedSpawnFunc,
+	report detachedFailureReporter, probe detachedStageStateProbe) slotWaiterSpec {
+	return slotWaiterSpec{
+		runID:     runID,
+		stageID:   stageID,
+		nonce:     newAdmissionNonce(),
+		contended: q.Contended,
+		marker:    marker,
+		prepare:   prepare,
+		spawn:     spawn,
+		report:    report,
+		probe:     probe,
+		cap:       concurrencyWaiterCap,
+		poll:      concurrencySlotPollInterval,
+		jitter:    randomJitteredPoll,
+		logf:      stderrLogf,
+	}
+}
+
+// startSlotWaiter is the slot-waiter start seam (#3964, shared by every
+// host-spawn verb since #3969). Production points at the process-wide
+// registry; a verb test stubs it so no waiter goroutine polls the fake
+// backend. Read synchronously inside the dispatch call.
+var startSlotWaiter = slotWaiters.start
+
+// startQueuedSlotWaiter starts spec's waiter through startSlotWaiter (or
+// finds the one already running for the stage) and returns the queued
+// answer's StageConcurrency projection with Waiter set, plus the queued
+// warning. verb is the host-spawn verb that queued the stage: the warning
+// names it as the call to re-invoke if this MCP process exits, and the waiter
+// names it if it stops at its cap.
+func startQueuedSlotWaiter(q *concurrencySlotQueuedError, spec slotWaiterSpec, verb string) (*StageConcurrency, string) {
+	spec.verb = verb
+	waiter, _ := startSlotWaiter(spec)
+	slot := q.stageConcurrency()
+	slot.Waiter = waiter
+	warning := fmt.Sprintf(
+		"stage queued for this host's local concurrency slot (group %q, limit %d, position %d): %s. NO runner was spawned: "+
+			"this session's slot waiter (%s) re-POSTs the host-dispatch marker every %s and spawns the runner DETACHED when the stage is admitted, "+
+			"for up to %s. The waiter lives in this MCP process — if the process exits (a shim hot-swap or /mcp) the queue row goes stale "+
+			"after 60s and the stage must be re-queued: re-invoke %s.",
+		q.Group, q.Limit, q.Position, q.holderSummary(), waiter, spec.poll, spec.cap, verb)
+	if waiter == slotWaiterAlreadyWaiting {
+		warning += " " + slotWaiterInputsDroppedNote(verb)
+	}
+	return slot, warning
+}
+
+// slotWaiterInputsDroppedNote is the already_waiting disclosure (#3969): one
+// registry serves every host-spawn verb, so the waiter already running for
+// the stage spawns it with the FIRST queuing call's prepare closure and spawn
+// path, and verb's inputs on this call are dropped.
+func slotWaiterInputsDroppedNote(verb string) string {
+	return "A slot waiter was ALREADY waiting for this stage in this MCP process, so ITS spawn inputs govern: the stage is spawned on admission " +
+		"with the first queuing call's prepare closure and spawn path (its push_and_open_pr, run_children's --parallel-isolate and admitting base branch), " +
+		"and the inputs of this " + verb + " call are DROPPED."
+}
+
+// liveWaiterHeldNote is the warning a verb returns when liveWaiterOwnsSpawn
+// refuses its spawn (#3969). It says the waiter MAY own the spawn, because the
+// guard keys on the waiter's hold, not its admission, and names the recovery
+// for a waiter that exited without admission.
+func liveWaiterHeldNote(verb string) string {
+	return "the host-dispatch marker answered transitioned:false while a slot waiter in this MCP process held the stage, so this " + verb + " call spawned NO runner. " +
+		"That waiter may own the spawn, but it may also have exited without admission (cap expiry, a terminal refusal, or another session dispatched the stage). " +
+		"If no runner appears, re-invoke " + verb + " after the waiter exits. If the waiter was admitted, ITS spawn inputs govern and the inputs of this " + verb + " call are DROPPED."
+}
+
+// slotWaiterRegistry dedupes one waiter per stage per process. It also
+// records each stage's last waiter exit against a monotonic exit sequence, so
+// heldSince can tell a verb whether a waiter was live at any point in a
+// window, including one that spawned and exited inside it (#3969).
 type slotWaiterRegistry struct {
 	mu     sync.Mutex
 	active map[uuid.UUID]chan struct{}
+	// seq counts waiter exits; exited maps a stage to the seq of its last
+	// waiter exit. One entry per stage ever queued in this process.
+	seq    uint64
+	exited map[uuid.UUID]uint64
 }
 
 // slotWaiters is the process-wide registry.
-var slotWaiters = &slotWaiterRegistry{active: map[uuid.UUID]chan struct{}{}}
+var slotWaiters = &slotWaiterRegistry{active: map[uuid.UUID]chan struct{}{}, exited: map[uuid.UUID]uint64{}}
+
+// mark opens a heldSince window: it returns the exit sequence now.
+func (reg *slotWaiterRegistry) mark() uint64 {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	return reg.seq
+}
+
+// heldSince reports whether a waiter for stageID is live now, or exited after
+// mark, so it was live at some point in the window mark opened.
+func (reg *slotWaiterRegistry) heldSince(stageID uuid.UUID, mark uint64) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if _, ok := reg.active[stageID]; ok {
+		return true
+	}
+	return reg.exited[stageID] > mark
+}
+
+// exit clears stageID's registry entry, records the exit and closes ch. Every
+// waiter exit runs it, so a later start succeeds.
+func (reg *slotWaiterRegistry) exit(stageID uuid.UUID, ch chan struct{}) {
+	reg.mu.Lock()
+	delete(reg.active, stageID)
+	reg.seq++
+	if reg.exited == nil {
+		reg.exited = map[uuid.UUID]uint64{}
+	}
+	reg.exited[stageID] = reg.seq
+	reg.mu.Unlock()
+	close(ch)
+}
+
+// liveWaiterOwnsSpawn is the double-spawn guard on a verb's marker site
+// (#3969): the marker answered 200 and did NOT transition the stage, and a
+// slot waiter in this process held the stage at some point since mark. The
+// guard keys on that hold, NOT on the waiter's admission: the waiter may own
+// the spawn (its admission dispatched the stage), but it may also have exited
+// without admission (cap expiry, a terminal refusal, or another session
+// dispatched the stage). Either way the verb must not spawn: a second runner
+// is worse than a refusal a re-invoke after the waiter exits clears
+// (liveWaiterHeldNote). A transitioned:false with no such waiter keeps each
+// verb's proceed behaviour (the dead-runner re-dispatch).
+func liveWaiterOwnsSpawn(res *HostDispatchResult, stageID uuid.UUID, mark uint64) bool {
+	if res != nil && res.Transitioned {
+		return false
+	}
+	return slotWaiters.heldSince(stageID, mark)
+}
 
 // start launches a waiter for spec.stageID, or reports already_waiting when
 // one is live in this process. done closes when the (new or existing) waiter
@@ -128,10 +281,7 @@ func (reg *slotWaiterRegistry) start(spec slotWaiterSpec) (status string, done <
 	go func() {
 		defer func() {
 			cancel()
-			reg.mu.Lock()
-			delete(reg.active, spec.stageID)
-			reg.mu.Unlock()
-			close(ch)
+			reg.exit(spec.stageID, ch)
 		}()
 		runSlotWaiter(ctx, spec)
 	}()
@@ -202,8 +352,8 @@ func runSlotWaiter(ctx context.Context, spec slotWaiterSpec) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			spec.logf("fishhawk: concurrency slot waiter for run %s stage %s stopped after its %s cap without admission; the stage stays awaiting_host_dispatch — re-dispatch it with fishhawk_dispatch_stage\n",
-				spec.runID, spec.stageID, spec.cap)
+			spec.logf("fishhawk: concurrency slot waiter for run %s stage %s stopped after its %s cap without admission; the stage stays awaiting_host_dispatch — %s\n",
+				spec.runID, spec.stageID, spec.cap, spec.recoveryVerb())
 			return
 		case <-timer.C:
 		}
@@ -227,11 +377,13 @@ func runSlotWaiter(ctx context.Context, spec slotWaiterSpec) {
 			}
 			continue
 		case slotAdmitted:
-			spawnOrRelease(reqCtx, spec)
+			spawnOrRelease(reqCtx, spec, res)
 			return
 		case slotOtherAdmission:
 			if lost && ownLostAdmission(reqCtx, spec) {
-				spawnOrRelease(reqCtx, spec)
+				// res is the transitioned:false answer that followed the lost
+				// request: the server's idempotent arm carries base_branch too.
+				spawnOrRelease(reqCtx, spec, res)
 				return
 			}
 			spec.logf("fishhawk: concurrency slot waiter for run %s stage %s: the stage was already dispatched by another session; not spawning\n",
@@ -276,12 +428,13 @@ func ownLostAdmission(ctx context.Context, spec slotWaiterSpec) bool {
 		c.AdmissionNonce == spec.nonce
 }
 
-// spawnOrRelease rebuilds the spawn inputs and spawns the runner for an
-// admitted stage. On a prepare or spawn failure it releases the slot through
-// the existing reap-failure path (expected_state dispatched, category C), so
-// the stage leaves dispatched and the next queued stage is admitted at once.
-func spawnOrRelease(ctx context.Context, spec slotWaiterSpec) {
-	in, err := spec.prepare()
+// spawnOrRelease rebuilds the spawn inputs from admit, the marker response
+// that admitted the stage, and spawns the runner for it. On a prepare or spawn
+// failure it releases the slot through the existing reap-failure path
+// (expected_state dispatched, category C), so the stage leaves dispatched and
+// the next queued stage is admitted at once.
+func spawnOrRelease(ctx context.Context, spec slotWaiterSpec, admit *HostDispatchResult) {
+	in, err := spec.prepare(admit)
 	if err == nil {
 		_, err = spec.spawn(in.binary, in.argv, in.env, spec.runID.String(), spec.stageID.String(), spec.report, spec.probe)
 	}

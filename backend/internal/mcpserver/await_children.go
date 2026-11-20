@@ -32,6 +32,8 @@ type AwaitChildrenInput struct {
 //   - "children_dispatchable" — some child's implement stage is awaiting a host
 //     dispatch AND its dependency slices are provably merged onto the parent's
 //     consolidated branch, so fishhawk_run_children will actually spawn it.
+//     A child queued for a concurrency slot with a live waiter is not
+//     announced: the waiter spawns it on admission (#3969).
 //   - "integration_failed"    — the parent's newest fan-in FAILURE
 //     (slice_head_missing, slice_integration_conflict or
 //     slice_integration_failed) is newer than its newest clean integration
@@ -181,6 +183,12 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               succeeded BEFORE the between-wave integration runs,
                               so a state-keyed release would announce a dispatch
                               the server then refuses 409 wave_not_integrated.
+                              A child QUEUED for a local concurrency slot
+                              (concurrency awaiting_concurrency_slot) with a
+                              live waiter is NOT announced: the slot waiter
+                              fishhawk_run_children started spawns it on
+                              admission. One whose waiter died (waiter_live
+                              false) is announced, so re-invoking re-queues it.
                               next_step re-invokes fishhawk_run_children.
   - "integration_failed"    — the parent's newest fan-in FAILURE
                               (slice_head_missing, slice_integration_conflict
@@ -1099,6 +1107,12 @@ func (r *runResolver) awaitChildrenCampaignAmendmentRelease(ctx context.Context,
 // ChildStatus.Blocked would be wrong in a way invisible to this package's own
 // tests: Blocked keys on predecessor run STATE, which flips to succeeded BEFORE
 // the integration runs.
+//
+// A child QUEUED for a local concurrency slot with a LIVE waiter (#3969) is
+// excluded too: its stage reads awaiting_host_dispatch, but a host-spawn
+// verb's slot waiter will spawn it on admission, so announcing it would only
+// spin the run_children/await_children loop. A queued child whose waiter died
+// (waiter_live false) is announced again, so a re-invoke re-queues it.
 func awaitChildrenDispatchable(cs *ChildrenStatus) []string {
 	sliceRunID := make(map[int]string, len(cs.Children))
 	for _, c := range cs.Children {
@@ -1117,11 +1131,23 @@ func awaitChildrenDispatchable(cs *ChildrenStatus) []string {
 		if !implementStageDispatchable(c.ImplementStageState) {
 			continue
 		}
+		if childQueuedWithLiveWaiter(cs.implementStages[c.RunID].Concurrency) {
+			continue
+		}
 		if covered, _ := wavecoverage.Covered(c.DependsOn, sliceRunID, cs.IntegratedChildRunIDs); covered {
 			out = append(out, c.RunID)
 		}
 	}
 	return out
+}
+
+// childQueuedWithLiveWaiter reports whether a child's implement stage is
+// QUEUED for a local concurrency slot (#3964 / ADR-087) with a slot waiter
+// that refreshed its queue row within the queue TTL (#3969). Such a child is
+// in flight, not dispatchable: its waiter spawns it on admission. A stale or
+// absent waiter_live reads false, so a child nobody will spawn is dispatchable.
+func childQueuedWithLiveWaiter(c *StageConcurrency) bool {
+	return c != nil && c.Status == concurrencyStatusAwaitingSlot && c.waiterLive()
 }
 
 // awaitChildrenNonSucceeded returns the run ids of every child not in run state

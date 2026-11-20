@@ -199,7 +199,7 @@ type StageWaitStatus struct {
 	// so this block is where the queue position, the holders and whether a
 	// live waiter will spawn it are visible. Nil when the stage has no active
 	// slot row, is terminal, or the backend predates the block.
-	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot state while non-terminal (#3964): status awaiting_concurrency_slot means the stage is QUEUED behind the holders for a slot (status above reads pending; the raw state stays awaiting_host_dispatch) and spawns only once admitted — waiter_live false means no waiter will spawn it, so re-dispatch with fishhawk_dispatch_stage; status holding means it holds a slot. Absent when the stage holds no slot row"`
+	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot state while non-terminal (#3964): status awaiting_concurrency_slot means the stage is QUEUED behind the holders for a slot (status above reads pending; the raw state stays awaiting_host_dispatch) and spawns only once admitted — waiter_live false means no waiter will spawn it. The waiter may have come from any host-spawn verb (#3969); re-invoke the one that queued it: fishhawk_run_children for a fan-out child, otherwise re-dispatch with fishhawk_dispatch_stage (or re-invoke fishhawk_run_stage or fishhawk_drive_run); status holding means it holds a slot. Absent when the stage holds no slot row"`
 }
 
 // FixupRecovery is the additive #3081 marker carried on StageWaitStatus when a

@@ -87,12 +87,18 @@ func ValidateHostCapacityEnv(lookupEnv func(string) (string, bool)) error {
 	return err
 }
 
+// resolveProcessHostCapacity is the production host-capacity read:
+// resolveHostCapacity over this process's real environment. It is a named
+// function, not an inline closure, so TestResolveProcessHostCapacity runs the
+// production read itself (the test binary's init pins processHostCapacity).
+func resolveProcessHostCapacity() (hostCapacityResolution, error) {
+	return resolveHostCapacity(os.LookupEnv)
+}
+
 // processHostCapacity is this process's host capacity, resolved lazily and
 // once, on first use (the first host-dispatch marker or fishhawk_doctor call),
 // like processHostLabel. Config.internal and RunHostDispatcher wire it.
-var processHostCapacity = sync.OnceValues(func() (hostCapacityResolution, error) {
-	return resolveHostCapacity(os.LookupEnv)
-})
+var processHostCapacity = sync.OnceValues(resolveProcessHostCapacity)
 
 // capacityGroupKeyFor is the host capacity group key for label:
 // concurrency.CapacityGroupKey, mirrored. An empty label is the server's
