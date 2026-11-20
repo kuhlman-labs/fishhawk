@@ -1,0 +1,13 @@
+id: scenario:issue-3969/run-children-description-names-queue
+statement: In the stdio MCP tools/list result, the fishhawk_run_children description states that a child whose dispatch is queued is marked queued, that this session's waiter spawns it on admission from the admitting response's base_branch, and that a queued child consumes the per-invocation budget. Its output schema exposes queued, concurrency_slot and queued_count.
+steps: Built fishhawk-mcp from the sanctioned checkout (cce58f08) and ran it on stdio (env -i, FISHHAWK_BACKEND_URL=http://localhost:8090, an fhm_ bearer minted from trace-upload-target) with initialize, notifications/initialized and tools/list. Cross-checked with POST /mcp tools/list on the preview. Read fishhawk_run_children's description and outputSchema.
+assertions:
+    expected: The text states the queued marking, the waiter spawn from the admitting base_branch and the budget rule, and the schema exposes queued, concurrency_slot and queued_count.
+    observed_at_record: The description says a queued child 'is reported queued:true with its concurrency_slot block'. It says this session's slot waiter spawns the child DETACHED exactly once on admission, 'against the ADMITTING response's base_branch'. On the budget, it says 'a child this call queues spends one unit exactly like a spawned one' and a queued child with a live waiter counts as in flight. The outputSchema contains queued, concurrency_slot and queued_count.
+    repro_handle: printf initialize/initialized/tools/list | FISHHAWK_BACKEND_URL=http://localhost:8090 FISHHAWK_API_TOKEN=<fhm_> fishhawk-mcp
+origin:
+    issue: 3969
+    pr: 5483
+    run_id: 765500b0-33c7-4f06-b24a-0c1073b1f37a
+    head_sha: cce58f0847845e4721427a6ed5b6368d1204a107
+    recorded_at: 2026-11-20T19:05:17Z
