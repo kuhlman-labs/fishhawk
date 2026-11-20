@@ -9352,6 +9352,11 @@ WHERE c.conname = 'stage_concurrency_slots_pkey' AND c.contype = 'p'`).Scan(&col
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp through 0118: %v", err)
 	}
+	// Pin the schema at exactly 0118: revert everything from the tip down
+	// through 0119 (downThrough asserts it lands on 118; a no-op while 0118 is
+	// the tip). The bare MigrateDown below then always reverts 0118, so the
+	// cleanVersion check holds once a later migration lands.
+	downThrough(t, url, "0119")
 	if got := pkColumns(); got != "stage_id,group_key" {
 		t.Fatalf("primary key after 0118 = %q, want stage_id,group_key", got)
 	}
@@ -9419,7 +9424,7 @@ VALUES ($1, $2, 'spec:o/r:a', 1, 'held', now(), now()), ($1, $2, 'spec:o/r:b', 1
 	}
 	if cleanVersion != 118 || cleanDirty || dirtyVersion != 117 || !dirty {
 		t.Fatalf("schema_migrations before/after the refused rollback = %d dirty=%v / %d dirty=%v, want 118 clean / 117 dirty; "+
-			"if this moved, update the force-118 recovery in the 0118.down header and HINT, the 0118.up header, "+
+			"if this moved, update the force-118 recovery in the 0118.down header and DETAIL, the 0118.up header, "+
 			"backend/internal/concurrency/README.md § \"Migration 0118\" and deploy/helm/fishhawk/README.md",
 			cleanVersion, cleanDirty, dirtyVersion, dirty)
 	}
