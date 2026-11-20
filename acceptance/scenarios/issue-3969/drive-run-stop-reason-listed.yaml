@@ -2,13 +2,14 @@ id: scenario:issue-3969/drive-run-stop-reason-listed
 statement: The fishhawk_drive_run tool's output schema lists awaiting_concurrency_slot among the stopped_reason values, and its description names it as the stop for a queued dispatch.
 verify_hint: 'MCP tool result: tools/list on the preview''s /mcp route returns fishhawk_drive_run with outputSchema.properties.stopped_reason.description containing awaiting_concurrency_slot. Decided by TestDriveRun_QueuedDispatchStopsAwaitingSlot''s schema assertion.'
 steps: Minted an fhm_ bearer from a trace-upload-target fixture (fixtures, signing-key, dev/sign over '{}', mcp-token). POST /mcp tools/list, then the same on stdio fishhawk-mcp built from the sanctioned checkout. Read fishhawk_drive_run's outputSchema.properties.stopped_reason.description and its description.
+steps_carried_from: head cce58f0847845e4721427a6ed5b6368d1204a107 recorded_at 2026-11-20T19:05:17Z
 assertions:
-    expected: awaiting_concurrency_slot is in stopped_reason and named in the description.
-    observed_at_record: stopped_reason lists '... host_dispatch_failed | awaiting_concurrency_slot | ...'. The description says a dispatch the marker QUEUES (409 concurrency_slot_queued) for a plan, implement or acceptance stage is not a failure, and the drive stops awaiting_concurrency_slot.
-    repro_handle: POST http://localhost:8090/mcp tools/list; read tools[name=fishhawk_drive_run].outputSchema.properties.stopped_reason
+    expected: awaiting_concurrency_slot appears in stopped_reason and is named in the description as the queued stop.
+    observed_at_record: 'stopped_reason lists awaiting_concurrency_slot. The description says a queued dispatch ''is not a failure, for a plan, implement or acceptance stage alike: the drive spawns nothing, hands the stage to this session''s slot waiter, and stops awaiting_concurrency_slot''.'
+    repro_handle: POST http://localhost:8090/mcp tools/list
 origin:
     issue: 3969
     pr: 5483
     run_id: 765500b0-33c7-4f06-b24a-0c1073b1f37a
-    head_sha: cce58f0847845e4721427a6ed5b6368d1204a107
-    recorded_at: 2026-11-20T19:05:17Z
+    head_sha: 36e122cf3806f0fce61b7e552286541d027ff564
+    recorded_at: 2026-11-20T20:22:22Z
