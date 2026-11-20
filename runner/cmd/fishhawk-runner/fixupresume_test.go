@@ -115,30 +115,83 @@ func resumeEvents(t *testing.T, lines []bundle.Line) []map[string]string {
 	return out
 }
 
+// withFixupResumeOptIn drives the opt-in env value and the runner-channel kind
+// through the package seams for the test's duration. The getenv returns value
+// for fixupResumeEnvVar and falls through to os.Getenv for every other key, so
+// a host's own FISHHAWK_FIXUP_RESUME never leaks in. Package-global seam: the
+// callers must not use t.Parallel.
+func withFixupResumeOptIn(t *testing.T, value, kind string) {
+	t.Helper()
+	origGetenv, origKind := fixupResumeGetenv, fixupResumeRunnerKind
+	t.Cleanup(func() { fixupResumeGetenv, fixupResumeRunnerKind = origGetenv, origKind })
+	fixupResumeGetenv = func(k string) string {
+		if k == fixupResumeEnvVar {
+			return value
+		}
+		return os.Getenv(k)
+	}
+	fixupResumeRunnerKind = func() string { return kind }
+}
+
+// withFixupResumeAvailable opens the ADR-119 availability gate seam for the
+// test's duration (production ships it closed).
+func withFixupResumeAvailable(t *testing.T) {
+	t.Helper()
+	orig := fixupResumeAvailable
+	t.Cleanup(func() { fixupResumeAvailable = orig })
+	fixupResumeAvailable = true
+}
+
+// enableFixupResume opts in on the local channel with the gate open: every
+// seam a resume needs, none of them the process env.
+func enableFixupResume(t *testing.T) {
+	t.Helper()
+	withFixupResumeOptIn(t, fixupResumeOptIn, runnerKindLocal)
+	withFixupResumeAvailable(t)
+}
+
 // B1. One row per reason; every fallback row differs from the resumed
 // baseline in EXACTLY ONE input, so deleting that row's guard flips the row
 // to "resumed".
 func TestDecideFixupResume(t *testing.T) {
-	base := fixupResumeInputs{agent: "claude-code", agentBinary: "/opt/claude", requestedModel: "m1", workingDir: "/wt/run-1"}
+	base := fixupResumeInputs{agent: "claude-code", agentBinary: "/opt/claude", requestedModel: "m1", workingDir: "/wt/run-1",
+		runnerKind: runnerKindLocal, available: true}
 	rec := agentSessionRecord{SessionID: "S1", Agent: "claude-code", AgentBinary: "/opt/claude", RequestedModel: "m1", WorkingDir: "/wt/run-1"}
-	on := func(string) string { return "" }
-
-	cases := []struct {
-		name    string
-		in      fixupResumeInputs
-		rec     *agentSessionRecord
-		readErr error
-		getenv  func(string) string
-		want    string
-	}{
-		{name: "resumed baseline", in: base, rec: &rec, getenv: on, want: fixupResumeReasonResumed},
-		{name: "kill switch off", in: base, rec: &rec, getenv: func(k string) string {
+	optIn := func(v string) func(string) string {
+		return func(k string) string {
 			if k == fixupResumeEnvVar {
-				return " off "
+				return v
 			}
 			return ""
-		}, want: fixupResumeReasonDisabled},
-		{name: "kill switch other value ignored", in: base, rec: &rec, getenv: func(string) string { return "0" }, want: fixupResumeReasonResumed},
+		}
+	}
+	on := optIn("on")
+
+	cases := []struct {
+		name       string
+		in         fixupResumeInputs
+		rec        *agentSessionRecord
+		readErr    error
+		getenv     func(string) string
+		want       string
+		wantDetail string
+	}{
+		{name: "resumed baseline", in: base, rec: &rec, getenv: on, want: fixupResumeReasonResumed},
+		{name: "opt-in unset", in: base, rec: &rec, getenv: func(string) string { return "" }, want: fixupResumeReasonDisabled},
+		{name: "opt-in off", in: base, rec: &rec, getenv: optIn("off"), want: fixupResumeReasonDisabled},
+		{name: "opt-in off padded", in: base, rec: &rec, getenv: optIn(" off "), want: fixupResumeReasonDisabled},
+		{name: "opt-in 1", in: base, rec: &rec, getenv: optIn("1"), want: fixupResumeReasonDisabled},
+		{name: "opt-in true", in: base, rec: &rec, getenv: optIn("true"), want: fixupResumeReasonDisabled},
+		{name: "opt-in upper-case ON", in: base, rec: &rec, getenv: optIn("ON"), want: fixupResumeReasonDisabled},
+		{name: "opt-in on padded resumes", in: base, rec: &rec, getenv: optIn(" on "), want: fixupResumeReasonResumed},
+		{name: "github_actions channel", in: withKind(base, runnerKindGitHubActions), rec: &rec, getenv: on,
+			want: fixupResumeReasonUnsupportedChannel, wantDetail: "runner kind github_actions"},
+		{name: "gitlab_ci channel", in: withKind(base, runnerKindGitLabCI), rec: &rec, getenv: on,
+			want: fixupResumeReasonUnsupportedChannel, wantDetail: "runner kind gitlab_ci"},
+		{name: "empty channel fails closed", in: withKind(base, ""), rec: &rec, getenv: on,
+			want: fixupResumeReasonUnsupportedChannel, wantDetail: "runner kind "},
+		{name: "availability gate off", in: withAvailable(base, false), rec: &rec, getenv: on,
+			want: fixupResumeReasonDisabled, wantDetail: fixupResumeUnavailableDetail},
 		{name: "unsupported agent", in: withAgent(base, "codex"), rec: recWithAgent(rec, "codex"), getenv: on, want: fixupResumeReasonUnsupportedAgent},
 		{name: "ledger unreadable", in: base, rec: &rec, readErr: errors.New("corrupt"), getenv: on, want: fixupResumeReasonLedgerUnreadable},
 		{name: "no session recorded", in: base, rec: nil, getenv: on, want: fixupResumeReasonNoSessionRecorded},
@@ -154,6 +207,9 @@ func TestDecideFixupResume(t *testing.T) {
 			if got.reason != tc.want {
 				t.Fatalf("reason = %q, want %q", got.reason, tc.want)
 			}
+			if got.detail != tc.wantDetail {
+				t.Errorf("detail = %q, want %q", got.detail, tc.wantDetail)
+			}
 			wantResume := tc.want == fixupResumeReasonResumed
 			if got.resume != wantResume {
 				t.Errorf("resume = %v, want %v", got.resume, wantResume)
@@ -168,6 +224,42 @@ func TestDecideFixupResume(t *testing.T) {
 	}
 }
 
+// TestFixupResumeRunnerKind_DefaultReadsEnv leaves the fixupResumeRunnerKind
+// seam at its PRODUCTION default and drives the process env, so the default
+// really is detectRunnerKind(os.Getenv): the channel the signed manifest
+// stamps. The channel vars are scrubbed first so the host (CI exports
+// GITHUB_ACTIONS=true) cannot perturb the unset arm.
+func TestFixupResumeRunnerKind_DefaultReadsEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{name: "github_actions", env: map[string]string{"GITHUB_ACTIONS": "true"}, want: runnerKindGitHubActions},
+		{name: "gitlab_ci", env: map[string]string{"GITLAB_CI": "true"}, want: runnerKindGitLabCI},
+		{name: "local", env: map[string]string{}, want: runnerKindLocal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GITHUB_ACTIONS", "")
+			t.Setenv("GITHUB_RUN_ID", "")
+			t.Setenv("GITLAB_CI", "")
+			t.Setenv("CI_PIPELINE_ID", "")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if got := fixupResumeRunnerKind(); got != tc.want {
+				t.Errorf("fixupResumeRunnerKind() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func withKind(in fixupResumeInputs, k string) fixupResumeInputs { in.runnerKind = k; return in }
+func withAvailable(in fixupResumeInputs, a bool) fixupResumeInputs {
+	in.available = a
+	return in
+}
 func withAgent(in fixupResumeInputs, a string) fixupResumeInputs { in.agent = a; return in }
 func recWithAgent(r agentSessionRecord, a string) *agentSessionRecord {
 	r.Agent = a
@@ -453,6 +545,28 @@ func TestInvokePrimaryAgent_Branches(t *testing.T) {
 		t.Errorf("fallback decision: resume=%q events=%v", fake.gotInv.ResumeSessionID, evs)
 	}
 
+	// A fallback decision carrying a detail emits it in the event payload and the
+	// log line; one without a detail emits no "detail" key.
+	fake = &fakeInvoker{canned: agent.Result{OK: true}}
+	var detailLog bytes.Buffer
+	res, _ = invokePrimaryAgent(context.Background(), fake, inv,
+		&fixupResumeDecision{reason: fixupResumeReasonDisabled, detail: fixupResumeUnavailableDetail}, cfg, &detailLog)
+	evs = resumeKindPayloads(t, res.Events, fixupSessionResumeEvent)
+	if len(evs) != 1 || evs[0]["reason"] != "disabled" || evs[0]["detail"] != fixupResumeUnavailableDetail {
+		t.Errorf("fallback decision with detail: events=%v, want detail %q", evs, fixupResumeUnavailableDetail)
+	}
+	if !strings.Contains(detailLog.String(), `"detail":"`+fixupResumeUnavailableDetail+`"`) {
+		t.Errorf("fallback decision with detail: log line missing the detail:\n%s", detailLog.String())
+	}
+	fake = &fakeInvoker{canned: agent.Result{OK: true}}
+	res, _ = invokePrimaryAgent(context.Background(), fake, inv, &fixupResumeDecision{reason: fixupResumeReasonDisabled}, cfg, io.Discard)
+	evs = resumeKindPayloads(t, res.Events, fixupSessionResumeEvent)
+	if len(evs) != 1 {
+		t.Errorf("fallback without detail: events=%v", evs)
+	} else if _, has := evs[0]["detail"]; has {
+		t.Errorf("fallback without detail carried a detail key: %v", evs[0])
+	}
+
 	fake = &fakeInvoker{canned: agent.Result{OK: false, FailureCategory: "A"}, returnErr: agent.ErrAgentQuotaUnavailable}
 	res, err := invokePrimaryAgent(context.Background(), fake, inv, &fixupResumeDecision{resume: true, sessionID: "S1", reason: "resumed"}, cfg, io.Discard)
 	evs = resumeKindPayloads(t, res.Events, fixupSessionResumeEvent)
@@ -481,6 +595,7 @@ func TestPrimaryResumeDecision_FirstAttemptOnly(t *testing.T) {
 // resumes it with the fetched fix-up prompt as the turn.
 func TestRun_FixupResume_ResumesRecordedSession(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	enableFixupResume(t)
 	const runID = "40890b05-0000-4000-8000-000000000001"
 	wt, ledger := cwdLineage(t, runID)
 
@@ -530,6 +645,7 @@ func TestRun_FixupResume_ResumesRecordedSession(t *testing.T) {
 // B6. A fix-up with no recorded session spawns fresh, traced in bundle + log.
 func TestRun_FixupResume_NoLedger_FallsBackTraced(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	enableFixupResume(t)
 	const runID = "40890b06-0000-4000-8000-000000000001"
 	cwdLineage(t, runID)
 	fake := &fakeInvoker{canned: agent.Result{OK: true}}
@@ -559,6 +675,7 @@ func TestRun_FixupResume_NoLedger_FallsBackTraced(t *testing.T) {
 // B7. An ADR-023 self-retry after a failed resumed attempt spawns fresh.
 func TestRun_FixupResume_SelfRetrySpawnsFresh(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	enableFixupResume(t)
 	const runID = "40890b07-0000-4000-8000-000000000001"
 	wt, ledger := cwdLineage(t, runID)
 	seedLedger(t, ledger, runID, wt, "S1")
@@ -594,11 +711,101 @@ func TestRun_FixupResume_SelfRetrySpawnsFresh(t *testing.T) {
 	}
 }
 
+// runFixupFallbackScenario seeds a matching ledger for runID, runs a fix-up
+// pass and returns the fake invoker, the uploader and the stderr log. Every
+// seam is the caller's: it must already have called withFixupResumeOptIn etc.
+func runFixupFallbackScenario(t *testing.T, runID string) (*fakeInvoker, *fakeUploader, string) {
+	t.Helper()
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	wt, ledger := cwdLineage(t, runID)
+	seedLedger(t, ledger, runID, wt, "S1")
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupRespFor("FIXUP")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	var stderr strings.Builder
+	if got := run(fixupResumeArgs(runID), &stderr); got != exitOK {
+		t.Fatalf("run = %d:\n%s", got, stderr.String())
+	}
+	return fake, fu, stderr.String()
+}
+
+// B6a. The shipped default is OFF: with a matching ledger, the local channel
+// and the gate open, an unset opt-in still spawns fresh, reason disabled.
+func TestRun_FixupResume_DefaultOffFallsBackDisabled(t *testing.T) {
+	withFixupResumeOptIn(t, "", runnerKindLocal)
+	withFixupResumeAvailable(t)
+	fake, fu, stderr := runFixupFallbackScenario(t, "40890b0a-0000-4000-8000-000000000001")
+	if fake.gotInv.ResumeSessionID != "" {
+		t.Errorf("ResumeSessionID = %q, want empty (resume is opt-in)", fake.gotInv.ResumeSessionID)
+	}
+	_, lines := shippedRaw(t, fu)
+	evs := resumeEvents(t, lines)
+	if len(evs) != 1 || evs[0]["outcome"] != "fallback" || evs[0]["reason"] != "disabled" {
+		t.Fatalf("bundle fixup_session_resume = %v, want one fallback/disabled", evs)
+	}
+	if _, has := evs[0]["detail"]; has {
+		t.Errorf("an unset opt-in carried a detail: %v", evs[0])
+	}
+	if !strings.Contains(stderr, `"event":"fixup_session_resume"`) || !strings.Contains(stderr, `"reason":"disabled"`) {
+		t.Errorf("missing disabled log line:\n%s", stderr)
+	}
+}
+
+// B6b. A non-local channel refuses the resume even with the opt-in on and the
+// gate open (ADR-119 D2).
+func TestRun_FixupResume_NonLocalChannelFallsBack(t *testing.T) {
+	for i, kind := range []string{runnerKindGitHubActions, runnerKindGitLabCI} {
+		t.Run(kind, func(t *testing.T) {
+			withFixupResumeOptIn(t, fixupResumeOptIn, kind)
+			withFixupResumeAvailable(t)
+			fake, fu, stderr := runFixupFallbackScenario(t, fmt.Sprintf("40890b0b-0000-4000-8000-00000000000%d", i+1))
+			if fake.gotInv.ResumeSessionID != "" {
+				t.Errorf("ResumeSessionID = %q, want empty on the %s channel", fake.gotInv.ResumeSessionID, kind)
+			}
+			_, lines := shippedRaw(t, fu)
+			evs := resumeEvents(t, lines)
+			if len(evs) != 1 || evs[0]["outcome"] != "fallback" || evs[0]["reason"] != "unsupported_channel" {
+				t.Fatalf("bundle fixup_session_resume = %v, want one fallback/unsupported_channel", evs)
+			}
+			if !strings.Contains(stderr, `"reason":"unsupported_channel"`) {
+				t.Errorf("missing unsupported_channel log line:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// B6c. The opt-in alone is inert while the availability gate ships closed: it
+// leaves fixupResumeAvailable at its production value, so the fallback carries
+// the gate's detail in the bundle event and the log line.
+func TestRun_FixupResume_OptInHeldBehindAvailabilityGate(t *testing.T) {
+	withFixupResumeOptIn(t, fixupResumeOptIn, runnerKindLocal)
+	const wantDetail = "resume unavailable until ADR-119 D3 and D5"
+	fake, fu, stderr := runFixupFallbackScenario(t, "40890b0c-0000-4000-8000-000000000001")
+	if fake.gotInv.ResumeSessionID != "" {
+		t.Errorf("ResumeSessionID = %q, want empty while the gate is closed", fake.gotInv.ResumeSessionID)
+	}
+	_, lines := shippedRaw(t, fu)
+	evs := resumeEvents(t, lines)
+	if len(evs) != 1 || evs[0]["outcome"] != "fallback" || evs[0]["reason"] != "disabled" {
+		t.Fatalf("bundle fixup_session_resume = %v, want one fallback/disabled", evs)
+	}
+	if evs[0]["detail"] != wantDetail {
+		t.Errorf("bundle detail = %q, want %q", evs[0]["detail"], wantDetail)
+	}
+	if !strings.Contains(stderr, `"reason":"disabled"`) || !strings.Contains(stderr, `"detail":"`+wantDetail+`"`) {
+		t.Errorf("log line missing the gate detail:\n%s", stderr)
+	}
+}
+
 // B8. The verify-fix re-invoke copies the shared inv, so it stays fresh while
 // the primary resumed.
 func TestRun_FixupResume_VerifyFixReinvokeStaysFresh(t *testing.T) {
 	repo := verifyFixBaseRepo(t)
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	enableFixupResume(t)
 	ctx := context.Background()
 	wtDir, err := worktreesDir(ctx, repo)
 	if err != nil {
@@ -876,6 +1083,7 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 		t.Skip("git not available")
 	}
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	enableFixupResume(t)
 
 	// Arm R: resume.
 	armR := runFixupHarnessArm(t, "4089b10a-0000-4000-8000-000000000001", nil)
@@ -899,17 +1107,9 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 		t.Errorf("arm R fixup_session_resume = %v, want one resumed", armR.resumeEvents)
 	}
 
-	// Arm F: the identical scenario with the kill switch off.
-	orig := fixupResumeGetenv
-	t.Cleanup(func() { fixupResumeGetenv = orig })
-	fixupResumeGetenv = func(k string) string {
-		if k == fixupResumeEnvVar {
-			return "off"
-		}
-		return os.Getenv(k)
-	}
+	// Arm F: the identical scenario with the opt-in dropped.
+	withFixupResumeOptIn(t, "", runnerKindLocal)
 	armF := runFixupHarnessArm(t, "4089b10b-0000-4000-8000-000000000001", nil)
-	fixupResumeGetenv = orig
 	if fixF := armF.calls[len(armF.calls)-1]; fixF.resume != "" || fixF.prompt != harnessFixupPrompt {
 		t.Errorf("arm F fix-up spawn = %+v, want fresh with the fix-up prompt", fixF)
 	}
@@ -929,7 +1129,8 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 	t.Logf("harness token model: resumed fix-up = %d (cache_read %d), fresh fix-up = %d (%.1fx)",
 		resumedUsage, armR.manifest.CacheReadInputTokens, freshUsage, float64(freshUsage)/float64(resumedUsage))
 
-	// Arm X: the stored session expired between passes.
+	// Arm X: the stored session expired between passes. Re-enable the opt-in.
+	enableFixupResume(t)
 	armX := runFixupHarnessArm(t, "4089b10c-0000-4000-8000-000000000001", func(store, sid string) {
 		_ = os.Remove(filepath.Join(store, sid+".len"))
 		_ = os.Remove(filepath.Join(store, sid+".jsonl"))
