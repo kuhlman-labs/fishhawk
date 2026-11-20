@@ -4,12 +4,12 @@ verify_hint: 'MCP tool result: a JSON-RPC tools/list against the preview''s /mcp
 steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. POST http://localhost:8090/mcp tools/list (Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list, params._meta io.modelcontextprotocol/protocolVersion, clientCapabilities and clientInfo). Also ran fishhawk-mcp built from the sanctioned checkout on stdio with the same bearer. Read fishhawk_run_stage's description and outputSchema.
 steps_carried_from: head cce58f0847845e4721427a6ed5b6368d1204a107 recorded_at 2026-11-20T19:05:17Z
 assertions:
-    expected: The description names the early return, the outcome, the await_stage next_step and the detached waiter spawn.
-    observed_at_record: 'The description says a queued dispatch ''returns EARLY, holding nothing and spawning nothing: outcome awaiting_concurrency_slot (NON-terminal), concurrency_slot ... and next_step fishhawk_await_stage. This session''s slot waiter re-polls the marker and spawns the runner DETACHED on admission''. The outputSchema outcome enum includes awaiting_concurrency_slot, and the schema has concurrency_slot and next_step properties. HTTP and stdio agree.'
-    repro_handle: POST http://localhost:8090/mcp tools/list
+    expected: The description says a queued dispatch returns early with outcome awaiting_concurrency_slot and a fishhawk_await_stage next_step, and that this session's waiter spawns the runner detached on admission.
+    observed_at_record: 'The description reads: ''Queued dispatch (#3969 / ADR-094): when this host''s local concurrency slot is full ... This call then returns EARLY, holding nothing and spawning nothing: outcome awaiting_concurrency_slot (NON-terminal), concurrency_slot (position, holders, waiter) and next_step fishhawk_await_stage. This session''s slot waiter re-polls the marker and spawns the runner DETACHED on admission''. The outputSchema outcome description lists awaiting_concurrency_slot, and concurrency_slot and next_step properties are present.'
+    repro_handle: POST http://localhost:8090/mcp tools/list with an fhm_ bearer
 origin:
     issue: 3969
     pr: 5483
     run_id: 765500b0-33c7-4f06-b24a-0c1073b1f37a
-    head_sha: 36e122cf3806f0fce61b7e552286541d027ff564
-    recorded_at: 2026-11-20T20:22:22Z
+    head_sha: 2373d5b6417c9028ffa60a71589039c080a9783a
+    recorded_at: 2026-11-20T21:13:50Z

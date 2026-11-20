@@ -1,15 +1,14 @@
 id: scenario:issue-3969/dispatch-description-drops-interim
 statement: 'The fishhawk_dispatch_stage tool description no longer says that fishhawk_run_stage, fishhawk_drive_run and fishhawk_run_children fail closed on a queued dispatch until #3969, and says instead that every host-spawn verb queues.'
 verify_hint: 'MCP tool result: tools/list on the preview''s /mcp route returns the fishhawk_dispatch_stage description without the ''Until #3969'' sentence. Decided by TestDispatchStage_Description_HostCapacity.'
-steps: 'Minted an fhm_ bearer from a trace-upload-target fixture (fixtures, signing-key, dev/sign over ''{}'', mcp-token). POST /mcp tools/list and stdio tools/list. Searched the fishhawk_dispatch_stage description for ''Until #3969'' and ''fail closed'', and for the queue sentence.'
-steps_carried_from: head cce58f0847845e4721427a6ed5b6368d1204a107 recorded_at 2026-11-20T19:05:17Z
+steps: 'Minted an fhm_ bearer from trace-upload-target (fixtures, signing-key, dev/sign over ''{}'', mcp-token). Ran POST /mcp tools/list and stdio tools/list from fishhawk-mcp built from the sanctioned checkout. Searched the fishhawk_dispatch_stage description for ''Until #3969'' and for the queue sentence.'
 assertions:
-    expected: The interim sentence is gone and the text says every host-spawn verb queues.
-    observed_at_record: 'Neither ''Until #3969'' nor ''fail closed'' is present. It contains ''Every host-spawn verb queues the same way (#3969): fishhawk_run_stage returns outcome awaiting_concurrency_slot, fishhawk_drive_run stops awaiting_concurrency_slot, and fishhawk_run_children marks the child queued; in each case this session''s slot waiter spawns the runner on admission.'''
+    expected: The interim fail-closed sentence is gone and the text says every host-spawn verb queues.
+    observed_at_record: '''Until #3969'' is absent, and there is no fail-closed sentence about run_stage, drive_run or run_children. The description says: ''Every host-spawn verb queues the same way (#3969): fishhawk_run_stage returns outcome awaiting_concurrency_slot, fishhawk_drive_run stops awaiting_concurrency_slot, and fishhawk_run_children marks the child queued; in each case this session''s slot waiter spawns the runner on admission.'''
     repro_handle: POST http://localhost:8090/mcp tools/list
 origin:
     issue: 3969
     pr: 5483
     run_id: 765500b0-33c7-4f06-b24a-0c1073b1f37a
-    head_sha: 36e122cf3806f0fce61b7e552286541d027ff564
-    recorded_at: 2026-11-20T20:22:22Z
+    head_sha: 2373d5b6417c9028ffa60a71589039c080a9783a
+    recorded_at: 2026-11-20T21:13:50Z
