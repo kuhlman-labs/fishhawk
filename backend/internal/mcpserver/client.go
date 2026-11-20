@@ -2732,7 +2732,7 @@ type StageConcurrency struct {
 	// been refreshed within the queue TTL — survives omitempty: that false is
 	// the operator's signal that no waiter will spawn the stage.
 	WaiterLive *bool  `json:"waiter_live,omitempty" jsonschema:"while awaiting_concurrency_slot: true when a slot waiter refreshed the queue row within the queue TTL (60s). The waiter may come from any host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run or fishhawk_run_children). false means NO live waiter will spawn the stage — re-invoke the verb that queued it: fishhawk_run_children for a fan-out child, otherwise fishhawk_dispatch_stage, fishhawk_run_stage or fishhawk_drive_run"`
-	Waiter     string `json:"waiter,omitempty" jsonschema:"on a queued host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run or fishhawk_run_children): started (this MCP session's slot waiter will spawn the stage on admission) or already_waiting (one already is)"`
+	Waiter     string `json:"waiter,omitempty" jsonschema:"on a queued host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run or fishhawk_run_children): started (this MCP session's slot waiter will spawn the stage on admission) or already_waiting (one already is: the FIRST queuing call's spawn inputs govern and this call's are dropped)"`
 	// QueuedBefore / WaitedSeconds ride the host-dispatch admission block.
 	QueuedBefore  bool `json:"queued_before,omitempty" jsonschema:"on an admission: true when the stage queued before it was admitted"`
 	WaitedSeconds int  `json:"waited_seconds,omitempty" jsonschema:"on an admission: seconds the stage spent queued"`

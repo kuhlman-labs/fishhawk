@@ -167,22 +167,89 @@ func startQueuedSlotWaiter(q *concurrencySlotQueuedError, spec slotWaiterSpec, v
 	waiter, _ := startSlotWaiter(spec)
 	slot := q.stageConcurrency()
 	slot.Waiter = waiter
-	return slot, fmt.Sprintf(
+	warning := fmt.Sprintf(
 		"stage queued for this host's local concurrency slot (group %q, limit %d, position %d): %s. NO runner was spawned: "+
 			"this session's slot waiter (%s) re-POSTs the host-dispatch marker every %s and spawns the runner DETACHED when the stage is admitted, "+
 			"for up to %s. The waiter lives in this MCP process — if the process exits (a shim hot-swap or /mcp) the queue row goes stale "+
 			"after 60s and the stage must be re-queued: re-invoke %s.",
 		q.Group, q.Limit, q.Position, q.holderSummary(), waiter, spec.poll, spec.cap, verb)
+	if waiter == slotWaiterAlreadyWaiting {
+		warning += " " + slotWaiterInputsDroppedNote(verb)
+	}
+	return slot, warning
 }
 
-// slotWaiterRegistry dedupes one waiter per stage per process.
+// slotWaiterInputsDroppedNote is the already_waiting disclosure (#3969): one
+// registry serves every host-spawn verb, so the waiter already running for
+// the stage spawns it with the FIRST queuing call's prepare closure and spawn
+// path, and verb's inputs on this call are dropped.
+func slotWaiterInputsDroppedNote(verb string) string {
+	return "A slot waiter was ALREADY waiting for this stage in this MCP process, so ITS spawn inputs govern: the stage is spawned on admission " +
+		"with the first queuing call's prepare closure and spawn path (its push_and_open_pr, run_children's --parallel-isolate and admitting base branch), " +
+		"and the inputs of this " + verb + " call are DROPPED."
+}
+
+// slotWaiterRegistry dedupes one waiter per stage per process. It also
+// records each stage's last waiter exit against a monotonic exit sequence, so
+// heldSince can tell a verb whether a waiter was live at any point in a
+// window, including one that spawned and exited inside it (#3969).
 type slotWaiterRegistry struct {
 	mu     sync.Mutex
 	active map[uuid.UUID]chan struct{}
+	// seq counts waiter exits; exited maps a stage to the seq of its last
+	// waiter exit. One entry per stage ever queued in this process.
+	seq    uint64
+	exited map[uuid.UUID]uint64
 }
 
 // slotWaiters is the process-wide registry.
-var slotWaiters = &slotWaiterRegistry{active: map[uuid.UUID]chan struct{}{}}
+var slotWaiters = &slotWaiterRegistry{active: map[uuid.UUID]chan struct{}{}, exited: map[uuid.UUID]uint64{}}
+
+// mark opens a heldSince window: it returns the exit sequence now.
+func (reg *slotWaiterRegistry) mark() uint64 {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	return reg.seq
+}
+
+// heldSince reports whether a waiter for stageID is live now, or exited after
+// mark, so it was live at some point in the window mark opened.
+func (reg *slotWaiterRegistry) heldSince(stageID uuid.UUID, mark uint64) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if _, ok := reg.active[stageID]; ok {
+		return true
+	}
+	return reg.exited[stageID] > mark
+}
+
+// exit clears stageID's registry entry, records the exit and closes ch. Every
+// waiter exit runs it, so a later start succeeds.
+func (reg *slotWaiterRegistry) exit(stageID uuid.UUID, ch chan struct{}) {
+	reg.mu.Lock()
+	delete(reg.active, stageID)
+	reg.seq++
+	if reg.exited == nil {
+		reg.exited = map[uuid.UUID]uint64{}
+	}
+	reg.exited[stageID] = reg.seq
+	reg.mu.Unlock()
+	close(ch)
+}
+
+// liveWaiterOwnsSpawn is the double-spawn guard on a verb's marker site
+// (#3969): the marker answered 200 and did NOT transition the stage, and a
+// slot waiter in this process held the stage at some point since mark. That
+// waiter's admission is what dispatched the stage (it spawns, or has spawned,
+// the runner), so the verb must not spawn a second one. A transitioned:false
+// with no such waiter keeps each verb's proceed behaviour (the dead-runner
+// re-dispatch).
+func liveWaiterOwnsSpawn(res *HostDispatchResult, stageID uuid.UUID, mark uint64) bool {
+	if res != nil && res.Transitioned {
+		return false
+	}
+	return slotWaiters.heldSince(stageID, mark)
+}
 
 // start launches a waiter for spec.stageID, or reports already_waiting when
 // one is live in this process. done closes when the (new or existing) waiter
@@ -201,10 +268,7 @@ func (reg *slotWaiterRegistry) start(spec slotWaiterSpec) (status string, done <
 	go func() {
 		defer func() {
 			cancel()
-			reg.mu.Lock()
-			delete(reg.active, spec.stageID)
-			reg.mu.Unlock()
-			close(ch)
+			reg.exit(spec.stageID, ch)
 		}()
 		runSlotWaiter(ctx, spec)
 	}()

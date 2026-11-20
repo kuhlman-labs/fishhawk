@@ -5483,6 +5483,92 @@ func (f *driveFakeBackend) stateOfLocked(typ string) string {
 	return f.stateOf(typ)
 }
 
+// TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse (#3969, concern
+// 86b55541): the drive reads the implement stage awaiting_host_dispatch, then
+// this process's slot waiter is admitted inside the window before the drive's
+// own marker POST (the marker hook flips the stage to dispatched), so the
+// drive's marker answers 200 transitioned:false. With a waiter held in the
+// window — live through the marker, or spawned and exited inside it — the
+// drive spawns NOTHING and stops awaiting_concurrency_slot. With no waiter,
+// transitioned:false keeps today's proceed and the drive spawns once.
+func TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		hold, exitAtMarker bool
+		wantSpawns         int
+	}{
+		{name: "waiter live through the marker", hold: true, wantSpawns: 0},
+		{name: "waiter exits inside the window", hold: true, exitAtMarker: true, wantSpawns: 0},
+		{name: "no waiter proceeds", wantSpawns: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDriveFake("running", []Stage{
+				stg(drivePlanID, "plan", "succeeded", 0),
+				stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+			})
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+			// A spawned implement fails at once, so the proceed row stops.
+			f.setOnSpawn(func(f *driveFakeBackend, typ string) { f.setState(typ, "failed") })
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			t.Cleanup(srv.Close)
+			release := func() {}
+			if tc.hold {
+				release = holdSlotWaiter(t, uuid.MustParse(driveImplID))
+			}
+			inner := srv.Config.Handler
+			wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/host-dispatch") {
+					// The waiter's admission lands first: the drive's marker
+					// then finds the stage already dispatched.
+					f.mu.Lock()
+					f.setState("implement", "dispatched")
+					f.mu.Unlock()
+					if tc.exitAtMarker {
+						release()
+					}
+				}
+				inner.ServeHTTP(w, req)
+			}))
+			t.Cleanup(wrapped.Close)
+			r.api = newAPIClient(config{backendURL: wrapped.URL, apiToken: "tok"})
+			r.getenv = driveRunnerBinEnv(func() string { return "/fake/fishhawk-runner" })
+			r.driveMaxWallclock = 2 * time.Second
+			workingDir := t.TempDir()
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), WorkingDir: workingDir, GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if got := rec.list(); len(got) != tc.wantSpawns {
+				t.Fatalf("drive spawns = %v, want %d (stopped_reason %q)", got, tc.wantSpawns, out.StoppedReason)
+			}
+			if tc.wantSpawns != 0 {
+				if out.StoppedReason == stoppedAwaitingConcurrencySlot {
+					t.Fatalf("stopped_reason = %q with no waiter, want the ordinary proceed", out.StoppedReason)
+				}
+				return
+			}
+			if out.StoppedReason != stoppedAwaitingConcurrencySlot {
+				t.Fatalf("stopped_reason = %q, want awaiting_concurrency_slot; warnings: %v", out.StoppedReason, out.Warnings)
+			}
+			na := out.NextActions
+			if na == nil || len(na.Actions) != 2 || na.Actions[0].Action != "fishhawk_await_stage" || na.Actions[0].Params["stage_id"] != driveImplID {
+				t.Fatalf("next_actions = %+v, want fishhawk_await_stage on the implement stage first", na)
+			}
+			if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Kind != "dispatch" || !strings.Contains(out.StepsTaken[n-1].Note, "the existing waiter owns the spawn") {
+				t.Fatalf("steps_taken = %+v, want a final dispatch step naming the existing waiter", out.StepsTaken)
+			}
+			joined := strings.Join(out.Warnings, "\n")
+			for _, want := range []string{"spawned NOTHING", "fishhawk_drive_run call are DROPPED"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warnings missing %q: %s", want, joined)
+				}
+			}
+		})
+	}
+}
+
 // TestDriveRun_QueuedPrepareUsesAdmissionTimeInputs (approval condition Q3,
 // ADR-087): the drive's queued-arm prepare re-resolves the runner binary and
 // rebuilds the env with the token CURRENT at admission. The binary and token

@@ -591,6 +591,113 @@ func TestStartQueuedSlotWaiter_NamesTheVerb(t *testing.T) {
 	}
 }
 
+// TestStartQueuedSlotWaiter_AlreadyWaitingKeepsFirstCallersInputs (#3969,
+// the cross-verb dedupe residual): one per-stage registry serves every
+// host-spawn verb, so a second verb queuing a stage that already has a waiter
+// gets already_waiting, its warning says the FIRST caller's spawn inputs
+// govern and this call's are dropped, and on admission only the first
+// caller's prepare and spawn run.
+func TestStartQueuedSlotWaiter_AlreadyWaitingKeepsFirstCallersInputs(t *testing.T) {
+	q, ok := asConcurrencySlotQueued(queuedAnswer(time.Now()).err)
+	if !ok {
+		t.Fatal("queuedAnswer is not a typed queued error")
+	}
+	gate := make(chan struct{})
+	m := &seqMarker{answers: []markerAnswer{admittedAnswer}}
+	first, second := &slotSpawnRecorder{}, &slotSpawnRecorder{}
+	specA := testSlotSpec(m, first)
+	specA.marker = gatedMarker{slotMarker: m, gate: gate}
+	specA.prepare = func(*HostDispatchResult) (slotSpawnInputs, error) {
+		return slotSpawnInputs{binary: "/first/runner"}, nil
+	}
+	specB := specA
+	specB.prepare = func(*HostDispatchResult) (slotSpawnInputs, error) {
+		return slotSpawnInputs{binary: "/second/runner"}, nil
+	}
+	specB.spawn = second.spawn
+	var done <-chan struct{}
+	saved := startSlotWaiter
+	startSlotWaiter = func(s slotWaiterSpec) (string, <-chan struct{}) {
+		var status string
+		status, done = slotWaiters.start(s)
+		return status, done
+	}
+	t.Cleanup(func() { startSlotWaiter = saved })
+
+	slotA, warnA := startQueuedSlotWaiter(q, specA, "fishhawk_run_stage")
+	slotB, warnB := startQueuedSlotWaiter(q, specB, "fishhawk_drive_run")
+	if slotA.Waiter != slotWaiterStarted || slotB.Waiter != slotWaiterAlreadyWaiting {
+		t.Fatalf("waiters = %q, %q; want started, already_waiting", slotA.Waiter, slotB.Waiter)
+	}
+	if strings.Contains(warnA, "DROPPED") {
+		t.Errorf("started warning claims dropped inputs: %s", warnA)
+	}
+	for _, want := range []string{"ALREADY waiting", "ITS spawn inputs govern", "push_and_open_pr", "--parallel-isolate", "fishhawk_drive_run call are DROPPED"} {
+		if !strings.Contains(warnB, want) {
+			t.Errorf("already_waiting warning missing %q: %s", want, warnB)
+		}
+	}
+	close(gate)
+	waitDone(t, done)
+	first.mu.Lock()
+	binaries := append([]string(nil), first.binaries...)
+	first.mu.Unlock()
+	if len(binaries) != 1 || binaries[0] != "/first/runner" {
+		t.Fatalf("first caller's spawns = %v, want exactly one with its own /first/runner", binaries)
+	}
+	if got := second.spawned(); len(got) != 0 {
+		t.Fatalf("second caller's spawns = %v, want none: its inputs are dropped", got)
+	}
+}
+
+// holdSlotWaiter registers a live waiter for stageID in the process-wide
+// registry, as slotWaiters.start does, with no poll goroutine. release exits
+// it through the production exit path; it is idempotent and also runs at
+// cleanup.
+func holdSlotWaiter(t *testing.T, stageID uuid.UUID) (release func()) {
+	t.Helper()
+	ch := make(chan struct{})
+	slotWaiters.mu.Lock()
+	if _, ok := slotWaiters.active[stageID]; ok {
+		slotWaiters.mu.Unlock()
+		t.Fatalf("stage %s already has a live waiter", stageID)
+	}
+	slotWaiters.active[stageID] = ch
+	slotWaiters.mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { slotWaiters.exit(stageID, ch) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// TestSlotWaiterRegistry_HeldSince (#3969): heldSince is true while a waiter
+// is live and, for a window opened before it exited, after it exits; a window
+// opened after the exit sees nothing.
+func TestSlotWaiterRegistry_HeldSince(t *testing.T) {
+	stageID := uuid.New()
+	before := slotWaiters.mark()
+	if slotWaiters.heldSince(stageID, before) {
+		t.Fatal("heldSince = true with no waiter ever registered")
+	}
+	release := holdSlotWaiter(t, stageID)
+	if !slotWaiters.heldSince(stageID, before) || !slotWaiters.heldSince(stageID, slotWaiters.mark()) {
+		t.Fatal("heldSince = false while the waiter is live")
+	}
+	release()
+	if !slotWaiters.heldSince(stageID, before) {
+		t.Fatal("heldSince = false for a window opened before the waiter exited")
+	}
+	if slotWaiters.heldSince(stageID, slotWaiters.mark()) {
+		t.Fatal("heldSince = true for a window opened after the waiter exited")
+	}
+	if liveWaiterOwnsSpawn(&HostDispatchResult{Transitioned: true}, stageID, before) {
+		t.Fatal("liveWaiterOwnsSpawn = true on transitioned:true: the verb's own admission spawns")
+	}
+	if !liveWaiterOwnsSpawn(&HostDispatchResult{Transitioned: false}, stageID, before) {
+		t.Fatal("liveWaiterOwnsSpawn = false on transitioned:false with a waiter held in the window")
+	}
+}
+
 // gatedMarker holds every marker call until gate closes.
 type gatedMarker struct {
 	slotMarker

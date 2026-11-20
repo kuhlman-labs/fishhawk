@@ -190,9 +190,13 @@ const (
 	// concurrency_slot_queued, ADR-087 / ADR-094 D1, #3969). It is not a
 	// failure: NO runner is spawned by the drive, the stage stays
 	// awaiting_host_dispatch, and this session's slot waiter spawns it through
-	// the drive's own spawn closure exactly once on admission. next_actions
-	// (driveSlotQueuedActions) lead with fishhawk_await_stage on the queued
-	// stage, then fishhawk_drive_run to resume once it settles.
+	// the drive's own spawn closure exactly once on admission (or, when a
+	// waiter already held the stage, through that waiter's own inputs). It is
+	// also the stop when the marker answers transitioned:false while this
+	// process's waiter held the stage in the iteration: the waiter owns the
+	// spawn. next_actions (driveSlotQueuedActions) lead with
+	// fishhawk_await_stage on the queued stage, then fishhawk_drive_run to
+	// resume once it settles.
 	stoppedAwaitingConcurrencySlot = "awaiting_concurrency_slot"
 	// stoppedForgeUnresolved is the fail-CLOSED stop when the pre-loop forge
 	// target read (resolveRunForgeTarget, E45.46 / #3463) refuses: the run row
@@ -405,7 +409,12 @@ plan, implement or acceptance stage alike: the drive spawns nothing, hands the
 stage to this session's slot waiter, and stops awaiting_concurrency_slot. The
 waiter keeps the queue row live and, once the stage is admitted, spawns its
 runner DETACHED exactly once through the drive's own spawn path, with the
-runner binary, argv and token resolved at admission. next_actions lead with
+runner binary, argv and token resolved at admission. When this MCP process
+already had a waiter for the stage (waiter already_waiting), that FIRST
+waiter's spawn inputs govern and the drive's are dropped. A drive re-invoked
+while the stage is queued spawns nothing: if the marker answers transitioned:false
+while this process's waiter held the stage, the waiter was admitted and owns
+the spawn, and the drive stops awaiting_concurrency_slot again. next_actions lead with
 fishhawk_await_stage on the queued stage, then fishhawk_drive_run to resume once
 it settles. Any other marker failure still stops host_dispatch_failed with no
 spawn.
@@ -699,6 +708,11 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			continue
 		}
 
+		// Open this iteration's live-waiter window BEFORE the stage read
+		// (#3969): a slot waiter in this process that is live at any point
+		// from here to the host-dispatch marker's answer owns that stage's
+		// spawn (liveWaiterOwnsSpawn at the marker site below).
+		waiterMark := slotWaiters.mark()
 		stages, serr := r.api.ListRunStages(ctx, runUUID)
 		if serr != nil {
 			return nil, out, fmt.Errorf("drive: list stages: %w", serr)
@@ -1020,9 +1034,11 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			// attempt exists — the signal the in-flight/stale guard above anchors on.
 			// FAIL CLOSED — a transport error or 4xx means NO spawn (an unmarked
 			// spawn would recreate the ambiguity #1912 removes). transitioned:false
-			// (already 'dispatched') proceeds; the guard above already handled the
-			// unspawned-this-invocation dispatched case, so reaching here means a
-			// pending/awaiting_host_dispatch stage the marker flips forward.
+			// (already 'dispatched') proceeds — unless this process's slot waiter
+			// held the stage in this iteration (below); the guard above already
+			// handled the unspawned-this-invocation dispatched case, so reaching
+			// here means a pending/awaiting_host_dispatch stage the marker flips
+			// forward.
 			//
 			// A 409 concurrency_slot_queued (#3969 / ADR-094 D1) is NOT a marker
 			// failure: the stage was queued for this host's local concurrency
@@ -1030,7 +1046,14 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			// implement and acceptance dispatches alike. Spawn nothing; hand the
 			// stage to this session's slot waiter and stop
 			// awaiting_concurrency_slot.
-			_, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
+			//
+			// transitioned:false while a slot waiter in this process held the
+			// stage since this iteration's stage read is NOT the dead-runner
+			// re-dispatch: the waiter was admitted inside that window and owns
+			// the spawn, so spawning here would be a SECOND runner (#3969).
+			// Stop awaiting_concurrency_slot instead; the waiter's own spawn
+			// inputs govern.
+			hdRes, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
 			report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
 				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
 				return e
@@ -1062,6 +1085,18 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 				out.StoppedReason = stoppedHostDispatchFailed
 				out.Warnings = append(out.Warnings, fmt.Sprintf(
 					"host-dispatch marker for %s failed; NOT spawning (fail-closed): %v", recordName, hderr))
+				return nil, out, nil
+			}
+			if liveWaiterOwnsSpawn(hdRes, stageUUID, waiterMark) {
+				out.StepsTaken = append(out.StepsTaken, DriveStep{
+					Kind: "dispatch", Stage: recordName, Delegated: false,
+					Note: "the host-dispatch marker answered transitioned:false while this session's slot waiter held the stage; NO runner spawned by the drive — the existing waiter owns the spawn",
+				})
+				out.StoppedReason = stoppedAwaitingConcurrencySlot
+				out.Warnings = append(out.Warnings, fmt.Sprintf(
+					"%s was already dispatched by this MCP process's slot waiter for the stage; the drive spawned NOTHING, so no second runner exists. %s",
+					recordName, slotWaiterInputsDroppedNote("fishhawk_drive_run")))
+				out.NextActions = driveSlotQueuedActions(runUUID, disp.ID, disp.Type, in.WorkingDir)
 				return nil, out, nil
 			}
 			env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
@@ -1670,8 +1705,9 @@ func driveSlotQueuedActions(runID uuid.UUID, stageID, stage, workingDir string) 
 			Params:       params,
 			Precondition: "the queued stage has settled (fishhawk_await_stage released on a terminal or parked state)",
 			Consumes:     consumesNone,
-			Reason: "resume the drive from the settled stage. Re-invoking while the stage is still queued records one more dispatch act, " +
-				"re-queues it (the waiter reports already_waiting) and stops awaiting_concurrency_slot again",
+			Reason: "resume the drive from the settled stage. Re-invoking while the stage is still queued records one more dispatch act and spawns nothing: " +
+				"the existing slot waiter owns the spawn (the marker re-queues the stage and the waiter reports already_waiting, or the waiter was admitted " +
+				"meanwhile and the marker answers transitioned:false), and the drive stops awaiting_concurrency_slot again with the existing waiter's spawn inputs governing",
 		},
 	}}
 }

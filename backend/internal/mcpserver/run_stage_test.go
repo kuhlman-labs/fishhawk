@@ -5041,9 +5041,13 @@ func TestRunStage_QueuedDispatchReturnsAwaitingSlot(t *testing.T) {
 			slotWaitFor(t, "the waiter's detached spawn after admission", func() bool { return len(rec.snapshot()) > 0 })
 			waitSlotWaitersDrained(t)
 			calls := rec.snapshot()
-			if len(calls) != 1 || calls[0].stg != stageID.String() || calls[0].runID != runID.String() ||
-				calls[0].binary != "/fake/fishhawk-runner" || !argvHasPair(calls[0].argv, "--stage", stage) {
-				t.Fatalf("detached spawns = %+v, want exactly one for the %s stage", calls, stage)
+			// Never print the env: the process environment may carry a real token.
+			if len(calls) != 1 {
+				t.Fatalf("detached spawns = %d, want exactly one for the %s stage", len(calls), stage)
+			}
+			if c := calls[0]; c.stg != stageID.String() || c.runID != runID.String() ||
+				c.binary != "/fake/fishhawk-runner" || !argvHasPair(c.argv, "--stage", stage) {
+				t.Fatalf("detached spawn = {binary:%q run:%q stage:%q argv:%v}, want the %s stage's spawn", c.binary, c.runID, c.stg, c.argv, stage)
 			}
 			if n := blocking.Load(); n != 0 {
 				t.Fatalf("runStageCommand calls = %d, want 0 before and after admission", n)
@@ -5120,6 +5124,89 @@ func TestRunStage_QueuedPrepareUsesAdmissionTimeInputs(t *testing.T) {
 	}
 	if !argvHasPair(calls[0].argv, "--stage-id", stageID.String()) {
 		t.Errorf("spawn argv = %v, want the implement stage's argv", calls[0].argv)
+	}
+}
+
+// TestRunStage_LiveWaiterOwnsSpawnOnTransitionedFalse (#3969, concern
+// 86b55541): when the marker answers 200 transitioned:false while this
+// process's slot waiter holds the stage — or held it at any point in this
+// invocation, then spawned and exited — the waiter's admission dispatched it,
+// so run_stage spawns NOTHING and returns awaiting_concurrency_slot with the
+// await_stage next step. The marker flips the stage to dispatched itself
+// (hostDispatchForceNoop), modelling the waiter's admission landing inside
+// the window. With no waiter, transitioned:false keeps today's proceed (the
+// dead-runner re-dispatch spawns once).
+func TestRunStage_LiveWaiterOwnsSpawnOnTransitionedFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// hold registers a live waiter before the call; exitAtMarker exits it
+		// on the marker POST, before the answer.
+		hold, exitAtMarker bool
+		wantSpawns         int
+	}{
+		{name: "waiter live through the marker", hold: true, wantSpawns: 0},
+		{name: "waiter exits inside the window", hold: true, exitAtMarker: true, wantSpawns: 0},
+		{name: "no waiter proceeds", wantSpawns: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			blocking := captureAllArgv(t)
+			detached := &queuedSpawnLog{}
+			savedSpawn := dispatchSpawnDetached
+			dispatchSpawnDetached = detached.spawn
+			t.Cleanup(func() { dispatchSpawnDetached = savedSpawn })
+			runID, stageID := uuid.New(), uuid.New()
+			seedStageOfType(fb, runID, stageID, "implement", "awaiting_host_dispatch")
+			fb.mu.Lock()
+			fb.hostDispatchForceNoop = true
+			fb.mu.Unlock()
+			release := func() {}
+			if tc.hold {
+				release = holdSlotWaiter(t, stageID)
+			}
+			inner := srv.Config.Handler
+			wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/host-dispatch") && tc.exitAtMarker {
+					release() // the waiter spawned and exited before the answer
+				}
+				inner.ServeHTTP(w, r)
+			}))
+			t.Cleanup(wrapped.Close)
+			r := newResolver(wrapped, nil)
+
+			_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+				RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+				WorkingDir: t.TempDir(), GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+			})
+			if err != nil {
+				t.Fatalf("runStage: %v", err)
+			}
+			if got := len(*blocking) + len(detached.snapshot()); got != tc.wantSpawns {
+				t.Fatalf("spawns = %d (blocking %d, detached %d), want %d", got, len(*blocking), len(detached.snapshot()), tc.wantSpawns)
+			}
+			if tc.wantSpawns != 0 {
+				if out.Outcome == concurrencyStatusAwaitingSlot {
+					t.Fatalf("outcome = %q with no waiter, want the ordinary spawn return", out.Outcome)
+				}
+				return
+			}
+			if out.Outcome != concurrencyStatusAwaitingSlot || out.ConcurrencySlot == nil || out.ConcurrencySlot.Waiter != slotWaiterAlreadyWaiting {
+				t.Fatalf("outcome = %q, concurrency_slot = %+v; want awaiting_concurrency_slot with waiter already_waiting", out.Outcome, out.ConcurrencySlot)
+			}
+			ns := out.NextStep
+			if ns == nil || ns.Action != "fishhawk_await_stage" || ns.Params["stage_id"] != stageID.String() || ns.Params["run_id"] != runID.String() {
+				t.Fatalf("next_step = %+v, want fishhawk_await_stage on the stage", ns)
+			}
+			if out.StageState != "dispatched" {
+				t.Errorf("stage_state = %q, want dispatched (the waiter's admission)", out.StageState)
+			}
+			joined := strings.Join(out.Warnings, "\n")
+			for _, want := range []string{"owns the spawn", "no second runner", "fishhawk_run_stage call are DROPPED"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warnings missing %q: %s", want, joined)
+				}
+			}
+		})
 	}
 }
 
