@@ -630,6 +630,51 @@ func TestAwaitChildrenDispatchableIsPure(t *testing.T) {
 	}
 }
 
+// TestAwaitChildrenDispatchable_SkipsQueuedChildWithLiveWaiter (#3969): a
+// child queued for a local concurrency slot whose waiter is LIVE is not
+// announced, because that waiter spawns it on admission; announcing it would
+// spin the run_children/await_children loop. A queued child whose waiter is
+// stale (waiter_live false) and a child with no concurrency block are both
+// announced, so the exclusion keys on liveness, not on queued status.
+func TestAwaitChildrenDispatchable_SkipsQueuedChildWithLiveWaiter(t *testing.T) {
+	live, stale := true, false
+	queued := func(l *bool) Stage {
+		return Stage{Type: "implement", State: "awaiting_host_dispatch", Concurrency: &StageConcurrency{
+			Status: concurrencyStatusAwaitingSlot, Group: "local-implement:h1", Limit: 1, Position: 1, WaiterLive: l,
+		}}
+	}
+	cs := &ChildrenStatus{
+		Children: []ChildStatus{
+			{RunID: "r0", SliceIndex: 0, State: "running", ImplementStageState: "awaiting_host_dispatch"},
+			{RunID: "r1", SliceIndex: 1, State: "running", ImplementStageState: "awaiting_host_dispatch"},
+			{RunID: "r2", SliceIndex: 2, State: "running", ImplementStageState: "awaiting_host_dispatch"},
+		},
+		implementStages: map[string]Stage{
+			"r0": queued(&live),
+			"r1": queued(&stale),
+			"r2": {Type: "implement", State: "awaiting_host_dispatch"},
+		},
+	}
+	got := awaitChildrenDispatchable(cs)
+	if len(got) != 2 || got[0] != "r1" || got[1] != "r2" {
+		t.Fatalf("dispatchable = %v, want [r1 r2] (r0 is queued with a live waiter; r1's waiter is stale; r2 has no slot row)", got)
+	}
+	for _, tc := range []struct {
+		c    *StageConcurrency
+		want bool
+	}{
+		{nil, false},
+		{&StageConcurrency{Status: concurrencyStatusAwaitingSlot}, false}, // waiter_live absent
+		{&StageConcurrency{Status: "holding", WaiterLive: &live}, false},
+		{queued(&stale).Concurrency, false},
+		{queued(&live).Concurrency, true},
+	} {
+		if got := childQueuedWithLiveWaiter(tc.c); got != tc.want {
+			t.Errorf("childQueuedWithLiveWaiter(%+v) = %v, want %v", tc.c, got, tc.want)
+		}
+	}
+}
+
 // --- #4080: coverage-aware releases ---
 
 // seedParentImplementStage seeds the decomposed parent's implement stage at

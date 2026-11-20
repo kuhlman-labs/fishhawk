@@ -54,6 +54,7 @@ func TestClampMaxParallel(t *testing.T) {
 type detachedSpawnCall struct {
 	binary  string
 	argv    []string
+	env     []string
 	runID   string
 	stageID string
 	report  detachedFailureReporter
@@ -74,7 +75,7 @@ type fakeDetachedSpawn struct {
 }
 
 func (f *fakeDetachedSpawn) fn(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
-	c := detachedSpawnCall{binary: binary, argv: append([]string(nil), argv...), runID: runID, stageID: stageID, report: report, probe: probe}
+	c := detachedSpawnCall{binary: binary, argv: append([]string(nil), argv...), env: append([]string(nil), env...), runID: runID, stageID: stageID, report: report, probe: probe}
 	f.mu.Lock()
 	f.calls = append(f.calls, c)
 	err := f.failFor[runID]
@@ -2139,5 +2140,352 @@ func TestRunChildren_UnresolvedDefaultBranch_RefusesBeforeAnyMarker(t *testing.T
 	}
 	if calls := spawn.snapshot(); len(calls) != 0 {
 		t.Fatalf("spawned %d children despite the refusal", len(calls))
+	}
+}
+
+// --- queued children (#3969 / ADR-094 D1) -----------------------------------
+
+// queuedRunChildrenSeams installs the recording detached-spawn seam and
+// shrinks the slot waiter's poll interval and cap BEFORE the queued call,
+// because the call reads them synchronously (approval condition Q6). Its last
+// cleanup, which runs first, waits for every waiter to exit before the seams
+// are restored.
+func queuedRunChildrenSeams(t *testing.T) *fakeDetachedSpawn {
+	t.Helper()
+	spawn := withFakeDetachedSpawn(t)
+	savedPoll, savedCap := concurrencySlotPollInterval, concurrencyWaiterCap
+	concurrencySlotPollInterval = 5 * time.Millisecond
+	concurrencyWaiterCap = timescale.D(20 * time.Second)
+	t.Cleanup(func() { concurrencySlotPollInterval, concurrencyWaiterCap = savedPoll, savedCap })
+	t.Cleanup(func() { waitSlotWaitersDrained(t) })
+	return spawn
+}
+
+// captureSlotWaiterStarts stubs startSlotWaiter so no waiter goroutine polls
+// the fake; it records every spec a queued arm hands it.
+func captureSlotWaiterStarts(t *testing.T) *[]slotWaiterSpec {
+	t.Helper()
+	var mu sync.Mutex
+	captured := &[]slotWaiterSpec{}
+	saved := startSlotWaiter
+	startSlotWaiter = func(spec slotWaiterSpec) (string, <-chan struct{}) {
+		mu.Lock()
+		defer mu.Unlock()
+		*captured = append(*captured, spec)
+		return slotWaiterStarted, nil
+	}
+	t.Cleanup(func() { startSlotWaiter = saved })
+	return captured
+}
+
+// TestRunChildren_QueuedChildMarkedQueued (#3969, approval condition Q2): a
+// child whose host-dispatch marker answers 409 concurrency_slot_queued is NOT
+// a failure. It is reported queued with its queue block and a started waiter,
+// NO runner is spawned at return, and the child spends one unit of the
+// per-invocation budget exactly like a spawned child. With effective_cap 1 and
+// two dispatchable children that would both queue, only ONE waiter starts and
+// the other child is named in the budget warning.
+func TestRunChildren_QueuedChildMarkedQueued(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	sc, r := newQueuedMarkerResolver(t, srv)
+	spawn := queuedRunChildrenSeams(t)
+	starts := captureSlotWaiterStarts(t)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	seedChildRun(fb, a, "awaiting_host_dispatch")
+	seedChildRun(fb, b, "awaiting_host_dispatch")
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 1)
+
+	_, out, err := r.runChildren(context.Background(), nil, runChildrenIn(parent))
+	if err != nil {
+		t.Fatalf("runChildren on a queued marker: %v (a queued child is data, not a tool error)", err)
+	}
+	if len(*starts) != 1 {
+		t.Fatalf("slot waiters started = %d, want exactly 1 (effective_cap 1: a queued child spends the budget)", len(*starts))
+	}
+	spec := (*starts)[0]
+	if spec.verb != "fishhawk_run_children" || spec.runID != a || spec.stageID.String() != stageIDOf(fb, a) ||
+		spec.poll != 5*time.Millisecond || spec.spawn == nil || spec.report == nil || spec.probe == nil || spec.prepare == nil {
+		t.Fatalf("waiter spec = %+v, want child %s's stage, the shrunk poll and the detached spawn/report/probe/prepare", spec, a)
+	}
+	if out.QueuedCount != 1 || out.DispatchedCount != 0 {
+		t.Fatalf("queued_count = %d, dispatched_count = %d; want 1 and 0", out.QueuedCount, out.DispatchedCount)
+	}
+	ca := childByID(out)[a.String()]
+	if !ca.Queued || ca.Dispatched || ca.LogPath != "" || ca.StageState != "awaiting_host_dispatch" {
+		t.Fatalf("child a = %+v, want queued, not dispatched, no log path, stage awaiting_host_dispatch", ca)
+	}
+	slot := ca.ConcurrencySlot
+	if slot == nil || slot.Status != concurrencyStatusAwaitingSlot || slot.Group != "local-implement:h1" ||
+		slot.Position != 2 || slot.Waiter != slotWaiterStarted {
+		t.Fatalf("child a concurrency_slot = %+v, want the queued block with a started waiter", slot)
+	}
+	if w := warningContaining(ca.Warnings, "NO runner was spawned"); w == "" || !strings.Contains(w, "re-invoke fishhawk_run_children") {
+		t.Errorf("child a warnings = %v, want the queued warning naming fishhawk_run_children as the re-queue", ca.Warnings)
+	}
+	cb := childByID(out)[b.String()]
+	if cb.Queued || cb.Dispatched {
+		t.Errorf("child b = %+v, want neither queued nor dispatched (the budget was spent)", cb)
+	}
+	budget := warningContaining(out.Warnings, "per-invocation dispatch budget")
+	if !strings.Contains(budget, b.String()) || strings.Contains(budget, a.String()) {
+		t.Errorf("budget warning = %q, want child b named and child a not", budget)
+	}
+	if n := len(spawn.snapshot()); n != 0 {
+		t.Fatalf("detached spawns at return = %d, want 0 while queued", n)
+	}
+	if sc.queuedAnswers() != 1 {
+		t.Errorf("queued marker answers = %d, want 1 (child b was never marked)", sc.queuedAnswers())
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_await_children" || out.NextStep.Params["run_id"] != parent.String() {
+		t.Errorf("next_step = %+v, want fishhawk_await_children on the parent", out.NextStep)
+	}
+	if got := stageStateOf(fb, a); got != "awaiting_host_dispatch" {
+		t.Errorf("child a stage = %q, want awaiting_host_dispatch while queued", got)
+	}
+
+	desc := strings.Join(strings.Fields(listToolDescriptions(t)["fishhawk_run_children"]), " ")
+	for _, want := range []string{
+		"reported queued:true with its concurrency_slot block",
+		"spawns the child DETACHED exactly once on admission, against the ADMITTING response's base_branch",
+		"a child this call queues spends one unit exactly like a spawned one",
+		"does not announce a queued child with a live waiter as dispatchable",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_run_children description missing %q", want)
+		}
+	}
+	if !strings.Contains(runChildrenCapDisclosure, "counts as in flight") || !strings.Contains(runChildrenCapDisclosure, "spends one unit") {
+		t.Errorf("runChildrenCapDisclosure = %q, want the queued-child budget rule", runChildrenCapDisclosure)
+	}
+}
+
+// TestRunChildren_LiveWaiterChildCountsInFlight (approval condition Q2, the
+// re-invocation half): a child whose implement stage discovery reads queued
+// for a concurrency slot with a LIVE waiter is in flight. It is not marked
+// again, it is reported queued, and it debits the budget, so with
+// effective_cap 1 the other dispatchable child is deferred. A child whose
+// waiter is stale (waiter_live false) is dispatchable and is marked and
+// spawned: the in-flight count keys on liveness, not on queued status.
+func TestRunChildren_LiveWaiterChildCountsInFlight(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		live bool
+	}{{"live waiter", true}, {"stale waiter", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			spawn := withFakeDetachedSpawn(t)
+			parent, q, b := uuid.New(), uuid.New(), uuid.New()
+			seedChildRun(fb, q, "awaiting_host_dispatch")
+			seedChildRun(fb, b, "pending")
+			live := tc.live
+			fb.mu.Lock()
+			fb.stagesByRun[q][0].Concurrency = &StageConcurrency{
+				Status: concurrencyStatusAwaitingSlot, Group: "local-implement:h1", Limit: 1, Position: 1, WaiterLive: &live,
+			}
+			fb.mu.Unlock()
+			seedPlanDecomposed(fb, parent, []string{q.String(), b.String()}, 1)
+			qStage, bStage := uuid.MustParse(stageIDOf(fb, q)), uuid.MustParse(stageIDOf(fb, b))
+
+			_, out, err := r.runChildren(context.Background(), nil, runChildrenIn(parent))
+			if err != nil {
+				t.Fatalf("runChildren: %v", err)
+			}
+			fb.mu.Lock()
+			qMarkers, bMarkers := fb.hostDispatchCalledByID[qStage], fb.hostDispatchCalledByID[bStage]
+			fb.mu.Unlock()
+			cq := childByID(out)[q.String()]
+			if tc.live {
+				if qMarkers != 0 || bMarkers != 0 || len(spawn.snapshot()) != 0 {
+					t.Fatalf("markers q=%d b=%d, spawns %d; want none (the live-waiter child fills effective_cap 1)", qMarkers, bMarkers, len(spawn.snapshot()))
+				}
+				if !cq.Queued || cq.Dispatched || cq.ConcurrencySlot == nil || !cq.ConcurrencySlot.waiterLive() || out.QueuedCount != 1 {
+					t.Fatalf("child q = %+v, queued_count %d; want reported queued with its live-waiter block", cq, out.QueuedCount)
+				}
+				if w := warningContaining(out.Warnings, "per-invocation dispatch budget"); !strings.Contains(w, b.String()) || !strings.Contains(w, "minus 1 already in flight") {
+					t.Errorf("budget warning = %q, want child b deferred against 1 in flight", w)
+				}
+				return
+			}
+			if qMarkers != 1 || cq.Queued || !cq.Dispatched {
+				t.Fatalf("stale-waiter child = %+v after %d markers; want marked and spawned like any dispatchable child", cq, qMarkers)
+			}
+			if got := spawn.runIDs(); len(got) != 1 || got[0] != q.String() {
+				t.Fatalf("spawned %v, want only the stale-waiter child (b deferred by the budget it spent)", got)
+			}
+		})
+	}
+}
+
+// TestRunChildren_QueuedChildSpawnsOnAdmittingBaseBranch (#3969): the queued
+// child's waiter spawns it exactly ONCE on admission, against the base_branch
+// the ADMITTING marker response carries. The queue-time 409 carries no base
+// and the fallback is main, so a waiter that rebuilt the argv from anything
+// but the admitting response spawns against main. A second invocation while
+// the child is still queued finds the live waiter (already_waiting) and
+// spawns nothing more.
+func TestRunChildren_QueuedChildSpawnsOnAdmittingBaseBranch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	sc, r := newQueuedMarkerResolver(t, srv)
+	spawn := queuedRunChildrenSeams(t)
+	parent, child := uuid.New(), uuid.New()
+	seedChildRun(fb, child, "awaiting_host_dispatch")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+	stageID := stageIDOf(fb, child)
+	fb.mu.Lock()
+	fb.hostDispatchBaseBranchByStage = map[string]string{stageID: "fishhawk/consolidated-x"}
+	fb.mu.Unlock()
+	in := runChildrenIn(parent)
+	in.BaseBranch = "main"
+
+	_, out, err := r.runChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	c := childByID(out)[child.String()]
+	if !c.Queued || c.Dispatched || c.ConcurrencySlot == nil || c.ConcurrencySlot.Waiter != slotWaiterStarted {
+		t.Fatalf("child = %+v, want queued with a started waiter", c)
+	}
+	if n := len(spawn.snapshot()); n != 0 {
+		t.Fatalf("detached spawns at return = %d, want 0", n)
+	}
+
+	_, out2, err := r.runChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("second runChildren: %v", err)
+	}
+	if c2 := childByID(out2)[child.String()]; !c2.Queued || c2.ConcurrencySlot == nil || c2.ConcurrencySlot.Waiter != slotWaiterAlreadyWaiting {
+		t.Fatalf("second call child = %+v, want queued with waiter already_waiting", c2)
+	}
+
+	sc.admit()
+	slotWaitFor(t, "the waiter's detached spawn after admission", func() bool { return len(spawn.snapshot()) > 0 })
+	waitSlotWaitersDrained(t)
+	calls := spawn.snapshot()
+	if len(calls) != 1 || calls[0].runID != child.String() || calls[0].stageID != stageID {
+		t.Fatalf("detached spawns = %d, want exactly one for the queued child", len(calls))
+	}
+	for _, flag := range []string{"--base-branch", "--check-base-ref"} {
+		if got := argvFlag(calls[0].argv, flag); got != "fishhawk/consolidated-x" {
+			t.Errorf("%s = %q, want the ADMITTING response's fishhawk/consolidated-x (not the fallback main)", flag, got)
+		}
+	}
+	if !argvHasPair(calls[0].argv, "--run-id", child.String()) || !argvContains(calls[0].argv, "--parallel-isolate") {
+		t.Errorf("spawn argv = %v, want the child's runner argv", calls[0].argv)
+	}
+	if got := stageStateOf(fb, child); got != "dispatched" {
+		t.Errorf("child stage = %q, want dispatched after the waiter's admission", got)
+	}
+}
+
+// argvContains reports whether argv carries the bare flag.
+func argvContains(argv []string, flag string) bool {
+	for _, a := range argv {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunChildren_QueuedPrepareUsesAdmissionTimeInputs (approval condition
+// Q3, ADR-087): a queued child's prepare re-resolves the runner binary and
+// rebuilds the env with the token CURRENT at admission. Both change after the
+// queued call returns and before the waiter is admitted; the detached spawn
+// carries the new values, not the queue-time ones.
+func TestRunChildren_QueuedPrepareUsesAdmissionTimeInputs(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	sc, r := newQueuedMarkerResolver(t, srv)
+	spawn := queuedRunChildrenSeams(t)
+	starts := captureSlotWaiterStarts(t)
+	runnerBin := "/old/fishhawk-runner"
+	r.getenv = func(k string) string {
+		if k == "FISHHAWK_RUNNER_BIN" {
+			return runnerBin
+		}
+		return ""
+	}
+	parent, child := uuid.New(), uuid.New()
+	seedChildRun(fb, child, "awaiting_host_dispatch")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+	in := runChildrenIn(parent)
+	in.RunnerBinary = "" // resolved from FISHHAWK_RUNNER_BIN, which changes below
+
+	if _, out, err := r.runChildren(context.Background(), nil, in); err != nil || out.QueuedCount != 1 || len(*starts) != 1 {
+		t.Fatalf("runChildren = queued %d, %v, waiter starts %d; want one queued waiter", out.QueuedCount, err, len(*starts))
+	}
+	spec := (*starts)[0]
+
+	// Between queue and admission: a new runner binary and a rotated token.
+	runnerBin = "/new/fishhawk-runner"
+	r.api.token = "tok-rotated"
+	sc.admit()
+	_, done := slotWaiters.start(spec) // the real waiter, started after the change
+	waitDone(t, done)
+	calls := spawn.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("detached spawns = %d, want exactly one on admission", len(calls))
+	}
+	if calls[0].binary != "/new/fishhawk-runner" {
+		t.Errorf("spawned binary = %q, want the admission-time /new/fishhawk-runner", calls[0].binary)
+	}
+	if !argvHasPair(calls[0].argv, "--run-id", child.String()) {
+		t.Errorf("spawn argv = %v, want the child's argv", calls[0].argv)
+	}
+	// Never print the env: the process environment may carry a real token.
+	hasRotated, hasQueueTime := envHas(calls[0].env, "FISHHAWK_API_TOKEN=tok-rotated"), envHas(calls[0].env, "FISHHAWK_API_TOKEN=tok-test")
+	if !hasRotated || hasQueueTime {
+		t.Errorf("spawn env: admission-time token present = %v, queue-time token present = %v; want only FISHHAWK_API_TOKEN=tok-rotated", hasRotated, hasQueueTime)
+	}
+}
+
+// TestRunChildren_AdmissionResolveFailureCompensates: on the immediate path
+// the child re-resolves its runner binary after the marker flipped the stage
+// to 'dispatched' (childSpawnInputs). A binary that no longer resolves is a
+// spawn error: nothing is forked, and the stage is reported category C so it
+// is retryable rather than stranded.
+func TestRunChildren_AdmissionResolveFailureCompensates(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	spawn := withFakeDetachedSpawn(t)
+	withFakeRunnerMissing(t)
+	withFakeExecutable(t, t.TempDir(), false)
+	var reads int
+	r.getenv = func(k string) string {
+		if k != "FISHHAWK_RUNNER_BIN" {
+			return ""
+		}
+		reads++
+		if reads == 1 { // the up-front resolution only
+			return "/fake/fishhawk-runner"
+		}
+		return ""
+	}
+	parent, child := uuid.New(), uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+	stageID := uuid.MustParse(stageIDOf(fb, child))
+	in := runChildrenIn(parent)
+	in.RunnerBinary = ""
+
+	_, out, err := r.runChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if n := len(spawn.snapshot()); n != 0 {
+		t.Fatalf("detached spawns = %d, want 0 (the runner binary did not resolve at admission)", n)
+	}
+	c := childByID(out)[child.String()]
+	if c.Dispatched || warningContaining(c.Warnings, "Reported it as a category-C stage failure") == "" {
+		t.Fatalf("child = %+v, want not dispatched with the category-C compensation warning", c)
+	}
+	fb.mu.Lock()
+	reports := fb.reapFailureByStage[stageID]
+	fb.mu.Unlock()
+	if len(reports) != 1 || reports[0].Category != "C" || reports[0].Reason != "runner_spawn_failed" {
+		t.Fatalf("reap-failure reports = %+v, want one category-C runner_spawn_failed", reports)
+	}
+	if got := stageStateOf(fb, child); got != "failed" {
+		t.Errorf("child stage = %q, want failed (compensated, retryable)", got)
 	}
 }

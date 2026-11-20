@@ -63,19 +63,26 @@ type RunChildrenInput struct {
 }
 
 // ChildResult is one decomposed child's dispatch outcome. Dispatched is true
-// only when THIS call actually forked a detached runner for the child.
+// only when THIS call actually forked a detached runner for the child. Queued
+// is true when the child is queued for a local concurrency slot with a live
+// slot waiter (#3969): no runner was spawned, and the waiter spawns it on
+// admission.
 //
 // Post-#2363 there is NO exit code and NO terminal outcome here: the spawn is
 // DETACHED and this call returns in milliseconds, long before any child
 // finishes. The handle a caller keeps is (RunID, StageID, LogPath); the wait is
 // fishhawk_await_children.
 type ChildResult struct {
-	RunID      string   `json:"run_id"`
-	StageID    string   `json:"stage_id,omitempty"`
-	Dispatched bool     `json:"dispatched" jsonschema:"true when this call forked a detached runner for the child's implement stage; false when no runner was spawned this call — it was already in-flight/terminal at discovery, the host-dispatch marker failed closed or refused, the per-invocation dispatch budget was exhausted, or the spawn itself failed"`
-	StageState string   `json:"stage_state,omitempty" jsonschema:"the child implement stage's state as read at discovery (or echoed by the host-dispatch marker); NOT a post-run state — the runner is still running when this call returns"`
-	LogPath    string   `json:"log_path,omitempty" jsonschema:"the detached runner's log file on the MCP server's host; present only for a child this call spawned"`
-	Warnings   []string `json:"warnings,omitempty"`
+	RunID      string `json:"run_id"`
+	StageID    string `json:"stage_id,omitempty"`
+	Dispatched bool   `json:"dispatched" jsonschema:"true when this call forked a detached runner for the child's implement stage; false when no runner was spawned this call — it was already in-flight/terminal at discovery, it is queued for a local concurrency slot (queued:true, not a failure), the host-dispatch marker failed closed or refused, the per-invocation dispatch budget was exhausted, or the spawn itself failed"`
+	StageState string `json:"stage_state,omitempty" jsonschema:"the child implement stage's state as read at discovery (or echoed by the host-dispatch marker); NOT a post-run state — the runner is still running when this call returns"`
+	LogPath    string `json:"log_path,omitempty" jsonschema:"the detached runner's log file on the MCP server's host; present only for a child this call spawned"`
+	// Queued and ConcurrencySlot report a child queued for a local
+	// concurrency slot (#3969 / ADR-094 D1).
+	Queued          bool              `json:"queued,omitempty" jsonschema:"true when the child's implement stage is QUEUED for a local concurrency slot with a live slot waiter: this call's host-dispatch marker answered 409 concurrency_slot_queued and this session's waiter was started (or found already waiting), or discovery read the stage queued with waiter_live true. NOT a failure: NO runner was spawned yet, and the waiter spawns the child DETACHED exactly once on admission, against the ADMITTING marker response's base_branch. It counts against the per-invocation dispatch budget like a dispatched child"`
+	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"present when queued: the queue block (status awaiting_concurrency_slot, group, limit, position, holders) and, for a child queued by THIS call, waiter (started or already_waiting)"`
+	Warnings        []string          `json:"warnings,omitempty"`
 }
 
 // RunChildrenOutput is the consolidated per-child dispatch result. A per-child
@@ -84,6 +91,8 @@ type ChildResult struct {
 type RunChildrenOutput struct {
 	Children        []ChildResult `json:"children" jsonschema:"one entry per discovered child, in plan_decomposed order"`
 	DispatchedCount int           `json:"dispatched_count" jsonschema:"how many children this call actually spawned"`
+	// QueuedCount counts the children reported queued:true.
+	QueuedCount int `json:"queued_count,omitempty" jsonschema:"how many children are queued for a local concurrency slot with a live slot waiter (queued:true): queued by this call, or read queued at discovery. Their waiters spawn them on admission; wait with fishhawk_await_children, which does not announce a queued child with a live waiter as dispatchable"`
 	// EffectiveCap is a PER-INVOCATION DISPATCH BUDGET, not a live-runner
 	// bound. See runChildrenCapDisclosure.
 	EffectiveCap int `json:"effective_cap" jsonschema:"the PER-INVOCATION dispatch budget this call ran under (0 == unlimited). It bounds how many children THIS call spawned against a point-in-time in-flight snapshot; it does NOT bound the number of live detached runners for the parent — two concurrent invocations can each spend a full budget against the same snapshot"`
@@ -101,14 +110,19 @@ type RunChildrenOutput struct {
 // is NOT, rendered into both the tool description and the code path that spends
 // it. The mechanism is a per-invocation budget computed over a point-in-time
 // snapshot: count the discovered children whose implement stage reads
-// dispatched|running during THIS invocation's partition, and spawn at most
-// cap-inFlight children. It does NOT bound the number of live detached runners
+// dispatched|running, or is queued for a concurrency slot with a live waiter
+// (#3969), during THIS invocation's partition, and spawn or queue at most
+// cap-inFlight children. A child this call queues consumes one unit exactly
+// like a spawned one, because its waiter spawns it later: the immediate and
+// the deferred spawns of one invocation together stay within the budget. It
+// does NOT bound the number of live detached runners
 // for the parent — two concurrent invocations can each snapshot the same
 // inFlight and each spend a full budget against it. The per-stage host-dispatch
 // CAS stops them double-spawning the SAME child, but the loser simply proceeds
 // to a different one. Bounding live runners would need a server-side
 // reservation the host-dispatch marker does not offer.
 const runChildrenCapDisclosure = "effective_cap is a PER-INVOCATION DISPATCH BUDGET over a point-in-time snapshot, " +
+	"in which a child queued for a concurrency slot with a live waiter counts as in flight and a child this call queues spends one unit like a spawned one, " +
 	"not a bound on the number of live detached runners: two concurrent invocations can each spend a full budget " +
 	"against the same in-flight snapshot (the per-stage host-dispatch CAS prevents double-spawning the SAME child, " +
 	"but the loser proceeds to a different one)"
@@ -155,13 +169,27 @@ Re-invocation is idempotent — only children whose implement stage is
 pending|awaiting_host_dispatch are dispatched; in-flight and terminal children
 are reported as-is and left untouched.
 
+A child the host-dispatch marker QUEUES for a local concurrency slot (409
+concurrency_slot_queued, #3969) is NOT a failure: it is reported queued:true
+with its concurrency_slot block, and NO runner is spawned this call. This
+session's slot waiter re-POSTs the marker and spawns the child DETACHED exactly
+once on admission, against the ADMITTING response's base_branch (the server
+stays the authority on the per-wave re-base), re-resolving the runner binary
+and the token at that moment. queued_count counts them. fishhawk_await_children
+does not announce a queued child with a live waiter as dispatchable; if the
+waiter dies (waiter_live false) it is announced again, and re-invoking
+re-queues it.
+
 effective_cap is a PER-INVOCATION DISPATCH BUDGET over a point-in-time snapshot
-of in-flight children (0 means unlimited). It does NOT bound the number of live
-detached runners for this parent: two concurrent invocations can each spend a
-full budget against the same snapshot. The per-stage host-dispatch CAS prevents
-them double-spawning the SAME child, but the loser proceeds to a different one.
-Children left undispatched by the budget are named in a warning; re-invoke once
-slots free.
+of in-flight children (0 means unlimited). A child queued for a concurrency slot
+with a live waiter counts as in flight, and a child this call queues spends one
+unit exactly like a spawned one, so the immediate and the waiter-deferred spawns
+of one invocation together stay within effective_cap and max_parallel. It does
+NOT bound the number of live detached runners for this parent: two concurrent
+invocations can each spend a full budget against the same snapshot. The
+per-stage host-dispatch CAS prevents them double-spawning the SAME child, but
+the loser proceeds to a different one. Children left undispatched by the budget
+are named in a warning; re-invoke once slots free.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage.
@@ -190,6 +218,9 @@ type childDispatch struct {
 	// executor is the child implement stage's executor from the same discovery
 	// read; dispatchOneChild derives the child's --agent from it (#5095).
 	executor StageExecutor
+	// queued is the stage's concurrency block when discovery read it queued
+	// for a slot with a live waiter (#3969): in flight, not dispatchable.
+	queued *StageConcurrency
 }
 
 // implementStageDispatchable reports whether an implement stage in the given
@@ -281,9 +312,10 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		return nil, RunChildrenOutput{}, err
 	}
 
-	// Resolve the runner binary once (shared by every child spawn).
-	binary, err := r.resolveRunnerBinary(in.RunnerBinary)
-	if err != nil {
+	// Resolve the runner binary up front so an unresolvable runner refuses
+	// before any marker. Each child re-resolves it AT ADMISSION
+	// (childSpawnInputs), so a queued child's waiter picks up a change.
+	if _, err := r.resolveRunnerBinary(in.RunnerBinary); err != nil {
 		return nil, RunChildrenOutput{}, err
 	}
 
@@ -354,7 +386,16 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		d.stateKnown = true
 		d.executor = stage.Executor
 		d.pending = implementStageDispatchable(stage.State)
-		if implementStageInFlight(stage.State) {
+		switch {
+		case childQueuedWithLiveWaiter(stage.Concurrency):
+			// Queued for a concurrency slot with a live waiter (#3969): that
+			// waiter spawns it on admission, so it is in flight, not
+			// dispatchable. A stale-waiter child stays dispatchable and is
+			// re-queued below.
+			d.pending = false
+			d.queued = stage.Concurrency
+			inFlight++
+		case implementStageInFlight(stage.State):
 			inFlight++
 		}
 		dispatches = append(dispatches, d)
@@ -371,8 +412,6 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		}
 	}
 
-	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
-
 	// (d) The sequential dispatch loop, in plan_decomposed order.
 	results := make(map[string]*ChildResult, len(dispatches))
 	var deferred []string
@@ -387,30 +426,31 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		res := r.dispatchOneChild(ctx, dispatchChildParams{
 			d:            d,
 			in:           in,
-			binary:       binary,
-			env:          env,
 			workingDir:   workingDir,
 			repo:         repo,
 			fallbackBase: fallbackBase,
 			forgeTarget:  forgeTarget,
 		})
 		results[d.runID] = res
-		if res.Dispatched && budget > 0 {
+		// A queued child spends one unit like a spawned one (#3969): its
+		// waiter spawns it on admission, after this call returns.
+		if (res.Dispatched || res.Queued) && budget > 0 {
 			budget--
 		}
 	}
 	if len(deferred) > 0 {
 		warnings = append(warnings, fmt.Sprintf(
-			"per-invocation dispatch budget (effective_cap %d minus %d already in flight) exhausted; %d dispatchable child(ren) NOT spawned this call: %s. Re-invoke fishhawk_run_children once slots free (fishhawk_await_children releases with children_dispatchable). Note: %s.",
+			"per-invocation dispatch budget (effective_cap %d minus %d already in flight, counting children queued for a concurrency slot with a live waiter) exhausted; %d dispatchable child(ren) NOT spawned this call: %s. Re-invoke fishhawk_run_children once slots free (fishhawk_await_children releases with children_dispatchable). Note: %s.",
 			concurrencyCap, inFlight, len(deferred), strings.Join(deferred, ", "), runChildrenCapDisclosure))
 	}
 
 	// (e) Assemble the consolidated output in plan_decomposed order so the
 	// result is stable across calls. dispatched_count is the number of children
-	// this call ACTUALLY spawned — a marker fail-closed, a wave refusal, a
-	// budget deferral or a spawn error records Dispatched:false and so does not
-	// inflate the count. There is no post-run stage_state refresh: the runners
-	// are still running.
+	// this call ACTUALLY spawned — a queued child, a marker fail-closed, a wave
+	// refusal, a budget deferral or a spawn error records Dispatched:false and
+	// so does not inflate the count. queued_count counts the queued:true
+	// children. There is no post-run stage_state refresh: the runners are
+	// still running.
 	out := RunChildrenOutput{
 		EffectiveCap:       concurrencyCap,
 		ResolvedWorkingDir: workingDir,
@@ -422,6 +462,9 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 			if res.Dispatched {
 				out.DispatchedCount++
 			}
+			if res.Queued {
+				out.QueuedCount++
+			}
 			if res.StageState == "" && d.stateKnown {
 				res.StageState = d.state
 			}
@@ -431,6 +474,11 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		cr := ChildResult{RunID: d.runID, StageID: d.stageID, Dispatched: false}
 		if d.stateKnown {
 			cr.StageState = d.state
+		}
+		if d.queued != nil {
+			cr.Queued = true
+			cr.ConcurrencySlot = d.queued
+			out.QueuedCount++
 		}
 		out.Children = append(out.Children, cr)
 	}
@@ -468,8 +516,6 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 type dispatchChildParams struct {
 	d            childDispatch
 	in           RunChildrenInput
-	binary       string
-	env          []string
 	workingDir   string
 	repo         string
 	fallbackBase string
@@ -509,8 +555,13 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 	// unambiguously means a spawn attempt exists at spawn time. UNLIKE the
 	// single-stage verbs, run_children keys the spawn on the marker's
 	// transitioned signal: only transitioned:true (THIS call won the CAS)
-	// proceeds. FAIL CLOSED on any marker error.
+	// proceeds. FAIL CLOSED on any marker error but one: a 409
+	// concurrency_slot_queued (#3969 / ADR-094 D1) queued the child for a
+	// local concurrency slot, which is not a failure.
 	hdr, hderr := r.api.HostDispatchStage(ctx, childUUID, stageUUID)
+	if q, queued := asConcurrencySlotQueued(hderr); queued {
+		return r.queueChildForSlot(p, agent, childUUID, stageUUID, q, res)
+	}
 	if hderr != nil {
 		// The per-wave integration refusal (E50.13 / #2363) is the one marker
 		// error that means "nothing is wrong, wait": this child's predecessors
@@ -539,27 +590,20 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		res.StageState = hdr.StageState
 	}
 
-	// The SERVER is the authority on the per-wave re-base (#2363): the marker
-	// returns the consolidated base_branch once every dependency slice this
-	// child declares is provably merged onto it, and empty for every other
-	// caller. The client derives nothing.
-	base := p.fallbackBase
-	if hdr.BaseBranch != "" {
-		base = hdr.BaseBranch
-	}
-
-	argv := childRunnerArgv(d.runID, d.stageID, r.api.baseURL, p.in.Workflow, p.workingDir, p.repo, p.forgeTarget, agent, base)
-
 	// The report + probe closures are built exactly as dispatch_stage.go builds
 	// them, bound to THIS child's (run, stage). report is BOTH the detached
 	// reaper's failure channel AND — see below — the spawn-error compensation.
-	report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
-		_, rerr := r.api.ReportStageFailure(ctx, childUUID, stageUUID, category, reason, detail, exitCode)
-		return rerr
-	}
+	report := r.childFailureReporter(childUUID, stageUUID)
 	probe := r.stageStateProbe(childUUID, d.stageID)
 
-	logPath, spawnErr := spawnRunnerStageDetachedFn(p.binary, argv, p.env, d.runID, d.stageID, report, probe)
+	// The spawn inputs are built from this call's own admitting response; a
+	// runner binary that no longer resolves is a spawn error, compensated
+	// below exactly like a failed fork (the stage is already 'dispatched').
+	spawnIn, spawnErr := r.childSpawnInputs(p, agent, hdr)
+	var logPath string
+	if spawnErr == nil {
+		logPath, spawnErr = spawnRunnerStageDetachedFn(spawnIn.binary, spawnIn.argv, spawnIn.env, d.runID, d.stageID, report, probe)
+	}
 	if spawnErr == nil {
 		res.Dispatched = true
 		res.LogPath = logPath
@@ -631,6 +675,67 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 	res.Warnings = append(res.Warnings, fmt.Sprintf(
 		"spawn failed after the host-dispatch marker had already flipped the stage to 'dispatched' (%v), and the category-C failure report meant to make it retryable ALSO failed (%v), so this child's implement stage is STRANDED in 'dispatched' with no runner and no reaper. fishhawk_retry_stage will NOT clear it — it admits only a 'failed' stage. Recover with fishhawk_reap_stage(run_id:%q, stage_id:%q, category:\"C\"), then fishhawk_retry_stage, then re-invoke fishhawk_run_children. (Fallback for a client without that verb: POST %s/v0/runs/%s/stages/%s/reap-failure with {\"category\":\"C\",\"reason\":\"runner_spawn_failed\"}.)",
 		spawnErr, rerr, d.runID, d.stageID, r.api.baseURL, d.runID, d.stageID))
+	return res
+}
+
+// childFailureReporter is the report closure bound to one child's (run,
+// stage): the detached reaper's failure channel, the immediate path's
+// spawn-error compensation, and a queued child's waiter release.
+func (r *runResolver) childFailureReporter(childUUID, stageUUID uuid.UUID) detachedFailureReporter {
+	return func(ctx context.Context, category, reason, detail string, exitCode int) error {
+		_, rerr := r.api.ReportStageFailure(ctx, childUUID, stageUUID, category, reason, detail, exitCode)
+		return rerr
+	}
+}
+
+// childSpawnInputs builds one child's spawn inputs AT ADMISSION: on the
+// immediate path from this call's own 200 marker response, and on the queued
+// path inside the waiter's prepare, from the response that admitted the stage
+// (#3969). It re-resolves the runner binary and rebuilds the env with the
+// token CURRENT at that moment (ADR-087), so a binary or token change while a
+// child is queued is picked up.
+//
+// The SERVER is the authority on the per-wave re-base (#2363): the marker
+// returns the consolidated base_branch once every dependency slice this child
+// declares is provably merged onto it, and empty for every other caller. The
+// client derives nothing; p.fallbackBase is used only when the admitting
+// response names no base.
+func (r *runResolver) childSpawnInputs(p dispatchChildParams, agent string, hdr *HostDispatchResult) (slotSpawnInputs, error) {
+	binary, err := r.resolveRunnerBinary(p.in.RunnerBinary)
+	if err != nil {
+		return slotSpawnInputs{}, err
+	}
+	base := p.fallbackBase
+	if hdr != nil && hdr.BaseBranch != "" {
+		base = hdr.BaseBranch
+	}
+	return slotSpawnInputs{
+		binary: binary,
+		argv:   childRunnerArgv(p.d.runID, p.d.stageID, r.api.baseURL, p.in.Workflow, p.workingDir, p.repo, p.forgeTarget, agent, base),
+		env:    append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token),
+	}, nil
+}
+
+// queueChildForSlot is fishhawk_run_children's queued arm (#3969 / ADR-094
+// D1): the marker answered 409 concurrency_slot_queued, so NO runner is
+// spawned this call. It starts this process's slot waiter for the child (or
+// finds the one already running) and records the child queued with its queue
+// block. The waiter spawns the child DETACHED through
+// spawnRunnerStageDetachedFn, captured here synchronously, and its prepare
+// rebuilds the spawn inputs from the ADMITTING response, so a dependent child
+// spawns against the base_branch the server returns when it admits the
+// stage. A prepare or spawn failure after admission is reported category C
+// by the waiter, releasing the slot.
+func (r *runResolver) queueChildForSlot(p dispatchChildParams, agent string, childUUID, stageUUID uuid.UUID, q *concurrencySlotQueuedError, res *ChildResult) *ChildResult {
+	prepare := func(admit *HostDispatchResult) (slotSpawnInputs, error) {
+		return r.childSpawnInputs(p, agent, admit)
+	}
+	spec := newQueuedSlotSpec(childUUID, stageUUID, q, r.api, prepare, detachedSpawnFunc(spawnRunnerStageDetachedFn),
+		r.childFailureReporter(childUUID, stageUUID), r.stageStateProbe(childUUID, p.d.stageID))
+	slot, warning := startQueuedSlotWaiter(q, spec, "fishhawk_run_children")
+	res.Queued = true
+	res.ConcurrencySlot = slot
+	res.Warnings = append(res.Warnings, warning)
 	return res
 }
 
