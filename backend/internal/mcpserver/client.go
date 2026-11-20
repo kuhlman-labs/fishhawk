@@ -2731,8 +2731,8 @@ type StageConcurrency struct {
 	// WaiterLive is a pointer so an explicit false — the queue row has NOT
 	// been refreshed within the queue TTL — survives omitempty: that false is
 	// the operator's signal that no waiter will spawn the stage.
-	WaiterLive *bool  `json:"waiter_live,omitempty" jsonschema:"while awaiting_concurrency_slot: true when a dispatch waiter refreshed the queue row within the queue TTL (60s); false means NO live waiter will spawn the stage — re-dispatch it with fishhawk_dispatch_stage"`
-	Waiter     string `json:"waiter,omitempty" jsonschema:"on a queued fishhawk_dispatch_stage: started (this MCP session's slot waiter will spawn the stage on admission) or already_waiting (one already is)"`
+	WaiterLive *bool  `json:"waiter_live,omitempty" jsonschema:"while awaiting_concurrency_slot: true when a slot waiter refreshed the queue row within the queue TTL (60s). The waiter may come from any host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run or fishhawk_run_children). false means NO live waiter will spawn the stage — re-invoke the verb that queued it: fishhawk_run_children for a fan-out child, otherwise fishhawk_dispatch_stage, fishhawk_run_stage or fishhawk_drive_run"`
+	Waiter     string `json:"waiter,omitempty" jsonschema:"on a queued host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run or fishhawk_run_children): started (this MCP session's slot waiter will spawn the stage on admission) or already_waiting (one already is)"`
 	// QueuedBefore / WaitedSeconds ride the host-dispatch admission block.
 	QueuedBefore  bool `json:"queued_before,omitempty" jsonschema:"on an admission: true when the stage queued before it was admitted"`
 	WaitedSeconds int  `json:"waited_seconds,omitempty" jsonschema:"on an admission: seconds the stage spent queued"`
@@ -2771,9 +2771,11 @@ const concurrencySlotQueuedCode = "concurrency_slot_queued"
 // concurrency_slot_queued marker answer (#3964 / ADR-087): the stage did NOT
 // get a local concurrency slot and was queued, untouched. It carries the
 // parsed details and WRAPS the *apiError, so errors.As(*apiError) still holds
-// and every caller that fails closed on a non-nil marker error (run_stage,
-// drive_run, run_children) spawns nothing. asConcurrencySlotQueued recovers
-// it; fishhawk_dispatch_stage hands the queued dispatch to its slot waiter.
+// and a caller that fails closed on a non-nil marker error spawns nothing.
+// asConcurrencySlotQueued recovers it; every host-spawn verb
+// (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run,
+// fishhawk_run_children, #3969) hands the queued dispatch to this process's
+// slot waiter, which spawns on admission.
 type concurrencySlotQueuedError struct {
 	Group               string
 	Limit               int
@@ -2843,9 +2845,8 @@ func (e *concurrencySlotQueuedError) holderSummary() string {
 func (e *concurrencySlotQueuedError) Error() string {
 	return fmt.Sprintf(
 		"dispatch queued for this host's local concurrency slot (group %q, limit %d, position %d): %s. "+
-			"fishhawk_dispatch_stage queues the stage and spawns it automatically once a slot frees; "+
-			"fishhawk_run_stage, fishhawk_drive_run and fishhawk_run_children fail closed on a queued dispatch until #3969 — "+
-			"re-invoke them after the holder settles: %v",
+			"Every host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run, fishhawk_run_children) "+
+			"queues the stage and spawns it through this session's slot waiter once a slot frees (#3969): %v",
 		e.Group, e.Limit, e.Position, e.holderSummary(), e.apiErr)
 }
 
@@ -2892,10 +2893,11 @@ func asHostMemoryPressure(err error) bool {
 // backend cannot spawn the host-local runner (ADR-024), so it parks an agent
 // stage at 'awaiting_host_dispatch' rather than 'dispatched'. The MCP host-spawn
 // verbs (fishhawk_run_stage, fishhawk_dispatch_stage, fishhawk_drive_run) call
-// this IMMEDIATELY BEFORE spawning the runner and FAIL CLOSED on any error, so
-// post-#1912 'dispatched' unambiguously means "a spawn attempt exists". The
-// endpoint CAS-transitions {pending, awaiting_host_dispatch} → dispatched.
-// Callers fail closed on a non-nil error (transport / 4xx). 4xx surfaces:
+// this IMMEDIATELY BEFORE spawning the runner and FAIL CLOSED on any error
+// other than the queued answer below, so post-#1912 'dispatched' unambiguously
+// means "a spawn attempt exists". The endpoint CAS-transitions {pending,
+// awaiting_host_dispatch} → dispatched. Callers fail closed on any other
+// non-nil error (transport / 4xx). 4xx surfaces:
 //   - 401 authentication_required / 403 insufficient_scope (needs write:runs)
 //   - 404 stage_not_found (unknown stage, or the stage's run_id disagrees)
 //   - 409 dispatch_not_admissible — either a running/terminal/awaiting_* gate
@@ -2920,8 +2922,9 @@ func asHostMemoryPressure(err error) bool {
 //     ADR-087): the stage's group has no free slot, so the stage was QUEUED
 //     and left at awaiting_host_dispatch. Returned as a
 //     *concurrencySlotQueuedError (asConcurrencySlotQueued) carrying the
-//     parsed position/holders and wrapping the *apiError, annotated here ONCE
-//     so every host-spawn verb fails closed with an actionable message.
+//     parsed position/holders and wrapping the *apiError, typed here ONCE so
+//     every host-spawn verb hands the queued dispatch to this process's slot
+//     waiter, which spawns on admission (#3969).
 //   - 500 dependency_check_failed — the guard's parent-plan / sibling / audit
 //     read errored (retryable), never a silent admit.
 //
@@ -2988,9 +2991,8 @@ func (c *apiClient) HostDispatchStageWithNonce(ctx context.Context, runID, stage
 				"dispatch refused by the per-wave integration guard: this fan-out child's predecessors have succeeded but are not yet integrated onto the parent's consolidated branch; the server integrates between waves — retry the dispatch shortly (fishhawk_await_children releases when the child becomes dispatchable): %w",
 				err)
 		}
-		// The local concurrency queue (#3964): typed so fishhawk_dispatch_stage
-		// can hand the dispatch to its slot waiter, and annotated for every
-		// other host-spawn verb, which fails closed on it (#3969).
+		// The local concurrency queue (#3964): typed so every host-spawn verb
+		// can hand the queued dispatch to its slot waiter (#3969).
 		if errors.As(err, &ae) && ae.Code == concurrencySlotQueuedCode {
 			return nil, newConcurrencySlotQueuedError(ae)
 		}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -103,6 +104,37 @@ func TestValidateHostCapacityEnv(t *testing.T) {
 	if err := ValidateHostCapacityEnv(envLookup("0", true)); !errors.Is(err, errInvalidHostCapacity) {
 		t.Errorf("0: err = %v, want errInvalidHostCapacity", err)
 	}
+}
+
+// TestResolveProcessHostCapacity runs the PRODUCTION read (#3969 carry-forward
+// item 3): resolveProcessHostCapacity over the real process environment, which
+// processHostCapacity wraps in sync.OnceValues. The test binary's init pins
+// processHostCapacity, so this is the only test that reaches os.LookupEnv.
+func TestResolveProcessHostCapacity(t *testing.T) {
+	t.Run("set valid", func(t *testing.T) {
+		t.Setenv(hostCapacityEnv, "5")
+		res, err := resolveProcessHostCapacity()
+		if err != nil || res.Capacity != 5 || res.Source != hostCapacitySourceEnv || res.Raw != "5" {
+			t.Fatalf("resolveProcessHostCapacity() = %+v, %v; want capacity 5 from the env", res, err)
+		}
+	})
+	t.Run("set invalid", func(t *testing.T) {
+		t.Setenv(hostCapacityEnv, "0")
+		res, err := resolveProcessHostCapacity()
+		if !errors.Is(err, errInvalidHostCapacity) || res.Source != hostCapacitySourceInvalid {
+			t.Fatalf("resolveProcessHostCapacity() = %+v, %v; want the invalid-capacity error", res, err)
+		}
+	})
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv(hostCapacityEnv, "") // restores the caller's value on cleanup
+		if err := os.Unsetenv(hostCapacityEnv); err != nil {
+			t.Fatalf("unsetenv: %v", err)
+		}
+		res, err := resolveProcessHostCapacity()
+		if err != nil || res.Capacity != defaultHostCapacity || res.Source != hostCapacitySourceDefault {
+			t.Fatalf("resolveProcessHostCapacity() = %+v, %v; want the default %d", res, err, defaultHostCapacity)
+		}
+	})
 }
 
 // TestHostCapacityParity pins the mirrored constants to

@@ -5045,11 +5045,18 @@ func TestHostDispatchStage_QueuedDecodedAndAnnotated(t *testing.T) {
 		msg := err.Error()
 		for _, want := range []string{
 			"run " + holderRun.String() + " stage " + holderStage.String(),
-			"fishhawk_dispatch_stage", "fishhawk_run_stage", "fishhawk_drive_run", "fishhawk_run_children", "#3969",
+			"Every host-spawn verb (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run, fishhawk_run_children)",
+			"spawns it through this session's slot waiter once a slot frees (#3969)",
 			"concurrency_slot_queued",
 		} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("message missing %q: %s", want, msg)
+			}
+		}
+		// The #3969 interim is gone: no verb fails closed on a queued dispatch.
+		for _, gone := range []string{"fail closed", "until #3969"} {
+			if strings.Contains(msg, gone) {
+				t.Errorf("message still says %q: %s", gone, msg)
 			}
 		}
 		sc := q.stageConcurrency()
