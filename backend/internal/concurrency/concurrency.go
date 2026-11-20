@@ -4,7 +4,10 @@
 // marker transitions it to dispatched, and either is ADMITTED (the stage CAS
 // and the held mark commit in one transaction) or QUEUED FIFO behind the
 // group's live holders. Group keys are scoped identities (ScopedGroupKey,
-// ParseGroupKey; ADR-094 Amendment A1 keeps the legacy strings canonical). Admission is FIFO except for a waiter an operator
+// ParseGroupKey; ADR-094 Amendment A1 keeps the legacy strings canonical).
+// The host capacity group (CapacityGroupKey, ADR-094 D4) is exempt from the
+// multi-group FIFO rule and keeps only ADR-087's reservation formula.
+// Admission is FIFO except for a waiter an operator
 // PROMOTED (#4191), which is ordered just ahead of every other fresh waiter for
 // the rest of its queue episode. Holding is derived from stage state, so a
 // settled, parked or crashed holder releases without a write here. README.md
@@ -43,6 +46,18 @@ const (
 	DefaultVerifyLimit = 1
 	// MaxLimit bounds a declared limit (matches the 0097 CHECK).
 	MaxLimit = 64
+	// CapacityGroupName is the name of the host capacity group every
+	// host-dispatched agent stage holds one slot of (ADR-094 D4, #4241):
+	// key "host:<host>:capacity" (CapacityGroupKey).
+	CapacityGroupName = "capacity"
+	// DefaultHostCapacity is the capacity group's slot count when the
+	// admitting request declares none.
+	DefaultHostCapacity = 3
+	// PreviewTargetGroupName is the built-in host-scoped group a stage that
+	// drives the host's one preview target declares (key
+	// "host:<host>:preview-target", PreviewTargetGroupKey). It is held at
+	// limit 1: a host group's limit is never spec-set.
+	PreviewTargetGroupName = "preview-target"
 	// QueueTTL is how long a queued row stays live without a refresh. A row
 	// older than this is skipped by everyone behind it and, when its owner
 	// polls again, restarts at the TAIL.
@@ -57,9 +72,10 @@ const (
 	DispatchedStaleAfter = 15 * time.Minute
 	// MaxGroups bounds the size of one admission's group set (ADR-094 D2 /
 	// #4240). It is deliberately ABOVE the workflow-v2 schema's
-	// concurrency.groups maxItems (8): ADR-094 slice 3 (#4241) adds the host
-	// capacity group to a full spec-declared set, and that must not need a
-	// store change. TestMaxGroupsAboveSchemaMaxItems pins the ordering.
+	// concurrency.groups maxItems (8): the server adds the host capacity
+	// group and a stage-type default group (ADR-094 D4/D5, #4241) to a full
+	// spec-declared set, and that needs no store change.
+	// TestMaxGroupsAboveSchemaMaxItems pins the ordering.
 	MaxGroups = 16
 )
 
@@ -184,9 +200,10 @@ type Holder struct {
 }
 
 // Admission is Admit's verdict. Its top-level Position and Holders describe
-// the BINDING group: while queued, the group with the highest position (ties
-// broken in canonical key order); once admitted, the first group in canonical
-// key order. Groups lists every group of the set.
+// the BINDING group (BindingIndex): while queued, the group with the highest
+// position (ties prefer a non-capacity group, then canonical key order); once
+// admitted, the first non-capacity group in canonical key order. Groups lists
+// every group of the set.
 type Admission struct {
 	// Admitted reports the stage was transitioned to dispatched and holds a
 	// slot; Stage is the post-transition stage.
@@ -296,6 +313,74 @@ func VerifyGroupKey(host string) string {
 // NamedGroupKey is a spec-declared group key, scoped to its repository.
 func NamedGroupKey(repo, name string) string {
 	return "spec:" + repo + ":" + name
+}
+
+// CapacityGroupKey is the host capacity group key, host:<host>:capacity
+// (ADR-094 D4): ScopedGroupKey(ScopeHost, host, CapacityGroupName) for every
+// valid host label. An empty host becomes UnknownHost. The server refuses a
+// host label containing ':' before any key is built.
+func CapacityGroupKey(host string) string {
+	return hostScopedKey(host, CapacityGroupName)
+}
+
+// PreviewTargetGroupKey is the built-in preview-target group key,
+// host:<host>:preview-target: ScopedGroupKey(ScopeHost, host,
+// PreviewTargetGroupName) for every valid host label.
+func PreviewTargetGroupKey(host string) string {
+	return hostScopedKey(host, PreviewTargetGroupName)
+}
+
+func hostScopedKey(host, name string) string {
+	if host == "" {
+		host = UnknownHost
+	}
+	return string(ScopeHost) + ":" + host + ":" + name
+}
+
+// IsCapacityGroupKey reports whether key is a host capacity group key, i.e.
+// it parses (ParseGroupKey) to scope host with the name CapacityGroupName.
+// The capacity group is exempt from Admit's FIFO rule (b) and ranks last in
+// the binding-group choice (BindingIndex); README.md § "Host capacity group".
+func IsCapacityGroupKey(key string) bool {
+	g, ok := ParseGroupKey(key)
+	return ok && g.Scope == ScopeHost && g.Name == CapacityGroupName
+}
+
+// BindingIndex returns the index in groups of the BINDING group: the group
+// the single-group top-level fields of Admission, Status and Promotion (and
+// the server's wire shape) describe. groups may be in any order; ties are
+// broken by key, never by index.
+//
+//   - queued: the group at the highest Position; at equal positions a
+//     non-capacity group wins, then the first key in canonical (byte) order.
+//   - not queued (admitted or holding): Position is ignored, so the first
+//     non-capacity group in canonical order.
+//
+// So the host capacity group binds only when it alone is strictly highest
+// while queued, or is the set's only group, and the top-level fields keep
+// naming the stage-type group a pre-#4240 client expects. A set without a
+// capacity key picks exactly as before: the highest position, ties in
+// canonical order, and once admitted the first key in canonical order. It
+// returns 0 for an empty slice.
+func BindingIndex(groups []GroupState, queued bool) int {
+	b := 0
+	for i := 1; i < len(groups); i++ {
+		if bindsBefore(groups[i], groups[b], queued) {
+			b = i
+		}
+	}
+	return b
+}
+
+// bindsBefore reports whether g outranks cur in BindingIndex's order.
+func bindsBefore(g, cur GroupState, queued bool) bool {
+	if queued && g.Position != cur.Position {
+		return g.Position > cur.Position
+	}
+	if gc, cc := IsCapacityGroupKey(g.Key), IsCapacityGroupKey(cur.Key); gc != cc {
+		return !gc
+	}
+	return g.Key < cur.Key
 }
 
 // Group-identity names that map onto the legacy host keys.

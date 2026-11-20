@@ -3109,19 +3109,40 @@ func TestDispatchStage_UnresolvedDefaultBranch_RefusesBeforeMarker(t *testing.T)
 	}
 }
 
-// TestDispatchStage_Description_PlansUngrouped pins the #5214 rule 11 sentence:
-// only a local implement joins a default concurrency group, so plan stages are
-// ungrouped (mirrors server resolveStageConcurrency).
-func TestDispatchStage_Description_PlansUngrouped(t *testing.T) {
-	desc := listToolDescriptions(t)["fishhawk_dispatch_stage"]
+// TestDispatchStage_Description_HostCapacity pins the #4241 (ADR-094 D4/A2)
+// concurrency sentences, which supersede #5214 rule 11: every host-dispatched
+// stage holds a host capacity slot, review stages included, a queued stage
+// reserves one slot, the concrete reservation example, and the #3969 interim.
+// It also pins that the old "only implement is grouped" sentences are gone.
+func TestDispatchStage_Description_HostCapacity(t *testing.T) {
+	desc := strings.Join(strings.Fields(listToolDescriptions(t)["fishhawk_dispatch_stage"]), " ")
 	for _, want := range []string{
-		"Only a local implement",
-		"join no",
-		"plan stages may overlap each other and a running implement",
-		"Acceptance serializes only on its shared preview slot",
+		"every host-dispatched plan, implement, acceptance and verify pass holds one slot of host:<host>:capacity",
+		"default 3; FISHHAWK_HOST_CAPACITY",
+		"so do agent review stages and any other agent-executed host-dispatched stage",
+		"ADR-094 D6 (#4242)",
+		"An implement also holds local-implement:<host>",
+		"holds local-verify:<host>",
+		"ADDS groups to these defaults",
+		"each earlier queued stage reserves one slot",
+		"capacity blocks only when holders plus earlier reservations fill capacity",
+		"at capacity 3 with implement limit 2, two holding implements plus one queued implement fill capacity",
+		"at capacity 4 one slot stays free",
+		"Until #3969, fishhawk_run_stage, fishhawk_drive_run and fishhawk_run_children fail closed on a queued dispatch",
+		"for plan and acceptance stages that happens only when holders plus earlier reservations fill capacity",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_dispatch_stage description missing %q:\n%s", want, desc)
+		}
+	}
+	for _, gone := range []string{
+		"Only a local implement",
+		"plan stages may overlap",
+		"never blocks later stages on capacity",
+		"only when host capacity is actually full",
+	} {
+		if strings.Contains(desc, gone) {
+			t.Errorf("fishhawk_dispatch_stage description still says %q", gone)
 		}
 	}
 }

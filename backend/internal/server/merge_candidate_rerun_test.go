@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -670,8 +671,9 @@ func TestRerunQueuedFixup_ConvertsInPlace(t *testing.T) {
 			impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, state)
 			ctx := context.Background()
 			runRow := sd.rr.getRuns[sd.runID]
-			if groups, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); len(groups) != 1 || groups[0].Key != "local-implement:h1" {
-				t.Fatalf("fixture: groups before = %+v, want [local-implement:h1]", groups)
+			wantBefore := []concurrency.GroupRequest{{Key: "local-implement:h1", Limit: 1}, {Key: "host:h1:capacity", Limit: concurrency.DefaultHostCapacity}}
+			if groups, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1", concurrency.DefaultHostCapacity); !slices.Equal(groups, wantBefore) {
+				t.Fatalf("fixture: groups before = %+v, want %+v", groups, wantBefore)
 			}
 			before := chainLen(sd.au)
 
@@ -713,8 +715,9 @@ func TestRerunQueuedFixup_ConvertsInPlace(t *testing.T) {
 			if !strings.Contains(resp.MergeCandidateVerifyNote, "keeps its place") || !strings.Contains(resp.MergeCandidateVerifyNote, "refunded") {
 				t.Errorf("note = %q, want the in-place conversion named", resp.MergeCandidateVerifyNote)
 			}
-			if groups, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); len(groups) != 1 || groups[0].Key != "local-verify:h1" {
-				t.Errorf("groups after = %+v, want [local-verify:h1]", groups)
+			wantAfter := []concurrency.GroupRequest{{Key: "local-verify:h1", Limit: 1}, {Key: "host:h1:capacity", Limit: concurrency.DefaultHostCapacity}}
+			if groups, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1", concurrency.DefaultHostCapacity); !slices.Equal(groups, wantAfter) {
+				t.Errorf("groups after = %+v, want %+v", groups, wantAfter)
 			}
 		})
 	}

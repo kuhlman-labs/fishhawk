@@ -1,0 +1,14 @@
+id: scenario:issue-4241/mcp-startup-refuses-invalid-capacity
+statement: fishhawk-mcp started with FISHHAWK_HOST_CAPACITY=0 (or abc) exits 1 before serving, and its stderr names FISHHAWK_HOST_CAPACITY and the rejected value.
+verify_hint: 'CLI surface: run the fishhawk-mcp binary with the env set; observe the exit code and stderr. TestRun_RefusesInvalidHostCapacity backs it hermetically.'
+steps: 'Ran fishhawk-mcp (built from the sanctioned checkout) with stdin </dev/null under env -i with FISHHAWK_BACKEND_URL=http://localhost:8090, a dummy token, and FISHHAWK_HOST_CAPACITY set to 0, abc, 65 and -1 in turn. Posture B: also ran go test -run TestRun_RefusesInvalidHostCapacity ./cmd/fishhawk-mcp/ in the sanctioned checkout.'
+assertions:
+    expected: exit 1 before serving; stderr names FISHHAWK_HOST_CAPACITY and the rejected value
+    observed_at_record: 'Every value exited 1 with 0 bytes on stdout. stderr read, for example: ''fishhawk-mcp: invalid host capacity: FISHHAWK_HOST_CAPACITY="0" is not an integer in 1..64 (unset it for the default 3)''. The go test reported ok.'
+    repro_handle: FISHHAWK_HOST_CAPACITY=abc /tmp/fhacc4241b/bin/fishhawk-mcp </dev/null; echo $?
+origin:
+    issue: 4241
+    pr: 5482
+    run_id: 59af8515-5848-4b52-9fa3-e72d9d421e6d
+    head_sha: d90254a2723c1d53da20d4d17fc150d9df446e71
+    recorded_at: 2026-11-20T15:14:46Z

@@ -1018,8 +1018,10 @@ func TestCampaignHotfix_AutoPromoteCarriesGroupPositions_PG(t *testing.T) {
 	f.campaignWith(nil, hot, "", false)
 	for i := range 2 {
 		d, _, raw := f.queued(hot, hostBody("h1"))
+		// The set is {host:h1:capacity, local-implement:h1} (ADR-094 D4).
 		gs := queuedGroups(t, raw)
-		if d.Position != 1 || len(gs) != 1 || gs[0].Group != "local-implement:h1" || gs[0].Position != 1 || !sameStageIDs(holderIDs(gs[0].Holders), a.ID) {
+		impl, ok := groupStateOf(gs, "local-implement:h1")
+		if d.Position != 1 || len(gs) != 2 || !ok || impl.Position != 1 || !sameStageIDs(holderIDs(impl.Holders), a.ID) {
 			t.Fatalf("POST %d: details = %+v, groups %+v; want position 1 behind A in local-implement:h1", i+1, d, gs)
 		}
 	}

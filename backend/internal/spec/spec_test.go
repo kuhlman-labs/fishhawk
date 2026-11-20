@@ -8572,6 +8572,141 @@ func TestParse_StageConcurrencyGroups_Rejections(t *testing.T) {
 	}
 }
 
+// TestValidate_ConcurrencyGroupsHostCapacityReserved is the per-failure-mode
+// table for the reserved host capacity group (ADR-094 A2 / #4241, C8). The
+// ParseBytes rows run the full YAML → schema → semantic path: the exact
+// `{group: capacity, scope: host}` entry is schema-valid, so only the
+// semantic refusal can stop it, and a case or whitespace variant of the name
+// is refused earlier by the schema group pattern. The semantic rows set each
+// variant on a parsed Spec in Go and call the exported spec.Validate, which
+// skips the schema pass, so only the canonical (trimmed, lowercased) compare
+// can refuse them.
+func TestValidate_ConcurrencyGroupsHostCapacityReserved(t *testing.T) {
+	const base = "/workflows/wf/stages/0/concurrency"
+
+	refused := []struct {
+		name     string
+		body     string
+		wantPath string
+	}{
+		// The exact row: one schema-valid entry with no limit, so the verify,
+		// limit and duplicate rules are all silent on it.
+		{name: "exact", body: "\n          groups:\n            - {group: capacity, scope: host}", wantPath: base + "/groups/0"},
+		// Refused at the ENTRY pointer, after a declarable host entry.
+		{name: "second_entry", body: "\n          groups:\n            - {group: implement, scope: host}\n            - {group: capacity, scope: host}", wantPath: base + "/groups/1"},
+		// Checked ahead of the limit rule: a limit does not turn the refusal
+		// into a host-limit refusal at /limit.
+		{name: "with_limit", body: "\n          groups:\n            - {group: capacity, scope: host, limit: 4}", wantPath: base + "/groups/0"},
+		// Checked ahead of the duplicate rule: the FIRST entry is refused.
+		{name: "listed_twice", body: "\n          groups:\n            - {group: capacity, scope: host}\n            - {group: capacity, scope: host}", wantPath: base + "/groups/0"},
+	}
+	for _, tc := range refused {
+		t.Run("parse_"+tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(stageConcurrencyDoc(tc.body)))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+			}
+			if ve.Path != tc.wantPath || ve.Message != spec.MsgConcurrencyHostCapacityReserved {
+				t.Errorf("ValidationError = %q: %q, want %q: %q", ve.Path, ve.Message, tc.wantPath, spec.MsgConcurrencyHostCapacityReserved)
+			}
+		})
+	}
+
+	// Through ParseBytes a case or whitespace variant never reaches the
+	// semantic rule: the schema group pattern refuses it at /group.
+	for _, name := range []string{"Capacity", "CAPACITY", " capacity", "capacity "} {
+		t.Run("parse_variant_"+strconv.Quote(name), func(t *testing.T) {
+			body := "\n          groups:\n            - {group: " + strconv.Quote(name) + ", scope: host}"
+			_, err := spec.ParseBytes([]byte(stageConcurrencyDoc(body)))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %T %v, want *spec.SchemaError (the group pattern)", err, err)
+			}
+			if se.Path != base+"/groups/0/group" || !strings.Contains(se.Message, "does not match pattern") {
+				t.Errorf("SchemaError = %q: %q, want the group pattern at %s/groups/0/group", se.Path, se.Message, base)
+			}
+		})
+	}
+
+	// Semantic rows: a Spec built in Go reaches Validate without the schema
+	// pass, so the canonical compare is the only refusal in the path.
+	parsedWith := func(t *testing.T) *spec.Spec {
+		t.Helper()
+		s, err := spec.ParseBytes([]byte(stageConcurrencyDoc("\n          groups:\n            - {group: deploy-target, scope: repository}")))
+		if err != nil {
+			t.Fatalf("ParseBytes(control): %v", err)
+		}
+		return s
+	}
+	t.Run("semantic_control_validates", func(t *testing.T) {
+		if err := spec.Validate(parsedWith(t)); err != nil {
+			t.Fatalf("Validate(unmutated parse) = %v, want nil: the semantic rows below would be refused for another reason", err)
+		}
+	})
+	semantic := []struct {
+		name  string
+		group string
+		scope string
+	}{
+		{name: "exact", group: "capacity", scope: "host"},
+		{name: "title_case", group: "Capacity", scope: "host"},
+		{name: "upper_case", group: "CAPACITY", scope: "host"},
+		{name: "leading_space", group: " capacity", scope: "host"},
+		{name: "trailing_space", group: "capacity ", scope: "host"},
+		{name: "scope_variant", group: "capacity", scope: " Host "},
+	}
+	for _, tc := range semantic {
+		t.Run("semantic_"+tc.name, func(t *testing.T) {
+			s := parsedWith(t)
+			s.Workflows["wf"].Stages[0].Concurrency.Groups[0] = spec.StageConcurrencyGroup{Group: tc.group, Scope: tc.scope}
+			err := spec.Validate(s)
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("Validate(%q, scope %q) = %T %v, want *spec.ValidationError", tc.group, tc.scope, err, err)
+			}
+			if ve.Path != base+"/groups/0" || ve.Message != spec.MsgConcurrencyHostCapacityReserved {
+				t.Errorf("ValidationError = %q: %q, want %q: %q", ve.Path, ve.Message, base+"/groups/0", spec.MsgConcurrencyHostCapacityReserved)
+			}
+		})
+	}
+
+	// Controls: the reservation is scoped to scope host, so a repository
+	// group named capacity is an ordinary repository group.
+	t.Run("accepts_repository_capacity", func(t *testing.T) {
+		if _, err := spec.ParseBytes([]byte(stageConcurrencyDoc("\n          groups:\n            - {group: capacity, scope: repository, limit: 2}"))); err != nil {
+			t.Fatalf("ParseBytes: %v, want a repository-scoped capacity group accepted", err)
+		}
+	})
+}
+
+// TestValidate_ConcurrencyGroupsPreviewTarget pins the built-in host group
+// preview-target (ADR-094 D5 / A2): declarable with scope host and no limit,
+// and refused with a limit, carrying the reworded host-limit message that
+// names the host operator's knob (FISHHAWK_HOST_CAPACITY) and no longer
+// defers to "host-declared capacity (#4241)".
+func TestValidate_ConcurrencyGroupsPreviewTarget(t *testing.T) {
+	const base = "/workflows/wf/stages/0/concurrency"
+	if _, err := spec.ParseBytes([]byte(stageConcurrencyDoc("\n          groups:\n            - {group: preview-target, scope: host}"))); err != nil {
+		t.Fatalf("ParseBytes(preview-target, no limit): %v, want accepted", err)
+	}
+	_, err := spec.ParseBytes([]byte(stageConcurrencyDoc("\n          groups:\n            - {group: preview-target, scope: host, limit: 2}")))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+	}
+	want := fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "preview-target")
+	if ve.Path != base+"/groups/0/limit" || ve.Message != want {
+		t.Errorf("ValidationError = %q: %q, want %q: %q", ve.Path, ve.Message, base+"/groups/0/limit", want)
+	}
+	if !strings.Contains(ve.Message, "FISHHAWK_HOST_CAPACITY") {
+		t.Errorf("host-limit message = %q, want it to name FISHHAWK_HOST_CAPACITY", ve.Message)
+	}
+	if strings.Contains(ve.Message, "until host-declared capacity") {
+		t.Errorf("host-limit message = %q, still defers to host-declared capacity (#4241), which this change delivers", ve.Message)
+	}
+}
+
 // TestStageConcurrency_NotInheritableThroughDefaults pins the stage-level-only
 // rule: `concurrency` is deliberately absent from the `defaults` blocks, so a
 // file-level default declaring it is refused rather than silently inherited.

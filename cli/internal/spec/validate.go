@@ -42,7 +42,8 @@ import (
 //     every declared persona attached by some stage or required by some
 //     escalation's require.reviewers — each rung run immediately after its
 //     review_conventions sibling, as the backend does;
-//   - a stage's concurrency.groups (ADR-094 / #4240): a duplicate (scope,
+//   - a stage's concurrency.groups (ADR-094 / #4240; A2 / #4241): the
+//     reserved host verify and host capacity entries, a duplicate (scope,
 //     group) pair, and a limit on any scope-host entry.
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
@@ -996,22 +997,32 @@ func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 const MsgFmtConcurrencyGroupDuplicate = "concurrency.groups lists (scope %q, group %q) twice (also at entry %d); a stage holds each group once, so declare it once"
 
 // MsgFmtConcurrencyHostGroupLimit rejects a limit on any scope-host groups entry.
-const MsgFmtConcurrencyHostGroupLimit = "concurrency.groups entry (scope \"host\", group %q) declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository's spec; the host's implement group takes the host default limit and any other host-scoped group is held at limit 1 until host-declared capacity (#4241). Remove limit, or declare the group with scope repository"
+const MsgFmtConcurrencyHostGroupLimit = "concurrency.groups entry (scope \"host\", group %q) declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository's spec; the host's implement group takes the host default limit, the host capacity group is sized by FISHHAWK_HOST_CAPACITY, and preview-target and any other host-scoped group is held at limit 1. Remove limit, or declare the group with scope repository"
 
 // MsgConcurrencyHostVerifyReserved rejects a scope-host entry naming the host verify group.
 const MsgConcurrencyHostVerifyReserved = "concurrency.groups entry (scope \"host\", group \"verify\") is reserved: local-verify:<host> is reserved for server-decided merge-candidate verify passes and specialist jobs, so a spec cannot declare it. Remove the entry, or declare a group with scope repository"
+
+// MsgConcurrencyHostCapacityReserved rejects a scope-host entry naming the host capacity group.
+const MsgConcurrencyHostCapacityReserved = "concurrency.groups entry (scope \"host\", group \"capacity\") is reserved: host:<host>:capacity is the host capacity group every host-dispatched stage already holds, sized by the host operator through FISHHAWK_HOST_CAPACITY (default 3), so a spec cannot declare it. Remove the entry, or declare a group with scope repository"
 
 // checkStageConcurrencyGroups mirrors the backend's
 // validateStageConcurrencyGroups over the raw yaml.v3 tree: per entry in
 // declaration order, a scope-host entry naming `verify` is refused at the
 // entry's pointer (local-verify:<host> is reserved for server-decided
-// merge-candidate verify passes and specialist jobs) and the entry's other
-// checks are skipped, as the backend returns on it; otherwise a scope-host
-// entry carrying `limit` is refused (host groups are shared by every
-// repository on the host), then a (scope, group) pair already seen is
-// refused. The backend returns the first refusal; this sweep reports every
-// one. Shape mismatches are skipped, as everywhere in this file — the schema
-// already rejected them.
+// merge-candidate verify passes and specialist jobs), and so is a scope-host
+// entry naming `capacity` (host:<host>:capacity is held by every
+// host-dispatched stage already and sized by the host operator; ADR-094 A2);
+// either reserved entry's other checks are skipped, as the backend returns on
+// it. Otherwise a scope-host entry carrying `limit` is refused (host groups
+// are shared by every repository on the host), then a (scope, group) pair
+// already seen is refused. The backend returns the first refusal; this sweep
+// reports every one. Shape mismatches are skipped, as everywhere in this
+// file — the schema already rejected them.
+//
+// The capacity compare is CANONICAL (trimmed, lowercased), as the backend's
+// is. Here it is defence in depth only: ValidateBytes returns on the schema
+// pass, whose group pattern already refuses a case or whitespace variant, so
+// no input reaches the fold with a non-canonical name.
 func checkStageConcurrencyGroups(stage map[string]any, base string, errs *[]ValidationErrorEntry) {
 	conc, ok := stage["concurrency"].(map[string]any)
 	if !ok {
@@ -1032,6 +1043,10 @@ func checkStageConcurrencyGroups(stage map[string]any, base string, errs *[]Vali
 		ptr := fmt.Sprintf("%s/concurrency/groups/%d", base, j)
 		if scope == "host" && name == "verify" {
 			*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: MsgConcurrencyHostVerifyReserved})
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(scope)) == "host" && strings.ToLower(strings.TrimSpace(name)) == "capacity" {
+			*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: MsgConcurrencyHostCapacityReserved})
 			continue
 		}
 		if _, hasLimit := entry["limit"]; hasLimit && scope == "host" {

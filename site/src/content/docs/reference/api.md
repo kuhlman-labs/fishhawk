@@ -204,6 +204,28 @@ keeps its state. A stage that is already `dispatched` keeps its idempotent
 200, and nothing in flight is stopped. Re-dispatch once the condition
 clears.
 
+The marker also admits each stage into its concurrency groups, and the table
+does not spell out the host's share of that either. Every host-dispatched
+stage holds one slot of the host capacity group `host:<host>:capacity`. That
+covers a plan, an implement, an acceptance, a merge-candidate verify pass, an
+agent review and any other agent-run stage. An implement also holds
+`local-implement:<host>`, and a verify pass `local-verify:<host>`. The
+capacity limit applies to one request: the optional body field `capacity`
+(1 to 64), which the MCP server sends from `FISHHAWK_HOST_CAPACITY`, and 3
+when it is absent. Nothing is stored, so set the variable to the same value
+in every process that dispatches for the host. A queued stage reserves one
+capacity slot; later stages queue only when holders plus earlier
+reservations fill capacity. At capacity 3, two
+running implements and one queued implement fill it, and a later plan,
+acceptance or verify pass queues; at capacity 4 one slot stays free. A
+queued stage gets 409 `concurrency_slot_queued` and keeps its state. A
+`capacity` outside 1 to 64, or one that is not an integer, gets 400
+`validation_failed` with `details.field` `capacity`. A workflow stage's
+`concurrency` declaration adds groups to these defaults and never removes
+them, and it cannot declare `{group: capacity, scope: host}`. Upgrade
+fishhawkd before setting `FISHHAWK_HOST_CAPACITY`: an older daemon refuses
+the field with 400.
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->

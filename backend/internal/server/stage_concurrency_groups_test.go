@@ -116,7 +116,8 @@ func auditGroupKeys(p map[string]any) []string {
 
 // TestHostDispatch_DeclaredGroupsAdmitAtomically (CF14 vehicle): A and B are
 // on different hosts and share only the repository group. A is admitted into
-// both of its groups; B is queued with BOTH rows queued (no partial hold),
+// every group of its set — the declared two plus the host capacity group
+// (ADR-094 D4) — and B is queued with EVERY row queued (no partial hold),
 // and every wire surface lists the set.
 func TestHostDispatch_DeclaredGroupsAdmitAtomically(t *testing.T) {
 	f := newSCPG(t, pgStore)
@@ -128,55 +129,63 @@ func TestHostDispatch_DeclaredGroupsAdmitAtomically(t *testing.T) {
 
 	resp := f.admitted(a, hostBody("h1"))
 	wantA := []concurrencyGroupRef{
+		{Group: "host:h1:capacity", Scope: "host", Limit: concurrency.DefaultHostCapacity},
 		{Group: "local-implement:h1", Scope: "host", Limit: concurrency.DefaultLimit},
 		{Group: repoKey, Scope: "repository", Limit: 1},
 	}
 	if c := resp.Concurrency; c == nil || !slices.Equal(c.Groups, wantA) || c.Group != "local-implement:h1" || c.Limit != concurrency.DefaultLimit {
 		t.Fatalf("A 200 concurrency = %+v, want binding local-implement:h1 and groups %+v", resp.Concurrency, wantA)
 	}
-	if rows := f.slotRows(a.ID); len(rows) != 2 || rows[0].state != "held" || rows[1].state != "held" {
-		t.Fatalf("A slot rows = %+v, want two held", rows)
+	if rows := f.slotRows(a.ID); len(rows) != 3 || rows[0].state != "held" || rows[1].state != "held" || rows[2].state != "held" {
+		t.Fatalf("A slot rows = %+v, want three held", rows)
 	}
-	if ps := f.auditPayloads(CategoryStageConcurrencyAdmitted, a.ID); len(ps) != 1 || !slices.Equal(auditGroupKeys(ps[0]), []string{"local-implement:h1", repoKey}) {
-		t.Errorf("A admitted audit = %+v, want one row listing both groups", ps)
+	if ps := f.auditPayloads(CategoryStageConcurrencyAdmitted, a.ID); len(ps) != 1 || !slices.Equal(auditGroupKeys(ps[0]), []string{"host:h1:capacity", "local-implement:h1", repoKey}) {
+		t.Errorf("A admitted audit = %+v, want one row listing every group", ps)
 	}
 
 	d, msg, raw := f.queued(b, hostBody("h2"))
 	gs := queuedGroups(t, raw)
-	if len(gs) != 2 || gs[0].Group != "local-implement:h2" || gs[0].Scope != "host" || gs[1].Group != repoKey || gs[1].Scope != "repository" {
-		t.Fatalf("B details.groups = %+v, want local-implement:h2 (host) and %s (repository)", gs, repoKey)
+	if len(gs) != 3 || gs[0].Group != "host:h2:capacity" || gs[0].Scope != "host" || gs[1].Group != "local-implement:h2" || gs[1].Scope != "host" ||
+		gs[2].Group != repoKey || gs[2].Scope != "repository" {
+		t.Fatalf("B details.groups = %+v, want host:h2:capacity and local-implement:h2 (host) and %s (repository)", gs, repoKey)
 	}
-	if !sameStageIDs(holderIDs(gs[1].Holders), a.ID) || len(gs[0].Holders) != 0 || gs[0].Position != 1 || gs[1].Position != 1 {
-		t.Errorf("B details.groups = %+v, want A holding only the repository group, both at position 1", gs)
+	if !sameStageIDs(holderIDs(gs[2].Holders), a.ID) || len(gs[0].Holders) != 0 || len(gs[1].Holders) != 0 || gs[0].Position != 1 || gs[1].Position != 1 || gs[2].Position != 1 {
+		t.Errorf("B details.groups = %+v, want A holding only the repository group, all at position 1", gs)
 	}
-	// Binding group: equal positions, so the canonical-first key.
+	// Binding group: equal positions, so the canonical-first non-capacity key.
 	if d.Group != "local-implement:h2" || d.Position != 1 {
 		t.Errorf("B top-level = %+v, want the binding group local-implement:h2 at 1", d)
 	}
-	if !strings.HasSuffix(msg, `; group set: ["local-implement:h2" (limit 1) at position 1, "`+repoKey+`" (limit 1) at position 1]`) {
+	if !strings.HasSuffix(msg, `; group set: ["host:h2:capacity" (limit 3) at position 1, "local-implement:h2" (limit 1) at position 1, "`+repoKey+`" (limit 1) at position 1]`) {
 		t.Errorf("B message = %q, want the group-set suffix", msg)
 	}
-	if rows := f.slotRows(b.ID); len(rows) != 2 || rows[0].state != "queued" || rows[1].state != "queued" || rows[0].acquiredAt != nil || rows[1].acquiredAt != nil {
-		t.Fatalf("B slot rows = %+v, want both queued, none acquired", rows)
+	rows := f.slotRows(b.ID)
+	if len(rows) != 3 {
+		t.Fatalf("B slot rows = %+v, want three", rows)
 	}
-	if ps := f.auditPayloads(CategoryStageConcurrencyQueued, b.ID); len(ps) != 1 || !slices.Equal(auditGroupKeys(ps[0]), []string{"local-implement:h2", repoKey}) || ps[0]["group"] != "local-implement:h2" {
-		t.Errorf("B queued audit = %+v, want one row listing both groups", ps)
+	for _, r := range rows {
+		if r.state != "queued" || r.acquiredAt != nil {
+			t.Fatalf("B slot rows = %+v, want every row queued, none acquired", rows)
+		}
+	}
+	if ps := f.auditPayloads(CategoryStageConcurrencyQueued, b.ID); len(ps) != 1 || !slices.Equal(auditGroupKeys(ps[0]), []string{"host:h2:capacity", "local-implement:h2", repoKey}) || ps[0]["group"] != "local-implement:h2" {
+		t.Errorf("B queued audit = %+v, want one row listing every group", ps)
 	}
 	for name, blk := range f.blocks(b) {
-		if blk == nil || blk.Status != stageConcurrencyStatusQueued || blk.Group != "local-implement:h2" || blk.Position != 1 || len(blk.Groups) != 2 ||
-			blk.Groups[1].Group != repoKey || blk.Groups[1].Position != 1 || !sameStageIDs(holderIDs(blk.Groups[1].Holders), a.ID) {
-			t.Errorf("B %s block = %+v, want queued with both groups", name, blk)
+		if blk == nil || blk.Status != stageConcurrencyStatusQueued || blk.Group != "local-implement:h2" || blk.Position != 1 || len(blk.Groups) != 3 ||
+			blk.Groups[2].Group != repoKey || blk.Groups[2].Position != 1 || !sameStageIDs(holderIDs(blk.Groups[2].Holders), a.ID) {
+			t.Errorf("B %s block = %+v, want queued with every group", name, blk)
 		}
 	}
 	for name, blk := range f.blocks(a) {
-		if blk == nil || blk.Status != stageConcurrencyStatusHolding || len(blk.Groups) != 2 || blk.Groups[0].Position != 0 {
-			t.Errorf("A %s block = %+v, want holding with both groups and no positions", name, blk)
+		if blk == nil || blk.Status != stageConcurrencyStatusHolding || blk.Group != "local-implement:h1" || len(blk.Groups) != 3 || blk.Groups[0].Position != 0 {
+			t.Errorf("A %s block = %+v, want holding with every group and no positions", name, blk)
 		}
 	}
 
 	f.to(a.ID, run.StageStateRunning, run.StageStateSucceeded)
-	if resp := f.admitted(b, hostBody("h2")); len(resp.Concurrency.Groups) != 2 {
-		t.Errorf("B 200 groups = %+v, want both", resp.Concurrency.Groups)
+	if resp := f.admitted(b, hostBody("h2")); len(resp.Concurrency.Groups) != 3 {
+		t.Errorf("B 200 groups = %+v, want all three", resp.Concurrency.Groups)
 	}
 }
 
@@ -192,8 +201,8 @@ func TestHostDispatch_DeclaredHostImplementGroupIsTheDefaultGroup(t *testing.T) 
 	if d.Group != "local-implement:h1" || d.Limit != concurrency.DefaultLimit || !sameStageIDs(holderIDs(d.Holders), x.ID) {
 		t.Fatalf("Y details = %+v, want queued behind X in local-implement:h1 at the default limit", d)
 	}
-	if gs := queuedGroups(t, raw); len(gs) != 1 || gs[0].Group != "local-implement:h1" || gs[0].Scope != "host" {
-		t.Errorf("Y details.groups = %+v, want the one default group", gs)
+	if gs := queuedGroups(t, raw); len(gs) != 2 || gs[0].Group != "host:h1:capacity" || gs[1].Group != "local-implement:h1" || gs[1].Scope != "host" {
+		t.Errorf("Y details.groups = %+v, want the capacity group and the one default group", gs)
 	}
 }
 
@@ -203,41 +212,48 @@ func preChangeQueuedMessage(group string, limit, position int, why string) strin
 		group, limit, position, why)
 }
 
-// TestHostDispatch_SingleGroupBlockGainsOneGroupEntry (CF-R7-suffix): a
-// shorthand stage and a default stage keep every pre-change field value, the
-// 409 message is byte-identical, and groups carries exactly one entry.
-func TestHostDispatch_SingleGroupBlockGainsOneGroupEntry(t *testing.T) {
+// TestHostDispatch_BindingFieldsKeepPreChangeValues (CF-R7-suffix, ADR-094
+// D4): every set now carries the host capacity group, but the top-level
+// fields keep every pre-change value because the binding group prefers a
+// non-capacity group, and the 409 message keeps the pre-change text byte for
+// byte as its prefix, followed by the group-set suffix. The shorthand case
+// runs on a PLAN stage, whose default set is the capacity group alone, so
+// the named group is its stage-type group.
+func TestHostDispatch_BindingFieldsKeepPreChangeValues(t *testing.T) {
 	for _, tc := range []struct {
-		name, block, group, scope string
+		name, group, scope string
+		typ                run.StageType
+		doc                string
 	}{
-		{"default", "", "local-implement:h1", "host"},
-		{"shorthand", "\n          group: deploy-target", "spec:" + fhRepo + ":deploy-target", "repository"},
+		{"default implement", "local-implement:h1", "host", run.StageTypeImplement, concurrencySpec("")},
+		{"shorthand plan", "spec:" + fhRepo + ":deploy-target", "repository", run.StageTypePlan, typedSpec(run.StageTypePlan, "\n          group: deploy-target")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSCPG(t, pgStore)
-			a, b := f.impl(), f.impl()
-			f.setSpec(a, concurrencySpec(tc.block))
-			f.setSpec(b, concurrencySpec(tc.block))
+			a, b := f.stage(fhRepo, tc.typ), f.stage(fhRepo, tc.typ)
+			f.setSpec(a, tc.doc)
+			f.setSpec(b, tc.doc)
 			resp := f.admitted(a, hostBody("h1"))
-			if c := resp.Concurrency; c.Group != tc.group || c.Limit != 1 || c.QueuedBefore ||
-				!slices.Equal(c.Groups, []concurrencyGroupRef{{Group: tc.group, Scope: tc.scope, Limit: 1}}) {
-				t.Fatalf("A 200 concurrency = %+v", c)
+			wantRefs := []concurrencyGroupRef{{Group: "host:h1:capacity", Scope: "host", Limit: concurrency.DefaultHostCapacity}, {Group: tc.group, Scope: tc.scope, Limit: 1}}
+			if c := resp.Concurrency; c.Group != tc.group || c.Limit != 1 || c.QueuedBefore || !slices.Equal(c.Groups, wantRefs) {
+				t.Fatalf("A 200 concurrency = %+v, want binding %s and groups %+v", c, tc.group, wantRefs)
 			}
 			d, msg, raw := f.queued(b, hostBody("h1"))
 			if d.Group != tc.group || d.Limit != 1 || d.Position != 1 || !sameStageIDs(holderIDs(d.Holders), a.ID) {
 				t.Fatalf("B details = %+v", d)
 			}
-			want := preChangeQueuedMessage(tc.group, 1, 1, "held by run "+a.RunID.String()+" stage "+a.ID.String())
+			want := preChangeQueuedMessage(tc.group, 1, 1, "held by run "+a.RunID.String()+" stage "+a.ID.String()) +
+				`; group set: ["host:h1:capacity" (limit 3) at position 1, "` + tc.group + `" (limit 1) at position 1]`
 			if msg != want {
-				t.Errorf("B message =\n%q\nwant byte-identical\n%q", msg, want)
+				t.Errorf("B message =\n%q\nwant the pre-change text plus the group-set suffix\n%q", msg, want)
 			}
 			gs := queuedGroups(t, raw)
-			if len(gs) != 1 || gs[0].Group != tc.group || gs[0].Scope != tc.scope || gs[0].Limit != 1 || gs[0].Position != 1 || !sameStageIDs(holderIDs(gs[0].Holders), a.ID) {
-				t.Errorf("B details.groups = %+v, want one entry equal to the top-level fields", gs)
+			if len(gs) != 2 || gs[1].Group != tc.group || gs[1].Scope != tc.scope || gs[1].Limit != 1 || gs[1].Position != 1 || !sameStageIDs(holderIDs(gs[1].Holders), a.ID) {
+				t.Errorf("B details.groups = %+v, want the stage-type entry equal to the top-level fields", gs)
 			}
 			for name, blk := range f.blocks(b) {
-				if blk == nil || blk.Group != tc.group || blk.Position != 1 || len(blk.Groups) != 1 || blk.Groups[0].Group != tc.group || blk.Groups[0].Scope != tc.scope || blk.Groups[0].Position != 1 {
-					t.Errorf("B %s block = %+v, want one groups entry", name, blk)
+				if blk == nil || blk.Group != tc.group || blk.Position != 1 || len(blk.Groups) != 2 || blk.Groups[1].Group != tc.group || blk.Groups[1].Scope != tc.scope || blk.Groups[1].Position != 1 {
+					t.Errorf("B %s block = %+v, want the binding group and two groups entries", name, blk)
 				}
 			}
 		})
@@ -440,6 +456,35 @@ func TestBindingGroup_PicksTheDocumentedGroup(t *testing.T) {
 	}
 	if blk := toHostDispatchConcurrency(concurrency.Admission{Admitted: true, Groups: set}, nil, ""); blk.Group != "local-implement:h1" || blk.Limit != 1 || len(blk.Groups) != 2 {
 		t.Errorf("admitted block = %+v, want binding local-implement:h1 and both groups", blk)
+	}
+}
+
+// TestBindingGroup_SkipsCapacity (ADR-094 D4): the host capacity group sorts
+// canonical-first (host:... < local-...) but never binds while another group
+// ties or outranks it: admitted, the stage-type group binds; queued at equal
+// positions, the stage-type group binds; only a capacity group alone at the
+// strictly highest position binds. The R7 fallback (a store that left Groups
+// empty) synthesises the requested set's non-capacity group too.
+func TestBindingGroup_SkipsCapacity(t *testing.T) {
+	cap3 := concurrency.GroupState{Key: "host:h1:capacity", Limit: 3, Position: 1}
+	impl := concurrency.GroupState{Key: "local-implement:h1", Limit: 1, Position: 1}
+	if b := bindingGroup([]concurrency.GroupState{cap3, impl}, true); b.Key != impl.Key {
+		t.Errorf("admitted binding = %s, want %s", b.Key, impl.Key)
+	}
+	if b := bindingGroup([]concurrency.GroupState{cap3, impl}, false); b.Key != impl.Key {
+		t.Errorf("queued tie binding = %s, want %s", b.Key, impl.Key)
+	}
+	high := cap3
+	high.Position = 2
+	if b := bindingGroup([]concurrency.GroupState{high, impl}, false); b.Key != high.Key {
+		t.Errorf("queued capacity-highest binding = %s, want %s", b.Key, high.Key)
+	}
+	if b := bindingGroup([]concurrency.GroupState{cap3}, true); b.Key != cap3.Key {
+		t.Errorf("capacity-only binding = %s, want %s", b.Key, cap3.Key)
+	}
+	req := []concurrency.GroupRequest{{Key: "host:h1:capacity", Limit: 3}, {Key: "local-implement:h1", Limit: 1}}
+	if gs := admissionGroups(concurrency.Admission{Position: 2}, req); len(gs) != 1 || gs[0].Key != "local-implement:h1" || gs[0].Limit != 1 || gs[0].Position != 2 {
+		t.Errorf("R7 fallback = %+v, want local-implement:h1 at limit 1, position 2", gs)
 	}
 }
 

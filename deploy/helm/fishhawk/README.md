@@ -66,6 +66,41 @@ future split-mode guard must be wired into
 
 ## Upgrading
 
+**The release adding the host capacity group (ADR-094 D4/D5,
+[#4241](https://github.com/kuhlman-labs/fishhawk/issues/4241)) has no
+migration.** Capacity rows are ordinary `stage_concurrency_slots` rows, and
+the capacity limit is per request (the marker body's optional `capacity`,
+which the MCP sends from `FISHHAWK_HOST_CAPACITY`), so there is no stored
+declaration. Order matters for the client variable only: **upgrade fishhawkd
+before any MCP or host-dispatcher process sets `FISHHAWK_HOST_CAPACITY`.** An
+older fishhawkd refuses the unknown `capacity` key with 400
+`validation_failed`, so a client that sends it fails closed (no spawn) until
+the daemon is upgraded; a client with the variable unset sends a
+byte-identical body and works against either. On the upgraded daemon every
+host-dispatched stage also holds one `host:<host>:capacity` slot (default 3):
+a host running implement limit 2 should set `FISHHAWK_HOST_CAPACITY=4`,
+because a queued implement reserves one capacity slot and at 3 it would queue
+later plan, acceptance and verify stages. **The upgrade also re-queues every
+live waiter.** On its first poll after the upgrade each queued stage asks for
+a larger set: it gains `host:<host>:capacity`, and an implement whose
+declaration did not name the host implement group (the named
+`{group, limit}` shorthand, or a `groups` list without
+`{group: implement, scope: host}`) also gains `local-implement:<host>`. A set
+that differs restarts at the queue tail and clears its `order_key`, so
+waiters re-queue in the order they next poll and lose any operator promotion:
+re-run `fishhawk_promote_queued_stage` after the upgrade. Stages admitted
+before the upgrade hold no capacity row (nor, for such an implement, a
+`local-implement:<host>` row), so capacity under-counts until they settle.
+To roll back, unset
+`FISHHAWK_HOST_CAPACITY` in every MCP and host-dispatcher env FIRST, then
+revert the binary. A reverted binary never names the capacity group, so held
+capacity rows count for nothing, and a queued stage whose set changed restarts
+at the queue tail on its next poll. A captured spec relying on additive
+`concurrency.groups` reverts to the replace meaning. Rolling back further,
+through 0118 (below), must drain every held implement and verify-pass stage
+too: on this release each holds a capacity row beside its type group, so 0118's
+down migration counts it as multi-group.
+
 **The release carrying migration 0118 (multi-group concurrency slots,
 [#4240](https://github.com/kuhlman-labs/fishhawk/issues/4240)) needs the
 binary and the schema to change together.** 0118 widens the

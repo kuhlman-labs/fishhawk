@@ -1,0 +1,13 @@
+id: scenario:issue-4241/dispatch-description-states-capacity
+statement: In the stdio MCP tools/list result, the fishhawk_dispatch_stage description no longer says plan, review and acceptance stages join no concurrency group. It states that every host-dispatched agent stage (plan, implement, acceptance, review, verify pass) holds a host capacity slot, and that a queued stage holds a capacity reservation.
+steps: Minted an fhm_ bearer from a trace-upload-target fixture (signing-key, dev/sign over '{}', mcp-token). Ran fishhawk-mcp built from the sanctioned checkout on stdio against http://localhost:8090 with initialize, notifications/initialized and tools/list. Read the fishhawk_dispatch_stage description.
+assertions:
+    expected: no 'join no concurrency group'; capacity slot for all agent stages; queued stage holds a reservation
+    observed_at_record: 'No ''join no concurrency group''. The description says: ''every host-dispatched plan, implement, acceptance and verify pass holds one slot of host:<host>:capacity ... and so do agent review stages and any other agent-executed host-dispatched stage'', and ''On capacity each earlier queued stage reserves one slot ... capacity blocks only when holders plus earlier reservations fill capacity''. It gives the capacity 3 vs 4 example (K2) and notes D6 (#4242) (K5).'
+    repro_handle: python3 -I /tmp/fhacc4241b/scripts/stdio.py - tools/list
+origin:
+    issue: 4241
+    pr: 5482
+    run_id: 59af8515-5848-4b52-9fa3-e72d9d421e6d
+    head_sha: d90254a2723c1d53da20d4d17fc150d9df446e71
+    recorded_at: 2026-11-20T15:14:46Z

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -639,19 +640,23 @@ func TestHostDispatch_TerminalRunRefused(t *testing.T) {
 	}
 }
 
-// TestHostDispatch_PlanStageNotGrouped: an undeclared non-implement stage is
-// ungrouped — admitted beside an implement holder, no block, no row.
-func TestHostDispatch_PlanStageNotGrouped(t *testing.T) {
+// TestHostDispatch_PlanStageHoldsCapacity (ADR-094 D4/D5, #4241): an
+// undeclared plan stage holds one slot of the host capacity group and
+// nothing else. It is admitted beside an implement holder, its block names
+// host:h1:capacity at the default capacity (the binding group, as the set's
+// only group), and its one slot row is that group's, held.
+func TestHostDispatch_PlanStageHoldsCapacity(t *testing.T) {
 	f := newSCPG(t, pgStore)
 	a := f.impl()
 	p := f.stage("kuhlman-labs/fishhawk", run.StageTypePlan)
 	f.admitted(a, hostBody("h1"))
 	resp := f.admitted(p, hostBody("h1"))
-	if resp.Concurrency != nil {
-		t.Fatalf("plan admission carries a concurrency block %+v", resp.Concurrency)
+	want := []concurrencyGroupRef{{Group: "host:h1:capacity", Scope: "host", Limit: concurrency.DefaultHostCapacity}}
+	if c := resp.Concurrency; c == nil || c.Group != "host:h1:capacity" || c.Limit != concurrency.DefaultHostCapacity || !slices.Equal(c.Groups, want) {
+		t.Fatalf("plan admission block = %+v, want host:h1:capacity at %d and groups %+v", resp.Concurrency, concurrency.DefaultHostCapacity, want)
 	}
-	if _, ok := f.slot(p.ID); ok {
-		t.Fatal("ungrouped plan stage wrote a slot row")
+	if rows := f.slotRows(p.ID); len(rows) != 1 || rows[0].key != "host:h1:capacity" || rows[0].state != "held" {
+		t.Fatalf("plan slot rows = %+v, want one held host:h1:capacity row", rows)
 	}
 }
 
@@ -690,6 +695,9 @@ func TestHostDispatch_SpecLimitTwoAdmitsBoth(t *testing.T) {
 
 // TestHostDispatch_SpecNamedGroupRepoScoped: a named group is repository
 // scoped — queued behind a same-repo holder, admitted beside another repo's.
+// The named shorthand ADDS its group to the implement default set (ADR-094
+// A2), so every stage also holds local-implement:<host>; C runs on a third
+// host, where that group is free, so only the repository group decides it.
 func TestHostDispatch_SpecNamedGroupRepoScoped(t *testing.T) {
 	f := newSCPG(t, pgStore)
 	a := f.stage("org/one", run.StageTypeImplement)
@@ -698,13 +706,14 @@ func TestHostDispatch_SpecNamedGroupRepoScoped(t *testing.T) {
 	for _, st := range []*run.Stage{a, b, c} {
 		f.setSpec(st, concurrencySpec("\n          group: deploy-target"))
 	}
-	if resp := f.admitted(a, hostBody("h1")); resp.Concurrency.Group != "spec:org/one:deploy-target" {
-		t.Fatalf("A group = %q", resp.Concurrency.Group)
+	if resp := f.admitted(a, hostBody("h1")); !hasGroupRef(resp.Concurrency.Groups, "spec:org/one:deploy-target", 1) {
+		t.Fatalf("A groups = %+v, want spec:org/one:deploy-target", resp.Concurrency.Groups)
 	}
-	if d, _, _ := f.queued(b, hostBody("h2")); d.Group != "spec:org/one:deploy-target" || !sameStageIDs(holderIDs(d.Holders), a.ID) {
-		t.Fatalf("B details = %+v, want queued behind A in the repo group (host-independent)", d)
+	_, _, raw := f.queued(b, hostBody("h2"))
+	if g, ok := groupStateOf(queuedGroups(t, raw), "spec:org/one:deploy-target"); !ok || !sameStageIDs(holderIDs(g.Holders), a.ID) {
+		t.Fatalf("B details.groups = %s, want queued behind A in the repo group (host-independent)", raw)
 	}
-	f.admitted(c, hostBody("h1"))
+	f.admitted(c, hostBody("h3"))
 }
 
 // TestHostDispatch_SpecParseFailureFallsBackToDefault: an unparseable spec
@@ -1015,15 +1024,20 @@ func (f *scPG) triggerPass(st *run.Stage, head string) {
 	f.appendStageAudit(st, CategoryStageMergeCandidateVerifyTriggered, mcTrigger(head))
 }
 
-// slotGroup reads the committed slot row's group key.
+// slotGroup reads the key of the stage's one committed slot row that is not
+// the host capacity group's (every set carries that one, ADR-094 D4).
 func (f *scPG) slotGroup(id uuid.UUID) string {
 	f.t.Helper()
-	var g string
-	if err := f.pool.QueryRow(context.Background(),
-		`SELECT group_key FROM stage_concurrency_slots WHERE stage_id = $1`, id).Scan(&g); err != nil {
-		f.t.Fatalf("read slot group of %s: %v", id, err)
+	var keys []string
+	for _, r := range f.slotRows(id) {
+		if !concurrency.IsCapacityGroupKey(r.key) {
+			keys = append(keys, r.key)
+		}
 	}
-	return g
+	if len(keys) != 1 {
+		f.t.Fatalf("slot rows of %s = %+v, want exactly one non-capacity group", id, f.slotRows(id))
+	}
+	return keys[0]
 }
 
 // TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup is the
@@ -1035,6 +1049,12 @@ func (f *scPG) slotGroup(id uuid.UUID) string {
 // slot is held, and the marker answers 409 concurrency_slot_queued at
 // position 4. The pass holds no implement slot: a later implement still sees
 // only the implement holder.
+//
+// The pass declares capacity 8: each queued implement reserves one slot of
+// host:h1:capacity (ADR-094 A2, the reservation formula), so at the default
+// capacity of 3 the holder plus three reservations would fill capacity and
+// queue the pass there. 1 holder + 3 reservations < 8 leaves the verify group
+// the only group in the path.
 func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T) {
 	f := newSCPG(t, pgStore)
 	holder := f.impl()
@@ -1047,7 +1067,7 @@ func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T)
 
 	pass := f.impl()
 	f.triggerPass(pass, "aaaa1111")
-	resp := f.admitted(pass, hostBody("h1"))
+	resp := f.admitted(pass, `{"host":"h1","capacity":8}`)
 	if resp.Concurrency == nil || resp.Concurrency.Group != "local-verify:h1" || resp.Concurrency.Limit != 1 || resp.Concurrency.QueuedBefore {
 		t.Fatalf("pass admission block = %+v, want {local-verify:h1, limit 1, queued_before:false}", resp.Concurrency)
 	}
@@ -1059,15 +1079,17 @@ func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T)
 	}
 
 	d, _, raw := f.queued(f.impl(), hostBody("h1"))
-	if d.Group != "local-implement:h1" || d.Position != 4 || !sameStageIDs(holderIDs(d.Holders), holder.ID) || strings.Contains(raw, pass.ID.String()) {
+	impl, _ := groupStateOf(queuedGroups(t, raw), "local-implement:h1")
+	if d.Group != "local-implement:h1" || d.Position != 4 || !sameStageIDs(holderIDs(d.Holders), holder.ID) || !sameStageIDs(holderIDs(impl.Holders), holder.ID) {
 		t.Fatalf("next implement details = %s, want position 4 behind the implement holder only", raw)
 	}
 }
 
 // TestHostDispatch_SecondMergeCandidatePassQueuesInVerifyGroup: a second pass
 // on the host queues behind the first in local-verify:h1 (limit 1), and its
-// 409 holders list names the first pass only — never the implement holder.
-// An absent body lands in local-verify:unknown.
+// 409 holders list names the first pass only — never the implement holder
+// (which shares only the host capacity group with the passes). An absent body
+// lands in local-verify:unknown.
 func TestHostDispatch_SecondMergeCandidatePassQueuesInVerifyGroup(t *testing.T) {
 	f := newSCPG(t, pgStore)
 	impl := f.impl()
@@ -1079,7 +1101,8 @@ func TestHostDispatch_SecondMergeCandidatePassQueuesInVerifyGroup(t *testing.T) 
 	f.admitted(p1, hostBody("h1"))
 
 	d, _, raw := f.queued(p2, hostBody("h1"))
-	if d.Group != "local-verify:h1" || d.Limit != 1 || d.Position != 1 || !sameStageIDs(holderIDs(d.Holders), p1.ID) || strings.Contains(raw, impl.ID.String()) {
+	verify, _ := groupStateOf(queuedGroups(t, raw), "local-verify:h1")
+	if d.Group != "local-verify:h1" || d.Limit != 1 || d.Position != 1 || !sameStageIDs(holderIDs(d.Holders), p1.ID) || !sameStageIDs(holderIDs(verify.Holders), p1.ID) {
 		t.Fatalf("second pass details = %s, want queued at 1 in local-verify:h1 behind the first pass only", raw)
 	}
 
@@ -1133,17 +1156,18 @@ func TestHostDispatch_NonPassReopensStayInImplementGroup(t *testing.T) {
 // TestHostDispatch_MergeCandidatePassIgnoresDeclaredImplementGroup isolates
 // the ORDERING of the routing branch: with the implement stage declaring
 // concurrency {group: impl, limit: 2}, a full implement is admitted through
-// spec:<repo>:impl while a pass is admitted through local-verify:h1. Placing
-// the pass branch after the declared lookup routes the pass to
-// spec:<repo>:impl (limit 2), which this fixture leaves free.
+// spec:<repo>:impl (added to its default local-implement:h1) while a pass is
+// admitted through local-verify:h1. Placing the pass branch after the
+// declared lookup gives the pass the implement set, whose local-implement:h1
+// slot the full implement holds, so the pass queues.
 func TestHostDispatch_MergeCandidatePassIgnoresDeclaredImplementGroup(t *testing.T) {
 	f := newSCPG(t, pgStore)
 	full, pass := f.impl(), f.impl()
 	for _, st := range []*run.Stage{full, pass} {
 		f.setSpec(st, concurrencySpec("\n          group: impl\n          limit: 2"))
 	}
-	if resp := f.admitted(full, hostBody("h1")); resp.Concurrency.Group != "spec:kuhlman-labs/fishhawk:impl" || resp.Concurrency.Limit != 2 {
-		t.Fatalf("full implement block = %+v, want spec:kuhlman-labs/fishhawk:impl limit 2", resp.Concurrency)
+	if resp := f.admitted(full, hostBody("h1")); !hasGroupRef(resp.Concurrency.Groups, "spec:kuhlman-labs/fishhawk:impl", 2) {
+		t.Fatalf("full implement block = %+v, want spec:kuhlman-labs/fishhawk:impl limit 2 in its set", resp.Concurrency)
 	}
 	f.triggerPass(pass, "eeee5555")
 	if resp := f.admitted(pass, hostBody("h1")); resp.Concurrency.Group != "local-verify:h1" || resp.Concurrency.Limit != 1 {
@@ -1219,18 +1243,19 @@ func TestHostDispatch_UnreadableTriggerRoutesAsImplement(t *testing.T) {
 
 // TestHostDispatch_MergeCandidateRoutingBoundaries: a non-implement stage is
 // never a pass (the prompt endpoint serves one only for implement), so a plan
-// stage carrying a trigger row stays ungrouped; and with no audit repository
-// wired an implement stage keeps the default implement group.
+// stage carrying a trigger row holds only the host capacity group; and with
+// no audit repository wired an implement stage keeps the default implement
+// group.
 func TestHostDispatch_MergeCandidateRoutingBoundaries(t *testing.T) {
-	t.Run("plan stage with a trigger row stays ungrouped", func(t *testing.T) {
+	t.Run("plan stage with a trigger row holds only capacity", func(t *testing.T) {
 		f := newSCPG(t, pgStore)
 		p := f.stage("kuhlman-labs/fishhawk", run.StageTypePlan)
 		f.triggerPass(p, "abab7777")
-		if resp := f.admitted(p, hostBody("h1")); resp.Concurrency != nil {
-			t.Fatalf("plan admission carries a concurrency block %+v, want ungrouped", resp.Concurrency)
+		if resp := f.admitted(p, hostBody("h1")); resp.Concurrency == nil || len(resp.Concurrency.Groups) != 1 || resp.Concurrency.Group != "host:h1:capacity" {
+			t.Fatalf("plan admission block = %+v, want host:h1:capacity alone", resp.Concurrency)
 		}
-		if _, ok := f.slot(p.ID); ok {
-			t.Fatal("ungrouped plan stage wrote a slot row")
+		if rows := f.slotRows(p.ID); len(rows) != 1 || rows[0].key != "host:h1:capacity" {
+			t.Fatalf("plan slot rows = %+v, want host:h1:capacity alone", rows)
 		}
 	})
 	t.Run("nil audit repository keeps the implement group", func(t *testing.T) {

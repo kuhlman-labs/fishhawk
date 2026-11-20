@@ -821,3 +821,32 @@ func TestMCPServerConfig_LocalHostRungsOnlyOnStdio(t *testing.T) {
 		}
 	}
 }
+
+// TestRun_RefusesInvalidHostCapacity (#4241): an invalid
+// FISHHAWK_HOST_CAPACITY exits 1 with a stderr line naming the variable,
+// before any credential is loaded or anything is served. The rest of the
+// environment is valid (an env token, a loopback http transport, a
+// pre-cancelled context), so without the refusal run would bind, shut down on
+// the cancel and exit 0. Not parallel: t.Setenv.
+func TestRun_RefusesInvalidHostCapacity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("FISHHAWK_API_TOKEN", "fhk_host_capacity_test")
+	t.Setenv("FISHHAWK_BACKEND_URL", "http://127.0.0.1:1")
+	for _, raw := range []string{"0", "abc", ""} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("FISHHAWK_HOST_CAPACITY", raw)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var stdout, stderr strings.Builder
+			got := run(ctx, []string{"fishhawk-mcp", "--transport", "http", "--addr", "127.0.0.1:0"}, &stdout, &stderr)
+			if got != exitFailure {
+				t.Fatalf("run = %d, want %d (stderr: %s)", got, exitFailure, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "fishhawk-mcp: ") || !strings.Contains(stderr.String(), "FISHHAWK_HOST_CAPACITY") {
+				t.Errorf("stderr = %q, want a fishhawk-mcp line naming FISHHAWK_HOST_CAPACITY", stderr.String())
+			}
+		})
+	}
+}

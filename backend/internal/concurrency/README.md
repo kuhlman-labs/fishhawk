@@ -7,7 +7,9 @@ An operator moves one queued waiter to the front with `Promote` (#4191).
 Table: `stage_concurrency_slots` (migration 0097; `order_key` added by 0102;
 one row per (stage, group) since 0118, § "Migration 0118: deploy and rollback
 order"). A stage is admitted into a SET of groups, all or nothing (ADR-094
-D2/D3, #4240, § "Group sets and scoped keys").
+D2/D3, #4240, § "Group sets and scoped keys"). Every host-dispatched agent
+stage's set includes the host capacity group, which is exempt from the
+multi-group FIFO rule (ADR-094 D4, #4241, § "Host capacity group").
 It also READS `specialist_jobs` (0103) to count running specialist jobs as
 holders (§ "Specialist-job holders (ADR-097 D6)").
 The SQL is hand-written pgx, with no sqlc (same precedent as
@@ -111,7 +113,8 @@ The SQL is hand-written pgx, with no sqlc (same precedent as
    position/holders snapshot.
 7. **Lock hit**: decide fully before any write. Admit only when EVERY group
    G satisfies (a) `holders + job holders + round_ahead < Limit` AND (b)
-   `multi_round_ahead == 0` (§ "Group sets and scoped keys"). For a
+   `multi_round_ahead == 0` (§ "Group sets and scoped keys"). (b) is not
+   checked on the host capacity group (§ "Host capacity group"). For a
    single-group queue (b) is vacuous and (a) is ADR-087's rule. `round_ahead`
    counts only fresh queued rows enqueued at or before the round start
    (approval condition 2). A contended loser's row is inserted after it
@@ -174,6 +177,8 @@ k` for every accepted key (`TestGroupKey_RoundTrip`).
 | host / `<host>` / `implement` | `local-implement:<host>` (`DefaultGroupKey`) |
 | host / `<host>` / `verify` | `local-verify:<host>` (`VerifyGroupKey`; reserved for merge-candidate verify passes and specialist jobs, so no spec declares it: § "Verify group") |
 | repository / `<owner/repo>` / `<name>` | `spec:<owner/repo>:<name>` (`NamedGroupKey`) |
+| host / `<host>` / `capacity` | `host:<host>:capacity` (`CapacityGroupKey`; server-added to every host-dispatched agent stage, so no spec declares it: § "Host capacity group") |
+| host / `<host>` / `preview-target` | `host:<host>:preview-target` (`PreviewTargetGroupKey`; built in, held at limit 1) |
 | host / `<host>` / any other name | `host:<host>:<name>` |
 | account / `<id>` / `<name>` | `account:<id>:<name>` (reserved for review capacity, #4242; no spec declares it) |
 
@@ -199,7 +204,9 @@ set:
 - (a) `holders(G) + job holders(G) + round_ahead(G) < limit(G)`: ADR-087's
   reservation formula, which reserves one slot per earlier fresh waiter; and
 - (b) `multi_round_ahead(G) == 0`: no earlier fresh waiter on G belongs to a
-  set of more than one group (D2's strict per-group FIFO).
+  set of more than one group (D2's strict per-group FIFO). (b) applies to
+  every group EXCEPT `host:<label>:capacity`, which keeps only (a) (§ "Host
+  capacity group").
 
 Read the other way: a later waiter on G is refused when (i) an earlier fresh
 waiter on G has a multi-group set, or (ii) no slot of G remains after
@@ -260,16 +267,114 @@ restarts the whole set at the tail with `order_key` cleared and
 `TestAdmitSet_SetGrowthRestartsAtTail`).
 
 **The binding group.** `Admission`, `Status` and `Promotion` keep their
-single-group top-level fields, and those fields describe the BINDING group:
-while queued, the group with the highest position, ties broken in canonical
-key order; while holding (or once admitted), the first group in canonical
-key order. `Promotion` picks it by the old positions. A single-group stage's
-binding group is its only group, so its read surfaces are unchanged. The
-`Groups` list carries every group.
+single-group top-level fields, and those fields describe the BINDING group,
+picked by the exported `BindingIndex` (the server's wire shape uses the same
+helper). While queued, it is the group with the highest position; at equal
+positions a non-capacity group wins, then canonical key order. While holding
+(or once admitted), it is the first non-capacity group in canonical key
+order. `Promotion` picks it by the old positions. So the host capacity group
+binds only when it alone is strictly highest, or is the set's only group,
+and an implement's top-level fields keep naming `local-implement:<host>` as a
+pre-#4240 client expects (`TestBindingIndex_CapacityRanksLast`, one case per
+arm; `TestStatus_BindingSkipsCapacity`, at the Admit, Status and Promote
+sites). A set without a capacity key picks exactly as before, and a
+single-group stage's binding group is its only group, so its read surfaces
+are unchanged. The `Groups` list carries every group.
 
 **`MaxGroups`.** The store accepts up to 16 groups per set, above the
-workflow-v2 schema's 8 entries, so #4241 can add the host capacity group to
-a full declared set (§ "Constants").
+workflow-v2 schema's 8 entries, so the server can add the host capacity
+group and a stage-type default group to a full declared set (§ "Constants").
+
+## Host capacity group (ADR-094 D4/D5, #4241)
+
+Every stage that reaches the host-dispatch marker's admission arm also holds
+one slot of the host capacity group, `CapacityGroupKey(host)` =
+`host:<host>:capacity` (`IsCapacityGroupKey` recognises it). It bounds how
+many agent sessions one host runs at once, across stage types. The server
+builds every set (`backend/internal/server/stage_concurrency.go`,
+`resolveStageConcurrency`); the store sees ordinary keys and limits, and
+differs for capacity only in rule (b) and the binding preference.
+
+| Stage | Default set (ADR-094 D5 as amended by A2) |
+|---|---|
+| implement | `{capacity, local-implement:<host>}` |
+| merge-candidate verify-only pass | `{capacity, local-verify:<host>}`: ADR-092 D3's host verify group, in place of D5's per-base `spec:<repo>:verify:<base>` |
+| acceptance | `{capacity}` |
+| plan, agent review, and any other agent-executed host-dispatched stage | `{capacity}` |
+
+An agent review stage, like every other agent-executed host-dispatched
+stage, holds a capacity slot because it runs an agent session on the host.
+That is separate from ADR-094 D6's review-capacity groups (#4242, the
+reserved `account` scope), which bound a reviewer account rather than a
+host; when D6 lands, a review stage holds both.
+
+A spec declaration ADDS to the default set and never replaces it. No spec
+may declare `{group: capacity, scope: host}`: both validators and
+`declaredGroupRequests` refuse it under a case- and whitespace-folded
+compare. `preview-target` (`PreviewTargetGroupKey(host)`) is a built-in
+host-scoped group a spec declares without a limit; it is held at limit 1.
+
+**The limit is per request.** The capacity limit is whatever the admitting
+request carries: the marker body's optional `capacity` (the MCP process's
+`FISHHAWK_HOST_CAPACITY`, 1..64), else `DefaultHostCapacity` = 3. Nothing is
+stored beyond each row's `slot_limit`. As for every group, the admitting
+stage's limit governs its own decision (ADR-087), so two processes on one
+host label with different values each admit against their own limit; set
+the variable identically in every process that dispatches for a host. Like
+the host label, the value is client-supplied (ADR-094 Q1): it is advisory
+against a hostile `write:runs` caller, not a security boundary.
+
+**Rule (b) does not apply to capacity** (Captain ruling 2026-11-20, #4241).
+Nearly every capacity waiter has a multi-group set (an implement also waits
+on `local-implement:<host>`), so strict per-group FIFO on capacity would
+queue every later plan, acceptance and verify pass behind an implement that
+is waiting for a DIFFERENT group. On `host:<label>:capacity`, `Admit`
+therefore checks only condition (a), ADR-087's reservation formula:
+`holders + job holders + round_ahead < limit` (job holders are 0 there:
+specialist jobs admit through `local-verify:<host>` only). Every other group
+of the set still checks (a) and (b). `TestAdmitSet_CapacityExemptFromFIFO`
+pins it: at capacity 6 and implement limit 2, with I1 and I2 holding and I3
+queued on `local-implement:<host>`, a later plan, acceptance and verify pass
+are each admitted (2 + 1, 3 + 1 and 4 + 1 are all below 6), and I3 stays
+queued. With (b) re-applied to capacity the plan queues.
+
+**A queued waiter still reserves a capacity slot.** (a) counts every earlier
+live waiter, including one queued only because ANOTHER group of its set is
+full. So "full" on capacity means holders + job holders + earlier live
+waiters >= limit: a later stage blocks only when holders plus earlier
+reservations fill capacity. Example: at capacity 3 with implement limit 2,
+two holding implements plus one queued implement fill capacity (2 + 1), so a
+later plan, acceptance or verify pass queues
+(`TestAdmitSet_CapacityReservationCountsAsFull`; once I2 settles, I3 and
+then the plan are admitted, and held capacity rows never exceed 3). At
+capacity 4 one slot stays free, so a host running implement limit 2 wants
+`FISHHAWK_HOST_CAPACITY=4`; each further queued implement reserves one more
+slot. A reservation lasts until its waiter is admitted or goes stale past
+`QueueTTL`. `TestAdmitSet_HostCapacityBoundsMixedTypes` pins the full-host
+case: two implements and one acceptance fill capacity 3, and a fourth plan,
+verify pass or other-repository acceptance queues on capacity alone, with
+exactly 3 capacity rows held. `TestAdmitSet_RacingCapacityAcrossTypes` races
+the four set shapes on one host and reads the committed rows back after
+every round: capacity, `local-implement`, `local-verify` and the acceptance
+group never hold more than their limits, and no stage is partly held.
+
+**The head-of-line that remains.** (b) still orders every non-capacity
+group: implements queue FIFO behind an earlier multi-group implement on
+`local-implement:<host>`, verify passes on `local-verify:<host>`, and stages
+sharing a spec-declared group on that group.
+
+**Upgrade.** On its first poll after the upgrade, every live queued waiter
+asks for a larger set (it gains `host:<label>:capacity`, and an implement
+whose declaration did not name `local-implement:<host>` gains that too), so
+the set-change rule restarts it at the tail and clears its `order_key`: an
+operator promotion is lost and must be re-applied. Stages admitted before the
+upgrade hold no capacity row, so capacity under-counts until they settle.
+
+**Rollback.** No migration: capacity rows are ordinary
+`stage_concurrency_slots` rows. A reverted binary never names the capacity
+group, so held capacity rows count for nobody, and a queued stage whose set
+shrinks restarts at the tail on its next poll (§ "Admit, step by step" step
+4). No declaration state exists to clear.
 
 ## Migration 0118: deploy and rollback order
 
@@ -359,9 +464,10 @@ stage is first in each of them (`TestPromote_MultiGroupOneKeyAcrossSet`).
 Admission stays all-or-nothing, so a promoted multi-group stage never holds
 one group while it is queued in another, and a later waiter in the group it
 could not yet take stays behind it (`TestPromote_MultiGroupNeverWedges`).
-Refusing promotion of multi-group stages (option c) was rejected: ADR-094
-slice 3 (#4241) puts every host-dispatched stage in at least two groups, which
-would disable promotion and the expedited-hotfix auto-promote.
+Refusing promotion of multi-group stages (option c) was rejected: the host
+capacity group (#4241, § "Host capacity group") puts every implement and
+verify pass in at least two groups, which would disable promotion and the
+expedited-hotfix auto-promote.
 
 ## Promote
 
@@ -610,7 +716,9 @@ effective key (§ "Ordering and `order_key`") sorts before the caller's.
 | `DefaultGroupPrefix` | `local-implement:` | The default group is per host: `local-implement:<host>`. The MCP client derives `<host>` in `backend/internal/mcpserver/hostlabel.go` (`FISHHAWK_HOST_LABEL` > persisted host-id > hostname, #4212). |
 | `UnknownHost` | `unknown` | The host label used when the client sends none (a pre-change MCP, or an MCP whose `hostlabel.go` ladder resolved nothing). |
 | `DefaultLimit` / `MaxLimit` | 1 / 64 | One local implement per host by default. 64 matches the 0097 CHECK and the spec bound. |
-| `MaxGroups` | 16 | The largest group set one admission may name. Deliberately ABOVE the workflow-v2 schema's `concurrency.groups` `maxItems` of 8, so ADR-094 slice 3 (#4241) can add the host capacity group to a full declared set without a store change (`TestMaxGroupsAboveSchemaMaxItems`). |
+| `MaxGroups` | 16 | The largest group set one admission may name. Deliberately ABOVE the workflow-v2 schema's `concurrency.groups` `maxItems` of 8, so the server can add the host capacity group and a stage-type default group (ADR-094 D4/D5, #4241) to a full declared set (`TestMaxGroupsAboveSchemaMaxItems`). |
+| `CapacityGroupName` / `DefaultHostCapacity` | `capacity` / 3 | ADR-094 D4 (#4241): every host-dispatched agent stage holds one slot of `host:<host>:capacity`. 3 is the capacity when the admitting request declares none (an MCP with `FISHHAWK_HOST_CAPACITY` unset, or a pre-#4241 client). § "Host capacity group". |
+| `PreviewTargetGroupName` | `preview-target` | The built-in host-scoped group for the host's one preview target, held at limit 1. |
 | `VerifyGroupPrefix` / `DefaultVerifyLimit` | `local-verify:` / 1 | ADR-092 D3 (#4200): a merge-candidate verify-only pass is admitted through `local-verify:<host>`, separate from `local-implement:<host>`. One pass per host at a time, because each pass runs the full verify gate. |
 | `JobHeartbeatTTL` | 2m | A running specialist job counts as a `local-verify` holder only while its runner re-POSTs admission (every 15s) within this window, so a crashed job blocks verify passes for at most about two minutes, not its whole runtime. |
 | `QueueTTL` | 60s | 12× the waiter poll interval, so a live waiter never goes stale. A dead waiter stops blocking the queue within a minute. |
@@ -629,8 +737,9 @@ effective key (§ "Ordering and `order_key`") sorts before the caller's.
   the lock winner never needs a second connection. Pinned by
   `TestAdmit_PoolSmallerThanConcurrentAdmits` (8 admitters on a 2-connection
   pool). `TestAdmitSet_RacingOverlappingSets` races 9 admitters over the sets
-  {G1,G2}, {G2,G3} and {G1} on a 3-connection pool. Every round, some
-  admitter takes its whole lock set and decides.
+  {G1,G2}, {G2,G3} and {G1} on a 3-connection pool, and
+  `TestAdmitSet_RacingCapacityAcrossTypes` races 12 over four capacity sets.
+  Every round, some admitter takes its whole lock set and decides.
 - **The server's admission lock holds no connection (approval condition 4).**
   `orchestrator.LockStageAdmission` is a process-local per-stage
   `sync.Mutex`. It holds NO pooled connection and NO transaction. A marker
@@ -688,7 +797,8 @@ under-count holders.
 
 ## Residuals
 
-- The host key is a client-supplied label, not a security boundary.
+- The host key is a client-supplied label, not a security boundary, and so
+  is the per-request host capacity (§ "Host capacity group").
 - The per-stage concurrency block and `StatusForStages` do not list specialist
   job holders (ADR-094 D7, #4243): a verify pass queued behind a running job
   shows no holder.

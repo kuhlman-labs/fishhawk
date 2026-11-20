@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -659,7 +660,7 @@ ORDER BY s.stage_id, s.group_key COLLATE "C"`)
 		}
 	}
 	// PROPERTY 1: no group holds more live stages than its limit.
-	for _, g := range []string{mg1, mg2, mg3} {
+	for g := range limits {
 		if liveHeld[g] > limits[g] {
 			f.t.Fatalf("%s: group %s has %d held rows of live stages, want at most its limit %d (over-admitted)", phase, g, liveHeld[g], limits[g])
 		}
@@ -681,19 +682,7 @@ ORDER BY s.stage_id, s.group_key COLLATE "C"`)
 // ADMIT anyone (README § "Admit, step by step" step 7), so only the drain
 // asserts admissions.
 func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
-	ctx := context.Background()
-	cfg, err := pgxpool.ParseConfig(pgtest.NewURL(t))
-	if err != nil {
-		t.Fatalf("parse config: %v", err)
-	}
-	cfg.MaxConns = 3
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("small pool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	f := &fixture{t: t, pool: pool, repo: run.NewPostgresRepository(pool), store: NewPostgresStore(pool)}
-
+	f := newRacePoolFixture(t)
 	limits := map[string]int{mg1: 1, mg2: 2, mg3: 1}
 	g := func(key string) GroupRequest { return gr(key, limits[key]) }
 	var trials []raceTrial
@@ -710,11 +699,32 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 			raceTrial{shape: "B", st: f.stage(), set: b},
 			raceTrial{shape: "C", st: f.stage(), set: []GroupRequest{g(mg1)}})
 	}
+	// The hook keeps each decider inside its transaction, and so holding
+	// every group lock, for a widened window in every round.
+	f.raceAndDrain(trials, limits, 5, func(int) bool { return true })
+}
 
-	// Warm the pool: hold all three connections at once, so connection setup
-	// does not stagger the first round.
-	conns := make([]*pgxpool.Conn, 0, cfg.MaxConns)
-	for range cfg.MaxConns {
+// raceConns is the racing tests' pool size: fewer connections than admitters.
+const raceConns = 3
+
+// newRacePoolFixture is a fixture over a fresh database on a raceConns-
+// connection pool, warmed so connection setup does not stagger the first
+// round.
+func newRacePoolFixture(t *testing.T) *fixture {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(pgtest.NewURL(t))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cfg.MaxConns = raceConns
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("small pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	conns := make([]*pgxpool.Conn, 0, raceConns)
+	for range raceConns {
 		c, err := pool.Acquire(ctx)
 		if err != nil {
 			t.Fatalf("warm the pool: %v", err)
@@ -724,7 +734,17 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 	for _, c := range conns {
 		c.Release()
 	}
+	return &fixture{t: t, pool: pool, repo: run.NewPostgresRepository(pool), store: NewPostgresStore(pool)}
+}
 
+// raceAndDrain runs up to rounds racing rounds over the trials, then a
+// sequential drain, reading the committed rows back after every round and
+// pass (assertCommittedSlots) and asserting every trial is admitted exactly
+// once. widen(round) reports whether that round parks each decider for 50ms
+// between its decision and its CAS, holding every group lock of its set.
+func (f *fixture) raceAndDrain(trials []raceTrial, limits map[string]int, rounds int, widen func(round int) bool) {
+	t := f.t
+	t.Helper()
 	admittedCount := make([]int, len(trials))
 	release := func(asked map[uuid.UUID]bool) {
 		t.Helper()
@@ -735,11 +755,6 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 		}
 	}
 
-	// Racing rounds. The hook keeps each decider inside its transaction, and
-	// so holding every group lock, for a widened window between its decision
-	// and its CAS.
-	f.store.afterDecision = func(context.Context, bool) { time.Sleep(timescale.D(50 * time.Millisecond)) }
-	const rounds = 5
 	for round := 1; round <= rounds; round++ {
 		var pending []int
 		for i := range trials {
@@ -749,6 +764,10 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 		}
 		if len(pending) == 0 {
 			break
+		}
+		f.store.afterDecision = nil
+		if widen(round) {
+			f.store.afterDecision = func(context.Context, bool) { time.Sleep(timescale.D(50 * time.Millisecond)) }
 		}
 		start := make(chan struct{})
 		results := make([]Admission, len(pending))
@@ -781,6 +800,13 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 				admittedCount[i]++
 			}
 		}
+		admittedNow := 0
+		for _, a := range asked {
+			if a {
+				admittedNow++
+			}
+		}
+		t.Logf("%s: %d asked, %d decided, %d admitted", phase, len(pending), decided, admittedNow)
 		// PROPERTY 3: some admitter took its whole lock set and decided.
 		if decided == 0 {
 			t.Fatalf("%s: all %d admitters answered Contended, want at least one to take its whole lock set and decide", phase, len(pending))
@@ -814,6 +840,7 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 			t.Fatalf("queue still holds %d stages after %d drain passes, want it drained within %d", len(asked), pass-1, len(trials))
 		}
 		phase := fmt.Sprintf("drain pass %d", pass)
+		t.Logf("%s: %d asked, %d admitted", phase, len(asked), admitted)
 		f.assertCommittedSlots(phase, trials, limits, asked)
 		if admitted == 0 {
 			t.Fatalf("%s: admitted none of %d queued stages, want the FIFO head admitted", phase, len(asked))
@@ -826,4 +853,224 @@ func TestAdmitSet_RacingOverlappingSets(t *testing.T) {
 		}
 	}
 	f.assertCommittedSlots("after the drain", trials, limits, map[uuid.UUID]bool{})
+}
+
+// Host capacity group (ADR-094 D4, #4241): every host-dispatched agent stage
+// also holds one slot of host:<label>:capacity, which is exempt from rule (b)
+// and keeps rule (a) (Captain ruling 2026-11-20). README § "Host capacity
+// group".
+
+// liveHeld counts the held rows of group whose stage is still live
+// (dispatched or running): a released stage's rows stay 'held'.
+func (f *fixture) liveHeld(group string) int {
+	f.t.Helper()
+	var n int
+	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM stage_concurrency_slots s
+JOIN stages st ON st.id = s.stage_id
+WHERE s.group_key = $1 AND s.state = 'held' AND st.state IN ('dispatched', 'running')`, group).Scan(&n); err != nil {
+		f.t.Fatalf("count held %s rows: %v", group, err)
+	}
+	return n
+}
+
+func groupByKey(t *testing.T, gs []GroupState, key string) GroupState {
+	t.Helper()
+	for _, g := range gs {
+		if g.Key == key {
+			return g
+		}
+	}
+	t.Fatalf("groups %+v have no %s", gs, key)
+	return GroupState{}
+}
+
+func (f *fixture) assertAllQueued(st *run.Stage, n int) {
+	f.t.Helper()
+	rows := f.setRows(st.ID)
+	if len(rows) != n {
+		f.t.Fatalf("stage %s rows = %+v, want %d", st.ID, rows, n)
+	}
+	for _, r := range rows {
+		if r.state != "queued" || r.acquiredAt != nil {
+			f.t.Fatalf("stage %s row %s = %+v, want queued (no partial hold)", st.ID, r.group, r)
+		}
+	}
+	if got := f.stageState(st.ID); got != run.StageStateAwaitingHostDispatch {
+		f.t.Fatalf("stage %s = %s, want awaiting_host_dispatch", st.ID, got)
+	}
+}
+
+// TestAdmitSet_HostCapacityBoundsMixedTypes: at capacity 3 with implement
+// limit 2, two implements and one acceptance fill the host, and a fourth
+// stage of every type queues on capacity alone: every other group of its set
+// is free. Exactly 3 capacity rows are held.
+func TestAdmitSet_HostCapacityBoundsMixedTypes(t *testing.T) {
+	capKey, impl := CapacityGroupKey("h1"), DefaultGroupKey("h1")
+	capG := gr(capKey, DefaultHostCapacity)
+	fourth := []struct {
+		name string
+		set  []GroupRequest
+	}{
+		{"plan", []GroupRequest{capG}},
+		{"verify pass", []GroupRequest{capG, gr(VerifyGroupKey("h1"), DefaultVerifyLimit)}},
+		{"acceptance in another repository", []GroupRequest{capG, gr(NamedGroupKey("org/two", "local-acceptance"), 1)}},
+	}
+	for _, tc := range fourth {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			i1, i2, a1, s := f.stage(), f.stage(), f.stage(), f.stage()
+			f.mustAdmitSet(i1, capG, gr(impl, 2))
+			f.mustAdmitSet(i2, capG, gr(impl, 2))
+			f.mustAdmitSet(a1, capG, gr(NamedGroupKey("org/one", "local-acceptance"), 1))
+			q := f.mustQueueSet(s, 1, tc.set...)
+			if c := groupByKey(t, q.Groups, capKey); c.Limit != DefaultHostCapacity || c.Position != 1 || len(c.Holders) != 3 {
+				t.Fatalf("capacity group = %+v, want limit 3, position 1, three holders", c)
+			}
+			for _, g := range q.Groups {
+				if g.Key != capKey && len(g.Holders) != 0 {
+					t.Fatalf("group %s holders = %v, want free: capacity alone queues the fourth stage", g.Key, holderIDs(g.Holders))
+				}
+			}
+			f.assertAllQueued(s, len(tc.set))
+			if n := f.liveHeld(capKey); n != DefaultHostCapacity {
+				t.Fatalf("held %s rows = %d, want exactly %d", capKey, n, DefaultHostCapacity)
+			}
+		})
+	}
+}
+
+// TestAdmitSet_CapacityExemptFromFIFO (C1 test 1): I3 {capacity, implement}
+// is an earlier fresh MULTI-group waiter on capacity, queued only on
+// local-implement. At capacity 6, (a) passes for each later stage (2+1, 3+1
+// and 4+1 are all below 6), so only rule (b) could queue them; capacity is
+// exempt, so a later plan, acceptance and verify pass are each admitted and
+// I3 stays queued.
+func TestAdmitSet_CapacityExemptFromFIFO(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG, implG := gr(capKey, 6), gr(DefaultGroupKey("h1"), 2)
+	i1, i2, i3 := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(i1, capG, implG)
+	f.mustAdmitSet(i2, capG, implG)
+	f.mustQueueSet(i3, 1, capG, implG)
+	for _, later := range []struct {
+		name string
+		set  []GroupRequest
+	}{
+		{"plan", []GroupRequest{capG}},
+		{"acceptance", []GroupRequest{capG, gr(NamedGroupKey("o/r", "local-acceptance"), 1)}},
+		{"verify pass", []GroupRequest{capG, gr(VerifyGroupKey("h1"), DefaultVerifyLimit)}},
+	} {
+		if a := f.admitSet(f.stage(), later.set...); !a.Admitted {
+			t.Fatalf("later %s = queued (groups %+v), want admitted: capacity is exempt from rule (b) behind the queued implement", later.name, a.Groups)
+		}
+	}
+	f.assertAllQueued(i3, 2)
+	if n := f.liveHeld(capKey); n != 5 {
+		t.Fatalf("held %s rows = %d, want 5 (I1, I2 and the three later stages)", capKey, n)
+	}
+}
+
+// TestAdmitSet_CapacityReservationCountsAsFull (C1 test 2): the exemption
+// drops rule (b) only; rule (a) still reserves one capacity slot per earlier
+// live waiter. At capacity 3, two holding implements plus a third QUEUED on
+// local-implement fill capacity (2 + 1), so a later plan queues. Once I2
+// settles, I3 and then the plan are admitted, and held capacity rows never
+// exceed 3.
+func TestAdmitSet_CapacityReservationCountsAsFull(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG, implG := gr(capKey, 3), gr(DefaultGroupKey("h1"), 2)
+	i1, i2, i3, p := f.stage(), f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(i1, capG, implG)
+	f.mustAdmitSet(i2, capG, implG)
+	f.mustQueueSet(i3, 1, capG, implG)
+	q := f.mustQueueSet(p, 2, capG)
+	if c := groupByKey(t, q.Groups, capKey); c.Position != 2 || len(c.Holders) != 2 {
+		t.Fatalf("plan capacity group = %+v, want position 2 behind I3 with two holders (2 holders + 1 reservation = 3)", c)
+	}
+	f.assertAllQueued(p, 1)
+	check := func(phase string, want int) {
+		t.Helper()
+		if n := f.liveHeld(capKey); n != want {
+			t.Fatalf("%s: held %s rows = %d, want %d (never above 3)", phase, capKey, n, want)
+		}
+	}
+	check("I3 and the plan queued", 2)
+	f.to(i2.ID, run.StageStateRunning, run.StageStateSucceeded)
+	f.mustAdmitSet(i3, capG, implG)
+	check("I3 admitted", 2)
+	f.mustAdmitSet(p, capG)
+	check("the plan admitted", 3)
+	if a := f.admitSet(f.stage(), capG); a.Admitted {
+		t.Fatal("a fifth stage at three live capacity holders was admitted, want queued")
+	}
+	check("a fifth stage queued", 3)
+}
+
+// TestAdmitSet_RacingCapacityAcrossTypes races {capacity, implement},
+// {capacity, acceptance}, {capacity, verify} and {capacity} sets on one host
+// (modelled on TestAdmitSet_RacingOverlappingSets, #5480). After every round
+// and drain pass: held capacity rows <= the capacity limit (2), held
+// local-implement <= its limit (2), held local-verify and acceptance <= 1,
+// and every stage is all held or all queued. Odd rounds park each decider
+// between decision and CAS (maximal contention); even rounds do not, so
+// several deciders commit in sequence within a round and each must count the
+// committed holders before it. Capacity's lock sorts first in every set
+// (host: < local- < spec:), so its holder always completes its lock set:
+// property (3) is deterministic.
+func TestAdmitSet_RacingCapacityAcrossTypes(t *testing.T) {
+	f := newRacePoolFixture(t)
+	capKey, impl, verify, acc := CapacityGroupKey("h1"), DefaultGroupKey("h1"), VerifyGroupKey("h1"), NamedGroupKey("o/r", "local-acceptance")
+	// Capacity 2 sits below the type groups' combined bound (2 + 1 + 1, and
+	// plans are unbounded), so capacity is the only thing that can hold a
+	// pass to 2 admissions: an over-admission on capacity shows as > 2 held.
+	limits := map[string]int{capKey: 2, impl: 2, verify: DefaultVerifyLimit, acc: 1}
+	g := func(key string) GroupRequest { return gr(key, limits[key]) }
+	var trials []raceTrial
+	for i := range 3 {
+		sets := [][]GroupRequest{{g(capKey), g(impl)}, {g(capKey), g(acc)}, {g(capKey), g(verify)}}
+		if i%2 == 1 {
+			for _, set := range sets {
+				slices.Reverse(set)
+			}
+		}
+		trials = append(trials,
+			raceTrial{shape: "implement", st: f.stage(), set: sets[0]},
+			raceTrial{shape: "acceptance", st: f.stage(), set: sets[1]},
+			raceTrial{shape: "verify", st: f.stage(), set: sets[2]},
+			raceTrial{shape: "plan", st: f.stage(), set: []GroupRequest{g(capKey)}})
+	}
+	f.raceAndDrain(trials, limits, 6, func(round int) bool { return round%2 == 1 })
+}
+
+// TestStatus_BindingSkipsCapacity pins the binding preference at every store
+// site: the top-level fields describe the stage-type group, not the capacity
+// group. P holds capacity only, so the two groups' holder lists differ and a
+// capacity-first pick is visible.
+func TestStatus_BindingSkipsCapacity(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	capKey, impl := CapacityGroupKey("h1"), DefaultGroupKey("h1")
+	capG, implG := gr(capKey, DefaultHostCapacity), gr(impl, DefaultLimit)
+	p, i1, i2 := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(p, capG)
+	if adm := f.mustAdmitSet(i1, capG, implG); len(adm.Holders) != 0 {
+		t.Fatalf("admitted I1 top-level holders = %v, want local-implement's (none), not capacity's [P]", holderIDs(adm.Holders))
+	}
+	// I2 is position 1 in both groups (a tie): local-implement binds.
+	if q := f.mustQueueSet(i2, 1, capG, implG); len(q.Holders) != 1 || q.Holders[0].StageID != i1.ID {
+		t.Fatalf("queued I2 top-level holders = %v, want local-implement's [I1], not capacity's [P I1]", holderIDs(q.Holders))
+	}
+	st := f.positions(i1.ID, i2.ID)
+	if h := st[i1.ID]; h.State != SlotHeld || h.GroupKey != impl || h.Limit != DefaultLimit || len(h.Holders) != 1 || h.Holders[0].StageID != i1.ID || len(h.Groups) != 2 {
+		t.Fatalf("held I1 status = %+v, want top-level %s at limit 1 held by I1", h, impl)
+	}
+	if q := st[i2.ID]; q.State != SlotQueued || q.GroupKey != impl || q.Limit != DefaultLimit || q.Position != 1 || len(q.Holders) != 1 || len(q.Groups) != 2 {
+		t.Fatalf("queued I2 status = %+v, want top-level %s at position 1", q, impl)
+	}
+	pr, err := f.store.Promote(ctx, PromoteRequest{StageID: i2.ID, Record: func(context.Context, pgx.Tx, Promotion) error { return nil }})
+	if err != nil || pr.Changed || pr.GroupKey != impl || pr.Limit != DefaultLimit || len(pr.Holders) != 1 {
+		t.Fatalf("Promote(I2) = %+v, %v; want an unchanged promotion naming %s", pr, err, impl)
+	}
 }

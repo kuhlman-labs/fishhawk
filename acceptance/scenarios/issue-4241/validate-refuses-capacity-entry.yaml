@@ -1,0 +1,14 @@
+id: scenario:issue-4241/validate-refuses-capacity-entry
+statement: 'The fishhawk validate CLI exits non-zero on a workflow-v2 spec whose stage declares the concurrency.groups entry {group: capacity, scope: host}, and its stderr names the reserved host capacity group. The same spec without that entry validates (exit 0).'
+verify_hint: 'CLI surface: run fishhawk validate against a temporary workflow-v2 spec file with and without the capacity entry; observe the exit codes and stderr.'
+steps: 'Built the fishhawk CLI from the sanctioned checkout (cd cli && go build -o /tmp/fhacc4241b/bin/fishhawk ./cmd/fishhawk). Wrote cap.yaml with version "2" and workflows.w.stages[0] {id apply, type implement, executor.agent claude-code, concurrency.groups [{group: capacity, scope: host}]}. Wrote base.yaml, the identical stage without the concurrency block. Ran fishhawk validate on each. Cross-checked through the preview''s HTTP MCP fishhawk_validate with workflow_spec inline.'
+assertions:
+    expected: non-zero exit naming the reserved host capacity group; exit 0 without the entry
+    observed_at_record: 'cap.yaml: exit 1, stderr ''concurrency.groups entry (scope "host", group "capacity") is reserved: host:<host>:capacity is the host capacity group every host-dispatched stage already holds, sized by the host operator through FISHHAWK_HOST_CAPACITY (default 3), so a spec cannot declare it''. base.yaml: OK, exit 0. MCP validate gave valid false for cap and true for base.'
+    repro_handle: /tmp/fhacc4241b/bin/fishhawk validate /tmp/fhacc4241b/specs/cap.yaml
+origin:
+    issue: 4241
+    pr: 5482
+    run_id: 59af8515-5848-4b52-9fa3-e72d9d421e6d
+    head_sha: d90254a2723c1d53da20d4d17fc150d9df446e71
+    recorded_at: 2026-11-20T15:14:46Z
