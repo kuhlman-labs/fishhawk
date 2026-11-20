@@ -5556,11 +5556,11 @@ func TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse(t *testing.T) {
 			if na == nil || len(na.Actions) != 2 || na.Actions[0].Action != "fishhawk_await_stage" || na.Actions[0].Params["stage_id"] != driveImplID {
 				t.Fatalf("next_actions = %+v, want fishhawk_await_stage on the implement stage first", na)
 			}
-			if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Kind != "dispatch" || !strings.Contains(out.StepsTaken[n-1].Note, "the existing waiter owns the spawn") {
+			if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Kind != "dispatch" || !strings.Contains(out.StepsTaken[n-1].Note, "the waiter may own the spawn") {
 				t.Fatalf("steps_taken = %+v, want a final dispatch step naming the existing waiter", out.StepsTaken)
 			}
 			joined := strings.Join(out.Warnings, "\n")
-			for _, want := range []string{"spawned NOTHING", "fishhawk_drive_run call are DROPPED"} {
+			for _, want := range []string{"spawned NO runner", "exited without admission", "re-invoke fishhawk_drive_run", "fishhawk_drive_run call are DROPPED"} {
 				if !strings.Contains(joined, want) {
 					t.Errorf("warnings missing %q: %s", want, joined)
 				}

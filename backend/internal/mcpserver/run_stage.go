@@ -177,7 +177,7 @@ type RunStageOutput struct {
 	// admission. The live-waiter arm (transitioned:false while this process's
 	// waiter held the stage) returns the same shape with only waiter
 	// already_waiting set. Omitted on every other return.
-	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"present only when outcome==awaiting_concurrency_slot: the stage is QUEUED behind this host's slot holders (status awaiting_concurrency_slot, group, limit, position, holders) and NO runner was spawned. waiter is started (this session's slot waiter spawns the runner DETACHED on admission) or already_waiting (one already is, and ITS spawn inputs govern: this call's are dropped). When the marker answered transitioned:false while this session's waiter held the stage, the waiter's admission already dispatched it: only waiter already_waiting is set and the waiter owns the spawn"`
+	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"present only when outcome==awaiting_concurrency_slot: the stage is QUEUED behind this host's slot holders (status awaiting_concurrency_slot, group, limit, position, holders) and NO runner was spawned. waiter is started (this session's slot waiter spawns the runner DETACHED on admission) or already_waiting (one already is, and ITS spawn inputs govern: this call's are dropped). When the marker answered transitioned:false while this session's waiter held the stage, only waiter already_waiting is set: that waiter may own the spawn, but it may also have exited without admission (cap expiry, a terminal refusal, or another session dispatched the stage), so re-invoke after it exits if no runner appears"`
 	NextStep        *SuggestedAction  `json:"next_step,omitempty" jsonschema:"present only when outcome==awaiting_concurrency_slot: the fishhawk_await_stage call, params pre-filled, that holds through the queue and releases when the stage settles. This call returns no events for the queued stage: read them from the audit log or the signed trace"`
 
 	// Budget is the workflow's current periodic-budget status (#693 /
@@ -380,9 +380,11 @@ time and are not re-run at admission, matching fishhawk_dispatch_stage. When
 this MCP process already had a waiter for the stage (waiter already_waiting),
 that FIRST waiter's spawn inputs (its push_and_open_pr, its spawn path) govern
 and this call's are dropped. A call whose marker answers transitioned:false
-while this process's waiter held the stage spawns nothing either: the waiter
-was admitted and owns the spawn, so the call returns the same
-awaiting_concurrency_slot shape with waiter already_waiting.
+while this process's waiter held the stage spawns nothing either and returns
+the same awaiting_concurrency_slot shape with waiter already_waiting: that
+waiter may own the spawn, but it may also have exited without admission (cap
+expiry, a terminal refusal, or another session dispatched the stage). If no
+runner appears, re-invoke after the waiter exits.
 
 Cancellation: cancelling the tool call sends SIGTERM (then SIGKILL
 after a 30s grace) to the runner. Graceful cleanup requires the
@@ -706,9 +708,9 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// or 4xx means NO spawn (an unmarked spawn would recreate the ambiguity #1912
 	// removes). transitioned:false (already 'dispatched') proceeds: the manual
 	// dead-runner re-dispatch — unless a slot waiter in this process held the
-	// stage during this invocation. That waiter's admission dispatched it and
-	// owns the spawn, so this call returns awaiting_concurrency_slot instead of
-	// spawning a SECOND runner (#3969).
+	// stage during this invocation. That waiter may own the spawn (or may have
+	// exited without admission), so this call returns awaiting_concurrency_slot
+	// instead of risking a SECOND runner (#3969, liveWaiterHeldNote).
 	//
 	// A 409 concurrency_slot_queued (#3969 / ADR-094 D1) is NOT a failure: the
 	// stage was queued for this host's local concurrency slot and left at
@@ -725,9 +727,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
 	}
 	if liveWaiterOwnsSpawn(hdRes, stageUUID, waiterMark) {
-		warnings = append(warnings,
-			"the host-dispatch marker answered transitioned:false while this MCP process's slot waiter held the stage: that waiter's admission dispatched it "+
-				"and it owns the spawn, so NO runner was spawned by this call and no second runner exists. "+slotWaiterInputsDroppedNote("fishhawk_run_stage"))
+		warnings = append(warnings, liveWaiterHeldNote("fishhawk_run_stage"))
 		return r.runStageQueuedOutput(in, runUUID, stageUUID, &StageConcurrency{Waiter: slotWaiterAlreadyWaiting}, warnings)
 	}
 

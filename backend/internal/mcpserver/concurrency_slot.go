@@ -189,6 +189,16 @@ func slotWaiterInputsDroppedNote(verb string) string {
 		"and the inputs of this " + verb + " call are DROPPED."
 }
 
+// liveWaiterHeldNote is the warning a verb returns when liveWaiterOwnsSpawn
+// refuses its spawn (#3969). It says the waiter MAY own the spawn, because the
+// guard keys on the waiter's hold, not its admission, and names the recovery
+// for a waiter that exited without admission.
+func liveWaiterHeldNote(verb string) string {
+	return "the host-dispatch marker answered transitioned:false while a slot waiter in this MCP process held the stage, so this " + verb + " call spawned NO runner. " +
+		"That waiter may own the spawn, but it may also have exited without admission (cap expiry, a terminal refusal, or another session dispatched the stage). " +
+		"If no runner appears, re-invoke " + verb + " after the waiter exits. If the waiter was admitted, ITS spawn inputs govern and the inputs of this " + verb + " call are DROPPED."
+}
+
 // slotWaiterRegistry dedupes one waiter per stage per process. It also
 // records each stage's last waiter exit against a monotonic exit sequence, so
 // heldSince can tell a verb whether a waiter was live at any point in a
@@ -239,11 +249,14 @@ func (reg *slotWaiterRegistry) exit(stageID uuid.UUID, ch chan struct{}) {
 
 // liveWaiterOwnsSpawn is the double-spawn guard on a verb's marker site
 // (#3969): the marker answered 200 and did NOT transition the stage, and a
-// slot waiter in this process held the stage at some point since mark. That
-// waiter's admission is what dispatched the stage (it spawns, or has spawned,
-// the runner), so the verb must not spawn a second one. A transitioned:false
-// with no such waiter keeps each verb's proceed behaviour (the dead-runner
-// re-dispatch).
+// slot waiter in this process held the stage at some point since mark. The
+// guard keys on that hold, NOT on the waiter's admission: the waiter may own
+// the spawn (its admission dispatched the stage), but it may also have exited
+// without admission (cap expiry, a terminal refusal, or another session
+// dispatched the stage). Either way the verb must not spawn: a second runner
+// is worse than a refusal a re-invoke after the waiter exits clears
+// (liveWaiterHeldNote). A transitioned:false with no such waiter keeps each
+// verb's proceed behaviour (the dead-runner re-dispatch).
 func liveWaiterOwnsSpawn(res *HostDispatchResult, stageID uuid.UUID, mark uint64) bool {
 	if res != nil && res.Transitioned {
 		return false

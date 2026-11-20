@@ -193,8 +193,9 @@ const (
 	// the drive's own spawn closure exactly once on admission (or, when a
 	// waiter already held the stage, through that waiter's own inputs). It is
 	// also the stop when the marker answers transitioned:false while this
-	// process's waiter held the stage in the iteration: the waiter owns the
-	// spawn. next_actions (driveSlotQueuedActions) lead with
+	// process's waiter held the stage in the iteration: that waiter may own the
+	// spawn (or may have exited without admission; re-invoke if no runner
+	// appears). next_actions (driveSlotQueuedActions) lead with
 	// fishhawk_await_stage on the queued stage, then fishhawk_drive_run to
 	// resume once it settles.
 	stoppedAwaitingConcurrencySlot = "awaiting_concurrency_slot"
@@ -413,8 +414,10 @@ runner binary, argv and token resolved at admission. When this MCP process
 already had a waiter for the stage (waiter already_waiting), that FIRST
 waiter's spawn inputs govern and the drive's are dropped. A drive re-invoked
 while the stage is queued spawns nothing: if the marker answers transitioned:false
-while this process's waiter held the stage, the waiter was admitted and owns
-the spawn, and the drive stops awaiting_concurrency_slot again. next_actions lead with
+while this process's waiter held the stage, the drive stops
+awaiting_concurrency_slot again: that waiter may own the spawn, but it may also
+have exited without admission (cap expiry, a terminal refusal, or another
+session dispatched the stage), so re-invoke after it exits if no runner appears. next_actions lead with
 fishhawk_await_stage on the queued stage, then fishhawk_drive_run to resume once
 it settles. Any other marker failure still stops host_dispatch_failed with no
 spawn.
@@ -1049,10 +1052,11 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			//
 			// transitioned:false while a slot waiter in this process held the
 			// stage since this iteration's stage read is NOT the dead-runner
-			// re-dispatch: the waiter was admitted inside that window and owns
-			// the spawn, so spawning here would be a SECOND runner (#3969).
-			// Stop awaiting_concurrency_slot instead; the waiter's own spawn
-			// inputs govern.
+			// re-dispatch: the waiter may have been admitted inside that window
+			// and own the spawn, so spawning here could be a SECOND runner
+			// (#3969). Stop awaiting_concurrency_slot instead; an admitted
+			// waiter's own spawn inputs govern, and a waiter that exited without
+			// admission leaves the re-invoke as the recovery (liveWaiterHeldNote).
 			hdRes, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
 			report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
 				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
@@ -1090,12 +1094,10 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			if liveWaiterOwnsSpawn(hdRes, stageUUID, waiterMark) {
 				out.StepsTaken = append(out.StepsTaken, DriveStep{
 					Kind: "dispatch", Stage: recordName, Delegated: false,
-					Note: "the host-dispatch marker answered transitioned:false while this session's slot waiter held the stage; NO runner spawned by the drive — the existing waiter owns the spawn",
+					Note: "the host-dispatch marker answered transitioned:false while this session's slot waiter held the stage; NO runner spawned by the drive — the waiter may own the spawn; if no runner appears, re-invoke after it exits",
 				})
 				out.StoppedReason = stoppedAwaitingConcurrencySlot
-				out.Warnings = append(out.Warnings, fmt.Sprintf(
-					"%s was already dispatched by this MCP process's slot waiter for the stage; the drive spawned NOTHING, so no second runner exists. %s",
-					recordName, slotWaiterInputsDroppedNote("fishhawk_drive_run")))
+				out.Warnings = append(out.Warnings, fmt.Sprintf("%s: %s", recordName, liveWaiterHeldNote("fishhawk_drive_run")))
 				out.NextActions = driveSlotQueuedActions(runUUID, disp.ID, disp.Type, in.WorkingDir)
 				return nil, out, nil
 			}
@@ -1706,8 +1708,9 @@ func driveSlotQueuedActions(runID uuid.UUID, stageID, stage, workingDir string) 
 			Precondition: "the queued stage has settled (fishhawk_await_stage released on a terminal or parked state)",
 			Consumes:     consumesNone,
 			Reason: "resume the drive from the settled stage. Re-invoking while the stage is still queued records one more dispatch act and spawns nothing: " +
-				"the existing slot waiter owns the spawn (the marker re-queues the stage and the waiter reports already_waiting, or the waiter was admitted " +
-				"meanwhile and the marker answers transitioned:false), and the drive stops awaiting_concurrency_slot again with the existing waiter's spawn inputs governing",
+				"the existing slot waiter owns the spawn when the marker re-queues the stage and the waiter reports already_waiting, and a waiter that held the stage " +
+				"when the marker answers transitioned:false may own it (or may have exited without admission: re-invoke after it exits if no runner appears); " +
+				"either way the drive stops awaiting_concurrency_slot again, with an admitted waiter's spawn inputs governing",
 		},
 	}}
 }

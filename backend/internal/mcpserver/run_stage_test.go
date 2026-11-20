@@ -5201,7 +5201,7 @@ func TestRunStage_LiveWaiterOwnsSpawnOnTransitionedFalse(t *testing.T) {
 				t.Errorf("stage_state = %q, want dispatched (the waiter's admission)", out.StageState)
 			}
 			joined := strings.Join(out.Warnings, "\n")
-			for _, want := range []string{"owns the spawn", "no second runner", "fishhawk_run_stage call are DROPPED"} {
+			for _, want := range []string{"may own the spawn", "exited without admission", "re-invoke fishhawk_run_stage", "fishhawk_run_stage call are DROPPED"} {
 				if !strings.Contains(joined, want) {
 					t.Errorf("warnings missing %q: %s", want, joined)
 				}
