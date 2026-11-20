@@ -14,24 +14,48 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
-// Fix-up session resume (E83.56 / #4089). An operator fix-up pass RESUMES the
-// implement agent's Claude Code session (agent.Invocation.ResumeSessionID →
+// Fix-up session resume (E83.56 / #4089). An operator fix-up pass MAY RESUME
+// the implement agent's Claude Code session (agent.Invocation.ResumeSessionID →
 // `claude --resume <id>`) instead of re-orienting a fresh agent, so the
-// resumed turn is only the backend's fetched fix-up prompt. The runner records
-// each successful implement agent's session in a sidecar ledger beside the
-// lineage worktree and decides, per fix-up dispatch, whether it can resume.
-// Every case that cannot resume falls back to today's full fresh fix-up and
-// says why in a fixup_session_resume trace event and runner log line.
+// resumed turn is only the backend's fetched fix-up prompt. It does so only
+// when the host opts in on the local runner channel (ADR-119 D2); the
+// availability gate below holds even that off today. The runner records each
+// successful implement agent's session in a sidecar ledger beside the lineage
+// worktree and decides, per fix-up dispatch, whether it can resume. Every case
+// that cannot resume falls back to today's full fresh fix-up and says why in a
+// fixup_session_resume trace event and runner log line.
 // Long-form: README.md § "Fix-up session resume (E83.56 / #4089)".
 
-// fixupResumeEnvVar is the operator kill switch: the exact value "off"
-// (surrounding whitespace ignored) disables resume, so every fix-up spawns
-// fresh. Any other value, including empty, leaves resume on.
+// fixupResumeEnvVar is the ADR-119 D2 operator opt-in: resume runs only when
+// the value, surrounding whitespace ignored, is exactly "on". Unset, empty,
+// "off" and every other value fall back disabled, so every fix-up spawns fresh.
 const fixupResumeEnvVar = "FISHHAWK_FIXUP_RESUME"
 
+// fixupResumeOptIn is the one value of fixupResumeEnvVar that opts in.
+const fixupResumeOptIn = "on"
+
+// fixupResumeReleased is the ADR-119 availability gate (#5350, operator
+// decision 2026-11-14). The record keeps resume OFF until D2, D3 and D5 land;
+// whichever of D3 (#5351) and D5 (#5353) lands last sets it true.
+const fixupResumeReleased = false
+
+// fixupResumeAvailable is the seam resolveFixupResume reads for the gate.
+// Production never assigns it; a test sets it true to exercise a resume.
+var fixupResumeAvailable = fixupResumeReleased
+
+// fixupResumeRunnerKind is the channel seam: the same detectRunnerKind source
+// logStartup and the signed manifest use. A test overrides it so a resume test
+// is not at the mercy of the CI process env (GitHub Actions reads as
+// github_actions).
+var fixupResumeRunnerKind = func() string { return detectRunnerKind(os.Getenv) }
+
+// fixupResumeUnavailableDetail is the operator-facing detail on a disabled
+// fallback caused by the availability gate rather than the opt-in.
+const fixupResumeUnavailableDetail = "resume unavailable until ADR-119 D3 and D5"
+
 // fixupResumeGetenv is the environment reader decideFixupResume consults for
-// the kill switch. A package-level var in the lineageSeedGetenv shape, so a
-// test drives the switch without t.Setenv.
+// the opt-in. A package-level var in the lineageSeedGetenv shape, so a test
+// drives the opt-in without t.Setenv.
 var fixupResumeGetenv = os.Getenv
 
 // agentSessionLedgerSchema versions the ledger file. A file carrying any other
@@ -53,6 +77,7 @@ const (
 
 	fixupResumeReasonResumed            = "resumed"
 	fixupResumeReasonDisabled           = "disabled"
+	fixupResumeReasonUnsupportedChannel = "unsupported_channel"
 	fixupResumeReasonUnsupportedAgent   = "unsupported_agent"
 	fixupResumeReasonNoSessionRecorded  = "no_session_recorded"
 	fixupResumeReasonLedgerUnreadable   = "ledger_unreadable"
@@ -171,52 +196,65 @@ func writeAgentSessionRecord(path, runID string, rec agentSessionRecord) error {
 	return nil
 }
 
-// fixupResumeInputs is what the current fix-up dispatch would spawn with.
+// fixupResumeInputs is what the current fix-up dispatch would spawn with (the
+// spawn identity), plus the dispatch's runner channel and the availability gate.
 type fixupResumeInputs struct {
 	agent          string
 	agentBinary    string
 	requestedModel string
 	workingDir     string
+	runnerKind     string
+	available      bool
 }
 
 // fixupResumeDecision is decideFixupResume's verdict. resume is true only for
-// reason "resumed"; sessionID is then the id to resume.
+// reason "resumed"; sessionID is then the id to resume. detail is set only on
+// fallbacks that carry an operator-facing explanation.
 type fixupResumeDecision struct {
 	resume    bool
 	sessionID string
 	reason    string
+	detail    string
 }
 
 // decideFixupResume decides whether a fix-up can resume the recorded implement
-// session. Pure: the ledger was read by the caller (rec, readErr) and the kill
-// switch comes through getenv. The guards run in order, the first that applies
-// naming the fallback reason; a session is resumed only when the recorded
-// spawn matches the current one on agent id, agent binary, requested model and
-// working directory (claude files sessions per cwd, and a different binary or
-// model would continue a conversation the current spawn did not hold).
+// session. Pure: the ledger was read by the caller (rec, readErr) and the
+// opt-in comes through getenv. The guards run in order, the first that applies
+// naming the fallback reason: the opt-in, then the runner channel (ADR-119 D2),
+// then the availability gate, then the spawn-identity guards. A session is
+// resumed only when the recorded spawn matches the current one on agent id,
+// agent binary, requested model and working directory (claude files sessions
+// per cwd, and a different binary or model would continue a conversation the
+// current spawn did not hold).
 func decideFixupResume(in fixupResumeInputs, rec *agentSessionRecord, readErr error, getenv func(string) string) fixupResumeDecision {
-	fallback := func(reason string) fixupResumeDecision { return fixupResumeDecision{reason: reason} }
+	fallback := func(reason, detail string) fixupResumeDecision {
+		return fixupResumeDecision{reason: reason, detail: detail}
+	}
 	switch {
-	case strings.TrimSpace(getenv(fixupResumeEnvVar)) == "off":
-		return fallback(fixupResumeReasonDisabled)
+	case strings.TrimSpace(getenv(fixupResumeEnvVar)) != fixupResumeOptIn:
+		return fallback(fixupResumeReasonDisabled, "")
+	case in.runnerKind != runnerKindLocal:
+		return fallback(fixupResumeReasonUnsupportedChannel, "runner kind "+in.runnerKind)
+	case !in.available:
+		return fallback(fixupResumeReasonDisabled, fixupResumeUnavailableDetail)
 	case in.agent != "claude-code":
-		return fallback(fixupResumeReasonUnsupportedAgent)
+		return fallback(fixupResumeReasonUnsupportedAgent, "")
 	case readErr != nil:
-		return fallback(fixupResumeReasonLedgerUnreadable)
+		return fallback(fixupResumeReasonLedgerUnreadable, "")
 	case rec == nil || rec.SessionID == "":
-		return fallback(fixupResumeReasonNoSessionRecorded)
+		return fallback(fixupResumeReasonNoSessionRecorded, "")
 	case rec.Agent != in.agent || rec.AgentBinary != in.agentBinary:
-		return fallback(fixupResumeReasonAgentMismatch)
+		return fallback(fixupResumeReasonAgentMismatch, "")
 	case rec.RequestedModel != in.requestedModel:
-		return fallback(fixupResumeReasonModelMismatch)
+		return fallback(fixupResumeReasonModelMismatch, "")
 	case rec.WorkingDir != in.workingDir:
-		return fallback(fixupResumeReasonWorkingDirMismatch)
+		return fallback(fixupResumeReasonWorkingDirMismatch, "")
 	}
 	return fixupResumeDecision{resume: true, sessionID: rec.SessionID, reason: fixupResumeReasonResumed}
 }
 
 // resolveFixupResume reads runID's ledger entry and decides against the
-// spawn inv describes.
+// spawn inv describes. It also reads the channel and availability-gate seams.
 func resolveFixupResume(ledgerPath string, cfg *config, inv agent.Invocation, getenv func(string) string) fixupResumeDecision {
 	rec, readErr := lookupAgentSession(ledgerPath, cfg.runID)
 	return decideFixupResume(fixupResumeInputs{
@@ -224,6 +262,8 @@ func resolveFixupResume(ledgerPath string, cfg *config, inv agent.Invocation, ge
 		agentBinary:    cfg.agentBinary,
 		requestedModel: inv.Model,
 		workingDir:     inv.WorkingDir,
+		runnerKind:     fixupResumeRunnerKind(),
+		available:      fixupResumeAvailable,
 	}, rec, readErr, getenv)
 }
 
@@ -275,7 +315,7 @@ func invokePrimaryAgent(ctx context.Context, invoker agent.Invoker, inv agent.In
 	}
 	if !d.resume {
 		res, err := invoker.Invoke(ctx, inv)
-		res.Events = fixupResumeTrace(res.Events, cfg, fixupResumeOutcomeFallback, d.reason, "", "", logSink)
+		res.Events = fixupResumeTrace(res.Events, cfg, fixupResumeOutcomeFallback, d.reason, "", d.detail, logSink)
 		return res, err
 	}
 	resumeInv := inv
