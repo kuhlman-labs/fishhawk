@@ -349,7 +349,17 @@ later plan, acceptance or verify pass queues
 then the plan are admitted, and held capacity rows never exceed 3). At
 capacity 4 one slot stays free, so a host running implement limit 2 wants
 `FISHHAWK_HOST_CAPACITY=4`; each further queued implement reserves one more
-slot. A reservation lasts until its waiter is admitted or goes stale past
+slot. A queued capacity reservation lasts until its waiter is admitted, and
+only while that waiter refreshes its row within `QueueTTL`: condition (a)
+counts only fresh queued rows, so a row stale past `QueueTTL` reserves
+nothing. `TestAdmitSet_StaleCapacityReservationEnds` pins it: at capacity
+3 with implement limit 2, I1 and I2 hold and I3 queues on
+`{capacity, implement}`; once only I3's row ages past `QueueTTL`, a new
+capacity-only stage is admitted at once. Since #3969 every host-spawn verb
+(`fishhawk_dispatch_stage`, `fishhawk_run_stage`, `fishhawk_drive_run`,
+`fishhawk_run_children`) leaves a live waiter behind a queued set, so a
+waiterless set arises only when a waiter's process dies (an MCP restart, a
+shim hot-swap, `/mcp`) or its cap expires, and it stops reserving within
 `QueueTTL`. `TestAdmitSet_HostCapacityBoundsMixedTypes` pins the full-host
 case: two implements and one acceptance fill capacity 3, and a fourth plan,
 verify pass or other-repository acceptance queues on capacity alone, with
