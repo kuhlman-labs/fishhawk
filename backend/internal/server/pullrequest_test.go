@@ -5913,6 +5913,98 @@ func TestShipPullRequest_MergeCandidateVerified_GateUnavailableRoutesNothing(t *
 	}
 }
 
+// mcvLaunchGolden reads a #5408 shared merge-candidate report golden from
+// testdata/wire, failing closed on a read error, a decode error (unknown keys
+// refused) or a missing result / reason / head.
+func mcvLaunchGolden(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "testdata", "wire", name))
+	if err != nil {
+		t.Fatalf("read shared golden %s: %v", name, err)
+	}
+	raw = bytes.TrimSpace(raw)
+	var body struct {
+		Outcome                  string `json:"outcome"`
+		Branch                   string `json:"branch"`
+		HeadSHA                  string `json:"head_sha"`
+		MergeCandidateResult     string `json:"merge_candidate_result"`
+		MergeCandidateReason     string `json:"merge_candidate_reason"`
+		MergeCandidateOutputTail string `json:"merge_candidate_output_tail"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		t.Fatalf("decode shared golden %s: %v", name, err)
+	}
+	if body.MergeCandidateResult == "" || body.MergeCandidateReason == "" || body.HeadSHA != mcvHead || body.Branch != mcvBranch {
+		t.Fatalf("shared golden %s lacks a result/reason or the fixture head/branch: %+v", name, body)
+	}
+	return raw
+}
+
+// TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens is the
+// BACKEND half of the #5408 cross-boundary pair (ADR-102 Amendment A1). The
+// runner half, TestMergeCandidateVerify_ContainerLaunchMarker, drives the real
+// merge-candidate pass on the container path and asserts it ships these
+// shared files' fields (testdata/wire/merge_candidate_launch_failed_report.json
+// and merge_candidate_post_launch_exit125_report.json; the upload client's
+// TestShipPullRequest_MergeCandidateLaunchGoldensMatchWire pins the wire
+// bytes). Here the SAME bytes cross the real /pull-request handler under a
+// fix-up-DELEGATING workflow: a launch failure (runtime 125 before the launch
+// marker) records not_executed / verify_gate_launch_failed, routes NO fix-up
+// and never makes the head merge-eligible, while a post-marker exit 125 (the
+// command's own status) records failed and routes exactly one fix-up.
+func TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens(t *testing.T) {
+	t.Run("launch_failed", func(t *testing.T) {
+		golden := mcvLaunchGolden(t, "merge_candidate_launch_failed_report.json")
+		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+		// A base-advance rebase classifies the head, so the merge gate
+		// REQUIRES a merge-candidate verdict for it (else not_required).
+		f.seedRebased(mcvHead, mcvHead, false)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, golden)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp.Result != mergeCandidateResultNotExecuted || resp.FixupRouted || resp.FixupRefusal != "" {
+			t.Errorf("response = %+v, want not_executed with no routed fix-up and no refusal", resp)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 0 (a launch failure is no verdict on the tree)", n)
+		}
+		rows := mcvVerdictRows(f.au)
+		if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted || rows[0].Reason != "verify_gate_launch_failed" || rows[0].HeadSHA != mcvHead {
+			t.Fatalf("merge_candidate_verified rows = %+v, want one not_executed / verify_gate_launch_failed row", rows)
+		}
+		if got := f.stageState(t, f.impl.ID); got == run.StageStateRunning {
+			t.Errorf("implement state = %q, want settled out of running", got)
+		}
+		// Approval condition L5(a): not_executed is never merge-eligible.
+		state, err := f.s.mergeCandidateVerifyState(t.Context(), f.runRow(t), mcvHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.State != mergeCandidateStateUnverified {
+			t.Errorf("mergeCandidateVerifyState = %+v, want unverified: a launch failure is never merge-eligible", state)
+		}
+	})
+	t.Run("post_launch_exit_125", func(t *testing.T) {
+		golden := mcvLaunchGolden(t, "merge_candidate_post_launch_exit125_report.json")
+		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, golden)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp.Result != mergeCandidateResultFailed || !resp.FixupRouted {
+			t.Fatalf("response = %+v, want failed with one routed fix-up", resp)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 1 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 1", n)
+		}
+	})
+}
+
 // TestShipPullRequest_MergeCandidateVerified_RefusalArms: a report with no
 // live trigger is a 409 that records nothing and leaves the stage running; a
 // trigger read error is a retryable 500 that records nothing; a non-implement

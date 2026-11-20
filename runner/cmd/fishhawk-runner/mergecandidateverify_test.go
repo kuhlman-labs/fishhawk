@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -411,6 +412,9 @@ func TestMergeCandidateVerify_NotExecutedArms(t *testing.T) {
 		// both fall to the default verify_failed.
 		{"temp_fail_exit_75", "failed", gateTempFail, "", mcReasonTempFail},
 		{"lock_refused_exit_73", "failed", gateLockRefused, "", mcReasonLockContended},
+		// A container launch failure (#5408, ADR-102 A1): only the disposition
+		// arm makes it not_executed.
+		{"launch_failed", "failed", gateLaunchFailed, "", mcReasonGateLaunchFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			orig := mergeCandidateVerifyFn
@@ -776,4 +780,138 @@ func TestMergeCandidateVerify_ContainerWorkTreePreflightIsNotExecuted(t *testing
 			}
 		})
 	}
+}
+
+// mcvDockerLaunch125Text is a runtime-authored daemon failure: docker's own
+// 125, printed before any gate command started. The merge-candidate launch
+// golden (testdata/wire/merge_candidate_launch_failed_report.json) carries it.
+const mcvDockerLaunch125Text = "docker: Error response from daemon: failed to create shim task: OCI runtime create failed: unable to start container process: unknown.\n"
+
+// mcvPostLaunchCommandText is what the verify COMMAND printed before exiting
+// 125 itself: the post-launch golden
+// (testdata/wire/merge_candidate_post_launch_exit125_report.json) carries it.
+const mcvPostLaunchCommandText = "verify: the command itself exited 125\n"
+
+// mcvWireGolden decodes a shared merge-candidate report golden.
+func mcvWireGolden(t *testing.T, name string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", name))
+	if err != nil {
+		t.Fatalf("read shared golden %s: %v", name, err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode shared golden %s: %v", name, err)
+	}
+	return m
+}
+
+// TestMergeCandidateVerify_ContainerLaunchMarker is the RUNNER half of the
+// #5408 cross-boundary pair: it drives the REAL merge-candidate pass through
+// runVerifyCommittedTree and runGateInContainer on the container path (both
+// runtime seams scripted) and pins that a runtime 125/126/127 with NO launch
+// marker ships not_executed / verify_gate_launch_failed, while the same codes
+// after the marker ship failed / verify_failed with the marker stripped. The
+// two 125 arms are asserted equal to the shared goldens the backend's
+// TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens posts
+// through the real /pull-request handler.
+func TestMergeCandidateVerify_ContainerLaunchMarker(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	for _, tc := range []struct {
+		name       string
+		text       string
+		code       int
+		marker     bool
+		wantResult string
+		wantReason string
+		golden     string
+	}{
+		{"launch_failed_125", mcvDockerLaunch125Text, 125, false, mergeCandidateNotExecuted, mcReasonGateLaunchFailed, "merge_candidate_launch_failed_report.json"},
+		{"launch_failed_126", dockerLaunch127Text, 126, false, mergeCandidateNotExecuted, mcReasonGateLaunchFailed, ""},
+		{"launch_failed_127", dockerLaunch127Text, 127, false, mergeCandidateNotExecuted, mcReasonGateLaunchFailed, ""},
+		{"post_launch_exit_125", mcvPostLaunchCommandText, 125, true, mergeCandidateFailed, "verify_failed", "merge_candidate_post_launch_exit125_report.json"},
+		{"post_launch_exit_126", mcvPostLaunchCommandText, 126, true, mergeCandidateFailed, "verify_failed", ""},
+		{"post_launch_exit_127", mcvPostLaunchCommandText, 127, true, mergeCandidateFailed, "verify_failed", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
+			scriptLaunchGate(t, tc.text, tc.code, tc.marker, false)
+			code, ship := runMCVWithState(t, mcvCfg(dispatch, mcvVerifyCmd),
+				mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}, st)
+			if code != exitOK {
+				t.Errorf("exit = %d, want exitOK", code)
+			}
+			if ship.MergeCandidateResult != tc.wantResult || ship.MergeCandidateReason != tc.wantReason {
+				t.Fatalf("result/reason = %q/%q, want %s/%s", ship.MergeCandidateResult, ship.MergeCandidateReason, tc.wantResult, tc.wantReason)
+			}
+			if strings.Contains(ship.MergeCandidateOutputTail, "fishhawk-gate-launched:") {
+				t.Errorf("the launch marker leaked into the shipped tail: %q", ship.MergeCandidateOutputTail)
+			}
+			if tc.golden == "" {
+				return
+			}
+			want := mcvWireGolden(t, tc.golden)
+			str := func(k string) string { v, _ := want[k].(string); return v }
+			if str("merge_candidate_result") != ship.MergeCandidateResult ||
+				str("merge_candidate_reason") != ship.MergeCandidateReason ||
+				str("merge_candidate_output_tail") != ship.MergeCandidateOutputTail ||
+				str("merge_candidate_failures") != ship.MergeCandidateFailures {
+				t.Errorf("shipped fields drifted from %s:\n result=%q reason=%q\n tail=%q\n failures=%q",
+					tc.golden, ship.MergeCandidateResult, ship.MergeCandidateReason, ship.MergeCandidateOutputTail, ship.MergeCandidateFailures)
+			}
+			if str("outcome") != upload.OutcomeMergeCandidateVerified {
+				t.Errorf("golden outcome = %q, want %s", str("outcome"), upload.OutcomeMergeCandidateVerified)
+			}
+			for key, shipped := range map[string]bool{
+				"head_sha":                        ship.HeadSHA != "",
+				"branch":                          ship.Branch != "",
+				"merge_candidate_result":          ship.MergeCandidateResult != "",
+				"merge_candidate_reason":          ship.MergeCandidateReason != "",
+				"merge_candidate_output_tail":     ship.MergeCandidateOutputTail != "",
+				"merge_candidate_failures":        ship.MergeCandidateFailures != "",
+				"merge_candidate_failure_summary": ship.MergeCandidateFailureSummary != nil,
+			} {
+				if _, inGolden := want[key]; inGolden != shipped {
+					t.Errorf("golden %s has %s = %t, but the runner shipped it = %t", tc.golden, key, inGolden, shipped)
+				}
+			}
+		})
+	}
+	// Approval condition L5(b): the launch-failure tail goes through the SAME
+	// mergeCandidateEvidence path (redactString, then the
+	// MaxMergeCandidateOutputTailBytes bound) as every other tail, so a
+	// credential in the runtime's own text never ships.
+	t.Run("launch_failed_tail_is_redacted_and_bounded", func(t *testing.T) {
+		secret := "ghp_" + strings.Repeat("Z9y8X7w6V5", 4)[:36]
+		text := "docker: Error response from daemon: Get \"https://x-access-token:" + secret + "@ghcr.io/v2/\": unauthorized.\n" +
+			strings.Repeat("pull chatter\n", upload.MaxMergeCandidateOutputTailBytes/8)
+		st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
+		scriptLaunchGate(t, text, 125, false, false)
+		_, ship := runMCVWithState(t, mcvCfg(dispatch, mcvVerifyCmd),
+			mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}, st)
+		if ship.MergeCandidateResult != mergeCandidateNotExecuted || ship.MergeCandidateReason != mcReasonGateLaunchFailed {
+			t.Fatalf("result/reason = %q/%q", ship.MergeCandidateResult, ship.MergeCandidateReason)
+		}
+		for name, v := range map[string]string{"tail": ship.MergeCandidateOutputTail, "failures": ship.MergeCandidateFailures} {
+			if strings.Contains(v, secret) || strings.Contains(v, secret[18:]) {
+				t.Errorf("the runtime text's credential shipped in %s", name)
+			}
+		}
+		if n := len(ship.MergeCandidateOutputTail); n == 0 || n > upload.MaxMergeCandidateOutputTailBytes {
+			t.Errorf("tail length = %d, want within (0, %d]", n, upload.MaxMergeCandidateOutputTailBytes)
+		}
+	})
+	t.Run("launch_failed_short_credential_redacted", func(t *testing.T) {
+		secret := "ghp_" + strings.Repeat("Q1w2E3r4T5", 4)[:36]
+		st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
+		scriptLaunchGate(t, "docker: Error response from daemon: token "+secret+" rejected\n", 125, false, false)
+		_, ship := runMCVWithState(t, mcvCfg(dispatch, mcvVerifyCmd),
+			mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}, st)
+		if !strings.HasPrefix(ship.MergeCandidateOutputTail, "gate container: launch failed:") {
+			t.Fatalf("tail = %q, want the launch-failed lead", ship.MergeCandidateOutputTail)
+		}
+		if strings.Contains(ship.MergeCandidateOutputTail, secret) {
+			t.Errorf("the runtime text's credential shipped in the tail: %q", ship.MergeCandidateOutputTail)
+		}
+	})
 }

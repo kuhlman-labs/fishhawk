@@ -1,0 +1,1 @@
+{"outcome":"merge_candidate_verified","branch":"fishhawk/run-mcv","head_sha":"1111111111111111111111111111111111111111","merge_candidate_result":"failed","merge_candidate_reason":"verify_failed","merge_candidate_output_tail":"verify: the command itself exited 125\n"}

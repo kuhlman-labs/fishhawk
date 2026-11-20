@@ -970,6 +970,7 @@ func TestGateDisposition_String(t *testing.T) {
 		{gateTimedOut, "timed_out"},
 		{gateTempFail, "temp_fail"},
 		{gateLockRefused, "lock_refused"},
+		{gateLaunchFailed, "launch_failed"},
 		{gateDisposition(99), "gateDisposition(99)"},
 	} {
 		if got := tc.d.String(); got != tc.want {
@@ -994,6 +995,9 @@ func TestGateDisposition_NeverExecutedInfra(t *testing.T) {
 		{gateTimedOut, false},
 		{gateTempFail, false},
 		{gateLockRefused, false},
+		// A container launch failure (#5408): the command never started, so
+		// reverify-resume's never-executed arm covers it.
+		{gateLaunchFailed, true},
 	} {
 		if got := tc.d.neverExecutedInfra(); got != tc.want {
 			t.Errorf("%s.neverExecutedInfra() = %t, want %t", tc.d, got, tc.want)
@@ -4806,4 +4810,250 @@ func TestRunVerifyCommittedTree_ContainerWorkTreePreflight(t *testing.T) {
 			t.Errorf("the gate ran despite the failed preflight: %q", g.order)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Container launch marker (#5408, ADR-102 Amendment A1)
+// ---------------------------------------------------------------------------
+
+// dockerLaunch127Text is a runtime-authored "the command could not be found"
+// failure: docker's own 127, printed before any gate command started.
+const dockerLaunch127Text = "docker: Error response from daemon: failed to create task for container: exec: \"sh\": executable file not found in $PATH: unknown.\n"
+
+// launchMarkerNonce returns the nonce a marked gate_run argv carries (the
+// element after gateiso.LaunchMarkerArg0), or "" for an unwrapped argv.
+func launchMarkerNonce(argv []string) string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == gateiso.LaunchMarkerArg0 {
+			return argv[i+1]
+		}
+	}
+	return ""
+}
+
+// scriptLaunchGate scripts both runtime seams (healthy preflight / passwd /
+// seed) and answers gate_run with text, code and timedOut. marker=true echoes
+// the argv's launch-marker line before text (the command started); false
+// returns text alone (the runtime failed before the wrapper ran). An UNWRAPPED
+// argv always gets the bare text, so a counterfactual that drops the ctx
+// marker reddens on the behavioural assertion, never on fixture setup.
+func scriptLaunchGate(t *testing.T, text string, code int, marker, timedOut bool) *gateExecScript {
+	t.Helper()
+	var g *gateExecScript
+	g = scriptGateExec(t, func(label string, n int) (string, int, bool) {
+		if label != "gate_run" {
+			return serviceHappyPath(label, n)
+		}
+		out := text
+		if nonce := launchMarkerNonce(g.argv[label]); marker && nonce != "" {
+			out = gateiso.LaunchMarkerLine(nonce) + "\n" + text
+		}
+		return out, code, timedOut
+	})
+	return g
+}
+
+// TestRunGateInContainer_LaunchMarker pins the launch-marker arm of
+// runGateInContainer per failure mode: only a MARKED exec is wrapped (with a
+// fresh nonce each time), a runtime 125/126/127 with no marker line is
+// gateLaunchFailed, the same codes after the marker are the command's own
+// status (gateExecuted, marker stripped, the rest byte-exact), and neither an
+// ordinary failure nor a timeout is ever read as a launch failure.
+func TestRunGateInContainer_LaunchMarker(t *testing.T) {
+	marked := withLaunchMarker(context.Background())
+	run := func(t *testing.T, ctx context.Context, text string, code int, marker, timedOut bool) (*gateExecScript, string, int, gateDisposition) {
+		t.Helper()
+		installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+		g := scriptLaunchGate(t, text, code, marker, timedOut)
+		out, gotCode, disp := runBoundedGateCommandDisposed(ctx, "make verify", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+		return g, out, gotCode, disp
+	}
+	t.Run("marked_argv_wraps_with_fresh_nonce", func(t *testing.T) {
+		var nonces []string
+		for range 2 {
+			g, _, _, _ := run(t, marked, "ok\n", 0, true, false)
+			argv := g.argv["gate_run"]
+			nonce := launchMarkerNonce(argv)
+			if len(nonce) != 32 {
+				t.Fatalf("marked gate_run carries no 32-hex nonce: %q", argv)
+			}
+			want := gateiso.WrapLaunchMarker([]string{"sh", "-c", "make verify"}, nonce)
+			if len(argv) < len(want) || !slices.Equal(argv[len(argv)-len(want):], want) {
+				t.Fatalf("gate_run tail = %q, want %q", argv, want)
+			}
+			if argv[len(argv)-len(want)-1] != "img:1" {
+				t.Errorf("the wrapper must follow the image: %q", argv)
+			}
+			nonces = append(nonces, nonce)
+		}
+		if nonces[0] == nonces[1] {
+			t.Errorf("two execs carried the same nonce %q", nonces[0])
+		}
+	})
+	t.Run("unmarked_argv_byte_unchanged", func(t *testing.T) {
+		g, out, code, disp := run(t, context.Background(), "ok\n", 125, false, false)
+		argv := g.argv["gate_run"]
+		if slices.Contains(argv, gateiso.LaunchMarkerArg0) {
+			t.Fatalf("an unmarked exec was wrapped: %q", argv)
+		}
+		if n := len(argv); n < 4 || !slices.Equal(argv[n-4:], []string{"img:1", "sh", "-c", "make verify"}) {
+			t.Fatalf("unmarked gate_run tail = %q, want [img:1 sh -c make verify]", argv)
+		}
+		if disp != gateExecuted || code != 125 || out != "ok\n" {
+			t.Errorf("unmarked 125 = (%q, %d, %s), want the bare verdict (ok, 125, executed)", out, code, disp)
+		}
+	})
+	const cmdText = "--- FAIL: TestX (0.00s)\nFAIL\n"
+	for _, code := range []int{125, 126, 127} {
+		t.Run(fmt.Sprintf("no_marker_%d_is_launch_failed", code), func(t *testing.T) {
+			_, out, gotCode, disp := run(t, marked, dockerLaunch127Text, code, false, false)
+			if disp != gateLaunchFailed || gotCode != code {
+				t.Fatalf("(code, disp) = (%d, %s), want (%d, launch_failed)", gotCode, disp, code)
+			}
+			if !strings.HasPrefix(out, "gate container: launch failed:") || !strings.Contains(out, strings.TrimSpace(dockerLaunch127Text)) {
+				t.Errorf("output = %q, want the launch-failed lead and the runtime text", out)
+			}
+		})
+		t.Run(fmt.Sprintf("post_marker_%d_is_executed", code), func(t *testing.T) {
+			_, out, gotCode, disp := run(t, marked, cmdText, code, true, false)
+			if disp != gateExecuted || gotCode != code {
+				t.Fatalf("(code, disp) = (%d, %s), want (%d, executed)", gotCode, disp, code)
+			}
+			if out != cmdText {
+				t.Errorf("output = %q, want the marker stripped and the rest byte-exact %q", out, cmdText)
+			}
+		})
+	}
+	t.Run("no_marker_exit_1_is_executed", func(t *testing.T) {
+		_, out, code, disp := run(t, marked, cmdText, 1, false, false)
+		if disp != gateExecuted || code != 1 || out != cmdText {
+			t.Errorf("= (%q, %d, %s), want (%q, 1, executed)", out, code, disp, cmdText)
+		}
+	})
+	t.Run("pass_with_marker_stripped", func(t *testing.T) {
+		_, out, code, disp := run(t, marked, "ok\n", 0, true, false)
+		if disp != gateExecuted || code != 0 || out != "ok\n" {
+			t.Errorf("= (%q, %d, %s), want (ok, 0, executed)", out, code, disp)
+		}
+	})
+	t.Run("timed_out_with_runtime_code_is_never_launch_failed", func(t *testing.T) {
+		// Isolates the !timedOut guard: a deadline-killed exec whose seam
+		// still reported a runtime code is a timeout, never a launch failure.
+		_, _, _, disp := run(t, marked, ">> partial", 125, false, true)
+		if disp != gateTimedOut {
+			t.Errorf("disp = %s, want timed_out", disp)
+		}
+	})
+	t.Run("timed_out_is_never_launch_failed", func(t *testing.T) {
+		_, _, code, disp := run(t, marked, ">> partial", -1, false, true)
+		if disp != gateTimedOut || code != -1 {
+			t.Errorf("(code, disp) = (%d, %s), want (-1, timed_out)", code, disp)
+		}
+	})
+}
+
+// TestRunVerifyFixLoop_ContainerLaunchFailedIsCategoryC: a runtime 127 before
+// the launch marker (#5408) ends the fix loop category C through the
+// unavailable arm, with the fix agent NEVER invoked and no absorb. The runtime
+// text carries no infra signature (asserted first), so no absorb can mask the
+// arm: reverting `case gateUnavailable, gateLaunchFailed:` hands the agent a
+// tree that was never judged.
+func TestRunVerifyFixLoop_ContainerLaunchFailedIsCategoryC(t *testing.T) {
+	if isVerifyInfraFailure(containerLaunchFailedOutput(127, dockerLaunch127Text)) {
+		t.Fatal("precondition: the launch-failure text must carry no infra signature")
+	}
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	scriptLaunchGate(t, dockerLaunch127Text, 127, false, false)
+	cfg, _ := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	cfg.verifyMaxIterations = 2
+	res := agent.Result{OK: true}
+	var log strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
+	if err != nil || reinvoked || tree != "" {
+		t.Fatalf("err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
+	}
+	if res.OK || res.FailureCategory != "C" || !strings.Contains(res.FailureReason, "launch failed") {
+		t.Errorf("res = OK:%t cat:%q reason:%q, want category C naming the launch failure", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("fix agent invoked %d times, want 0", invoker.callIdx)
+	}
+	if !strings.Contains(log.String(), `"event":"verify_gate_unavailable"`) {
+		t.Errorf("log lacks verify_gate_unavailable:\n%s", log.String())
+	}
+	for _, never := range []string{"verify_infra_flake_retry", "verify_fix_reinvoke"} {
+		if strings.Contains(log.String(), never) {
+			t.Errorf("%s fired on a launch failure:\n%s", never, log.String())
+		}
+	}
+}
+
+// TestRunVerifyGateCommitted_ContainerLaunchFailedIsCategoryC: the single-shot
+// gate wraps a launch failure in ErrVerifyInfraFailure +
+// errGateContainerUnavailable (category C) via hostUnavailable, NOT
+// errGateIsolationRefused, runs verify exactly once and never absorbs.
+func TestRunVerifyGateCommitted_ContainerLaunchFailedIsCategoryC(t *testing.T) {
+	if isVerifyInfraFailure(containerLaunchFailedOutput(127, dockerLaunch127Text)) {
+		t.Fatal("precondition: the launch-failure text must carry no infra signature")
+	}
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	scriptLaunchGate(t, dockerLaunch127Text, 127, false, false)
+	repo, _, _ := verifiedTreeRepo(t)
+	var log strings.Builder
+	events, tree, err := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), &log)
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errGateContainerUnavailable) {
+		t.Fatalf("err = %v, want ErrVerifyInfraFailure + errGateContainerUnavailable", err)
+	}
+	if errors.Is(err, errGateIsolationRefused) {
+		t.Errorf("a launch failure must not read as a refusal: %v", err)
+	}
+	if got := committedGateFailureCategory(err); got != "C" {
+		t.Errorf("committedGateFailureCategory = %q, want C", got)
+	}
+	if tree != "" {
+		t.Errorf("a launch-failed gate must not yield a verified tree")
+	}
+	runs, retries := 0, 0
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			runs++
+		case "verify_infra_flake_retry":
+			retries++
+		}
+	}
+	if runs != 1 || retries != 0 {
+		t.Errorf("verify_run = %d retries = %d, want 1 / 0", runs, retries)
+	}
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMismatch_ContainerLaunchFailedIsCategoryC
+// pins the #960 strict re-verify's launch-failure arm (#5408 approval
+// condition L1): a re-verify whose container runtime exited 127 before the
+// launch marker never judged the pushed tree, so it is ErrVerifyInfraFailure +
+// errGateContainerUnavailable (category C), never ErrPushedTreeNotVerified,
+// and origin stays untouched. The text carries no re-verify infra signature
+// (asserted first), so only the disposition arm makes it category C.
+func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_ContainerLaunchFailedIsCategoryC(t *testing.T) {
+	if isReverifyInfraFailure(containerLaunchFailedOutput(127, dockerLaunch127Text), true) {
+		t.Fatal("precondition: the launch-failure text must carry no re-verify infra signature")
+	}
+	h := newStrictReverifyHarness(t)
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	g := scriptLaunchGate(t, dockerLaunch127Text, 127, false, false)
+	_, err := h.ship(t, context.Background(), "make verify")
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errGateContainerUnavailable) {
+		t.Fatalf("err = %v, want ErrVerifyInfraFailure + errGateContainerUnavailable", err)
+	}
+	if errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Errorf("a launch failure must NOT wrap ErrPushedTreeNotVerified: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "C" {
+		t.Errorf("pushFailureCategory = %q, want C", got)
+	}
+	if g.counts["gate_run"] != 1 {
+		t.Errorf("re-verify gate runs = %d, want 1", g.counts["gate_run"])
+	}
+	h.assertOriginUntouched(t)
 }

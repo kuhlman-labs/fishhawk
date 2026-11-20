@@ -24,6 +24,16 @@ import (
 //	        then category C verify_lock_contended;
 //	other   the change failed.
 //
+// Container launch arm (ADR-102 Amendment A1, #5408): docker/podman return the
+// contained status for every code but their own 125/126/127. On the container
+// path a committed-tree verify runs behind the launch-marker wrapper, and
+// runGateInContainer reads those three codes through the marker: with NO
+// marker line the command never started, so the exec is gateLaunchFailed
+// (category C, merge-candidate not_executed / verify_gate_launch_failed);
+// after the marker they are the command's own status ("the change failed").
+// verifyExitDisposition never sees a launch failure: a non-gateExecuted
+// disposition is returned unchanged.
+//
 // This repository's scripts/test exits VERIFY_EXIT_LOCK_REFUSED=73 on every
 // verify-lock refusal and declares VERIFY_EXIT_TEMPFAIL=75;
 // TestVerifyExitCodesMatchScriptsTest pins both against the script.
@@ -40,7 +50,7 @@ const (
 
 // verifyExitDisposition maps the verify command's exit code onto the gate
 // disposition. Only gateExecuted is remapped: a refused, unavailable,
-// checkout-refused or timed-out gate keeps its own disposition whatever code
+// launch-failed, checkout-refused or timed-out gate keeps its own disposition whatever code
 // the process reported (a container runtime's own failure code, a killed
 // process's -1).
 func verifyExitDisposition(exitCode int, disp gateDisposition) gateDisposition {
