@@ -2155,7 +2155,10 @@ func TestAwaitStage_ReleasesWhenWaiterGone(t *testing.T) {
 			if out.Concurrency == nil || out.Concurrency.Group != "local-implement:h1" || out.Concurrency.Position != 1 {
 				t.Errorf("Concurrency = %+v, want the queued block", out.Concurrency)
 			}
-			for _, want := range []string{"NO live waiter", "fishhawk_dispatch_stage", `"local-implement:h1"`, "position 1"} {
+			// #3969: the waiter may come from any host-spawn verb, so the
+			// message names the fan-out recovery (re-invoke
+			// fishhawk_run_children), not only a bare re-dispatch.
+			for _, want := range []string{"NO live waiter", "fishhawk_dispatch_stage", "re-invoke fishhawk_run_children", "fishhawk_run_stage", "fishhawk_drive_run", `"local-implement:h1"`, "position 1"} {
 				if tc.wantMsg && !strings.Contains(out.Message, want) {
 					t.Errorf("Message missing %q: %q", want, out.Message)
 				}
@@ -2244,12 +2247,25 @@ func TestAwaitStage_HeldQueueTimesOutWithBlockVisible(t *testing.T) {
 }
 
 // TestAwaitStageToolDescription_NamesConcurrencyHold pins the #3964 sentence
-// in the tool description.
+// in the tool description, and the #3969 widening: the waiter may come from
+// any host-spawn verb, and a fan-out child's recovery is re-invoking
+// fishhawk_run_children. The old "fishhawk_dispatch_stage started one" claim
+// is gone.
 func TestAwaitStageToolDescription_NamesConcurrencyHold(t *testing.T) {
-	desc := awaitStageToolDescription(t)
-	for _, want := range []string{"awaiting_concurrency_slot", "waiter_live", "re-dispatch with fishhawk_dispatch_stage"} {
+	// Collapse the description's line wraps so a phrase is pinned, not its
+	// wrap point.
+	desc := strings.Join(strings.Fields(awaitStageToolDescription(t)), " ")
+	for _, want := range []string{
+		"awaiting_concurrency_slot", "waiter_live", "re-dispatch with fishhawk_dispatch_stage",
+		"any host-spawn verb", "fishhawk_run_children for a fan-out child",
+	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_await_stage description missing %q", want)
+		}
+	}
+	for _, gone := range []string{"fishhawk_dispatch_stage started one", "a local implement stage that could not get"} {
+		if strings.Contains(desc, gone) {
+			t.Errorf("fishhawk_await_stage description still carries the pre-#3969 claim %q", gone)
 		}
 	}
 }
