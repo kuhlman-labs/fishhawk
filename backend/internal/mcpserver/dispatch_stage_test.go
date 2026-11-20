@@ -2929,12 +2929,12 @@ func TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn(t *testing.T)
 	}
 	spawns := countingSpawn(t, nil)
 	var started []slotWaiterSpec
-	saved := dispatchStartSlotWaiter
-	dispatchStartSlotWaiter = func(spec slotWaiterSpec) (string, <-chan struct{}) {
+	saved := startSlotWaiter
+	startSlotWaiter = func(spec slotWaiterSpec) (string, <-chan struct{}) {
 		started = append(started, spec)
 		return slotWaiterAlreadyWaiting, nil
 	}
-	t.Cleanup(func() { dispatchStartSlotWaiter = saved })
+	t.Cleanup(func() { startSlotWaiter = saved })
 
 	in := f.input()
 	in.RunnerBinary = ""
@@ -2967,10 +2967,13 @@ func TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn(t *testing.T)
 		spec.jitter == nil || spec.spawn == nil || spec.prepare == nil {
 		t.Fatalf("waiter spec = %+v, want the stage, a fresh admission nonce, the uncontended answer, the poll jitter and spawn inputs", spec)
 	}
+	if spec.verb != "fishhawk_dispatch_stage" || !strings.Contains(strings.Join(out.Warnings, "\n"), "re-invoke fishhawk_dispatch_stage") {
+		t.Errorf("waiter verb = %q, warnings = %q; want fishhawk_dispatch_stage named as the recovery", spec.verb, out.Warnings)
+	}
 	// prepare REBUILDS the spawn inputs at admission: a runner binary changed
 	// while queued is the one spawned.
 	runnerBin = "/new/fishhawk-runner"
-	got, perr := spec.prepare()
+	got, perr := spec.prepare(nil)
 	if perr != nil || got.binary != "/new/fishhawk-runner" || !strings.Contains(strings.Join(got.argv, " "), "--check-base-ref main") {
 		t.Fatalf("prepare = binary %q argv %v, %v; want the binary current at admission and the implement argv", got.binary, got.argv, perr)
 	}
@@ -2981,8 +2984,11 @@ func TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn(t *testing.T)
 
 // TestDispatchStage_ImmediateAdmissionSpawnFailureReaps: a GROUPED admission
 // (200 with a concurrency block) whose spawn fails releases the slot through
-// reap-failure pinned to dispatched, category C. The ungrouped admission keeps
-// today's behaviour (the error, no reap).
+// reap-failure pinned to dispatched, category C. A capacity-only block is the
+// grouped signal on a plan, acceptance or review admission (#4241, #3969
+// carry-forward item 2), so it releases too. An admission with no block keeps
+// today's behaviour (the error, no reap): with a slot store wired every stage
+// is grouped, so that arm happens only when the server runs no store.
 func TestDispatchStage_ImmediateAdmissionSpawnFailureReaps(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -2990,7 +2996,8 @@ func TestDispatchStage_ImmediateAdmissionSpawnFailureReaps(t *testing.T) {
 		wantReap bool
 	}{
 		{"grouped", `{"transitioned":true,"stage_state":"dispatched","concurrency":{"group":"local-implement:h1","limit":1,"queued_before":false,"waited_seconds":0}}`, true},
-		{"ungrouped", `{"transitioned":true,"stage_state":"dispatched"}`, false},
+		{"capacity-only (plan/acceptance/review)", `{"transitioned":true,"stage_state":"dispatched","concurrency":{"group":"host:h1:capacity","limit":3}}`, true},
+		{"no concurrency store (no block)", `{"transitioned":true,"stage_state":"dispatched"}`, false},
 		{"idempotent re-dispatch", `{"transitioned":false,"stage_state":"dispatched","concurrency":{"group":"local-implement:h1","limit":1}}`, false},
 	}
 	for _, tc := range cases {
@@ -3112,8 +3119,9 @@ func TestDispatchStage_UnresolvedDefaultBranch_RefusesBeforeMarker(t *testing.T)
 // TestDispatchStage_Description_HostCapacity pins the #4241 (ADR-094 D4/A2)
 // concurrency sentences, which supersede #5214 rule 11: every host-dispatched
 // stage holds a host capacity slot, review stages included, a queued stage
-// reserves one slot, the concrete reservation example, and the #3969 interim.
-// It also pins that the old "only implement is grouped" sentences are gone.
+// reserves one slot, the concrete reservation example, and that every
+// host-spawn verb queues (#3969). It also pins that the old "only implement is
+// grouped" sentences and the #3969 interim are gone.
 func TestDispatchStage_Description_HostCapacity(t *testing.T) {
 	desc := strings.Join(strings.Fields(listToolDescriptions(t)["fishhawk_dispatch_stage"]), " ")
 	for _, want := range []string{
@@ -3128,8 +3136,9 @@ func TestDispatchStage_Description_HostCapacity(t *testing.T) {
 		"capacity blocks only when holders plus earlier reservations fill capacity",
 		"at capacity 3 with implement limit 2, two holding implements plus one queued implement fill capacity",
 		"at capacity 4 one slot stays free",
-		"Until #3969, fishhawk_run_stage, fishhawk_drive_run and fishhawk_run_children fail closed on a queued dispatch",
-		"for plan and acceptance stages that happens only when holders plus earlier reservations fill capacity",
+		"Every host-spawn verb queues the same way (#3969): fishhawk_run_stage returns outcome awaiting_concurrency_slot, fishhawk_drive_run stops awaiting_concurrency_slot, and fishhawk_run_children marks the child queued",
+		"this session's slot waiter spawns the runner on admission",
+		"For plan and acceptance stages a queue happens only when holders plus earlier reservations fill capacity",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_dispatch_stage description missing %q:\n%s", want, desc)
@@ -3140,6 +3149,8 @@ func TestDispatchStage_Description_HostCapacity(t *testing.T) {
 		"plan stages may overlap",
 		"never blocks later stages on capacity",
 		"only when host capacity is actually full",
+		"Until #3969",
+		"fail closed on a queued dispatch",
 	} {
 		if strings.Contains(desc, gone) {
 			t.Errorf("fishhawk_dispatch_stage description still says %q", gone)

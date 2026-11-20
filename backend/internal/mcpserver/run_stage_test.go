@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // passedWordRe is a word-boundary, case-insensitive match for "passed" (#2458
@@ -4855,4 +4858,345 @@ func TestRunStage_NextActions_BindingAssertionAndFanInVerifyFolds(t *testing.T) 
 			t.Errorf("served next_actions %v carry no fan-in verify-pass await (state %s)", actionNames(out.NextActions), out.NextActions.State)
 		}
 	})
+}
+
+// --- queued dispatch (#3969 / ADR-094 D1) -----------------------------------
+
+// queuedMarkerScript wraps the shared fakeBackend's server so the
+// host-dispatch marker answers 409 concurrency_slot_queued (slotQueuedBody,
+// which carries no base_branch) until admit is called. Every later marker
+// call, and every other route, is the shared fake's own handler, which flips
+// the seeded stage awaiting_host_dispatch -> dispatched with transitioned:true.
+type queuedMarkerScript struct {
+	mu       sync.Mutex
+	admitted bool
+	queued   int // 409 answers served
+}
+
+func (s *queuedMarkerScript) admit() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.admitted = true
+}
+
+func (s *queuedMarkerScript) queuedAnswers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queued
+}
+
+// newQueuedMarkerResolver is newResolver over srv with the marker scripted by
+// a queuedMarkerScript.
+func newQueuedMarkerResolver(t *testing.T, srv *httptest.Server) (*queuedMarkerScript, *runResolver) {
+	t.Helper()
+	sc := &queuedMarkerScript{}
+	inner := srv.Config.Handler
+	wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/host-dispatch") {
+			sc.mu.Lock()
+			admitted := sc.admitted
+			if !admitted {
+				sc.queued++
+			}
+			sc.mu.Unlock()
+			if !admitted {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(slotQueuedBody))
+				return
+			}
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(wrapped.Close)
+	return sc, newResolver(wrapped, nil)
+}
+
+// queuedSpawnCall is one recorded dispatchSpawnDetached call.
+type queuedSpawnCall struct {
+	binary     string
+	argv, env  []string
+	runID, stg string
+}
+
+// queuedSpawnLog records dispatchSpawnDetached calls under mu (the slot
+// waiter spawns from its own goroutine).
+type queuedSpawnLog struct {
+	mu    sync.Mutex
+	calls []queuedSpawnCall
+}
+
+func (l *queuedSpawnLog) spawn(binary string, argv, env []string, runID, stageID string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, queuedSpawnCall{binary: binary, argv: append([]string(nil), argv...), env: append([]string(nil), env...), runID: runID, stg: stageID})
+	return "/dev/null", nil
+}
+
+func (l *queuedSpawnLog) snapshot() []queuedSpawnCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]queuedSpawnCall(nil), l.calls...)
+}
+
+// queuedRunStageSeams swaps the seams a queued run_stage reaches: the
+// detached spawn (recorded), the blocking runStageCommand (forbidden: counted
+// and failed), runStageLookPath, and the waiter's poll interval and cap,
+// shrunk BEFORE the queued call because the call reads them synchronously
+// (approval condition Q6). Its last cleanup, which runs first, waits for every
+// waiter to exit before the seams are restored.
+func queuedRunStageSeams(t *testing.T) (*queuedSpawnLog, *atomic.Int32) {
+	t.Helper()
+	rec := &queuedSpawnLog{}
+	blocking := new(atomic.Int32)
+	savedSpawn, savedCmd, savedLook := dispatchSpawnDetached, runStageCommand, runStageLookPath
+	savedPoll, savedCap := concurrencySlotPollInterval, concurrencyWaiterCap
+	dispatchSpawnDetached = rec.spawn
+	runStageCommand = func(name string, args ...string) *exec.Cmd {
+		blocking.Add(1)
+		t.Errorf("runStageCommand(%s %v) called: a queued fishhawk_run_stage must never spawn the blocking runner", name, args)
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(string) (string, error) { return "/fake/fishhawk-runner", nil }
+	concurrencySlotPollInterval = 5 * time.Millisecond
+	concurrencyWaiterCap = timescale.D(20 * time.Second)
+	t.Cleanup(func() {
+		dispatchSpawnDetached, runStageCommand, runStageLookPath = savedSpawn, savedCmd, savedLook
+		concurrencySlotPollInterval, concurrencyWaiterCap = savedPoll, savedCap
+	})
+	t.Cleanup(func() { waitSlotWaitersDrained(t) })
+	return rec, blocking
+}
+
+// waitSlotWaitersDrained waits until the process-wide waiter registry is empty.
+func waitSlotWaitersDrained(t *testing.T) {
+	t.Helper()
+	slotWaitFor(t, "every slot waiter exited", func() bool {
+		slotWaiters.mu.Lock()
+		defer slotWaiters.mu.Unlock()
+		return len(slotWaiters.active) == 0
+	})
+}
+
+// TestRunStage_QueuedDispatchReturnsAwaitingSlot (#3969): a 409
+// concurrency_slot_queued marker answer is NOT a failure on the blocking verb.
+// run_stage spawns NOTHING blocking, starts this session's slot waiter and
+// returns early with outcome awaiting_concurrency_slot, the queue block and a
+// fishhawk_await_stage next step. A second call on the still-queued stage
+// reports waiter already_waiting and spawns nothing more. On admission the
+// waiter spawns the runner exactly once, DETACHED, and exits.
+func TestRunStage_QueuedDispatchReturnsAwaitingSlot(t *testing.T) {
+	for _, stage := range []string{"plan", "implement"} {
+		t.Run(stage, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			sc, r := newQueuedMarkerResolver(t, srv)
+			r.api.hostLabel = fixedHostLabel("h1")
+			rec, blocking := queuedRunStageSeams(t)
+			runID, stageID := uuid.New(), uuid.New()
+			seedStageOfType(fb, runID, stageID, stage, "awaiting_host_dispatch")
+			in := RunStageInput{
+				RunID: runID.String(), Workflow: "feature_change", Stage: stage,
+				WorkingDir: t.TempDir(), GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+			}
+
+			_, out, err := r.runStage(context.Background(), nil, in)
+			if err != nil {
+				t.Fatalf("runStage on a queued marker: %v (a queued dispatch is not a failure)", err)
+			}
+			if out.Outcome != "awaiting_concurrency_slot" {
+				t.Fatalf("outcome = %q, want awaiting_concurrency_slot", out.Outcome)
+			}
+			slot := out.ConcurrencySlot
+			if slot == nil || slot.Status != concurrencyStatusAwaitingSlot || slot.Group != "local-implement:h1" || slot.Position != 2 ||
+				slot.Waiter != slotWaiterStarted || len(slot.Holders) != 1 || slot.EnqueuedAt == nil {
+				t.Fatalf("concurrency_slot = %+v, want the queued block with a started waiter", slot)
+			}
+			ns := out.NextStep
+			if ns == nil || ns.Action != "fishhawk_await_stage" || ns.Params["run_id"] != runID.String() ||
+				ns.Params["stage_id"] != stageID.String() || ns.Params["stage"] != stage || !strings.Contains(ns.Precondition, "QUEUED") {
+				t.Fatalf("next_step = %+v, want fishhawk_await_stage on the queued handle naming the queue", ns)
+			}
+			if out.StageState != "awaiting_host_dispatch" || out.StageWaitStatus == nil || out.ResolvedWorkingDir != in.WorkingDir ||
+				!strings.Contains(out.RunURL, runID.String()) {
+				t.Fatalf("output = %+v, want the queued stage's state, wait status, working dir and run url", out)
+			}
+			joined := strings.Join(out.Warnings, "\n")
+			for _, want := range []string{"NO runner was spawned", "DETACHED", "re-invoke fishhawk_run_stage"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("warnings missing %q: %s", want, joined)
+				}
+			}
+			if n := len(rec.snapshot()); n != 0 {
+				t.Fatalf("detached spawns = %d at return, want 0 while queued", n)
+			}
+
+			// A second call on the still-queued stage finds the live waiter.
+			_, out2, err := r.runStage(context.Background(), nil, in)
+			if err != nil || out2.Outcome != "awaiting_concurrency_slot" || out2.ConcurrencySlot == nil ||
+				out2.ConcurrencySlot.Waiter != slotWaiterAlreadyWaiting {
+				t.Fatalf("second call = %+v, %v; want awaiting_concurrency_slot with waiter already_waiting", out2.ConcurrencySlot, err)
+			}
+
+			sc.admit()
+			slotWaitFor(t, "the waiter's detached spawn after admission", func() bool { return len(rec.snapshot()) > 0 })
+			waitSlotWaitersDrained(t)
+			calls := rec.snapshot()
+			if len(calls) != 1 || calls[0].stg != stageID.String() || calls[0].runID != runID.String() ||
+				calls[0].binary != "/fake/fishhawk-runner" || !argvHasPair(calls[0].argv, "--stage", stage) {
+				t.Fatalf("detached spawns = %+v, want exactly one for the %s stage", calls, stage)
+			}
+			if n := blocking.Load(); n != 0 {
+				t.Fatalf("runStageCommand calls = %d, want 0 before and after admission", n)
+			}
+			if sc.queuedAnswers() < 2 {
+				t.Errorf("queued answers = %d, want the queued call, the second call and the waiter's polls", sc.queuedAnswers())
+			}
+			fb.mu.Lock()
+			state := fb.stagesByRun[runID][0].State
+			fb.mu.Unlock()
+			if state != "dispatched" {
+				t.Fatalf("stage state = %q, want dispatched after the waiter's admission", state)
+			}
+		})
+	}
+}
+
+// TestRunStage_QueuedPrepareUsesAdmissionTimeInputs (approval condition Q3,
+// ADR-087): the queued arm's prepare re-resolves the runner binary and
+// rebuilds the env with the token CURRENT at admission. The binary and token
+// change after the queued call returns and before the waiter is admitted; the
+// detached spawn carries the new values, not the queue-time ones.
+func TestRunStage_QueuedPrepareUsesAdmissionTimeInputs(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	sc, r := newQueuedMarkerResolver(t, srv)
+	rec, _ := queuedRunStageSeams(t)
+	runnerBin := "/old/fishhawk-runner"
+	r.getenv = func(k string) string {
+		if k == "FISHHAWK_RUNNER_BIN" {
+			return runnerBin
+		}
+		return ""
+	}
+	var captured []slotWaiterSpec
+	saved := startSlotWaiter
+	startSlotWaiter = func(spec slotWaiterSpec) (string, <-chan struct{}) {
+		captured = append(captured, spec)
+		return slotWaiterStarted, nil
+	}
+	t.Cleanup(func() { startSlotWaiter = saved })
+	runID, stageID := uuid.New(), uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "awaiting_host_dispatch")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		WorkingDir: t.TempDir(), GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil || out.Outcome != "awaiting_concurrency_slot" || len(captured) != 1 {
+		t.Fatalf("runStage = %q, %v, waiter starts %d; want one queued waiter", out.Outcome, err, len(captured))
+	}
+	spec := captured[0]
+	if spec.verb != "fishhawk_run_stage" || spec.stageID != stageID || spec.runID != runID || len(spec.nonce) != 36 ||
+		spec.poll != 5*time.Millisecond || spec.spawn == nil || spec.report == nil || spec.probe == nil {
+		t.Fatalf("waiter spec = %+v, want the stage, a nonce, the shrunk poll and the detached spawn/report/probe", spec)
+	}
+
+	// Between queue and admission: a new runner binary and a rotated token.
+	runnerBin = "/new/fishhawk-runner"
+	r.api.token = "tok-rotated"
+	sc.admit()
+	_, done := slotWaiters.start(spec) // the real waiter, started after the change
+	waitDone(t, done)
+	calls := rec.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("detached spawns = %d, want exactly one on admission", len(calls))
+	}
+	if calls[0].binary != "/new/fishhawk-runner" {
+		t.Errorf("spawned binary = %q, want the admission-time /new/fishhawk-runner", calls[0].binary)
+	}
+	// Never print the env: the process environment may carry a real token.
+	hasRotated, hasQueueTime := envHas(calls[0].env, "FISHHAWK_API_TOKEN=tok-rotated"), envHas(calls[0].env, "FISHHAWK_API_TOKEN=tok-test")
+	if !hasRotated || hasQueueTime {
+		t.Errorf("spawn env: admission-time token present = %v, queue-time token present = %v; want only the admission-time FISHHAWK_API_TOKEN=tok-rotated", hasRotated, hasQueueTime)
+	}
+	if !argvHasPair(calls[0].argv, "--stage-id", stageID.String()) {
+		t.Errorf("spawn argv = %v, want the implement stage's argv", calls[0].argv)
+	}
+}
+
+// envHas reports whether env carries the exact entry kv.
+func envHas(env []string, kv string) bool {
+	for _, e := range env {
+		if e == kv {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunStage_QueuedOutputSchema (approval condition Q8): the reflected
+// RunStageOutput schema advertises the awaiting_concurrency_slot outcome and
+// the concurrency_slot and next_step fields, and a queued result validates
+// against it (the go-sdk validates tool output against this schema).
+func TestRunStage_QueuedOutputSchema(t *testing.T) {
+	schema, err := jsonschema.For[RunStageOutput](nil)
+	if err != nil {
+		t.Fatalf("infer RunStageOutput schema: %v", err)
+	}
+	for field, wants := range map[string][]string{
+		"outcome":          {"awaiting_concurrency_slot", "NON-terminal", "fishhawk_await_stage"},
+		"concurrency_slot": {"outcome==awaiting_concurrency_slot", "NO runner was spawned", "DETACHED"},
+		"next_step":        {"outcome==awaiting_concurrency_slot", "fishhawk_await_stage", "audit log"},
+	} {
+		prop, ok := schema.Properties[field]
+		if !ok {
+			t.Errorf("RunStageOutput schema has no %q property", field)
+			continue
+		}
+		for _, want := range wants {
+			if !strings.Contains(prop.Description, want) {
+				t.Errorf("%s description missing %q: %s", field, want, prop.Description)
+			}
+		}
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve schema: %v", err)
+	}
+	q, _ := asConcurrencySlotQueued(newConcurrencySlotQueuedError(&apiError{StatusCode: 409, Code: concurrencySlotQueuedCode,
+		Details: map[string]any{"group": "local-implement:h1", "limit": 1, "position": 1}}))
+	slot := q.stageConcurrency()
+	slot.Waiter = slotWaiterStarted
+	out := RunStageOutput{
+		StageState: "awaiting_host_dispatch", Events: []RunnerEvent{}, Outcome: "awaiting_concurrency_slot",
+		ConcurrencySlot: slot, NextStep: queuedAwaitStageNextStep(uuid.NewString(), uuid.NewString(), "plan"),
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var instance map[string]any
+	if err := json.Unmarshal(raw, &instance); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := resolved.Validate(instance); err != nil {
+		t.Fatalf("a queued RunStageOutput fails the output schema: %v", err)
+	}
+}
+
+// TestRunStage_Description_QueuedDispatch pins the tool text for the queued
+// arm (#3969).
+func TestRunStage_Description_QueuedDispatch(t *testing.T) {
+	desc := strings.Join(strings.Fields(listToolDescriptions(t)["fishhawk_run_stage"]), " ")
+	for _, want := range []string{
+		"outcome awaiting_concurrency_slot (NON-terminal)",
+		"spawns the runner DETACHED on admission",
+		"next_step fishhawk_await_stage",
+		"read the event stream from the audit log or the signed trace",
+		"plan, implement, acceptance and review stages alike",
+		"ran at queue time and are not re-run at admission",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_run_stage description missing %q", want)
+		}
+	}
 }

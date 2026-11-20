@@ -90,7 +90,9 @@ const dispatchStageSourceTag = "fishhawk_dispatch_stage"
 // reapProbeBackoff — no goroutine reads it after the verb returns, and a serial
 // test override cannot race a leaked reaper. The concurrency-slot waiter
 // (#3964) receives it as a captured value (slotWaiterSpec.spawn), never by
-// reading this var from its goroutine. Kept SEPARATE from the drive loop's
+// reading this var from its goroutine; fishhawk_run_stage's queued arm
+// (#3969) captures it the same way, because its blocking spawn cannot outlive
+// the call. Kept SEPARATE from the drive loop's
 // r.driveSpawn field so a manual dispatch stays distinguishable from a drive-loop
 // spawn in the shared-fake recovery tests.
 var dispatchSpawnDetached = spawnRunnerStageDetached
@@ -202,10 +204,12 @@ the host. Call the
 returned next_step fishhawk_await_stage — it holds through the queue while the
 waiter is live. The waiter lives in this MCP process: if the process exits (a
 shim hot-swap or /mcp), the queue row goes stale after 60s and the stage must
-be re-dispatched. Until #3969, fishhawk_run_stage, fishhawk_drive_run and
-fishhawk_run_children fail closed on a queued dispatch instead of waiting; for
-plan and acceptance stages that happens only when holders plus earlier
-reservations fill capacity. An invalid FISHHAWK_HOST_CAPACITY fails every
+be re-dispatched. Every host-spawn verb queues the same way (#3969):
+fishhawk_run_stage returns outcome awaiting_concurrency_slot,
+fishhawk_drive_run stops awaiting_concurrency_slot, and fishhawk_run_children
+marks the child queued; in each case this session's slot waiter spawns the
+runner on admission. For plan and acceptance stages a queue happens only when
+holders plus earlier reservations fill capacity. An invalid FISHHAWK_HOST_CAPACITY fails every
 dispatch closed before the marker (no spawn); fishhawk_doctor's host_capacity
 rung names it.
 
@@ -622,24 +626,14 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	hdRes, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
 	probe := r.stageStateProbe(runUUID, resolvedStageID)
 	if q, queued := asConcurrencySlotQueued(hderr); queued {
-		return r.queueDispatchForSlot(in, runUUID, stageUUID, workingDir, q, warnings, slotWaiterSpec{
-			runID:     runUUID,
-			stageID:   stageUUID,
-			nonce:     newAdmissionNonce(),
-			contended: q.Contended,
-			marker:    r.api,
-			prepare: func() (slotSpawnInputs, error) {
+		// prepare ignores the admitting response: a dispatch_stage spawn takes
+		// its base branch from the input or the run's default branch, exactly
+		// as on an immediate admission.
+		return r.queueDispatchForSlot(in, runUUID, stageUUID, workingDir, q, warnings,
+			newQueuedSlotSpec(runUUID, stageUUID, q, r.api, func(*HostDispatchResult) (slotSpawnInputs, error) {
 				p, perr := prepareSpawn()
 				return p.slotSpawnInputs, perr
-			},
-			spawn:  dispatchSpawnDetached,
-			report: report,
-			probe:  probe,
-			cap:    concurrencyWaiterCap,
-			poll:   concurrencySlotPollInterval,
-			jitter: randomJitteredPoll,
-			logf:   stderrLogf,
-		})
+			}, dispatchSpawnDetached, report, probe))
 	}
 	if hderr != nil {
 		return nil, DispatchStageOutput{}, fmt.Errorf(
@@ -669,8 +663,11 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 		// An immediate GROUPED admission whose spawn failed (#3964): release
 		// the slot through the reap-failure path so the stage leaves
-		// dispatched and the next queued stage is admitted at once. The
-		// ungrouped path keeps today's behaviour above.
+		// dispatched and the next queued stage is admitted at once. With a
+		// slot store wired every host-dispatched agent stage is grouped (a
+		// plan, acceptance or review holds at least host:<host>:capacity,
+		// #4241), so the ungrouped path above happens only when the server
+		// runs no concurrency store.
 		relCtx := context.WithoutCancel(ctx)
 		if rerr := releaseSlotAfterSpawnFailure(relCtx, r.api, runUUID, stageUUID, "fishhawk_dispatch_stage", err); rerr != nil {
 			return nil, DispatchStageOutput{}, fmt.Errorf(
@@ -713,11 +710,6 @@ type dispatchSpawnPlan struct {
 	previewCmd, previewSource string
 }
 
-// dispatchStartSlotWaiter is the slot-waiter start seam (#3964). Production
-// points at the process-wide registry; a dispatch test stubs it so no waiter
-// goroutine polls the fake backend. Read synchronously inside dispatchStage.
-var dispatchStartSlotWaiter = slotWaiters.start
-
 // queueDispatchForSlot is the queued arm of fishhawk_dispatch_stage (#3964 /
 // ADR-087): the marker answered 409 concurrency_slot_queued, so NO runner is
 // spawned. It starts this process's slot waiter for the stage (or reports the
@@ -725,22 +717,13 @@ var dispatchStartSlotWaiter = slotWaiters.start
 // fishhawk_await_stage next step: await holds through the queue while the
 // waiter keeps the queue row live.
 func (r *runResolver) queueDispatchForSlot(in DispatchStageInput, runUUID, stageUUID uuid.UUID, workingDir string, q *concurrencySlotQueuedError, warnings []string, spec slotWaiterSpec) (*mcp.CallToolResult, DispatchStageOutput, error) {
-	waiter, _ := dispatchStartSlotWaiter(spec)
-	slot := q.stageConcurrency()
-	slot.Waiter = waiter
-	warnings = append(warnings, fmt.Sprintf(
-		"stage queued for this host's local concurrency slot (group %q, limit %d, position %d): %s. NO runner was spawned: "+
-			"this session's slot waiter (%s) re-POSTs the host-dispatch marker every %s and spawns the runner when the stage is admitted, "+
-			"for up to %s. The waiter lives in this MCP process — if the process exits (a shim hot-swap or /mcp) the queue row goes stale "+
-			"after 60s and the stage must be re-dispatched with fishhawk_dispatch_stage.",
-		q.Group, q.Limit, q.Position, q.holderSummary(), waiter, spec.poll, spec.cap))
+	slot, queuedWarning := startQueuedSlotWaiter(q, spec, "fishhawk_dispatch_stage")
+	warnings = append(warnings, queuedWarning)
 	stageWaitStatus, fetchErr := r.postDispatchStageWaitStatus(runUUID, in.Stage, stageUUID.String())
 	if fetchErr != nil {
 		warnings = append(warnings,
 			fmt.Sprintf("post-queue stage fetch failed (stage_wait_status omitted): %v", fetchErr))
 	}
-	next := awaitStageNextStep(runUUID.String(), stageUUID.String(), in.Stage)
-	next.Precondition = "the stage is QUEUED for a local concurrency slot (awaiting_concurrency_slot); this session's slot waiter spawns its runner on admission"
 	return nil, DispatchStageOutput{
 		RunID:              runUUID.String(),
 		StageID:            stageUUID.String(),
@@ -748,7 +731,7 @@ func (r *runResolver) queueDispatchForSlot(in DispatchStageInput, runUUID, stage
 		StageWaitStatus:    stageWaitStatus,
 		RunURL:             r.api.baseURL + "/runs/" + runUUID.String(),
 		ConcurrencySlot:    slot,
-		NextStep:           next,
+		NextStep:           queuedAwaitStageNextStep(runUUID.String(), stageUUID.String(), in.Stage),
 		Warnings:           warnings,
 	}, nil
 }
@@ -775,6 +758,16 @@ func (r *runResolver) postDispatchStageWaitStatus(runUUID uuid.UUID, stage, stag
 		return nil, fmt.Errorf("stage %s not found in run %s stage list", stageID, runUUID)
 	}
 	return st, nil
+}
+
+// queuedAwaitStageNextStep is awaitStageNextStep for a QUEUED dispatch: the
+// same pre-filled fishhawk_await_stage call, whose precondition names the
+// queue and the slot waiter that spawns the runner on admission. Every
+// host-spawn verb's queued arm returns it (#3969).
+func queuedAwaitStageNextStep(runID, stageID, stage string) *SuggestedAction {
+	next := awaitStageNextStep(runID, stageID, stage)
+	next.Precondition = "the stage is QUEUED for a local concurrency slot (awaiting_concurrency_slot); this session's slot waiter spawns its runner on admission"
+	return next
 }
 
 // awaitStageNextStep builds the fishhawk_await_stage pointer a successful
