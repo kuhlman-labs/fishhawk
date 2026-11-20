@@ -2295,6 +2295,96 @@ func TestHostLabelRung(t *testing.T) {
 	}
 }
 
+// --- host_capacity rung (#4241) ---
+
+// TestDoctor_HostCapacityRung: the doctor attaches host_capacity as a sibling
+// of `report`, keyed on the resolved label, in each of its three arms: env
+// (the declared value), default (3, nothing sent) and invalid (no capacity,
+// the error and a remediation naming FISHHAWK_HOST_CAPACITY).
+func TestDoctor_HostCapacityRung(t *testing.T) {
+	const served = `{"repo": "x/y", "forge": "github",
+	  "app": {"installed": true, "installation_id": 4242}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`
+	_, invalidErr := resolveHostCapacity(func(string) (string, bool) { return "65", true })
+	for _, tc := range []struct {
+		name         string
+		label        string
+		res          hostCapacityResolution
+		err          error
+		wantCapacity int // 0: absent
+		wantSource   string
+		wantGroup    string
+		wantNote     []string
+		wantRemedy   bool
+	}{
+		{"env", "doc-pin", hostCapacityResolution{Capacity: 4, Source: hostCapacitySourceEnv, Raw: "4"}, nil,
+			4, hostCapacitySourceEnv, "host:doc-pin:capacity", []string{hostCapacityEnv, "capacity 4", "same value in every process"}, false},
+		{"default", "doc-pin", hostCapacityResolution{Capacity: 3, Source: hostCapacitySourceDefault}, nil,
+			3, hostCapacitySourceDefault, "host:doc-pin:capacity", []string{hostCapacityEnv + " is unset", "default 3"}, false},
+		{"invalid", "", hostCapacityResolution{Source: hostCapacitySourceInvalid, Raw: "65"}, invalidErr,
+			0, hostCapacitySourceInvalid, "host:unknown:capacity", []string{`"65"`, "fails closed before any request"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newDoctorFakeBackend(t)
+			fb.rawBody = served
+			r := newResolver(srv, nil)
+			r.api.hostLabel = fixedHostLabel(tc.label)
+			r.api.hostCapacity = fixedHostCapacity(tc.res, tc.err)
+			_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+			if err != nil {
+				t.Fatalf("doctor: %v", err)
+			}
+			hc := out.HostCapacity
+			if hc == nil {
+				t.Fatal("host_capacity is absent")
+			}
+			if hc.Source != tc.wantSource || hc.CapacityGroup != tc.wantGroup || hc.Variable != hostCapacityEnv {
+				t.Errorf("host_capacity = %+v, want source %s group %s", hc, tc.wantSource, tc.wantGroup)
+			}
+			switch {
+			case tc.wantCapacity == 0 && hc.Capacity != nil:
+				t.Errorf("capacity = %d, want absent on source invalid", *hc.Capacity)
+			case tc.wantCapacity != 0 && (hc.Capacity == nil || *hc.Capacity != tc.wantCapacity):
+				t.Errorf("capacity = %v, want %d", hc.Capacity, tc.wantCapacity)
+			}
+			for _, want := range tc.wantNote {
+				if !strings.Contains(hc.Note, want) {
+					t.Errorf("note = %q, want it to contain %q", hc.Note, want)
+				}
+			}
+			if tc.wantRemedy != (hc.Remediation != "") {
+				t.Errorf("remediation = %q, want present=%v", hc.Remediation, tc.wantRemedy)
+			}
+			if tc.wantRemedy && (!strings.Contains(hc.Remediation, hostCapacityEnv) || !strings.Contains(hc.Remediation, "1..64")) {
+				t.Errorf("remediation = %q, want it to name %s and 1..64", hc.Remediation, hostCapacityEnv)
+			}
+			encoded, _ := json.Marshal(out)
+			if !strings.Contains(string(encoded), `"host_capacity":{`) {
+				t.Errorf("DoctorOutput lacks the host_capacity sibling key:\n%s", encoded)
+			}
+			reportBytes, _ := json.Marshal(out.Report)
+			if strings.Contains(string(reportBytes), "host_capacity") {
+				t.Errorf("host_capacity leaked INSIDE report:\n%s", reportBytes)
+			}
+		})
+	}
+}
+
+// TestDoctorToolDescription_DescribesHostCapacity: the wire-visible
+// description documents the rung, the variable, its three sources and the
+// per-process consequence.
+func TestDoctorToolDescription_DescribesHostCapacity(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"host_capacity —", hostCapacityEnv, "host:<label>:capacity", "env (", "default (", "invalid (",
+		"uses 3", "same value in every process", "reads it lazily",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
+
 // TestDoctorToolDescription_DescribesHostLabel: the wire-visible description
 // documents the rung, its override, all four sources and the spec-group
 // exception.
@@ -2565,7 +2655,7 @@ func TestDoctor_IdentityFields_E2E_ThroughRealServer(t *testing.T) {
 func TestDoctorToolDescription_DescribesHostRungs(t *testing.T) {
 	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
 	for _, want := range []string{
-		"four rungs", "credential —", "model_credential —", "env:FISHHAWK_API_TOKEN", "mcp_route_request_bearer",
+		"five rungs", "credential —", "model_credential —", "env:FISHHAWK_API_TOKEN", "mcp_route_request_bearer",
 		"shadowed_stored_login", "report.scopes.subject", "claude auth status --json", "within 72h",
 		"not_applicable", "run_bound_token", "not_local_stdio_process", "no expiry reported",
 	} {

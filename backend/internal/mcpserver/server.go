@@ -71,6 +71,13 @@ type config struct {
 	// server's `unknown` host).
 	hostLabel func() hostLabelResolution
 
+	// hostCapacity resolves this process's FISHHAWK_HOST_CAPACITY (#4241).
+	// Config.internal wires the lazy, once-per-process processHostCapacity, so
+	// fishhawkd's /mcp route reads it at the first marker or doctor call and an
+	// invalid value fails that marker closed; a test-built config{} literal
+	// leaves it nil, which sends no capacity (the server default, 3).
+	hostCapacity func() (hostCapacityResolution, error)
+
 	// credentialSource, storedLoginPresent and localHostRungs are the
 	// package-private mirrors of the Config fields of the same names (#5227).
 	credentialSource   string
@@ -155,6 +162,7 @@ func (c Config) internal() config {
 		httpTransport: c.HTTPTransport,
 		allowedRoots:  c.AllowedRoots,
 		hostLabel:     processHostLabel,
+		hostCapacity:  processHostCapacity,
 
 		credentialSource:   c.CredentialSource,
 		storedLoginPresent: c.StoredLoginPresent,

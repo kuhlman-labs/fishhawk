@@ -140,6 +140,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stdout, version.String())
 		return exitOK
 	}
+	// An invalid FISHHAWK_HOST_CAPACITY (#4241) refuses the process before it
+	// loads a credential or serves anything: every host-dispatch marker it
+	// sent would fail closed anyway, so starting would only hide the error.
+	if err := mcpserver.ValidateHostCapacityEnv(os.LookupEnv); err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
+		return exitFailure
+	}
 	cfg, err := loadConfig(os.Getenv, credstore.Load, refreshStoredCredential)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)

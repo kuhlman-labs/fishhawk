@@ -32,12 +32,14 @@ type DoctorInput struct {
 // computed LOCALLY by this MCP process about its OWN environment. Folding it
 // into `report` would render a locally-computed fact as something the daemon
 // answered, which is a false claim about provenance. HostLabel (#4212) is the
-// second such locally-computed sibling, under the same rule, and Credential
-// and ModelCredential (#5227) are the third and fourth.
+// second such locally-computed sibling, under the same rule, Credential and
+// ModelCredential (#5227) are the third and fourth, and HostCapacity (#4241)
+// is the fifth.
 type DoctorOutput struct {
 	Report            OnboardingReadinessReport `json:"report"`
 	RunnerCredentials *runnerCredentialsRung    `json:"runner_credentials,omitempty" jsonschema:"computed LOCALLY by this MCP server about its OWN process environment (NOT served by fishhawkd): whether the RUNNER-held GitLab push credential a local runner would inherit is present; reports PRESENCE only and says nothing about a gitlab_ci runner"`
 	HostLabel         *hostLabelRung            `json:"host_label,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): the host label this process sends on the host-dispatch marker, which keys the default local-implement:<label> concurrency group, and which rung of the resolution ladder answered it"`
+	HostCapacity      *hostCapacityRung         `json:"host_capacity,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): the host capacity this process declares on the host-dispatch marker, sizing the host:<label>:capacity group every host-dispatched agent stage holds one slot of, and whether it came from FISHHAWK_HOST_CAPACITY, the default 3, or an invalid value that fails every marker closed"`
 	// Credential and ModelCredential (#5227) are the third and fourth
 	// locally-computed siblings, under the same provenance rule. Both are
 	// HOST-LOCAL: they run only when Config.LocalHostRungs is set and the
@@ -166,7 +168,7 @@ func (r *runResolver) modelCredentialRung(ctx context.Context) *modelCredentialR
 type hostLabelRung struct {
 	Label        string `json:"label" jsonschema:"the sanitised host label the host-dispatch marker sends; empty when nothing resolved (source none)"`
 	Source       string `json:"source" jsonschema:"which rung answered, in precedence order: override (FISHHAWK_HOST_LABEL), persisted (the per-machine host-id file), hostname (the volatile os.Hostname fallback), or none"`
-	DefaultGroup string `json:"default_group" jsonschema:"the default local concurrency group a host-dispatched stage from this process lands in: local-implement:<label>, or local-implement:unknown with no label. A spec-named group is repo-scoped and does not carry the label"`
+	DefaultGroup string `json:"default_group" jsonschema:"the default local concurrency group a host-dispatched implement stage from this process holds: local-implement:<label>, or local-implement:unknown with no label. A spec-named group is repo-scoped, does not carry the label, and is held in addition to this default since #4241. Every host-dispatched agent stage also holds host:<label>:capacity (the host_capacity rung)"`
 	Path         string `json:"path,omitempty" jsonschema:"the host-id file path the persisted rung read or created; absent when the override answered or the path could not be resolved"`
 	Variable     string `json:"variable" jsonschema:"the override env var: FISHHAWK_HOST_LABEL"`
 	Note         string `json:"note" jsonschema:"the human sentence on how the label was resolved, naming the cause on a fallback"`
@@ -192,6 +194,45 @@ func newHostLabelRung(res hostLabelResolution) *hostLabelRung {
 			where = "the host-id file at " + res.Path
 		}
 		rung.Remediation = "Pin a stable label: export " + hostLabelEnv + "=<label> in the environment that LAUNCHES fishhawk-mcp (or fishhawkd, for the /mcp route) and reconnect the MCP server (/mcp), or fix " + where + " so the persisted rung can answer (a damaged file is never overwritten: delete it to regenerate)."
+	}
+	return rung
+}
+
+// hostCapacityRung is the LOCALLY-computed doctor rung reporting this
+// process's host capacity (FISHHAWK_HOST_CAPACITY, ADR-094 D4 / #4241). A
+// sibling of `report` for the same provenance reason as hostLabelRung: the
+// capacity is per request, so the daemon holds no value to serve.
+type hostCapacityRung struct {
+	Capacity      *int   `json:"capacity,omitempty" jsonschema:"the capacity host:<label>:capacity is admitted against for this process's markers: the env value (source env) or the server default 3 (source default); absent on source invalid"`
+	Source        string `json:"source" jsonschema:"env (FISHHAWK_HOST_CAPACITY is set to an integer in 1..64 and sent as the marker's capacity) | default (unset: nothing is sent and the server uses 3) | invalid (set to anything else: every host-dispatch marker from this process fails closed before any request, so nothing spawns)"`
+	CapacityGroup string `json:"capacity_group" jsonschema:"the host capacity group key the server files this process's host-dispatched stages under: host:<label>:capacity, or host:unknown:capacity with no label"`
+	Variable      string `json:"variable" jsonschema:"the env var: FISHHAWK_HOST_CAPACITY"`
+	Note          string `json:"note" jsonschema:"the human sentence on what the capacity means for this process"`
+	Remediation   string `json:"remediation,omitempty" jsonschema:"on source invalid: the operator next step, naming FISHHAWK_HOST_CAPACITY and the accepted range"`
+}
+
+// newHostCapacityRung renders a capacity resolution for label as the doctor
+// rung. Only source invalid carries a remediation.
+func newHostCapacityRung(res hostCapacityResolution, err error, label string) *hostCapacityRung {
+	group := capacityGroupKeyFor(label)
+	rung := &hostCapacityRung{
+		Source:        res.Source,
+		CapacityGroup: group,
+		Variable:      hostCapacityEnv,
+	}
+	if err != nil {
+		rung.Source = hostCapacitySourceInvalid
+		rung.Note = fmt.Sprintf("%v. Every host-dispatch marker from this process fails closed before any request, so no stage is marked and nothing spawns.", err)
+		rung.Remediation = fmt.Sprintf("Set %s to an integer in 1..%d, or unset it for the default %d, in the environment that LAUNCHES fishhawk-mcp (or fishhawkd, for the /mcp route), then restart that process and reconnect the MCP server (/mcp).", hostCapacityEnv, maxHostCapacity, defaultHostCapacity)
+		return rung
+	}
+	n := res.Capacity
+	rung.Capacity = &n
+	switch res.Source {
+	case hostCapacitySourceEnv:
+		rung.Note = fmt.Sprintf("Set by %s: every host-dispatch marker from this process sends capacity %d, sizing %s for that admission only. Set the same value in every process that dispatches for this host label, because each admits against its own value.", hostCapacityEnv, n, group)
+	default:
+		rung.Note = fmt.Sprintf("%s is unset, so the marker sends no capacity and the server sizes %s at its default %d.", hostCapacityEnv, group, defaultHostCapacity)
 	}
 	return rung
 }
@@ -558,10 +599,10 @@ work_item_provider rung (see below):
               fishhawkd; absence means the backend cannot answer, which is
               NOT the same claim as unregistered.
 
-Alongside the report key the output carries four rungs, each a SIBLING key,
-never a field inside it: runner_credentials, host_label, credential and
-model_credential, computed LOCALLY by this MCP server about its own process
-and NOT served by fishhawkd:
+Alongside the report key the output carries five rungs, each a SIBLING key,
+never a field inside it: runner_credentials, host_label, host_capacity,
+credential and model_credential, computed LOCALLY by this MCP server about its
+own process and NOT served by fishhawkd:
 
   - runner_credentials — a GitLab run needs TWO credentials: fishhawkd's
               FISHHAWKD_GITLAB_TOKEN (what the app rung covers) and the RUNNER
@@ -597,9 +638,23 @@ and NOT served by fishhawkd:
               files the stage under local-implement:unknown). On hostname and
               none, remediation names FISHHAWK_HOST_LABEL and the host-id
               path. A spec-named concurrency group is repo-scoped and does not
-              carry the label, so default_group applies only to stages
-              without one. Resolved once per process, on the first doctor or
-              host-dispatch call.
+              carry the label; since #4241 it is held in addition to
+              default_group on an implement stage, never instead of it.
+              Resolved once per process, on the first doctor or host-dispatch
+              call.
+  - host_capacity — the capacity of the host capacity group capacity_group
+              (host:<label>:capacity), which every host-dispatched agent stage
+              (plan, implement, acceptance, review, a verify pass) holds one
+              slot of. source is env (FISHHAWK_HOST_CAPACITY is an integer in
+              1..64, sent as the marker's capacity for each request) | default
+              (unset: nothing is sent and the server uses 3) | invalid (any
+              other value, including set-but-empty: every host-dispatch marker
+              from this process fails closed before any request, and
+              remediation names FISHHAWK_HOST_CAPACITY and the range). The
+              capacity is per request, so set the same value in every process
+              that dispatches for one host label. The stdio fishhawk-mcp
+              refuses to start on an invalid value; fishhawkd's /mcp route
+              reads it lazily, so there it surfaces here and at marker time.
   - credential — where this server's bearer came from: source is
               env:FISHHAWK_API_TOKEN (variable names it) | stored_login |
               stored_login_refreshed (the stored ` + "`fishhawk token login`" + `
@@ -778,7 +833,12 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 	out.RunnerCredentials = runnerCredentials(report.Forge, r.getenv)
 	// The second LOCALLY-computed rung (#4212): this process's host label,
 	// resolved lazily (the first doctor or host-dispatch call resolves it).
-	out.HostLabel = newHostLabelRung(r.api.hostLabelResolution())
+	hostLabel := r.api.hostLabelResolution()
+	out.HostLabel = newHostLabelRung(hostLabel)
+	// The fifth LOCALLY-computed rung (#4241): this process's host capacity,
+	// resolved lazily like the label, keyed on the same label.
+	capRes, capErr := r.api.hostCapacityResolution()
+	out.HostCapacity = newHostCapacityRung(capRes, capErr, hostLabel.Label)
 	// The host-local rungs (#5227): the bearer's source and the model CLI
 	// sign-in. Each reports not_applicable outside the operator's stdio
 	// process or for a run-bound bearer, before anything is read or exec'd.

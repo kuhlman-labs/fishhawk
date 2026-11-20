@@ -203,13 +203,18 @@ func SetHostDispatcherPaused(stateDir string, paused bool) error {
 
 // RunHostDispatcher runs the dispatcher until ctx is cancelled. It ticks once
 // immediately and then every Interval; a cancel finishes the in-flight tick
-// before returning. It returns an error when the configuration or state dir is
-// refused at start, when another dispatcher holds the state-dir lock, or when
-// the lock file is replaced underneath it.
+// before returning. It returns an error when the configuration, an invalid
+// FISHHAWK_HOST_CAPACITY (#4241) or the state dir is refused at start, when
+// another dispatcher holds the state-dir lock, or when the lock file is
+// replaced underneath it. The capacity check runs before the state dir is
+// touched, so a refused start creates and locks nothing.
 func RunHostDispatcher(ctx context.Context, cfg HostDispatcherConfig) error {
 	cfg, err := cfg.withDefaults()
 	if err != nil {
 		return err
+	}
+	if err := ValidateHostCapacityEnv(os.LookupEnv); err != nil {
+		return fmt.Errorf("host-dispatch refused to start: %w", err)
 	}
 	if err := prepareHostDispatchStateDir(cfg.StateDir, fileOwnerUID); err != nil {
 		return err
@@ -221,7 +226,7 @@ func RunHostDispatcher(ctx context.Context, cfg HostDispatcherConfig) error {
 	defer lock.unlock()
 
 	r := &runResolver{
-		api:          newAPIClient(config{backendURL: cfg.BackendURL, apiToken: cfg.APIToken, hostLabel: processHostLabel}),
+		api:          newAPIClient(config{backendURL: cfg.BackendURL, apiToken: cfg.APIToken, hostLabel: processHostLabel, hostCapacity: processHostCapacity}),
 		getenv:       os.Getenv,
 		allowedRoots: cfg.AllowedRoots,
 	}
