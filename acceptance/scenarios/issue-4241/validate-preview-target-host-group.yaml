@@ -1,14 +1,14 @@
 id: scenario:issue-4241/validate-preview-target-host-group
 statement: 'fishhawk validate accepts a stage declaring concurrency.groups [{group: preview-target, scope: host}]. It refuses the same entry carrying limit 1, and the refusal carries the REWORDED host-limit message: it says host-scoped limits belong to the host operator and the capacity group is sized by FISHHAWK_HOST_CAPACITY, and it no longer contains ''until host-declared capacity (#4241)''. This is the corrected operator follow-up form from the first officer''s carry-forward item 2.'
 verify_hint: 'CLI surface: fishhawk validate on two temporary spec files; observe exit 0, then a non-zero exit with stderr containing FISHHAWK_HOST_CAPACITY and not containing ''until host-declared capacity''.'
-steps: 'Wrote pt.yaml (implement stage, concurrency.groups [{group: preview-target, scope: host}]) and ptl.yaml (the same entry with limit: 1). Ran fishhawk validate (built from the sanctioned checkout) on each.'
+steps: 'Using the CLI built from the sanctioned checkout, wrote pt.yaml with version "2", an implement stage and concurrency.groups [{group: preview-target, scope: host}]. Wrote ptl.yaml with the same entry plus limit: 1. Ran fishhawk validate on each.'
 assertions:
-    expected: exit 0; then non-zero with FISHHAWK_HOST_CAPACITY wording and no 'until host-declared capacity'
-    observed_at_record: 'pt.yaml exit 0 OK. ptl.yaml exit 1: ''.../groups/0/limit: concurrency.groups entry (scope "host", group "preview-target") declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository''s spec; ... the host capacity group is sized by FISHHAWK_HOST_CAPACITY, and preview-target and any other host-scoped group is held at limit 1...''. It does not contain ''until host-declared capacity''.'
-    repro_handle: fishhawk validate /tmp/fhacc4241/specs/pt.yaml; fishhawk validate /tmp/fhacc4241/specs/ptl.yaml
+    expected: exit 0; then non-zero with FISHHAWK_HOST_CAPACITY and the host-operator wording, without 'until host-declared capacity'
+    observed_at_record: 'pt.yaml exit 0. ptl.yaml exit 1: ''...groups/0/limit: ... a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository''s spec; the host''s implement group takes the host default limit, the host capacity group is sized by FISHHAWK_HOST_CAPACITY, and preview-target and any other host-scoped group is held at limit 1''. The text does not contain ''until host-declared capacity''.'
+    repro_handle: /tmp/fhacc4241b/bin/fishhawk validate /tmp/fhacc4241b/specs/ptl.yaml
 origin:
     issue: 4241
     pr: 5482
     run_id: 59af8515-5848-4b52-9fa3-e72d9d421e6d
-    head_sha: b81c31556ff1bde789dc12f96c3fe28ef017f1b5
-    recorded_at: 2026-11-20T14:28:24Z
+    head_sha: d90254a2723c1d53da20d4d17fc150d9df446e71
+    recorded_at: 2026-11-20T15:14:46Z
