@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -150,36 +151,113 @@ func validHostLabel(h string) bool {
 	return true
 }
 
-// resolveStageConcurrency returns the stage's concurrency group and limit, or
-// grouped=false for an ungrouped stage. The spec stage is matched the same way
-// resolveAgentTimeout matches it (id == stage type, else type). A declared
+// resolveStageConcurrency returns the stage's concurrency group SET (ADR-094
+// D2), or grouped=false for an ungrouped stage. The spec stage is matched the
+// same way resolveAgentTimeout matches it (id == stage type, else type). A
+// declared `groups` list resolves through declaredGroupRequests. A declared
 // `concurrency` without a group joins the host default group with its
 // EffectiveLimit; a named group is repository-scoped. No declaration groups
-// implement stages in the host default group at limit 1 and leaves every other
-// stage type ungrouped (today's behaviour). An absent or unparseable spec
-// falls back to that same default — the restrictive direction — and a parse
-// failure logs a WARN.
+// implement stages in the host default group at limit 1 and leaves every
+// other stage type ungrouped (today's behaviour). An absent or unparseable
+// spec falls back to that same default — the restrictive direction — and a
+// parse failure logs a WARN. Every arm but the declared list yields exactly
+// one group, with the key and limit it resolved to before #4240.
 //
 // ADR-092 D3 (#4200): an implement stage carrying a LIVE merge-candidate
 // verify trigger is a verify-only pass (no agent), so it resolves to the host
 // verify group local-verify:<host> at DefaultVerifyLimit BEFORE the declared
 // lookup — a spec-declared implement group or limit never captures a pass,
-// and a pass never queues behind full implements. See
-// isMergeCandidateVerifyPass for the fallback on an unreadable trigger.
-func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, stage *run.Stage, host string) (group string, limit int, grouped bool) {
+// and a pass never queues behind full implements in local-implement:<host>.
+// No declared stage shares the pass's group: declaredGroupRequests refuses an
+// entry for local-verify:<host>. See isMergeCandidateVerifyPass for the
+// fallback on an unreadable trigger.
+//
+// A non-nil err (an entry with no canonical key, or one for the reserved host
+// verify group; both unreachable for a validated spec) fails closed: the
+// marker answers 500 and admits nothing.
+func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, stage *run.Stage, host string) (groups []concurrency.GroupRequest, grouped bool, err error) {
+	one := func(key string, limit int) ([]concurrency.GroupRequest, bool, error) {
+		return []concurrency.GroupRequest{{Key: key, Limit: limit}}, true, nil
+	}
 	if s.isMergeCandidateVerifyPass(ctx, stage) {
-		return concurrency.VerifyGroupKey(host), concurrency.DefaultVerifyLimit, true
+		return one(concurrency.VerifyGroupKey(host), concurrency.DefaultVerifyLimit)
 	}
 	if decl, ok := s.declaredStageConcurrency(ctx, runRow, stage.Type); ok {
-		if decl.Group == "" {
-			return concurrency.DefaultGroupKey(host), decl.EffectiveLimit(), true
+		if len(decl.Groups) > 0 {
+			groups, err := declaredGroupRequests(decl, runRow.Repo, host)
+			if err != nil {
+				return nil, false, err
+			}
+			return groups, true, nil
 		}
-		return concurrency.NamedGroupKey(runRow.Repo, decl.Group), decl.EffectiveLimit(), true
+		if decl.Group == "" {
+			return one(concurrency.DefaultGroupKey(host), decl.EffectiveLimit())
+		}
+		return one(concurrency.NamedGroupKey(runRow.Repo, decl.Group), decl.EffectiveLimit())
 	}
 	if stage.Type == run.StageTypeImplement {
-		return concurrency.DefaultGroupKey(host), concurrency.DefaultLimit, true
+		return one(concurrency.DefaultGroupKey(host), concurrency.DefaultLimit)
 	}
-	return "", 0, false
+	return nil, false, nil
+}
+
+// hostScopedGroupLimit is the slot count of a NON-legacy host-scoped group
+// (e.g. host:<h>:preview-target). A host-scoped group is shared by every
+// repository on the host, so no repository's spec may size it (approval
+// condition H1); host-declared capacity is ADR-094 slice 3's (#4241).
+const hostScopedGroupLimit = 1
+
+// declaredGroupRequests maps a declared `groups` list onto the store's group
+// set. Each entry's key is concurrency.ScopedGroupKey with the host label as
+// a host scope's id and repo as a repository scope's id, so {implement, host}
+// IS the default group local-implement:<host> (ADR-094 Amendment A1).
+//
+// Limits: a repository entry takes its EffectiveLimit. A host entry NEVER
+// reads its own Limit, unconditionally, so a stored spec (one captured under
+// an older validator, or decoded around validation) can never size a group
+// shared with other repositories: the entry canonicalising to
+// local-implement:<host> takes DefaultLimit, and every other host entry takes
+// hostScopedGroupLimit. A scope other than host or repository, or an identity
+// ScopedGroupKey refuses, answers an error and no set.
+//
+// An entry canonicalising to concurrency.VerifyGroupKey(host) also answers an
+// error and no set: local-verify:<host> is reserved for server-decided
+// merge-candidate verify passes and specialist jobs (ADR-094 A1 decision 6).
+// Both validators refuse {verify, host}, and spec.ParseBytes runs the
+// backend's, so a captured spec carrying it takes the unparseable-spec
+// fallback; this refusal keeps a declaration that skipped validation out of
+// that group too.
+func declaredGroupRequests(decl *spec.StageConcurrency, repo, host string) ([]concurrency.GroupRequest, error) {
+	out := make([]concurrency.GroupRequest, 0, len(decl.Groups))
+	for i, e := range decl.Groups {
+		var scopeID string
+		switch e.Scope {
+		case spec.ConcurrencyScopeHost:
+			scopeID = host
+		case spec.ConcurrencyScopeRepository:
+			scopeID = repo
+		default:
+			return nil, fmt.Errorf("concurrency.groups[%d]: scope %q is not declarable", i, e.Scope)
+		}
+		key, err := concurrency.ScopedGroupKey(concurrency.Scope(e.Scope), scopeID, e.Group)
+		if err != nil {
+			return nil, fmt.Errorf("concurrency.groups[%d]: %w", i, err)
+		}
+		if key == concurrency.VerifyGroupKey(host) {
+			return nil, fmt.Errorf("concurrency.groups[%d]: %s is reserved for merge-candidate verify passes and specialist jobs", i, key)
+		}
+		limit := e.EffectiveLimit()
+		if e.Scope == spec.ConcurrencyScopeHost {
+			switch key {
+			case concurrency.DefaultGroupKey(host):
+				limit = concurrency.DefaultLimit
+			default:
+				limit = hostScopedGroupLimit
+			}
+		}
+		out = append(out, concurrency.GroupRequest{Key: key, Limit: limit})
+	}
+	return out, nil
 }
 
 // isMergeCandidateVerifyPass reports whether the runner fetching this stage's
@@ -254,15 +332,129 @@ func toConcurrencyHolders(hs []concurrency.Holder) []concurrencyHolder {
 	return out
 }
 
+// concurrencyGroupRef names one group of a set: the 200 marker block's and
+// both slot audit rows' `groups` entries. Scope is omitted when the key does
+// not parse (concurrency.ParseGroupKey).
+type concurrencyGroupRef struct {
+	Group string `json:"group"`
+	Scope string `json:"scope,omitempty"`
+	Limit int    `json:"limit"`
+}
+
+// concurrencyGroupState is one group of a set with its live state: the 409
+// details' and the Stage block's `groups` entries (docs/api/v0.openapi.yaml
+// ConcurrencyGroupState). Position is the 1-based queue position in this
+// group while queued (omitted holding).
+type concurrencyGroupState struct {
+	Group    string              `json:"group"`
+	Scope    string              `json:"scope,omitempty"`
+	Limit    int                 `json:"limit"`
+	Position int                 `json:"position,omitempty"`
+	Holders  []concurrencyHolder `json:"holders"`
+}
+
+// groupScopeOf is the wire scope of key: "" when it does not parse.
+func groupScopeOf(key string) string {
+	g, ok := concurrency.ParseGroupKey(key)
+	if !ok {
+		return ""
+	}
+	return string(g.Scope)
+}
+
+// wireScope prefers the store's scope and falls back to parsing the key.
+func wireScope(gs concurrency.GroupState) string {
+	if gs.Scope != "" {
+		return string(gs.Scope)
+	}
+	return groupScopeOf(gs.Key)
+}
+
+// admissionGroups is adm's per-group view, never empty: a store that left
+// Groups empty (a fake, or a pre-#4240 store) is read as ONE group, the
+// canonical-first requested group carrying the top-level Position and
+// Holders (R7).
+func admissionGroups(adm concurrency.Admission, req []concurrency.GroupRequest) []concurrency.GroupState {
+	if len(adm.Groups) > 0 {
+		return adm.Groups
+	}
+	g := concurrency.GroupState{Position: adm.Position, Holders: adm.Holders}
+	if len(req) > 0 {
+		first := req[0]
+		for _, r := range req[1:] {
+			if r.Key < first.Key {
+				first = r
+			}
+		}
+		g.Key, g.Limit = first.Key, first.Limit
+	}
+	return []concurrency.GroupState{g}
+}
+
+// bindingGroup picks the group the top-level wire fields describe (the
+// concurrency.Admission rule): once admitted, the first group in canonical
+// order; while queued, the highest position, ties broken in canonical order.
+// groups is non-empty (admissionGroups).
+func bindingGroup(groups []concurrency.GroupState, admitted bool) concurrency.GroupState {
+	sorted := append([]concurrency.GroupState(nil), groups...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
+	b := sorted[0]
+	if !admitted {
+		for _, g := range sorted[1:] {
+			if g.Position > b.Position {
+				b = g
+			}
+		}
+	}
+	return b
+}
+
+func toConcurrencyGroupRefs(groups []concurrency.GroupState) []concurrencyGroupRef {
+	out := make([]concurrencyGroupRef, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, concurrencyGroupRef{Group: g.Key, Scope: wireScope(g), Limit: g.Limit})
+	}
+	return out
+}
+
+func toConcurrencyGroupStates(groups []concurrency.GroupState, queued bool) []concurrencyGroupState {
+	out := make([]concurrencyGroupState, 0, len(groups))
+	for _, g := range groups {
+		e := concurrencyGroupState{Group: g.Key, Scope: wireScope(g), Limit: g.Limit, Holders: toConcurrencyHolders(g.Holders)}
+		if queued {
+			e.Position = g.Position
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // hostDispatchConcurrency is the 200 marker body's `concurrency` block for a
-// grouped admission. AdmissionNonce echoes the request's nonce (omitted when
-// it carried none).
+// grouped admission. Group and Limit describe the BINDING group (the first in
+// canonical order), retained for pre-#4240 clients; Groups lists the whole
+// set. AdmissionNonce echoes the request's nonce (omitted when it carried
+// none).
 type hostDispatchConcurrency struct {
-	Group          string `json:"group"`
-	Limit          int    `json:"limit"`
-	QueuedBefore   bool   `json:"queued_before"`
-	WaitedSeconds  int    `json:"waited_seconds"`
-	AdmissionNonce string `json:"admission_nonce,omitempty"`
+	Group          string                `json:"group"`
+	Limit          int                   `json:"limit"`
+	QueuedBefore   bool                  `json:"queued_before"`
+	WaitedSeconds  int                   `json:"waited_seconds"`
+	AdmissionNonce string                `json:"admission_nonce,omitempty"`
+	Groups         []concurrencyGroupRef `json:"groups"`
+}
+
+// toHostDispatchConcurrency builds the 200 block for an admission of req.
+func toHostDispatchConcurrency(adm concurrency.Admission, req []concurrency.GroupRequest, nonce string) *hostDispatchConcurrency {
+	groups := admissionGroups(adm, req)
+	b := bindingGroup(groups, true)
+	return &hostDispatchConcurrency{
+		Group:          b.Key,
+		Limit:          b.Limit,
+		QueuedBefore:   adm.QueuedBefore,
+		WaitedSeconds:  adm.WaitedSeconds,
+		AdmissionNonce: nonce,
+		Groups:         toConcurrencyGroupRefs(groups),
+	}
 }
 
 // stageConcurrency is the Stage `concurrency` block (docs/api/v0.openapi.yaml
@@ -294,6 +486,10 @@ type stageConcurrency struct {
 	Host             string     `json:"host,omitempty"`
 	HeldDispatchedAt *time.Time `json:"held_dispatched_at,omitempty"`
 	AdmissionNonce   string     `json:"admission_nonce,omitempty"`
+	// Groups lists every group of the stage's set (ADR-094 D2); the
+	// top-level Group, Limit, Position and Holders describe the binding
+	// group, retained for pre-#4240 clients.
+	Groups []concurrencyGroupState `json:"groups"`
 }
 
 func toStageConcurrency(st concurrency.Status) *stageConcurrency {
@@ -303,6 +499,13 @@ func toStageConcurrency(st concurrency.Status) *stageConcurrency {
 		Holders:    toConcurrencyHolders(st.Holders),
 		EnqueuedAt: st.EnqueuedAt,
 	}
+	groups := st.Groups
+	if len(groups) == 0 {
+		// R7: a store that left Groups empty reads as one group, the
+		// top-level fields.
+		groups = []concurrency.GroupState{{Key: st.GroupKey, Limit: st.Limit, Position: st.Position, Holders: st.Holders}}
+	}
+	out.Groups = toConcurrencyGroupStates(groups, st.State != concurrency.SlotHeld)
 	if st.State == concurrency.SlotHeld {
 		out.Status = stageConcurrencyStatusHolding
 		out.AcquiredAt = st.AcquiredAt
@@ -342,26 +545,41 @@ func (s *Server) stageConcurrencyBlocks(ctx context.Context, stageIDs []uuid.UUI
 // Retry-After of the waiter poll interval. Queued is a 409, not a 2xx, so a
 // pre-change client (which treats any 2xx as "proceed and spawn") fails
 // closed.
-func (s *Server) writeConcurrencySlotQueued(w http.ResponseWriter, r *http.Request, stageID uuid.UUID, group string, limit int, adm concurrency.Admission) {
+func (s *Server) writeConcurrencySlotQueued(w http.ResponseWriter, r *http.Request, stageID uuid.UUID, req []concurrency.GroupRequest, adm concurrency.Admission) {
 	w.Header().Set("Retry-After", strconv.Itoa(int(concurrency.WaiterPollInterval/time.Second)))
+	b, details := concurrencyQueuedDetails(stageID, req, adm)
+	adm.Position, adm.Holders = b.Position, b.Holders
 	s.writeError(w, r, http.StatusConflict, "concurrency_slot_queued",
-		concurrencyQueuedMessage(group, limit, adm),
-		map[string]any{
-			"stage_id":              stageID.String(),
-			"group":                 group,
-			"limit":                 limit,
-			"position":              adm.Position,
-			"holders":               toConcurrencyHolders(adm.Holders),
-			"enqueued_at":           adm.EnqueuedAt,
-			"contended":             adm.Contended,
-			"queue_ttl_seconds":     int(concurrency.QueueTTL / time.Second),
-			"poll_interval_seconds": int(concurrency.WaiterPollInterval / time.Second),
-		})
+		concurrencyQueuedMessage(b.Key, b.Limit, adm), details)
+}
+
+// concurrencyQueuedDetails builds the 409 details: every pre-#4240 field,
+// describing the binding group (highest position, ties in canonical order),
+// plus `groups` listing the whole set. It returns the binding group too; the
+// top-level position and holders are the binding group's, so they stay
+// consistent with `group` after an auto-promote rewrote the set's positions.
+func concurrencyQueuedDetails(stageID uuid.UUID, req []concurrency.GroupRequest, adm concurrency.Admission) (concurrency.GroupState, map[string]any) {
+	groups := admissionGroups(adm, req)
+	b := bindingGroup(groups, false)
+	return b, map[string]any{
+		"stage_id":              stageID.String(),
+		"group":                 b.Key,
+		"limit":                 b.Limit,
+		"position":              b.Position,
+		"holders":               toConcurrencyHolders(b.Holders),
+		"enqueued_at":           adm.EnqueuedAt,
+		"contended":             adm.Contended,
+		"queue_ttl_seconds":     int(concurrency.QueueTTL / time.Second),
+		"poll_interval_seconds": int(concurrency.WaiterPollInterval / time.Second),
+		"groups":                toConcurrencyGroupStates(groups, true),
+	}
 }
 
 // concurrencyQueuedMessage renders the 409 message. An empty holders list
 // (queued behind earlier waiters, or a contended lock) is named as such
-// rather than rendered as an empty "held by".
+// rather than rendered as an empty "held by". A set of more than one group
+// appends a "; group set: [...]" suffix naming each group's limit and
+// position, so a single-group message is unchanged byte for byte.
 func concurrencyQueuedMessage(group string, limit int, adm concurrency.Admission) string {
 	var why string
 	switch {
@@ -376,33 +594,47 @@ func concurrencyQueuedMessage(group string, limit int, adm concurrency.Admission
 	default:
 		why = "no live holders; queued behind earlier waiters"
 	}
-	return fmt.Sprintf("stage queued for a concurrency slot in group %q (limit %d) at position %d: %s; re-POST the marker to keep the queue row live and to be admitted",
+	msg := fmt.Sprintf("stage queued for a concurrency slot in group %q (limit %d) at position %d: %s; re-POST the marker to keep the queue row live and to be admitted",
 		group, limit, adm.Position, why)
+	if len(adm.Groups) > 1 {
+		parts := make([]string, 0, len(adm.Groups))
+		for _, g := range adm.Groups {
+			parts = append(parts, fmt.Sprintf("%q (limit %d) at position %d", g.Key, g.Limit, g.Position))
+		}
+		msg += "; group set: [" + strings.Join(parts, ", ") + "]"
+	}
+	return msg
 }
 
 // emitStageConcurrencyQueued / emitStageConcurrencyAdmitted append the two
 // slot audit rows AFTER the admission transaction committed. Best-effort, the
 // emitHostDispatchAcceptanceAnchor posture: a nil AuditRepo or a failed append
 // logs a WARN and never changes the response.
-func (s *Server) emitStageConcurrencyQueued(ctx context.Context, stage *run.Stage, group string, limit int, host string, adm concurrency.Admission) {
+func (s *Server) emitStageConcurrencyQueued(ctx context.Context, stage *run.Stage, req []concurrency.GroupRequest, host string, adm concurrency.Admission) {
+	groups := admissionGroups(adm, req)
+	b := bindingGroup(groups, false)
 	s.emitStageConcurrency(ctx, stage, CategoryStageConcurrencyQueued, map[string]any{
 		"stage_id":  stage.ID.String(),
-		"group":     group,
-		"limit":     limit,
+		"group":     b.Key,
+		"limit":     b.Limit,
 		"position":  adm.Position,
 		"holders":   toConcurrencyHolders(adm.Holders),
 		"host":      host,
 		"contended": adm.Contended,
+		"groups":    toConcurrencyGroupRefs(groups),
 	})
 }
 
-func (s *Server) emitStageConcurrencyAdmitted(ctx context.Context, stage *run.Stage, group string, limit int, adm concurrency.Admission) {
+func (s *Server) emitStageConcurrencyAdmitted(ctx context.Context, stage *run.Stage, req []concurrency.GroupRequest, adm concurrency.Admission) {
+	groups := admissionGroups(adm, req)
+	b := bindingGroup(groups, true)
 	s.emitStageConcurrency(ctx, stage, CategoryStageConcurrencyAdmitted, map[string]any{
 		"stage_id":       stage.ID.String(),
-		"group":          group,
-		"limit":          limit,
+		"group":          b.Key,
+		"limit":          b.Limit,
 		"queued_before":  adm.QueuedBefore,
 		"waited_seconds": adm.WaitedSeconds,
+		"groups":         toConcurrencyGroupRefs(groups),
 	})
 }
 
@@ -447,13 +679,12 @@ func (s *Server) emitStageConcurrency(ctx context.Context, stage *run.Stage, cat
 // expedited item is auto-promoted to the head of its group
 // (autoPromoteExpeditedWaiter, fail-open), and the 409 reports the
 // post-promote position.
-func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, group string, limit int, host, nonce string, expedited *campaign.Item) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
+func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, groups []concurrency.GroupRequest, host, nonce string, expedited *campaign.Item) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
 	adm, err := s.cfg.Concurrency.Admit(r.Context(), concurrency.Request{
 		StageID:        stage.ID,
 		RunID:          stage.RunID,
 		From:           stage.State,
-		GroupKey:       group,
-		Limit:          limit,
+		Groups:         groups,
 		Host:           host,
 		AdmissionNonce: nonce,
 	})
@@ -462,20 +693,14 @@ func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage
 	}
 	if !adm.Admitted {
 		if adm.NewlyQueued {
-			s.emitStageConcurrencyQueued(r.Context(), stage, group, limit, host, adm)
+			s.emitStageConcurrencyQueued(r.Context(), stage, groups, host, adm)
 		}
 		if expedited != nil {
 			adm = s.autoPromoteExpeditedWaiter(r.Context(), stage, expedited, adm)
 		}
-		s.writeConcurrencySlotQueued(w, r, stage.ID, group, limit, adm)
+		s.writeConcurrencySlotQueued(w, r, stage.ID, groups, adm)
 		return nil, nil, true, nil
 	}
-	s.emitStageConcurrencyAdmitted(r.Context(), stage, group, limit, adm)
-	return adm.Stage, &hostDispatchConcurrency{
-		Group:          group,
-		Limit:          limit,
-		QueuedBefore:   adm.QueuedBefore,
-		WaitedSeconds:  adm.WaitedSeconds,
-		AdmissionNonce: nonce,
-	}, false, nil
+	s.emitStageConcurrencyAdmitted(r.Context(), stage, groups, adm)
+	return adm.Stage, toHostDispatchConcurrency(adm, groups, nonce), false, nil
 }

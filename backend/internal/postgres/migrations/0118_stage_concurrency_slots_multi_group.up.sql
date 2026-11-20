@@ -1,0 +1,40 @@
+-- 0118: stage_concurrency_slots holds ONE ROW PER (stage, group) (#4240,
+-- ADR-094 D2 multi-group holding, Amendment A1). backend/internal/concurrency
+-- is the only reader and writer; its README is the contract.
+--
+-- The primary key widens in place from (stage_id) to (stage_id, group_key).
+-- Every held and queued row survives with identical columns, and no key
+-- string is rewritten (A1: the legacy local-implement:/local-verify:/spec:
+-- strings stay canonical, so advisory-lock keys are unchanged).
+--
+-- Invariant: a stage's rows are ONE admission episode. The episode state
+-- (state, enqueued_at, last_seen_at, order_key, acquired_at,
+-- held_dispatched_at, admission_nonce) is shared across the stage's rows and
+-- always written together, in one statement reading one timestamp. A stage
+-- is admitted into every group of its set or none (no partial hold).
+--
+-- FORWARD deploy order: stop EVERY old fishhawkd (including every API pod of
+-- a multi-replica deployment), migrate up, then start the new binary. A
+-- rolling upgrade is unsupported for this release: each binary's
+-- ON CONFLICT target needs its own primary key, so a binary running against
+-- the other schema fails every grouped admission (500, fail-closed) until
+-- both match.
+--
+-- ROLLBACK order: stop the new binary, migrate down through 0118, then start
+-- the reverted binary. Before rolling back:
+--   1. Drain EVERY stage this query lists; 0118.down REFUSES (RAISE
+--      EXCEPTION naming one stage) while one is held, and a refused attempt
+--      leaves the version dirty (0118.down gives the force-118 recovery):
+--        SELECT stage_id FROM stage_concurrency_slots
+--        GROUP BY stage_id HAVING count(*) > 1 AND bool_or(state = 'held');
+--   2. Confirm that no non-terminal run's captured workflow spec declares
+--      concurrency.groups, or cancel those runs. A reverted binary cannot
+--      parse such a spec and falls back to the default group. The match is
+--      deliberately broad (any `groups:` key), so inspect each hit:
+--        SELECT id FROM runs
+--        WHERE state NOT IN ('succeeded', 'failed', 'cancelled')
+--          AND workflow_spec IS NOT NULL
+--          AND convert_from(workflow_spec, 'UTF8') ~ '\mgroups\s*:';
+ALTER TABLE stage_concurrency_slots
+    DROP CONSTRAINT stage_concurrency_slots_pkey,
+    ADD CONSTRAINT stage_concurrency_slots_pkey PRIMARY KEY (stage_id, group_key);

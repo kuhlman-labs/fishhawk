@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -280,6 +281,25 @@ func (s *Server) autoPromoteExpeditedWaiter(ctx context.Context, stage *run.Stag
 	if p.Changed {
 		adm.Position = p.NewPosition
 		adm.Holders = p.Holders
+		adm.Groups = withPromotedGroups(adm.Groups, p.Groups)
 	}
 	return adm
+}
+
+// withPromotedGroups returns groups with each promoted group's position and
+// holders replaced by the promotion's (matched by key), and a group the
+// admission did not list appended, so the 409 details.groups report the
+// post-promote set (R4). groups is copied, never mutated.
+func withPromotedGroups(groups []concurrency.GroupState, promoted []concurrency.PromotionGroup) []concurrency.GroupState {
+	out := append([]concurrency.GroupState(nil), groups...)
+	for _, pg := range promoted {
+		i := slices.IndexFunc(out, func(g concurrency.GroupState) bool { return g.Key == pg.Key })
+		if i < 0 {
+			out = append(out, concurrency.GroupState{Key: pg.Key, Limit: pg.Limit})
+			i = len(out) - 1
+		}
+		out[i].Position = pg.NewPosition
+		out[i].Holders = pg.Holders
+	}
+	return out
 }

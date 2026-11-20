@@ -661,6 +661,13 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 			}
 		}
 
+		// concurrency.groups (ADR-094 D2/D3 / #4240): the two rules the
+		// schema cannot express. Version-agnostic in code but unreachable
+		// below major 2 (no v0/v1 schema declares `concurrency`).
+		if err := validateStageConcurrencyGroups(stagePath(i, "/concurrency/groups"), stage.Concurrency); err != nil {
+			return err
+		}
+
 		// Approver role refs must resolve. Version-agnostic in code but
 		// unreachable for major >= 2: a v2 gate can never carry Approvers
 		// (the v2removed sweep rejects the raw `approvers` key upstream), so
@@ -1077,6 +1084,71 @@ func validateWebhookSecretChannel(d *DelegateConfig, path func(suffix string) st
 			Path:    path(""),
 			Message: "webhook delegate declares both secret_header and secret_field; the secret is placed in exactly one of them",
 		}
+	}
+	return nil
+}
+
+// The concurrency.groups semantic refusals (ADR-094 / #4240). Byte-identical
+// to cli/internal/spec/validate.go's constants of the same name: the two Go
+// modules are deliberately separate, so TestConcurrencyGroupsMessageParity
+// (cli/internal/spec/spec_test.go) reads both source files and requires each
+// declaration verbatim. They must
+// stay single-line `const … = "…"` declarations.
+//
+// MsgFmtConcurrencyGroupDuplicate's arguments are the scope, the group name
+// and the index of the earlier entry; MsgFmtConcurrencyHostGroupLimit's is
+// the group name; MsgConcurrencyHostVerifyReserved takes none.
+
+// MsgFmtConcurrencyGroupDuplicate rejects a (scope, group) pair listed twice in one stage's set.
+const MsgFmtConcurrencyGroupDuplicate = "concurrency.groups lists (scope %q, group %q) twice (also at entry %d); a stage holds each group once, so declare it once"
+
+// MsgFmtConcurrencyHostGroupLimit rejects a limit on any scope-host groups entry.
+const MsgFmtConcurrencyHostGroupLimit = "concurrency.groups entry (scope \"host\", group %q) declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository's spec; the host's implement group takes the host default limit and any other host-scoped group is held at limit 1 until host-declared capacity (#4241). Remove limit, or declare the group with scope repository"
+
+// MsgConcurrencyHostVerifyReserved rejects a scope-host entry naming the host verify group.
+const MsgConcurrencyHostVerifyReserved = "concurrency.groups entry (scope \"host\", group \"verify\") is reserved: local-verify:<host> is reserved for server-decided merge-candidate verify passes and specialist jobs, so a spec cannot declare it. Remove the entry, or declare a group with scope repository"
+
+// concurrencyHostVerifyGroup is the host-scoped name concurrency.ScopedGroupKey
+// maps onto local-verify:<host> (ADR-094 A1 decision 1).
+const concurrencyHostVerifyGroup = "verify"
+
+// validateStageConcurrencyGroups enforces the three concurrency.groups rules
+// the schema cannot express, entry by entry in declaration order: (1) a
+// scope-host entry does not name verify (ADR-094 A1 decision 6:
+// concurrency.ScopedGroupKey maps it onto local-verify:<host>, reserved for
+// server-decided merge-candidate verify passes and specialist jobs), refused
+// at the entry's pointer; (2) a scope-host entry carries no limit (H1 / R6:
+// host-scoped groups are shared by every repository on the host; host
+// implement maps onto local-implement:<host>, whose limit is the host
+// default); (3) no (scope, group) pair appears twice. This package does not
+// import concurrency, so the predicates are checked on the declared scope and
+// name directly. Nil or shorthand-only blocks pass.
+func validateStageConcurrencyGroups(groupsPath string, c *StageConcurrency) error {
+	if c == nil {
+		return nil
+	}
+	seen := make(map[[2]string]int, len(c.Groups))
+	for j, g := range c.Groups {
+		if g.Scope == ConcurrencyScopeHost && g.Group == concurrencyHostVerifyGroup {
+			return &ValidationError{
+				Path:    fmt.Sprintf("%s/%d", groupsPath, j),
+				Message: MsgConcurrencyHostVerifyReserved,
+			}
+		}
+		if g.Scope == ConcurrencyScopeHost && g.Limit != 0 {
+			return &ValidationError{
+				Path:    fmt.Sprintf("%s/%d/limit", groupsPath, j),
+				Message: fmt.Sprintf(MsgFmtConcurrencyHostGroupLimit, g.Group),
+			}
+		}
+		k := [2]string{g.Scope, g.Group}
+		if prev, dup := seen[k]; dup {
+			return &ValidationError{
+				Path:    fmt.Sprintf("%s/%d", groupsPath, j),
+				Message: fmt.Sprintf(MsgFmtConcurrencyGroupDuplicate, g.Scope, g.Group, prev),
+			}
+		}
+		seen[k] = j
 	}
 	return nil
 }

@@ -41,7 +41,9 @@ import (
 //     implement only, declared names only, an agent reviewer required), and
 //     every declared persona attached by some stage or required by some
 //     escalation's require.reviewers — each rung run immediately after its
-//     review_conventions sibling, as the backend does.
+//     review_conventions sibling, as the backend does;
+//   - a stage's concurrency.groups (ADR-094 / #4240): a duplicate (scope,
+//     group) pair, and a limit on any scope-host entry.
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
 // structs — this package carries no typed decode; the stage-reference
@@ -104,6 +106,7 @@ func validateAgentVersions(raw any) error {
 			checkStageReviewConventions(st, wfName, i, declaredConventions, &errs)
 			checkStageReviewerPersonas(st, wfName, i, declaredPersonas, &errs)
 			checkStagePermissions(st, base, wfName, &errs)
+			checkStageConcurrencyGroups(st, base, &errs)
 		}
 	}
 	checkReviewConventionsReferenced(root, &errs)
@@ -980,4 +983,71 @@ func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 		}
 	}
 	return nil
+}
+
+// The concurrency.groups semantic refusals (ADR-094 / #4240). Byte-identical
+// to backend/internal/spec/validate.go's constants of the same name: the two
+// Go modules are deliberately separate, so TestConcurrencyGroupsMessageParity
+// (this package's spec_test.go) reads both source files and requires each
+// declaration verbatim. They must stay single-line `const … = "…"`
+// declarations.
+
+// MsgFmtConcurrencyGroupDuplicate rejects a (scope, group) pair listed twice in one stage's set.
+const MsgFmtConcurrencyGroupDuplicate = "concurrency.groups lists (scope %q, group %q) twice (also at entry %d); a stage holds each group once, so declare it once"
+
+// MsgFmtConcurrencyHostGroupLimit rejects a limit on any scope-host groups entry.
+const MsgFmtConcurrencyHostGroupLimit = "concurrency.groups entry (scope \"host\", group %q) declares a limit: a host-scoped group is shared by every repository on the host, so its limit belongs to the host operator, not to a repository's spec; the host's implement group takes the host default limit and any other host-scoped group is held at limit 1 until host-declared capacity (#4241). Remove limit, or declare the group with scope repository"
+
+// MsgConcurrencyHostVerifyReserved rejects a scope-host entry naming the host verify group.
+const MsgConcurrencyHostVerifyReserved = "concurrency.groups entry (scope \"host\", group \"verify\") is reserved: local-verify:<host> is reserved for server-decided merge-candidate verify passes and specialist jobs, so a spec cannot declare it. Remove the entry, or declare a group with scope repository"
+
+// checkStageConcurrencyGroups mirrors the backend's
+// validateStageConcurrencyGroups over the raw yaml.v3 tree: per entry in
+// declaration order, a scope-host entry naming `verify` is refused at the
+// entry's pointer (local-verify:<host> is reserved for server-decided
+// merge-candidate verify passes and specialist jobs) and the entry's other
+// checks are skipped, as the backend returns on it; otherwise a scope-host
+// entry carrying `limit` is refused (host groups are shared by every
+// repository on the host), then a (scope, group) pair already seen is
+// refused. The backend returns the first refusal; this sweep reports every
+// one. Shape mismatches are skipped, as everywhere in this file — the schema
+// already rejected them.
+func checkStageConcurrencyGroups(stage map[string]any, base string, errs *[]ValidationErrorEntry) {
+	conc, ok := stage["concurrency"].(map[string]any)
+	if !ok {
+		return
+	}
+	groups, ok := conc["groups"].([]any)
+	if !ok {
+		return
+	}
+	seen := make(map[[2]string]int, len(groups))
+	for j, raw := range groups {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		scope, _ := entry["scope"].(string)
+		name, _ := entry["group"].(string)
+		ptr := fmt.Sprintf("%s/concurrency/groups/%d", base, j)
+		if scope == "host" && name == "verify" {
+			*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: MsgConcurrencyHostVerifyReserved})
+			continue
+		}
+		if _, hasLimit := entry["limit"]; hasLimit && scope == "host" {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    ptr + "/limit",
+				Message: fmt.Sprintf(MsgFmtConcurrencyHostGroupLimit, name),
+			})
+		}
+		k := [2]string{scope, name}
+		if prev, dup := seen[k]; dup {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    ptr,
+				Message: fmt.Sprintf(MsgFmtConcurrencyGroupDuplicate, scope, name, prev),
+			})
+			continue
+		}
+		seen[k] = j
+	}
 }

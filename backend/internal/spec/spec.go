@@ -897,8 +897,8 @@ type Stage struct {
 	// is a SPELLING of Egress and is normalized into it after decode; declaring
 	// both on one stage is a validation error, never a precedence rule.
 	Permissions *StagePermissions `json:"permissions,omitempty" yaml:"permissions,omitempty"`
-	// Concurrency is the workflow-v2 per-stage concurrency group (#3964 /
-	// ADR-087). Nil = the shipped default (host-dispatched implement stages
+	// Concurrency is the workflow-v2 per-stage concurrency group or group
+	// set (#3964 / ADR-087; ADR-094 / #4240). Nil = the shipped default (host-dispatched implement stages
 	// share `local-implement:<host>` at limit 1; other stage types are
 	// ungrouped). REQUIRED for the schema-permitted key to survive
 	// ParseBytes' DisallowUnknownFields decode. Honoured only for
@@ -912,17 +912,47 @@ type Stage struct {
 	GateContainer *GateContainer `json:"gate_container,omitempty" yaml:"gate_container,omitempty"`
 }
 
-// StageConcurrency is a stage's declared concurrency group (#3964 /
-// ADR-087). Both fields are optional individually; the schema's
-// minProperties 1 forbids the empty block. One group per stage: an empty
+// StageConcurrency is a stage's declared concurrency groups (#3964 /
+// ADR-087; group sets ADR-094 D2/D3 / #4240). The schema's minProperties 1
+// forbids the empty block, and its dependentSchemas makes the two forms
+// mutually exclusive. The single-group shorthand (Group/Limit): an empty
 // Group joins the host default group with the declared limit, a named Group
-// is repository-scoped and replaces the host default for that stage.
+// is repository-scoped and replaces the host default for that stage. The set
+// form (Groups) lists every group the stage holds, admitted all-or-nothing;
+// it REPLACES the shipped default set, provisionally until ADR-094 slice 3
+// (#4241) applies D5's add-only rule.
 type StageConcurrency struct {
 	// Group names a repository-scoped group (schema pattern
 	// ^[a-z0-9][a-z0-9._-]{0,62}$). Empty = the host default group.
 	Group string `json:"group,omitempty" yaml:"group,omitempty"`
 	// Limit is how many stages of the group may hold a slot at once
 	// (schema range 1..64). Zero = absent; read it through EffectiveLimit.
+	Limit int `json:"limit,omitempty" yaml:"limit,omitempty"`
+	// Groups is the set form (schema 1..8 entries). Validate refuses a
+	// duplicate (scope, group) pair and a Limit on any scope-host entry.
+	Groups []StageConcurrencyGroup `json:"groups,omitempty" yaml:"groups,omitempty"`
+}
+
+// Concurrency group scopes a `groups` entry may declare (ADR-094 D3).
+const (
+	// ConcurrencyScopeHost groups are shared by every repository on the
+	// host, so a spec cannot set their limit.
+	ConcurrencyScopeHost = "host"
+	// ConcurrencyScopeRepository groups are shared by the repository's
+	// stages across runs.
+	ConcurrencyScopeRepository = "repository"
+)
+
+// StageConcurrencyGroup is one entry of StageConcurrency.Groups.
+type StageConcurrencyGroup struct {
+	// Group is the group name (the Group pattern). With scope host,
+	// "implement" names the host's legacy group local-implement:<host>;
+	// "verify" (local-verify:<host>) is reserved and refused (ADR-094 A1).
+	Group string `json:"group" yaml:"group"`
+	// Scope is ConcurrencyScopeHost or ConcurrencyScopeRepository.
+	Scope string `json:"scope" yaml:"scope"`
+	// Limit is the slot count (schema range 1..64). Zero = absent; read it
+	// through EffectiveLimit. Always zero on a validated scope-host entry.
 	Limit int `json:"limit,omitempty" yaml:"limit,omitempty"`
 }
 
@@ -933,6 +963,14 @@ func (c *StageConcurrency) EffectiveLimit() int {
 		return 1
 	}
 	return c.Limit
+}
+
+// EffectiveLimit returns the entry's declared limit, or 1 when absent.
+func (g StageConcurrencyGroup) EffectiveLimit() int {
+	if g.Limit <= 0 {
+		return 1
+	}
+	return g.Limit
 }
 
 // StagePermissions is the declaration-only per-stage permissions block (E53.5 /

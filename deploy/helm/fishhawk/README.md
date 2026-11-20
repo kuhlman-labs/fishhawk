@@ -66,6 +66,41 @@ future split-mode guard must be wired into
 
 ## Upgrading
 
+**The release carrying migration 0118 (multi-group concurrency slots,
+[#4240](https://github.com/kuhlman-labs/fishhawk/issues/4240)) needs the
+binary and the schema to change together.** 0118 widens the
+`stage_concurrency_slots` primary key to `(stage_id, group_key)`, and each
+binary's `ON CONFLICT` target needs its own key. The migrate hook Job leaves
+a window where they disagree: as a `pre-upgrade` hook (external DB) the OLD
+pods keep serving on the migrated schema until the rollout replaces them, and
+as a `post-upgrade` hook (in-cluster Postgres) the NEW pods serve on the old
+schema until the Job finishes. In that window every grouped host-dispatch
+admission answers 500, transiently and fail-closed (nothing is admitted or
+queued, and the slot waiter retries), until the rollout completes. A rolling
+upgrade is unsupported for this release. To avoid the window, scale every
+fishhawkd Deployment to 0, migrate, then scale up:
+
+```sh
+# allInOne: <release>-fishhawk; split mode: <release>-fishhawk-api AND <release>-fishhawk-worker
+kubectl -n <namespace> scale deploy <release>-fishhawk --replicas=0
+helm upgrade <release> deploy/helm/fishhawk -n <namespace> [ -f <your-values> ]
+```
+
+With the `pre-upgrade` hook the Job migrates before the Deployments are
+applied, and the upgrade restores their replica counts on the new image.
+With the `post-upgrade` hook the new pods start before the Job, so the
+window lasts until the Job completes. Rolling back is the mirror image: scale
+to 0, migrate down through 0118, then `helm rollback`. Before rolling back,
+(1) drain every multi-group stage the header's query lists (0118's down
+migration refuses, naming one such stage, while any is held; a refused attempt
+leaves the version dirty at 117, so clear it with `migrate force 118`, not
+117, before retrying), and (2) confirm that no non-terminal
+run's captured workflow spec declares `concurrency.groups`, or cancel those
+runs, because a reverted binary cannot parse such a spec and falls back to the
+default group. The queries for both are in the header of
+`backend/internal/postgres/migrations/0118_stage_concurrency_slots_multi_group.up.sql`
+and in `backend/internal/concurrency/README.md`.
+
 **Chart 0.5.0 adds the `checksum/config` / `checksum/secret` pod-template
 annotations** ([#3577](https://github.com/kuhlman-labs/fishhawk/issues/3577)).
 The FIRST upgrade onto 0.5.0 performs one rolling restart, because the pod

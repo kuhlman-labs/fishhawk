@@ -750,7 +750,7 @@ func TestPromoteAndAdmit_StatementFailureRollsBack(t *testing.T) {
 
 	for _, tc := range []struct{ name, match string }{
 		{"read slot row", "SELECT true,"},
-		{"upsert slot row", "ON CONFLICT (stage_id) DO UPDATE"},
+		{"upsert slot row", "ON CONFLICT (stage_id, group_key) DO UPDATE"},
 	} {
 		t.Run("admit/"+tc.name, func(t *testing.T) {
 			fresh := f.stage()

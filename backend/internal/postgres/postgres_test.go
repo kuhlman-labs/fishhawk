@@ -9278,3 +9278,172 @@ func TestMigrateDown_RunsAutoDispatchReversal(t *testing.T) {
 		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0116 is an ALTER)", runsTable)
 	}
 }
+
+// TestMigrate_StageConcurrencySlotsMultiGroup pins 0118 (#4240, ADR-094 D2):
+// MigrateUp widens stage_concurrency_slots' primary key in place to
+// (stage_id, group_key) with every held and queued row surviving
+// column-for-column, so a stage can hold one row per group. The down
+// migration is FAIL-CLOSED for a held multi-group stage (approval condition
+// H2): it RAISEs naming the stage and changes nothing. Once that hold is
+// drained, it collapses a queued-only multi-row stage to its canonical-first
+// (byte-order) row, restores PRIMARY KEY (stage_id) and lands on 0117.
+func TestMigrate_StageConcurrencySlotsMultiGroup(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	downThrough(t, url, "0118")
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var runID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	seq := 0
+	seedStage := func(state string) uuid.UUID {
+		t.Helper()
+		seq++
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+VALUES (gen_random_uuid(), $1, $3, 'implement', 'agent', 'claude-code', $2) RETURNING id`, runID, state, seq).Scan(&id); err != nil {
+			t.Fatalf("seed stage: %v", err)
+		}
+		return id
+	}
+	held, queued := seedStage("dispatched"), seedStage("awaiting_host_dispatch")
+	if _, err := pool.Exec(ctx, `INSERT INTO stage_concurrency_slots
+  (stage_id, run_id, group_key, slot_limit, host, state, acquired_at, held_dispatched_at, admission_nonce)
+VALUES ($1, $3, 'local-implement:h1', 1, 'h1', 'held', now(), now(), 'n1'),
+       ($2, $3, 'spec:o/r:deploy', 2, 'h1', 'queued', NULL, NULL, NULL)`, held, queued, runID); err != nil {
+		t.Fatalf("seed slot rows at 0117: %v", err)
+	}
+	rowJSON := func(id uuid.UUID) string {
+		t.Helper()
+		var s string
+		if err := pool.QueryRow(ctx, `SELECT row_to_json(s)::text FROM stage_concurrency_slots s WHERE stage_id = $1`, id).Scan(&s); err != nil {
+			t.Fatalf("read slot row %s: %v", id, err)
+		}
+		return s
+	}
+	heldBefore, queuedBefore := rowJSON(held), rowJSON(queued)
+	pkColumns := func() string {
+		t.Helper()
+		var cols string
+		if err := pool.QueryRow(ctx, `SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+FROM pg_constraint c
+CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+WHERE c.conname = 'stage_concurrency_slots_pkey' AND c.contype = 'p'`).Scan(&cols); err != nil {
+			t.Fatalf("read primary key: %v", err)
+		}
+		return cols
+	}
+	if got := pkColumns(); got != "stage_id" {
+		t.Fatalf("primary key at 0117 = %q, want stage_id", got)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp through 0118: %v", err)
+	}
+	if got := pkColumns(); got != "stage_id,group_key" {
+		t.Fatalf("primary key after 0118 = %q, want stage_id,group_key", got)
+	}
+	if got := rowJSON(held); got != heldBefore {
+		t.Errorf("held row after 0118 = %s, want unchanged %s", got, heldBefore)
+	}
+	if got := rowJSON(queued); got != queuedBefore {
+		t.Errorf("queued row after 0118 = %s, want unchanged %s", got, queuedBefore)
+	}
+	// A second row for the queued stage in another group now inserts; its key
+	// sorts BEFORE the original in byte order, so the down keeps it.
+	if _, err := pool.Exec(ctx, `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state)
+VALUES ($1, $2, 'local-implement:h1', 1, 'queued')`, queued, runID); err != nil {
+		t.Fatalf("insert a second group row for one stage after 0118: %v", err)
+	}
+	// A held two-row stage: the down migration must refuse while it exists.
+	multiHeld := seedStage("running")
+	if _, err := pool.Exec(ctx, `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state, acquired_at, held_dispatched_at)
+VALUES ($1, $2, 'spec:o/r:a', 1, 'held', now(), now()), ($1, $2, 'spec:o/r:b', 1, 'held', now(), now())`, multiHeld, runID); err != nil {
+		t.Fatalf("seed held multi-group stage: %v", err)
+	}
+	slotCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM stage_concurrency_slots`).Scan(&n); err != nil {
+			t.Fatalf("count slot rows: %v", err)
+		}
+		return n
+	}
+	var cleanVersion int64
+	var cleanDirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&cleanVersion, &cleanDirty); err != nil {
+		t.Fatalf("read schema_migrations: %v", err)
+	}
+	downErr := postgres.MigrateDown(url)
+	if downErr == nil || !strings.Contains(downErr.Error(), multiHeld.String()) || !strings.Contains(downErr.Error(), "rollback of 0118 refused") {
+		t.Fatalf("MigrateDown with a held multi-group stage = %v, want the 0118 refusal naming stage %s", downErr, multiHeld)
+	}
+	// The recovery rides in DETAIL: golang-migrate appends the rendered DETAIL
+	// to the message after ", " and drops HINT. Its error also dumps the raw
+	// migration body, so match only text the server renders: the ", " DETAIL
+	// join and the DELETE with the stage id filled in.
+	for _, want := range []string{
+		", This attempt left the database dirty at version 117; 0118 is still applied, so clear it with migrate force 118 (not 117).",
+		"DELETE FROM stage_concurrency_slots WHERE stage_id = '" + multiHeld.String() + "'",
+	} {
+		if !strings.Contains(downErr.Error(), want) {
+			t.Errorf("MigrateDown refusal = %v, want its rendered DETAIL to contain %q", downErr, want)
+		}
+	}
+	// Read the STATE, not just the error: the refusal changed nothing.
+	if got := pkColumns(); got != "stage_id,group_key" {
+		t.Errorf("primary key after the refused rollback = %q, want stage_id,group_key", got)
+	}
+	if n := slotCount(); n != 5 {
+		t.Errorf("slot rows after the refused rollback = %d, want 5 (nothing collapsed)", n)
+	}
+	// golang-migrate marked the step's TARGET version dirty before the refused
+	// step; the DDL rolled back, so 0118 is genuinely still applied. The
+	// documented recovery is `migrate force 118`, never the reported 117.
+	var dirtyVersion int64
+	var dirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&dirtyVersion, &dirty); err != nil {
+		t.Fatalf("read schema_migrations after the refused rollback: %v", err)
+	}
+	if cleanVersion != 118 || cleanDirty || dirtyVersion != 117 || !dirty {
+		t.Fatalf("schema_migrations before/after the refused rollback = %d dirty=%v / %d dirty=%v, want 118 clean / 117 dirty; "+
+			"if this moved, update the force-118 recovery in the 0118.down header and HINT, the 0118.up header, "+
+			"backend/internal/concurrency/README.md § \"Migration 0118\" and deploy/helm/fishhawk/README.md",
+			cleanVersion, cleanDirty, dirtyVersion, dirty)
+	}
+	// The documented recovery: `migrate force 118` clears the marker.
+	if _, err := pool.Exec(ctx, `UPDATE schema_migrations SET version = $1, dirty = $2`, cleanVersion, cleanDirty); err != nil {
+		t.Fatalf("force schema_migrations back after the refused rollback: %v", err)
+	}
+	// The operator drains the hold: the stage settles and its rows go.
+	if _, err := pool.Exec(ctx, `DELETE FROM stage_concurrency_slots WHERE stage_id = $1`, multiHeld); err != nil {
+		t.Fatalf("drain the held multi-group stage: %v", err)
+	}
+
+	downThrough(t, url, "0118")
+	if got := pkColumns(); got != "stage_id" {
+		t.Errorf("primary key after rolling back 0118 = %q, want stage_id", got)
+	}
+	var groups []string
+	if err := pool.QueryRow(ctx, `SELECT array_agg(group_key) FROM stage_concurrency_slots WHERE stage_id = $1`, queued).Scan(&groups); err != nil {
+		t.Fatalf("read the collapsed stage: %v", err)
+	}
+	if len(groups) != 1 || groups[0] != "local-implement:h1" {
+		t.Errorf("queued two-row stage after rolling back 0118 = %v, want only its canonical-first row local-implement:h1", groups)
+	}
+	if got := rowJSON(held); got != heldBefore {
+		t.Errorf("single-row held stage after rolling back 0118 = %s, want unchanged %s", got, heldBefore)
+	}
+}

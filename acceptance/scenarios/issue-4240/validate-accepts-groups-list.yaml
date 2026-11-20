@@ -1,0 +1,14 @@
+id: scenario:issue-4240/validate-accepts-groups-list
+statement: '`fishhawk validate` exits 0 for a workflow-v2 file whose implement stage declares `concurrency.groups: [{group: implement, scope: host}, {group: deploy-target, scope: repository, limit: 2}]`.'
+verify_hint: 'CLI: `fishhawk validate <file>` exits 0 with no error output.'
+steps: 'Built the CLI from the sanctioned checkout. Wrote accept.yaml: v2, stage apply (implement, claude-code), concurrency.groups [{group: implement, scope: host}, {group: deploy-target, scope: repository, limit: 2}]. Ran `fishhawk validate accept.yaml`; cross-checked through the preview''s MCP fishhawk_validate.'
+assertions:
+    expected: Exit 0, no error output.
+    observed_at_record: exit 0, 'OK', empty stderr; MCP diagnostics [].
+    repro_handle: fishhawk validate accept.yaml
+origin:
+    issue: 4240
+    pr: 5479
+    run_id: 3fd75737-959c-47f9-a418-4a983e327e4c
+    head_sha: fbda43cf22a560d57420142b4a8a336d82ba0177
+    recorded_at: 2026-11-19T21:46:52Z
