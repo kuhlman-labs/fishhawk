@@ -190,6 +190,8 @@ miss on any group commits queued rows only, and nothing is held
 (`TestAdmitSet_OneGroupFullHoldsNeither`, with the full group sorting first
 and last). Release is derived from stage state as before, so one settle
 frees every group of the set at once (`TestAdmitSet_ReleaseFreesEveryGroup`).
+Racing overlapping sets never leave a partial hold or over-admit a group
+(`TestAdmitSet_RacingOverlappingSets`).
 
 **The per-group rule.** The stage is admitted when, for EVERY group G of its
 set:
@@ -626,7 +628,9 @@ effective key (§ "Ordering and `order_key`") sorts before the caller's.
   admitter ever holds a connection while waiting for another admitter, and
   the lock winner never needs a second connection. Pinned by
   `TestAdmit_PoolSmallerThanConcurrentAdmits` (8 admitters on a 2-connection
-  pool).
+  pool). `TestAdmitSet_RacingOverlappingSets` races 9 admitters over the sets
+  {G1,G2}, {G2,G3} and {G1} on a 3-connection pool. Every round, some
+  admitter takes its whole lock set and decides.
 - **The server's admission lock holds no connection (approval condition 4).**
   `orchestrator.LockStageAdmission` is a process-local per-stage
   `sync.Mutex`. It holds NO pooled connection and NO transaction. A marker
