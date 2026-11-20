@@ -59,9 +59,10 @@ type DispatchStageOutput struct {
 	// ConcurrencySlot is the local concurrency-slot state (#3964 / ADR-087):
 	// on a QUEUED dispatch, status awaiting_concurrency_slot with position,
 	// holders and waiter (started | already_waiting) — no runner was spawned;
-	// on a grouped admission, the group/limit/queued_before block. Absent for
-	// an ungrouped stage.
-	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"local concurrency-slot state. status awaiting_concurrency_slot means the dispatch was QUEUED behind this host's slot holders and NO runner was spawned: this session's slot waiter (waiter started | already_waiting) spawns it on admission, so call next_step fishhawk_await_stage. On an immediate grouped admission it carries group, limit and queued_before. Absent for an ungrouped stage"`
+	// on a grouped admission, the group/limit/queued_before block. Every
+	// host-dispatched agent stage now holds the host capacity group (#4241),
+	// so it is absent only when the server runs no concurrency store.
+	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"local concurrency-slot state. status awaiting_concurrency_slot means the dispatch was QUEUED behind this host's slot holders and NO runner was spawned: this session's slot waiter (waiter started | already_waiting) spawns it on admission, so call next_step fishhawk_await_stage. On an immediate grouped admission it carries group, limit and queued_before (the stage-type group when the set has one, else host:<host>:capacity). Absent only when the server runs no concurrency store"`
 
 	Warnings []string `json:"warnings,omitempty"`
 
@@ -172,27 +173,41 @@ flag is inert on every non-acceptance stage. When
 a dispatch DOES park at needs_target, the refusal now names the exact bring-up
 command to run.
 
-Local concurrency slots (#3964 / ADR-087): by default one local IMPLEMENT
-stage runs per host at a time (group local-implement:<host>, limit 1; a
-workflow-v2 stage "concurrency" block overrides it). Only a local implement
-stage joins a default group: plan, review and acceptance stages join no
-concurrency group unless the workflow spec declares a stage concurrency block,
-so plan stages may overlap each other and a running implement (#5214).
-Acceptance serializes only on its shared preview slot. An implement stage
-re-opened for a merge-candidate VERIFY-ONLY pass (ADR-090/ADR-092 D3: a live
-stage_merge_candidate_verify_triggered row, no agent) is admitted through its
-own group local-verify:<host>, limit 1, never behind a queued full implement;
-fix-ups and conflict-resolution re-opens stay in local-implement. When the
-host's slot is held, the dispatch is QUEUED, not refused: NO runner is spawned, the stage
+Local concurrency slots (#3964 / ADR-087, host capacity ADR-094 D4 / #4241):
+every host-dispatched plan, implement, acceptance and verify pass holds one
+slot of host:<host>:capacity (default 3; FISHHAWK_HOST_CAPACITY in this MCP
+process's environment sets it, 1..64, sent per request), and so do agent
+review stages and any other agent-executed host-dispatched stage. Beside
+ADR-094 D6 (#4242): D6's account:<provider>/<account>:review group admits
+fishhawkd's own review rounds, which run as fishhawkd goroutines and hold no
+host capacity slot. An implement also holds local-implement:<host> (limit 1;
+a workflow-v2 stage "concurrency" block raises it with {limit: N}), and a
+merge-candidate VERIFY-ONLY pass (ADR-090/ADR-092 D3: a live
+stage_merge_candidate_verify_triggered row, no agent) holds local-verify:<host>
+(limit 1), never behind a queued full implement on that group; fix-ups and
+conflict-resolution re-opens stay in local-implement. A declared concurrency
+block ADDS groups to these defaults. On capacity each earlier queued stage
+reserves one slot but is not a FIFO barrier, so capacity blocks only when
+holders plus earlier reservations fill capacity, and a plan, acceptance or
+verify pass queues only then. Example: at capacity 3 with implement limit 2,
+two holding implements plus one queued implement fill capacity, so a later
+plan, acceptance or verify pass queues; at capacity 4 one slot stays free.
+Acceptance also serializes on its shared preview slot. When a group is full,
+the dispatch is QUEUED, not refused: NO runner is spawned, the stage
 stays awaiting_host_dispatch, and the result carries concurrency_slot (status
 awaiting_concurrency_slot, position, holders, waiter). This session's slot
 waiter then re-polls every 5s and spawns the runner when a slot frees (for up
-to 3 hours); the queue is FIFO across every session on the host. Call the
+to 3 hours); the queue is FIFO per stage-type group across every session on
+the host. Call the
 returned next_step fishhawk_await_stage — it holds through the queue while the
 waiter is live. The waiter lives in this MCP process: if the process exits (a
 shim hot-swap or /mcp), the queue row goes stale after 60s and the stage must
 be re-dispatched. Until #3969, fishhawk_run_stage, fishhawk_drive_run and
-fishhawk_run_children fail closed on a queued dispatch instead of waiting.
+fishhawk_run_children fail closed on a queued dispatch instead of waiting; for
+plan and acceptance stages that happens only when holders plus earlier
+reservations fill capacity. An invalid FISHHAWK_HOST_CAPACITY fails every
+dispatch closed before the marker (no spawn); fishhawk_doctor's host_capacity
+rung names it.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).

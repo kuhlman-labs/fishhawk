@@ -4909,6 +4909,83 @@ func TestHostDispatchStage_SendsHostBody(t *testing.T) {
 	}
 }
 
+// hostDispatchRecorder is an httptest marker that records every request body
+// and answers a 200 admission.
+func hostDispatchRecorder(t *testing.T) (*httptest.Server, *[]string) {
+	t.Helper()
+	var bodies []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched"}`))
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &bodies
+}
+
+// TestHostDispatchStage_SendsDeclaredCapacity (#4241): a source-env capacity
+// rides the marker body as {"capacity": n}, with or without a label and nonce.
+func TestHostDispatchStage_SendsDeclaredCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name, label, nonce, wantBody string
+	}{
+		{"with the label", "h1", "", `{"host":"h1","capacity":2}`},
+		{"with label and nonce", "h1", "n-1", `{"host":"h1","admission_nonce":"n-1","capacity":2}`},
+		{"without a label", "", "", `{"capacity":2}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, bodies := hostDispatchRecorder(t)
+			c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok", hostLabel: fixedHostLabel(tc.label)})
+			c.hostCapacity = fixedHostCapacity(hostCapacityResolution{Capacity: 2, Source: hostCapacitySourceEnv, Raw: "2"}, nil)
+			if _, err := c.HostDispatchStageWithNonce(context.Background(), uuid.New(), uuid.New(), tc.nonce); err != nil {
+				t.Fatalf("HostDispatchStageWithNonce: %v", err)
+			}
+			if len(*bodies) != 1 || (*bodies)[0] != tc.wantBody {
+				t.Errorf("bodies = %q, want exactly %q", *bodies, tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestHostDispatchStage_OmitsCapacityWhenUnset (#4241): the default source
+// sends no capacity key, so the body is byte-identical to a pre-#4241 client.
+func TestHostDispatchStage_OmitsCapacityWhenUnset(t *testing.T) {
+	for _, tc := range []struct{ label, wantBody string }{
+		{"h1", `{"host":"h1"}`},
+		{"", ""},
+	} {
+		ts, bodies := hostDispatchRecorder(t)
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok", hostLabel: fixedHostLabel(tc.label)})
+		c.hostCapacity = fixedHostCapacity(hostCapacityResolution{Capacity: 3, Source: hostCapacitySourceDefault}, nil)
+		if _, err := c.HostDispatchStage(context.Background(), uuid.New(), uuid.New()); err != nil {
+			t.Fatalf("HostDispatchStage: %v", err)
+		}
+		if len(*bodies) != 1 || (*bodies)[0] != tc.wantBody || strings.Contains((*bodies)[0], "capacity") {
+			t.Errorf("label %q: bodies = %q, want exactly %q", tc.label, *bodies, tc.wantBody)
+		}
+	}
+}
+
+// TestHostDispatchStage_FailsClosedOnInvalidCapacity (#4241): an invalid
+// FISHHAWK_HOST_CAPACITY makes NO request, so no stage is marked and nothing
+// spawns, and the error names the variable.
+func TestHostDispatchStage_FailsClosedOnInvalidCapacity(t *testing.T) {
+	ts, bodies := hostDispatchRecorder(t)
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok", hostLabel: fixedHostLabel("h1")})
+	_, resErr := resolveHostCapacity(func(string) (string, bool) { return "0", true })
+	c.hostCapacity = fixedHostCapacity(hostCapacityResolution{Source: hostCapacitySourceInvalid, Raw: "0"}, resErr)
+	res, err := c.HostDispatchStageWithNonce(context.Background(), uuid.New(), uuid.New(), "n-1")
+	if err == nil || res != nil {
+		t.Fatalf("HostDispatchStageWithNonce = %+v, %v; want a fail-closed error", res, err)
+	}
+	if !errors.Is(err, errInvalidHostCapacity) || !strings.Contains(err.Error(), hostCapacityEnv) {
+		t.Errorf("err = %v, want errInvalidHostCapacity naming %s", err, hostCapacityEnv)
+	}
+	if len(*bodies) != 0 {
+		t.Errorf("the marker received %d request(s), want 0: %q", len(*bodies), *bodies)
+	}
+}
+
 // TestHostDispatchStage_QueuedDecodedAndAnnotated: a 409
 // concurrency_slot_queued decodes into the typed queued error (position,
 // holders, enqueued_at, contended), still errors.As into *apiError so every

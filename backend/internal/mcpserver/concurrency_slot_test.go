@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -590,6 +591,8 @@ type e2eSlotFixture struct {
 	// baseURL / bearer let a test open a SECOND session's client against the
 	// same server (another MCP process on the same host).
 	baseURL, bearer string
+	// pool reads stage_concurrency_slots rows back (#4241).
+	pool *pgxpool.Pool
 }
 
 func newE2ESlotFixture(t *testing.T) *e2eSlotFixture {
@@ -665,7 +668,7 @@ func newE2ESlotFixtureWithDefaultBranch(t *testing.T, wrap func(concurrency.Stor
 			time.Sleep(20 * time.Millisecond)
 		}
 	})
-	return &e2eSlotFixture{ctx: ctx, runRepo: runRepo, r: r, rec: rec, baseURL: ts.URL, bearer: bearer}
+	return &e2eSlotFixture{ctx: ctx, runRepo: runRepo, r: r, rec: rec, baseURL: ts.URL, bearer: bearer, pool: pool}
 }
 
 // session opens another MCP session's client on the SAME host label.
@@ -737,6 +740,12 @@ func (f *e2eSlotFixture) spawnCount(st *runpkg.Stage) int {
 // park creates a run with one implement stage at awaiting_host_dispatch.
 func (f *e2eSlotFixture) park(t *testing.T, workflowSpec []byte) *runpkg.Stage {
 	t.Helper()
+	return f.parkType(t, workflowSpec, runpkg.StageTypeImplement)
+}
+
+// parkType creates a run with one agent stage of typ at awaiting_host_dispatch.
+func (f *e2eSlotFixture) parkType(t *testing.T, workflowSpec []byte, typ runpkg.StageType) *runpkg.Stage {
+	t.Helper()
 	row, err := f.runRepo.CreateRun(f.ctx, runpkg.CreateRunParams{
 		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
 		WorkflowSpec: workflowSpec,
@@ -745,7 +754,7 @@ func (f *e2eSlotFixture) park(t *testing.T, workflowSpec []byte) *runpkg.Stage {
 		t.Fatalf("create run: %v", err)
 	}
 	st, err := f.runRepo.CreateStage(f.ctx, runpkg.CreateStageParams{
-		RunID: row.ID, Sequence: 1, Type: runpkg.StageTypeImplement,
+		RunID: row.ID, Sequence: 1, Type: typ,
 		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
 	})
 	if err != nil {
@@ -1149,5 +1158,141 @@ workflows:
 	}
 	if got := f.rec.spawned(); len(got) != 2 {
 		t.Fatalf("spawns = %v, want both fake runners spawned immediately", got)
+	}
+}
+
+// --- host capacity group (ADR-094 D4 / #4241), end to end ----------------
+
+// slotRows counts the stage_concurrency_slots rows of key in state.
+func (f *e2eSlotFixture) slotRows(t *testing.T, key, state string) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT count(*) FROM stage_concurrency_slots WHERE group_key = $1 AND state = $2`, key, state).Scan(&n); err != nil {
+		t.Fatalf("count %s rows of %s: %v", state, key, err)
+	}
+	return n
+}
+
+// capacityClient is an MCP client on label whose capacity resolver reads
+// lookupEnv through the production resolveHostCapacity, or a nil resolver
+// (a pre-#4241 client) when lookupEnv is nil.
+func (f *e2eSlotFixture) capacityClient(label string, lookupEnv func(string) (string, bool)) *apiClient {
+	api := newAPIClient(config{backendURL: f.baseURL, apiToken: f.bearer, hostLabel: fixedHostLabel(label)})
+	if lookupEnv != nil {
+		api.hostCapacity = func() (hostCapacityResolution, error) { return resolveHostCapacity(lookupEnv) }
+	}
+	return api
+}
+
+// queuedOnCapacity asserts err is the 409 concurrency_slot_queued answer
+// whose binding group and details.groups both name capKey at limit.
+func queuedOnCapacity(t *testing.T, err error, capKey string, limit int) {
+	t.Helper()
+	q, ok := asConcurrencySlotQueued(err)
+	if !ok {
+		t.Fatalf("err = %v, want 409 concurrency_slot_queued", err)
+	}
+	if q.Group != capKey || q.Limit != limit {
+		t.Errorf("queued binding group = %s at %d, want %s at %d", q.Group, q.Limit, capKey, limit)
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("err %v carries no *apiError", err)
+	}
+	details := ae.Details
+	groups, _ := details["groups"].([]any)
+	for _, g := range groups {
+		m, _ := g.(map[string]any)
+		if m["group"] == capKey && m["limit"] == float64(limit) {
+			return
+		}
+	}
+	t.Errorf("details.groups = %v, want an entry for %s at limit %d", details["groups"], capKey, limit)
+}
+
+// TestConcurrencySlot_E2E_HostCapacityTwo crosses every boundary of the
+// capacity declaration: FISHHAWK_HOST_CAPACITY=2 in the MCP process env (a
+// fake lookupEnv through the real resolver), the client wire, the real
+// server handler, the Postgres slot store and its rows. An implement and an
+// acceptance stage are admitted at limit 2; a plan stage, whose only group is
+// the capacity group, then queues naming host:<label>:capacity at limit 2.
+// With the declared capacity ignored (always 3) the plan would be admitted.
+func TestConcurrencySlot_E2E_HostCapacityTwo(t *testing.T) {
+	f := newE2ESlotFixture(t)
+	const label = "e2e-cap-two"
+	capKey := concurrency.CapacityGroupKey(label)
+	api := f.capacityClient(label, func(key string) (string, bool) {
+		if key == "FISHHAWK_HOST_CAPACITY" {
+			return "2", true
+		}
+		return "", false
+	})
+	for _, typ := range []runpkg.StageType{runpkg.StageTypeImplement, runpkg.StageTypeAcceptance} {
+		st := f.parkType(t, nil, typ)
+		res, err := api.HostDispatchStage(f.ctx, st.RunID, st.ID)
+		if err != nil || res == nil || !res.Transitioned {
+			t.Fatalf("%s: HostDispatchStage = %+v, %v; want an admission", typ, res, err)
+		}
+	}
+	plan := f.parkType(t, nil, runpkg.StageTypePlan)
+	_, err := api.HostDispatchStage(f.ctx, plan.RunID, plan.ID)
+	queuedOnCapacity(t, err, capKey, 2)
+	if got := f.stageState(t, plan); got != string(runpkg.StageStateAwaitingHostDispatch) {
+		t.Errorf("queued plan state = %s, want awaiting_host_dispatch", got)
+	}
+	if held, queued := f.slotRows(t, capKey, "held"), f.slotRows(t, capKey, "queued"); held != 2 || queued != 1 {
+		t.Errorf("%s rows: %d held, %d queued; want 2 held, 1 queued", capKey, held, queued)
+	}
+}
+
+// TestConcurrencySlot_E2E_OldClientGetsThree: a client with no capacity
+// resolver (pre-#4241, so no capacity on the wire) admits three plan stages
+// on a fresh label at the server default 3, and the fourth queues naming
+// host:<label>:capacity at limit 3.
+func TestConcurrencySlot_E2E_OldClientGetsThree(t *testing.T) {
+	f := newE2ESlotFixture(t)
+	const label = "e2e-cap-old"
+	capKey := concurrency.CapacityGroupKey(label)
+	api := f.capacityClient(label, nil)
+	for i := 0; i < 3; i++ {
+		st := f.parkType(t, nil, runpkg.StageTypePlan)
+		res, err := api.HostDispatchStage(f.ctx, st.RunID, st.ID)
+		if err != nil || res == nil || !res.Transitioned {
+			t.Fatalf("plan %d: HostDispatchStage = %+v, %v; want an admission", i+1, res, err)
+		}
+		if res.Concurrency == nil || res.Concurrency.Group != capKey || res.Concurrency.Limit != concurrency.DefaultHostCapacity {
+			t.Errorf("plan %d admission block = %+v, want %s at %d", i+1, res.Concurrency, capKey, concurrency.DefaultHostCapacity)
+		}
+	}
+	fourth := f.parkType(t, nil, runpkg.StageTypePlan)
+	_, err := api.HostDispatchStage(f.ctx, fourth.RunID, fourth.ID)
+	queuedOnCapacity(t, err, capKey, concurrency.DefaultHostCapacity)
+	if held := f.slotRows(t, capKey, "held"); held != 3 {
+		t.Errorf("%s held rows = %d, want 3", capKey, held)
+	}
+}
+
+// TestConcurrencySlot_E2E_InvalidCapacityMarksNothing: an invalid
+// FISHHAWK_HOST_CAPACITY fails the marker closed at the client, so against
+// the real server the stage stays awaiting_host_dispatch and no slot row is
+// written.
+func TestConcurrencySlot_E2E_InvalidCapacityMarksNothing(t *testing.T) {
+	f := newE2ESlotFixture(t)
+	const label = "e2e-cap-bad"
+	api := f.capacityClient(label, func(string) (string, bool) { return "0", true })
+	st := f.parkType(t, nil, runpkg.StageTypePlan)
+	if _, err := api.HostDispatchStage(f.ctx, st.RunID, st.ID); !errors.Is(err, errInvalidHostCapacity) {
+		t.Fatalf("err = %v, want errInvalidHostCapacity", err)
+	}
+	if got := f.stageState(t, st); got != string(runpkg.StageStateAwaitingHostDispatch) {
+		t.Errorf("stage state = %s, want awaiting_host_dispatch (nothing marked)", got)
+	}
+	var n int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM stage_concurrency_slots WHERE stage_id = $1`, st.ID).Scan(&n); err != nil {
+		t.Fatalf("count slot rows: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("slot rows for the stage = %d, want 0", n)
 	}
 }

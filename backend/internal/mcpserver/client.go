@@ -56,6 +56,13 @@ type apiClient struct {
 	// through hostLabelResolution, which tolerates nil. An empty label sends
 	// no body, which the server reads as the `unknown` host.
 	hostLabel func() hostLabelResolution
+	// hostCapacity resolves this MCP process's host capacity
+	// (FISHHAWK_HOST_CAPACITY, ADR-094 D4 / #4241): processHostCapacity in
+	// production, resolved lazily and once. A source-env value is sent as the
+	// marker's {"capacity"}; the default sends nothing; an error fails every
+	// marker closed before any request. Nil (a test-built config{} literal)
+	// sends nothing, which is the pre-#4241 client.
+	hostCapacity func() (hostCapacityResolution, error)
 }
 
 // refinementDraftClientTimeout bounds the MCP client's wait on the two
@@ -118,6 +125,7 @@ func newAPIClient(cfg config) *apiClient {
 		// sharing one would silently couple them.
 		httpIssueSet: &http.Client{Timeout: issueSetClientTimeout},
 		hostLabel:    cfg.hostLabel,
+		hostCapacity: cfg.hostCapacity,
 	}
 }
 
@@ -133,6 +141,16 @@ func (c *apiClient) hostLabelResolution() hostLabelResolution {
 		return hostLabelResolution{Source: hostLabelSourceNone}
 	}
 	return c.hostLabel()
+}
+
+// hostCapacityResolution is the client's resolved host capacity. A nil
+// resolver (a test-built config{} literal) is the server default, sent as
+// nothing.
+func (c *apiClient) hostCapacityResolution() (hostCapacityResolution, error) {
+	if c.hostCapacity == nil {
+		return hostCapacityResolution{Capacity: defaultHostCapacity, Source: hostCapacitySourceDefault}, nil
+	}
+	return c.hostCapacity()
 }
 
 // sanitizeHostLabel maps raw onto the server's accepted host-label class. Pure
@@ -2697,7 +2715,7 @@ const (
 // bodies.
 type StageConcurrency struct {
 	Status   string `json:"status,omitempty" jsonschema:"awaiting_concurrency_slot (the stage is QUEUED for a local concurrency slot: it stays at awaiting_host_dispatch until a slot frees) or holding (the stage holds a slot). Absent on the host-dispatch admission block"`
-	Group    string `json:"group,omitempty" jsonschema:"the concurrency group: local-implement:<host> by default for a local implement stage, local-verify:<host> (limit 1) for an ADR-090 merge-candidate verify-only pass, spec:<repo>:<name> for a spec-declared named group"`
+	Group    string `json:"group,omitempty" jsonschema:"the binding concurrency group of the stage's set: local-implement:<host> by default for a local implement stage, local-verify:<host> (limit 1) for an ADR-090 merge-candidate verify-only pass, spec:<repo>:<name> for a spec-declared named group, or host:<host>:capacity (the host capacity group every host-dispatched agent stage also holds, #4241) for a stage whose set has no other group, such as a plan"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"how many stages the group admits at once"`
 	Position int    `json:"position,omitempty" jsonschema:"1-based queue position while awaiting_concurrency_slot"`
 	// Promoted mirrors the stage block's promoted flag (#4191): an operator
@@ -2908,8 +2926,13 @@ func asHostMemoryPressure(err error) bool {
 //     read errored (retryable), never a silent admit.
 //
 // The request carries this process's host label as {"host": label} (#3964),
-// keying the default `local-implement:<host>` group; an empty label sends no
-// body (the server's `unknown` host).
+// keying the default `local-implement:<host>` group and the host capacity
+// group `host:<host>:capacity`; an empty label sends no host (the server's
+// `unknown` host). It carries {"capacity": n} only when FISHHAWK_HOST_CAPACITY
+// is set (ADR-094 D4 / #4241), sizing host:<host>:capacity for THIS request;
+// unset sends none and the server uses 3. An invalid FISHHAWK_HOST_CAPACITY
+// fails closed here, before any request is made, so no stage is marked and
+// nothing spawns.
 func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
 	return c.HostDispatchStageWithNonce(ctx, runID, stageID, "")
 }
@@ -2920,13 +2943,22 @@ func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.U
 // after a lost response. An empty nonce sends none.
 func (c *apiClient) HostDispatchStageWithNonce(ctx context.Context, runID, stageID uuid.UUID, nonce string) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
+	capRes, err := c.hostCapacityResolution()
+	if err != nil {
+		return nil, fmt.Errorf("host-dispatch refused before any request (no stage was marked, nothing spawned): %w; fix %s in the environment that launches this process and reconnect the MCP server", err, hostCapacityEnv)
+	}
+	var capacity *int
+	if n, ok := capRes.declared(); ok {
+		capacity = &n
+	}
 	var body []byte
 	host := c.hostLabelResolution().Label
-	if host != "" || nonce != "" {
+	if host != "" || nonce != "" || capacity != nil {
 		b, err := json.Marshal(struct {
 			Host           string `json:"host,omitempty"`
 			AdmissionNonce string `json:"admission_nonce,omitempty"`
-		}{Host: host, AdmissionNonce: nonce})
+			Capacity       *int   `json:"capacity,omitempty"`
+		}{Host: host, AdmissionNonce: nonce, Capacity: capacity})
 		if err != nil {
 			return nil, fmt.Errorf("marshal host-dispatch body: %w", err)
 		}

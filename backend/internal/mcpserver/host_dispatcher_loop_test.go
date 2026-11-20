@@ -927,3 +927,22 @@ func TestRunHostDispatcher_ConfigRefusals(t *testing.T) {
 	}
 	lock.unlock()
 }
+
+// TestRunHostDispatcher_RefusesInvalidHostCapacity (#4241): an invalid
+// FISHHAWK_HOST_CAPACITY refuses the start with an error naming the variable,
+// before the state dir is created or locked. The config is otherwise valid
+// and the context pre-cancelled, so without the check the dispatcher would
+// tick once, create the state dir and exit cleanly.
+func TestRunHostDispatcher_RefusesInvalidHostCapacity(t *testing.T) {
+	t.Setenv(hostCapacityEnv, "0")
+	dir := filepath.Join(t.TempDir(), "state")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := RunHostDispatcher(ctx, HostDispatcherConfig{StateDir: dir, AllowedRoots: []string{"/tmp"}, BackendURL: "http://127.0.0.1:1", RunnerBinary: "/bin/true", Log: io.Discard})
+	if err == nil || !errors.Is(err, errInvalidHostCapacity) || !strings.Contains(err.Error(), hostCapacityEnv) {
+		t.Fatalf("err = %v, want a refusal naming %s", err, hostCapacityEnv)
+	}
+	if _, serr := os.Stat(dir); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("a refused start created the state dir: %v", serr)
+	}
+}
