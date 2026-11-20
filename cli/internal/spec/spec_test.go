@@ -3943,7 +3943,97 @@ func TestValidateBytes_StageConcurrencyGroups(t *testing.T) {
 	}
 }
 
-// TestConcurrencyGroupsMessageParity is the MECHANICAL drift guard for the three
+// TestValidate_ConcurrencyGroupsHostCapacityReserved is the CLI's
+// per-failure-mode table for the reserved host capacity group (ADR-094 A2 /
+// #4241), mirroring the backend test of the same name. The exact entry is
+// schema-valid, so only the semantic refusal stops it, and it is refused
+// WHOLE at its entry pointer (no second entry for its limit, as the backend
+// returns on it). A case or whitespace variant is refused by the schema group
+// pattern first: ValidateBytes returns on the schema pass, so the CLI's
+// canonical fold is defence in depth that no ValidateBytes input reaches, and
+// this test claims no fold-only RED for it.
+func TestValidate_ConcurrencyGroupsHostCapacityReserved(t *testing.T) {
+	const base = "/workflows/wf/stages/0/concurrency"
+	refused := []struct {
+		name      string
+		body      string
+		wantPaths []string
+	}{
+		{name: "exact", body: "\n          groups:\n            - {group: capacity, scope: host}", wantPaths: []string{base + "/groups/0"}},
+		{name: "second_entry", body: "\n          groups:\n            - {group: implement, scope: host}\n            - {group: capacity, scope: host}", wantPaths: []string{base + "/groups/1"}},
+		{name: "with_limit", body: "\n          groups:\n            - {group: capacity, scope: host, limit: 4}", wantPaths: []string{base + "/groups/0"}},
+		// Each reserved entry is refused as reserved, never as a duplicate.
+		{name: "listed_twice", body: "\n          groups:\n            - {group: capacity, scope: host}\n            - {group: capacity, scope: host}", wantPaths: []string{base + "/groups/0", base + "/groups/1"}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes(concurrencyGroupsCLIDoc(tc.body))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+			}
+			if len(ve.Errors) != len(tc.wantPaths) {
+				t.Fatalf("entries = %+v, want exactly %d capacity refusal(s) at %v", ve.Errors, len(tc.wantPaths), tc.wantPaths)
+			}
+			for i, e := range ve.Errors {
+				if e.Path != tc.wantPaths[i] || e.Message != spec.MsgConcurrencyHostCapacityReserved {
+					t.Errorf("entry %d = %q: %q, want %q: %q", i, e.Path, e.Message, tc.wantPaths[i], spec.MsgConcurrencyHostCapacityReserved)
+				}
+			}
+		})
+	}
+	for _, name := range []string{"Capacity", "CAPACITY", " capacity", "capacity "} {
+		t.Run("variant_"+strconv.Quote(name), func(t *testing.T) {
+			body := "\n          groups:\n            - {group: " + strconv.Quote(name) + ", scope: host}"
+			err := spec.ValidateBytes(concurrencyGroupsCLIDoc(body))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+			}
+			found := false
+			for _, e := range ve.Errors {
+				if e.Path == base+"/groups/0/group" {
+					found = true
+				}
+				if e.Message == spec.MsgConcurrencyHostCapacityReserved {
+					t.Errorf("entry %+v carries the semantic refusal; the schema pass should have returned first", e)
+				}
+			}
+			if !found {
+				t.Errorf("entries = %+v, want the group pattern refusal at %s/groups/0/group", ve.Errors, base)
+			}
+		})
+	}
+	t.Run("accepts_repository_capacity", func(t *testing.T) {
+		if err := spec.ValidateBytes(concurrencyGroupsCLIDoc("\n          groups:\n            - {group: capacity, scope: repository, limit: 2}")); err != nil {
+			t.Fatalf("ValidateBytes: %v, want a repository-scoped capacity group accepted", err)
+		}
+	})
+}
+
+// TestValidate_ConcurrencyGroupsPreviewTarget mirrors the backend test: the
+// built-in host group preview-target is declarable without a limit and
+// refused with one, carrying the reworded host-limit message.
+func TestValidate_ConcurrencyGroupsPreviewTarget(t *testing.T) {
+	const base = "/workflows/wf/stages/0/concurrency"
+	if err := spec.ValidateBytes(concurrencyGroupsCLIDoc("\n          groups:\n            - {group: preview-target, scope: host}")); err != nil {
+		t.Fatalf("ValidateBytes(preview-target, no limit): %v, want accepted", err)
+	}
+	err := spec.ValidateBytes(concurrencyGroupsCLIDoc("\n          groups:\n            - {group: preview-target, scope: host, limit: 2}"))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+	}
+	want := fmt.Sprintf(spec.MsgFmtConcurrencyHostGroupLimit, "preview-target")
+	if len(ve.Errors) != 1 || ve.Errors[0].Path != base+"/groups/0/limit" || ve.Errors[0].Message != want {
+		t.Fatalf("entries = %+v, want exactly %s/groups/0/limit: %q", ve.Errors, base, want)
+	}
+	if !strings.Contains(want, "FISHHAWK_HOST_CAPACITY") || strings.Contains(want, "until host-declared capacity") {
+		t.Errorf("host-limit message = %q, want it to name FISHHAWK_HOST_CAPACITY and not defer to host-declared capacity", want)
+	}
+}
+
+// TestConcurrencyGroupsMessageParity is the MECHANICAL drift guard for the four
 // hand-duplicated concurrency.groups messages (#4240): the modules cannot
 // share a constant, so parity is asserted by reading both source files and
 // requiring the identical declaration line in each.
@@ -3952,6 +4042,7 @@ func TestConcurrencyGroupsMessageParity(t *testing.T) {
 		`const MsgFmtConcurrencyGroupDuplicate = ` + strconv.Quote(spec.MsgFmtConcurrencyGroupDuplicate),
 		`const MsgFmtConcurrencyHostGroupLimit = ` + strconv.Quote(spec.MsgFmtConcurrencyHostGroupLimit),
 		`const MsgConcurrencyHostVerifyReserved = ` + strconv.Quote(spec.MsgConcurrencyHostVerifyReserved),
+		`const MsgConcurrencyHostCapacityReserved = ` + strconv.Quote(spec.MsgConcurrencyHostCapacityReserved),
 	}
 	for _, path := range []string{
 		"../../../backend/internal/spec/validate.go",
