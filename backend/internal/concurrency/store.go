@@ -153,7 +153,9 @@ const multiGroupStageQ = `EXISTS (SELECT 1 FROM stage_concurrency_slots m
 // key, because it is about when a row was COMMITTED, which a promotion never
 // changes. multi_round_ahead is the subset of round_ahead whose stage has a
 // multi-group set: Admit's condition (b) (README.md § "Group sets and scoped
-// keys"); Status and Promote ignore it.
+// keys"). (b) skips the host capacity group: it applies to every group
+// except host:<label>:capacity (Captain ruling 2026-11-20, #4241; README.md
+// § "Host capacity group"). Status and Promote ignore it.
 var aheadSQL = `SELECT
   count(*) FILTER (WHERE s.enqueued_at <= $5) AS round_ahead,
   count(*) AS all_ahead,
@@ -260,18 +262,6 @@ func groupScope(key string) Scope {
 	return g.Scope
 }
 
-// bindingQueued picks the binding group of a queued set: the highest
-// position, ties broken in canonical key order (positions is in that order).
-func bindingQueued(positions []int) int {
-	b := 0
-	for i, p := range positions {
-		if p > positions[b] {
-			b = i
-		}
-	}
-	return b
-}
-
 // Admit decides one admission atomically. See README.md § "Admit".
 //
 // Any error rolls the whole transaction back: the stage keeps its state and
@@ -358,6 +348,7 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 
 	views := make([]groupView, len(groups))
 	positions := make([]int, len(groups))
+	queuedGroups := make([]GroupState, len(groups))
 	for i, g := range groups {
 		holders, err := listHolders(ctx, tx, g.Key, acct)
 		if err != nil {
@@ -369,18 +360,16 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 		}
 		views[i] = v
 		positions[i] = v.allAhead + 1
+		queuedGroups[i] = GroupState{Key: g.Key, Scope: groupScope(g.Key), Limit: g.Limit, Position: positions[i], Holders: v.holders}
 	}
-	b := bindingQueued(positions)
+	b := BindingIndex(queuedGroups, true)
 	queued := Admission{
 		Position:    positions[b],
 		Holders:     views[b].holders,
 		EnqueuedAt:  enqueuedAt,
 		NewlyQueued: newlyQueued,
 		Contended:   !hit,
-		Groups:      make([]GroupState, len(groups)),
-	}
-	for i, g := range groups {
-		queued.Groups[i] = GroupState{Key: g.Key, Scope: groupScope(g.Key), Limit: g.Limit, Position: positions[i], Holders: views[i].holders}
+		Groups:      queuedGroups,
 	}
 
 	// (5) Lock miss: queued without deciding.
@@ -395,6 +384,13 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 	// waiters < limit (ADR-087's reservation formula), AND (b) no earlier
 	// fresh waiter on G has a multi-group set (ADR-094 D2 strict per-group
 	// FIFO). (b) is vacuous when every earlier waiter is single-group.
+	//
+	// (b) applies to every group EXCEPT host:<label>:capacity (Captain ruling
+	// 2026-11-20, #4241): almost every capacity waiter is multi-group, so (b)
+	// would queue a plan behind an implement waiting on local-implement. The
+	// capacity group keeps (a), so each earlier live waiter still reserves
+	// one capacity slot: "full" there means holders + job holders + earlier
+	// live waiters >= limit (README.md § "Host capacity group").
 	admit := true
 	for i, g := range groups {
 		jobs, err := countJobHolders(ctx, tx, g.Key, acct)
@@ -403,7 +399,8 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 		}
 		v := views[i]
 		free := len(v.holders)+jobs+v.roundAhead < g.Limit // (a)
-		if !free || v.multi > 0 {                          // (b)
+		fifo := v.multi > 0 && !IsCapacityGroupKey(g.Key)  // (b)
+		if !free || fifo {
 			admit = false
 		}
 	}
@@ -449,7 +446,6 @@ SELECT COALESCE(max(waited), 0) FROM marked`, req.StageID, req.AdmissionNonce).S
 	out := Admission{
 		Admitted:      true,
 		Stage:         stage,
-		Holders:       views[0].holders,
 		EnqueuedAt:    enqueuedAt,
 		QueuedBefore:  queuedBefore,
 		WaitedSeconds: waited,
@@ -458,6 +454,7 @@ SELECT COALESCE(max(waited), 0) FROM marked`, req.StageID, req.AdmissionNonce).S
 	for i, g := range groups {
 		out.Groups[i] = GroupState{Key: g.Key, Scope: groupScope(g.Key), Limit: g.Limit, Holders: views[i].holders}
 	}
+	out.Holders = out.Groups[BindingIndex(out.Groups, false)].Holders
 	return out, nil
 }
 
@@ -702,7 +699,6 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 			continue
 		}
 		groups := make([]GroupState, len(set))
-		positions := make([]int, len(set))
 		for i, r := range set {
 			key := scope{r.st.GroupKey, r.acct}
 			holders, ok := holdersBy[key]
@@ -721,12 +717,9 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 				}
 				g.Position = allAhead + 1
 			}
-			groups[i], positions[i] = g, g.Position
+			groups[i] = g
 		}
-		b := 0
-		if queued {
-			b = bindingQueued(positions)
-		}
+		b := BindingIndex(groups, queued)
 		st := set[b].st
 		st.Limit, st.Holders, st.Groups = groups[b].Limit, groups[b].Holders, groups
 		if queued {
@@ -875,7 +868,7 @@ FROM stage_concurrency_slots WHERE stage_id = $1 FOR UPDATE`, req.StageID)
 		return allAhead + 1, nil
 	}
 	pgs := make([]PromotionGroup, len(set))
-	oldPositions := make([]int, len(set))
+	oldPositions := make([]GroupState, len(set))
 	first := true
 	for i, r := range set {
 		holders, err := listHolders(ctx, tx, r.group, acct)
@@ -887,10 +880,10 @@ FROM stage_concurrency_slots WHERE stage_id = $1 FOR UPDATE`, req.StageID)
 			return Promotion{}, err
 		}
 		pgs[i] = PromotionGroup{Key: r.group, Limit: r.limit, OldPosition: oldPos, NewPosition: oldPos, Holders: holders}
-		oldPositions[i] = oldPos
+		oldPositions[i] = GroupState{Key: r.group, Position: oldPos}
 		first = first && oldPos == 1
 	}
-	b := bindingQueued(oldPositions)
+	b := BindingIndex(oldPositions, true)
 	result := func(changed bool) Promotion {
 		bg := pgs[b]
 		return Promotion{
