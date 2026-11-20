@@ -3,11 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -56,9 +57,9 @@ const (
 	stageConcurrencyStatusHolding = "holding"
 )
 
-// hostDispatchBodyMax bounds the optional {"host", "admission_nonce"} marker
-// body; hostLabelMax is a DNS name's length bound; admissionNonceMax bounds
-// the slot waiter's nonce (a UUID is 36).
+// hostDispatchBodyMax bounds the optional {"host", "admission_nonce",
+// "capacity"} marker body; hostLabelMax is a DNS name's length bound;
+// admissionNonceMax bounds the slot waiter's nonce (a UUID is 36).
 const (
 	hostDispatchBodyMax = 4 << 10
 	hostLabelMax        = 253
@@ -73,54 +74,109 @@ type hostDispatchBody struct {
 	// its admission response can tell its own admission from another
 	// session's (concurrency README § "Admission nonce").
 	AdmissionNonce string `json:"admission_nonce"`
+	// Capacity is the host capacity the client declares for THIS request
+	// (ADR-094 D4 as amended by A2, #4241): the limit of
+	// host:<host>:capacity for this one Admit call, 1..concurrency.MaxLimit.
+	// Absent or JSON null declares none, and the admission uses
+	// concurrency.DefaultHostCapacity. Nothing is stored: the next request
+	// sizes its own admission.
+	Capacity *int `json:"capacity"`
 }
 
+// hostDispatchRequest is a parsed marker body.
+type hostDispatchRequest struct {
+	host  string
+	nonce string
+	// capacity is the declared host capacity, nil when the body declared
+	// none.
+	capacity *int
+}
+
+// capacityLimit is the host capacity group's limit for this request: the
+// declared capacity, else concurrency.DefaultHostCapacity.
+func (q hostDispatchRequest) capacityLimit() int {
+	if q.capacity != nil {
+		return *q.capacity
+	}
+	return concurrency.DefaultHostCapacity
+}
+
+// hostDispatchBodyShape names the body's keys in the decode-error message.
+const hostDispatchBodyShape = `{"host": string, "admission_nonce": string, "capacity": integer}`
+
 // parseHostDispatchBody reads the optional {"host": string, "admission_nonce":
-// string} body. An absent or empty body, or an empty host, yields
-// concurrency.UnknownHost (a pre-change client sends no body); an absent
-// nonce yields "". A malformed body, an unknown key, a host longer than
-// hostLabelMax or one outside [A-Za-z0-9._-], or a nonce longer than
-// admissionNonceMax or outside [A-Za-z0-9-] answers 400 validation_failed
-// (ok=false) before any stage read, so the stage is untouched.
-func (s *Server) parseHostDispatchBody(w http.ResponseWriter, r *http.Request) (host, nonce string, ok bool) {
+// string, "capacity": integer} body. An absent or empty body, or an empty
+// host, yields concurrency.UnknownHost (a pre-change client sends no body); an
+// absent nonce yields ""; an absent or null capacity yields none. A malformed
+// body, an unknown key, a host longer than hostLabelMax or one outside
+// [A-Za-z0-9._-], a nonce longer than admissionNonceMax or outside
+// [A-Za-z0-9-], or a capacity that is not an integer in
+// 1..concurrency.MaxLimit answers 400 validation_failed (ok=false) before any
+// stage read, so the stage is untouched and no slot row is written. A
+// non-integer capacity (a string, a fraction, a boolean) is named as
+// details.field=capacity, not body.
+func (s *Server) parseHostDispatchBody(w http.ResponseWriter, r *http.Request) (req hostDispatchRequest, ok bool) {
+	none := hostDispatchRequest{host: concurrency.UnknownHost}
 	if r.Body == nil {
-		return concurrency.UnknownHost, "", true
+		return none, true
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hostDispatchBodyMax))
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			fmt.Sprintf("host-dispatch body must be at most %d bytes", hostDispatchBodyMax),
 			map[string]any{"field": "body"})
-		return "", "", false
+		return hostDispatchRequest{}, false
 	}
 	if strings.TrimSpace(string(raw)) == "" {
-		return concurrency.UnknownHost, "", true
+		return none, true
 	}
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	var body hostDispatchBody
 	if err := dec.Decode(&body); err != nil {
+		var ute *json.UnmarshalTypeError
+		if errors.As(err, &ute) && ute.Field == "capacity" {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				hostCapacityRangeMessage(),
+				map[string]any{"field": "capacity", "error": err.Error()})
+			return hostDispatchRequest{}, false
+		}
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			`host-dispatch body must be a JSON object {"host": string, "admission_nonce": string}`,
+			"host-dispatch body must be a JSON object "+hostDispatchBodyShape,
 			map[string]any{"field": "body", "error": err.Error()})
-		return "", "", false
+		return hostDispatchRequest{}, false
 	}
 	if body.AdmissionNonce != "" && !validAdmissionNonce(body.AdmissionNonce) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			fmt.Sprintf("admission_nonce must be 1..%d characters from [A-Za-z0-9-]", admissionNonceMax),
 			map[string]any{"field": "admission_nonce"})
-		return "", "", false
+		return hostDispatchRequest{}, false
 	}
+	if body.Capacity != nil && (*body.Capacity < 1 || *body.Capacity > concurrency.MaxLimit) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			hostCapacityRangeMessage(),
+			map[string]any{"field": "capacity"})
+		return hostDispatchRequest{}, false
+	}
+	req = hostDispatchRequest{host: body.Host, nonce: body.AdmissionNonce, capacity: body.Capacity}
 	if body.Host == "" {
-		return concurrency.UnknownHost, body.AdmissionNonce, true
+		req.host = concurrency.UnknownHost
+		return req, true
 	}
 	if !validHostLabel(body.Host) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			fmt.Sprintf("host must be 1..%d characters from [A-Za-z0-9._-]", hostLabelMax),
 			map[string]any{"field": "host"})
-		return "", "", false
+		return hostDispatchRequest{}, false
 	}
-	return body.Host, body.AdmissionNonce, true
+	return req, true
+}
+
+// hostCapacityRangeMessage is the 400 message for a capacity outside the
+// accepted range or of the wrong JSON type.
+func hostCapacityRangeMessage() string {
+	return fmt.Sprintf("capacity must be an integer in 1..%d (the host capacity for this request; omit it for the default %d)",
+		concurrency.MaxLimit, concurrency.DefaultHostCapacity)
 }
 
 func validAdmissionNonce(n string) bool {
@@ -152,59 +208,111 @@ func validHostLabel(h string) bool {
 }
 
 // resolveStageConcurrency returns the stage's concurrency group SET (ADR-094
-// D2), or grouped=false for an ungrouped stage. The spec stage is matched the
-// same way resolveAgentTimeout matches it (id == stage type, else type). A
-// declared `groups` list resolves through declaredGroupRequests. A declared
-// `concurrency` without a group joins the host default group with its
-// EffectiveLimit; a named group is repository-scoped. No declaration groups
-// implement stages in the host default group at limit 1 and leaves every
-// other stage type ungrouped (today's behaviour). An absent or unparseable
-// spec falls back to that same default — the restrictive direction — and a
-// parse failure logs a WARN. Every arm but the declared list yields exactly
-// one group, with the key and limit it resolved to before #4240.
+// D2, D4, D5 as amended by A2, #4241). Every stage that reaches the marker's
+// admission arm is grouped: the set is the stage type's DEFAULT set, plus
+// every declared group (add-only, deduplicated by key; a declared entry's
+// limit wins on a shared key), plus one slot of the host capacity group
+// host:<host>:capacity at capacityLimit (the request's declared capacity,
+// else concurrency.DefaultHostCapacity; nothing is stored, so the limit sizes
+// THIS admission only). Default sets, before the capacity group:
+//
+//   - implement: local-implement:<host> at DefaultLimit.
+//   - a merge-candidate verify pass: local-verify:<host> at
+//     DefaultVerifyLimit, and nothing declared (below).
+//   - plan, acceptance, an agent review and every other agent stage type:
+//     nothing, so the set is the capacity group alone.
+//
+// Declaration forms, each ADDED to the default set (ADR-094 Q5 supersedes
+// ADR-087's replace rule, and A2 supersedes A1 decision 5):
+//
+//   - {limit: N} declares local-implement:<host> at N: it resizes the
+//     implement default on an implement stage, and adds that group elsewhere.
+//   - {group: X, limit: N} adds the repository group spec:<repo>:X at N.
+//   - a `groups` list adds each entry through declaredGroupRequests.
+//
+// The spec stage is matched the same way resolveAgentTimeout matches it
+// (id == stage type, else type). An absent or unparseable spec declares
+// nothing, so the stage keeps its default set (a parse failure logs a WARN).
 //
 // ADR-092 D3 (#4200): an implement stage carrying a LIVE merge-candidate
-// verify trigger is a verify-only pass (no agent), so it resolves to the host
-// verify group local-verify:<host> at DefaultVerifyLimit BEFORE the declared
-// lookup — a spec-declared implement group or limit never captures a pass,
-// and a pass never queues behind full implements in local-implement:<host>.
-// No declared stage shares the pass's group: declaredGroupRequests refuses an
-// entry for local-verify:<host>. See isMergeCandidateVerifyPass for the
-// fallback on an unreadable trigger.
+// verify trigger is a verify-only pass (no agent), so it resolves to
+// {capacity, local-verify:<host>} BEFORE the declared lookup — a
+// spec-declared implement group or limit never captures a pass, and a pass
+// never queues behind full implements in local-implement:<host>. This
+// deliberately keeps ADR-092 D3's host verify group instead of D5's per-base
+// verify group (ADR-094 A2). No declared stage shares the pass's group:
+// declaredGroupRequests refuses an entry for local-verify:<host>. See
+// isMergeCandidateVerifyPass for the fallback on an unreadable trigger.
 //
-// A non-nil err (an entry with no canonical key, or one for the reserved host
-// verify group; both unreachable for a validated spec) fails closed: the
-// marker answers 500 and admits nothing.
-func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, stage *run.Stage, host string) (groups []concurrency.GroupRequest, grouped bool, err error) {
-	one := func(key string, limit int) ([]concurrency.GroupRequest, bool, error) {
-		return []concurrency.GroupRequest{{Key: key, Limit: limit}}, true, nil
-	}
+// A non-nil err (an entry with no canonical key, or one for a reserved host
+// group; both unreachable for a validated spec) fails closed: the marker
+// answers 500 and admits nothing.
+func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, stage *run.Stage, host string, capacityLimit int) ([]concurrency.GroupRequest, error) {
 	if s.isMergeCandidateVerifyPass(ctx, stage) {
-		return one(concurrency.VerifyGroupKey(host), concurrency.DefaultVerifyLimit)
+		return withHostCapacity([]concurrency.GroupRequest{{Key: concurrency.VerifyGroupKey(host), Limit: concurrency.DefaultVerifyLimit}}, host, capacityLimit), nil
+	}
+	var set []concurrency.GroupRequest
+	if stage.Type == run.StageTypeImplement {
+		set = []concurrency.GroupRequest{{Key: concurrency.DefaultGroupKey(host), Limit: concurrency.DefaultLimit}}
 	}
 	if decl, ok := s.declaredStageConcurrency(ctx, runRow, stage.Type); ok {
-		if len(decl.Groups) > 0 {
-			groups, err := declaredGroupRequests(decl, runRow.Repo, host)
-			if err != nil {
-				return nil, false, err
-			}
-			return groups, true, nil
+		declared, err := declaredStageGroups(decl, runRow.Repo, host)
+		if err != nil {
+			return nil, err
 		}
-		if decl.Group == "" {
-			return one(concurrency.DefaultGroupKey(host), decl.EffectiveLimit())
-		}
-		return one(concurrency.NamedGroupKey(runRow.Repo, decl.Group), decl.EffectiveLimit())
+		set = unionGroupRequests(set, declared)
 	}
-	if stage.Type == run.StageTypeImplement {
-		return one(concurrency.DefaultGroupKey(host), concurrency.DefaultLimit)
-	}
-	return nil, false, nil
+	return withHostCapacity(set, host, capacityLimit), nil
 }
 
-// hostScopedGroupLimit is the slot count of a NON-legacy host-scoped group
-// (e.g. host:<h>:preview-target). A host-scoped group is shared by every
-// repository on the host, so no repository's spec may size it (approval
-// condition H1); host-declared capacity is ADR-094 slice 3's (#4241).
+// declaredStageGroups maps one declaration form onto its group requests: the
+// `groups` list through declaredGroupRequests, the named shorthand onto its
+// repository group, and the bare {limit: N} onto the host implement group.
+func declaredStageGroups(decl *spec.StageConcurrency, repo, host string) ([]concurrency.GroupRequest, error) {
+	switch {
+	case len(decl.Groups) > 0:
+		return declaredGroupRequests(decl, repo, host)
+	case decl.Group == "":
+		return []concurrency.GroupRequest{{Key: concurrency.DefaultGroupKey(host), Limit: decl.EffectiveLimit()}}, nil
+	default:
+		return []concurrency.GroupRequest{{Key: concurrency.NamedGroupKey(repo, decl.Group), Limit: decl.EffectiveLimit()}}, nil
+	}
+}
+
+// unionGroupRequests returns base plus every add entry, deduplicated by key:
+// an add entry whose key base already holds replaces that entry's limit in
+// place, so {limit: N} resizes an implement stage's default group.
+func unionGroupRequests(base, add []concurrency.GroupRequest) []concurrency.GroupRequest {
+	out := append([]concurrency.GroupRequest(nil), base...)
+	for _, g := range add {
+		i := slices.IndexFunc(out, func(o concurrency.GroupRequest) bool { return o.Key == g.Key })
+		if i >= 0 {
+			out[i].Limit = g.Limit
+			continue
+		}
+		out = append(out, g)
+	}
+	return out
+}
+
+// withHostCapacity adds the host capacity group host:<host>:capacity at limit
+// to set (ADR-094 D4): every stage that reaches the marker's admission arm
+// holds one capacity slot. The capacity group is exempt from the store's FIFO
+// rule (b) and admits on ADR-087's reservation formula alone: holders plus
+// earlier live waiters below the limit, so each earlier waiter reserves one
+// slot even while it is blocked only on another group. At capacity 3, two
+// holding implements and one implement queued on local-implement:<host> fill
+// capacity, and a later plan, acceptance or verify pass queues; at capacity 4
+// one slot stays free (concurrency README § "Host capacity group").
+func withHostCapacity(set []concurrency.GroupRequest, host string, limit int) []concurrency.GroupRequest {
+	return unionGroupRequests(set, []concurrency.GroupRequest{{Key: concurrency.CapacityGroupKey(host), Limit: limit}})
+}
+
+// hostScopedGroupLimit is the slot count of a NON-legacy, non-capacity
+// host-scoped group (e.g. the built-in host:<h>:preview-target). A
+// host-scoped group is shared by every repository on the host, so no
+// repository's spec may size it (approval condition H1); the host operator
+// sizes only the capacity group, through FISHHAWK_HOST_CAPACITY.
 const hostScopedGroupLimit = 1
 
 // declaredGroupRequests maps a declared `groups` list onto the store's group
@@ -216,20 +324,30 @@ const hostScopedGroupLimit = 1
 // reads its own Limit, unconditionally, so a stored spec (one captured under
 // an older validator, or decoded around validation) can never size a group
 // shared with other repositories: the entry canonicalising to
-// local-implement:<host> takes DefaultLimit, and every other host entry takes
-// hostScopedGroupLimit. A scope other than host or repository, or an identity
-// ScopedGroupKey refuses, answers an error and no set.
+// local-implement:<host> takes DefaultLimit, and every other host entry
+// (preview-target included) takes hostScopedGroupLimit. A scope other than
+// host or repository, or an identity ScopedGroupKey refuses, answers an error
+// and no set.
 //
-// An entry canonicalising to concurrency.VerifyGroupKey(host) also answers an
-// error and no set: local-verify:<host> is reserved for server-decided
-// merge-candidate verify passes and specialist jobs (ADR-094 A1 decision 6).
-// Both validators refuse {verify, host}, and spec.ParseBytes runs the
-// backend's, so a captured spec carrying it takes the unparseable-spec
-// fallback; this refusal keeps a declaration that skipped validation out of
-// that group too.
+// Two host groups are reserved, and an entry for either answers an error and
+// no set. An entry whose CANONICAL identity, its scope and name trimmed and
+// lowercased, is the host capacity group concurrency.CapacityGroupKey(host):
+// the server adds that group to every set at the request's capacity, so no
+// spec may declare or size it (ADR-094 A2). The fold is defence in depth for
+// a declaration built in Go: the schema pattern already refuses a case or
+// whitespace variant at parse time. And an entry canonicalising to
+// concurrency.VerifyGroupKey(host): local-verify:<host> is reserved for
+// server-decided merge-candidate verify passes and specialist jobs (ADR-094
+// A1 decision 6). Both validators refuse both entries, and spec.ParseBytes
+// runs the backend's, so a captured spec carrying one takes the
+// unparseable-spec fallback; these refusals keep a declaration that skipped
+// validation out of those groups too.
 func declaredGroupRequests(decl *spec.StageConcurrency, repo, host string) ([]concurrency.GroupRequest, error) {
 	out := make([]concurrency.GroupRequest, 0, len(decl.Groups))
 	for i, e := range decl.Groups {
+		if isHostCapacityEntry(e, host) {
+			return nil, fmt.Errorf("concurrency.groups[%d]: %s is reserved: the host capacity group is added to every host-dispatched stage's set and sized by the host operator", i, concurrency.CapacityGroupKey(host))
+		}
 		var scopeID string
 		switch e.Scope {
 		case spec.ConcurrencyScopeHost:
@@ -258,6 +376,15 @@ func declaredGroupRequests(decl *spec.StageConcurrency, repo, host string) ([]co
 		out = append(out, concurrency.GroupRequest{Key: key, Limit: limit})
 	}
 	return out, nil
+}
+
+// isHostCapacityEntry reports whether e's canonical identity — its scope and
+// group name trimmed and lowercased — is the host capacity group of host.
+func isHostCapacityEntry(e spec.StageConcurrencyGroup, host string) bool {
+	scope := strings.ToLower(strings.TrimSpace(e.Scope))
+	name := strings.ToLower(strings.TrimSpace(e.Group))
+	key, err := concurrency.ScopedGroupKey(concurrency.Scope(scope), host, name)
+	return err == nil && key == concurrency.CapacityGroupKey(host)
 }
 
 // isMergeCandidateVerifyPass reports whether the runner fetching this stage's
@@ -372,7 +499,8 @@ func wireScope(gs concurrency.GroupState) string {
 
 // admissionGroups is adm's per-group view, never empty: a store that left
 // Groups empty (a fake, or a pre-#4240 store) is read as ONE group, the
-// canonical-first requested group carrying the top-level Position and
+// requested set's binding group (the first non-capacity group in canonical
+// order, concurrency.BindingIndex) carrying the top-level Position and
 // Holders (R7).
 func admissionGroups(adm concurrency.Admission, req []concurrency.GroupRequest) []concurrency.GroupState {
 	if len(adm.Groups) > 0 {
@@ -380,33 +508,25 @@ func admissionGroups(adm concurrency.Admission, req []concurrency.GroupRequest) 
 	}
 	g := concurrency.GroupState{Position: adm.Position, Holders: adm.Holders}
 	if len(req) > 0 {
-		first := req[0]
-		for _, r := range req[1:] {
-			if r.Key < first.Key {
-				first = r
-			}
+		states := make([]concurrency.GroupState, len(req))
+		for i, r := range req {
+			states[i] = concurrency.GroupState{Key: r.Key, Limit: r.Limit}
 		}
+		first := states[concurrency.BindingIndex(states, false)]
 		g.Key, g.Limit = first.Key, first.Limit
 	}
 	return []concurrency.GroupState{g}
 }
 
-// bindingGroup picks the group the top-level wire fields describe (the
-// concurrency.Admission rule): once admitted, the first group in canonical
-// order; while queued, the highest position, ties broken in canonical order.
-// groups is non-empty (admissionGroups).
+// bindingGroup picks the group the top-level wire fields describe, by the
+// store's own rule (concurrency.BindingIndex): once admitted, the first
+// non-capacity group in canonical order; while queued, the highest position,
+// ties preferring a non-capacity group, then canonical order. So the host
+// capacity group binds only when it alone is strictly highest while queued,
+// or is the set's only group, and a pre-#4240 client keeps reading the
+// stage-type group. groups is non-empty (admissionGroups).
 func bindingGroup(groups []concurrency.GroupState, admitted bool) concurrency.GroupState {
-	sorted := append([]concurrency.GroupState(nil), groups...)
-	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
-	b := sorted[0]
-	if !admitted {
-		for _, g := range sorted[1:] {
-			if g.Position > b.Position {
-				b = g
-			}
-		}
-	}
-	return b
+	return groups[concurrency.BindingIndex(groups, !admitted)]
 }
 
 func toConcurrencyGroupRefs(groups []concurrency.GroupState) []concurrencyGroupRef {
@@ -430,8 +550,9 @@ func toConcurrencyGroupStates(groups []concurrency.GroupState, queued bool) []co
 }
 
 // hostDispatchConcurrency is the 200 marker body's `concurrency` block for a
-// grouped admission. Group and Limit describe the BINDING group (the first in
-// canonical order), retained for pre-#4240 clients; Groups lists the whole
+// grouped admission. Group and Limit describe the BINDING group (bindingGroup:
+// the first non-capacity group in canonical order), retained for pre-#4240
+// clients; Groups lists the whole
 // set. AdmissionNonce echoes the request's nonce (omitted when it carried
 // none).
 type hostDispatchConcurrency struct {
@@ -459,7 +580,7 @@ func toHostDispatchConcurrency(adm concurrency.Admission, req []concurrency.Grou
 
 // stageConcurrency is the Stage `concurrency` block (docs/api/v0.openapi.yaml
 // StageConcurrency): the stage's ACTIVE slot state. Absent for a stage with no
-// active slot row (ungrouped, settled, parked, bypassed).
+// active slot row (never marked, settled, parked, bypassed).
 type stageConcurrency struct {
 	// Status is awaiting_concurrency_slot (queued) or holding.
 	Status string `json:"status"`
@@ -554,7 +675,8 @@ func (s *Server) writeConcurrencySlotQueued(w http.ResponseWriter, r *http.Reque
 }
 
 // concurrencyQueuedDetails builds the 409 details: every pre-#4240 field,
-// describing the binding group (highest position, ties in canonical order),
+// describing the binding group (bindingGroup: highest position, ties
+// preferring a non-capacity group, then canonical order),
 // plus `groups` listing the whole set. It returns the binding group too; the
 // top-level position and holders are the binding group's, so they stay
 // consistent with `group` after an auto-promote rewrote the set's positions.

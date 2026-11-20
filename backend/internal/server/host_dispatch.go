@@ -73,7 +73,9 @@ const hostDispatchHoldRetry = "re-dispatch once the ops monitor clears the condi
 //
 // Concurrency (#3964 / ADR-087) is present only on a GROUPED admission (the
 // stage took a concurrency slot): its group, limit, and whether/how long it
-// queued first. Omitted on the ungrouped, nil-store and idempotent arms.
+// queued first. With a slot store wired every stage on the admitting arm is
+// grouped (it holds a host capacity slot, ADR-094 D4 / #4241), so it is
+// omitted only on the nil-store and idempotent arms.
 type hostDispatchResponse struct {
 	Transitioned bool                     `json:"transitioned"`
 	StageState   string                   `json:"stage_state"`
@@ -97,11 +99,14 @@ type hostDispatchResponse struct {
 //     'pending' until trace time (the local first-stage semantics, #1030) —
 //     marking it here stamps the spawn signal at spawn time.
 //
-// Concurrency groups (#3964 / ADR-087): with Config.Concurrency wired, a
-// GROUPED stage (every local implement stage by default, or a spec-declared
-// `concurrency` group) takes that CAS only when its group has a free slot;
-// otherwise it is QUEUED — 409 concurrency_slot_queued, the stage left
-// untouched at awaiting_host_dispatch. See stage_concurrency.go.
+// Concurrency groups (#3964 / ADR-087, ADR-094 D4/D5 / #4241): with
+// Config.Concurrency wired, EVERY stage on the admitting arm is grouped: it
+// holds one slot of host:<host>:capacity (the request's declared capacity,
+// default 3) plus its type's default groups (local-implement:<host> for an
+// implement, local-verify:<host> for a merge-candidate verify pass) plus any
+// spec-declared groups. It takes that CAS only when every group of its set
+// has a free slot; otherwise it is QUEUED — 409 concurrency_slot_queued, the
+// stage left untouched at awaiting_host_dispatch. See stage_concurrency.go.
 //
 // Idempotent: a stage already 'dispatched' returns 200 {transitioned:false} — a
 // spawned runner died and the operator is re-dispatching, which the caller
@@ -251,18 +256,20 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Optional {"host", "admission_nonce"} body (#3964): the client's host
-	// label keys the default concurrency group, and a slot waiter's nonce is
-	// recorded on the slot it is admitted to. Parsed only when a slot store is
+	// Optional {"host", "admission_nonce", "capacity"} body (#3964, #4241):
+	// the client's host label keys the host groups, a slot waiter's nonce is
+	// recorded on the slot it is admitted to, and the declared capacity sizes
+	// this request's host capacity group. Parsed only when a slot store is
 	// wired (a nil store keeps today's body-ignoring marker byte-identical),
-	// after the auth ladder and the id parse, and before any stage read — a
-	// 400 leaves the stage untouched.
-	host, nonce := concurrency.UnknownHost, ""
+	// after the dev-mode refusal, the auth ladder and the id parse, and
+	// before any stage read — a 400 leaves the stage untouched.
+	body := hostDispatchRequest{host: concurrency.UnknownHost}
 	if s.cfg.Concurrency != nil {
-		if host, nonce, ok = s.parseHostDispatchBody(w, r); !ok {
+		if body, ok = s.parseHostDispatchBody(w, r); !ok {
 			return
 		}
 	}
+	host, nonce := body.host, body.nonce
 
 	// Fence against a concurrent acceptance-admission short-circuit walk (#1936).
 	// When an orchestrator is wired, acquire the SAME per-stage admission lock
@@ -609,11 +616,17 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	from := stage.State
 	var updated *run.Stage
 	var slot *hostDispatchConcurrency
+	//
+	// Every stage that reaches this arm with a slot store wired is grouped
+	// (ADR-094 D4/D5, #4241): it holds one slot of host:<host>:capacity,
+	// sized by THIS request's declared capacity (else
+	// concurrency.DefaultHostCapacity) and used for this Admit call only.
 	var groups []concurrency.GroupRequest
 	grouped := false
 	if s.cfg.Concurrency != nil {
 		var rerr error
-		groups, grouped, rerr = s.resolveStageConcurrency(r.Context(), runRow, stage, host)
+		groups, rerr = s.resolveStageConcurrency(r.Context(), runRow, stage, host, body.capacityLimit())
+		grouped = true
 		if rerr != nil {
 			// Unreachable for a validated spec (ADR-094 A1 keys admit no ':'
 			// in a host label, repository or group name). Fail closed: no
