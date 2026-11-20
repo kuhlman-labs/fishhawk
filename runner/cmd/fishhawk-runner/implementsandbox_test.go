@@ -270,6 +270,7 @@ func TestRun_ImplementSpawnCarriesSignalSandboxWrapper(t *testing.T) {
 	})
 
 	t.Run("fix-up resume", func(t *testing.T) {
+		enableFixupResume(t)
 		implementEnv(t, "kuhlman-labs/fishhawk", "main")
 		withImplementSignalProbe(t, true, "")
 		const runID = "48580003-0000-4000-8000-000000000001"
@@ -292,6 +293,7 @@ func TestRun_ImplementSpawnCarriesSignalSandboxWrapper(t *testing.T) {
 	})
 
 	t.Run("resume-failed fallback", func(t *testing.T) {
+		enableFixupResume(t)
 		implementEnv(t, "kuhlman-labs/fishhawk", "main")
 		withImplementSignalProbe(t, true, "")
 		const runID = "48580004-0000-4000-8000-000000000001"
