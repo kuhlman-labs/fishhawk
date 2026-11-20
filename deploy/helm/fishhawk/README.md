@@ -80,7 +80,18 @@ byte-identical body and works against either. On the upgraded daemon every
 host-dispatched stage also holds one `host:<host>:capacity` slot (default 3):
 a host running implement limit 2 should set `FISHHAWK_HOST_CAPACITY=4`,
 because a queued implement reserves one capacity slot and at 3 it would queue
-later plan, acceptance and verify stages. To roll back, unset
+later plan, acceptance and verify stages. **The upgrade also re-queues every
+live waiter.** On its first poll after the upgrade each queued stage asks for
+a larger set: it gains `host:<host>:capacity`, and an implement whose
+declaration did not name the host implement group (the named
+`{group, limit}` shorthand, or a `groups` list without
+`{group: implement, scope: host}`) also gains `local-implement:<host>`. A set
+that differs restarts at the queue tail and clears its `order_key`, so
+waiters re-queue in the order they next poll and lose any operator promotion:
+re-run `fishhawk_promote_queued_stage` after the upgrade. Stages admitted
+before the upgrade hold no capacity row (nor, for such an implement, a
+`local-implement:<host>` row), so capacity under-counts until they settle.
+To roll back, unset
 `FISHHAWK_HOST_CAPACITY` in every MCP and host-dispatcher env FIRST, then
 revert the binary. A reverted binary never names the capacity group, so held
 capacity rows count for nothing, and a queued stage whose set changed restarts

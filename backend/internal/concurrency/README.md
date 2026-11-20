@@ -363,6 +363,13 @@ group: implements queue FIFO behind an earlier multi-group implement on
 `local-implement:<host>`, verify passes on `local-verify:<host>`, and stages
 sharing a spec-declared group on that group.
 
+**Upgrade.** On its first poll after the upgrade, every live queued waiter
+asks for a larger set (it gains `host:<label>:capacity`, and an implement
+whose declaration did not name `local-implement:<host>` gains that too), so
+the set-change rule restarts it at the tail and clears its `order_key`: an
+operator promotion is lost and must be re-applied. Stages admitted before the
+upgrade hold no capacity row, so capacity under-counts until they settle.
+
 **Rollback.** No migration: capacity rows are ordinary
 `stage_concurrency_slots` rows. A reverted binary never names the capacity
 group, so held capacity rows count for nobody, and a queued stage whose set

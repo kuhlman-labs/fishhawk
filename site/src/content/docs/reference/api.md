@@ -214,8 +214,8 @@ capacity limit applies to one request: the optional body field `capacity`
 (1 to 64), which the MCP server sends from `FISHHAWK_HOST_CAPACITY`, and 3
 when it is absent. Nothing is stored, so set the variable to the same value
 in every process that dispatches for the host. A queued stage reserves one
-capacity slot without making later stages wait behind it, so capacity blocks
-only when holders plus earlier reservations fill it. At capacity 3, two
+capacity slot; later stages queue only when holders plus earlier
+reservations fill capacity. At capacity 3, two
 running implements and one queued implement fill it, and a later plan,
 acceptance or verify pass queues; at capacity 4 one slot stays free. A
 queued stage gets 409 `concurrency_slot_queued` and keeps its state. A

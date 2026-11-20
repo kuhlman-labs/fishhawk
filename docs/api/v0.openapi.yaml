@@ -19870,12 +19870,11 @@ paths:
         once or queued in all of them (no partial hold), FIFO per group
         except that the capacity group is exempt from the multi-group FIFO
         rule: it admits on holders plus earlier live waiters below the limit
-        alone, so a queued stage reserves one capacity slot but never makes a
-        later stage wait behind it on capacity. It blocks only when holders
-        plus earlier reservations fill capacity: at capacity 3, two holding
-        implements and one implement queued on `local-implement:<host>` fill
-        it, and a later plan, acceptance or verify pass queues; at capacity
-        4 one slot stays free. The 200 block, the 409 details and both audit
+        alone. A queued stage reserves one capacity slot; later stages queue
+        only when holders plus earlier reservations fill capacity. At
+        capacity 3, two holding implements and one implement queued on
+        `local-implement:<host>` fill capacity, and a later plan, acceptance
+        or verify pass queues; at capacity 4 one slot stays free. The 200 block, the 409 details and both audit
         rows list the set as `groups`; their top-level group fields describe
         the binding group (a non-capacity group whenever the set has one). On the `pending|awaiting_host_dispatch` arm a
         grouped stage is either ADMITTED (the same CAS to `dispatched`, plus a
