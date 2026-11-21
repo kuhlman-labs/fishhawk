@@ -895,3 +895,474 @@ func hdoWireState(t *testing.T, wire string, path ...any) string {
 	s, _ := v.(string)
 	return s
 }
+
+// --- #5298: the implement review round hold on an acceptance stage. ---
+
+// The literals the server's campaign awaiting block uses for system work in
+// flight (backend/internal/server/campaign_item_awaiting.go awaitingKindSystem
+// and awaitingReasonInFlight). The tests assert these literals, not the
+// overlay's own constants, so a drift on either side reads RED.
+const (
+	hdoServerKindSystem     = "system"
+	hdoServerReasonInFlight = "in_flight"
+)
+
+// TestObserveHostDispatch_ReviewRoundRefusals pins the run_refusals arm for
+// the two round-hold codes: waiting, system/in_flight, the refusal carried,
+// the routine "no operator action" text up to 30 minutes and the orphan text
+// (fishhawk_get_run_status, fishhawk_rerun_review) past it; the daily cap
+// still outranks the hold.
+func TestObserveHostDispatch_ReviewRoundRefusals(t *testing.T) {
+	runID, stageID := uuid.NewString(), uuid.NewString()
+	const noAction = "no operator action is needed"
+	probe := func(code string, age time.Duration, mut func(*HostDispatcherStatus)) hostDispatchProbe {
+		st := hdoStatus()
+		st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: stageID, Code: code,
+			Detail: "round detail", FirstAt: hdoNow.Add(-age), LastAt: hdoNow.Add(-10 * time.Second)}}
+		if mut != nil {
+			mut(&st)
+		}
+		return hostDispatchProbe{found: true, dir: "/state", st: st}
+	}
+	for _, tc := range []struct {
+		name       string
+		p          hostDispatchProbe
+		kind       string
+		reason     string
+		state      string
+		contains   []string
+		notContain []string
+	}{
+		{name: "in_flight at 10m", p: probe(hdRefuseImplementReviewInFlight, 10*time.Minute, nil),
+			kind: hdoServerKindSystem, reason: hdoServerReasonInFlight, state: hostDispatchStateWaiting,
+			contains: []string{"implement_review_in_flight", "first tick after the round settles", noAction}},
+		{name: "not_started at 10m", p: probe(hdRefuseImplementReviewNotStarted, 10*time.Minute, nil),
+			kind: hdoServerKindSystem, reason: hdoServerReasonInFlight, state: hostDispatchStateWaiting,
+			contains: []string{"implement_review_not_started", "no round is recorded for the implement stage's current head", noAction}},
+		{name: "in_flight at exactly 30m is still routine", p: probe(hdRefuseImplementReviewInFlight, 30*time.Minute, nil),
+			kind: hdoServerKindSystem, reason: hdoServerReasonInFlight, state: hostDispatchStateWaiting,
+			contains: []string{noAction}, notContain: []string{"fishhawk_rerun_review"}},
+		{name: "in_flight at 31m reads orphaned", p: probe(hdRefuseImplementReviewInFlight, 31*time.Minute, nil),
+			kind: hdoServerKindSystem, reason: hdoServerReasonInFlight, state: hostDispatchStateWaiting,
+			contains:   []string{"fishhawk_rerun_review", "fishhawk_get_run_status", "may be orphaned", "since " + hdoNow.Add(-31*time.Minute).Format(time.RFC3339)},
+			notContain: []string{noAction}},
+		{name: "not_started at 31m reads orphaned", p: probe(hdRefuseImplementReviewNotStarted, 31*time.Minute, nil),
+			kind: hdoServerKindSystem, reason: hdoServerReasonInFlight, state: hostDispatchStateWaiting,
+			contains:   []string{"fishhawk_rerun_review", "fishhawk_get_run_status", "consolidated round", "implement_review_not_started"},
+			notContain: []string{noAction}},
+		{name: "daily cap outranks an in_flight entry", p: probe(hdRefuseImplementReviewInFlight, 10*time.Minute, func(s *HostDispatcherStatus) { s.DailyCap, s.SpawnsToday = 2, 2 }),
+			kind: "human", reason: hostDispatchReasonCapped, state: hostDispatchStateCapped, notContain: []string{noAction}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			obs, v := observeHostDispatch(tc.p, runID, stageID, hdoNow)
+			if v.Kind != tc.kind || v.Reason != tc.reason || obs.State != tc.state {
+				t.Fatalf("verdict %s/%s state %q; want %s/%s state %q (next_step %q)", v.Kind, v.Reason, obs.State, tc.kind, tc.reason, tc.state, v.NextStep)
+			}
+			if tc.state == hostDispatchStateWaiting && (obs.RefusalCode != tc.p.st.RunRefusals[runID].Code || obs.RefusalStageID != stageID) {
+				t.Errorf("refusal %q stage %q; want the entry's code and stage carried", obs.RefusalCode, obs.RefusalStageID)
+			}
+			hdoContainsAll(t, "next_step", v.NextStep, tc.contains...)
+			hdoContainsNone(t, "next_step", v.NextStep, tc.notContain...)
+		})
+	}
+}
+
+// hdoRoundRun seeds a feature_change run at acceptance on the shared fake
+// backend: plan and implement succeeded (implement review_agents_configured
+// configured), acceptance awaiting_host_dispatch, review pending. round is
+// "pending" (started, no verdicts), "settled" (started plus two verdicts) or
+// "none" (no round recorded). It returns the run and acceptance stage ids.
+func hdoRoundRun(fb *fakeBackend, configured int, round, workingDir string) (uuid.UUID, uuid.UUID) {
+	runID, planID, implID, accID, revID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	n := configured
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local", AutoDispatch: true, WorkingDir: workingDir}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planID.String(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: implID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded", ReviewAgentsConfigured: &n},
+		{ID: accID.String(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+		{ID: revID.String(), RunID: runID.String(), Sequence: 4, Type: "review", State: "pending"},
+	}
+	fb.mu.Unlock()
+	switch round {
+	case "pending":
+		seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	case "settled":
+		seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+		seedImplementReviewedAudit(fb, runID, implID, 0)
+		seedImplementReviewedAudit(fb, runID, implID, 1)
+	}
+	return runID, accID
+}
+
+func hdoAcceptanceItem(runID, stageID uuid.UUID) CampaignItem {
+	it := hdoItem(runID.String(), stageID.String())
+	it.Awaiting.StageType = "acceptance"
+	return it
+}
+
+// hdoRoundReads is the number of stage and per-run audit reads the fake saw
+// for runID.
+func hdoRoundReads(fb *fakeBackend, runID uuid.UUID) (stages int, audit bool) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	_, audit = fb.perRunAuditLastQueryByID[runID]
+	return fb.stagesCalledByID[runID], audit
+}
+
+// hdoRoundResolver is an enabled overlay resolver over the shared fake
+// backend, with the dispatcher status at dir (the exclusive env rung) unless
+// dir is "".
+func hdoRoundResolver(t *testing.T, srv *httptest.Server, dir, cwd string) *runResolver {
+	t.Helper()
+	env := map[string]string{}
+	if dir != "" {
+		env[hostDispatchStateDirEnv] = dir
+	}
+	r := hdoResolver(env, cwd, nil)
+	r.api = newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"})
+	return r
+}
+
+// TestOverlayCampaignHostDispatch_PreTickAcceptanceRoundHold pins the V2
+// pre-tick round check: with no run_refusals entry yet, an acceptance item
+// whose round is in flight or expected-but-unrecorded reads system/in_flight
+// (host_dispatch state live attached), a settled round leaves the backend's
+// block, and the check skips non-acceptance items, human verdicts and an
+// existing round-code entry.
+func TestOverlayCampaignHostDispatch_PreTickAcceptanceRoundHold(t *testing.T) {
+	const noAction = "no operator action is needed"
+	run := func(t *testing.T, mut func(*HostDispatcherStatus), items func(fb *fakeBackend) ([]CampaignItem, uuid.UUID)) (*campaignItemAwaiting, *fakeBackend, uuid.UUID) {
+		t.Helper()
+		hdoEmptyTMPDIR(t)
+		fb, srv := newFakeBackend(t)
+		st := hdoStatus()
+		its, runID := items(fb)
+		if mut != nil {
+			mut(&st)
+		}
+		dir := filepath.Join(t.TempDir(), "state")
+		hdoWrite(t, dir, st)
+		hdoRoundResolver(t, srv, dir, t.TempDir()).overlayCampaignHostDispatch(context.Background(), its)
+		if its[0].Awaiting.HostDispatch == nil {
+			t.Fatalf("no host_dispatch block on %+v", its[0].Awaiting)
+		}
+		return its[0].Awaiting, fb, runID
+	}
+	acceptance := func(configured int, round string) func(fb *fakeBackend) ([]CampaignItem, uuid.UUID) {
+		return func(fb *fakeBackend) ([]CampaignItem, uuid.UUID) {
+			runID, accID := hdoRoundRun(fb, configured, round, "")
+			return []CampaignItem{hdoAcceptanceItem(runID, accID)}, runID
+		}
+	}
+
+	t.Run("round in flight reads system/in_flight before the first tick", func(t *testing.T) {
+		blk, _, _ := run(t, nil, acceptance(2, "pending"))
+		if blk.Kind != hdoServerKindSystem || blk.Reason != hdoServerReasonInFlight || blk.HostDispatch.State != hostDispatchStateLive {
+			t.Fatalf("awaiting = %s/%s state %q; want system/in_flight with state live (next_step %q)", blk.Kind, blk.Reason, blk.HostDispatch.State, blk.NextStep)
+		}
+		hdoContainsAll(t, "next_step", blk.NextStep, "implement_review_in_flight", noAction)
+		hdoContainsAll(t, "detail", blk.HostDispatch.Detail, "implement_review_in_flight")
+	})
+	t.Run("round expected but not started reads system/in_flight", func(t *testing.T) {
+		blk, _, _ := run(t, nil, acceptance(2, "none"))
+		if blk.Kind != hdoServerKindSystem || blk.Reason != hdoServerReasonInFlight || blk.HostDispatch.State != hostDispatchStateLive {
+			t.Fatalf("awaiting = %s/%s state %q; want system/in_flight", blk.Kind, blk.Reason, blk.HostDispatch.State)
+		}
+		hdoContainsAll(t, "next_step", blk.NextStep, "implement_review_not_started")
+	})
+	t.Run("round settled stays host_dispatcher/host_dispatch", func(t *testing.T) {
+		blk, fb, runID := run(t, nil, acceptance(2, "settled"))
+		if blk.Kind != hostDispatchAwaitKind || blk.Reason != hostDispatchReasonDispatch || blk.NextStep != hdoBackendNext || blk.HostDispatch.State != hostDispatchStateLive {
+			t.Fatalf("awaiting = %s/%s state %q next_step %q; want the backend's block, live", blk.Kind, blk.Reason, blk.HostDispatch.State, blk.NextStep)
+		}
+		if n, audit := hdoRoundReads(fb, runID); n != 1 || !audit {
+			t.Fatalf("stage reads %d, audit read %v; want the round actually read", n, audit)
+		}
+	})
+	t.Run("no reviewers configured and no round stays host_dispatcher", func(t *testing.T) {
+		blk, _, _ := run(t, nil, acceptance(0, "none"))
+		if blk.Kind != hostDispatchAwaitKind || blk.Reason != hostDispatchReasonDispatch {
+			t.Fatalf("awaiting = %s/%s; want host_dispatcher/host_dispatch", blk.Kind, blk.Reason)
+		}
+	})
+	t.Run("an implement-stage item is not checked", func(t *testing.T) {
+		blk, fb, runID := run(t, nil, func(fb *fakeBackend) ([]CampaignItem, uuid.UUID) {
+			runID, _ := hdoRoundRun(fb, 2, "pending", "")
+			return []CampaignItem{hdoItem(runID.String(), uuid.NewString())}, runID
+		})
+		if blk.Kind != hostDispatchAwaitKind || blk.Reason != hostDispatchReasonDispatch {
+			t.Fatalf("awaiting = %s/%s; want host_dispatcher/host_dispatch", blk.Kind, blk.Reason)
+		}
+		if n, audit := hdoRoundReads(fb, runID); n != 0 || audit {
+			t.Fatalf("stage reads %d, audit read %v; want no round read for an implement item", n, audit)
+		}
+	})
+	t.Run("a paused dispatcher keeps human/host_dispatch_paused", func(t *testing.T) {
+		blk, fb, runID := run(t, func(s *HostDispatcherStatus) { s.Paused = true }, acceptance(2, "pending"))
+		if blk.Kind != "human" || blk.Reason != hostDispatchReasonPaused {
+			t.Fatalf("awaiting = %s/%s; want human/host_dispatch_paused", blk.Kind, blk.Reason)
+		}
+		if n, audit := hdoRoundReads(fb, runID); n != 0 || audit {
+			t.Fatalf("stage reads %d, audit read %v; want no round read under a human verdict", n, audit)
+		}
+	})
+}
+
+// TestOverlayCampaignHostDispatch_PreTickWaitingAndEntryCodes pins the two
+// waiting arms of the check's condition: an entry on a non-round waiting code
+// is checked (and rewritten on a hold), while an existing round-code entry is
+// not re-checked (it already reads system/in_flight, with zero round reads).
+func TestOverlayCampaignHostDispatch_PreTickWaitingAndEntryCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		code      string
+		round     string
+		wantKind  string
+		wantReads int
+	}{
+		{name: "concurrency_slot_queued entry, round pending", code: hdRefuseSlotQueued, round: "pending", wantKind: hdoServerKindSystem, wantReads: 1},
+		{name: "concurrency_slot_queued entry, round settled", code: hdRefuseSlotQueued, round: "settled", wantKind: hostDispatchAwaitKind, wantReads: 1},
+		{name: "implement_review_in_flight entry, round settled", code: hdRefuseImplementReviewInFlight, round: "settled", wantKind: hdoServerKindSystem, wantReads: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			fb, srv := newFakeBackend(t)
+			runID, accID := hdoRoundRun(fb, 2, tc.round, "")
+			st := hdoStatus()
+			st.RunRefusals = map[string]hostDispatchRunRefusal{runID.String(): {RunID: runID.String(), StageID: accID.String(), Code: tc.code,
+				FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow.Add(-10 * time.Second)}}
+			dir := filepath.Join(t.TempDir(), "state")
+			hdoWrite(t, dir, st)
+			items := []CampaignItem{hdoAcceptanceItem(runID, accID)}
+			hdoRoundResolver(t, srv, dir, t.TempDir()).overlayCampaignHostDispatch(context.Background(), items)
+			blk := items[0].Awaiting
+			if blk.Kind != tc.wantKind || blk.HostDispatch.State != hostDispatchStateWaiting || blk.HostDispatch.RefusalCode != tc.code {
+				t.Fatalf("awaiting kind %q state %q refusal %q; want kind %q, waiting on %s (next_step %q)", blk.Kind, blk.HostDispatch.State, blk.HostDispatch.RefusalCode, tc.wantKind, tc.code, blk.NextStep)
+			}
+			if n, _ := hdoRoundReads(fb, runID); n != tc.wantReads {
+				t.Fatalf("stage reads = %d; want %d", n, tc.wantReads)
+			}
+		})
+	}
+}
+
+// TestOverlayCampaignHostDispatch_RoundCheckReadCap pins the shared read
+// budget: under the call rung, 17 distinct acceptance runs spend 16 round
+// checks and the 17th reads unverified with no read for its run; under the
+// per-run rungs (W4), GetRun reads that exhaust the cap leave every round
+// check unread, so each acceptance item reads unverified, never live.
+func TestOverlayCampaignHostDispatch_RoundCheckReadCap(t *testing.T) {
+	const capText = "its implement review round was not read: the overlay's read cap of 16 reached"
+	t.Run("call rung: the 17th item is unverified and unread", func(t *testing.T) {
+		hdoEmptyTMPDIR(t)
+		fb, srv := newFakeBackend(t)
+		items := make([]CampaignItem, 17)
+		runs := make([]uuid.UUID, 17)
+		for i := range items {
+			runID, accID := hdoRoundRun(fb, 2, "pending", "")
+			runs[i], items[i] = runID, hdoAcceptanceItem(runID, accID)
+		}
+		dir := filepath.Join(t.TempDir(), "state")
+		hdoWrite(t, dir, hdoStatus())
+		hdoRoundResolver(t, srv, dir, t.TempDir()).overlayCampaignHostDispatch(context.Background(), items)
+		for i, it := range items[:16] {
+			if it.Awaiting.Kind != hdoServerKindSystem || it.Awaiting.Reason != hdoServerReasonInFlight {
+				t.Errorf("item %d = %s/%s; want system/in_flight", i+1, it.Awaiting.Kind, it.Awaiting.Reason)
+			}
+		}
+		last := items[16].Awaiting
+		if last.Kind != hostDispatchAwaitKind || last.Reason != hostDispatchReasonUnverified || last.HostDispatch.State != hostDispatchStateUnverified {
+			t.Fatalf("item 17 = %s/%s state %q; want host_dispatcher/host_dispatch_unverified", last.Kind, last.Reason, last.HostDispatch.State)
+		}
+		hdoContainsAll(t, "item 17 next_step", last.NextStep, capText, "--state-dir "+dir)
+		if n, audit := hdoRoundReads(fb, runs[16]); n != 0 || audit {
+			t.Fatalf("run 17: stage reads %d, audit read %v; want none past the cap", n, audit)
+		}
+	})
+	t.Run("a repeated run is checked once", func(t *testing.T) {
+		hdoEmptyTMPDIR(t)
+		fb, srv := newFakeBackend(t)
+		runID, accID := hdoRoundRun(fb, 2, "pending", "")
+		items := []CampaignItem{hdoAcceptanceItem(runID, accID), hdoAcceptanceItem(runID, accID)}
+		dir := filepath.Join(t.TempDir(), "state")
+		hdoWrite(t, dir, hdoStatus())
+		hdoRoundResolver(t, srv, dir, t.TempDir()).overlayCampaignHostDispatch(context.Background(), items)
+		for i, it := range items {
+			if it.Awaiting.Kind != hdoServerKindSystem {
+				t.Errorf("item %d kind %q; want system", i+1, it.Awaiting.Kind)
+			}
+		}
+		if n, _ := hdoRoundReads(fb, runID); n != 1 {
+			t.Fatalf("stage reads = %d; want 1 (memoised per run)", n)
+		}
+	})
+	t.Run("per-run rungs: one run is read, then checked", func(t *testing.T) {
+		tmpRung := hdoEmptyTMPDIR(t)
+		hdoWrite(t, tmpRung, hdoStatus())
+		fb, srv := newFakeBackend(t)
+		runID, accID := hdoRoundRun(fb, 2, "pending", t.TempDir())
+		items := []CampaignItem{hdoAcceptanceItem(runID, accID)}
+		hdoRoundResolver(t, srv, "", t.TempDir()).overlayCampaignHostDispatch(context.Background(), items)
+		blk := items[0].Awaiting
+		if blk.Kind != hdoServerKindSystem || blk.Reason != hdoServerReasonInFlight || blk.HostDispatch.State != hostDispatchStateLive {
+			t.Fatalf("awaiting = %s/%s state %q; want system/in_flight, live from TMPDIR", blk.Kind, blk.Reason, blk.HostDispatch.State)
+		}
+		fb.mu.Lock()
+		gets := fb.getRunCalledByID[runID]
+		fb.mu.Unlock()
+		if n, _ := hdoRoundReads(fb, runID); gets != 1 || n != 1 {
+			t.Fatalf("GetRun reads %d, stage reads %d; want 1 and 1", gets, n)
+		}
+	})
+	t.Run("W4 per-run rungs: GetRun reads exhaust the cap before any round check", func(t *testing.T) {
+		tmpRung := hdoEmptyTMPDIR(t)
+		hdoWrite(t, tmpRung, hdoStatus())
+		fb, srv := newFakeBackend(t)
+		items := make([]CampaignItem, hostDispatchOverlayReadCap)
+		runs := make([]uuid.UUID, len(items))
+		for i := range items {
+			runID, accID := hdoRoundRun(fb, 2, "pending", t.TempDir())
+			runs[i], items[i] = runID, hdoAcceptanceItem(runID, accID)
+		}
+		hdoRoundResolver(t, srv, "", t.TempDir()).overlayCampaignHostDispatch(context.Background(), items)
+		for i, it := range items {
+			if it.Awaiting.Kind != hostDispatchAwaitKind || it.Awaiting.Reason != hostDispatchReasonUnverified || it.Awaiting.HostDispatch.State != hostDispatchStateUnverified {
+				t.Errorf("item %d = %s/%s state %q; want host_dispatcher/host_dispatch_unverified", i+1, it.Awaiting.Kind, it.Awaiting.Reason, it.Awaiting.HostDispatch.State)
+			}
+			hdoContainsAll(t, fmt.Sprintf("item %d next_step", i+1), it.Awaiting.NextStep, capText)
+			fb.mu.Lock()
+			gets := fb.getRunCalledByID[runs[i]]
+			fb.mu.Unlock()
+			if n, audit := hdoRoundReads(fb, runs[i]); gets != 1 || n != 0 || audit {
+				t.Errorf("run %d: GetRun %d, stage reads %d, audit %v; want the GetRun read only", i+1, gets, n, audit)
+			}
+		}
+	})
+}
+
+// TestOverlayCampaignHostDispatch_RoundCheckReadFails pins the fail-closed
+// reads: a failed stage read, a failed audit read, or a run id that is not a
+// UUID reads unverified, never live and never system/in_flight.
+func TestOverlayCampaignHostDispatch_RoundCheckReadFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(fb *fakeBackend, runID uuid.UUID)
+		id   string // overrides the item's run id
+		want string
+	}{
+		{name: "audit read 500", mut: func(fb *fakeBackend, _ uuid.UUID) { fb.perRunAuditStatus = http.StatusInternalServerError },
+			want: "its implement review round could not be read: "},
+		{name: "stage read 500", mut: func(fb *fakeBackend, runID uuid.UUID) { fb.stagesStatusByRun[runID] = http.StatusInternalServerError },
+			want: "its implement review round could not be read: "},
+		{name: "run id not a UUID", id: "not-a-uuid", want: "its implement review round was not read: its run id is not a UUID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			fb, srv := newFakeBackend(t)
+			runID, accID := hdoRoundRun(fb, 2, "pending", "")
+			if tc.mut != nil {
+				fb.mu.Lock()
+				tc.mut(fb, runID)
+				fb.mu.Unlock()
+			}
+			item := hdoAcceptanceItem(runID, accID)
+			if tc.id != "" {
+				item.RunID, item.Awaiting.RunID = tc.id, tc.id
+			}
+			dir := filepath.Join(t.TempDir(), "state")
+			hdoWrite(t, dir, hdoStatus())
+			items := []CampaignItem{item}
+			hdoRoundResolver(t, srv, dir, t.TempDir()).overlayCampaignHostDispatch(context.Background(), items)
+			blk := items[0].Awaiting
+			if blk.Kind != hostDispatchAwaitKind || blk.Reason != hostDispatchReasonUnverified || blk.HostDispatch.State != hostDispatchStateUnverified {
+				t.Fatalf("awaiting = %s/%s state %q; want host_dispatcher/host_dispatch_unverified (next_step %q)", blk.Kind, blk.Reason, blk.HostDispatch.State, blk.NextStep)
+			}
+			hdoContainsAll(t, "next_step", blk.NextStep, tc.want)
+		})
+	}
+}
+
+// TestRunHostDispatchFor_AcceptanceHeldByReviewRound pins the run-status
+// clause: an acceptance stage the round holds is not one the dispatcher would
+// spawn, so with no refusal entry the block is omitted; with no hold it reads
+// live; and a dispatcher round-hold entry still surfaces as waiting.
+func TestRunHostDispatchFor_AcceptanceHeldByReviewRound(t *testing.T) {
+	runID, planID, implID, accID, revID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	two := 2
+	stages := []Stage{
+		{ID: planID, RunID: runID, Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: implID, RunID: runID, Sequence: 2, Type: "implement", State: "succeeded", ReviewAgentsConfigured: &two},
+		{ID: accID, RunID: runID, Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+		{ID: revID, RunID: runID, Sequence: 4, Type: "review", State: "pending"},
+	}
+	view := &runDriveView{Run: Run{ID: runID, State: "running", RunnerKind: "local", AutoDispatch: true}}
+	resolve := func(t *testing.T, st HostDispatcherStatus) *runResolver {
+		t.Helper()
+		hdoEmptyTMPDIR(t)
+		dir := filepath.Join(t.TempDir(), "state")
+		hdoWrite(t, dir, st)
+		return hdoResolver(map[string]string{hostDispatchStateDirEnv: dir}, t.TempDir(), nil)
+	}
+	t.Run("held with no entry is omitted", func(t *testing.T) {
+		if got := resolve(t, hdoStatus()).runHostDispatchFor(context.Background(), view, stages, hdRefuseImplementReviewInFlight); got != nil {
+			t.Fatalf("host_dispatch = %+v; want nil while the round holds acceptance", got)
+		}
+		if got := resolve(t, hdoStatus()).runHostDispatchFor(context.Background(), view, stages, hdRefuseImplementReviewNotStarted); got != nil {
+			t.Fatalf("host_dispatch = %+v; want nil while the round is expected but not started", got)
+		}
+	})
+	t.Run("no hold reads live", func(t *testing.T) {
+		got := resolve(t, hdoStatus()).runHostDispatchFor(context.Background(), view, stages, "")
+		if got == nil || got.State != hostDispatchStateLive {
+			t.Fatalf("host_dispatch = %+v; want state live", got)
+		}
+	})
+	t.Run("a dispatcher round-hold entry reads waiting", func(t *testing.T) {
+		st := hdoStatus()
+		st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: accID, Code: hdRefuseImplementReviewInFlight,
+			FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow.Add(-10 * time.Second)}}
+		got := resolve(t, st).runHostDispatchFor(context.Background(), view, stages, hdRefuseImplementReviewInFlight)
+		if got == nil || got.State != hostDispatchStateWaiting || got.RefusalCode != hdRefuseImplementReviewInFlight {
+			t.Fatalf("host_dispatch = %+v; want waiting on implement_review_in_flight", got)
+		}
+	})
+}
+
+// TestGetRunStatus_HostDispatchOmittedWhileRoundHoldsAcceptance pins the
+// tools.go wiring of runHostDispatchFor's roundHold: fishhawk_get_run_status
+// passes the round hold computed from its own implement review status and
+// stages, so a round-held acceptance with no refusal entry has no
+// host_dispatch block, and a settled round reads live.
+func TestGetRunStatus_HostDispatchOmittedWhileRoundHoldsAcceptance(t *testing.T) {
+	for _, tc := range []struct {
+		round   string
+		wantNil bool
+	}{
+		{round: "pending", wantNil: true},
+		{round: "none", wantNil: true},
+		{round: "settled"},
+	} {
+		t.Run("round "+tc.round, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			fb, srv := newFakeBackend(t)
+			runID, _ := hdoRoundRun(fb, 2, tc.round, t.TempDir())
+			dir := filepath.Join(t.TempDir(), "state")
+			hdoWrite(t, dir, hdoStatus())
+			r := hdoRoundResolver(t, srv, dir, t.TempDir())
+			_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("getRunStatus: %v", err)
+			}
+			if tc.wantNil {
+				if out.HostDispatch != nil {
+					t.Fatalf("host_dispatch = %+v; want no block while the round holds acceptance", out.HostDispatch)
+				}
+				return
+			}
+			if out.HostDispatch == nil || out.HostDispatch.State != hostDispatchStateLive {
+				t.Fatalf("host_dispatch = %+v; want state live once the round settles", out.HostDispatch)
+			}
+		})
+	}
+}

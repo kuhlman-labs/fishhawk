@@ -2016,7 +2016,7 @@ type GetRunStatusOutput struct {
 	// stdio process reads the host dispatcher's status.json and reports what it
 	// says about this run. Computed at read time, display-only, and retained by
 	// the diagnosis skeleton (tierNever).
-	HostDispatch *hostDispatchObservation `json:"host_dispatch,omitempty" jsonschema:"the host dispatcher's state for this run, read from its host-local status.json by the operator's stdio fishhawk-mcp (#5402): state live | waiting | held | refusing | capped | paused | stale | absent | unverified, the status_path or the paths_tried, the dispatcher's tick times and failure code, this run's latest refusal (code, detail, stage, first/last seen) and the daily cap. Present only on the stdio transport with an operator bearer, for a run the dispatcher would consider (local, non-terminal, a pending or awaiting_host_dispatch stage, marked or a child of a marked parent) or one it holds a refusal for; absent over HTTP /mcp"`
+	HostDispatch *hostDispatchObservation `json:"host_dispatch,omitempty" jsonschema:"the host dispatcher's state for this run, read from its host-local status.json by the operator's stdio fishhawk-mcp (#5402): state live | waiting | held | refusing | capped | paused | stale | absent | unverified, the status_path or the paths_tried, the dispatcher's tick times and failure code, this run's latest refusal (code, detail, stage, first/last seen) and the daily cap. Present only on the stdio transport with an operator bearer, for a run the dispatcher would consider (local, non-terminal, a pending or awaiting_host_dispatch stage, marked or a child of a marked parent) or one it holds a refusal for; absent over HTTP /mcp. An acceptance stage held for the implement review round (#5298) reads waiting with refusal_code implement_review_in_flight or implement_review_not_started; before the dispatcher's first refusal the block is omitted while the round holds acceptance, and next_actions names the hold"`
 	// ChildrenStatus is the decomposed-parent per-child + integration-phase
 	// view (#1147): each child's live lifecycle state in slice-index order
 	// plus the fan-in phase classified from the four fan-in audit kinds
@@ -2623,8 +2623,10 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// Host-dispatch status overlay (#5402): the operator's stdio process reads
 	// the dispatcher's host-local status.json for a run the dispatcher would
 	// consider (or one it holds a refusal for). Off the view and stages already
-	// fetched; nil (omitted) everywhere else. next_actions is unchanged.
-	hostDispatch := r.runHostDispatchFor(ctx, view, stages)
+	// fetched; nil (omitted) everywhere else. next_actions is unchanged. The
+	// implement review round hold (#5298) comes from the status and stages
+	// already read, with no extra read.
+	hostDispatch := r.runHostDispatchFor(ctx, view, stages, implementReviewRoundHold(implementReviewStatus, stages))
 
 	assembled := GetRunStatusOutput{
 		Run:                       *runRow,

@@ -54,7 +54,19 @@ const (
 	hostDispatchReasonUnverified = "host_dispatch_unverified"
 	hostDispatchStatusCmd        = "fishhawk-mcp host-dispatch --status"
 	hostDispatchCampaignHeldCode = "campaign_dispatch_held"
+	// hostDispatchAwaitKindSystem byte-matches the server's awaitingKindSystem
+	// (backend/internal/server/campaign_item_awaiting.go).
+	hostDispatchAwaitKindSystem = "system"
+	// hostDispatchReasonInFlight byte-matches the server's
+	// awaitingReasonInFlight (campaign_item_awaiting.go): system work is in
+	// flight and the item waits on it, not on an operator.
+	hostDispatchReasonInFlight = "in_flight"
 )
+
+// hostDispatchReviewRoundOrphanAfter is how long an implement review round
+// hold on an acceptance stage reads as routine (#5298). Past it the next_step
+// says the round may be orphaned and names the read and the re-run verbs.
+const hostDispatchReviewRoundOrphanAfter = 30 * time.Minute
 
 // hostDispatchOverlayReadCap bounds the GetRun reads one campaign status call
 // spends on working_dir rungs. Each read is a backend round trip inside a
@@ -96,6 +108,13 @@ var (
 		hdRefuseMarkerNotTransitioned: true,
 		"dependency_not_satisfied":    true,
 		"wave_not_integrated":         true,
+	}
+	// hostDispatchReviewRoundRefusals are the implement review round holds on
+	// an acceptance stage (#5298): system work (the review round) is in flight
+	// or expected, so the block reads system/in_flight, not human.
+	hostDispatchReviewRoundRefusals = map[string]bool{
+		hdRefuseImplementReviewInFlight:   true,
+		hdRefuseImplementReviewNotStarted: true,
 	}
 )
 
@@ -376,8 +395,8 @@ func hostDispatchCapResetsAt(st HostDispatcherStatus, now time.Time) string {
 // bounded here. Precedence: absent, unverified (unreadable file), then the
 // dispatcher's health (stale, paused, failing), then the run's own entry
 // (a stage mismatch is provisionally unverified; paused, capped, held and
-// refusing decide; a waiting code is provisional), then the global daily cap,
-// then the provisional states, else live.
+// refusing decide; a waiting or review-round code is provisional), then the
+// global daily cap, then the provisional states, else live.
 func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Time) (hostDispatchObservation, hostDispatchVerdict) {
 	obs := hostDispatchObservation{PathsTried: hostDispatchBoundedPaths(p.tried)}
 	if !p.found {
@@ -467,6 +486,17 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 				next = fmt.Sprintf("A campaign hotfix hold is active%s; the stage dispatches after the hotfix lands. Do not dispatch past the hold.", detail)
 			}
 			return obs, hostDispatchVerdict{Kind: hostDispatchAwaitKindHuman, Reason: hostDispatchReasonRefused, NextStep: next}
+		case hostDispatchReviewRoundRefusals[ref.Code]:
+			// #5298: the dispatcher holds acceptance for the implement review
+			// round. It retries on its own, so the item waits on system work;
+			// past hostDispatchReviewRoundOrphanAfter the round may be orphaned.
+			provisional = hostDispatchStateWaiting
+			next := hostDispatchReviewRoundNextStep(ref.Code)
+			if now.Sub(ref.FirstAt) > hostDispatchReviewRoundOrphanAfter {
+				next = fmt.Sprintf("The implement review round has held this acceptance stage (%s) since %s and may be orphaned: a failed reviewer retry or a server restart can leave a round pending, and a decomposed parent's consolidated round may never have started. Read the implement review_status and next_actions with fishhawk_get_run_status; fishhawk_rerun_review re-runs a zero-verdict advisory round or starts a decomposed parent's first consolidated round.",
+					obs.RefusalCode, obs.RefusalFirstAt)
+			}
+			provisionalVerdict = hostDispatchVerdict{Kind: hostDispatchAwaitKindSystem, Reason: hostDispatchReasonInFlight, NextStep: next}
 		case hostDispatchWaitingRefusals[ref.Code]:
 			provisional = hostDispatchStateWaiting
 		default:
@@ -485,6 +515,9 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 	switch provisional {
 	case hostDispatchStateWaiting:
 		obs.State = hostDispatchStateWaiting
+		if provisionalVerdict.Kind != "" {
+			return obs, provisionalVerdict
+		}
 		return obs, hostDispatchVerdict{
 			Kind:     hostDispatchAwaitKind,
 			Reason:   hostDispatchReasonDispatch,
@@ -495,6 +528,16 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 	}
 	obs.State = hostDispatchStateLive
 	return obs, hostDispatchVerdict{}
+}
+
+// hostDispatchReviewRoundNextStep is the routine next_step for an implement
+// review round hold on an acceptance stage (#5298), read from the dispatcher's
+// refusal or, before its first tick, from the round itself.
+func hostDispatchReviewRoundNextStep(code string) string {
+	if code == hdRefuseImplementReviewNotStarted {
+		return "Acceptance waits for the implement review round (implement_review_not_started): the workflow declares implement agent reviewers but no round is recorded for the implement stage's current head yet. The host dispatcher holds the stage and dispatches it on the first tick after the round starts and settles; no operator action is needed."
+	}
+	return "Acceptance waits for the implement review round, which is in flight (implement_review_in_flight). The host dispatcher holds the stage and dispatches it on the first tick after the round settles; no operator action is needed."
 }
 
 // hostDispatchUnverified is the could-not-check verdict; dir, when known,
@@ -566,6 +609,11 @@ func applyHostDispatchObservation(blk *campaignItemAwaiting, obs hostDispatchObs
 // never decides another run's item. At most hostDispatchOverlayReadCap runs
 // are read; an item whose own rung could not be probed reads unverified when
 // its ladder found no status.
+//
+// In both branches an acceptance item the dispatcher has not refused for the
+// implement review round gets the pre-tick round check
+// (applyAcceptanceRoundHold, #5298). Its reads share the one read budget with
+// the working_dir GetRun reads, so the cap bounds both.
 func (r *runResolver) overlayCampaignHostDispatch(ctx context.Context, items []CampaignItem) {
 	if !r.hostDispatchOverlayEnabled() {
 		return
@@ -584,18 +632,20 @@ func (r *runResolver) overlayCampaignHostDispatch(ctx context.Context, items []C
 	for _, dir := range r.hostDispatchCallRungs() {
 		call.probe(dir)
 	}
+	rounds := map[string]hostDispatchRoundRead{}
+	reads := 0
 	if call.done() || r.hostDispatchEnv(hostDispatchStateDirEnv) != "" {
 		found := call.result()
 		for _, i := range idx {
 			blk := items[i].Awaiting
 			obs, v := observeHostDispatch(found, blk.RunID, blk.StageID, now)
+			r.applyAcceptanceRoundHold(ctx, blk, rounds, &obs, &v, &reads)
 			applyHostDispatchObservation(blk, obs, v)
 		}
 		return
 	}
 	rungOf := map[string]string{}
 	why := map[string]string{}
-	reads := 0
 	for _, i := range idx {
 		id := items[i].Awaiting.RunID
 		if _, ok := rungOf[id]; ok {
@@ -638,8 +688,75 @@ func (r *runResolver) overlayCampaignHostDispatch(ctx context.Context, items []C
 		if reason, unprobed := why[blk.RunID]; unprobed && obs.State == hostDispatchStateAbsent {
 			obs, v = hostDispatchUnverified(obs, reason, "")
 		}
+		r.applyAcceptanceRoundHold(ctx, blk, rounds, &obs, &v, &reads)
 		applyHostDispatchObservation(blk, obs, v)
 	}
+}
+
+// hostDispatchRoundRead is one run's pre-tick implement review round check:
+// the hold code ("" when settled), or why the round could not be read (the
+// item then reads unverified).
+type hostDispatchRoundRead struct {
+	hold string
+	why  string
+}
+
+// applyAcceptanceRoundHold is the overlay's pre-tick round check (#5298 V2):
+// it closes the window before the dispatcher's first tick, when no
+// run_refusals entry exists yet and the block would read live. For an
+// acceptance item whose observation is live, or waiting on a code that is not
+// a round hold, it reads the run's stages and the shared round predicate
+// (acceptanceRoundHold) and, on a hold, rewrites the verdict to
+// system/in_flight. Human verdicts (held, paused, capped, refusing, absent,
+// stale, unverified) stand, and a round-code entry is not re-checked.
+//
+// Each run is checked once per call (rounds memoises it). A check is ONE unit
+// against the read budget shared with the working_dir GetRun reads and capped
+// by hostDispatchOverlayReadCap; past the cap, or on a read error, the item
+// reads unverified, never live.
+func (r *runResolver) applyAcceptanceRoundHold(ctx context.Context, blk *campaignItemAwaiting, rounds map[string]hostDispatchRoundRead, obs *hostDispatchObservation, v *hostDispatchVerdict, budget *int) {
+	if blk.StageType == "acceptance" && (obs.State == hostDispatchStateLive || (obs.State == hostDispatchStateWaiting && !hostDispatchReviewRoundRefusals[obs.RefusalCode])) {
+		rd, ok := rounds[blk.RunID]
+		if !ok {
+			rd = r.readAcceptanceRound(ctx, blk.RunID, budget)
+			rounds[blk.RunID] = rd
+		}
+		switch {
+		case rd.why != "":
+			dir := ""
+			if obs.StatusPath != "" {
+				dir = filepath.Dir(obs.StatusPath)
+			}
+			*obs, *v = hostDispatchUnverified(*obs, rd.why, dir)
+		case rd.hold != "":
+			obs.Detail = "the implement review round holds acceptance: " + rd.hold
+			*v = hostDispatchVerdict{Kind: hostDispatchAwaitKindSystem, Reason: hostDispatchReasonInFlight, NextStep: hostDispatchReviewRoundNextStep(rd.hold)}
+		}
+	}
+}
+
+// readAcceptanceRound performs one run's round check against the shared read
+// budget: the stage read (for the implement stage's review_agents_configured)
+// and the implement review status, through the same predicate the dispatcher
+// applies.
+func (r *runResolver) readAcceptanceRound(ctx context.Context, runID string, budget *int) hostDispatchRoundRead {
+	if *budget >= hostDispatchOverlayReadCap {
+		return hostDispatchRoundRead{why: fmt.Sprintf("its implement review round was not read: the overlay's read cap of %d reached", hostDispatchOverlayReadCap)}
+	}
+	runUUID, err := uuid.Parse(runID)
+	if err != nil {
+		return hostDispatchRoundRead{why: "its implement review round was not read: its run id is not a UUID"}
+	}
+	*budget++
+	stages, err := r.api.ListRunStages(ctx, runUUID)
+	if err != nil {
+		return hostDispatchRoundRead{why: "its implement review round could not be read: " + boundHostDispatchText(err.Error())}
+	}
+	hold, err := r.acceptanceRoundHold(ctx, runUUID, stages)
+	if err != nil {
+		return hostDispatchRoundRead{why: "its implement review round could not be read: " + boundHostDispatchText(err.Error())}
+	}
+	return hostDispatchRoundRead{hold: hold}
 }
 
 // runHostDispatchFor is fishhawk_get_run_status's host_dispatch block. It is
@@ -650,7 +767,12 @@ func (r *runResolver) overlayCampaignHostDispatch(ctx context.Context, items []C
 // (its auto_dispatch mark, or a decomposition child of a marked parent). It
 // probes env, else cwd, the run's own working_dir rung (no extra read) and
 // TMPDIR.
-func (r *runResolver) runHostDispatchFor(ctx context.Context, view *runDriveView, stages []Stage) *hostDispatchObservation {
+//
+// roundHold is implementReviewRoundHold over the status call's own implement
+// review status and stages (#5298): an acceptance stage it holds is not one
+// the dispatcher would spawn, so with no refusal entry the block is omitted
+// and next_actions names the hold.
+func (r *runResolver) runHostDispatchFor(ctx context.Context, view *runDriveView, stages []Stage, roundHold string) *hostDispatchObservation {
 	if !r.hostDispatchOverlayEnabled() || view == nil {
 		return nil
 	}
@@ -658,7 +780,7 @@ func (r *runResolver) runHostDispatchFor(ctx context.Context, view *runDriveView
 	stageID := ""
 	dispatchable := false
 	if run.RunnerKind == driveRunnerKindLocal && !runStateIsTerminal(run.State) {
-		if disp := driveDispatchableStage(stages, nil, view.DerivedStatus == derivedAcceptancePending); disp != nil && hostDispatchSpawnable(*disp) {
+		if disp := driveDispatchableStage(stages, nil, view.DerivedStatus == derivedAcceptancePending); disp != nil && hostDispatchSpawnable(*disp) && (disp.Type != "acceptance" || roundHold == "") {
 			stageID, dispatchable = disp.ID, true
 		}
 	}
