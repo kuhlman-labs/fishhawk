@@ -79,6 +79,10 @@ const (
 	// mcReasonTempFail: the verify command exited 75 (EX_TEMPFAIL, the #4022
 	// exit-code contract) — an infrastructure failure, not a verdict.
 	mcReasonTempFail = "verify_infra_tempfail"
+	// mcReasonGateLaunchFailed: container path — the runtime exited
+	// 125/126/127 before the launch marker (#5408, ADR-102 A1), so the verify
+	// command never started.
+	mcReasonGateLaunchFailed = "verify_gate_launch_failed"
 )
 
 // mergeCandidateDefaultVerifyTimeout is the fallback when neither the operator
@@ -209,8 +213,10 @@ func mergeCandidateVerify(ctx context.Context, cfg config, req mergeCandidateVer
 
 // classifyMergeCandidateVerify maps the gate's (outcome, disposition) to the
 // pass's result. A gate that never reached a verdict about the TREE — infra
-// skip, isolation refusal, an unavailable host, the runner's own deadline, an
-// exit-75 temporary failure, or verify-lock contention — is not_executed,
+// skip, isolation refusal, an unavailable host, a container launch failure
+// (the runtime exited 125/126/127 before the launch marker, #5408 / ADR-102
+// A1 — verify_gate_launch_failed), the runner's own deadline, an exit-75
+// temporary failure, or verify-lock contention — is not_executed,
 // NEVER failed: a failed result is head-bound and routes a fix-up, which would
 // hand the fix agent a tree that was never judged. The pass does not re-run a
 // temporary failure itself: a not_executed result leaves the head
@@ -226,6 +232,8 @@ func classifyMergeCandidateVerify(outcome string, disp gateDisposition, _ string
 		return mergeCandidateNotExecuted, mcReasonGateRefused
 	case disp == gateUnavailable:
 		return mergeCandidateNotExecuted, mcReasonGateUnavailable
+	case disp == gateLaunchFailed:
+		return mergeCandidateNotExecuted, mcReasonGateLaunchFailed
 	case disp == gateTimedOut:
 		return mergeCandidateNotExecuted, mcReasonGateTimedOut
 	case disp == gateTempFail:

@@ -32,6 +32,22 @@ Accepted: Option 1. Ratified by the Captain on 2026-10-31. The verify exit-code 
 
 Projects whose verify command cannot set exit codes fall back to text signatures until project-declared signatures land (#4022 Proposal 2 follow-up).
 
+## Amendment A1: container launch failures are not a verdict (Captain decision 2026-11-19 on #5408; text ratified at merge)
+
+Ratification: Captain, 2026-11-19 (#5408); final text confirmed by the Captain at merge.
+
+**Context.** This is the #5226 gap 1 residual. On the container gate path, docker and podman return the contained command's exit status for every code except their own 125 (the runtime itself failed), 126 (the command could not be invoked) and 127 (the command could not be found). Those three codes collide with "any other non-zero = the change failed": a break before the command started reached the server as `verify_failed` and routed a merge-candidate fix-up.
+
+**Decision.**
+
+- **A1.1.** The container-path committed-tree verify runs behind a runner-owned launch-marker wrapper. The wrapper prints a fresh per-exec runner nonce on its own line, then execs the verify command.
+- **A1.2.** Exit 125, 126 or 127 with no marker line is not a verdict: the command never started. It ends category C at the implement gates (the verify-fix loop, the single-shot gate, the strict re-verify before push and reverify-resume), reports `not_executed` / `verify_gate_launch_failed` at the merge-candidate verify, and is never handed to the fix agent.
+- **A1.3.** The same codes after the marker are the command's own status and stay "the change failed".
+- **A1.4.** Host paths and unmarked container execs are unchanged.
+- **A1.5.** Trust posture. The command cannot retract an already-printed marker, so it cannot forge a launch failure; forging marker presence only yields today's `verify_failed`. A tree-declared gate image controls its own `sh` and can suppress the marker, but that reaches only `not_executed` / category C, never a pass and never a fix-up: the same residual this record accepts for 75 and 73 and #4392 accepts for the work-tree preflight. A `not_executed` merge-candidate result is never merge-eligible: it binds no verdict to the head, so the merge gate still reads the head as unverified.
+
+**Consequences.** docs/spec/workflow-v2.md § "Verify exit-code contract" gains the container launch-failure rule, and its collision residual now reads 125/126/127 through the marker, never by code alone. The #4391 manual escape remains for other environment breaks. This in-body amendment changes no front-matter field and adds no edge, so `index.json` and the README table are unchanged.
+
 ### Intake signals (advisory)
 
 Derived automatically when this item was filed. Everything below is a candidate for a human: nothing was closed, relabelled or transitioned.
