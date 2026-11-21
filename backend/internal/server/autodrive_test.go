@@ -3458,3 +3458,294 @@ func TestAutoDriveRunGate_Merge_ReviewCoverageHold_ObserveOnly(t *testing.T) {
 		})
 	}
 }
+
+// --- route_fixup over server-check concerns (#5477) --------------------------
+
+// seedServerCheckConcern inserts one open concern the server synthesized
+// (provenance server_check), the human-only class ADR-084 rule 5 / ADR-143
+// keep out of every delegated fix-up route.
+func seedServerCheckConcern(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, stageKind, severity, note string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:      runID,
+		StageID:    stageID,
+		StageKind:  stageKind,
+		Provenance: concern.ProvenanceServerCheck,
+		Concerns:   []concern.RaisedConcern{{Severity: severity, Category: "security", Note: note, CheckKey: "diff_secret:" + note}},
+	})
+	if err != nil {
+		t.Fatalf("seed server-check concern: %v", err)
+	}
+	if !rows[0].IsServerCheck() {
+		t.Fatalf("seeded row provenance = %q, want server_check (the fixture would pass for the wrong reason)", rows[0].Provenance)
+	}
+	return rows[0]
+}
+
+// seedSettledImplementRound records a complete two-verdict implement review
+// round with the given verdict.
+func seedSettledImplementRound(t *testing.T, au *auditFake, runID uuid.UUID, v planreview.Verdict) {
+	t.Helper()
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: v})
+	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: v})
+}
+
+// concernStateOf reads one concern back from the fake store.
+func concernStateOf(t *testing.T, cr *fakeConcernRepo, id uuid.UUID) concern.State {
+	t.Helper()
+	rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+	if err != nil {
+		t.Fatalf("read concern %s: %v", id, err)
+	}
+	return rows[0].State
+}
+
+// triggerConcernIDs decodes the concern_ids of the single appended
+// stage_fixup_triggered entry.
+func triggerConcernIDs(t *testing.T, au *auditFake) []string {
+	t.Helper()
+	var p struct {
+		ConcernIDs []string `json:"concern_ids"`
+	}
+	if err := json.Unmarshal(auditEntry(t, au, CategoryStageFixupTriggered).Payload, &p); err != nil {
+		t.Fatalf("decode stage_fixup_triggered: %v", err)
+	}
+	return p.ConcernIDs
+}
+
+// TestAutoDriveRunGate_RouteFixup_SkipsServerCheckConcerns pins autoFixup's
+// server-check filter (#5477). The medium reviewer row keeps convergent_concerns
+// met whether or not the filter exists, so the evaluator cannot mask its
+// deletion: without it the high server-check id is routed and its row flips to
+// addressed_pending.
+func TestAutoDriveRunGate_RouteFixup_SkipsServerCheckConcerns(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	reviewer := seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "medium", "scope", "tighten the seam")
+	sc := seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup on the reviewer concern", out)
+	}
+	if ids := triggerConcernIDs(t, au); len(ids) != 1 || ids[0] != reviewer.ID.String() {
+		t.Errorf("stage_fixup_triggered.concern_ids = %v, want exactly [%s] (the server-check id %s must not be routed)", ids, reviewer.ID, sc.ID)
+	}
+	if st := concernStateOf(t, cr, reviewer.ID); st != concern.StateAddressedPending {
+		t.Errorf("reviewer concern state = %s, want addressed_pending", st)
+	}
+	if st := concernStateOf(t, cr, sc.ID); st != concern.StateRaised {
+		t.Errorf("server-check concern state = %s, want raised (a delegated route never moves it)", st)
+	}
+}
+
+// TestAutoDriveRunGate_RouteFixup_PlanConcernPlusServerCheckObserves pins the
+// accepted shape (a) of #5477: an open PLAN-stage reviewer concern keeps the
+// evaluator met, autoFixup selects nothing (the only implement-stage row is a
+// server check), and the pass is observe-only with no decision. A second
+// vehicle for the autoFixup filter: without it the server-check row is routed.
+func TestAutoDriveRunGate_RouteFixup_PlanConcernPlusServerCheckObserves(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	seedOpenConcern(t, cr, runID, plan.ID, concern.StageKindPlan, "high", "scope", "plan gap")
+	sc := seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || out.DecisionRequired || out.Paged {
+		t.Fatalf("outcome = %+v, want observe-only with no decision", out)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries, want 0", n, CategoryStageFixupTriggered)
+	}
+	if st := concernStateOf(t, cr, sc.ID); st != concern.StateRaised {
+		t.Errorf("server-check concern state = %s, want raised", st)
+	}
+}
+
+// TestAutoDriveRunGate_RouteFixup_ServerCheckOnlyAwaitsHuman is the #5477
+// headline: a settled round whose only open concern is a server-check row
+// hands the gate to the human as decision_required server_check_awaiting_human
+// instead of polling observe-only, and routes nothing.
+func TestAutoDriveRunGate_RouteFixup_ServerCheckOnlyAwaitsHuman(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	sc := seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateServerCheckAwaitingHuman || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want decision_required server_check_awaiting_human route_fixup", out)
+	}
+	if out.Acted || out.Paged {
+		t.Fatalf("outcome = %+v, want neither acted nor paged", out)
+	}
+	if !strings.Contains(out.Note, sc.ID.String()) || !strings.Contains(out.Note, "no fix-up was auto-routed") {
+		t.Errorf("note = %q, want it to name %s and that no fix-up was auto-routed", out.Note, sc.ID)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries, want 0", n, CategoryStageFixupTriggered)
+	}
+	if st := concernStateOf(t, cr, sc.ID); st != concern.StateRaised {
+		t.Errorf("server-check concern state = %s, want raised", st)
+	}
+}
+
+// assertServerCheckObserveOnly asserts the pass fell through observe-only:
+// no decision, no act, no fix-up trigger.
+func assertServerCheckObserveOnly(t *testing.T, out AutoDriveOutcome, au *auditFake) {
+	t.Helper()
+	if out.Acted || out.DecisionRequired || out.Paged || out.DecisionState != "" {
+		t.Fatalf("outcome = %+v, want observe-only with no decision", out)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries, want 0", n, CategoryStageFixupTriggered)
+	}
+}
+
+// (C1) serverCheckAwaitingHumanHold fail-closed branch: the implement stage is
+// not in a fix-up-eligible state, so the hold does not fire.
+func TestAutoDriveRunGate_ServerCheckAwaitingHuman_IneligibleStateObserves(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateRunning
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertServerCheckObserveOnly(t, out, au)
+}
+
+// (C2) serverCheckAwaitingHumanHold fail-closed branch: a class-1 acceptance
+// fix-up deferral owns the next pass, so the hold does not fire.
+func TestAutoDriveRunGate_ServerCheckAwaitingHuman_DeferralPendingObserves(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	seedReviewEntry(t, au, runID, 4, CategoryAcceptanceTriageDecided, map[string]any{"disposition": acceptanceDispositionFixupDeferred})
+	seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertServerCheckObserveOnly(t, out, au)
+}
+
+// (C3) Evaluator pin, not a hold branch: with 1 of 2 verdicts in, the
+// evaluator answers unmet on the round (AwaitingHuman false), so the arm never
+// reaches serverCheckAwaitingHumanHold and the pass stays observe-only.
+func TestAutoDriveRunGate_ServerCheckAwaitingHuman_RoundInFlightObserves(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertServerCheckObserveOnly(t, out, au)
+}
+
+// (D2 of the plan approval) serverCheckAwaitingHumanHold fail-closed branch: the
+// only open server-check row belongs to a stage that is NOT the current
+// implement stage. The evaluator (which reads every open concern of the run)
+// still flags AwaitingHuman, but the hold finds no implement-stage concern and
+// does not fire, so no decision marker is recorded.
+func TestAutoDriveRunGate_ServerCheckAwaitingHuman_OtherStageRowObserves(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	seedServerCheckConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "high", "superseded-stage")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertServerCheckObserveOnly(t, out, au)
+
+	// Through the campaign translation too: no decision reaches the driver, so
+	// trackDecision records no campaign_gate_decision_required marker.
+	cout, err := s.DriveCampaignRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("DriveCampaignRunGate: %v", err)
+	}
+	if cout.DecisionRequired || cout.DecisionState != "" {
+		t.Fatalf("campaign outcome = %+v, want no decision", cout)
+	}
+}
+
+// TestServerCheckAwaitingHumanHold_FailClosedBranches drives the hold directly
+// over each re-derivation the AutoDriveRunGate fixtures cannot reach on their
+// own (the evaluator and the hold read the open set separately, so a
+// reviewer row the hold sees is a race the hold must not trust past).
+func TestServerCheckAwaitingHumanHold_FailClosedBranches(t *testing.T) {
+	s, _, _, _ := newAutoDriveServer(t)
+	runRow := &run.Run{ID: uuid.New(), State: run.StateRunning}
+	impl := &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: run.StageTypeImplement, State: run.StageStateAwaitingApproval, Sequence: 2}
+	plan := &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: run.StageTypePlan, State: run.StageStateSucceeded, Sequence: 1}
+	sc := &concern.Concern{ID: uuid.New(), RunID: runRow.ID, StageID: impl.ID, StageKind: concern.StageKindImplement, Severity: "high", State: concern.StateRaised, Provenance: concern.ProvenanceServerCheck}
+	reviewer := &concern.Concern{ID: uuid.New(), RunID: runRow.ID, StageID: impl.ID, StageKind: concern.StageKindImplement, Severity: "medium", State: concern.StateRaised}
+
+	tests := []struct {
+		name   string
+		stages []*run.Stage
+		open   []*concern.Concern
+		want   bool
+	}{
+		{"holds: implement-stage server-check only", []*run.Stage{plan, impl}, []*concern.Concern{sc}, true},
+		{"no implement stage", []*run.Stage{plan}, []*concern.Concern{sc}, false},
+		{"a reviewer row on the implement stage", []*run.Stage{plan, impl}, []*concern.Concern{sc, reviewer}, false},
+		{"no implement-stage concern", []*run.Stage{plan, impl}, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, held := s.serverCheckAwaitingHumanHold(context.Background(), runRow, tt.stages, tt.open)
+			if held != tt.want {
+				t.Fatalf("held = %v, want %v (outcome %+v)", held, tt.want, out)
+			}
+			if held && (out.DecisionState != operatorrole.DecisionStateServerCheckAwaitingHuman || !out.DecisionRequired) {
+				t.Errorf("outcome = %+v, want decision_required server_check_awaiting_human", out)
+			}
+			if !held && out != (AutoDriveOutcome{}) {
+				t.Errorf("outcome = %+v, want the zero outcome when not held", out)
+			}
+		})
+	}
+}

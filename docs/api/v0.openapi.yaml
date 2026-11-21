@@ -18749,7 +18749,7 @@ paths:
                   paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
                   page_event: { type: string, description: 'The page event name, set when paged.' }
                   decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
-                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582).' }
+                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582); server_check_awaiting_human (the route_fixup arm is unmet only because every open concern of the settled round is a human-only server_check finding: a human waives or defers it from the Web UI, and no fix-up is routed) (#5477).' }
                   reported: { type: boolean, description: 'True when a workflow-v2 `mode: report` class surfaced a proposal at a live gate (#2222): a run_auto_driven act:report row was appended (at most once per gate occurrence), `action` names the verb the class governs, and nothing was dispatched or paged. The driver keeps polling.' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -29901,6 +29901,10 @@ paths:
                     the `stage_fixup_triggered` payload records
                     `delegated: "convergent_concerns"`. Omitted →
                     behavior byte-identical to today.
+                    A delegated request whose `concern_ids` name a
+                    `server_check` concern of the run is refused first,
+                    before the condition is evaluated, with 422
+                    `fixup_server_check_requires_human` (#5477).
                 implement_model:
                   type: string
                   description: |
@@ -30085,7 +30089,15 @@ paths:
             `bytes`, `max_bytes`, `overflow_bytes`, `concern_count`,
             `concern_ids` (the routed ids, at most 50) and `remedy`: shorten
             `operator_concern`, split the concerns across passes, or route fewer
-            `concern_ids`). Body's `message` explains the specific reason.
+            `concern_ids`); or a `delegated: true` request whose `concern_ids`
+            name a concern a server check raised (provenance `server_check`) on
+            this run (`fixup_server_check_requires_human`, #5477 — refused before
+            the delegation check, the concern resolution and any state change;
+            `details` carry `concern_ids` (only the requested server-check ids),
+            `provenance: server_check`, `delegated: true` and `remedy:
+            human_decision`). A delegated route never names a `server_check`
+            concern, which is human-only (ADR-084 rule 5, ADR-143); a
+            non-delegated route may. Body's `message` explains the specific reason.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

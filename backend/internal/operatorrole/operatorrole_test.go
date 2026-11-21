@@ -468,6 +468,11 @@ func TestDelegatedApprovalDecisionStates(t *testing.T) {
 	if DecisionStateDelegatedApprovalNoProgress != "delegated_approval_no_progress" {
 		t.Errorf("DecisionStateDelegatedApprovalNoProgress = %q, want %q", DecisionStateDelegatedApprovalNoProgress, "delegated_approval_no_progress")
 	}
+	// #5477: the route_fixup server-check-only handoff, decoded by the
+	// fishhawk_drive_run decision arm and rendered on the campaign marker.
+	if DecisionStateServerCheckAwaitingHuman != "server_check_awaiting_human" {
+		t.Errorf("DecisionStateServerCheckAwaitingHuman = %q, want %q", DecisionStateServerCheckAwaitingHuman, "server_check_awaiting_human")
+	}
 }
 
 func TestValidateOverlayReadError(t *testing.T) {
