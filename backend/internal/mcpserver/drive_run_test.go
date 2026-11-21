@@ -1202,6 +1202,125 @@ func TestDriveRun_HumanQuorumRequired_StopsWithApproveAction(t *testing.T) {
 	}
 }
 
+// TestDriveDecisionActions_ServerCheckAwaitingHuman pins the #5477 arm
+// directly: three actions in human-first order — read the gate view, PROPOSE a
+// waive, and only then the non-delegated fix-up, whose precondition and reason
+// say it is a HUMAN decision an agent caller must not take on its own
+// authority (approval condition D1).
+func TestDriveDecisionActions_ServerCheckAwaitingHuman(t *testing.T) {
+	runID := uuid.New()
+	na := driveDecisionActions(operatorrole.DecisionStateServerCheckAwaitingHuman, runID, "/tmp/checkout")
+	if na == nil || na.State != operatorrole.DecisionStateServerCheckAwaitingHuman {
+		t.Fatalf("next_actions = %+v, want state %s", na, operatorrole.DecisionStateServerCheckAwaitingHuman)
+	}
+	if got, want := strings.Join(actionNameList(na.Actions), ","), "fishhawk_get_gate_view,fishhawk_propose_waive,fishhawk_fixup_stage"; got != want {
+		t.Fatalf("actions = %v, want %v (human-only moves first, the fix-up last)", got, want)
+	}
+	for _, a := range na.Actions {
+		if a.Params["run_id"] != runID.String() {
+			t.Errorf("%s params = %v, want run_id %s", a.Action, a.Params, runID)
+		}
+	}
+	gate, propose, fixup := na.Actions[0], na.Actions[1], na.Actions[2]
+	if gate.Consumes != consumesNone || propose.Consumes != consumesNone {
+		t.Errorf("gate view consumes %q, propose_waive consumes %q; want both %q", gate.Consumes, propose.Consumes, consumesNone)
+	}
+	if fixup.Consumes != consumesFixupBudget {
+		t.Errorf("fixup_stage consumes = %q, want %q", fixup.Consumes, consumesFixupBudget)
+	}
+	if fixup.Params["concern_ids"] == "" {
+		t.Errorf("fixup_stage params = %v, want a concern_ids placeholder", fixup.Params)
+	}
+	if fixup.Params["force_additional_pass"] != "" {
+		t.Errorf("fixup_stage params = %v: a server-check stop must not suggest a budget override", fixup.Params)
+	}
+	if propose.Params["judgement"] != concernJudgementPlaceholder {
+		t.Errorf("propose_waive params = %v, want the judgement placeholder", propose.Params)
+	}
+	for _, want := range []string{"only on a human's explicit decision", "non-delegated", "must NOT take this on its own authority", "waive or defer from the Fishhawk Web UI", "fishhawk_propose_waive", "come first"} {
+		if !strings.Contains(fixup.Precondition, want) {
+			t.Errorf("fixup_stage precondition must contain %q: %s", want, fixup.Precondition)
+		}
+	}
+	for _, want := range []string{"a HUMAN decision, not an agent's", "Fishhawk Web UI attention queue", "non-delegated", "re-invoke fishhawk_drive_run"} {
+		if !strings.Contains(fixup.Reason, want) {
+			t.Errorf("fixup_stage reason must contain %q: %s", want, fixup.Reason)
+		}
+	}
+	if !strings.Contains(propose.Precondition, "may only PROPOSE") {
+		t.Errorf("propose_waive precondition must say an agent may only PROPOSE: %s", propose.Precondition)
+	}
+	if !strings.Contains(propose.Reason, "Fishhawk Web UI attention queue") || !strings.Contains(propose.Reason, "re-invoke fishhawk_drive_run") {
+		t.Errorf("propose_waive reason must name the Web UI confirm and the re-invoke: %s", propose.Reason)
+	}
+	if !strings.Contains(gate.Precondition, "server_check") || !strings.Contains(gate.Precondition, "HUMAN decision") {
+		t.Errorf("gate view precondition must name the server_check rule: %s", gate.Precondition)
+	}
+}
+
+// TestDriveRun_DecisionRequired_ServerCheckAwaitingHuman is the R3b
+// cross-boundary pin (#5477) through the real driveRun loop: the gate returns
+// decision_required/server_check_awaiting_human, and the loop STOPS with that
+// reason (not gate_error), carries the human-first roster from
+// driveDecisionActions, and spawns nothing. The stopped_reason comes from the
+// pre-existing generic gate.DecisionRequired case (a regression pin); the
+// action names are the new control.
+func TestDriveRun_DecisionRequired_ServerCheckAwaitingHuman(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateServerCheckAwaitingHuman,
+			Action:           "route_fixup",
+			Note:             "1 open server-check concern awaits a human",
+		}
+	})
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+operatorrole.DecisionStateServerCheckAwaitingHuman {
+		t.Fatalf("stopped_reason = %q, want decision_required:server_check_awaiting_human", out.StoppedReason)
+	}
+	if out.StoppedReason == stoppedGateError {
+		t.Fatal("server_check_awaiting_human must not collapse into gate_error")
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("server_check_awaiting_human stop carried no next_actions")
+	}
+	names := driveActionNames(out.NextActions.Actions)
+	for _, want := range []string{"fishhawk_get_gate_view", "fishhawk_propose_waive", "fishhawk_fixup_stage"} {
+		if !names[want] {
+			t.Errorf("server-check roster missing %s; got %v", want, actionNameList(out.NextActions.Actions))
+		}
+	}
+	var fixup *SuggestedAction
+	for i := range out.NextActions.Actions {
+		if out.NextActions.Actions[i].Action == "fishhawk_fixup_stage" {
+			fixup = &out.NextActions.Actions[i]
+		}
+	}
+	if fixup == nil {
+		t.Fatalf("next_actions did not name fishhawk_fixup_stage: %v", actionNameList(out.NextActions.Actions))
+	}
+	if fixup.Consumes != consumesFixupBudget {
+		t.Errorf("fishhawk_fixup_stage consumes = %q, want %q", fixup.Consumes, consumesFixupBudget)
+	}
+	if !strings.Contains(fixup.Precondition, "only on a human's explicit decision") {
+		t.Errorf("fishhawk_fixup_stage precondition must require a human's decision: %s", fixup.Precondition)
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on a server_check_awaiting_human stop: %v", rec.list())
+	}
+}
+
 // TestAutoDriveOutcome_WireTagParity is the #2381 single test that spans the
 // server-emit → client-decode seam binding condition 1 asked for. A runtime
 // handler→client-model round trip in ONE process is architecturally

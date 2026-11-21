@@ -1824,6 +1824,36 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 				Reason:       "cast your own counting approval to reach quorum, then re-invoke fishhawk_drive_run",
 			},
 		}}
+	case state == operatorrole.DecisionStateServerCheckAwaitingHuman:
+		// route_fixup found the settled round's open implement concerns are ALL
+		// server-check findings (#5477). Clearing or routing one is a human
+		// decision (ADR-084 rule 5, ADR-143), so the human-only moves lead: read
+		// the concerns, PROPOSE a waive for a human to confirm in the Web UI.
+		// The non-delegated fix-up is listed last and only as a human's call;
+		// an agent caller must never take it on its own authority.
+		return &NextActions{State: state, Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_get_gate_view",
+				Params:       withParams(params, map[string]string{"stage_kind": "implement"}),
+				Precondition: "every open implement concern is a server-check finding (provenance server_check); clearing or routing one is a HUMAN decision, so no fix-up was auto-routed",
+				Consumes:     consumesNone,
+				Reason:       "read the open server_check concerns and what each check flagged before a human decides",
+			},
+			{
+				Action:       "fishhawk_propose_waive",
+				Params:       withParams(params, map[string]string{"concern_id": "gate_view.open[].id", "judgement": concernJudgementPlaceholder}),
+				Precondition: "an open server_check concern looks like a false positive or an accepted trade-off; an agent may only PROPOSE a waive (ADR-143), it clears nothing",
+				Consumes:     consumesNone,
+				Reason:       "record the proposal for a human to confirm from the Fishhawk Web UI attention queue; a human waives or defers there, then re-invoke fishhawk_drive_run",
+			},
+			{
+				Action:       "fishhawk_fixup_stage",
+				Params:       withParams(params, map[string]string{"stage_id": "run.stages[kind=implement].id", "concern_ids": "gate_view.open[].id"}),
+				Precondition: "only on a human's explicit decision, as a non-delegated route: an agent caller must NOT take this on its own authority; the human-only moves (waive or defer from the Fishhawk Web UI, or fishhawk_propose_waive) come first",
+				Consumes:     consumesFixupBudget,
+				Reason:       "a HUMAN decision, not an agent's: once a human chooses to route a server-check concern back to the implement agent instead of waiving or deferring it from the Fishhawk Web UI attention queue, route it as a non-delegated fix-up, then re-invoke fishhawk_drive_run",
+			},
+		}}
 	case state == operatorrole.DecisionStateDelegatedApprovalNoProgress:
 		// A delegated approve came back a duplicate — the delegated vote already
 		// stands but never counts toward a human quorum (#2381). The operator's own
