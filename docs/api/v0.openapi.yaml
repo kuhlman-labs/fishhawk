@@ -27731,6 +27731,9 @@ paths:
                                   - security_findings_unverified
                                   - children_pending
                                   - stage_not_terminal
+                                  - merge_candidate_unverified
+                                  - merge_candidate_verify_failed
+                                  - merge_candidate_check_failed
                               detail:
                                 type: string
                         resolved:
