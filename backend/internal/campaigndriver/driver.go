@@ -125,7 +125,8 @@ const (
 // audit-category mechanism (audit.KnownCategories); it needs no new ADR and
 // takes the mandatory run-bound flag when #4599 / E89 #4537 lands. The payload
 // carries no cross-run identifiers: only this run's own campaign_id, issue_ref,
-// run_id, gate stage and closed-set tokens (never the actor's Note, which can
+// run_id, gate stage, closed-set tokens and, on fixup_no_changes_unaddressed
+// only, its own concern_ids (#5390) (never the actor's Note, which can
 // name other runs). The once-per-occurrence dedupe assumes a single campaign
 // driver per deployment; two concurrent drivers could double-append.
 const (
@@ -252,6 +253,12 @@ type GateActionOutcome struct {
 	// campaign_gate_decision_required marker per occurrence.
 	DecisionRequired bool
 	DecisionState    string
+	// ConcernIDs names the open concern ids behind a decision. It is set only
+	// on a fixup_no_changes_unaddressed decision (#5390): the ids the last
+	// no-change fix-up pass routed. They are this run's own concern ids, never
+	// another run's, so the marker's no-cross-run-identifiers property holds.
+	// recordDecision writes them as the marker's optional concern_ids key.
+	ConcernIDs []string
 	// GateKnown is true when the adapter read the run's stages after the gate
 	// evaluation. False when the read failed, the run repository is unwired,
 	// or the read was skipped because the driver holds no key and the outcome
@@ -725,14 +732,21 @@ func (t *Ticker) trackDecision(ctx context.Context, logger *slog.Logger, c *camp
 	if t.decisionUnchanged(runRow.ID, key) {
 		return
 	}
-	t.recordDecision(ctx, logger, c, it, runRow, key)
+	t.recordDecision(ctx, logger, c, it, runRow, key, out.ConcernIDs)
 }
 
 // recordDecision appends one campaign_gate_decision_required row on the run
 // chain and stores the key only after the append succeeds, so a failed append
-// is retried on the next tick.
-func (t *Ticker) recordDecision(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, key decisionKey) {
+// is retried on the next tick. A non-empty concernIDs (only on
+// fixup_no_changes_unaddressed, #5390) adds the optional concern_ids key; it
+// is written here rather than in decisionPayload so the cleared row, which
+// reuses decisionPayload, never carries it, and an empty slice leaves the key
+// absent (never null or []).
+func (t *Ticker) recordDecision(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, key decisionKey, concernIDs []string) {
 	payload := decisionPayload(c, it, runRow, key)
+	if len(concernIDs) > 0 {
+		payload["concern_ids"] = concernIDs
+	}
 	if _, err := t.appendRunChained(ctx, runRow.ID, key.stageID(), CategoryCampaignGateDecisionRequired, payload); err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: decision marker append failed",
 			slog.String("campaign_id", c.ID.String()),
@@ -801,8 +815,9 @@ func gateReleased(key decisionKey, out GateActionOutcome) bool {
 	return true
 }
 
-// decisionPayload is the exact marker payload: this run's own campaign_id,
-// issue_ref, run_id, gate and closed-set tokens. out.Note is never included.
+// decisionPayload is the exact base marker payload: this run's own
+// campaign_id, issue_ref, run_id, gate and closed-set tokens. out.Note is never
+// included. recordDecision may add concern_ids; clearDecision adds cleared_by.
 func decisionPayload(c *campaign.Campaign, it *campaign.Item, runRow *run.Run, key decisionKey) map[string]any {
 	return map[string]any{
 		"campaign_id":    c.ID.String(),
