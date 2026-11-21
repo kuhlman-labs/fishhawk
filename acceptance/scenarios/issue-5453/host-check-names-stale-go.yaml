@@ -2,12 +2,14 @@ id: scenario:issue-5453/host-check-names-stale-go
 statement: Running scripts/check-gate-image --host with a `go` first on PATH whose version is below the checkout's go.work go directive, under GOTOOLCHAIN=local and with golangci-lint/gofmt matching the pins, exits 3 and its stderr names the go version, the go.work directive and the deploy/gate-image/Dockerfile GO_VERSION pin; with GOTOOLCHAIN=auto the same toolchain exits 0.
 verify_hint: CLI exit code and stderr of scripts/check-gate-image --host with stub go/golangci-lint/gofmt scripts first on PATH (stub version lines in a temp dir).
 steps: 'Posture B in the sanctioned checkout (15f05868a, read-only). In /tmp/fhacc5453/stale, made stub scripts: go (''go env GOVERSION'' prints go1.26.9; ''go env GOTOOLCHAIN'' echoes $GOTOOLCHAIN; ''go version <path>'' prints ''<path>: go1.27.4''), golangci-lint (''golangci-lint has version 2.15.0 built with go1.27.4'') and gofmt. Ran PATH=/tmp/fhacc5453/stale:/usr/bin:/bin:/opt/homebrew/bin GOTOOLCHAIN=local scripts/check-gate-image --host, then the same with GOTOOLCHAIN=auto. Also ran GOTOOLCHAIN=go1.26.9 (approval condition Z2), and a pinned stub (go1.27.4) under local.'
+steps_carried_from: head 15f05868a7118ae0aa67d227fa721d8f47c500a7 recorded_at 2026-11-21T21:43:06Z
 assertions:
     expected: exit 3 naming the go version, the go.work directive and the GO_VERSION pin; exit 0 under auto
-    observed_at_record: 'Under local: exit 3, with stderr ''host go go1.26.9 (GOTOOLCHAIN=local, which never switches) is older than go.work:16 `go 1.27.0` ... deploy/gate-image/Dockerfile:74 GO_VERSION 1.27.4 is the pinned Go: rebuild the gate image or put go1.27.4 first on PATH''. Under auto: exit 0 with ''ok host go toolchain switching (GOTOOLCHAIN=auto)''. The named GOTOOLCHAIN exited 0 with ''ok host go toolchain named''. Pinned exited 0.'
+    observed_at_record: 'local: exit 3, stderr ''host go go1.26.9 (GOTOOLCHAIN=local...) is older than go.work:16 `go 1.27.0` ... deploy/gate-image/Dockerfile:74 GO_VERSION 1.27.4 is the pinned Go: rebuild the gate image...''. auto: exit 0 ''ok host go toolchain switching''. go1.26.9: exit 0 ''named''. pinned/local: exit 0.'
+    repro_handle: PATH=<stubdir>:/usr/bin:/bin GOTOOLCHAIN=local scripts/check-gate-image --host; echo $?
 origin:
     issue: 5453
     pr: 5516
     run_id: 481559bd-0c1a-4716-a3a3-38eab129c028
-    head_sha: 15f05868a7118ae0aa67d227fa721d8f47c500a7
-    recorded_at: 2026-11-21T21:43:06Z
+    head_sha: aaae268a8c71468545bab0377192709b036a9474
+    recorded_at: 2026-11-21T22:53:06Z

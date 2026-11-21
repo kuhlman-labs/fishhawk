@@ -1,13 +1,14 @@
 id: scenario:issue-5453/lint-leg-exits-tempfail-naming-image
 statement: Running scripts/test lint with the same stale toolchain, FISHHAWK_GATE_CONTAINER=1 and FISHHAWK_GATE_IMAGE set to an image ref exits 75 and stderr carries host_toolchain_mismatch and a gate_image_stale line naming that image ref, the GO_VERSION pin and the docker buildx rebuild command; with the pinned toolchain it does not refuse.
 verify_hint: CLI exit code (75) and stderr of scripts/test lint under the stub toolchain.
-steps: Posture B in the sanctioned checkout with the stale stubs from /tmp/fhacc5453/stale. Ran env PATH=<stale>:... GOTOOLCHAIN=local FISHHAWK_GATE_CONTAINER=1 FISHHAWK_GATE_IMAGE_REF=fishhawk-gate:local XDG_CACHE_HOME=/tmp/fhacc5453/xdg scripts/test lint. Repeated with FISHHAWK_GATE_IMAGE instead of _REF, as the criterion words it, and once with the pinned go1.27.4 stub.
+steps: 'Posture B in the sanctioned checkout aaae268a8, with stale stubs: go go1.26.9, golangci-lint 2.15.0 built with go1.27.4, gofmt exits 0. Ran env PATH=<stubs>:/usr/bin:/bin GOTOOLCHAIN=local FISHHAWK_GATE_CONTAINER=1 FISHHAWK_GATE_IMAGE_REF=fishhawk-gate:local XDG_CACHE_HOME=<tmp> scripts/test lint. Repeated with FISHHAWK_GATE_IMAGE in place of _REF, then with a pinned go1.27.4 stub and _REF.'
 assertions:
-    expected: exit 75, host_toolchain_mismatch, and a gate_image_stale line naming the image ref, the pin and the rebuild command; the pinned toolchain does not refuse
-    observed_at_record: 'Stale with _REF: exit 75. stderr had the check-gate-image line naming GO_VERSION 1.27.4 and ''scripts/test: host_toolchain_mismatch: lint REFUSED'', then ''scripts/test: gate_image_stale: the gate image fishhawk-gate:local carries the toolchain above'', then ''docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image''. With FISHHAWK_GATE_IMAGE only: exit 75 and the image named ''<unnamed: the runner did not set FISHHAWK_GATE_IMAGE_REF>''. That is the intended behaviour under Z1. Pinned: exit 0, with no host_toolchain_mismatch or gate_image_stale.'
+    expected: exit 75; host_toolchain_mismatch; a gate_image_stale line naming the image ref, the GO_VERSION pin and the rebuild command; the pinned toolchain does not refuse
+    observed_at_record: 'stale + _REF: exit 75. Stderr has ''host_toolchain_mismatch: lint REFUSED ... (exit 75, EX_TEMPFAIL)'' and a line naming Dockerfile:74 GO_VERSION 1.27.4. It has ''gate_image_stale: the gate image fishhawk-gate:local carries the toolchain above'' and the ''docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image'' command. stale + FISHHAWK_GATE_IMAGE: exit 75, image shown as ''<unnamed: the runner did not set FISHHAWK_GATE_IMAGE_REF>''. pinned: exit 0, no refusal.'
+    repro_handle: env PATH=<stubdir>:/usr/bin:/bin GOTOOLCHAIN=local FISHHAWK_GATE_CONTAINER=1 FISHHAWK_GATE_IMAGE_REF=fishhawk-gate:local scripts/test lint; echo $?
 origin:
     issue: 5453
     pr: 5516
     run_id: 481559bd-0c1a-4716-a3a3-38eab129c028
-    head_sha: 15f05868a7118ae0aa67d227fa721d8f47c500a7
-    recorded_at: 2026-11-21T21:43:06Z
+    head_sha: aaae268a8c71468545bab0377192709b036a9474
+    recorded_at: 2026-11-21T22:53:06Z

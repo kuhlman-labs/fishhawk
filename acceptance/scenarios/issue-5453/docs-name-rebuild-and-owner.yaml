@@ -1,13 +1,13 @@
 id: scenario:issue-5453/docs-name-rebuild-and-owner
 statement: deploy/gate-image/README.md and docs/agents/operations.md state that a toolchain-pin bump requires rebuilding the local gate image and refreshing host golangci-lint, and name who triggers it.
 verify_hint: Read the two files in the checkout; decided by review.
-steps: Read deploy/gate-image/README.md lines 85-99 and docs/agents/operations.md lines 43-49 in the sanctioned checkout.
+steps: 'Posture B: read deploy/gate-image/README.md lines 88-99 and docs/agents/operations.md lines 43-49 in the sanctioned checkout aaae268a8.'
 assertions:
-    expected: Both docs state the rebuild and host golangci-lint refresh, and name who triggers it
-    observed_at_record: 'The README''s ''After a pin bump'' says a change to a Dockerfile ARG or a go directive ''requires rebuilding fishhawk-gate:local and refreshing the host golangci-lint and Go ... the operator running the local stack (the first officer during a campaign) triggers it'', and gives the rebuild commands. operations.md says the same: ''rebuild fishhawk-gate:local and refresh the host golangci-lint and Go; ... the operator (the first officer during a campaign) triggers it''.'
+    expected: Both docs state the rebuild and the host golangci-lint refresh, and name who triggers it
+    observed_at_record: 'README ''After a pin bump'' says the change requires rebuilding fishhawk-gate:local and refreshing the host golangci-lint and Go: ''the operator running the local stack (the first officer during a campaign) triggers it''. operations.md says the same and names the operator (the first officer during a campaign).'
 origin:
     issue: 5453
     pr: 5516
     run_id: 481559bd-0c1a-4716-a3a3-38eab129c028
-    head_sha: 15f05868a7118ae0aa67d227fa721d8f47c500a7
-    recorded_at: 2026-11-21T21:43:06Z
+    head_sha: aaae268a8c71468545bab0377192709b036a9474
+    recorded_at: 2026-11-21T22:53:06Z
