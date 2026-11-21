@@ -885,9 +885,22 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	l.pruneRunRefusals(candidates)
 	// A per-tick-cap or memory-pressure break still counts as a completed pass.
 	l.status.LastCompleteTickAt = l.now().UTC()
+	// Like runRefusals, the deprioritised set keeps only runs still in this
+	// tick's candidate list: a run that went terminal or left the list is never
+	// evaluated again, so it would otherwise hold its entry until a restart.
+	live := make(map[string]bool, len(candidates))
+	for _, r := range candidates {
+		live[r.ID] = true
+	}
+	for id := range refused {
+		if !live[id] {
+			delete(refused, id)
+		}
+	}
 	l.deprioritised = refused
-	// The rotation state is bounded by the deprioritised set: a run that left
-	// rank 2 is re-stamped by the evaluation that puts it back.
+	// The rotation state is bounded by the deprioritised set, and so by the live
+	// candidates: a run that left rank 2 is re-stamped by the evaluation that
+	// puts it back.
 	for id := range l.lastEvaluated {
 		if !refused[id] {
 			delete(l.lastEvaluated, id)
