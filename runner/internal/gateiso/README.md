@@ -530,7 +530,17 @@ then `HOME=/tmp`, `GOPATH=/tmp/gopath`, `GOCACHE=/gocache`, `GOMODCACHE=/gomodca
 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` and `FISHHAWK_GATE_CONTAINER=1`
 (`GateContainerMarker`, on EVERY container exec) are appended drop-then-append,
 then the runner's `extraEnv` entries drop-then-append so a caller-supplied value
-wins. In the volume form `WithCacheVolumeEnv` then re-pins
+wins. `runGateInContainer` then applies `WithGateImageEnv`, which pins
+`FISHHAWK_GATE_IMAGE_REF=<the resolved image>` (`GateImageRefEnvKey`: the
+`FISHHAWK_GATE_IMAGE` tag, a declared `gate_container`'s `name@digest`, or a
+`fishhawk-gate-build` tag) drop-then-append AFTER the extras, so the runner's
+value wins ([#5453](https://github.com/kuhlman-labs/fishhawk/issues/5453):
+`scripts/test lint` names it in its `gate_image_stale` line). It is
+runner-set and bypasses the allow-list by design, like the pins above; it
+carries no secret, only an image reference, never a registry URL with userinfo.
+It is deliberately NOT `FISHHAWK_GATE_IMAGE`, the runner's own configuration
+variable, which never crosses into the container
+(`TestWithGateImageEnv`, `TestRunGateInContainer_GateImageEnv`). In the volume form `WithCacheVolumeEnv` then re-pins
 `GOCACHE=/gatecache/gocache` and `GOLANGCI_LINT_CACHE=/gatecache/lintcache`
 drop-then-append (the bind-form `/gocache` / `/lintcache` are not mounted
 there). A provisioned service's env (`PostgresService.GateEnv`, the

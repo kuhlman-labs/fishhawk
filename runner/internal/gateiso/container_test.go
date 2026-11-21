@@ -722,6 +722,61 @@ func TestContainerEnv_ServiceEnvWinsOverExtras(t *testing.T) {
 	}
 }
 
+// TestWithGateImageEnv (#5453): the runner's image ref is appended exactly
+// once under FISHHAWK_GATE_IMAGE_REF, overriding any earlier value of the key
+// (a sanitized or extras one), an empty image is a no-op, the input is never
+// mutated, and the runner's own FISHHAWK_GATE_IMAGE name is never emitted.
+func TestWithGateImageEnv(t *testing.T) {
+	count := func(env []string, prefix string) int {
+		n := 0
+		for _, kv := range env {
+			if strings.HasPrefix(kv, prefix) {
+				n++
+			}
+		}
+		return n
+	}
+	if GateImageRefEnvKey != "FISHHAWK_GATE_IMAGE_REF" {
+		t.Fatalf("GateImageRefEnvKey = %q: scripts/test reads FISHHAWK_GATE_IMAGE_REF", GateImageRefEnvKey)
+	}
+	t.Run("appends once", func(t *testing.T) {
+		base := ContainerEnv(nil, nil)
+		got := WithGateImageEnv(base, "img:1")
+		if count(got, "FISHHAWK_GATE_IMAGE_REF=") != 1 || got[len(got)-1] != "FISHHAWK_GATE_IMAGE_REF=img:1" {
+			t.Fatalf("image ref not appended once, last: %q", got)
+		}
+		if count(got, "FISHHAWK_GATE_IMAGE=") != 0 {
+			t.Errorf("the runner's own FISHHAWK_GATE_IMAGE name reached the container env: %q", got)
+		}
+		if len(got) != len(base)+1 {
+			t.Errorf("len = %d, want %d (base plus the pin): %q", len(got), len(base)+1, got)
+		}
+	})
+	t.Run("overrides a prior value", func(t *testing.T) {
+		base := ContainerEnv(nil, []string{"FISHHAWK_GATE_IMAGE_REF=other:9", "GOFLAGS=y"})
+		got := WithGateImageEnv(base, "img:1")
+		if count(got, "FISHHAWK_GATE_IMAGE_REF=") != 1 || idx(got, "FISHHAWK_GATE_IMAGE_REF=img:1") < 0 {
+			t.Fatalf("the runner's image ref did not win: %q", got)
+		}
+		if idx(got, "GOFLAGS=y") < 0 {
+			t.Errorf("WithGateImageEnv dropped an unrelated entry: %q", got)
+		}
+		if idx(base, "FISHHAWK_GATE_IMAGE_REF=other:9") < 0 || idx(base, "FISHHAWK_GATE_IMAGE_REF=img:1") >= 0 {
+			t.Errorf("WithGateImageEnv mutated its input: %q", base)
+		}
+	})
+	t.Run("empty image is a no-op", func(t *testing.T) {
+		base := ContainerEnv(nil, nil)
+		got := WithGateImageEnv(base, "")
+		if !reflect.DeepEqual(got, base) || count(got, "FISHHAWK_GATE_IMAGE_REF") != 0 {
+			t.Fatalf("empty image changed env: %q", got)
+		}
+		if len(got) > 0 && &got[0] == &base[0] {
+			t.Error("WithGateImageEnv returned its input slice, not a copy")
+		}
+	})
+}
+
 // --- passwd + service mounts -------------------------------------------------
 
 func TestBuildArgv_ServiceMountAndPasswdReadOnly(t *testing.T) {

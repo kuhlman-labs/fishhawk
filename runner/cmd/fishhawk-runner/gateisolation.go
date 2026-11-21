@@ -1164,6 +1164,10 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		uid, gid = st.uid, st.gid
 	}
 	env := gateiso.ContainerEnv(sanitizedEnv, extraEnv)
+	// The RESOLVED image ref (#5453): after extras, so the runner's value
+	// wins, and before the cache and service env. A distinct key from the
+	// runner's own FISHHAWK_GATE_IMAGE configuration variable.
+	env = gateiso.WithGateImageEnv(env, image)
 	passwdFile := st.gatePasswdFile(ctx, sel.Runtime, image, vc.Root, cliEnv, uid, gid)
 	// The per-process cache volume (#3967) for the RESOLVED image — a
 	// declared gate_container's name@digest or FISHHAWK_GATE_IMAGE alike. ""

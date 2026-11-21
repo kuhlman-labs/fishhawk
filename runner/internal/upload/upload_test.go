@@ -4654,7 +4654,8 @@ func TestShipPullRequest_ReverifyFailureBodyMatchesSharedFixture(t *testing.T) {
 }
 
 // TestShipPullRequest_MergeCandidateLaunchGoldensMatchWire is the wire-bytes
-// leg of the #5408 container launch-marker goldens (approval condition L2):
+// leg of the #5408 container launch-marker goldens (approval condition L2) and
+// the #5453 stale-gate-image golden (merge_candidate_toolchain_mismatch_report.json):
 // the runner pass's TestMergeCandidateVerify_ContainerLaunchMarker asserts it
 // ships each golden's merge-candidate fields, the backend's
 // TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens posts each
@@ -4663,7 +4664,12 @@ func TestShipPullRequest_ReverifyFailureBodyMatchesSharedFixture(t *testing.T) {
 // JSON-equal to the golden. A tag rename or a field leaking onto the
 // merge-candidate body reddens it.
 func TestShipPullRequest_MergeCandidateLaunchGoldensMatchWire(t *testing.T) {
-	for _, name := range []string{"merge_candidate_launch_failed_report.json", "merge_candidate_post_launch_exit125_report.json"} {
+	for _, name := range []string{
+		"merge_candidate_launch_failed_report.json",
+		"merge_candidate_post_launch_exit125_report.json",
+		// #5453: a stale gate image's exit 75 (not_executed / verify_infra_tempfail).
+		"merge_candidate_toolchain_mismatch_report.json",
+	} {
 		t.Run(name, func(t *testing.T) {
 			golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", name))
 			if err != nil {
