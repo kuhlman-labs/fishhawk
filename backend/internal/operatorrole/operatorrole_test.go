@@ -478,6 +478,11 @@ func TestDelegatedApprovalDecisionStates(t *testing.T) {
 	if DecisionStateFixupNoChangesUnaddressed != "fixup_no_changes_unaddressed" {
 		t.Errorf("DecisionStateFixupNoChangesUnaddressed = %q, want %q", DecisionStateFixupNoChangesUnaddressed, "fixup_no_changes_unaddressed")
 	}
+	// #5265: the may_approve hold on a plan declaring a new architectural
+	// decision, decoded by the fishhawk_drive_run decision arm.
+	if DecisionStateArchitecturalDecisionAwaitingCaptain != "architectural_decision_awaiting_captain" {
+		t.Errorf("DecisionStateArchitecturalDecisionAwaitingCaptain = %q, want %q", DecisionStateArchitecturalDecisionAwaitingCaptain, "architectural_decision_awaiting_captain")
+	}
 }
 
 func TestValidateOverlayReadError(t *testing.T) {

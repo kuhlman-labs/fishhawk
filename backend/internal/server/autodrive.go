@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
@@ -22,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -91,7 +93,8 @@ type AutoDriveOutcome struct {
 	// states operatorrole.DecisionStateHumanQuorumRequired and
 	// DecisionStateDelegatedApprovalNoProgress; the #5477 route_fixup state
 	// DecisionStateServerCheckAwaitingHuman; the #5390 route_fixup state
-	// DecisionStateFixupNoChangesUnaddressed) and Action names the
+	// DecisionStateFixupNoChangesUnaddressed; the #5265 may_approve state
+	// DecisionStateArchitecturalDecisionAwaitingCaptain) and Action names the
 	// delegated verb whose arm surfaced it. Set with Acted=false and
 	// Paged=false. Introduced by the E48.41 / #2091 fix so an exhausted
 	// fix-up budget on the delegated route_fixup arm parks the operator with
@@ -227,6 +230,12 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 			// decision for the captain; a read error is observe-only
 			// (fail-closed). No approval is submitted either way.
 			if out, held := s.firstOfficerAutoDriveHold(ctx, runRow.ID, gated, delegation.ActionApprove); held {
+				return out, nil
+			}
+			// #5265: a plan declaring a new_architectural_decision is a design
+			// ruling for the captain, not a clean-dual-approval auto-approve.
+			// An unreadable plan artifact fails closed to the same decline.
+			if out, held := s.architecturalDecisionAutoDriveHold(ctx, gated); held {
 				return out, nil
 			}
 			result, aerr := s.approveStageAs(ctx, id, approveActionParams{
@@ -458,6 +467,86 @@ func (s *Server) firstOfficerAutoDriveHold(ctx context.Context, runID uuid.UUID,
 		Action:           action,
 		Note:             hold.Message + "; " + firstOfficerHoldNextStep,
 	}, true
+}
+
+// architecturalDecisionAutoDriveHold declines a delegated approve of a PLAN
+// gate whose newest standard_v1 plan artifact declares a
+// new_architectural_decision (#5265): whether the direction needs an ADR is a
+// ruling for the captain, not something clean_dual_approval settles. It
+// returns decision_required architectural_decision_awaiting_captain (action
+// approve) and nothing is submitted or appended here; the campaign driver's
+// trackDecision records the campaign_gate_decision_required marker.
+//
+// Fail-closed: a list error or an undecodable newest plan artifact returns
+// the same decline, because the plan cannot be shown to declare no new
+// decision (the posture of delegatedApproveWouldAdvance's unreadable modes).
+//
+// held=false (the arm proceeds) when stage is nil, when it is not a plan
+// stage (an implement gate's plan already passed its own plan gate), when the
+// artifact store is unwired (nothing to read, the firstOfficerHoldRefusal
+// nil-ConcernRepo convention; production always wires it), or when the stage
+// carries no standard_v1 plan artifact (a PROPOSE stage's report has no
+// declaration field).
+//
+// The Note never echoes the planner-authored decision_summary or rationale:
+// it reaches the operator agent through fishhawk_drive_run, where planner
+// text is an injection surface. The captain reads the declaration on the plan
+// gate's plan_warnings advisory.
+func (s *Server) architecturalDecisionAutoDriveHold(ctx context.Context, stage *run.Stage) (AutoDriveOutcome, bool) {
+	if stage == nil || stage.Type != run.StageTypePlan || s.cfg.ArtifactRepo == nil {
+		return AutoDriveOutcome{}, false
+	}
+	p, err := s.gatedPlanArtifact(ctx, stage.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: gated plan artifact unreadable; declining delegated approve",
+			slog.String("run_id", stage.RunID.String()), slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
+			Action:           delegation.ActionApprove,
+			Note: "the gated plan artifact could not be read, so it cannot be shown to declare no new " +
+				"architectural decision (fail-closed); the plan gate goes to the captain and no delegated approval was submitted",
+		}, true
+	}
+	if p == nil || !p.NewArchitecturalDecision.Declared() {
+		return AutoDriveOutcome{}, false
+	}
+	return AutoDriveOutcome{
+		DecisionRequired: true,
+		DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
+		Action:           delegation.ActionApprove,
+		Note: "the plan declares a new architectural decision; the captain decides whether the direction needs an ADR " +
+			"(named on the plan gate's plan_warnings advisory); no delegated approval was submitted",
+	}, true
+}
+
+// gatedPlanArtifact returns the newest standard_v1 plan-kind artifact on the
+// stage (the stagePlanForOverlap / attentionPlanSummary pick rule), or
+// (nil, nil) when the stage carries none. Unlike stagePlanForOverlap it
+// surfaces a list or decode error, so the caller can fail closed.
+func (s *Server) gatedPlanArtifact(ctx context.Context, stageID uuid.UUID) (*plan.Plan, error) {
+	arts, err := s.cfg.ArtifactRepo.ListForStage(ctx, stageID)
+	if err != nil {
+		return nil, fmt.Errorf("list gated plan artifacts: %w", err)
+	}
+	var picked *artifact.Artifact
+	for _, a := range arts {
+		if a.Kind != artifact.KindPlan || a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		if picked == nil || a.CreatedAt.After(picked.CreatedAt) {
+			picked = a
+		}
+	}
+	if picked == nil {
+		return nil, nil
+	}
+	var p plan.Plan
+	if err := json.Unmarshal(picked.Content, &p); err != nil {
+		return nil, fmt.Errorf("decode gated plan artifact: %w", err)
+	}
+	return &p, nil
 }
 
 // mergeOverlapAutoDriveHold applies the merge overlap guard (E83.61 / #4119)

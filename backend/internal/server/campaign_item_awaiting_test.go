@@ -753,3 +753,111 @@ func TestCampaignDriver_ServerCheckAwaitingHuman_StatusRendersDecision(t *testin
 		t.Errorf("server-check concern state = %s, want raised", st)
 	}
 }
+
+// TestCampaignDriver_ArchitecturalDecision_StatusRendersDecision is the #5265
+// cross-boundary test: the REAL campaign Ticker drives a run whose plan gate
+// has a clean dual review and a plan declaring a new_architectural_decision
+// through DriveCampaignRunGate and AutoDriveRunGate over a wired artifact
+// store, records one campaign_gate_decision_required marker, and the REAL
+// campaign status read renders it on the item's awaiting block. The control
+// subtest's undeclared plan records no marker and auto-approves.
+func TestCampaignDriver_ArchitecturalDecision_StatusRendersDecision(t *testing.T) {
+	type fixture struct {
+		s         *Server
+		au        *auditFake
+		runID     uuid.UUID
+		planStage *run.Stage
+		campaign  *campaign.Campaign
+	}
+	drive := func(t *testing.T, planJSON []byte) fixture {
+		t.Helper()
+		repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+		au := newAuditFake()
+		camps := &pauseNoopCampaignRepo{fakeCampaignRepo: newFakeCampaignRepo()}
+		arts := newFakeArtifactRepo()
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      repo,
+			AuditRepo:    au,
+			ConcernRepo:  newFakeConcernRepo(),
+			ArtifactRepo: arts,
+			CampaignRepo: camps.fakeCampaignRepo,
+			ApprovalRepo: newFakeApprovalRepo(),
+			Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		})
+		runID, stages := startAutoDriveRun(t, s, repo)
+		planStage := stages[0]
+		seedCleanPlanApproval(t, au, runID)
+		seedStandardPlanArtifact(t, arts, planStage.ID, planJSON)
+		c := camps.seedCampaignWithItems("acme/widgets", "issue:10", []*campaign.Item{
+			{IssueRef: "issue:1", State: campaign.ItemStateRunning, RunID: idp(runID), Position: 0},
+		})
+		tk := &campaigndriver.Ticker{
+			Campaigns: camps,
+			Runs:      repo,
+			Starter:   neverStarter{t: t},
+			Audit:     au,
+			GateActor: gateActorFunc(func(ctx context.Context, runRow *run.Run) (campaigndriver.GateActionOutcome, error) {
+				return s.DriveCampaignRunGate(ctx, runRow, campaignOperatorIdentity(), nil, nil)
+			}),
+		}
+		tk.Tick(context.Background())
+		return fixture{s: s, au: au, runID: runID, planStage: planStage, campaign: c}
+	}
+
+	t.Run("declared", func(t *testing.T) {
+		f := drive(t, withNADPlanJSON(t, validPlanBytes(t)))
+		markers, err := f.au.ListForRunByCategory(context.Background(), f.runID, campaigndriver.CategoryCampaignGateDecisionRequired)
+		if err != nil {
+			t.Fatalf("list markers: %v", err)
+		}
+		if len(markers) != 1 {
+			t.Fatalf("%d campaign_gate_decision_required rows on the run chain, want exactly 1", len(markers))
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(markers[0].Payload, &payload); err != nil {
+			t.Fatalf("decode marker: %v", err)
+		}
+		var keys []string
+		for k := range payload {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if got := strings.Join(keys, ","); got != "action,campaign_id,decision_state,gate,issue_ref,run_id" {
+			t.Fatalf("marker payload keys = %s, want exactly action,campaign_id,decision_state,gate,issue_ref,run_id", got)
+		}
+		if payload["decision_state"] != "architectural_decision_awaiting_captain" || payload["gate"] != f.planStage.ID.String() || payload["action"] != "approve" {
+			t.Fatalf("marker payload = %v, want architectural_decision_awaiting_captain/approve keyed on the plan stage %s", payload, f.planStage.ID)
+		}
+
+		got, _ := statusAwaitingByRef(t, callCampaignStatusAs(f.s, f.campaign.ID, gateViewReadIdentity()))
+		blk := got["issue:1"]
+		if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonGateApproval {
+			t.Fatalf("awaiting = %+v, want human/gate_approval", blk)
+		}
+		if blk.Decision == nil || blk.Decision.DecisionState != "architectural_decision_awaiting_captain" ||
+			blk.Decision.Action != "approve" || blk.Decision.Gate != f.planStage.ID.String() {
+			t.Fatalf("awaiting decision = %+v, want architectural_decision_awaiting_captain/approve on gate %s", blk.Decision, f.planStage.ID)
+		}
+		if n := countAudit(f.au, "approval_submitted"); n != 0 {
+			t.Errorf("approval_submitted entries = %d, want 0", n)
+		}
+		if f.planStage.State != run.StageStateAwaitingApproval {
+			t.Errorf("plan stage = %q, want still awaiting_approval", f.planStage.State)
+		}
+	})
+
+	t.Run("control", func(t *testing.T) {
+		f := drive(t, validPlanBytes(t))
+		markers, err := f.au.ListForRunByCategory(context.Background(), f.runID, campaigndriver.CategoryCampaignGateDecisionRequired)
+		if err != nil {
+			t.Fatalf("list markers: %v", err)
+		}
+		if len(markers) != 0 {
+			t.Fatalf("%d campaign_gate_decision_required rows, want 0 for an undeclared plan", len(markers))
+		}
+		if f.planStage.State != run.StageStateSucceeded {
+			t.Errorf("plan stage = %q, want succeeded (auto-approved)", f.planStage.State)
+		}
+	})
+}
