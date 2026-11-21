@@ -3556,6 +3556,256 @@ func TestFixupStage_Delegated_NotConfigured(t *testing.T) {
 	}
 }
 
+// --- Delegated route over server-check concerns (#5477) ---------------------
+
+// seedFixupServerCheckRow inserts one implement-stage concern minted the way the
+// server checks mint theirs (provenance server_check, no reviewer model), so
+// the delegated-route guard keys on a real provenance value.
+func seedFixupServerCheckRow(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, severity, note string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            concern.StageKindImplement,
+		Provenance:           concern.ProvenanceServerCheck,
+		OriginReviewSequence: 3,
+		Concerns:             []concern.RaisedConcern{{Severity: severity, Category: "diff_secrets", Note: note, CheckKey: "k-" + note}},
+	})
+	if err != nil {
+		t.Fatalf("seed server-check concern: %v", err)
+	}
+	if !rows[0].IsServerCheck() {
+		t.Fatalf("seeded row provenance = %q, want server_check (the fixture must carry the provenance the guard keys on)", rows[0].Provenance)
+	}
+	return rows[0]
+}
+
+// serverCheckFixupFixture is a delegated run whose implement stage is parked
+// at awaiting_approval after a settled one-verdict approve_with_concerns round,
+// with one medium REVIEWER row and one high SERVER_CHECK row. The reviewer row
+// keeps convergent_concerns met, so checkDelegation passes whether or not the
+// server-check guard exists: deleting the guard is observable as a routed pass.
+type serverCheckFixupFixture struct {
+	s        *Server
+	repo     *approvalRunRepo
+	au       *auditFake
+	cr       *fakeConcernRepo
+	stage    *run.Stage
+	reviewer *concern.Concern
+	sc       *concern.Concern
+}
+
+func newServerCheckFixupFixture(t *testing.T, wrap func(*fakeConcernRepo) concern.Repository) serverCheckFixupFixture {
+	t.Helper()
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	var store concern.Repository = cr
+	if wrap != nil {
+		store = wrap(cr)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: store})
+	stage := repo.seedGatelessStage(run.StageStateAwaitingApproval)
+	seedDelegatedRun(repo, stage)
+	seedReviewEntry(t, au, stage.RunID, 1, "implement_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 1})
+	seedReviewEntry(t, au, stage.RunID, 2, "implement_reviewed",
+		planreview.ImplementReviewedPayload{
+			ReviewerKind: "agent",
+			Authority:    planreview.AuthorityAdvisory,
+			Verdict:      planreview.VerdictApproveWithConcerns,
+		})
+	reviewer := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 2, "tighten the test")
+	sc := seedFixupServerCheckRow(t, cr, stage.RunID, stage.ID, "high", "secret-in-diff")
+	return serverCheckFixupFixture{s: s, repo: repo, au: au, cr: cr, stage: stage, reviewer: reviewer, sc: sc}
+}
+
+// assertNoFixupRouted reads the committed state after a refusal: the stage is
+// still parked, no stage_fixup_triggered entry exists, and every named row is
+// still raised.
+func assertNoFixupRouted(t *testing.T, f serverCheckFixupFixture, rows ...*concern.Concern) {
+	t.Helper()
+	if f.stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no state change on refusal)", f.stage.State)
+	}
+	if idx := auditEntriesByCategory(f.au, CategoryStageFixupTriggered); len(idx) != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d after refusal, want 0", len(idx))
+	}
+	for _, c := range rows {
+		if c.State != concern.StateRaised {
+			t.Errorf("concern %s state = %q, want raised (nothing routed)", c.ID, c.State)
+		}
+	}
+}
+
+// TestFixupStage_Delegated_ServerCheckIDRefused422 pins the delegated-route
+// guard (#5477): a delegated:true fix-up whose concern_ids name a server_check
+// row is refused 422 fixup_server_check_requires_human, naming ONLY the
+// requested server-check id, and nothing transitions. A second server_check
+// row the caller did not name must not appear in the response.
+func TestFixupStage_Delegated_ServerCheckIDRefused422(t *testing.T) {
+	f := newServerCheckFixupFixture(t, nil)
+	unnamed := seedFixupServerCheckRow(t, f.cr, f.stage.RunID, f.stage.ID, "medium", "unnamed-drift")
+
+	w := postFixup(t, f.s, f.stage.ID, fixupRequest{
+		ConcernIDs: []string{f.reviewer.ID.String(), f.sc.ID.String()},
+		Reason:     "route both back",
+		Delegated:  true,
+	})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	if errBody.Code != "fixup_server_check_requires_human" {
+		t.Errorf("code = %q, want fixup_server_check_requires_human", errBody.Code)
+	}
+	ids, ok := errBody.Details["concern_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != f.sc.ID.String() {
+		t.Errorf("details.concern_ids = %v, want exactly [%s] (only the requested server-check id)", errBody.Details["concern_ids"], f.sc.ID)
+	}
+	if errBody.Details["provenance"] != "server_check" || errBody.Details["delegated"] != true || errBody.Details["remedy"] != "human_decision" {
+		t.Errorf("details = %v, want provenance server_check, delegated true, remedy human_decision", errBody.Details)
+	}
+	for _, key := range []string{"concern_ids", "provenance", "delegated", "remedy"} {
+		if _, ok := errBody.Details[key]; !ok {
+			t.Errorf("details missing %q: %v", key, errBody.Details)
+		}
+	}
+	if len(errBody.Details) != 4 {
+		t.Errorf("details keys = %v, want exactly concern_ids, provenance, delegated, remedy", errBody.Details)
+	}
+	if !strings.Contains(errBody.Message, "non-delegated fix-up") || !strings.Contains(errBody.Message, "Fishhawk Web UI") {
+		t.Errorf("message = %q, want the human-only remedies named", errBody.Message)
+	}
+	if body := w.Body.String(); strings.Contains(body, unnamed.ID.String()) || strings.Contains(body, f.reviewer.ID.String()) {
+		t.Errorf("body names an id beyond the requested server-check row:\n%s", body)
+	}
+	assertNoFixupRouted(t, f, f.reviewer, f.sc, unnamed)
+}
+
+// TestFixupStage_NonDelegated_ServerCheckIDRouted: the guard keys on the
+// request's delegated field, so a non-delegated fix-up over the same mixed set
+// still routes both rows (the operator route stays open, #5477).
+func TestFixupStage_NonDelegated_ServerCheckIDRouted(t *testing.T) {
+	f := newServerCheckFixupFixture(t, nil)
+
+	w := postFixup(t, f.s, f.stage.ID, fixupRequest{
+		ConcernIDs: []string{f.reviewer.ID.String(), f.sc.ID.String()},
+		Reason:     "operator routes both back",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	idx := auditEntriesByCategory(f.au, CategoryStageFixupTriggered)
+	if len(idx) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 1", len(idx))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(f.au.appended[idx[0]].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	ids, _ := payload["concern_ids"].([]any)
+	if len(ids) != 2 || ids[0] != f.reviewer.ID.String() || ids[1] != f.sc.ID.String() {
+		t.Errorf("payload.concern_ids = %v, want [%s %s]", payload["concern_ids"], f.reviewer.ID, f.sc.ID)
+	}
+	if f.sc.State != concern.StateAddressedPending {
+		t.Errorf("server-check row state = %q, want addressed_pending (a non-delegated route may name it)", f.sc.State)
+	}
+}
+
+// TestFixupStage_DelegatedServerCheckGuard_UnknownIDFallsThrough: an unknown
+// id makes the guard's read return ErrNotFound; the guard writes nothing, so
+// the resolver answers its existing 400 rather than a 422 or a 500.
+func TestFixupStage_DelegatedServerCheckGuard_UnknownIDFallsThrough(t *testing.T) {
+	f := newServerCheckFixupFixture(t, nil)
+	unknown := uuid.New()
+
+	w := postFixup(t, f.s, f.stage.ID, fixupRequest{
+		ConcernIDs: []string{f.sc.ID.String(), unknown.String()},
+		Reason:     "route them back",
+		Delegated:  true,
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (the resolver's unknown concern_id, not 422 or 500):\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	if errBody.Code != "validation_failed" || !strings.Contains(errBody.Message, "unknown concern_id") {
+		t.Errorf("error = %+v, want validation_failed naming the unknown concern_id", errBody)
+	}
+	assertNoFixupRouted(t, f, f.reviewer, f.sc)
+}
+
+// failFirstGetByIDsRepo fails only the FIRST GetByIDs call with a
+// non-NotFound error. The guard makes the first read, so with its fail-closed
+// branch mutated to fall through, the resolver's later read succeeds and the
+// pass routes: the read-error branch is the only thing between the request
+// and a state change.
+type failFirstGetByIDsRepo struct {
+	*fakeConcernRepo
+	calls int
+}
+
+func (f *failFirstGetByIDsRepo) GetByIDs(ctx context.Context, ids []uuid.UUID) ([]*concern.Concern, error) {
+	f.calls++
+	if f.calls == 1 {
+		return nil, errors.New("concern store unavailable")
+	}
+	return f.fakeConcernRepo.GetByIDs(ctx, ids)
+}
+
+// TestFixupStage_DelegatedServerCheckGuard_ReadErrorFailsClosed: a guard read
+// error other than ErrNotFound fails closed with 500 internal_error, and
+// nothing transitions.
+func TestFixupStage_DelegatedServerCheckGuard_ReadErrorFailsClosed(t *testing.T) {
+	var store *failFirstGetByIDsRepo
+	f := newServerCheckFixupFixture(t, func(cr *fakeConcernRepo) concern.Repository {
+		store = &failFirstGetByIDsRepo{fakeConcernRepo: cr}
+		return store
+	})
+
+	w := postFixup(t, f.s, f.stage.ID, fixupRequest{
+		ConcernIDs: []string{f.reviewer.ID.String(), f.sc.ID.String()},
+		Reason:     "route both back",
+		Delegated:  true,
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	if errBody.Code != "internal_error" || !strings.Contains(errBody.Message, "delegated server-check guard") {
+		t.Errorf("error = %+v, want internal_error from the delegated server-check guard", errBody)
+	}
+	if store.calls != 1 {
+		t.Errorf("GetByIDs calls = %d, want 1 (the guard stops the request before the resolver reads)", store.calls)
+	}
+	assertNoFixupRouted(t, f, f.reviewer, f.sc)
+}
+
+// TestFixupStage_DelegatedServerCheckGuard_ForeignRunRowFallsThrough: another
+// run's server_check row is ignored by the guard, so the resolver answers its
+// existing 400 and the 422 never discloses another run's provenance.
+func TestFixupStage_DelegatedServerCheckGuard_ForeignRunRowFallsThrough(t *testing.T) {
+	f := newServerCheckFixupFixture(t, nil)
+	foreign := seedFixupServerCheckRow(t, f.cr, uuid.New(), uuid.New(), "high", "foreign-secret")
+
+	w := postFixup(t, f.s, f.stage.ID, fixupRequest{
+		ConcernIDs: []string{f.reviewer.ID.String(), foreign.ID.String()},
+		Reason:     "route them back",
+		Delegated:  true,
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (the resolver's cross-run refusal, not 422):\n%s", w.Code, w.Body.String())
+	}
+	errBody := decodeErrorEnvelope(t, w)
+	if errBody.Code != "validation_failed" || !strings.Contains(errBody.Message, "belongs to a different run/stage") {
+		t.Errorf("error = %+v, want validation_failed naming the different run/stage", errBody)
+	}
+	if strings.Contains(w.Body.String(), "server_check") {
+		t.Errorf("body discloses another run's server_check provenance:\n%s", w.Body.String())
+	}
+	assertNoFixupRouted(t, f, f.reviewer, foreign)
+}
+
 // TestFixupStage_OperatorAgentActorAttribution: a fix-up routed under
 // an operator-agent token records actor_kind=agent with the full token
 // subject on the stage_fixup_triggered entry (ADR-040 D4, #1027).

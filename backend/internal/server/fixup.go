@@ -308,7 +308,11 @@ type fixupRequest struct {
 	// may_route_fixup condition server-side at action time — 403
 	// delegation_not_configured / delegation_condition_unmet on refusal,
 	// `delegated: "<rule>"` on the stage_fixup_triggered payload when
-	// met. Absent → behavior byte-identical to today.
+	// met. Absent → behavior byte-identical to today. A delegated request
+	// whose concern_ids name a server_check concern of the run is refused
+	// first, 422 fixup_server_check_requires_human (#5477): those rows are
+	// human-only (ADR-084 rule 5, ADR-143), so only a non-delegated route
+	// may name them.
 	Delegated bool `json:"delegated"`
 	// ImplementModel is the optional operator/driver model override for
 	// THIS fix-up pass (#1164, the #1013 operator rung applied to the
@@ -677,6 +681,12 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// state, re-evaluated server-side before any state change.
 	var delegatedRule string
 	if reqBody.Delegated {
+		// A delegated route never names a human-only server-check concern
+		// (ADR-084 rule 5, ADR-143 / #5477). Refused before checkDelegation,
+		// resolveConcernsByID and any state change.
+		if len(concernIDs) > 0 && s.cfg.ConcernRepo != nil && s.refuseDelegatedServerCheckFixup(w, r, stage.RunID, concernIDs) {
+			return
+		}
 		rule, ok := s.checkDelegation(w, r, stage.RunID, delegation.ActionRouteFixup)
 		if !ok {
 			return
@@ -1648,6 +1658,67 @@ func conventionsOverrideAttemptRefusal(ref string) string {
 	return fmt.Sprintf(
 		"%s is a %s concern: it reports an instruction in a repository review-conventions file read at the run's pinned base commit, which this run must not edit, so it is not a code obligation a fix-up can address; waive or defer it and fix the conventions file in a separate change",
 		ref, planreview.ConventionsOverrideAttemptConcernCategory)
+}
+
+// errCodeFixupServerCheckRequiresHuman is the 422 a delegated fix-up gets when
+// its concern_ids name a server_check concern of the run (#5477).
+const errCodeFixupServerCheckRequiresHuman = "fixup_server_check_requires_human"
+
+// refuseDelegatedServerCheckFixup is the delegated-route guard over
+// human-only server-check concerns (#5477). A concern minted by a server
+// check (provenance server_check: diff secrets, permission drift, an unpinned
+// control) is human-only (ADR-084 rule 5, ADR-143), so a delegated:true
+// fix-up must never hand it to the implement agent as an instruction. The
+// guard keys on the request's delegated field, exactly as checkDelegation
+// does, and on the row's provenance; it never reads the caller's subject. It
+// covers concern_ids only: the deprecated positional path resolves
+// implement_reviewed reviewer-verdict concerns, which never carry a
+// server_check row, because the server checks mint theirs with InsertRaised.
+//
+// It returns true when it has written a response and the handler must stop:
+//   - any requested row is a server_check concern of runID → 422
+//     fixup_server_check_requires_human, naming only those requested ids;
+//   - a read error other than concern.ErrNotFound → 500 internal_error (fail
+//     closed: nothing transitions).
+//
+// It returns false and writes nothing when no requested row is a server_check
+// concern of the run. An unknown id (ErrNotFound) and a row of another run
+// therefore fall through to resolveConcernsByID, which answers its existing
+// 400s, so no provenance is disclosed across runs. It appends no audit row,
+// evaluates no delegation and makes no transition.
+func (s *Server) refuseDelegatedServerCheckFixup(w http.ResponseWriter, r *http.Request, runID uuid.UUID, ids []uuid.UUID) bool {
+	rows, err := s.cfg.ConcernRepo.GetByIDs(r.Context(), ids)
+	if err != nil {
+		if errors.Is(err, concern.ErrNotFound) {
+			return false
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"read concern_ids for the delegated server-check guard failed", map[string]any{"error": err.Error()})
+		return true
+	}
+	offending := make([]string, 0, len(rows))
+	seen := make(map[uuid.UUID]struct{}, len(rows))
+	for _, c := range rows {
+		if c.IsServerCheck() && c.RunID == runID { // a delegated route never names a server-check concern (#5477)
+			if _, dup := seen[c.ID]; !dup {
+				seen[c.ID] = struct{}{}
+				offending = append(offending, c.ID.String())
+			}
+		}
+	}
+	if len(offending) == 0 {
+		return false
+	}
+	s.writeError(w, r, http.StatusUnprocessableEntity, errCodeFixupServerCheckRequiresHuman,
+		fmt.Sprintf("%d concern(s) %s were raised by a server check (provenance %s), not a model reviewer; a delegated fix-up cannot route them (ADR-084 rule 5, ADR-143). Drop them from concern_ids to route the reviewer concerns, or have a human waive or defer them from the Fishhawk Web UI attention queue, or route them in a non-delegated fix-up.",
+			len(offending), strings.Join(offending, ", "), concern.ProvenanceServerCheck),
+		map[string]any{
+			"concern_ids": offending,
+			"provenance":  concern.ProvenanceServerCheck,
+			"delegated":   true,
+			"remedy":      "human_decision",
+		})
+	return true
 }
 
 // resolveConcernsByID resolves stable concern UUIDs against the durable
