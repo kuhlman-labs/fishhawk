@@ -57,11 +57,11 @@ const (
 )
 
 // hostDispatchOverlayReadCap bounds the GetRun reads one campaign status call
-// spends discovering a state dir. Each read is a backend round trip inside a
-// status call the operator polls on every drive tick. A status found on any
-// rung already speaks for EVERY item (one dispatcher per stack), so the cap
-// only bounds the worst case where no dispatcher is found at all; the items it
-// skips then read unverified, never absent.
+// spends on working_dir rungs. Each read is a backend round trip inside a
+// status call the operator polls on every drive tick. A decisive env or cwd
+// rung needs no read; otherwise each distinct run is read until the cap. An
+// item the cap skipped keeps the call rungs and TMPDIR (which speak for every
+// item) and, when those find nothing, reads unverified, never absent.
 const hostDispatchOverlayReadCap = 16
 
 // hostDispatchPathsTriedMax bounds paths_tried: past it the list keeps the
@@ -208,18 +208,39 @@ func hostDispatchDefaultRung() string {
 // with a non-stale status (or an unreadable one) ends the walk; a STALE hit is
 // remembered and the walk continues, so a dead dispatcher's leftover file
 // cannot hide a live one further down. When every hit is stale, the first
-// stale hit is reported.
+// stale hit is reported. Forks share one per-call rung cache, so each dir is
+// read at most once per call and every ladder sees the same read of it.
 type hostDispatchLadder struct {
 	r     *runResolver
 	now   time.Time
+	cache map[string]hostDispatchRung
 	seen  map[string]bool
 	tried []string
 	hit   *hostDispatchProbe
 	stale *hostDispatchProbe
 }
 
+// hostDispatchRung is one dir's read: its paths_tried entry and its status
+// (nil when absent or untrusted).
+type hostDispatchRung struct {
+	tried string
+	hit   *hostDispatchProbe
+	stale bool
+}
+
 func (r *runResolver) newHostDispatchLadder(now time.Time) *hostDispatchLadder {
-	return &hostDispatchLadder{r: r, now: now, seen: map[string]bool{}}
+	return &hostDispatchLadder{r: r, now: now, cache: map[string]hostDispatchRung{}, seen: map[string]bool{}}
+}
+
+// fork copies the walk so far; the copy continues independently over the
+// shared rung cache.
+func (l *hostDispatchLadder) fork() *hostDispatchLadder {
+	seen := make(map[string]bool, len(l.seen))
+	for k := range l.seen {
+		seen[k] = true
+	}
+	return &hostDispatchLadder{r: l.r, now: l.now, cache: l.cache, seen: seen,
+		tried: append([]string(nil), l.tried...), hit: l.hit, stale: l.stale}
 }
 
 // done reports whether a decisive (non-stale) rung was found.
@@ -238,37 +259,45 @@ func (l *hostDispatchLadder) probe(dir string) {
 		return
 	}
 	l.seen[dir] = true
+	rg, ok := l.cache[dir]
+	if !ok {
+		rg = l.read(dir)
+		l.cache[dir] = rg
+	}
+	l.tried = append(l.tried, rg.tried)
+	switch {
+	case rg.hit == nil:
+	case rg.stale:
+		if l.stale == nil {
+			l.stale = rg.hit
+		}
+	default:
+		l.hit = rg.hit
+	}
+}
+
+// read is one rung's filesystem read (probe's uncached half).
+func (l *hostDispatchLadder) read(dir string) hostDispatchRung {
 	fi, err := os.Lstat(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			l.tried = append(l.tried, dir)
-		} else {
-			l.tried = append(l.tried, fmt.Sprintf("%s (skipped: %v)", dir, err))
+			return hostDispatchRung{tried: dir}
 		}
-		return
+		return hostDispatchRung{tried: fmt.Sprintf("%s (skipped: %v)", dir, err)}
 	}
 	if problem := hostDispatchStateDirProblem(fi, l.r.hostDispatchOwnerFunc()); problem != "" {
-		l.tried = append(l.tried, fmt.Sprintf("%s (skipped: %s)", dir, hostDispatchSkipLabel(problem)))
-		return
+		return hostDispatchRung{tried: fmt.Sprintf("%s (skipped: %s)", dir, hostDispatchSkipLabel(problem))}
 	}
-	l.tried = append(l.tried, dir)
 	st, err := ReadHostDispatcherStatus(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return
+		return hostDispatchRung{tried: dir}
 	}
 	p := &hostDispatchProbe{found: true, dir: dir, st: st}
 	if err != nil {
 		p.readErr = err.Error()
-		l.hit = p
-		return
+		return hostDispatchRung{tried: dir, hit: p}
 	}
-	if st.State(l.now) == hostDispatchStateStale {
-		if l.stale == nil {
-			l.stale = p
-		}
-		return
-	}
-	l.hit = p
+	return hostDispatchRung{tried: dir, hit: p, stale: st.State(l.now) == hostDispatchStateStale}
 }
 
 // result is the decisive hit, else the first stale hit, else not found.
@@ -375,7 +404,13 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 		obs.State = hostDispatchStateStale
 		what := fmt.Sprintf("was last written at %s (more than %d ticks ago)", obs.LastTickAt, hostDispatchStatusStaleTicks)
 		obs.Detail = "last tick at " + obs.LastTickAt
-		if !st.Stale(now) {
+		switch {
+		case st.FutureDated(now):
+			// A future timestamp never ages out; no live writer stamps one.
+			stamps := fmt.Sprintf("last_tick_at %s, last_complete_tick_at %s", obs.LastTickAt, obs.LastCompleteTickAt)
+			what = fmt.Sprintf("is future-dated (%s; more than %s ahead of this host's clock at %s)", stamps, hostDispatchStatusFutureSkew, hostDispatchRFC3339(now))
+			obs.Detail = "future-dated: " + stamps
+		case !st.Stale(now):
 			what = "shows no completed candidate pass since " + obs.LastCompleteTickAt
 			obs.Detail = "no completed candidate pass since " + obs.LastCompleteTickAt
 		}
@@ -523,13 +558,14 @@ func applyHostDispatchObservation(blk *campaignItemAwaiting, obs hostDispatchObs
 }
 
 // overlayCampaignHostDispatch rewrites every host_dispatcher awaiting block in
-// items from ONE status resolved per call. The call rungs (env, else cwd) are
-// probed with no run read; only when they find nothing decisive and the env
-// var is unset are the items' runs read for their working_dir rungs (at most
-// hostDispatchOverlayReadCap reads, stopping at the first decisive hit), then
-// the TMPDIR default. Global states therefore reach every item, including the
-// ones the cap skipped; an item whose own rung could not be probed reads
-// unverified only when no status was found anywhere.
+// items. The call rungs (env, else cwd) are probed once with no run read and,
+// with TMPDIR, speak for every item. When they find nothing decisive and the
+// env var is unset, each item's ladder continues with its OWN run's
+// working_dir rung and then TMPDIR: a working_dir rung speaks only for items
+// whose run has that working_dir, so a status planted in one run's checkout
+// never decides another run's item. At most hostDispatchOverlayReadCap runs
+// are read; an item whose own rung could not be probed reads unverified when
+// its ladder found no status.
 func (r *runResolver) overlayCampaignHostDispatch(ctx context.Context, items []CampaignItem) {
 	if !r.hostDispatchOverlayEnabled() {
 		return
@@ -544,55 +580,63 @@ func (r *runResolver) overlayCampaignHostDispatch(ctx context.Context, items []C
 		return
 	}
 	now := r.hostDispatchClock()
-	lad := r.newHostDispatchLadder(now)
+	call := r.newHostDispatchLadder(now)
 	for _, dir := range r.hostDispatchCallRungs() {
-		lad.probe(dir)
+		call.probe(dir)
 	}
-	envSet := r.hostDispatchEnv(hostDispatchStateDirEnv) != ""
-	unprobed := map[string]bool{}
-	why := map[string]string{}
-	if !lad.done() && !envSet {
-		reads := 0
-		seen := map[string]bool{}
+	if call.done() || r.hostDispatchEnv(hostDispatchStateDirEnv) != "" {
+		found := call.result()
 		for _, i := range idx {
-			if lad.done() {
-				break
-			}
-			id := items[i].Awaiting.RunID
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			if reads >= hostDispatchOverlayReadCap {
-				unprobed[id] = true
-				why[id] = fmt.Sprintf("its run was not read: the overlay's read cap of %d reached", hostDispatchOverlayReadCap)
-				continue
-			}
-			runUUID, perr := uuid.Parse(id)
-			if perr != nil {
-				unprobed[id] = true
-				why[id] = "its run id is not a UUID"
-				continue
-			}
-			reads++
-			run, err := r.api.GetRun(ctx, runUUID)
-			if err != nil {
-				unprobed[id] = true
-				why[id] = "its run could not be read: " + boundHostDispatchText(err.Error())
-				continue
-			}
-			lad.probe(hostDispatchWorkingDirRung(run.WorkingDir))
+			blk := items[i].Awaiting
+			obs, v := observeHostDispatch(found, blk.RunID, blk.StageID, now)
+			applyHostDispatchObservation(blk, obs, v)
 		}
+		return
 	}
-	if !envSet {
-		lad.probe(hostDispatchDefaultRung())
+	rungOf := map[string]string{}
+	why := map[string]string{}
+	reads := 0
+	for _, i := range idx {
+		id := items[i].Awaiting.RunID
+		if _, ok := rungOf[id]; ok {
+			continue
+		}
+		if _, ok := why[id]; ok {
+			continue
+		}
+		if reads >= hostDispatchOverlayReadCap {
+			why[id] = fmt.Sprintf("its run was not read: the overlay's read cap of %d reached", hostDispatchOverlayReadCap)
+			continue
+		}
+		runUUID, perr := uuid.Parse(id)
+		if perr != nil {
+			why[id] = "its run id is not a UUID"
+			continue
+		}
+		reads++
+		run, err := r.api.GetRun(ctx, runUUID)
+		if err != nil {
+			why[id] = "its run could not be read: " + boundHostDispatchText(err.Error())
+			continue
+		}
+		rungOf[id] = hostDispatchWorkingDirRung(run.WorkingDir)
 	}
-	found := lad.result()
+	tmp := hostDispatchDefaultRung()
+	byRung := map[string]hostDispatchProbe{}
 	for _, i := range idx {
 		blk := items[i].Awaiting
+		rung := rungOf[blk.RunID] // "" (no own rung): the call rungs and TMPDIR only
+		found, ok := byRung[rung]
+		if !ok {
+			lad := call.fork()
+			lad.probe(rung)
+			lad.probe(tmp)
+			found = lad.result()
+			byRung[rung] = found
+		}
 		obs, v := observeHostDispatch(found, blk.RunID, blk.StageID, now)
-		if obs.State == hostDispatchStateAbsent && unprobed[blk.RunID] {
-			obs, v = hostDispatchUnverified(obs, why[blk.RunID], "")
+		if reason, unprobed := why[blk.RunID]; unprobed && obs.State == hostDispatchStateAbsent {
+			obs, v = hostDispatchUnverified(obs, reason, "")
 		}
 		applyHostDispatchObservation(blk, obs, v)
 	}

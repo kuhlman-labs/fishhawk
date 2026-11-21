@@ -97,7 +97,8 @@ A1), `--state-dir` (default `FISHHAWK_HOST_DISPATCH_STATE_DIR` when set, else
 `--pause` / `--resume`, and `--status` (state `live | paused | failing |
 stale` from `HostDispatcherStatus.State`; exit 0 when live or paused, 1 when
 absent, stale or failing; stale means the last tick, or a known last completed
-pass, is older than 3 intervals, a chosen default). SIGINT/SIGTERM lets the
+pass, is older than 3 intervals, a chosen default, or either is future-dated).
+SIGINT/SIGTERM lets the
 in-flight tick finish, then exits.
 The scripts/dev wiring and its operator documentation are
 [E88.3 / #4527](https://github.com/kuhlman-labs/fishhawk/issues/4527).
@@ -174,13 +175,19 @@ counts). `last_tick_failure` (`{code, at}`) is set by every non-paused early
 return (`state_dir_lock_lost`, `ledger_read_failed`, `ledger_write_failed`,
 `list_runs_failed`) and reset at each tick start; a paused tick records none.
 `HostDispatcherStatus.State(now)` reads, in order: `stale` when the last tick
-(`last_tick_at`) is older than 3 intervals (liveness); `paused` (a deliberate
+(`last_tick_at`) is older than 3 intervals (liveness), or when `last_tick_at` or
+`last_complete_tick_at` is more than 60s ahead of the reader's clock
+(future-dated: no live writer stamps one, and it would never age out);
+`paused` (a deliberate
 pause skips the pass, so it is exempt from the completed-pass test); `failing`
 when `last_tick_failure` is not older than `last_complete_tick_at`; `stale` when
 a KNOWN `last_complete_tick_at` is older than 3 intervals; else `live`. A zero
 or absent `last_complete_tick_at` (a pre-#5402 dispatcher, or a hand-written
 fixture) is unknown, not stale, so such a file is judged on `last_tick_at`
-alone and reads exactly as before. `FISHHAWK_HOST_DISPATCH_STATE_DIR`
+alone and reads exactly as before. The reader clamps `interval_seconds` to
+[1, 300] before computing the 3-interval window (an absent or non-positive value
+is the 30s default), so a huge value cannot keep a dead file live.
+`FISHHAWK_HOST_DISPATCH_STATE_DIR`
 (`hostDispatchStateDirEnv`) names a state dir outside the default: `fishhawk-mcp
 host-dispatch` reads it as its `--state-dir` default, and the status overlay
 below reads it as its exclusive rung.
@@ -200,8 +207,8 @@ It adds no server API or wire type.
   in-runner agent, the backend's block passes through unchanged and no host
   file is read.
 - *Ladder.* `FISHHAWK_HOST_DISPATCH_STATE_DIR` alone when it is set (exclusive),
-  else `<MCP process cwd>/.fishhawk/cache/host-dispatch`, then each item's run
-  `<working_dir>/.fishhawk/cache/host-dispatch` (absolute only), then
+  else `<MCP process cwd>/.fishhawk/cache/host-dispatch`, then the item's own
+  run `<working_dir>/.fishhawk/cache/host-dispatch` (absolute only), then
   `$TMPDIR/fishhawk-host-dispatch`. scripts/dev pins `HD_STATE_DIR` to its own
   checkout (scripts/dev:67) while `--allowed-roots` may cover other checkouts,
   so a run's working_dir rung can miss; the cwd rung (the stdio process runs in
@@ -220,19 +227,33 @@ It adds no server API or wire type.
   file into tool output passes `boundHostDispatchText` (control characters
   dropped, cut to the writer's 300 bytes); `paths_tried` keeps at most 6
   entries (a final `(+N more)`). Code-set membership and stage-id equality use
-  the raw values.
-- *Global first (R1).* `fishhawk_get_campaign_status` resolves ONE status per
-  call and applies it to EVERY `host_dispatcher` item (one dispatcher per
-  stack; two dispatchers with different state dirs serving one backend from one
-  host would show as the first found). The per-run lookup reads no run: the
-  server's block already carries `run_id` and `stage_id`. Runs are read (for
-  their working_dir rung) only when the env var is unset and the cwd rung found
-  nothing decisive, at most 16 reads per call (`hostDispatchOverlayReadCap`):
-  each read is a backend round trip inside a status call the operator polls,
-  and a found status already speaks for every item, so the cap only bounds the
-  no-dispatcher-found case. An item whose run read failed or was skipped by the
-  cap reads `host_dispatcher` / `host_dispatch_unverified` (never absent) when
-  no status was found anywhere.
+  the raw values. A future-dated stamp reads stale and `interval_seconds` is
+  clamped (above), so a planted file cannot stay live by its timestamps.
+  **Accepted residual.** The trust check cannot tell the operator from another
+  process with the operator's uid, including a local run's agent, which can
+  write a trusted rung (its own checkout's `.fishhawk/cache/`, which is
+  gitignored, or `$TMPDIR`). The overlay is therefore DISPLAY-ONLY advisory
+  text, never a dispatch decision. A working_dir rung speaks only for its own
+  run's items, and the freshness bounds above hold a planted file to a 60s
+  future window, so a planted file reaches no other run. The authoritative fix
+  is the server-side heartbeat
+  ([#5489](https://github.com/kuhlman-labs/fishhawk/issues/5489)).
+- *Global first (R1), own rung per run.* In `fishhawk_get_campaign_status` the
+  env, cwd and `$TMPDIR` rungs are global: a status found there applies to
+  EVERY `host_dispatcher` item (one dispatcher per stack; two dispatchers with
+  different state dirs serving one backend from one host would show as the
+  first found). A run's working_dir rung is not: a status found only there
+  applies only to items whose run has that working_dir, and every other item
+  continues down its own ladder (its own run's rung, then `$TMPDIR`) or reads
+  unverified. It never makes another run's item read live. The per-run lookup
+  reads no run: the server's block already carries `run_id` and `stage_id`.
+  Runs are read (for their working_dir rung) only when the env var is unset
+  and the cwd rung found nothing decisive; each distinct run is read once, at
+  most 16 reads per call (`hostDispatchOverlayReadCap`), since each read is a
+  backend round trip inside a status call the operator polls. Each rung is
+  read at most once per call. An item whose run read failed or was skipped by
+  the cap keeps the global rungs and reads `host_dispatcher` /
+  `host_dispatch_unverified` (never absent) when they found no status.
 - *Precedence and reasons.* No status: human / `host_dispatcher_absent`, naming
   the paths tried and the env var, never claiming the dispatcher is down. An
   unreadable file: `host_dispatcher` / `host_dispatch_unverified`. Then the
@@ -375,7 +396,8 @@ stage-state probe and the server's cancel path.
 Tests: `host_dispatcher_test.go` (the core, wire to spawn seam),
 `host_dispatcher_loop_test.go` (ticks, caps, ledger, pause, reap, order, state
 dir, lock, run refusals, tick health), `host_dispatch_overlay_test.go` (overlay
-modes, ladder, trust, text bounds, read cap), the overlay's gate and
+modes, freshness bounds, ladder, trust, text bounds, read cap, a working_dir
+rung speaking only for its own run), the overlay's gate and
 cross-boundary tests in `campaign_test.go`, `TestGetRunStatus_HostDispatchBlock`
 in `tools_test.go`, and `backend/cmd/fishhawk-mcp/host_dispatch_test.go`
 (flags, status, pause/resume, routing).

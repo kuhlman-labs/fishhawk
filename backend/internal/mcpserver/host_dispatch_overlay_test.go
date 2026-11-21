@@ -291,6 +291,37 @@ func TestHostDispatchOverlay_Modes(t *testing.T) {
 			s.DailyCap, s.SpawnsToday = 2, 2
 			s.RunRefusals = entry(hdRefuseWorkingDirAbsent, otherStage, "")
 		}), kind: "human", reason: hostDispatchReasonCapped, state: hostDispatchStateCapped},
+		// Freshness bounds (27e34411): a future-dated stamp never ages out, and
+		// a huge interval_seconds would stretch the 3x window without the clamp.
+		{name: "t future-dated last tick reads stale", st: with(func(s *HostDispatcherStatus) { s.LastTickAt = hdoNow.Add(2 * time.Minute) }),
+			kind: "human", reason: hostDispatchReasonAbsent, state: hostDispatchStateStale,
+			contains: []string{"is future-dated", "last_tick_at " + hdoNow.Add(2*time.Minute).Format(time.RFC3339)}, notContain: []string{noAction},
+			check: func(t *testing.T, blk *campaignItemAwaiting, _ string) {
+				if !strings.HasPrefix(blk.HostDispatch.Detail, "future-dated") {
+					t.Errorf("detail = %q; want it to start with future-dated", blk.HostDispatch.Detail)
+				}
+			}},
+		{name: "t future-dated last complete tick reads stale", st: with(func(s *HostDispatcherStatus) { s.LastCompleteTickAt = hdoNow.Add(2 * time.Minute) }),
+			kind: "human", reason: hostDispatchReasonAbsent, state: hostDispatchStateStale, contains: []string{"is future-dated"},
+			check: func(t *testing.T, blk *campaignItemAwaiting, _ string) {
+				if !strings.HasPrefix(blk.HostDispatch.Detail, "future-dated") {
+					t.Errorf("detail = %q; want it to start with future-dated", blk.HostDispatch.Detail)
+				}
+			}},
+		{name: "t a stamp inside the 60s skew reads live", st: with(func(s *HostDispatcherStatus) { s.LastTickAt = hdoNow.Add(30 * time.Second) }),
+			kind: hostDispatchAwaitKind, reason: hostDispatchReasonDispatch, state: hostDispatchStateLive},
+		{name: "t interval_seconds 1e9 is clamped to 300", st: with(func(s *HostDispatcherStatus) {
+			s.IntervalSeconds = 1e9
+			s.LastTickAt, s.LastCompleteTickAt = hdoNow.Add(-20*time.Minute), hdoNow.Add(-20*time.Minute)
+		}), kind: "human", reason: hostDispatchReasonAbsent, state: hostDispatchStateStale, contains: []string{"was last written at"}},
+		{name: "t the clamped 300s interval still allows a 15-minute window", st: with(func(s *HostDispatcherStatus) {
+			s.IntervalSeconds = 1e9
+			s.LastTickAt, s.LastCompleteTickAt = hdoNow.Add(-14*time.Minute), hdoNow.Add(-14*time.Minute)
+		}), kind: hostDispatchAwaitKind, reason: hostDispatchReasonDispatch, state: hostDispatchStateLive},
+		{name: "t interval_seconds below 1 is clamped to 1", st: with(func(s *HostDispatcherStatus) {
+			s.IntervalSeconds = 0.001
+			s.LastTickAt, s.LastCompleteTickAt = hdoNow.Add(-2*time.Second), hdoNow.Add(-2*time.Second)
+		}), kind: hostDispatchAwaitKind, reason: hostDispatchReasonDispatch, state: hostDispatchStateLive},
 		{name: "s pre-#5402 status reads live", st: HostDispatcherStatus{PID: 7, LastTickAt: hdoNow.Add(-60 * time.Second), IntervalSeconds: 30, SpawnsToday: 5, SpawnsDay: hdoNow.Format(time.DateOnly)},
 			kind: hostDispatchAwaitKind, reason: hostDispatchReasonDispatch, state: hostDispatchStateLive},
 	}
@@ -632,9 +663,9 @@ func TestHostDispatchOverlay_BoundsStatusText(t *testing.T) {
 	}
 }
 
-// TestOverlayCampaignHostDispatch_ReadCapPausedAppliesToEveryItem pins R1: one
-// status found anywhere applies to EVERY item, including those the read cap
-// skipped.
+// TestOverlayCampaignHostDispatch_ReadCapPausedAppliesToEveryItem pins R1: a
+// status on a global rung (here TMPDIR) applies to EVERY item, including those
+// the read cap skipped.
 func TestOverlayCampaignHostDispatch_ReadCapPausedAppliesToEveryItem(t *testing.T) {
 	build := func(t *testing.T) ([]CampaignItem, *hdoRuns) {
 		b := newHDORuns(t)
@@ -663,9 +694,10 @@ func TestOverlayCampaignHostDispatch_ReadCapPausedAppliesToEveryItem(t *testing.
 		}
 	})
 	t.Run("no status anywhere: item 17 unverified", func(t *testing.T) {
-		hdoEmptyTMPDIR(t)
+		tmpRung := hdoEmptyTMPDIR(t)
 		items, b := build(t)
-		hdoResolver(nil, t.TempDir(), b).overlayCampaignHostDispatch(context.Background(), items)
+		cwd := t.TempDir()
+		hdoResolver(nil, cwd, b).overlayCampaignHostDispatch(context.Background(), items)
 		for i, it := range items[:16] {
 			if it.Awaiting.Reason != hostDispatchReasonAbsent {
 				t.Errorf("item %d reason = %q; want host_dispatcher_absent", i+1, it.Awaiting.Reason)
@@ -676,13 +708,95 @@ func TestOverlayCampaignHostDispatch_ReadCapPausedAppliesToEveryItem(t *testing.
 			t.Fatalf("item 17 = %s/%s; want host_dispatcher/host_dispatch_unverified", last.Kind, last.Reason)
 		}
 		hdoContainsAll(t, "item 17 next_step", last.NextStep, "fishhawk-mcp host-dispatch --status", "read cap")
+		// Each item's ladder names only its own run's working_dir rung.
 		for i, it := range items {
-			p := it.Awaiting.HostDispatch.PathsTried
-			if len(p) > hostDispatchPathsTriedMax || !strings.HasPrefix(p[len(p)-1], "(+") || !strings.HasSuffix(p[len(p)-1], " more)") {
-				t.Errorf("item %d paths_tried = %v; want at most %d entries ending '(+N more)'", i+1, p, hostDispatchPathsTriedMax)
+			want := []string{filepath.Join(cwd, hostDispatchCheckoutStateDir)}
+			if i < hostDispatchOverlayReadCap {
+				want = append(want, filepath.Join(b.dirs[it.Awaiting.RunID], hostDispatchCheckoutStateDir))
+			}
+			want = append(want, tmpRung)
+			if got := it.Awaiting.HostDispatch.PathsTried; fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("item %d paths_tried = %v; want %v", i+1, got, want)
 			}
 		}
 	})
+}
+
+// TestHostDispatchBoundedPaths pins the paths_tried bound: at most
+// hostDispatchPathsTriedMax entries, the last a "(+N more)".
+func TestHostDispatchBoundedPaths(t *testing.T) {
+	var in []string
+	for i := range 9 {
+		in = append(in, fmt.Sprintf("/d%d", i))
+	}
+	got := hostDispatchBoundedPaths(in)
+	if len(got) != hostDispatchPathsTriedMax || got[len(got)-1] != "(+4 more)" || got[0] != "/d0" {
+		t.Fatalf("bounded = %v; want %d entries, /d0 first, ending (+4 more)", got, hostDispatchPathsTriedMax)
+	}
+	if got := hostDispatchBoundedPaths(in[:3]); fmt.Sprint(got) != fmt.Sprint(in[:3]) {
+		t.Fatalf("bounded short list = %v; want it unchanged", got)
+	}
+}
+
+// TestOverlayCampaignHostDispatch_WorkingDirRungSpeaksOnlyForItsRun pins the
+// 27e34411 decision: a status found only on run A's working_dir rung decides
+// A's items and never another run's. Run B's item continues down its own
+// ladder (its own rung, then TMPDIR) and never reads A's live status. Both
+// item orders run, so neither ordering can let A's hit leak into B.
+func TestOverlayCampaignHostDispatch_WorkingDirRungSpeaksOnlyForItsRun(t *testing.T) {
+	runA, runB := uuid.NewString(), uuid.NewString()
+	rung := func(root string) string { return filepath.Join(root, hostDispatchCheckoutStateDir) }
+	for _, tc := range []struct {
+		name   string
+		tmp    *HostDispatcherStatus // the real dispatcher on TMPDIR; nil is absent
+		bState string
+		bWhy   string
+	}{
+		{name: "real state absent", bState: hostDispatchStateAbsent, bWhy: hostDispatchReasonAbsent},
+		{name: "real state paused", tmp: func() *HostDispatcherStatus {
+			st := hdoStatus()
+			st.Paused = true
+			return &st
+		}(), bState: hostDispatchStatePaused, bWhy: hostDispatchReasonPaused},
+	} {
+		for _, order := range []string{"A first", "B first"} {
+			t.Run(tc.name+", "+order, func(t *testing.T) {
+				tmpRung := hdoEmptyTMPDIR(t)
+				if tc.tmp != nil {
+					hdoWrite(t, tmpRung, *tc.tmp)
+				}
+				cwd, wdA, wdB := t.TempDir(), t.TempDir(), t.TempDir()
+				hdoWrite(t, rung(wdA), hdoStatus()) // planted live status in A's checkout
+				b := newHDORuns(t)
+				b.dirs[runA], b.dirs[runB] = wdA, wdB
+				itemA, itemB := hdoItem(runA, uuid.NewString()), hdoItem(runB, uuid.NewString())
+				items := []CampaignItem{itemA, itemB}
+				if order == "B first" {
+					items = []CampaignItem{itemB, itemA}
+				}
+				hdoResolver(nil, cwd, b).overlayCampaignHostDispatch(context.Background(), items)
+				var ga, gb *campaignItemAwaiting
+				for _, it := range items {
+					if it.Awaiting.RunID == runA {
+						ga = it.Awaiting
+					} else {
+						gb = it.Awaiting
+					}
+				}
+				if gb.HostDispatch.State != tc.bState || gb.Reason != tc.bWhy {
+					t.Fatalf("B = %s/%s state %q (status_path %q); want state %q reason %s, never A's planted live status",
+						gb.Kind, gb.Reason, gb.HostDispatch.State, gb.HostDispatch.StatusPath, tc.bState, tc.bWhy)
+				}
+				if gb.NextStep == hdoBackendNext {
+					t.Errorf("B next_step is the backend's live text")
+				}
+				hdoContainsNone(t, "B paths_tried", strings.Join(gb.HostDispatch.PathsTried, "|"), rung(wdA))
+				if ga.HostDispatch.State != hostDispatchStateLive || ga.HostDispatch.StatusPath != filepath.Join(rung(wdA), hostDispatchStatusFile) {
+					t.Fatalf("A state %q path %q; want live from its own working_dir rung", ga.HostDispatch.State, ga.HostDispatch.StatusPath)
+				}
+			})
+		}
+	}
 }
 
 // TestOverlayCampaignHostDispatch_GetRunErrorIsUnverified pins R1: a run whose

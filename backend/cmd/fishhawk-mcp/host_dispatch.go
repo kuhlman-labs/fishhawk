@@ -99,7 +99,7 @@ func runHostDispatch(ctx context.Context, args []string, stdout, stderr io.Write
 	fs.StringVar(&f.runnerBinary, "runner-binary", "", "fishhawk-runner path (default: FISHHAWK_RUNNER_BIN, beside this binary, then PATH)")
 	fs.BoolVar(&f.pause, "pause", false, "create <state-dir>/pause (a running dispatcher stops POSTing markers) and exit")
 	fs.BoolVar(&f.resume, "resume", false, "remove <state-dir>/pause and exit")
-	fs.BoolVar(&f.status, "status", false, "print the status file; exit 0 when live or paused, 1 when absent, stale (older than 3 intervals) or failing (the latest tick failed)")
+	fs.BoolVar(&f.status, "status", false, "print the status file; exit 0 when live or paused, 1 when absent, stale (older than 3 intervals, or future-dated) or failing (the latest tick failed)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK

@@ -56,8 +56,17 @@ const (
 	// or a known last completed pass, is older than this many intervals (a
 	// chosen default, not an ADR value).
 	hostDispatchStatusStaleTicks = 3
-	hostDispatchListPageLimit    = 100
-	hostDispatchListMaxPages     = 10
+	// hostDispatchStatusFutureSkew: a last_tick_at or last_complete_tick_at
+	// more than this far ahead of the reader's clock is future-dated and reads
+	// stale, so a planted or clock-skewed file cannot read live forever.
+	hostDispatchStatusFutureSkew = 60 * time.Second
+	// The reader clamps interval_seconds to [min, max] before computing the
+	// staleness window, so a huge value cannot keep a dead file live. The
+	// dispatcher's own interval is capped at hostDispatchMaxInterval.
+	hostDispatchStatusMinIntervalSeconds = 1
+	hostDispatchStatusMaxIntervalSeconds = 300
+	hostDispatchListPageLimit            = 100
+	hostDispatchListMaxPages             = 10
 )
 
 // State-dir entries.
@@ -191,18 +200,31 @@ type HostDispatcherStatus struct {
 	RunRefusals map[string]hostDispatchRunRefusal `json:"run_refusals,omitempty"`
 }
 
+// interval is the staleness unit: interval_seconds clamped to
+// [hostDispatchStatusMinIntervalSeconds, hostDispatchStatusMaxIntervalSeconds],
+// or hostDispatchDefaultInterval when it is absent or not positive. The clamp
+// runs on the float, before the Duration conversion.
 func (s HostDispatcherStatus) interval() time.Duration {
-	interval := time.Duration(s.IntervalSeconds * float64(time.Second))
-	if interval <= 0 {
-		interval = hostDispatchDefaultInterval
+	secs := s.IntervalSeconds
+	if !(secs > 0) {
+		return hostDispatchDefaultInterval
 	}
-	return interval
+	secs = min(max(secs, hostDispatchStatusMinIntervalSeconds), hostDispatchStatusMaxIntervalSeconds)
+	return time.Duration(secs * float64(time.Second))
+}
+
+// FutureDated reports whether last_tick_at or last_complete_tick_at is more
+// than hostDispatchStatusFutureSkew ahead of now. No live writer stamps one,
+// and such a file would otherwise never age out.
+func (s HostDispatcherStatus) FutureDated(now time.Time) bool {
+	limit := now.Add(hostDispatchStatusFutureSkew)
+	return s.LastTickAt.After(limit) || s.LastCompleteTickAt.After(limit)
 }
 
 // Stale reports whether the status is older than hostDispatchStatusStaleTicks
-// intervals at now: the process stopped ticking (liveness).
+// intervals at now (the process stopped ticking: liveness), or future-dated.
 func (s HostDispatcherStatus) Stale(now time.Time) bool {
-	return s.LastTickAt.IsZero() || now.Sub(s.LastTickAt) > hostDispatchStatusStaleTicks*s.interval()
+	return s.LastTickAt.IsZero() || s.FutureDated(now) || now.Sub(s.LastTickAt) > hostDispatchStatusStaleTicks*s.interval()
 }
 
 // TickFailed reports whether the latest tick failed: a recorded failure not
@@ -223,7 +245,8 @@ func (s HostDispatcherStatus) CompletedStale(now time.Time) bool {
 }
 
 // State is the dispatcher's health at now, shared by `--status` and the stdio
-// status overlay: "stale" (not ticking, judged on last_tick_at), "paused" (a
+// status overlay: "stale" (not ticking, judged on last_tick_at, or a
+// future-dated last_tick_at or last_complete_tick_at), "paused" (a
 // deliberate pause skips the pass, so it is exempt from the completed-pass
 // test), "failing" (the latest tick failed), "stale" (ticking, but a known
 // last completed pass is too old), else "live". A status file written before
