@@ -118,16 +118,37 @@ on PATH), and the standalone `gofmt` on PATH, when present, must report a Go
 of that MAJOR.MINOR through `go version <gofmt path>` (whose output is parsed,
 never its exit status, which is 0 even on a non-Go file). `lint` never runs a
 standalone gofmt, but that half refuses anyway, because an agent's own
-`gofmt -l` on a Homebrew go1.27 gofmt is what misled run 580c33c6. On any
-mismatch `lint` exits 1 with a line starting
+`gofmt -l` on a Homebrew go1.27 gofmt is what misled run 580c33c6. Check (d)
+(#5453) adds the `go` on PATH: when `go env GOTOOLCHAIN` is `local` (or empty)
+it must satisfy every go.work / root go.mod / `*/go.mod` `go` and `toolchain`
+directive, read with `go env GOVERSION`, because a stale gate image or host Go
+after a pin bump otherwise makes `go` refuse the module. `auto`, `path`, a
+`+auto` / `+path` suffix and a named toolchain (`goX.Y.Z`, with or without
+`+local`) skip it with an `ok host go toolchain switching` / `named` line, so
+the probe never switches or downloads a toolchain. The checker exits `3` when
+every violation is such a HOST/IMAGE tool mismatch against coherent pins, and
+`1` when any is a TREE defect the diff can cause (a missing ARG, a `GO_VERSION`
+without MAJOR.MINOR, an unparseable or over-pin directive). On exit `3`, `lint`
+exits `VERIFY_EXIT_TEMPFAIL` (75: the change was NOT judged, so the runner reads
+merge-candidate `not_executed` / `verify_infra_tempfail` and implement category
+C, never a fix-up) with a line starting
 `scripts/test: host_toolchain_mismatch:` (a stable token) that calls it an
-environment problem, not a defect in the tree, and names the remedies:
+environment problem, not a defect in the tree. Inside the gate container
+(`FISHHAWK_GATE_CONTAINER=1`) it adds a `scripts/test: gate_image_stale:` line
+naming the image from `FISHHAWK_GATE_IMAGE_REF` (set by the runner; distinct
+from `FISHHAWK_GATE_IMAGE`, the runner's own configuration variable) and the
+rebuild command (`docker buildx build --load --build-context
+frontend=./frontend -t fishhawk-gate:local deploy/gate-image`, then
+`scripts/check-gate-image --image fishhawk-gate:local`). On the host it names the
+remedies:
 `scripts/test lint --in-gate-image` / `verify --in-gate-image`, or the pinned
 tools first on PATH (`export PATH="$(go env GOROOT)/bin:$PATH"` when
 `go version` reports the pinned Go; `go env -w GOTOOLCHAIN` switches `go`,
 never a standalone gofmt). `verify` refuses the same way, because `cmd_verify`
-calls `cmd_lint` unconditionally. A missing or non-executable
-`scripts/check-gate-image` refuses too (fail closed: this is a control, unlike
+calls `cmd_lint` unconditionally. Any other non-zero checker status prints
+`scripts/test: gate-image pins unreadable:` and exits 1 (the tree's fault). A
+missing or non-executable
+`scripts/check-gate-image` refuses too, with exit 1 (fail closed: this is a control, unlike
 the static pin report below). Inside the gate image the check passes, because
 the image carries the pinned tools. It is pinned by
 `scripts/test-check-gate-image`'s `h*` arms and by
@@ -1044,7 +1065,9 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
 - **`scripts/check-gate-image --host`** (#4245) is the lint leg's
   host-toolchain precondition (§ "Lint" above): it compares the host's
   golangci-lint version and build Go, and its standalone gofmt's Go, with the
-  Dockerfile pins, never touching docker or the network.
+  Dockerfile pins, and (#5453) the `go` on PATH with the go.work / go.mod
+  directives under GOTOOLCHAIN=local, never touching docker or the network.
+  It exits `3` for host-only mismatches, which `lint` maps to exit 75.
 
 ### Testing
 
@@ -1192,7 +1215,8 @@ returns 73 at every refusal site — the shell-kind immediate refusal, runner-me
 budget, the retaken-after-displacement refusal, and both never-settled restart bail-outs —
 `_acquire_verify_lock` propagates it, and both `verify` and `verify --in-gate-image` exit with it. A
 red tree still exits 1. The refusal TEXT is unchanged. `VERIFY_EXIT_TEMPFAIL=75` is declared beside it
-for the same contract but nothing in `scripts/test` exits 75 yet. The contract, and what the runner
+for the same contract; the lint leg's host-toolchain precondition exits 75 on a host or gate-image tool
+mismatch against coherent pins (§ "Lint", #5453). The contract, and what the runner
 does with each code: `docs/spec/workflow-v2.md` § "Verify exit-code contract".
 
 **What the runner does with a RUNNER-meets-RUNNER refusal (#3948, #4022).** The runner's committed-tree

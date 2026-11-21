@@ -40,6 +40,13 @@ owns the rebuild/activation tables, guards, flags and their residuals.
 - A newer host Go can differ semantically from the pinned toolchain (e.g.
   jsonv2). Run the host checker and use the pinned tools or image. Host Go env
   files do not repair a network-isolated container's baked-in toolchain.
+- After a merge changes a gate-image Dockerfile `ARG` or a go directive,
+  rebuild `fishhawk-gate:local` and refresh the host golangci-lint and Go;
+  nothing does it automatically, so the operator (the first officer during a
+  campaign) triggers it. Until then verify exits `75` with `gate_image_stale`
+  or `host_toolchain_mismatch` and the merge candidate is `not_executed` /
+  `verify_infra_tempfail`, not a failed change. Commands:
+  [gate image](../../deploy/gate-image/README.md).
 - A locked macOS screen can block credential helpers during public Docker pulls.
   The runner uses its own credential-free config; interactive pulls and the
   host `--in-gate-image` path can still block. Unlock, or follow the public-image
