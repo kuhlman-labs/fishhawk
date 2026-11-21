@@ -1835,6 +1835,49 @@ func TestTick_DecisionRequired_RecordsMarkerOncePerOccurrence(t *testing.T) {
 	}
 }
 
+// TestTick_DecisionRequired_MarkerNamesConcernIDs pins the #5390 optional
+// concern_ids key: a fixup_no_changes_unaddressed decision's marker carries
+// the outcome's ConcernIDs as a JSON array, two identical ticks record ONE
+// marker, and the cleared row a later released tick appends keeps exactly the
+// base keys plus cleared_by (concern_ids is written in recordDecision only,
+// never in the shared decisionPayload clearDecision reuses).
+func TestTick_DecisionRequired_MarkerNamesConcernIDs(t *testing.T) {
+	s := uuid.New()
+	noChange := scriptStep{out: GateActionOutcome{
+		DecisionRequired: true, DecisionState: "fixup_no_changes_unaddressed", Action: "route_fixup",
+		ConcernIDs: []string{"a", "b"},
+		GateKnown:  true, GateStageID: &s, ParkedGateStageIDs: []uuid.UUID{s},
+		Note: "decision_required: fixup_no_changes_unaddressed",
+	}}
+	f := newDecisionFixture(t, scriptedActor(noChange, noChange, observeReleased()))
+	f.ticks(2)
+
+	m := f.markers()
+	if len(m) != 1 {
+		t.Fatalf("decision_required rows = %d over 2 identical decision ticks, want 1", len(m))
+	}
+	p := assertPayloadKeys(t, m[0], append(append([]string{}, markerKeys...), "concern_ids")...)
+	ids, ok := p["concern_ids"].([]any)
+	if !ok || len(ids) != 2 || ids[0] != "a" || ids[1] != "b" {
+		t.Fatalf("marker concern_ids = %#v, want JSON array [a b]", p["concern_ids"])
+	}
+	if p["decision_state"] != "fixup_no_changes_unaddressed" || p["action"] != "route_fixup" || p["gate"] != s.String() {
+		t.Fatalf("marker payload = %v", p)
+	}
+
+	f.ticks(1)
+	cl := f.clears()
+	if len(cl) != 1 {
+		t.Fatalf("decision_cleared rows = %d after the released tick, want 1", len(cl))
+	}
+	if cp := assertPayloadKeys(t, cl[0], clearedKeys...); cp["cleared_by"] != clearedByNoDecision {
+		t.Fatalf("cleared payload = %v", cp)
+	}
+	if n := len(f.markers()); n != 1 {
+		t.Fatalf("decision_required rows = %d after the released tick, want 1", n)
+	}
+}
+
 func TestTick_DecisionRequired_RunLevelNilStageOncePerOccurrence(t *testing.T) {
 	f := newDecisionFixture(t, scriptedActor(runDecision("fixup_budget_exhausted")))
 	f.ticks(3)

@@ -82,20 +82,25 @@ var autoDriveDispatchStages = map[string]struct{}{
 // (an exhausted fix-up budget / ceiling on the delegated route_fixup arm): the
 // driver STOPS and hands the gate to the operator rather than the endpoint
 // returning a 500.
+// concern_ids is present only on decision_state fixup_no_changes_unaddressed
+// (#5390): the open concern ids the last no-change fix-up pass routed, which
+// the delegated arm declined to re-route. It is omitted (absent, never null
+// or []) on every other outcome.
 // reported carries the workflow-v2 `mode: report` outcome (#2222): a
 // proposal was surfaced as a run_auto_driven act:report row and nothing was
 // acted on. acted / paged / decision_required all stay false, so a driver
 // that switches only on those keeps polling — no client change is needed to
 // consume it.
 type autoDriveResponse struct {
-	Acted            bool   `json:"acted"`
-	Action           string `json:"action,omitempty"`
-	Paged            bool   `json:"paged"`
-	PageEvent        string `json:"page_event,omitempty"`
-	DecisionRequired bool   `json:"decision_required"`
-	DecisionState    string `json:"decision_state,omitempty"`
-	Reported         bool   `json:"reported"`
-	Note             string `json:"note"`
+	Acted            bool     `json:"acted"`
+	Action           string   `json:"action,omitempty"`
+	Paged            bool     `json:"paged"`
+	PageEvent        string   `json:"page_event,omitempty"`
+	DecisionRequired bool     `json:"decision_required"`
+	DecisionState    string   `json:"decision_state,omitempty"`
+	ConcernIDs       []string `json:"concern_ids,omitempty"`
+	Reported         bool     `json:"reported"`
+	Note             string   `json:"note"`
 }
 
 // handleAutoDrive implements POST /v0/runs/{run_id}/auto-drive (#1700): it

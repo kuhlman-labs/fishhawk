@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -3743,7 +3744,7 @@ func TestServerCheckAwaitingHumanHold_FailClosedBranches(t *testing.T) {
 			if held && (out.DecisionState != operatorrole.DecisionStateServerCheckAwaitingHuman || !out.DecisionRequired) {
 				t.Errorf("outcome = %+v, want decision_required server_check_awaiting_human", out)
 			}
-			if !held && out != (AutoDriveOutcome{}) {
+			if !held && !reflect.DeepEqual(out, AutoDriveOutcome{}) {
 				t.Errorf("outcome = %+v, want the zero outcome when not held", out)
 			}
 		})

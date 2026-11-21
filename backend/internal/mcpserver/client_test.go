@@ -1659,6 +1659,42 @@ func TestAutoDriveRunGate_DecodesDecisionRequired(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_DecodesConcernIDs pins the #5390 concern_ids wire tag
+// on the client's AutoDriveOutcome copy from a RAW JSON literal: drive_run's
+// fake gate encodes the client's own struct, so only a literal body catches a
+// tag drift here. A body without the key decodes nil (older backend, or any
+// state other than fixup_no_changes_unaddressed).
+func TestAutoDriveRunGate_DecodesConcernIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"present", `{"acted":false,"paged":false,"decision_required":true,"decision_state":"fixup_no_changes_unaddressed","action":"route_fixup","concern_ids":["a","b"],"note":"n"}`, []string{"a", "b"}},
+		{"absent", `{"acted":false,"paged":false,"decision_required":true,"decision_state":"fixup_budget_exhausted","action":"route_fixup","note":"n"}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/auto-drive") {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+			out, err := c.AutoDriveRunGate(context.Background(), uuid.New())
+			if err != nil {
+				t.Fatalf("AutoDriveRunGate: %v", err)
+			}
+			if !reflect.DeepEqual(out.ConcernIDs, tc.want) {
+				t.Errorf("ConcernIDs = %#v, want %#v (a wrong concern_ids json tag drops the ids)", out.ConcernIDs, tc.want)
+			}
+		})
+	}
+}
+
 // TestRunReviewAuthority_WireShape pins the hand-maintained MCP wire mirror for
 // the run-status review_authority block (E53.2 / #2225): the backend tags MUST
 // byte-match Run.ReviewAuthority / RunReviewAuthority or the slice silently

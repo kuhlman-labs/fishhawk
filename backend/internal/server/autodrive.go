@@ -90,7 +90,8 @@ type AutoDriveOutcome struct {
 	// fixup_budget_exhausted / fixup_ceiling_reached; the #2381 delegated-approval
 	// states operatorrole.DecisionStateHumanQuorumRequired and
 	// DecisionStateDelegatedApprovalNoProgress; the #5477 route_fixup state
-	// DecisionStateServerCheckAwaitingHuman) and Action names the
+	// DecisionStateServerCheckAwaitingHuman; the #5390 route_fixup state
+	// DecisionStateFixupNoChangesUnaddressed) and Action names the
 	// delegated verb whose arm surfaced it. Set with Acted=false and
 	// Paged=false. Introduced by the E48.41 / #2091 fix so an exhausted
 	// fix-up budget on the delegated route_fixup arm parks the operator with
@@ -100,6 +101,11 @@ type AutoDriveOutcome struct {
 	// duplicate (delegated_approval_no_progress) instead of wedging the run.
 	DecisionRequired bool
 	DecisionState    string
+	// ConcernIDs names the open concern ids behind the decision. It is set
+	// only with DecisionRequired by the #5390 no-change guard
+	// (DecisionStateFixupNoChangesUnaddressed): the ids the last no-change
+	// fix-up pass routed, which the delegated arm declined to re-route.
+	ConcernIDs []string
 	// Reported is true when a workflow-v2 `mode: report` class surfaced a
 	// PROPOSAL at a live gate (ADR-066 / #2222): a run_auto_driven act:report
 	// attribution row was appended, Action names the delegation verb the
@@ -290,6 +296,20 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 					DecisionState:    "fixup_concerns_overflow",
 					Action:           delegation.ActionRouteFixup,
 					Note:             ferr.Error(),
+				}, nil
+			}
+			// The last fix-up pass routed exactly this open set and produced
+			// no commit (#5390): re-routing it unchanged would repeat the
+			// silent no-op, so the delegated arm makes ZERO automatic
+			// re-routes and hands the decision to the operator.
+			var repeat *fixupNoChangeRepeatError
+			if errors.As(ferr, &repeat) {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    operatorrole.DecisionStateFixupNoChangesUnaddressed,
+					Action:           delegation.ActionRouteFixup,
+					ConcernIDs:       repeat.ConcernIDs,
+					Note:             fixupNoChangeRepeatNote(repeat),
 				}, nil
 			}
 			return AutoDriveOutcome{Action: delegation.ActionRouteFixup, Note: "fixup dispatch failed"}, ferr
@@ -1372,7 +1392,14 @@ func (s *Server) emitCampaignGatePaged(ctx context.Context, runRow *run.Run, id 
 // fixupActionParams.ConcernIDs, stage_fixup_triggered.concern_ids or
 // MarkAddressedPending. The actor keeps its own check rather than trusting
 // the evaluator's partition alone; on a mixed set it routes only the reviewer
-// rows.
+// rows. Their ids are still collected (serverCheck) for the #5390 no-change
+// guard, which removes them from the last pass's routed set before comparing
+// it with the routable set.
+//
+// Before the budget arithmetic, the #5390 guard (noChangeRepeatOfOpenSet)
+// refuses with a *fixupNoChangeRepeatError when the newest fix-up window on
+// the stage routed exactly the routable set and its earliest outcome was
+// fixup_no_changes; the guard's audit read errors are returned (fail-closed).
 func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, stages []*run.Stage, open []*concern.Concern, rule string) (bool, error) {
 	impl := implementStage(stages)
 	if impl == nil || !fixupEligibleState(impl, stages) {
@@ -1386,12 +1413,13 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 		return false, nil
 	}
 	var selected []planreview.Concern
-	var ids []uuid.UUID
+	var ids, serverCheck []uuid.UUID
 	for _, c := range open {
 		if c.StageKind != concern.StageKindImplement || c.StageID != impl.ID {
 			continue
 		}
 		if c.IsServerCheck() { // human-only: never auto-routed (#5477)
+			serverCheck = append(serverCheck, c.ID)
 			continue
 		}
 		selected = append(selected, planreview.Concern{
@@ -1404,6 +1432,16 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	}
 	if len(selected) == 0 {
 		return false, nil
+	}
+	// #5390: never re-route, unchanged, a set whose last pass produced no
+	// commit. Placed before the budget and ceiling arithmetic so the more
+	// specific decision wins over fixup_budget_exhausted / fixup_ceiling_reached.
+	repeat, err := s.noChangeRepeatOfOpenSet(ctx, runRow.ID, impl.ID, ids, serverCheck)
+	if err != nil {
+		return false, err
+	}
+	if repeat != nil {
+		return false, repeat
 	}
 	priorPasses, err := s.countFixupPasses(ctx, runRow.ID, impl.ID)
 	if err != nil {
@@ -1493,6 +1531,19 @@ func (s *Server) serverCheckAwaitingHumanHold(ctx context.Context, runRow *run.R
 		Note: fmt.Sprintf("%d open implement concern(s) [%s] were raised by a server check (provenance server_check) and are human-only (ADR-084 rule 5, ADR-143): a human waives or defers them from the Fishhawk Web UI, or routes them in a non-delegated fix-up; no fix-up was auto-routed",
 			len(ids), strings.Join(ids, ", ")),
 	}, true
+}
+
+// fixupNoChangeRepeatNote is the decision_required note for the #5390
+// no-change guard: the count and ids, the fact that nothing was auto-routed,
+// and the remedies (E5). Re-routing one sharper concern is exactly the case
+// the guard's first-window-only limitation affects (#5496).
+func fixupNoChangeRepeatNote(e *fixupNoChangeRepeatError) string {
+	return fmt.Sprintf("the last fix-up pass routed exactly the %d open implement concern(s) [%s] and produced no commit; no fix-up was auto-routed. "+
+		"Remedies: re-route ONE sharper concern with fishhawk_fixup_stage and an operator_concern naming the exact change "+
+		"(a second no-change pass on this stage is not detected, follow-up #5496); "+
+		"or finish the change on the run branch, fishhawk_vouch_commit it, and THEN close the concerns with fishhawk_resolve_concerns (with evidence), a waive or a defer, because the no-change veto keeps them open; "+
+		"or waive or defer them",
+		len(e.ConcernIDs), strings.Join(e.ConcernIDs, ", "))
 }
 
 // --- mode: report (ADR-066 / #2222) -----------------------------------------

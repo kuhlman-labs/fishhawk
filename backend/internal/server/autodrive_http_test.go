@@ -466,6 +466,63 @@ func TestAutoDrive_RouteFixupServerCheckOnly_ParksDecision(t *testing.T) {
 	}
 }
 
+// TestAutoDrive_NoChangePass_DecisionNamesConcernIDs is the #5390 HTTP pin
+// over the REAL handleAutoDrive. Pass 1 is a real delegated route whose RAW
+// body carries NO concern_ids key (absent, not null and not []). After the
+// pass's fixup_no_changes, pass 2's raw body carries decision_state
+// fixup_no_changes_unaddressed and concern_ids as a JSON array equal to the
+// routed id.
+func TestAutoDrive_NoChangePass_DecisionNamesConcernIDs(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	au.stampSequence = true
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	a := soleOpenImplementConcern(t, cr, runID)
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveFixupCapableIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("pass 1 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var acted map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &acted); err != nil {
+		t.Fatal(err)
+	}
+	if string(acted["acted"]) != "true" {
+		t.Fatalf("pass 1 body = %s, want acted=true", w.Body.String())
+	}
+	if raw, ok := acted["concern_ids"]; ok {
+		t.Errorf("acted body carries concern_ids = %s, want the key absent", raw)
+	}
+
+	impl.State = run.StageStateAwaitingApproval
+	seedFixupNoChangesSeq(au, runID, impl.ID, 5000)
+
+	w = autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveFixupCapableIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("pass 2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if string(body["decision_required"]) != "true" || string(body["decision_state"]) != `"`+operatorrole.DecisionStateFixupNoChangesUnaddressed+`"` {
+		t.Fatalf("pass 2 body = %s, want decision_required=true decision_state=%q", w.Body.String(), operatorrole.DecisionStateFixupNoChangesUnaddressed)
+	}
+	raw, ok := body["concern_ids"]
+	if !ok {
+		t.Fatalf("pass 2 body = %s, want a concern_ids key", w.Body.String())
+	}
+	var ids []string
+	if err := json.Unmarshal(raw, &ids); err != nil || !strings.HasPrefix(string(raw), "[") {
+		t.Fatalf("concern_ids = %s, want a JSON array of strings (%v)", raw, err)
+	}
+	if len(ids) != 1 || ids[0] != a.ID.String() {
+		t.Errorf("concern_ids = %v, want [%s]", ids, a.ID)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 1 {
+		t.Errorf("%d %s entries, want exactly 1 (pass 2 routes nothing)", n, CategoryStageFixupTriggered)
+	}
+}
+
 // TestAutoDrive_RouteFixupGenuineError_Surfaces500 is the sibling to the
 // decision-required park: a GENUINE (non-sentinel) route_fixup dispatch failure
 // — here a repo transition error — still surfaces as 500 auto_drive_dispatch_failed,

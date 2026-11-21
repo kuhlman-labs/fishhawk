@@ -18694,6 +18694,16 @@ paths:
         well-defined, EXPECTED gate state, distinct from a genuine dispatch
         failure (still a 500 below).
 
+        The `route_fixup` arm also parks with
+        `decision_state: fixup_no_changes_unaddressed` (#5390) when the last
+        fix-up pass on the implement stage routed exactly the routable open
+        set (less the stage's open `server_check` ids) and produced no commit
+        (`fixup_no_changes`). Nothing is re-routed, and the body adds
+        `concern_ids` naming the routed ids. Only positive evidence counts (a
+        trigger without `concern_ids` never trips it), and a guard audit read
+        failure is a 500. The guard covers only the first no-change window per
+        stage (#5496).
+
         The `may_approve` arm parks the same way for the delegated-approval
         states (#2381): it DECLINES with `decision_state: human_quorum_required`
         when a delegated approve could never advance the gate — a gate declaring
@@ -18749,7 +18759,11 @@ paths:
                   paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
                   page_event: { type: string, description: 'The page event name, set when paged.' }
                   decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
-                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582); server_check_awaiting_human (the route_fixup arm is unmet only because every open concern of the settled round is a human-only server_check finding: a human waives or defers it from the Web UI, and no fix-up is routed) (#5477).' }
+                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582); server_check_awaiting_human (the route_fixup arm is unmet only because every open concern of the settled round is a human-only server_check finding: a human waives or defers it from the Web UI, and no fix-up is routed) (#5477); fixup_no_changes_unaddressed (the last fix-up pass routed exactly the routable open set and produced no commit, so no fix-up is re-routed; concern_ids names the ids) (#5390).' }
+                  concern_ids:
+                    type: array
+                    items: { type: string }
+                    description: 'The open concern ids the last no-change fix-up pass routed, which the route_fixup arm declined to re-route. Present only on decision_state fixup_no_changes_unaddressed (#5390); absent on every other outcome.'
                   reported: { type: boolean, description: 'True when a workflow-v2 `mode: report` class surfaced a proposal at a live gate (#2222): a run_auto_driven act:report row was appended (at most once per gate occurrence), `action` names the verb the class governs, and nothing was dispatched or paged. The driver keeps polling.' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
