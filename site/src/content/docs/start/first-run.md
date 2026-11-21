@@ -470,7 +470,10 @@ That is one issue, driven through five gates, to a merged pull request.
 
 Throughout the run Fishhawk posts a `fishhawk_audit_complete` Check Run on the
 pull request. It carries the audit verdict: the plan is on file, the trace
-bundle shipped, the agent review landed. What it does not do, on its own, is
+bundle shipped, the agent review landed. When the workflow declares a verify
+command, it also waits for the merge candidate to pass it: Fishhawk does not
+report the check green on a head it rebased or conflict-resolved until a
+verify-only pass passes on exactly that head. What it does not do, on its own, is
 stop a merge. A Check Run is a report until the repository's branch protection
 makes it a required status check, and Fishhawk cannot make it one for you — the
 App installation holds no `administration: write` permission.
