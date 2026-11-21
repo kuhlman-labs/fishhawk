@@ -1813,3 +1813,33 @@ func TestTierResidualBounded_ElidesFanInVerifyUnavailable(t *testing.T) {
 		t.Errorf("T9 recorded no run.fan_in_verify_unavailable ledger entry; entries = %+v", led.entries)
 	}
 }
+
+// TestSkeletonRunStatus_RetainsHostDispatch pins S5a (#5402): the diagnosis
+// skeleton keeps the operator-actionable host_dispatch block verbatim and
+// never itemises it (tierNever rows are never itemised, so a dropped block
+// would vanish silently).
+func TestSkeletonRunStatus_RetainsHostDispatch(t *testing.T) {
+	runID := uuid.NewString()
+	out := maximalRunStatusOutput(runID)
+	hd := &hostDispatchObservation{
+		State: hostDispatchStateRefusing, StatusPath: "/s/status.json",
+		PathsTried:  []string{"/a/.fishhawk/cache/host-dispatch", "/b/.fishhawk/cache/host-dispatch", "/tmp/fishhawk-host-dispatch"},
+		RefusalCode: hdRefuseWorkingDirAbsent, RefusalDetail: strings.Repeat("d", hostDispatchTextMax),
+		Detail: strings.Repeat("x", hostDispatchTextMax),
+	}
+	out.HostDispatch = hd
+	sk, _, err := skeletonRunStatus(out, runID, fixedBudget(1<<30))
+	if err != nil {
+		t.Fatalf("skeleton: %v", err)
+	}
+	if !reflect.DeepEqual(sk.HostDispatch, hd) {
+		t.Fatalf("skeleton host_dispatch = %+v; want the input block verbatim", sk.HostDispatch)
+	}
+	if sk.Elisions != nil {
+		for _, f := range sk.Elisions.Fields {
+			if strings.HasPrefix(f.Field, "host_dispatch") {
+				t.Fatalf("elision entry %+v names host_dispatch; it is retained", f)
+			}
+		}
+	}
+}

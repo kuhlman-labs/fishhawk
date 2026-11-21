@@ -143,13 +143,16 @@ type Config struct {
 	StoredLoginPresent func() (bool, error)
 
 	// LocalHostRungs enables fishhawk_doctor's two host-local rungs, credential
-	// and model_credential (#5227). Only the operator's own stdio fishhawk-mcp
-	// process sets it (backend/cmd/fishhawk-mcp/main.go). It is false by default
-	// and false on fishhawkd's /mcp route, where this process's host and
-	// credential store are the daemon's, not the caller's. When false, both
-	// rungs report not_applicable and nothing is exec'd or read. A run-bound
-	// bearer (an fhm_ in-runner agent token) also reports not_applicable, so an
-	// agent never learns whether an operator login exists.
+	// and model_credential (#5227), and the host-dispatch status overlay on
+	// fishhawk_get_campaign_status and fishhawk_get_run_status (#5402), which
+	// reads the host dispatcher's status.json. Only the operator's own stdio
+	// fishhawk-mcp process sets it (backend/cmd/fishhawk-mcp/main.go). It is
+	// false by default and false on fishhawkd's /mcp route, where this
+	// process's host, files and credential store are the daemon's, not the
+	// caller's. When false, both rungs report not_applicable, the overlay is
+	// off, and nothing is exec'd or read. A run-bound bearer (an fhm_ in-runner
+	// agent token) also reports not_applicable and gets no overlay, so an agent
+	// never learns whether an operator login exists or reads the host's files.
 	LocalHostRungs bool
 }
 
