@@ -1201,6 +1201,12 @@ On the operator's stdio fishhawk-mcp, every awaiting block of kind
 host_dispatcher is overlaid from the host dispatcher's status.json (paused,
 capped, refusing, stale or absent read as human with the remedy in next_step;
 unverified when it could not be checked) and carries a host_dispatch block.
+An acceptance stage held for the implement review round reads system/in_flight
+(#5298): from the dispatcher's implement_review_in_flight or
+implement_review_not_started refusal or, before its first tick, from a pre-tick
+round check that shares the overlay's read cap (past the cap it reads
+unverified). Past 30 minutes the next_step names fishhawk_get_run_status and
+fishhawk_rerun_review.
 `),
 	}, resolver.getCampaignStatus)
 }
