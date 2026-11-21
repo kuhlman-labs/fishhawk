@@ -1321,6 +1321,89 @@ func TestDriveRun_DecisionRequired_ServerCheckAwaitingHuman(t *testing.T) {
 	}
 }
 
+// TestDriveDecisionActions_ArchitecturalDecisionAwaitingCaptain pins the #5265
+// arm directly: read the plan gate view first, then approve only on the
+// captain's ruling, then reject. No action re-invokes the delegated driver.
+func TestDriveDecisionActions_ArchitecturalDecisionAwaitingCaptain(t *testing.T) {
+	runID := uuid.New()
+	state := operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain
+	na := driveDecisionActions(state, runID, "/tmp/checkout")
+	if na == nil || na.State != state {
+		t.Fatalf("next_actions = %+v, want state %s", na, state)
+	}
+	if got, want := strings.Join(actionNameList(na.Actions), ","), "fishhawk_get_gate_view,fishhawk_approve_plan,fishhawk_reject_plan"; got != want {
+		t.Fatalf("actions = %v, want %v (read the declaration first)", got, want)
+	}
+	for _, a := range na.Actions {
+		if a.Params["run_id"] != runID.String() {
+			t.Errorf("%s params = %v, want run_id %s", a.Action, a.Params, runID)
+		}
+		if a.Action == "fishhawk_drive_run" || a.Action == "fishhawk_delegation" {
+			t.Errorf("roster names the delegated auto-drive %s; the captain's ruling is not delegable", a.Action)
+		}
+	}
+	gate, approve, reject := na.Actions[0], na.Actions[1], na.Actions[2]
+	if gate.Params["stage_kind"] != "plan" {
+		t.Errorf("gate view params = %v, want stage_kind plan", gate.Params)
+	}
+	if gate.Consumes != consumesNone {
+		t.Errorf("gate view consumes %q, want %q", gate.Consumes, consumesNone)
+	}
+	if !strings.Contains(gate.Reason, "new_architectural_decision") || !strings.Contains(gate.Reason, "plan_warnings") {
+		t.Errorf("gate view reason must name the declaration on plan_warnings: %s", gate.Reason)
+	}
+	if approve.Consumes != consumesApprovalSlot || reject.Consumes != consumesApprovalSlot {
+		t.Errorf("approve consumes %q, reject consumes %q; want both %q", approve.Consumes, reject.Consumes, consumesApprovalSlot)
+	}
+	for _, want := range []string{"HUMAN", "captain", "must NOT approve on its own authority"} {
+		if !strings.Contains(approve.Precondition, want) {
+			t.Errorf("approve_plan precondition must contain %q: %s", want, approve.Precondition)
+		}
+	}
+	if !strings.Contains(reject.Precondition, "needs an ADR") {
+		t.Errorf("reject_plan precondition must name the ADR ruling: %s", reject.Precondition)
+	}
+}
+
+// TestDriveRun_DecisionRequired_ArchitecturalDecisionAwaitingCaptain drives the
+// real driveRun loop (#5265): a gate returning
+// decision_required/architectural_decision_awaiting_captain stops the loop with
+// that reason, carries the arm's roster, and spawns nothing.
+func TestDriveRun_DecisionRequired_ArchitecturalDecisionAwaitingCaptain(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "awaiting_approval", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
+			Action:           "approve",
+			Note:             "the plan declares a new architectural decision",
+		}
+	})
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain {
+		t.Fatalf("stopped_reason = %q, want decision_required:architectural_decision_awaiting_captain", out.StoppedReason)
+	}
+	if out.NextActions == nil {
+		t.Fatal("architectural_decision_awaiting_captain stop carried no next_actions")
+	}
+	if got, want := strings.Join(actionNameList(out.NextActions.Actions), ","), "fishhawk_get_gate_view,fishhawk_approve_plan,fishhawk_reject_plan"; got != want {
+		t.Errorf("actions = %v, want %v", got, want)
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on an architectural_decision_awaiting_captain stop: %v", rec.list())
+	}
+}
+
 // assertFixupNoChangeRoster pins the #5390 fixup_no_changes_unaddressed roster:
 // the order, the concern_ids value on the fix-up, resolve and waive actions,
 // the operator_concern param, no budget override, and the E5 vouch-then-close
