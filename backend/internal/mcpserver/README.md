@@ -312,10 +312,18 @@ keeps the entry, fail closed). It lists local `pending` and `running` runs
 episode first, then `created_at` and `id`. A run whose latest evaluation was
 refused for campaign state, or held after the gate admitted it, moves last
 until a fresh evaluation stops refusing it, and is never skipped without that
-evaluation. Older held runs therefore cannot spend every tick's budget: a newer
-admissible run is reached on the next tick. Finally it evaluates candidates until the
-per-tick cap of candidates that reached the campaign-link read is spent. That
-cap therefore bounds both the campaign-link reads and the marker POSTs per tick.
+evaluation. Those deprioritised runs rotate: they are ordered
+least-recently-evaluated first, then `created_at` and `id`. A run the per-tick
+cap left unreached keeps its older evaluation stamp, so it sorts ahead of the
+runs that spent the budget. Of N deprioritised runs, each is re-evaluated within
+ceil(N / per-tick cap) ticks, counting only ticks that complete the candidate
+pass without a `host_memory_pressure` stop and while ranks 0 and 1 (queue
+episodes and never-refused runs) leave budget. A run held once and admissible
+again is therefore reached even while older runs stay held (#5246). The rotation
+state is in-memory and resets on restart, like the deprioritised set. Finally it
+evaluates candidates until the per-tick cap of candidates that reached the
+campaign-link read is spent. That cap therefore bounds both the campaign-link
+reads and the marker POSTs per tick.
 The daily count is always persisted and rolls over at 00:00:00Z, so a restart
 does not reset it. The status file and `--status` report it as `spawns_today`;
 it is enforced only when `--daily-cap` is set. `daily_cap=N` (status file field
@@ -360,7 +368,13 @@ when the holder exits, however it exits, so a crashed dispatcher's lock is free
 at once and no contender ever reads, judges or removes another's lock. The file
 is never removed. Every tick checks that the path still names the locked
 inode: a dispatcher whose lock file was removed or replaced stops
-(`state_dir_lock_lost`). Deleting the state dir resets the ledger.
+(`state_dir_lock_lost`). The flock helper is unix-only
+(`host_dispatcher_lock_unix.go`); on Windows `acquireHostDispatchLock` fails
+closed with `state_dir_locked`, so the package builds there and a dispatcher
+never runs unlocked. That is build portability and defence in depth: a Windows
+start is already refused by the owner check (`state_dir_not_owned`), and the
+stub's refusal is reached only by a direct call. Deleting the state dir resets
+the ledger.
 
 **Env custody.** The spawned runner's environment is `os.Environ()` with every
 `FISHHAWK_API_TOKEN` entry removed, and every entry whose value equals the

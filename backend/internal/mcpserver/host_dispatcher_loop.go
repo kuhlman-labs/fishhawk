@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -522,40 +521,8 @@ type hostDispatchLock struct {
 	path string
 }
 
-// acquireHostDispatchLock takes the lock without blocking. A held lock refuses
-// state_dir_locked, naming the pid the holder wrote (diagnostics only: the
-// flock, not the file content, is the lock).
-func acquireHostDispatchLock(dir string) (*hostDispatchLock, error) {
-	path := filepath.Join(dir, hostDispatchLockFile)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600) //nolint:gosec // operator state dir
-	if err != nil {
-		return nil, fmt.Errorf("%s: open %s: %w", hdStateDirLocked, path, err)
-	}
-	if ferr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); ferr != nil { //nolint:gosec // an fd fits an int
-		_ = f.Close()
-		if errors.Is(ferr, syscall.EWOULDBLOCK) {
-			holder := "unknown"
-			if pid, rerr := readHostDispatchLock(path); rerr == nil {
-				holder = strconv.Itoa(pid)
-			}
-			return nil, fmt.Errorf("%s: another dispatcher (pid %s) holds %s; stop it first", hdStateDirLocked, holder, path)
-		}
-		return nil, fmt.Errorf("%s: flock %s: %w", hdStateDirLocked, path, ferr)
-	}
-	l := &hostDispatchLock{f: f, path: path}
-	if !l.held() {
-		_ = f.Close()
-		return nil, fmt.Errorf("%s: %s was replaced while it was being locked; retry", hdStateDirLocked, path)
-	}
-	if err := f.Chmod(0o600); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("%s: chmod 0600 %s: %w", hdStateDirLocked, path, err)
-	}
-	if err := f.Truncate(0); err == nil {
-		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
-	}
-	return l, nil
-}
+// acquireHostDispatchLock lives in host_dispatcher_lock_unix.go (flock(2)); the
+// Windows stub in host_dispatcher_lock_windows.go fails closed.
 
 // held reports whether <dir>/lock still names the inode this process holds
 // the flock on. Every tick checks it first, so a dispatcher whose lock file
@@ -572,6 +539,25 @@ func (l *hostDispatchLock) held() bool {
 
 // unlock releases the flock. It leaves the file in place.
 func (l *hostDispatchLock) unlock() { _ = l.f.Close() }
+
+// finishHostDispatchLock runs once the flock is held on f (shared by the
+// platform acquire files). It refuses, closing f, when path no longer names
+// the locked inode, then pins mode 0600 and records the pid.
+func finishHostDispatchLock(f *os.File, path string) (*hostDispatchLock, error) {
+	l := &hostDispatchLock{f: f, path: path}
+	if !l.held() {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s: %s was replaced while it was being locked; retry", hdStateDirLocked, path)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s: chmod 0600 %s: %w", hdStateDirLocked, path, err)
+	}
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
+	}
+	return l, nil
+}
 
 func readHostDispatchLock(path string) (int, error) {
 	raw, err := os.ReadFile(path) //nolint:gosec // operator state dir
@@ -656,9 +642,18 @@ type hostDispatchLoop struct {
 	queued map[string]time.Time
 	// deprioritised holds the runs whose latest evaluation was refused for
 	// campaign state (CampaignRefused) or after the gate admitted it (Held):
-	// moved last until a fresh evaluation stops refusing, so persistently held
-	// older runs cannot spend every tick's budget.
+	// moved last until a fresh evaluation stops refusing. Rank-2 runs rotate
+	// least-recently-evaluated first, so neither older held runs nor same-rank
+	// peers can spend every tick's budget. Of N deprioritised runs, each is
+	// re-evaluated within ceil(N / PerTickCap) ticks that COMPLETE the candidate
+	// pass without a host_memory_pressure stop and while ranks 0 and 1 leave
+	// budget.
 	deprioritised map[string]bool
+	// evalTick counts the ticks that reached the candidate pass; lastEvaluated
+	// maps run id -> the evalTick of the last tick that evaluated it. It is
+	// pruned to the deprioritised set at the end of each completed pass.
+	evalTick      uint64
+	lastEvaluated map[string]uint64
 	// ownRuns holds the runs this process spawned a runner for.
 	ownRuns map[string]bool
 	// gateCalls counts Admit calls (the per-tick budget reads it).
@@ -679,6 +674,7 @@ func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string
 		writeFile:     writeHostDispatchFile,
 		queued:        map[string]time.Time{},
 		deprioritised: map[string]bool{},
+		lastEvaluated: map[string]uint64{},
 		ownRuns:       map[string]bool{},
 		runRefusals:   map[string]hostDispatchRunRefusal{},
 	}
@@ -849,11 +845,13 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 		l.logf("list local runs failed; no spawns this tick: %v", err)
 		return nil
 	}
+	l.evalTick++
 	l.order(candidates)
 
 	// A campaign-state or held refusal deprioritises the run until a fresh
 	// evaluation of it stops refusing; a run this tick does not reach keeps
-	// its place.
+	// its rank AND its older lastEvaluated, so it sorts ahead of the runs that
+	// spent the budget next tick.
 	refused := make(map[string]bool, len(l.deprioritised))
 	for id := range l.deprioritised {
 		refused[id] = true
@@ -874,6 +872,7 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 		}
 		before := l.gateCalls
 		o := l.core.evaluate(ctx, id)
+		l.lastEvaluated[run.ID] = l.evalTick
 		if o.CampaignRefused || l.gateCalls != before {
 			attempts++
 		}
@@ -886,7 +885,27 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	l.pruneRunRefusals(candidates)
 	// A per-tick-cap or memory-pressure break still counts as a completed pass.
 	l.status.LastCompleteTickAt = l.now().UTC()
+	// Like runRefusals, the deprioritised set keeps only runs still in this
+	// tick's candidate list: a run that went terminal or left the list is never
+	// evaluated again, so it would otherwise hold its entry until a restart.
+	live := make(map[string]bool, len(candidates))
+	for _, r := range candidates {
+		live[r.ID] = true
+	}
+	for id := range refused {
+		if !live[id] {
+			delete(refused, id)
+		}
+	}
 	l.deprioritised = refused
+	// The rotation state is bounded by the deprioritised set, and so by the live
+	// candidates: a run that left rank 2 is re-stamped by the evaluation that
+	// puts it back.
+	for id := range l.lastEvaluated {
+		if !refused[id] {
+			delete(l.lastEvaluated, id)
+		}
+	}
 	return nil
 }
 
@@ -1036,7 +1055,9 @@ func (l *hostDispatchLoop) listCandidates(ctx context.Context) ([]Run, error) {
 // order sorts candidates: live queue episodes first (oldest episode first),
 // then created_at and id, with runs whose latest evaluation was refused for
 // campaign state or after the gate admitted it moved last (deprioritised,
-// never skipped without a fresh evaluation).
+// never skipped without a fresh evaluation). The deprioritised rank is ordered
+// least-recently-evaluated first, then created_at and id, so a run the per-tick
+// cap left unreached sorts ahead of the runs that spent the budget.
 func (l *hostDispatchLoop) order(runs []Run) {
 	rank := func(r Run) int {
 		if _, ok := l.queued[r.ID]; ok {
@@ -1057,6 +1078,12 @@ func (l *hostDispatchLoop) order(runs []Run) {
 			ea, eb := l.queued[a.ID], l.queued[b.ID]
 			if !ea.Equal(eb) {
 				return ea.Before(eb)
+			}
+		}
+		if ra == 2 {
+			la, lb := l.lastEvaluated[a.ID], l.lastEvaluated[b.ID]
+			if la != lb {
+				return la < lb
 			}
 		}
 		if !a.CreatedAt.Equal(b.CreatedAt) {
