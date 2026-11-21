@@ -84,6 +84,7 @@ instead of per-handler refusals. A dispatcher subject may call only the routes
 | `GET /v0/runs` | candidate list (`runner_kind=local`, `pending` / `running`) |
 | `GET /v0/runs/{run_id}` | drive view, forge target, parent read, `?include=campaign_link` (gate and reap) |
 | `GET /v0/runs/{run_id}/stages` | stage selection, in-flight refresh, the runner reaper's stage-state probe |
+| `GET /v0/runs/{run_id}/audit` | the implement review round read before an acceptance spawn (#5298) |
 | `POST /v0/runs/{run_id}/auto-drive/acts` | the `run_auto_driven` record act |
 | `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch` | the host-dispatch marker |
 | `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` | the category-C report for a failed spawn or a reaped runner |
@@ -114,10 +115,24 @@ refused dispatcher `cancel` leaves the run running). On the client side,
 the core makes is on the allowlist. Widening the list changes all three, and
 this table, together.
 
+The audit row is justified by the scope grant, not by a route ruling:
+`read:audit` is already in `Scopes()` (ADR-104 Q4, "read runs and their audit
+chain"), and the row is the one route that implements it. It is a read and adds
+no write reach.
+
 Remaining reach (accepted): within the allowlist a stolen dispatcher token can
 record dispatch acts, post the marker for any run in its account, report a
-category-C stage failure, and run acceptance admission. It cannot approve,
-merge, mint, recover, cancel or decide a gate.
+category-C stage failure, and run acceptance admission. It can also read ANY
+run's audit chain in its account through `GET /v0/runs/{run_id}/audit`, every
+category and `?chain=true` included (a dispatcher is not a run-bound subject,
+so the run-bound withholding does not apply). That is within the `read:audit`
+scope it already held. Audit payloads carry no plaintext credential by
+construction: token rows record a token id or a SHA-256 of the token, and
+`diff_secrets_detected` records locations, pattern classes and truncated
+fingerprints, never matched bytes. Agent and operator free text (reasons,
+review summaries) is credential-scanned best effort only, the same posture as
+every other `read:audit` reader. It cannot approve, merge, mint, recover,
+cancel or decide a gate.
 
 ## Runner credential custody (narrower than ADR-104 Q4)
 

@@ -40,6 +40,11 @@ type hdRun struct {
 	// that HTTP status instead.
 	Link     *runCampaignLink
 	LinkCode int
+	// Audit is served on GET /v0/runs/{id}/audit with category, stage_id and
+	// since_sequence filtering (the implement review round read, #5298);
+	// AuditFailCategory answers 500 for reads of that category.
+	Audit             []AuditEntry
+	AuditFailCategory string
 }
 
 type hdRequest struct {
@@ -204,6 +209,32 @@ func (b *hdBackend) serve(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 		writeJSON(w, 404, apiErrBody("stage_not_found", parts[4]))
+	case len(parts) == 4 && parts[3] == "audit" && req.Method == http.MethodGet:
+		q := req.URL.Query()
+		cat := q.Get("category")
+		if run.AuditFailCategory != "" && cat == run.AuditFailCategory {
+			writeJSON(w, 500, apiErrBody("internal", "audit read failed"))
+			return
+		}
+		var since int64
+		if v := q.Get("since_sequence"); v != "" {
+			_, _ = fmt.Sscan(v, &since)
+		}
+		items := []AuditEntry{}
+		for _, e := range run.Audit {
+			if cat != "" && e.Category != cat {
+				continue
+			}
+			if sid := q.Get("stage_id"); sid != "" && (e.StageID == nil || *e.StageID != sid) {
+				continue
+			}
+			if e.Sequence <= since {
+				continue
+			}
+			items = append(items, e)
+		}
+		out, _ := json.Marshal(map[string]any{"items": items, "next_cursor": ""})
+		writeJSON(w, 200, string(out))
 	case len(parts) == 6 && parts[3] == "stages" && parts[5] == "reap-failure":
 		b.reaps = append(b.reaps, parts[4])
 		b.setState(run, parts[4], "failed")
@@ -1177,6 +1208,7 @@ func TestHostDispatcher_RequestsStayOnServerAllowlist(t *testing.T) {
 	h := newHDHarness(t)
 	h.eval(t, h.addRun(nil))
 	h.eval(t, acceptanceRun(h))
+	h.eval(t, featureChangeAcceptanceRun(h, hdIntPtr(0), nil))
 	zero := 0
 	parent := h.addRun(func(r *hdRun) { r.Stages = nil })
 	h.eval(t, h.addRun(func(r *hdRun) {
@@ -1188,6 +1220,7 @@ func TestHostDispatcher_RequestsStayOnServerAllowlist(t *testing.T) {
 	h.eval(t, h.addRun(nil))
 	h.b.mu.Lock()
 	defer h.b.mu.Unlock()
+	sawAudit := false
 	if len(h.b.reaps) != 1 {
 		t.Fatalf("reaps = %v; want the spawn-failure report exercised", h.b.reaps)
 	}
@@ -1196,6 +1229,12 @@ func TestHostDispatcher_RequestsStayOnServerAllowlist(t *testing.T) {
 		if !hostdispatcher.RouteAllowed(q.Method, path) {
 			t.Errorf("%s %s is not in hostdispatcher.Routes(); the server would answer 403 host_dispatcher_route_forbidden", q.Method, path)
 		}
+		if q.Method == http.MethodGet && strings.HasSuffix(path, "/audit") {
+			sawAudit = true
+		}
+	}
+	if !sawAudit {
+		t.Fatal("the acceptance round read never reached GET /v0/runs/{run_id}/audit")
 	}
 }
 
@@ -1223,5 +1262,241 @@ func TestHostDispatcher_UnmarkedRunWithoutWorkingDirIsNotEligible(t *testing.T) 
 	r := h.addRun(func(r *hdRun) { r.AutoDispatch = false; r.WorkingDir = "" })
 	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseNotEligible {
 		t.Fatalf("unmarked run without working_dir = %+v; want not_eligible", o)
+	}
+}
+
+// featureChangeAcceptanceRun is the #5298 feature_change layout: plan(1) and
+// implement(2) succeeded, acceptance(3) awaiting_host_dispatch BEFORE the human
+// review(4), which is still pending. configured is the implement stage's
+// review_agents_configured (nil = an older server that omits it).
+func featureChangeAcceptanceRun(h *hdHarness, configured *int, mut func(*hdRun)) *hdRun {
+	return h.addRun(func(r *hdRun) {
+		dispatched := time.Now().Add(-time.Hour).UTC()
+		r.Stages = []Stage{
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 2, Type: "implement", State: "succeeded", ReviewAgentsConfigured: configured, DispatchedAt: &dispatched},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 4, Type: "review", State: "pending"},
+		}
+		if mut != nil {
+			mut(r)
+		}
+	})
+}
+
+func hdIntPtr(n int) *int { return &n }
+
+// hdAppendAudit appends one audit row for the run's implement stage.
+func (h *hdHarness) hdAppendAudit(r *hdRun, category string, payload map[string]any) {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	sid := r.Stages[1].ID
+	r.Audit = append(r.Audit, AuditEntry{
+		ID: uuid.NewString(), Sequence: int64(len(r.Audit) + 1), RunID: r.ID, StageID: &sid,
+		Category: category, Payload: payload,
+	})
+}
+
+func (h *hdHarness) hdStartRound(r *hdRun, configured int) {
+	h.hdAppendAudit(r, "implement_review_started", map[string]any{"configured_agents": configured, "authority": "advisory"})
+}
+
+func (h *hdHarness) hdVerdict(r *hdRun, verdict string, concerns int) {
+	cs := make([]map[string]any, concerns)
+	for i := range cs {
+		cs[i] = map[string]any{"severity": "medium", "category": "scope", "note": "fix it"}
+	}
+	h.hdAppendAudit(r, "implement_reviewed", map[string]any{"reviewer_kind": "agent", "verdict": verdict, "concerns": cs})
+}
+
+func isRoundStartedRead(q hdRequest) bool {
+	return q.Method == http.MethodGet && strings.Contains(q.Path, "/audit?") && strings.Contains(q.Path, "category=implement_review_started")
+}
+
+func (h *hdHarness) assertNothingPosted(t *testing.T, what string) {
+	t.Helper()
+	if n := h.b.count(isMarkerReq); n != 0 {
+		t.Errorf("%s: %d marker POST(s); want 0", what, n)
+	}
+	if n := h.b.count(isRecordReq); n != 0 {
+		t.Errorf("%s: %d record-act POST(s); want 0", what, n)
+	}
+	if n := h.b.count(func(q hdRequest) bool { return strings.HasSuffix(q.Path, "/acceptance-admission") }); n != 0 {
+		t.Errorf("%s: %d acceptance-admission request(s); want 0", what, n)
+	}
+	if h.spawner.n() != 0 {
+		t.Errorf("%s: %d spawn(s); want 0", what, h.spawner.n())
+	}
+	if h.gate.admits != 0 {
+		t.Errorf("%s: %d gate admit(s); want 0", what, h.gate.admits)
+	}
+}
+
+// #5298: a feature_change acceptance stage sequenced BEFORE a pending review
+// stage spawns once the implement review round settles (or no round is
+// expected), with the auto-preview pair and one run_auto_driven act.
+func TestHostDispatcher_FeatureChangeAcceptanceSpawns(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured *int
+		seed       func(h *hdHarness, r *hdRun)
+	}{
+		{"round_complete_clean", hdIntPtr(2), func(h *hdHarness, r *hdRun) {
+			h.hdStartRound(r, 2)
+			h.hdVerdict(r, "approve", 0)
+			h.hdVerdict(r, "approve", 0)
+		}},
+		{"round_complete_with_concerns", hdIntPtr(2), func(h *hdHarness, r *hdRun) {
+			h.hdStartRound(r, 2)
+			h.hdVerdict(r, "approve", 0)
+			h.hdVerdict(r, "approve_with_concerns", 1)
+		}},
+		{"no_reviewers_configured", hdIntPtr(0), func(*hdHarness, *hdRun) {}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHDHarness(t)
+			r := featureChangeAcceptanceRun(h, tc.configured, nil)
+			tc.seed(h, r)
+			o := h.eval(t, r)
+			if !o.Spawned || o.StageType != "acceptance" || o.StageID != r.Stages[2].ID {
+				t.Fatalf("eval = %+v; want the acceptance stage spawned", o)
+			}
+			env := strings.Join(h.spawner.spawns[0].Env, "\n")
+			if !strings.Contains(env, acceptancePreviewCmdEnv+"=") || !strings.Contains(env, acceptancePreviewTeardownCmdEnv+"=") {
+				t.Fatalf("acceptance env lacks the auto-preview pair:\n%s", env)
+			}
+			if h.gate.admits != 1 {
+				t.Fatalf("gate admits = %d; want 1", h.gate.admits)
+			}
+			if len(h.b.acts) != 1 || h.b.acts[0].Stage != "acceptance" || h.b.acts[0].Action != autoDriveDispatchActionName {
+				t.Fatalf("acts = %+v; want one run_auto_driven dispatch_stage act for acceptance", h.b.acts)
+			}
+		})
+	}
+}
+
+// #5298: while the implement review round is in flight (0 or 1 of 2 verdicts)
+// the acceptance stage is refused implement_review_in_flight with nothing
+// admitted, recorded, marked or spawned.
+func TestHostDispatcher_AcceptanceHeldWhileImplementReviewInFlight(t *testing.T) {
+	for _, verdicts := range []int{0, 1} {
+		t.Run(fmt.Sprintf("%d_of_2_verdicts", verdicts), func(t *testing.T) {
+			h := newHDHarness(t)
+			r := featureChangeAcceptanceRun(h, hdIntPtr(2), nil)
+			h.hdStartRound(r, 2)
+			for i := 0; i < verdicts; i++ {
+				h.hdVerdict(r, "approve", 0)
+			}
+			o := h.eval(t, r)
+			if o.Spawned || o.Refusal != hdRefuseImplementReviewInFlight || o.StageID != r.Stages[2].ID {
+				t.Fatalf("eval = %+v; want implement_review_in_flight on the acceptance stage", o)
+			}
+			if !o.CampaignRefused {
+				t.Fatalf("eval = %+v; a round-held candidate must count against the per-tick cap (CampaignRefused)", o)
+			}
+			h.assertNothingPosted(t, "in-flight round")
+		})
+	}
+}
+
+// #5298 V1: a decomposed parent whose fan-in recorded slices_integrated and
+// parked acceptance BEFORE DispatchConsolidatedReview wrote
+// implement_review_started reads none; the configured reviewers make it
+// implement_review_not_started, then in_flight, then a spawn.
+func TestHostDispatcher_DecomposedParentAcceptanceHeldUntilConsolidatedRound(t *testing.T) {
+	h := newHDHarness(t)
+	r := featureChangeAcceptanceRun(h, hdIntPtr(2), func(r *hdRun) {
+		r.Stages[1].DispatchedAt = nil // reached succeeded through awaiting_children
+	})
+	h.hdAppendAudit(r, auditCategorySlicesIntegrated, map[string]any{"slices": 2})
+
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseImplementReviewNotStarted || o.StageID != r.Stages[2].ID {
+		t.Fatalf("tick 1 = %+v; want implement_review_not_started", o)
+	}
+	if !strings.Contains(o.Detail, "no review round is recorded") {
+		t.Fatalf("tick 1 detail = %q; want the not-started detail", o.Detail)
+	}
+	h.assertNothingPosted(t, "round not started")
+
+	h.hdStartRound(r, 2)
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseImplementReviewInFlight {
+		t.Fatalf("tick 2 = %+v; want implement_review_in_flight", o)
+	}
+	h.assertNothingPosted(t, "round in flight")
+
+	h.hdVerdict(r, "approve", 0)
+	h.hdVerdict(r, "approve", 0)
+	if o := h.eval(t, r); !o.Spawned || o.StageType != "acceptance" {
+		t.Fatalf("tick 3 = %+v; want the acceptance spawn once the round settled", o)
+	}
+}
+
+// #5298: an unreadable implement review round refuses fail closed.
+func TestHostDispatcher_AcceptanceReviewStatusReadFailsClosed(t *testing.T) {
+	h := newHDHarness(t)
+	r := featureChangeAcceptanceRun(h, hdIntPtr(2), func(r *hdRun) { r.AuditFailCategory = "implement_review_started" })
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseReviewStatusReadFailed {
+		t.Fatalf("eval = %+v; want review_status_read_failed", o)
+	}
+	// W3: an unreadable round counts against --per-tick-cap like a held one, so
+	// N unreadable rounds cannot do N campaign-link plus N round reads a tick.
+	if !o.CampaignRefused {
+		t.Fatalf("eval = %+v; want CampaignRefused so the unreadable round counts against --per-tick-cap", o)
+	}
+	h.assertNothingPosted(t, "round read failed")
+}
+
+// #5298 V4: a paused campaign refuses campaign_not_running before the round
+// hold reads the implement round at all.
+func TestHostDispatcher_CampaignHoldWinsOverReviewRoundHold(t *testing.T) {
+	h := newHDHarness(t)
+	r := featureChangeAcceptanceRun(h, hdIntPtr(2), func(r *hdRun) { r.Link = hdLinked("paused") })
+	h.hdStartRound(r, 2)
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseCampaignNotRunning || !o.CampaignRefused {
+		t.Fatalf("eval = %+v; want campaign_not_running (CampaignRefused)", o)
+	}
+	if n := h.b.count(isRoundStartedRead); n != 0 {
+		t.Fatalf("%d implement_review_started audit read(s); want 0 (the campaign hold comes first)", n)
+	}
+	h.assertNothingPosted(t, "campaign paused")
+}
+
+// #5298: a 409 concurrency_slot_queued marker leaves the settled-round
+// acceptance stage parked with no spawn.
+func TestHostDispatcher_FeatureChangeAcceptanceSlotQueued(t *testing.T) {
+	h := newHDHarness(t)
+	r := featureChangeAcceptanceRun(h, hdIntPtr(0), nil)
+	h.b.marker = func(string, string) (int, string) {
+		return 409, apiErrBody(concurrencySlotQueuedCode, "slot queued")
+	}
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseSlotQueued || !o.QueueEpisode {
+		t.Fatalf("eval = %+v; want concurrency_slot_queued", o)
+	}
+	if h.spawner.n() != 0 || h.b.stageState(r.ID, r.Stages[2].ID) != "awaiting_host_dispatch" {
+		t.Fatal("a queued acceptance must stay awaiting_host_dispatch with no spawn")
+	}
+}
+
+// #5298 W3: a round-held acceptance candidate reached the campaign-link read,
+// so it counts against --per-tick-cap: a tick with more round-held candidates
+// than the cap does at most cap campaign-link reads.
+func TestTick_RoundHeldAcceptanceCountsAgainstPerTickCap(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	for i := 0; i < 5; i++ {
+		r := featureChangeAcceptanceRun(lh.hdHarness, hdIntPtr(2), nil)
+		lh.hdStartRound(r, 2)
+	}
+	l := lh.loop(func(c *HostDispatcherConfig) { c.PerTickCap = 2 })
+	lh.tick(l)
+	if n := lh.b.count(isLinkReq); n != 2 {
+		t.Fatalf("campaign-link reads = %d; want exactly the per-tick cap (2)", n)
+	}
+	if lh.spawner.n() != 0 || lh.b.count(isMarkerReq) != 0 {
+		t.Fatal("a round-held acceptance must not be marked or spawned")
 	}
 }

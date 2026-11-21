@@ -744,6 +744,13 @@ var runStatusPathTable = []pathClassification{
 	{Path: "stages[].dispatched_at", Tier: tierNever},
 	// concurrency (#3964): a redundant decode-mirror like stages[].progress; holders bounded by MaxLimit 64.
 	{Path: "stages[].concurrency", Tier: tierNever},
+	// review_agents_configured (#5298) is a small spec-resolved pointer-int
+	// scalar (the implement stage's workflow-declared agent reviewer count),
+	// a decode-mirror like the adjacent agent_timeout_seconds and dispatched_at
+	// rows. Classifying it tierNever rides it along without a skeleton-ledger
+	// entry, so it neither bypasses the budget nor perturbs the
+	// diagnosis-skeleton size the floor assertions pin.
+	{Path: "stages[].review_agents_configured", Tier: tierNever},
 	{Path: "stages[].failure_reason", Tier: "T7", Class: classOversizedCapable, Surfaces: restStages, Unbounded: unboundedStages},
 	{Path: "stages[].id", Tier: "skeleton", Class: classStored, Surfaces: restStages},
 	{Path: "stages[].run_id", Tier: "skeleton", Class: classStored, Surfaces: restStages},

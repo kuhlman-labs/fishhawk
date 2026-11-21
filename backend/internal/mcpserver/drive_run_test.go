@@ -6027,3 +6027,355 @@ func TestDriveRun_Description_QueuedDispatch(t *testing.T) {
 		t.Errorf("stopped_reason schema does not list awaiting_concurrency_slot: %+v", prop)
 	}
 }
+
+// --- #5298: feature_change acceptance before a pending review stage ---------
+
+// driveFeatureChangeAcceptanceFake builds the #5298 layout: plan and implement
+// succeeded (implement review_agents_configured = configured, nil = absent),
+// acceptance pending at a LOWER sequence than the still-pending human review.
+// dispatched marks the implement stage as runner-dispatched (dispatched_at
+// set); false models a decomposed parent that reached succeeded via fan-in.
+func driveFeatureChangeAcceptanceFake(configured *int, dispatched bool) *driveFakeBackend {
+	impl := stg(driveImplID, "implement", "succeeded", 1)
+	impl.ReviewAgentsConfigured = configured
+	if dispatched {
+		at := time.Now().Add(-time.Hour).UTC()
+		impl.DispatchedAt = &at
+	}
+	return newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+		stg(driveAccID, "acceptance", "pending", 2),
+		stg(driveReviewID, "review", "pending", 3),
+	})
+}
+
+func driveIntPtr(n int) *int { return &n }
+
+func driveSettleAcceptanceOnSpawn(f *driveFakeBackend) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
+		if typ == "acceptance" {
+			f.setState("acceptance", "succeeded")
+			f.runState = "succeeded"
+		}
+	})
+	f.setOnGate(func(*driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+}
+
+func TestDriveRun_FeatureChangeAcceptance_DispatchesWithReviewStagePending(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured *int
+		seed       func(f *driveFakeBackend)
+	}{
+		{"round_complete_clean", driveIntPtr(2), func(f *driveFakeBackend) {
+			f.seedImplementReviewStarted(2)
+			f.seedImplementReviewed("approve")
+			f.seedImplementReviewed("approve")
+		}},
+		{"round_complete_with_concerns", driveIntPtr(2), func(f *driveFakeBackend) {
+			f.seedImplementReviewStarted(2)
+			f.seedImplementReviewed("approve")
+			f.seedImplementReviewed("approve_with_concerns")
+		}},
+		{"no_reviewers_configured", driveIntPtr(0), func(*driveFakeBackend) {}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := driveFeatureChangeAcceptanceFake(tc.configured, true)
+			tc.seed(f)
+			driveSettleAcceptanceOnSpawn(f)
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			defer srv.Close()
+			r.driveMaxWallclock = 2 * time.Second
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if got := rec.list(); len(got) != 1 || got[0] != "acceptance" {
+				t.Fatalf("spawn sequence = %v (stopped %q); want [acceptance] with the later review stage pending", got, out.StoppedReason)
+			}
+		})
+	}
+}
+
+func TestDriveRun_FeatureChangeAcceptance_HeldWhileImplementReviewInFlight(t *testing.T) {
+	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
+	f.seedImplementReviewStarted(2)
+	f.seedImplementReviewed("approve") // 1 of 2: pending
+	driveSettleAcceptanceOnSpawn(f)
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 60 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q; want timeout (poll while the round is in flight, never stalled)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v while the implement review round was in flight", got)
+	}
+	if !strings.Contains(strings.Join(out.Warnings, "\n"), hdRefuseImplementReviewInFlight) {
+		t.Fatalf("warnings = %v; want the deadline to name %s", out.Warnings, hdRefuseImplementReviewInFlight)
+	}
+	if out.NextActions == nil || out.NextActions.State != "implement_review_pending" {
+		t.Fatalf("next_actions = %+v; want implement_review_pending", out.NextActions)
+	}
+}
+
+func TestDriveRun_DecomposedParentAcceptance_HeldUntilRoundStarts(t *testing.T) {
+	t.Run("held_to_deadline", func(t *testing.T) {
+		f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), false)
+		driveSettleAcceptanceOnSpawn(f)
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveMaxWallclock = 60 * time.Millisecond
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedTimeout {
+			t.Fatalf("stopped_reason = %q; want timeout", out.StoppedReason)
+		}
+		if got := rec.list(); len(got) != 0 {
+			t.Fatalf("spawned %v before the consolidated round started", got)
+		}
+		if !strings.Contains(strings.Join(out.Warnings, "\n"), hdRefuseImplementReviewNotStarted) {
+			t.Fatalf("warnings = %v; want the deadline to name %s", out.Warnings, hdRefuseImplementReviewNotStarted)
+		}
+		if out.NextActions == nil || out.NextActions.State != "implement_review_not_started" {
+			t.Fatalf("next_actions = %+v; want implement_review_not_started", out.NextActions)
+		}
+		if !driveHasAction(out.NextActions.Actions, "fishhawk_rerun_review") {
+			t.Fatalf("next_actions = %+v; want fishhawk_rerun_review for a decomposed parent", out.NextActions.Actions)
+		}
+	})
+	t.Run("spawns_once_round_settles", func(t *testing.T) {
+		f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), false)
+		driveSettleAcceptanceOnSpawn(f)
+		reads := 0
+		f.setOnStages(func(f *driveFakeBackend) {
+			reads++
+			if reads == 3 { // the round starts and settles mid-drive
+				f.seedImplementReviewStarted(2)
+				f.seedImplementReviewed("approve")
+				f.seedImplementReviewed("approve")
+			}
+		})
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveMaxWallclock = 2 * time.Second
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if got := rec.list(); len(got) != 1 || got[0] != "acceptance" {
+			t.Fatalf("spawn sequence = %v (stopped %q); want [acceptance] once the round settled", got, out.StoppedReason)
+		}
+		if reads < 3 {
+			t.Fatalf("stage reads = %d; acceptance spawned before the round was seeded", reads)
+		}
+	})
+}
+
+// #5298 (concern eb54866c): a hold the loop observed, then released by another
+// actor (here a runner picks acceptance up elsewhere), must not be named at the
+// deadline: the round-hold state is cleared on every step-(c) pass.
+func TestDriveRun_FeatureChangeAcceptance_HoldReleasedElsewhereNotNamedAtDeadline(t *testing.T) {
+	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
+	f.seedImplementReviewStarted(2)
+	f.seedImplementReviewed("approve") // 1 of 2: in flight, so the first passes hold
+	reads := 0
+	f.setOnStages(func(f *driveFakeBackend) {
+		reads++
+		if reads == 3 { // acceptance now runs elsewhere; it is no longer held
+			f.setState("acceptance", "running")
+		}
+	})
+	driveSettleAcceptanceOnSpawn(f)
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 200 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if reads < 4 {
+		t.Fatalf("stage reads = %d; the loop never iterated past the release", reads)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v; acceptance ran elsewhere", got)
+	}
+	if w := strings.Join(out.Warnings, "\n"); strings.Contains(w, "held by the implement review round") {
+		t.Fatalf("warnings = %v; a released hold must not be named at the deadline", out.Warnings)
+	}
+	if out.NextActions != nil && (out.NextActions.State == "implement_review_pending" || out.NextActions.State == "implement_review_not_started") {
+		t.Fatalf("next_actions = %+v; a released hold must not set the round-hold arm", out.NextActions)
+	}
+}
+
+// seedPlanDecomposed appends a plan_decomposed row through the fake's own audit
+// slice (W5): the positive decomposition signal the not-started arm resolves
+// an unknown shape from.
+func (f *driveFakeBackend) seedPlanDecomposed() {
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{
+		ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(),
+		Category: "plan_decomposed", Payload: map[string]any{"child_run_ids": []any{uuid.New().String()}},
+	})
+}
+
+// #5298 (concerns 8bbba318, 3b8b838d): a fan-in verify pass dispatches a
+// decomposed parent's implement stage (stamping dispatched_at) before its first
+// consolidated round, so dispatched_at alone cannot pick the not-started shape.
+// The deadline resolves it from plan_decomposed: a parent keeps
+// fishhawk_rerun_review, a positively non-decomposed run gets the hand
+// acceptance dispatch, and an unreadable record never offers acceptance.
+func TestDriveRun_NotStartedHold_DeadlineShapeFromPlanDecomposed(t *testing.T) {
+	cases := []struct {
+		name         string
+		seed         func(f *driveFakeBackend)
+		wantRerun    bool
+		wantDispatch bool
+	}{
+		{"redispatched_parent", func(f *driveFakeBackend) { f.seedPlanDecomposed() }, true, false},
+		{"non_decomposed", func(*driveFakeBackend) {}, false, true},
+		{"plan_decomposed_unreadable", func(f *driveFakeBackend) { f.auditErrCategory = "plan_decomposed" }, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
+			tc.seed(f)
+			driveSettleAcceptanceOnSpawn(f)
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			defer srv.Close()
+			r.driveMaxWallclock = 60 * time.Millisecond
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if out.StoppedReason != stoppedTimeout {
+				t.Fatalf("stopped_reason = %q; want timeout", out.StoppedReason)
+			}
+			if got := rec.list(); len(got) != 0 {
+				t.Fatalf("spawned %v before the round started", got)
+			}
+			if out.NextActions == nil || out.NextActions.State != "implement_review_not_started" {
+				t.Fatalf("next_actions = %+v; want implement_review_not_started", out.NextActions)
+			}
+			if got := driveHasAction(out.NextActions.Actions, "fishhawk_rerun_review"); got != tc.wantRerun {
+				t.Fatalf("fishhawk_rerun_review offered = %v; want %v (actions %+v)", got, tc.wantRerun, out.NextActions.Actions)
+			}
+			if got := driveHasAction(out.NextActions.Actions, "fishhawk_dispatch_stage"); got != tc.wantDispatch {
+				t.Fatalf("fishhawk_dispatch_stage offered = %v; want %v (actions %+v)", got, tc.wantDispatch, out.NextActions.Actions)
+			}
+		})
+	}
+}
+
+// TestResolveImplementReviewNotStartedShape_ReadsOnlyWhenUnknown pins the
+// fold's cost gate: an arm whose shape the stages already prove, or any other
+// arm, makes no plan_decomposed read and is left unchanged.
+func TestResolveImplementReviewNotStartedShape_ReadsOnlyWhenUnknown(t *testing.T) {
+	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), false) // DispatchedAt nil: a proven parent
+	f.seedPlanDecomposed()
+	pdReads := 0
+	f.setOnAudit(func(_ *driveFakeBackend, category string) {
+		if category == "plan_decomposed" {
+			pdReads++
+		}
+	})
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	defer srv.Close()
+	run := &Run{ID: f.runID.String(), RunnerKind: "local"}
+	f.mu.Lock()
+	stages := append([]Stage(nil), f.stages...)
+	f.mu.Unlock()
+	for _, na := range []*NextActions{
+		implementReviewNotStartedNextActions(run, implementReviewShapeDecomposedParent),
+		{State: "implement_review_pending"},
+	} {
+		beforeState, beforeActions := na.State, strings.Join(actionNames(na), ",")
+		r.resolveImplementReviewNotStartedShape(context.Background(), f.runID, run, stages, na)
+		if na.State != beforeState || strings.Join(actionNames(na), ",") != beforeActions {
+			t.Fatalf("na changed from %s %s to %s %v", beforeState, beforeActions, na.State, actionNames(na))
+		}
+	}
+	if pdReads != 0 {
+		t.Fatalf("plan_decomposed reads = %d; want 0 when the shape is already proven", pdReads)
+	}
+}
+
+func TestDriveRun_FeatureChangeAcceptance_ReviewStatusReadFailsClosed(t *testing.T) {
+	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
+	f.auditErrCategory = "implement_review_started"
+	driveSettleAcceptanceOnSpawn(f)
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 2 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchCheckFailed {
+		t.Fatalf("stopped_reason = %q; want dispatch_check_failed", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on an unreadable implement review round", got)
+	}
+}
+
+func TestImplementReviewRoundHold(t *testing.T) {
+	implWith := func(c *int) []Stage {
+		return []Stage{{Type: "implement", State: "succeeded", ReviewAgentsConfigured: c}}
+	}
+	cases := []struct {
+		name   string
+		status *ReviewStatus
+		conf   *int
+		want   string
+	}{
+		{"pending_configured_2", &ReviewStatus{Status: "pending"}, driveIntPtr(2), hdRefuseImplementReviewInFlight},
+		{"pending_configured_0", &ReviewStatus{Status: "pending"}, driveIntPtr(0), hdRefuseImplementReviewInFlight},
+		{"pending_configured_nil", &ReviewStatus{Status: "pending"}, nil, hdRefuseImplementReviewInFlight},
+		{"none_configured_2", &ReviewStatus{Status: "none"}, driveIntPtr(2), hdRefuseImplementReviewNotStarted},
+		{"none_configured_0", &ReviewStatus{Status: "none"}, driveIntPtr(0), ""},
+		{"none_configured_nil", &ReviewStatus{Status: "none"}, nil, ""},
+		{"nil_status_configured_2", nil, driveIntPtr(2), hdRefuseImplementReviewNotStarted},
+		{"complete_configured_2", &ReviewStatus{Status: "complete"}, driveIntPtr(2), ""},
+		{"skipped_configured_2", &ReviewStatus{Status: "skipped"}, driveIntPtr(2), ""},
+		{"failed_configured_2", &ReviewStatus{Status: "failed"}, driveIntPtr(2), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := implementReviewRoundHold(tc.status, implWith(tc.conf)); got != tc.want {
+				t.Fatalf("implementReviewRoundHold = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func driveHasAction(actions []SuggestedAction, name string) bool {
+	for _, a := range actions {
+		if a.Action == name {
+			return true
+		}
+	}
+	return false
+}
