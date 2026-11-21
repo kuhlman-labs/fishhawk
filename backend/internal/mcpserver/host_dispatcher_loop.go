@@ -16,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -49,9 +51,10 @@ const (
 	hostDispatchMaxInterval        = 45 * time.Second
 	hostDispatchDefaultMaxInFlight = 2
 	hostDispatchDefaultPerTick     = 4
-	// hostDispatchStatusStaleTicks: --status reports a dispatcher stale when its
-	// last tick is older than this many intervals (a chosen default, not an
-	// ADR value).
+	// hostDispatchStatusStaleTicks: HostDispatcherStatus.State (--status and
+	// the stdio status overlay) reports a dispatcher stale when its last tick,
+	// or a known last completed pass, is older than this many intervals (a
+	// chosen default, not an ADR value).
 	hostDispatchStatusStaleTicks = 3
 	hostDispatchListPageLimit    = 100
 	hostDispatchListMaxPages     = 10
@@ -64,6 +67,17 @@ const (
 	hostDispatchPauseFile  = "pause"
 	hostDispatchLockFile   = "lock"
 )
+
+// hostDispatchStateDirEnv names a dispatcher state dir outside the default
+// (#5402): `fishhawk-mcp host-dispatch` reads it as its --state-dir default,
+// and the stdio server's status overlay reads it as its exclusive rung. The
+// cmd package declares the same literal, and both sides have a test that sets
+// exactly this name, so a rename on either side reddens one.
+const hostDispatchStateDirEnv = "FISHHAWK_HOST_DISPATCH_STATE_DIR"
+
+// hostDispatchTextMax bounds every file-sourced string the dispatcher writes
+// into status.json's run_refusals and the overlay copies into tool output.
+const hostDispatchTextMax = 300
 
 // Loop refusal codes (the core's are in host_dispatcher.go).
 const (
@@ -123,6 +137,28 @@ type HostDispatcherConfig struct {
 	Log io.Writer
 }
 
+// hostDispatchRunRefusal is one run's latest non-benign refusal in
+// status.json's run_refusals (#5402). FirstAt is when this code (for this
+// stage) was first seen in an unbroken run of refusals; LastAt is the latest
+// tick that refused it. A spawn or a benign outcome clears the entry, and a run
+// that is no longer a candidate is pruned at the end of a completed pass.
+type hostDispatchRunRefusal struct {
+	RunID   string    `json:"run_id"`
+	StageID string    `json:"stage_id,omitempty"`
+	Code    string    `json:"code"`
+	Detail  string    `json:"detail,omitempty"`
+	FirstAt time.Time `json:"first_at"`
+	LastAt  time.Time `json:"last_at"`
+}
+
+// hostDispatchTickFailure is the failing early return of the latest tick
+// (state_dir_lock_lost, ledger_read_failed, ledger_write_failed or
+// list_runs_failed). Every tick start resets it, so it names the CURRENT tick.
+type hostDispatchTickFailure struct {
+	Code string    `json:"code"`
+	At   time.Time `json:"at"`
+}
+
 // HostDispatcherStatus is the status file a dispatcher rewrites every tick
 // (<state-dir>/status.json, mode 0600).
 type HostDispatcherStatus struct {
@@ -142,16 +178,94 @@ type HostDispatcherStatus struct {
 	// is set (ADR-104 A1).
 	DailyCap int `json:"daily_cap,omitempty"`
 	InFlight int `json:"in_flight"`
+	// LastCompleteTickAt is the last tick that finished its candidate pass
+	// (#5402). Zero (absent) is UNKNOWN: a pre-#5402 dispatcher never writes
+	// it, so State then judges on last_tick_at alone.
+	LastCompleteTickAt time.Time `json:"last_complete_tick_at,omitzero"`
+	// LastTickFailure is the latest tick's failing early return; absent when
+	// the latest tick did not fail (a paused tick records none).
+	LastTickFailure *hostDispatchTickFailure `json:"last_tick_failure,omitempty"`
+	// RunRefusals holds each candidate run's latest non-benign refusal, keyed
+	// by run id. cap_reached:per_tick is global-only (last_refusal_code) and
+	// never an entry here.
+	RunRefusals map[string]hostDispatchRunRefusal `json:"run_refusals,omitempty"`
 }
 
-// Stale reports whether the status is older than hostDispatchStatusStaleTicks
-// intervals at now.
-func (s HostDispatcherStatus) Stale(now time.Time) bool {
+func (s HostDispatcherStatus) interval() time.Duration {
 	interval := time.Duration(s.IntervalSeconds * float64(time.Second))
 	if interval <= 0 {
 		interval = hostDispatchDefaultInterval
 	}
-	return s.LastTickAt.IsZero() || now.Sub(s.LastTickAt) > hostDispatchStatusStaleTicks*interval
+	return interval
+}
+
+// Stale reports whether the status is older than hostDispatchStatusStaleTicks
+// intervals at now: the process stopped ticking (liveness).
+func (s HostDispatcherStatus) Stale(now time.Time) bool {
+	return s.LastTickAt.IsZero() || now.Sub(s.LastTickAt) > hostDispatchStatusStaleTicks*s.interval()
+}
+
+// TickFailed reports whether the latest tick failed: a recorded failure not
+// older than the last completed pass. A failure with no completed pass at all
+// is current, so a dispatcher whose every tick fails reads failing.
+func (s HostDispatcherStatus) TickFailed() bool {
+	return s.LastTickFailure != nil && !s.LastTickFailure.At.Before(s.LastCompleteTickAt)
+}
+
+// CompletedStale reports whether a KNOWN last completed pass is older than
+// hostDispatchStatusStaleTicks intervals at now (health, as opposed to Stale's
+// liveness). A zero LastCompleteTickAt is unknown, not stale (S3).
+func (s HostDispatcherStatus) CompletedStale(now time.Time) bool {
+	if s.LastCompleteTickAt.IsZero() {
+		return false // unknown: a pre-#5402 writer; liveness alone decides (S3)
+	}
+	return now.Sub(s.LastCompleteTickAt) > hostDispatchStatusStaleTicks*s.interval()
+}
+
+// State is the dispatcher's health at now, shared by `--status` and the stdio
+// status overlay: "stale" (not ticking, judged on last_tick_at), "paused" (a
+// deliberate pause skips the pass, so it is exempt from the completed-pass
+// test), "failing" (the latest tick failed), "stale" (ticking, but a known
+// last completed pass is too old), else "live". A status file written before
+// #5402 carries none of the new keys and reads exactly as it did before.
+func (s HostDispatcherStatus) State(now time.Time) string {
+	if s.Stale(now) {
+		return "stale"
+	}
+	if s.Paused {
+		return "paused"
+	}
+	if s.TickFailed() {
+		return "failing"
+	}
+	if s.CompletedStale(now) {
+		return "stale"
+	}
+	return "live"
+}
+
+// boundHostDispatchText is the one bound for file-sourced text that reaches
+// status.json or tool output: invalid UTF-8 and every control rune (C0, DEL,
+// C1) are dropped, and the result is cut at the last rune boundary at or under
+// hostDispatchTextMax bytes. The writer applies it to run_refusals detail and
+// the overlay re-applies it on read, so both share one limit.
+func boundHostDispatchText(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToValidUTF8(s, "") {
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := b.String()
+	if len(out) <= hostDispatchTextMax {
+		return out
+	}
+	cut := hostDispatchTextMax
+	for cut > 0 && !utf8.RuneStart(out[cut]) {
+		cut--
+	}
+	return out[:cut]
 }
 
 // ReadHostDispatcherStatus reads <stateDir>/status.json. A missing file
@@ -300,9 +414,28 @@ func fileOwnerUID(fi os.FileInfo) (int, bool) {
 	}
 }
 
+// hostDispatchStateDirProblem is the state-dir trust check, shared by the
+// dispatcher (prepareHostDispatchStateDir) and the stdio status overlay: it
+// returns hdStateDirSymlink, hdStateDirNotDir or hdStateDirNotOwned, in that
+// order, for an Lstat result that is not a real directory owned by
+// os.Getuid(), or "" when the entry is trusted. An owner that cannot be read
+// fails closed.
+func hostDispatchStateDirProblem(fi os.FileInfo, owner func(os.FileInfo) (int, bool)) string {
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return hdStateDirSymlink
+	}
+	if !fi.IsDir() {
+		return hdStateDirNotDir
+	}
+	if uid, ok := owner(fi); !ok || uid != os.Getuid() {
+		return hdStateDirNotOwned
+	}
+	return ""
+}
+
 // prepareHostDispatchStateDir creates dir 0700 when absent and refuses a
-// symlink, a non-directory, or an entry not owned by os.Getuid(). An existing
-// owned dir is tightened to 0700.
+// symlink, a non-directory, or an entry not owned by os.Getuid()
+// (hostDispatchStateDirProblem). An existing owned dir is tightened to 0700.
 func prepareHostDispatchStateDir(dir string, owner func(os.FileInfo) (int, bool)) error {
 	if dir == "" {
 		return fmt.Errorf("%s: no state dir configured", hdStateDirUnconfigured)
@@ -317,14 +450,12 @@ func prepareHostDispatchStateDir(dir string, owner func(os.FileInfo) (int, bool)
 	if err != nil {
 		return fmt.Errorf("%s: %w", hdStateDirCreateFailure, err)
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
+	switch hostDispatchStateDirProblem(fi, owner) {
+	case hdStateDirSymlink:
 		return fmt.Errorf("%s: state dir %s is a symlink; point --state-dir at a real directory", hdStateDirSymlink, dir)
-	}
-	if !fi.IsDir() {
+	case hdStateDirNotDir:
 		return fmt.Errorf("%s: state dir %s is not a directory", hdStateDirNotDir, dir)
-	}
-	uid, ok := owner(fi)
-	if !ok || uid != os.Getuid() {
+	case hdStateDirNotOwned:
 		return fmt.Errorf("%s: state dir %s is not owned by the current user (or its owner cannot be verified on this platform)", hdStateDirNotOwned, dir)
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -511,6 +642,9 @@ type hostDispatchLoop struct {
 	gateCalls int
 	// outcomes holds the current tick's per-candidate outcomes.
 	outcomes []hostDispatchOutcome
+	// runRefusals is each candidate run's latest non-benign refusal, keyed by
+	// run id; writeStatus copies it into status.json's run_refusals.
+	runRefusals map[string]hostDispatchRunRefusal
 }
 
 func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string) *hostDispatchLoop {
@@ -523,6 +657,7 @@ func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string
 		queued:        map[string]time.Time{},
 		deprioritised: map[string]bool{},
 		ownRuns:       map[string]bool{},
+		runRefusals:   map[string]hostDispatchRunRefusal{},
 	}
 	l.lockHeld = func() bool { return false }
 	l.core = newHostDispatcher(r, binary, l, l)
@@ -577,6 +712,34 @@ func (l *hostDispatchLoop) noteRefusal(code, runID, stageID string) {
 	l.status.LastRefusalAt = l.now().UTC()
 }
 
+// noteTickFailure records a failing early return of this tick: the status
+// file's last_tick_failure and its global last refusal.
+func (l *hostDispatchLoop) noteTickFailure(code string) {
+	l.status.LastTickFailure = &hostDispatchTickFailure{Code: code, At: l.now().UTC()}
+	l.noteRefusal(code, "", "")
+}
+
+// hostDispatchRefusalRepeated reports whether o repeats the run's recorded
+// refusal (same code, same stage): a repeat keeps first_at and is not logged
+// again.
+func hostDispatchRefusalRepeated(prev hostDispatchRunRefusal, seen bool, o hostDispatchOutcome) bool {
+	return seen && prev.Code == o.Refusal && prev.StageID == o.StageID
+}
+
+// pruneRunRefusals drops the entries of runs that are not in this tick's
+// candidate list (terminal, no longer local, gone).
+func (l *hostDispatchLoop) pruneRunRefusals(candidates []Run) {
+	live := make(map[string]bool, len(candidates))
+	for _, r := range candidates {
+		live[r.ID] = true
+	}
+	for id := range l.runRefusals {
+		if !live[id] {
+			delete(l.runRefusals, id)
+		}
+	}
+}
+
 func (l *hostDispatchLoop) persistLedger() error {
 	raw, err := json.Marshal(l.ledger)
 	if err != nil {
@@ -590,6 +753,13 @@ func (l *hostDispatchLoop) writeStatus() {
 		l.status.SpawnsToday = l.ledger.SpawnsToday
 		l.status.SpawnsDay = l.ledger.Day
 		l.status.InFlight = len(l.ledger.InFlight)
+	}
+	l.status.RunRefusals = nil
+	if len(l.runRefusals) > 0 {
+		l.status.RunRefusals = make(map[string]hostDispatchRunRefusal, len(l.runRefusals))
+		for id, ref := range l.runRefusals {
+			l.status.RunRefusals[id] = ref
+		}
 	}
 	raw, err := json.Marshal(l.status)
 	if err == nil {
@@ -609,15 +779,18 @@ func (l *hostDispatchLoop) rollDay() {
 }
 
 // tick is one dispatcher round. A tick error is logged and never spawns; only
-// a lost state-dir lock is returned (the loop must stop).
+// a lost state-dir lock is returned (the loop must stop). Every non-paused
+// early return records last_tick_failure; only a tick that finishes its
+// candidate pass stamps last_complete_tick_at (#5402).
 func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.status.LastTickAt = l.now().UTC()
+	l.status.LastTickFailure = nil
 	defer l.writeStatus()
 
 	if !l.lockHeld() {
-		l.noteRefusal(hdRefuseLockLost, "", "")
+		l.noteTickFailure(hdRefuseLockLost)
 		return fmt.Errorf("%s: another dispatcher took %s", hdRefuseLockLost, filepath.Join(l.cfg.StateDir, hostDispatchLockFile))
 	}
 	if p, err := l.paused(); p {
@@ -632,7 +805,7 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 
 	ledger, err := loadHostDispatchLedger(l.cfg.StateDir)
 	if err != nil {
-		l.noteRefusal(hdRefuseLedgerRead, "", "")
+		l.noteTickFailure(hdRefuseLedgerRead)
 		l.logf("ledger read failed; no spawns this tick: %v", err)
 		return nil
 	}
@@ -642,14 +815,14 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	l.reap(ctx)
 	l.refreshInFlight(ctx)
 	if err := l.persistLedger(); err != nil {
-		l.noteRefusal(hdRefuseLedgerWrite, "", "")
+		l.noteTickFailure(hdRefuseLedgerWrite)
 		l.logf("ledger write failed; no spawns this tick: %v", err)
 		return nil
 	}
 
 	candidates, err := l.listCandidates(ctx)
 	if err != nil {
-		l.noteRefusal(hdRefuseListFailed, "", "")
+		l.noteTickFailure(hdRefuseListFailed)
 		l.logf("list local runs failed; no spawns this tick: %v", err)
 		return nil
 	}
@@ -666,6 +839,8 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	l.outcomes = l.outcomes[:0]
 	for i, run := range candidates {
 		if attempts >= l.cfg.PerTickCap {
+			// Global only: cap_reached:per_tick is never a run_refusals entry,
+			// and the runs it leaves keep their entries for a later tick.
 			l.noteRefusal(hdRefuseCapPerTick, run.ID, "")
 			l.logf("%s: %d candidate(s) left for a later tick", hdRefuseCapPerTick, len(candidates)-i)
 			break
@@ -685,6 +860,9 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 			break
 		}
 	}
+	l.pruneRunRefusals(candidates)
+	// A per-tick-cap or memory-pressure break still counts as a completed pass.
+	l.status.LastCompleteTickAt = l.now().UTC()
 	l.deprioritised = refused
 	return nil
 }
@@ -704,12 +882,34 @@ func (l *hostDispatchLoop) record(o hostDispatchOutcome, refused map[string]bool
 		delete(refused, o.RunID)
 	}
 	if o.Spawned {
+		delete(l.runRefusals, o.RunID)
 		l.ownRuns[o.RunID] = true
 		l.logf("spawned run=%s stage=%s (%s) respawn=%v log=%s", o.RunID, o.StageID, o.StageType, o.Respawn, o.LogPath)
 		return
 	}
-	if o.Refusal != "" && !hostDispatchBenignRefusals[o.Refusal] {
-		l.noteRefusal(o.Refusal, o.RunID, o.StageID)
+	if o.Refusal == "" || hostDispatchBenignRefusals[o.Refusal] {
+		delete(l.runRefusals, o.RunID)
+		return
+	}
+	l.noteRefusal(o.Refusal, o.RunID, o.StageID)
+	prev, seen := l.runRefusals[o.RunID]
+	repeated := hostDispatchRefusalRepeated(prev, seen, o)
+	now := l.now().UTC()
+	first := now
+	if repeated {
+		first = prev.FirstAt
+	}
+	l.runRefusals[o.RunID] = hostDispatchRunRefusal{
+		RunID:   o.RunID,
+		StageID: o.StageID,
+		Code:    o.Refusal,
+		FirstAt: first,
+		LastAt:  now,
+
+		// The writer bound (S4): control characters dropped, 300 bytes.
+		Detail: boundHostDispatchText(o.Detail),
+	}
+	if !repeated {
 		l.logf("refused run=%s stage=%s: %s %s", o.RunID, o.StageID, o.Refusal, o.Detail)
 	}
 }
