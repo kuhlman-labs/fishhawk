@@ -78,13 +78,16 @@ const (
 	mergeCandidateResultNotExecuted = "not_executed"
 )
 
-// Verify states mergeCandidateVerifyState reports for a head.
+// Verify states mergeCandidateVerifyState reports for a head. Each is spelled
+// as an alias of the auditcomplete seam (ADR-090 Amendment A2, #5409), so the
+// merge gate and the fishhawk_audit_complete merge-candidate rule share one
+// spelling and a rename on either side is a compile error.
 const (
-	mergeCandidateStateNotRequired = "not_required"
-	mergeCandidateStateUnverified  = "unverified"
-	mergeCandidateStateInFlight    = "in_flight"
-	mergeCandidateStatePassed      = "passed"
-	mergeCandidateStateFailed      = "failed"
+	mergeCandidateStateNotRequired = string(auditcomplete.MergeCandidateNotRequired)
+	mergeCandidateStateUnverified  = string(auditcomplete.MergeCandidateUnverified)
+	mergeCandidateStateInFlight    = string(auditcomplete.MergeCandidateInFlight)
+	mergeCandidateStatePassed      = string(auditcomplete.MergeCandidatePassed)
+	mergeCandidateStateFailed      = string(auditcomplete.MergeCandidateFailed)
 )
 
 // mergeCandidateOutputTailMax bounds the stored output tail. The runner

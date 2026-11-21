@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
@@ -3743,9 +3745,242 @@ func TestServerCheckAwaitingHumanHold_FailClosedBranches(t *testing.T) {
 			if held && (out.DecisionState != operatorrole.DecisionStateServerCheckAwaitingHuman || !out.DecisionRequired) {
 				t.Errorf("outcome = %+v, want decision_required server_check_awaiting_human", out)
 			}
-			if !held && out != (AutoDriveOutcome{}) {
+			if !held && !reflect.DeepEqual(out, AutoDriveOutcome{}) {
 				t.Errorf("outcome = %+v, want the zero outcome when not held", out)
 			}
 		})
+	}
+}
+
+// --- #5265: may_approve hold on a declared new architectural decision --------
+
+// newArchitecturalDecisionServer is newAutoDriveServer plus a wired in-memory
+// artifact store, with the run started and a clean dual plan approval seeded,
+// so the only thing the may_approve arm can decline on is the plan artifact.
+func newArchitecturalDecisionServer(t *testing.T) (*Server, *autoDriveRepo, *auditFake, *fakeArtifactRepo, uuid.UUID, []*run.Stage) {
+	t.Helper()
+	s, repo, au, _ := newAutoDriveServer(t)
+	arts := newFakeArtifactRepo()
+	s.cfg.ArtifactRepo = arts
+	runID, stages := startAutoDriveRun(t, s, repo)
+	seedCleanPlanApproval(t, au, runID)
+	return s, repo, au, arts, runID, stages
+}
+
+// seedStandardPlanArtifact stores content as a standard_v1 plan-kind artifact
+// on the stage, through the fake store's Create.
+func seedStandardPlanArtifact(t *testing.T, arts *fakeArtifactRepo, stageID uuid.UUID, content []byte) {
+	t.Helper()
+	v := "standard_v1"
+	if _, err := arts.Create(context.Background(), artifact.CreateParams{
+		StageID: stageID, Kind: artifact.KindPlan, SchemaVersion: &v,
+		Content: content, ContentHash: uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+}
+
+// assertArchitecturalDecisionDecline asserts the #5265 decline: decision_required
+// architectural_decision_awaiting_captain on the approve arm, no action, no
+// approval recorded, and the plan stage still parked at its gate.
+func assertArchitecturalDecisionDecline(t *testing.T, out AutoDriveOutcome, au *auditFake, planStage *run.Stage) {
+	t.Helper()
+	if out.Acted || out.Paged || out.Reported {
+		t.Fatalf("outcome = %+v, want no action on a declined approve", out)
+	}
+	if !out.DecisionRequired ||
+		out.DecisionState != operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain ||
+		out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want decision_required architectural_decision_awaiting_captain approve", out)
+	}
+	if out.ConcernIDs != nil {
+		t.Errorf("ConcernIDs = %v, want nil (the hold names no concerns)", out.ConcernIDs)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 0 {
+		t.Errorf("approval_submitted entries = %d, want 0 (the decline records no vote)", n)
+	}
+	if planStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("plan stage = %q, want still awaiting_approval", planStage.State)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_Declined is the #5265 done-means:
+// a clean dual plan approval over a plan that declares a
+// new_architectural_decision is NOT auto-approved. The Note carries none of the
+// planner-authored declaration text (approval condition J3).
+func TestAutoDriveRunGate_ArchitecturalDecision_Declined(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	seedStandardPlanArtifact(t, arts, planStage.ID, withNADPlanJSON(t, validPlanBytes(t)))
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertArchitecturalDecisionDecline(t, out, au, planStage)
+	for _, planner := range []string{"durable crew message bus", "crew messages move to a durable queue", "ADR-082", "#3728"} {
+		if strings.Contains(out.Note, planner) {
+			t.Errorf("Note %q echoes planner-authored text %q (injection surface)", out.Note, planner)
+		}
+	}
+	if !strings.Contains(out.Note, "new architectural decision") {
+		t.Errorf("Note = %q, want it to name the new architectural decision", out.Note)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_ControlApproves is the control: the
+// same fixture over a plan with NO declaration auto-approves, so the decline
+// above is the hold's doing and not the fixture's.
+func TestAutoDriveRunGate_ArchitecturalDecision_ControlApproves(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	seedStandardPlanArtifact(t, arts, planStage.ID, validPlanBytes(t))
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want acted approve", out)
+	}
+	if planStage.State != run.StageStateSucceeded {
+		t.Errorf("plan stage = %q, want succeeded (auto-advanced)", planStage.State)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 1 {
+		t.Errorf("approval_submitted entries = %d, want 1", n)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_ListErrorFailsClosed: an
+// unreadable artifact store cannot show the plan declares no new decision, so
+// the arm declines rather than approving.
+func TestAutoDriveRunGate_ArchitecturalDecision_ListErrorFailsClosed(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	seedStandardPlanArtifact(t, arts, planStage.ID, validPlanBytes(t))
+	arts.listErr = errors.New("artifact store unavailable")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertArchitecturalDecisionDecline(t, out, au, planStage)
+	if !strings.Contains(out.Note, "fail-closed") {
+		t.Errorf("Note = %q, want the fail-closed note", out.Note)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_UndecodableFailsClosed: a newest
+// plan artifact that does not decode fails closed to the same decline.
+func TestAutoDriveRunGate_ArchitecturalDecision_UndecodableFailsClosed(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	seedStandardPlanArtifact(t, arts, planStage.ID, []byte(`{"new_architectural_decision": 5}`))
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertArchitecturalDecisionDecline(t, out, au, planStage)
+	if !strings.Contains(out.Note, "fail-closed") {
+		t.Errorf("Note = %q, want the fail-closed note", out.Note)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_NewestArtifactWins pins the
+// revised-plan rule: only the newest plan artifact is read, so a revision that
+// drops the declaration clears the hold. Explicit CreatedAt values avoid a
+// timestamp tie.
+func TestAutoDriveRunGate_ArchitecturalDecision_NewestArtifactWins(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	v := "standard_v1"
+	base := time.Now().UTC()
+	arts.all = append(arts.all,
+		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: withNADPlanJSON(t, validPlanBytes(t)), CreatedAt: base.Add(-time.Hour)},
+		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: validPlanBytes(t), CreatedAt: base},
+	)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want acted approve (the newest plan declares nothing)", out)
+	}
+	if planStage.State != run.StageStateSucceeded {
+		t.Errorf("plan stage = %q, want succeeded", planStage.State)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 1 {
+		t.Errorf("approval_submitted entries = %d, want 1", n)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_ImplementGateNotHeld: the hold is
+// plan-gate only. An implement gate whose run's plan declared a decision is
+// auto-approved, because that plan already passed its own plan gate.
+func TestAutoDriveRunGate_ArchitecturalDecision_ImplementGateNotHeld(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	arts := newFakeArtifactRepo()
+	s.cfg.ArtifactRepo = arts
+	runID, stages := startAutoDriveRun(t, s, repo)
+	planStage, impl := stages[0], stages[1]
+	planStage.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedStandardPlanArtifact(t, arts, planStage.ID, withNADPlanJSON(t, validPlanBytes(t)))
+	// Also seed the declared plan on the implement stage itself, by
+	// construction, so the plan-type guard is the only thing that keeps this
+	// gate from being held (without it the hold would read this artifact).
+	seedStandardPlanArtifact(t, arts, impl.ID, withNADPlanJSON(t, validPlanBytes(t)))
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApprove)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want acted approve of the implement gate", out)
+	}
+	if impl.State != run.StageStateSucceeded {
+		t.Errorf("implement stage = %q, want succeeded", impl.State)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_NoPlanArtifactNotHeld: a wired
+// store whose plan stage carries no standard_v1 plan-kind artifact (here a
+// PROPOSE-style grooming_report, which has no declaration field) is not held.
+func TestAutoDriveRunGate_ArchitecturalDecision_NoPlanArtifactNotHeld(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	if _, err := arts.Create(context.Background(), artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindGroomingReport,
+		Content: []byte(`{"new_architectural_decision": 5}`), ContentHash: uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("seed grooming report: %v", err)
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want acted approve (no plan artifact to declare anything)", out)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 1 {
+		t.Errorf("approval_submitted entries = %d, want 1", n)
+	}
+}
+
+// TestArchitecturalDecisionAutoDriveHold_NilStageNotHeld pins the nil-stage
+// guard directly: the may_approve call site only passes a non-nil gated stage,
+// so the guard is unobservable through AutoDriveRunGate.
+func TestArchitecturalDecisionAutoDriveHold_NilStageNotHeld(t *testing.T) {
+	s, _, _, _ := newAutoDriveServer(t)
+	s.cfg.ArtifactRepo = newFakeArtifactRepo()
+	out, held := s.architecturalDecisionAutoDriveHold(context.Background(), nil)
+	if held || !reflect.DeepEqual(out, AutoDriveOutcome{}) {
+		t.Fatalf("hold(nil) = (%+v, %v), want (zero outcome, false)", out, held)
 	}
 }

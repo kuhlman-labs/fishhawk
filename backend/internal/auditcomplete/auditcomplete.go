@@ -23,10 +23,13 @@
 //     yet, OR the only gaps are pending-flavored: a live PR-HEAD
 //     fetch failure (head_fetch_failed), a dispatched agent
 //     implement-review that hasn't landed yet (review_pending, the
-//     #947 pre-merge presence gate), or a code-scanning signal we
+//     #947 pre-merge presence gate), a code-scanning signal we
 //     couldn't read/decode (security_findings_unverified, the #1096
-//     fail-open gate). We can't say "done"; the reviewer waits and
-//     branch protection re-evaluates on the next publish.
+//     fail-open gate), or a live PR head whose merge-candidate verify
+//     has not passed or could not be read (merge_candidate_unverified /
+//     merge_candidate_check_failed, ADR-090 A2 / #5409). We can't say
+//     "done"; the reviewer waits and branch protection re-evaluates on
+//     the next publish.
 //   - State=pass → every load-bearing artifact + audit entry is
 //     present and the chain verifies.
 package auditcomplete
@@ -36,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -111,7 +115,54 @@ const (
 	// fix-up-re-opened acceptance case (#1682) it names the re-dispatch that
 	// clears it.
 	MissingStageNotTerminal MissingKind = "stage_not_terminal"
+	// MissingMergeCandidateUnverified marks a live PR head that needs a
+	// merge-candidate verify (ADR-090 D2 / Amendment 1 / ADR-142) and has no
+	// passing verdict for exactly that head yet: unverified, or a verify-only
+	// pass for it is queued or running (ADR-090 Amendment A2, #5409). Pending-
+	// flavored like review_pending: "wait for the pass", not "broken". An
+	// unrecognised predicate answer lands here too, fail-closed. The spelling
+	// deliberately equals the merge gate's 409 code.
+	MissingMergeCandidateUnverified MissingKind = "merge_candidate_unverified"
+	// MissingMergeCandidateVerifyFailed marks a live PR head whose recorded
+	// merge-candidate verify FAILED (ADR-090 Amendment A2, #5409). A HARD gap
+	// like foreign_commit: its presence flips the overall state to fail. The
+	// spelling deliberately equals the merge gate's 409 code.
+	MissingMergeCandidateVerifyFailed MissingKind = "merge_candidate_verify_failed"
+	// MissingMergeCandidateCheckFailed marks a merge-candidate verify state
+	// that could not be READ (a run-row or predicate read error, ADR-090
+	// Amendment A2, #5409). Pending-flavored like head_fetch_failed: never a
+	// hard Compute error and never a pass. The spelling deliberately equals
+	// the merge gate's 502 code.
+	MissingMergeCandidateCheckFailed MissingKind = "merge_candidate_check_failed"
 )
+
+// MergeCandidateStatus is the merge-candidate verify state the server's single
+// ADR-090 D2 predicate (server.mergeCandidateVerifyState) reports for a head.
+// The server spells its own state constants as aliases of these, so one
+// spelling governs both packages (ADR-090 Amendment A2, #5409).
+type MergeCandidateStatus string
+
+// MergeCandidateStatus values.
+const (
+	MergeCandidateNotRequired MergeCandidateStatus = "not_required"
+	MergeCandidateUnverified  MergeCandidateStatus = "unverified"
+	MergeCandidateInFlight    MergeCandidateStatus = "in_flight"
+	MergeCandidatePassed      MergeCandidateStatus = "passed"
+	MergeCandidateFailed      MergeCandidateStatus = "failed"
+)
+
+// MergeCandidateResult is the predicate's answer for one head: the status and,
+// for a classified head, the Fishhawk write that produced it (base_advance,
+// conflict_resolution or fan_in).
+type MergeCandidateResult struct {
+	Status MergeCandidateStatus
+	Cause  string
+}
+
+// MergeCandidateStateFetcher reads the merge-candidate verify state of headSHA
+// for runRow. An error holds the check pending (merge_candidate_check_failed),
+// never green.
+type MergeCandidateStateFetcher func(ctx context.Context, runRow *run.Run, headSHA string) (MergeCandidateResult, error)
 
 // categoryAcceptanceReopened is the audit category server.reopenAcceptanceOnFixupPush
 // writes when a fix-up push invalidates a settled acceptance verdict (#1682).
@@ -257,6 +308,13 @@ type Deps struct {
 	// comparison. Nil defaults to time.Now; tests inject a fixed time
 	// to drive the backstop-elapsed branch deterministically.
 	Now func() time.Time
+	// MergeCandidate reads the merge-candidate verify state of the live PR
+	// head rule 5 read (rule 8, ADR-090 Amendment A2 / #5409). Production
+	// wires server.mergeCandidateVerifyState, the same predicate the merge
+	// gate reads, so the check and the gate cannot diverge. Nil skips the
+	// rule, mirroring the nil-PRHead pattern; so does a live head rule 5
+	// could not read.
+	MergeCandidate MergeCandidateStateFetcher
 }
 
 // ReviewPresenceInputs is the already-fetched data ReviewPresent decides
@@ -760,7 +818,10 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	//     Surfaces as a "pending"-flavored missing item; doesn't
 	//     flip the overall state to fail. A flapping GitHub signal
 	//     mustn't break the audit gate.
-	rule5(ctx, deps, runID, &missing)
+	//
+	// rule5 returns the live head it read ("" when it read none), which rule 8
+	// below binds the merge-candidate verify state to.
+	liveHead := rule5(ctx, deps, runID, &missing)
 
 	// Rule 6: a configured agent implement-review (ADR-027) must have
 	// reached a terminal verdict before the audit can go green (#947).
@@ -792,13 +853,29 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	// and never a silently-open pass.
 	securityFindingsRule(ctx, deps, runID, &missing)
 
-	// Decide overall state. A `head_fetch_failed`, `review_pending`, or
-	// `security_findings_unverified` item is pending-flavored — if the missing
+	// Rule 8 (ADR-090 Amendment A2, #5409): hold the check pending while the
+	// live PR head rule 5 read needs a merge-candidate verify that has not
+	// passed for exactly that head, and fail it on a failed verify for that
+	// head. It reads the merge gate's own predicate through deps.MergeCandidate,
+	// so the check and the gate cannot disagree on the same head. Skipped when
+	// the closure is nil or rule 5 read no live head (no GitHub client, no
+	// installation or PR, the GitLab family: ADR-090 D7). Like rule5 the helper
+	// never errors: a read failure is a pending-flavored
+	// merge_candidate_check_failed item, never a hard Compute error and never a
+	// pass. A pass in flight re-opens the implement stage, so the mid-flight
+	// early return above already answers pending with stage_not_terminal.
+	mergeCandidateRule(ctx, deps, runID, liveHead, &missing)
+
+	// Decide overall state. A `head_fetch_failed`, `review_pending`,
+	// `security_findings_unverified`, `merge_candidate_unverified` or
+	// `merge_candidate_check_failed` item is pending-flavored — if the missing
 	// list holds ONLY such items, the audit isn't broken: we either couldn't
 	// verify the drift rule against a live source, a dispatched agent review
-	// simply hasn't landed yet, or we couldn't read the code-scanning signal.
-	// State stays pending so branch protection re-evaluates on a successful
-	// follow-up publish rather than tripping a misleading red.
+	// simply hasn't landed yet, we couldn't read the code-scanning signal, or
+	// the live head's merge-candidate verify has not passed yet or could not be
+	// read. State stays pending so branch protection re-evaluates on a
+	// successful follow-up publish rather than tripping a misleading red. A
+	// `merge_candidate_verify_failed` item is a hard gap and fails the state.
 	switch {
 	case len(missing) == 0:
 		return Result{State: stagecheck.StatePass, Resolved: resolved}, nil
@@ -992,14 +1069,125 @@ func securityFindingsDetail(findings []securityscan.Finding) string {
 		len(findings), first.RuleID, loc)
 }
 
+// mergeCandidateRule implements Compute's rule 8 (ADR-090 Amendment A2,
+// #5409): the fishhawk_audit_complete check reads the merge-candidate verify
+// state of the live PR head rule 5 read, through the same single predicate the
+// merge gate reads (deps.MergeCandidate). The mapping:
+//
+//   - not_required or passed → nothing (passed means a verdict for EXACTLY
+//     liveHead, recorded or ADR-096 enforce-mode transferred);
+//   - unverified or in_flight → a pending-flavored merge_candidate_unverified;
+//   - failed → a hard merge_candidate_verify_failed (state fail);
+//   - a run-row or predicate read error → a pending-flavored
+//     merge_candidate_check_failed whose detail is a FIXED message plus the
+//     head: the raw error goes to the server log only, never to the published
+//     Check Run;
+//   - any other answer → merge_candidate_unverified, fail-closed.
+//
+// It returns without reading anything when deps.MergeCandidate is nil or
+// liveHead is "" (ADR-090 D7: a deployment or run that cannot read the live
+// head skips the rule). Mirrors rule5's I/O posture: it never returns an error.
+func mergeCandidateRule(ctx context.Context, deps Deps, runID uuid.UUID, liveHead string, out *[]MissingItem) {
+	if deps.MergeCandidate == nil || liveHead == "" {
+		return
+	}
+	runRow, err := deps.Runs.GetRun(ctx, runID)
+	if err != nil {
+		slog.Default().LogAttrs(ctx, slog.LevelWarn,
+			"audit-complete: merge-candidate rule could not read the run row",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", liveHead),
+			slog.String("error", err.Error()))
+		*out = append(*out, MissingItem{
+			Kind: MissingMergeCandidateCheckFailed,
+			Detail: fmt.Sprintf("could not read the run row to decide the merge-candidate verify state of PR head %s; "+
+				"the check holds pending until the read recovers", liveHead),
+			Headline: fmt.Sprintf("merge candidate %s verify state unreadable", shortSHA(liveHead)),
+		})
+		return
+	}
+	res, err := deps.MergeCandidate(ctx, runRow, liveHead)
+	if err != nil {
+		slog.Default().LogAttrs(ctx, slog.LevelWarn,
+			"audit-complete: merge-candidate rule could not read the verify state",
+			slog.String("run_id", runID.String()),
+			slog.String("head_sha", liveHead),
+			slog.String("error", err.Error()))
+		*out = append(*out, MissingItem{
+			Kind: MissingMergeCandidateCheckFailed,
+			Detail: fmt.Sprintf("could not read the merge-candidate verify state of PR head %s; "+
+				"the check holds pending until the read recovers", liveHead),
+			Headline: fmt.Sprintf("merge candidate %s verify state unreadable", shortSHA(liveHead)),
+		})
+		return
+	}
+	switch res.Status {
+	case MergeCandidateNotRequired, MergeCandidatePassed:
+		return
+	case MergeCandidateUnverified:
+		*out = append(*out, MissingItem{
+			Kind: MissingMergeCandidateUnverified,
+			Detail: fmt.Sprintf("PR head %s needs a merge-candidate verify (cause %s): no passing merge-candidate verify exists "+
+				"for exactly this head, and the merge gate refuses it until one passes (fishhawk_merge_run names the step that starts the pass)",
+				liveHead, mergeCandidateCauseText(res.Cause)),
+			Headline: fmt.Sprintf("merge candidate %s not yet verified", shortSHA(liveHead)),
+		})
+	case MergeCandidateInFlight:
+		*out = append(*out, MissingItem{
+			Kind: MissingMergeCandidateUnverified,
+			Detail: fmt.Sprintf("PR head %s needs a merge-candidate verify (cause %s): a verify-only pass for this head is queued "+
+				"or running; the check clears when it passes", liveHead, mergeCandidateCauseText(res.Cause)),
+			Headline: fmt.Sprintf("merge candidate %s verify in flight", shortSHA(liveHead)),
+		})
+	case MergeCandidateFailed:
+		*out = append(*out, MissingItem{
+			Kind: MissingMergeCandidateVerifyFailed,
+			Detail: fmt.Sprintf("the merge-candidate verify FAILED for PR head %s (cause %s): route a fix-up with fishhawk_fixup_stage, "+
+				"or re-run the verify with fishhawk_rebase_run_branch rerun_failed_verify:true", liveHead, mergeCandidateCauseText(res.Cause)),
+			Headline: fmt.Sprintf("merge candidate %s verify failed", shortSHA(liveHead)),
+		})
+	default:
+		*out = append(*out, MissingItem{
+			Kind: MissingMergeCandidateUnverified,
+			Detail: fmt.Sprintf("the merge-candidate verify state of PR head %s is unrecognised (%q); the check holds pending, "+
+				"fail-closed, and the merge gate does not admit this head", liveHead, string(res.Status)),
+			Headline: fmt.Sprintf("merge candidate %s not yet verified", shortSHA(liveHead)),
+		})
+	}
+}
+
+// mergeCandidateCauseText renders a predicate cause for a detail, naming an
+// empty one rather than printing nothing.
+func mergeCandidateCauseText(cause string) string {
+	if cause == "" {
+		return "unspecified"
+	}
+	return cause
+}
+
+// shortSHA abbreviates a head sha for a Check Run headline; details always
+// carry the full sha.
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
 // rule5 implements the foreign-commit detection. Appends missing
 // items to `out` and never returns an error — fetch failures land
 // as `head_fetch_failed` so the state-decision logic can treat them
 // as pending rather than fail. Pure data-flow helper; the I/O is
 // guarded by the PRHead callback being non-nil.
-func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) {
+//
+// It returns the live PR head it read: non-empty only when deps.PRHead
+// returned without error, "" when PRHead is nil, the gather failed or found
+// nothing to compare, or the head fetch failed (ADR-090 Amendment A2: rule 8
+// binds the merge-candidate verify state to exactly this head). The missing
+// items it appends do not depend on the return.
+func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) string {
 	if deps.PRHead == nil {
-		return
+		return ""
 	}
 	gather, ok, err := gatherForeignCommitInputs(ctx, deps, runID)
 	if err != nil {
@@ -1010,14 +1198,14 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 			Kind:   MissingHeadFetchFail,
 			Detail: fmt.Sprintf("could not gather Fishhawk-recorded head_shas: %v", err),
 		})
-		return
+		return ""
 	}
 	if !ok {
 		// Either no implement stage yet, no installation, no PR
 		// artifact, or no parseable PR number — Rule 3 covers the
 		// missing artifact case; for the others rule 5 has nothing
 		// to compare against.
-		return
+		return ""
 	}
 
 	liveSHA, err := deps.PRHead(ctx, gather.scope, gather.repo, gather.prNumber)
@@ -1026,10 +1214,10 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 			Kind:   MissingHeadFetchFail,
 			Detail: fmt.Sprintf("could not read PR HEAD from GitHub: %v", err),
 		})
-		return
+		return ""
 	}
 	if _, hit := gather.knownSHAs[liveSHA]; hit {
-		return
+		return liveSHA
 	}
 
 	// Render every SHA in FULL and sorted: truncating to 7 characters made an
@@ -1055,6 +1243,7 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 		Kind:   MissingForeignCommit,
 		Detail: detail,
 	})
+	return liveSHA
 }
 
 // abbreviatedPrefixesOf returns, sorted, every known entry that is strictly
@@ -1764,16 +1953,19 @@ const checkClearsTail = " — this check clears on its own once acceptance settl
 // PR HEAD), `review_pending` (a dispatched agent review hasn't landed
 // yet), `security_findings_unverified` (we couldn't read/decode the
 // code-scanning signal), `children_pending` (a decomposition child's
-// implement stage hasn't terminated, #3092), or `stage_not_terminal` (a
-// non-review stage is mid-flight, #3190). Used to demote the overall state from fail to
-// pending: none is an audit GAP, just "wait / we don't know." A mix with
-// any hard gap (plan_missing, trace_missing, foreign_commit,
-// security_findings_unresolved, …) still fails.
+// implement stage hasn't terminated, #3092), `stage_not_terminal` (a
+// non-review stage is mid-flight, #3190), `merge_candidate_unverified` (the
+// live head's merge-candidate verify has not passed yet, ADR-090 A2 / #5409)
+// or `merge_candidate_check_failed` (that verify state could not be read).
+// Used to demote the overall state from fail to pending: none is an audit
+// GAP, just "wait / we don't know." A mix with any hard gap (plan_missing,
+// trace_missing, foreign_commit, security_findings_unresolved,
+// merge_candidate_verify_failed, …) still fails.
 func onlyPendingFlavored(missing []MissingItem) bool {
 	for _, m := range missing {
 		switch m.Kind {
 		case MissingHeadFetchFail, MissingReviewPending, MissingSecurityScanUnverified, MissingChildrenPending,
-			MissingStageNotTerminal:
+			MissingStageNotTerminal, MissingMergeCandidateUnverified, MissingMergeCandidateCheckFailed:
 			// pending-flavored — keep scanning
 		default:
 			return false

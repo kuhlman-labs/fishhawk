@@ -4767,15 +4767,19 @@ func (c *apiClient) ArbitrateAcceptance(ctx context.Context, runID uuid.UUID, re
 // imported) per the thin local-copy rule — import direction is cli → backend,
 // not the reverse. A mistyped json tag here would silently drop
 // DecisionRequired to false and route the driver to the observe-only default,
-// so client_test.go pins the wire decode.
+// so client_test.go pins the wire decode. ConcernIDs is present only on
+// decision_state fixup_no_changes_unaddressed (#5390): the open concern ids
+// the last no-change fix-up pass routed, which drive_run carries onto its
+// fix-up, resolve and waive next_actions; it decodes nil otherwise.
 type AutoDriveOutcome struct {
-	Acted            bool   `json:"acted"`
-	Action           string `json:"action,omitempty"`
-	Paged            bool   `json:"paged"`
-	PageEvent        string `json:"page_event,omitempty"`
-	DecisionRequired bool   `json:"decision_required"`
-	DecisionState    string `json:"decision_state,omitempty"`
-	Note             string `json:"note"`
+	Acted            bool     `json:"acted"`
+	Action           string   `json:"action,omitempty"`
+	Paged            bool     `json:"paged"`
+	PageEvent        string   `json:"page_event,omitempty"`
+	DecisionRequired bool     `json:"decision_required"`
+	DecisionState    string   `json:"decision_state,omitempty"`
+	ConcernIDs       []string `json:"concern_ids,omitempty"`
+	Note             string   `json:"note"`
 }
 
 // AutoDriveRunGate calls POST /v0/runs/{run_id}/auto-drive (#1700): it drives

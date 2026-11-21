@@ -3523,3 +3523,315 @@ func TestMissingItem_HeadlineNeverOnTheWire(t *testing.T) {
 		t.Errorf("marshalled MissingItem = %s, want no headline key", b)
 	}
 }
+
+// --- Rule 8 (merge-candidate verify, ADR-090 Amendment A2 / #5409) ---
+
+// fakeMergeCandidate is a MergeCandidateStateFetcher that answers a fixed
+// result/error and records every head it is asked about.
+type fakeMergeCandidate struct {
+	res   auditcomplete.MergeCandidateResult
+	err   error
+	heads []string
+	runs  []uuid.UUID
+}
+
+func (f *fakeMergeCandidate) fetch(_ context.Context, runRow *run.Run, headSHA string) (auditcomplete.MergeCandidateResult, error) {
+	f.heads = append(f.heads, headSHA)
+	f.runs = append(f.runs, runRow.ID)
+	return f.res, f.err
+}
+
+// kindsOf returns every missing item's kind, in order.
+func kindsOf(items []auditcomplete.MissingItem) []auditcomplete.MissingKind {
+	out := make([]auditcomplete.MissingKind, 0, len(items))
+	for _, m := range items {
+		out = append(out, m.Kind)
+	}
+	return out
+}
+
+// TestComputeResult_MergeCandidateRule drives every mapped branch and every
+// fail-closed arm of rule 8 on foreignCommitSetup, the complete-run fixture
+// that reaches StatePass with PRHead serving the recorded head. On that
+// fixture the merge_candidate_* item is the ONLY missing item, so each row's
+// state is decided by rule 8 alone.
+func TestComputeResult_MergeCandidateRule(t *testing.T) {
+	cases := []struct {
+		name       string
+		res        auditcomplete.MergeCandidateResult
+		err        error
+		wantState  stagecheck.State
+		wantKind   auditcomplete.MissingKind // "" = no merge_candidate item
+		wantDetail []string
+	}{
+		{"not_required clears", auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateNotRequired}, nil,
+			stagecheck.StatePass, "", nil},
+		{"passed clears", auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidatePassed, Cause: "conflict_resolution"}, nil,
+			stagecheck.StatePass, "", nil},
+		{"unverified pends", auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateUnverified, Cause: "conflict_resolution"}, nil,
+			stagecheck.StatePending, auditcomplete.MissingMergeCandidateUnverified,
+			[]string{"conflict_resolution", "no passing merge-candidate verify exists for exactly this head", "fishhawk_merge_run"}},
+		{"in_flight pends", auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateInFlight, Cause: "base_advance"}, nil,
+			stagecheck.StatePending, auditcomplete.MissingMergeCandidateUnverified,
+			[]string{"base_advance", "queued or running"}},
+		{"failed fails", auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateFailed, Cause: "fan_in"}, nil,
+			stagecheck.StateFail, auditcomplete.MissingMergeCandidateVerifyFailed,
+			[]string{"fan_in", "fishhawk_fixup_stage", "rerun_failed_verify:true"}},
+		{"closure error pends", auditcomplete.MergeCandidateResult{}, errors.New("audit read refused"),
+			stagecheck.StatePending, auditcomplete.MissingMergeCandidateCheckFailed,
+			[]string{"could not read the merge-candidate verify state"}},
+		{"unrecognised status pends fail-closed", auditcomplete.MergeCandidateResult{Status: "bogus"}, nil,
+			stagecheck.StatePending, auditcomplete.MissingMergeCandidateUnverified,
+			[]string{"unrecognised", "bogus"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+			fake := &fakeMergeCandidate{res: tc.res, err: tc.err}
+			d := auditcomplete.Deps{
+				Runs: runs, Artifacts: arts, Audit: ar,
+				PRHead:         stubPRHead(t, recordedSHA, nil),
+				MergeCandidate: fake.fetch,
+			}
+			res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("ComputeResult returned an error, want nil (rule 8 never hard-errors): %v", err)
+			}
+			if res.State != tc.wantState {
+				t.Errorf("state = %s, want %s; missing=%+v", res.State, tc.wantState, res.Missing)
+			}
+			if len(fake.heads) != 1 || fake.heads[0] != recordedSHA {
+				t.Errorf("closure heads = %v, want exactly [%s] (the live PR head rule 5 read)", fake.heads, recordedSHA)
+			}
+			if len(fake.runs) != 1 || fake.runs[0] != runID {
+				t.Errorf("closure run rows = %v, want exactly [%s]", fake.runs, runID)
+			}
+			if tc.wantKind == "" {
+				if len(res.Missing) != 0 {
+					t.Errorf("missing = %+v, want none", res.Missing)
+				}
+				return
+			}
+			if len(res.Missing) != 1 || res.Missing[0].Kind != tc.wantKind {
+				t.Fatalf("missing kinds = %v, want exactly [%s]", kindsOf(res.Missing), tc.wantKind)
+			}
+			item := res.Missing[0]
+			if !strings.Contains(item.Detail, recordedSHA) {
+				t.Errorf("detail does not name the full live head %s: %s", recordedSHA, item.Detail)
+			}
+			for _, want := range tc.wantDetail {
+				if !strings.Contains(item.Detail, want) {
+					t.Errorf("detail does not contain %q: %s", want, item.Detail)
+				}
+			}
+			if !strings.Contains(item.Headline, recordedSHA[:7]) {
+				t.Errorf("headline %q does not name the short head %s", item.Headline, recordedSHA[:7])
+			}
+		})
+	}
+}
+
+// TestComputeResult_MergeCandidateNilClosure_Skips: a nil MergeCandidate
+// closure skips rule 8, and the complete fixture stays a pass.
+func TestComputeResult_MergeCandidateNilClosure_Skips(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	})
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StatePass || len(res.Missing) != 0 {
+		t.Errorf("state = %s missing = %+v, want pass with nothing missing (nil closure skips rule 8)", res.State, res.Missing)
+	}
+}
+
+// TestComputeResult_MergeCandidatePRHeadError_NotCalled: when the live head
+// fetch fails, rule 8 has no head to bind to. The closure is NOT called and
+// the state is exactly the pre-change one: pending with only head_fetch_failed.
+func TestComputeResult_MergeCandidatePRHeadError_NotCalled(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	fake := &fakeMergeCandidate{res: auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateFailed}}
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead:         stubPRHead(t, "", errors.New("rate limited")),
+		MergeCandidate: fake.fetch,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if len(fake.heads) != 0 {
+		t.Errorf("closure called with %v, want no call on a failed head fetch", fake.heads)
+	}
+	if res.State != stagecheck.StatePending {
+		t.Errorf("state = %s, want pending", res.State)
+	}
+	if got := kindsOf(res.Missing); len(got) != 1 || got[0] != auditcomplete.MissingHeadFetchFail {
+		t.Errorf("missing kinds = %v, want exactly [head_fetch_failed]", got)
+	}
+}
+
+// TestComputeResult_MergeCandidatePRHeadNil_NotCalled: no PRHead closure
+// (no GitHub client: ADR-090 D7) means no live head, so the closure is NOT
+// called and the state is exactly the pre-change one: pass.
+func TestComputeResult_MergeCandidatePRHeadNil_NotCalled(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	fake := &fakeMergeCandidate{res: auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateFailed}}
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		MergeCandidate: fake.fetch,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if len(fake.heads) != 0 {
+		t.Errorf("closure called with %v, want no call without a PRHead closure", fake.heads)
+	}
+	if res.State != stagecheck.StatePass || len(res.Missing) != 0 {
+		t.Errorf("state = %s missing = %+v, want pass with nothing missing", res.State, res.Missing)
+	}
+}
+
+// TestComputeResult_MergeCandidateForeignHead_StillBound: rule 8 binds to the
+// head rule 5 READ even when rule 5 flags it foreign; the closure receives
+// exactly that head.
+func TestComputeResult_MergeCandidateForeignHead_StillBound(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const live = "fe11fe11fe11fe11fe11fe11fe11fe11fe11fe11"
+	fake := &fakeMergeCandidate{res: auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateNotRequired}}
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead:         stubPRHead(t, live, nil),
+		MergeCandidate: fake.fetch,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if len(fake.heads) != 1 || fake.heads[0] != live {
+		t.Errorf("closure heads = %v, want exactly [%s]", fake.heads, live)
+	}
+	if got := kindsOf(res.Missing); len(got) != 1 || got[0] != auditcomplete.MissingForeignCommit {
+		t.Errorf("missing kinds = %v, want exactly [foreign_commit] (rule 5 unchanged)", got)
+	}
+}
+
+// TestComputeResult_MergeCandidateFailedWithReviewPending_Fails: a hard
+// merge_candidate_verify_failed mixed with a pending-flavored review_pending
+// item still fails the state.
+func TestComputeResult_MergeCandidateFailedWithReviewPending_Fails(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	impl := runs.stages[1]
+	ar.appendChained(t, runID, &impl.ID, "implement_review_started", nil) // seq 5
+	fake := &fakeMergeCandidate{res: auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateFailed, Cause: "base_advance"}}
+	now := dispatchTime(5).Add(time.Minute) // within the backstop: the review is still in flight
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead:             stubPRHead(t, recordedSHA, nil),
+		ImplementReviewers: func(*run.Run) *spec.ReviewersConfig { return &spec.ReviewersConfig{Agent: 1} },
+		ReviewBackstop:     func(int) time.Duration { return 24 * time.Hour },
+		Now:                func() time.Time { return now },
+		MergeCandidate:     fake.fetch,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if !containsKind(res.Missing, auditcomplete.MissingReviewPending) || !containsKind(res.Missing, auditcomplete.MissingMergeCandidateVerifyFailed) {
+		t.Fatalf("missing kinds = %v, want review_pending and merge_candidate_verify_failed", kindsOf(res.Missing))
+	}
+	if res.State != stagecheck.StateFail {
+		t.Errorf("state = %s, want fail (a failed verify is a hard gap)", res.State)
+	}
+}
+
+// getRunFailsAfterPRHead serves GetRun normally until armed, then fails it.
+// The PRHead stub arms it, so rule 5's own run-chain walk succeeds and the
+// ONLY failing GetRun is rule 8's.
+type getRunFailsAfterPRHead struct {
+	*fakeRuns
+	armed bool
+	err   error
+}
+
+func (f *getRunFailsAfterPRHead) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if f.armed {
+		return nil, f.err
+	}
+	return f.fakeRuns.GetRun(ctx, id)
+}
+
+// TestComputeResult_MergeCandidateErrorDetail_NeverCarriesRawError pins
+// approval condition M5: the closure-error and GetRun-error arms publish a
+// FIXED message plus the head, never the raw error text, and stay pending
+// with a nil Compute error.
+func TestComputeResult_MergeCandidateErrorDetail_NeverCarriesRawError(t *testing.T) {
+	const marker = "SECRET-MARKER-7f3a9c"
+	t.Run("closure error", func(t *testing.T) {
+		runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+		fake := &fakeMergeCandidate{err: errors.New("dial tcp: " + marker)}
+		res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+			Runs: runs, Artifacts: arts, Audit: ar,
+			PRHead:         stubPRHead(t, recordedSHA, nil),
+			MergeCandidate: fake.fetch,
+		})
+		if err != nil {
+			t.Fatalf("ComputeResult: %v", err)
+		}
+		assertCheckFailedWithoutMarker(t, res, recordedSHA, marker)
+	})
+	t.Run("GetRun error", func(t *testing.T) {
+		runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+		wrapped := &getRunFailsAfterPRHead{fakeRuns: runs, err: errors.New("pq: " + marker)}
+		fake := &fakeMergeCandidate{res: auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateNotRequired}}
+		res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+			Runs: wrapped, Artifacts: arts, Audit: ar,
+			PRHead: func(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, prNumber int) (string, error) {
+				wrapped.armed = true
+				return recordedSHA, nil
+			},
+			MergeCandidate: fake.fetch,
+		})
+		if err != nil {
+			t.Fatalf("ComputeResult: %v", err)
+		}
+		if len(fake.heads) != 0 {
+			t.Errorf("closure called with %v, want no call when the run row cannot be read", fake.heads)
+		}
+		assertCheckFailedWithoutMarker(t, res, recordedSHA, marker)
+	})
+}
+
+func assertCheckFailedWithoutMarker(t *testing.T, res auditcomplete.Result, head, marker string) {
+	t.Helper()
+	if res.State != stagecheck.StatePending {
+		t.Errorf("state = %s, want pending", res.State)
+	}
+	if got := kindsOf(res.Missing); len(got) != 1 || got[0] != auditcomplete.MissingMergeCandidateCheckFailed {
+		t.Fatalf("missing kinds = %v, want exactly [merge_candidate_check_failed]", got)
+	}
+	item := res.Missing[0]
+	if strings.Contains(item.Detail, marker) || strings.Contains(item.Headline, marker) {
+		t.Errorf("published detail/headline carries the raw error text %q: detail=%q headline=%q", marker, item.Detail, item.Headline)
+	}
+	if !strings.Contains(item.Detail, head) {
+		t.Errorf("detail does not name the head %s: %s", head, item.Detail)
+	}
+}
+
+// TestComputeResult_MergeCandidatePendingTitle: the pending Check Run title
+// renders the rule-8 headline ("Held: …" via HeldHeadline).
+func TestComputeResult_MergeCandidatePendingTitle(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	fake := &fakeMergeCandidate{res: auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateUnverified, Cause: "conflict_resolution"}}
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead:         stubPRHead(t, recordedSHA, nil),
+		MergeCandidate: fake.fetch,
+	})
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if got, want := auditcomplete.HeldHeadline(res.Missing), "merge candidate "+recordedSHA[:7]+" not yet verified"; got != want {
+		t.Errorf("HeldHeadline = %q, want %q", got, want)
+	}
+}

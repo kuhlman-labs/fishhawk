@@ -236,3 +236,49 @@ Recorded instance: #4293, run e16e6c42. The operator pushed a merge of `main` (h
 **Implementation.** #4368.
 
 **Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-092 (Q4; pass admission group), ADR-093 (D8 for queue-dispatched merges) and ADR-096 (D2 for independent deltas; D5 fan-in base). D1, D3, D4, D6, D7 and the rest of D2/D5 still govern.
+
+## Amendment A2: fishhawk_audit_complete goes pending on an unverified merge candidate (Captain decision 2026-11-19 on #5409; text ratified at merge)
+
+Ratification: Captain, 2026-11-19 (#5409); final text confirmed by the Captain at merge.
+
+**Context.** This is the #5226 gap 2 (PR #5405). D8 left merges performed outside Fishhawk ungated, and the `fishhawk_audit_complete` Check Run did not go pending on an unverified candidate. So a PR could be merged from the forge UI while its merge candidate was unverified, with the check reading green. The Captain decided the check alone changes (CHECK ONLY): no new refusal and no forge binding. This amendment does not conflict with ADR-093, which partially supersedes D8 for queue-dispatched merges: the queue still merges only a head that verified, and this amendment changes only what the check reports for merges the queue does not dispatch.
+
+**Decision.**
+
+- **A2.1.** The check reads the D2 predicate the merge gate reads (`mergeCandidateVerifyState`, D2 as amended by Amendment 1 and ADR-142), for the live PR head the foreign-commit rule reads.
+- **A2.2.** The mapping:
+  - `not_required` or `passed` clears;
+  - `unverified` or `in_flight` adds a pending-flavored `merge_candidate_unverified` item;
+  - `failed` adds a `merge_candidate_verify_failed` item;
+  - a predicate or run-row read error adds a pending-flavored `merge_candidate_check_failed` item, whose detail is a fixed message plus the head (the raw error goes to the server log only);
+  - any other answer is held pending as `merge_candidate_unverified`.
+
+  The binding behaviour is that the check never reads green on a failed or unreadable candidate, and that a pass for a different head does not clear it. Mapping a failed verify to a hard `fail` (`merge_candidate_verify_failed`, mirroring the merge gate's 409 code) rather than to pending is a planner choice, for the Captain to confirm at merge. Its precondition: when a delegated fix-up (D6) or the #4391 re-run re-opens the implement stage, the check's mid-flight early return answers pending with `stage_not_terminal` items, so a failed head that is being repaired reads pending, not failed.
+- **A2.3.** `passed` means a verdict for exactly that head: a recorded pass, or in ADR-096 `enforce` mode a transferred verdict for that head. That is the same answer the merge gate admits on.
+- **A2.4.** A deployment or run that cannot read the live head (no GitHub client, no installation or PR, the GitLab family) skips the rule, as D7 does.
+- **A2.5.** This amendment makes nothing required on the forge. Branch protection applies to every PR, so binding the check as required is a separate, later, human-led step, gated on the server posting a passing status on PRs that are not Fishhawk runs. Admin merges are unaffected.
+
+**D8, as amended.** Fishhawk still does not refuse merges performed outside it. But the `fishhawk_audit_complete` state Fishhawk computes no longer reads green on an unverified, in-flight or failed merge candidate. Whether that blocks an outside merge is the repository's branch protection (ADR-017).
+
+**What holds, and where.**
+
+- The rule makes the COMPUTED state pending at the run's live head wherever it is computed: `GET /v0/stages/{id}/checks`, the forced at-head publishes (the rebase verb, the vouch), and the queue and inline pre-merge republishes.
+- Unforced publishes (the synchronize webhook, the `GET /checks` heal, the reconciler's heal sweep) still target the RECORDED head (the #4397 residual).
+- The conflict-resolution report publishes nothing at the merge head. So the live head can carry NO `fishhawk_audit_complete` check until an at-head publish runs.
+- On the forge, "pending at the PR head" therefore holds only where an at-head publish has reached. A production at-head publish after a Fishhawk-written head (a conflict resolution or a base advance) is the candidate follow-up; this amendment adds none.
+
+**Consequences.**
+
+- Every audit-complete recompute pays the predicate's audit reads, and for a vouched head up to one pull-request read and two compares (the Amendment 1 cost). That applies on the read endpoint, the synchronize republish, the reconciler heal sweep and every forced republish.
+- An outside merge of an unverified candidate leaves the computed check pending on the merged head, which records that the landed tree was never verified.
+- There are three new missing kinds: `merge_candidate_unverified`, `merge_candidate_verify_failed` and `merge_candidate_check_failed`. There is no new audit category, state, cause or runner wire field. The verifier mirror stays rules 1 to 4.
+
+**Residuals, stated.**
+
+- The Q4 gate-to-merge window.
+- GitLab-family runs (D7).
+- The `auto_merge` stage, still deferred to forge protection.
+- Unforced publishes, which still target the recorded head (#4397 residual), and the absence of a publish at a conflict-resolution merge head.
+- A failed head, whose published check keeps its last published non-green state, because the verdict republish stays passed-only.
+
+**Implementation.** #5409.

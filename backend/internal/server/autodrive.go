@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
@@ -22,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -90,7 +92,9 @@ type AutoDriveOutcome struct {
 	// fixup_budget_exhausted / fixup_ceiling_reached; the #2381 delegated-approval
 	// states operatorrole.DecisionStateHumanQuorumRequired and
 	// DecisionStateDelegatedApprovalNoProgress; the #5477 route_fixup state
-	// DecisionStateServerCheckAwaitingHuman) and Action names the
+	// DecisionStateServerCheckAwaitingHuman; the #5390 route_fixup state
+	// DecisionStateFixupNoChangesUnaddressed; the #5265 may_approve state
+	// DecisionStateArchitecturalDecisionAwaitingCaptain) and Action names the
 	// delegated verb whose arm surfaced it. Set with Acted=false and
 	// Paged=false. Introduced by the E48.41 / #2091 fix so an exhausted
 	// fix-up budget on the delegated route_fixup arm parks the operator with
@@ -100,6 +104,11 @@ type AutoDriveOutcome struct {
 	// duplicate (delegated_approval_no_progress) instead of wedging the run.
 	DecisionRequired bool
 	DecisionState    string
+	// ConcernIDs names the open concern ids behind the decision. It is set
+	// only with DecisionRequired by the #5390 no-change guard
+	// (DecisionStateFixupNoChangesUnaddressed): the ids the last no-change
+	// fix-up pass routed, which the delegated arm declined to re-route.
+	ConcernIDs []string
 	// Reported is true when a workflow-v2 `mode: report` class surfaced a
 	// PROPOSAL at a live gate (ADR-066 / #2222): a run_auto_driven act:report
 	// attribution row was appended, Action names the delegation verb the
@@ -223,6 +232,12 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 			if out, held := s.firstOfficerAutoDriveHold(ctx, runRow.ID, gated, delegation.ActionApprove); held {
 				return out, nil
 			}
+			// #5265: a plan declaring a new_architectural_decision is a design
+			// ruling for the captain, not a clean-dual-approval auto-approve.
+			// An unreadable plan artifact fails closed to the same decline.
+			if out, held := s.architecturalDecisionAutoDriveHold(ctx, gated); held {
+				return out, nil
+			}
 			result, aerr := s.approveStageAs(ctx, id, approveActionParams{
 				Stage:         gated,
 				Decision:      approval.DecisionApprove,
@@ -290,6 +305,20 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 					DecisionState:    "fixup_concerns_overflow",
 					Action:           delegation.ActionRouteFixup,
 					Note:             ferr.Error(),
+				}, nil
+			}
+			// The last fix-up pass routed exactly this open set and produced
+			// no commit (#5390): re-routing it unchanged would repeat the
+			// silent no-op, so the delegated arm makes ZERO automatic
+			// re-routes and hands the decision to the operator.
+			var repeat *fixupNoChangeRepeatError
+			if errors.As(ferr, &repeat) {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    operatorrole.DecisionStateFixupNoChangesUnaddressed,
+					Action:           delegation.ActionRouteFixup,
+					ConcernIDs:       repeat.ConcernIDs,
+					Note:             fixupNoChangeRepeatNote(repeat),
 				}, nil
 			}
 			return AutoDriveOutcome{Action: delegation.ActionRouteFixup, Note: "fixup dispatch failed"}, ferr
@@ -438,6 +467,86 @@ func (s *Server) firstOfficerAutoDriveHold(ctx context.Context, runID uuid.UUID,
 		Action:           action,
 		Note:             hold.Message + "; " + firstOfficerHoldNextStep,
 	}, true
+}
+
+// architecturalDecisionAutoDriveHold declines a delegated approve of a PLAN
+// gate whose newest standard_v1 plan artifact declares a
+// new_architectural_decision (#5265): whether the direction needs an ADR is a
+// ruling for the captain, not something clean_dual_approval settles. It
+// returns decision_required architectural_decision_awaiting_captain (action
+// approve) and nothing is submitted or appended here; the campaign driver's
+// trackDecision records the campaign_gate_decision_required marker.
+//
+// Fail-closed: a list error or an undecodable newest plan artifact returns
+// the same decline, because the plan cannot be shown to declare no new
+// decision (the posture of delegatedApproveWouldAdvance's unreadable modes).
+//
+// held=false (the arm proceeds) when stage is nil, when it is not a plan
+// stage (an implement gate's plan already passed its own plan gate), when the
+// artifact store is unwired (nothing to read, the firstOfficerHoldRefusal
+// nil-ConcernRepo convention; production always wires it), or when the stage
+// carries no standard_v1 plan artifact (a PROPOSE stage's report has no
+// declaration field).
+//
+// The Note never echoes the planner-authored decision_summary or rationale:
+// it reaches the operator agent through fishhawk_drive_run, where planner
+// text is an injection surface. The captain reads the declaration on the plan
+// gate's plan_warnings advisory.
+func (s *Server) architecturalDecisionAutoDriveHold(ctx context.Context, stage *run.Stage) (AutoDriveOutcome, bool) {
+	if stage == nil || stage.Type != run.StageTypePlan || s.cfg.ArtifactRepo == nil {
+		return AutoDriveOutcome{}, false
+	}
+	p, err := s.gatedPlanArtifact(ctx, stage.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: gated plan artifact unreadable; declining delegated approve",
+			slog.String("run_id", stage.RunID.String()), slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
+			Action:           delegation.ActionApprove,
+			Note: "the gated plan artifact could not be read, so it cannot be shown to declare no new " +
+				"architectural decision (fail-closed); the plan gate goes to the captain and no delegated approval was submitted",
+		}, true
+	}
+	if p == nil || !p.NewArchitecturalDecision.Declared() {
+		return AutoDriveOutcome{}, false
+	}
+	return AutoDriveOutcome{
+		DecisionRequired: true,
+		DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
+		Action:           delegation.ActionApprove,
+		Note: "the plan declares a new architectural decision; the captain decides whether the direction needs an ADR " +
+			"(named on the plan gate's plan_warnings advisory); no delegated approval was submitted",
+	}, true
+}
+
+// gatedPlanArtifact returns the newest standard_v1 plan-kind artifact on the
+// stage (the stagePlanForOverlap / attentionPlanSummary pick rule), or
+// (nil, nil) when the stage carries none. Unlike stagePlanForOverlap it
+// surfaces a list or decode error, so the caller can fail closed.
+func (s *Server) gatedPlanArtifact(ctx context.Context, stageID uuid.UUID) (*plan.Plan, error) {
+	arts, err := s.cfg.ArtifactRepo.ListForStage(ctx, stageID)
+	if err != nil {
+		return nil, fmt.Errorf("list gated plan artifacts: %w", err)
+	}
+	var picked *artifact.Artifact
+	for _, a := range arts {
+		if a.Kind != artifact.KindPlan || a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		if picked == nil || a.CreatedAt.After(picked.CreatedAt) {
+			picked = a
+		}
+	}
+	if picked == nil {
+		return nil, nil
+	}
+	var p plan.Plan
+	if err := json.Unmarshal(picked.Content, &p); err != nil {
+		return nil, fmt.Errorf("decode gated plan artifact: %w", err)
+	}
+	return &p, nil
 }
 
 // mergeOverlapAutoDriveHold applies the merge overlap guard (E83.61 / #4119)
@@ -1372,7 +1481,14 @@ func (s *Server) emitCampaignGatePaged(ctx context.Context, runRow *run.Run, id 
 // fixupActionParams.ConcernIDs, stage_fixup_triggered.concern_ids or
 // MarkAddressedPending. The actor keeps its own check rather than trusting
 // the evaluator's partition alone; on a mixed set it routes only the reviewer
-// rows.
+// rows. Their ids are still collected (serverCheck) for the #5390 no-change
+// guard, which removes them from the last pass's routed set before comparing
+// it with the routable set.
+//
+// Before the budget arithmetic, the #5390 guard (noChangeRepeatOfOpenSet)
+// refuses with a *fixupNoChangeRepeatError when the newest fix-up window on
+// the stage routed exactly the routable set and its earliest outcome was
+// fixup_no_changes; the guard's audit read errors are returned (fail-closed).
 func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, stages []*run.Stage, open []*concern.Concern, rule string) (bool, error) {
 	impl := implementStage(stages)
 	if impl == nil || !fixupEligibleState(impl, stages) {
@@ -1386,12 +1502,13 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 		return false, nil
 	}
 	var selected []planreview.Concern
-	var ids []uuid.UUID
+	var ids, serverCheck []uuid.UUID
 	for _, c := range open {
 		if c.StageKind != concern.StageKindImplement || c.StageID != impl.ID {
 			continue
 		}
 		if c.IsServerCheck() { // human-only: never auto-routed (#5477)
+			serverCheck = append(serverCheck, c.ID)
 			continue
 		}
 		selected = append(selected, planreview.Concern{
@@ -1404,6 +1521,16 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	}
 	if len(selected) == 0 {
 		return false, nil
+	}
+	// #5390: never re-route, unchanged, a set whose last pass produced no
+	// commit. Placed before the budget and ceiling arithmetic so the more
+	// specific decision wins over fixup_budget_exhausted / fixup_ceiling_reached.
+	repeat, err := s.noChangeRepeatOfOpenSet(ctx, runRow.ID, impl.ID, ids, serverCheck)
+	if err != nil {
+		return false, err
+	}
+	if repeat != nil {
+		return false, repeat
 	}
 	priorPasses, err := s.countFixupPasses(ctx, runRow.ID, impl.ID)
 	if err != nil {
@@ -1493,6 +1620,19 @@ func (s *Server) serverCheckAwaitingHumanHold(ctx context.Context, runRow *run.R
 		Note: fmt.Sprintf("%d open implement concern(s) [%s] were raised by a server check (provenance server_check) and are human-only (ADR-084 rule 5, ADR-143): a human waives or defers them from the Fishhawk Web UI, or routes them in a non-delegated fix-up; no fix-up was auto-routed",
 			len(ids), strings.Join(ids, ", ")),
 	}, true
+}
+
+// fixupNoChangeRepeatNote is the decision_required note for the #5390
+// no-change guard: the count and ids, the fact that nothing was auto-routed,
+// and the remedies (E5). Re-routing one sharper concern is exactly the case
+// the guard's first-window-only limitation affects (#5496).
+func fixupNoChangeRepeatNote(e *fixupNoChangeRepeatError) string {
+	return fmt.Sprintf("the last fix-up pass routed exactly the %d open implement concern(s) [%s] and produced no commit; no fix-up was auto-routed. "+
+		"Remedies: re-route ONE sharper concern with fishhawk_fixup_stage and an operator_concern naming the exact change "+
+		"(a second no-change pass on this stage is not detected, follow-up #5496); "+
+		"or finish the change on the run branch, fishhawk_vouch_commit it, and THEN close the concerns with fishhawk_resolve_concerns (with evidence), a waive or a defer, because the no-change veto keeps them open; "+
+		"or waive or defer them",
+		len(e.ConcernIDs), strings.Join(e.ConcernIDs, ", "))
 }
 
 // --- mode: report (ADR-066 / #2222) -----------------------------------------
