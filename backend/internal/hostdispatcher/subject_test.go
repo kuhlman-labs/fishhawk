@@ -126,6 +126,7 @@ func TestRouteAllowed(t *testing.T) {
 		{"GET", "/v0/runs", true},
 		{"GET", "/v0/runs/" + id, true},
 		{"GET", "/v0/runs/" + id + "/stages", true},
+		{"GET", "/v0/runs/" + id + "/audit", true},
 		{"POST", "/v0/runs/" + id + "/auto-drive/acts", true},
 		{"POST", "/v0/runs/" + id + "/stages/" + id + "/host-dispatch", true},
 		{"POST", "/v0/runs/" + id + "/stages/" + id + "/reap-failure", true},
@@ -144,7 +145,11 @@ func TestRouteAllowed(t *testing.T) {
 		{"GET", "/v0/runs/" + id + "%2Fstages", false},
 		{"GET", "/v0/runs/%zz", false},
 		{"GET", "v0/runs", false},
-		{"GET", "/v0/runs/" + id + "/audit", false},
+		{"GET", "/v0/audit", false},
+		{"POST", "/v0/runs/" + id + "/audit", false},
+		{"GET", "/v0/runs/" + id + "/audit/", false},
+		{"HEAD", "/v0/runs/" + id + "/audit", false},
+		{"GET", "/v0/runs/" + id + "/audit/export", false},
 	} {
 		if got := RouteAllowed(c.method, c.path); got != c.want {
 			t.Errorf("RouteAllowed(%s, %s) = %v, want %v", c.method, c.path, got, c.want)

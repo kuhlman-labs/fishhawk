@@ -9613,3 +9613,117 @@ func TestNextActions_WaiveProposalTerminalRunNone(t *testing.T) {
 		})
 	}
 }
+
+// #5298 V1/W2: an implement stage whose workflow declares agent reviewers but
+// whose round is not recorded holds acceptance (implement_review_not_started).
+// The recovery verb is shape-specific: fishhawk_rerun_review for a decomposed
+// parent (implement reached succeeded via fan-in, never dispatched), and a
+// hand acceptance dispatch with auto_preview for a run positively known not to
+// be one. A dispatched implement stage alone is UNKNOWN (a fan-in verify pass
+// dispatches a parent's implement stage before its first consolidated round),
+// so the classifier never offers acceptance there.
+func TestNextActions_ImplementReviewNotStarted(t *testing.T) {
+	stagesWith := func(conf *int, dispatched bool, accState string) []Stage {
+		impl := naStage("implement", "succeeded")
+		impl.Sequence = 2
+		impl.ReviewAgentsConfigured = conf
+		if dispatched {
+			at := time.Now().Add(-time.Hour).UTC()
+			impl.DispatchedAt = &at
+		}
+		plan := naStage("plan", "succeeded")
+		plan.Sequence = 1
+		acc := naStage("acceptance", accState)
+		acc.Sequence = 3
+		rev := naStage("review", "pending")
+		rev.Sequence = 4
+		return []Stage{plan, impl, acc, rev}
+	}
+	two, zero := 2, 0
+	classify := func(stages []Stage, status *ReviewStatus) *NextActions {
+		run := naRun("running")
+		run.RunnerKind = "local"
+		return nextActionsFor(run, stages, nil, status, nil, nil, false, false, false, "", "", releaseSignals{})
+	}
+
+	t.Run("decomposed_parent_offers_rerun_review", func(t *testing.T) {
+		na := classify(stagesWith(&two, false, "awaiting_host_dispatch"), naReviewStatus("implement", "none"))
+		if na == nil || na.State != "implement_review_not_started" {
+			t.Fatalf("state = %+v; want implement_review_not_started", na)
+		}
+		names := actionNames(na)
+		if !slices.Contains(names, "fishhawk_rerun_review") || slices.Contains(names, "fishhawk_dispatch_stage") {
+			t.Fatalf("actions = %v; want fishhawk_rerun_review and no acceptance dispatch for a decomposed parent", names)
+		}
+	})
+	t.Run("dispatched_implement_shape_unknown_offers_rerun_review_not_acceptance", func(t *testing.T) {
+		na := classify(stagesWith(&two, true, "pending"), naReviewStatus("implement", "none"))
+		if na == nil || na.State != "implement_review_not_started" {
+			t.Fatalf("state = %+v; want implement_review_not_started", na)
+		}
+		names := actionNames(na)
+		if !slices.Contains(names, "fishhawk_rerun_review") || slices.Contains(names, "fishhawk_dispatch_stage") {
+			t.Fatalf("actions = %v; a dispatched implement stage may be a fan-in-verified parent: want fishhawk_rerun_review and no acceptance dispatch", names)
+		}
+	})
+	t.Run("decomposed_child_offers_dispatch_with_auto_preview", func(t *testing.T) {
+		run := naRun("running")
+		run.RunnerKind = "local"
+		parent := "parent-run"
+		run.DecomposedFrom = &parent
+		na := nextActionsFor(run, stagesWith(&two, true, "pending"), nil, naReviewStatus("implement", "none"), nil, nil, false, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "implement_review_not_started" {
+			t.Fatalf("state = %+v; want implement_review_not_started", na)
+		}
+		if names := actionNames(na); slices.Contains(names, "fishhawk_rerun_review") || !slices.Contains(names, "fishhawk_dispatch_stage") {
+			t.Fatalf("actions = %v; a fan-out child is never a parent: want the hand acceptance dispatch", names)
+		}
+	})
+	t.Run("non_decomposed_offers_dispatch_with_auto_preview", func(t *testing.T) {
+		run := naRun("running")
+		run.RunnerKind = "local"
+		na := implementReviewNotStartedNextActions(run, implementReviewShapeNotDecomposed)
+		names := actionNames(na)
+		if slices.Contains(names, "fishhawk_rerun_review") {
+			t.Fatalf("actions = %v; fishhawk_rerun_review refuses no_review_round on a non-decomposed run", names)
+		}
+		d := findAction(t, na, "fishhawk_dispatch_stage")
+		if d.Params["stage"] != "acceptance" || d.Params["auto_preview"] != "true" {
+			t.Fatalf("dispatch params = %v; want stage acceptance with auto_preview", d.Params)
+		}
+		if !strings.Contains(d.Precondition, "implement_review_started") {
+			t.Fatalf("precondition = %q; want it to name the missing round", d.Precondition)
+		}
+	})
+	t.Run("non_decomposed_github_actions_polls_only", func(t *testing.T) {
+		run := naRun("running")
+		run.RunnerKind = "github_actions"
+		na := implementReviewNotStartedNextActions(run, implementReviewShapeNotDecomposed)
+		if na.State != "implement_review_not_started" {
+			t.Fatalf("state = %q; want implement_review_not_started", na.State)
+		}
+		if names := actionNames(na); slices.Contains(names, "fishhawk_dispatch_stage") || slices.Contains(names, "fishhawk_rerun_review") {
+			t.Fatalf("actions = %v; a github_actions run has nothing to run from the operator host", names)
+		}
+		if len(na.Actions) != 1 || !strings.Contains(na.Actions[0].Reason, "github_actions") {
+			t.Fatalf("actions = %+v; want one poll naming runner_kind github_actions", na.Actions)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		conf *int
+	}{{"configured_nil", nil}, {"configured_0", &zero}} {
+		t.Run(tc.name+"_stays_acceptance_pending", func(t *testing.T) {
+			na := classify(stagesWith(tc.conf, false, "awaiting_host_dispatch"), naReviewStatus("implement", "none"))
+			if na == nil || na.State != "acceptance_pending" {
+				t.Fatalf("state = %+v; want acceptance_pending (no round expected)", na)
+			}
+		})
+	}
+	t.Run("pending_round_stays_implement_review_pending", func(t *testing.T) {
+		na := classify(stagesWith(&two, false, "awaiting_host_dispatch"), naReviewStatus("implement", "pending"))
+		if na == nil || na.State != "implement_review_pending" {
+			t.Fatalf("state = %+v; want implement_review_pending", na)
+		}
+	})
+}

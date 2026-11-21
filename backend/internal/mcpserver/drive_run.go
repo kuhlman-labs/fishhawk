@@ -642,9 +642,25 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		mergeQueued = true
 	}
 
+	// The implement review round hold the loop's LATEST step-(c) pass observed
+	// (#5298 W1), so a deadline reached while acceptance is held names the
+	// reason. Cleared on every step-(c) pass before it is re-evaluated, so a
+	// hold that another actor released (acceptance dispatched elsewhere, or
+	// implement re-opened) never names a stale hold at the deadline.
+	var lastRoundHold string
+	var lastRoundHoldStatus *ReviewStatus
+	var lastRoundHoldRun *Run
+	var lastRoundHoldStages []Stage
+
 	for {
 		if time.Now().After(deadline) {
 			out.StoppedReason = stoppedTimeout
+			if lastRoundHold != "" {
+				out.Warnings = append(out.Warnings, fmt.Sprintf(
+					"max_minutes elapsed while the acceptance stage was held by the implement review round (%s); acceptance dispatches once the round settles", lastRoundHold))
+				out.NextActions = roundHoldNextActions(lastRoundHoldRun, lastRoundHoldStages, lastRoundHold, lastRoundHoldStatus)
+				r.resolveImplementReviewNotStartedShape(ctx, runUUID, lastRoundHoldRun, lastRoundHoldStages, out.NextActions)
+			}
 			return nil, out, nil
 		}
 		if ctx.Err() != nil {
@@ -776,7 +792,31 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		}
 
 		// (c) Dispatch the first host-dispatchable stage — record BEFORE spawn.
-		if disp := driveDispatchableStage(stages, spawned, acceptancePendingDerived); disp != nil {
+		lastRoundHold, lastRoundHoldStatus, lastRoundHoldRun, lastRoundHoldStages = "", nil, nil, nil
+		disp := driveDispatchableStage(stages, spawned, acceptancePendingDerived)
+		// The implement review ROUND hold (#5298): a spawnable acceptance waits
+		// for the implement round to settle, whether it is in flight or expected
+		// but not yet recorded. Both codes POLL (stall reset, no gate call), so a
+		// decomposed parent whose consolidated round has not started polls to the
+		// deadline, which then names the hold. A read error stops fail-closed: an
+		// unreadable round must never open the acceptance spawn.
+		if disp != nil && disp.Type == "acceptance" && hostDispatchSpawnable(*disp) {
+			accHold, accSt, accErr := r.acceptanceRoundHoldStatus(ctx, runUUID, stages)
+			if accErr != nil {
+				out.StoppedReason = stoppedDispatchCheckFailed
+				out.Warnings = append(out.Warnings,
+					"implement review-status read for the acceptance round hold failed; stopping fail-closed: "+accErr.Error())
+				out.NextActions = driveDecisionActions("stalled", runUUID, in.WorkingDir)
+				return nil, out, nil
+			}
+			lastRoundHold, lastRoundHoldStatus, lastRoundHoldRun, lastRoundHoldStages = accHold, accSt, runRow, stages
+			if accHold != "" {
+				stall = 0
+				driveSleep(ctx, pollInterval)
+				continue
+			}
+		}
+		if disp != nil {
 			stall = 0
 			recordName := driveDispatchName(*disp, dispatchedCount)
 			// A prior run_auto_driven dispatch row for this stage name is a
@@ -1323,7 +1363,9 @@ func driveSleep(ctx context.Context, d time.Duration) {
 // (driveGatePreconditionsMet) is a belt-and-suspenders mirror of the backend
 // drive rules for any unexpected sequence layout: implement requires a preceding
 // plan stage to have succeeded; acceptance requires the implement stage to have
-// succeeded and every review stage to be terminal.
+// succeeded and every review stage sequenced before it, or executing, to be
+// terminal. A returned acceptance stage is not yet clear to spawn: the callers
+// apply the implement review round hold (acceptanceRoundHold, #5298) first.
 //
 // acceptancePendingDerived (#1961): when the backend's derived_status reads
 // acceptance_pending — review evidence terminal, required checks green, only the
@@ -1379,9 +1421,15 @@ func driveDispatchableStage(stages []Stage, spawned map[string]bool, acceptanceP
 // dispatching st hold, mirroring the backend drive rules: plan is always
 // dispatchable; implement requires any existing plan stage to have succeeded;
 // acceptance requires the implement stage to have succeeded AND every review
-// stage to be terminal. A defensive backstop for an unexpected sequence layout —
-// the earliest-non-terminal ordering in driveDispatchableStage already prevents
-// the common premature-dispatch case.
+// stage sequenced BEFORE it, or executing, to be terminal. A defensive backstop
+// for an unexpected sequence layout — the earliest-non-terminal ordering in
+// driveDispatchableStage already prevents the common premature-dispatch case.
+//
+// A review stage sequenced AFTER acceptance (feature_change orders acceptance
+// before the human review, #5298) does not block it unless that review stage is
+// executing (dispatched or running). The function stays pure over stage rows:
+// the implement review ROUND is not a stage row, so the callers apply the
+// shared round hold (runResolver.acceptanceRoundHold) before any spawn.
 //
 // acceptancePendingDerived (#1961): under the backend's derived acceptance_pending
 // signal, acceptance's every-review-terminal requirement additionally accepts a
@@ -1406,6 +1454,11 @@ func driveGatePreconditionsMet(st Stage, stages []Stage, acceptancePendingDerive
 				implementSucceeded = true
 			}
 			if s.Type == "review" && !stageStateIsTerminal(s.State) {
+				if s.Sequence > st.Sequence && !driveReviewStageExecuting(s.State) {
+					// A later-sequenced review stage that is not executing does not
+					// gate acceptance (#5298); the round hold covers the review round.
+					continue
+				}
 				if acceptancePendingDerived && s.State == "awaiting_approval" {
 					// Settled human-review evidence under the derived signal — does
 					// not block the mechanical acceptance dispatch.
@@ -1418,6 +1471,108 @@ func driveGatePreconditionsMet(st Stage, stages []Stage, acceptancePendingDerive
 	default: // plan
 		return true
 	}
+}
+
+// driveReviewStageExecuting reports whether a review stage is executing: the
+// server has triggered it (dispatched) or it is running. An executing review
+// stage still blocks acceptance whatever its sequence (the #1961 pins).
+func driveReviewStageExecuting(state string) bool {
+	return state == "dispatched" || state == "running"
+}
+
+// implementReviewExpected reports whether the server says an implement agent
+// review round is expected for impl: its review_agents_configured (the
+// workflow-declared agent reviewer count) is present and above zero. A nil
+// count (an older server, a run without a workflow spec) reads false, so the
+// round hold falls back to the started proxy, where `none` reads settled.
+func implementReviewExpected(impl *Stage) bool {
+	return impl != nil && impl.ReviewAgentsConfigured != nil && *impl.ReviewAgentsConfigured > 0
+}
+
+// implementReviewRoundHold is the shared implement-review ROUND predicate
+// (#5298) that the host dispatcher, fishhawk_drive_run, next_actions and the
+// campaign overlay all read, so they agree on when acceptance may dispatch.
+// st is reviewStatusFor's implement status, whose round identity is the
+// implement stage's CURRENT head: the latest unfloored implement_review_started
+// anchor plus the #894 fix-up floor and the #3690 retry floor, so a re-opened
+// or fixed-up implement stage reads pending until its new round lands.
+//
+// It returns implement_review_in_flight while the round is pending, and
+// implement_review_not_started while the workflow declares implement agent
+// reviewers but no round is recorded for that head (the decomposed-parent
+// window: fan-in Advance parks acceptance before DispatchConsolidatedReview
+// writes implement_review_started). complete, skipped and failed read settled
+// (""), and so does `none` when no round is expected.
+func implementReviewRoundHold(st *ReviewStatus, stages []Stage) string {
+	if st != nil && st.Status == "pending" {
+		return hdRefuseImplementReviewInFlight
+	}
+	if (st == nil || st.Status == "none") && implementReviewExpected(stageByType(stages, "implement")) {
+		return hdRefuseImplementReviewNotStarted
+	}
+	return ""
+}
+
+// acceptanceRoundHold reads the run's implement review status and applies
+// implementReviewRoundHold. A read error is returned for the caller to fail
+// closed on: an unreadable round must never open the acceptance spawn.
+func (r *runResolver) acceptanceRoundHold(ctx context.Context, runID uuid.UUID, stages []Stage) (string, error) {
+	hold, _, err := r.acceptanceRoundHoldStatus(ctx, runID, stages)
+	return hold, err
+}
+
+// acceptanceRoundHoldStatus is acceptanceRoundHold that also returns the
+// implement review status it read, for a caller that renders next_actions.
+func (r *runResolver) acceptanceRoundHoldStatus(ctx context.Context, runID uuid.UUID, stages []Stage) (string, *ReviewStatus, error) {
+	st, err := r.reviewStatusFor(ctx, runID, "implement")
+	if err != nil {
+		return "", nil, err
+	}
+	return implementReviewRoundHold(st, stages), st, nil
+}
+
+// roundHoldNextActions builds the next_actions arm a round-held acceptance
+// returns from fishhawk_drive_run (#5298 W1): implement_review_pending for the
+// in-flight hold, implement_review_not_started for the expected-but-unrecorded
+// one. It reuses the classifier's arms so the drive and the status surfaces
+// name the same state and verbs.
+func roundHoldNextActions(run *Run, stages []Stage, hold string, st *ReviewStatus) *NextActions {
+	impl := stageByType(stages, "implement")
+	switch hold {
+	case hdRefuseImplementReviewInFlight:
+		return implementReviewPendingNextActions(run, st)
+	case hdRefuseImplementReviewNotStarted:
+		return implementReviewNotStartedNextActions(run, implementReviewShapeOf(run, impl))
+	}
+	return nil
+}
+
+// resolveImplementReviewNotStartedShape settles an UNKNOWN
+// implement_review_not_started shape (#5298 W2) from the run's plan_decomposed
+// record, the positive decomposition signal: the server's first-round handler
+// identifies a parent by its children, never by dispatched_at, and a fan-in
+// verify pass dispatches a parent's implement stage before its first
+// consolidated round. It rewrites na in place: a plan_decomposed record picks
+// the decomposed-parent arm (fishhawk_rerun_review), none picks the
+// non-decomposed arm. A read error leaves the unknown arm, which never offers
+// an acceptance dispatch. Zero reads unless na is that arm with an unknown
+// shape. Wired at fishhawk_get_run_status and the drive deadline return.
+func (r *runResolver) resolveImplementReviewNotStartedShape(ctx context.Context, runID uuid.UUID, run *Run, stages []Stage, na *NextActions) {
+	if na == nil || na.State != "implement_review_not_started" || run == nil {
+		return
+	}
+	if implementReviewShapeOf(run, stageByType(stages, "implement")) != implementReviewShapeUnknown {
+		return
+	}
+	pd, err := r.api.LatestPlanDecomposed(ctx, runID)
+	if err != nil {
+		return
+	}
+	shape := implementReviewShapeNotDecomposed
+	if pd != nil {
+		shape = implementReviewShapeDecomposedParent
+	}
+	*na = *implementReviewNotStartedNextActions(run, shape)
 }
 
 // driveAnyInFlight reports whether any stage is still executing: a running

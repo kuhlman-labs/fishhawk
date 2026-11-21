@@ -146,10 +146,16 @@ func OutsideProfile(requested []string) []string {
 // concurrency promote, ...) is reachable with a dispatcher token. Widening it
 // is a contract change: update the README, the server's route-reach pin and
 // the dispatcher's request pin together.
+//
+// GET /v0/runs/{run_id}/audit (#5298) is the dispatcher's read of a run's
+// implement review round before it spawns an acceptance stage. It implements
+// the read:audit scope Scopes() already grants (ADR-104 Q4: "read runs and
+// their audit chain"); it is a read, and adds no write reach.
 var routes = []string{
 	"GET /v0/runs",
 	"GET /v0/runs/{run_id}",
 	"GET /v0/runs/{run_id}/stages",
+	"GET /v0/runs/{run_id}/audit",
 	"POST /v0/runs/{run_id}/auto-drive/acts",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure",
