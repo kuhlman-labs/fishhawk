@@ -155,9 +155,11 @@ func (m *adE2EMerger) count() int {
 	return m.calls
 }
 
-// adE2ESpawn is one recorded spawn.
+// adE2ESpawn is one recorded spawn, with the runner environment the
+// dispatcher composed for it.
 type adE2ESpawn struct {
 	RunID, StageID, StageType string
+	Env                       []string
 }
 
 // adE2ESpawner is the dispatcher's spawn seam. It records every spawn and, per
@@ -171,13 +173,13 @@ type adE2ESpawner struct {
 	emulate map[string]func(runID, stageID uuid.UUID)
 }
 
-func (s *adE2ESpawner) spawn(_ string, _, _ []string, runID, stageID string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
+func (s *adE2ESpawner) spawn(_ string, _, env []string, runID, stageID string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
 	st, err := s.h.runs.GetStage(s.h.ctx, uuid.MustParse(stageID))
 	if err != nil {
 		return "", err
 	}
 	s.mu.Lock()
-	s.spawns = append(s.spawns, adE2ESpawn{RunID: runID, StageID: stageID, StageType: string(st.Type)})
+	s.spawns = append(s.spawns, adE2ESpawn{RunID: runID, StageID: stageID, StageType: string(st.Type), Env: append([]string(nil), env...)})
 	fn := s.emulate[string(st.Type)]
 	s.mu.Unlock()
 	if fn != nil {
@@ -205,13 +207,19 @@ type adE2EHarness struct {
 	approvals  approval.Repository
 	amendments scopeamendment.Repository
 	tokens     apitoken.Repository
-	orch       *orchestrator.Orchestrator
-	srv        *server.Server
-	ts         *httptest.Server
+	// concerns is the server's concern repository (nil on the review leg,
+	// which never reads it).
+	concerns concern.Repository
+	orch     *orchestrator.Orchestrator
+	srv      *server.Server
+	ts       *httptest.Server
 
 	root     string
 	workDir  string
 	specYAML string
+	// planJSON, when set, is the plan artifact emulatePlanParked stores in
+	// place of adE2EPlanJSON.
+	planJSON []byte
 
 	campaign *campaign.Campaign
 	item     *campaign.Item
@@ -242,6 +250,7 @@ func newAdE2EHarness(t *testing.T, specYAML string) *adE2EHarness {
 		approvals:  approval.NewPostgresRepository(pool),
 		amendments: scopeamendment.NewPostgresRepository(pool),
 		tokens:     apitoken.NewPostgresRepository(pool),
+		concerns:   concern.NewPostgresRepository(pool),
 		merger:     &adE2EMerger{},
 	}
 	h.root = t.TempDir()
@@ -256,7 +265,7 @@ func newAdE2EHarness(t *testing.T, specYAML string) *adE2EHarness {
 		ArtifactRepo:        h.artifacts,
 		CampaignRepo:        h.campaigns,
 		ApprovalRepo:        h.approvals,
-		ConcernRepo:         concern.NewPostgresRepository(pool),
+		ConcernRepo:         h.concerns,
 		ScopeAmendmentRepo:  h.amendments,
 		APITokenRepo:        h.tokens,
 		Orchestrator:        h.orch,
@@ -443,7 +452,10 @@ func (h *adE2EHarness) appendRunAudit(runID uuid.UUID, stageID *uuid.UUID, categ
 // a settled clean two-agent plan review, and the stage at awaiting_approval.
 func (h *adE2EHarness) emulatePlanParked(runID, stageID uuid.UUID) {
 	h.ensureRunRunning(runID)
-	content := adE2EPlanJSON(h.t)
+	content := h.planJSON
+	if content == nil {
+		content = adE2EPlanJSON(h.t)
+	}
 	sum := sha256.Sum256(content)
 	schema := "standard_v1"
 	if _, err := h.artifacts.Create(h.ctx, artifact.CreateParams{
