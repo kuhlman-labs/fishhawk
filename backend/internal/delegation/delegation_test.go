@@ -100,6 +100,14 @@ func openConcern(severity string) *concern.Concern {
 	return &concern.Concern{ID: uuid.New(), Severity: severity, State: concern.StateRaised}
 }
 
+// serverCheckConcern is an open concern the server synthesized (provenance
+// server_check, #5477) rather than one a reviewer raised.
+func serverCheckConcern(severity string) *concern.Concern {
+	c := openConcern(severity)
+	c.Provenance = concern.ProvenanceServerCheck
+	return c
+}
+
 func entry(seq int64, payload any) *audit.Entry {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -573,6 +581,13 @@ func TestConvergentConcerns(t *testing.T) {
 			verdictEntry(3, planreview.VerdictReject),
 		},
 	}}
+	allApproveAudit := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 2)},
+		"implement_reviewed": {
+			verdictEntry(2, planreview.VerdictApprove),
+			verdictEntry(3, planreview.VerdictApprove),
+		},
+	}}
 	// advisory is the default testWorkflow implement-stage authority
 	// (agent:2, human:1 → AuthorityAdvisory); gating overrides to
 	// agent-only (agent:1, human:0 → AuthorityGating).
@@ -711,6 +726,31 @@ func TestConvergentConcerns(t *testing.T) {
 			audit:      settledWithConcerns,
 			wantReason: "0 open concerns to route",
 		},
+		{
+			// #5477: a server-check row is human-only (ADR-084 rule 5 /
+			// ADR-143), so a settled round whose only open concern is one
+			// leaves nothing routable and names the human.
+			name:       "unmet: server-check-only open set awaits the human",
+			open:       []*concern.Concern{serverCheckConcern("medium")},
+			audit:      settledWithConcerns,
+			wantReason: "every open concern is a server-check finding",
+		},
+		{
+			// #5477: a high server-check row does not feed the severity max,
+			// so it cannot lift a low-only reviewer set over the threshold.
+			name:       "unmet: high server-check row does not lift a low reviewer set over the threshold",
+			open:       []*concern.Concern{serverCheckConcern("high"), openConcern("low")},
+			audit:      allApproveAudit,
+			wantReason: "below the route_fixup_min_severity threshold (medium)",
+		},
+		{
+			// #5477: a routable reviewer concern at the threshold still
+			// routes beside a server-check row.
+			name:    "met: server-check row beside a medium reviewer concern",
+			open:    []*concern.Concern{serverCheckConcern("high"), openConcern("medium")},
+			audit:   settledWithConcerns,
+			wantMet: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -730,6 +770,72 @@ func TestConvergentConcerns(t *testing.T) {
 			}
 			if !tt.wantMet && !strings.Contains(d.UnmetReason, tt.wantReason) {
 				t.Errorf("UnmetReason = %q, want it to contain %q", d.UnmetReason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// TestEvaluate_RouteFixupAwaitingHuman pins Decision.AwaitingHuman (#5477):
+// true ONLY for a settled round whose open concerns are all server-check
+// rows, and false for a partial round, a gating reject and a reviewer-only
+// below-threshold park, each of which is unmet for a different reason.
+func TestEvaluate_RouteFixupAwaitingHuman(t *testing.T) {
+	settled := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 2)},
+		"implement_reviewed": {
+			verdictEntry(2, planreview.VerdictApprove),
+			verdictEntry(3, planreview.VerdictApproveWithConcerns),
+		},
+	}}
+	tests := []struct {
+		name      string
+		reviewers *spec.ReviewersConfig
+		open      []*concern.Concern
+		audit     *fakeAudit
+		want      bool
+	}{
+		{
+			name:  "settled round, server-check only",
+			open:  []*concern.Concern{serverCheckConcern("medium")},
+			audit: settled,
+			want:  true,
+		},
+		{
+			name: "partial round (1 of 2) with a server-check row",
+			open: []*concern.Concern{serverCheckConcern("medium")},
+			audit: &fakeAudit{entries: map[string][]*audit.Entry{
+				"implement_review_started": {startedEntry(1, 2)},
+				"implement_reviewed":       {verdictEntry(2, planreview.VerdictApproveWithConcerns)},
+			}},
+		},
+		{
+			name:      "gating reject with a server-check row",
+			reviewers: &spec.ReviewersConfig{Agent: 1, Human: 0},
+			open:      []*concern.Concern{serverCheckConcern("medium")},
+			audit: &fakeAudit{entries: map[string][]*audit.Entry{
+				"implement_review_started": {startedEntry(1, 1)},
+				"implement_reviewed":       {verdictEntry(2, planreview.VerdictReject)},
+			}},
+		},
+		{
+			name:  "reviewer-only all-low park",
+			open:  []*concern.Concern{openConcern("low")},
+			audit: settled,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+			if tt.reviewers != nil {
+				implementStage(wf).Reviewers = tt.reviewers
+			}
+			ev := cleanDualEvaluator(nil, tt.open, tt.audit)
+			d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionRouteFixup)
+			if d.Met {
+				t.Fatalf("Met = true, want unmet (reason %q)", d.UnmetReason)
+			}
+			if d.AwaitingHuman != tt.want {
+				t.Errorf("AwaitingHuman = %v, want %v (reason %q)", d.AwaitingHuman, tt.want, d.UnmetReason)
 			}
 		})
 	}

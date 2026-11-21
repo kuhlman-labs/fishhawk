@@ -106,21 +106,23 @@ func (s *Server) implementReviewRoundInFlight(ctx context.Context, runID, implem
 // route_fixup with the same predicate autoFixup's arm reads
 // (res.Decision(delegation.ActionRouteFixup), nil campaign override as the
 // merge-candidate route does): delegated reports the class is delegated at
-// all, met that its convergent_concerns condition is satisfied now. An
-// unevaluable delegation is neither (fail-closed).
-func (s *Server) acceptanceRouteFixupDelegation(ctx context.Context, runRow *run.Run) (delegated, met bool, unmetReason string) {
+// all, met that its convergent_concerns condition is satisfied now, and
+// awaitingHuman that it is unmet SOLELY because the round's open concerns are
+// all server-check rows (Decision.AwaitingHuman, #5477). An unevaluable
+// delegation is none of them (fail-closed).
+func (s *Server) acceptanceRouteFixupDelegation(ctx context.Context, runRow *run.Run) (delegated, met, awaitingHuman bool, unmetReason string) {
 	if runRow == nil {
-		return false, false, "run not loaded"
+		return false, false, false, "run not loaded"
 	}
 	res, _, ok := s.evaluateRunDelegation(ctx, runRow, nil)
 	if !ok || res == nil {
-		return false, false, "delegation not evaluable"
+		return false, false, false, "delegation not evaluable"
 	}
 	d, found := res.Decision(delegation.ActionRouteFixup)
 	if !found {
-		return false, false, "route_fixup not delegated"
+		return false, false, false, "route_fixup not delegated"
 	}
-	return true, d.Met, d.UnmetReason
+	return true, d.Met, d.AwaitingHuman, d.UnmetReason
 }
 
 // decideAcceptanceFixupDeferral decides whether routeAcceptanceClass1 defers
@@ -148,7 +150,7 @@ func (s *Server) decideAcceptanceFixupDeferral(ctx context.Context, runID, imple
 			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
 		return nil, "", false
 	}
-	if delegated, _, why := s.acceptanceRouteFixupDelegation(ctx, runRow); !delegated {
+	if delegated, _, _, why := s.acceptanceRouteFixupDelegation(ctx, runRow); !delegated {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"acceptance triage class-1: implement review in flight but route_fixup is not delegated; routing immediately",
 			slog.String("run_id", runID.String()), slog.String("reason", why))
@@ -264,13 +266,29 @@ func (s *Server) releaseDeferredAcceptanceFixup(ctx context.Context, runID uuid.
 	selected := append([]planreview.Concern(nil), p.FixupDeferral.Concerns...)
 	var reviewIDs []uuid.UUID
 	reviewIDStrings := []string{}
-	_, met, unmet := s.acceptanceRouteFixupDelegation(ctx, runRow)
+	_, met, awaitingHuman, unmet := s.acceptanceRouteFixupDelegation(ctx, runRow)
 	switch {
 	case !met:
 		// The fold of reviewer concerns needs the run's route_fixup
 		// delegation MET (binding condition 1 of #4075); the acceptance
 		// obligation still routes alone.
 		fields["review_concern_fold_unmet"] = unmet
+		// A server-check-only round (#5477) is unmet because its open
+		// concerns are human-only: record the ids the release held back, so
+		// the same row names them on this branch as on the met branch. A
+		// list error records nothing extra.
+		if awaitingHuman && s.cfg.ConcernRepo != nil { // server-check-only round: record the held ids (#5477)
+			rows, lerr := s.cfg.ConcernRepo.ListByRun(ctx, runID)
+			if lerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"acceptance fix-up release: list concerns for held server-check ids failed; recording the unmet fold alone",
+					slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
+				break
+			}
+			if _, _, held := foldableReviewConcerns(rows, implementID); len(held) > 0 {
+				fields["held_review_concern_ids"] = held
+			}
+		}
 	case s.cfg.ConcernRepo == nil:
 		fields["review_concerns_unavailable"] = true
 	default:
@@ -310,9 +328,10 @@ func (s *Server) releaseDeferredAcceptanceFixup(ctx context.Context, runID uuid.
 
 // foldableReviewConcerns selects the implement stage's open (raised /
 // reopened) review concerns the release may route, mapped exactly as
-// resolveConcernsByID does. conventions_override_attempt (never routable) and
+// resolveConcernsByID does. conventions_override_attempt (never routable),
 // requirement (a human judgment, as autoFixup's requirementArbitrationOpen
-// pages on) are held back and returned as held ids.
+// pages on) and server_check rows (provenance server_check: human-only under
+// ADR-084 rule 5 / ADR-143, #5477) are held back and returned as held ids.
 func foldableReviewConcerns(rows []*concern.Concern, implementStageID uuid.UUID) ([]planreview.Concern, []uuid.UUID, []string) {
 	var out []planreview.Concern
 	var ids []uuid.UUID
@@ -324,7 +343,7 @@ func foldableReviewConcerns(rows []*concern.Concern, implementStageID uuid.UUID)
 		if c.State != concern.StateRaised && c.State != concern.StateReopened {
 			continue
 		}
-		if planreview.IsConventionsOverrideAttempt(c.Category) || strings.EqualFold(c.Category, requirementConcernCategory) {
+		if planreview.IsConventionsOverrideAttempt(c.Category) || strings.EqualFold(c.Category, requirementConcernCategory) || c.IsServerCheck() {
 			held = append(held, c.ID.String())
 			continue
 		}

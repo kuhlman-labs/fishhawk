@@ -245,9 +245,14 @@ const DelegatedApprovalActorSubject = TokenSubjectPrefix + "delegated"
 //     unevaluable escalation, or an unreadable block).
 //   - delegated_approval_no_progress: a delegated approve came back a duplicate,
 //     so the act made no progress; reported instead of a no-op acted:true.
+//   - server_check_awaiting_human: the route_fixup arm found the settled
+//     implement-review round's open concerns are ALL server-check rows
+//     (provenance server_check), which delegation never routes (ADR-084 rule 5 /
+//     ADR-143); a human waives, defers or deliberately routes them (#5477).
 const (
 	DecisionStateHumanQuorumRequired         = "human_quorum_required"
 	DecisionStateDelegatedApprovalNoProgress = "delegated_approval_no_progress"
+	DecisionStateServerCheckAwaitingHuman    = "server_check_awaiting_human"
 )
 
 // CampaignActorScopes returns the write scopes the campaign auto-driver's
