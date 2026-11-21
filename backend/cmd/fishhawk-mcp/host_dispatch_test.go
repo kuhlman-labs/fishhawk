@@ -190,3 +190,97 @@ func TestRun_RoutesHostDispatchSubcommand(t *testing.T) {
 		t.Fatal("isHostDispatchInvocation misclassified an invocation")
 	}
 }
+
+// writeStatusWith writes st plus extra raw keys into dir/status.json. The
+// #5402 element types (run_refusals entries, last_tick_failure) are
+// unexported in mcpserver, so a fixture carries them as the JSON the
+// dispatcher writes.
+func writeStatusWith(t *testing.T, dir string, st mcpserver.HostDispatcherStatus, extra map[string]any) {
+	t.Helper()
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Item 10: a fresh status with two per-run refusals prints run_refusals=2.
+func TestHostDispatchStatus_PrintsRunRefusalCount(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	entry := func(run, code string) map[string]any {
+		return map[string]any{"run_id": run, "stage_id": "s-" + run, "code": code, "first_at": now.Add(-time.Minute), "last_at": now.Add(-30 * time.Second)}
+	}
+	writeStatusWith(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-30 * time.Second), LastCompleteTickAt: now.Add(-30 * time.Second), IntervalSeconds: 30},
+		map[string]any{"run_refusals": map[string]any{"a": entry("a", "working_dir_absent"), "b": entry("b", "cap_reached:daily")}})
+	code, out, stderr := runHD(t, testHostDispatchDeps(&hostDispatchRecorder{}, nil, now), "--status", "--state-dir", dir)
+	if code != exitOK || !strings.Contains(out, "state=live") || !strings.Contains(out, " run_refusals=2") {
+		t.Fatalf("code=%d out=%q stderr=%q; want 0, state=live and run_refusals=2", code, out, stderr)
+	}
+	if !strings.Contains(out, " last_complete_tick_at="+now.Add(-30*time.Second).Format(time.RFC3339)) {
+		t.Fatalf("out=%q; want last_complete_tick_at", out)
+	}
+}
+
+// Item 11 (R2): a ticking dispatcher whose latest tick failed prints
+// state=failing with the failure code and exits 1.
+func TestHostDispatchStatus_FailingTickExitsOne(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	writeStatusWith(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-10 * time.Second), LastCompleteTickAt: now.Add(-40 * time.Second), IntervalSeconds: 30},
+		map[string]any{"last_tick_failure": map[string]any{"code": "list_runs_failed", "at": now.Add(-10 * time.Second)}})
+	code, out, _ := runHD(t, testHostDispatchDeps(&hostDispatchRecorder{}, nil, now), "--status", "--state-dir", dir)
+	if code != exitFailure || !strings.Contains(out, "state=failing") || !strings.Contains(out, " tick_failure=list_runs_failed at="+now.Add(-10*time.Second).Format(time.RFC3339)) {
+		t.Fatalf("code=%d out=%q; want 1, state=failing and tick_failure=list_runs_failed", code, out)
+	}
+}
+
+// Item 12: FISHHAWK_HOST_DISPATCH_STATE_DIR is the --state-dir default.
+// TMPDIR points at a temp dir FIRST, so a reverted default never touches the
+// host's real $TMPDIR/fishhawk-host-dispatch.
+func TestHostDispatch_StateDirDefaultsToEnv(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	envDir := filepath.Join(t.TempDir(), "env-state")
+	deps := testHostDispatchDeps(&hostDispatchRecorder{}, map[string]string{"FISHHAWK_HOST_DISPATCH_STATE_DIR": envDir}, time.Now())
+	if code, _, stderr := runHD(t, deps, "--pause"); code != exitOK {
+		t.Fatalf("--pause: code=%d stderr=%q", code, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(envDir, "pause")); err != nil {
+		t.Fatalf("pause file not in the env dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "fishhawk-host-dispatch", "pause")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pause file landed in the TMPDIR default: %v", err)
+	}
+}
+
+// Item 15 (S3): a status file a pre-#5402 dispatcher wrote (no
+// last_complete_tick_at, last_tick_failure or run_refusals) prints today's
+// line: state=live, no new token, exit 0.
+func TestHostDispatchStatus_PreChangeFileReadsLive(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	writeStatus(t, dir, mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-60 * time.Second), IntervalSeconds: 30, SpawnsToday: 5, SpawnsDay: now.Format(time.DateOnly)})
+	code, out, _ := runHD(t, testHostDispatchDeps(&hostDispatchRecorder{}, nil, now), "--status", "--state-dir", dir)
+	if code != exitOK || !strings.Contains(out, "state=live") {
+		t.Fatalf("pre-change file: code=%d out=%q; want 0 state=live", code, out)
+	}
+	for _, tok := range []string{"last_complete_tick_at=", "tick_failure=", "run_refusals="} {
+		if strings.Contains(out, tok) {
+			t.Fatalf("pre-change file printed %q: %q", tok, out)
+		}
+	}
+}
