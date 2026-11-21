@@ -820,10 +820,15 @@ workflows:
         # One acceptance at a time on this host: every local acceptance
         # validates against the single shared preview (localhost:8090,
         # fishhawk_preview DB), so two would clobber each other's target.
+        # The built-in host-scoped preview-target group holds that limit at 1
+        # (ADR-094 A1 decision 6: a host-scoped entry carries no limit), and
+        # the group set is ADDED to the stage's default {host capacity}
+        # (ADR-094 A2), so acceptance also holds a host capacity slot.
         # Interim safety net until per-run previews (#4063).
         concurrency:
-          group: local-acceptance
-          limit: 1
+          groups:
+            - group: preview-target
+              scope: host
         executor:
           # An acceptance stage must run under an agent or human executor.
           agent: claude-code

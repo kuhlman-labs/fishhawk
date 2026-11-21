@@ -119,8 +119,8 @@ A waive, bulk waive (`fishhawk_waive_concerns`), resolve (`fishhawk_resolve_conc
 | `storage_eio` | free host disk, restart Docker, confirm Postgres is healthy, then reap stranded stages |
 | `postgres_unreachable` | check the Postgres container and its logs, restart it, then reap stages stranded by the outage |
 | `orphaned_runner` | confirm the pid is a `fishhawk-runner` whose stage is terminal, then kill it; it can block `reload` and `post-merge` |
-| `amendment_window_closing` | decide now with `fishhawk_decide_scope_amendment`; after the window the agent stops waiting and a later approval lands only through `fishhawk_retry_stage` |
-| `amendment_pending_on_terminal_stage` | deny the amendment to close it, or approve it and run `fishhawk_retry_stage` |
+| `amendment_window_closing` | decide now with `fishhawk_decide_scope_amendment`; after the window the agent stops waiting and a later approval lands through `fishhawk_retry_stage` when the stage fails category C, or `fishhawk_resume_run` (which folds an approved amendment automatically) when it fails category B |
+| `amendment_pending_on_terminal_stage` | deny the amendment to close it, or approve it and land the paths with `fishhawk_retry_stage` (stage failed category C) or `fishhawk_resume_run` (category B; it folds an approved amendment automatically) |
 | `host_memory_pressure` | free memory from the contributors the row names; if the dispatch hold is on, new host dispatches wait (below) |
 | `workload_containers_high` | let in-flight stages finish, stop idle gate containers, run fewer stages concurrently |
 

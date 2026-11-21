@@ -2164,13 +2164,18 @@ func runStageEventMessage(payload any) string {
 		// wait-poll window expired UNDECIDED. Surfacing it in-band is what lets
 		// an operator watching a blocking fishhawk_run_stage learn the request
 		// went unanswered instead of inferring it from a generic verify failure.
-		// The recovery it names is QUALIFIED by the #4127 lapse rule: decide then
-		// fishhawk_retry_stage works unless the stage succeeded, was cancelled or
-		// superseded, or the run succeeded or was cancelled (a failed stage or
-		// failed run stays recoverable); once one of those lapses the request (a
-		// decide is refused 409 amendment_lapsed) the recovery is
-		// fishhawk_resume_run add_scope_files (category B) or
-		// fishhawk_retry_stage (category C).
+		// The recovery it names is QUALIFIED by the #4127 lapse rule: the request
+		// is decidable unless the stage succeeded, was cancelled or superseded, or
+		// the run succeeded or was cancelled (a failed stage or failed run stays
+		// recoverable); once one of those lapses the request (a decide is refused
+		// 409 amendment_lapsed) the recovery is fishhawk_resume_run
+		// add_scope_files (category B) or fishhawk_retry_stage (category C).
+		// The recovery verb for the still-decidable request is category-keyed
+		// (#5403): fishhawk_retry_stage refuses every category-B stage (422
+		// retry_not_applicable), and this line is emitted at agent exit, BEFORE
+		// the committed gate classifies the failure, so it cannot branch on the
+		// category — it names both routes conditionally. The runner's failure
+		// text (undecidedAmendmentRecovery) is the branching source of truth.
 		// The field set {event, amendments:[{amendment_id, paths:[{path,
 		// operation}]}]} is the literal-JSONL seam this relay shares with the
 		// runner emitter (detectUndecidedScopeAmendments, cf. #618) — the two
@@ -2216,7 +2221,10 @@ func runStageEventMessage(payload any) string {
 			}
 			return fmt.Sprintf("scope_amendment_undecided %s — never decided (NOT denied); "+
 				"it stays pending — a failed stage or failed run stays recoverable: decide it with "+
-				"fishhawk_decide_scope_amendment, then fishhawk_retry_stage. A stage that succeeds, is cancelled or "+
+				"fishhawk_decide_scope_amendment, then, if the stage fails category C, fishhawk_retry_stage; "+
+				"if it fails category B (a red committed tree, the common case), fishhawk_resume_run — a stage "+
+				"retry is refused for category B, and an approved amendment is folded automatically on resume. "+
+				"A stage that succeeds, is cancelled or "+
 				"superseded, or a run that succeeds or is cancelled, lapses it (a later decide is refused 409 "+
 				"amendment_lapsed) — recover then with fishhawk_resume_run add_scope_files naming these paths "+
 				"(category B) or fishhawk_retry_stage (category C)",
