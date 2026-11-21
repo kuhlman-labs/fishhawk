@@ -36,38 +36,44 @@ import (
 // the record act commits nothing; one after it (a queued or refused marker)
 // keeps that act's row, which covers the next attempt of the same dispatch.
 const (
-	hdRefuseNotLocal              = "runner_kind_not_local"
-	hdRefuseRunTerminal           = "run_terminal"
-	hdRefusePathOutside           = pathOutsideAllowedRootsCode
-	hdRefuseWorkingDirUnbound     = "working_dir_unbound"
-	hdRefuseWorkingDirAbsent      = "working_dir_absent"
-	hdRefuseNotEligible           = "not_eligible"
-	hdRefuseParentUnreadable      = "parent_unreadable"
-	hdRefuseRunReadFailed         = "run_read_failed"
-	hdRefuseStagesReadFailed      = "stages_read_failed"
-	hdRefuseNothingDispatchable   = "nothing_dispatchable"
-	hdRefuseInFlight              = "in_flight"
-	hdRefuseStaleRunnerLive       = "stale_runner_live"
-	hdRefuseStaleRunnerUnknown    = "stale_runner_unknown"
-	hdRefuseStaleRespawnCap       = "stale_respawn_cap_reached"
-	hdRefuseRespawnLedgerFailed   = "respawn_ledger_failed"
-	hdRefuseForgeUnresolved       = "forge_unresolved"
-	hdRefuseBaseBranchUnresolved  = "base_branch_unresolved"
-	hdRefuseExecutorUnsupported   = "executor_agent_unsupported"
-	hdRefuseCampaignUnavailable   = "campaign_link_unavailable"
-	hdRefuseCampaignUnresolved    = "campaign_link_unresolved"
-	hdRefuseCampaignNotRunning    = "campaign_not_running"
-	hdRefuseGateUnconfigured      = "gate_unconfigured"
-	hdRefuseAcceptanceAdmission   = "acceptance_admission_failed"
-	hdRefuseAcceptanceShortCircut = "acceptance_short_circuited"
-	hdRefuseAcceptanceNeedsTarget = "acceptance_needs_target"
-	hdRefuseRecordFailed          = "record_act_failed"
-	hdRefuseSlotQueued            = concurrencySlotQueuedCode
-	hdRefuseMemoryPressure        = hostMemoryPressureCode
-	hdRefuseMarkerFailed          = "host_dispatch_failed"
-	hdRefuseMarkerNotTransitioned = "marker_not_transitioned"
-	hdRefuseSpawnCancelled        = "spawn_refused_run_cancelled"
-	hdRefuseSpawnFailed           = "spawn_failed"
+	hdRefuseNotLocal             = "runner_kind_not_local"
+	hdRefuseRunTerminal          = "run_terminal"
+	hdRefusePathOutside          = pathOutsideAllowedRootsCode
+	hdRefuseWorkingDirUnbound    = "working_dir_unbound"
+	hdRefuseWorkingDirAbsent     = "working_dir_absent"
+	hdRefuseNotEligible          = "not_eligible"
+	hdRefuseParentUnreadable     = "parent_unreadable"
+	hdRefuseRunReadFailed        = "run_read_failed"
+	hdRefuseStagesReadFailed     = "stages_read_failed"
+	hdRefuseNothingDispatchable  = "nothing_dispatchable"
+	hdRefuseInFlight             = "in_flight"
+	hdRefuseStaleRunnerLive      = "stale_runner_live"
+	hdRefuseStaleRunnerUnknown   = "stale_runner_unknown"
+	hdRefuseStaleRespawnCap      = "stale_respawn_cap_reached"
+	hdRefuseRespawnLedgerFailed  = "respawn_ledger_failed"
+	hdRefuseForgeUnresolved      = "forge_unresolved"
+	hdRefuseBaseBranchUnresolved = "base_branch_unresolved"
+	hdRefuseExecutorUnsupported  = "executor_agent_unsupported"
+	hdRefuseCampaignUnavailable  = "campaign_link_unavailable"
+	hdRefuseCampaignUnresolved   = "campaign_link_unresolved"
+	hdRefuseCampaignNotRunning   = "campaign_not_running"
+	// The implement review round hold on a spawnable acceptance stage (#5298).
+	// None is benign: each is logged once per unbroken run and recorded in the
+	// status file's run_refusals.
+	hdRefuseImplementReviewInFlight   = "implement_review_in_flight"
+	hdRefuseImplementReviewNotStarted = "implement_review_not_started"
+	hdRefuseReviewStatusReadFailed    = "review_status_read_failed"
+	hdRefuseGateUnconfigured          = "gate_unconfigured"
+	hdRefuseAcceptanceAdmission       = "acceptance_admission_failed"
+	hdRefuseAcceptanceShortCircut     = "acceptance_short_circuited"
+	hdRefuseAcceptanceNeedsTarget     = "acceptance_needs_target"
+	hdRefuseRecordFailed              = "record_act_failed"
+	hdRefuseSlotQueued                = concurrencySlotQueuedCode
+	hdRefuseMemoryPressure            = hostMemoryPressureCode
+	hdRefuseMarkerFailed              = "host_dispatch_failed"
+	hdRefuseMarkerNotTransitioned     = "marker_not_transitioned"
+	hdRefuseSpawnCancelled            = "spawn_refused_run_cancelled"
+	hdRefuseSpawnFailed               = "spawn_failed"
 )
 
 // defaultHostDispatchStaleAfter is how long a 'dispatched' stage this process
@@ -121,8 +127,11 @@ type hostDispatchOutcome struct {
 	// QueueEpisode is true when the marker queued the stage: it stays at
 	// awaiting_host_dispatch and the next tick should re-attempt it first.
 	QueueEpisode bool
-	// CampaignRefused marks a refusal for campaign state (the tick moves the
-	// run last next time; it never skips it without a fresh read).
+	// CampaignRefused marks a refusal after the campaign-link read and before
+	// the gate: for campaign state, or for the implement review round hold on
+	// an acceptance stage (#5298). The tick counts it against the per-tick cap,
+	// which therefore bounds the campaign-link reads, and moves the run last
+	// next time; it never skips it without a fresh read.
 	CampaignRefused bool
 	// Held marks a refusal AFTER the gate admitted the attempt (the server's
 	// marker refused it, the record act failed, the acceptance target is
@@ -329,6 +338,14 @@ func campaignPermits(link *runCampaignLink) (string, string) {
 	}
 }
 
+// hdRoundHoldDetail is the refusal detail for an implement review round hold.
+func hdRoundHoldDetail(hold string) string {
+	if hold == hdRefuseImplementReviewNotStarted {
+		return "the workflow declares implement agent reviewers but no review round is recorded for the implement stage's current head yet; acceptance dispatches on the first tick after the round starts and settles"
+	}
+	return "the implement review round is in flight; acceptance dispatches on the first tick after the round settles"
+}
+
 // evaluate decides one candidate run and walks the pre-marker sequence when it
 // is admissible. It is synchronous; a refusal commits at most the one
 // run_auto_driven row of the dispatch attempt it refused.
@@ -340,6 +357,13 @@ func campaignPermits(link *runCampaignLink) (string, string) {
 // outside every allowed root), then the directory on this host
 // (working_dir_absent). Eligibility comes first so an unmarked run always
 // reads not_eligible, whatever its working_dir.
+//
+// After the stage read and argv composition come the campaign-link read, then
+// (#5298) the implement review round hold on a fresh acceptance spawn
+// (implement_review_in_flight, implement_review_not_started, or
+// review_status_read_failed when the round cannot be read), then the gate. A
+// held campaign therefore refuses for campaign state before the round hold,
+// and the round hold precedes every reservation, act, marker and spawn.
 func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDispatchOutcome {
 	o := hostDispatchOutcome{RunID: runID.String()}
 	view, err := h.r.fetchRunDriveView(ctx, runID)
@@ -460,6 +484,25 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 	if code, detail := campaignPermits(link); code != "" {
 		o.CampaignRefused = true
 		return h.refuse(o, code, detail)
+	}
+
+	// (1b) The implement review round hold (#5298), after the campaign-link
+	// read so a paused or held campaign refuses for campaign state first, and
+	// before the gate, so a held acceptance takes no reservation and posts
+	// nothing. It applies only to a fresh acceptance spawn; the stale re-spawn
+	// of a dispatched stage is not held. A read error refuses fail closed. The
+	// candidate reached the campaign-link read, so it counts against the
+	// per-tick cap (CampaignRefused) exactly as a campaign refusal does.
+	if disp.Type == "acceptance" && hostDispatchSpawnable(*disp) {
+		hold, revErr := h.r.acceptanceRoundHold(ctx, runID, stages)
+		if revErr != nil {
+			o.CampaignRefused = true
+			return h.refuse(o, hdRefuseReviewStatusReadFailed, revErr.Error())
+		}
+		if hold != "" {
+			o.CampaignRefused = true
+			return h.refuse(o, hold, hdRoundHoldDetail(hold))
+		}
 	}
 
 	// (2) The gate: caps, ledger reservation and pause — the last local

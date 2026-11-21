@@ -1497,6 +1497,73 @@ func planReviewRejected(rs *ReviewStatus) bool {
 	return false
 }
 
+// implementReviewPendingNextActions is the implement_review_pending arm: the
+// implement review round is in flight, so poll (or block on
+// fishhawk_await_review) until it settles. fishhawk_drive_run's deadline return
+// reuses it for the implement_review_in_flight round hold (#5298).
+func implementReviewPendingNextActions(run *Run, st *ReviewStatus) *NextActions {
+	return &NextActions{
+		State: "implement_review_pending",
+		Actions: []SuggestedAction{
+			pollAction(run, suggestedReviewPollIntervalSeconds,
+				implementReviewMergeHint(st)),
+			{
+				Action:       "fishhawk_await_review",
+				Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
+				Precondition: "optional convenience block over the same poll",
+				Consumes:     consumesNone,
+				Reason:       "blocks until the implement review reaches a terminal status",
+			},
+		},
+	}
+}
+
+// implementReviewDecomposedParent reports whether impl reached succeeded
+// through the decomposition fan-in rather than its own runner: the stage
+// transition table makes succeeded reachable without a 'dispatched' entry only
+// from awaiting_children, and dispatched_at is stamped on every entry into
+// 'dispatched' and never cleared, so a succeeded implement stage with no
+// dispatched_at is a decomposed parent's. A parent whose implement stage a
+// fan-in verify pass re-opened and dispatched reads as non-decomposed here.
+func implementReviewDecomposedParent(impl *Stage) bool {
+	return impl != nil && impl.State == "succeeded" && impl.DispatchedAt == nil
+}
+
+// implementReviewNotStartedNextActions is the implement_review_not_started arm
+// (#5298): the workflow declares implement agent reviewers
+// (review_agents_configured > 0) but no round is recorded for the implement
+// stage's current head, so the host dispatcher and fishhawk_drive_run hold
+// acceptance. It leads with a poll. The recovery verb depends on the shape:
+// a decomposed parent's consolidated round is started by fishhawk_rerun_review
+// (#4282); on any other run that verb refuses (no_review_round), because the
+// round was never written at trace time (the plan failed to load or the
+// review prompt build failed), so the operator dispatches acceptance by hand.
+func implementReviewNotStartedNextActions(run *Run, impl *Stage) *NextActions {
+	actions := []SuggestedAction{
+		pollAction(run, suggestedReviewPollIntervalSeconds,
+			"the workflow declares implement agent reviewers but no review round is recorded for the implement stage's current head; acceptance dispatches once the round starts and settles — re-poll"),
+	}
+	if implementReviewDecomposedParent(impl) {
+		actions = append(actions, SuggestedAction{
+			Action:       "fishhawk_rerun_review",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the round never starts: this decomposed parent's consolidated review dispatch did not run (for example, it could not reach the forge). Read the implement review_status with fishhawk_get_run_status first",
+			Consumes:     consumesNone,
+			Reason:       "starts a decomposed parent's first consolidated implement review round (#4282); acceptance then dispatches once that round settles",
+		})
+	} else {
+		params := map[string]string{"run_id": run.ID, "stage": "acceptance", "auto_preview": "true"}
+		actions = append(actions, SuggestedAction{
+			Action:       "fishhawk_dispatch_stage",
+			Params:       params,
+			Precondition: "the implement review round was never recorded for the implement stage's current head (no implement_review_started row: the plan failed to load or the review prompt build failed at trace time), so no round will start on its own and fishhawk_rerun_review refuses no_review_round. Read the run status first and accept that acceptance then runs with no implement agent review",
+			Consumes:     consumesNone,
+			Reason:       "dispatches the held acceptance stage by hand with the auto-preview pair; the host dispatcher keeps holding it while the round is missing",
+		})
+	}
+	return &NextActions{State: "implement_review_not_started", Actions: actions}
+}
+
 // implementStageNextActions covers the implement stage's post-plan
 // states. Returns nil when no arm matches (the caller falls through to
 // the unclassified fallback). acceptance is the run's acceptance stage
@@ -1564,20 +1631,14 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 		}
 	case "awaiting_approval", "succeeded":
 		if implementReviewStatus != nil && implementReviewStatus.Status == "pending" {
-			return &NextActions{
-				State: "implement_review_pending",
-				Actions: []SuggestedAction{
-					pollAction(run, suggestedReviewPollIntervalSeconds,
-						implementReviewMergeHint(implementReviewStatus)),
-					{
-						Action:       "fishhawk_await_review",
-						Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
-						Precondition: "optional convenience block over the same poll",
-						Consumes:     consumesNone,
-						Reason:       "blocks until the implement review reaches a terminal status",
-					},
-				},
-			}
+			return implementReviewPendingNextActions(run, implementReviewStatus)
+		}
+		// #5298: the workflow declares implement agent reviewers but no round is
+		// recorded for the implement stage's current head, so the host dispatcher
+		// and fishhawk_drive_run hold acceptance (implement_review_not_started).
+		// Name that hold rather than offering an acceptance dispatch they refuse.
+		if implementReviewStatus != nil && implementReviewStatus.Status == "none" && implementReviewExpected(impl) && acceptance != nil && (acceptance.State == "pending" || acceptance.State == "awaiting_host_dispatch") {
+			return implementReviewNotStartedNextActions(run, impl)
 		}
 		if hint != nil {
 			// #3116: recommending fishhawk_fixup_stage is only legal while the
