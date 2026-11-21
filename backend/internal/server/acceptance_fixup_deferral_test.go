@@ -470,11 +470,19 @@ func TestAcceptanceFixupDeferral_Release_FoldFilters(t *testing.T) {
 		}
 		req := mk("requirement", "req-note")
 		conv := mk(planreview.ConventionsOverrideAttemptConcernCategory, "conv-note")
+		// #5477: a server-check row (human-only) is held too.
+		sc := mk("security", "sc-note")
+		sc.Provenance = concern.ProvenanceServerCheck
 		g.runRealRound(planreview.SeverityMedium, true)
-		notes, _, _, _ := g.triggerConcerns(t)
+		notes, _, ids, _ := g.triggerConcerns(t)
 		joined := strings.Join(notes, "|")
-		if strings.Contains(joined, "req-note") || strings.Contains(joined, "conv-note") {
+		if strings.Contains(joined, "req-note") || strings.Contains(joined, "conv-note") || strings.Contains(joined, "sc-note") {
 			t.Errorf("held concerns routed: %v", notes)
+		}
+		for _, id := range ids {
+			if id == sc.ID.String() {
+				t.Errorf("server-check id %s folded into the released pass's concern_ids %v", sc.ID, ids)
+			}
 		}
 		m, _ := g.newestTriage(t)
 		held, _ := m["held_review_concern_ids"].([]any)
@@ -482,7 +490,7 @@ func TestAcceptanceFixupDeferral_Release_FoldFilters(t *testing.T) {
 		for _, h := range held {
 			heldS = append(heldS, h.(string))
 		}
-		deferralContainsAll(t, heldS, req.ID.String(), conv.ID.String())
+		deferralContainsAll(t, heldS, req.ID.String(), conv.ID.String(), sc.ID.String())
 	})
 	t.Run("fold requires delegation met", func(t *testing.T) {
 		f := newDeferralFixture(t, deferralDelegatedSpec, true)
@@ -497,6 +505,47 @@ func TestAcceptanceFixupDeferral_Release_FoldFilters(t *testing.T) {
 			t.Errorf("review_concern_fold_unmet = %v, want the threshold reason", m["review_concern_fold_unmet"])
 		}
 	})
+}
+
+// TestAcceptanceFixupDeferral_Release_ServerCheckOnlyHoldsIDs (#5477, R2): a
+// CLEAN real round over a run whose only open concern is a server-check row
+// leaves route_fixup unmet (every open concern is a server-check finding). The
+// acceptance obligation still routes alone, and the release's triage row
+// records the held server-check id beside review_concern_fold_unmet.
+func TestAcceptanceFixupDeferral_Release_ServerCheckOnlyHoldsIDs(t *testing.T) {
+	g := newDeferralFixture(t, deferralDelegatedSpec, true)
+	g.ship(t)
+	sc := &concern.Concern{ID: uuid.New(), RunID: g.runID, StageID: g.implID, StageKind: concern.StageKindImplement,
+		Severity: "high", Category: "security", Note: "sc-note", State: concern.StateRaised, Provenance: concern.ProvenanceServerCheck}
+	g.cr.rows = append(g.cr.rows, sc)
+	a := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m-a"}
+	b := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m-b"}
+	g.s.runImplementReviewInvocations(context.Background(), g.runID, g.implID,
+		[]reviewerInvocation{{reviewer: a}, {reviewer: b}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", g.startedSeq)
+
+	notes, _, ids, _ := g.triggerConcerns(t)
+	if len(notes) != 1 || len(ids) != 0 {
+		t.Fatalf("release must route the acceptance obligation alone: notes=%v ids=%v", notes, ids)
+	}
+	m, _ := g.newestTriage(t)
+	if s, _ := m["review_concern_fold_unmet"].(string); !strings.Contains(s, "every open concern is a server-check finding") {
+		t.Errorf("review_concern_fold_unmet = %v, want the server-check-only reason", m["review_concern_fold_unmet"])
+	}
+	held, _ := m["held_review_concern_ids"].([]any)
+	if len(held) != 1 || held[0] != sc.ID.String() {
+		t.Errorf("held_review_concern_ids = %v, want exactly [%s]", m["held_review_concern_ids"], sc.ID)
+	}
+	if routed, ok := m["routed_review_concern_ids"].([]any); !ok || len(routed) != 0 {
+		t.Errorf("routed_review_concern_ids = %v, want []", m["routed_review_concern_ids"])
+	}
+	rows, err := g.cr.GetByIDs(context.Background(), []uuid.UUID{sc.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].State != concern.StateRaised {
+		t.Errorf("server-check concern state = %s, want raised", rows[0].State)
+	}
 }
 
 // TestAcceptanceFixupDeferral_RoundSettlesDuringDeferralWrite: the round's

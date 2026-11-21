@@ -285,3 +285,69 @@ func TestCampaignGateDecisionCategories_RegisteredAndRunBoundReadable(t *testing
 		t.Fatalf("run-bound caller kept %d of %d decision rows, want all", len(kept), len(cats))
 	}
 }
+
+// TestDriveCampaignRunGate_ServerCheckOnly_CarriesDecision pins the #5477
+// decision through the campaign translation on both flows: commit-yourself
+// (the implement stage is the gate the marker keys on) and push_and_open_pr
+// (a review stage is parked, so the marker is run-level).
+func TestDriveCampaignRunGate_ServerCheckOnly_CarriesDecision(t *testing.T) {
+	tests := []struct {
+		name      string
+		runLevel  bool
+		wantGate  func(impl *run.Stage) *uuid.UUID
+		wantParks func(impl, review *run.Stage) []uuid.UUID
+	}{
+		{
+			name:      "commit-yourself: implement stage is the gate",
+			wantGate:  func(impl *run.Stage) *uuid.UUID { return &impl.ID },
+			wantParks: func(impl, _ *run.Stage) []uuid.UUID { return []uuid.UUID{impl.ID} },
+		},
+		{
+			name:      "push_and_open_pr: run-level key, review parked",
+			runLevel:  true,
+			wantGate:  func(*run.Stage) *uuid.UUID { return nil },
+			wantParks: func(_, review *run.Stage) []uuid.UUID { return []uuid.UUID{review.ID} },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, repo, au, cr := newAutoDriveServer(t)
+			runID, stages := startAutoDriveRun(t, s, repo)
+			plan, impl := stages[0], stages[1]
+			plan.State = run.StageStateSucceeded
+			impl.State = run.StageStateAwaitingApproval
+			var review *run.Stage
+			if tt.runLevel {
+				impl.State = run.StageStateSucceeded
+				review = &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval, Sequence: 3}
+				repo.mu.Lock()
+				repo.stagesByRun[runID] = append(repo.stagesByRun[runID], review)
+				repo.mu.Unlock()
+			}
+			seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+			seedServerCheckConcern(t, cr, runID, impl.ID, "implement", "high", "leaked-token")
+
+			out, err := s.DriveCampaignRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+			if err != nil {
+				t.Fatalf("DriveCampaignRunGate: %v", err)
+			}
+			if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateServerCheckAwaitingHuman || out.Action != delegation.ActionRouteFixup {
+				t.Fatalf("outcome = %+v, want decision_required server_check_awaiting_human route_fixup", out)
+			}
+			if !out.GateKnown {
+				t.Fatal("GateKnown = false, want the gate read")
+			}
+			want := tt.wantGate(impl)
+			switch {
+			case want == nil && out.GateStageID != nil:
+				t.Fatalf("GateStageID = %v, want nil (run-level key)", *out.GateStageID)
+			case want != nil && (out.GateStageID == nil || *out.GateStageID != *want):
+				t.Fatalf("GateStageID = %v, want %s", out.GateStageID, *want)
+			}
+			parks := tt.wantParks(impl, review)
+			if len(out.ParkedGateStageIDs) != len(parks) || out.ParkedGateStageIDs[0] != parks[0] {
+				t.Fatalf("ParkedGateStageIDs = %v, want %v", out.ParkedGateStageIDs, parks)
+			}
+		})
+	}
+}

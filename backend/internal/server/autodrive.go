@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -88,7 +89,8 @@ type AutoDriveOutcome struct {
 	// driver must STOP, not spin. DecisionState names the state (e.g.
 	// fixup_budget_exhausted / fixup_ceiling_reached; the #2381 delegated-approval
 	// states operatorrole.DecisionStateHumanQuorumRequired and
-	// DecisionStateDelegatedApprovalNoProgress) and Action names the
+	// DecisionStateDelegatedApprovalNoProgress; the #5477 route_fixup state
+	// DecisionStateServerCheckAwaitingHuman) and Action names the
 	// delegated verb whose arm surfaced it. Set with Acted=false and
 	// Paged=false. Introduced by the E48.41 / #2091 fix so an exhausted
 	// fix-up budget on the delegated route_fixup arm parks the operator with
@@ -297,6 +299,14 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_route_fixup met but no fixup-eligible implement state; observe-only",
 			slog.String("run_id", runRow.ID.String()))
+	}
+	// route_fixup unmet ONLY because every open concern is a server-check
+	// finding (#5477): a human-only decision (ADR-084 rule 5 / ADR-143), so the
+	// pass hands the gate to the human rather than polling observe-only.
+	if d, found := res.Decision(delegation.ActionRouteFixup); found && !d.Met && d.AwaitingHuman {
+		if out, held := s.serverCheckAwaitingHumanHold(ctx, runRow, stages, open); held {
+			return out, nil
+		}
 	}
 
 	// may_retry(infra_flake) -> retry the failed stage.
@@ -1351,11 +1361,18 @@ func (s *Server) emitCampaignGatePaged(ctx context.Context, runRow *run.Run, id 
 	}
 }
 
-// autoFixup routes every open implement-stage concern back to the agent
-// under id via fixupStageAs, defaulting the bounded-pass budget exactly
+// autoFixup routes every open implement-stage REVIEWER concern back to the
+// agent under id via fixupStageAs, defaulting the bounded-pass budget exactly
 // as the HTTP handler does. Returns dispatched=false (no error) when the
 // double-gate fails — no implement stage, an ineligible state, or no open
 // concern to route — so the caller falls to observe-only.
+//
+// Server-check rows (provenance server_check) are skipped (#5477): they are
+// human-only under ADR-084 rule 5 / ADR-143, so their ids never reach
+// fixupActionParams.ConcernIDs, stage_fixup_triggered.concern_ids or
+// MarkAddressedPending. The actor keeps its own check rather than trusting
+// the evaluator's partition alone; on a mixed set it routes only the reviewer
+// rows.
 func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, stages []*run.Stage, open []*concern.Concern, rule string) (bool, error) {
 	impl := implementStage(stages)
 	if impl == nil || !fixupEligibleState(impl, stages) {
@@ -1372,6 +1389,9 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	var ids []uuid.UUID
 	for _, c := range open {
 		if c.StageKind != concern.StageKindImplement || c.StageID != impl.ID {
+			continue
+		}
+		if c.IsServerCheck() { // human-only: never auto-routed (#5477)
 			continue
 		}
 		selected = append(selected, planreview.Concern{
@@ -1431,6 +1451,48 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 		return false, err
 	}
 	return true, nil
+}
+
+// serverCheckAwaitingHumanHold answers the route_fixup arm when the evaluator
+// flagged Decision.AwaitingHuman (#5477): the settled implement-review round's
+// open concerns are all server-check rows, which delegation never routes
+// (ADR-084 rule 5 / ADR-143). It re-derives the gate rather than trusting the
+// evaluator's read alone, and holds ONLY when every check passes: an implement
+// stage exists, it is in a fix-up-eligible state, no class-1 acceptance fix-up
+// deferral is pending, and the implement stage has at least one open concern,
+// all of them server-check. Then it returns decision_required
+// server_check_awaiting_human for route_fixup. Any failed check returns
+// held=false and the pass falls through unchanged (observe-only). Nothing is
+// appended and no fix-up budget is spent either way; the campaign driver's
+// trackDecision records the marker.
+func (s *Server) serverCheckAwaitingHumanHold(ctx context.Context, runRow *run.Run, stages []*run.Stage, open []*concern.Concern) (AutoDriveOutcome, bool) {
+	impl := implementStage(stages)
+	if impl == nil || !fixupEligibleState(impl, stages) {
+		return AutoDriveOutcome{}, false
+	}
+	if s.acceptanceFixupDeferralPending(ctx, runRow.ID) {
+		return AutoDriveOutcome{}, false
+	}
+	var ids []string
+	for _, c := range open {
+		if c.StageKind != concern.StageKindImplement || c.StageID != impl.ID {
+			continue
+		}
+		if !c.IsServerCheck() {
+			return AutoDriveOutcome{}, false
+		}
+		ids = append(ids, c.ID.String())
+	}
+	if len(ids) == 0 {
+		return AutoDriveOutcome{}, false
+	}
+	return AutoDriveOutcome{
+		DecisionRequired: true,
+		DecisionState:    operatorrole.DecisionStateServerCheckAwaitingHuman,
+		Action:           delegation.ActionRouteFixup,
+		Note: fmt.Sprintf("%d open implement concern(s) [%s] were raised by a server check (provenance server_check) and are human-only (ADR-084 rule 5, ADR-143): a human waives or defers them from the Fishhawk Web UI, or routes them in a non-delegated fix-up; no fix-up was auto-routed",
+			len(ids), strings.Join(ids, ", ")),
+	}, true
 }
 
 // --- mode: report (ADR-066 / #2222) -----------------------------------------

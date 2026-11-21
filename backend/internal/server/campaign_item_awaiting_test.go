@@ -17,6 +17,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -116,9 +119,15 @@ func TestClassifyCampaignItemAwaiting(t *testing.T) {
 
 // awaitMarkerEntry builds a decision_required (or cleared) row for gate.
 func awaitMarkerEntry(seq int64, category, gate string) *audit.Entry {
+	return awaitDecisionMarkerEntry(seq, category, gate, "human_quorum_required", "approve")
+}
+
+// awaitDecisionMarkerEntry is awaitMarkerEntry with an explicit decision state
+// and action.
+func awaitDecisionMarkerEntry(seq int64, category, gate, state, action string) *audit.Entry {
 	body, _ := json.Marshal(map[string]any{
 		"campaign_id": uuid.NewString(), "issue_ref": "issue:1", "run_id": uuid.NewString(),
-		"gate": gate, "decision_state": "human_quorum_required", "action": "approve",
+		"gate": gate, "decision_state": state, "action": action,
 	})
 	return &audit.Entry{Sequence: seq, Category: category, Timestamp: time.Unix(1_700_000_000+seq, 0).UTC(), Payload: body}
 }
@@ -139,6 +148,7 @@ func TestOverlayCampaignItemAwaiting(t *testing.T) {
 		return &campaignPendingAmendmentsPayload{Items: []campaignPendingAmendmentPayload{{ItemRunID: id, DecisionLive: live}}}
 	}
 	terminal := []*run.Stage{awaitStage(1, run.StageTypePlan, run.StageStateSucceeded)}
+	implGate := awaitStage(2, run.StageTypeImplement, run.StageStateAwaitingApproval)
 
 	cases := []struct {
 		name            string
@@ -150,6 +160,8 @@ func TestOverlayCampaignItemAwaiting(t *testing.T) {
 		wantKind        string
 		wantReason      string
 		wantGate        string // "" = no decision
+		wantState       string // "" = human_quorum_required
+		wantAction      string // "" = approve
 		wantWithheld    bool
 		wantUnavailable bool
 		wantLoad        bool
@@ -210,6 +222,11 @@ func TestOverlayCampaignItemAwaiting(t *testing.T) {
 		{name: "marker read error is unavailable", stages: []*run.Stage{gateStage}, readable: true, pending: none,
 			markerErr: errors.New("audit down"),
 			wantKind:  awaitingKindHuman, wantReason: awaitingReasonGateApproval, wantUnavailable: true, wantLoad: true},
+		// #5477: the route_fixup server-check-only decision on the implement gate.
+		{name: "server-check awaiting-human marker on the implement gate", stages: []*run.Stage{implGate}, readable: true, pending: none,
+			markers:  []*audit.Entry{awaitDecisionMarkerEntry(4, req, implGate.ID.String(), "server_check_awaiting_human", "route_fixup")},
+			wantKind: awaitingKindHuman, wantReason: awaitingReasonGateApproval, wantGate: implGate.ID.String(),
+			wantState: "server_check_awaiting_human", wantAction: "route_fixup", wantLoad: true},
 		{name: "malformed marker payload not shown", stages: []*run.Stage{gateStage}, readable: true, pending: none,
 			markers:  []*audit.Entry{{Sequence: 4, Category: req, Payload: json.RawMessage(`{"gate":`)}},
 			wantKind: awaitingKindHuman, wantReason: awaitingReasonGateApproval, wantLoad: true},
@@ -242,9 +259,16 @@ func TestOverlayCampaignItemAwaiting(t *testing.T) {
 				}
 				return
 			}
+			wantState, wantAction := tc.wantState, tc.wantAction
+			if wantState == "" {
+				wantState = "human_quorum_required"
+			}
+			if wantAction == "" {
+				wantAction = "approve"
+			}
 			if got.Decision == nil || got.Decision.Gate != tc.wantGate ||
-				got.Decision.DecisionState != "human_quorum_required" || got.Decision.Action != "approve" || got.Decision.RecordedAt.IsZero() {
-				t.Fatalf("decision = %+v, want gate %s human_quorum_required/approve", got.Decision, tc.wantGate)
+				got.Decision.DecisionState != wantState || got.Decision.Action != wantAction || got.Decision.RecordedAt.IsZero() {
+				t.Fatalf("decision = %+v, want gate %s %s/%s", got.Decision, tc.wantGate, wantState, wantAction)
 			}
 		})
 	}
@@ -621,5 +645,111 @@ func TestCurrentAwaitingMarker_UnreadablePayloadIsNone(t *testing.T) {
 	good := awaitMarkerEntry(3, req, campaigndriver.GateRunLevel)
 	if m := currentAwaitingMarker([]*audit.Entry{good}, nil); m == nil || m.Gate != campaigndriver.GateRunLevel || m.Sequence != 3 {
 		t.Fatalf("well-formed marker = %+v, want gate run at sequence 3", m)
+	}
+}
+
+// pauseNoopCampaignRepo gives the campaign fake the one CampaignStore method it
+// lacks, so the REAL campaigndriver.Ticker can drive it.
+type pauseNoopCampaignRepo struct {
+	*fakeCampaignRepo
+}
+
+func (r *pauseNoopCampaignRepo) PauseCampaignItem(_ context.Context, id uuid.UUID, _ campaign.PauseReason) (*campaign.Item, error) {
+	return r.GetCampaignItem(context.Background(), id)
+}
+
+// neverStarter fails the test if the Ticker tries to start a run: the fixture's
+// only item is already running.
+type neverStarter struct{ t *testing.T }
+
+func (n neverStarter) StartCampaignRun(context.Context, *campaign.Item, *campaign.Campaign) (*run.Run, error) {
+	n.t.Errorf("StartCampaignRun called; the fixture's only item is already running")
+	return nil, errors.New("not expected")
+}
+
+// gateActorFunc adapts a func to campaigndriver.GateActor.
+type gateActorFunc func(ctx context.Context, runRow *run.Run) (campaigndriver.GateActionOutcome, error)
+
+func (f gateActorFunc) DriveRunGate(ctx context.Context, runRow *run.Run) (campaigndriver.GateActionOutcome, error) {
+	return f(ctx, runRow)
+}
+
+// TestCampaignDriver_ServerCheckAwaitingHuman_StatusRendersDecision is the
+// #5477 cross-boundary test (R3a): the REAL campaign Ticker drives a run whose
+// settled implement round left only a server-check concern through
+// DriveCampaignRunGate, records one campaign_gate_decision_required marker,
+// and the REAL campaign status read renders it on the item's awaiting block.
+func TestCampaignDriver_ServerCheckAwaitingHuman_StatusRendersDecision(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	camps := &pauseNoopCampaignRepo{fakeCampaignRepo: newFakeCampaignRepo()}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+		CampaignRepo: camps.fakeCampaignRepo,
+		ApprovalRepo: newFakeApprovalRepo(),
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+	})
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApprove)
+	sc := seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+	c := camps.seedCampaignWithItems("acme/widgets", "issue:10", []*campaign.Item{
+		{IssueRef: "issue:1", State: campaign.ItemStateRunning, RunID: idp(runID), Position: 0},
+	})
+
+	tk := &campaigndriver.Ticker{
+		Campaigns: camps,
+		Runs:      repo,
+		Starter:   neverStarter{t: t},
+		Audit:     au,
+		GateActor: gateActorFunc(func(ctx context.Context, runRow *run.Run) (campaigndriver.GateActionOutcome, error) {
+			return s.DriveCampaignRunGate(ctx, runRow, campaignOperatorIdentity(), nil, nil)
+		}),
+	}
+	tk.Tick(context.Background())
+
+	markers, err := au.ListForRunByCategory(context.Background(), runID, campaigndriver.CategoryCampaignGateDecisionRequired)
+	if err != nil {
+		t.Fatalf("list markers: %v", err)
+	}
+	if len(markers) != 1 {
+		t.Fatalf("%d campaign_gate_decision_required rows on the run chain, want exactly 1", len(markers))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(markers[0].Payload, &payload); err != nil {
+		t.Fatalf("decode marker: %v", err)
+	}
+	var keys []string
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if got := strings.Join(keys, ","); got != "action,campaign_id,decision_state,gate,issue_ref,run_id" {
+		t.Fatalf("marker payload keys = %s, want exactly action,campaign_id,decision_state,gate,issue_ref,run_id (no Note, so no concern ids)", got)
+	}
+	if payload["decision_state"] != "server_check_awaiting_human" || payload["gate"] != impl.ID.String() || payload["action"] != "route_fixup" {
+		t.Fatalf("marker payload = %v, want server_check_awaiting_human/route_fixup keyed on the implement stage %s", payload, impl.ID)
+	}
+
+	got, _ := statusAwaitingByRef(t, callCampaignStatusAs(s, c.ID, gateViewReadIdentity()))
+	blk := got["issue:1"]
+	if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonGateApproval {
+		t.Fatalf("awaiting = %+v, want human/gate_approval", blk)
+	}
+	if blk.Decision == nil || blk.Decision.DecisionState != "server_check_awaiting_human" ||
+		blk.Decision.Action != "route_fixup" || blk.Decision.Gate != impl.ID.String() {
+		t.Fatalf("awaiting decision = %+v, want server_check_awaiting_human/route_fixup on gate %s", blk.Decision, impl.ID)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries, want 0", n, CategoryStageFixupTriggered)
+	}
+	if st := concernStateOf(t, cr, sc.ID); st != concern.StateRaised {
+		t.Errorf("server-check concern state = %s, want raised", st)
 	}
 }
