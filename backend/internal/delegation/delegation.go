@@ -128,13 +128,21 @@ func ActionForClass(class string) (string, bool) {
 // decision came from (ADR-066 / #2222): which mode resolved it and which
 // input decided that mode. Both are EMPTY for a v0/v1 knob block, which has
 // no matrix — the decision itself is unchanged.
+//
+// AwaitingHuman is Go-only (no wire mapping; the GET /v0/runs/{id}
+// delegation block keeps rendering UnmetReason). It is set only for
+// ActionRouteFixup, and only when convergent_concerns is unmet SOLELY
+// because the settled implement-review round's open concerns are all
+// server-check rows (provenance server_check, ADR-084 rule 5 / ADR-143):
+// nothing is routable by delegation and the next move is a human's (#5477).
 type Decision struct {
-	Action      string
-	Condition   spec.DelegationCondition
-	Met         bool
-	UnmetReason string
-	Mode        spec.ActionMode
-	Source      spec.ResolutionSource
+	Action        string
+	Condition     spec.DelegationCondition
+	Met           bool
+	UnmetReason   string
+	Mode          spec.ActionMode
+	Source        spec.ResolutionSource
+	AwaitingHuman bool
 }
 
 // Result carries every configured knob's Decision plus the effective
@@ -454,6 +462,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		if !met {
 			d.UnmetReason = reason
 		}
+		d.AwaitingHuman = k.action == ActionRouteFixup && !met && strings.HasPrefix(reason, convergentAwaitingHumanPrefix)
 		if k.condition != "" {
 			res.Actions = append(res.Actions, d)
 			continue
@@ -987,7 +996,8 @@ func routeFixupThreshold(effective *spec.OperatorAgent) int {
 
 // evalConvergentConcerns answers may_route_fixup's condition: the
 // implement-review round's verdicts are all in, no GATING-authority
-// reject is present, and at least one concern is open to route. Pinned
+// reject is present, and at least one routable (reviewer-raised, not
+// server-check) concern is open. Pinned
 // to the implement stage because fix-up routing is an implement-stage
 // verb.
 //
@@ -1010,6 +1020,18 @@ func routeFixupThreshold(effective *spec.OperatorAgent) int {
 // A reject verdict (necessarily advisory authority here, since a gating
 // reject already returned above) BYPASSES the threshold: the ADR-027
 // arbitration path stays met regardless of severities.
+//
+// Server-check partition (#5477): a concern the server synthesized
+// (provenance server_check — the diff-secret, permission-drift and
+// control-unpinned checks) is human-only under ADR-084 rule 5 / ADR-143, so
+// it is never "an open concern to route". routableConcerns splits it out
+// after the round, verdict-count and gating-reject checks: the server-check
+// rows neither satisfy the at-least-one-open-concern predicate nor feed the
+// route_fixup_min_severity max (a high server-check row cannot lift a
+// low-only reviewer set over the threshold). A settled round that leaves
+// ONLY server-check rows answers unmet with a reason beginning
+// convergentAwaitingHumanPrefix, which Evaluate turns into
+// Decision.AwaitingHuman.
 func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run, wf *spec.Workflow, effective *spec.OperatorAgent, open []*concern.Concern) (bool, string, error) {
 	const cond = string(spec.ConditionConvergentConcerns)
 	configured, verdicts, started, err := e.reviewRound(ctx, runRow, wf, run.StageTypeImplement)
@@ -1032,7 +1054,11 @@ func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run,
 			hasReject = true
 		}
 	}
-	if len(open) == 0 {
+	routable, serverCheck := routableConcerns(open)
+	if len(routable) == 0 {
+		if serverCheck > 0 {
+			return false, fmt.Sprintf("%s (%d open, provenance server_check); a server-check concern is human-only (ADR-084 rule 5, ADR-143): a human waives or defers it from the Fishhawk Web UI, or routes it in a non-delegated fix-up naming the concern; 0 reviewer concerns to route", convergentAwaitingHumanPrefix, serverCheck), nil
+		}
 		return false, cond + ": 0 open concerns to route", nil
 	}
 	// With every verdict approve-class (no reject to arbitrate), only route
@@ -1040,7 +1066,7 @@ func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run,
 	if !hasReject {
 		threshold := routeFixupThreshold(effective)
 		maxRank := 0
-		for _, c := range open {
+		for _, c := range routable {
 			if r := severityRank(c.Severity); r > maxRank {
 				maxRank = r
 			}
@@ -1050,6 +1076,26 @@ func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run,
 		}
 	}
 	return true, "", nil
+}
+
+// convergentAwaitingHumanPrefix begins convergent_concerns' unmet reason when
+// a settled round's open concerns are ALL server-check rows. Evaluate keys
+// Decision.AwaitingHuman on it (#5477).
+const convergentAwaitingHumanPrefix = "convergent_concerns: every open concern is a server-check finding"
+
+// routableConcerns partitions open concerns for delegated fix-up routing
+// (#5477): reviewer-raised rows are routable; server-check rows (provenance
+// server_check) are human-only under ADR-084 rule 5 / ADR-143 and are only
+// counted, never routed by delegation.
+func routableConcerns(open []*concern.Concern) (routable []*concern.Concern, serverCheck int) {
+	for _, c := range open {
+		if c.IsServerCheck() { // human-only: never routable by delegation (#5477)
+			serverCheck++
+			continue
+		}
+		routable = append(routable, c)
+	}
+	return routable, serverCheck
 }
 
 // thresholdName renders a severity rank back to its low/medium/high name

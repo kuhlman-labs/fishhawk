@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -423,6 +424,45 @@ func TestAutoDriveHTTP_HumanQuorumGate_DecisionRequired(t *testing.T) {
 	}
 	if countAudit(au, "approval_submitted") != 0 {
 		t.Error("approval_submitted row recorded on a human-quorum decline; the arm must not submit")
+	}
+}
+
+// TestAutoDrive_RouteFixupServerCheckOnly_ParksDecision is the #5477 HTTP pin:
+// the REAL POST /v0/runs/{id}/auto-drive handler, over a settled implement
+// round whose only open concern is a server-check row, serializes
+// decision_required=true and decision_state=server_check_awaiting_human on the
+// wire, acts on nothing and appends no run_auto_driven row.
+func TestAutoDrive_RouteFixupServerCheckOnly_ParksDecision(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedSettledImplementRound(t, au, runID, planreview.VerdictApproveWithConcerns)
+	sc := seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveFixupCapableIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["decision_required"] != true || body["decision_state"] != operatorrole.DecisionStateServerCheckAwaitingHuman {
+		t.Fatalf("body = %v, want decision_required=true decision_state=%q", body, operatorrole.DecisionStateServerCheckAwaitingHuman)
+	}
+	if body["acted"] != false {
+		t.Fatalf("acted = %v, want false", body["acted"])
+	}
+	if countAudit(au, CategoryRunAutoDriven) != 0 {
+		t.Error("run_auto_driven row appended on a decision_required (non-acted) outcome")
+	}
+	if countAudit(au, CategoryStageFixupTriggered) != 0 {
+		t.Error("stage_fixup_triggered appended; a server-check-only round must route nothing")
+	}
+	if st := concernStateOf(t, cr, sc.ID); st != concern.StateRaised {
+		t.Errorf("server-check concern state = %s, want raised", st)
 	}
 }
 
