@@ -375,13 +375,15 @@ func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {
 }
 
 // auditCompleteDeps builds the auditcomplete.Deps with every closure the
-// Compute rules need (#229 / #282 / #947). Centralized so the four
+// Compute rules need (#229 / #282 / #947 / #5409). Centralized so the
 // closures — PRHead (foreign-commit rule 5), ImplementReviewers +
-// ReviewBackstop + Now (review-pending rule 6) — cannot be forgotten at one
+// ReviewBackstop + Now (review-pending rule 6) and MergeCandidate
+// (merge-candidate rule 8, ADR-090 Amendment A2) — cannot be forgotten at one
 // of the multiple Compute call sites (the checks read endpoint, the
-// synchronize republish, the post-review republish). Each closure is
-// nil-tolerant inside Compute, so a dev/test Server without GitHub or a
-// workflow spec degrades cleanly to the rules it can evaluate.
+// synchronize republish, the post-review republish, the forced at-head
+// republishes). Each closure is nil-tolerant inside Compute, so a dev/test
+// Server without GitHub or a workflow spec degrades cleanly to the rules it
+// can evaluate.
 func (s *Server) auditCompleteDeps() auditcomplete.Deps {
 	return auditcomplete.Deps{
 		Runs:      s.cfg.RunRepo,
@@ -403,6 +405,31 @@ func (s *Server) auditCompleteDeps() auditcomplete.Deps {
 		// a stuck review can't wedge the audit gate any longer than it
 		// wedges the merge.
 		ReviewBackstop: s.planReviewBackstop,
+		// Merge-candidate verify state of the live PR head rule 5 read
+		// (ADR-090 Amendment A2, #5409). The closure reads the merge gate's
+		// own predicate, mergeCandidateVerifyState, so the check and the gate
+		// cannot diverge. Nil (no audit repository) skips rule 8, as does a
+		// live head rule 5 could not read (no GitHub client, ADR-090 D7).
+		MergeCandidate: s.mergeCandidateStateFetcher(),
+	}
+}
+
+// mergeCandidateStateFetcher returns the closure auditcomplete's rule 8 calls
+// (ADR-090 Amendment A2, #5409): the merge gate's single ADR-090 D2 predicate,
+// mergeCandidateVerifyState, mapped onto the auditcomplete seam. Nil when no
+// audit repository is wired, so Compute skips the rule cleanly. The error is
+// returned unchanged; rule 8 logs it and publishes a fixed message, so a raw
+// error never reaches the Check Run.
+func (s *Server) mergeCandidateStateFetcher() auditcomplete.MergeCandidateStateFetcher {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	return func(ctx context.Context, runRow *run.Run, headSHA string) (auditcomplete.MergeCandidateResult, error) {
+		st, err := s.mergeCandidateVerifyState(ctx, runRow, headSHA)
+		if err != nil {
+			return auditcomplete.MergeCandidateResult{}, err
+		}
+		return auditcomplete.MergeCandidateResult{Status: auditcomplete.MergeCandidateStatus(st.State), Cause: st.Cause}, nil
 	}
 }
 
