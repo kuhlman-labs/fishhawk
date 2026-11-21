@@ -2513,6 +2513,11 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// taken. Wired at BOTH nextActionsFor call sites (here and run_stage.go).
 	release.RollbackOffer = acceptanceRollbackOfferIn(recent)
 	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
+	// #5298 W2: settle an implement_review_not_started arm whose shape the
+	// stages alone cannot prove (a fan-in verify pass dispatched the parent's
+	// implement stage) from the plan_decomposed record. BEFORE the acceptance
+	// integration gate, so a resolved hand acceptance dispatch is still gated.
+	r.resolveImplementReviewNotStartedShape(ctx, runID, runRow, stages, nextActions)
 	// #4080: hold the acceptance dispatch for a decomposed parent whose
 	// consolidated branch does not provably carry every child's slice —
 	// state acceptance_held_integration_incomplete, fishhawk_await_children

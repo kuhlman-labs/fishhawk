@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1362,6 +1363,51 @@ func TestGetRunStatus_HostDispatchOmittedWhileRoundHoldsAcceptance(t *testing.T)
 			}
 			if out.HostDispatch == nil || out.HostDispatch.State != hostDispatchStateLive {
 				t.Fatalf("host_dispatch = %+v; want state live once the round settles", out.HostDispatch)
+			}
+		})
+	}
+}
+
+// TestGetRunStatus_NotStartedShapeFromPlanDecomposed pins the tools.go wiring
+// of resolveImplementReviewNotStartedShape (#5298, concern 8bbba318): a
+// decomposed parent whose implement stage a fan-in verify pass dispatched
+// keeps fishhawk_rerun_review, and a dispatched run with no plan_decomposed
+// record gets the hand acceptance dispatch.
+func TestGetRunStatus_NotStartedShapeFromPlanDecomposed(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		decomposed bool
+		want, deny string
+	}{
+		{"redispatched_parent", true, "fishhawk_rerun_review", "fishhawk_dispatch_stage"},
+		{"non_decomposed", false, "fishhawk_dispatch_stage", "fishhawk_rerun_review"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			fb, srv := newFakeBackend(t)
+			runID, _ := hdoRoundRun(fb, 2, "none", t.TempDir())
+			at := time.Now().Add(-time.Hour).UTC()
+			fb.mu.Lock()
+			for i := range fb.stagesByRun[runID] {
+				if fb.stagesByRun[runID][i].Type == "implement" {
+					fb.stagesByRun[runID][i].DispatchedAt = &at
+				}
+			}
+			fb.mu.Unlock()
+			if tc.decomposed {
+				seedPlanDecomposed(fb, runID, []string{uuid.NewString()}, 1)
+			}
+			r := hdoRoundResolver(t, srv, "", t.TempDir())
+			_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("getRunStatus: %v", err)
+			}
+			if out.NextActions == nil || out.NextActions.State != "implement_review_not_started" {
+				t.Fatalf("next_actions = %+v; want implement_review_not_started", out.NextActions)
+			}
+			names := actionNames(out.NextActions)
+			if !slices.Contains(names, tc.want) || slices.Contains(names, tc.deny) {
+				t.Fatalf("actions = %v; want %s and no %s", names, tc.want, tc.deny)
 			}
 		})
 	}

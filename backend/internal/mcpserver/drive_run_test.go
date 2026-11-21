@@ -6188,6 +6188,138 @@ func TestDriveRun_DecomposedParentAcceptance_HeldUntilRoundStarts(t *testing.T) 
 	})
 }
 
+// #5298 (concern eb54866c): a hold the loop observed, then released by another
+// actor (here a runner picks acceptance up elsewhere), must not be named at the
+// deadline: the round-hold state is cleared on every step-(c) pass.
+func TestDriveRun_FeatureChangeAcceptance_HoldReleasedElsewhereNotNamedAtDeadline(t *testing.T) {
+	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
+	f.seedImplementReviewStarted(2)
+	f.seedImplementReviewed("approve") // 1 of 2: in flight, so the first passes hold
+	reads := 0
+	f.setOnStages(func(f *driveFakeBackend) {
+		reads++
+		if reads == 3 { // acceptance now runs elsewhere; it is no longer held
+			f.setState("acceptance", "running")
+		}
+	})
+	driveSettleAcceptanceOnSpawn(f)
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 200 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if reads < 4 {
+		t.Fatalf("stage reads = %d; the loop never iterated past the release", reads)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v; acceptance ran elsewhere", got)
+	}
+	if w := strings.Join(out.Warnings, "\n"); strings.Contains(w, "held by the implement review round") {
+		t.Fatalf("warnings = %v; a released hold must not be named at the deadline", out.Warnings)
+	}
+	if out.NextActions != nil && (out.NextActions.State == "implement_review_pending" || out.NextActions.State == "implement_review_not_started") {
+		t.Fatalf("next_actions = %+v; a released hold must not set the round-hold arm", out.NextActions)
+	}
+}
+
+// seedPlanDecomposed appends a plan_decomposed row through the fake's own audit
+// slice (W5): the positive decomposition signal the not-started arm resolves
+// an unknown shape from.
+func (f *driveFakeBackend) seedPlanDecomposed() {
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{
+		ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(),
+		Category: "plan_decomposed", Payload: map[string]any{"child_run_ids": []any{uuid.New().String()}},
+	})
+}
+
+// #5298 (concerns 8bbba318, 3b8b838d): a fan-in verify pass dispatches a
+// decomposed parent's implement stage (stamping dispatched_at) before its first
+// consolidated round, so dispatched_at alone cannot pick the not-started shape.
+// The deadline resolves it from plan_decomposed: a parent keeps
+// fishhawk_rerun_review, a positively non-decomposed run gets the hand
+// acceptance dispatch, and an unreadable record never offers acceptance.
+func TestDriveRun_NotStartedHold_DeadlineShapeFromPlanDecomposed(t *testing.T) {
+	cases := []struct {
+		name         string
+		seed         func(f *driveFakeBackend)
+		wantRerun    bool
+		wantDispatch bool
+	}{
+		{"redispatched_parent", func(f *driveFakeBackend) { f.seedPlanDecomposed() }, true, false},
+		{"non_decomposed", func(*driveFakeBackend) {}, false, true},
+		{"plan_decomposed_unreadable", func(f *driveFakeBackend) { f.auditErrCategory = "plan_decomposed" }, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
+			tc.seed(f)
+			driveSettleAcceptanceOnSpawn(f)
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			defer srv.Close()
+			r.driveMaxWallclock = 60 * time.Millisecond
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if out.StoppedReason != stoppedTimeout {
+				t.Fatalf("stopped_reason = %q; want timeout", out.StoppedReason)
+			}
+			if got := rec.list(); len(got) != 0 {
+				t.Fatalf("spawned %v before the round started", got)
+			}
+			if out.NextActions == nil || out.NextActions.State != "implement_review_not_started" {
+				t.Fatalf("next_actions = %+v; want implement_review_not_started", out.NextActions)
+			}
+			if got := driveHasAction(out.NextActions.Actions, "fishhawk_rerun_review"); got != tc.wantRerun {
+				t.Fatalf("fishhawk_rerun_review offered = %v; want %v (actions %+v)", got, tc.wantRerun, out.NextActions.Actions)
+			}
+			if got := driveHasAction(out.NextActions.Actions, "fishhawk_dispatch_stage"); got != tc.wantDispatch {
+				t.Fatalf("fishhawk_dispatch_stage offered = %v; want %v (actions %+v)", got, tc.wantDispatch, out.NextActions.Actions)
+			}
+		})
+	}
+}
+
+// TestResolveImplementReviewNotStartedShape_ReadsOnlyWhenUnknown pins the
+// fold's cost gate: an arm whose shape the stages already prove, or any other
+// arm, makes no plan_decomposed read and is left unchanged.
+func TestResolveImplementReviewNotStartedShape_ReadsOnlyWhenUnknown(t *testing.T) {
+	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), false) // DispatchedAt nil: a proven parent
+	f.seedPlanDecomposed()
+	pdReads := 0
+	f.setOnAudit(func(_ *driveFakeBackend, category string) {
+		if category == "plan_decomposed" {
+			pdReads++
+		}
+	})
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	defer srv.Close()
+	run := &Run{ID: f.runID.String(), RunnerKind: "local"}
+	f.mu.Lock()
+	stages := append([]Stage(nil), f.stages...)
+	f.mu.Unlock()
+	for _, na := range []*NextActions{
+		implementReviewNotStartedNextActions(run, implementReviewShapeDecomposedParent),
+		{State: "implement_review_pending"},
+	} {
+		beforeState, beforeActions := na.State, strings.Join(actionNames(na), ",")
+		r.resolveImplementReviewNotStartedShape(context.Background(), f.runID, run, stages, na)
+		if na.State != beforeState || strings.Join(actionNames(na), ",") != beforeActions {
+			t.Fatalf("na changed from %s %s to %s %v", beforeState, beforeActions, na.State, actionNames(na))
+		}
+	}
+	if pdReads != 0 {
+		t.Fatalf("plan_decomposed reads = %d; want 0 when the shape is already proven", pdReads)
+	}
+}
+
 func TestDriveRun_FeatureChangeAcceptance_ReviewStatusReadFailsClosed(t *testing.T) {
 	f := driveFeatureChangeAcceptanceFake(driveIntPtr(2), true)
 	f.auditErrCategory = "implement_review_started"

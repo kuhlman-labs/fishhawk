@@ -1441,6 +1441,11 @@ func TestHostDispatcher_AcceptanceReviewStatusReadFailsClosed(t *testing.T) {
 	if o.Spawned || o.Refusal != hdRefuseReviewStatusReadFailed {
 		t.Fatalf("eval = %+v; want review_status_read_failed", o)
 	}
+	// W3: an unreadable round counts against --per-tick-cap like a held one, so
+	// N unreadable rounds cannot do N campaign-link plus N round reads a tick.
+	if !o.CampaignRefused {
+		t.Fatalf("eval = %+v; want CampaignRefused so the unreadable round counts against --per-tick-cap", o)
+	}
 	h.assertNothingPosted(t, "round read failed")
 }
 

@@ -642,8 +642,11 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		mergeQueued = true
 	}
 
-	// The last implement review round hold the loop observed (#5298 W1), so a
-	// deadline reached while acceptance is held names the reason.
+	// The implement review round hold the loop's LATEST step-(c) pass observed
+	// (#5298 W1), so a deadline reached while acceptance is held names the
+	// reason. Cleared on every step-(c) pass before it is re-evaluated, so a
+	// hold that another actor released (acceptance dispatched elsewhere, or
+	// implement re-opened) never names a stale hold at the deadline.
 	var lastRoundHold string
 	var lastRoundHoldStatus *ReviewStatus
 	var lastRoundHoldRun *Run
@@ -656,6 +659,7 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 				out.Warnings = append(out.Warnings, fmt.Sprintf(
 					"max_minutes elapsed while the acceptance stage was held by the implement review round (%s); acceptance dispatches once the round settles", lastRoundHold))
 				out.NextActions = roundHoldNextActions(lastRoundHoldRun, lastRoundHoldStages, lastRoundHold, lastRoundHoldStatus)
+				r.resolveImplementReviewNotStartedShape(ctx, runUUID, lastRoundHoldRun, lastRoundHoldStages, out.NextActions)
 			}
 			return nil, out, nil
 		}
@@ -788,6 +792,7 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		}
 
 		// (c) Dispatch the first host-dispatchable stage — record BEFORE spawn.
+		lastRoundHold, lastRoundHoldStatus, lastRoundHoldRun, lastRoundHoldStages = "", nil, nil, nil
 		disp := driveDispatchableStage(stages, spawned, acceptancePendingDerived)
 		// The implement review ROUND hold (#5298): a spawnable acceptance waits
 		// for the implement round to settle, whether it is in flight or expected
@@ -1537,9 +1542,37 @@ func roundHoldNextActions(run *Run, stages []Stage, hold string, st *ReviewStatu
 	case hdRefuseImplementReviewInFlight:
 		return implementReviewPendingNextActions(run, st)
 	case hdRefuseImplementReviewNotStarted:
-		return implementReviewNotStartedNextActions(run, impl)
+		return implementReviewNotStartedNextActions(run, implementReviewShapeOf(run, impl))
 	}
 	return nil
+}
+
+// resolveImplementReviewNotStartedShape settles an UNKNOWN
+// implement_review_not_started shape (#5298 W2) from the run's plan_decomposed
+// record, the positive decomposition signal: the server's first-round handler
+// identifies a parent by its children, never by dispatched_at, and a fan-in
+// verify pass dispatches a parent's implement stage before its first
+// consolidated round. It rewrites na in place: a plan_decomposed record picks
+// the decomposed-parent arm (fishhawk_rerun_review), none picks the
+// non-decomposed arm. A read error leaves the unknown arm, which never offers
+// an acceptance dispatch. Zero reads unless na is that arm with an unknown
+// shape. Wired at fishhawk_get_run_status and the drive deadline return.
+func (r *runResolver) resolveImplementReviewNotStartedShape(ctx context.Context, runID uuid.UUID, run *Run, stages []Stage, na *NextActions) {
+	if na == nil || na.State != "implement_review_not_started" || run == nil {
+		return
+	}
+	if implementReviewShapeOf(run, stageByType(stages, "implement")) != implementReviewShapeUnknown {
+		return
+	}
+	pd, err := r.api.LatestPlanDecomposed(ctx, runID)
+	if err != nil {
+		return
+	}
+	shape := implementReviewShapeNotDecomposed
+	if pd != nil {
+		shape = implementReviewShapeDecomposedParent
+	}
+	*na = *implementReviewNotStartedNextActions(run, shape)
 }
 
 // driveAnyInFlight reports whether any stage is still executing: a running

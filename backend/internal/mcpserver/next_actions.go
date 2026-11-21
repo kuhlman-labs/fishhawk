@@ -1518,15 +1518,43 @@ func implementReviewPendingNextActions(run *Run, st *ReviewStatus) *NextActions 
 	}
 }
 
-// implementReviewDecomposedParent reports whether impl reached succeeded
-// through the decomposition fan-in rather than its own runner: the stage
-// transition table makes succeeded reachable without a 'dispatched' entry only
-// from awaiting_children, and dispatched_at is stamped on every entry into
-// 'dispatched' and never cleared, so a succeeded implement stage with no
-// dispatched_at is a decomposed parent's. A parent whose implement stage a
-// fan-in verify pass re-opened and dispatched reads as non-decomposed here.
-func implementReviewDecomposedParent(impl *Stage) bool {
-	return impl != nil && impl.State == "succeeded" && impl.DispatchedAt == nil
+// implementReviewRoundShape is which recovery the implement_review_not_started
+// arm offers (#5298 W2). The server starts a decomposed parent's first
+// consolidated round through fishhawk_rerun_review and identifies the parent
+// by its children, never by dispatched_at (review_rerun.go
+// rerunFirstConsolidatedRound), so only a positive signal picks either shape.
+type implementReviewRoundShape int
+
+const (
+	// implementReviewShapeUnknown: nothing in the snapshot proves either
+	// shape. A fan-in verify pass dispatches a decomposed parent's implement
+	// stage (stamping dispatched_at) before its first consolidated round, so a
+	// dispatched implement stage alone proves nothing.
+	implementReviewShapeUnknown implementReviewRoundShape = iota
+	// implementReviewShapeDecomposedParent: the run is a decomposed parent.
+	implementReviewShapeDecomposedParent
+	// implementReviewShapeNotDecomposed: the run is positively not a
+	// decomposed parent, so fishhawk_rerun_review refuses no_review_round.
+	implementReviewShapeNotDecomposed
+)
+
+// implementReviewShapeOf reads the shape from the run and its implement stage
+// alone. A run minted as a fan-out child is not a parent (the server refuses
+// its first round no_review_round). A succeeded implement stage with no
+// dispatched_at is a decomposed parent's: the stage transition table makes
+// succeeded reachable without a 'dispatched' entry only from
+// awaiting_children, and dispatched_at is stamped on every entry into
+// 'dispatched' and never cleared. Anything else is unknown here; the status
+// and drive surfaces resolve it from the run's plan_decomposed record
+// (resolveImplementReviewNotStartedShape).
+func implementReviewShapeOf(run *Run, impl *Stage) implementReviewRoundShape {
+	if run != nil && run.DecomposedFrom != nil && *run.DecomposedFrom != "" {
+		return implementReviewShapeNotDecomposed
+	}
+	if impl != nil && impl.State == "succeeded" && impl.DispatchedAt == nil {
+		return implementReviewShapeDecomposedParent
+	}
+	return implementReviewShapeUnknown
 }
 
 // implementReviewNotStartedNextActions is the implement_review_not_started arm
@@ -1535,15 +1563,27 @@ func implementReviewDecomposedParent(impl *Stage) bool {
 // stage's current head, so the host dispatcher and fishhawk_drive_run hold
 // acceptance. It leads with a poll. The recovery verb depends on the shape:
 // a decomposed parent's consolidated round is started by fishhawk_rerun_review
-// (#4282); on any other run that verb refuses (no_review_round), because the
-// round was never written at trace time (the plan failed to load or the
-// review prompt build failed), so the operator dispatches acceptance by hand.
-func implementReviewNotStartedNextActions(run *Run, impl *Stage) *NextActions {
-	actions := []SuggestedAction{
-		pollAction(run, suggestedReviewPollIntervalSeconds,
-			"the workflow declares implement agent reviewers but no review round is recorded for the implement stage's current head; acceptance dispatches once the round starts and settles — re-poll"),
+// (#4282); on a run that is positively not a decomposed parent that verb
+// refuses (no_review_round), because the round was never written at trace
+// time (the plan failed to load or the review prompt build failed), so a
+// local operator dispatches acceptance by hand; a github_actions run only
+// polls (nothing runs from the operator host). An UNKNOWN shape offers
+// fishhawk_rerun_review, never an acceptance dispatch: a missed decomposed
+// parent must not be steered to acceptance with no consolidated review, and on
+// any other run the verb refuses write-free.
+func implementReviewNotStartedNextActions(run *Run, shape implementReviewRoundShape) *NextActions {
+	const hold = "the workflow declares implement agent reviewers but no review round is recorded for the implement stage's current head; acceptance dispatches once the round starts and settles"
+	if shape == implementReviewShapeNotDecomposed && run.RunnerKind == "github_actions" {
+		return &NextActions{State: "implement_review_not_started", Actions: []SuggestedAction{
+			pollAction(run, suggestedReviewPollIntervalSeconds,
+				hold+"; runner_kind github_actions auto-dispatches the acceptance stage — nothing to run from the operator host; re-poll"),
+		}}
 	}
-	if implementReviewDecomposedParent(impl) {
+	actions := []SuggestedAction{
+		pollAction(run, suggestedReviewPollIntervalSeconds, hold+" — re-poll"),
+	}
+	switch shape {
+	case implementReviewShapeDecomposedParent:
 		actions = append(actions, SuggestedAction{
 			Action:       "fishhawk_rerun_review",
 			Params:       map[string]string{"run_id": run.ID},
@@ -1551,14 +1591,21 @@ func implementReviewNotStartedNextActions(run *Run, impl *Stage) *NextActions {
 			Consumes:     consumesNone,
 			Reason:       "starts a decomposed parent's first consolidated implement review round (#4282); acceptance then dispatches once that round settles",
 		})
-	} else {
-		params := map[string]string{"run_id": run.ID, "stage": "acceptance", "auto_preview": "true"}
+	case implementReviewShapeNotDecomposed:
 		actions = append(actions, SuggestedAction{
 			Action:       "fishhawk_dispatch_stage",
-			Params:       params,
+			Params:       map[string]string{"run_id": run.ID, "stage": "acceptance", "auto_preview": "true"},
 			Precondition: "the implement review round was never recorded for the implement stage's current head (no implement_review_started row: the plan failed to load or the review prompt build failed at trace time), so no round will start on its own and fishhawk_rerun_review refuses no_review_round. Read the run status first and accept that acceptance then runs with no implement agent review",
 			Consumes:     consumesNone,
 			Reason:       "dispatches the held acceptance stage by hand with the auto-preview pair; the host dispatcher keeps holding it while the round is missing",
+		})
+	default:
+		actions = append(actions, SuggestedAction{
+			Action:       "fishhawk_rerun_review",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the round never starts and this snapshot could not tell whether the run is a decomposed parent (its implement stage was dispatched, for example by a fan-in verify pass, and no plan_decomposed read settled it). On a decomposed parent this starts the first consolidated round; on any other run it refuses no_review_round write-free, and fishhawk_get_run_status then names the hand acceptance dispatch",
+			Consumes:     consumesNone,
+			Reason:       "starts a decomposed parent's first consolidated implement review round (#4282) without risking an acceptance dispatch that skips the consolidated review",
 		})
 	}
 	return &NextActions{State: "implement_review_not_started", Actions: actions}
@@ -1638,7 +1685,7 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 		// and fishhawk_drive_run hold acceptance (implement_review_not_started).
 		// Name that hold rather than offering an acceptance dispatch they refuse.
 		if implementReviewStatus != nil && implementReviewStatus.Status == "none" && implementReviewExpected(impl) && acceptance != nil && (acceptance.State == "pending" || acceptance.State == "awaiting_host_dispatch") {
-			return implementReviewNotStartedNextActions(run, impl)
+			return implementReviewNotStartedNextActions(run, implementReviewShapeOf(run, impl))
 		}
 		if hint != nil {
 			// #3116: recommending fishhawk_fixup_stage is only legal while the
