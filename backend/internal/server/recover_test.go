@@ -2294,6 +2294,281 @@ func TestRecoverRun_InheritsParentApprovedAmendments(t *testing.T) {
 	}
 }
 
+// seedPendingAmendmentRow files a PENDING amendment (never decided) on
+// (runID, stageID) carrying path, and returns its id.
+func seedPendingAmendmentRow(t *testing.T, sa *fakeScopeAmendmentRepo, runID, stageID uuid.UUID, path string) uuid.UUID {
+	t.Helper()
+	a, err := sa.Create(context.Background(), scopeamendment.CreateParams{
+		RunID:   runID,
+		StageID: stageID,
+		Paths:   []scopeamendment.PathEntry{{Path: path, Operation: scopeamendment.OperationModify}},
+		Reason:  "pending seam",
+	})
+	if err != nil {
+		t.Fatalf("create pending amendment: %v", err)
+	}
+	return a.ID
+}
+
+// promptRenderScopePaths GETs the stage's prompt-render and returns the set of
+// effective scope.files paths the rendered implement prompt carries.
+func promptRenderScopePaths(t *testing.T, s *Server, stageID uuid.UUID) map[string]bool {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prompt-render status = %d, want 200:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt-render: %v", err)
+	}
+	got := make(map[string]bool, len(resp.ScopeFiles))
+	for _, f := range resp.ScopeFiles {
+		got[f.Path] = true
+	}
+	return got
+}
+
+// TestRecoverRun_UndecidedThenApprovedParentAmendmentInheritedOnResume pins the
+// server half of the category-B recovery text the runner emits (#5403). A
+// category-B-failed parent keeps its undecided amendments decidable; the
+// operator approves ONE through the real decide route
+// (fishhawk_decide_scope_amendment's handler) and leaves the other pending,
+// then resumes with an EMPTY body (no add_scope_files). The recovery child must
+// carry exactly the approved path on its OWN implement stage — folded into its
+// prompt scope — and must NOT inherit the still-pending sibling, which is why the
+// runner text says to decide BEFORE resuming and need not tell the operator to
+// re-name an approved path in add_scope_files.
+//
+// The decide-returns-200 assertion is a HANDLER check against the fake
+// repository (the route accepts a decision on a failed run's pending row); it
+// is not the #4127 lapse pin — the lapse rule (failed does not lapse) lives in
+// scopeamendment.StageStateLapses / RunStateLapses and is pinned in that
+// package.
+func TestRecoverRun_UndecidedThenApprovedParentAmendmentInheritedOnResume(t *testing.T) {
+	const plannedFile = "backend/internal/server/handlers.go"
+	const approvedPath = "backend/internal/server/cancel_test.go"
+	const pendingPath = "backend/internal/server/still_pending.go"
+
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
+
+	parent, planStage, parentImplement := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "recoverable plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	// Two amendments the failed implement stage left UNDECIDED.
+	approveID := seedPendingAmendmentRow(t, sa, parent.ID, parentImplement.ID, approvedPath)
+	pendingID := seedPendingAmendmentRow(t, sa, parent.ID, parentImplement.ID, pendingPath)
+
+	au := &recoverAuditRepo{}
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		ArtifactRepo:       art,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	// (a) the operator approves ONE through the real decide route; the other
+	// stays pending.
+	dw := postDecision(t, s, parent.ID, approveID, `{"decision":"approve","reason":"coupled seam"}`,
+		func(r *http.Request) *http.Request { return withOperatorIdentity(r, "write:stages") })
+	if dw.Code != http.StatusOK {
+		t.Fatalf("decide status = %d, want 200 (a failed parent keeps its undecided row decidable):\n%s", dw.Code, dw.Body.String())
+	}
+	if pend, _ := sa.GetByID(context.Background(), pendingID); pend.Status != scopeamendment.StatusPending {
+		t.Fatalf("sibling status = %q after approving the other, want pending", pend.Status)
+	}
+
+	// Resume with an EMPTY body: no add_scope_files.
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode recover response: %v", err)
+	}
+	childStages, err := rr.ListStagesForRun(context.Background(), created.ID)
+	if err != nil || len(childStages) != 1 {
+		t.Fatalf("child stages = %v (err %v), want exactly one", childStages, err)
+	}
+	childImplement := childStages[0]
+
+	// (b) exactly one approved amendment on the child's OWN implement stage,
+	// holding only the approved path — the pending sibling was not inherited.
+	childAmendments, err := sa.ListByRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list child amendments: %v", err)
+	}
+	if len(childAmendments) != 1 {
+		t.Fatalf("child amendments = %d, want 1 (the inherited approved amendment only)", len(childAmendments))
+	}
+	ca := childAmendments[0]
+	if ca.StageID != childImplement.ID || ca.StageID == parentImplement.ID {
+		t.Errorf("inherited amendment StageID = %s, want the child's own implement %s", ca.StageID, childImplement.ID)
+	}
+	if ca.Status != scopeamendment.StatusApproved {
+		t.Errorf("inherited amendment Status = %q, want approved", ca.Status)
+	}
+	if len(ca.Paths) != 1 || ca.Paths[0].Path != approvedPath {
+		t.Errorf("inherited amendment Paths = %+v, want only %q", ca.Paths, approvedPath)
+	}
+
+	// (c) provenance lists only the approved path.
+	inherited := decodeInheritedAmendments(t, au, created.ID)
+	if len(inherited) != 1 || inherited[0].Path != approvedPath {
+		t.Errorf("provenance inherited_amendments = %+v, want only %q", inherited, approvedPath)
+	}
+
+	// (d) the approved path is folded into the child implement prompt's
+	// effective scope.files with no add_scope_files; the pending sibling is not.
+	got := promptRenderScopePaths(t, s, childImplement.ID)
+	if !got[plannedFile] {
+		t.Errorf("ScopeFiles missing the parent plan's %q; got %#v", plannedFile, got)
+	}
+	if !got[approvedPath] {
+		t.Errorf("ScopeFiles missing the approved path %q (inheritance fold broke); got %#v", approvedPath, got)
+	}
+	if got[pendingPath] {
+		t.Errorf("ScopeFiles contains the still-pending path %q; a pending amendment must not be folded or inherited", pendingPath)
+	}
+
+	// The still-pending sibling stays pending on the PARENT's stage: a
+	// recovery run does not inherit it, so it must be decided before resuming.
+	pend, _ := sa.GetByID(context.Background(), pendingID)
+	if pend.Status != scopeamendment.StatusPending || pend.StageID != parentImplement.ID {
+		t.Errorf("sibling = %q on stage %s, want still pending on the parent's implement %s",
+			pend.Status, pend.StageID, parentImplement.ID)
+	}
+}
+
+// TestRecoverRun_DecompositionChildInPlace_ApprovedAmendmentStillFolds pins the
+// in-place half of the category-B recovery text (#5403). A decomposition child
+// is re-driven on the SAME run and the SAME implement stage id, so an APPROVED
+// amendment already on that stage still applies — no add_scope_files is needed
+// and no second row is minted — and the re-rendered implement prompt's
+// scope.files carries it (mergeApprovedScopeAmendments). A row left PENDING on
+// the same stage stays pending on that same stage id after /recover: it is not
+// folded, so the runner's undecided-amendment check would match it again on the
+// re-drive and withhold the verify-fix reinvoke again, which is why the text
+// says to decide BEFORE resuming.
+func TestRecoverRun_DecompositionChildInPlace_ApprovedAmendmentStillFolds(t *testing.T) {
+	const approvedPath = "docs/extra.md"
+	const pendingPath = "backend/new.go"
+	const plannedFile = "backend/internal/server/handlers.go"
+
+	s, rr, sa, _, art := newDecompositionRecoverServer(t)
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+	child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+	seedApprovedAmendment(t, sa, child.ID, implStage.ID, approvedPath)
+	pendingID := seedPendingAmendmentRow(t, sa, child.ID, implStage.ID, pendingPath)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Same run, same implement stage id, re-opened pending.
+	if resp.ID != child.ID {
+		t.Errorf("re-drive minted a new run %s, want in-place %s", resp.ID, child.ID)
+	}
+	stages, err := rr.ListStagesForRun(context.Background(), child.ID)
+	if err != nil || len(stages) != 1 {
+		t.Fatalf("child stages = %v (err %v), want the one implement stage", stages, err)
+	}
+	if stages[0].ID != implStage.ID {
+		t.Errorf("implement stage id = %s, want unchanged %s", stages[0].ID, implStage.ID)
+	}
+	reopened, err := rr.GetStage(context.Background(), implStage.ID)
+	if err != nil {
+		t.Fatalf("get implement stage: %v", err)
+	}
+	if reopened.State != run.StageStatePending {
+		t.Errorf("implement stage state = %q, want pending (re-opened)", reopened.State)
+	}
+
+	// The approved row is still approved on the SAME stage id and no second row
+	// was minted for it; the seeded pending row is the only other row.
+	rows, err := sa.ListByRun(context.Background(), child.ID)
+	if err != nil {
+		t.Fatalf("list amendments: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("amendments = %d, want 2 (the seeded approved + pending rows, nothing minted)", len(rows))
+	}
+	var approved, pending int
+	for _, a := range rows {
+		if a.StageID != implStage.ID {
+			t.Errorf("amendment %s StageID = %s, want the unchanged implement stage %s", a.ID, a.StageID, implStage.ID)
+		}
+		switch a.Status {
+		case scopeamendment.StatusApproved:
+			approved++
+			if len(a.Paths) != 1 || a.Paths[0].Path != approvedPath {
+				t.Errorf("approved row Paths = %+v, want only %q", a.Paths, approvedPath)
+			}
+		case scopeamendment.StatusPending:
+			pending++
+		}
+	}
+	if approved != 1 || pending != 1 {
+		t.Errorf("approved/pending rows = %d/%d, want 1/1", approved, pending)
+	}
+
+	// The seeded pending row is still pending on the same stage id.
+	pend, err := sa.GetByID(context.Background(), pendingID)
+	if err != nil {
+		t.Fatalf("get pending amendment: %v", err)
+	}
+	if pend.Status != scopeamendment.StatusPending || pend.StageID != implStage.ID {
+		t.Errorf("pending row = %q on stage %s, want still pending on %s", pend.Status, pend.StageID, implStage.ID)
+	}
+
+	// The approved path folds into the re-opened stage's prompt scope.files with
+	// no add_scope_files; the pending path does not.
+	got := promptRenderScopePaths(t, s, implStage.ID)
+	if !got[plannedFile] {
+		t.Errorf("ScopeFiles missing the parent plan's %q; got %#v", plannedFile, got)
+	}
+	if !got[approvedPath] {
+		t.Errorf("ScopeFiles missing the approved path %q (mergeApprovedScopeAmendments fold broke); got %#v", approvedPath, got)
+	}
+	if got[pendingPath] {
+		t.Errorf("ScopeFiles contains the still-pending path %q; a pending amendment must not be folded", pendingPath)
+	}
+}
+
 // TestRecoverRun_InheritDedupsAgainstOperatorAddScopeFiles pins the dedup
 // branch (#1770): when the operator's add_scope_files names the SAME path as an
 // inherited approved amendment, exactly one amendment row is minted for that

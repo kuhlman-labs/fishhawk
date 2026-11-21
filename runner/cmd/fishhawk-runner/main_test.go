@@ -19200,16 +19200,17 @@ func TestDetectUndecidedScopeAmendments_NoOpGuards(t *testing.T) {
 }
 
 // TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery pins the
-// category-B demote annotation: the captured verify output is preserved as the
-// prefix, and the appended text names the amendment id, the requested path(s)
-// with their operation, the never-DECIDED (not denied) framing, and the
-// recovery QUALIFIED by the #4127 lapse rule: decide-then-retry while the
-// stage or run is failed (both stay recoverable), and fishhawk_resume_run
-// add_scope_files / fishhawk_retry_stage once the request lapses (a stage that
-// succeeds, is cancelled or superseded, or a run that succeeds or is
-// cancelled). The pre-#4127 UNQUALIFIED
-// "still landable" sentence must be gone. The empty case returns the reason
-// byte-identically.
+// undecided-amendment failure annotation per failure category (#5403): the
+// captured verify output is preserved as the prefix, and the appended text
+// names the amendment id, the requested path(s) with their operation, the
+// never-DECIDED (not denied) framing, and the recovery QUALIFIED by the #4127
+// lapse rule. The recovery verb is keyed on the category the stage was demoted
+// to: category B is told decide-then-fishhawk_resume_run and NEVER
+// fishhawk_retry_stage (which refuses every category-B stage, 422
+// retry_not_applicable); categories A and C keep decide-then-fishhawk_retry_stage
+// and never name fishhawk_resume_run. The pre-#4127 UNQUALIFIED "still
+// landable" sentence must be gone. The empty case returns the reason
+// byte-identically for every category.
 func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T) {
 	const reason = "verify command \"go test ./...\" failed:\nFAIL example.com/mod"
 	undecided := []upload.ScopeAmendment{
@@ -19219,34 +19220,63 @@ func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T)
 		}},
 	}
 
-	got := annotateUndecidedAmendmentFailure(reason, undecided)
-
-	if !strings.HasPrefix(got, reason) {
-		t.Errorf("annotation dropped the captured verify output prefix:\n%s", got)
+	retryOnly := []string{
+		"then fishhawk_retry_stage",
+		"an approval folds the requested paths into the retried stage",
+		"recover then with fishhawk_retry_stage",
 	}
-	for _, want := range []string{
-		"amd-42",
-		"pkg/coupled_test.go (modify)",
-		"pkg/new.go (create)",
-		"never DECIDED (not denied",
-		"The request stays `pending` — a failed stage or failed run stays recoverable",
-		"a run that succeeds or is cancelled, LAPSES the request (#4127)",
-		"decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
-		"LAPSES the request (#4127)",
-		"amendment_lapsed",
-		"fishhawk_resume_run add_scope_files naming the paths above (category B)",
-		"fishhawk_retry_stage (category C)",
+	for _, tc := range []struct {
+		name     string
+		category string
+		want     []string
+		forbid   string // verb that must NOT appear anywhere in the text
+	}{
+		{
+			name:     "category B names resume_run and never retry_stage",
+			category: "B",
+			want: []string{
+				"then fishhawk_resume_run",
+				"422 retry_not_applicable",
+				"folded automatically on resume",
+				"#1770",
+				"fishhawk_resume_run add_scope_files naming the paths above",
+				"Decide before resuming",
+			},
+			forbid: "fishhawk_retry_stage",
+		},
+		{name: "category C names retry_stage and never resume_run", category: "C", want: retryOnly, forbid: "fishhawk_resume_run"},
+		{name: "category A names retry_stage and never resume_run", category: "A", want: retryOnly, forbid: "fishhawk_resume_run"},
 	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("annotated reason missing %q:\n%s", want, got)
-		}
-	}
-	if strings.Contains(got, "The request is still `pending`, so the decision is still landable") {
-		t.Errorf("annotated reason still carries the unqualified pre-#4127 recovery:\n%s", got)
-	}
+		t.Run(tc.name, func(t *testing.T) {
+			got := annotateUndecidedAmendmentFailure(reason, undecided, tc.category)
 
-	if plain := annotateUndecidedAmendmentFailure(reason, nil); plain != reason {
-		t.Errorf("no-undecided case must return the reason unchanged, got %q", plain)
+			if !strings.HasPrefix(got, reason) {
+				t.Errorf("annotation dropped the captured verify output prefix:\n%s", got)
+			}
+			for _, want := range append([]string{
+				"amd-42",
+				"pkg/coupled_test.go (modify)",
+				"pkg/new.go (create)",
+				"never DECIDED (not denied",
+				"decide it with fishhawk_decide_scope_amendment",
+				"The request stays `pending` — a failed stage or failed run stays recoverable",
+				"a run that succeeds or is cancelled, LAPSES the request (#4127)",
+				"amendment_lapsed",
+			}, tc.want...) {
+				if !strings.Contains(got, want) {
+					t.Errorf("annotated reason missing %q:\n%s", want, got)
+				}
+			}
+			if strings.Contains(got, tc.forbid) {
+				t.Errorf("category %s annotation must not name %s:\n%s", tc.category, tc.forbid, got)
+			}
+			if strings.Contains(got, "The request is still `pending`, so the decision is still landable") {
+				t.Errorf("annotated reason still carries the unqualified pre-#4127 recovery:\n%s", got)
+			}
+			if plain := annotateUndecidedAmendmentFailure(reason, nil, tc.category); plain != reason {
+				t.Errorf("no-undecided case must return the reason unchanged, got %q", plain)
+			}
+		})
 	}
 }
 
@@ -19448,11 +19478,31 @@ func TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke(t *testing.T) {
 	// The demote reason is actionable: the amendment id, the requested path, and
 	// the recovery qualified by the #4127 lapse rule (decide-then-retry while the
 	// stage or run is failed; resume_run add_scope_files once it lapses).
-	for _, want := range []string{"amd-e2e", "mod/other.go", "fishhawk_decide_scope_amendment", "fishhawk_retry_stage",
+	for _, want := range []string{"amd-e2e", "mod/other.go", "fishhawk_decide_scope_amendment", "then fishhawk_resume_run",
 		"LAPSES the request", "fishhawk_resume_run add_scope_files"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("failure reason missing %q:\n%s", want, stderr.String())
 		}
+	}
+	// The REPORTED failure reason — what the backend receives in the
+	// failure-report POST (#5403) — must route a category-B failure to
+	// fishhawk_resume_run and never to fishhawk_retry_stage, which refuses every
+	// category-B stage (422 retry_not_applicable). Read from the uploader's
+	// recorded report, not from stderr, which may legitimately mention other
+	// verbs. This is the cross-boundary run() → committed gate → classifier →
+	// annotation test: it proves the caller wires res.FailureCategory through.
+	rep := fu.gotPRArgs
+	if rep == nil {
+		t.Fatal("no failure report reached the uploader")
+	}
+	if rep.Outcome != "failed" || rep.Category != "B" {
+		t.Errorf("failure report outcome/category = %q/%q, want failed/B", rep.Outcome, rep.Category)
+	}
+	if !strings.Contains(rep.Reason, "then fishhawk_resume_run") {
+		t.Errorf("reported failure reason must route category B to fishhawk_resume_run:\n%s", rep.Reason)
+	}
+	if strings.Contains(rep.Reason, "fishhawk_retry_stage") {
+		t.Errorf("reported category-B failure reason must not name fishhawk_retry_stage (refused 422 retry_not_applicable):\n%s", rep.Reason)
 	}
 }
 
