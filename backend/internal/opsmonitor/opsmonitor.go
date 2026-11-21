@@ -141,8 +141,8 @@ var remedies = map[string]string{
 	ConditionStorageEIO:                      "Storage is returning I/O errors: free host disk, restart Docker Desktop, confirm Postgres is healthy, then reap stranded stages (fishhawk_reap_stage).",
 	ConditionPostgresUnreachable:             "Check the Postgres container (`docker ps`, `docker logs`), free host disk if it crashed on EIO, restart it, then reap stages stranded by the outage.",
 	ConditionOrphanedRunner:                  "Confirm the pid is a fishhawk-runner whose stage is terminal (`ps -o pid,args -p <pid>`) and kill it; it holds host resources and can block reload/post-merge.",
-	ConditionAmendmentWindowClosing:          "Decide the amendment now with fishhawk_decide_scope_amendment (fishhawk_list_scope_amendments names it). Once the window closes the implement agent stops waiting, and a later approval lands only through fishhawk_retry_stage.",
-	ConditionAmendmentPendingOnTerminalStage: "The stage is terminal, so no agent will read a decision: deny the amendment with fishhawk_decide_scope_amendment to close it, or approve it and run fishhawk_retry_stage to land the paths.",
+	ConditionAmendmentWindowClosing:          "Decide the amendment now with fishhawk_decide_scope_amendment (fishhawk_list_scope_amendments names it). Once the window closes the implement agent stops waiting, and a later approval lands through fishhawk_retry_stage when the stage fails category C, or fishhawk_resume_run (which folds an approved amendment automatically) when it fails category B.",
+	ConditionAmendmentPendingOnTerminalStage: "The stage is terminal, so no agent will read a decision: deny the amendment with fishhawk_decide_scope_amendment to close it, or approve it and land the paths with fishhawk_retry_stage when the stage failed category C, or fishhawk_resume_run (which folds an approved amendment automatically) when it failed category B.",
 	// The three host-health remedies are host- and codebase-agnostic. The
 	// memory and container probes compose their own remedy naming the
 	// contributors, which wins over these table entries.

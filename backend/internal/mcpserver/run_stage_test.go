@@ -1312,9 +1312,13 @@ func TestRunStageEventMessage_ScopeAmendmentUndecided(t *testing.T) {
 		"docs/ARCHITECTURE.md (modify)",
 		"x/new.go (create)",
 		"never decided (NOT denied)",
-		// #4127: the decide-then-retry recovery is QUALIFIED by the lapse
-		// rule, and the post-lapse recovery is named.
-		"it stays pending — a failed stage or failed run stays recoverable: decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
+		// #4127: the recovery is QUALIFIED by the lapse rule, and the
+		// post-lapse recovery is named. #5403: the decidable-request recovery
+		// names BOTH routes conditionally (the line is emitted before the
+		// category exists), because fishhawk_retry_stage refuses category B.
+		"it stays pending — a failed stage or failed run stays recoverable: decide it with fishhawk_decide_scope_amendment",
+		"if the stage fails category C, fishhawk_retry_stage",
+		"if it fails category B (a red committed tree, the common case), fishhawk_resume_run",
 		"or a run that succeeds or is cancelled, lapses it",
 		"amendment_lapsed",
 		"fishhawk_resume_run add_scope_files naming these paths (category B)",
@@ -1328,6 +1332,11 @@ func TestRunStageEventMessage_ScopeAmendmentUndecided(t *testing.T) {
 	// decision was landable regardless of what happened to the stage or run.
 	if strings.Contains(got, "(NOT denied); decide it with") {
 		t.Errorf("message = %q still carries the unqualified decide-then-retry recovery", got)
+	}
+	// #5403: the UNCONDITIONAL decide-then-retry clause is gone — it sent a
+	// category-B failure to fishhawk_retry_stage, which refuses it.
+	if strings.Contains(got, "decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage") {
+		t.Errorf("message = %q still carries the unconditional decide-then-retry clause", got)
 	}
 }
 

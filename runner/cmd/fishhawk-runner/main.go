@@ -2945,11 +2945,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if demote != nil {
 			res.OK = false
 			res.FailureCategory = committedGateFailureCategory(demote)
-			// A stage blocked on an unanswered operator says so, with both
-			// recovery verbs, instead of reporting a bare verify failure. Only on
-			// the FAILURE path: a green stage with a pending amendment stays green
-			// (the agent adapted in-scope) and carries the event alone.
-			res.FailureReason = annotateUndecidedAmendmentFailure(demote.Error(), undecidedAmendments)
+			// A stage blocked on an unanswered operator says so, with the
+			// recovery verb keyed on the category just set (B → resume_run, A/C
+			// → retry_stage; #5403), instead of reporting a bare verify failure.
+			// Only on the FAILURE path: a green stage with a pending amendment
+			// stays green (the agent adapted in-scope) and carries the event alone.
+			res.FailureReason = annotateUndecidedAmendmentFailure(demote.Error(), undecidedAmendments, res.FailureCategory)
 			invokeErr = demote
 		}
 	}
@@ -12602,27 +12603,63 @@ func detectUndecidedScopeAmendments(ctx context.Context, client uploadClient, cf
 	}}
 }
 
+// undecidedAmendmentRecovery is the single source of the recovery verbs the
+// undecided-amendment failure text names, keyed on the failure category the
+// stage was demoted to (#5403). whilePending is the clause for the request
+// while it is still `pending` (decide it, then recover); afterLapse is the
+// clause for once the request has lapsed (#4127).
+//
+// Category B (a red committed tree — the common case) is recovered with
+// fishhawk_resume_run: fishhawk_retry_stage refuses every category-B stage
+// (422 retry_not_applicable), so naming it would send the operator into a
+// refusal. A resume folds an APPROVED amendment automatically — a top-level
+// resume inherits it onto the recovery run's implement stage (#1770) and a
+// decomposition child is re-driven in place on the same implement stage — so
+// add_scope_files need name only paths the operator did not approve. A request
+// left pending is not inherited by a recovery run, and on an in-place re-drive
+// it stays pending and withholds the verify-fix reinvoke again, so the text
+// says to decide first. Any other category (A/C) is retried in place with
+// fishhawk_retry_stage, which folds an approval into the retried stage's
+// effective scope.
+func undecidedAmendmentRecovery(failureCategory string) (whilePending, afterLapse string) {
+	if failureCategory == "B" {
+		return "decide it with fishhawk_decide_scope_amendment, then fishhawk_resume_run on this run " +
+				"(for a decomposition child, on the child's own run id) — a stage retry is refused for every " +
+				"category-B failure (422 retry_not_applicable). An APPROVED amendment is folded automatically on " +
+				"resume: a top-level resume inherits it onto the recovery run's implement stage (#1770), and a " +
+				"decomposition child is re-driven in place on the same implement stage, so add_scope_files need " +
+				"name only paths you did not approve. Decide before resuming: a request left pending is not " +
+				"inherited by a recovery run, and on an in-place re-drive it stays pending and withholds the " +
+				"verify-fix reinvoke again",
+			"fishhawk_resume_run add_scope_files naming the paths above, on which the agent may re-request them"
+	}
+	return "decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage — an approval folds the " +
+			"requested paths into the retried stage's effective scope",
+		"fishhawk_retry_stage, on which the agent may re-request them"
+}
+
 // annotateUndecidedAmendmentFailure appends the undecided-amendment recovery
-// path to a category-B demote reason (#2601). The bare committed-tree verify
+// path to a verify-gate demote reason (#2601). The bare committed-tree verify
 // failure reads as "the agent wrote broken code", when in fact the stage was
 // blocked on an operator who never answered — so the message names the
 // amendment id(s) and requested path(s), states that the request was never
 // DECIDED (not denied), and gives the recovery QUALIFIED by the #4127 lapse
 // rule: the request stays `pending` (a failed stage or failed run stays
-// recoverable), so fishhawk_decide_scope_amendment then fishhawk_retry_stage
-// folds an approval into the retried stage; once the stage succeeds, is
-// cancelled or superseded, or the run succeeds or is cancelled, the request
-// LAPSES (a later decide is refused 409 amendment_lapsed) and the recovery is
-// fishhawk_resume_run
-// add_scope_files naming the paths (category B) or fishhawk_retry_stage
-// (category C), on which the agent may re-request them.
+// recoverable), so it is decidable; once the stage succeeds, is cancelled or
+// superseded, or the run succeeds or is cancelled, the request LAPSES (a later
+// decide is refused 409 amendment_lapsed). The recovery verbs are keyed on
+// failureCategory — the category the stage was demoted to — and both the
+// pending and the lapse clauses come from undecidedAmendmentRecovery, so a
+// category-B failure is never told to fishhawk_retry_stage, which refuses it
+// (#5403).
 //
 // Pure and reason-preserving: the captured verify output stays the prefix, so
 // nothing an operator or reviewer reads today is lost.
-func annotateUndecidedAmendmentFailure(reason string, undecided []upload.ScopeAmendment) string {
+func annotateUndecidedAmendmentFailure(reason string, undecided []upload.ScopeAmendment, failureCategory string) string {
 	if len(undecided) == 0 {
 		return reason
 	}
+	whilePending, afterLapse := undecidedAmendmentRecovery(failureCategory)
 	parts := make([]string, 0, len(undecided))
 	for _, a := range undecided {
 		paths := make([]string, 0, len(a.Paths))
@@ -12645,14 +12682,11 @@ func annotateUndecidedAmendmentFailure(reason string, undecided []upload.ScopeAm
 	return fmt.Sprintf("%s\n\nThis stage filed a mid-stage scope amendment that was never DECIDED (not denied — the "+
 		"operator's decision window expired undecided): %s. The verify-fix reinvoke was withheld because a fix the "+
 		"agent cannot make without an un-amended path cannot converge. The request stays `pending` — a failed stage or "+
-		"failed run stays recoverable — so the decision is landable: decide it with fishhawk_decide_scope_amendment, "+
-		"then fishhawk_retry_stage — an approval folds the requested paths into the retried stage's effective scope. "+
+		"failed run stays recoverable — so the decision is landable: %s. "+
 		"A stage that succeeds, is cancelled or superseded, or a run that succeeds or is cancelled, LAPSES the "+
 		"request (#4127): it can no longer be approved (a later decide is refused 409 amendment_lapsed), so recover "+
-		"then with fishhawk_resume_run "+
-		"add_scope_files naming the paths above (category B) or fishhawk_retry_stage (category C), on which the agent "+
-		"may re-request them.",
-		reason, strings.Join(parts, "; "))
+		"then with %s.",
+		reason, strings.Join(parts, "; "), whilePending, afterLapse)
 }
 
 // scopePaths extracts the repo-relative path list from the resolved
