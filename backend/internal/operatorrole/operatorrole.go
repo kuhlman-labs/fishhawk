@@ -249,10 +249,14 @@ const DelegatedApprovalActorSubject = TokenSubjectPrefix + "delegated"
 //     implement-review round's open concerns are ALL server-check rows
 //     (provenance server_check), which delegation never routes (ADR-084 rule 5 /
 //     ADR-143); a human waives, defers or deliberately routes them (#5477).
+//   - fixup_no_changes_unaddressed: the #5390 route_fixup state, meaning the
+//     last fix-up pass routed exactly the routable open set and produced no
+//     commit, so the delegated arm declines to re-route it unchanged.
 const (
 	DecisionStateHumanQuorumRequired         = "human_quorum_required"
 	DecisionStateDelegatedApprovalNoProgress = "delegated_approval_no_progress"
 	DecisionStateServerCheckAwaitingHuman    = "server_check_awaiting_human"
+	DecisionStateFixupNoChangesUnaddressed   = "fixup_no_changes_unaddressed"
 )
 
 // CampaignActorScopes returns the write scopes the campaign auto-driver's

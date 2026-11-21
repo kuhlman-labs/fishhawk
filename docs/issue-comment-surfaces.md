@@ -3002,11 +3002,14 @@ Notes:
   the SOLE writer, on the item's linked run chain (`AppendChained`, `system`
   actor, `StageID` = the parked gate stage or nil):
   - `campaign_gate_decision_required` (payload `{campaign_id, issue_ref, run_id,
-    gate, decision_state, action}`) records once per occurrence key that the
-    gate actor (`server.Server.DriveCampaignRunGate`) returned a
+    gate, decision_state, action, concern_ids?}`) records once per occurrence
+    key that the gate actor (`server.Server.DriveCampaignRunGate`) returned a
     DecisionRequired outcome; `gate` is the parked plan/implement stage id or
-    the literal `run`.
-  - `campaign_gate_decision_cleared` (the same payload plus `cleared_by`:
+    the literal `run`. `concern_ids` is present only on `decision_state`
+    `fixup_no_changes_unaddressed` (#5390): this run's own concern ids that the
+    last no-change fix-up pass routed. It is absent on every other marker.
+  - `campaign_gate_decision_cleared` (the base payload, never `concern_ids`,
+    plus `cleared_by`:
     `acted`, `paged` or `no_decision`) records that a later non-decision
     outcome whose stage read positively showed the gate no longer parked
     cleared it. An indeterminate read never clears, and a run-level (`run`)

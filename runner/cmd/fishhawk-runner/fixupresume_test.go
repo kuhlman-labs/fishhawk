@@ -152,7 +152,11 @@ func enableFixupResume(t *testing.T) {
 
 // B1. One row per reason; every fallback row differs from the resumed
 // baseline in EXACTLY ONE input, so deleting that row's guard flips the row
-// to "resumed".
+// to "resumed". EXCEPT the two "order pin" rows (#5390, from the #5350
+// review): each differs in TWO inputs on purpose, satisfying two of the first
+// three guards (opt-in, runner channel, availability gate), so its expected
+// reason exists only because of their order. Reordering those guards flips
+// one of the two rows.
 func TestDecideFixupResume(t *testing.T) {
 	base := fixupResumeInputs{agent: "claude-code", agentBinary: "/opt/claude", requestedModel: "m1", workingDir: "/wt/run-1",
 		runnerKind: runnerKindLocal, available: true}
@@ -192,6 +196,10 @@ func TestDecideFixupResume(t *testing.T) {
 			want: fixupResumeReasonUnsupportedChannel, wantDetail: "runner kind "},
 		{name: "availability gate off", in: withAvailable(base, false), rec: &rec, getenv: on,
 			want: fixupResumeReasonDisabled, wantDetail: fixupResumeUnavailableDetail},
+		{name: "order pin: channel before availability gate", in: withAvailable(withKind(base, runnerKindGitHubActions), false),
+			rec: &rec, getenv: on, want: fixupResumeReasonUnsupportedChannel, wantDetail: "runner kind github_actions"},
+		{name: "order pin: opt-in before channel", in: withKind(base, runnerKindGitHubActions), rec: &rec,
+			getenv: func(string) string { return "" }, want: fixupResumeReasonDisabled},
 		{name: "unsupported agent", in: withAgent(base, "codex"), rec: recWithAgent(rec, "codex"), getenv: on, want: fixupResumeReasonUnsupportedAgent},
 		{name: "ledger unreadable", in: base, rec: &rec, readErr: errors.New("corrupt"), getenv: on, want: fixupResumeReasonLedgerUnreadable},
 		{name: "no session recorded", in: base, rec: nil, getenv: on, want: fixupResumeReasonNoSessionRecorded},
@@ -1026,9 +1034,10 @@ const (
 )
 
 // runFixupHarnessArm drives run() twice against the REAL claudecode adapter
-// spawning the fake `claude`: pass 1 an implement stage, pass 2 a one-concern
-// fix-up. betweenPasses runs after pass 1 (Arm X deletes the stored session).
-func runFixupHarnessArm(t *testing.T, runID string, betweenPasses func(store, sessionID string)) fixupHarnessArm {
+// spawning the fake `claude`: pass 1 an implement stage, pass 2 the fix-up
+// fixupResp serves. betweenPasses runs after pass 1 (Arm X deletes the stored
+// session).
+func runFixupHarnessArm(t *testing.T, runID string, fixupResp *upload.FetchedPrompt, betweenPasses func(store, sessionID string)) fixupHarnessArm {
 	t.Helper()
 	bin, store, calls := writeFakeClaude(t)
 	t.Setenv("FISHHAWK_AGENT_BIN", bin)
@@ -1052,7 +1061,7 @@ func runFixupHarnessArm(t *testing.T, runID string, betweenPasses func(store, se
 	}
 
 	fu2 := newFakeUploader(t)
-	fu2.promptResp = fixupRespFor(harnessFixupPrompt)
+	fu2.promptResp = fixupResp
 	withFakeUploader(t, fu2)
 	stderr.Reset()
 	if got := run(fixupResumeArgs(runID), &stderr); got != exitOK {
@@ -1086,7 +1095,7 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 	enableFixupResume(t)
 
 	// Arm R: resume.
-	armR := runFixupHarnessArm(t, "4089b10a-0000-4000-8000-000000000001", nil)
+	armR := runFixupHarnessArm(t, "4089b10a-0000-4000-8000-000000000001", fixupRespFor(harnessFixupPrompt), nil)
 	if armR.fixupCallCount != 1 {
 		t.Fatalf("arm R fix-up spawns = %d, want 1", armR.fixupCallCount)
 	}
@@ -1109,7 +1118,7 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 
 	// Arm F: the identical scenario with the opt-in dropped.
 	withFixupResumeOptIn(t, "", runnerKindLocal)
-	armF := runFixupHarnessArm(t, "4089b10b-0000-4000-8000-000000000001", nil)
+	armF := runFixupHarnessArm(t, "4089b10b-0000-4000-8000-000000000001", fixupRespFor(harnessFixupPrompt), nil)
 	if fixF := armF.calls[len(armF.calls)-1]; fixF.resume != "" || fixF.prompt != harnessFixupPrompt {
 		t.Errorf("arm F fix-up spawn = %+v, want fresh with the fix-up prompt", fixF)
 	}
@@ -1131,7 +1140,7 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 
 	// Arm X: the stored session expired between passes. Re-enable the opt-in.
 	enableFixupResume(t)
-	armX := runFixupHarnessArm(t, "4089b10c-0000-4000-8000-000000000001", func(store, sid string) {
+	armX := runFixupHarnessArm(t, "4089b10c-0000-4000-8000-000000000001", fixupRespFor(harnessFixupPrompt), func(store, sid string) {
 		_ = os.Remove(filepath.Join(store, sid+".len"))
 		_ = os.Remove(filepath.Join(store, sid+".jsonl"))
 	})
@@ -1149,5 +1158,95 @@ func TestFixupResume_TokenCostHarness_ThreeXCheaper(t *testing.T) {
 	}
 	if xUsage := armX.manifest.InputTokens + armX.manifest.OutputTokens; xUsage != freshUsage || armX.completed != freshUsage {
 		t.Errorf("arm X usage manifest=%d completed=%d, want arm F's %d plus the zero-token refused attempt", xUsage, armX.completed, freshUsage)
+	}
+}
+
+// fixupResumeConcernsGolden is the shared wire golden
+// testdata/wire/fixup_resume_concerns_prompt.json: the FULL implement fix-up
+// prompt the backend serves after a real concern_ids route, plus its
+// "### Fix-up concerns" section and the routed ids and notes. The backend
+// producer is TestFixupResumeWire_ServedPromptMatchesGolden
+// (backend/internal/server/prompt_fixup_resume_wire_test.go), regenerated
+// with -update.
+type fixupResumeConcernsGolden struct {
+	FixupConcernsSection string   `json:"fixup_concerns_section"`
+	ConcernIDs           []string `json:"concern_ids"`
+	Notes                []string `json:"notes"`
+}
+
+// fixupResumeGoldenPrompt decodes the shared golden into the runner's
+// FetchedPrompt (unknown keys are ignored by the decode) and fills the
+// dispatch fields fixupPromptResp sets, plus the golden's concern keys.
+func fixupResumeGoldenPrompt(t *testing.T) (*upload.FetchedPrompt, fixupResumeConcernsGolden) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "fixup_resume_concerns_prompt.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	var p upload.FetchedPrompt
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("decode shared golden into FetchedPrompt: %v", err)
+	}
+	var g fixupResumeConcernsGolden
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatalf("decode shared golden concern keys: %v", err)
+	}
+	if !p.Fixup || p.StageType != "implement" || p.Prompt == "" {
+		t.Fatalf("golden fixup = %v stage_type = %q prompt empty = %v, want a served implement fix-up", p.Fixup, p.StageType, p.Prompt == "")
+	}
+	if g.FixupConcernsSection == "" || len(g.ConcernIDs) == 0 || len(g.ConcernIDs) != len(g.Notes) {
+		t.Fatalf("golden concern keys malformed: section empty = %v, ids %v, notes %q", g.FixupConcernsSection == "", g.ConcernIDs, g.Notes)
+	}
+	shape := fixupPromptResp("fixup-branch-tip-sha")
+	p.StageID = shape.StageID
+	p.PromptHash = shape.PromptHash
+	p.FixupBranch = shape.FixupBranch
+	p.FixupExpectedHeadSHA = shape.FixupExpectedHeadSHA
+	return &p, g
+}
+
+// B11 (#5390). The backend's routed concern text reaches the RESUMED turn:
+// run() twice through the REAL claudecode adapter spawning the fake `claude`,
+// pass 2 serving the shared golden's full fix-up prompt. The fake records each
+// spawn's --resume id and -p text to disk, so a resumed turn that is not the
+// fetched prompt (a fixed "continue", a trimmed or re-wrapped prompt) is
+// directly observable. Replaces the synthetic-string-only pin of
+// harnessFixupPrompt with the bytes the backend actually serves.
+func TestFixupResume_BackendConcernTextReachesResumedTurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake claude is a /bin/sh script")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	enableFixupResume(t)
+	resp, golden := fixupResumeGoldenPrompt(t)
+	want := resp.Prompt
+
+	arm := runFixupHarnessArm(t, "5390b10a-0000-4000-8000-000000000001", resp, nil)
+	if arm.fixupCallCount != 1 {
+		t.Fatalf("fix-up spawns = %d, want 1", arm.fixupCallCount)
+	}
+	fix := arm.calls[len(arm.calls)-1]
+	if fix.resume == "" || fix.resume != arm.pass1Session {
+		t.Errorf("fix-up --resume %q, want the pass-1 session %q", fix.resume, arm.pass1Session)
+	}
+	if fix.prompt != want {
+		t.Errorf("resumed fix-up turn differs from the fetched golden prompt (len %d, want %d); the resumed -p turn must be the served prompt byte for byte\n--- got ---\n%s",
+			len(fix.prompt), len(want), fix.prompt)
+	}
+	if !strings.Contains(fix.prompt, golden.FixupConcernsSection) {
+		t.Errorf("resumed fix-up turn lacks the golden ### Fix-up concerns section:\n%s", golden.FixupConcernsSection)
+	}
+	for i, id := range golden.ConcernIDs {
+		for _, s := range []string{id, golden.Notes[i]} {
+			if !strings.Contains(fix.prompt, s) {
+				t.Errorf("resumed fix-up turn lacks routed concern text %q", s)
+			}
+		}
+	}
+	if len(arm.resumeEvents) != 1 || arm.resumeEvents[0]["outcome"] != "resumed" {
+		t.Errorf("fixup_session_resume = %v, want one resumed", arm.resumeEvents)
 	}
 }

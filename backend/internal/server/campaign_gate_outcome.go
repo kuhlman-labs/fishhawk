@@ -12,9 +12,9 @@ import (
 
 // DriveCampaignRunGate is the campaign driver's gate actor (E88.4 / #4528). It
 // calls AutoDriveRunGate unchanged and translates its outcome into the
-// driver's campaigndriver.GateActionOutcome, carrying DecisionRequired and
-// DecisionState so the driver can record a campaign_gate_decision_required
-// marker. The serve.go campaignGateActor adapter delegates here, so the
+// driver's campaigndriver.GateActionOutcome, carrying DecisionRequired,
+// DecisionState and ConcernIDs (set only on fixup_no_changes_unaddressed,
+// #5390) so the driver can record a campaign_gate_decision_required marker. The serve.go campaignGateActor adapter delegates here, so the
 // translation lives in one place the server tests reach.
 //
 // After the gate evaluation it reads the run's stages once and reports the
@@ -42,6 +42,7 @@ func (s *Server) DriveCampaignRunGate(ctx context.Context, runRow *run.Run, id I
 		Note:             out.Note,
 		DecisionRequired: out.DecisionRequired,
 		DecisionState:    out.DecisionState,
+		ConcernIDs:       out.ConcernIDs,
 	}
 	if err != nil {
 		// The driver discards an errored outcome before any marker logic.
