@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -765,6 +767,38 @@ func TestStateDirLock_SecondDispatcherRefused(t *testing.T) {
 	b.unlock()
 }
 
+// An unopenable lock path (the state dir is missing) refuses state_dir_locked
+// naming the path, and a lock file that was removed and re-created between the
+// open and the post-flock identity check is refused and closed, never held.
+// Counterfactual run by hand: making held() return true let the replaced file
+// through with no error, RED.
+func TestStateDirLock_OpenAndReplacedRefusals(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent")
+	if _, err := acquireHostDispatchLock(missing); err == nil || !strings.Contains(err.Error(), hdStateDirLocked) || !strings.Contains(err.Error(), filepath.Join(missing, hostDispatchLockFile)) {
+		t.Fatalf("missing state dir: err = %v; want %s naming the lock path", err, hdStateDirLocked)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, hostDispatchLockFile)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := finishHostDispatchLock(f, path)
+	if err == nil || l != nil || !strings.Contains(err.Error(), hdStateDirLocked) || !strings.Contains(err.Error(), "was replaced") {
+		t.Fatalf("replaced lock file: lock = %v, err = %v; want %s ... was replaced", l, err, hdStateDirLocked)
+	}
+	if _, serr := f.Stat(); serr == nil {
+		t.Fatal("the refused lock's file is still open")
+	}
+}
+
 // hdContend starts n contenders at once over dir. Each winner holds the lock
 // for a while and records how many winners were inside together.
 func hdContend(t *testing.T, dir string, n int) (winners, maxInside int) {
@@ -910,6 +944,130 @@ func TestTick_HeldOlderRunsDoNotStarveNewer(t *testing.T) {
 	}
 	if len(lh.b.acts) != hostDispatchDefaultPerTick+1 {
 		t.Fatalf("run_auto_driven rows = %d; want one per held dispatch plus the spawn (%d)", len(lh.b.acts), hostDispatchDefaultPerTick+1)
+	}
+}
+
+// #5246: within the deprioritised rank, a run held once and admissible again
+// is reached even while older runs stay held. PerTickCap+1 older runs are held
+// forever and one newer run is held until the test clears it. Rank 2 rotates
+// least-recently-evaluated first, so after the hold clears the newer run is
+// re-evaluated within ceil((held+1)/PerTickCap) = 2 ticks (the bound holds over
+// ticks that COMPLETE the candidate pass without a host_memory_pressure stop
+// and while ranks 0 and 1 leave budget; this fixture has neither). Under a
+// created_at-only rank 2 the first PerTickCap older runs take the whole budget
+// on every tick and the newer run is never evaluated.
+// Counterfactuals run by hand, each RED: `if la != lb {` -> `if false {` in
+// order (the newer run is starved); deleting the `l.lastEvaluated[run.ID] =
+// l.evalTick` stamp (every stamp reads 0, same starvation); deleting the
+// `delete(l.lastEvaluated, id)` prune (the post-spawn bounded-map assertion).
+func TestTick_OnceHeldNewerRunReachedWithinDeprioritisedRank(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	perTick := hostDispatchDefaultPerTick
+	older := map[string]bool{}
+	for i := 0; i < perTick+1; i++ {
+		r := lh.add(-time.Duration(10-i)*time.Hour, nil)
+		older[r.ID] = true
+	}
+	newer := lh.add(0, nil)
+	var newerHeld atomic.Bool
+	newerHeld.Store(true)
+	lh.b.marker = func(runID, _ string) (int, string) {
+		if older[runID] || (runID == newer.ID && newerHeld.Load()) {
+			return 409, apiErrBody("dependency_not_satisfied", "wave 1 is not integrated")
+		}
+		return 200, `{"transitioned":true,"stage_state":"dispatched"}`
+	}
+	l := lh.loop(func(c *HostDispatcherConfig) { c.PerTickCap = perTick })
+
+	postsBefore := 0
+	tickBounded := func(label string) {
+		t.Helper()
+		lh.tick(l)
+		total := lh.b.count(isMarkerReq)
+		if got := total - postsBefore; got > perTick {
+			t.Fatalf("%s: %d marker POSTs; the per-tick budget bounds them at %d", label, got, perTick)
+		}
+		postsBefore = total
+	}
+
+	// Fixture guard: the newer run must be held (and so deprioritised) by tick 2.
+	heldAt := 0
+	for tick := 1; tick <= 2 && heldAt == 0; tick++ {
+		tickBounded("hold phase")
+		if o, ok := outcomeFor(l, newer.ID); ok && o.Held && o.Refusal == "dependency_not_satisfied" {
+			heldAt = tick
+		}
+	}
+	if heldAt == 0 {
+		t.Fatalf("the newer run was not held by tick 2 (outcome %+v); the fixture needs it evaluated and held", l.outcomes)
+	}
+	if lh.spawner.n() != 0 {
+		t.Fatalf("spawns = %+v during the hold; want none", lh.spawner.spawns)
+	}
+
+	newerHeld.Store(false)
+	deprioritised := perTick + 2                     // perTick+1 older runs plus the newer one
+	bound := (deprioritised + perTick - 1) / perTick // ceil(N / PerTickCap)
+	for tick := 1; tick <= bound && lh.spawner.n() == 0; tick++ {
+		tickBounded("after the hold cleared")
+	}
+	if lh.spawner.n() != 1 || lh.spawner.spawns[0].Run != newer.ID {
+		t.Fatalf("spawns = %+v; want exactly the newer run within %d ticks of the hold clearing", lh.spawner.spawns, bound)
+	}
+
+	// Pruning: the spawned run left the deprioritised set, and the rotation
+	// state is bounded by that set.
+	if _, ok := l.lastEvaluated[newer.ID]; ok {
+		t.Fatalf("lastEvaluated still has the spawned run %s; the map must be pruned to the deprioritised set", newer.ID)
+	}
+	for id := range l.lastEvaluated {
+		if !l.deprioritised[id] {
+			t.Fatalf("lastEvaluated[%s] outlives the deprioritised set %v", id, l.deprioritised)
+		}
+	}
+}
+
+// #5246: order's rank 2 is least-recently-evaluated first, then created_at and
+// id. The seeded lastEvaluated values deliberately invert created_at order, so
+// a created_at-only rank 2 fails the assertion.
+func TestOrder_DeprioritisedLeastRecentlyEvaluatedFirst(t *testing.T) {
+	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	run := func(id string, createdOffset time.Duration) Run {
+		return Run{ID: id, CreatedAt: base.Add(createdOffset)}
+	}
+	l := &hostDispatchLoop{
+		queued: map[string]time.Time{
+			"q-late":  base.Add(2 * time.Minute),
+			"q-early": base.Add(time.Minute),
+		},
+		deprioritised: map[string]bool{"d-old": true, "d-mid": true, "d-new": true, "d-tie-x": true, "d-tie-y": true},
+		lastEvaluated: map[string]uint64{"d-old": 5, "d-mid": 2, "d-new": 2, "d-tie-x": 7, "d-tie-y": 7},
+	}
+	runs := []Run{
+		run("d-tie-y", time.Hour),
+		run("d-new", 3*time.Hour),
+		run("n-new", 5*time.Hour),
+		run("d-old", 0),
+		run("q-late", 9*time.Hour),
+		run("d-tie-x", time.Hour),
+		run("n-old", 4*time.Hour),
+		run("d-mid", 2*time.Hour),
+		run("q-early", 8*time.Hour),
+	}
+	l.order(runs)
+	var got []string
+	for _, r := range runs {
+		got = append(got, r.ID)
+	}
+	want := []string{
+		"q-early", "q-late", // rank 0: oldest queue episode first
+		"n-old", "n-new", // rank 1: created_at
+		"d-mid", "d-new", // rank 2: lastEvaluated 2, then created_at
+		"d-old",              // lastEvaluated 5, though it is the oldest run
+		"d-tie-x", "d-tie-y", // lastEvaluated 7, same created_at: id
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("order = %v; want %v", got, want)
 	}
 }
 
