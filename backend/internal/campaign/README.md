@@ -211,6 +211,30 @@ The persistence half of the campaign hotfix verb (`POST /v0/campaigns/{campaign_
 
 **Rollback.** `0106` is additive. Revert the binary first, then migrate down. The down migration drops both tables, an expedited item survives as an ordinary item at its (possibly negative) position, and a held campaign is simply un-held.
 
+## Item start claims (#5266)
+
+Both campaign item starters — the operator item start (`POST /v0/campaigns/{campaign_id}/runs`) and the campaign driver — reserve the item in `campaign_item_start_claims` (migration `0119`) BEFORE they mint a run, and link the minted run only while they still hold that reservation. A losing starter is refused before it mints, so it never creates a run the host dispatcher could admit (the dispatcher admits an unlinked `auto_dispatch` run). Contract in `repository.go`, hand-written pgx in `postgres.go`.
+
+**Table.** One row per item (`item_id` primary key, cascading with the item): `claim_id`, `starter` (`operator` | `campaign_driver`, `campaign_item_start_claims_starter_check`), `claimed_at`, `expires_at` (`campaign_item_start_claims_window_check`: `expires_at > claimed_at`). No `account_id` and no RLS: tenancy is the parent campaign's, as for `campaign_items` and the `0106` tables.
+
+**Methods and refusals.** Each refusal is an `*ItemStartConflictError{ItemID, Reason, WinnerRunID, HeldClaim}` (match with `errors.As`) and writes nothing.
+
+- `ClaimCampaignItemStart(ClaimCampaignItemStartParams{ItemID, Starter, Clock})` — missing item `ErrNotFound`; item already linked `StartConflictLinked` (names `WinnerRunID`); a live claim `StartConflictClaimed` (names `HeldClaim`); otherwise a fresh `claim_id`, or the REPLACEMENT of an expired claim (crash recovery: `INSERT … ON CONFLICT (item_id) DO UPDATE … WHERE expires_at <= EXCLUDED.claimed_at`). An unknown starter, a nil `Clock` or a zero reading is `ErrStartClaimInvalid`.
+- `LinkClaimedCampaignItemRun(LinkClaimedCampaignItemRunParams{ItemID, ClaimID, RunID})` — deletes the caller's claim and sets `run_id` in one transaction. The same run already linked is an idempotent re-link; another run is `StartConflictLinked`; the caller's claim gone (replaced or released) is `StartConflictClaimLost` (with the replacer as `HeldClaim` when one exists). An expired claim nobody replaced still links: expiry only lets ANOTHER claimant replace it. A nil claim or run id is `ErrStartClaimInvalid`.
+- `ReleaseCampaignItemStart(itemID, claimID)` — deletes only the caller's own claim; idempotent (consumed, released or replaced claims return nil and are left alone).
+
+`SetCampaignItemRun` stays unconditional for the unlink, the operator restart reset and the reconcile relink. Like it, the link's returned item does not attach `Item.Expedite`.
+
+**Lock order.** The `campaign_items` row (`LockCampaignItemForUpdate`), then the claim row — the package order. A claim blocked behind a committing link re-reads the committed row under READ COMMITTED and refuses `linked` (`TestClaimCampaignItemStart_WaitsOnItemLock_SeesCommittedLink`). The release is one DELETE on the claim row and never waits on an item row while holding one.
+
+**Clock domain and TTL.** `claimed_at` / `expires_at` are fishhawkd-clock values, never Postgres `now()`, compared only against the caller's own clock (AGENTS.md trap #3048). The adapter reads `Clock` ONCE, after the item lock is granted (#5266 X4), so a lock wait never eats into the claim: `ExpiresAt = ClaimedAt + ItemStartClaimTTL` (10 minutes) from the moment the claimant holds the item (`TestClaimCampaignItemStart_LockWait_StampsFromPostLockClock`). Before minting, a starter checks `StartClaim.Covers(now, start budget + cleanup budget)` and releases and refuses a claim that does not cover its post-claim work.
+
+**Start and cleanup budgets (U3).** `ItemStartBudget` (4 minutes) bounds the start after the claim: the mint, the claimed link and the running transition. `ItemStartCleanupBudget` (30 seconds) bounds a failed start's cleanup: the transition-failure unlink, the release, the run cancel and the abandon audit append. Cleanup runs on its OWN context, `context.WithTimeout(context.WithoutCancel(ctx), ItemStartCleanupBudget)`, created where cleanup begins and never derived from the start's possibly expired context. The worst-case post-claim wall clock, `ItemStartWorstCase` = 4m30s, is under half the TTL, so a live starter's claim cannot be stolen unless its process stalls 5m30s past its own deadlines — and even then the claim-bound link refuses `claim_lost`, so the item still gets exactly one linked run. `TestItemStartBudgets_WorstCasePostClaimUnderHalfTheClaimTTL` pins the ratio. A crashed starter blocks its item for at most the TTL.
+
+**Hand-written pgx, no sqlc (U5).** The child table and its queries are hand-written pgx on the `0106` precedent, ratified at the #5266 plan gate: new `campaign_items` columns would change every sqlc `SELECT *` / `RETURNING *` scan of that table. `queries.sql` and `db/queries.sql.go` are unchanged; a later need for a sqlc query goes through a scope amendment, not a workaround.
+
+**Rollback.** `0119` is additive. Revert the binary first (it reads and writes the table on every start), then migrate down: the down migration drops the table and claims in flight vanish, which a reverted binary never reads.
+
 ## The third campaign source: an approved grooming order (E54.6 / #2238)
 
 `POST /v0/campaigns` accepts three mutually-exclusive sources: an `epic_ref` to
