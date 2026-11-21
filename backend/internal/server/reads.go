@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // stageResponse mirrors docs/api/v0.openapi.yaml's `Stage` schema.
@@ -74,6 +75,19 @@ type stageResponse struct {
 	// means forge approval/landing. Other values name a resolution failure.
 	// Absent on older servers and action responses; never infer consent from it.
 	ReviewGateAdmission string `json:"review_gate_admission,omitempty"`
+	// ReviewAgentsConfigured is the implement stage's workflow-declared agent
+	// reviewer count (#5298): the same Reviewers.AgentCount() that
+	// resolveStageReviewers feeds the implement review round. It is an
+	// EXPECTATION signal (>0 means an agent review round is expected for this
+	// stage), not the round's completeness threshold: a started round's
+	// configured_agents can be higher when reviewer personas attach. Three
+	// states: absent (a POINTER with omitempty) means unknown — a non-implement
+	// stage, a run without a workflow_spec, an unparseable spec, an unknown
+	// workflow id, a spec without an implement stage, or any action endpoint;
+	// 0 means no agent round will run (a non-agent executor or no reviewers);
+	// N means N agent reviewers are declared. Populated only by the two
+	// observability read handlers (handleGetStage, handleListRunStages).
+	ReviewAgentsConfigured *int `json:"review_agents_configured,omitempty"`
 
 	// Progress is the runner's mid-execution stage_progress heartbeat projected
 	// onto the stage row (#2541): last_event / turns_this_attempt /
@@ -206,6 +220,41 @@ func (s *Server) resolvedModelForStage(ctx context.Context, st *run.Stage) strin
 	return ""
 }
 
+// stageReviewAgentsConfigured resolves the implement stage's
+// review_agents_configured observability field (#5298) from the run's workflow
+// spec. It returns nil (unknown) when st is not an implement stage, the run row
+// or its workflow_spec is absent, the spec does not parse, the run's workflow
+// id is not in it, or the workflow has no implement stage. It returns a
+// pointer to 0 when that spec stage's executor is not an agent (a non-agent
+// shape never gets an agent review round) or it declares no reviewers, and
+// otherwise a pointer to Reviewers.AgentCount(). The stage match is the first
+// stage of type implement, the same one resolveStageReviewers returns to the
+// implement review round. Pure: no audit or store read.
+func stageReviewAgentsConfigured(runRow *run.Run, st *run.Stage) *int {
+	if st == nil || st.Type != run.StageTypeImplement || runRow == nil || runRow.WorkflowSpec == nil {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return nil
+	}
+	for _, ss := range wf.Stages {
+		if ss.Type != spec.StageTypeImplement {
+			continue
+		}
+		n := 0
+		if ss.Executor.Agent != "" && ss.Reviewers != nil {
+			n = ss.Reviewers.AgentCount()
+		}
+		return &n
+	}
+	return nil
+}
+
 // handleListRunStages implements GET /v0/runs/{run_id}/stages.
 // Returns stages ordered by sequence ascending; no pagination.
 // MVP_SPEC §4.2 caps stages-per-workflow at a small N, so flat
@@ -269,6 +318,7 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 		if runRow != nil {
 			resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, st.Type)
 		}
+		resp.ReviewAgentsConfigured = stageReviewAgentsConfigured(runRow, st)
 		if p, ok := progressByStage[st.ID]; ok {
 			resp.Progress = toStageProgress(&p)
 		}
@@ -312,6 +362,7 @@ func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
 		runRow = rr
 		resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, got.Type)
 	}
+	resp.ReviewAgentsConfigured = stageReviewAgentsConfigured(runRow, got)
 	if got.Type == run.StageTypeReview && got.ExecutorKind == run.ExecutorHuman {
 		resp.ReviewGateAdmission = reviewGateAdmissionForRun(got, runRow).String()
 	}

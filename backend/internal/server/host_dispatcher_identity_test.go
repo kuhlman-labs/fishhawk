@@ -302,6 +302,7 @@ var hdWantAllowlist = []string{
 	"GET /v0/runs",
 	"GET /v0/runs/{run_id}",
 	"GET /v0/runs/{run_id}/stages",
+	"GET /v0/runs/{run_id}/audit",
 	"POST /v0/runs/{run_id}/auto-drive/acts",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure",

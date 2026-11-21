@@ -543,6 +543,155 @@ func TestStageAgentTimeoutSeconds_FromSpec(t *testing.T) {
 	}
 }
 
+// reviewAgentsTwoSpec declares two implement agent reviewers; the plan stage's
+// own reviewers must not leak into the implement count.
+const reviewAgentsTwoSpec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor: {agent: claude-code}
+        reviewers:
+          agents:
+            - provider: claudecode
+      - id: implement
+        type: implement
+        executor: {agent: claude-code}
+        reviewers:
+          agents:
+            - provider: claudecode
+            - provider: codex
+`
+
+// reviewAgentsNoneSpec declares no implement reviewers.
+const reviewAgentsNoneSpec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor: {agent: claude-code}
+      - id: implement
+        type: implement
+        executor: {agent: claude-code}
+`
+
+// reviewAgentsHumanImplementSpec declares reviewers on a HUMAN-executed
+// implement stage: a non-agent shape never gets an agent review round.
+const reviewAgentsHumanImplementSpec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor: {human: true}
+        reviewers:
+          agents:
+            - provider: claudecode
+            - provider: codex
+`
+
+// TestStageReviewAgentsConfigured_FromSpec drives the #5298
+// review_agents_configured field on BOTH observability read handlers. It reads
+// the raw body for key presence, so absent (unknown) and 0 (no round) stay
+// distinct: a spec declaring two implement agents reads 2; a spec with no
+// implement reviewers, or a human-executed implement stage, reads 0 with the
+// key present; the plan stage and a run without workflow_spec carry no key.
+func TestStageReviewAgentsConfigured_FromSpec(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	const key = `"review_agents_configured"`
+	for _, c := range []struct {
+		name     string
+		specYAML string // "" = the run carries no workflow_spec
+		want     string // the raw implement value, "" = key absent
+	}{
+		{"two_agents", reviewAgentsTwoSpec, "2"},
+		{"no_reviewers", reviewAgentsNoneSpec, "0"},
+		{"human_executor", reviewAgentsHumanImplementSpec, "0"},
+		{"no_workflow_spec", "", ""},
+		{"unparseable_spec", "version: [", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			repo := newStagesRunRepo()
+			runID := uuid.New()
+			planID, implID := uuid.New(), uuid.New()
+			repo.stages[runID] = []*run.Stage{
+				{ID: planID, RunID: runID, Sequence: 0, Type: run.StageTypePlan,
+					ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+					State: run.StageStateSucceeded, CreatedAt: now, UpdatedAt: now},
+				{ID: implID, RunID: runID, Sequence: 1, Type: run.StageTypeImplement,
+					ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+					State: run.StageStateSucceeded, CreatedAt: now, UpdatedAt: now},
+			}
+			runRow := &run.Run{ID: runID, WorkflowID: "feature_change"}
+			if c.specYAML != "" {
+				runRow.WorkflowSpec = []byte(c.specYAML)
+			}
+			repo.runForGet = runRow
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+			get := func(path string) []byte {
+				t.Helper()
+				w := httptest.NewRecorder()
+				s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+				if w.Code != http.StatusOK {
+					t.Fatalf("GET %s = %d:\n%s", path, w.Code, w.Body.String())
+				}
+				return w.Body.Bytes()
+			}
+			check := func(where string, obj map[string]json.RawMessage, want string) {
+				t.Helper()
+				got, ok := obj["review_agents_configured"]
+				switch {
+				case want == "" && ok:
+					t.Errorf("%s: review_agents_configured = %s, want the key absent", where, got)
+				case want != "" && !ok:
+					t.Errorf("%s: review_agents_configured absent, want %s", where, want)
+				case want != "" && string(got) != want:
+					t.Errorf("%s: review_agents_configured = %s, want %s", where, got, want)
+				}
+			}
+
+			// (a) GET /v0/stages/{id}: the implement row and the plan row.
+			body := get(fmt.Sprintf("/v0/stages/%s", implID))
+			var single map[string]json.RawMessage
+			if err := json.Unmarshal(body, &single); err != nil {
+				t.Fatal(err)
+			}
+			check("GET stage implement", single, c.want)
+			if c.want == "0" && !strings.Contains(string(body), key+":0") {
+				t.Errorf("GET stage body should carry %s:0, got:\n%s", key, body)
+			}
+			if planBody := get(fmt.Sprintf("/v0/stages/%s", planID)); strings.Contains(string(planBody), key) {
+				t.Errorf("GET stage plan carries %s, want absent:\n%s", key, planBody)
+			}
+
+			// (b) GET /v0/runs/{id}/stages: the same per item.
+			body = get(fmt.Sprintf("/v0/runs/%s/stages", runID))
+			var list struct {
+				Items []map[string]json.RawMessage `json:"items"`
+			}
+			if err := json.Unmarshal(body, &list); err != nil {
+				t.Fatal(err)
+			}
+			if len(list.Items) != 2 {
+				t.Fatalf("got %d stages, want 2", len(list.Items))
+			}
+			for _, it := range list.Items {
+				switch string(it["type"]) {
+				case `"implement"`:
+					check("list implement", it, c.want)
+				case `"plan"`:
+					check("list plan", it, "")
+				}
+			}
+			if c.want == "0" && !strings.Contains(string(body), key+":0") {
+				t.Errorf("list body should carry %s:0, got:\n%s", key, body)
+			}
+		})
+	}
+}
+
 // TestStageAgentTimeoutSeconds_ZeroOnUnresolvableSpec is the fail-open negative
 // covering three legs across two endpoints:
 //   - unparseable spec on GET /v0/stages/{id}: GetRun succeeds but resolveAgentTimeout
