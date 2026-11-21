@@ -473,6 +473,11 @@ func TestDelegatedApprovalDecisionStates(t *testing.T) {
 	if DecisionStateServerCheckAwaitingHuman != "server_check_awaiting_human" {
 		t.Errorf("DecisionStateServerCheckAwaitingHuman = %q, want %q", DecisionStateServerCheckAwaitingHuman, "server_check_awaiting_human")
 	}
+	// #5390: the route_fixup no-change handoff, emitted by the server's
+	// no-change guard and decoded by the fishhawk_drive_run decision arm.
+	if DecisionStateFixupNoChangesUnaddressed != "fixup_no_changes_unaddressed" {
+		t.Errorf("DecisionStateFixupNoChangesUnaddressed = %q, want %q", DecisionStateFixupNoChangesUnaddressed, "fixup_no_changes_unaddressed")
+	}
 }
 
 func TestValidateOverlayReadError(t *testing.T) {
