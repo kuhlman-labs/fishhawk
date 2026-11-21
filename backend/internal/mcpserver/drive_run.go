@@ -1871,6 +1871,34 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 		// outcome's concern ids; a caller without them gets the placeholder
 		// form rather than the default get_run_status arm.
 		return &NextActions{State: state, Actions: driveFixupNoChangeActions(params, nil)}
+	case state == operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain:
+		// The delegated may_approve arm declined because the gated plan declares
+		// a new_architectural_decision, or its plan artifact could not be read
+		// (#5265). Whether the direction needs an ADR is the captain's ruling, so
+		// reading the declaration leads; approving is a human's call only.
+		return &NextActions{State: state, Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_get_gate_view",
+				Params:       withParams(params, map[string]string{"stage_kind": "plan"}),
+				Precondition: "the gated plan declares a new architectural decision (or its plan artifact could not be read), so no delegated approval was submitted",
+				Consumes:     consumesNone,
+				Reason:       "read the plan's new_architectural_decision on the plan gate's plan_warnings advisory before the captain rules",
+			},
+			{
+				Action:       "fishhawk_approve_plan",
+				Params:       params,
+				Precondition: "only after a HUMAN, the captain, has ruled the direction needs no ADR, or the ADR is recorded: an agent caller must NOT approve on its own authority",
+				Consumes:     consumesApprovalSlot,
+				Reason:       "record the captain's ruling as the plan approval, then re-invoke fishhawk_drive_run",
+			},
+			{
+				Action:       "fishhawk_reject_plan",
+				Params:       params,
+				Precondition: "the captain ruled the direction needs an ADR before this plan proceeds",
+				Consumes:     consumesApprovalSlot,
+				Reason:       "reject with a reason naming the ADR to record first; the reason propagates to a new run for the same issue",
+			},
+		}}
 	case state == operatorrole.DecisionStateDelegatedApprovalNoProgress:
 		// A delegated approve came back a duplicate — the delegated vote already
 		// stands but never counts toward a human quorum (#2381). The operator's own

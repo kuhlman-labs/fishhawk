@@ -252,11 +252,16 @@ const DelegatedApprovalActorSubject = TokenSubjectPrefix + "delegated"
 //   - fixup_no_changes_unaddressed: the #5390 route_fixup state, meaning the
 //     last fix-up pass routed exactly the routable open set and produced no
 //     commit, so the delegated arm declines to re-route it unchanged.
+//   - architectural_decision_awaiting_captain: the may_approve arm declined
+//     because the gated plan declares a new_architectural_decision (or its plan
+//     artifact could not be read, fail-closed); the captain decides whether the
+//     direction needs an ADR (#5265).
 const (
-	DecisionStateHumanQuorumRequired         = "human_quorum_required"
-	DecisionStateDelegatedApprovalNoProgress = "delegated_approval_no_progress"
-	DecisionStateServerCheckAwaitingHuman    = "server_check_awaiting_human"
-	DecisionStateFixupNoChangesUnaddressed   = "fixup_no_changes_unaddressed"
+	DecisionStateHumanQuorumRequired                  = "human_quorum_required"
+	DecisionStateDelegatedApprovalNoProgress          = "delegated_approval_no_progress"
+	DecisionStateServerCheckAwaitingHuman             = "server_check_awaiting_human"
+	DecisionStateFixupNoChangesUnaddressed            = "fixup_no_changes_unaddressed"
+	DecisionStateArchitecturalDecisionAwaitingCaptain = "architectural_decision_awaiting_captain"
 )
 
 // CampaignActorScopes returns the write scopes the campaign auto-driver's

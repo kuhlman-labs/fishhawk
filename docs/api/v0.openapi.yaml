@@ -18710,11 +18710,17 @@ paths:
         an `approvals` block (a distinct-human count a delegated submission
         never satisfies), or a firing/unevaluable escalation, or an unreadable
         approvals block — submitting NO approval; only a genuine legacy
-        no-approvals gate still auto-approves. And a delegated approve that comes
+        no-approvals gate passes this pre-check. And a delegated approve that comes
         back a DUPLICATE (no progress) is reported as
         `decision_state: delegated_approval_no_progress` rather than a no-op
         `acted:true`. Neither declined pass appends a `run_auto_driven`
-        attribution row.
+        attribution row. On a plan gate, the arm also declines with
+        `decision_state: architectural_decision_awaiting_captain` (#5265) when
+        the newest `standard_v1` plan artifact declares a
+        `new_architectural_decision`, or when that artifact cannot be listed or
+        decoded (fail-closed): whether the direction needs an ADR is the
+        captain's ruling, so no approval is submitted and no `run_auto_driven`
+        row is appended. The note never echoes the planner's declaration text.
 
         The `may_merge` arm runs the merge overlap guard (#4119) after the
         first-officer hold and before the merge-candidate gate (#4582): a
@@ -18759,7 +18765,7 @@ paths:
                   paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
                   page_event: { type: string, description: 'The page event name, set when paged.' }
                   decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
-                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582); server_check_awaiting_human (the route_fixup arm is unmet only because every open concern of the settled round is a human-only server_check finding: a human waives or defers it from the Web UI, and no fix-up is routed) (#5477); fixup_no_changes_unaddressed (the last fix-up pass routed exactly the routable open set and produced no commit, so no fix-up is re-routed; concern_ids names the ids) (#5390).' }
+                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582); server_check_awaiting_human (the route_fixup arm is unmet only because every open concern of the settled round is a human-only server_check finding: a human waives or defers it from the Web UI, and no fix-up is routed) (#5477); fixup_no_changes_unaddressed (the last fix-up pass routed exactly the routable open set and produced no commit, so no fix-up is re-routed; concern_ids names the ids) (#5390); architectural_decision_awaiting_captain (the may_approve arm declined a plan gate whose newest plan artifact declares a new_architectural_decision, or whose plan artifact could not be read, fail-closed: the captain rules whether the direction needs an ADR, and no approval is submitted) (#5265).' }
                   concern_ids:
                     type: array
                     items: { type: string }
