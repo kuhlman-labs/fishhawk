@@ -619,6 +619,11 @@ var runStatusPathTable = []pathClassification{
 	{Path: "plan_stage_wait_status", Tier: tierNever},
 	{Path: "implement_stage_wait_status", Tier: tierNever},
 	{Path: "acceptance_stage_wait_status", Tier: tierNever},
+	// host_dispatch (#5402) is the small, bounded, operator-actionable
+	// dispatcher block (every string at most 300 bytes, paths_tried at most 6
+	// entries), so like the wait-status blocks it is never itemised and the
+	// diagnosis skeleton retains it.
+	{Path: "host_dispatch", Tier: tierNever},
 	{Path: "budget", Tier: "T1", Class: classComputed},
 	{Path: "cache_efficiency", Tier: "T1", Class: classComputed},
 	{Path: "cost", Tier: "T1", Class: classComputed},
@@ -1181,6 +1186,7 @@ var skeletonRetainedPaths = map[string]struct{}{
 	"plan_stage_wait_status":       {},
 	"implement_stage_wait_status":  {},
 	"acceptance_stage_wait_status": {},
+	"host_dispatch":                {},
 	"next_actions.state":           {},
 	"elisions":                     {},
 	// run.concerns.open_implement is deliberately NOT retained here (#3043),
@@ -1212,6 +1218,7 @@ func skeletonRunStatus(out GetRunStatusOutput, runID string, budget responseBudg
 		PlanStageWaitStatus:       out.PlanStageWaitStatus,
 		ImplementStageWaitStatus:  out.ImplementStageWaitStatus,
 		AcceptanceStageWaitStatus: out.AcceptanceStageWaitStatus,
+		HostDispatch:              out.HostDispatch,
 	}
 	for _, s := range out.Stages {
 		row := Stage{Type: s.Type, State: s.State, FailureCategory: s.FailureCategory}

@@ -5369,14 +5369,18 @@ type CampaignItem struct {
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 	// Awaiting mirrors the backend's status-only per-item awaiting block
-	// (E88.4 / #4528), passed through verbatim. omitempty, so a list read, an
-	// older backend, or an unstarted, terminal or run-terminal item carries no
-	// key.
-	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read)"`
+	// (E88.4 / #4528). omitempty, so a list read, an older backend, or an
+	// unstarted, terminal or run-terminal item carries no key. The block is
+	// the backend's, passed through verbatim except on the operator's stdio
+	// fishhawk-mcp, where a host_dispatcher block is overlaid from the host
+	// dispatcher's status.json (#5402, host_dispatch_overlay.go).
+	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read). On the operator's stdio fishhawk-mcp a host_dispatcher block is overlaid from the host dispatcher's status.json and carries host_dispatch (the dispatcher's state): it stays host_dispatcher/host_dispatch when the dispatcher is live or will retry on its own, becomes host_dispatcher/host_dispatch_unverified when it could not be checked, and becomes human with host_dispatch_paused, host_dispatch_capped, host_dispatch_refused or host_dispatcher_absent (no status file found, or a stale one) when an operator must act; next_step names the remedy. The overlay is absent over HTTP /mcp"`
 }
 
 // campaignItemAwaiting mirrors the backend's `CampaignItemAwaiting` schema
 // (campaignItemAwaitingPayload). stage_* are absent for no_active_stage.
+// HostDispatch is MCP-local: the stdio status overlay (#5402) sets it on a
+// host_dispatcher block; the backend never sends it.
 type campaignItemAwaiting struct {
 	Kind                string                        `json:"kind"`
 	Reason              string                        `json:"reason"`
@@ -5388,6 +5392,7 @@ type campaignItemAwaiting struct {
 	Decision            *campaignItemAwaitingDecision `json:"decision,omitempty"`
 	DecisionWithheld    bool                          `json:"decision_withheld,omitempty"`
 	DecisionUnavailable bool                          `json:"decision_unavailable,omitempty"`
+	HostDispatch        *hostDispatchObservation      `json:"host_dispatch,omitempty"`
 }
 
 // campaignItemAwaitingDecision is the current (uncleared) decision marker:
