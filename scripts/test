@@ -16,8 +16,8 @@
 #                             module does not stop the rest; see above)
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
 #   scripts/test lint         run `golangci-lint run --allow-serial-runners ./...` in every module;
-#                             refuses (host_toolchain_mismatch) on a host golangci-lint/gofmt
-#                             that differs from the gate-image pins (#4245); with no
+#                             refuses (host_toolchain_mismatch, exit 75) on a host golangci-lint/
+#                             gofmt/go that differs from the gate-image pins (#4245, #5453); with no
 #                             GOLANGCI_LINT_CACHE set it uses a per-checkout lint cache (#5151)
 #   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
 #   scripts/test verify --packages backend/internal/run,cli/internal/spec
@@ -70,10 +70,12 @@ set -euo pipefail
 # verify lock could not be acquired; any other non-zero = the change failed.
 # Every verify-lock refusal (_acquire_verify_lock_at's refusal sites, propagated
 # by _acquire_verify_lock and exited by cmd_verify and the --in-gate-image verify
-# path) exits 73. Nothing exits 75 yet: no leg here can tell an infrastructure
-# failure from a red tree by exit status, so 75 is reserved for the contract and
-# the runner's text signatures stay the fallback. The runner's Go side
-# (runner/cmd/fishhawk-runner) carries the same two values: change them together.
+# path) exits 73. The lint leg's host-toolchain precondition exits 75 when
+# `scripts/check-gate-image --host` exits 3 (#5453): every violation is a host or
+# gate-image tool disagreeing with this checkout's coherent pins (a stale image or
+# host Go after a pin bump), so the change was NOT judged; a pin-file defect the
+# diff caused still exits 1. The runner's Go side (runner/cmd/fishhawk-runner)
+# carries the same two values: change them together.
 VERIFY_EXIT_TEMPFAIL=75
 VERIFY_EXIT_LOCK_REFUSED=73
 
@@ -1099,22 +1101,55 @@ EOF
 # whose "fix" would red CI, and a lint leg passing beside that gofmt reads as
 # corroboration. Unlike _verify_gate_image_pins (a pin REPORT that skips when the
 # script is absent) this is a CONTROL, so a missing checker refuses (fail closed).
+#
+# Exit mapping (#5453, ADR-102). The checker exits 3 when every violation is a
+# HOST/IMAGE tool (golangci-lint, gofmt, or a `go` older than a go.work/go.mod
+# directive under GOTOOLCHAIN=local) disagreeing with coherent pins: a stale gate
+# image or host Go after a pin bump. The change was NOT judged, so this exits
+# VERIFY_EXIT_TEMPFAIL (75): merge-candidate not_executed / verify_infra_tempfail,
+# implement category C, never a fix-up. Inside the gate container
+# (FISHHAWK_GATE_CONTAINER=1) it also prints a gate_image_stale line naming the
+# image the runner set in FISHHAWK_GATE_IMAGE_REF (never FISHHAWK_GATE_IMAGE, the
+# runner's own configuration variable) and the rebuild command. Any other
+# non-zero status is a pin-file defect (or unreadable pins) the diff can cause,
+# so it exits 1, as does the missing-checker refusal.
 _require_lint_host_toolchain() {
   if [ ! -x "$ROOT/scripts/check-gate-image" ]; then
     echo "scripts/test: scripts/check-gate-image missing or not executable — cannot check the host golangci-lint/gofmt against the gate-image pins, refusing to lint (fail closed)" >&2
     exit 1
   fi
-  if ! "$ROOT/scripts/check-gate-image" --root "$ROOT" --host >&2; then
+  local host_rc=0
+  "$ROOT/scripts/check-gate-image" --root "$ROOT" --host >&2 || host_rc=$?
+  if [ "$host_rc" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$host_rc" -ne 3 ]; then
+    echo "scripts/test: gate-image pins unreadable: scripts/check-gate-image --host exited $host_rc on this checkout's pin files (deploy/gate-image/Dockerfile, go.work, go.mod) — a pin-file defect is the change's to fix, so lint REFUSED with exit 1" >&2
+    exit 1
+  fi
+  cat >&2 <<'EOF'
+scripts/test: host_toolchain_mismatch: lint REFUSED — the host golangci-lint/gofmt/go above differ from this checkout's gate-image pins (deploy/gate-image/Dockerfile).
+Any format, lint or `go` refusal from them would describe the HOST toolchain, not the code: this is an ENVIRONMENT problem, NOT a defect in the tree.
+The change was NOT judged (exit 75, EX_TEMPFAIL). Do not edit files or request a scope amendment to "fix" it.
+EOF
+  if [ "${FISHHAWK_GATE_CONTAINER:-}" = 1 ]; then
+    printf 'scripts/test: gate_image_stale: the gate image %s carries the toolchain above, not this checkout'"'"'s deploy/gate-image/Dockerfile pins.\n' \
+      "${FISHHAWK_GATE_IMAGE_REF:-<unnamed: the runner did not set FISHHAWK_GATE_IMAGE_REF>}" >&2
     cat >&2 <<'EOF'
-scripts/test: host_toolchain_mismatch: lint REFUSED — the host golangci-lint/gofmt above differ from this checkout's gate-image pins (deploy/gate-image/Dockerfile).
-Any format or lint finding from them would describe the HOST toolchain, not the code: this is an ENVIRONMENT problem, NOT a defect in the tree.
-Do not edit files or request a scope amendment to "fix" it. Remedies:
+Remedy (the operator running the local stack; the first officer during a campaign): rebuild the image from this checkout, then re-run:
+  docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image
+  scripts/check-gate-image --image fishhawk-gate:local
+  or re-pin a published digest that `scripts/check-gate-image --image <ref>` accepts.
+EOF
+  else
+    cat >&2 <<'EOF'
+Remedies:
   - CI parity in the pinned image: `scripts/test lint --in-gate-image` / `scripts/test verify --in-gate-image`
   - or put the pinned tools first on PATH: `export PATH="$(go env GOROOT)/bin:$PATH"` when `go version`
     reports the pinned Go, and install the pinned golangci-lint release named above.
 EOF
-    exit 1
   fi
+  exit "$VERIFY_EXIT_TEMPFAIL" # host_toolchain_mismatch
 }
 
 # Per-checkout golangci-lint cache (#5151). golangci-lint's issue cache is keyed
