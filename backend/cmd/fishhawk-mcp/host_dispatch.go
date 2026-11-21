@@ -32,6 +32,11 @@ const (
 	hostDispatchMaxInterval = 45 * time.Second
 	// hostDispatchStaleTicks mirrors HostDispatcherStatus.Stale's threshold.
 	hostDispatchStaleTicks = 3
+	// hostDispatchStateDirEnv is the --state-dir default when set (#5402). It
+	// mirrors mcpserver's unexported constant of the same name, which the
+	// stdio server's status overlay reads; TestHostDispatch_StateDirDefaultsToEnv
+	// sets exactly this name.
+	hostDispatchStateDirEnv = "FISHHAWK_HOST_DISPATCH_STATE_DIR"
 )
 
 type hostDispatchFlags struct {
@@ -67,13 +72,19 @@ func defaultHostDispatchDeps() hostDispatchDeps {
 	}
 }
 
-func defaultHostDispatchStateDir() string {
+// defaultHostDispatchStateDir is the --state-dir default:
+// FISHHAWK_HOST_DISPATCH_STATE_DIR when set, else
+// $TMPDIR/fishhawk-host-dispatch.
+func defaultHostDispatchStateDir(getenv func(string) string) string {
+	if dir := getenv(hostDispatchStateDirEnv); dir != "" {
+		return dir
+	}
 	return filepath.Join(os.TempDir(), "fishhawk-host-dispatch")
 }
 
 // runHostDispatch is the subcommand entry point; args are the arguments AFTER
 // "host-dispatch". Exit codes: 0 ok (and --status live or paused), 1 a runtime
-// failure (and --status absent or stale), 2 a usage error.
+// failure (and --status absent, stale or failing), 2 a usage error.
 func runHostDispatch(ctx context.Context, args []string, stdout, stderr io.Writer, deps hostDispatchDeps) int {
 	fs := flag.NewFlagSet("fishhawk-mcp host-dispatch", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -83,12 +94,12 @@ func runHostDispatch(ctx context.Context, args []string, stdout, stderr io.Write
 	fs.IntVar(&f.maxInFlight, "max-in-flight", 2, "maximum stages this dispatcher keeps dispatched or running (ADR-104 Q6)")
 	fs.IntVar(&f.perTickCap, "per-tick-cap", 4, "maximum candidates per tick that reach the campaign-link read (bounds reads and marker POSTs)")
 	fs.IntVar(&f.dailyCap, "daily-cap", 0, "maximum spawns per UTC day (persisted; rolls over at 00:00:00Z); 0 or absent is no daily cap (ADR-104 A1)")
-	fs.StringVar(&f.stateDir, "state-dir", defaultHostDispatchStateDir(), "dispatcher state dir (ledger, status, pause and lock files; 0700, owned by you, never a symlink)")
+	fs.StringVar(&f.stateDir, "state-dir", defaultHostDispatchStateDir(deps.getenv), "dispatcher state dir (ledger, status, pause and lock files; 0700, owned by you, never a symlink); defaults to "+hostDispatchStateDirEnv+" when set")
 	fs.DurationVar(&f.staleAfter, "stale-after", 0, "how long a dispatched stage this process is not running may sit before its runner's liveness is probed (0: the drive_run default)")
 	fs.StringVar(&f.runnerBinary, "runner-binary", "", "fishhawk-runner path (default: FISHHAWK_RUNNER_BIN, beside this binary, then PATH)")
 	fs.BoolVar(&f.pause, "pause", false, "create <state-dir>/pause (a running dispatcher stops POSTing markers) and exit")
 	fs.BoolVar(&f.resume, "resume", false, "remove <state-dir>/pause and exit")
-	fs.BoolVar(&f.status, "status", false, "print the status file; exit 0 when live or paused, 1 when absent or stale (older than 3 intervals)")
+	fs.BoolVar(&f.status, "status", false, "print the status file; exit 0 when live or paused, 1 when absent, stale (older than 3 intervals, or future-dated) or failing (the latest tick failed)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -178,13 +189,7 @@ func hostDispatchStatus(stateDir string, stdout, stderr io.Writer, now time.Time
 		}
 		return exitFailure
 	}
-	state := "live"
-	switch {
-	case st.Stale(now):
-		state = "stale"
-	case st.Paused:
-		state = "paused"
-	}
+	state := st.State(now)
 	_, _ = fmt.Fprintf(stdout, "state=%s pid=%d host=%s last_tick_at=%s paused=%v in_flight=%d spawns_today=%d (%s)",
 		state, st.PID, st.Host, st.LastTickAt.Format(time.RFC3339), st.Paused, st.InFlight, st.SpawnsToday, st.SpawnsDay)
 	if st.DailyCap > 0 {
@@ -193,8 +198,19 @@ func hostDispatchStatus(stateDir string, stdout, stderr io.Writer, now time.Time
 	if st.LastRefusalCode != "" {
 		_, _ = fmt.Fprintf(stdout, " last_refusal=%s run=%s stage=%s at=%s", st.LastRefusalCode, st.LastRefusalRunID, st.LastRefusalStageID, st.LastRefusalAt.Format(time.RFC3339))
 	}
+	// The #5402 fields print only when present, so a status file written by an
+	// older dispatcher prints the same line as before.
+	if !st.LastCompleteTickAt.IsZero() {
+		_, _ = fmt.Fprintf(stdout, " last_complete_tick_at=%s", st.LastCompleteTickAt.Format(time.RFC3339))
+	}
+	if st.TickFailed() {
+		_, _ = fmt.Fprintf(stdout, " tick_failure=%s at=%s", st.LastTickFailure.Code, st.LastTickFailure.At.Format(time.RFC3339))
+	}
+	if n := len(st.RunRefusals); n > 0 {
+		_, _ = fmt.Fprintf(stdout, " run_refusals=%d", n)
+	}
 	_, _ = fmt.Fprintln(stdout)
-	if state == "stale" {
+	if state == "stale" || state == "failing" {
 		return exitFailure
 	}
 	return exitOK

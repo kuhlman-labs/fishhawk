@@ -571,12 +571,14 @@ func TestHostDispatcher_ChildEligibility(t *testing.T) {
 	}
 }
 
+// An outside or relative working_dir is refused path_outside_allowed_roots.
+// An empty one is working_dir_unbound since #5402
+// (TestHostDispatcher_WorkingDirUnbound).
 func TestHostDispatcher_RefusesOutsideAllowedRoots(t *testing.T) {
 	h := newHDHarness(t)
 	outside := h.addRun(func(r *hdRun) { r.WorkingDir = t.TempDir() })
-	empty := h.addRun(func(r *hdRun) { r.WorkingDir = "" })
 	relative := h.addRun(func(r *hdRun) { r.WorkingDir = "relative/dir" })
-	for _, r := range []*hdRun{outside, empty, relative} {
+	for _, r := range []*hdRun{outside, relative} {
 		if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefusePathOutside {
 			t.Fatalf("working_dir %q = %+v; want path_outside_allowed_roots", r.WorkingDir, o)
 		}
@@ -1194,5 +1196,32 @@ func TestHostDispatcher_RequestsStayOnServerAllowlist(t *testing.T) {
 		if !hostdispatcher.RouteAllowed(q.Method, path) {
 			t.Errorf("%s %s is not in hostdispatcher.Routes(); the server would answer 403 host_dispatcher_route_forbidden", q.Method, path)
 		}
+	}
+}
+
+// #5402 (folded from #5267): a marked local run with no working_dir bound is
+// refused working_dir_unbound with no campaign-link read, no POST and no
+// spawn. Without the guard the empty dir reaches hostDispatchConfined and
+// reads path_outside_allowed_roots, which names a root problem the operator
+// does not have.
+func TestHostDispatcher_WorkingDirUnbound(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(func(r *hdRun) { r.WorkingDir = "" })
+	if o := h.eval(t, r); o.Spawned || o.Refusal != "working_dir_unbound" {
+		t.Fatalf("empty working_dir = %+v; want working_dir_unbound", o)
+	}
+	if h.b.count(isLinkReq) != 0 || h.b.count(func(q hdRequest) bool { return q.Method == http.MethodPost }) != 0 || h.spawner.n() != 0 {
+		t.Fatal("an unbound working_dir drew a campaign-link read, a POST or a spawn")
+	}
+}
+
+// #5402: eligibility is checked before the working_dir, so an UNMARKED run
+// with no working_dir reads not_eligible (the benign skip), never
+// working_dir_unbound or path_outside_allowed_roots.
+func TestHostDispatcher_UnmarkedRunWithoutWorkingDirIsNotEligible(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(func(r *hdRun) { r.AutoDispatch = false; r.WorkingDir = "" })
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseNotEligible {
+		t.Fatalf("unmarked run without working_dir = %+v; want not_eligible", o)
 	}
 }

@@ -1,0 +1,15 @@
+id: scenario:issue-5402/status-cli-reports-tick-failure
+statement: '`fishhawk-mcp host-dispatch --status --state-dir <dir>`, run against a status.json whose last_tick_at is current but whose last_tick_failure (code list_runs_failed) is newer than last_complete_tick_at, exits 1 and prints a single stdout line containing `state=failing` and `tick_failure=list_runs_failed`.'
+verify_hint: 'CLI: write <dir>/status.json with last_tick_at = now, last_complete_tick_at = now minus 60 s, last_tick_failure {code: list_runs_failed, at: now}, then run the binary and read its exit code and stdout.'
+steps: 'Created dir /tmp/fhacc5402/s2 (mode 0700). Wrote status.json (mode 0600) with last_tick_at = now, last_complete_tick_at = now minus 60 s, interval_seconds 30 and last_tick_failure {code: list_runs_failed, at: now}. Ran fishhawk-mcp host-dispatch --status --state-dir /tmp/fhacc5402/s2.'
+steps_carried_from: head beadbfee4ec6d4bab02c2558fa4d146ee49f8798 recorded_at 2026-11-21T03:08:01Z
+assertions:
+    expected: exit 1; state=failing and tick_failure=list_runs_failed
+    observed_at_record: exit 1; single line 'state=failing ... tick_failure=list_runs_failed at=...'
+    repro_handle: fishhawk-mcp host-dispatch --status --state-dir /tmp/fhacc5402/s2
+origin:
+    issue: 5402
+    pr: 5500
+    run_id: 39a4e171-1dd2-4b1a-a173-5aa41d273c40
+    head_sha: 68f3d134e126805da682b339c66ea3bd4ad96f45
+    recorded_at: 2026-11-21T04:01:03Z

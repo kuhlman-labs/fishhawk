@@ -85,27 +85,33 @@ through the same `loadConfig` ladder as the server modes.
 
 **Entry points** (`host_dispatcher_loop.go`, five names pinned in
 `export_surface_test.go`): `HostDispatcherConfig`, `RunHostDispatcher`,
-`HostDispatcherStatus` (with `Stale`), `ReadHostDispatcherStatus` and
+`HostDispatcherStatus` (with `Stale` and `State`), `ReadHostDispatcherStatus` and
 `SetHostDispatcherPaused`. `backend/cmd/fishhawk-mcp/host_dispatch.go` routes
 `fishhawk-mcp host-dispatch` to them before the transport flag parse. Its flags
 are `--allowed-roots` (falls back to `FISHHAWK_MCP_ALLOWED_ROOTS`; leaving both
 empty exits 2), `--interval` (default 30s; above 45s exits 2),
 `--max-in-flight` (default 2, ADR-104 Q6), `--per-tick-cap` (default 4),
 `--daily-cap` (opt-in, no default: 0 or absent is no daily cap, ADR-104
-A1), `--state-dir` (default
+A1), `--state-dir` (default `FISHHAWK_HOST_DISPATCH_STATE_DIR` when set, else
 `$TMPDIR/fishhawk-host-dispatch`), `--stale-after`, `--runner-binary`,
-`--pause` / `--resume`, and `--status` (exit 0 when live or paused, 1 when
-absent or stale, where stale means the last tick is older than 3 intervals,
-a chosen default). SIGINT/SIGTERM lets the in-flight tick finish, then exits.
+`--pause` / `--resume`, and `--status` (state `live | paused | failing |
+stale` from `HostDispatcherStatus.State`; exit 0 when live or paused, 1 when
+absent, stale or failing; stale means the last tick, or a known last completed
+pass, is older than 3 intervals, a chosen default, or either is future-dated).
+SIGINT/SIGTERM lets the
+in-flight tick finish, then exits.
 The scripts/dev wiring and its operator documentation are
 [E88.3 / #4527](https://github.com/kuhlman-labs/fishhawk/issues/4527).
 
-**Eligibility** (`host_dispatcher.go`). A run is a candidate when it is local,
-not terminal, has a `working_dir` that is non-empty, absolute and inside an
-allowed root (`path_outside_allowed_roots` otherwise) and that exists on this
-host as a directory (`working_dir_absent` otherwise, before the campaign-link
-read), and either carries the mark or is a decomposition child whose parent
-carries it. A parent read error skips the child (fail closed). A verify-only
+**Eligibility** (`host_dispatcher.go`). The checks run in this order (#5402,
+folded from #5267): the run is local (`runner_kind_not_local`), not terminal
+(`run_terminal`), and eligible: it carries the mark or is a decomposition child
+whose parent carries it (`not_eligible`; a parent read error is
+`parent_unreadable`, fail closed). Only then is its `working_dir` checked: it
+must be bound (`working_dir_unbound` for an empty one), absolute and inside an
+allowed root (`path_outside_allowed_roots`), and a directory on this host
+(`working_dir_absent`), all before the campaign-link read. So an unmarked run
+reads `not_eligible` whatever its `working_dir`. A verify-only
 re-open is eligible only through that same mark: an unmarked run is never
 spawned, whatever re-opened it. The
 stage comes from `driveDispatchableStage`. A failed stage is never re-picked,
@@ -139,8 +145,8 @@ admission path, and `concurrency_slot.go` is untouched. A 409
 `transitioned:false` answer is `marker_not_transitioned` with no spawn.
 
 **Refusal codes.** Per candidate: `runner_kind_not_local`, `run_terminal`,
-`path_outside_allowed_roots`, `working_dir_absent`, `not_eligible`,
-`parent_unreadable`,
+`not_eligible`, `parent_unreadable`, `working_dir_unbound`,
+`path_outside_allowed_roots`, `working_dir_absent`,
 `nothing_dispatchable`, `in_flight`, `stale_runner_live`,
 `stale_runner_unknown`, `stale_respawn_cap_reached`, the three campaign codes,
 `paused`, `cap_reached:max_in_flight`, `cap_reached:daily` (only possible when
@@ -151,6 +157,147 @@ server's own code for any other marker refusal (for example
 `cap_reached:per_tick`, `ledger_read_failed`, `list_runs_failed`,
 `state_dir_lock_lost`. The status file records the latest one that is not a
 routine skip.
+
+**Status file** (`<state-dir>/status.json`, `HostDispatcherStatus`). Besides
+the global `last_refusal_*` fields above, a dispatcher writes three keys
+(#5402), all omitted when empty so an older reader ignores them.
+`run_refusals` maps each candidate run id to its latest non-benign refusal
+(`run_id`, `stage_id`, `code`, `detail` cut to 300 bytes with control
+characters dropped, `first_at`, `last_at`). A spawn or a benign outcome
+(`runner_kind_not_local`, `run_terminal`, `not_eligible`,
+`nothing_dispatchable`, `in_flight`) clears the run's entry, a completed pass
+prunes the entries of runs that are no longer candidates, and an early return
+leaves the map untouched. A repeated refusal (same code, same stage) keeps
+`first_at` and is logged once per run. `cap_reached:per_tick` is global-only: it
+is never a per-run entry. `last_complete_tick_at` is stamped only after a tick
+finishes its candidate pass (a per-tick-cap or memory-pressure break still
+counts). `last_tick_failure` (`{code, at}`) is set by every non-paused early
+return (`state_dir_lock_lost`, `ledger_read_failed`, `ledger_write_failed`,
+`list_runs_failed`) and reset at each tick start; a paused tick records none.
+`HostDispatcherStatus.State(now)` reads, in order: `stale` when the last tick
+(`last_tick_at`) is older than 3 intervals (liveness), or when `last_tick_at` or
+`last_complete_tick_at` is more than 60s ahead of the reader's clock
+(future-dated: no live writer stamps one, and it would never age out);
+`paused` (a deliberate
+pause skips the pass, so it is exempt from the completed-pass test); `failing`
+when `last_tick_failure` is not older than `last_complete_tick_at`; `stale` when
+a KNOWN `last_complete_tick_at` is older than 3 intervals; else `live`. A zero
+or absent `last_complete_tick_at` (a pre-#5402 dispatcher, or a hand-written
+fixture) is unknown, not stale, so such a file is judged on `last_tick_at`
+alone and reads exactly as before. The reader clamps `interval_seconds` to
+[1, 300] before computing the 3-interval window (an absent or non-positive value
+is the 30s default), so a huge value cannot keep a dead file live.
+`FISHHAWK_HOST_DISPATCH_STATE_DIR`
+(`hostDispatchStateDirEnv`) names a state dir outside the default: `fishhawk-mcp
+host-dispatch` reads it as its `--state-dir` default, and the status overlay
+below reads it as its exclusive rung.
+
+**Status overlay (#5402).** The backend's campaign awaiting block says the
+host dispatcher "spawns this stage on its next tick" for every
+`host_dispatcher` item; it cannot know whether a dispatcher runs, is paused,
+capped or refusing, because that state lives only in the host-local
+status.json. `host_dispatch_overlay.go` is the interim MCP-local mechanism, under
+the Captain's 2026-11-20 ruling (c), that reads it; the server heartbeat
+([#5489](https://github.com/kuhlman-labs/fishhawk/issues/5489)) supersedes it.
+It adds no server API or wire type.
+
+- *Enable gate.* It runs only when `hostDispatchOverlayEnabled`:
+  `Config.LocalHostRungs` (the operator's own stdio `fishhawk-mcp`) and a bearer
+  that is not run-bound (`fhm_`). Over fishhawkd's `/mcp` route, and for an
+  in-runner agent, the backend's block passes through unchanged and no host
+  file is read.
+- *Ladder.* `FISHHAWK_HOST_DISPATCH_STATE_DIR` alone when it is set (exclusive),
+  else `<MCP process cwd>/.fishhawk/cache/host-dispatch`, then the item's own
+  run `<working_dir>/.fishhawk/cache/host-dispatch` (absolute only), then
+  `$TMPDIR/fishhawk-host-dispatch`. scripts/dev pins `HD_STATE_DIR` to its own
+  checkout (scripts/dev:67) while `--allowed-roots` may cover other checkouts,
+  so a run's working_dir rung can miss; the cwd rung (the stdio process runs in
+  the operator's checkout) or the env var finds the dispatcher, usually with
+  zero run reads. The first trusted rung with a non-stale status wins; a STALE
+  hit is remembered and the walk continues, and when every hit is stale the
+  first is reported. An unreadable status.json (corrupt, a symlink) ends the
+  walk as unverified.
+- *Trust and bounds (S4).* A rung's directory is trusted only if it passes the
+  dispatcher's own check, `hostDispatchStateDirProblem` (a real directory, not a
+  symlink, owned by the current uid; an unreadable owner fails closed). An
+  untrusted rung is skipped and named in `paths_tried` and the absent next_step
+  as `(skipped: symlink)`, `(skipped: not a directory)` or `(skipped: not
+  owned by this user)`; the env rung stays exclusive even when untrusted. The
+  probe never creates, chmods or writes anything. Every string copied from the
+  file into tool output passes `boundHostDispatchText` (control characters
+  dropped, cut to the writer's 300 bytes); `paths_tried` keeps at most 6
+  entries (a final `(+N more)`). Code-set membership and stage-id equality use
+  the raw values. A future-dated stamp reads stale and `interval_seconds` is
+  clamped (above), so a planted file cannot stay live by its timestamps.
+  **Accepted residual.** The trust check cannot tell the operator from another
+  process with the operator's uid, including a local run's agent, which can
+  write a trusted rung (its own checkout's `.fishhawk/cache/`, which is
+  gitignored, or `$TMPDIR`). The overlay is therefore DISPLAY-ONLY advisory
+  text, never a dispatch decision. A working_dir rung speaks only for its own
+  run's items, and the freshness bounds above hold a planted file to a 60s
+  future window, so a planted file reaches no other run. The authoritative fix
+  is the server-side heartbeat
+  ([#5489](https://github.com/kuhlman-labs/fishhawk/issues/5489)).
+- *Global first (R1), own rung per run.* In `fishhawk_get_campaign_status` the
+  env, cwd and `$TMPDIR` rungs are global: a status found there applies to
+  EVERY `host_dispatcher` item (one dispatcher per stack; two dispatchers with
+  different state dirs serving one backend from one host would show as the
+  first found). A run's working_dir rung is not: a status found only there
+  applies only to items whose run has that working_dir, and every other item
+  continues down its own ladder (its own run's rung, then `$TMPDIR`) or reads
+  unverified. It never makes another run's item read live. The per-run lookup
+  reads no run: the server's block already carries `run_id` and `stage_id`.
+  Runs are read (for their working_dir rung) only when the env var is unset
+  and the cwd rung found nothing decisive; each distinct run is read once, at
+  most 16 reads per call (`hostDispatchOverlayReadCap`), since each read is a
+  backend round trip inside a status call the operator polls. Each rung is
+  read at most once per call. An item whose run read failed or was skipped by
+  the cap keeps the global rungs and reads `host_dispatcher` /
+  `host_dispatch_unverified` (never absent) when they found no status.
+- *Precedence and reasons.* No status: human / `host_dispatcher_absent`, naming
+  the paths tried and the env var, never claiming the dispatcher is down. An
+  unreadable file: `host_dispatcher` / `host_dispatch_unverified`. Then the
+  dispatcher's `State`: stale reads human / `host_dispatcher_absent` (last tick
+  too old, or no completed pass since); paused reads human /
+  `host_dispatch_paused` naming `--resume --state-dir <dir>` (the pause-check
+  wording only when `last_refusal_code` is `pause_check_failed` and
+  `last_refusal_at` is not before `last_tick_at`); failing reads human /
+  `host_dispatch_refused` with the tick code. Then the run's entry: an entry
+  naming another stage than the item's (S5b, it may predate the stage's
+  advance) is provisionally `host_dispatch_unverified` naming both stage ids;
+  `paused` / `pause_check_failed` (the mid-tick Admit race,
+  `hostDispatchPausedRefusals`) read paused; `cap_reached:daily` reads human /
+  `host_dispatch_capped`; the deliberate holds `campaign_not_running` and
+  `campaign_dispatch_held` (`hostDispatchHoldRefusals`) read human /
+  `host_dispatch_refused` cause-first, with no hand-dispatch advice;
+  `cap_reached:max_in_flight`, `concurrency_slot_queued`,
+  `host_memory_pressure`, `marker_not_transitioned`,
+  `dependency_not_satisfied` and `wave_not_integrated`
+  (`hostDispatchWaitingRefusals`) are provisionally waiting
+  (`host_dispatcher` / `host_dispatch`, "no operator action is needed"); any
+  other code reads human / `host_dispatch_refused`, advising
+  `fishhawk_dispatch_stage` only when the refusal is not a deliberate hold.
+  Then the global daily cap (`daily_cap` reached on today's UTC `spawns_day`)
+  reads human / `host_dispatch_capped` with the reset time. So the daily cap
+  outranks a waiting or stage-mismatch entry, and a refusing, held or paused
+  entry outranks the cap. Otherwise live: the block is unchanged, now
+  positively verified. Each overlaid block carries `host_dispatch`, the
+  observation.
+- *Limit.* A benign refusal (for example `nothing_dispatchable`) clears the
+  run's entry, so a stage the dispatcher will never offer (the #5298 shape)
+  still reads live until that stall gets a non-benign code. A new stall or
+  hold code reaches the overlay only by being non-benign and joining the right
+  code set above (a hold code joins `hostDispatchHoldRefusals`, as #5473 and
+  #5486 would); an unknown non-benign code reads refusing.
+- *Run status.* `fishhawk_get_run_status` gains `host_dispatch` (the same
+  observation, `runHostDispatchFor`) for a run the dispatcher would consider
+  (local, non-terminal, a pending or `awaiting_host_dispatch` dispatchable
+  stage, and eligible by the dispatcher's own `eligible` predicate: marked, or a
+  child of a marked parent) or one it holds a `run_refusals` entry for. It uses
+  the run's own working_dir rung (no extra read) and compares the entry with
+  the dispatchable stage (S5b). It is `tierNever` in `runStatusPathTable` and
+  retained by the diagnosis skeleton (S5a), like the wait-status blocks;
+  `next_actions` is unchanged.
 
 **Tick and caps.** Each tick runs these steps in order. It checks that this
 process still holds the state-dir lock (`state_dir_lock_lost` stops the loop).
@@ -248,8 +395,12 @@ stage-state probe and the server's cancel path.
 
 Tests: `host_dispatcher_test.go` (the core, wire to spawn seam),
 `host_dispatcher_loop_test.go` (ticks, caps, ledger, pause, reap, order, state
-dir, lock), and `backend/cmd/fishhawk-mcp/host_dispatch_test.go` (flags,
-status, pause/resume, routing).
+dir, lock, run refusals, tick health), `host_dispatch_overlay_test.go` (overlay
+modes, freshness bounds, ladder, trust, text bounds, read cap, a working_dir
+rung speaking only for its own run), the overlay's gate and
+cross-boundary tests in `campaign_test.go`, `TestGetRunStatus_HostDispatchBlock`
+in `tools_test.go`, and `backend/cmd/fishhawk-mcp/host_dispatch_test.go`
+(flags, status, pause/resume, routing).
 
 ## Tool reference and internals
 

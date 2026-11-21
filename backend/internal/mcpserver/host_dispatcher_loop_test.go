@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // host_dispatcher_loop_test.go drives the host-dispatcher tick loop (E88.2 /
@@ -35,6 +38,8 @@ type hdLoopHarness struct {
 	terminated []string
 	// onDriveView runs on every plain run read (the core's drive view).
 	onDriveView func(runID string)
+	// listCode non-zero answers the run list with that status.
+	listCode int
 }
 
 func newHDLoopHarness(t *testing.T) *hdLoopHarness {
@@ -54,7 +59,12 @@ func (lh *hdLoopHarness) serve(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodGet && req.URL.Path == "/v0/runs" {
 		lh.mu.Lock()
 		lh.listQuery = append(lh.listQuery, req.URL.RawQuery)
+		code := lh.listCode
 		lh.mu.Unlock()
+		if code != 0 {
+			writeJSON(w, code, apiErrBody("internal", "list failed"))
+			return
+		}
 		state := req.URL.Query().Get("state")
 		lh.b.mu.Lock()
 		ids := make([]string, 0, len(lh.b.runs))
@@ -337,6 +347,12 @@ func TestTick_PerTickCapBoundsReadsAndPosts(t *testing.T) {
 	st, _ := ReadHostDispatcherStatus(lh.dir)
 	if st.LastRefusalCode != hdRefuseCapPerTick {
 		t.Fatalf("last refusal = %q; want %s", st.LastRefusalCode, hdRefuseCapPerTick)
+	}
+	// #5402 R5: the per-tick cap is global-only, never a per-run entry.
+	for id, ref := range st.RunRefusals {
+		if ref.Code == hdRefuseCapPerTick {
+			t.Fatalf("run_refusals[%s] = %+v; %s must stay global-only", id, ref, hdRefuseCapPerTick)
+		}
 	}
 }
 
@@ -944,5 +960,300 @@ func TestRunHostDispatcher_RefusesInvalidHostCapacity(t *testing.T) {
 	}
 	if _, serr := os.Stat(dir); !errors.Is(serr, os.ErrNotExist) {
 		t.Fatalf("a refused start created the state dir: %v", serr)
+	}
+}
+
+// --- #5402: per-run refusals, completed-tick health, shared helpers ---------
+
+// hdStatusFileRaw reads status.json as raw JSON, so a test sees exactly what
+// the writer put in the FILE (absent keys included).
+func hdStatusFileRaw(t *testing.T, dir string) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, hostDispatchStatusFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode status.json: %v", err)
+	}
+	return m
+}
+
+func hdMustStatus(t *testing.T, dir string) HostDispatcherStatus {
+	t.Helper()
+	st, err := ReadHostDispatcherStatus(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func hdHasControlRune(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// Item 4: a non-benign refusal is recorded per run in the FILE, the spawned
+// run has no entry, and the global last_refusal_* fields are unchanged. The
+// writer bounds the detail (S4).
+func TestHostDispatchLoop_RunRefusals_RecordedPerRun(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	spawned := lh.add(0, nil)
+	capped := lh.add(time.Minute, nil)
+	l := lh.loop(func(c *HostDispatcherConfig) { c.DailyCap = 1 })
+	lh.tick(l)
+	st := hdMustStatus(t, lh.dir)
+	ref, ok := st.RunRefusals[capped.ID]
+	if !ok {
+		t.Fatalf("status.json run_refusals = %+v; want an entry for the capped run %s", st.RunRefusals, capped.ID)
+	}
+	if ref.RunID != capped.ID || ref.Code != hdRefuseCapDaily || ref.StageID != capped.Stages[0].ID || !ref.FirstAt.Equal(lh.clock) || !ref.LastAt.Equal(lh.clock) {
+		t.Fatalf("entry = %+v; want run %s, %s, stage %s, first_at == last_at == %s", ref, capped.ID, hdRefuseCapDaily, capped.Stages[0].ID, lh.clock)
+	}
+	if _, ok := st.RunRefusals[spawned.ID]; ok || lh.spawner.n() != 1 {
+		t.Fatalf("spawned run has an entry (%v) or spawns = %d; want no entry and one spawn", ok, lh.spawner.n())
+	}
+	if st.LastRefusalCode != hdRefuseCapDaily || st.LastRefusalRunID != capped.ID || st.LastRefusalStageID != capped.Stages[0].ID {
+		t.Fatalf("global last refusal = %q run=%s stage=%s; want %s for %s", st.LastRefusalCode, st.LastRefusalRunID, st.LastRefusalStageID, hdRefuseCapDaily, capped.ID)
+	}
+
+	// The writer bound: a long detail with control characters.
+	long := strings.Repeat("x", 2500) + "\n\x1b[31m" + strings.Repeat("y", 2490)
+	l.record(hostDispatchOutcome{RunID: capped.ID, StageID: capped.Stages[0].ID, Refusal: "marker_refused_by_test", Detail: long}, map[string]bool{})
+	l.writeStatus()
+	st = hdMustStatus(t, lh.dir)
+	d := st.RunRefusals[capped.ID].Detail
+	if len(d) == 0 || len(d) > hostDispatchTextMax || hdHasControlRune(d) || !utf8.ValidString(d) {
+		t.Fatalf("file detail is %d bytes (control rune %v); want 1..%d bytes, utf8, no control rune", len(d), hdHasControlRune(d), hostDispatchTextMax)
+	}
+}
+
+// Item 5: a spawn clears the run's entry, a benign outcome clears it (C is
+// still a candidate, so only that branch removes it), and a run that is no
+// longer a candidate (terminal) is pruned.
+func TestHostDispatchLoop_RunRefusals_ClearedAndPruned(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	later := filepath.Join(lh.root, "later")
+	a := lh.add(0, func(r *hdRun) { r.WorkingDir = later })
+	b := lh.add(time.Minute, func(r *hdRun) { r.Link = hdLinked("paused") })
+	c := lh.add(2*time.Minute, func(r *hdRun) { r.WorkingDir = filepath.Join(lh.root, "never") })
+	l := lh.loop(nil)
+	lh.tick(l)
+	st := hdMustStatus(t, lh.dir)
+	if st.RunRefusals[a.ID].Code != hdRefuseWorkingDirAbsent || st.RunRefusals[b.ID].Code != hdRefuseCampaignNotRunning || st.RunRefusals[c.ID].Code != hdRefuseWorkingDirAbsent {
+		t.Fatalf("tick 1 run_refusals = %+v; want A and C %s, B %s", st.RunRefusals, hdRefuseWorkingDirAbsent, hdRefuseCampaignNotRunning)
+	}
+	if err := os.Mkdir(later, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lh.b.mu.Lock()
+	b.State = "succeeded"
+	c.AutoDispatch = false // tick 2 reads the benign not_eligible
+	lh.b.mu.Unlock()
+	lh.clock = lh.clock.Add(30 * time.Second)
+	lh.tick(l)
+	if lh.spawner.n() != 1 || lh.spawner.spawns[0].Run != a.ID {
+		t.Fatalf("tick 2 spawns = %+v; want A spawned", lh.spawner.spawns)
+	}
+	st = hdMustStatus(t, lh.dir)
+	if ref, ok := st.RunRefusals[a.ID]; ok {
+		t.Fatalf("A's entry survived its spawn: %+v", ref)
+	}
+	if ref, ok := st.RunRefusals[b.ID]; ok {
+		t.Fatalf("terminal B's entry was not pruned: %+v", ref)
+	}
+	if ref, ok := st.RunRefusals[c.ID]; ok {
+		t.Fatalf("C's entry survived a benign outcome: %+v", ref)
+	}
+	if _, ok := hdStatusFileRaw(t, lh.dir)["run_refusals"]; ok {
+		t.Fatal("status.json still carries a run_refusals key with no entries")
+	}
+}
+
+// Item 6: a repeated refusal is logged once per run; first_at is kept and
+// last_at advances; a code change logs again and resets first_at.
+func TestHostDispatchLoop_RepeatedRefusalLoggedOnce(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	later := filepath.Join(lh.root, "later")
+	r := lh.add(0, func(r *hdRun) { r.WorkingDir = later })
+	var logBuf bytes.Buffer
+	l := lh.loop(func(c *HostDispatcherConfig) { c.Log = &logBuf })
+	lines := func() int { return strings.Count(logBuf.String(), "refused run="+r.ID) }
+	t0 := lh.clock
+	for i := 0; i < 3; i++ {
+		lh.tick(l)
+		lh.clock = lh.clock.Add(30 * time.Second)
+	}
+	if n := lines(); n != 1 {
+		t.Fatalf("refused lines after 3 identical refusals = %d; want 1:\n%s", n, logBuf.String())
+	}
+	ref := hdMustStatus(t, lh.dir).RunRefusals[r.ID]
+	if !ref.FirstAt.Equal(t0) || !ref.LastAt.Equal(t0.Add(60*time.Second)) {
+		t.Fatalf("entry = %+v; want first_at %s kept and last_at %s", ref, t0, t0.Add(60*time.Second))
+	}
+	if err := os.Mkdir(later, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lh.b.mu.Lock()
+	r.Link = hdLinked("paused")
+	lh.b.mu.Unlock()
+	lh.tick(l)
+	if n := lines(); n != 2 {
+		t.Fatalf("refused lines after a code change = %d; want 2:\n%s", n, logBuf.String())
+	}
+	ref = hdMustStatus(t, lh.dir).RunRefusals[r.ID]
+	if ref.Code != hdRefuseCampaignNotRunning || !ref.FirstAt.Equal(lh.clock) {
+		t.Fatalf("entry after the change = %+v; want %s with first_at reset to %s", ref, hdRefuseCampaignNotRunning, lh.clock)
+	}
+}
+
+// Item 7 (R2): every non-paused early return records last_tick_failure, so a
+// dispatcher whose ticks fail reads failing rather than live; a paused tick
+// records none; a completed tick clears it.
+func TestTick_EarlyReturnRecordsTickFailure(t *testing.T) {
+	rows := []struct {
+		code  string
+		fault func(lh *hdLoopHarness, l *hostDispatchLoop)
+	}{
+		{hdRefuseLockLost, func(_ *hdLoopHarness, l *hostDispatchLoop) { l.lockHeld = func() bool { return false } }},
+		{hdRefuseLedgerRead, func(lh *hdLoopHarness, _ *hostDispatchLoop) {
+			path := filepath.Join(lh.dir, hostDispatchLedgerFile)
+			target := filepath.Join(lh.t.TempDir(), "ledger.json")
+			if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+				lh.t.Fatal(err)
+			}
+			if err := os.Remove(path); err != nil {
+				lh.t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				lh.t.Fatal(err)
+			}
+		}},
+		{hdRefuseLedgerWrite, func(_ *hdLoopHarness, l *hostDispatchLoop) {
+			l.writeFile = func(dir, name string, data []byte) error {
+				if name == hostDispatchLedgerFile {
+					return errors.New("disk full")
+				}
+				return writeHostDispatchFile(dir, name, data)
+			}
+		}},
+		{hdRefuseListFailed, func(lh *hdLoopHarness, _ *hostDispatchLoop) {
+			lh.mu.Lock()
+			lh.listCode = 500
+			lh.mu.Unlock()
+		}},
+	}
+	for _, row := range rows {
+		t.Run(row.code, func(t *testing.T) {
+			lh := newHDLoopHarness(t)
+			l := lh.loop(nil)
+			t0 := lh.clock
+			lh.tick(l)
+			t1 := t0.Add(30 * time.Second)
+			lh.clock = t1
+			row.fault(lh, l)
+			_ = l.tick(context.Background()) // state_dir_lock_lost returns its error
+			st := hdMustStatus(t, lh.dir)
+			if !st.LastTickAt.Equal(t1) || !st.LastCompleteTickAt.Equal(t0) {
+				t.Fatalf("last_tick_at=%s last_complete_tick_at=%s; want %s and %s", st.LastTickAt, st.LastCompleteTickAt, t1, t0)
+			}
+			if st.LastTickFailure == nil || st.LastTickFailure.Code != row.code || !st.LastTickFailure.At.Equal(t1) {
+				t.Fatalf("last_tick_failure = %+v; want {%s %s}", st.LastTickFailure, row.code, t1)
+			}
+			if got := st.State(t1); got != "failing" {
+				t.Fatalf("State = %q; want failing", got)
+			}
+			if row.code != hdRefuseListFailed {
+				return
+			}
+			// Recovery: the fault clears and a completed tick drops the failure.
+			lh.mu.Lock()
+			lh.listCode = 0
+			lh.mu.Unlock()
+			t2 := t1.Add(30 * time.Second)
+			lh.clock = t2
+			lh.tick(l)
+			if _, ok := hdStatusFileRaw(t, lh.dir)["last_tick_failure"]; ok {
+				t.Fatal("status.json still carries last_tick_failure after a completed tick")
+			}
+			if st := hdMustStatus(t, lh.dir); !st.LastCompleteTickAt.Equal(t2) || st.State(t2) != "live" {
+				t.Fatalf("after recovery last_complete_tick_at=%s state=%s; want %s, live", st.LastCompleteTickAt, st.State(t2), t2)
+			}
+		})
+	}
+	t.Run("paused", func(t *testing.T) {
+		lh := newHDLoopHarness(t)
+		l := lh.loop(nil)
+		t0 := lh.clock
+		lh.tick(l)
+		t1 := t0.Add(30 * time.Second)
+		lh.clock = t1
+		if err := SetHostDispatcherPaused(lh.dir, true); err != nil {
+			t.Fatal(err)
+		}
+		lh.tick(l)
+		st := hdMustStatus(t, lh.dir)
+		if !st.Paused || st.LastTickFailure != nil || !st.LastCompleteTickAt.Equal(t0) || st.State(t1) != "paused" {
+			t.Fatalf("paused tick: paused=%v failure=%+v last_complete=%s state=%s; want true, nil, %s, paused", st.Paused, st.LastTickFailure, st.LastCompleteTickAt, st.State(t1), t0)
+		}
+	})
+}
+
+// Item 8: State's order and the S3 unknown-zero rule, on constructed statuses.
+func TestHostDispatcherStatus_State(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	iv := 30 * time.Second
+	ago := func(n int) time.Time { return now.Add(-time.Duration(n) * iv) }
+	fail := func(at time.Time) *hostDispatchTickFailure {
+		return &hostDispatchTickFailure{Code: hdRefuseListFailed, At: at}
+	}
+	rows := []struct {
+		name string
+		st   HostDispatcherStatus
+		want string
+	}{
+		{"live", HostDispatcherStatus{LastTickAt: ago(0), LastCompleteTickAt: ago(0)}, "live"},
+		{"stale last tick", HostDispatcherStatus{LastTickAt: ago(4), LastCompleteTickAt: ago(4)}, "stale"},
+		{"paused, old completed pass", HostDispatcherStatus{LastTickAt: ago(0), LastCompleteTickAt: ago(10), Paused: true}, "paused"},
+		{"failure newer than last complete", HostDispatcherStatus{LastTickAt: ago(0), LastCompleteTickAt: ago(1), LastTickFailure: fail(ago(0))}, "failing"},
+		{"failure older than last complete", HostDispatcherStatus{LastTickAt: ago(0), LastCompleteTickAt: ago(0), LastTickFailure: fail(ago(1))}, "live"},
+		{"completed pass stale, no failure", HostDispatcherStatus{LastTickAt: ago(0), LastCompleteTickAt: ago(4)}, "stale"},
+		{"S3 zero complete, fresh tick", HostDispatcherStatus{LastTickAt: ago(0)}, "live"},
+		{"S3 zero complete, old tick", HostDispatcherStatus{LastTickAt: ago(4)}, "stale"},
+		{"S3 zero complete, fresh failure", HostDispatcherStatus{LastTickAt: ago(0), LastTickFailure: fail(ago(0))}, "failing"},
+	}
+	for _, row := range rows {
+		row.st.IntervalSeconds = iv.Seconds()
+		if got := row.st.State(now); got != row.want {
+			t.Errorf("%s: State = %q; want %q", row.name, got, row.want)
+		}
+	}
+}
+
+// Item 14 (S4): the shared text bound.
+func TestBoundHostDispatchText(t *testing.T) {
+	if got := boundHostDispatchText(strings.Repeat("a", 5000)); len(got) != hostDispatchTextMax {
+		t.Errorf("5000-byte ASCII: len = %d; want %d", len(got), hostDispatchTextMax)
+	}
+	// 299 ASCII bytes then a 3-byte rune: the 300-byte cut falls inside it.
+	split := strings.Repeat("a", 299) + "€" + "tail"
+	if got := boundHostDispatchText(split); len(got) > hostDispatchTextMax || !utf8.ValidString(got) || got != strings.Repeat("a", 299) {
+		t.Errorf("mid-rune cut: %d bytes valid=%v; want the 299-byte prefix", len(got), utf8.ValidString(got))
+	}
+	rows := map[string]string{
+		"a\x1b[31mb\nc\u0085d": "a[31mbcd",
+		"a\xffb":               "ab",
+		"short clean text":     "short clean text",
+		"tab\there\x7f":        "tabhere",
+	}
+	for in, want := range rows {
+		if got := boundHostDispatchText(in); got != want {
+			t.Errorf("boundHostDispatchText(%q) = %q; want %q", in, got, want)
+		}
 	}
 }

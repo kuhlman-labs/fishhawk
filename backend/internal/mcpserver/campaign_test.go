@@ -5184,3 +5184,139 @@ func TestGetCampaignStatus_ScopeOverlapDescription_NamesPredecessorRule(t *testi
 		}
 	}
 }
+
+// --- #5402: the stdio host-dispatch status overlay on campaign status ---
+
+// TestGetCampaignStatus_HostDispatchOverlay_Gated pins the enable gate: the
+// overlay reads the host only on the operator's stdio process with a
+// non-run-bound bearer.
+func TestGetCampaignStatus_HostDispatchOverlay_Gated(t *testing.T) {
+	campaignID, runID, stageID := uuid.New(), uuid.NewString(), uuid.NewString()
+	var runReads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/v0/campaigns/"+campaignID.String()+"/status" {
+			body, _ := json.Marshal(CampaignStatus{
+				Campaign: Campaign{ID: campaignID.String(), State: "running"},
+				Items:    []CampaignItem{hdoItem(runID, stageID)},
+			})
+			writeJSON(w, http.StatusOK, string(body))
+			return
+		}
+		if req.Method == http.MethodGet && req.URL.Path == "/v0/runs/"+runID {
+			runReads.Add(1) // the overlay's working_dir read (other helpers read sub-paths)
+		}
+		writeJSON(w, http.StatusNotFound, apiErrBody("not_found", "not served"))
+	}))
+	t.Cleanup(srv.Close)
+	hdoEmptyTMPDIR(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	paused := hdoStatus()
+	paused.Paused = true
+	hdoWrite(t, dir, paused)
+
+	for _, tc := range []struct {
+		name           string
+		localHostRungs bool
+		runBound       bool
+		wantReason     string
+	}{
+		{"http /mcp (localHostRungs false)", false, false, hostDispatchReasonDispatch},
+		{"run-bound bearer", true, true, hostDispatchReasonDispatch},
+		{"operator stdio", true, false, hostDispatchReasonPaused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runReads.Store(0)
+			r := newResolver(srv, map[string]string{hostDispatchStateDirEnv: dir})
+			r.localHostRungs, r.runBoundToken = tc.localHostRungs, tc.runBound
+			r.getwd = func() (string, error) { return t.TempDir(), nil }
+			r.hostDispatchNow = func() time.Time { return hdoNow }
+			_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: campaignID.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus: %v", err)
+			}
+			blk := out.Items[0].Awaiting
+			if blk.Reason != tc.wantReason {
+				t.Fatalf("reason = %q; want %q", blk.Reason, tc.wantReason)
+			}
+			if tc.wantReason == hostDispatchReasonPaused {
+				// Through the real SDK handler: the overlaid block passes the
+				// reflected output schema.
+				wire := hdoCallOverSession(t, r, "fishhawk_get_campaign_status", map[string]any{"campaign_id": campaignID.String()})
+				if got := hdoWireState(t, wire, "items", 0, "awaiting"); got != hostDispatchStatePaused || !strings.Contains(wire, `"reason":"host_dispatch_paused"`) {
+					t.Fatalf("wire host_dispatch.state = %q; want paused with reason host_dispatch_paused: %s", got, wire)
+				}
+			}
+			if tc.wantReason == hostDispatchReasonDispatch {
+				raw, _ := json.Marshal(blk)
+				if blk.Kind != hostDispatchAwaitKind || blk.NextStep != hdoBackendNext || strings.Contains(string(raw), "host_dispatch\":{") || runReads.Load() != 0 {
+					t.Fatalf("gated off: block %s, run reads %d; want the backend block unchanged, no host_dispatch key, zero reads", raw, runReads.Load())
+				}
+			}
+		})
+	}
+}
+
+// TestGetCampaignStatus_HostDispatchCapped_ThroughRealDispatcherAndServer is
+// the cross-boundary test (#5402 done-means 1): a REAL dispatcher loop writes
+// status.json, the REAL server computes the awaiting block, and the MCP
+// overlay turns host_dispatcher/host_dispatch into human/host_dispatch_capped.
+func TestGetCampaignStatus_HostDispatchCapped_ThroughRealDispatcherAndServer(t *testing.T) {
+	hdoEmptyTMPDIR(t)
+	// Step 1: the real loop, DailyCap 1 over two marked runs.
+	lh := newHDLoopHarness(t)
+	lh.add(0, nil)
+	capped := lh.add(time.Minute, nil)
+	l := lh.loop(func(c *HostDispatcherConfig) { c.DailyCap = 1 })
+	lh.tick(l)
+	st, err := ReadHostDispatcherStatus(lh.dir)
+	if err != nil {
+		t.Fatalf("read the real status file: %v", err)
+	}
+	if st.RunRefusals[capped.ID].Code != hdRefuseCapDaily || st.LastCompleteTickAt.IsZero() {
+		t.Fatalf("status.json = %+v; want a cap_reached:daily entry for %s and a completed tick", st, capped.ID)
+	}
+
+	// Step 2: the real server, serving an item linked to run B.
+	now := time.Now().UTC()
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "acme/widgets", EpicRef: "issue:1", State: campaign.StateRunning,
+		PausePolicy: campaign.PausePolicyPauseCampaign, CreatedAt: now, UpdatedAt: now}
+	runID := uuid.MustParse(capped.ID)
+	runRow := &runpkg.Run{ID: runID, Repo: "acme/widgets", State: runpkg.StateRunning, AutoDispatch: true,
+		RunnerKind: runpkg.RunnerKindLocal, CreatedAt: now, UpdatedAt: now}
+	stage := &runpkg.Stage{ID: uuid.MustParse(capped.Stages[0].ID), RunID: runID, Sequence: 1, Type: runpkg.StageTypePlan,
+		State: runpkg.StageStateAwaitingHostDispatch, CreatedAt: now, UpdatedAt: now}
+	repo := &autoStartStatusRepo{c: c, items: []*campaign.Item{
+		{ID: uuid.New(), CampaignID: c.ID, IssueRef: "issue:2", State: campaign.ItemStateRunning, RunID: &runID, CreatedAt: now, UpdatedAt: now},
+	}}
+	const bearer = "fhk_host_dispatch_overlay_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:campaigns", "read:runs"}, PlainText: bearer}}
+	s := server.New(server.Config{CampaignRepo: repo, RunRepo: &awaitingStatusRunRepo{r: runRow, stages: []*runpkg.Stage{stage}}, APITokenRepo: tokRepo})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// The server's own block, read with the overlay off.
+	off := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+	_, raw, err := off.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: c.ID.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus (overlay off): %v", err)
+	}
+	if b := raw.Items[0].Awaiting; b == nil || b.Kind != hostDispatchAwaitKind || b.Reason != hostDispatchReasonDispatch || b.StageID != capped.Stages[0].ID {
+		t.Fatalf("server block = %+v; want host_dispatcher/host_dispatch on stage %s", b, capped.Stages[0].ID)
+	}
+
+	// Step 3: the operator's stdio resolver, env rung = the harness state dir.
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer}), localHostRungs: true,
+		getenv: envFuncFromMap(map[string]string{hostDispatchStateDirEnv: lh.dir}), getwd: func() (string, error) { return t.TempDir(), nil },
+		hostDispatchNow: func() time.Time { return lh.clock }}
+	_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: c.ID.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus (overlay on): %v", err)
+	}
+	blk := out.Items[0].Awaiting
+	if blk.Kind != "human" || blk.Reason != hostDispatchReasonCapped || blk.HostDispatch == nil || blk.HostDispatch.RefusalCode != hdRefuseCapDaily {
+		t.Fatalf("awaiting = %+v (host_dispatch %+v); want human/host_dispatch_capped with refusal_code %s", blk, blk.HostDispatch, hdRefuseCapDaily)
+	}
+	reset := time.Date(lh.clock.Year(), lh.clock.Month(), lh.clock.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour).Format(time.RFC3339)
+	hdoContainsAll(t, "next_step", blk.NextStep, "--daily-cap 1", reset, "fishhawk_dispatch_stage")
+	hdoContainsNone(t, "next_step", blk.NextStep, "no operator action is needed")
+}
