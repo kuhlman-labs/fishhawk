@@ -60,6 +60,7 @@ markers:          # honour an in-line fishhawk:allow-secret only here
 ## Residuals
 
 - **Detection is the pattern set.** A credential format outside `redaction.DefaultPatterns` passes. `json-password-field` matches any JSON-shaped `password`/`secret`/`token`/`api_key` key with a string value, including Go map literals in test code — each hit is a high concern only a human can clear, and a fixture marker cannot suppress it (§ Allowlist, #5462: low-entropy classes are never marker-suppressed; an `entries` rule is the route). Tuning is a follow-up decision, not a change here.
+- **Digests minted before #5462 are not rewritten.** From #5461 until #5462 a marker could suppress a `json-password-field` or `authorization-bearer` hit and mint its unsalted per-hit fingerprint. An entry written in that window (a `diff_secrets_detected` payload's `suppressed[].check_key`, or a marker concern row's `check_key`) may still carry such a digest beside its path and pattern; the append-only audit log is not rewritten, so only deployments whose allowlist marker scope named one of those two classes are affected.
 - **Per-line matching.** A credential split across two added lines is not matched (the `authorization-bearer` regex's `\s*` cannot span the newline here).
 - **A truncated patch is scanned only up to the cut.** The server records `patch_truncated` on its audit entry.
 - **A marker scope is a trust grant.** Inside a scope, any added line can mark itself; each marked hit still raises a low human-only concern, so the self-marking path is seen, not blocked.

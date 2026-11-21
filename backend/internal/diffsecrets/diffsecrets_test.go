@@ -881,4 +881,16 @@ func TestSuppression_CarriesNoBytes(t *testing.T) {
 			t.Errorf("%s: suppression output carries the credential bytes", name)
 		}
 	}
+	// The whole-sample needle above cannot fire over the JSON half for
+	// json-password-field (json.Marshal escapes its quotes) and misses a leak of
+	// only the guessable VALUE, which is what #5462 protects. Search both halves
+	// for the bare value of each low-entropy sample.
+	for name, value := range map[string]string{
+		"json-password-field":  strings.Repeat("j", 8),
+		"authorization-bearer": strings.Repeat("h", 12),
+	} {
+		if strings.Contains(string(raw), value) || strings.Contains(notes.String(), value) {
+			t.Errorf("%s: suppression output carries the bare credential value", name)
+		}
+	}
 }
