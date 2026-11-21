@@ -1,0 +1,14 @@
+id: scenario:issue-5402/status-cli-pre-change-file-live
+statement: '`fishhawk-mcp host-dispatch --status --state-dir <dir>`, run against a status.json whose last_tick_at is current and which has no last_complete_tick_at, last_tick_failure or run_refusals key (the shape a pre-change dispatcher writes), exits 0 and prints a single stdout line containing `state=live` and none of the tokens `last_complete_tick_at=`, `tick_failure=` or `run_refusals=`.'
+verify_hint: 'CLI: write <dir>/status.json (mode 0600, dir 0700) with pid 7, last_tick_at = now, interval_seconds 30, spawns_today 5 and spawns_day today, and no other keys, then run the binary and read its exit code and stdout.'
+steps: Created dir /tmp/fhacc5402/s3 (mode 0700). Wrote status.json (mode 0600) with only pid 7, last_tick_at = now, interval_seconds 30, spawns_today 5 and spawns_day today. Ran fishhawk-mcp host-dispatch --status --state-dir /tmp/fhacc5402/s3.
+assertions:
+    expected: exit 0; state=live; none of the three tokens
+    observed_at_record: 'exit 0; one line: state=live pid=7 host= last_tick_at=... paused=false in_flight=0 spawns_today=5 (2026-11-21). It has no last_complete_tick_at=, tick_failure= or run_refusals= token.'
+    repro_handle: fishhawk-mcp host-dispatch --status --state-dir /tmp/fhacc5402/s3
+origin:
+    issue: 5402
+    pr: 5500
+    run_id: 39a4e171-1dd2-4b1a-a173-5aa41d273c40
+    head_sha: beadbfee4ec6d4bab02c2558fa4d146ee49f8798
+    recorded_at: 2026-11-21T03:08:01Z
