@@ -181,7 +181,9 @@ func TestSafeRuleID(t *testing.T) {
 // TestAllowlist_Partition: one row per arm. Each guard row's fixture is a
 // hit the guard alone keeps: every other rule in the allowlist WOULD match it.
 func TestAllowlist_Partition(t *testing.T) {
-	const pA, pB = "github-pat-classic", "aws-access-key-id"
+	const pA, pB, pLow = "github-pat-classic", "aws-access-key-id", "json-password-field"
+	lowScope := Rule{ID: "pw-s", Paths: []string{"fix/**"}, Patterns: []string{pLow}, Reason: "r"}
+	lowEntry := Rule{ID: "pw-e", Paths: []string{"fix/p.go"}, Patterns: []string{pLow}, Reason: "r"}
 	entry := Rule{ID: "docs-p", Paths: []string{"docs/p.md"}, Patterns: []string{pA}, Reason: "r"}
 	scope := Rule{ID: "fix-s", Paths: []string{"fix/**"}, Patterns: []string{pA}, Reason: "r"}
 	everything := Rule{ID: "all", Paths: []string{"**"}, Patterns: []string{pA}, Reason: "r"}
@@ -241,6 +243,15 @@ func TestAllowlist_Partition(t *testing.T) {
 			&Allowlist{Entries: []Rule{{ID: "fix-e", Paths: []string{"fix/**"}, Patterns: []string{pA}, Reason: "r"}}, Markers: []Rule{scope}},
 			Hit{Path: "fix/a.go", Line: 2, Pattern: pA, Marked: true},
 			&Suppression{By: ByEntry, RuleID: "fix-e", RuleFingerprint: RuleFingerprint(ListEntries, "fix/**", pA)}},
+		// (n) COUNTERFACTUAL: revert the Partition marker condition to
+		// `if h.Marked {` — the hit is marked, inside the scope and of its class
+		// (its fingerprint is preset, so only this guard can keep it), RED.
+		{"scope keeps a marked LOW-ENTROPY hit inside a scope naming its class", &Allowlist{Markers: []Rule{lowScope}},
+			Hit{Path: "fix/p.go", Line: 2, Pattern: pLow, Marked: true, Fingerprint: "00000000000000bb"}, nil},
+		// (o) the human-reviewed route still suppresses a low-entropy class.
+		{"entry still suppresses a low-entropy class", &Allowlist{Entries: []Rule{lowEntry}},
+			Hit{Path: "fix/p.go", Line: 2, Pattern: pLow, Marked: true},
+			&Suppression{By: ByEntry, RuleID: "pw-e", RuleFingerprint: RuleFingerprint(ListEntries, "fix/p.go", pLow)}},
 		// (l)
 		{"nil allowlist keeps everything", nil, Hit{Path: "docs/p.md", Line: 1, Pattern: pA, Marked: true}, nil},
 		{"empty allowlist keeps everything", &Allowlist{}, Hit{Path: "docs/p.md", Line: 1, Pattern: pA, Marked: true}, nil},
@@ -262,6 +273,100 @@ func TestAllowlist_Partition(t *testing.T) {
 			want.Hit = c.hit
 			if len(kept) != 0 || !reflect.DeepEqual(sup, []Suppression{want}) {
 				t.Fatalf("kept=%+v suppressed=%+v, want %+v", kept, sup, want)
+			}
+		})
+	}
+}
+
+// jsonPasswordMatches returns every json-password-field match on line, the
+// bytes hitFingerprint would have hashed.
+func jsonPasswordMatches(t *testing.T, line string) []string {
+	t.Helper()
+	for _, p := range redaction.DefaultPatterns {
+		if p.Name == "json-password-field" {
+			return p.Regex.FindAllString(line, -1)
+		}
+	}
+	t.Fatal("json-password-field is not a DefaultPatterns class")
+	return nil
+}
+
+// TestMarker_LowEntropyFixtureLineRaises is the in-package end-to-end of the
+// #5462 ruling: a markers rule naming json-password-field parses, yet a marked
+// line carrying a guessable password value inside its scope is KEPT (so the
+// server raises it high), is never fingerprinted, and leaves no suppression
+// record or check key. COUNTERFACTUAL: make markerSuppressible return true —
+// the hit is then marker-suppressed with a per-hit fingerprint, so kept is empty
+// and the summary carries a check key over the guessable value's digest, RED.
+func TestMarker_LowEntropyFixtureLineRaises(t *testing.T) {
+	doc := "version: 1\nmarkers:\n" + rule("pw-fixtures", "fix/**", "json-password-field", "synthetic fixtures")
+	al, rej, err := ParseAllowlist([]byte(doc), redaction.DefaultPatterns)
+	if err != nil || len(rej) != 0 || len(al.Markers) != 1 {
+		t.Fatalf("rule must still parse (inert for markers): err=%v rej=%+v al=%+v", err, rej, al)
+	}
+	line := passwordLine() + " // " + MarkerToken
+	hits := Scan(section("fix/p.go", "@@ -0,0 +1 @@\n+"+line+"\n"), redaction.DefaultPatterns).Hits
+	kept, sup := al.Partition(hits)
+	if len(sup) != 0 {
+		t.Errorf("suppressed = %+v, want none", sup)
+	}
+	if len(kept) != 1 || kept[0].Pattern != "json-password-field" || kept[0].Path != "fix/p.go" || !kept[0].Marked || kept[0].Fingerprint != "" {
+		t.Fatalf("kept = %+v, want the one marked, unfingerprinted json-password-field hit", kept)
+	}
+	sum := NewSuppressionSummary(&AllowlistStatusRecord{Status: StatusLoaded}, sup)
+	raw, err := json.Marshal(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["marker_suppressed_hit_count"] != float64(0) || len(m["suppressed"].([]any)) != 0 {
+		t.Errorf("summary = %s, want marker_suppressed_hit_count 0 and no records", raw)
+	}
+	for _, r := range GroupSuppressions(sup) {
+		if r.CheckKey != "" {
+			t.Errorf("record carries check_key %q", r.CheckKey)
+		}
+	}
+	digest := hitFingerprint("fix/p.go", "json-password-field", jsonPasswordMatches(t, line))
+	if strings.Contains(string(raw), digest) {
+		t.Errorf("summary carries the digest %s of the guessable value", digest)
+	}
+}
+
+// TestMarker_DualHitLineKeepsLowEntropyHit (#5462, N2): ONE marked line can
+// match a high-entropy class and a low-entropy class together — a JSON `token`
+// key holding a ghp_ value, or a bearer header holding one. The
+// scope names both classes, yet only the high-entropy hit is marker-suppressed;
+// the low-entropy hit on the same line is KEPT (raising high), so a marker no
+// longer fully quiets the line. The remedy is an `entries` rule, shown last.
+// COUNTERFACTUAL: make markerSuppressible return true — both hits are then
+// suppressed and kept is empty, RED.
+func TestMarker_DualHitLineKeepsLowEntropyHit(t *testing.T) {
+	for _, c := range []struct{ name, line, low string }{
+		{"json token key holding a PAT", jsonTokenLine(), "json-password-field"},
+		{"bearer header holding a PAT", bearerPATLine(), "authorization-bearer"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			scope := Rule{ID: "fix-s", Paths: []string{"fix/**"}, Patterns: []string{"github-pat-classic", c.low}, Reason: "r"}
+			hits := Scan(section("fix/p.go", "@@ -0,0 +1 @@\n+"+c.line+" // "+MarkerToken+"\n"), redaction.DefaultPatterns).Hits
+			if len(hits) != 2 || hits[0].Pattern != "github-pat-classic" || hits[1].Pattern != c.low {
+				t.Fatalf("hits = %+v, want github-pat-classic then %s", hits, c.low)
+			}
+			kept, sup := (&Allowlist{Markers: []Rule{scope}}).Partition(hits)
+			if len(sup) != 1 || sup[0].By != ByMarker || sup[0].Hit.Pattern != "github-pat-classic" || !fingerprintPattern.MatchString(sup[0].Hit.Fingerprint) {
+				t.Errorf("suppressed = %+v, want only the marker-suppressed github-pat-classic hit", sup)
+			}
+			if len(kept) != 1 || kept[0].Pattern != c.low || kept[0].Fingerprint != "" {
+				t.Fatalf("kept = %+v, want only the unfingerprinted %s hit", kept, c.low)
+			}
+			// The remedy: an entries rule names the low-entropy class on that path.
+			entry := Rule{ID: "fix-e", Paths: []string{"fix/p.go"}, Patterns: []string{c.low}, Reason: "r"}
+			kept, _ = (&Allowlist{Entries: []Rule{entry}, Markers: []Rule{scope}}).Partition(hits)
+			if len(kept) != 0 {
+				t.Errorf("with an entries rule kept = %+v, want the whole line quiet", kept)
 			}
 		})
 	}
