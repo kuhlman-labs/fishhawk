@@ -51,6 +51,11 @@
 #   named-toolchain skip -> h18 h18b         unrecognized GOTOOLCHAIN -> h24
 #   go absent -> h20                          unparseable GOVERSION -> h21
 #   unparseable directive (tree, no echo) -> h22   `go env` failure -> h25
+#   toolchain directive not compared with the host go -> h26
+#   DYNAMIC node/pnpm (#5267): node compare -> d11   pnpm compare -> d12
+#   (missing line -> d13 and parse failure -> d13b ride the shared check_tool)
+#   NODE_VERSION / PNPM_VERSION missing-ARG guard -> d14 d14b
+#   STATIC unparseable directive bytes not echoed -> s11d s11e
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -139,6 +144,8 @@ ARG CHECK_JSONSCHEMA_VERSION=0.38.0
 RUN apt-get install -y --no-install-recommends zsh jq python3
 RUN curl -fsSLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz"
 ENV GOTOOLCHAIN=local
+ARG NODE_VERSION=22.11.0
+ARG PNPM_VERSION=9.15.0
 EOF
   printf 'go 1.25.0\n\nuse ./mod\n' > "$r/go.work"
   printf 'module example.invalid/mod\n\ngo 1.25\n' > "$r/mod/go.mod"
@@ -312,18 +319,21 @@ expect "s8b: apt docker.io" 1 "deploy/gate-image/Dockerfile:10: installs a docke
 
 r="$(mkfix s8c)"
 printf 'RUN curl -fsSLO "https://download.docker.com/linux/static/stable/${TARGETARCH}/docker-27.0.0.tgz"\n' >> "$r/deploy/gate-image/Dockerfile"
+ln="$(lineof "$r/deploy/gate-image/Dockerfile" 'download.docker.com')"
 run_static "$r"
-expect "s8c: a docker static tarball" 1 "deploy/gate-image/Dockerfile:13: installs a docker engine/CLI/plugin"
+expect "s8c: a docker static tarball" 1 "deploy/gate-image/Dockerfile:$ln: installs a docker engine/CLI/plugin"
 
 r="$(mkfix s8d)"
 printf 'COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker\n' >> "$r/deploy/gate-image/Dockerfile"
+ln="$(lineof "$r/deploy/gate-image/Dockerfile" 'COPY --from=docker:cli')"
 run_static "$r"
-expect "s8d: COPY --from=docker:cli" 1 "deploy/gate-image/Dockerfile:13: installs a docker engine/CLI/plugin"
+expect "s8d: COPY --from=docker:cli" 1 "deploy/gate-image/Dockerfile:$ln: installs a docker engine/CLI/plugin"
 
 r="$(mkfix s8e)"
 printf 'RUN install -m 0755 /tmp/x /usr/local/bin/docker\n' >> "$r/deploy/gate-image/Dockerfile"
+ln="$(lineof "$r/deploy/gate-image/Dockerfile" 'RUN install -m 0755')"
 run_static "$r"
-expect "s8e: a binary installed at /usr/local/bin/docker" 1 "deploy/gate-image/Dockerfile:13: installs a docker engine/CLI/plugin"
+expect "s8e: a binary installed at /usr/local/bin/docker" 1 "deploy/gate-image/Dockerfile:$ln: installs a docker engine/CLI/plugin"
 
 r="$(mkfix s8n)"
 edit "$r/deploy/gate-image/Dockerfile" 's#^FROM golang:#FROM docker.io/library/golang:#'
@@ -354,8 +364,9 @@ expect "s9d: ARG TARGETARCH=amd64 (a default)" 1 "deploy/gate-image/Dockerfile:6
 
 r="$(mkfix s9e)"
 printf 'ENV GOARCH=amd64\n' >> "$r/deploy/gate-image/Dockerfile"
+ln="$(lineof "$r/deploy/gate-image/Dockerfile" 'ENV GOARCH=amd64')"
 run_static "$r"
-expect "s9e: a hardcoded GOARCH literal" 1 "deploy/gate-image/Dockerfile:13: hardcoded GOARCH literal"
+expect "s9e: a hardcoded GOARCH literal" 1 "deploy/gate-image/Dockerfile:$ln: hardcoded GOARCH literal"
 
 r="$(mkfix s9f)"
 edit "$r/deploy/gate-image/Dockerfile" 's#^FROM golang:#FROM --platform=linux/amd64 golang:#'
@@ -391,12 +402,14 @@ expect "s11c: directives EQUAL to or below GO_VERSION pass" 0 "check-gate-image:
 r="$(mkfix s11d)"
 printf 'toolchain 1.25.6\n' >> "$r/go.work"
 run_static "$r"
-expect "s11d: a toolchain directive without the go prefix fails closed" 1 "go.work:4: unparseable \`toolchain 1.25.6\` directive"
+expect "s11d: a toolchain directive without the go prefix fails closed" 1 "go.work:4: unparseable \`toolchain\` directive (fail closed: its value is not a Go version)"
+lacks "s11d: the unparseable directive's bytes are not echoed" 'toolchain 1.25.6'
 
 r="$(mkfix s11e)"
-edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.x#'
+edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.x$(id)#'
 run_static "$r"
-expect "s11e: an unparseable go directive fails closed" 1 "mod/go.mod:3: unparseable \`go 1.25.x\` directive"
+expect "s11e: an unparseable go directive fails closed" 1 "mod/go.mod:3: unparseable \`go\` directive (fail closed: its value is not a Go version)"
+lacks "s11e: the unparseable directive's bytes are not echoed" '1.25.x$(id)'
 
 r="$(mkfix s12)"
 rm -f "$r/go.work" "$r/mod/go.mod"
@@ -420,6 +433,8 @@ GOOD_PROBE='go=go version go1.25.6 linux/arm64
 golangci-lint=golangci-lint has version 2.8.0 built with go1.25.5 from e2e40021 on 2026-01-07T21:29:47Z
 helm=v4.2.4+g3900f43
 check-jsonschema=check-jsonschema, version 0.38.0
+node=v22.11.0
+pnpm=9.15.0
 docker=absent'
 GOOD_INSPECT='sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 fishhawk-gate@sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97'
 
@@ -478,7 +493,8 @@ status=$?
 expect "d7: no docker on the host PATH fails closed naming docker" 1 "docker not found on PATH"
 
 run_dynamic d8 "$r" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test --platform linux/arm64
-expect "d8: matching versions pass" 0 "ok go 1.25.6" "ok golangci-lint 2.8.0" "ok helm v4.2.4" "ok check-jsonschema 0.38.0" "ok docker absent" \
+expect "d8: matching versions pass" 0 "ok go 1.25.6" "ok golangci-lint 2.8.0" "ok helm v4.2.4" "ok check-jsonschema 0.38.0" \
+  "ok node 22.11.0" "ok pnpm 9.15.0" "ok docker absent" \
   "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=fishhawk-gate@sha256:"
 argv="$(cat "$log")"
 first_run="$(awk '/^--- invocation/{n++} n==1' "$log")"
@@ -518,6 +534,33 @@ expect "d9c: an image with no RepoDigests passes with digests=none" 0 \
 FAKE_INSPECT_ENGINE=interface run_dynamic d10 "$r" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
 expect "d10: the inspect template is portable to a []interface{} RepoDigests engine" 0 \
   "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=fishhawk-gate@sha256:"
+
+# d11-d14 — node and pnpm against NODE_VERSION / PNPM_VERSION (#5267). Every
+# other probe line agrees with the fixture, so the node/pnpm branch is the
+# only one that can refuse.
+run_dynamic d11 "$r" "${GOOD_PROBE/node=v22.11.0/node=v22.10.0}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d11: image node v22.10.0 vs ARG NODE_VERSION 22.11.0" 1 \
+  "image fishhawk-gate:test: node reports 22.10.0 but deploy/gate-image/Dockerfile pins 22.11.0 — rebuild the image" "1 violation(s)"
+run_dynamic d12 "$r" "${GOOD_PROBE/pnpm=9.15.0/pnpm=9.14.2}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d12: image pnpm 9.14.2 vs ARG PNPM_VERSION 9.15.0" 1 \
+  "image fishhawk-gate:test: pnpm reports 9.14.2 but deploy/gate-image/Dockerfile pins 9.15.0 — rebuild the image" "1 violation(s)"
+run_dynamic d13 "$r" "$(printf '%s\n' "$GOOD_PROBE" | grep -v '^node=')" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d13: a missing node line fails closed" 1 "no node line in the probe output (fail closed)"
+run_dynamic d13b "$r" "${GOOD_PROBE/pnpm=9.15.0/pnpm=}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d13b: an empty pnpm line (pnpm absent in the image) fails closed" 1 "cannot parse a pnpm version from '' (fail closed)"
+r14="$(mkfix d14)"
+edit "$r14/deploy/gate-image/Dockerfile" '/^ARG NODE_VERSION=/d'
+run_dynamic d14 "$r14" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d14: the Dockerfile lacks ARG NODE_VERSION (fail closed)" 1 \
+  "deploy/gate-image/Dockerfile: no \`ARG NODE_VERSION=<version>\` default (fail closed" "ok pnpm 9.15.0" "1 violation(s)"
+lacks "d14: node is not reported ok against a missing pin" "ok node"
+r14b="$(mkfix d14b)"
+edit "$r14b/deploy/gate-image/Dockerfile" 's#^ARG PNPM_VERSION=.*#ARG PNPM_VERSION=#'
+run_dynamic d14b "$r14b" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d14b: an EMPTY ARG PNPM_VERSION= default fails closed" 1 \
+  "deploy/gate-image/Dockerfile: no \`ARG PNPM_VERSION=<version>\` default (fail closed" "ok node 22.11.0"
+run_static "$r14"
+expect "d14c: NODE_VERSION is a DYNAMIC-only pin (STATIC mode passes without it)" 0 "check-gate-image: ok"
 
 # --- host cases (#4245) ------------------------------------------------------
 # HOST mode probes the tools on PATH. Each case runs under a PATH of a per-case
@@ -591,7 +634,7 @@ HB_ALL="$(mkhostbin all golangci-lint gofmt go)"
 run_host "$r" "$HB_ALL"
 expect "h1: a host golangci-lint, gofmt and go agreeing with the pins pass" 0 \
   "ok host golangci-lint 2.8.0 (built with go1.25)" "ok host gofmt $HB_ALL/gofmt go1.25" \
-  "ok host go go1.25.6 (GOTOOLCHAIN=local) satisfies every go/toolchain directive (highest go.work:1 \`go 1.25.0\`)"
+  "ok host go go1.25.6 (GOTOOLCHAIN=local) satisfies every go directive (highest go.work:1 \`go 1.25.0\`)"
 
 H_GL_VER=2.9.0 run_host "$r" "$HB_ALL"
 expect "h2: host golangci-lint 2.9.0 vs ARG v2.8.0" 3 \
@@ -698,12 +741,26 @@ r23="$(mkfix h23)"
 rm -f "$r23/go.work" "$r23/mod/go.mod"
 run_host "$r23" "$HB_ALL"
 expect "h23: a root with no go directive has nothing to satisfy (STATIC s12 owns that refusal)" 0 \
-  "ok host go go1.25.6 (GOTOOLCHAIN=local): no go.work / go.mod go or toolchain directive to satisfy"
+  "ok host go go1.25.6 (GOTOOLCHAIN=local): no go.work / go.mod go directive to satisfy"
 H_GO_TC='bogus;x' run_host "$r" "$HB_ALL"
 expect "h24: an unrecognized GOTOOLCHAIN exits 3 (fail closed), sanitized" 3 \
   "host GOTOOLCHAIN 'bogusx' is not auto, path, local or a goX.Y[.Z] toolchain name"
 H_GO_ENV_RC=1 run_host "$r" "$HB_ALL"
 expect "h25: a failing \`go env GOTOOLCHAIN\` exits 3 (fail closed)" 3 "host \`go env GOTOOLCHAIN\` exited 1"
+# h26: a `toolchain` directive above the host go is NOT a requirement: under
+# GOTOOLCHAIN=local `go` ignores it and runs the module (it refuses on the `go`
+# line only), so (d) compares only `go` directives with the host go.
+r26="$(mkfix h26)"
+printf '\ntoolchain go1.25.6\n' >> "$r26/mod/go.mod"
+H_GO_VER=go1.25.3 run_host "$r26" "$HB_ALL"
+expect "h26: a toolchain directive above a host go that satisfies every go directive passes" 0 \
+  "ok host go go1.25.3 (GOTOOLCHAIN=local) satisfies every go directive (highest go.work:1 \`go 1.25.0\`)"
+lacks "h26: the toolchain directive is not reported as a requirement" "toolchain go1.25.6"
+r26b="$(mkfix h26b)"
+printf '\ntoolchain go1.25.9\n' >> "$r26b/mod/go.mod"
+run_host "$r26b" "$HB_ALL"
+expect "h26b: a toolchain directive EXCEEDING GO_VERSION is still the tree's defect (exit 1)" 1 \
+  "mod/go.mod:5: \`toolchain go1.25.9\` exceeds deploy/gate-image/Dockerfile:4 GO_VERSION 1.25.6" "1 of them in this tree's pin files (exit 1"
 
 echo
 echo "test-check-gate-image: $PASS passed, $FAIL failed"

@@ -56,6 +56,7 @@ covers whatever it ships. No Dockerfile change, so no image rebuild.
 | `GOLANGCI_LINT_VERSION` | EXACTLY the golangci-lint `install.sh` tag in every `.github/workflows/*` file and in `scripts/test`'s install hint; on the HOST (`--host`, #4245), EXACTLY the `golangci-lint version` on PATH, whose binary must also be `built with` a Go of `GO_VERSION`'s MAJOR.MINOR (its gofmt/goimports formatters follow the Go that built it). A bump that pairs a golangci-lint release built with another Go minor therefore makes `scripts/test lint` refuse everywhere, CI included, so bump both together |
 | `HELM_VERSION` (exact `vMAJOR.MINOR.PATCH`, currently `v4.3.2`) | MAJOR ≥ 4, because `scripts/test-helm-render` r9 renders `NOTES.txt` with `helm install --dry-run`, which Helm v3 (`--dry-run=client` too) refuses without a reachable cluster and the image has none. The helm render gate's documented CI half (`deploy/helm/fishhawk/README.md`, `setup-helm` `version:`) carries the same `v4.3.2`; nothing checks that pair, so bump both together |
 | `CHECK_JSONSCHEMA_VERSION` | the `check-jsonschema` validator `AGENTS.md` names for `docs/spec/` |
+| `NODE_VERSION`, `PNPM_VERSION` | `--image` only (#5267): EXACTLY the image's `node --version` (without its `v`) and `pnpm --version`; a missing ARG fails closed there. STATIC and `--host` never read them; the build itself holds `PNPM_VERSION` to `frontend/package.json`'s `packageManager` |
 
 The chain closes in two halves:
 
@@ -66,7 +67,8 @@ The chain closes in two halves:
   forbidden to implement stages is not an edit).
 - **Dockerfile ⇔ built image** — `scripts/check-gate-image --image REF
   [--platform P]` runs one probe inside the image and compares `go`,
-  `golangci-lint`, `helm` and `check-jsonschema` exactly, and fails when a
+  `golangci-lint`, `helm`, `check-jsonschema`, `node` and `pnpm` exactly
+  (node and pnpm since #5267), and fails when a
   docker binary is inside. Every `--in-gate-image` run performs it first, and
   the workflow below runs it on every build and weekly against the published
   `:main`.
@@ -75,7 +77,8 @@ The chain closes in two halves:
   gofmt on PATH (its Go, via `go version <path>`) with `GOLANGCI_LINT_VERSION`
   and `GO_VERSION`'s MAJOR.MINOR, and, when GOTOOLCHAIN forbids switching
   (`local`), checks that the `go` on PATH satisfies every go.work / go.mod
-  `go` and `toolchain` directive (#5453). It is `scripts/test lint`'s
+  `go` directive (#5453; a `toolchain` directive is not a requirement under
+  `GOTOOLCHAIN=local`, so it is never compared with the host go). It is `scripts/test lint`'s
   precondition (so verify's lint leg too): a mismatch refuses with
   `host_toolchain_mismatch`. It exits `3` when every violation is a host or
   image tool against coherent pins, which the lint leg turns into exit `75`

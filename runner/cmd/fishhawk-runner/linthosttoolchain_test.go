@@ -202,6 +202,13 @@ func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResul
 // and a host-path fixture must not.
 func runRealLintLegEnv(t *testing.T, root string, fx lintHostFixture, extraEnv []string) lintHostResult {
 	t.Helper()
+	return runRealScriptsTest(t, root, fx, extraEnv, "lint")
+}
+
+// runRealScriptsTest is runRealLintLegEnv for any scripts/test subcommand
+// (args), so a test can drive the lint leg through `verify` as well.
+func runRealScriptsTest(t *testing.T, root string, fx lintHostFixture, extraEnv []string, args ...string) lintHostResult {
+	t.Helper()
 	realGo, err := exec.LookPath("go")
 	if err != nil {
 		t.Fatalf("go not on PATH (%v): the fake go must exec the real one for cmd_lint's module walk", err)
@@ -245,7 +252,7 @@ func runRealLintLegEnv(t *testing.T, root string, fx lintHostFixture, extraEnv [
 		env = append(env, "FAKE_GO_TOOLCHAIN="+fx.goToolchain)
 	}
 	env = append(env, extraEnv...)
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "test"), "lint") //nolint:gosec // fixed workspace-relative path
+	cmd := exec.Command("bash", append([]string{filepath.Join(root, "scripts", "test")}, args...)...) //nolint:gosec // fixed workspace-relative path, fixed args
 	cmd.Dir = root
 	cmd.Env = env
 	out, runErr := cmd.CombinedOutput()
@@ -519,6 +526,48 @@ func TestLintLegStaleGateImageGoIsTempFail(t *testing.T) {
 	}
 	if !strings.Contains(ev.tail, lintHostStaleImage) || !strings.Contains(ev.tail, "GO_VERSION "+pins.goVersion) {
 		t.Errorf("the merge-candidate tail does not name the image and the pin; tail:\n%s", lintHostHygiene(ev.tail))
+	}
+}
+
+// TestVerifyLegStaleGateImageGoIsTempFail: the declared gate runs `scripts/test
+// verify` (through scripts/verify-change), not `scripts/test lint`, so the
+// lint leg's 75 must survive cmd_verify, which calls cmd_lint as a plain
+// statement. A later edit that wraps cmd_lint in a pipeline or `if !` turns 75
+// back into 1 (the change's fault) and fails this test. The verify lock is a
+// t.TempDir() path, never the checkout's shared one, and is released on exit.
+func TestVerifyLegStaleGateImageGoIsTempFail(t *testing.T) {
+	root := requireBashForLintHost(t)
+	fx, pins, older, directiveAt := staleGoFixture(t, root)
+	lock := filepath.Join(t.TempDir(), "verify.lock")
+	res := runRealScriptsTest(t, root, fx, []string{
+		"FISHHAWK_GATE_CONTAINER=1",
+		"FISHHAWK_GATE_IMAGE_REF=" + lintHostStaleImage,
+		"FISHHAWK_VERIFY_LOCK_PATH=" + lock,
+		"GOTOOLCHAIN=local",
+	}, "verify", "--no-tests")
+	clean := lintHostHygiene(res.out)
+	if res.code != verifyExitTempFail {
+		t.Fatalf("scripts/test verify --no-tests exited %d on a stale gate-image go, want %d (EX_TEMPFAIL: the lint leg's 75 must survive cmd_verify); output:\n%s", res.code, verifyExitTempFail, clean)
+	}
+	for _, want := range []string{
+		lintHostRefusal,
+		"gate_image_stale: the gate image " + lintHostStaleImage,
+		"host go " + older + " (GOTOOLCHAIN=local",
+		directiveAt,
+		"GO_VERSION " + pins.goVersion,
+	} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("output lacks %q; output:\n%s", lintHostHygiene(want), clean)
+		}
+	}
+	if res.runLog != "" || strings.Contains(res.out, lintHostFakeFinding) {
+		t.Errorf("golangci-lint run executed behind a stale-image go (run log: %q); output:\n%s", res.runLog, clean)
+	}
+	if _, err := os.Lstat(lock); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the verify lock %s survived the tempfail exit (lstat err %v)", lock, err)
+	}
+	if result, reason, _ := classifyLintLeg(res); result != mergeCandidateNotExecuted || reason != mcReasonTempFail {
+		t.Errorf("merge-candidate classification = %s / %s, want %s / %s", result, reason, mergeCandidateNotExecuted, mcReasonTempFail)
 	}
 }
 

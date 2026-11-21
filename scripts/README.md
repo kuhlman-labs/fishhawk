@@ -120,9 +120,11 @@ never its exit status, which is 0 even on a non-Go file). `lint` never runs a
 standalone gofmt, but that half refuses anyway, because an agent's own
 `gofmt -l` on a Homebrew go1.27 gofmt is what misled run 580c33c6. Check (d)
 (#5453) adds the `go` on PATH: when `go env GOTOOLCHAIN` is `local` (or empty)
-it must satisfy every go.work / root go.mod / `*/go.mod` `go` and `toolchain`
-directive, read with `go env GOVERSION`, because a stale gate image or host Go
-after a pin bump otherwise makes `go` refuse the module. `auto`, `path`, a
+it must satisfy every go.work / root go.mod / `*/go.mod` `go` directive, read
+with `go env GOVERSION`, because a stale gate image or host Go after a pin bump
+otherwise makes `go` refuse the module. A `toolchain` directive is parsed and
+over-pin-checked but never compared with the host go: under
+`GOTOOLCHAIN=local` `go` ignores it and runs the module. `auto`, `path`, a
 `+auto` / `+path` suffix and a named toolchain (`goX.Y.Z`, with or without
 `+local`) skip it with an `ok host go toolchain switching` / `named` line, so
 the probe never switches or downloads a toolchain. The checker exits `3` when
@@ -153,7 +155,8 @@ the static pin report below). Inside the gate image the check passes, because
 the image carries the pinned tools. It is pinned by
 `scripts/test-check-gate-image`'s `h*` arms and by
 `runner/cmd/fishhawk-runner/linthosttoolchain_test.go`, which drives the real
-`scripts/test lint` with fake tools on PATH. A direct host `gofmt -l` outside
+`scripts/test lint` with fake tools on PATH (and `scripts/test verify
+--no-tests`, so the lint leg's `75` is pinned through `cmd_verify` too). A direct host `gofmt -l` outside
 `scripts/test` is NOT guarded by this.
 
 **Per-checkout lint cache ([#5151](https://github.com/kuhlman-labs/fishhawk/issues/5151)).**

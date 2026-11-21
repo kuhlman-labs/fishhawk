@@ -42,13 +42,16 @@
 #
 # DYNAMIC mode (--image) runs ONE probe inside the image:
 #   docker run --rm --entrypoint '' [--platform P] REF sh -c '<probe>'
-# and compares `go version`, `golangci-lint version`, `helm version --short`
-# and `check-jsonschema --version` to the Dockerfile ARGs, all EXACT, and
-# fails when a docker binary is present inside. A missing or unparseable line,
-# a failed docker exec, or docker absent from the host PATH fails closed —
-# never a pass. On success it prints one `ok <tool> <version>` line per tool
-# and an `ok image <REF> id=<ID> digests=<...>` line naming what was checked;
-# pass an ID or digest as REF to pin exactly that image.
+# and compares `go version`, `golangci-lint version`, `helm version --short`,
+# `check-jsonschema --version`, `node --version` and `pnpm --version` to the
+# Dockerfile ARGs, all EXACT (node and pnpm against NODE_VERSION and
+# PNPM_VERSION, #5267; those two ARGs are read in this mode only, and a missing
+# one is a fail-closed violation), and fails when a docker binary is present
+# inside. A missing or unparseable line, a failed docker exec, or docker absent
+# from the host PATH fails closed — never a pass. On success it prints one
+# `ok <tool> <version>` line per tool and an `ok image <REF> id=<ID>
+# digests=<...>` line naming what was checked; pass an ID or digest as REF to
+# pin exactly that image.
 #
 # HOST mode (--host, #4245) probes the tools on THIS host's PATH against the
 # Dockerfile ARGs, never docker and never the network. It is the precondition of
@@ -70,24 +73,26 @@
 #       status. Patch releases are compared at MAJOR.MINOR only (Go minor
 #       revisions fix critical issues, not formatting);
 #   (d) the `go` on PATH must satisfy every go.work / root go.mod / */go.mod
-#       `go` and `toolchain` directive when GOTOOLCHAIN forbids switching
-#       (#5453): a stale gate image or host Go after a pin bump otherwise makes
-#       `go` refuse the module under GOTOOLCHAIN=local, and that refusal reads
-#       as the change's failure. `go env GOTOOLCHAIN` and `go env GOVERSION` are
-#       read as two single-variable calls from `/` with GOWORK=off, so no
-#       toolchain switch or download is triggered (`go env GOTOOLCHAIN` never
-#       switches). `auto`, `path` and a `+auto` / `+path` suffix print `ok host
-#       go toolchain switching (GOTOOLCHAIN=<v>)` and skip: the directives
-#       select the toolchain. A NAMED toolchain (`goX.Y[.Z]`, with or without
-#       `+local`) prints `ok host go toolchain named (GOTOOLCHAIN=<v>)` and
-#       skips, because reading its GOVERSION would switch to (and may
-#       download) it. The check is enforced only under `local` or an empty
-#       setting (no switching); any other GOTOOLCHAIN value, `go` absent from
-#       PATH or an unparseable GOVERSION fails closed. A directive EXCEEDING
-#       GO_VERSION is the tree's defect (the STATIC (c2) text); an unparseable
-#       directive fails closed WITHOUT echoing its bytes; a root with ZERO
-#       directives has nothing to satisfy and prints an ok line (STATIC (c2)
-#       owns that anti-vacuity refusal).
+#       `go` directive when GOTOOLCHAIN forbids switching (#5453): a stale gate
+#       image or host Go after a pin bump otherwise makes `go` refuse the
+#       module under GOTOOLCHAIN=local, and that refusal reads as the change's
+#       failure. A `toolchain` directive is parsed and over-pin-checked like a
+#       `go` directive but never compared with the host go: under
+#       GOTOOLCHAIN=local `go` ignores it and runs the module. `go env
+#       GOTOOLCHAIN` and `go env GOVERSION` are read as two single-variable
+#       calls from `/` with GOWORK=off, so no toolchain switch or download is
+#       triggered (`go env GOTOOLCHAIN` never switches). `auto`, `path` and a
+#       `+auto` / `+path` suffix print `ok host go toolchain switching
+#       (GOTOOLCHAIN=<v>)` and skip: the directives select the toolchain. A
+#       NAMED toolchain (`goX.Y[.Z]`, with or without `+local`) prints `ok host
+#       go toolchain named (GOTOOLCHAIN=<v>)` and skips, because reading its
+#       GOVERSION would switch to (and may download) it. The check is enforced
+#       only under `local` or an empty setting (no switching); any other
+#       GOTOOLCHAIN value, `go` absent from PATH or an unparseable GOVERSION
+#       fails closed. A directive EXCEEDING GO_VERSION is the tree's defect
+#       (the STATIC (c2) text); an unparseable directive fails closed WITHOUT
+#       echoing its bytes; a root with ZERO directives has nothing to satisfy
+#       and prints an ok line (STATIC (c2) owns that anti-vacuity refusal).
 # Every mismatch is reported (not just the first); on success it prints one
 # `ok host golangci-lint <v> (built with go<mm>)`, one `ok host gofmt ...` and
 # one `ok host go ...` line. --host with --image or --platform is a usage error.
@@ -324,7 +329,7 @@ if [ "$HOST" = 1 ]; then
   if [ -z "$GO_MM" ]; then
     :
   elif ! command -v go >/dev/null 2>&1; then
-    violate "host \`go\` not found on PATH (fail closed: it cannot be compared with the go.work / go.mod go and toolchain directives)"
+    violate "host \`go\` not found on PATH (fail closed: it cannot be compared with the go.work / go.mod go directives)"
   else
     host_tc_rc=0
     host_tc="$(cd / && GOWORK=off go env GOTOOLCHAIN 2>/dev/null)" || host_tc_rc=$?
@@ -382,6 +387,9 @@ if [ "$HOST" = 1 ]; then
             dir_tree=1
             continue
           fi
+          # Only a `go` directive is a requirement: GOTOOLCHAIN=local ignores
+          # `toolchain` (it only selects a toolchain when switching).
+          [ "$kind" = go ] || continue
           if [ -z "$max_key" ] || go_ver_gt "$key" "$max_key"; then
             max_key="$key" max_at="$rel:$ln" max_dir="$kind $val"
           fi
@@ -390,11 +398,11 @@ if [ "$HOST" = 1 ]; then
       if [ "$dir_tree" = 1 ]; then
         :
       elif [ -z "$max_key" ]; then
-        echo "ok host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}): no go.work / go.mod go or toolchain directive to satisfy"
+        echo "ok host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}): no go.work / go.mod go directive to satisfy"
       elif go_ver_gt "$max_key" "$host_gv_key"; then
         violate "host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}, which never switches) is older than $max_at \`$max_dir\`, so \`go\` refuses the module — $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION is the pinned Go: rebuild the gate image or put go$GO_VERSION first on PATH"
       else
-        echo "ok host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}) satisfies every go/toolchain directive (highest $max_at \`$max_dir\`)"
+        echo "ok host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}) satisfies every go directive (highest $max_at \`$max_dir\`)"
       fi
     fi
   fi
@@ -418,11 +426,26 @@ if [ -n "$IMAGE" ]; then
     echo "check-gate-image: docker not found on PATH — --image needs docker to run the probe inside $IMAGE (fail closed, not a skip)" >&2
     exit 1
   fi
+  # NODE_VERSION / PNPM_VERSION (#5267): read here, not with the ARGs above,
+  # so STATIC and HOST mode never refuse on them. A missing one is recorded
+  # and its tool is not compared; the probe still runs and every other tool
+  # is still reported.
+  NODE_VERSION="" PNPM_VERSION=""
+  for name in NODE_VERSION PNPM_VERSION; do
+    rec="$(arg_default "$name")"
+    if [ -z "$rec" ] || [ -z "${rec#*	}" ]; then
+      violate "$DOCKERFILE_REL: no \`ARG $name=<version>\` default (fail closed: the pin cannot be compared)"
+      continue
+    fi
+    eval "$name=\${rec#*	}"
+  done
   probe='
 printf "go=%s\n" "$(go version 2>/dev/null | head -n 1)"
 printf "golangci-lint=%s\n" "$(golangci-lint version 2>/dev/null | head -n 1)"
 printf "helm=%s\n" "$(helm version --short 2>/dev/null | head -n 1)"
 printf "check-jsonschema=%s\n" "$(check-jsonschema --version 2>/dev/null | head -n 1)"
+printf "node=%s\n" "$(node --version 2>/dev/null | head -n 1)"
+printf "pnpm=%s\n" "$(pnpm --version 2>/dev/null | head -n 1)"
 found=""
 for p in $(command -v docker 2>/dev/null) $(command -v dockerd 2>/dev/null) /usr/bin/docker /usr/local/bin/docker /bin/docker /usr/bin/dockerd /usr/local/bin/dockerd; do
   if [ -e "$p" ]; then found="$found $p"; fi
@@ -479,6 +502,18 @@ if [ -n "$found" ]; then printf "docker=present:%s\n" "$found"; else printf "doc
   raw="$(probe_value check-jsonschema)"
   got="$(printf '%s\n' "$raw" | sed -nE 's/^check-jsonschema, version ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
   check_tool check-jsonschema "$CHECK_JSONSCHEMA_VERSION" "$raw" "$got"
+
+  if [ -n "$NODE_VERSION" ]; then
+    raw="$(probe_value node)"
+    got="$(printf '%s\n' "$raw" | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
+    check_tool node "$NODE_VERSION" "$raw" "$got"
+  fi
+
+  if [ -n "$PNPM_VERSION" ]; then
+    raw="$(probe_value pnpm)"
+    got="$(printf '%s\n' "$raw" | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
+    check_tool pnpm "$PNPM_VERSION" "$raw" "$got"
+  fi
 
   raw="$(probe_value docker)"
   case "$raw" in
@@ -548,7 +583,7 @@ for f in ${go_files[@]+"${go_files[@]}"}; do
     fi
     key="$(go_directive_key "$kind" "$val")"
     if [ -z "$key" ]; then
-      violate "$rel:$ln: unparseable \`$kind $val\` directive (fail closed)"
+      violate "$rel:$ln: unparseable \`$kind\` directive (fail closed: its value is not a Go version)"
       continue
     fi
     if [ "$kind" = go ]; then
