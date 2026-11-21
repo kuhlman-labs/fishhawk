@@ -78,6 +78,24 @@ func (BaseFake) SetCampaignItemRun(_ context.Context, _ uuid.UUID, _ *uuid.UUID)
 	return nil, ErrNotFound
 }
 
+// ClaimCampaignItemStart returns nil, ErrNotFound. A fake that drives an item
+// start overrides it (and LinkClaimedCampaignItemRun) with the Postgres
+// semantics the test needs.
+func (BaseFake) ClaimCampaignItemStart(_ context.Context, _ ClaimCampaignItemStartParams) (*StartClaim, error) {
+	return nil, ErrNotFound
+}
+
+// LinkClaimedCampaignItemRun returns nil, ErrNotFound.
+func (BaseFake) LinkClaimedCampaignItemRun(_ context.Context, _ LinkClaimedCampaignItemRunParams) (*Item, error) {
+	return nil, ErrNotFound
+}
+
+// ReleaseCampaignItemStart returns nil (nothing to release), matching the
+// real adapter's idempotent no-row release.
+func (BaseFake) ReleaseCampaignItemStart(_ context.Context, _, _ uuid.UUID) error {
+	return nil
+}
+
 // SetCampaignItemAutonomy returns nil, ErrNotFound.
 func (BaseFake) SetCampaignItemAutonomy(_ context.Context, _ uuid.UUID, _ string) (*Item, error) {
 	return nil, ErrNotFound

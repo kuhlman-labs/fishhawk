@@ -6,11 +6,13 @@ import (
 	"errors"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
@@ -3104,5 +3106,737 @@ func TestPostgres_AppendCampaignItems_TerminalCampaignRefused(t *testing.T) {
 	}
 	if _, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{CampaignID: uuid.New()}); !errors.Is(err, campaign.ErrCampaignNotFound) {
 		t.Errorf("missing campaign err = %v, want ErrCampaignNotFound", err)
+	}
+}
+
+// --- Item start claims (#5266) ---
+
+var claimT0 = time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+
+// fixedClock returns a clock pinned at at.
+func fixedClock(at time.Time) func() time.Time { return func() time.Time { return at } }
+
+// newClaimFixture seeds one unlinked item on a fresh database.
+func newClaimFixture(t *testing.T) (*pgxpool.Pool, campaign.Repository, run.Repository, *campaign.Item) {
+	t.Helper()
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(context.Background(), campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:5266",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	return pool, repo, run.NewPostgresRepository(pool), item
+}
+
+func makeClaimRun(t *testing.T, runs run.Repository) uuid.UUID {
+	t.Helper()
+	r, err := runs.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	return r.ID
+}
+
+func claimAt(t *testing.T, repo campaign.Repository, itemID uuid.UUID, starter string, at time.Time) *campaign.StartClaim {
+	t.Helper()
+	c, err := repo.ClaimCampaignItemStart(context.Background(), campaign.ClaimCampaignItemStartParams{
+		ItemID: itemID, Starter: starter, Clock: fixedClock(at),
+	})
+	if err != nil {
+		t.Fatalf("claim %s at %s: %v", starter, at, err)
+	}
+	return c
+}
+
+// readClaimRow reads the item's committed claim row, or nil when it has none.
+func readClaimRow(t *testing.T, pool *pgxpool.Pool, itemID uuid.UUID) *campaign.StartClaim {
+	t.Helper()
+	var c campaign.StartClaim
+	err := pool.QueryRow(context.Background(),
+		`SELECT item_id, claim_id, starter, claimed_at, expires_at FROM campaign_item_start_claims WHERE item_id = $1`,
+		itemID).Scan(&c.ItemID, &c.ClaimID, &c.Starter, &c.ClaimedAt, &c.ExpiresAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		t.Fatalf("read claim row: %v", err)
+	}
+	return &c
+}
+
+func wantStartConflict(t *testing.T, err error, reason campaign.StartConflictReason) *campaign.ItemStartConflictError {
+	t.Helper()
+	var ce *campaign.ItemStartConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("err = %v, want *ItemStartConflictError{%s}", err, reason)
+	}
+	if ce.Reason != reason {
+		t.Fatalf("conflict reason = %q, want %q (err %v)", ce.Reason, reason, err)
+	}
+	return ce
+}
+
+func sameClaim(a, b *campaign.StartClaim) bool {
+	return a != nil && b != nil && a.ItemID == b.ItemID && a.ClaimID == b.ClaimID && a.Starter == b.Starter &&
+		a.ClaimedAt.Equal(b.ClaimedAt) && a.ExpiresAt.Equal(b.ExpiresAt)
+}
+
+func TestClaimCampaignItemStart_UnlinkedItem_ClaimsWithTTL(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	got := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	if got.ItemID != item.ID || got.ClaimID == uuid.Nil || got.Starter != campaign.StarterOperator {
+		t.Errorf("claim = %+v, want item %s, a fresh claim id, starter operator", got, item.ID)
+	}
+	if !got.ClaimedAt.Equal(claimT0) || !got.ExpiresAt.Equal(claimT0.Add(campaign.ItemStartClaimTTL)) {
+		t.Errorf("claim window = [%s, %s], want [%s, +%s]", got.ClaimedAt, got.ExpiresAt, claimT0, campaign.ItemStartClaimTTL)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, got) {
+		t.Errorf("committed claim row = %+v, want %+v", row, got)
+	}
+}
+
+func TestClaimCampaignItemStart_LinkedItem_RefusedNamingWinner(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	winner := makeClaimRun(t, runs)
+	if _, err := repo.SetCampaignItemRun(context.Background(), item.ID, &winner); err != nil {
+		t.Fatalf("link winner: %v", err)
+	}
+	got, err := repo.ClaimCampaignItemStart(context.Background(), campaign.ClaimCampaignItemStartParams{
+		ItemID: item.ID, Starter: campaign.StarterCampaignDriver, Clock: fixedClock(claimT0),
+	})
+	ce := wantStartConflict(t, err, campaign.StartConflictLinked)
+	if got != nil {
+		t.Errorf("claim = %+v, want nil on a refusal", got)
+	}
+	if ce.WinnerRunID == nil || *ce.WinnerRunID != winner || ce.ItemID != item.ID {
+		t.Errorf("conflict = %+v, want item %s winner %s", ce, item.ID, winner)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row after a linked refusal = %+v, want none written", row)
+	}
+}
+
+func TestClaimCampaignItemStart_LiveClaimHeld_Refused(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	holder := claimAt(t, repo, item.ID, campaign.StarterCampaignDriver, claimT0)
+	_, err := repo.ClaimCampaignItemStart(context.Background(), campaign.ClaimCampaignItemStartParams{
+		ItemID: item.ID, Starter: campaign.StarterOperator, Clock: fixedClock(claimT0.Add(time.Minute)),
+	})
+	ce := wantStartConflict(t, err, campaign.StartConflictClaimed)
+	if !sameClaim(ce.HeldClaim, holder) {
+		t.Errorf("HeldClaim = %+v, want the holder %+v", ce.HeldClaim, holder)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, holder) {
+		t.Errorf("claim row after a refused claimant = %+v, want the holder's row unchanged %+v", row, holder)
+	}
+}
+
+func TestClaimCampaignItemStart_ExpiredClaim_Reclaimed(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	crashed := claimAt(t, repo, item.ID, campaign.StarterCampaignDriver, claimT0)
+	// A claimant AT the crashed claim's expires_at reclaims (crash recovery).
+	at := crashed.ExpiresAt
+	got := claimAt(t, repo, item.ID, campaign.StarterOperator, at)
+	if got.ClaimID == crashed.ClaimID || got.Starter != campaign.StarterOperator {
+		t.Errorf("reclaim = %+v, want a NEW operator claim (crashed claim %s)", got, crashed.ClaimID)
+	}
+	if !got.ClaimedAt.Equal(at) || !got.ExpiresAt.Equal(at.Add(campaign.ItemStartClaimTTL)) {
+		t.Errorf("reclaim window = [%s, %s], want [%s, +TTL]", got.ClaimedAt, got.ExpiresAt, at)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, got) {
+		t.Errorf("committed row = %+v, want the reclaim %+v", row, got)
+	}
+}
+
+func TestClaimCampaignItemStart_MissingItem_NotFound(t *testing.T) {
+	_, repo, _, _ := newClaimFixture(t)
+	_, err := repo.ClaimCampaignItemStart(context.Background(), campaign.ClaimCampaignItemStartParams{
+		ItemID: uuid.New(), Starter: campaign.StarterOperator, Clock: fixedClock(claimT0),
+	})
+	if !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("claim on a missing item: err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestClaimCampaignItemStart_InvalidParams_Refused(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	missing := uuid.New()
+	for name, tc := range map[string]campaign.ClaimCampaignItemStartParams{
+		// A MISSING item proves the first two are refused before any read:
+		// a read would answer ErrNotFound instead.
+		"unknown starter": {ItemID: missing, Starter: "human", Clock: fixedClock(claimT0)},
+		"empty starter":   {ItemID: missing, Starter: "", Clock: fixedClock(claimT0)},
+		"nil clock":       {ItemID: missing, Starter: campaign.StarterOperator},
+		"zero reading":    {ItemID: item.ID, Starter: campaign.StarterOperator, Clock: fixedClock(time.Time{})},
+	} {
+		got, err := repo.ClaimCampaignItemStart(context.Background(), tc)
+		if !errors.Is(err, campaign.ErrStartClaimInvalid) || got != nil {
+			t.Errorf("%s: claim = %+v, err = %v, want nil, ErrStartClaimInvalid", name, got, err)
+		}
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row after invalid claims = %+v, want none", row)
+	}
+}
+
+// waitForLockWaiter blocks until a backend on this test's database is waiting
+// on a lock, failing if done closes first (the claim returned without
+// waiting) or the bound elapses.
+func waitForLockWaiter(t *testing.T, pool *pgxpool.Pool, done <-chan struct{}) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		select {
+		case <-done:
+			t.Fatal("the claim returned before the test released the item lock: it did not wait on the item row lock")
+		default:
+		}
+		var waiting int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`,
+		).Scan(&waiting); err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no backend began waiting on the item lock within 15s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestClaimCampaignItemStart_WaitsOnItemLock_SeesCommittedLink pins the T1
+// atomicity: a claim blocked behind a transaction that holds the item row lock
+// and links a run reads the COMMITTED row once the lock is released and
+// refuses linked, rather than claiming an item that is now linked.
+func TestClaimCampaignItemStart_WaitsOnItemLock_SeesCommittedLink(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	winner := makeClaimRun(t, runs)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM campaign_items WHERE id = $1 FOR UPDATE`, item.ID); err != nil {
+		t.Fatalf("lock item: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE campaign_items SET run_id = $2 WHERE id = $1`, item.ID, winner); err != nil {
+		t.Fatalf("link inside the open transaction: %v", err)
+	}
+
+	done := make(chan struct{})
+	var claimErr error
+	go func() {
+		defer close(done)
+		_, claimErr = repo.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+			ItemID: item.ID, Starter: campaign.StarterCampaignDriver, Clock: fixedClock(claimT0),
+		})
+	}()
+	waitForLockWaiter(t, pool, done)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit the link: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("claim did not return within 15s of the link committing")
+	}
+	ce := wantStartConflict(t, claimErr, campaign.StartConflictLinked)
+	if ce.WinnerRunID == nil || *ce.WinnerRunID != winner {
+		t.Errorf("WinnerRunID = %v, want the committed run %s", ce.WinnerRunID, winner)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row = %+v, want none: the item was linked when the claim acquired the lock", row)
+	}
+}
+
+// TestClaimCampaignItemStart_LockWait_StampsFromPostLockClock pins #5266 X4:
+// the claim's claimed_at / expires_at come from the clock read AFTER the item
+// row lock is granted. The lock wait here consumes 9 of the claim TTL's 10
+// minutes; a claim stamped before the lock would have 1 minute left, which no
+// longer covers the start and cleanup budgets.
+func TestClaimCampaignItemStart_LockWait_StampsFromPostLockClock(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	ctx := context.Background()
+	var clockNanos atomicTime
+	clockNanos.set(claimT0)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM campaign_items WHERE id = $1 FOR UPDATE`, item.ID); err != nil {
+		t.Fatalf("lock item: %v", err)
+	}
+
+	done := make(chan struct{})
+	var got *campaign.StartClaim
+	var claimErr error
+	go func() {
+		defer close(done)
+		got, claimErr = repo.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+			ItemID: item.ID, Starter: campaign.StarterOperator, Clock: clockNanos.get,
+		})
+	}()
+	waitForLockWaiter(t, pool, done)
+	postLock := claimT0.Add(9 * time.Minute)
+	clockNanos.set(postLock)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("release the item lock: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("claim did not return within 15s of the lock release")
+	}
+	if claimErr != nil {
+		t.Fatalf("claim after the lock wait: %v", claimErr)
+	}
+	if !got.ClaimedAt.Equal(postLock) || !got.ExpiresAt.Equal(postLock.Add(campaign.ItemStartClaimTTL)) {
+		t.Errorf("claim window = [%s, %s], want [%s, +TTL] (stamped from the post-lock clock, not %s)",
+			got.ClaimedAt, got.ExpiresAt, postLock, claimT0)
+	}
+	if !got.Covers(postLock, campaign.ItemStartWorstCase) {
+		t.Errorf("claim %+v does not cover ItemStartWorstCase (%s) at %s", got, campaign.ItemStartWorstCase, postLock)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, got) {
+		t.Errorf("committed row = %+v, want %+v", row, got)
+	}
+}
+
+// atomicTime is a race-safe mutable clock.
+type atomicTime struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (a *atomicTime) set(t time.Time) { a.mu.Lock(); a.t = t; a.mu.Unlock() }
+func (a *atomicTime) get() time.Time  { a.mu.Lock(); defer a.mu.Unlock(); return a.t }
+
+// TestClaimCampaignItemStart_Concurrent_ExactlyOneWins: two starters claiming
+// the same item at the same instant — exactly one gets the claim, the other is
+// refused claimed naming the winner.
+func TestClaimCampaignItemStart_Concurrent_ExactlyOneWins(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	starters := []string{campaign.StarterOperator, campaign.StarterCampaignDriver}
+	claims := make([]*campaign.StartClaim, len(starters))
+	errs := make([]error, len(starters))
+	var wg sync.WaitGroup
+	for i, s := range starters {
+		wg.Add(1)
+		go func(i int, s string) {
+			defer wg.Done()
+			claims[i], errs[i] = repo.ClaimCampaignItemStart(context.Background(), campaign.ClaimCampaignItemStartParams{
+				ItemID: item.ID, Starter: s, Clock: fixedClock(claimT0),
+			})
+		}(i, s)
+	}
+	wg.Wait()
+	var winner *campaign.StartClaim
+	refused := 0
+	for i := range starters {
+		if errs[i] != nil {
+			wantStartConflict(t, errs[i], campaign.StartConflictClaimed)
+			refused++
+			continue
+		}
+		if winner != nil {
+			t.Fatalf("both starters claimed: %+v and %+v", winner, claims[i])
+		}
+		winner = claims[i]
+	}
+	if winner == nil || refused != 1 {
+		t.Fatalf("winner = %+v, refused = %d, want exactly one winner and one refusal", winner, refused)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, winner) {
+		t.Errorf("committed row = %+v, want the winner %+v", row, winner)
+	}
+}
+
+func TestLinkClaimedCampaignItemRun_OwnClaim_LinksAndConsumesClaim(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	claim := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	runID := makeClaimRun(t, runs)
+	got, err := repo.LinkClaimedCampaignItemRun(context.Background(), campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: item.ID, ClaimID: claim.ClaimID, RunID: runID,
+	})
+	if err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if got.RunID == nil || *got.RunID != runID {
+		t.Errorf("returned item RunID = %v, want %s", got.RunID, runID)
+	}
+	back, err := repo.GetCampaignItem(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if back.RunID == nil || *back.RunID != runID {
+		t.Errorf("committed RunID = %v, want %s", back.RunID, runID)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row after the link = %+v, want consumed", row)
+	}
+}
+
+func TestLinkClaimedCampaignItemRun_ClaimReplaced_RefusedClaimLost(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	b := claimAt(t, repo, item.ID, campaign.StarterCampaignDriver, a.ExpiresAt)
+	runID := makeClaimRun(t, runs)
+	got, err := repo.LinkClaimedCampaignItemRun(context.Background(), campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: item.ID, ClaimID: a.ClaimID, RunID: runID,
+	})
+	ce := wantStartConflict(t, err, campaign.StartConflictClaimLost)
+	if got != nil {
+		t.Errorf("item = %+v, want nil on a refusal", got)
+	}
+	if !sameClaim(ce.HeldClaim, b) {
+		t.Errorf("HeldClaim = %+v, want the replacer %+v", ce.HeldClaim, b)
+	}
+	back, err := repo.GetCampaignItem(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if back.RunID != nil {
+		t.Errorf("committed RunID = %v, want the item still unlinked", *back.RunID)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, b) {
+		t.Errorf("claim row = %+v, want B's row intact %+v", row, b)
+	}
+}
+
+func TestLinkClaimedCampaignItemRun_Released_RefusedClaimLostWithNoHolder(t *testing.T) {
+	_, repo, runs, item := newClaimFixture(t)
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	if err := repo.ReleaseCampaignItemStart(context.Background(), item.ID, a.ClaimID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	_, err := repo.LinkClaimedCampaignItemRun(context.Background(), campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: item.ID, ClaimID: a.ClaimID, RunID: makeClaimRun(t, runs),
+	})
+	ce := wantStartConflict(t, err, campaign.StartConflictClaimLost)
+	if ce.HeldClaim != nil {
+		t.Errorf("HeldClaim = %+v, want nil (no claim holds the item)", ce.HeldClaim)
+	}
+	back, err := repo.GetCampaignItem(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if back.RunID != nil {
+		t.Errorf("committed RunID = %v, want unlinked", *back.RunID)
+	}
+}
+
+// TestLinkClaimedCampaignItemRun_ExpiredUnreplaced_StillLinks: expiry only
+// lets ANOTHER claimant replace a claim; the link itself never checks the
+// clock, so a starter whose claim expired but was not replaced still links.
+func TestLinkClaimedCampaignItemRun_ExpiredUnreplaced_StillLinks(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	// Claimed long ago: the claim is expired against any present clock.
+	claim := claimAt(t, repo, item.ID, campaign.StarterCampaignDriver, claimT0.Add(-24*time.Hour))
+	runID := makeClaimRun(t, runs)
+	got, err := repo.LinkClaimedCampaignItemRun(context.Background(), campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: item.ID, ClaimID: claim.ClaimID, RunID: runID,
+	})
+	if err != nil {
+		t.Fatalf("link through an expired, unreplaced claim: %v", err)
+	}
+	if got.RunID == nil || *got.RunID != runID {
+		t.Errorf("RunID = %v, want %s", got.RunID, runID)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row = %+v, want consumed", row)
+	}
+}
+
+func TestLinkClaimedCampaignItemRun_LinkedToOther_RefusedLinked(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	claim := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	// An unconditional link (the reconcile relink path) lands first.
+	other := makeClaimRun(t, runs)
+	if _, err := repo.SetCampaignItemRun(context.Background(), item.ID, &other); err != nil {
+		t.Fatalf("link other: %v", err)
+	}
+	_, err := repo.LinkClaimedCampaignItemRun(context.Background(), campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: item.ID, ClaimID: claim.ClaimID, RunID: makeClaimRun(t, runs),
+	})
+	ce := wantStartConflict(t, err, campaign.StartConflictLinked)
+	if ce.WinnerRunID == nil || *ce.WinnerRunID != other {
+		t.Errorf("WinnerRunID = %v, want %s", ce.WinnerRunID, other)
+	}
+	back, err := repo.GetCampaignItem(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if back.RunID == nil || *back.RunID != other {
+		t.Errorf("committed RunID = %v, want unchanged %s", back.RunID, other)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, claim) {
+		t.Errorf("claim row = %+v, want untouched %+v (the refusal writes nothing)", row, claim)
+	}
+}
+
+func TestLinkClaimedCampaignItemRun_SameRun_Idempotent(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	claim := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	runID := makeClaimRun(t, runs)
+	p := campaign.LinkClaimedCampaignItemRunParams{ItemID: item.ID, ClaimID: claim.ClaimID, RunID: runID}
+	if _, err := repo.LinkClaimedCampaignItemRun(context.Background(), p); err != nil {
+		t.Fatalf("first link: %v", err)
+	}
+	got, err := repo.LinkClaimedCampaignItemRun(context.Background(), p)
+	if err != nil {
+		t.Fatalf("re-link of the same run: %v, want idempotent success", err)
+	}
+	if got.RunID == nil || *got.RunID != runID {
+		t.Errorf("re-link RunID = %v, want %s", got.RunID, runID)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row = %+v, want none", row)
+	}
+}
+
+func TestLinkClaimedCampaignItemRun_MissingItemAndInvalidParams(t *testing.T) {
+	_, repo, runs, item := newClaimFixture(t)
+	runID := makeClaimRun(t, runs)
+	if _, err := repo.LinkClaimedCampaignItemRun(context.Background(), campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: uuid.New(), ClaimID: uuid.New(), RunID: runID,
+	}); !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("link on a missing item: err = %v, want ErrNotFound", err)
+	}
+	for name, p := range map[string]campaign.LinkClaimedCampaignItemRunParams{
+		"nil claim id": {ItemID: item.ID, RunID: runID},
+		"nil run id":   {ItemID: item.ID, ClaimID: uuid.New()},
+	} {
+		if _, err := repo.LinkClaimedCampaignItemRun(context.Background(), p); !errors.Is(err, campaign.ErrStartClaimInvalid) {
+			t.Errorf("%s: err = %v, want ErrStartClaimInvalid", name, err)
+		}
+	}
+	back, err := repo.GetCampaignItem(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if back.RunID != nil {
+		t.Errorf("RunID = %v, want unlinked after refused links", *back.RunID)
+	}
+}
+
+func TestReleaseCampaignItemStart_OwnClaim_FreesTheItem(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	if err := repo.ReleaseCampaignItemStart(context.Background(), item.ID, a.ClaimID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row after release = %+v, want none", row)
+	}
+	// A new claim at the SAME instant succeeds: the item is free.
+	b := claimAt(t, repo, item.ID, campaign.StarterCampaignDriver, claimT0)
+	if b.ClaimID == a.ClaimID {
+		t.Errorf("post-release claim reused claim id %s", a.ClaimID)
+	}
+}
+
+func TestReleaseCampaignItemStart_OtherHoldersClaim_Untouched(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	b := claimAt(t, repo, item.ID, campaign.StarterCampaignDriver, a.ExpiresAt)
+	// A's stale token released after B's reclaim must not free B's claim.
+	if err := repo.ReleaseCampaignItemStart(context.Background(), item.ID, a.ClaimID); err != nil {
+		t.Fatalf("stale release: %v", err)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, b) {
+		t.Errorf("claim row after a stale release = %+v, want B's row intact %+v", row, b)
+	}
+}
+
+func TestReleaseCampaignItemStart_Idempotent(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	if err := repo.ReleaseCampaignItemStart(context.Background(), item.ID, uuid.New()); err != nil {
+		t.Errorf("release with no claim: %v, want nil", err)
+	}
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	for i := 0; i < 2; i++ {
+		if err := repo.ReleaseCampaignItemStart(context.Background(), item.ID, a.ClaimID); err != nil {
+			t.Errorf("release #%d: %v, want nil", i+1, err)
+		}
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row = %+v, want none", row)
+	}
+}
+
+// TestReleaseCampaignItemStart_DatabaseError_Surfaced: a release whose DELETE
+// cannot run returns the wrapped error (the caller logs it; the claim then
+// lapses by TTL) and leaves the claim row in place.
+func TestReleaseCampaignItemStart_DatabaseError_Surfaced(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := repo.ReleaseCampaignItemStart(ctx, item.ID, a.ClaimID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("release on a cancelled context: err = %v, want context.Canceled", err)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, a) {
+		t.Errorf("claim row after a failed release = %+v, want the claim intact %+v", row, a)
+	}
+}
+
+// holdItemLock opens a transaction holding item's row lock, rolled back at
+// test cleanup.
+func holdItemLock(t *testing.T, pool *pgxpool.Pool, itemID uuid.UUID) {
+	t.Helper()
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	if _, err := tx.Exec(context.Background(), `SELECT id FROM campaign_items WHERE id = $1 FOR UPDATE`, itemID); err != nil {
+		t.Fatalf("lock item: %v", err)
+	}
+}
+
+// cancelDuringLockWait runs call on a cancellable context, cancels it once the
+// call is blocked on the item row lock, and returns the call's error.
+func cancelDuringLockWait(t *testing.T, pool *pgxpool.Pool, call func(context.Context) error) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	var callErr error
+	go func() {
+		defer close(done)
+		callErr = call(ctx)
+	}()
+	waitForLockWaiter(t, pool, done)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("call did not return within 15s of its context being cancelled")
+	}
+	return callErr
+}
+
+// TestClaimCampaignItemStart_LockWaitCancelled_ErrorsWithoutClaiming: a claim
+// whose context ends while it waits on the item row lock returns the lock
+// error — not a conflict — and writes no claim row.
+func TestClaimCampaignItemStart_LockWaitCancelled_ErrorsWithoutClaiming(t *testing.T) {
+	pool, repo, _, item := newClaimFixture(t)
+	holdItemLock(t, pool, item.ID)
+	err := cancelDuringLockWait(t, pool, func(ctx context.Context) error {
+		_, err := repo.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+			ItemID: item.ID, Starter: campaign.StarterOperator, Clock: fixedClock(claimT0),
+		})
+		return err
+	})
+	var ce *campaign.ItemStartConflictError
+	if err == nil || errors.As(err, &ce) || !strings.Contains(err.Error(), "lock campaign item") {
+		t.Fatalf("claim cancelled in the lock wait: err = %v, want a wrapped lock error, not a conflict", err)
+	}
+	if row := readClaimRow(t, pool, item.ID); row != nil {
+		t.Errorf("claim row = %+v, want none after a cancelled claim", row)
+	}
+}
+
+// TestLinkClaimedCampaignItemRun_LockWaitCancelled_KeepsClaimUnlinked: a link
+// whose context ends while it waits on the item row lock returns the lock
+// error, consumes no claim and links no run.
+func TestLinkClaimedCampaignItemRun_LockWaitCancelled_KeepsClaimUnlinked(t *testing.T) {
+	pool, repo, runs, item := newClaimFixture(t)
+	runID := makeClaimRun(t, runs)
+	a := claimAt(t, repo, item.ID, campaign.StarterOperator, claimT0)
+	holdItemLock(t, pool, item.ID)
+	err := cancelDuringLockWait(t, pool, func(ctx context.Context) error {
+		_, err := repo.LinkClaimedCampaignItemRun(ctx, campaign.LinkClaimedCampaignItemRunParams{
+			ItemID: item.ID, ClaimID: a.ClaimID, RunID: runID,
+		})
+		return err
+	})
+	var ce *campaign.ItemStartConflictError
+	if err == nil || errors.As(err, &ce) || !strings.Contains(err.Error(), "lock campaign item") {
+		t.Fatalf("link cancelled in the lock wait: err = %v, want a wrapped lock error, not a conflict", err)
+	}
+	if row := readClaimRow(t, pool, item.ID); !sameClaim(row, a) {
+		t.Errorf("claim row = %+v, want the claim intact %+v", row, a)
+	}
+	var linked *uuid.UUID
+	if err := pool.QueryRow(context.Background(), `SELECT run_id FROM campaign_items WHERE id = $1`, item.ID).Scan(&linked); err != nil {
+		t.Fatalf("read run_id: %v", err)
+	}
+	if linked != nil {
+		t.Errorf("run_id = %s, want unlinked after a cancelled link", *linked)
+	}
+}
+
+// TestItemStartBudgets_WorstCasePostClaimUnderHalfTheClaimTTL pins the claim
+// invariant (#5266 U3): everything a live starter does after claiming — the
+// start budget plus, on its own context, the cleanup budget — fits in under
+// half the claim TTL, so a live starter's claim cannot be stolen.
+func TestItemStartBudgets_WorstCasePostClaimUnderHalfTheClaimTTL(t *testing.T) {
+	if campaign.ItemStartCleanupBudget <= 0 {
+		t.Errorf("ItemStartCleanupBudget = %s, want > 0", campaign.ItemStartCleanupBudget)
+	}
+	if campaign.ItemStartBudget <= 0 {
+		t.Errorf("ItemStartBudget = %s, want > 0", campaign.ItemStartBudget)
+	}
+	sum := campaign.ItemStartBudget + campaign.ItemStartCleanupBudget
+	if campaign.ItemStartWorstCase != sum {
+		t.Errorf("ItemStartWorstCase = %s, want ItemStartBudget + ItemStartCleanupBudget = %s", campaign.ItemStartWorstCase, sum)
+	}
+	if sum >= campaign.ItemStartClaimTTL/2 {
+		t.Errorf("ItemStartBudget (%s) + ItemStartCleanupBudget (%s) = %s, want < ItemStartClaimTTL/2 (%s)",
+			campaign.ItemStartBudget, campaign.ItemStartCleanupBudget, sum, campaign.ItemStartClaimTTL/2)
+	}
+}
+
+func TestStartClaim_Covers(t *testing.T) {
+	c := &campaign.StartClaim{ClaimedAt: claimT0, ExpiresAt: claimT0.Add(campaign.ItemStartClaimTTL)}
+	need := campaign.ItemStartWorstCase
+	for name, tc := range map[string]struct {
+		claim *campaign.StartClaim
+		now   time.Time
+		want  bool
+	}{
+		"fresh claim":                {c, claimT0, true},
+		"exactly the need remaining": {c, c.ExpiresAt.Add(-need), true},
+		"one ns short":               {c, c.ExpiresAt.Add(-need + time.Nanosecond), false},
+		"expired":                    {c, c.ExpiresAt.Add(time.Minute), false},
+		"nil claim":                  {nil, claimT0, false},
+	} {
+		if got := tc.claim.Covers(tc.now, need); got != tc.want {
+			t.Errorf("%s: Covers = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestItemStartConflictError_NamesItemReasonAndHolder(t *testing.T) {
+	item, winner, claimID := uuid.New(), uuid.New(), uuid.New()
+	linked := (&campaign.ItemStartConflictError{ItemID: item, Reason: campaign.StartConflictLinked, WinnerRunID: &winner}).Error()
+	for _, want := range []string{item.String(), "linked", winner.String()} {
+		if !strings.Contains(linked, want) {
+			t.Errorf("linked Error() = %q, want it to name %q", linked, want)
+		}
+	}
+	held := (&campaign.ItemStartConflictError{ItemID: item, Reason: campaign.StartConflictClaimed,
+		HeldClaim: &campaign.StartClaim{ClaimID: claimID, Starter: campaign.StarterCampaignDriver, ExpiresAt: claimT0}}).Error()
+	for _, want := range []string{item.String(), "claimed", claimID.String(), campaign.StarterCampaignDriver} {
+		if !strings.Contains(held, want) {
+			t.Errorf("claimed Error() = %q, want it to name %q", held, want)
+		}
 	}
 }

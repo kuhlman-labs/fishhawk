@@ -9452,3 +9452,130 @@ VALUES ($1, $2, 'spec:o/r:a', 1, 'held', now(), now()), ($1, $2, 'spec:o/r:b', 1
 		t.Errorf("single-row held stage after rolling back 0118 = %s, want unchanged %s", got, heldBefore)
 	}
 }
+
+// TestMigrate_0119_CampaignItemStartClaims_Constraints pins 0119 (#5266):
+// campaign_item_start_claims admits a valid claim; a starter outside
+// {operator, campaign_driver} names campaign_item_start_claims_starter_check;
+// expires_at <= claimed_at names campaign_item_start_claims_window_check; the
+// primary key admits ONE claim per item; and deleting the item deletes its
+// claim.
+func TestMigrate_0119_CampaignItemStartClaims_Constraints(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	seedItem := func() uuid.UUID {
+		t.Helper()
+		campaignID, itemID := uuid.New(), uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO campaigns (id, repo, epic_ref) VALUES ($1, 'o/r', 'issue:1')`, campaignID); err != nil {
+			t.Fatalf("seed campaign: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO campaign_items (id, campaign_id, issue_ref) VALUES ($1, $2, 'issue:2')`, itemID, campaignID); err != nil {
+			t.Fatalf("seed item: %v", err)
+		}
+		return itemID
+	}
+	const insert = `INSERT INTO campaign_item_start_claims (item_id, claim_id, starter, claimed_at, expires_at) VALUES ($1, $2, $3, $4, $5)`
+	t0 := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+
+	itemID := seedItem()
+	if _, err := pool.Exec(ctx, insert, itemID, uuid.New(), "operator", t0, t0.Add(10*time.Minute)); err != nil {
+		t.Fatalf("insert a valid claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, insert, seedItem(), uuid.New(), "campaign_driver", t0, t0.Add(time.Second)); err != nil {
+		t.Errorf("insert a valid campaign_driver claim: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	for name, tc := range map[string]struct {
+		starter    string
+		expiresAt  time.Time
+		constraint string
+	}{
+		"starter outside the set":   {"human", t0.Add(time.Minute), "campaign_item_start_claims_starter_check"},
+		"empty starter":             {"", t0.Add(time.Minute), "campaign_item_start_claims_starter_check"},
+		"expires_at == claimed_at":  {"operator", t0, "campaign_item_start_claims_window_check"},
+		"expires_at before claimed": {"operator", t0.Add(-time.Minute), "campaign_item_start_claims_window_check"},
+	} {
+		// A fresh item per case, so the primary key never masks the CHECK.
+		_, err := pool.Exec(ctx, insert, seedItem(), uuid.New(), tc.starter, t0, tc.expiresAt)
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != tc.constraint {
+			t.Errorf("%s: err = %v, want a %s violation", name, err, tc.constraint)
+		}
+	}
+	if _, err := pool.Exec(ctx, insert, itemID, uuid.New(), "campaign_driver", t0, t0.Add(time.Minute)); !errors.As(err, &pgErr) || pgErr.ConstraintName != "campaign_item_start_claims_pkey" {
+		t.Errorf("second claim on one item: err = %v, want a campaign_item_start_claims_pkey violation", err)
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM campaign_items WHERE id = $1`, itemID); err != nil {
+		t.Fatalf("delete the claimed item: %v", err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM campaign_item_start_claims WHERE item_id = $1`, itemID).Scan(&left); err != nil {
+		t.Fatalf("read cascade: %v", err)
+	}
+	if left != 0 {
+		t.Errorf("claims after deleting the item = %d, want 0 (ON DELETE CASCADE)", left)
+	}
+}
+
+// TestMigrateDown_CampaignItemStartClaimsReversal pins the 0119 down
+// (#5266): rolling back 0119 drops campaign_item_start_claims (and the claim
+// rows in it) and leaves campaign_items and the claimed item intact;
+// MigrateUp again restores the table.
+func TestMigrateDown_CampaignItemStartClaimsReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	campaignID, itemID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO campaigns (id, repo, epic_ref) VALUES ($1, 'o/r', 'issue:1')`, campaignID); err != nil {
+		t.Fatalf("seed campaign: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref) VALUES ($1, $2, 'issue:2')`, itemID, campaignID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	t0 := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_item_start_claims (item_id, claim_id, starter, claimed_at, expires_at) VALUES ($1, $2, 'operator', $3, $4)`,
+		itemID, uuid.New(), t0, t0.Add(10*time.Minute)); err != nil {
+		t.Fatalf("insert claim after MigrateUp: %v", err)
+	}
+
+	downThrough(t, url, "0119")
+
+	if tableExists(t, url, "campaign_item_start_claims") {
+		t.Error("campaign_item_start_claims exists after rolling back 0119, want dropped")
+	}
+	var items int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM campaign_items WHERE id = $1`, itemID).Scan(&items); err != nil {
+		t.Fatalf("read campaign_items after rollback: %v", err)
+	}
+	if items != 1 {
+		t.Errorf("claimed item after rolling back 0119 = %d rows, want 1 (campaign_items untouched)", items)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if !tableExists(t, url, "campaign_item_start_claims") {
+		t.Error("campaign_item_start_claims missing after re-applying 0119")
+	}
+}
