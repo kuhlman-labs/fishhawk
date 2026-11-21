@@ -123,8 +123,21 @@ type runResolver struct {
 
 	// localHostRungs is Config.LocalHostRungs: true only in the operator's own
 	// stdio fishhawk-mcp process, where the doctor's credential and
-	// model_credential rungs may read this host (#5227).
+	// model_credential rungs (#5227) and the host-dispatch status overlay
+	// (#5402, host_dispatch_overlay.go) may read this host. fishhawkd's /mcp
+	// route leaves it false.
 	localHostRungs bool
+
+	// hostDispatchNow is the host-dispatch status overlay's clock seam (#5402).
+	// Nil falls back to time.Now; tests inject the dispatcher harness's clock
+	// so staleness and the daily cap are judged at a fixed instant.
+	hostDispatchNow func() time.Time
+
+	// hostDispatchOwner is the overlay's state-dir owner seam (S4, #5402),
+	// passed to hostDispatchStateDirProblem. Nil falls back to fileOwnerUID;
+	// tests inject a uid other than os.Getuid() to present a real directory as
+	// another user's, exactly as TestStateDir_Refusals does.
+	hostDispatchOwner func(os.FileInfo) (int, bool)
 
 	// runBoundToken is true when this registry's bearer is a run-bound
 	// in-runner agent token (fhm_). Computed once in NewServer from the prefix
@@ -1999,6 +2012,11 @@ type GetRunStatusOutput struct {
 	// restores it).
 	Divergence *gateDivergence `json:"divergence,omitempty" jsonschema:"the newest unanswered divergence question (E75.5): a captain decision at an allow-listed gate (concern waive, concern defer, plan reject) went against clear human precedent. Carries the sequence, the decision vs the modal outcome, the agreement ratio, cited sequences, the options one_off | doctrine_change and the answer pointer (fishhawk_answer_divergence). Optional — leaving it unanswered blocks nothing. Omitted when the backend's divergence feature is disabled (the shipped default) or none is open"`
 	Precedent  *gatePrecedent  `json:"precedent,omitempty" jsonschema:"how this kind of gate was decided before (E75.4): the open gate's decision class, up to 3 cited prior decisions with explained scores + matched keys, the aggregate summary (modal outcome, agreement ratio) and a full_query pointer (fishhawk_precedent) to the unbounded set. DISPLAY-ONLY — never authority, never a gate input, never an agent input; the decision is still the captain's. Reason excerpts are elided unless include_review_prose=true. Omitted when no human gate is open or no precedent is indexed"`
+	// HostDispatch is the host-dispatch status overlay (#5402): the operator's
+	// stdio process reads the host dispatcher's status.json and reports what it
+	// says about this run. Computed at read time, display-only, and retained by
+	// the diagnosis skeleton (tierNever).
+	HostDispatch *hostDispatchObservation `json:"host_dispatch,omitempty" jsonschema:"the host dispatcher's state for this run, read from its host-local status.json by the operator's stdio fishhawk-mcp (#5402): state live | waiting | held | refusing | capped | paused | stale | absent | unverified, the status_path or the paths_tried, the dispatcher's tick times and failure code, this run's latest refusal (code, detail, stage, first/last seen) and the daily cap. Present only on the stdio transport with an operator bearer, for a run the dispatcher would consider (local, non-terminal, a pending or awaiting_host_dispatch stage, marked or a child of a marked parent) or one it holds a refusal for; absent over HTTP /mcp"`
 	// ChildrenStatus is the decomposed-parent per-child + integration-phase
 	// view (#1147): each child's live lifecycle state in slice-index order
 	// plus the fan-in phase classified from the four fan-in audit kinds
@@ -2602,6 +2620,12 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	divergenceBlock := runRow.Divergence
 	runRow.Divergence = nil
 
+	// Host-dispatch status overlay (#5402): the operator's stdio process reads
+	// the dispatcher's host-local status.json for a run the dispatcher would
+	// consider (or one it holds a refusal for). Off the view and stages already
+	// fetched; nil (omitted) everywhere else. next_actions is unchanged.
+	hostDispatch := r.runHostDispatchFor(ctx, view, stages)
+
 	assembled := GetRunStatusOutput{
 		Run:                       *runRow,
 		Stages:                    stages,
@@ -2626,6 +2650,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		GroomingApplyStatus:       groomingApplyStatus,
 		Precedent:                 gatePrecedentBlock,
 		Divergence:                divergenceBlock,
+		HostDispatch:              hostDispatch,
 	}
 
 	// (b) reviewer prose (E45.92 / #3627). The same per-reviewer implement

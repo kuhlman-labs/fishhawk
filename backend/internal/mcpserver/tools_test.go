@@ -20398,3 +20398,147 @@ func TestApprovePlan_BindingAssertionsStateVacuityRule(t *testing.T) {
 		}
 	}
 }
+
+// TestGetRunStatus_HostDispatchBlock pins fishhawk_get_run_status's
+// host_dispatch block (#5402): present for a run the dispatcher would consider
+// (marked, or a child of a marked parent: F1) or one it holds a refusal for,
+// and absent off the operator's stdio process.
+func TestGetRunStatus_HostDispatchBlock(t *testing.T) {
+	hdoEmptyTMPDIR(t)
+	fb, srv := newFakeBackend(t)
+	idx := 0
+	parentMarked, parentUnmarked := uuid.New(), uuid.New()
+	fb.getRunByID[parentMarked] = Run{ID: parentMarked.String(), Repo: "x/y", State: "running", RunnerKind: "local", AutoDispatch: true}
+	fb.getRunByID[parentUnmarked] = Run{ID: parentUnmarked.String(), Repo: "x/y", State: "running", RunnerKind: "local"}
+	type fixture struct{ runID, implID uuid.UUID }
+	seed := func(mut func(*Run)) fixture {
+		id, plan, impl := uuid.New(), uuid.New(), uuid.New()
+		row := Run{ID: id.String(), Repo: "x/y", State: "running", RunnerKind: "local", AutoDispatch: true, WorkingDir: t.TempDir()}
+		if mut != nil {
+			mut(&row)
+		}
+		fb.getRunByID[id] = row
+		fb.stagesByRun[id] = []Stage{
+			{ID: plan.String(), RunID: id.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: impl.String(), RunID: id.String(), Sequence: 2, Type: "implement", State: "awaiting_host_dispatch"},
+		}
+		return fixture{id, impl}
+	}
+	child := func(parent uuid.UUID) func(*Run) {
+		return func(r *Run) {
+			p := parent.String()
+			r.AutoDispatch, r.SliceIndex, r.DecomposedFrom = false, &idx, &p
+		}
+	}
+	unmarked := func(r *Run) { r.AutoDispatch = false }
+	write := func(t *testing.T, mut func(*HostDispatcherStatus)) string {
+		dir := filepath.Join(t.TempDir(), "state")
+		st := hdoStatus()
+		mut(&st)
+		hdoWrite(t, dir, st)
+		return dir
+	}
+	pausedSt := func(s *HostDispatcherStatus) { s.Paused = true }
+	ledgerFailed := func(s *HostDispatcherStatus) {
+		s.LastTickFailure = &hostDispatchTickFailure{Code: hdRefuseLedgerRead, At: s.LastTickAt}
+	}
+	withEntry := func(f *fixture, stage *uuid.UUID) func(*HostDispatcherStatus) {
+		return func(s *HostDispatcherStatus) {
+			sid := f.implID.String()
+			if stage != nil {
+				sid = stage.String()
+			}
+			s.RunRefusals = map[string]hostDispatchRunRefusal{f.runID.String(): {RunID: f.runID.String(), StageID: sid, Code: hdRefuseWorkingDirAbsent, FirstAt: hdoNow, LastAt: hdoNow}}
+		}
+	}
+	marked := seed(nil)
+	plainUnmarked := seed(unmarked)
+	markedChild := seed(child(parentMarked))
+	refusedChild := seed(child(parentMarked))
+	unmarkedChild := seed(child(parentUnmarked))
+	refusedUnmarked := seed(unmarked)
+	otherStage := uuid.New()
+
+	for _, tc := range []struct {
+		name     string
+		f        fixture
+		st       func(*HostDispatcherStatus)
+		disabled bool
+		runBound bool
+		// wdStatus writes the status into the run's own working_dir rung;
+		// env then names an empty dir (exclusive) unless noEnv.
+		wdStatus  bool
+		noEnv     bool
+		wantNil   bool
+		wantState string
+		check     func(t *testing.T, hd *hostDispatchObservation)
+	}{
+		{name: "marked run, paused", f: marked, st: pausedSt, wantState: hostDispatchStatePaused},
+		{name: "marked run, ledger_read_failed", f: marked, st: ledgerFailed, wantState: hostDispatchStateRefusing,
+			check: func(t *testing.T, hd *hostDispatchObservation) {
+				if hd.TickFailureCode != hdRefuseLedgerRead {
+					t.Errorf("tick_failure_code = %q; want %s", hd.TickFailureCode, hdRefuseLedgerRead)
+				}
+			}},
+		{name: "S5b entry for another stage", f: marked, st: withEntry(&marked, &otherStage), wantState: hostDispatchStateUnverified,
+			check: func(t *testing.T, hd *hostDispatchObservation) {
+				hdoContainsAll(t, "detail", hd.Detail, marked.implID.String(), otherStage.String())
+			}},
+		{name: "unmarked run", f: plainUnmarked, st: pausedSt, wantNil: true},
+		{name: "localHostRungs false", f: marked, st: pausedSt, disabled: true, wantNil: true},
+		{name: "run-bound token", f: marked, st: pausedSt, runBound: true, wantNil: true},
+		// F1: a child is eligible through its parent's mark.
+		{name: "F1 child of a marked parent, dispatcher-wide refusal", f: markedChild, st: ledgerFailed, wantState: hostDispatchStateRefusing},
+		{name: "F1 child of a marked parent the dispatcher refused", f: refusedChild, st: withEntry(&refusedChild, nil), wantState: hostDispatchStateRefusing,
+			check: func(t *testing.T, hd *hostDispatchObservation) {
+				if hd.RefusalCode != hdRefuseWorkingDirAbsent {
+					t.Errorf("refusal_code = %q; want %s", hd.RefusalCode, hdRefuseWorkingDirAbsent)
+				}
+			}},
+		{name: "child of an unmarked parent", f: unmarkedChild, st: pausedSt, wantNil: true},
+		{name: "F1 unmarked run with a run_refusals entry", f: refusedUnmarked, st: withEntry(&refusedUnmarked, nil), wantState: hostDispatchStateRefusing},
+		{name: "env unset: the run's own working_dir rung", f: marked, st: pausedSt, wdStatus: true, noEnv: true, wantState: hostDispatchStatePaused},
+		{name: "env set is exclusive", f: marked, st: pausedSt, wdStatus: true, wantState: hostDispatchStateAbsent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{hostDispatchStateDirEnv: write(t, tc.st)}
+			if tc.wdStatus {
+				wdRung := filepath.Join(fb.getRunByID[tc.f.runID].WorkingDir, hostDispatchCheckoutStateDir)
+				st := hdoStatus()
+				tc.st(&st)
+				hdoWrite(t, wdRung, st)
+				t.Cleanup(func() { _ = os.RemoveAll(wdRung) })
+				env[hostDispatchStateDirEnv] = filepath.Join(t.TempDir(), "empty")
+				if tc.noEnv {
+					env = nil
+				}
+			}
+			r := newResolver(srv, env)
+			r.localHostRungs, r.runBoundToken = !tc.disabled, tc.runBound
+			r.getwd = func() (string, error) { return t.TempDir(), nil }
+			r.hostDispatchNow = func() time.Time { return hdoNow }
+			_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: tc.f.runID.String()})
+			if err != nil {
+				t.Fatalf("getRunStatus: %v", err)
+			}
+			if tc.wantNil {
+				if out.HostDispatch != nil {
+					t.Fatalf("host_dispatch = %+v; want no block", out.HostDispatch)
+				}
+				return
+			}
+			if out.HostDispatch == nil || out.HostDispatch.State != tc.wantState {
+				t.Fatalf("host_dispatch = %+v; want state %q", out.HostDispatch, tc.wantState)
+			}
+			if tc.check != nil {
+				tc.check(t, out.HostDispatch)
+			}
+			// Through the real SDK handler: the block passes the reflected
+			// output schema.
+			wire := hdoCallOverSession(t, r, "fishhawk_get_run_status", map[string]any{"run_id": tc.f.runID.String()})
+			if got := hdoWireState(t, wire); got != tc.wantState {
+				t.Fatalf("wire host_dispatch.state = %q; want %q", got, tc.wantState)
+			}
+		})
+	}
+}

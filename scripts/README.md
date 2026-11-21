@@ -2228,13 +2228,20 @@ The next `scripts/dev up` or reload also clears it.
 #### Operating it
 
 - **Status.** `bin/fishhawk-mcp host-dispatch --status --state-dir
-  .fishhawk/cache/host-dispatch` prints one line, `state=<live|paused|stale>
-  pid=… host=… last_tick_at=… paused=… in_flight=… spawns_today=…`, plus the
-  latest refusal when there is one. `daily_cap=N` (status file field
-  `daily_cap`) appears only when an operator set `--daily-cap`.
-  It exits 0 when live or paused, and 1 when the status is absent or stale.
-  Pass the `--state-dir`: the binary's default is
-  `$TMPDIR/fishhawk-host-dispatch`, not the `scripts/dev` one.
+  .fishhawk/cache/host-dispatch` prints one line,
+  `state=<live|paused|failing|stale> pid=… host=… last_tick_at=… paused=…
+  in_flight=… spawns_today=…`, plus the latest refusal when there is one.
+  `daily_cap=N` (status file field `daily_cap`) appears only when an operator
+  set `--daily-cap`. Since #5402 the line also carries
+  `last_complete_tick_at=…` (the last tick that finished its candidate pass),
+  `tick_failure=<code> at=…` when the latest tick failed (`state=failing`, for
+  example `list_runs_failed` while the backend is down), and `run_refusals=N`
+  when N candidate runs carry a current refusal. It exits 0 when live or
+  paused, and 1 when the status is absent, stale or failing. Pass the
+  `--state-dir`: the binary's default is `FISHHAWK_HOST_DISPATCH_STATE_DIR`
+  when set, else `$TMPDIR/fishhawk-host-dispatch`, not the `scripts/dev`
+  one. `scripts/dev` still passes `--state-dir` explicitly and reads only the
+  `pid` field of `status.json`.
 - **Pause / resume by hand.** `--pause` / `--resume` with the same
   `--state-dir`. A manual pause holds until the next `up` (including the one
   that ends every reload), which always starts it resumed. Set

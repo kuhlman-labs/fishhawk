@@ -39,6 +39,7 @@ const (
 	hdRefuseNotLocal              = "runner_kind_not_local"
 	hdRefuseRunTerminal           = "run_terminal"
 	hdRefusePathOutside           = pathOutsideAllowedRootsCode
+	hdRefuseWorkingDirUnbound     = "working_dir_unbound"
 	hdRefuseWorkingDirAbsent      = "working_dir_absent"
 	hdRefuseNotEligible           = "not_eligible"
 	hdRefuseParentUnreadable      = "parent_unreadable"
@@ -216,7 +217,9 @@ func hostDispatchWorkingDirPresent(workingDir string) bool {
 
 // hostDispatchConfined reports whether workingDir is non-empty, absolute and
 // inside one of roots. It is independent of the resolver's httpTransport: an
-// empty working_dir would otherwise fall back to the process cwd.
+// empty working_dir would otherwise fall back to the process cwd. evaluate
+// refuses an empty working_dir as working_dir_unbound before it calls this;
+// the empty check here is defence in depth.
 func hostDispatchConfined(workingDir string, roots []string) bool {
 	if workingDir == "" || !filepath.IsAbs(workingDir) {
 		return false
@@ -329,6 +332,14 @@ func campaignPermits(link *runCampaignLink) (string, string) {
 // evaluate decides one candidate run and walks the pre-marker sequence when it
 // is admissible. It is synchronous; a refusal commits at most the one
 // run_auto_driven row of the dispatch attempt it refused.
+//
+// The checks before the stage read run in this order (#5402, folded from
+// #5267): runner_kind local, run not terminal, eligibility (the mark, or a
+// marked parent: parent_unreadable / not_eligible), a bound working_dir
+// (working_dir_unbound), confinement (path_outside_allowed_roots: relative or
+// outside every allowed root), then the directory on this host
+// (working_dir_absent). Eligibility comes first so an unmarked run always
+// reads not_eligible, whatever its working_dir.
 func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDispatchOutcome {
 	o := hostDispatchOutcome{RunID: runID.String()}
 	view, err := h.r.fetchRunDriveView(ctx, runID)
@@ -342,18 +353,21 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 	if runStateIsTerminal(run.State) {
 		return h.refuse(o, hdRefuseRunTerminal, "run is "+run.State)
 	}
-	if !hostDispatchConfined(run.WorkingDir, h.r.allowedRoots) {
-		return h.refuse(o, hdRefusePathOutside, fmt.Sprintf("working_dir %q is empty, relative or outside every allowed root", run.WorkingDir))
-	}
-	if !hostDispatchWorkingDirPresent(run.WorkingDir) {
-		return h.refuse(o, hdRefuseWorkingDirAbsent, fmt.Sprintf("working_dir %q is not a directory on this host; the run's checkout lives elsewhere", run.WorkingDir))
-	}
 	ok, why, eerr := h.eligible(ctx, run)
 	if eerr != nil {
 		return h.refuse(o, hdRefuseParentUnreadable, eerr.Error())
 	}
 	if !ok {
 		return h.refuse(o, hdRefuseNotEligible, why)
+	}
+	if run.WorkingDir == "" {
+		return h.refuse(o, hdRefuseWorkingDirUnbound, "the run has no working_dir bound; start it with an absolute working_dir")
+	}
+	if !hostDispatchConfined(run.WorkingDir, h.r.allowedRoots) {
+		return h.refuse(o, hdRefusePathOutside, fmt.Sprintf("working_dir %q is relative or outside every allowed root", run.WorkingDir))
+	}
+	if !hostDispatchWorkingDirPresent(run.WorkingDir) {
+		return h.refuse(o, hdRefuseWorkingDirAbsent, fmt.Sprintf("working_dir %q is not a directory on this host; the run's checkout lives elsewhere", run.WorkingDir))
 	}
 
 	stages, serr := h.r.api.ListRunStages(ctx, runID)

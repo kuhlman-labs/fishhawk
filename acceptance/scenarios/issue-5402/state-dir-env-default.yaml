@@ -1,0 +1,14 @@
+id: scenario:issue-5402/state-dir-env-default
+statement: With FISHHAWK_HOST_DISPATCH_STATE_DIR=<dir> set and no --state-dir flag, `fishhawk-mcp host-dispatch --pause` exits 0, prints `host-dispatch paused (state dir <dir>)`, and creates <dir>/pause.
+verify_hint: 'CLI: export the variable to a fresh temp dir, run --pause, check stdout, the exit code and that <dir>/pause exists; then --resume removes it.'
+steps: Built fishhawk-mcp from the sanctioned checkout. Created /tmp/fhacc5402/env (0700). FISHHAWK_HOST_DISPATCH_STATE_DIR=/tmp/fhacc5402/env fishhawk-mcp host-dispatch --pause (no --state-dir); listed dir; --resume same way; listed again.
+assertions:
+    expected: exit 0, named message, <dir>/pause created
+    observed_at_record: exit 0, 'host-dispatch paused (state dir /tmp/fhacc5402/env)', pause created; --resume exit 0 removes it
+    repro_handle: FISHHAWK_HOST_DISPATCH_STATE_DIR=/tmp/fhacc5402/env fishhawk-mcp host-dispatch --pause
+origin:
+    issue: 5402
+    pr: 5500
+    run_id: 39a4e171-1dd2-4b1a-a173-5aa41d273c40
+    head_sha: 68f3d134e126805da682b339c66ea3bd4ad96f45
+    recorded_at: 2026-11-21T04:01:03Z

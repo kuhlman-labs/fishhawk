@@ -1196,6 +1196,11 @@ stage has not settled, so its agent may still be waiting). Decide one with
 fishhawk_decide_scope_amendment on amendment.run_id. The block is ABSENT when
 the backend did not compute it (an older backend, a read failure, or a token
 without read:audit) — not the same claim as items [] (none pending).
+
+On the operator's stdio fishhawk-mcp, every awaiting block of kind
+host_dispatcher is overlaid from the host dispatcher's status.json (paused,
+capped, refusing, stale or absent read as human with the remedy in next_step;
+unverified when it could not be checked) and carries a host_dispatch block.
 `),
 	}, resolver.getCampaignStatus)
 }
@@ -1216,6 +1221,9 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		}
 		return nil, GetCampaignStatusOutput{}, fmt.Errorf("get campaign status: %w", err)
 	}
+	// Host-dispatch status overlay (#5402): stdio operator process only, after
+	// the successful backend read and before the output is built.
+	r.overlayCampaignHostDispatch(ctx, st.Items)
 
 	return nil, GetCampaignStatusOutput{
 		Campaign:    st.Campaign,
