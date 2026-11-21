@@ -380,14 +380,19 @@ is the HOST (visible-cache / lint-cache creation, the mount guard, the host
 `GOMODCACHE` probe or `go mod download` on an offline host, endpoint binding,
 any gate-service provisioning step):
 `verify_gate_unavailable` / `errGateContainerUnavailable`, same treatment.
-Both are classified on the OUT-OF-BAND `gateDisposition` the gate seam returns
+So is `launch_failed` (#5408, ADR-102 A1): the container runtime exited
+125/126/127 before the committed-tree verify's launch-marker line, so the
+command never started — category C, merge-candidate `not_executed` /
+`verify_gate_launch_failed`, never the fix agent; see
+`runner/internal/gateiso/README.md` § "Never-executed gates → category C".
+All are classified on the OUT-OF-BAND `gateDisposition` the gate seam returns
 beside the output (#3448) — never by matching the `gate isolation refused:`
 text, which is untrusted verify output and survives only as the operator-facing
 message. A seed refusal of the checkout's OWN metadata
 (`gateiso.ErrSeedCheckout`) is tree-attributable and stays on the fix-agent
 path. `runVerifyCommittedTree` has six production call sites; the four at the
-two classifying gates read the disposition, the #960 strict re-verify pair
-drops it. Long-form: `runner/internal/gateiso/README.md` § "Never-executed
+two classifying gates read the disposition, and the #960 strict re-verify pair
+reads it only for its timed-out, exit-code (73 / 75) and launch-failure arms. Long-form: `runner/internal/gateiso/README.md` § "Never-executed
 gates → category C".
 
 **What changed for EVERY runner, image or not.** Both gate sites'

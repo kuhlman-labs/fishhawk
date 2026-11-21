@@ -404,6 +404,13 @@ probed under a bound and fail fast as `container_credentials_blocked`.
   -e GIT_CONFIG_VALUE_<n>=/work --entrypoint '' <image> <argv…>
 ```
 
+`BuildArgv` is unchanged by the launch marker (#5408, ADR-102 A1): a gate
+the runner marks `withLaunchMarker` (only the committed-tree verify) hands it
+an `Argv` already wrapped by `WrapLaunchMarker` (`launchmarker.go`), so the
+`<argv…>` tail reads `sh -c <marker script> fishhawk-gate-launch <nonce>
+<verify argv…>`. Every unmarked exec's argv is byte-unchanged. See
+§ "Never-executed gates → category C", `launch_failed`.
+
 The first cache alternative is the BIND form (`ContainerSpec.CacheVolume`
 empty — byte-identical to the pre-#3967 argv, so every existing golden passes
 unedited); the second is the VOLUME form (§ "Persistent cache volume"), whose
@@ -1290,6 +1297,31 @@ The five dispositions, by classification:
   `workingTreeGateFailureCategory`. The LAST execution's disposition
   governs, so an absorb re-run that itself times out is a timed-out gate.
   Long-form: `runner/cmd/fishhawk-runner/README.md` § "Timed-out gate".
+- **`launch_failed`** — container path only (#5408, ADR-102 Amendment A1).
+  docker and podman return the contained status for every code but their
+  own 125 (the runtime failed), 126 (cannot invoke) and 127 (not found), so
+  those three collide with "the change failed". A committed-tree verify
+  therefore runs behind the launch-marker wrapper (`WrapLaunchMarker`): `sh`
+  prints `fishhawk-gate-launched:<nonce>` (a fresh 32-hex `NewLaunchNonce`
+  per exec) on its own stdout line, then `exec`s the verify argv verbatim.
+  `runGateInContainer` strips that line from every marked exec's output
+  (`CutLaunchMarker`: only a WHOLE line counts, so an argv echo does not),
+  and a 125/126/127 exit (`IsRuntimeLaunchExit`) with NO marker line and no
+  timeout is `gateLaunchFailed`, logged `gate_container_launch_failed`. The
+  same codes AFTER the marker are the command's own status (`executed`).
+  `neverExecutedInfra()` and `hostUnavailable()` are TRUE: category C at
+  every committed-tree gate (the fix loop's `verify_gate_unavailable` arm,
+  `errGateContainerUnavailable` at the single-shot gate and the #960 strict
+  re-verify, reverify-resume's never-executed arm), never the fix agent; the
+  merge-candidate verify reports `not_executed` / `verify_gate_launch_failed`.
+  Only VERIFY gates are marked (`withLaunchMarker` at
+  `runVerifyCommittedTreeEnv`): their argv is already `sh -c <command>`, so the
+  wrapper adds no image requirement, while diff coverage, counterfactuals and
+  specialist jobs keep their argv verbatim. Residual: a tree-declared image
+  controls its own `sh` and can suppress the marker, which reaches only
+  category C / `not_executed`, never a pass or a fix-up. Pinned by
+  `TestCutLaunchMarker`, `TestWrapLaunchMarker_HostShellExecsArgvVerbatim`
+  and `TestRunGateInContainer_LaunchMarker`.
 
 Every pre-exec output (refusal text included) matches none of
 `isVerifyInfraFailure`'s classes, so a never-executed gate is never absorbed

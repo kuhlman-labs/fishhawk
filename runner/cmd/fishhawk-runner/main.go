@@ -6385,13 +6385,18 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// runs on EVERY iteration — including the `iter--; continue` re-runs
 		// the absorbs schedule — the disposition read here is always the
 		// LAST verify's: an absorb re-run that itself times out lands here.
+		//
+		// gateLaunchFailed (#5408, ADR-102 A1) shares the unavailable arm: the
+		// container runtime exited 125/126/127 before the launch marker, so
+		// the command never started. Category C, never the fix agent; the
+		// logged detail names the launch failure.
 		switch disp {
 		case gateRefused:
 			refused = true
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_gate_refused","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, iter+1, strings.TrimSpace(out))
-		case gateUnavailable:
+		case gateUnavailable, gateLaunchFailed:
 			unavailable = true
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_gate_unavailable","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
@@ -7074,7 +7079,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// executor.verify.timeout. It is logged here so the trace carries the
 	// verify_gate_timed_out event beside the verify_run it describes.
 	refused := outcome == "failed" && disp == gateRefused
-	unavailable := outcome == "failed" && disp == gateUnavailable
+	unavailable := outcome == "failed" && disp.hostUnavailable()
 	timedOut := outcome == "failed" && disp == gateTimedOut
 	verifyAttempts := 1
 	if timedOut {
@@ -7114,7 +7119,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		events = append(events, stampVerifyRunChangeID(ev, changeID))
 		verifyAttempts++
 		refused = outcome == "failed" && disp == gateRefused
-		unavailable = outcome == "failed" && disp == gateUnavailable
+		unavailable = outcome == "failed" && disp.hostUnavailable()
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
 			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
@@ -7140,7 +7145,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		// tree, and an absorb re-run that itself timed out is a timed-out
 		// gate (#3383 — the LAST execution's disposition governs).
 		refused = outcome == "failed" && disp == gateRefused
-		unavailable = outcome == "failed" && disp == gateUnavailable
+		unavailable = outcome == "failed" && disp.hostUnavailable()
 		verifyAttempts++
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
@@ -7158,7 +7163,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		events = append(events, stampVerifyRunChangeID(ev, changeID))
 		verifyAttempts++
 		refused = outcome == "failed" && disp == gateRefused
-		unavailable = outcome == "failed" && disp == gateUnavailable
+		unavailable = outcome == "failed" && disp.hostUnavailable()
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
 			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
@@ -7810,7 +7815,12 @@ func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA 
 	// withGitWorkTreeRequired: wt is a runner-materialized clone, a full git
 	// work tree, so the container path preflights that git sees it at /work
 	// and maps a failure to gateUnavailable, never a red verdict (#4392).
-	output, exitCode, disp := runBoundedGateCommandDisposed(withGitWorkTreeRequired(withDecidingGate(ctx)), verifyCmd, wt,
+	// withLaunchMarker (#5408, ADR-102 A1): the committed-tree verify is the
+	// only marked exec, so on the container path a runtime 125/126/127 before
+	// the wrapper's launch marker is gateLaunchFailed, never a verdict. Diff
+	// coverage, the auto-format absorb, counterfactuals, specialist jobs and
+	// direct runBoundedGateCommand callers are byte-unchanged.
+	output, exitCode, disp := runBoundedGateCommandDisposed(withLaunchMarker(withGitWorkTreeRequired(withDecidingGate(ctx))), verifyCmd, wt,
 		filepath.Join(parent, "golangci-lint-cache"), runTimeout, extraEnv...)
 	phases.endVerify()
 	if disp == gateTimedOut {
@@ -11272,9 +11282,10 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// is the pre-push authority and is never narrowed.
 		// The disposition is read for these cases: gateTimedOut (#3383), the
 		// runner's own deadline killing the re-verify before a verdict;
-		// gateLockRefused / gateTempFail (exit 73 / 75, #4022); and
-		// gateExecuted, which the gate-infrastructure "skipped" arm requires
-		// (#3948). Every other
+		// gateLockRefused / gateTempFail (exit 73 / 75, #4022); gateLaunchFailed
+		// (#5408, ADR-102 A1), a container runtime 125/126/127 before the
+		// launch marker, category C; and gateExecuted, which the
+		// gate-infrastructure "skipped" arm requires (#3948). Every other
 		// failure keeps this site's isReverifyInfraFailure classification
 		// unchanged (out_of_scope for #3448).
 		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
@@ -11414,6 +11425,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			if outcome == "failed" && disp == gateTempFail {
 				return fmt.Errorf("%w: %w: %s; %s\n%s", gitops.ErrVerifyInfraFailure, errVerifyTempFail,
 					verifyTempFailReason(cfg.verifyCmd, reverifyRuns), accounting, out)
+			}
+			// A container launch failure (#5408, ADR-102 A1): the runtime
+			// exited 125/126/127 before the launch marker, so the re-verify's
+			// command never started. Category C, never ErrPushedTreeNotVerified.
+			if outcome == "failed" && disp == gateLaunchFailed {
+				return fmt.Errorf("%w: %w: %s; %s\n%s", gitops.ErrVerifyInfraFailure, errGateContainerUnavailable,
+					lead, accounting, out)
 			}
 			// A re-verify the gate infrastructure never ran (#3948): still
 			// not a pass, so the push stays blocked, but category C — the

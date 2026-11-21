@@ -4653,6 +4653,69 @@ func TestShipPullRequest_ReverifyFailureBodyMatchesSharedFixture(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_MergeCandidateLaunchGoldensMatchWire is the wire-bytes
+// leg of the #5408 container launch-marker goldens (approval condition L2):
+// the runner pass's TestMergeCandidateVerify_ContainerLaunchMarker asserts it
+// ships each golden's merge-candidate fields, the backend's
+// TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens posts each
+// golden through the real handler, and THIS test sends the same fields
+// through the real ShipPullRequest and asserts the request body is
+// JSON-equal to the golden. A tag rename or a field leaking onto the
+// merge-candidate body reddens it.
+func TestShipPullRequest_MergeCandidateLaunchGoldensMatchWire(t *testing.T) {
+	for _, name := range []string{"merge_candidate_launch_failed_report.json", "merge_candidate_post_launch_exit125_report.json"} {
+		t.Run(name, func(t *testing.T) {
+			golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", name))
+			if err != nil {
+				t.Fatalf("read shared golden: %v", err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal(golden, &want); err != nil {
+				t.Fatalf("decode golden: %v", err)
+			}
+			field := func(k string) string {
+				v, _ := want[k].(string)
+				return v
+			}
+			if field("outcome") != OutcomeMergeCandidateVerified || field("merge_candidate_result") == "" {
+				t.Fatalf("golden outcome/result = %q/%q (fixture drifted)", field("outcome"), field("merge_candidate_result"))
+			}
+			var gotBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"transitioned":true}`)
+			}))
+			defer srv.Close()
+			_, priv, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &Client{BaseURL: srv.URL, HTTP: srv.Client(), Backoff: time.Millisecond}
+			if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+				RunID: "r", StageID: "s", PrivateKey: priv,
+				Outcome:                  field("outcome"),
+				Branch:                   field("branch"),
+				HeadSHA:                  field("head_sha"),
+				MergeCandidateResult:     field("merge_candidate_result"),
+				MergeCandidateReason:     field("merge_candidate_reason"),
+				MergeCandidateOutputTail: field("merge_candidate_output_tail"),
+				MergeCandidateFailures:   field("merge_candidate_failures"),
+			}); err != nil {
+				t.Fatalf("ShipPullRequest: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(gotBody, &got); err != nil {
+				t.Fatalf("decode sent body %q: %v", gotBody, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("sent merge-candidate body != shared golden\n got: %s\nwant: %s", gotBody, bytes.TrimSpace(golden))
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TERMINAL-EGRESS retry budget (E68.7 / #2897)
 // ---------------------------------------------------------------------------

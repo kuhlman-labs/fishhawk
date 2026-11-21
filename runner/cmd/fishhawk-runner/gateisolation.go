@@ -136,13 +136,28 @@ const (
 	// after the bounded contention re-run, never the fix agent.
 	// neverExecutedInfra() stays FALSE for the same reason as gateTempFail.
 	gateLockRefused
+	// gateLaunchFailed: container path only — the runtime CLI exited
+	// 125/126/127 BEFORE the launch-marker wrapper printed its per-exec nonce
+	// line (#5408, ADR-102 A1), so the gate command never started. Only gates
+	// marked withLaunchMarker (the committed-tree verify) can reach it. A
+	// no-verdict outcome: category C at every gate (hostUnavailable), never
+	// the fix agent; the merge-candidate verify reports it not_executed /
+	// verify_gate_launch_failed.
+	gateLaunchFailed
 )
+
+// hostUnavailable reports whether the disposition is a HOST-caused
+// never-executed gate: gateUnavailable or a container launch failure. Both
+// classify category C as errGateContainerUnavailable.
+func (d gateDisposition) hostUnavailable() bool {
+	return d == gateUnavailable || d == gateLaunchFailed
+}
 
 // neverExecutedInfra reports whether the disposition is one the gates
 // classify category C without an absorb and without the fix agent: the gate
 // never ran for a reason the tree cannot have caused.
 func (d gateDisposition) neverExecutedInfra() bool {
-	return d == gateRefused || d == gateUnavailable
+	return d == gateRefused || d.hostUnavailable()
 }
 
 // String renders the disposition for log lines and test failures.
@@ -162,6 +177,8 @@ func (d gateDisposition) String() string {
 		return "temp_fail"
 	case gateLockRefused:
 		return "lock_refused"
+	case gateLaunchFailed:
+		return "launch_failed"
 	}
 	return fmt.Sprintf("gateDisposition(%d)", int(d))
 }
@@ -696,6 +713,33 @@ func requiresGitWorkTree(ctx context.Context) bool {
 	return v
 }
 
+// launchMarkerKey marks a gate exec's context as one whose container argv
+// runs behind the launch-marker wrapper (#5408, ADR-102 A1). Only
+// runVerifyCommittedTreeEnv sets it, so every other exec — diff coverage, the
+// auto-format absorb, counterfactuals, specialist jobs and direct
+// runBoundedGateCommand callers — keeps its argv byte-unchanged.
+type launchMarkerKey struct{}
+
+// withLaunchMarker marks ctx as a gate whose container exec is wrapped by
+// gateiso.WrapLaunchMarker, so a runtime 125/126/127 with no marker line is
+// gateLaunchFailed rather than a verdict.
+func withLaunchMarker(ctx context.Context) context.Context {
+	return context.WithValue(ctx, launchMarkerKey{}, true)
+}
+
+// wantsLaunchMarker reports whether ctx was marked by withLaunchMarker.
+func wantsLaunchMarker(ctx context.Context) bool {
+	v, _ := ctx.Value(launchMarkerKey{}).(bool)
+	return v
+}
+
+// containerLaunchFailedOutput renders a gateLaunchFailed exec's output: a
+// runner-authored lead naming the launch failure, then the runtime's own text.
+func containerLaunchFailedOutput(code int, out string) string {
+	return fmt.Sprintf("gate container: launch failed: the container runtime exited %d before the gate command started (no launch marker), so the change was NOT judged: %s",
+		code, strings.TrimSpace(out))
+}
+
 // gitWorkTreePreflightArgv is the in-container work-tree preflight (#4392):
 // it prints `true` and exits 0 only inside a git work tree.
 var gitWorkTreePreflightArgv = []string{"git", "rev-parse", "--is-inside-work-tree"}
@@ -1044,7 +1088,13 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // metadata being refused, so it is gateCheckoutRefused (tree-attributable,
 // classified as an executed failure); the exec path is gateExecuted whatever
 // the exit code, EXCEPT that a seam result reporting the runner's own
-// deadline expiry is gateTimedOut (#3383, no verdict). A gate-service
+// deadline expiry is gateTimedOut (#3383, no verdict), and that a gate
+// marked withLaunchMarker (only the committed-tree verify) runs its argv behind
+// gateiso.WrapLaunchMarker: its marker line is stripped from the output on
+// every exec, and a runtime exit 125/126/127 with NO marker line (and no
+// timeout) is gateLaunchFailed (#5408, ADR-102 A1 — the command never
+// started; category C, never the fix agent), while the same codes after the
+// marker are the command's own status (gateExecuted). A gate-service
 // teardown failure is logged (gate_service_cleanup_failed) and never changes
 // the gate's verdict. Every exec that reaches the seam logs one
 // gate_container_timing line splitting cache / seed / service / exec time.
@@ -1137,6 +1187,14 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		// redirect the DSN the runner provisioned.
 		env = gateiso.WithServiceEnv(env, s.GateEnv())
 	}
+	// A marked (verify) gate runs behind the launch-marker wrapper (#5408):
+	// a fresh per-exec nonce, so a runtime 125/126/127 with no marker line is
+	// a launch failure, never a verdict. Unmarked execs keep argv verbatim.
+	gateArgv, nonce := argv, ""
+	if wantsLaunchMarker(ctx) {
+		nonce = gateiso.NewLaunchNonce()
+		gateArgv = gateiso.WrapLaunchMarker(argv, nonce)
+	}
 	spec := gateiso.ContainerSpec{
 		Runtime:    sel.Runtime,
 		Image:      image,
@@ -1145,7 +1203,7 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		GoModCache: vc.GoModCache,
 		PasswdFile: passwdFile,
 		Env:        env,
-		Argv:       argv,
+		Argv:       gateArgv,
 		UID:        uid,
 		GID:        gid,
 	}
@@ -1214,6 +1272,14 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
 		defer cancel()
 		_, _, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
+	}
+	if nonce != "" {
+		var launched bool
+		out, launched = gateiso.CutLaunchMarker(out, nonce)
+		if !launched && !timedOut && gateiso.IsRuntimeLaunchExit(code) {
+			st.logEvent(`{"event":"gate_container_launch_failed","exit_code":%d}`, code)
+			return containerLaunchFailedOutput(code, out), code, gateLaunchFailed
+		}
 	}
 	if timedOut {
 		// The runner's own deadline killed the runtime CLI's process group
