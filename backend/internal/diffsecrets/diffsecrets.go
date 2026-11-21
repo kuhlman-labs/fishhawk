@@ -68,11 +68,13 @@ const noteLineCap = 20
 // line, and context or removed lines are never consulted. PathRedacted is true
 // when the pattern set changed the path (a credential-shaped FILE NAME):
 // Partition never suppresses such a hit. Fingerprint is set ONLY on a Marked
-// hit (K1 of the #5230 plan gate): the first 16 hex of SHA-256 over (path,
-// pattern, every match of the pattern on the line). The matched bytes are
-// hashed in memory and dropped; the digest is the per-hit identity
-// MarkerCheckKey de-duplicates on, so a NEW self-marked line raises its own
-// concern while a re-review of the same line raises nothing new.
+// hit of a marker-suppressible class (K1 of the #5230 plan gate, narrowed by
+// #5462): the first 16 hex of SHA-256 over (path, pattern, every match of the
+// pattern on the line). The matched bytes are hashed in memory and dropped; the
+// digest is the per-hit identity MarkerCheckKey de-duplicates on, so a NEW
+// self-marked line raises its own concern while a re-review of the same line
+// raises nothing new. A marked hit of a low-entropy class keeps Marked=true
+// and an EMPTY Fingerprint: its bytes are never hashed (markerSuppressible).
 //
 // PathAmbiguous is true when the section's path cannot be trusted as an
 // allowlist input (#5230 implement review): Partition never suppresses such a
@@ -204,7 +206,7 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 						PathRedacted:  redacted,
 						PathAmbiguous: ambiguous,
 					}
-					if marked {
+					if marked && markerSuppressible(p.Name) {
 						h.Fingerprint = hitFingerprint(shown, p.Name, p.Regex.FindAllString(content, -1))
 					}
 					res.Hits = append(res.Hits, h)
@@ -232,9 +234,44 @@ func displayPath(path string, patterns []redaction.Pattern) (string, bool) {
 	return string(out), string(out) != path
 }
 
-// hitFingerprint is the per-hit identity of a marked hit: the truncated
-// SHA-256 over (path, pattern, matches), NUL-separated. The matches never
-// leave this function.
+// markerSuppressiblePatterns is the fail-closed allow-set of pattern classes
+// a fixture marker may suppress (#5462, Captain ruling EXCLUDE, under ADR-084
+// A2 point 3). Each listed class has a fixed prefix plus a random body of at
+// least 16 characters, so a truncated digest over the match cannot confirm a
+// guess offline. json-password-field and authorization-bearer admit short,
+// guessable values (a one-word JSON password, a four-letter bearer token), so
+// they are deliberately absent: an unsalted per-hit fingerprint of such a
+// value would be confirmable offline by anyone able to read the audit trail. A
+// class missing from this set is never marker-suppressed (fail closed), so a
+// class added to redaction.DefaultPatterns later stays unsuppressible until
+// someone classifies it (TestMarkerSuppressible_ClassifiesEveryDefaultPattern
+// fails until then). Allowlist `entries` still suppress every class.
+var markerSuppressiblePatterns = map[string]bool{
+	"github-pat-classic":          true,
+	"github-pat-fine-grained":     true,
+	"github-app-token":            true,
+	"github-oauth-token":          true,
+	"github-user-to-server-token": true,
+	"github-refresh-token":        true,
+	"gitlab-pat":                  true,
+	"openai-api-key":              true,
+	"openai-project-key":          true,
+	"anthropic-api-key":           true,
+	"aws-access-key-id":           true,
+	"npm-publish-token":           true,
+}
+
+// markerSuppressible reports whether a fixture marker may suppress (and so
+// fingerprint) a hit of the named pattern class. Scan gates the per-hit
+// fingerprint on it and Allowlist.Partition gates marker scopes on it.
+func markerSuppressible(pattern string) bool {
+	return markerSuppressiblePatterns[pattern]
+}
+
+// hitFingerprint is the per-hit identity of a marked hit of a
+// marker-suppressible class: the truncated SHA-256 over (path, pattern,
+// matches), NUL-separated. The matches never leave this function, and Scan
+// never calls it for a low-entropy class (markerSuppressible).
 func hitFingerprint(path, pattern string, matches []string) string {
 	h := sha256.New()
 	h.Write([]byte(path))

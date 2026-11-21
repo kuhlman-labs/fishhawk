@@ -3,6 +3,7 @@ package diffsecrets
 import (
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,6 +38,39 @@ func samples() map[string]string {
 		"json-password-field":         `{"pass` + `word"` + `: "` + strings.Repeat("j", 8) + `"}`,
 	}
 }
+
+// highEntropyClasses are the DefaultPatterns classes a fixture marker may
+// suppress (#5462): a fixed prefix plus a random body of at least 16
+// characters. lowEntropyClasses admit short, guessable values and are never
+// marker-suppressed. Every DefaultPatterns name must be in exactly one list
+// (TestMarkerSuppressible_ClassifiesEveryDefaultPattern).
+var (
+	highEntropyClasses = []string{
+		"github-pat-classic", "github-pat-fine-grained", "github-app-token", "github-oauth-token",
+		"github-user-to-server-token", "github-refresh-token", "gitlab-pat", "openai-api-key",
+		"openai-project-key", "anthropic-api-key", "aws-access-key-id", "npm-publish-token",
+	}
+	lowEntropyClasses = []string{"json-password-field", "authorization-bearer"}
+)
+
+// swordfishValue is the guessable value a low-entropy fixture line carries.
+func swordfishValue() string { return "sword" + "fish" }
+
+// passwordLine is a runtime-built json-password-field line over a guessable
+// value (no committed literal matches the pattern).
+func passwordLine() string { return `{"pass` + `word": "` + swordfishValue() + `"}` }
+
+// shortBearerLine is a runtime-built authorization-bearer line over a
+// four-character token.
+func shortBearerLine() string { return "Author" + "ization: Bea" + "rer te" + "st" }
+
+// jsonTokenLine is one line matching BOTH github-pat-classic (the value) and
+// json-password-field (the `token` key around it).
+func jsonTokenLine() string { return `{"tok` + `en": "` + classicPAT() + `"}` }
+
+// bearerPATLine is one line matching BOTH github-pat-classic and
+// authorization-bearer.
+func bearerPATLine() string { return "Author" + "ization: Bea" + "rer " + classicPAT() }
 
 func section(path, hunks string) string {
 	return "diff --git a/" + path + " b/" + path + "\n" +
@@ -617,6 +651,9 @@ func TestScan_MarkerFlag(t *testing.T) {
 			if h.Marked != c.want[i] {
 				t.Errorf("%s: hit %d Marked = %v, want %v", name, i, h.Marked, c.want[i])
 			}
+			// The cases hold a marker-suppressible class (github-pat-classic), so
+			// Fingerprint is set iff Marked; a low-entropy class is exempt
+			// (TestScan_LowEntropyMarkedHitNotFingerprinted).
 			if (h.Fingerprint != "") != h.Marked {
 				t.Errorf("%s: hit %d Fingerprint %q set iff Marked violated", name, i, h.Fingerprint)
 			}
@@ -655,6 +692,85 @@ func TestScan_MarkedHitFingerprint(t *testing.T) {
 	}
 	if hitFingerprint("p", "github-pat-classic", []string{"x"}) == hitFingerprint("p", "aws-access-key-id", []string{"x"}) {
 		t.Error("pattern does not enter the fingerprint")
+	}
+}
+
+// TestMarkerSuppressible_ClassifiesEveryDefaultPattern pins the fail-closed
+// split (#5462): every DefaultPatterns name is classified, the predicate agrees
+// with the table, and the production allow-set holds no stale or typo entry.
+// COUNTERFACTUAL: make markerSuppressible return true — json-password-field then
+// reads suppressible where the table says low-entropy, RED. Adding a pattern to
+// redaction.DefaultPatterns without classifying it here also fails.
+func TestMarkerSuppressible_ClassifiesEveryDefaultPattern(t *testing.T) {
+	class := map[string]bool{} // name -> marker-suppressible
+	for _, n := range highEntropyClasses {
+		if _, dup := class[n]; dup {
+			t.Errorf("%q is listed twice", n)
+		}
+		class[n] = true
+	}
+	for _, n := range lowEntropyClasses {
+		if _, dup := class[n]; dup {
+			t.Errorf("%q is in both lists", n)
+		}
+		class[n] = false
+	}
+	known := map[string]bool{}
+	for _, p := range redaction.DefaultPatterns {
+		known[p.Name] = true
+		want, ok := class[p.Name]
+		if !ok {
+			t.Errorf("DefaultPatterns class %q is unclassified: add it to highEntropyClasses (and markerSuppressiblePatterns) only if its body is >= 16 random characters, else to lowEntropyClasses", p.Name)
+			continue
+		}
+		if got := markerSuppressible(p.Name); got != want {
+			t.Errorf("markerSuppressible(%q) = %v, want %v", p.Name, got, want)
+		}
+	}
+	for n := range class {
+		if !known[n] {
+			t.Errorf("table class %q is not a DefaultPatterns name (stale or typo)", n)
+		}
+	}
+	for n := range markerSuppressiblePatterns {
+		if !known[n] {
+			t.Errorf("markerSuppressiblePatterns key %q is not a DefaultPatterns name (stale or typo)", n)
+		}
+	}
+	for _, n := range []string{"", "no-such-class"} {
+		if markerSuppressible(n) {
+			t.Errorf("markerSuppressible(%q) = true, want false (fail closed)", n)
+		}
+	}
+}
+
+// TestScan_LowEntropyMarkedHitNotFingerprinted (#5462): a MARKED hit of a
+// low-entropy class keeps Marked=true but mints NO fingerprint, so its bytes
+// are never hashed. The control arm shows the guard is class-specific.
+// COUNTERFACTUAL: revert the Scan condition to `if marked {` — the two
+// low-entropy arms then read a 16-hex Fingerprint, RED.
+func TestScan_LowEntropyMarkedHitNotFingerprinted(t *testing.T) {
+	cases := []struct {
+		name, line, pattern string
+		wantFingerprint     bool
+	}{
+		{"json-password-field", "v := " + passwordLine(), "json-password-field", false},
+		{"short authorization-bearer", "v := " + shortBearerLine(), "authorization-bearer", false},
+		{"control: marker-suppressible class", "v := " + classicPAT(), "github-pat-classic", true},
+	}
+	for _, c := range cases {
+		hits := Scan(section("fix/p.go", "@@ -0,0 +1 @@\n+"+c.line+" // "+MarkerToken+"\n"), redaction.DefaultPatterns).Hits
+		if len(hits) != 1 || hits[0].Pattern != c.pattern || !hits[0].Marked {
+			t.Errorf("%s: hits = %+v, want one marked %s hit", c.name, hits, c.pattern)
+			continue
+		}
+		fp := hits[0].Fingerprint
+		if c.wantFingerprint && !fingerprintPattern.MatchString(fp) {
+			t.Errorf("%s: Fingerprint %q, want 16 hex", c.name, fp)
+		}
+		if !c.wantFingerprint && fp != "" {
+			t.Errorf("%s: Fingerprint %q, want empty (low-entropy bytes must never be hashed)", c.name, fp)
+		}
 	}
 }
 
@@ -700,8 +816,11 @@ func TestMarkerNote_LocationOnly(t *testing.T) {
 }
 
 // TestSuppression_CarriesNoBytes extends TestHit_CarriesNoBytes to
-// Suppression, SuppressionRecord, MarkerCheckKey and MarkerNote over every
-// default pattern's sample, every hit marked and suppressed by a `**` scope.
+// Suppression, SuppressionRecord, SuppressionSummary, MarkerCheckKey, MarkerNote
+// and the Note/Key of the hits that stay raised. Every default pattern's sample
+// is marked and a `**` marker scope names EVERY class, so only the #5462 guard
+// splits them: the twelve marker-suppressible classes are suppressed (and
+// fingerprinted); the two low-entropy classes are kept, unfingerprinted.
 func TestSuppression_CarriesNoBytes(t *testing.T) {
 	var b strings.Builder
 	var all []string
@@ -713,16 +832,49 @@ func TestSuppression_CarriesNoBytes(t *testing.T) {
 	}
 	al := &Allowlist{Markers: []Rule{{ID: "all", Paths: []string{"**"}, Patterns: all, Reason: "r"}}}
 	kept, sup := al.Partition(Scan(b.String(), redaction.DefaultPatterns).Hits)
-	if len(kept) != 0 || len(sup) < len(redaction.DefaultPatterns) {
-		t.Fatalf("kept=%d suppressed=%d", len(kept), len(sup))
+
+	sortedPatterns := func(n int, at func(i int) string) []string {
+		out := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, at(i))
+		}
+		sort.Strings(out)
+		return out
 	}
+	wantKept := append([]string(nil), lowEntropyClasses...)
+	sort.Strings(wantKept)
+	wantSup := append([]string(nil), highEntropyClasses...)
+	sort.Strings(wantSup)
+	if got := sortedPatterns(len(kept), func(i int) string { return kept[i].Pattern }); !reflect.DeepEqual(got, wantKept) {
+		t.Fatalf("kept = %v, want exactly the low-entropy classes %v", got, wantKept)
+	}
+	if got := sortedPatterns(len(sup), func(i int) string { return sup[i].Hit.Pattern }); !reflect.DeepEqual(got, wantSup) {
+		t.Fatalf("suppressed = %v, want the allow-set classes %v", got, wantSup)
+	}
+	for _, h := range kept {
+		if !h.Marked || h.Fingerprint != "" {
+			t.Errorf("kept %s: Marked=%v Fingerprint=%q, want marked and unfingerprinted", h.Pattern, h.Marked, h.Fingerprint)
+		}
+	}
+	for _, s := range sup {
+		if s.By != ByMarker || !fingerprintPattern.MatchString(s.Hit.Fingerprint) {
+			t.Errorf("suppressed %s: By=%q Fingerprint=%q, want a marker suppression with a 16-hex fingerprint", s.Hit.Pattern, s.By, s.Hit.Fingerprint)
+		}
+	}
+
+	recs := GroupSuppressions(sup)
 	raw, _ := json.Marshal(struct {
 		S []Suppression
 		R []SuppressionRecord
-	}{sup, GroupSuppressions(sup)})
+		M SuppressionSummary
+		K []Hit
+	}{sup, recs, NewSuppressionSummary(&AllowlistStatusRecord{Status: StatusLoaded}, sup), kept})
 	var notes strings.Builder
-	for _, r := range GroupSuppressions(sup) {
+	for _, r := range recs {
 		notes.WriteString(MarkerNote(r) + r.CheckKey)
+	}
+	for _, g := range GroupHits(kept) {
+		notes.WriteString(Note(g) + g.Key())
 	}
 	for name, secret := range samples() {
 		if strings.Contains(string(raw), secret) || strings.Contains(notes.String(), secret) {

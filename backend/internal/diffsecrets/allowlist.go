@@ -285,9 +285,11 @@ type Suppression struct {
 // (PathRedacted), cannot be trusted (PathAmbiguous: a spoofable section
 // header), or is AllowlistPath itself — a credential added to the allowlist
 // file always raises. Otherwise entries are checked first, in file
-// order (By=entry); then, only for a Marked hit, marker scopes (By=marker). A
-// rule matches when one of its globs matches the path AND its pattern list
-// names the hit's pattern.
+// order (By=entry), and an entry suppresses a hit of any class; then, only for
+// a Marked hit of a marker-suppressible class (markerSuppressible), marker
+// scopes (By=marker). A marked hit of a low-entropy class not covered by an
+// entry is KEPT, so it raises a high concern (#5462). A rule matches when one
+// of its globs matches the path AND its pattern list names the hit's pattern.
 func (a *Allowlist) Partition(hits []Hit) (kept []Hit, suppressed []Suppression) {
 	if a == nil || (len(a.Entries) == 0 && len(a.Markers) == 0) {
 		return hits, nil
@@ -301,7 +303,7 @@ func (a *Allowlist) Partition(hits []Hit) (kept []Hit, suppressed []Suppression)
 			suppressed = append(suppressed, s)
 			continue
 		}
-		if h.Marked {
+		if h.Marked && markerSuppressible(h.Pattern) {
 			if s, ok := matchRules(ListMarkers, ByMarker, a.Markers, h); ok {
 				suppressed = append(suppressed, s)
 				continue

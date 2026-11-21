@@ -923,6 +923,70 @@ func TestDiffSecrets_AllowlistSuppressesAtAdmissionCommit(t *testing.T) {
 	assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(), nil, alNeedles()...)
 }
 
+// alLowEntropyScope is an admission allowlist whose markers rule names a
+// LOW-ENTROPY class (json-password-field): the rule parses, but a marker may not
+// suppress that class (#5462), so the scope is inert.
+const alLowEntropyScope = `version: 1
+markers:
+  - id: pw-fixtures
+    paths: ["fix/**"]
+    patterns: ["json-password-field"]
+    reason: "synthetic fixtures"
+`
+
+// alPasswordMarked is a runtime-built MARKED json-password-field line over a
+// guessable value.
+func alPasswordMarked(value string) string {
+	return `{"pass` + `word": "` + value + `"} // ` + diffsecrets.MarkerToken
+}
+
+// TestDiffSecrets_LowEntropyMarkerRaisesHigh (#5462, Captain ruling EXCLUDE): a
+// marked line carrying a guessable password value inside a marker scope that
+// names json-password-field still raises ONE high server_check concern keyed
+// per (class, path); it gets no low marker concern, no per-hit fingerprint, no
+// suppressed[] record, and its bytes appear nowhere.
+//
+// COUNTERFACTUAL: make diffsecrets' markerSuppressible return true — the same
+// fixture then yields ONE low marker row whose check_key carries a per-hit
+// fingerprint, ZERO high rows and one suppressed record, so every assertion
+// below that counts rows, records or the marker prefix goes RED.
+func TestDiffSecrets_LowEntropyMarkerRaisesHigh(t *testing.T) {
+	f := newALFixture(t)
+	f.gh.put(alAdmit, diffsecrets.AllowlistPath, alLowEntropyScope)
+	value := "sword" + "fish"
+	f.raise(alPatch(alFile{"fix/p.go", []string{alPasswordMarked(value)}}), alHead)
+
+	rows := f.rows(t)
+	high, marker := byCategory(rows)
+	if len(high) != 1 {
+		t.Fatalf("high rows = %d, want 1: %+v", len(high), high)
+	}
+	if h := high[0]; h.Severity != "high" || h.Provenance != concern.ProvenanceServerCheck ||
+		h.CheckKey != diffsecrets.CheckKey("json-password-field", "fix/p.go") {
+		t.Errorf("high row = %+v, want high/server_check keyed json-password-field on fix/p.go", h)
+	}
+	if len(marker) != 0 {
+		t.Errorf("marker rows = %d, want 0: %+v", len(marker), marker)
+	}
+	for _, r := range rows {
+		if strings.HasPrefix(r.CheckKey, diffsecrets.MarkerCheckName+"|") {
+			t.Errorf("row check_key %q is a marker key; no per-hit fingerprint may be minted", r.CheckKey)
+		}
+	}
+	ps := f.entries(t)
+	if len(ps) != 1 {
+		t.Fatalf("entries = %d, want 1", len(ps))
+	}
+	p := ps[0]
+	if p.Allowlist == nil || p.Allowlist.Status != diffsecrets.StatusLoaded || p.Allowlist.Ref != alAdmit {
+		t.Errorf("allowlist status = %+v, want loaded at the admission commit", p.Allowlist)
+	}
+	if p.MarkerSuppressedHitCount != 0 || p.SuppressedHitCount != 0 || len(p.Suppressed) != 0 || p.HitCount != 1 {
+		t.Errorf("summary = %+v hit_count=%d, want 0 suppressed, an empty suppressed[] and hit_count 1", p.SuppressionSummary, p.HitCount)
+	}
+	assertNoNeedleBytes(t, f.cr.fakeConcernRepo, f.au.auditFake, f.logs.String(), nil, value)
+}
+
 // TestDiffSecrets_MarkerConcernNonBlockingHumanOnly: the marker concern does
 // not block the human merge verb (low severity) and only a human can clear it
 // (server_check provenance).
