@@ -5378,7 +5378,7 @@ type CampaignItem struct {
 	// the backend's, passed through verbatim except on the operator's stdio
 	// fishhawk-mcp, where a host_dispatcher block is overlaid from the host
 	// dispatcher's status.json (#5402, host_dispatch_overlay.go).
-	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read). On the operator's stdio fishhawk-mcp a host_dispatcher block is overlaid from the host dispatcher's status.json and carries host_dispatch (the dispatcher's state): it stays host_dispatcher/host_dispatch when the dispatcher is live or will retry on its own, becomes host_dispatcher/host_dispatch_unverified when it could not be checked, and becomes human with host_dispatch_paused, host_dispatch_capped, host_dispatch_refused or host_dispatcher_absent (no status file found, or a stale one) when an operator must act; next_step names the remedy. The overlay is absent over HTTP /mcp"`
+	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read). On the operator's stdio fishhawk-mcp a host_dispatcher block is overlaid from the host dispatcher's status.json and carries host_dispatch (the dispatcher's state): it stays host_dispatcher/host_dispatch when the dispatcher is live or will retry on its own, becomes host_dispatcher/host_dispatch_unverified when it could not be checked, and becomes human with host_dispatch_paused, host_dispatch_capped, host_dispatch_refused or host_dispatcher_absent (no status file found, or a stale one) when an operator must act; next_step names the remedy. An acceptance stage held for the implement review round reads system/in_flight, whether the round is in flight or expected but not yet started: that reading comes from the dispatcher's refusal (implement_review_in_flight or implement_review_not_started) or, before the dispatcher's first tick, from the round itself, and past 30 minutes the next_step names fishhawk_get_run_status and fishhawk_rerun_review. The overlay is absent over HTTP /mcp"`
 }
 
 // campaignItemAwaiting mirrors the backend's `CampaignItemAwaiting` schema
@@ -6804,6 +6804,16 @@ type Stage struct {
 	// or the field silently decodes to zero — the #371-class wire-mirror trap.
 	AgentTimeoutSeconds int    `json:"agent_timeout_seconds,omitempty"`
 	ReviewGateAdmission string `json:"review_gate_admission,omitempty" jsonschema:"workflow-derived human review routing from the backend; admitted means operator confirmation, pull_request_managed means forge approval/landing; absent or any other value must never suggest direct approval"`
+	// ReviewAgentsConfigured mirrors the backend
+	// stageResponse.review_agents_configured (#5298): the implement stage's
+	// workflow-declared agent reviewer count, an expectation signal (>0 means a
+	// review round is expected), not the round's completeness threshold. Nil
+	// means unknown (a non-implement stage, an older backend, a run without a
+	// workflow_spec, an action endpoint); the implement review round hold then
+	// falls back to the started proxy. A POINTER so 0 (no round will run) stays
+	// distinct from absent. The json tag MUST byte-match the backend or the
+	// field silently decodes to nil — the #371-class wire-mirror trap.
+	ReviewAgentsConfigured *int `json:"review_agents_configured,omitempty" jsonschema:"implement stage only: the workflow-declared agent reviewer count, an expectation signal (greater than 0 means an implement review round is expected), not the round's completeness threshold; it can be lower than a started round's configured_agents when reviewer personas attach. 0 means no agent round will run; absent means unknown"`
 	// Progress mirrors the backend stageResponse.progress (#2541): the runner's
 	// mid-execution stage_progress heartbeat, so a mid-stage poll projects real
 	// activity (last_event / turns / tokens) onto the stage-wait status instead

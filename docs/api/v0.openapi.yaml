@@ -68,7 +68,9 @@ components:
         A token whose subject is `host-dispatcher/<host>` (ADR-104 Q4,
         E88.2 / #4526) may call ONLY the routes `fishhawk-mcp
         host-dispatch` uses: `GET /v0/runs`, `GET /v0/runs/{run_id}`,
-        `GET /v0/runs/{run_id}/stages`,
+        `GET /v0/runs/{run_id}/stages`, `GET /v0/runs/{run_id}/audit`
+        (the implement review round read before an acceptance spawn,
+        #5298; the `read:audit` scope the profile holds),
         `POST /v0/runs/{run_id}/auto-drive/acts`,
         `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`,
         `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` and
@@ -7528,6 +7530,27 @@ components:
             and `GET /v0/runs/{run_id}/stages`); `0` on the
             action-endpoint responses that build a Stage.
           example: 3600
+        review_agents_configured:
+          type: integer
+          minimum: 0
+          description: |
+            Implement stages only (#5298): the agent reviewer count the
+            run's workflow declares for the implement stage, the same
+            count the implement review round is dispatched with. It is
+            an EXPECTATION signal (greater than `0` means an implement
+            review round is expected), not the round's completeness
+            threshold: a started round's `configured_agents` can be
+            higher when reviewer personas attach. `0` means no agent
+            round will run (a non-agent executor, or no reviewers
+            declared). Omitted when the server cannot tell: a
+            non-implement stage, a run without a `workflow_spec`, an
+            unparseable spec, a workflow or implement stage the spec
+            does not declare, an older backend, and every
+            action-endpoint response that builds a Stage. Populated
+            only on the observability read paths
+            (`GET /v0/stages/{stage_id}` and
+            `GET /v0/runs/{run_id}/stages`).
+          example: 2
         progress:
           oneOf:
             - type: "null"
