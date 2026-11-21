@@ -1226,7 +1226,18 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			// This is NOT observe-only (keep polling) and NOT a fail-loud gate
 			// error — the driver STOPS and hands the operator the real next moves
 			// (force an extra fix-up pass, waive / defer the concerns, or cancel).
+			// The #5390 no-change state carries the routed concern ids on the
+			// outcome, so its arm is built here with gate.ConcernIDs rather than
+			// through driveDecisionActions' placeholder form.
 			out.StoppedReason = "decision_required:" + gate.DecisionState
+			if gate.DecisionState == operatorrole.DecisionStateFixupNoChangesUnaddressed {
+				params := map[string]string{"run_id": runUUID.String()}
+				if in.WorkingDir != "" {
+					params["working_dir"] = in.WorkingDir
+				}
+				out.NextActions = &NextActions{State: gate.DecisionState, Actions: driveFixupNoChangeActions(params, gate.ConcernIDs)}
+				return nil, out, nil
+			}
 			out.NextActions = driveDecisionActions(gate.DecisionState, runUUID, in.WorkingDir)
 			return nil, out, nil
 		default:
@@ -1854,6 +1865,12 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 				Reason:       "a HUMAN decision, not an agent's: once a human chooses to route a server-check concern back to the implement agent instead of waiving or deferring it from the Fishhawk Web UI attention queue, route it as a non-delegated fix-up, then re-invoke fishhawk_drive_run",
 			},
 		}}
+	case state == operatorrole.DecisionStateFixupNoChangesUnaddressed:
+		// The last fix-up pass routed exactly the routable open set and
+		// produced no commit (#5390). The drive loop builds this arm with the
+		// outcome's concern ids; a caller without them gets the placeholder
+		// form rather than the default get_run_status arm.
+		return &NextActions{State: state, Actions: driveFixupNoChangeActions(params, nil)}
 	case state == operatorrole.DecisionStateDelegatedApprovalNoProgress:
 		// A delegated approve came back a duplicate — the delegated vote already
 		// stands but never counts toward a human quorum (#2381). The operator's own
@@ -1918,6 +1935,66 @@ func withParams(base, extra map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// driveFixupNoChangeActions is the fixup_no_changes_unaddressed roster
+// (#5390): the delegated route_fixup arm declined to re-route, unchanged, a
+// concern set whose last fix-up pass produced no commit. concernIDs are the
+// ids that pass routed (the outcome's ConcernIDs); with none it falls back to
+// the run.concerns.items[].id placeholder. The fix-up action leads but never
+// sets force_additional_pass: repeating the failed route is the no-op the
+// guard exists to stop. A vouched fix must still be closed by hand, because
+// the no-change veto keeps the routed concerns open.
+func driveFixupNoChangeActions(params map[string]string, concernIDs []string) []SuggestedAction {
+	ids := "run.concerns.items[].id"
+	if len(concernIDs) > 0 {
+		ids = strings.Join(concernIDs, ",")
+	}
+	return []SuggestedAction{
+		{
+			Action:       "fishhawk_fixup_stage",
+			Params:       withParams(params, map[string]string{"stage_id": "run.stages[kind=implement].id", "concern_ids": ids, "operator_concern": "<the exact change the agent must make>"}),
+			Precondition: "the last fix-up pass routed exactly these open concerns and produced no commit (fixup_no_changes_unaddressed); no fix-up was auto-routed",
+			Consumes:     consumesFixupBudget,
+			Reason: "re-route ONE sharper concern with an operator_concern naming the exact change, then re-invoke fishhawk_drive_run. " +
+				"This re-route is exactly the case the guard's first-window-only limitation affects: if it also produces no commit, the next delegated pass is not declined (follow-up #5496)",
+		},
+		{
+			Action:       "fishhawk_vouch_commit",
+			Params:       withParams(params, map[string]string{"sha": "<full SHA of the commit you pushed on the run branch>", "reason": "<why this commit is the run's fix for the routed concerns>"}),
+			Precondition: "you finished the change yourself and pushed it to the run branch",
+			Consumes:     consumesNone,
+			Reason:       "vouch the commit as run-authored lineage, THEN close the concerns with fishhawk_resolve_concerns (with evidence), a waive or a defer, because the no-change veto keeps them open",
+		},
+		{
+			Action:       "fishhawk_resolve_concerns",
+			Params:       withParams(params, map[string]string{"concern_ids": ids, "evidence": "<what you executed or observed that shows each concern is fixed>", "judgement": concernJudgementPlaceholder}),
+			Precondition: "a vouched commit on the run branch fixes the routed concerns",
+			Consumes:     consumesNone,
+			Reason:       "close the fixed concerns with your evidence, then re-invoke fishhawk_drive_run",
+		},
+		{
+			Action:       "fishhawk_waive_concerns",
+			Params:       withParams(params, map[string]string{"concern_ids": ids, "reason": "<why these concerns do not block the merge>", "judgement": concernJudgementPlaceholder}),
+			Precondition: "the routed concerns are false positives or do not block the merge",
+			Consumes:     consumesNone,
+			Reason:       "waive them with NO follow-up and NO fix-up budget, then re-invoke fishhawk_drive_run",
+		},
+		{
+			Action:       "fishhawk_defer_concern",
+			Params:       withParams(params, map[string]string{"concern_id": "<one of " + ids + ">", "parent_epic": "<epic the follow-up rolls up to>", "judgement": concernJudgementPlaceholder}),
+			Precondition: "a routed concern is worth a separate change but should not block the merge",
+			Consumes:     consumesNone,
+			Reason:       "file a pre-drafted follow-up work item and resolve the concern in one call, then re-invoke fishhawk_drive_run",
+		},
+		{
+			Action:       "fishhawk_cancel_run",
+			Params:       params,
+			Precondition: "the routed concerns are not resolvable in this run",
+			Consumes:     consumesNone,
+			Reason:       "cancel this run, then start a fresh one with fishhawk_start_run once the concerns are addressed",
+		},
+	}
 }
 
 // driveFixupConcernActions is the out-of-band concern-disposition roster the

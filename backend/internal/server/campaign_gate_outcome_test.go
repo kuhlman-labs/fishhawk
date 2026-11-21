@@ -2,14 +2,21 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"reflect"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -349,5 +356,176 @@ func TestDriveCampaignRunGate_ServerCheckOnly_CarriesDecision(t *testing.T) {
 				t.Fatalf("ParkedGateStageIDs = %v, want %v", out.ParkedGateStageIDs, parks)
 			}
 		})
+	}
+}
+
+// TestDriveCampaignRunGate_NoChangePass_CarriesConcernIDs runs the #5390
+// no-change fixture (a real delegated route, a re-parked gate, and the pass's
+// fixup_no_changes after its trigger) through DriveCampaignRunGate: the
+// translated outcome carries the guard's decision AND its ConcernIDs, with the
+// implement stage as the known gate.
+func TestDriveCampaignRunGate_NoChangePass_CarriesConcernIDs(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	au.stampSequence = true
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	a := soleOpenImplementConcern(t, cr, runID)
+	if first := autoDriveGate(t, s, repo, runID); !first.Acted {
+		t.Fatalf("pass 1 = %+v, want the real delegated route", first)
+	}
+	impl.State = run.StageStateAwaitingApproval
+	seedFixupNoChangesSeq(au, runID, impl.ID, 5000)
+
+	out, err := s.DriveCampaignRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("DriveCampaignRunGate: %v", err)
+	}
+	if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateFixupNoChangesUnaddressed || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want decision_required fixup_no_changes_unaddressed route_fixup", out)
+	}
+	if !reflect.DeepEqual(out.ConcernIDs, []string{a.ID.String()}) {
+		t.Fatalf("ConcernIDs = %v, want [%s] (the translation dropped the guard's ids)", out.ConcernIDs, a.ID)
+	}
+	if !out.GateKnown || out.GateStageID == nil || *out.GateStageID != impl.ID {
+		t.Fatalf("gate = known:%v stage:%v, want known implement stage %s", out.GateKnown, out.GateStageID, impl.ID)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 1 {
+		t.Errorf("%d %s entries, want 1 (the guard must route nothing)", n, CategoryStageFixupTriggered)
+	}
+}
+
+// TestCampaignDriverTick_NoChangePass_MarkerNamesConcernIDs_E2E is the #5390
+// full path (E3): a real delegated route by the campaign Ticker, the persisted
+// stage_fixup_triggered, the runner's REAL fixup_no_changes report through
+// POST /v0/runs/{run_id}/pull-request (succeedFixupNoChangesStage →
+// advanceVariantStageAfterReport, which re-parks the stage and appends the
+// real fixup_no_changes row), the guard, DriveCampaignRunGate and the Ticker's
+// trackDecision / recordDecision marker. An open server-check concern X rides
+// along so #5477's filter composes: X is never routed and never named.
+//
+// Tick 2's state is fixup-eligible with convergent_concerns met and the
+// no-change pass refunded, so without the guard the Ticker would route a
+// second pass and record no decision.
+func TestCampaignDriverTick_NoChangePass_MarkerNamesConcernIDs_E2E(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	au.stampSequence = true
+	cr := newFakeConcernRepo()
+	camps := &pauseNoopCampaignRepo{fakeCampaignRepo: newFakeCampaignRepo()}
+	sf := newSigningFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+		CampaignRepo: camps.fakeCampaignRepo,
+		ApprovalRepo: newFakeApprovalRepo(),
+		SigningRepo:  sf,
+		ArtifactRepo: newFakeArtifactRepo(),
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+	})
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	a := soleOpenImplementConcern(t, cr, runID)
+	x := seedServerCheckConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "leaked-token")
+	camps.seedCampaignWithItems("acme/widgets", "issue:10", []*campaign.Item{
+		{IssueRef: "issue:1", State: campaign.ItemStateRunning, RunID: idp(runID), Position: 0},
+	})
+	tk := &campaigndriver.Ticker{
+		Campaigns: camps,
+		Runs:      repo,
+		Starter:   neverStarter{t: t},
+		Audit:     au,
+		GateActor: gateActorFunc(func(ctx context.Context, runRow *run.Run) (campaigndriver.GateActionOutcome, error) {
+			return s.DriveCampaignRunGate(ctx, runRow, campaignOperatorIdentity(), nil, nil)
+		}),
+	}
+	markers := func() []*audit.Entry {
+		t.Helper()
+		m, err := au.ListForRunByCategory(context.Background(), runID, campaigndriver.CategoryCampaignGateDecisionRequired)
+		if err != nil {
+			t.Fatalf("list markers: %v", err)
+		}
+		return m
+	}
+
+	// Tick 1: the real delegated route of the routable set [A] (X excluded).
+	tk.Tick(context.Background())
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 1 {
+		t.Fatalf("tick 1: %d %s entries, want 1 (the real delegated route)", n, CategoryStageFixupTriggered)
+	}
+	trig := auditEntry(t, au, CategoryStageFixupTriggered)
+	var tp struct {
+		ConcernIDs []string `json:"concern_ids"`
+	}
+	if err := json.Unmarshal(trig.Payload, &tp); err != nil || !reflect.DeepEqual(tp.ConcernIDs, []string{a.ID.String()}) {
+		t.Fatalf("tick 1 trigger concern_ids = %v (%v), want [%s] (server-check %s excluded)", tp.ConcernIDs, err, a.ID, x.ID)
+	}
+	if n := len(markers()); n != 0 {
+		t.Fatalf("tick 1: %d decision markers, want 0", n)
+	}
+
+	// The runner picks the fix-up pass up and reports it produced no commit
+	// through the REAL pull-request handler.
+	stage, err := repo.GetStage(context.Background(), impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	stage.State = run.StageStateRunning
+	priv, _ := sf.issue(t, runID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_no_changes",
+		"branch":              "fishhawk/run-e2e/stage-impl",
+		"base_sha":            "base-def",
+		"files_changed_count": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runID, impl.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("fixup_no_changes report status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), impl.ID); got.State != run.StageStateAwaitingApproval {
+		t.Fatalf("implement stage = %s after the no-change report, want awaiting_approval (the real re-park)", got.State)
+	}
+	if n := countAudit(au, CategoryFixupNoChanges); n != 1 {
+		t.Fatalf("%d %s entries after the report, want 1 (written by succeedFixupNoChangesStage)", n, CategoryFixupNoChanges)
+	}
+
+	// Tick 2: the guard declines and the Ticker records the marker.
+	tk.Tick(context.Background())
+	m := markers()
+	if len(m) != 1 {
+		t.Fatalf("tick 2: %d decision markers, want 1", len(m))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(m[0].Payload, &payload); err != nil {
+		t.Fatalf("decode marker: %v", err)
+	}
+	var keys []string
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if got := strings.Join(keys, ","); got != "action,campaign_id,concern_ids,decision_state,gate,issue_ref,run_id" {
+		t.Fatalf("marker payload keys = %s, want the six base keys plus concern_ids", got)
+	}
+	ids, ok := payload["concern_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != a.ID.String() {
+		t.Fatalf("marker concern_ids = %#v, want JSON array [%s]", payload["concern_ids"], a.ID)
+	}
+	if strings.Contains(string(m[0].Payload), x.ID.String()) {
+		t.Fatalf("marker payload %s names the server-check concern %s (the #5477 filter did not compose)", m[0].Payload, x.ID)
+	}
+	if payload["decision_state"] != operatorrole.DecisionStateFixupNoChangesUnaddressed || payload["action"] != delegation.ActionRouteFixup || payload["gate"] != impl.ID.String() {
+		t.Fatalf("marker payload = %v, want fixup_no_changes_unaddressed/route_fixup keyed on the implement stage %s", payload, impl.ID)
+	}
+
+	// Ticks 3 and 4: the same occurrence appends nothing more.
+	tk.Tick(context.Background())
+	tk.Tick(context.Background())
+	if n := len(markers()); n != 1 {
+		t.Errorf("after ticks 3-4: %d decision markers, want 1", n)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 1 {
+		t.Errorf("after ticks 3-4: %d %s entries, want 1 (zero automatic re-routes)", n, CategoryStageFixupTriggered)
 	}
 }

@@ -1321,6 +1321,115 @@ func TestDriveRun_DecisionRequired_ServerCheckAwaitingHuman(t *testing.T) {
 	}
 }
 
+// assertFixupNoChangeRoster pins the #5390 fixup_no_changes_unaddressed roster:
+// the order, the concern_ids value on the fix-up, resolve and waive actions,
+// the operator_concern param, no budget override, and the E5 vouch-then-close
+// text with the G4 first-window-only limitation reference.
+func assertFixupNoChangeRoster(t *testing.T, na *NextActions, runID uuid.UUID, wantIDs string) {
+	t.Helper()
+	if na == nil || na.State != operatorrole.DecisionStateFixupNoChangesUnaddressed {
+		t.Fatalf("next_actions = %+v, want state %s", na, operatorrole.DecisionStateFixupNoChangesUnaddressed)
+	}
+	if got, want := strings.Join(actionNameList(na.Actions), ","),
+		"fishhawk_fixup_stage,fishhawk_vouch_commit,fishhawk_resolve_concerns,fishhawk_waive_concerns,fishhawk_defer_concern,fishhawk_cancel_run"; got != want {
+		t.Fatalf("actions = %v, want %v (the sharper fix-up first, not the default get_run_status arm)", got, want)
+	}
+	for _, a := range na.Actions {
+		if a.Params["run_id"] != runID.String() {
+			t.Errorf("%s params = %v, want run_id %s", a.Action, a.Params, runID)
+		}
+	}
+	fixup, vouch, resolve, waive, deferA := na.Actions[0], na.Actions[1], na.Actions[2], na.Actions[3], na.Actions[4]
+	for _, a := range []SuggestedAction{fixup, resolve, waive} {
+		if a.Params["concern_ids"] != wantIDs {
+			t.Errorf("%s concern_ids = %q, want %q", a.Action, a.Params["concern_ids"], wantIDs)
+		}
+	}
+	if !strings.Contains(deferA.Params["concern_id"], wantIDs) {
+		t.Errorf("fishhawk_defer_concern concern_id = %q, want one of %q", deferA.Params["concern_id"], wantIDs)
+	}
+	if fixup.Params["operator_concern"] == "" {
+		t.Errorf("fishhawk_fixup_stage params = %v, want an operator_concern param", fixup.Params)
+	}
+	if _, ok := fixup.Params["force_additional_pass"]; ok {
+		t.Errorf("fishhawk_fixup_stage params = %v: must not suggest force_additional_pass (it repeats the failed route)", fixup.Params)
+	}
+	if fixup.Consumes != consumesFixupBudget {
+		t.Errorf("fishhawk_fixup_stage consumes = %q, want %q", fixup.Consumes, consumesFixupBudget)
+	}
+	for _, want := range []string{"ONE sharper concern", "operator_concern", "first-window-only limitation", "#5496"} {
+		if !strings.Contains(fixup.Reason, want) {
+			t.Errorf("fishhawk_fixup_stage reason must contain %q: %s", want, fixup.Reason)
+		}
+	}
+	if !strings.Contains(fixup.Precondition, "produced no commit") {
+		t.Errorf("fishhawk_fixup_stage precondition must say the last pass produced no commit: %s", fixup.Precondition)
+	}
+	if vouch.Params["sha"] == "" {
+		t.Errorf("fishhawk_vouch_commit params = %v, want a sha placeholder", vouch.Params)
+	}
+	for _, want := range []string{"THEN close", "fishhawk_resolve_concerns", "no-change veto keeps them open"} {
+		if !strings.Contains(vouch.Reason, want) {
+			t.Errorf("fishhawk_vouch_commit reason must contain %q: %s", want, vouch.Reason)
+		}
+	}
+	if resolve.Params["evidence"] == "" {
+		t.Errorf("fishhawk_resolve_concerns params = %v, want an evidence placeholder", resolve.Params)
+	}
+	if waive.Params["reason"] == "" || waive.Params["judgement"] != concernJudgementPlaceholder {
+		t.Errorf("fishhawk_waive_concerns params = %v, want reason and judgement placeholders", waive.Params)
+	}
+}
+
+// TestDriveDecisionActions_FixupNoChangesUnaddressed pins the #5390 arm in
+// driveDecisionActions directly: a caller without the outcome's ids gets the
+// roster with the placeholder concern_ids, never the default get_run_status
+// arm.
+func TestDriveDecisionActions_FixupNoChangesUnaddressed(t *testing.T) {
+	runID := uuid.New()
+	na := driveDecisionActions(operatorrole.DecisionStateFixupNoChangesUnaddressed, runID, "/tmp/checkout")
+	assertFixupNoChangeRoster(t, na, runID, "run.concerns.items[].id")
+	if na.Actions[0].Params["working_dir"] != "/tmp/checkout" {
+		t.Errorf("fishhawk_fixup_stage params = %v, want working_dir carried", na.Actions[0].Params)
+	}
+}
+
+// TestDriveRun_DecisionRequired_FixupNoChangesUnaddressed is the #5390
+// cross-boundary pin through the real driveRun loop: the gate returns
+// decision_required/fixup_no_changes_unaddressed with ConcernIDs [a,b] (over
+// the client's JSON decode), and the loop STOPS with that reason, carries the
+// ids onto the fix-up, resolve and waive actions, and spawns nothing.
+func TestDriveRun_DecisionRequired_FixupNoChangesUnaddressed(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateFixupNoChangesUnaddressed,
+			Action:           "route_fixup",
+			ConcernIDs:       []string{"a", "b"},
+			Note:             "the last fix-up pass routed exactly the 2 open implement concern(s) [a, b] and produced no commit",
+		}
+	})
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+operatorrole.DecisionStateFixupNoChangesUnaddressed {
+		t.Fatalf("stopped_reason = %q, want decision_required:fixup_no_changes_unaddressed", out.StoppedReason)
+	}
+	assertFixupNoChangeRoster(t, out.NextActions, f.runID, "a,b")
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on a fixup_no_changes_unaddressed stop: %v", rec.list())
+	}
+}
+
 // TestAutoDriveOutcome_WireTagParity is the #2381 single test that spans the
 // server-emit → client-decode seam binding condition 1 asked for. A runtime
 // handler→client-model round trip in ONE process is architecturally
