@@ -482,8 +482,8 @@ Notes:
       than left implicit; a run-less-anchor page surface is not in E77.6.
     - Neither kind is RESOLVABLE: `pageEventResolved` returns false for both, so
       a later approval or fix-up never records-and-skips a crew-escalation page.
-      Only a reviewer-reject page and the #5308 acceptance dispatch page are
-      resolvable.
+      Only a reviewer-reject page, the #5308 acceptance dispatch page and the
+      two #5497 stall-watch pages are resolvable.
   - **Acceptance scenario-corpus reports (E72.4, #3328)** — two kinds written
     by `server/pullrequest.go` on the acceptance runner's post-verdict report,
     each followed by an anchor rebuild (no new comment surface, no page-class
@@ -1813,6 +1813,41 @@ Notes:
   acceptance-dispatch lead plus the status refresh remain. An auto_dispatch local
   run whose dispatcher refuses or is not running is NOT covered here; the #5500
   awaiting-block overlay owns it.
+- The stall-watch operator pages — `stage_failed_awaiting_operator` and
+  `child_dispatch_awaiting_operator` (#5497) — are **system-actor
+  (`system:stall-watch`), stage-scoped audit kinds that are PINGS-ONLY: no
+  dedicated Notifier method, no `activityCategories` entry and no anchor
+  timeline render**. WRITER: `server/stall_watch.go::ScanFailedStageStalls`
+  (a failed stage with no operator or driver act past the threshold) and
+  `server/stall_watch_children.go::ScanUndispatchedChildStalls` (a dispatchable
+  decomposition child nobody dispatched), both through `appendStallPage`, which
+  dedups on the condition EPISODE and fires `notifyPageClass` only when a row
+  landed. The watch only pages: it never retries, revives, resumes or
+  dispatches. PAYLOAD (failed stage) `{stage_id, stage_type, failure_category,
+  run_state, next_action, next_action_target, quiet_since, quiet_seconds,
+  threshold_seconds, episode_key, reason}`; the child row adds `child_run_id`,
+  `parent_run_id`, `slice_index`, `stage_state`, `auto_dispatch`,
+  `effective_max_parallel` and `in_flight_siblings`. Server-written text only,
+  never the stage's `failure_reason`. PROJECTION: `ping.go::pageClassEvents`
+  turns them into `failed_stage_stalled` and `child_dispatch_stalled`. The body
+  is built only from server-owned text: a fixed lead, the stage TYPE read from
+  the live stage, the next action only when it is in the closed set
+  (`fishhawk_retry_stage`, `fishhawk_revive_run`, `fishhawk_resume_run`,
+  `fishhawk_run_children`, otherwise "open the run for the remedy"), and the
+  parent run id only when it parses as a UUID. The `reason` and every other
+  payload string never reach the body. RESOLUTION: `pageEventResolved`
+  (`stallPageResolved`) treats the page as resolved when the named stage is
+  absent, when its condition ENDED (`FailedStageStallEpisode` /
+  `ChildDispatchStallEpisode` return `!ok`), when its current episode key
+  differs from the row's (a later episode), or when the run state puts the
+  remedy out of reach: a cancelled or succeeded run for the failed-stage page,
+  any terminal run for the child page. Episode keys come from the stage row's
+  own per-transition stamps (`ended_at` + `self_retry_count`;
+  `self_retry_count` + `dispatched_at`), since no stage-transition audit row
+  exists. Both `firePings` and the push channel's `firePushes` apply it, so a
+  not-yet-posted page from an ended episode is recorded-and-skipped. DEDUP: the
+  ping by the row's `Sequence`, the row by `(stage_id, episode_key)`.
+  Best-effort: a failed append loses that episode's page until the next tick.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper

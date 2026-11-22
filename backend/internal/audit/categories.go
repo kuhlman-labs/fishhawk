@@ -461,6 +461,25 @@ import "sort"
 // kind, auto_dispatch flag and a server-written reason, so
 // withholdScopeOverlapFromRunBound needs no entry for it. It takes the
 // mandatory run-bound flag when #4599 / E89 #4537 lands.
+// #5497 added the two stall-watch pages, stage-scoped system rows
+// (actor subject system:stall-watch) that server/stall_watch.go appends when a
+// failed stage (stage_failed_awaiting_operator) or a dispatchable decomposition
+// child (child_dispatch_awaiting_operator) has seen no operator or driver act
+// past the threshold. Both are PAGE-CLASS markers projected by
+// issuecomment.pageClassEvents (pings-only: no activityCategories entry, no
+// Notifier method). Both are INTENDED run-bound READABLE: their payloads carry
+// only this run's own stage id, stage type and state, closed-set tokens
+// (failure category, run state, next action), server-computed timestamps and
+// durations, the episode key and a server-written reason, never the stage's
+// failure_reason or any agent text. in_flight_siblings and
+// effective_max_parallel on the child row are COUNTS, not cross-run
+// identifiers. parent_run_id (and next_action_target, which repeats it) on the
+// child row is the ONLY cross-run field, and it equals the child run's own
+// decomposed_from, which the child's run row already exposes, so
+// withholdScopeOverlapFromRunBound needs no entry for either category. This
+// comment is an INTERIM registration under ADR-106's existing audit-category
+// mechanism, not ADR-106 registry option B; both take the mandatory run-bound
+// flag when #4599 / E89 #4537 lands.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -517,6 +536,7 @@ var KnownCategories = map[string]struct{}{
 	"captain_handover_offered":                {},
 	"captain_handover_withdrawn":              {},
 	"captain_relinquished":                    {},
+	"child_dispatch_awaiting_operator":        {}, // #5497: stall-watch page for a dispatchable decomposition child nobody dispatched (server/stall_watch_children.go) — pings-only page-class marker
 	"child_pushed":                            {},
 	"conflict_resolution_pushed":              {},
 	"conflict_resolution_review_skipped":      {}, // #4795: the conflict-resolution report's automatic review did not start a round (reason resolution_docs_only | decomposed_parent); payload is this run's ids and SHAs, a closed reason slug, validated repo paths and a count, no free text, so it is run-bound-readable under ADR-106 (server/conflictresolution_review.go) — INTERNAL
@@ -771,6 +791,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_conflict_resolution_failed":        {},
 	"stage_conflict_resolution_triggered":     {},
 	"stage_merge_candidate_verify_triggered":  {}, // E83.33 / #4018 (ADR-090): the durable trigger that re-opens the implement stage for a verify-only merge-candidate pass; never reads or spends the fix-up budget (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
+	"stage_failed_awaiting_operator":          {}, // #5497: stall-watch page for a failed stage with no operator or driver act past the threshold (server/stall_watch.go) — pings-only page-class marker
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_superseded":                  {}, // E86.54 / #4391: the operator's in-place supersession of a queued, never-dispatched ADR-090 D6 fix-up by a verify-only re-run; inert unless a conversion trigger names its fix-up trigger (server/merge_candidate_rerun.go) — INTERNAL, not an issue-comment surface
 	"stage_fixup_triggered":                   {},
