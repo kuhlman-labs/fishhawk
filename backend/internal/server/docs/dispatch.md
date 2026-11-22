@@ -91,7 +91,8 @@ remaining scope).
   ticker cannot pin admissions shut (`backend/internal/opsmonitor/README.md`).
 - **Where it fires.** After every eligibility and dependency guard (dev mode,
   auth, runner_kind/executor, terminal run, wave order, post-deploy hold,
-  decomposed-parent acceptance), the state switch, the decomposed-parent
+  decomposed-parent acceptance), the state switch, the operator per-run
+  dispatch hold (`run_dispatch_held`, #5486, above), the decomposed-parent
   fan-in verify hold refusal (#4846, below) and the superseded
   merge-candidate pass refusal (#4811, below), and BEFORE the bare CAS
   or the concurrency slot admission. Only the two admissible arms reach it —
@@ -114,6 +115,76 @@ remaining scope).
   `…_NilIsDefault`, `…_AlreadyDispatchedUntouched` (the hold is not even
   consulted) and `…_PrecedesSlotAdmission` (a grouped implement stage: a held
   hold never calls `concurrency.Store.Admit`; the not-held control does).
+
+## Operator per-run dispatch hold (`run_dispatch_hold.go`, E110.50 / [#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486))
+
+An operator hold that parks every NEW host dispatch of a run and of every run
+below it in its lineage, so a decomposition wave cannot be spawned in the
+same tick its predecessor integrates.
+
+- **Verb.** `POST /v0/runs/{run_id}/dispatch-hold` `{"action": "set"|"clear"
+  (default set), "reason": string}` (MCP `fishhawk_hold_dispatch`). Rungs,
+  each decided before any write: 401 `authentication_required`, 403
+  `run_token_forbidden` (a run-bound agent token), 403 `insufficient_scope`
+  (no `write:runs`), 400 `validation_failed` (non-UUID run id, unknown
+  action, unknown field or trailing content, a trimmed reason empty or over
+  1000 bytes), 503 `dispatch_hold_unavailable` (no run or audit repository),
+  404 `run_not_found`, 409 `run_terminal` (set on a terminal run; clear is
+  always allowed), 500 `dispatch_hold_failed` (a read or the append failed;
+  nothing written). A set while own-held, or a clear while not own-held, is a
+  200 `changed:false` no-op that appends nothing. The 200 body carries the
+  EFFECTIVE hold after the act, so a clear on a child that still inherits a
+  parent's hold says which run to clear. Tier: `requireRunAccount(memberWrite)`;
+  a delegated operator-agent token is admitted (a hold grants no gate act), and
+  a host-dispatcher token is refused by its route allowlist.
+- **State.** No column and no migration. The run's OWN chain carries a
+  `run_dispatch_hold_set` / `run_dispatch_hold_cleared` pair (payload
+  `{action, reason, actor}`); `dispatchHoldActive` holds while the latest set
+  row's sequence is newer than the latest cleared row's. Set and clear are a
+  pre-check then `AppendChained`, not a guarded append: a concurrent duplicate
+  can add a redundant row, and latest-wins keeps the state right under any
+  interleaving.
+- **Ancestry.** `resolveRunDispatchHold` checks the run, then walks
+  `runParentID` (DecomposedFrom, else ParentRunID) up to
+  `maxCampaignAncestorDepth` (8) hops; the first held run wins and
+  `inherited` is true when it is an ancestor. A missing ancestor, a cycle or
+  the depth bound stops the walk with a WARN naming the run and decides on the
+  runs read so far (a hold is only ever placed through a readable run, and
+  failing closed would wedge a broken lineage with no remedy). Any other read
+  error is returned. With no `AuditRepo` the resolver is inert.
+- **Marker placement.** `guardRunDispatchHold` runs right after the marker's
+  state switch (the idempotent `dispatched` arm is exempt, so in-flight work is
+  never touched) and BEFORE the fan-in verify hold, the superseded-pass
+  settle, the host memory hold, the campaign dispatch hold and the CAS / slot
+  admission, for every stage type. A hold answers a plain `409
+  run_dispatch_held` (details `run_id, stage_id, held_run_id, inherited,
+  reason, held_by, held_at, audit_sequence`), so an MCP slot waiter re-POSTing
+  the marker stops (#4826) and its stale queue row stops counting after
+  `concurrency.QueueTTL`. A resolver read error answers `500
+  dependency_check_failed` (fail closed).
+- **No override.** There is no per-dispatch bypass flag: the audited clear is
+  the explicit operator override, so every bypass is on the chain.
+- **Reads.** `GET /v0/runs/{run_id}` projects `dispatch_hold` (own or
+  inherited) for a non-terminal run, or `dispatch_hold_unavailable` on a read
+  error (the read still answers 200; the marker re-checks fail closed). The
+  campaign status `awaiting` block attaches it for a readable caller and reads
+  `human`/`dispatch_held` for a block waiting on a dispatch or on its
+  children; a running stage keeps `in_flight`.
+- **Untrusted text.** The reason is operator free text. It is rendered only as
+  a data field (`details.reason`, `dispatch_hold.reason`); no message and no
+  `next_step` embeds it.
+- **Accepted risks.** Any `memberWrite` caller can clear a hold (the audit row
+  records the actor). There is a one-marker window between the guard's read
+  and the CAS: a set that lands in it admits that one marker.
+- **Tests** (`run_dispatch_hold_test.go`): `TestRunDispatchHold_*` (set/clear
+  audited, one row per refusal rung with a committed-chain read, no-op
+  idempotency, inherited clear, the end-to-end parent-holds-child-marker
+  test over HTTP), `TestResolveRunDispatchHold_Ancestry`,
+  `TestHostDispatch_RunDispatchHold*` (every stage type, the decomposed child,
+  clear readmits, read fails closed, the queued waiter refused before Admit,
+  the dispatched arm unaffected); `TestGetRun_DispatchHold`
+  (`runs_get_test.go`); `TestCampaignItemAwaiting_DispatchHeld`
+  (`campaign_item_awaiting_test.go`).
 
 ## Superseded merge-candidate pass refusal (`host_dispatch.go`, [#4811](https://github.com/kuhlman-labs/fishhawk/issues/4811))
 

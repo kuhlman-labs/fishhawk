@@ -153,6 +153,19 @@ type hostDispatchResponse struct {
 // dependency_check_failed and an unrecordable release 503
 // campaign_audit_unavailable (guardCampaignDispatchHold).
 //
+// Operator per-run dispatch hold (E110.50 / #5486): a stage of ANY type in
+// either admissible arm whose run, or any DecomposedFrom / ParentRunID
+// ancestor within maxCampaignAncestorDepth hops, carries an active operator
+// dispatch hold (the latest run_dispatch_hold_set row newer than the latest
+// run_dispatch_hold_cleared one) returns a plain 409 run_dispatch_held, right
+// after the state switch and BEFORE the fan-in verify hold, the superseded
+// pass, the host memory hold, the campaign dispatch hold and the CAS / slot
+// admission, so it commits nothing and takes no queue row; an MCP slot waiter
+// re-POSTing the marker stops on it. The idempotent `dispatched` arm is
+// exempt. A hold read error answers 500 dependency_check_failed. There is no
+// per-dispatch override: POST /v0/runs/{held_run_id}/dispatch-hold action
+// clear is the operator's audited override (guardRunDispatchHold).
+//
 // Superseded merge-candidate pass (#4811): an IMPLEMENT stage in either
 // admissible arm whose live verify-only pass was triggered for a head that a
 // recorded head write sequenced after the trigger has since moved past is
@@ -542,6 +555,19 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
 			"stage is not in a host-dispatchable state",
 			map[string]any{"stage_id": stageID.String(), "state": string(stage.State)})
+		return
+	}
+
+	// Operator per-run dispatch hold (E110.50 / #5486): a hold on this run, or
+	// on any DecomposedFrom / ParentRunID ancestor (at most
+	// maxCampaignAncestorDepth hops), refuses EVERY stage type with a plain
+	// 409 run_dispatch_held, so an MCP slot waiter stops. After the state
+	// switch (the idempotent dispatched arm stays exempt, so in-flight work
+	// is never touched) and BEFORE every later hold and the CAS / slot
+	// admission, so a held stage commits nothing and takes no queue row. A
+	// read error answers 500 dependency_check_failed. See run_dispatch_hold.go.
+	if refusal := s.guardRunDispatchHold(r.Context(), runRow, stage); refusal != nil {
+		s.writeCampaignSourceRefusal(w, r, refusal)
 		return
 	}
 
