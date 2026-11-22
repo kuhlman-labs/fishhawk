@@ -51,8 +51,8 @@ type State string
 //   - DERIVED, unlike `paused`: DeriveState emits it from the item partition, so
 //     no driver or operator has to set it.
 //   - The invariant is an IFF holding AT EVERY DERIVE: state == awaiting_human
-//     iff the NextEligible partition has NO Eligible, Restartable, Running or
-//     Paused item AND >= 1 HumanLed item. The iff is what makes the state
+//     iff the NextEligible partition has NO Eligible, Restartable, Replanning,
+//     Running or Paused item AND >= 1 HumanLed item. The iff is what makes the state
 //     SELF-CORRECTING rather than sticky — the arm stops firing the moment the
 //     partition gains an Eligible or Restartable item (the operator relabels an
 //     autonomy:low issue to autonomy:medium), and the reverse edges in
@@ -106,14 +106,29 @@ type ItemState string
 // auto-driver handed off to a human is paused (running → paused) carrying a
 // PauseReason. It is NON-terminal — resuming flips it back to running — and
 // is never derived; only the driver/operator set it.
+//
+// `replanning` (#5379, migration 0120) is a running item whose linked run
+// failed BECAUSE an approver rejected its plan (the plan stage failed category
+// D with run.FailureReasonGateRejected). The settle paths
+// (campaigndriver.advance and the server's reconcile-on-read pass) write it
+// instead of `failed`, so a deliberate rejection is not read as a failure. It
+// is NON-terminal and keeps the rejected run's RunID as provenance. It is never
+// auto-dispatched (the operator decides when the replan starts, so a reject
+// made to re-scope the issue is not raced by a fresh run), and it never fails
+// its campaign (DeriveState counts it as progress). Its forward path is the
+// operator restart verb: RestartCampaignItem admits it, clears the stale link
+// and resets it to pending, outside the transition table exactly as for
+// cancelled/failed. A closed issue settles it through
+// SettleCampaignItemForClosedIssue.
 const (
-	ItemStatePending   ItemState = "pending"
-	ItemStateBlocked   ItemState = "blocked"
-	ItemStateRunning   ItemState = "running"
-	ItemStatePaused    ItemState = "paused"
-	ItemStateSucceeded ItemState = "succeeded"
-	ItemStateFailed    ItemState = "failed"
-	ItemStateCancelled ItemState = "cancelled"
+	ItemStatePending    ItemState = "pending"
+	ItemStateBlocked    ItemState = "blocked"
+	ItemStateRunning    ItemState = "running"
+	ItemStatePaused     ItemState = "paused"
+	ItemStateReplanning ItemState = "replanning"
+	ItemStateSucceeded  ItemState = "succeeded"
+	ItemStateFailed     ItemState = "failed"
+	ItemStateCancelled  ItemState = "cancelled"
 )
 
 // IsTerminal reports whether the state admits no further transitions.

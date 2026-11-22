@@ -154,8 +154,30 @@ func ValidCampaignTransition(from, to State) bool {
 // running → failed:    the item's run failed.
 // running → cancelled: manually halted mid-flight.
 // running → paused:    the auto-driver handed the item's gate off to a human.
+// running → replanning: the item's run failed because an approver rejected its
+//
+//	plan (#5379); the settle writes replanning instead of failed.
+//
 // paused  → running:   resumed after the gate was handled (re-engages next tick).
 // paused  → cancelled: manually halted while paused.
+// replanning → cancelled: the operator cancel cascade, which walks every
+//
+//	non-terminal item.
+//
+// replanning → succeeded: the reconcile-on-read issue-closed settle of a
+//
+//	closed-as-completed issue (SettleCampaignItemForClosedIssue). Its
+//	not_planned/duplicate arm lands on replanning → cancelled.
+//
+// DELIBERATELY ABSENT out of replanning:
+//
+//   - replanning → failed: a rejected plan is not a failure. No settle path
+//     may turn it into one.
+//   - replanning → pending / running: the replan is an operator restart.
+//     RestartCampaignItem resets the item to pending and clears its stale run
+//     link under its own from-guard, bypassing this table exactly as it does
+//     for cancelled/failed. A table edge would let an ordinary transition
+//     reach pending while keeping the rejected run linked.
 var campaignItemTransitions = map[ItemState]map[ItemState]struct{}{
 	ItemStatePending: {
 		ItemStateBlocked:   {},
@@ -171,13 +193,18 @@ var campaignItemTransitions = map[ItemState]map[ItemState]struct{}{
 		ItemStateCancelled: {},
 	},
 	ItemStateRunning: {
-		ItemStateSucceeded: {},
-		ItemStateFailed:    {},
-		ItemStateCancelled: {},
-		ItemStatePaused:    {},
+		ItemStateSucceeded:  {},
+		ItemStateFailed:     {},
+		ItemStateCancelled:  {},
+		ItemStatePaused:     {},
+		ItemStateReplanning: {},
 	},
 	ItemStatePaused: {
 		ItemStateRunning:   {},
+		ItemStateCancelled: {},
+	},
+	ItemStateReplanning: {
+		ItemStateSucceeded: {},
 		ItemStateCancelled: {},
 	},
 }
