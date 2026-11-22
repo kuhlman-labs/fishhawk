@@ -2079,6 +2079,15 @@ Notes:
   run's ids, intent and yield reason, never the untrusted `yield_detail`.
   Read them through `GET /v0/runs/{id}/audit`.
 
+- The operator per-run dispatch hold kinds `run_dispatch_hold_set` and
+  `run_dispatch_hold_cleared` (E110.50 / #5486, `server/run_dispatch_hold.go`)
+  are **INTERNAL, deliberately-not-a-surface** rows: no Notifier method, NOT
+  in `activityCategories`, nothing in `issuecomment` renders or posts them.
+  Each records the operator's set or clear of the run's dispatch hold
+  (`{action, reason, actor}`, same-run payload only); the latest of the pair
+  decides whether the host-dispatch marker refuses the run and its
+  descendants. Read them through `GET /v0/runs/{id}/audit`.
+
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier
   method**, but as of E42.6 (#1789) `concern_deferred` renders **data-drivenly**

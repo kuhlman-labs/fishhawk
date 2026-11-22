@@ -19,9 +19,9 @@ import (
 // the run's parked stage, and walks the single pre-marker sequence when it
 // does:
 //
-//	campaign-link read (fail closed) -> review round and lineage-lock holds
-//	-> gate (caps + pause, injected) -> record run_auto_driven (fail closed)
-//	-> host-dispatch marker -> spawn
+//	operator dispatch hold (fail closed) -> campaign-link read (fail closed)
+//	-> review round and lineage-lock holds -> gate (caps + pause, injected)
+//	-> record run_auto_driven (fail closed) -> host-dispatch marker -> spawn
 //
 // The core has NO goroutines and never acts on its own: the tick loop
 // (host_dispatcher_loop.go, slice 3) is its only caller, so every marker POST
@@ -82,6 +82,16 @@ const (
 	// run_refusals.
 	hdRefuseLineageLockHeld        = "lineage_lock_held"
 	hdRefuseLineageLockProbeFailed = "lineage_lock_probe_failed"
+
+	// The operator per-run dispatch hold (E110.50 / #5486): the run, or a
+	// decomposed_from / parent_run_id ancestor, carries a hold
+	// (run_dispatch_held), or the backend could not read the hold
+	// (dispatch_hold_unavailable, fail closed). Neither is benign: each is
+	// logged once per unbroken run and recorded in run_refusals. Neither sets
+	// CampaignRefused or Held, so a held run charges no per-tick budget and is
+	// evaluated normally on the first tick after the clear.
+	hdRefuseRunDispatchHeld         = "run_dispatch_held"
+	hdRefuseDispatchHoldUnavailable = "dispatch_hold_unavailable"
 )
 
 // defaultHostDispatchStaleAfter is how long a 'dispatched' stage this process
@@ -381,6 +391,30 @@ func hdLineageLockHeldDetail(lock hostDispatchLineageLock) string {
 		lock.HolderPID, holderRun, lock.LockPath)
 }
 
+// hdRunDispatchHeldDetail is the run_dispatch_held refusal detail: the held
+// run, whether the hold is inherited, who set it and the clear remedy. It is
+// bounded and carries NO hold reason: the reason is operator free text and is
+// rendered only as the run.dispatch_hold.reason data field.
+func hdRunDispatchHeldDetail(hold *RunDispatchHold) string {
+	whose := "this run"
+	if hold.Inherited {
+		whose = "ancestor run " + boundHostDispatchText(hold.HeldRunID)
+	}
+	return fmt.Sprintf("an operator dispatch hold on %s (held_run_id %s, inherited %t, held_by %s) parks this run's new dispatches; clear it with fishhawk_hold_dispatch run_id %s action clear, and the stage spawns on the next tick",
+		whose, boundHostDispatchText(hold.HeldRunID), hold.Inherited, boundHostDispatchText(hold.HeldBy), boundHostDispatchText(hold.HeldRunID))
+}
+
+// runDispatchHoldFromDetails reads a marker 409 run_dispatch_held refusal's
+// details into the fields hdRunDispatchHeldDetail renders (held_run_id,
+// inherited, held_by). It never reads details.reason.
+func runDispatchHoldFromDetails(details map[string]any) *RunDispatchHold {
+	hold := &RunDispatchHold{}
+	hold.HeldRunID, _ = details["held_run_id"].(string)
+	hold.Inherited, _ = details["inherited"].(bool)
+	hold.HeldBy, _ = details["held_by"].(string)
+	return hold
+}
+
 // hdLineageLockProbeFailedDetail is the refusal detail for an undecidable
 // lineage-lock probe; the probe error leads with its discriminator and remedy.
 func hdLineageLockProbeFailedDetail(err error) string {
@@ -408,6 +442,12 @@ func hdLineageLockProbeFailedDetail(err error) string {
 // decide), then the gate. A held campaign therefore refuses for campaign state
 // before the round hold, the round hold before the lineage-lock probe, and both
 // holds precede every reservation, act, marker and spawn.
+//
+// The operator per-run dispatch hold (E110.50 / #5486) is decided earlier:
+// right after the stage selection and the in-flight checks of the stale path,
+// before the argv composition, on a spawnable stage or a stale re-spawn
+// candidate (run_dispatch_held, or dispatch_hold_unavailable when the backend
+// could not read the hold).
 func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDispatchOutcome {
 	o := hostDispatchOutcome{RunID: runID.String()}
 	view, err := h.r.fetchRunDriveView(ctx, runID)
@@ -478,6 +518,24 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		}
 		respawn = true
 		o.Respawn = true
+	}
+
+	// (0) The operator per-run dispatch hold (E110.50 / #5486). Every in-flight
+	// case has returned above (this process runs it, or it was dispatched
+	// within the liveness threshold, or its runner is live or unprobed), so
+	// the stage here is spawnable (hostDispatchSpawnable) or a stale re-spawn
+	// candidate: the hold never touches in-flight work, and a stale re-spawn
+	// is a new spawn the hold parks. A present hold (own or inherited) and an
+	// unreadable hold (dispatch_hold_unavailable, fail closed) refuse before
+	// the argv, the campaign-link read, the gate reservation, the
+	// run_auto_driven act, the marker and the spawn. The backend marker
+	// enforces the same hold for every other spawner; this early refusal
+	// keeps the dispatcher from committing an act it cannot use.
+	if hold := run.DispatchHold; hold != nil {
+		return h.refuse(o, hdRefuseRunDispatchHeld, hdRunDispatchHeldDetail(hold))
+	}
+	if run.DispatchHoldUnavailable {
+		return h.refuse(o, hdRefuseDispatchHoldUnavailable, "the backend could not read this run's dispatch hold (dispatch_hold_unavailable); the stage is not spawned until the read succeeds on a later tick")
 	}
 
 	// Compose the argv before any POST: it reads no state the act or marker
@@ -681,6 +739,13 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		var ae *apiError
 		if errors.As(hderr, &ae) && ae.Code != "" {
 			code = ae.Code
+		}
+		if code == hdRefuseRunDispatchHeld {
+			// A hold set between the run read and this POST (E110.50 /
+			// #5486 L(f)). The 409's details carry the operator's free-text
+			// reason, which hderr.Error() would append, so the recorded
+			// detail is rebuilt from the hold's ids only.
+			return fail(code, hdRunDispatchHeldDetail(runDispatchHoldFromDetails(ae.Details)))
 		}
 		return fail(code, hderr.Error())
 	}

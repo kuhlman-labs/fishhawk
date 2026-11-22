@@ -1454,3 +1454,44 @@ func TestTick_LineageLockHeldDefersReopenedImplementUntilFreed(t *testing.T) {
 		t.Fatal("the run_refusals entry survived the spawn")
 	}
 }
+
+// E110.50 / #5486 (q), the issue's done-means: a wave-2 child of a held
+// decomposed parent carries the inherited hold on its run view. One tick
+// spawns nothing and records run_dispatch_held for the child in run_refusals;
+// once the hold is dropped, the NEXT tick spawns the child.
+func TestTick_RunDispatchHoldParksChildrenUntilCleared(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	parent := lh.add(0, func(r *hdRun) { r.Stages = nil })
+	wave2 := 1
+	child := lh.add(time.Second, func(r *hdRun) {
+		r.AutoDispatch = false
+		r.SliceIndex = &wave2
+		r.DecomposedFrom = parent.ID
+		r.Stages = []Stage{{ID: uuid.NewString(), RunID: r.ID, Sequence: 1, Type: "implement", State: "awaiting_host_dispatch", UpdatedAt: lh.clock}}
+		r.DispatchHold = hdTestHold(parent.ID, true)
+	})
+	l := lh.loop(nil)
+	lh.tick(l)
+	if lh.spawner.n() != 0 || lh.b.count(isMarkerReq) != 0 || lh.b.count(isRecordReq) != 0 {
+		t.Fatalf("held tick: spawns=%d markers=%d acts=%d; want 0, 0, 0", lh.spawner.n(), lh.b.count(isMarkerReq), lh.b.count(isRecordReq))
+	}
+	ref, ok := hdMustStatus(t, lh.dir).RunRefusals[child.ID]
+	if !ok || ref.Code != hdRefuseRunDispatchHeld || ref.StageID != child.Stages[0].ID {
+		t.Fatalf("run_refusals entry = %+v (present %v); want %s for the child's implement stage", ref, ok, hdRefuseRunDispatchHeld)
+	}
+	if strings.Contains(ref.Detail, hdHoldReason) || !strings.Contains(ref.Detail, parent.ID) {
+		t.Fatalf("run_refusals detail %q; want the held parent named and no hold reason", ref.Detail)
+	}
+
+	lh.b.mu.Lock()
+	child.DispatchHold = nil
+	lh.b.mu.Unlock()
+	lh.clock = lh.clock.Add(30 * time.Second)
+	lh.tick(l)
+	if lh.spawner.n() != 1 || lh.spawner.spawns[0].Run != child.ID {
+		t.Fatalf("cleared tick: spawns=%d; want exactly 1 for child %s", lh.spawner.n(), child.ID)
+	}
+	if _, ok := hdMustStatus(t, lh.dir).RunRefusals[child.ID]; ok {
+		t.Fatal("the run_refusals entry survived the spawn")
+	}
+}

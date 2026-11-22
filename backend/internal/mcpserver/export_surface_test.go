@@ -235,6 +235,10 @@ var exportBaseline = []string{
 	"HandoverBriefInput",
 	"HandoverBriefOutput",
 	"HealthInfo",
+	// E110.50 / #5486: fishhawk_hold_dispatch's I/O, exported for the SDK's
+	// jsonschema reflection like every DTO.
+	"HoldDispatchInput",
+	"HoldDispatchOutput",
 	"HostDispatchResult",
 	// E88.2 / #4526: the `fishhawk-mcp host-dispatch` entry points (ADR-104 host
 	// dispatcher) — the command's config, run loop, status file and pause verb.
@@ -472,6 +476,9 @@ var exportBaseline = []string{
 	"RunConcerns",
 	"RunCost",
 	"RunCostStage",
+	// E110.50 / #5486: the client mirror of the backend's effective dispatch
+	// hold (run.dispatch_hold, the hold verb's 200 and the awaiting block).
+	"RunDispatchHold",
 	"RunHostDispatcher", // E88.2 / #4526
 	"RunLatency",
 	"RunLiveValidation",

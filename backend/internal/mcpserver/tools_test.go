@@ -3693,7 +3693,14 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// otherwise). It clears nothing; there is NO confirm or reject tool —
 	// both are Web UI session-only (TestProposeWaive_NoConfirmOrRejectTool).
 	// 86 -> 87.
-	const wantToolCount = 87
+	//
+	// E110.50 / #5486 adds exactly ONE tool — fishhawk_hold_dispatch, the
+	// wrapper over POST /v0/runs/{run_id}/dispatch-hold. WHEN: a run's next
+	// dispatch (or a decomposed parent's next child wave) must wait for the
+	// operator. ELIGIBILITY: write:runs on a NON-run-bound credential
+	// (run_token_forbidden otherwise). The hold binds every spawner at the
+	// host-dispatch marker and its audited clear is the only override. 87 -> 88.
+	const wantToolCount = 88
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
