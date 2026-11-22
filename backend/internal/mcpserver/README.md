@@ -116,7 +116,11 @@ allowed root (`path_outside_allowed_roots`), and a directory on this host
 (`working_dir_absent`), all before the campaign-link read. So an unmarked run
 reads `not_eligible` whatever its `working_dir`. A verify-only
 re-open is eligible only through that same mark: an unmarked run is never
-spawned, whatever re-opened it. The
+spawned, whatever re-opened it. A campaign item run carries the mark when
+its starter stamps it (ADR-104 Q3): the campaign driver always does, and
+`fishhawk_start_campaign_item_run` does only with its explicit
+`auto_dispatch: true` opt-in ([#5266](https://github.com/kuhlman-labs/fishhawk/issues/5266)),
+which a run-bound token is refused. The
 stage comes from `driveDispatchableStage`. A failed stage is never re-picked,
 so the dispatcher originates no retries.
 
@@ -1125,6 +1129,20 @@ The `working_dir_required` rung keys on the RESOLVED kind, not the request field
 **This package never defaults `runner_kind` client-side** — on either verb. An omitted value must reach the backend absent, or the `working_dir` fallback rung is unreachable (`TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty`, `TestStartCampaign_ThreadsRunnerKindThroughRealClient`).
 
 **`runner_kind_resolution` survives the ADR-077 floor tier.** `StartCampaignItemRunOutput.RunnerKindResolution` is deliberately NOT `omitempty`: the floor rebuilds the response from a zero value and re-installs only non-omitempty fields (`carryNonOmitemptyFields`), so an omittable field would vanish exactly when the response is reduced hardest. It is classified `computed` in `floorCarryTable` (`TestStartCampaignItemRun_FloorTier_CarriesRunnerKindResolution`).
+
+### Item starts: the claim, `auto_dispatch` and the outcome-unknown error ([#5266](https://github.com/kuhlman-labs/fishhawk/issues/5266))
+
+**Driver-run create opens running.** On a deployment that runs the campaign driver, `POST /v0/campaigns` opens the campaign `running` in the same request, and the driver starts its eligible items on its next tick, so `fishhawk_start_campaign`'s description says no first item needs a hand start there. Elsewhere the campaign stays `pending` until the first `fishhawk_start_campaign_item_run`.
+
+**`auto_dispatch` is an explicit opt-in.** `StartCampaignItemRunInput.AutoDispatch` (`auto_dispatch`, omitempty, default false) threads through `apiClient.StartCampaignItemRun`'s `autoDispatch` parameter into the request body, which omits the key unless it is true (`TestStartCampaignItemRun_SendsAutoDispatchOnlyWhenTrue`, `TestStartCampaignItemRun_AutoDispatchInput_ReachesTheRequest`). True stamps the ADR-104 host-dispatcher mark, so `fishhawk-mcp host-dispatch` spawns the item run's parked local stages; nothing infers it from the deployment's driver posture. The backend refuses every run-bound (`mcp:run:*`) subject on the item start `403 run_token_forbidden`, flagged or not, and the tool renders that as an operator-only action.
+
+**Claim refusals and abandoned runs.** The backend claims the item before it mints, so a losing starter mints nothing. `startCampaignItemRunError` runs the code switch first and reads a `409 item_not_eligible` by its detail keys (`itemNotEligibleStartError`): `start_in_progress` (another starter's live claim; the tool names `claim_starter` and says do not retry, poll `fishhawk_get_campaign_status` until the item carries a `run_id`), `start_in_progress` with `claim_budget_short` (this start's own claim was too short to start under, so nothing was minted), `run_id` alone (the item is already linked; drive that run), and `cancelled_run_id` / `cancel_failed_run_id` (this call minted a run that ended unlinked and was abandoned). `abandonedItemRunClause` says the run was cancelled ONLY for `cancelled_run_id`; for `cancel_failed_run_id` it names the still-live run and `fishhawk_cancel_run`. The same clause makes a `500 internal_error` that names an abandoned run (a link or running-transition failure) definitive. `500 campaign_run_start_incomplete` (the backend minted a run but could not create its stages) names the run and, by its outcome key, says it was cancelled and the item can be started again, or that it is still live and must be cancelled first.
+
+**Lost responses report outcome unknown.** After the switch, a non-`apiError` (a transport error or client timeout, an unreadable body, an undecodable 2xx) or an unmapped 5xx returns an `outcome unknown` error that wraps the cause, says the run may already exist and be linked (so a blind retry may be refused `item_not_eligible`), and names the check: `fishhawk_get_campaign_status` (a `run_id` on the item means the start succeeded), else `fishhawk_list_runs` before starting again. Every mapped code stays definitive, including `502 campaign_run_start_failed`.
+
+**The item-start client.** `StartCampaignItemRun` rides its own `httpCampaignItemStart` client (falling back to `c.http` only for a test-built literal), whose `campaignItemStartClientTimeout` (5m) is a margin over the handler's worst-case post-claim time, `campaign.ItemStartBudget` + `campaign.ItemStartCleanupBudget` (4m30s). That is an argued margin, not a guarantee: the pre-claim forge reads are unbounded, and an MCP client may impose a lower tool-call timeout. The outcome-unknown error is the backstop.
+
+Tests: `TestCampaignItemStartClientTimeout_Wired`, `TestStartCampaignItemRun_RoutesThroughTheItemStartClient`, one `TestStartCampaignItemRun_*` per rendered mode in `campaign_test.go`, and two real-Postgres full-path tests: `TestStartCampaignItemRun_FullPath_AutoDispatchReachesPersistedRunAndStatus` (tool input to the persisted run's mark and the status read's `host_dispatcher` / `host_dispatch` awaiting, plus the already-linked 409 naming the run) and `TestStartCampaignItemRun_FullPath_ClaimHeld_ReportsStartInProgress` (a seeded driver claim crosses the real handler, client and renderer, and nothing is minted).
 
 ### `campaign_dangling_dependency` remedy branches ([#2953](https://github.com/kuhlman-labs/fishhawk/issues/2953))
 
@@ -3836,7 +3854,10 @@ per-tool contract). Internals not covered there:
   `run_children` / `drive_run` all inherit it. The tool refuses a `local` item with no `working_dir` and a
   non-absolute `working_dir` for any kind on BOTH transports — a strictly stronger rule than `start_run`'s HTTP-only
   guard) maps `item_not_eligible` / `item_human_led`
-  (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`. As of E67.43 / #2681
+  (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`, and since #5266
+  `campaign_run_start_incomplete`, `run_token_forbidden`, the claim-refusal shapes of `item_not_eligible` and an
+  outcome-unknown error for a lost response (§ "Item starts: the claim, `auto_dispatch` and the outcome-unknown
+  error"). As of E67.43 / #2681
   the `campaign_not_startable` message names the two REMAINING causes truthfully — a PAUSED campaign must be resumed
   (`fishhawk_resume_campaign`); a CANCELLED or SUCCEEDED campaign is closed, so drive the issue standalone with
   `fishhawk_start_run` — because a terminal-FAILED campaign is no longer refused: this verb REOPENS it (the campaign
