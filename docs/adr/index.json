@@ -1049,6 +1049,9 @@
         "ADR-093",
         "ADR-096"
       ],
+      "amends": [
+        "ADR-124"
+      ],
       "amended_by": [
         "ADR-142"
       ],
@@ -1540,6 +1543,9 @@
       "superseded_by": [],
       "amends": [
         "ADR-098"
+      ],
+      "amended_by": [
+        "ADR-090"
       ],
       "applies_to": []
     },
