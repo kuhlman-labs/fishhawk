@@ -241,3 +241,22 @@ func TestOpenAPI_CampaignAutoStartRefusalDocumented(t *testing.T) {
 		t.Errorf("runner_kind_source enum = %v", got)
 	}
 }
+
+// TestCampaignDriverRuns is the driver-posture signal table (#5266): it is
+// true exactly when serve.go set CampaignAutoStartRunnerKind (driver ticker
+// started), for every runner kind the driver accepts.
+func TestCampaignDriverRuns(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		want bool
+	}{
+		{"", false},
+		{run.RunnerKindGitHubActions, true},
+		{run.RunnerKindLocal, true},
+	} {
+		s := New(Config{CampaignAutoStartRunnerKind: tc.kind})
+		if got := s.campaignDriverRuns(); got != tc.want {
+			t.Errorf("campaignDriverRuns() with kind %q = %v, want %v", tc.kind, got, tc.want)
+		}
+	}
+}
