@@ -103,8 +103,11 @@ var (
 	// that landed after the tick's own pause check).
 	hostDispatchPausedRefusals = map[string]bool{hdRefusePaused: true, hdRefusePauseCheck: true}
 	// hostDispatchHoldRefusals are deliberate holds: the stage waits for the
-	// campaign, and a hand dispatch would bypass the hold.
-	hostDispatchHoldRefusals = map[string]bool{hdRefuseCampaignNotRunning: true, hostDispatchCampaignHeldCode: true}
+	// campaign or for the operator (run_dispatch_held, E110.50 / #5486), and a
+	// hand dispatch would bypass the hold (the run hold's marker refuses it
+	// too). dispatch_hold_unavailable is NOT a hold: it stays on the default
+	// refusing arm, since nothing says the run is held.
+	hostDispatchHoldRefusals = map[string]bool{hdRefuseCampaignNotRunning: true, hostDispatchCampaignHeldCode: true, hdRefuseRunDispatchHeld: true}
 	// hostDispatchWaitingRefusals clear on their own on a later tick.
 	// cap_reached:per_tick is global-only (never a per-run entry) and so is
 	// not listed.
@@ -491,6 +494,11 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 			next := fmt.Sprintf("The linked campaign is not running%s; the dispatcher holds this stage until it is resumed (fishhawk_resume_campaign). Do not dispatch past the hold.", detail)
 			if ref.Code == hostDispatchCampaignHeldCode {
 				next = fmt.Sprintf("A campaign hotfix hold is active%s; the stage dispatches after the hotfix lands. Do not dispatch past the hold.", detail)
+			}
+			if ref.Code == hdRefuseRunDispatchHeld {
+				// The detail names the held run and the remedy; the hold
+				// reason never reaches it (run.dispatch_hold.reason is data).
+				next = fmt.Sprintf("An operator dispatch hold parks this run%s. Clear it with fishhawk_hold_dispatch action clear on the held run (held_run_id) when its dispatches may resume; the dispatcher spawns the stage on the next tick. Do not dispatch past the hold.", detail)
 			}
 			return obs, hostDispatchVerdict{Kind: hostDispatchAwaitKindHuman, Reason: hostDispatchReasonRefused, NextStep: next}
 		case hostDispatchReviewRoundRefusals[ref.Code]:

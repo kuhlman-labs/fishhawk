@@ -1455,3 +1455,32 @@ func TestObserveHostDispatch_LineageLockHeld(t *testing.T) {
 		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseLineageLockProbeFailed)
 	})
 }
+
+// E110.50 / #5486 (r): a run_dispatch_held refusal reads held (an operator
+// must act) with a next_step naming fishhawk_hold_dispatch action clear and
+// telling the operator not to dispatch past it. dispatch_hold_unavailable is
+// not a hold: it stays on the default refusing arm.
+func TestObserveHostDispatch_RunDispatchHeld(t *testing.T) {
+	runID, stageID := uuid.NewString(), uuid.NewString()
+	probe := func(code, detail string) hostDispatchProbe {
+		st := hdoStatus()
+		st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: stageID, Code: code,
+			Detail: detail, FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow.Add(-10 * time.Second)}}
+		return hostDispatchProbe{found: true, dir: "/state", st: st}
+	}
+	t.Run("held", func(t *testing.T) {
+		obs, v := observeHostDispatch(probe(hdRefuseRunDispatchHeld, "an operator dispatch hold on this run (held_run_id "+runID+")"), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateHeld || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonRefused {
+			t.Fatalf("state %q verdict %s/%s; want held human/refused (next_step %q)", obs.State, v.Kind, v.Reason, v.NextStep)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, "operator dispatch hold", "fishhawk_hold_dispatch action clear", "held_run_id", "Do not dispatch past the hold")
+		hdoContainsNone(t, "next_step", v.NextStep, "campaign", "fishhawk_dispatch_stage dispatches the stage by hand")
+	})
+	t.Run("unavailable reads refusing", func(t *testing.T) {
+		obs, v := observeHostDispatch(probe(hdRefuseDispatchHoldUnavailable, "the backend could not read this run's dispatch hold"), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateRefusing || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonRefused {
+			t.Fatalf("state %q verdict %s/%s; want refusing human/refused", obs.State, v.Kind, v.Reason)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseDispatchHoldUnavailable)
+	})
+}

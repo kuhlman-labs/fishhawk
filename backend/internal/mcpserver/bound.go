@@ -684,6 +684,15 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.review_head_mismatch", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.fan_in_verify_unavailable", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_authority", Tier: "T9", Class: classStored, Surfaces: restRun},
+	// dispatch_hold (E110.50 / #5486) is one constant-shape entry (no lists;
+	// its reason is bounded at 1000 bytes server-side) the backend resolves
+	// per single-run read, and dispatch_hold_unavailable is its read-failure
+	// flag. Like host_dispatch they are the small, bounded, operator-actionable
+	// answer to "why does nothing dispatch" (a held run spawns nothing until
+	// it is cleared), so both are tierNever and the diagnosis skeleton retains
+	// them (skeletonRetainedPaths); absent when the run is not held.
+	{Path: "run.dispatch_hold", Tier: tierNever},
+	{Path: "run.dispatch_hold_unavailable", Tier: tierNever},
 	// merge_candidate_queue (ADR-092 / #4200) is one constant-shape entry (no
 	// lists): kept through every tier and itemised at the diagnosis skeleton,
 	// where GET /v0/runs/{id} (and the gate view) return it whole.
@@ -1183,19 +1192,21 @@ func attachAndMeasure(out *GetRunStatusOutput, led *elisionLedger, budget int) (
 // stages[].executor, next_actions.actions, ...), which a top-level-only diff
 // could not express.
 var skeletonRetainedPaths = map[string]struct{}{
-	"run.id":                       {},
-	"run.state":                    {},
-	"run.workflow_id":              {},
-	"stages[].type":                {},
-	"stages[].state":               {},
-	"stages[].failure_category":    {},
-	"stages[].failure_reason":      {},
-	"plan_stage_wait_status":       {},
-	"implement_stage_wait_status":  {},
-	"acceptance_stage_wait_status": {},
-	"host_dispatch":                {},
-	"next_actions.state":           {},
-	"elisions":                     {},
+	"run.id":                        {},
+	"run.state":                     {},
+	"run.workflow_id":               {},
+	"stages[].type":                 {},
+	"stages[].state":                {},
+	"stages[].failure_category":     {},
+	"stages[].failure_reason":       {},
+	"plan_stage_wait_status":        {},
+	"implement_stage_wait_status":   {},
+	"acceptance_stage_wait_status":  {},
+	"host_dispatch":                 {},
+	"run.dispatch_hold":             {},
+	"run.dispatch_hold_unavailable": {},
+	"next_actions.state":            {},
+	"elisions":                      {},
 	// run.concerns.open_implement is deliberately NOT retained here (#3043),
 	// and neither is run.concerns.superseded_implement (E45.83 / #3618):
 	// skeletonRunStatus builds its projection by hand and never copies
@@ -1221,6 +1232,10 @@ func skeletonRunStatus(out GetRunStatusOutput, runID string, budget responseBudg
 			ID:         out.Run.ID,
 			State:      out.Run.State,
 			WorkflowID: out.Run.WorkflowID,
+			// The operator dispatch hold (E110.50 / #5486) is retained like
+			// host_dispatch: it is why a held run dispatches nothing.
+			DispatchHold:            out.Run.DispatchHold,
+			DispatchHoldUnavailable: out.Run.DispatchHoldUnavailable,
 		},
 		PlanStageWaitStatus:       out.PlanStageWaitStatus,
 		ImplementStageWaitStatus:  out.ImplementStageWaitStatus,

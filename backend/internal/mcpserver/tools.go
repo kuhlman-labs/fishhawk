@@ -357,6 +357,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// beside the stage-control verbs. It never acts on the merge-candidate
 	// queue (fishhawk_promote_merge_queue_entry owns that promote, #4297).
 	registerPromoteQueuedStage(srv, resolver)
+	// E110.50 / #5486: the operator per-run dispatch hold, beside the queue
+	// controls. The backend enforces it at the host-dispatch marker, so it
+	// binds every spawner; the audited clear is the only override.
+	registerHoldDispatch(srv, resolver)
 	registerReconcileReviews(srv, resolver)
 	// #4219: the re-run of a verdict-less implement-review round, adjacent to
 	// the reconcile it follows (reconcile closes an orphaned round; this
