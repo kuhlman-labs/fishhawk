@@ -758,6 +758,15 @@ never has to push to a branch ADR-035 declares runner-owned.
   behaviourally by seeding deliberately DIFFERENT anchors so the restored
   state discriminates which one was consulted.
 
+## Merge-candidate verdict gate shape (#5498)
+
+A `merge_candidate_verified` row records the form of the pass it settles in two additive keys, stamped by `mergeCandidateGateShape` on the record path (`recordMergeCandidateVerifiedEvidenceAt`) only:
+
+- `gate_shape: "full"` and `gate_shape_source: "contracted"` on a `passed` or `failed` row: an EXECUTED pass. The source is `contracted`, not an observation: the runner's merge-candidate report (`pullRequestMergeCandidateBody`) carries no form field, and its pass always verifies with a nil (full) package scope, so the row names ADR-090 D3's CONTRACTED form.
+- Both keys ABSENT (not empty) on a `not_executed` row and on the operator re-run's void row (`voidFailedMergeCandidateVerdict`, below). The read-side synthesized payload is untouched.
+
+Why it matters: a decomposition child's non-fix-up implement gate runs ONE scoped verify over its slice's reverse-import reach (the slice gate; the config is `promptResponse.slice_gate`, resolved by `resolveSliceGateConfig` in `slice_gate.go`), so a decomposed parent's fan-in merge-candidate pass is the single FULL verify its merge rests on. That premise holds because the parent's chain never carries `child_pushed` (`succeedChildPushStage` appends it with the CHILD's run id) and its consolidated PR is `consolidated_pr_opened`, so a parent head always classifies `fan_in` and needs an exact-head passed pass. `TestMergeCandidateVerified_GateShapeOnlyOnExecutedResults` reads the appended rows back from the chain. A runner-reported form (a future `gate_shape_source: "runner_reported"`) is a follow-up.
+
 ## Operator verify-only re-run of a failed merge-candidate head (#4391)
 
 `POST /v0/runs/{run_id}/rebase-branch` with `rerun_failed_verify: true` (`rebase_branch.go` → `rebaseRerunFailedMergeCandidateVerify`, `merge_candidate_verify.go` → `voidFailedMergeCandidateVerdict`). It re-runs ONLY the ADR-090 verify of a head whose recorded verdict is `failed` (D3), with no agent and no fix-up budget.

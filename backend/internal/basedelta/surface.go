@@ -181,6 +181,27 @@ func validEntry(e string) bool {
 	return true
 }
 
+// Refusal is the surface guard both consumers read: "" for a usable
+// declaration, else the refusal Classify returns behind its undecidable
+// prefix — surface_undeclared for nil, invalid_surface:<entry> for the first
+// malformed entry, surface_incomplete for a declaration with no G entry, in
+// that order. Classify's guard and the server's slice-gate config (the second
+// consumer, backend/internal/server/slice_gate.go) both call it, so their
+// reasons cannot drift. Nil-safe. The entry is verbatim and unbounded; each
+// caller bounds its own copy.
+func (s *Surface) Refusal() string {
+	if s == nil {
+		return reasonSurfaceUndeclared
+	}
+	if bad, ok := s.firstInvalid(); ok {
+		return reasonInvalidSurface + ":" + bad
+	}
+	if s.incomplete() {
+		return reasonSurfaceIncomplete
+	}
+	return ""
+}
+
 // incomplete reports a declaration with no verdict-wide class: ADR-124
 // Option B's fail-open, refused as surface_incomplete.
 func (s *Surface) incomplete() bool {

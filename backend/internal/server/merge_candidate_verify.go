@@ -210,6 +210,16 @@ type mergeCandidateVerifiedPayload struct {
 	// void row is itself a not_executed verdict, so every ADR-090 reader
 	// already treats the head as re-triggerable without consulting it.
 	VoidsSequence int64 `json:"voids_sequence,omitempty"`
+	// GateShape and GateShapeSource (#5498) name the form of an EXECUTED
+	// pass. Stamped ONLY on passed and failed rows (mergeCandidateGateShape):
+	// "full" with source "contracted", because the runner's merge-candidate
+	// report carries no form field and its pass always verifies with a nil
+	// (full) package scope, so the row names ADR-090 D3's CONTRACTED form
+	// rather than a runner observation. Absent on not_executed rows and on an
+	// operator re-run's void row. A runner-reported form (a future source
+	// "runner_reported") is a follow-up.
+	GateShape       string `json:"gate_shape,omitempty"`
+	GateShapeSource string `json:"gate_shape_source,omitempty"`
 
 	// Source, TransferredFrom, RootHead and Sequence are READ-side
 	// annotations newestMergeCandidateVerdict sets; they are never stored on
@@ -663,6 +673,7 @@ func (s *Server) recordMergeCandidateVerifiedEvidenceAt(ctx context.Context, run
 		return nil, errMergeCandidateNoLiveTrigger
 	}
 
+	gateShape, gateShapeSource := mergeCandidateGateShape(result)
 	payload, err := json.Marshal(mergeCandidateVerifiedPayload{
 		HeadSHA:         trigger.ExpectedHeadSHA,
 		Cause:           trigger.Cause,
@@ -674,6 +685,8 @@ func (s *Server) recordMergeCandidateVerifiedEvidenceAt(ctx context.Context, run
 		Failures:        boundMergeCandidateFailures(ev.Failures),
 		FailureSummary:  boundMergeCandidateFailureSummary(ev.Summary),
 		OutputUntrusted: true,
+		GateShape:       gateShape,
+		GateShapeSource: gateShapeSource,
 	})
 	if err != nil {
 		return nil, err
@@ -707,6 +720,25 @@ func (s *Server) recordMergeCandidateVerifiedEvidenceAt(ctx context.Context, run
 	// runner retry never re-applies it.
 	ejected := s.mergeCandidateQueueOnVerdict(ctx, runID, trigger.ExpectedHeadSHA, result)
 	return &mergeCandidateVerifiedRecord{Trigger: trigger, Result: result, Ejected: ejected}, nil
+}
+
+// Gate-shape values a merge_candidate_verified row records (#5498).
+const (
+	mergeCandidateGateShapeFull             = "full"
+	mergeCandidateGateShapeSourceContracted = "contracted"
+)
+
+// mergeCandidateGateShape is the (gate_shape, gate_shape_source) a recorded
+// row carries: ("full", "contracted") for an executed pass (passed or
+// failed), ("", "") — both keys omitted — for every other result. The fan-in
+// merge-candidate pass is the single full verify a decomposed parent's merge
+// rests on (ADR-090 D3/D5), and the slice gate never narrows it.
+func mergeCandidateGateShape(result string) (shape, source string) {
+	switch result {
+	case mergeCandidateResultPassed, mergeCandidateResultFailed:
+		return mergeCandidateGateShapeFull, mergeCandidateGateShapeSourceContracted
+	}
+	return "", ""
 }
 
 // boundMergeCandidateTail keeps the LAST mergeCandidateOutputTailMax bytes of

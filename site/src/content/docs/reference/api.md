@@ -173,6 +173,20 @@ run their gates in different images. The runner applies its image policy,
 pull and build to that declaration. The object is absent when nothing is
 declared.
 
+The same two responses carry a `slice_gate` object on the implement stage of
+a decomposition child, unless the stage is a fix-up or a merge-candidate
+verify pass. It is the run's declared `verdict_transfer` block, reduced to
+two lists. `full_gate_paths` holds the workflow spec path, `global_surface`,
+`doc_check_inputs` and `opaque_paths`; a change matching one of them makes
+the child run the full verify gate. `inert_paths` holds the declared inert
+patterns. When the block is missing, malformed, has no `global_surface`
+entry or the spec does not parse, the object instead holds only
+`unavailable_reason` (`surface_undeclared`, `invalid_surface:<entry>`,
+`surface_incomplete` or `surface_unreadable`). The runner uses the lists to
+verify a child slice over the packages its change can reach; the parent's
+merge-candidate pass still verifies everything. Without the object the
+runner runs the full gate.
+
 The host-dispatch spawn marker
 (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`) also holds a stage
 that sits behind a deploy, which the table does not spell out. A `pending`
