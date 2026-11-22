@@ -506,6 +506,30 @@ run. The verb now refuses a decomposition child (and refuses when it cannot read
 the run row to tell), with `orphan_parent_ok:true` as the deliberate,
 disclosed-in-the-output override.
 
+### Stalled failed stage or undispatched child (stall page)
+
+fishhawkd's page-only stall watch (`--enable-stall-watch`, #5497; on in
+`scripts/dev`) pages when a condition has seen no operator or driver act for
+`--stall-watch-threshold` (default 30m). It never retries, revives, resumes or
+dispatches on its own. The page names the one legal remedy:
+
+- **`failed_stage_stalled`** (audit category `stage_failed_awaiting_operator`).
+  A failed stage on a live run: `fishhawk_retry_stage` on the named stage. A
+  failed run whose every failed stage is retryable: `fishhawk_revive_run`. A
+  failed decomposition child with a category-B failure under a live parent:
+  `fishhawk_resume_run` on the child.
+- **`child_dispatch_stalled`** (audit category
+  `child_dispatch_awaiting_operator`). A decomposition child whose implement
+  stage is dispatchable, but which nothing has spawned: `fishhawk_run_children`
+  on the parent. It does not page while a live fan-out holds the child behind
+  its cap, while a live slot waiter holds it, or while the host memory hold is
+  held.
+
+Any user- or agent-kind audit row on the run (or, for a child, on its parent)
+restarts the clock. A page whose episode has ended, for example because the
+stage was retried or dispatched or the run was cancelled, is never posted. The
+contract and residuals are in `backend/internal/stallwatch/README.md`.
+
 ### What a retry actually reaches (`fishhawk_retry_stage`, [E45.89 / #3624](https://github.com/kuhlman-labs/fishhawk/issues/3624))
 
 `fishhawk_retry_stage` **never spawns a runner.** It re-opens the stage and hands

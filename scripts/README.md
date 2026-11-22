@@ -1936,6 +1936,17 @@ to the campaign's parallel budget.
 - **Pins.** `scripts/test-dev` HD-f1 pins the flag, the opt-out and that the
   flag reaches the `serve` argv.
 
+They also pass `--enable-stall-watch` (#5497), which turns on the page-only
+stall watch. It pages when a failed stage, or a dispatchable decomposition
+child, has seen no operator or driver act for 30 minutes, and it never
+retries, revives or dispatches.
+
+- **Opting out.** `FISHHAWK_DEV_STALL_WATCH=0` drops the flag; fishhawkd's own
+  default is off. It takes effect at the next `up` or reload.
+- **Contract.** `backend/internal/stallwatch/README.md`.
+- **Pins.** `scripts/test-dev` SW-f1 pins the flag, the opt-out and that the
+  flag reaches the `serve` argv.
+
 ### `post-merge` and `reload`
 
 `scripts/dev post-merge [<issue>] [--start-deps]` is the one-step full per-PR
