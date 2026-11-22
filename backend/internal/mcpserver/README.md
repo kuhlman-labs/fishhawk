@@ -124,6 +124,37 @@ which a run-bound token is refused. The
 stage comes from `driveDispatchableStage`. A failed stage is never re-picked,
 so the dispatcher originates no retries.
 
+**The operator dispatch hold** ([#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486)).
+Right after the stage selection and the stale path's in-flight checks, and
+before the argv, the campaign-link read, the gate, the act, the marker and the
+spawn, a run whose read carries `dispatch_hold` (its own hold, or an inherited
+one from a `decomposed_from` / `parent_run_id` ancestor) refuses
+`run_dispatch_held`, and a run whose read carries `dispatch_hold_unavailable`
+refuses `dispatch_hold_unavailable` (fail closed: the backend could not read
+the hold). Both apply to a spawnable stage and to a stale re-spawn candidate,
+and neither touches in-flight work: a stage this process spawned, or one
+dispatched within the liveness threshold, still answers `in_flight`. Neither
+is benign, and neither sets `CampaignRefused`, so a held run charges no
+per-tick budget and spawns on the first tick after the clear. The refusal
+detail names the held run, `inherited`, `held_by` and the clear remedy; the
+hold `reason` is operator free text and appears only as the
+`run.dispatch_hold.reason` data field, never in a detail or next_step. A
+hold set after the run read reaches the dispatcher as a marker 409
+`run_dispatch_held`; that refusal comes after the gate admitted the attempt and
+the `run_auto_driven` act (`Held`), and its detail is rebuilt from the 409's
+ids, never from the error text that carries `details.reason`
+(`TestHostDispatcher_MarkerRunDispatchHeldDetailOmitsReason`). The
+backend marker enforces the same hold (409 `run_dispatch_held`) for every
+other spawner, so a queued slot waiter re-posting the marker stops on it
+(`TestSlotWaiter_StopsOnRunDispatchHeld`). Pinned by
+`TestHostDispatcher_RunDispatchHeldRefusesBeforeMarker`,
+`TestHostDispatcher_RunDispatchHoldLeavesInFlightAlone`,
+`TestHostDispatcher_DispatchHoldUnavailableRefusesStaleRespawn`,
+`TestTick_RunDispatchHoldParksChildrenUntilCleared` and, across the real
+serialization boundary (real POST and GET handlers, Postgres audit chain, real
+client decode into `fetchRunDriveView`),
+`TestRunDispatchHold_RealServerRefusesDispatcher`.
+
 **The single pre-marker sequence.** For each candidate, in order: the argv is
 composed (`composeStageRunnerArgv`, or `childRunnerArgv` for a child), then
 (1) the campaign-link read (`GET /v0/runs/{id}?include=campaign_link`)
@@ -232,7 +263,8 @@ wedged). Accepted risks:
 `not_eligible`, `parent_unreadable`, `working_dir_unbound`,
 `path_outside_allowed_roots`, `working_dir_absent`,
 `nothing_dispatchable`, `in_flight`, `stale_runner_live`,
-`stale_runner_unknown`, `stale_respawn_cap_reached`, the three campaign codes,
+`stale_runner_unknown`, `stale_respawn_cap_reached`, `run_dispatch_held`,
+`dispatch_hold_unavailable`, the three campaign codes,
 `implement_review_in_flight`, `implement_review_not_started`,
 `review_status_read_failed`, `lineage_lock_held`, `lineage_lock_probe_failed`,
 `paused`, `cap_reached:max_in_flight`, `cap_reached:daily` (only possible when
@@ -368,9 +400,12 @@ It adds no server API or wire type.
   advance) is provisionally `host_dispatch_unverified` naming both stage ids;
   `paused` / `pause_check_failed` (the mid-tick Admit race,
   `hostDispatchPausedRefusals`) read paused; `cap_reached:daily` reads human /
-  `host_dispatch_capped`; the deliberate holds `campaign_not_running` and
-  `campaign_dispatch_held` (`hostDispatchHoldRefusals`) read human /
-  `host_dispatch_refused` cause-first, with no hand-dispatch advice;
+  `host_dispatch_capped`; the deliberate holds `campaign_not_running`,
+  `campaign_dispatch_held` and `run_dispatch_held` (`hostDispatchHoldRefusals`)
+  read human / `host_dispatch_refused` cause-first, with no hand-dispatch
+  advice (`run_dispatch_held`'s next_step names `fishhawk_hold_dispatch`
+  action clear on the held run; `dispatch_hold_unavailable` is not a hold and
+  takes the default arm);
   `cap_reached:max_in_flight`, `concurrency_slot_queued`,
   `host_memory_pressure`, `marker_not_transitioned`,
   `dependency_not_satisfied` and `wave_not_integrated`
@@ -1427,6 +1462,16 @@ The spawn seam is CAPTURED into the waiter spec synchronously (`slotWaiterSpec.s
 **Tests.** `concurrency_slot_test.go`: the waiter unit tests over an in-file sequenced fake of `slotMarker` (spawn-once, another-session-wins, transient retry, terminal 4xx, the lost-response arms, rebuild-at-admission, cap expiry, cap-vs-in-flight, dedupe, spawn-failure release) and the END-TO-END `TestConcurrencySlot_E2E_TwoFakeRunners` / `_SpecLimitTwo` over a real `server.New` + pgtest Postgres concurrency store with recorded fake runners (they swap package seams, so no `t.Parallel`). The host-capacity e2e tests cross the MCP env → client wire → handler → store → rows boundary: `_HostCapacityTwo` (`FISHHAWK_HOST_CAPACITY=2` through the real resolver: an implement and an acceptance are admitted, a plan queues naming `host:<label>:capacity` at limit 2, and the table holds 2 held and 1 queued capacity rows), `_OldClientGetsThree` (no resolver: three plans admitted at 3, the fourth queued) and `_InvalidCapacityMarksNothing`. `hostcapacity_test.go` covers every env state and the lazy wiring, and `TestResolveProcessHostCapacity` drives the extracted production resolver (`resolveProcessHostCapacity`, which `processHostCapacity` wraps in `sync.OnceValues`) through `t.Setenv` (set-valid, set-invalid, unset), since the test binary's `init` pins `processHostCapacity`; `client_test.go` the send / omit / fail-closed-with-zero-requests wire arms and the queued error's every-verb-queues text. `dispatch_stage_test.go`: the queued arm (no spawn, waiter started, `next_step`) and the immediate-admission release, including its capacity-only row.
 
 The #3969 queued arms: `TestSlotWaiter_PrepareReceivesAdmittingResponse` (prepare gets the admitting response's `base_branch` on the admitted and the own-lost-admission arms; the 409 carries none) `TestStartQueuedSlotWaiter_NamesTheVerb`, `TestStartQueuedSlotWaiter_AlreadyWaitingKeepsFirstCallersInputs` and `TestSlotWaiterRegistry_HeldSince` (`concurrency_slot_test.go`); `TestConcurrencySlot_E2E_RunStageQueuesThenSpawnsDetached` (real `server.New` + pgtest: `run_stage` on B returns `awaiting_concurrency_slot` with a started waiter and no blocking spawn, and B is spawned once, detached, after A settles, its state read back from the store); `TestRunStage_QueuedDispatchReturnsAwaitingSlot`, `TestRunStage_QueuedPrepareUsesAdmissionTimeInputs`, `TestRunStage_LiveWaiterOwnsSpawnOnTransitionedFalse`, `TestRunStage_QueuedOutputSchema` and `TestRunStage_Description_QueuedDispatch` (`run_stage_test.go`); `TestDriveRun_QueuedDispatchStopsAwaitingSlot` (plan, implement and acceptance rows), `TestDriveRun_QueuedPrepareUsesAdmissionTimeInputs`, `TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse`, `TestDriveRun_QueuedPrepareFailureReleasesSlot` and `TestDriveRun_Description_QueuedDispatch` (`drive_run_test.go`); `TestRunChildren_QueuedChildMarkedQueued` (the budget: at `effective_cap` 1 two queuing children start one waiter and name the other in the budget warning), `TestRunChildren_LiveWaiterChildCountsInFlight`, `TestRunChildren_QueuedChildSpawnsOnAdmittingBaseBranch`, `TestRunChildren_QueuedPrepareUsesAdmissionTimeInputs` and `TestRunChildren_AdmissionResolveFailureCompensates` (`run_children_test.go`); `TestAwaitChildrenDispatchable_SkipsQueuedChildWithLiveWaiter` (`await_children_test.go`); and `TestAwaitStage_ReleasesWhenWaiterGone` / `TestAwaitStageToolDescription_NamesConcurrencyHold` (the stale-waiter message and description name every verb and the fan-out recovery). The store half, that a stale waiter's capacity reservation ends at `QueueTTL`, is `TestAdmitSet_StaleCapacityReservationEnds` (`backend/internal/concurrency/README.md` § "Host capacity group"). Each verb test that reads `concurrencySlotPollInterval` synchronously shrinks it before the queued call.
+
+### Holding a run's dispatches (`fishhawk_hold_dispatch`, [#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486))
+
+`fishhawk_hold_dispatch` (`dispatch_hold.go`) wraps `POST /v0/runs/{run_id}/dispatch-hold` (route contract: `backend/internal/server/docs/dispatch.md` § "Operator per-run dispatch hold"). WHEN: a run's next dispatch, or a decomposed parent's next child wave, must wait for the operator — for example a dependent wave that must not spawn in the same tick its predecessor integrates. The backend records the hold on the run's own audit chain (`run_dispatch_hold_set` / `run_dispatch_hold_cleared`, latest row wins) and enforces it at the host-dispatch marker for the run and every `decomposed_from` / `parent_run_id` descendant (at most 8 hops), so it binds every spawner: the host dispatcher, a queued slot waiter, `fishhawk_run_children`, `fishhawk_drive_run`, `fishhawk_run_stage` and a hand `fishhawk_dispatch_stage`. It never stops an in-flight stage. The audited clear is the only override; there is no per-dispatch bypass. This also dequeues a queued slot waiter (#4826): the waiter stops on the plain 409 `run_dispatch_held`, and its stale queue row stops counting after the concurrency `QueueTTL`.
+
+- **Input.** `run_id` (UUID), `action` (`set`, the default, or `clear`) and `reason` (required; trimmed, at most 1000 bytes, recorded on the audit row). Each is checked BEFORE the HTTP hop (`validateHoldDispatchInput`).
+- **Output.** `{run_id, action, changed, dispatch_hold, dispatch_hold_unavailable, audit_sequence, next_step}`. `dispatch_hold` is the EFFECTIVE hold after the act (`RunDispatchHold`, a byte-matched mirror of the server's `runDispatchHoldPayload`), so a clear on a child that still inherits a parent's hold reports `inherited: true` and the parent's `held_run_id`, and `next_step` names the clear on that run. A set while held and a clear while the run carries no own hold are `changed: false` no-ops. `next_step` is built from ids, flags and sequences only: the reason is DATA, never rendered into it (`holdDispatchNextStep`).
+- **Refusals.** Every backend refusal is a tool error carrying the code and `details` plus a remedy hint (`holdDispatchRefusalHint`): `run_not_found`, `run_terminal` (set on a terminal run; clear is always allowed), `run_token_forbidden`, `insufficient_scope`, `validation_failed`, `dispatch_hold_failed` (nothing recorded) and `dispatch_hold_unavailable` (no run or audit store).
+- **Auth.** `write:runs` (scope table `server/mcpscopes.go`, no `runBoundSubjectOK`). The backend refuses a run-bound agent token; a delegated operator-agent token is admitted, since a hold only stops or resumes host dispatch and grants no gate act. Any `write:runs` operator can clear a hold; the audit row records the actor.
+- **Read side.** `Run.DispatchHold` / `Run.DispatchHoldUnavailable` mirror `run.dispatch_hold` / `run.dispatch_hold_unavailable` on the single-run read (three states: held, not held, unknown); both are `tierNever` and retained by the diagnosis skeleton, like `host_dispatch`. The campaign status awaiting block's `dispatch_hold` (`campaignItemAwaiting.DispatchHold`) rides with the server's `human` / `dispatch_held` reason. Pinned by `TestHoldDispatch_ForwardsSetAndClear`, `TestHoldDispatch_ValidatesBeforeHTTP`, `TestHoldDispatch_RefusalHints`, `TestHoldDispatch_NextStepNeverEmbedsReason` and `TestRunMirror_DispatchHoldDecodes` (`dispatch_hold_test.go`).
 
 ### Promoting a queued waiter (`fishhawk_promote_queued_stage`, [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 

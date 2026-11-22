@@ -111,6 +111,11 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/comms-dispositions", s.requireRunAccount(readAccess, s.handleListCommsDispositions))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive", s.requireRunAccount(memberWrite, s.handleAutoDrive))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive/acts", s.requireRunAccount(memberWrite, s.handleAutoDriveRecordAct))
+	// Operator per-run dispatch hold (E110.50 / #5486): set or clear a hold
+	// the host-dispatch marker enforces for the run and its decomposition
+	// descendants (run_dispatch_hold.go). memberWrite: a delegated operator
+	// agent is admitted, since a hold grants no gate act.
+	mux.HandleFunc("POST /v0/runs/{run_id}/dispatch-hold", s.requireRunAccount(memberWrite, s.handleRunDispatchHold))
 	// On-demand orphaned-review recovery (#2712): the same per-run helper the
 	// boot sweep runs, reachable without restarting the daemon. adminWrite
 	// mirrors the sibling recovery verb reap-failure.

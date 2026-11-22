@@ -4297,3 +4297,120 @@ func TestGetRun_MergeCandidateQueue_MergeGateYieldNote(t *testing.T) {
 		})
 	}
 }
+
+// TestGetRun_DispatchHold (E110.50 / #5486): the single-run read projects the
+// run's EFFECTIVE dispatch hold: its own, an inherited one, absent when
+// unheld, dispatch_hold_unavailable on a read error (the read still answers
+// 200), and no hold read at all for a terminal run.
+func TestGetRun_DispatchHold(t *testing.T) {
+	get := func(t *testing.T, f *runHoldFixture, id uuid.UUID) (runResponse, map[string]json.RawMessage) {
+		t.Helper()
+		w, body := requestPath(t, f.s, http.MethodGet, "/v0/runs/"+id.String(), nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET = %d %s", w.Code, body)
+		}
+		var resp runResponse
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.Unmarshal(body, &raw)
+		return resp, raw
+	}
+	t.Run("own", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		r := f.rr.seedRun()
+		f.aud.seed(t, r.ID, CategoryRunDispatchHoldSet, "own hold")
+		resp, _ := get(t, f, r.ID)
+		if resp.DispatchHold == nil || resp.DispatchHold.Inherited || resp.DispatchHold.HeldRunID != r.ID.String() ||
+			resp.DispatchHold.Reason != "own hold" || resp.DispatchHold.HeldBy != "github:seed" || resp.DispatchHold.AuditSequence == 0 {
+			t.Fatalf("dispatch_hold = %+v", resp.DispatchHold)
+		}
+	})
+	t.Run("inherited", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		p := f.rr.seedRun()
+		c := f.childOf(p.ID)
+		f.aud.seed(t, p.ID, CategoryRunDispatchHoldSet, "parent hold")
+		resp, _ := get(t, f, c.ID)
+		if resp.DispatchHold == nil || !resp.DispatchHold.Inherited || resp.DispatchHold.HeldRunID != p.ID.String() ||
+			resp.DispatchHold.Reason != "parent hold" || resp.DispatchHold.HeldBy != "github:seed" {
+			t.Fatalf("dispatch_hold = %+v", resp.DispatchHold)
+		}
+	})
+	// A run-bound mcp:run: caller reading its own run: an INHERITED hold
+	// withholds the ancestor's reason and held_by (another run's chain); the
+	// held state and held_run_id stay. Its OWN hold keeps both (same-run).
+	t.Run("run-bound caller", func(t *testing.T) {
+		getAs := func(t *testing.T, f *runHoldFixture, id uuid.UUID) runResponse {
+			t.Helper()
+			req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+id.String(), nil)
+			req.SetPathValue("run_id", id.String())
+			req = withIdentity(req, Identity{Subject: "mcp:run:" + id.String(), TokenID: "tok-run", Scopes: []string{"read:runs"}})
+			w := httptest.NewRecorder()
+			f.s.handleGetRun(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("GET = %d %s", w.Code, w.Body.String())
+			}
+			var resp runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			return resp
+		}
+		f := newRunHoldFixture(t)
+		p := f.rr.seedRun()
+		c := f.childOf(p.ID)
+		f.aud.seed(t, p.ID, CategoryRunDispatchHoldSet, "parent hold")
+		resp := getAs(t, f, c.ID)
+		if h := resp.DispatchHold; h == nil || !h.Inherited || h.HeldRunID != p.ID.String() || h.Reason != "" || h.HeldBy != "" {
+			t.Fatalf("inherited dispatch_hold for a run-bound caller = %+v; want held, held_run_id %s, reason and held_by withheld", h, p.ID)
+		}
+		own := f.rr.seedRun()
+		f.aud.seed(t, own.ID, CategoryRunDispatchHoldSet, "own hold")
+		if h := getAs(t, f, own.ID).DispatchHold; h == nil || h.Inherited || h.Reason != "own hold" || h.HeldBy != "github:seed" {
+			t.Fatalf("own dispatch_hold for a run-bound caller = %+v; want reason and held_by kept", h)
+		}
+	})
+	t.Run("absent when unheld", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		r := f.rr.seedRun()
+		_, raw := get(t, f, r.ID)
+		if _, ok := raw["dispatch_hold"]; ok {
+			t.Fatal("dispatch_hold present on an unheld run")
+		}
+		if _, ok := raw["dispatch_hold_unavailable"]; ok {
+			t.Fatal("dispatch_hold_unavailable present on a readable unheld run")
+		}
+	})
+	t.Run("unavailable on a read error", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		r := f.rr.seedRun()
+		f.aud.holdListErr = errors.New("read down")
+		resp, raw := get(t, f, r.ID)
+		if !resp.DispatchHoldUnavailable || resp.DispatchHold != nil {
+			t.Fatalf("resp = unavailable %v hold %+v", resp.DispatchHoldUnavailable, resp.DispatchHold)
+		}
+		if _, ok := raw["dispatch_hold"]; ok {
+			t.Fatal("dispatch_hold present beside dispatch_hold_unavailable")
+		}
+	})
+	t.Run("terminal run does no hold read", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		r := f.rr.seedRun()
+		f.aud.seed(t, r.ID, CategoryRunDispatchHoldSet, "held then cancelled")
+		f.rr.mu.Lock()
+		f.rr.runs[r.ID].State = run.StateCancelled
+		f.rr.mu.Unlock()
+		// A failing hold read would set dispatch_hold_unavailable; a terminal
+		// run must not read at all.
+		f.aud.holdListErr = errors.New("read down")
+		_, raw := get(t, f, r.ID)
+		if _, ok := raw["dispatch_hold_unavailable"]; ok {
+			t.Fatal("a terminal run read its dispatch hold")
+		}
+		if _, ok := raw["dispatch_hold"]; ok {
+			t.Fatal("a terminal run projected a dispatch hold")
+		}
+	})
+}

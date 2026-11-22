@@ -246,8 +246,17 @@ type runResponse struct {
 	// #4526). Nil (omitted) on every other read, so a read without the include
 	// is byte-identical and costs no extra query.
 	CampaignLink *campaignLinkPayload `json:"campaign_link,omitempty"`
-	CreatedAt    time.Time            `json:"created_at"`
-	UpdatedAt    time.Time            `json:"updated_at"`
+	// DispatchHold is the run's EFFECTIVE operator dispatch hold (E110.50 /
+	// #5486): its own, or the nearest held DecomposedFrom / ParentRunID
+	// ancestor's (inherited true). Served on the single-run read of a
+	// non-terminal run only; omitted when not held. DispatchHoldUnavailable
+	// reports that the hold read failed, so held, not held and unknown stay
+	// three states. Best-effort: the marker re-checks fail closed. The MCP
+	// client mirror decodes both; the json tags MUST byte-match.
+	DispatchHold            *runDispatchHoldPayload `json:"dispatch_hold,omitempty"`
+	DispatchHoldUnavailable bool                    `json:"dispatch_hold_unavailable,omitempty"`
+	CreatedAt               time.Time               `json:"created_at"`
+	UpdatedAt               time.Time               `json:"updated_at"`
 	// Concerns is the run's OPEN review-concern summary (#964): count,
 	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
 	// concern_ids addressing needs. Populated by handleGetRun ONLY —
@@ -2569,6 +2578,28 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp.CampaignLink = link
+	}
+	// dispatch_hold (E110.50 / #5486) on the single-run read of a
+	// NON-TERMINAL run only; the list route pays no per-row read. Best-effort:
+	// a resolver error warn-logs and sets dispatch_hold_unavailable rather
+	// than failing the read, because the host-dispatch marker re-checks the
+	// hold fail closed. An INHERITED hold read by a run-bound mcp:run: caller
+	// withholds the ancestor's reason and held_by (emptied): that text lives
+	// on another run's chain, and the run-bound audit categories are readable
+	// as same-run payload only (audit/categories.go). The held state,
+	// held_run_id, held_at and audit_sequence stay.
+	if !got.State.IsTerminal() {
+		hold, herr := s.resolveRunDispatchHold(r.Context(), got)
+		if herr != nil {
+			s.cfg.Logger.Warn("dispatch hold read failed; reporting dispatch_hold_unavailable",
+				"run_id", runID.String(), "error", herr.Error())
+			resp.DispatchHoldUnavailable = true
+		} else {
+			if hold != nil && hold.Inherited && strings.HasPrefix(IdentityFrom(r.Context()).Subject, "mcp:run:") {
+				hold.Reason, hold.HeldBy = "", ""
+			}
+			resp.DispatchHold = hold
+		}
 	}
 	// forge_base_url (E45.46 / #3463) on the single-run read ONLY — the
 	// list endpoint deliberately omits it (no per-row registry read), and

@@ -1598,3 +1598,22 @@ func TestConcurrencySlot_E2E_InvalidCapacityMarksNothing(t *testing.T) {
 		t.Errorf("slot rows for the stage = %d, want 0", n)
 	}
 }
+
+// E110.50 / #5486 (s): a queued slot waiter re-POSTing the marker stops on a
+// plain 409 run_dispatch_held after ONE marker call and spawns nothing, so an
+// operator dispatch hold dequeues a waiter (#4826's "the waiter honours a
+// hold" alternative). Existing terminal-4xx behaviour, pinned for the code.
+func TestSlotWaiter_StopsOnRunDispatchHeld(t *testing.T) {
+	held := markerAnswer{err: &apiError{StatusCode: 409, Code: "run_dispatch_held", Message: "an operator dispatch hold on this run parks new host dispatches"}}
+	m := &seqMarker{answers: []markerAnswer{held, admittedAnswer}}
+	rec := &slotSpawnRecorder{}
+	spec := testSlotSpec(m, rec)
+	_, done := slotWaiters.start(spec)
+	waitDone(t, done)
+	if calls, _, _ := m.snapshot(); calls != 1 {
+		t.Fatalf("marker calls = %d, want 1 (run_dispatch_held stops the waiter)", calls)
+	}
+	if got := rec.spawned(); len(got) != 0 {
+		t.Fatalf("spawns = %v, want none under a dispatch hold", got)
+	}
+}
