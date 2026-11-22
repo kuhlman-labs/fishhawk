@@ -365,6 +365,15 @@ func checkSeedCheckout(checkout string) (root, workFile string, err error) {
 	return root, "", nil
 }
 
+// RequireRegularModuleMetadata refuses (ErrSeedCheckout) any go.mod, go.sum,
+// go.work or go.work.sum in dir that exists but is not a regular file: Lstat
+// only, so a symlink is refused and never followed, and the file is never
+// opened. It is a delegate to seedRequireRegularMetadata, so the container
+// module seed and its second consumer, the runner's slice-gate reach load
+// (#5498, runner/cmd/fishhawk-runner/slicereach.go), share ONE predicate over
+// the same four names.
+func RequireRegularModuleMetadata(dir string) error { return seedRequireRegularMetadata(dir) }
+
 // seedRequireRegularMetadata refuses any seedMetadataFiles entry in dir that
 // exists but is not a regular file (Lstat: a symlink is refused, never
 // followed).
