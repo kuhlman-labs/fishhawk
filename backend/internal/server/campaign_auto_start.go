@@ -160,7 +160,7 @@ type campaignAutoStartRefusalPayload struct {
 // ResolveCampaignAutoStart refuses it. Derived from config plus the campaign
 // row, never persisted.
 func (s *Server) campaignAutoStartRefusalForStatus(c *campaign.Campaign) *campaignAutoStartRefusalPayload {
-	if s.cfg.CampaignAutoStartRunnerKind == "" || c == nil || c.State != campaign.StateRunning {
+	if !s.campaignDriverRuns() || c == nil || c.State != campaign.StateRunning {
 		return nil
 	}
 	res := ResolveCampaignAutoStart(c, s.cfg.CampaignAutoStartRunnerKind)
@@ -174,4 +174,18 @@ func (s *Server) campaignAutoStartRefusalForStatus(c *campaign.Campaign) *campai
 		Detail:           res.Detail,
 		Remedy:           res.Remedy,
 	}
+}
+
+// campaignDriverRuns reports whether this deployment runs the campaign driver
+// (#5266). It reads Config.CampaignAutoStartRunnerKind, which serve.go sets
+// (campaignAutoStartStatusKind) ONLY when the driver ticker actually starts;
+// validateAutoStartRunnerKind refuses an empty --auto-start-runner-kind, so a
+// running driver always leaves it non-empty and a driver-off deployment always
+// leaves it empty. Two readers: the status read's auto_start_refusal block and
+// create-open (handleCreateCampaign opens a new campaign running at create so
+// the driver, which lists only running campaigns, picks it up on its next
+// tick). It is NEVER used to infer the auto_dispatch mark: the operator item
+// start stamps that only by its explicit request flag (ADR-104 Q3).
+func (s *Server) campaignDriverRuns() bool {
+	return s.cfg.CampaignAutoStartRunnerKind != ""
 }
