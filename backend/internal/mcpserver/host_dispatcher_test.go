@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -352,6 +353,33 @@ type hdHarness struct {
 	spawner *hdSpawner
 	gate    *hdGate
 	root    string
+	// lock is the verdict the lineage-lock seam returns (#5485; default
+	// free); lockInputs records every probe input.
+	lockMu     sync.Mutex
+	lock       hostDispatchLineageLock
+	lockInputs []hostDispatchLineageLockInput
+}
+
+// setLock sets the lineage-lock seam's verdict.
+func (h *hdHarness) setLock(v hostDispatchLineageLock) {
+	h.lockMu.Lock()
+	defer h.lockMu.Unlock()
+	h.lock = v
+}
+
+// lineageLock is the harness's lineage-lock seam.
+func (h *hdHarness) lineageLock(_ context.Context, in hostDispatchLineageLockInput) hostDispatchLineageLock {
+	h.lockMu.Lock()
+	defer h.lockMu.Unlock()
+	h.lockInputs = append(h.lockInputs, in)
+	return h.lock
+}
+
+// probeCalls is how many times the lineage-lock seam ran.
+func (h *hdHarness) probeCalls() int {
+	h.lockMu.Lock()
+	defer h.lockMu.Unlock()
+	return len(h.lockInputs)
 }
 
 func newHDHarness(t *testing.T) *hdHarness {
@@ -366,7 +394,9 @@ func newHDHarness(t *testing.T) *hdHarness {
 	d.spawn = sp.spawn
 	d.probe = func(context.Context, string) runnerLivenessVerdict { return runnerDead }
 	d.environ = func() []string { return []string{"PATH=/usr/bin"} }
-	return &hdHarness{b: b, d: d, spawner: sp, gate: g, root: root}
+	h := &hdHarness{b: b, d: d, spawner: sp, gate: g, root: root}
+	d.lineageLock = h.lineageLock
+	return h
 }
 
 var hdUnlinked = &runCampaignLink{Status: "unlinked", Campaigns: []runCampaignLinkEntry{}}
@@ -514,7 +544,7 @@ func TestHostDispatcher_RacingDispatchersSpawnOnce(t *testing.T) {
 	}
 	// A second dispatcher that read the stage parked before the first won.
 	other := newHostDispatcher(h.d.r, h.d.binary, &hdGate{}, newHDCounter())
-	other.spawn, other.environ = h.spawner.spawn, h.d.environ
+	other.spawn, other.environ, other.lineageLock = h.spawner.spawn, h.d.environ, h.d.lineageLock
 	o1 := h.eval(t, r)
 	h.b.setState(r, r.Stages[0].ID, "awaiting_host_dispatch") // the race: both read it parked
 	o2 := other.evaluate(context.Background(), uuid.MustParse(r.ID))
@@ -683,7 +713,7 @@ func TestHostDispatcher_StaleRespawnCappedAtOne(t *testing.T) {
 	// A restarted dispatcher (empty running set) over the same counter and the
 	// same marker epoch.
 	restarted := newHostDispatcher(h.d.r, h.d.binary, h.gate, h.d.respawns)
-	restarted.spawn, restarted.probe, restarted.environ = h.spawner.spawn, h.d.probe, h.d.environ
+	restarted.spawn, restarted.probe, restarted.environ, restarted.lineageLock = h.spawner.spawn, h.d.probe, h.d.environ, h.d.lineageLock
 	for i := 0; i < 5; i++ {
 		if o := restarted.evaluate(context.Background(), uuid.MustParse(r.ID)); o.Spawned || o.Refusal != hdRefuseStaleRespawnCap {
 			t.Fatalf("eval %d after the re-spawn = %+v; want stale_respawn_cap_reached", i, o)
@@ -1170,7 +1200,7 @@ func TestHostDispatcher_StaleRespawnReturnedOnPreSpawnFailure(t *testing.T) {
 		t.Fatalf("acts=%d spawns=%d; want one row and one re-spawn", len(h.b.acts), h.spawner.n())
 	}
 	restarted := newHostDispatcher(h.d.r, h.d.binary, h.gate, h.d.respawns)
-	restarted.spawn, restarted.probe, restarted.environ = h.spawner.spawn, h.d.probe, h.d.environ
+	restarted.spawn, restarted.probe, restarted.environ, restarted.lineageLock = h.spawner.spawn, h.d.probe, h.d.environ, h.d.lineageLock
 	if o := restarted.evaluate(context.Background(), uuid.MustParse(r.ID)); o.Spawned || o.Refusal != hdRefuseStaleRespawnCap {
 		t.Fatalf("after the re-spawn = %+v; want stale_respawn_cap_reached (the spawn consumed the epoch)", o)
 	}
@@ -1498,5 +1528,162 @@ func TestTick_RoundHeldAcceptanceCountsAgainstPerTickCap(t *testing.T) {
 	}
 	if lh.spawner.n() != 0 || lh.b.count(isMarkerReq) != 0 {
 		t.Fatal("a round-held acceptance must not be marked or spawned")
+	}
+}
+
+// reopenedImplementRun is the #5485 shape: acceptance succeeded and the
+// implement stage was re-opened for a fix-up, so the dispatcher selects it
+// while the acceptance runner may still hold the lineage lock.
+func reopenedImplementRun(h *hdHarness) *hdRun {
+	return h.addRun(func(r *hdRun) {
+		r.Stages = []Stage{
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 1, Type: "plan", State: "succeeded", UpdatedAt: time.Now()},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 2, Type: "implement", State: "awaiting_host_dispatch", UpdatedAt: time.Now()},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 3, Type: "acceptance", State: "succeeded", UpdatedAt: time.Now()},
+		}
+	})
+}
+
+var hdHeldLock = hostDispatchLineageLock{Held: true, HolderPID: 4242, HolderRunID: "acceptance-holder-run", LockPath: "/repo/.git/fishhawk-worktrees/run-abcd1234.lock", Root: "abcd1234"}
+
+// #5485: a live lineage-lock holder defers the re-opened implement stage with
+// nothing reserved, recorded, marked or spawned; a free lock spawns it.
+func TestHostDispatcher_LineageLockHeldDefers(t *testing.T) {
+	h := newHDHarness(t)
+	r := reopenedImplementRun(h)
+	h.setLock(hdHeldLock)
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseLineageLockHeld || !o.CampaignRefused || o.StageType != "implement" {
+		t.Fatalf("held lock = %+v; want lineage_lock_held on implement, CampaignRefused", o)
+	}
+	for _, want := range []string{"4242", "acceptance-holder-run", hdHeldLock.LockPath, "first tick that evaluates the run"} {
+		if !strings.Contains(o.Detail, want) {
+			t.Errorf("detail %q does not name %q", o.Detail, want)
+		}
+	}
+	h.assertNothingPosted(t, "lineage lock held")
+	if h.b.stageState(r.ID, r.Stages[1].ID) != "awaiting_host_dispatch" {
+		t.Fatal("a held implement stage must stay awaiting_host_dispatch")
+	}
+	h.setLock(hostDispatchLineageLock{LockPath: hdHeldLock.LockPath})
+	if o := h.eval(t, r); !o.Spawned || o.StageType != "implement" {
+		t.Fatalf("freed lock = %+v; want the implement stage spawned", o)
+	}
+	if h.spawner.n() != 1 {
+		t.Fatalf("spawns = %d; want exactly 1 after the lock frees", h.spawner.n())
+	}
+}
+
+// #5485 (L1): a probe that cannot decide refuses fail closed: no marker, no
+// record act, no reservation and no spawn.
+func TestHostDispatcher_LineageLockProbeFailedFailsClosed(t *testing.T) {
+	h := newHDHarness(t)
+	r := reopenedImplementRun(h)
+	h.setLock(hostDispatchLineageLock{Err: errors.New("fishhawk-runner lineage-lock-status exited 2 (usage)")})
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseLineageLockProbeFailed || !o.CampaignRefused {
+		t.Fatalf("probe failure = %+v; want lineage_lock_probe_failed, CampaignRefused", o)
+	}
+	if !strings.Contains(o.Detail, "exited 2 (usage)") {
+		t.Errorf("detail %q does not carry the probe error", o.Detail)
+	}
+	h.assertNothingPosted(t, "lineage lock probe failed")
+
+	h2 := newHDHarness(t)
+	h2.d.lineageLock = nil
+	r2 := reopenedImplementRun(h2)
+	if o := h2.eval(t, r2); o.Spawned || o.Refusal != hdRefuseLineageLockProbeFailed {
+		t.Fatalf("nil probe = %+v; want lineage_lock_probe_failed", o)
+	}
+	h2.assertNothingPosted(t, "nil lineage lock probe")
+}
+
+// #5485: the stale re-spawn path is held too, before its epoch is reserved.
+func TestHostDispatcher_LineageLockHeldDefersStaleRespawn(t *testing.T) {
+	h := newHDHarness(t)
+	r := staleRun(h, time.Hour)
+	h.setLock(hdHeldLock)
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseLineageLockHeld {
+		t.Fatalf("held stale stage = %+v; want lineage_lock_held", o)
+	}
+	st := r.Stages[0]
+	if !h.d.respawns.Allowed(st.ID, st.UpdatedAt) {
+		t.Fatal("a held stale stage consumed its marker epoch's re-spawn")
+	}
+	h.assertNothingPosted(t, "held stale re-spawn")
+}
+
+// #5485: the probe carries the lineage inputs the spawned runner computes its
+// root from: a solo run's own id, and a child's parent plus --parallel-isolate.
+func TestHostDispatcher_LineageLockProbeInputs(t *testing.T) {
+	h := newHDHarness(t)
+	solo := h.addRun(nil)
+	if o := h.eval(t, solo); !o.Spawned {
+		t.Fatalf("solo = %+v; want spawned", o)
+	}
+	want := hostDispatchLineageLockInput{WorkingDir: solo.WorkingDir, RunID: solo.ID}
+	if len(h.lockInputs) != 1 || h.lockInputs[0] != want {
+		t.Fatalf("solo probe inputs = %+v; want [%+v]", h.lockInputs, want)
+	}
+
+	ch, parent, kids := childHarness(t, "")
+	kid := kids[0]
+	if o := ch.eval(t, kid); !o.Spawned {
+		t.Fatalf("child = %+v; want spawned", o)
+	}
+	want = hostDispatchLineageLockInput{WorkingDir: kid.WorkingDir, RunID: kid.ID, DecomposedFrom: parent.ID, ParallelIsolate: true}
+	if len(ch.lockInputs) != 1 || ch.lockInputs[0] != want {
+		t.Fatalf("child probe inputs = %+v; want [%+v]", ch.lockInputs, want)
+	}
+}
+
+// #5485: a held campaign refuses for campaign state before the probe runs.
+func TestHostDispatcher_LineageLockCheckedAfterCampaignHold(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(func(r *hdRun) { r.Link = hdLinked("paused") })
+	h.setLock(hdHeldLock)
+	if o := h.eval(t, r); o.Refusal != hdRefuseCampaignNotRunning {
+		t.Fatalf("paused campaign = %+v; want campaign_not_running", o)
+	}
+	if n := h.probeCalls(); n != 0 {
+		t.Fatalf("lineage lock probe ran %d time(s); want 0 (the campaign hold comes first)", n)
+	}
+}
+
+// #5485: the default probe execs the runner with the spawn's scrubbed env, so
+// the dispatcher bearer never reaches the probe process.
+func TestHostDispatcher_LineageLockProbeEnvExcludesDispatcherToken(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fake runner")
+	}
+	h := newHDHarness(t)
+	dir := t.TempDir()
+	envOut := filepath.Join(dir, "env.txt")
+	bin := filepath.Join(dir, "fishhawk-runner")
+	script := "#!/bin/sh\nenv > '" + envOut + "'\n" +
+		`echo '{"root":"r","lock_path":"/l.lock","present":false,"held":false,"holder_pid":0,"holder_run_id":""}'` + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FISHHAWK_API_TOKEN", hdTestBearer)
+	t.Setenv("FISHHAWK_HD_TEST_ALIAS", hdTestBearer)
+	d := newHostDispatcher(h.d.r, bin, h.gate, newHDCounter())
+	d.environ = os.Environ
+	got := d.lineageLock(context.Background(), hostDispatchLineageLockInput{WorkingDir: h.root, RunID: uuid.NewString()})
+	if got.Err != nil || got.Held {
+		t.Fatalf("default probe = %+v; want a free verdict", got)
+	}
+	data, err := os.ReadFile(envOut)
+	if err != nil {
+		t.Fatalf("the fake runner recorded no env: %v", err)
+	}
+	if !strings.Contains(string(data), "PATH=") {
+		t.Fatalf("recorded env lacks PATH; the recording is not the probe's env:\n%s", data)
+	}
+	for _, kv := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(kv, "FISHHAWK_API_TOKEN=") || strings.Contains(kv, hdTestBearer) {
+			t.Fatalf("probe env carries the dispatcher bearer: %q", kv)
+		}
 	}
 }

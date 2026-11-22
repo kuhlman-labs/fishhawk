@@ -68,6 +68,12 @@ const (
 // says the round may be orphaned and names the read and the re-run verbs.
 const hostDispatchReviewRoundOrphanAfter = 30 * time.Minute
 
+// hostDispatchLineageLockStuckAfter is how long a lineage_lock_held refusal
+// (#5485) reads as routine waiting: a runner of the run's lineage, typically
+// the previous stage tearing down its preview, still holds the lineage lock.
+// Past it the holder may be wedged and the read escalates to the operator.
+const hostDispatchLineageLockStuckAfter = 15 * time.Minute
+
 // hostDispatchOverlayReadCap bounds the GetRun reads one campaign status call
 // spends on working_dir rungs. Each read is a backend round trip inside a
 // status call the operator polls on every drive tick. A decisive env or cwd
@@ -90,7 +96,8 @@ const hostDispatchDefaultStateDirName = "fishhawk-host-dispatch"
 
 // The per-run refusal code sets. Membership is tested on the RAW code read
 // from the file; output carries the bounded copy. A new code reaches the right
-// arm only by joining a set here (an unknown non-benign code reads refusing).
+// arm only by joining a set here or by a dedicated arm in observeHostDispatch
+// (lineage_lock_held, #5485); an unknown non-benign code reads refusing.
 var (
 	// hostDispatchPausedRefusals are the mid-tick Admit pause refusals (a pause
 	// that landed after the tick's own pause check).
@@ -497,6 +504,28 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 					obs.RefusalCode, obs.RefusalFirstAt)
 			}
 			provisionalVerdict = hostDispatchVerdict{Kind: hostDispatchAwaitKindSystem, Reason: hostDispatchReasonInFlight, NextStep: next}
+		case ref.Code == hdRefuseLineageLockHeld:
+			// #5485: a live runner of this lineage still holds the lineage
+			// lock. The dispatcher re-evaluates on its own, so the read waits;
+			// past hostDispatchLineageLockStuckAfter the holder may be wedged.
+			// lineage_lock_probe_failed stays on the default refusing arm: an
+			// operator must fix the runner binary.
+			if now.Sub(ref.FirstAt) <= hostDispatchLineageLockStuckAfter {
+				provisional = hostDispatchStateWaiting
+				provisionalVerdict = hostDispatchVerdict{
+					Kind:     hostDispatchAwaitKind,
+					Reason:   hostDispatchReasonDispatch,
+					NextStep: "A runner for this run's lineage (typically the previous stage tearing down its preview) still holds the lineage lock (lineage_lock_held). The host dispatcher spawns the stage on the first tick that evaluates the run after the lock frees; no operator action is needed.",
+				}
+				break
+			}
+			obs.State = hostDispatchStateRefusing
+			return obs, hostDispatchVerdict{
+				Kind:   hostDispatchAwaitKindHuman,
+				Reason: hostDispatchReasonRefused,
+				NextStep: fmt.Sprintf("The run's lineage lock has held this stage (%s) since %s, longer than %s, so its holder may be wedged%s. Once the holder exits the dispatcher spawns the stage on its next tick; if it is an orphaned runner, cancel its run or kill the pid by hand.",
+					obs.RefusalCode, obs.RefusalFirstAt, hostDispatchLineageLockStuckAfter, detail),
+			}
 		case hostDispatchWaitingRefusals[ref.Code]:
 			provisional = hostDispatchStateWaiting
 		default:

@@ -19,8 +19,9 @@ import (
 // the run's parked stage, and walks the single pre-marker sequence when it
 // does:
 //
-//	campaign-link read (fail closed) -> gate (caps + pause, injected)
-//	-> record run_auto_driven (fail closed) -> host-dispatch marker -> spawn
+//	campaign-link read (fail closed) -> review round and lineage-lock holds
+//	-> gate (caps + pause, injected) -> record run_auto_driven (fail closed)
+//	-> host-dispatch marker -> spawn
 //
 // The core has NO goroutines and never acts on its own: the tick loop
 // (host_dispatcher_loop.go, slice 3) is its only caller, so every marker POST
@@ -74,6 +75,13 @@ const (
 	hdRefuseMarkerNotTransitioned     = "marker_not_transitioned"
 	hdRefuseSpawnCancelled            = "spawn_refused_run_cancelled"
 	hdRefuseSpawnFailed               = "spawn_failed"
+
+	// The lineage-lock hold (#5485): a live runner still holds the run's
+	// lineage lock, or the probe could not decide (fail closed). Neither is
+	// benign: each is logged once per unbroken run and recorded in
+	// run_refusals.
+	hdRefuseLineageLockHeld        = "lineage_lock_held"
+	hdRefuseLineageLockProbeFailed = "lineage_lock_probe_failed"
 )
 
 // defaultHostDispatchStaleAfter is how long a 'dispatched' stage this process
@@ -128,9 +136,10 @@ type hostDispatchOutcome struct {
 	// awaiting_host_dispatch and the next tick should re-attempt it first.
 	QueueEpisode bool
 	// CampaignRefused marks a refusal after the campaign-link read and before
-	// the gate: for campaign state, or for the implement review round hold on
-	// an acceptance stage (#5298). The tick counts it against the per-tick cap,
-	// which therefore bounds the campaign-link reads, and moves the run last
+	// the gate: for campaign state, for the implement review round hold on an
+	// acceptance stage (#5298), or for the lineage-lock hold (#5485). The tick
+	// counts it against the per-tick cap, which therefore bounds the
+	// campaign-link reads and the lineage-lock probes, and moves the run last
 	// next time; it never skips it without a fresh read.
 	CampaignRefused bool
 	// Held marks a refusal AFTER the gate admitted the attempt (the server's
@@ -159,6 +168,10 @@ type hostDispatcher struct {
 	spawn driveSpawnFunc
 	// probe is the runner liveness seam (default probeRunnerLiveness).
 	probe func(ctx context.Context, stageID string) runnerLivenessVerdict
+	// lineageLock is the lineage-lock probe seam (#5485; default execs
+	// `<binary> lineage-lock-status` with the spawn's scrubbed env). nil
+	// refuses lineage_lock_probe_failed (fail closed).
+	lineageLock func(ctx context.Context, in hostDispatchLineageLockInput) hostDispatchLineageLock
 	// now is the clock seam.
 	now func() time.Time
 	// environ is the process-environment seam (default os.Environ).
@@ -181,7 +194,7 @@ type hostDispatcher struct {
 }
 
 func newHostDispatcher(r *runResolver, binary string, gate hostDispatchGate, respawns hostDispatchRespawnCounter) *hostDispatcher {
-	return &hostDispatcher{
+	h := &hostDispatcher{
 		r:          r,
 		binary:     binary,
 		gate:       gate,
@@ -194,6 +207,16 @@ func newHostDispatcher(r *runResolver, binary string, gate hostDispatchGate, res
 		running:    map[string]bool{},
 		recorded:   map[string]string{},
 	}
+	// The probe exec carries the spawn's environment: never the dispatcher
+	// bearer (hostDispatchRunnerEnv), the same custody rule as the spawn.
+	h.lineageLock = func(ctx context.Context, in hostDispatchLineageLockInput) hostDispatchLineageLock {
+		token := ""
+		if h.r != nil && h.r.api != nil {
+			token = h.r.api.token
+		}
+		return probeHostDispatchLineageLock(ctx, h.binary, hostDispatchRunnerEnv(h.environ(), token), in)
+	}
+	return h
 }
 
 // hostDispatchSpawnable is the dispatched-vs-fresh split for a stage
@@ -346,6 +369,16 @@ func hdRoundHoldDetail(hold string) string {
 	return "the implement review round is in flight; acceptance dispatches on the first tick after the round settles"
 }
 
+// hdLineageLockHeldDetail is the refusal detail for a held lineage lock.
+func hdLineageLockHeldDetail(lock hostDispatchLineageLock) string {
+	holderRun := lock.HolderRunID
+	if holderRun == "" {
+		holderRun = "unknown"
+	}
+	return fmt.Sprintf("the run's lineage lock %s is held by live pid %d (run %s), typically the previous stage's runner tearing down its preview; the stage spawns on the first tick that evaluates the run after the holder releases the lock",
+		lock.LockPath, lock.HolderPID, holderRun)
+}
+
 // evaluate decides one candidate run and walks the pre-marker sequence when it
 // is admissible. It is synchronous; a refusal commits at most the one
 // run_auto_driven row of the dispatch attempt it refused.
@@ -361,9 +394,12 @@ func hdRoundHoldDetail(hold string) string {
 // After the stage read and argv composition come the campaign-link read, then
 // (#5298) the implement review round hold on a fresh acceptance spawn
 // (implement_review_in_flight, implement_review_not_started, or
-// review_status_read_failed when the round cannot be read), then the gate. A
-// held campaign therefore refuses for campaign state before the round hold,
-// and the round hold precedes every reservation, act, marker and spawn.
+// review_status_read_failed when the round cannot be read), then (#5485) the
+// lineage-lock hold on every selected stage, fresh or stale re-spawn
+// (lineage_lock_held, or lineage_lock_probe_failed when the probe cannot
+// decide), then the gate. A held campaign therefore refuses for campaign state
+// before the round hold, the round hold before the lineage-lock probe, and both
+// holds precede every reservation, act, marker and spawn.
 func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDispatchOutcome {
 	o := hostDispatchOutcome{RunID: runID.String()}
 	view, err := h.r.fetchRunDriveView(ctx, runID)
@@ -503,6 +539,29 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 			o.CampaignRefused = true
 			return h.refuse(o, hold, hdRoundHoldDetail(hold))
 		}
+	}
+
+	// (1c) The lineage-lock hold (#5485), for every selected stage, fresh or
+	// stale re-spawn: a live runner of this lineage (typically the previous
+	// stage tearing down its preview after its stage already settled) still
+	// holds the lock the spawn would take, and a spawn into it dies category C
+	// lineage_lock_contention. The probe runs the spawn's own fishhawk-runner
+	// with the lineage inputs the spawn carries. A held lock or an undecidable
+	// probe refuses before the gate, so no reservation, act, marker or spawn
+	// follows; the candidate counts against the per-tick cap (CampaignRefused)
+	// and spawns on the first tick that evaluates it after the lock frees.
+	if h.lineageLock == nil {
+		o.CampaignRefused = true
+		return h.refuse(o, hdRefuseLineageLockProbeFailed, "no lineage lock probe is configured; deploy a fishhawk-runner that supports lineage-lock-status beside fishhawk-mcp")
+	}
+	lock := h.lineageLock(ctx, hostDispatchLineageLockInputFor(run, isChild))
+	if lock.Err != nil {
+		o.CampaignRefused = true
+		return h.refuse(o, hdRefuseLineageLockProbeFailed, "the lineage lock probe could not decide, so the stage is not spawned: "+lock.Err.Error())
+	}
+	if lock.Held {
+		o.CampaignRefused = true
+		return h.refuse(o, hdRefuseLineageLockHeld, hdLineageLockHeldDetail(lock))
 	}
 
 	// (2) The gate: caps, ledger reservation and pause — the last local

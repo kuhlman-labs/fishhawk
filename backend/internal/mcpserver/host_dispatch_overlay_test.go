@@ -1412,3 +1412,45 @@ func TestGetRunStatus_NotStartedShapeFromPlanDecomposed(t *testing.T) {
 		})
 	}
 }
+
+// TestObserveHostDispatch_LineageLockHeld pins the #5485 arm (L1): a
+// lineage_lock_held entry reads waiting host_dispatcher/host_dispatch up to 15
+// minutes, and refusing human/refused naming the holder past it;
+// lineage_lock_probe_failed always reads refusing.
+func TestObserveHostDispatch_LineageLockHeld(t *testing.T) {
+	runID, stageID := uuid.NewString(), uuid.NewString()
+	const holder = "held by live pid 4242 (run acceptance-holder-run)"
+	probe := func(code string, age time.Duration) hostDispatchProbe {
+		st := hdoStatus()
+		st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: stageID, Code: code,
+			Detail: "the run's lineage lock /l.lock is " + holder, FirstAt: hdoNow.Add(-age), LastAt: hdoNow.Add(-10 * time.Second)}}
+		return hostDispatchProbe{found: true, dir: "/state", st: st}
+	}
+	t.Run("fresh entry reads waiting", func(t *testing.T) {
+		obs, v := observeHostDispatch(probe(hdRefuseLineageLockHeld, time.Minute), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateWaiting || v.Kind != hostDispatchAwaitKind || v.Reason != hostDispatchReasonDispatch {
+			t.Fatalf("state %q verdict %s/%s; want waiting host_dispatcher/host_dispatch (next_step %q)", obs.State, v.Kind, v.Reason, v.NextStep)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, "lineage lock", "first tick that evaluates the run after the lock frees", "no operator action is needed")
+	})
+	t.Run("exactly 15 minutes is still waiting", func(t *testing.T) {
+		if obs, _ := observeHostDispatch(probe(hdRefuseLineageLockHeld, 15*time.Minute), runID, stageID, hdoNow); obs.State != hostDispatchStateWaiting {
+			t.Fatalf("state %q at 15m; want waiting", obs.State)
+		}
+	})
+	t.Run("past 15 minutes escalates to refusing", func(t *testing.T) {
+		obs, v := observeHostDispatch(probe(hdRefuseLineageLockHeld, 16*time.Minute), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateRefusing || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonRefused {
+			t.Fatalf("state %q verdict %s/%s; want refusing human/refused (next_step %q)", obs.State, v.Kind, v.Reason, v.NextStep)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseLineageLockHeld, holder, "since "+hdoNow.Add(-16*time.Minute).Format(time.RFC3339), "kill the pid by hand")
+		hdoContainsNone(t, "next_step", v.NextStep, "no operator action is needed")
+	})
+	t.Run("probe failure reads refusing", func(t *testing.T) {
+		obs, v := observeHostDispatch(probe(hdRefuseLineageLockProbeFailed, time.Minute), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateRefusing || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonRefused {
+			t.Fatalf("state %q verdict %s/%s; want refusing human/refused", obs.State, v.Kind, v.Reason)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseLineageLockProbeFailed)
+	})
+}

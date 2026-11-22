@@ -127,7 +127,8 @@ proceeds only when the run is unlinked, or linked with every campaign
 `running`. A read error is `campaign_link_unavailable` and an unresolved
 ancestry is `campaign_link_unresolved`, both fail closed. Any other campaign
 state is `campaign_not_running`. Then, for a spawnable acceptance stage, the
-implement review round hold (#5298, below). (2) The loop's gate (`hostDispatchLoop.Admit`)
+implement review round hold (#5298, below), then, for every selected stage, the
+lineage-lock hold (#5485, below). (2) The loop's gate (`hostDispatchLoop.Admit`)
 checks the pause file, max in-flight and, when an operator set one, the daily
 cap, then reserves the
 ledger entry and persists it. (3) `run_auto_driven` is recorded with
@@ -166,13 +167,59 @@ marker and spawn; a round-held candidate counts against the per-tick cap.
 `fishhawk_drive_run` polls while held (it never stalls) and at its deadline
 returns the hold code and its `next_actions`.
 
+**Lineage-lock deferral (#5485).** A runner holds its lineage lock
+(`<git-common-dir>/fishhawk-worktrees/run-<root>.lock`) for its whole process
+lifetime. An acceptance runner tearing down its preview still holds it after
+its stage reads `succeeded`, and the ledger cannot see that holder:
+`refreshInFlight` keeps only `dispatched` and `running` stages. A fix-up the
+campaign driver auto-routes about 40s later would be spawned into the lock and
+die category C `lineage_lock_contention`. So, after the round hold and before
+the gate, `evaluate` probes the lock for every selected stage, fresh or stale
+re-spawn (`host_dispatch_lineage_lock.go`). It execs the binary it spawns,
+`fishhawk-runner lineage-lock-status`, with the lineage inputs the spawn
+carries: `--working-dir`, `--run-id`, `--decomposed-from` from
+`runs.decomposed_from`, and `--parallel-isolate` exactly when the spawn is a
+child's implement stage. The runner answers with its own path rule and
+live-holder predicate (runner README, `lineage-lock-status`), so this module
+copies neither. A live holder refuses `lineage_lock_held`, naming the lock path,
+holder pid and holder run. A probe that cannot decide refuses
+`lineage_lock_probe_failed`, fail closed. Both are deferrals: nothing is
+reserved, recorded, marked or spawned, the candidate counts against the
+per-tick cap and is deprioritised, and the stage spawns on the first tick that
+evaluates the run after the lock frees. The probe exec carries the spawn's
+scrubbed env (`hostDispatchRunnerEnv`), never the dispatcher bearer. Its
+timeout is 5s, so with the per-tick cap counting every probed candidate a tick
+spends at most per-tick cap × 5s on probes (20s at the default cap of 4), well
+under the 60s QueueTTL a queued stage's re-POST must beat. The status overlay
+reads `lineage_lock_held` as waiting for 15 minutes
+(`hostDispatchLineageLockStuckAfter`), then as refusing (the holder may be
+wedged). Accepted risks:
+- A `fishhawk-runner` older than this change has no subcommand, so every
+  candidate refuses `lineage_lock_probe_failed`. The detail distinguishes exit
+  2 (usage: deploy a `fishhawk-runner` that supports `lineage-lock-status`
+  beside `fishhawk-mcp`; `scripts/dev` builds both together), exit 1 (the
+  `working_dir` is not a git checkout, or the lockfile could not be read) and a
+  timeout.
+- The conflict-resolution and merge-candidate verify passes return before
+  `acquireLineageLock` (runner `main.go`), so the hold also defers them while
+  the lock is held. That is conservative.
+- The dispatcher defers on any live holder. The runner's #2545 rule would
+  evict a holder whose run is cancelled, but the holder's run is the candidate
+  itself, which `evaluate` already proved non-terminal.
+- A stale lockfile whose pid the OS reused reads held, as it does for the
+  runner's own acquire; the overlay escalates it after 15 minutes.
+- Live verification of the acceptance-then-auto-route sequence decides on the
+  ABSENCE of a `lineage_lock_contention` failure on the routed fix-up; a
+  `lineage_lock_held` log line is corroboration only.
+
 **Refusal codes.** Per candidate: `runner_kind_not_local`, `run_terminal`,
 `not_eligible`, `parent_unreadable`, `working_dir_unbound`,
 `path_outside_allowed_roots`, `working_dir_absent`,
 `nothing_dispatchable`, `in_flight`, `stale_runner_live`,
 `stale_runner_unknown`, `stale_respawn_cap_reached`, the three campaign codes,
 `implement_review_in_flight`, `implement_review_not_started`,
-`review_status_read_failed`, `paused`, `cap_reached:max_in_flight`, `cap_reached:daily` (only possible when
+`review_status_read_failed`, `lineage_lock_held`, `lineage_lock_probe_failed`,
+`paused`, `cap_reached:max_in_flight`, `cap_reached:daily` (only possible when
 an operator set `--daily-cap`), `ledger_write_failed`, `record_act_failed`, `concurrency_slot_queued`,
 `host_memory_pressure`, `marker_not_transitioned`, `spawn_failed`, and the
 server's own code for any other marker refusal (for example
@@ -321,7 +368,12 @@ It adds no server API or wire type.
   (`hostDispatchReviewRoundOrphanAfter`); past it the next_step says the round
   may be orphaned (a failed reviewer retry or a server restart can leave it
   pending, and a decomposed parent's consolidated round may never have started)
-  and names `fishhawk_get_run_status` and `fishhawk_rerun_review`; any
+  and names `fishhawk_get_run_status` and `fishhawk_rerun_review`;
+  `lineage_lock_held` (#5485, its own arm) is provisionally waiting
+  (`host_dispatcher` / `host_dispatch`, "no operator action is needed") while
+  `refusal_first_at` is at most 15 minutes old, and past it reads human /
+  `host_dispatch_refused` naming the holder (`lineage_lock_probe_failed` takes
+  the default arm: an operator must fix the runner binary); any
   other code reads human / `host_dispatch_refused`, advising
   `fishhawk_dispatch_stage` only when the refusal is not a deliberate hold.
   Then the global daily cap (`daily_cap` reached on today's UTC `spawns_day`)
@@ -335,7 +387,7 @@ It adds no server API or wire type.
   until that stall gets a non-benign code (the #5298 acceptance stall now has
   one: the round hold codes above). A new stall or
   hold code reaches the overlay only by being non-benign and joining the right
-  code set above (a hold code joins `hostDispatchHoldRefusals`, as #5473 and
+  code set or arm above (a hold code joins `hostDispatchHoldRefusals`, as #5473 and
   #5486 would); an unknown non-benign code reads refusing.
 - *Run status.* `fishhawk_get_run_status` gains `host_dispatch` (the same
   observation, `runHostDispatchFor`) for a run the dispatcher would consider
@@ -374,8 +426,9 @@ again is therefore reached even while older runs stay held (#5246). The rotation
 state is in-memory and resets on restart, like the deprioritised set. Finally it
 evaluates candidates until the per-tick cap of candidates that reached the
 campaign-link read is spent. A candidate the implement review round holds
-(#5298) is refused after that read and counts too. That cap therefore bounds
-both the campaign-link reads and the marker POSTs per tick.
+(#5298) or the lineage-lock hold refuses (#5485) is refused after that read and
+counts too. That cap therefore bounds the campaign-link reads, the
+lineage-lock probes and the marker POSTs per tick.
 The daily count is always persisted and rolls over at 00:00:00Z, so a restart
 does not reset it. The status file and `--status` report it as `spawns_today`;
 it is enforced only when `--daily-cap` is set. `daily_cap=N` (status file field
