@@ -461,6 +461,19 @@ import "sort"
 // kind, auto_dispatch flag and a server-written reason, so
 // withholdScopeOverlapFromRunBound needs no entry for it. It takes the
 // mandatory run-bound flag when #4599 / E89 #4537 lands.
+// E110.50 / #5486 added run_dispatch_hold_set and run_dispatch_hold_cleared,
+// the operator per-run dispatch hold verb's pair (POST
+// /v0/runs/{run_id}/dispatch-hold, server/run_dispatch_hold.go). The latest
+// row of the pair by Sequence decides whether the run (and, through the
+// DecomposedFrom / ParentRunID ancestry walk, its descendants) is held at the
+// host-dispatch marker. Both are INTERNAL, actor = the operator, not
+// issue-comment surfaces (no Notifier method, no activityCategories entry).
+// Both are INTENDED run-bound READABLE: the payload is same-run only (the
+// action, the operator's reason and the actor subject; no other run's id),
+// so withholdScopeOverlapFromRunBound carries no deny-list entry for them.
+// This comment is an INTERIM registration under ADR-106's existing
+// audit-category mechanism, not ADR-106 registry option B; both take the
+// mandatory run-bound flag when #4599 / E89 #4537 lands.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -727,6 +740,8 @@ var KnownCategories = map[string]struct{}{
 	"run_branches_swept":                      {},
 	"run_budget_exceeded":                     {},
 	"run_completed":                           {},
+	"run_dispatch_hold_cleared":               {}, // E110.50 / #5486: the operator cleared the run's dispatch hold (server/run_dispatch_hold.go) — INTERNAL, same-run payload, run-bound-readable (interim ADR-106)
+	"run_dispatch_hold_set":                   {}, // E110.50 / #5486: the operator held new host dispatches of the run and its descendants (server/run_dispatch_hold.go) — INTERNAL, same-run payload, run-bound-readable (interim ADR-106)
 	"run_dispatched":                          {},
 	"run_merge_ci_observed":                   {}, // E82.2 / #3779: merge-commit CI conclusion fixed at maturity
 	"run_merge_reverted":                      {}, // E82.2 / #3779: a forge-confirmed revert of the run's merge

@@ -2670,6 +2670,23 @@ components:
             by `GET /v0/runs/{run_id}` ONLY when called with
             `include=campaign_link`; omitted on every other read, which is
             byte-identical to a read without the parameter.
+        dispatch_hold:
+          $ref: '#/components/schemas/RunDispatchHold'
+          description: |
+            The run's EFFECTIVE operator dispatch hold (E110.50 / #5486): its
+            own, or the nearest held `decomposed_from` / `parent_run_id`
+            ancestor's (`inherited: true`, at most 8 hops). Served by `GET
+            /v0/runs/{run_id}` ONLY, for a non-terminal run; the list
+            endpoint and a terminal run do no hold read. Omitted when the run
+            is not held. Set with `POST /v0/runs/{run_id}/dispatch-hold`.
+        dispatch_hold_unavailable:
+          type: boolean
+          description: |
+            True when `GET /v0/runs/{run_id}` could not read the run's
+            dispatch hold (E110.50 / #5486); `dispatch_hold` is then omitted
+            and its absence is not evidence. The read still answers 200,
+            because the host-dispatch marker re-checks the hold fail closed.
+            Absent means false.
         concerns:
           $ref: '#/components/schemas/RunConcerns'
           description: |
@@ -6547,6 +6564,15 @@ components:
         `decision_withheld: true` and the unchanged stage-state
         classification; no decision source is read for it. The marker
         payload carries no cross-run identifiers.
+
+        (c) The operator dispatch hold (E110.50 / #5486) is a decision source
+        too, read for a readable caller only: the item run's effective
+        `dispatch_hold` (its own or an ancestor's) is attached, and a block
+        waiting on a dispatch (`host_dispatcher` / `host_dispatch`, `human` /
+        `operator_dispatch`) or on its children (`system` / `children`)
+        reads `human` / `dispatch_held`. A running stage keeps `in_flight`,
+        because a hold never touches in-flight work. A hold read error sets
+        `decision_unavailable`.
       required: [kind, reason, run_id, next_step]
       properties:
         kind:
@@ -6567,6 +6593,7 @@ components:
             - in_flight
             - children
             - no_active_stage
+            - dispatch_held
         run_id: { $ref: '#/components/schemas/UUID' }
         stage_id:
           allOf: [{ $ref: '#/components/schemas/UUID' }]
@@ -6593,8 +6620,15 @@ components:
             True when a readable caller's decision source could not be read:
             the marker read failed or no audit repository is wired, or
             `pending_amendments` was not computed or is truncated without a
-            live entry for this run. Absence of `decision` is then not
-            evidence. Absent means false.
+            live entry for this run, or the dispatch hold read failed.
+            Absence of `decision` (or `dispatch_hold`) is then not evidence.
+            Absent means false.
+        dispatch_hold:
+          $ref: '#/components/schemas/RunDispatchHold'
+          description: |
+            The item run's effective operator dispatch hold (E110.50 /
+            #5486), for a readable caller only. Omitted when the run is not
+            held, the caller is not readable, or the read failed.
 
     CampaignItemAwaitingDecision:
       type: object
@@ -6619,6 +6653,80 @@ components:
           type: string
           format: date-time
           description: When the marker was recorded.
+
+    RunDispatchHold:
+      type: object
+      description: |
+        A run's EFFECTIVE operator dispatch hold (E110.50 / #5486): the run's
+        own, or the nearest held `decomposed_from` / `parent_run_id`
+        ancestor's (`inherited: true`). Derived from the held run's audit
+        chain: the latest `run_dispatch_hold_set` row newer than the latest
+        `run_dispatch_hold_cleared` row. `reason` is the operator's free
+        text, rendered only as this data field.
+      required: [held_run_id, inherited, reason, held_by, held_at, audit_sequence]
+      properties:
+        held_run_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: The run whose own hold applies; clear the hold on this run.
+        inherited:
+          type: boolean
+          description: True when the hold is an ancestor's, not the run's own.
+        reason:
+          type: string
+          description: The operator's reason, recorded with the set row.
+        held_by:
+          type: string
+          description: The subject that set the hold.
+        held_at:
+          type: string
+          format: date-time
+          description: When the set row was recorded.
+        audit_sequence:
+          type: integer
+          format: int64
+          description: The set row's sequence on the held run's chain.
+
+    RunDispatchHoldRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        action:
+          type: string
+          enum: [set, clear]
+          default: set
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why the run's dispatches are held or released; 1..1000 bytes after trimming.
+
+    RunDispatchHoldResponse:
+      type: object
+      required: [run_id, action, changed]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        action:
+          type: string
+          enum: [set, clear]
+        changed:
+          type: boolean
+          description: |
+            False for a no-op (a set while the run is already held by its own
+            hold, or a clear while it has none); nothing was appended.
+        dispatch_hold:
+          $ref: '#/components/schemas/RunDispatchHold'
+          description: |
+            The EFFECTIVE hold after the act (own or inherited); omitted when
+            none. A clear on a child that still inherits a parent's hold
+            answers `changed: false` with this block naming the parent.
+        dispatch_hold_unavailable:
+          type: boolean
+          description: True when the post-act hold read failed; the act itself is recorded. Absent means false.
+        audit_sequence:
+          type: integer
+          format: int64
+          description: The appended row's sequence; present only when `changed` is true.
 
     CampaignDispatchHold:
       type: object
@@ -20211,6 +20319,19 @@ paths:
               row is written; unlike `concurrency_slot_queued` it carries no
               `Retry-After`, so a slot waiter stops and the operator
               re-dispatches once the condition clears.
+            - `run_dispatch_held` — the operator per-run dispatch hold
+              (E110.50 / #5486): the run, or a `decomposed_from` /
+              `parent_run_id` ancestor (at most 8 hops), carries an active hold
+              set through `POST /v0/runs/{run_id}/dispatch-hold`. Any stage
+              type in the `pending` or `awaiting_host_dispatch` arm. `details`
+              carries `run_id`, `stage_id`, `held_run_id`, `inherited`,
+              `reason`, `held_by`, `held_at` and `audit_sequence`. Fires right
+              after the state switch, BEFORE every later hold, the CAS and the
+              slot admission, so the stage keeps its state and no queue row
+              is written. The idempotent already-`dispatched` arm is exempt. A
+              plain 409 with no `Retry-After`, so a slot waiter stops; do not
+              dispatch past it: clear it on `held_run_id`
+              (`fishhawk_hold_dispatch` action `clear`).
             - `campaign_dispatch_held` — the campaign dispatch hold (E83.100 /
               #4234): an IMPLEMENT stage in the `pending` or
               `awaiting_host_dispatch` arm whose run, or its nearest
@@ -20254,7 +20375,9 @@ paths:
             `deploy` stage ahead of a `pending` or `awaiting_host_dispatch`
             stage (E35.1 / #1598, E35.3 / #1600), or the decomposed-parent
             acceptance gate could not list the parent's decomposition children
-            or read its `slices_integrated` history (#4080), or the campaign
+            or read its `slices_integrated` history (#4080), or the operator
+            per-run dispatch hold (#5486) could not read a hold row or an
+            ancestor run, or the campaign
             dispatch hold (#4234) could not resolve the stage's campaign
             membership, its campaign, or the hold, or the superseded
             merge-candidate pass refusal (#4811) could not list the run's
@@ -30553,6 +30676,105 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: '`merge_queue_unconfigured` (no merge queue, a store without the capability, or no run repository) or `merge_lock_unavailable` (the merge-intent lock was not taken; nothing written, retryable).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/dispatch-hold:
+    post:
+      operationId: setRunDispatchHold
+      summary: Set or clear an operator dispatch hold on a run
+      description: |
+        The operator per-run dispatch hold (E110.50 / #5486). `action: set`
+        parks every NEW host dispatch of the run and of every run below it
+        in its `decomposed_from` / `parent_run_id` lineage (at most 8 hops):
+        the host-dispatch marker answers 409 `run_dispatch_held` for any
+        stage type, before the CAS, the slot admission and every later hold,
+        so nothing is committed and no queue row is taken. That binds every
+        spawner: the host dispatcher, a queued concurrency-slot waiter
+        re-POSTing the marker (#4826), `run_children`, `drive_run`,
+        `run_stage` and an operator `fishhawk_dispatch_stage`. A hold on a
+        decomposed parent therefore parks every later wave even after
+        `children_dispatchable` releases. In-flight stages are never
+        touched: the idempotent already-`dispatched` arm stays exempt.
+        `action: clear` releases it; the next marker POST is admitted. There
+        is no per-dispatch override: the audited clear is the explicit
+        override. MCP: `fishhawk_hold_dispatch`.
+
+        **State.** Derived from the run's own audit chain, with no column:
+        the latest `run_dispatch_hold_set` row against the latest
+        `run_dispatch_hold_cleared` row by sequence. A set while the run is
+        already held by its own hold, or a clear while it has none, is a 200
+        `changed: false` no-op that appends nothing. A clear on a child whose
+        hold is inherited is such a no-op too; `dispatch_hold.held_run_id`
+        names the run to clear.
+
+        **Refusals, each decided before anything is written.**
+        `401 authentication_required`; `403 run_token_forbidden` (a run-bound
+        agent token, even for its own run); `403 insufficient_scope` (no
+        `write:runs`); `403 account_forbidden` (the run belongs to another
+        workspace account); `400 validation_failed` (a non-UUID `run_id`, an
+        action other than `set` or `clear`, a body that is not exactly one
+        `{"action", "reason"}` object (unknown keys and trailing content are
+        refused), or a reason empty after trimming or over 1000 bytes);
+        `503 dispatch_hold_unavailable` (no run or audit repository);
+        `404 run_not_found`; `409 run_terminal` (`action: set` on a terminal
+        run; clear is always allowed); `500 dispatch_hold_failed` (a run or
+        hold-state read failed, or the append failed; nothing written).
+
+        **Audit.** A change appends a chained `run_dispatch_hold_set` or
+        `run_dispatch_hold_cleared` row `{action, reason, actor}` on the
+        run's own chain (actor_kind `user`, or `agent` for a delegated
+        operator-agent token). Both are internal categories, not
+        issue-comment surfaces.
+
+        **Authorization.** An authenticated identity with `write:runs` in the
+        run's workspace account. A delegated operator-agent token is
+        admitted: a hold only stops or resumes host dispatch and grants no
+        gate act. Any such caller can clear a hold; the row records the
+        actor. A host-dispatcher token is refused by its route allowlist.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RunDispatchHoldRequest' }
+      responses:
+        '200':
+          description: 'The hold was set or cleared (`changed: true`, with `audit_sequence`), or the call was a no-op (`changed: false`, nothing written).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunDispatchHoldResponse' }
+        '400':
+          description: '`validation_failed` — a non-UUID `run_id`, an unknown action, a body that is not exactly `{"action", "reason"}`, or a reason empty after trimming or over 1000 bytes (`details.field`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` (a run-bound agent token), `insufficient_scope` (no `write:runs`), or `account_forbidden` (the run belongs to another workspace account).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`run_terminal` — `action: set` on a terminal run (`details.run_state`). Nothing was written.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`dispatch_hold_failed` — the run or its hold state could not be read, or the append failed; nothing was written.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`dispatch_hold_unavailable` — no run or audit repository is configured.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

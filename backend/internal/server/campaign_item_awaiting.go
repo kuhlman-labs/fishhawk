@@ -50,7 +50,8 @@ const (
 )
 
 // Awaiting reasons. host_dispatch pairs with host_dispatcher; in_flight,
-// children and no_active_stage with system; the rest with human.
+// children and no_active_stage with system; the rest (dispatch_held
+// included) with human.
 const (
 	awaitingReasonHostDispatch          = "host_dispatch"
 	awaitingReasonOperatorDispatch      = "operator_dispatch"
@@ -64,6 +65,9 @@ const (
 	awaitingReasonInFlight              = "in_flight"
 	awaitingReasonChildren              = "children"
 	awaitingReasonNoActiveStage         = "no_active_stage"
+	// awaitingReasonDispatchHeld (E110.50 / #5486): an operator dispatch hold
+	// on the item's run or an ancestor parks its next dispatch.
+	awaitingReasonDispatchHeld = "dispatch_held"
 )
 
 // awaitingNextSteps is the server-constant next_step text per reason.
@@ -80,6 +84,7 @@ var awaitingNextSteps = map[string]string{
 	awaitingReasonInFlight:              "The stage is executing; no action is needed until it settles.",
 	awaitingReasonChildren:              "The stage waits on its child runs; drive them with fishhawk_run_children or fishhawk_await_children.",
 	awaitingReasonNoActiveStage:         "No stage is active; read fishhawk_get_run_status next_actions.",
+	awaitingReasonDispatchHeld:          "An operator dispatch hold parks this run's next dispatch (dispatch_hold names the held run); clear it with fishhawk_hold_dispatch action clear. Do not dispatch past it.",
 }
 
 // campaignItemAwaitingPayload mirrors docs/api/v0.openapi.yaml's
@@ -98,6 +103,9 @@ type campaignItemAwaitingPayload struct {
 	Decision            *campaignItemAwaitingDecision `json:"decision,omitempty"`
 	DecisionWithheld    bool                          `json:"decision_withheld,omitempty"`
 	DecisionUnavailable bool                          `json:"decision_unavailable,omitempty"`
+	// DispatchHold is the item run's EFFECTIVE operator dispatch hold
+	// (E110.50 / #5486), read for a READABLE caller only; omitted when none.
+	DispatchHold *runDispatchHoldPayload `json:"dispatch_hold,omitempty"`
 }
 
 // campaignItemAwaitingDecision is the current (uncleared) decision marker the
@@ -323,7 +331,44 @@ func (s *Server) campaignItemAwaitingForStatus(ctx context.Context, c *campaign.
 	blk := overlayCampaignItemAwaiting(classifyCampaignItemAwaiting(r, stages), readable, pending, func() (*awaitingMarker, error) {
 		return s.awaitingMarkerForRun(ctx, c, runID)
 	})
+	// The operator dispatch hold (E110.50 / #5486) is a decision source too:
+	// read for a READABLE caller only, after the overlay. The walk reads the
+	// item run's own chain and its DecomposedFrom / ParentRunID ancestors'.
+	if readable {
+		hold, herr := s.resolveRunDispatchHold(ctx, r)
+		if herr != nil {
+			s.cfg.Logger.Warn("campaign status: dispatch hold read failed; awaiting decision unavailable",
+				"campaign_id", c.ID.String(), "run_id", runID.String(), "error", herr.Error())
+		}
+		blk = applyAwaitingDispatchHold(blk, hold, herr)
+	}
 	return &blk
+}
+
+// applyAwaitingDispatchHold attaches the item run's effective dispatch hold
+// to a classified, overlaid block. A read error sets decision_unavailable. A
+// present hold is attached, and a block waiting on a dispatch (host_dispatcher
+// /host_dispatch, human/operator_dispatch) or on its children (system
+// /children, whose next wave the hold parks) switches to human/dispatch_held.
+// Every other reason is kept: a running stage stays in_flight, because a
+// hold never touches in-flight work, and a gate decision still needs its own
+// verb.
+func applyAwaitingDispatchHold(blk campaignItemAwaitingPayload, hold *runDispatchHoldPayload, err error) campaignItemAwaitingPayload {
+	if err != nil {
+		blk.DecisionUnavailable = true
+		return blk
+	}
+	if hold == nil {
+		return blk
+	}
+	blk.DispatchHold = hold
+	switch {
+	case blk.Kind == awaitingKindHostDispatcher && blk.Reason == awaitingReasonHostDispatch,
+		blk.Kind == awaitingKindHuman && blk.Reason == awaitingReasonOperatorDispatch,
+		blk.Kind == awaitingKindSystem && blk.Reason == awaitingReasonChildren:
+		setAwaitingReason(&blk, awaitingKindHuman, awaitingReasonDispatchHeld)
+	}
+	return blk
 }
 
 // awaitingMarkerForRun reads the decision marker rows of runID. runID is

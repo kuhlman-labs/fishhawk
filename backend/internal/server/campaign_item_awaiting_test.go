@@ -861,3 +861,92 @@ func TestCampaignDriver_ArchitecturalDecision_StatusRendersDecision(t *testing.T
 		}
 	})
 }
+
+// holdErrAwaitingAudit fails ONLY the dispatch-hold category reads, so the
+// decision-marker read still succeeds and cannot mask the hold-read arm.
+type holdErrAwaitingAudit struct{ *awaitingAuditFake }
+
+func (a holdErrAwaitingAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == CategoryRunDispatchHoldSet || category == CategoryRunDispatchHoldCleared {
+		return nil, errors.New("hold read down")
+	}
+	return a.awaitingAuditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestCampaignItemAwaiting_DispatchHeld (E110.50 / #5486): a readable caller
+// sees the item run's effective dispatch hold. A waiting-on-dispatch block
+// (host_dispatch) and a parent at awaiting_children switch to
+// human/dispatch_held; a running stage keeps system/in_flight but carries the
+// block; an unreadable caller gets no hold read; a hold read error sets
+// decision_unavailable.
+func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
+	ctx := context.Background()
+	item := func(r *run.Run) *campaign.Item {
+		return &campaign.Item{IssueRef: "issue:x", State: campaign.ItemStateRunning, RunID: idp(r.ID)}
+	}
+	mk := func(f *awaitingFixture, state run.StageState) *run.Run {
+		r := seedPARun(f.rr.pendingAmendRunRepo, "acme/widgets", nil, nil)
+		r.AutoDispatch = true
+		r.RunnerKind = run.RunnerKindLocal
+		f.rr.seedStage(r.ID, 1, state)
+		return r
+	}
+	t.Run("pending stage of a marked run reads dispatch_held", func(t *testing.T) {
+		f := newAwaitingFixture(t)
+		f.au.seed(f.host.ID, 9, CategoryRunDispatchHoldSet, "")
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), true, nil)
+		if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonDispatchHeld ||
+			blk.NextStep != awaitingNextSteps[awaitingReasonDispatchHeld] || blk.DispatchHold == nil ||
+			blk.DispatchHold.HeldRunID != f.host.ID.String() || blk.DispatchHold.Inherited {
+			t.Fatalf("awaiting = %+v", blk)
+		}
+		if !strings.Contains(blk.NextStep, "fishhawk_hold_dispatch") {
+			t.Fatalf("next_step = %q, want it to name fishhawk_hold_dispatch", blk.NextStep)
+		}
+	})
+	t.Run("unmarked run's operator_dispatch reads dispatch_held", func(t *testing.T) {
+		f := newAwaitingFixture(t)
+		f.au.seed(f.manual.ID, 9, CategoryRunDispatchHoldSet, "")
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.manual), true, nil)
+		if blk == nil || blk.Reason != awaitingReasonDispatchHeld || blk.DispatchHold == nil {
+			t.Fatalf("awaiting = %+v", blk)
+		}
+	})
+	t.Run("parent at awaiting_children reads dispatch_held", func(t *testing.T) {
+		f := newAwaitingFixture(t)
+		p := mk(f, run.StageStateAwaitingChildren)
+		f.au.seed(p.ID, 9, CategoryRunDispatchHoldSet, "")
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(p), true, nil)
+		if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonDispatchHeld || blk.DispatchHold == nil {
+			t.Fatalf("awaiting = %+v", blk)
+		}
+	})
+	t.Run("running stage keeps in_flight and carries the block", func(t *testing.T) {
+		f := newAwaitingFixture(t)
+		r := mk(f, run.StageStateRunning)
+		f.au.seed(r.ID, 9, CategoryRunDispatchHoldSet, "")
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(r), true, nil)
+		if blk == nil || blk.Kind != awaitingKindSystem || blk.Reason != awaitingReasonInFlight || blk.DispatchHold == nil {
+			t.Fatalf("awaiting = %+v", blk)
+		}
+	})
+	t.Run("unreadable caller gets no hold read", func(t *testing.T) {
+		f := newAwaitingFixture(t)
+		f.au.seed(f.host.ID, 9, CategoryRunDispatchHoldSet, "")
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), false, nil)
+		if blk == nil || blk.Reason != awaitingReasonHostDispatch || blk.DispatchHold != nil || !blk.DecisionWithheld {
+			t.Fatalf("awaiting = %+v", blk)
+		}
+		if q := f.au.queriedRuns(); len(q) != 0 {
+			t.Fatalf("an unreadable caller read the audit chain of %v", q)
+		}
+	})
+	t.Run("hold read error sets decision_unavailable", func(t *testing.T) {
+		f := newAwaitingFixture(t)
+		f.s.cfg.AuditRepo = holdErrAwaitingAudit{f.au}
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), true, &campaignPendingAmendmentsPayload{})
+		if blk == nil || !blk.DecisionUnavailable || blk.DispatchHold != nil || blk.Reason != awaitingReasonHostDispatch {
+			t.Fatalf("awaiting = %+v", blk)
+		}
+	})
+}

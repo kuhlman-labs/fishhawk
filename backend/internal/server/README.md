@@ -124,6 +124,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Writer-side anchor intent marker + gate (`operator_visible.go`, #3406)
 - Preview/dev-mode host-dispatch refusal (`devmode.go`, E72.13 / #3500)
 - Interim host memory hold (`host_dispatch.go`, E85.11 / [#4330](https://github.com/kuhlman-labs/fishhawk/issues/4330))
+- Operator per-run dispatch hold (`run_dispatch_hold.go`, E110.50 / [#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486)): `POST /v0/runs/{run_id}/dispatch-hold`, audit-derived state, ancestry inheritance, the `409 run_dispatch_held` marker guard, no per-dispatch override, accepted risks
 - Decomposition wave-order host-dispatch guard (`decomposition_dispatch_guard.go`, E48.99 / #2546)
 - Per-wave integration guard + `base_branch` derivation (`decomposition_dispatch_guard.go`, E50.13 / #2363)
 - Decomposed-parent fix-up policy increment (#4391)
