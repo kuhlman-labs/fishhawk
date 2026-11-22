@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -112,8 +115,10 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 
 // writeLintHostFakes writes FAKEBIN: golangci-lint (version line from env;
 // `run` logs $PWD, prints the fake finding, exits $FAKE_RUN_RC), gofmt (never
-// meant to run) and go (answers `version <FAKEBIN>/gofmt`, else execs the real
-// go, so cmd_lint's `go work edit -json` module walk still works).
+// meant to run) and go (answers `version <FAKEBIN>/gofmt`, and `env GOVERSION`
+// / `env GOTOOLCHAIN` from FAKE_GO_VERSION / FAKE_GO_TOOLCHAIN when those are
+// set (#5453), else execs the real go, so cmd_lint's `go work edit -json`
+// module walk still works).
 func writeLintHostFakes(t *testing.T, realGo string) string {
 	t.Helper()
 	bin := t.TempDir()
@@ -138,6 +143,14 @@ if [ "$1" = version ] && [ "$2" = ` + shellQuote(gofmt) + ` ]; then
   printf '%s: go%s\n' "$2" "$FAKE_GOFMT_GO"
   exit 0
 fi
+if [ "$1" = env ] && [ "$2" = GOVERSION ] && [ $# -eq 2 ] && [ -n "${FAKE_GO_VERSION+x}" ]; then
+  printf '%s\n' "$FAKE_GO_VERSION"
+  exit 0
+fi
+if [ "$1" = env ] && [ "$2" = GOTOOLCHAIN ] && [ $# -eq 2 ] && [ -n "${FAKE_GO_TOOLCHAIN+x}" ]; then
+  printf '%s\n' "$FAKE_GO_TOOLCHAIN"
+  exit 0
+fi
 exec ` + shellQuote(realGo) + ` "$@"
 `,
 	}
@@ -152,12 +165,25 @@ exec ` + shellQuote(realGo) + ` "$@"
 type lintHostFixture struct {
 	glVersion, glGo, gofmtGo string
 	runRC                    string
+	// goVersion / goToolchain, when non-empty, are what the fake go answers
+	// to `go env GOVERSION` / `go env GOTOOLCHAIN` (check-gate-image --host
+	// check (d), #5453). Empty leaves both to the REAL go.
+	goVersion, goToolchain string
 }
 
 type lintHostResult struct {
 	out    string
 	err    error
+	code   int // the script's exit code (-1 when it did not exit normally)
 	runLog string
+}
+
+// onPinGo makes the fake go answer check (d) with the pinned Go under
+// GOTOOLCHAIN=local, so a refusal fixture's ONE off-pin tool is the only
+// branch that can refuse, whatever the host's own go and GOTOOLCHAIN are.
+func (fx lintHostFixture) onPinGo(p gateImagePins) lintHostFixture {
+	fx.goVersion, fx.goToolchain = "go"+p.goVersion, "local"
+	return fx
 }
 
 // runRealLintLeg runs `bash <root>/scripts/test lint` under the fixture. It
@@ -165,6 +191,23 @@ type lintHostResult struct {
 // cache (#5151) never creates a dir in the real checkout's git dir or the
 // user's cache dir: an explicit value is left untouched.
 func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResult {
+	t.Helper()
+	return runRealLintLegEnv(t, root, fx, nil)
+}
+
+// runRealLintLegEnv is runRealLintLeg plus extraEnv, appended last (so it
+// wins: exec.Cmd keeps the last value of a duplicated key). The ambient
+// FISHHAWK_GATE_CONTAINER / FISHHAWK_GATE_IMAGE_REF are dropped first: inside
+// the runner's gate container this test binary inherits the container marker,
+// and a host-path fixture must not.
+func runRealLintLegEnv(t *testing.T, root string, fx lintHostFixture, extraEnv []string) lintHostResult {
+	t.Helper()
+	return runRealScriptsTest(t, root, fx, extraEnv, "lint")
+}
+
+// runRealScriptsTest is runRealLintLegEnv for any scripts/test subcommand
+// (args), so a test can drive the lint leg through `verify` as well.
+func runRealScriptsTest(t *testing.T, root string, fx lintHostFixture, extraEnv []string, args ...string) lintHostResult {
 	t.Helper()
 	realGo, err := exec.LookPath("go")
 	if err != nil {
@@ -182,7 +225,11 @@ func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResul
 			strings.HasPrefix(kv, "PATH="),
 			strings.HasPrefix(kv, "GIT_CONFIG_GLOBAL="),
 			strings.HasPrefix(kv, "GIT_CONFIG_SYSTEM="),
-			strings.HasPrefix(kv, "GOLANGCI_LINT_CACHE="):
+			strings.HasPrefix(kv, "GOLANGCI_LINT_CACHE="),
+			strings.HasPrefix(kv, "FISHHAWK_GATE_CONTAINER="),
+			strings.HasPrefix(kv, "FISHHAWK_GATE_IMAGE_REF="),
+			strings.HasPrefix(kv, "FAKE_GO_VERSION="),
+			strings.HasPrefix(kv, "FAKE_GO_TOOLCHAIN="):
 			continue
 		}
 		env = append(env, kv)
@@ -198,7 +245,14 @@ func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResul
 		"FAKE_RUN_RC="+fx.runRC,
 		"FAKE_RUN_LOG="+runLog,
 	)
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "test"), "lint") //nolint:gosec // fixed workspace-relative path
+	if fx.goVersion != "" {
+		env = append(env, "FAKE_GO_VERSION="+fx.goVersion)
+	}
+	if fx.goToolchain != "" {
+		env = append(env, "FAKE_GO_TOOLCHAIN="+fx.goToolchain)
+	}
+	env = append(env, extraEnv...)
+	cmd := exec.Command("bash", append([]string{filepath.Join(root, "scripts", "test")}, args...)...) //nolint:gosec // fixed workspace-relative path, fixed args
 	cmd.Dir = root
 	cmd.Env = env
 	out, runErr := cmd.CombinedOutput()
@@ -206,7 +260,15 @@ func runRealLintLeg(t *testing.T, root string, fx lintHostFixture) lintHostResul
 	if err != nil {
 		t.Fatal(err)
 	}
-	return lintHostResult{out: string(out), err: runErr, runLog: string(logged)}
+	code := 0
+	if runErr != nil {
+		code = -1
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			code = ee.ExitCode()
+		}
+	}
+	return lintHostResult{out: string(out), err: runErr, code: code, runLog: string(logged)}
 }
 
 func requireBashForLintHost(t *testing.T) string {
@@ -217,13 +279,15 @@ func requireBashForLintHost(t *testing.T) string {
 	return requireWorkspaceRoot(t, pkgSrcDir)
 }
 
-// assertLintRefused: the lint leg exited non-zero naming the refusal and the
-// offending value, and golangci-lint `run` NEVER executed.
+// assertLintRefused: the lint leg exited VERIFY_EXIT_TEMPFAIL (75, #5453: a
+// host toolchain mismatch against coherent pins means the change was NOT
+// judged) naming the refusal and the offending value, and golangci-lint `run`
+// NEVER executed.
 func assertLintRefused(t *testing.T, res lintHostResult, offending string) {
 	t.Helper()
 	clean := lintHostHygiene(res.out)
-	if res.err == nil {
-		t.Errorf("scripts/test lint exited 0 on a mismatched host toolchain; output:\n%s", clean)
+	if res.code != verifyExitTempFail {
+		t.Errorf("scripts/test lint exited %d on a mismatched host toolchain, want %d (EX_TEMPFAIL: not judged); output:\n%s", res.code, verifyExitTempFail, clean)
 	}
 	if !strings.Contains(res.out, lintHostRefusal) {
 		t.Errorf("output lacks the refusal token; output:\n%s", clean)
@@ -244,7 +308,7 @@ func TestLintLegRefusesForeignGolangciLintVersion(t *testing.T) {
 	pins := readGateImagePins(t, root)
 	res := runRealLintLeg(t, root, lintHostFixture{
 		glVersion: lintHostForeignGLVersion, glGo: pins.goVersion, gofmtGo: pins.goVersion, runRC: "1",
-	})
+	}.onPinGo(pins))
 	assertLintRefused(t, res, "host golangci-lint "+lintHostForeignGLVersion+" differs")
 }
 
@@ -253,7 +317,7 @@ func TestLintLegRefusesGolangciLintBuiltWithForeignGo(t *testing.T) {
 	pins := readGateImagePins(t, root)
 	res := runRealLintLeg(t, root, lintHostFixture{
 		glVersion: pins.glVersion, glGo: lintHostForeignGo, gofmtGo: pins.goVersion, runRC: "1",
-	})
+	}.onPinGo(pins))
 	assertLintRefused(t, res, "host golangci-lint is built with go"+strings.Join(strings.SplitN(lintHostForeignGo, ".", 3)[:2], "."))
 }
 
@@ -262,7 +326,7 @@ func TestLintLegRefusesForeignGofmt(t *testing.T) {
 	pins := readGateImagePins(t, root)
 	res := runRealLintLeg(t, root, lintHostFixture{
 		glVersion: pins.glVersion, glGo: pins.goVersion, gofmtGo: lintHostForeignGo, runRC: "1",
-	})
+	}.onPinGo(pins))
 	assertLintRefused(t, res, "/gofmt is built with go"+strings.Join(strings.SplitN(lintHostForeignGo, ".", 3)[:2], "."))
 }
 
@@ -287,8 +351,8 @@ func TestLintLegRefusesWithoutCheckGateImage(t *testing.T) {
 		glVersion: pins.glVersion, glGo: pins.goVersion, gofmtGo: pins.goVersion, runRC: "1",
 	})
 	clean := lintHostHygiene(res.out)
-	if res.err == nil {
-		t.Errorf("scripts/test lint exited 0 without scripts/check-gate-image; output:\n%s", clean)
+	if res.code != 1 {
+		t.Errorf("scripts/test lint exited %d without scripts/check-gate-image, want 1 (a missing control is the tree's fault); output:\n%s", res.code, clean)
 	}
 	if !strings.Contains(res.out, "scripts/check-gate-image missing or not executable") || !strings.Contains(res.out, "refusing to lint (fail closed)") {
 		t.Errorf("output does not name the missing checker; output:\n%s", clean)
@@ -355,4 +419,234 @@ func goWorkModuleCount(t *testing.T, root string) int {
 		t.Fatalf("go.work under %s declares no modules", root)
 	}
 	return n
+}
+
+// --- #5453 stale gate image / host Go: exit 75, not "the change failed" ---
+//
+// A Go pin bump leaves a stale gate image (or host Go) whose `go` is older than
+// a go.work / go.mod directive; under GOTOOLCHAIN=local that `go` refuses the
+// module, and before #5453 the lint leg's exit 1 read as the change's failure
+// (merge-candidate failed / verify_failed, an ejection and a D6 fix-up).
+// golangci-lint and gofmt stay ON the pins here, so check-gate-image --host's
+// Go-directive check (d) is the only branch that can refuse: with it disabled
+// the lint leg reaches the fake `run`, which prints a finding and exits 1.
+
+const lintHostStaleImage = "fishhawk-gate:stale-test"
+
+// goWorkGoDirective returns go.work's column-0 `go` directive value and line.
+func goWorkGoDirective(t *testing.T, root string) (string, int) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, "go.work")) //nolint:gosec // fixed workspace-relative path
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, raw := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(raw, "go "); ok {
+			if j := strings.Index(v, "//"); j >= 0 {
+				v = v[:j]
+			}
+			return strings.TrimSpace(v), i + 1
+		}
+	}
+	t.Fatalf("go.work under %s has no `go` directive", root)
+	return "", 0
+}
+
+// goOneMinorBelow returns a GOVERSION one minor below directive (1.27.0 ->
+// go1.26.0), which no GOTOOLCHAIN=local `go` may run the workspace with.
+func goOneMinorBelow(t *testing.T, directive string) string {
+	t.Helper()
+	parts := strings.SplitN(directive, ".", 3)
+	if len(parts) < 2 {
+		t.Fatalf("go.work directive %q has no MAJOR.MINOR", directive)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil || minor == 0 {
+		t.Fatalf("go.work directive %q: cannot step its minor down (%v)", directive, err)
+	}
+	return fmt.Sprintf("go%s.%d.0", parts[0], minor-1)
+}
+
+// staleGoFixture: golangci-lint and gofmt on the pins, a GOTOOLCHAIN=local go
+// one minor below go.work's directive, and a fake `run` that would exit 1.
+func staleGoFixture(t *testing.T, root string) (lintHostFixture, gateImagePins, string, string) {
+	t.Helper()
+	pins := readGateImagePins(t, root)
+	directive, line := goWorkGoDirective(t, root)
+	older := goOneMinorBelow(t, directive)
+	fx := lintHostFixture{
+		glVersion: pins.glVersion, glGo: pins.goVersion, gofmtGo: pins.goVersion, runRC: "1",
+		goVersion: older, goToolchain: "local",
+	}
+	return fx, pins, older, fmt.Sprintf("go.work:%d `go %s`", line, directive)
+}
+
+// classifyLintLeg composes the real (exit code, output) through the runner's
+// merge-candidate mapping exactly as the committed-tree pass does.
+func classifyLintLeg(res lintHostResult) (string, string, mergeCandidateOutputEvidence) {
+	outcome := "passed"
+	if res.code != 0 {
+		outcome = "failed"
+	}
+	result, reason := classifyMergeCandidateVerify(outcome, verifyExitDisposition(res.code, gateExecuted), res.out)
+	return result, reason, mergeCandidateEvidence(res.out, result)
+}
+
+func TestLintLegStaleGateImageGoIsTempFail(t *testing.T) {
+	root := requireBashForLintHost(t)
+	fx, pins, older, directiveAt := staleGoFixture(t, root)
+	res := runRealLintLegEnv(t, root, fx, []string{
+		"FISHHAWK_GATE_CONTAINER=1",
+		"FISHHAWK_GATE_IMAGE_REF=" + lintHostStaleImage,
+		"GOTOOLCHAIN=local",
+	})
+	clean := lintHostHygiene(res.out)
+	if res.code != verifyExitTempFail {
+		t.Fatalf("scripts/test lint exited %d on a stale gate-image go, want %d (EX_TEMPFAIL); output:\n%s", res.code, verifyExitTempFail, clean)
+	}
+	for _, want := range []string{
+		lintHostRefusal,
+		"gate_image_stale: the gate image " + lintHostStaleImage,
+		"host go " + older + " (GOTOOLCHAIN=local",
+		directiveAt,
+		"GO_VERSION " + pins.goVersion,
+		"docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image",
+	} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("output lacks %q; output:\n%s", lintHostHygiene(want), clean)
+		}
+	}
+	if res.runLog != "" || strings.Contains(res.out, lintHostFakeFinding) {
+		t.Errorf("golangci-lint run executed behind a stale-image go (run log: %q); output:\n%s", res.runLog, clean)
+	}
+	result, reason, ev := classifyLintLeg(res)
+	if result != mergeCandidateNotExecuted || reason != mcReasonTempFail {
+		t.Errorf("merge-candidate classification = %s / %s, want %s / %s (never failed / verify_failed: the tree was not judged)",
+			result, reason, mergeCandidateNotExecuted, mcReasonTempFail)
+	}
+	if !strings.Contains(ev.tail, lintHostStaleImage) || !strings.Contains(ev.tail, "GO_VERSION "+pins.goVersion) {
+		t.Errorf("the merge-candidate tail does not name the image and the pin; tail:\n%s", lintHostHygiene(ev.tail))
+	}
+}
+
+// TestVerifyLegStaleGateImageGoIsTempFail: the declared gate runs `scripts/test
+// verify` (through scripts/verify-change), not `scripts/test lint`, so the
+// lint leg's 75 must survive cmd_verify, which calls cmd_lint as a plain
+// statement. A later edit that wraps cmd_lint in a pipeline or `if !` turns 75
+// back into 1 (the change's fault) and fails this test. The verify lock is a
+// t.TempDir() path, never the checkout's shared one, and is released on exit.
+func TestVerifyLegStaleGateImageGoIsTempFail(t *testing.T) {
+	root := requireBashForLintHost(t)
+	fx, pins, older, directiveAt := staleGoFixture(t, root)
+	lock := filepath.Join(t.TempDir(), "verify.lock")
+	res := runRealScriptsTest(t, root, fx, []string{
+		"FISHHAWK_GATE_CONTAINER=1",
+		"FISHHAWK_GATE_IMAGE_REF=" + lintHostStaleImage,
+		"FISHHAWK_VERIFY_LOCK_PATH=" + lock,
+		"GOTOOLCHAIN=local",
+	}, "verify", "--no-tests")
+	clean := lintHostHygiene(res.out)
+	if res.code != verifyExitTempFail {
+		t.Fatalf("scripts/test verify --no-tests exited %d on a stale gate-image go, want %d (EX_TEMPFAIL: the lint leg's 75 must survive cmd_verify); output:\n%s", res.code, verifyExitTempFail, clean)
+	}
+	for _, want := range []string{
+		lintHostRefusal,
+		"gate_image_stale: the gate image " + lintHostStaleImage,
+		"host go " + older + " (GOTOOLCHAIN=local",
+		directiveAt,
+		"GO_VERSION " + pins.goVersion,
+	} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("output lacks %q; output:\n%s", lintHostHygiene(want), clean)
+		}
+	}
+	if res.runLog != "" || strings.Contains(res.out, lintHostFakeFinding) {
+		t.Errorf("golangci-lint run executed behind a stale-image go (run log: %q); output:\n%s", res.runLog, clean)
+	}
+	if _, err := os.Lstat(lock); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the verify lock %s survived the tempfail exit (lstat err %v)", lock, err)
+	}
+	if result, reason, _ := classifyLintLeg(res); result != mergeCandidateNotExecuted || reason != mcReasonTempFail {
+		t.Errorf("merge-candidate classification = %s / %s, want %s / %s", result, reason, mergeCandidateNotExecuted, mcReasonTempFail)
+	}
+}
+
+func TestLintLegHostGoOlderIsTempFail(t *testing.T) {
+	root := requireBashForLintHost(t)
+	fx, _, older, directiveAt := staleGoFixture(t, root)
+	res := runRealLintLegEnv(t, root, fx, []string{"GOTOOLCHAIN=local"})
+	clean := lintHostHygiene(res.out)
+	if res.code != verifyExitTempFail {
+		t.Fatalf("scripts/test lint exited %d on an older host go, want %d (EX_TEMPFAIL); output:\n%s", res.code, verifyExitTempFail, clean)
+	}
+	for _, want := range []string{lintHostRefusal, "host go " + older, directiveAt, "scripts/test lint --in-gate-image"} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("output lacks %q; output:\n%s", lintHostHygiene(want), clean)
+		}
+	}
+	if strings.Contains(res.out, "gate_image_stale") {
+		t.Errorf("a host-path refusal printed the in-container gate_image_stale line; output:\n%s", clean)
+	}
+	if res.runLog != "" {
+		t.Errorf("golangci-lint run executed behind an older host go (run log: %q)", res.runLog)
+	}
+}
+
+// TestLintLegTreePinDefectExitsOne: a pin-file defect the diff caused (here
+// no GO_VERSION ARG) is the change's fault, so it stays exit 1 and reaches the
+// fix agent as failed / verify_failed.
+func TestLintLegTreePinDefectExitsOne(t *testing.T) {
+	root := requireBashForLintHost(t)
+	pins := readGateImagePins(t, root)
+	copied := t.TempDir()
+	for _, rel := range []string{"scripts/test", "scripts/check-gate-image"} {
+		b, err := os.ReadFile(filepath.Join(root, rel)) //nolint:gosec // fixed workspace-relative path
+		if err != nil {
+			t.Fatal(err)
+		}
+		dst := filepath.Join(copied, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, b, 0o755); err != nil { //nolint:gosec // the copied scripts must be executable
+			t.Fatal(err)
+		}
+	}
+	df, err := os.ReadFile(filepath.Join(root, "deploy", "gate-image", "Dockerfile")) //nolint:gosec // fixed workspace-relative path
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, l := range strings.Split(string(df), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(l), "ARG GO_VERSION=") {
+			kept = append(kept, l)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(copied, "deploy", "gate-image"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(copied, "deploy", "gate-image", "Dockerfile"), []byte(strings.Join(kept, "\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := runRealLintLeg(t, copied, lintHostFixture{
+		glVersion: pins.glVersion, glGo: pins.goVersion, gofmtGo: pins.goVersion, runRC: "1",
+	}.onPinGo(pins))
+	clean := lintHostHygiene(res.out)
+	if res.code != 1 {
+		t.Fatalf("scripts/test lint exited %d on a Dockerfile with no GO_VERSION ARG, want 1 (the tree's fault); output:\n%s", res.code, clean)
+	}
+	for _, want := range []string{"no `ARG GO_VERSION=<version>` default", "gate-image pins unreadable"} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("output lacks %q; output:\n%s", want, clean)
+		}
+	}
+	if strings.Contains(res.out, lintHostRefusal) {
+		t.Errorf("a pin-file defect was reported as a host toolchain mismatch; output:\n%s", clean)
+	}
+	if res.runLog != "" {
+		t.Errorf("golangci-lint run executed despite the pin defect (run log: %q)", res.runLog)
+	}
+	if result, reason, _ := classifyLintLeg(res); result != mergeCandidateFailed || reason != "verify_failed" {
+		t.Errorf("merge-candidate classification = %s / %s, want %s / verify_failed", result, reason, mergeCandidateFailed)
+	}
 }

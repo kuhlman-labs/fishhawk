@@ -42,13 +42,16 @@
 #
 # DYNAMIC mode (--image) runs ONE probe inside the image:
 #   docker run --rm --entrypoint '' [--platform P] REF sh -c '<probe>'
-# and compares `go version`, `golangci-lint version`, `helm version --short`
-# and `check-jsonschema --version` to the Dockerfile ARGs, all EXACT, and
-# fails when a docker binary is present inside. A missing or unparseable line,
-# a failed docker exec, or docker absent from the host PATH fails closed —
-# never a pass. On success it prints one `ok <tool> <version>` line per tool
-# and an `ok image <REF> id=<ID> digests=<...>` line naming what was checked;
-# pass an ID or digest as REF to pin exactly that image.
+# and compares `go version`, `golangci-lint version`, `helm version --short`,
+# `check-jsonschema --version`, `node --version` and `pnpm --version` to the
+# Dockerfile ARGs, all EXACT (node and pnpm against NODE_VERSION and
+# PNPM_VERSION, #5267; those two ARGs are read in this mode only, and a missing
+# one is a fail-closed violation), and fails when a docker binary is present
+# inside. A missing or unparseable line, a failed docker exec, or docker absent
+# from the host PATH fails closed — never a pass. On success it prints one
+# `ok <tool> <version>` line per tool and an `ok image <REF> id=<ID>
+# digests=<...>` line naming what was checked; pass an ID or digest as REF to
+# pin exactly that image.
 #
 # HOST mode (--host, #4245) probes the tools on THIS host's PATH against the
 # Dockerfile ARGs, never docker and never the network. It is the precondition of
@@ -68,13 +71,41 @@
 #       absent fails closed. `go version <file>` exits 0 even on a non-Go file
 #       (`could not read Go build info`), so its OUTPUT is parsed, never its
 #       status. Patch releases are compared at MAJOR.MINOR only (Go minor
-#       revisions fix critical issues, not formatting).
+#       revisions fix critical issues, not formatting);
+#   (d) the `go` on PATH must satisfy every go.work / root go.mod / */go.mod
+#       `go` directive when GOTOOLCHAIN forbids switching (#5453): a stale gate
+#       image or host Go after a pin bump otherwise makes `go` refuse the
+#       module under GOTOOLCHAIN=local, and that refusal reads as the change's
+#       failure. A `toolchain` directive is parsed and over-pin-checked like a
+#       `go` directive but never compared with the host go: under
+#       GOTOOLCHAIN=local `go` ignores it and runs the module. `go env
+#       GOTOOLCHAIN` and `go env GOVERSION` are read as two single-variable
+#       calls from `/` with GOWORK=off, so no toolchain switch or download is
+#       triggered (`go env GOTOOLCHAIN` never switches). `auto`, `path` and a
+#       `+auto` / `+path` suffix print `ok host go toolchain switching
+#       (GOTOOLCHAIN=<v>)` and skip: the directives select the toolchain. A
+#       NAMED toolchain (`goX.Y[.Z]`, with or without `+local`) prints `ok host
+#       go toolchain named (GOTOOLCHAIN=<v>)` and skips, because reading its
+#       GOVERSION would switch to (and may download) it. The check is enforced
+#       only under `local` or an empty setting (no switching); any other
+#       GOTOOLCHAIN value, `go` absent from PATH or an unparseable GOVERSION
+#       fails closed. A directive EXCEEDING GO_VERSION is the tree's defect
+#       (the STATIC (c2) text); an unparseable directive fails closed WITHOUT
+#       echoing its bytes; a root with ZERO directives has nothing to satisfy
+#       and prints an ok line (STATIC (c2) owns that anti-vacuity refusal).
 # Every mismatch is reported (not just the first); on success it prints one
-# `ok host golangci-lint <v> (built with go<mm>)` and one `ok host gofmt ...`
-# line. --host with --image or --platform is a usage error.
+# `ok host golangci-lint <v> (built with go<mm>)`, one `ok host gofmt ...` and
+# one `ok host go ...` line. --host with --image or --platform is a usage error.
+# HOST violations are split in two: a TREE violation is a pin-file defect the
+# diff can cause (a missing ARG, a GO_VERSION without MAJOR.MINOR, an
+# unparseable or over-pin directive); a HOST violation is a tool on PATH
+# disagreeing with coherent pins. Any TREE violation exits 1 (the change's
+# fault wins); only HOST violations exit 3, which scripts/test's lint leg maps
+# to VERIFY_EXIT_TEMPFAIL (75): the change was NOT judged.
 #
 # EXIT: 0 ok, 1 violation (each line names file:line and both values),
-# 2 usage error or an unreadable Dockerfile.
+# 2 usage error or an unreadable Dockerfile, 3 (--host only) every violation
+# is a host/image tool mismatch against coherent pins.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -129,6 +160,13 @@ violate() {
   printf 'check-gate-image: %s\n' "$*" >&2
   violations=$((violations + 1))
 }
+# violate_tree: a violation the TREE's pin files cause (HOST mode's exit split:
+# any tree violation exits 1, host-only violations exit 3).
+tree_violations=0
+violate_tree() {
+  violate "$@"
+  tree_violations=$((tree_violations + 1))
+}
 
 # arg_default NAME -> prints "<line>\t<value>" for the first non-comment
 # `ARG NAME=value` line (quotes stripped), or nothing.
@@ -169,12 +207,68 @@ fi
 
 GO_MM="$(printf '%s\n' "$GO_VERSION" | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1.\2/p')"
 
+# go_ver_key VERSION -> "MAJ MIN PATCH PRE" (PRE 0 for a release, -1 for an
+# rc/beta, which sorts below the .0 release), or nothing when unparseable.
+# Accepts an optional leading `go` (toolchain form) and a `-suffix`.
+go_ver_key() {
+  printf '%s\n' "$1" | sed -nE '
+    s/^(go)?([0-9]+)\.([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 \4 0/p
+    t
+    s/^(go)?([0-9]+)\.([0-9]+)((rc|beta)[0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 0 -1/p
+    t
+    s/^(go)?([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 0 0/p'
+}
+# go_ver_gt A_KEY B_KEY -> success when A > B.
+go_ver_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, " "); split(b, y, " ")
+    for (i = 1; i <= 4; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 1 }'
+}
+GO_KEY="$(go_ver_key "$GO_VERSION")"
+
+# go_directive_files: sets go_files to go.work, a root go.mod and every
+# */go.mod under ROOT (STATIC (c)/(c2) and HOST (d) walk the same set).
+go_directive_files() {
+  go_files=()
+  [ -f "$ROOT/go.work" ] && go_files+=("$ROOT/go.work")
+  [ -f "$ROOT/go.mod" ] && go_files+=("$ROOT/go.mod")
+  local f
+  for f in "$ROOT"/*/go.mod; do
+    [ -f "$f" ] && go_files+=("$f")
+  done
+  return 0 # a false last `[ -f ]` must not fail the call under set -e
+}
+# go_directive_scan FILE -> one "<line>\t<go|toolchain>\t<value>" record per
+# column-0 directive (a trailing // comment and whitespace stripped).
+go_directive_scan() {
+  awk '
+    { line = $0; sub(/\r$/, "", line) }
+    match(line, /^(go|toolchain)[ \t]+/) {
+      kind = line; sub(/[ \t].*$/, "", kind)
+      v = substr(line, RLENGTH + 1)
+      sub(/\/\/.*$/, "", v); sub(/[ \t]+$/, "", v)
+      print NR "\t" kind "\t" v
+    }' "$1"
+}
+# go_directive_key KIND VALUE -> the go_ver_key of a well-formed directive
+# (`go X.Y[.Z]` without the go prefix, `toolchain goX.Y[.Z]` with it), or
+# nothing: a non-version string is rejected, never echoed as a version.
+go_directive_key() {
+  local kind="$1" val="$2" key
+  key="$(go_ver_key "$val")"
+  if [ -z "$key" ] || { [ "$kind" = toolchain ] && [ "${val#go}" = "$val" ]; } || { [ "$kind" = go ] && [ "${val#go}" != "$val" ]; }; then
+    return 0
+  fi
+  printf '%s\n' "$key"
+}
+
 # ---------------------------------------------------------------------------
 # HOST mode (#4245)
 # ---------------------------------------------------------------------------
 if [ "$HOST" = 1 ]; then
   if [ -z "$GO_MM" ]; then
-    violate "$DOCKERFILE_REL:$GO_VERSION_LINE: GO_VERSION '$GO_VERSION' has no parseable MAJOR.MINOR (fail closed: the host Go cannot be compared)"
+    violate_tree "$DOCKERFILE_REL:$GO_VERSION_LINE: GO_VERSION '$GO_VERSION' has no parseable MAJOR.MINOR (fail closed: the host Go cannot be compared)"
   fi
 
   if ! command -v golangci-lint >/dev/null 2>&1; then
@@ -222,9 +316,104 @@ if [ "$HOST" = 1 ]; then
     fi
   fi
 
+  # (d) the host `go` against the go.work / go.mod directives (#5453). Skipped
+  # when GO_VERSION has no MAJOR.MINOR: that tree violation already refuses.
+  # safe_word VALUE -> VALUE bounded to 64 bytes of [A-Za-z0-9._+-], so a host
+  # value is quoted without control bytes.
+  safe_word() {
+    local w
+    w="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._+-')"
+    printf '%s' "${w:0:64}"
+  }
+  host_go_enforced=0
+  if [ -z "$GO_MM" ]; then
+    :
+  elif ! command -v go >/dev/null 2>&1; then
+    violate "host \`go\` not found on PATH (fail closed: it cannot be compared with the go.work / go.mod go directives)"
+  else
+    host_tc_rc=0
+    host_tc="$(cd / && GOWORK=off go env GOTOOLCHAIN 2>/dev/null)" || host_tc_rc=$?
+    host_tc="${host_tc%%$'\n'*}"
+    if [ "$host_tc_rc" -ne 0 ]; then
+      violate "host \`go env GOTOOLCHAIN\` exited $host_tc_rc (fail closed: whether \`go\` may switch toolchains cannot be read)"
+    else
+      case "$host_tc" in
+        auto|path|*+auto|*+path)
+          echo "ok host go toolchain switching (GOTOOLCHAIN=$(safe_word "$host_tc"))" ;;
+        ''|local)
+          host_go_enforced=1 ;;
+        go[0-9]*)
+          host_tc_name="${host_tc%+local}"
+          case "$host_tc_name" in *+*) host_tc_name="" ;; esac
+          if [ -n "$host_tc_name" ] && [ -n "$(go_ver_key "$host_tc_name")" ]; then
+            echo "ok host go toolchain named (GOTOOLCHAIN=$host_tc)"
+          else
+            violate "host GOTOOLCHAIN '$(safe_word "$host_tc")' is not auto, path, local or a goX.Y[.Z] toolchain name (fail closed)"
+          fi ;;
+        *)
+          violate "host GOTOOLCHAIN '$(safe_word "$host_tc")' is not auto, path, local or a goX.Y[.Z] toolchain name (fail closed)" ;;
+      esac
+    fi
+  fi
+  if [ "$host_go_enforced" = 1 ]; then
+    host_gv="$(cd / && GOWORK=off go env GOVERSION 2>/dev/null)" || host_gv=""
+    host_gv="${host_gv%%$'\n'*}"
+    host_gv_key=""
+    if [ "${host_gv#go}" != "$host_gv" ]; then
+      host_gv_key="$(go_ver_key "$host_gv")"
+    fi
+    if [ -z "$host_gv_key" ]; then
+      violate "cannot parse a Go version from host \`go env GOVERSION\` ('$(safe_word "$host_gv")') under GOTOOLCHAIN=${host_tc:-<empty>} (fail closed)"
+    else
+      max_key="" max_at="" max_dir=""
+      dir_tree=0
+      go_directive_files
+      for f in ${go_files[@]+"${go_files[@]}"}; do
+        rel="${f#$ROOT/}"
+        if [ ! -r "$f" ]; then
+          echo "check-gate-image: cannot read $rel" >&2
+          exit 2
+        fi
+        while IFS='	' read -r ln kind val; do
+          [ -n "$ln" ] || continue
+          key="$(go_directive_key "$kind" "$val")"
+          if [ -z "$key" ]; then
+            violate_tree "$rel:$ln: unparseable \`$kind\` directive (fail closed: its value is not a Go version)"
+            dir_tree=1
+            continue
+          fi
+          if [ -n "$GO_KEY" ] && go_ver_gt "$key" "$GO_KEY"; then
+            violate_tree "$rel:$ln: \`$kind $val\` exceeds $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION — GOTOOLCHAIN=local in the image refuses it"
+            dir_tree=1
+            continue
+          fi
+          # Only a `go` directive is a requirement: GOTOOLCHAIN=local ignores
+          # `toolchain` (it only selects a toolchain when switching).
+          [ "$kind" = go ] || continue
+          if [ -z "$max_key" ] || go_ver_gt "$key" "$max_key"; then
+            max_key="$key" max_at="$rel:$ln" max_dir="$kind $val"
+          fi
+        done < <(go_directive_scan "$f")
+      done
+      if [ "$dir_tree" = 1 ]; then
+        :
+      elif [ -z "$max_key" ]; then
+        echo "ok host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}): no go.work / go.mod go directive to satisfy"
+      elif go_ver_gt "$max_key" "$host_gv_key"; then
+        violate "host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}, which never switches) is older than $max_at \`$max_dir\`, so \`go\` refuses the module — $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION is the pinned Go: rebuild the gate image or put go$GO_VERSION first on PATH"
+      else
+        echo "ok host go $host_gv (GOTOOLCHAIN=${host_tc:-<empty>}) satisfies every go directive (highest $max_at \`$max_dir\`)"
+      fi
+    fi
+  fi
+
   if [ "$violations" -gt 0 ]; then
-    echo "check-gate-image: $violations host toolchain violation(s)" >&2
-    exit 1
+    if [ "$tree_violations" -gt 0 ]; then
+      echo "check-gate-image: $violations host toolchain violation(s), $tree_violations of them in this tree's pin files (exit 1: a pin-file defect is the change's fault)" >&2
+      exit 1
+    fi
+    echo "check-gate-image: $violations host toolchain violation(s) against coherent pins (exit 3: the host/image toolchain, not the tree)" >&2
+    exit 3
   fi
   exit 0
 fi
@@ -237,11 +426,26 @@ if [ -n "$IMAGE" ]; then
     echo "check-gate-image: docker not found on PATH — --image needs docker to run the probe inside $IMAGE (fail closed, not a skip)" >&2
     exit 1
   fi
+  # NODE_VERSION / PNPM_VERSION (#5267): read here, not with the ARGs above,
+  # so STATIC and HOST mode never refuse on them. A missing one is recorded
+  # and its tool is not compared; the probe still runs and every other tool
+  # is still reported.
+  NODE_VERSION="" PNPM_VERSION=""
+  for name in NODE_VERSION PNPM_VERSION; do
+    rec="$(arg_default "$name")"
+    if [ -z "$rec" ] || [ -z "${rec#*	}" ]; then
+      violate "$DOCKERFILE_REL: no \`ARG $name=<version>\` default (fail closed: the pin cannot be compared)"
+      continue
+    fi
+    eval "$name=\${rec#*	}"
+  done
   probe='
 printf "go=%s\n" "$(go version 2>/dev/null | head -n 1)"
 printf "golangci-lint=%s\n" "$(golangci-lint version 2>/dev/null | head -n 1)"
 printf "helm=%s\n" "$(helm version --short 2>/dev/null | head -n 1)"
 printf "check-jsonschema=%s\n" "$(check-jsonschema --version 2>/dev/null | head -n 1)"
+printf "node=%s\n" "$(node --version 2>/dev/null | head -n 1)"
+printf "pnpm=%s\n" "$(pnpm --version 2>/dev/null | head -n 1)"
 found=""
 for p in $(command -v docker 2>/dev/null) $(command -v dockerd 2>/dev/null) /usr/bin/docker /usr/local/bin/docker /bin/docker /usr/bin/dockerd /usr/local/bin/dockerd; do
   if [ -e "$p" ]; then found="$found $p"; fi
@@ -299,6 +503,18 @@ if [ -n "$found" ]; then printf "docker=present:%s\n" "$found"; else printf "doc
   got="$(printf '%s\n' "$raw" | sed -nE 's/^check-jsonschema, version ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
   check_tool check-jsonschema "$CHECK_JSONSCHEMA_VERSION" "$raw" "$got"
 
+  if [ -n "$NODE_VERSION" ]; then
+    raw="$(probe_value node)"
+    got="$(printf '%s\n' "$raw" | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
+    check_tool node "$NODE_VERSION" "$raw" "$got"
+  fi
+
+  if [ -n "$PNPM_VERSION" ]; then
+    raw="$(probe_value pnpm)"
+    got="$(printf '%s\n' "$raw" | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
+    check_tool pnpm "$PNPM_VERSION" "$raw" "$got"
+  fi
+
   raw="$(probe_value docker)"
   case "$raw" in
     absent) echo "ok docker absent" ;;
@@ -351,34 +567,9 @@ elif [ "$HELM_MAJOR" -lt 4 ]; then
   violate "$DOCKERFILE_REL:$HELM_VERSION_LINE: HELM_VERSION $HELM_VERSION is below v4 — test-helm-render r9's \`helm install --dry-run\` needs a reachable cluster on Helm v3, and the gate image has none"
 fi
 
-# go_ver_key VERSION -> "MAJ MIN PATCH PRE" (PRE 0 for a release, -1 for an
-# rc/beta, which sorts below the .0 release), or nothing when unparseable.
-# Accepts an optional leading `go` (toolchain form) and a `-suffix`.
-go_ver_key() {
-  printf '%s\n' "$1" | sed -nE '
-    s/^(go)?([0-9]+)\.([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 \4 0/p
-    t
-    s/^(go)?([0-9]+)\.([0-9]+)((rc|beta)[0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 0 -1/p
-    t
-    s/^(go)?([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 0 0/p'
-}
-# go_ver_gt A_KEY B_KEY -> success when A > B.
-go_ver_gt() {
-  awk -v a="$1" -v b="$2" 'BEGIN {
-    split(a, x, " "); split(b, y, " ")
-    for (i = 1; i <= 4; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
-    exit 1 }'
-}
-GO_KEY="$(go_ver_key "$GO_VERSION")"
-
 # (c)/(c2) go.work, root go.mod, */go.mod directives.
 go_directive_sites=0
-go_files=()
-[ -f "$ROOT/go.work" ] && go_files+=("$ROOT/go.work")
-[ -f "$ROOT/go.mod" ] && go_files+=("$ROOT/go.mod")
-for f in "$ROOT"/*/go.mod; do
-  [ -f "$f" ] && go_files+=("$f")
-done
+go_directive_files
 for f in ${go_files[@]+"${go_files[@]}"}; do
   rel="${f#$ROOT/}"
   if [ ! -r "$f" ]; then
@@ -390,9 +581,9 @@ for f in ${go_files[@]+"${go_files[@]}"}; do
     if [ "$kind" = go ]; then
       go_directive_sites=$((go_directive_sites + 1))
     fi
-    key="$(go_ver_key "$val")"
-    if [ -z "$key" ] || { [ "$kind" = toolchain ] && [ "${val#go}" = "$val" ]; } || { [ "$kind" = go ] && [ "${val#go}" != "$val" ]; }; then
-      violate "$rel:$ln: unparseable \`$kind $val\` directive (fail closed)"
+    key="$(go_directive_key "$kind" "$val")"
+    if [ -z "$key" ]; then
+      violate "$rel:$ln: unparseable \`$kind\` directive (fail closed: its value is not a Go version)"
       continue
     fi
     if [ "$kind" = go ]; then
@@ -404,14 +595,7 @@ for f in ${go_files[@]+"${go_files[@]}"}; do
     if [ -n "$GO_KEY" ] && go_ver_gt "$key" "$GO_KEY"; then
       violate "$rel:$ln: \`$kind $val\` exceeds $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION — GOTOOLCHAIN=local in the image refuses it"
     fi
-  done < <(awk '
-    { line = $0; sub(/\r$/, "", line) }
-    match(line, /^(go|toolchain)[ \t]+/) {
-      kind = line; sub(/[ \t].*$/, "", kind)
-      v = substr(line, RLENGTH + 1)
-      sub(/\/\/.*$/, "", v); sub(/[ \t]+$/, "", v)
-      print NR "\t" kind "\t" v
-    }' "$f")
+  done < <(go_directive_scan "$f")
 done
 if [ "$go_directive_sites" -eq 0 ]; then
   violate "no go.work / go.mod \`go\` directive found under $ROOT (fail closed: zero Go pin sites cannot be compared)"

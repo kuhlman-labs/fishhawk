@@ -5943,7 +5943,9 @@ func mcvLaunchGolden(t *testing.T, name string) []byte {
 }
 
 // TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens is the
-// BACKEND half of the #5408 cross-boundary pair (ADR-102 Amendment A1). The
+// BACKEND half of the #5408 cross-boundary pair (ADR-102 Amendment A1), and
+// of the #5453 stale-gate-image golden
+// (merge_candidate_toolchain_mismatch_report.json, toolchain_mismatch*). The
 // runner half, TestMergeCandidateVerify_ContainerLaunchMarker, drives the real
 // merge-candidate pass on the container path and asserts it ships these
 // shared files' fields (testdata/wire/merge_candidate_launch_failed_report.json
@@ -6003,6 +6005,95 @@ func TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens(t *testin
 			t.Errorf("stage_fixup_triggered rows = %d, want 1", n)
 		}
 	})
+	// #5453: a stale gate image (scripts/test lint's exit 75 after
+	// check-gate-image --host exits 3) ships not_executed /
+	// verify_infra_tempfail. Under a fix-up-DELEGATING workflow it records the
+	// row naming the image, the GO_VERSION pin and the rebuild command, routes
+	// NO fix-up, leaves the head unverified, and the real merge handler then
+	// refuses that head 409 merge_candidate_unverified (approval condition Z4:
+	// a tree-authored exit 3 / 75 can never merge).
+	t.Run("toolchain_mismatch", func(t *testing.T) {
+		golden := mcvLaunchGolden(t, "merge_candidate_toolchain_mismatch_report.json")
+		f, g := newMCVShipGateFixture(t, mcvDelegatedV0SpecYAML)
+		f.seedRebased(mcvHead, mcvHead, false)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, golden)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp.Result != mergeCandidateResultNotExecuted || resp.FixupRouted || resp.FixupRefusal != "" {
+			t.Errorf("response = %+v, want not_executed with no routed fix-up and no refusal", resp)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 0 (a stale gate image is no verdict on the tree)", n)
+		}
+		rows := mcvVerdictRows(f.au)
+		if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted || rows[0].Reason != "verify_infra_tempfail" || rows[0].HeadSHA != mcvHead {
+			t.Fatalf("merge_candidate_verified rows = %+v, want one not_executed / verify_infra_tempfail row", rows)
+		}
+		for _, want := range []string{
+			"gate_image_stale: the gate image fishhawk-gate:stale-test",
+			"GO_VERSION 1.27.4",
+			"docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image",
+		} {
+			if !strings.Contains(rows[0].OutputTail, want) {
+				t.Errorf("recorded output tail lacks %q:\n%s", want, rows[0].OutputTail)
+			}
+		}
+		if got := f.stageState(t, f.impl.ID); got == run.StageStateRunning {
+			t.Errorf("implement state = %q, want settled out of running", got)
+		}
+		state, err := f.s.mergeCandidateVerifyState(t.Context(), f.runRow(t), mcvHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.State != mergeCandidateStateUnverified {
+			t.Errorf("mergeCandidateVerifyState = %+v, want unverified: a stale-image pass is never merge-eligible", state)
+		}
+		env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+		if d := env.Error.Details; d["head_sha"] != mcvHead || d["verify_state"] != mergeCandidateStateUnverified {
+			t.Errorf("merge refusal details = %v, want head %s, verify_state unverified", d, mcvHead)
+		}
+	})
+	// The done-means counterfactual's BACKEND half: the SAME tail posted as
+	// failed / verify_failed (what the runner ships when scripts/test has no
+	// exit-75 classification, i.e. the probe is absent) routes exactly one
+	// fix-up for a change with no defect — the misclassification #5453 closes.
+	t.Run("toolchain_mismatch_unprobed", func(t *testing.T) {
+		var golden struct {
+			Tail string `json:"merge_candidate_output_tail"`
+		}
+		if err := json.Unmarshal(mcvLaunchGolden(t, "merge_candidate_toolchain_mismatch_report.json"), &golden); err != nil || golden.Tail == "" {
+			t.Fatalf("golden tail = %q, err = %v", golden.Tail, err)
+		}
+		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, mcvReportBody(mcvHead, mergeCandidateResultFailed, "verify_failed", golden.Tail))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp.Result != mergeCandidateResultFailed || !resp.FixupRouted {
+			t.Fatalf("response = %+v, want failed with one routed fix-up", resp)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 1 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 1", n)
+		}
+	})
+}
+
+// newMCVShipGateFixture is newMCVShipFixture over newMCGateFixture's forge
+// wiring (GitHub fake, PR URL, installation, gate merger), so one fixture can
+// ship a merge-candidate report through the real /pull-request handler and
+// then drive the real merge handler at the same head (#5453).
+func newMCVShipGateFixture(t *testing.T, specYAML string) (*mcvShipFixture, *mcGateFixture) {
+	t.Helper()
+	g := newMCGateFixture(t, specYAML)
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	g.s.cfg.SigningRepo = sf
+	g.s.cfg.ArtifactRepo = ar
+	priv, _ := sf.issue(t, g.runID)
+	return &mcvShipFixture{mcvFixture: g.mcvFixture, sf: sf, ar: ar, priv: priv}, g
 }
 
 // TestShipPullRequest_MergeCandidateVerified_RefusalArms: a report with no

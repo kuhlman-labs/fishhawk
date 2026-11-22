@@ -2551,6 +2551,49 @@ func gateRunImage(argv []string) string {
 	return ""
 }
 
+// TestRunGateInContainer_GateImageEnv (#5453): every container exec carries
+// `-e FISHHAWK_GATE_IMAGE_REF=<the image the gate runs>` exactly once, and an
+// extraEnv value of the key loses to the runner's. Approval condition Z1: the
+// runner's OWN FISHHAWK_GATE_IMAGE configuration variable is unchanged — it
+// still selects the image the gate runs, and its host value never crosses into
+// the container (it is not on the containerEnvAllowed allow-list).
+func TestRunGateInContainer_GateImageEnv(t *testing.T) {
+	t.Setenv(gateImageEnvVar, "host-process:7")
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	g := scriptGateExec(t, nil)
+	out, code, disp := runBoundedGateArgvDisposed(context.Background(), []string{"sh", "-c", "true"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "lc"), time.Minute, gateiso.GateImageRefEnvKey+"=other:9")
+	if code != 0 || disp != gateExecuted || out != "gate ok" {
+		t.Fatalf("(out, code, disp) = (%q, %d, %s), want the gate's own verdict", out, code, disp)
+	}
+	gate := g.argv["gate_run"]
+	if got := gateRunImage(gate); got != "img:1" {
+		t.Fatalf("gate ran image %q, want img:1 from %s (the runner's configuration is unchanged)", got, gateImageEnvVar)
+	}
+	refs, own := 0, 0
+	for i := 0; i+1 < len(gate); i++ {
+		if gate[i] != "-e" {
+			continue
+		}
+		if strings.HasPrefix(gate[i+1], gateiso.GateImageRefEnvKey+"=") {
+			refs++
+		}
+		if strings.HasPrefix(gate[i+1], gateImageEnvVar+"=") {
+			own++
+		}
+	}
+	if v, _ := lastEnvValue(gate, gateiso.GateImageRefEnvKey); refs != 1 || v != "img:1" {
+		t.Errorf("gate argv carries %d %s pair(s), last %q; want exactly one, img:1 (the runner's value wins over extraEnv): %q",
+			refs, gateiso.GateImageRefEnvKey, v, gate)
+	}
+	if own != 0 {
+		t.Errorf("the runner's own %s reached the container argv: %q", gateImageEnvVar, gate)
+	}
+	if strings.Contains(strings.Join(gate, " "), "host-process:7") {
+		t.Errorf("the runner process's %s value leaked into the gate argv: %q", gateImageEnvVar, gate)
+	}
+}
+
 // pulledImageResponder answers a declared-image resolution: the n-th inspect
 // returns inspects[n-1] (exit 0) or "no such image" (exit 1) when absent or
 // empty; pull exits pullCode; everything else is the service happy path.
@@ -2629,6 +2672,11 @@ func TestDeclaredImage_Resolution(t *testing.T) {
 			}
 			if got := gateRunImage(g.argv["passwd"]); got != r.wantRun {
 				t.Errorf("passwd read image %q, want %q", got, r.wantRun)
+			}
+			// #5453: the in-container image ref is the RESOLVED ref the gate
+			// runs, never the env image img:1.
+			if got, _ := lastEnvValue(g.argv["gate_run"], gateiso.GateImageRefEnvKey); got != r.wantRun {
+				t.Errorf("gate argv %s = %q, want the resolved ref %q", gateiso.GateImageRefEnvKey, got, r.wantRun)
 			}
 			sel, ok := st.recordedSelection()
 			if !ok || sel.ImageSource != gateiso.ImageSourceStage || sel.ResolvedImage == nil ||

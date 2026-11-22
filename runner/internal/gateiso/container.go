@@ -546,9 +546,10 @@ func containerGoflags(value string) (string, bool) {
 // cache and toolchain pins are appended drop-then-append (HOME, GOPATH, GOCACHE,
 // GOMODCACHE, GOLANGCI_LINT_CACHE, GOPROXY=off, GOTOOLCHAIN=local,
 // GIT_CONFIG_GLOBAL/SYSTEM=/dev/null, FISHHAWK_GATE_CONTAINER=1), then extras
-// drop-then-append so a caller-supplied value wins over both. The volume
-// form's cache env (WithCacheVolumeEnv) and then the service env
-// (WithServiceEnv) are applied after all of it.
+// drop-then-append so a caller-supplied value wins over both. The runner's
+// image ref (WithGateImageEnv), the volume form's cache env
+// (WithCacheVolumeEnv) and then the service env (WithServiceEnv) are applied
+// after all of it, in that order.
 func ContainerEnv(sanitized []string, extras []string) []string {
 	var out []string
 	for _, kv := range sanitized {
@@ -575,6 +576,28 @@ func ContainerEnv(sanitized []string, extras []string) []string {
 		out = dropThenAppend(out, kv)
 	}
 	return out
+}
+
+// GateImageRefEnvKey names the image the gate container runs, set by the
+// runner on every container exec (WithGateImageEnv, #5453) so the in-gate
+// scripts/test can name a stale image in its gate_image_stale line. It is
+// deliberately NOT FISHHAWK_GATE_IMAGE: that is the runner's OWN configuration
+// variable (gateImageEnvVar), which never crosses into the container. The
+// value is an image reference (a tag, name@digest or a fishhawk-gate-build
+// tag), never a credential, so it bypasses the containerEnvAllowed allow-list
+// by design, exactly like the containerEnvPins.
+const GateImageRefEnvKey = "FISHHAWK_GATE_IMAGE_REF"
+
+// WithGateImageEnv returns a copy of env with FISHHAWK_GATE_IMAGE_REF=image
+// applied drop-then-append, so the runner's resolved image wins over any
+// sanitized or extra value of the key. An empty image leaves env unchanged
+// (still a copy). It never mutates env.
+func WithGateImageEnv(env []string, image string) []string {
+	out := append([]string(nil), env...)
+	if image == "" {
+		return out
+	}
+	return dropThenAppend(out, GateImageRefEnvKey+"="+image)
 }
 
 // WithServiceEnv applies a provisioned service's env (PostgresService.GateEnv)
