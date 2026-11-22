@@ -30,9 +30,22 @@ type fakeCampaignStore struct {
 	campaigns map[uuid.UUID]*campaign.Campaign
 	items     map[uuid.UUID][]*campaign.Item // keyed by campaign id
 
-	listErr      error
-	itemsErr     error
-	linkErr      error
+	listErr    error
+	itemsErr   error
+	linkErr    error // injected error for LinkClaimedCampaignItemRun (the claimed start link)
+	unlinkErr  error // injected error for SetCampaignItemRun (the transition-failure unlink)
+	claimErr   error // injected non-conflict error for ClaimCampaignItemStart
+	releaseErr error // injected error for ReleaseCampaignItemStart
+	// claimTTL overrides campaign.ItemStartClaimTTL for new claims (zero =
+	// the production TTL), so a test can hand out a claim that does not cover
+	// the start and cleanup budgets (X4).
+	claimTTL time.Duration
+	// claims holds the live claim per item, with the Postgres semantics
+	// (#5266): linked refuses, a live claim refuses, an expired claim is
+	// replaced, a link consumes only its own claim, release is claim-scoped.
+	claims       map[uuid.UUID]*campaign.StartClaim
+	claimCalls   int
+	releaseCalls int
 	transErr     error // injected error for TransitionCampaignItem (settle and start paths)
 	pauseErr     error // injected error for PauseCampaignItem (page path)
 	campTransErr error // injected error for TransitionCampaign (campaign-pause path)
@@ -132,11 +145,18 @@ func (f *fakeCampaignStore) ListCampaignItemsForCampaign(_ context.Context, id u
 	return out, nil
 }
 
-func (f *fakeCampaignStore) SetCampaignItemRun(_ context.Context, itemID uuid.UUID, runID *uuid.UUID) (*campaign.Item, error) {
+// Every claim, link, unlink and release method returns ctx.Err() on a done
+// context, as the pgx adapter would, so a test can tell which context a
+// cleanup act ran on (U3). On a live context this changes nothing.
+
+func (f *fakeCampaignStore) SetCampaignItemRun(ctx context.Context, itemID uuid.UUID, runID *uuid.UUID) (*campaign.Item, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.linkErr != nil {
-		return nil, f.linkErr
+	if f.unlinkErr != nil {
+		return nil, f.unlinkErr
 	}
 	f.links = append(f.links, linkRecord{itemID: itemID, runID: runID})
 	it := f.findItemLocked(itemID)
@@ -145,6 +165,116 @@ func (f *fakeCampaignStore) SetCampaignItemRun(_ context.Context, itemID uuid.UU
 	}
 	it.RunID = runID
 	return it, nil
+}
+
+func (f *fakeCampaignStore) ClaimCampaignItemStart(ctx context.Context, p campaign.ClaimCampaignItemStartParams) (*campaign.StartClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimCalls++
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
+	it := f.findItemLocked(p.ItemID)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	if it.RunID != nil {
+		w := *it.RunID
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictLinked, WinnerRunID: &w}
+	}
+	now := p.Clock()
+	if held := f.claims[it.ID]; held != nil && held.ExpiresAt.After(now) {
+		h := *held
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictClaimed, HeldClaim: &h}
+	}
+	ttl := f.claimTTL
+	if ttl == 0 {
+		ttl = campaign.ItemStartClaimTTL
+	}
+	cl := &campaign.StartClaim{ItemID: it.ID, ClaimID: uuid.New(), Starter: p.Starter, ClaimedAt: now, ExpiresAt: now.Add(ttl)}
+	if f.claims == nil {
+		f.claims = map[uuid.UUID]*campaign.StartClaim{}
+	}
+	f.claims[it.ID] = cl
+	out := *cl
+	return &out, nil
+}
+
+func (f *fakeCampaignStore) LinkClaimedCampaignItemRun(ctx context.Context, p campaign.LinkClaimedCampaignItemRunParams) (*campaign.Item, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.linkErr != nil {
+		return nil, f.linkErr
+	}
+	it := f.findItemLocked(p.ItemID)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	if it.RunID != nil {
+		if *it.RunID == p.RunID {
+			if c := f.claims[it.ID]; c != nil && c.ClaimID == p.ClaimID {
+				delete(f.claims, it.ID)
+			}
+			return it, nil
+		}
+		w := *it.RunID
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictLinked, WinnerRunID: &w}
+	}
+	held := f.claims[it.ID]
+	if held == nil || held.ClaimID != p.ClaimID {
+		conflict := &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictClaimLost}
+		if held != nil {
+			h := *held
+			conflict.HeldClaim = &h
+		}
+		return nil, conflict
+	}
+	delete(f.claims, it.ID)
+	rid := p.RunID
+	f.links = append(f.links, linkRecord{itemID: it.ID, runID: &rid})
+	it.RunID = &rid
+	return it, nil
+}
+
+func (f *fakeCampaignStore) ReleaseCampaignItemStart(ctx context.Context, itemID, claimID uuid.UUID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseCalls++
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
+	if c := f.claims[itemID]; c != nil && c.ClaimID == claimID {
+		delete(f.claims, itemID)
+	}
+	return nil
+}
+
+// liveClaims returns the number of claims still held.
+func (f *fakeCampaignStore) liveClaims() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.claims)
+}
+
+// seedClaim stores a claim another starter holds on it.
+func (f *fakeCampaignStore) seedClaim(it *campaign.Item, starter string, expiresAt time.Time) *campaign.StartClaim {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.claims == nil {
+		f.claims = map[uuid.UUID]*campaign.StartClaim{}
+	}
+	cl := &campaign.StartClaim{ItemID: it.ID, ClaimID: uuid.New(), Starter: starter, ClaimedAt: expiresAt.Add(-campaign.ItemStartClaimTTL), ExpiresAt: expiresAt}
+	f.claims[it.ID] = cl
+	return cl
 }
 
 func (f *fakeCampaignStore) TransitionCampaignItem(_ context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error) {
@@ -343,14 +473,36 @@ func (f *fakeNotifier) callCount() int {
 
 // --- run starter fake -------------------------------------------------------
 
+// fakeStarter is the recording RunStarter. It also implements the optional
+// RunCanceller seam (#5266); wrap it in starterOnly to drop the seam.
 type fakeStarter struct {
 	mu       sync.Mutex
 	calls    []uuid.UUID // item ids started, in order
 	startErr error
 	reader   *fakeRunReader // newly-created runs land here so advance can read them
+
+	// incomplete makes a start mint a run and then return a
+	// *StartIncompleteError naming it (stage creation failed).
+	incomplete bool
+	// blockUntilDone makes a start wait until its context is done, then
+	// return the minted run: a mint that outlived the start budget (U3).
+	blockUntilDone bool
+	// onStart runs inside each start before the run is minted.
+	onStart func(ctx context.Context)
+
+	// RunCanceller: cancels records each cancelled run id; cancelErr fails
+	// every cancel. A cancel on a done context returns ctx.Err().
+	cancels   []uuid.UUID
+	cancelErr error
 }
 
-func (f *fakeStarter) StartCampaignRun(_ context.Context, item *campaign.Item, _ *campaign.Campaign) (*run.Run, error) {
+func (f *fakeStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, _ *campaign.Campaign) (*run.Run, error) {
+	if f.onStart != nil {
+		f.onStart(ctx)
+	}
+	if f.blockUntilDone {
+		<-ctx.Done()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {
@@ -359,9 +511,44 @@ func (f *fakeStarter) StartCampaignRun(_ context.Context, item *campaign.Item, _
 	f.calls = append(f.calls, item.ID)
 	r := &run.Run{ID: uuid.New(), State: run.StatePending}
 	if f.reader != nil {
+		f.reader.mu.Lock()
 		f.reader.runs[r.ID] = r
+		f.reader.mu.Unlock()
+	}
+	if f.incomplete {
+		return nil, &StartIncompleteError{RunID: r.ID, Err: errors.New("create stages failed: boom")}
 	}
 	return r, nil
+}
+
+func (f *fakeStarter) CancelCampaignRun(ctx context.Context, runID uuid.UUID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
+	f.cancels = append(f.cancels, runID)
+	if f.reader != nil {
+		f.reader.setState(runID, run.StateCancelled)
+	}
+	return nil
+}
+
+func (f *fakeStarter) cancelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.cancels)
+}
+
+// starterOnly exposes only StartCampaignRun, so the driver finds no
+// RunCanceller seam on it.
+type starterOnly struct{ s *fakeStarter }
+
+func (o starterOnly) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*run.Run, error) {
+	return o.s.StartCampaignRun(ctx, item, c)
 }
 
 // --- audit recorder fake ----------------------------------------------------
@@ -452,7 +639,10 @@ func (f *fakeAudit) chainRows(runID uuid.UUID, category string) []*audit.Entry {
 	return out
 }
 
-func (f *fakeAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+func (f *fakeAudit) AppendGlobalChained(ctx context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.appendErr != nil {
@@ -824,9 +1014,11 @@ func TestTick_GetRunError_NoSettle(t *testing.T) {
 	}
 }
 
-// start: a SetCampaignItemRun (link) error is a logged continue — the item
+// start: a LinkClaimedCampaignItemRun error is a logged continue — the item
 // is NOT transitioned to running and no started audit is emitted (no partial
-// commit of a half-started item).
+// commit of a half-started item). Since #5266 the minted run is cancelled,
+// the claim released, and one campaign_item_run_abandoned row records
+// link_failed.
 func TestTick_LinkError_NoRunningTransition(t *testing.T) {
 	store := newFakeStore()
 	c := store.seedCampaign(campaign.StateRunning)
@@ -834,7 +1026,8 @@ func TestTick_LinkError_NoRunningTransition(t *testing.T) {
 	store.linkErr = errors.New("link failed")
 	reader := newFakeRunReader()
 	au := &fakeAudit{}
-	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	starter := &fakeStarter{reader: reader}
+	tk := newTicker(store, reader, starter, au, 4)
 
 	tk.Tick(context.Background()) // must not panic
 
@@ -844,9 +1037,42 @@ func TestTick_LinkError_NoRunningTransition(t *testing.T) {
 	if len(store.itemTransitions) != 0 {
 		t.Fatalf("expected no item transitions on link error, got %d", len(store.itemTransitions))
 	}
-	if au.count() != 0 {
-		t.Fatalf("expected no started audit on link error, got %d", au.count())
+	if n := len(au.byCategory(categoryCampaignIssueStarted)); n != 0 {
+		t.Fatalf("expected no started audit on link error, got %d", n)
 	}
+	assertDriverAbandoned(t, au, reader, starter, abandonLinkFailed, true)
+	if n := store.liveClaims(); n != 0 {
+		t.Fatalf("claims held after link failure = %d, want 0 (released)", n)
+	}
+}
+
+// assertDriverAbandoned asserts exactly one campaign_item_run_abandoned row
+// with reason and cancelled, naming the single minted run, and that the run
+// reads back cancelled exactly when cancelled is true.
+func assertDriverAbandoned(t *testing.T, au *fakeAudit, reader *fakeRunReader, starter *fakeStarter, reason string, cancelled bool) map[string]any {
+	t.Helper()
+	rows := au.byCategory(CategoryCampaignItemRunAbandoned)
+	if len(rows) != 1 {
+		t.Fatalf("campaign_item_run_abandoned rows = %d (%v), want 1", len(rows), rows)
+	}
+	p := rows[0].payload
+	if p["reason"] != reason || p["cancelled"] != cancelled || p["starter"] != campaign.StarterCampaignDriver {
+		t.Errorf("abandon payload = %v, want reason %s cancelled %v starter campaign_driver", p, reason, cancelled)
+	}
+	runID, err := uuid.Parse(fmt.Sprint(p["run_id"]))
+	if err != nil {
+		t.Fatalf("abandon payload run_id %v: %v", p["run_id"], err)
+	}
+	reader.mu.Lock()
+	r := reader.runs[runID]
+	reader.mu.Unlock()
+	if r == nil {
+		t.Fatalf("abandoned run %s was never minted", runID)
+	}
+	if got := r.State == run.StateCancelled; got != cancelled {
+		t.Errorf("abandoned run state = %s, want cancelled=%v", r.State, cancelled)
+	}
+	return p
 }
 
 // start: a TransitionCampaignItem(running) failure AFTER the link committed
@@ -873,9 +1099,11 @@ func TestTick_RunningTransitionError_RollsBackLinkAndRetries(t *testing.T) {
 	if it.RunID != nil {
 		t.Fatal("item must be unlinked after a failed running transition so it stays retryable")
 	}
-	if au.count() != 0 {
-		t.Fatalf("expected no started audit on transition failure, got %d", au.count())
+	if n := len(au.byCategory(categoryCampaignIssueStarted)); n != 0 {
+		t.Fatalf("expected no started audit on transition failure, got %d", n)
 	}
+	// #5266: the minted run is cancelled and recorded transition_failed.
+	assertDriverAbandoned(t, au, reader, starter, abandonTransitionFailed, true)
 	if len(starter.calls) != 1 {
 		t.Fatalf("expected exactly one start attempt on the first tick, got %d", len(starter.calls))
 	}
@@ -2243,5 +2471,364 @@ func TestTick_DecisionKeyHeldHint(t *testing.T) {
 		if *actor.hints[i] != w {
 			t.Fatalf("hint[%d] = %v, want %v", i, *actor.hints[i], w)
 		}
+	}
+}
+
+// --- claim before mint (#5266) ---------------------------------------------
+
+// TestStart_ClaimHeld_SkipsWithoutMinting: another starter's live claim on the
+// first eligible item is an INFO skip that mints nothing and spends no budget,
+// so the next eligible item still starts under a cap of 1.
+func TestStart_ClaimHeld_SkipsWithoutMinting(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	held := store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	next := store.seedItem(c, "issue:2", campaign.ItemStatePending, nil, nil)
+	heldClaim := store.seedClaim(held, campaign.StarterOperator, fixedNow().Add(time.Minute))
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 1)
+
+	tk.Tick(context.Background())
+
+	for _, id := range starter.calls {
+		if id == held.ID {
+			t.Fatalf("starter minted for the held item %s", held.ID)
+		}
+	}
+	if held.RunID != nil || held.State != campaign.ItemStatePending {
+		t.Errorf("held item = %+v, want untouched pending", held)
+	}
+	if got := store.claims[held.ID]; got == nil || got.ClaimID != heldClaim.ClaimID {
+		t.Errorf("held claim replaced or removed: %+v", got)
+	}
+	if len(starter.calls) != 1 || starter.calls[0] != next.ID || next.State != campaign.ItemStateRunning {
+		t.Fatalf("starter calls = %v (next state %s), want one start of the next item (budget unspent)", starter.calls, next.State)
+	}
+	if n := len(au.byCategory(CategoryCampaignItemRunAbandoned)); n != 0 {
+		t.Errorf("abandoned rows = %d, want 0", n)
+	}
+}
+
+// TestStart_ClaimLinked_Skips: an item the claim finds already linked (the
+// snapshot raced a link) is skipped without minting.
+func TestStart_ClaimLinked_Skips(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	it := store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	tk := newTicker(store, reader, starter, &fakeAudit{}, 4)
+	winner := uuid.New()
+	// The driver's listing sees the item unlinked; the claim sees the link.
+	starter.onStart = func(context.Context) { t.Fatal("starter reached for a linked item") }
+	items, _ := store.ListCampaignItemsForCampaign(context.Background(), c.ID)
+	snapshot := *items[0]
+	it.RunID = &winner
+
+	tk.start(context.Background(), tk.logger(), c, []*campaign.Item{&snapshot})
+
+	if len(starter.calls) != 0 || store.claimCalls != 1 || store.liveClaims() != 0 {
+		t.Errorf("starter calls/claim calls/live claims = %d/%d/%d, want 0/1/0", len(starter.calls), store.claimCalls, store.liveClaims())
+	}
+}
+
+// TestStart_ClaimError_SkipsWithoutMinting: a non-conflict claim error is a
+// WARN skip that never mints.
+func TestStart_ClaimError_SkipsWithoutMinting(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.claimErr = errors.New("db down")
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	tk := newTicker(store, reader, starter, &fakeAudit{}, 4)
+
+	tk.Tick(context.Background())
+
+	if len(starter.calls) != 0 {
+		t.Errorf("starter calls = %d, want 0 on a claim error", len(starter.calls))
+	}
+}
+
+// TestStart_ClaimDoesNotCoverBudgets_ReleasesWithoutMinting (X4): a claim
+// whose remaining lifetime is shorter than the start plus cleanup budgets is
+// released and the item skipped rather than minted.
+func TestStart_ClaimDoesNotCoverBudgets_ReleasesWithoutMinting(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	it := store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.claimTTL = campaign.ItemStartWorstCase - time.Second
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	tk := newTicker(store, reader, starter, &fakeAudit{}, 4)
+
+	tk.Tick(context.Background())
+
+	if len(starter.calls) != 0 || it.RunID != nil {
+		t.Fatalf("starter calls = %d, item run %v; want no mint under a short claim", len(starter.calls), it.RunID)
+	}
+	if store.releaseCalls != 1 || store.liveClaims() != 0 {
+		t.Errorf("release calls/live claims = %d/%d, want 1/0", store.releaseCalls, store.liveClaims())
+	}
+}
+
+// TestStart_MintFails_ReleasesClaim: a transient starter error releases the
+// claim so the next tick (or an operator) can start the item at once.
+func TestStart_MintFails_ReleasesClaim(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader, startErr: errors.New("forge 500")}
+	tk := newTicker(store, reader, starter, &fakeAudit{}, 4)
+
+	tk.Tick(context.Background())
+
+	if store.releaseCalls != 1 || store.liveClaims() != 0 {
+		t.Errorf("release calls/live claims = %d/%d, want 1/0", store.releaseCalls, store.liveClaims())
+	}
+}
+
+// TestStart_StartRefusal_ReleasesClaim: a campaign-level refusal releases the
+// claim it took and ends the pass, as before.
+func TestStart_StartRefusal_ReleasesClaim(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.seedItem(c, "issue:2", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader, startErr: &StartRefusal{Reason: "working_dir_unbound"}}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	if store.claimCalls != 1 || store.releaseCalls != 1 || store.liveClaims() != 0 {
+		t.Errorf("claim/release calls, live claims = %d/%d/%d, want 1/1/0 (pass ended after the refusal)", store.claimCalls, store.releaseCalls, store.liveClaims())
+	}
+	if n := len(au.byCategory(categoryCampaignAutoStartRefused)); n != 1 {
+		t.Errorf("refusal rows = %d, want 1", n)
+	}
+}
+
+// TestStart_NilRun_ReleasesClaim: a starter that returns no run and no error
+// releases the claim.
+func TestStart_NilRun_ReleasesClaim(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	tk := newTicker(store, newFakeRunReader(), nilRunStarter{}, &fakeAudit{}, 4)
+
+	tk.Tick(context.Background())
+
+	if store.releaseCalls != 1 || store.liveClaims() != 0 {
+		t.Errorf("release calls/live claims = %d/%d, want 1/0", store.releaseCalls, store.liveClaims())
+	}
+}
+
+type nilRunStarter struct{}
+
+func (nilRunStarter) StartCampaignRun(context.Context, *campaign.Item, *campaign.Campaign) (*run.Run, error) {
+	return nil, nil
+}
+
+// TestStart_AbandonsUnlinkedMintedRun: every way a minted run ends unlinked
+// cancels it and records its reason with cancelled true.
+func TestStart_AbandonsUnlinkedMintedRun(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		setup  func(store *fakeCampaignStore, it *campaign.Item, starter *fakeStarter, winner uuid.UUID)
+		winner bool
+	}{
+		{name: "claim_conflict", reason: abandonClaimConflict, winner: true,
+			setup: func(store *fakeCampaignStore, it *campaign.Item, starter *fakeStarter, winner uuid.UUID) {
+				// Another starter links the item while this one mints.
+				starter.onStart = func(context.Context) {
+					store.mu.Lock()
+					it.RunID = &winner
+					store.mu.Unlock()
+				}
+			}},
+		{name: "link_failed", reason: abandonLinkFailed,
+			setup: func(store *fakeCampaignStore, _ *campaign.Item, _ *fakeStarter, _ uuid.UUID) {
+				store.linkErr = errors.New("link boom")
+			}},
+		{name: "transition_failed", reason: abandonTransitionFailed,
+			setup: func(store *fakeCampaignStore, _ *campaign.Item, _ *fakeStarter, _ uuid.UUID) {
+				store.transErr = errors.New("transition boom")
+			}},
+		{name: "start_incomplete", reason: abandonStartIncomplete,
+			setup: func(_ *fakeCampaignStore, _ *campaign.Item, starter *fakeStarter, _ uuid.UUID) {
+				starter.incomplete = true
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			c := store.seedCampaign(campaign.StateRunning)
+			it := store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+			reader := newFakeRunReader()
+			starter := &fakeStarter{reader: reader}
+			au := &fakeAudit{}
+			winner := uuid.New()
+			tc.setup(store, it, starter, winner)
+			tk := newTicker(store, reader, starter, au, 4)
+
+			tk.start(context.Background(), tk.logger(), c, []*campaign.Item{{ID: it.ID, CampaignID: c.ID, IssueRef: it.IssueRef, State: it.State}})
+
+			p := assertDriverAbandoned(t, au, reader, starter, tc.reason, true)
+			if tc.winner && p["winner_run_id"] != winner.String() {
+				t.Errorf("winner_run_id = %v, want %s", p["winner_run_id"], winner)
+			}
+			if starter.cancelCount() != 1 {
+				t.Errorf("cancels = %d, want 1", starter.cancelCount())
+			}
+			if store.liveClaims() != 0 {
+				t.Errorf("live claims = %d, want 0", store.liveClaims())
+			}
+			if n := len(au.byCategory(categoryCampaignIssueStarted)); n != 0 {
+				t.Errorf("started rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestStart_AbandonCancelFails_RecordsCancelFailed: a failed cancel is
+// recorded truthfully (cancelled false) and the run stays live.
+func TestStart_AbandonCancelFails_RecordsCancelFailed(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.linkErr = errors.New("link boom")
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader, cancelErr: errors.New("cancel boom")}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	assertDriverAbandoned(t, au, reader, starter, abandonLinkFailed, false)
+}
+
+// TestStart_StarterWithoutCanceller_RecordsUncancelled: a Starter with no
+// RunCanceller seam records the abandon with cancelled false.
+func TestStart_StarterWithoutCanceller_RecordsUncancelled(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.linkErr = errors.New("link boom")
+	reader := newFakeRunReader()
+	inner := &fakeStarter{reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starterOnly{s: inner}, au, 4)
+
+	tk.Tick(context.Background())
+
+	assertDriverAbandoned(t, au, reader, inner, abandonLinkFailed, false)
+	if inner.cancelCount() != 0 {
+		t.Errorf("cancels = %d, want 0 without the seam", inner.cancelCount())
+	}
+}
+
+// TestStart_AbandonEmitFails_StillCancels: an audit append failure never
+// skips the cancel, which acts first.
+func TestStart_AbandonEmitFails_StillCancels(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	store.linkErr = errors.New("link boom")
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	au := &fakeAudit{appendErr: errors.New("audit down")}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	if starter.cancelCount() != 1 {
+		t.Errorf("cancels = %d, want 1 even when the abandon row cannot be appended", starter.cancelCount())
+	}
+	if store.liveClaims() != 0 {
+		t.Errorf("live claims = %d, want 0", store.liveClaims())
+	}
+}
+
+// TestStart_MintOutlivesBudget_CleanupRunsOnItsOwnContext (U3): the mint
+// returns only after the 100ms start budget expired, so the link fails on the
+// done start context (link_failed). The release, cancel and abandon emit run
+// on their own cleanup context and all land; every fake refuses a done
+// context, so a cleanup derived from the start context would land none.
+func TestStart_MintOutlivesBudget_CleanupRunsOnItsOwnContext(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cancelErr error
+		cancelled bool
+	}{
+		{name: "cancel ok", cancelled: true},
+		{name: "cancel fails", cancelErr: errors.New("cancel boom"), cancelled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			c := store.seedCampaign(campaign.StateRunning)
+			store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+			reader := newFakeRunReader()
+			starter := &fakeStarter{reader: reader, blockUntilDone: true, cancelErr: tc.cancelErr}
+			au := &fakeAudit{}
+			tk := newTicker(store, reader, starter, au, 4)
+			tk.StartBudget = 100 * time.Millisecond
+			tk.CleanupBudget = 5 * time.Second
+
+			tk.Tick(context.Background())
+
+			if n := store.liveClaims(); n != 0 {
+				t.Errorf("live claims = %d, want 0 (released on the cleanup context)", n)
+			}
+			wantCancels := 0
+			if tc.cancelled {
+				wantCancels = 1
+			}
+			if got := starter.cancelCount(); got != wantCancels {
+				t.Errorf("cancels = %d, want %d", got, wantCancels)
+			}
+			assertDriverAbandoned(t, au, reader, starter, abandonLinkFailed, tc.cancelled)
+		})
+	}
+}
+
+// TestStart_TickCancelledAfterTransition_StartedMarkerLands (X1): the
+// campaign_issue_started emit rides the detached start context, so a tick
+// context cancelled during the start still records it.
+func TestStart_TickCancelledAfterTransition_StartedMarkerLands(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	it := store.seedItem(c, "issue:1", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	tickCtx, cancelTick := context.WithCancel(context.Background())
+	defer cancelTick()
+	starter := &fakeStarter{reader: reader, onStart: func(context.Context) { cancelTick() }}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.start(tickCtx, tk.logger(), c, []*campaign.Item{{ID: it.ID, CampaignID: c.ID, IssueRef: it.IssueRef, State: it.State}})
+
+	if it.State != campaign.ItemStateRunning || it.RunID == nil {
+		t.Fatalf("item = %+v, want linked and running despite the cancelled tick", it)
+	}
+	if n := len(au.byCategory(categoryCampaignIssueStarted)); n != 1 {
+		t.Errorf("started rows = %d, want 1", n)
+	}
+}
+
+// TestStartIncompleteError_UnwrapsCause pins the seam type's Error/Unwrap.
+func TestStartIncompleteError_UnwrapsCause(t *testing.T) {
+	cause := errors.New("stages boom")
+	id := uuid.New()
+	err := error(&StartIncompleteError{RunID: id, Err: cause})
+	if !errors.Is(err, cause) {
+		t.Error("StartIncompleteError does not unwrap its cause")
+	}
+	if want := id.String(); !bytes.Contains([]byte(err.Error()), []byte(want)) {
+		t.Errorf("Error() = %q, want it to name run %s", err.Error(), want)
 	}
 }

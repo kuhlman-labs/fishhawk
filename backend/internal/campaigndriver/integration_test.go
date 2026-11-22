@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -192,4 +193,108 @@ func assertCampaignAdvanced(t *testing.T, au audit.Repository, campaignID uuid.U
 		}
 	}
 	t.Fatalf("no campaign_advanced audit entry found for campaign %s", campaignID)
+}
+
+// seedClaimItem creates a running campaign with one pending item over real
+// Postgres and returns the repos, ticker and item.
+func seedClaimItem(t *testing.T, now func() time.Time) (campaign.Repository, *seamStarter, *campaigndriver.Ticker, *campaign.Item) {
+	t.Helper()
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+	campaigns := campaign.NewPostgresRepository(pool)
+	runs := run.NewPostgresRepository(pool)
+	c, err := campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:1000"})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	it, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:1"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if _, err := campaigns.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("transition campaign to running: %v", err)
+	}
+	starter := newSeamStarter(runs)
+	tk := &campaigndriver.Ticker{
+		Campaigns: campaigns, Runs: runs, Starter: starter,
+		Audit: audit.NewPostgresRepository(pool), MaxParallel: 4, Now: now,
+	}
+	return campaigns, starter, tk, it
+}
+
+// TestIntegration_OperatorClaimHeld_DriverMintsNothing (#5266): a live
+// operator claim on the item, persisted in campaign_item_start_claims, makes
+// the driver's tick skip the item without minting a run.
+func TestIntegration_OperatorClaimHeld_DriverMintsNothing(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	campaigns, starter, tk, it := seedClaimItem(t, clock)
+	ctx := context.Background()
+	held, err := campaigns.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+		ItemID: it.ID, Starter: campaign.StarterOperator, Clock: func() time.Time { return now.Add(-time.Minute) },
+	})
+	if err != nil {
+		t.Fatalf("seed operator claim: %v", err)
+	}
+
+	tk.Tick(ctx)
+
+	if len(starter.started) != 0 {
+		t.Fatalf("driver minted %v under a live operator claim, want nothing", starter.started)
+	}
+	got := getItem(t, campaigns, it.CampaignID, it.ID)
+	if got.RunID != nil || got.State != campaign.ItemStatePending {
+		t.Fatalf("item = %s runID=%v, want pending and unlinked", got.State, got.RunID)
+	}
+	// The operator's claim is intact: its own link still succeeds.
+	if _, err := campaigns.LinkClaimedCampaignItemRun(ctx, campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: it.ID, ClaimID: held.ClaimID, RunID: mintRun(t, starter.runs),
+	}); err != nil {
+		t.Fatalf("operator's claimed link after the tick: %v (its claim was disturbed)", err)
+	}
+}
+
+// TestIntegration_StaleClaim_DriverReclaimsAndStarts (#5266): a crashed
+// starter's EXPIRED claim does not block the item; the driver reclaims it,
+// mints, links and consumes its own claim.
+func TestIntegration_StaleClaim_DriverReclaimsAndStarts(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	campaigns, starter, tk, it := seedClaimItem(t, func() time.Time { return now })
+	ctx := context.Background()
+	if _, err := campaigns.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+		ItemID: it.ID, Starter: campaign.StarterOperator,
+		Clock: func() time.Time { return now.Add(-campaign.ItemStartClaimTTL) },
+	}); err != nil {
+		t.Fatalf("seed stale claim: %v", err)
+	}
+
+	tk.Tick(ctx)
+
+	if len(starter.started) != 1 {
+		t.Fatalf("driver started %v, want exactly issue:1 after reclaiming a stale claim", starter.started)
+	}
+	got := getItem(t, campaigns, it.CampaignID, it.ID)
+	if got.State != campaign.ItemStateRunning || got.RunID == nil || *got.RunID != starter.byRef["issue:1"] {
+		t.Fatalf("item = %s runID=%v, want running and linked to %s", got.State, got.RunID, starter.byRef["issue:1"])
+	}
+	// The driver's claim was consumed by its link, so a fresh claim now sees
+	// the item linked rather than held.
+	if _, err := campaigns.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+		ItemID: it.ID, Starter: campaign.StarterOperator, Clock: func() time.Time { return now },
+	}); err == nil || !strings.Contains(err.Error(), string(campaign.StartConflictLinked)) {
+		t.Fatalf("claim after the driver's start = %v, want a linked conflict", err)
+	}
+}
+
+func mintRun(t *testing.T, runs run.Repository) uuid.UUID {
+	t.Helper()
+	ref := "issue:1"
+	r, err := runs.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &ref,
+	})
+	if err != nil {
+		t.Fatalf("mint run: %v", err)
+	}
+	return r.ID
 }

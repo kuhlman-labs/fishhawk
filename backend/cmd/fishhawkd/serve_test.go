@@ -8555,12 +8555,82 @@ func TestServeGo_AutoStartRunnerKindWiring(t *testing.T) {
 // newMergeFallbackClient pattern); every other GitHub path 404s, which the
 // best-effort capture/hydration seams degrade on.
 
-// autoStartE2ECampaigns serves one running campaign and its items.
+// autoStartE2ECampaigns serves one running campaign and its items, with
+// in-memory item start claims carrying the Postgres semantics (#5266): a
+// linked item or a live claim refuses, an expired claim is replaced, a link
+// consumes only its own claim, and release is claim-scoped.
 type autoStartE2ECampaigns struct {
 	campaign.BaseFake
-	mu    sync.Mutex
-	c     *campaign.Campaign
-	items []*campaign.Item
+	mu     sync.Mutex
+	c      *campaign.Campaign
+	items  []*campaign.Item
+	claims map[uuid.UUID]*campaign.StartClaim
+}
+
+func (s *autoStartE2ECampaigns) itemLocked(id uuid.UUID) *campaign.Item {
+	for _, it := range s.items {
+		if it.ID == id {
+			return it
+		}
+	}
+	return nil
+}
+
+func (s *autoStartE2ECampaigns) ClaimCampaignItemStart(_ context.Context, p campaign.ClaimCampaignItemStartParams) (*campaign.StartClaim, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	it := s.itemLocked(p.ItemID)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	if it.RunID != nil {
+		w := *it.RunID
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictLinked, WinnerRunID: &w}
+	}
+	now := p.Clock()
+	if held := s.claims[it.ID]; held != nil && held.ExpiresAt.After(now) {
+		h := *held
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictClaimed, HeldClaim: &h}
+	}
+	cl := &campaign.StartClaim{ItemID: it.ID, ClaimID: uuid.New(), Starter: p.Starter, ClaimedAt: now, ExpiresAt: now.Add(campaign.ItemStartClaimTTL)}
+	if s.claims == nil {
+		s.claims = map[uuid.UUID]*campaign.StartClaim{}
+	}
+	s.claims[it.ID] = cl
+	out := *cl
+	return &out, nil
+}
+
+func (s *autoStartE2ECampaigns) LinkClaimedCampaignItemRun(_ context.Context, p campaign.LinkClaimedCampaignItemRunParams) (*campaign.Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	it := s.itemLocked(p.ItemID)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	if it.RunID != nil {
+		if *it.RunID == p.RunID {
+			return it, nil
+		}
+		w := *it.RunID
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictLinked, WinnerRunID: &w}
+	}
+	if held := s.claims[it.ID]; held == nil || held.ClaimID != p.ClaimID {
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictClaimLost}
+	}
+	delete(s.claims, it.ID)
+	rid := p.RunID
+	it.RunID = &rid
+	return it, nil
+}
+
+func (s *autoStartE2ECampaigns) ReleaseCampaignItemStart(_ context.Context, itemID, claimID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.claims[itemID]; c != nil && c.ClaimID == claimID {
+		delete(s.claims, itemID)
+	}
+	return nil
 }
 
 func (s *autoStartE2ECampaigns) ListCampaigns(context.Context, campaign.ListCampaignsFilter) ([]*campaign.Campaign, error) {
@@ -8790,6 +8860,71 @@ func TestCampaignDriver_AutoStartLocal_EndToEnd(t *testing.T) {
 				t.Errorf("item not linked to the minted run: %+v", camps.items[0])
 			}
 		})
+	}
+}
+
+// cancellableE2ERuns adds a TransitionRun (the cancel path) and an optional
+// stage-creation failure to autoStartE2ERuns.
+type cancellableE2ERuns struct {
+	*autoStartE2ERuns
+	createStageErr error
+}
+
+func (s *cancellableE2ERuns) TransitionRun(_ context.Context, id uuid.UUID, to runpkg.State) (*runpkg.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.runs {
+		if r.ID == id {
+			r.State = to
+			return r, nil
+		}
+	}
+	return nil, runpkg.ErrNotFound
+}
+
+func (s *cancellableE2ERuns) CreateStage(ctx context.Context, p runpkg.CreateStageParams) (*runpkg.Stage, error) {
+	if s.createStageErr != nil {
+		return nil, s.createStageErr
+	}
+	return s.autoStartE2ERuns.CreateStage(ctx, p)
+}
+
+// TestCampaignRunStarter_CancelCampaignRun_CancelsThroughServer (#5266): the
+// adapter's RunCanceller seam reaches server.CancelCampaignRun, so a run the
+// driver abandons reads back cancelled.
+func TestCampaignRunStarter_CancelCampaignRun_CancelsThroughServer(t *testing.T) {
+	runs := &cancellableE2ERuns{autoStartE2ERuns: &autoStartE2ERuns{}}
+	r := &runpkg.Run{ID: uuid.New(), State: runpkg.StatePending}
+	runs.runs = append(runs.runs, r)
+	srv := server.New(server.Config{Addr: "127.0.0.1:0", RunRepo: runs})
+	var canceller campaigndriver.RunCanceller = campaignRunStarter{srv: srv}
+
+	if err := canceller.CancelCampaignRun(context.Background(), r.ID); err != nil {
+		t.Fatalf("CancelCampaignRun: %v", err)
+	}
+	if r.State != runpkg.StateCancelled {
+		t.Fatalf("run state = %s, want cancelled", r.State)
+	}
+}
+
+// TestCampaignRunStarter_StartIncomplete_MapsToDriverType (#5266): a start
+// whose run committed but whose stages failed surfaces to the driver as
+// *campaigndriver.StartIncompleteError naming the committed run.
+func TestCampaignRunStarter_StartIncomplete_MapsToDriverType(t *testing.T) {
+	runs := &cancellableE2ERuns{autoStartE2ERuns: &autoStartE2ERuns{}, createStageErr: errors.New("stage insert boom")}
+	srv := server.New(server.Config{Addr: "127.0.0.1:0", RunRepo: runs, AuditRepo: &autoStartE2EAudit{}, GitHub: newAutoStartE2EGitHub(t)})
+	a := campaignRunStarter{srv: srv, workflowID: "feature_change", runnerKind: runpkg.RunnerKindLocal}
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", State: campaign.StateRunning, WorkingDir: "/work/checkout"}
+	it := &campaign.Item{ID: uuid.New(), CampaignID: c.ID, IssueRef: "issue:10", State: campaign.ItemStatePending}
+
+	_, err := a.StartCampaignRun(context.Background(), it, c)
+
+	var incomplete *campaigndriver.StartIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("StartCampaignRun error = %v (%T), want *campaigndriver.StartIncompleteError", err, err)
+	}
+	if len(runs.runs) != 1 || incomplete.RunID != runs.runs[0].ID {
+		t.Fatalf("incomplete.RunID = %s, runs = %d, want the one committed run", incomplete.RunID, len(runs.runs))
 	}
 }
 
