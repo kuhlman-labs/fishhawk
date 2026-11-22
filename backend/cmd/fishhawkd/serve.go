@@ -4485,12 +4485,35 @@ type campaignRunStarter struct {
 // (a local campaign with no or a relative working_dir, or an invalid recorded
 // kind) returns a *campaigndriver.StartRefusal BEFORE any forge call, so the
 // driver starts no item of that campaign.
+//
+// A start whose run row committed but whose stages could not be created
+// (*server.RunStartIncompleteError) is mapped onto
+// *campaigndriver.StartIncompleteError{RunID, Err} (#5266), so the driver,
+// which never imports server, can cancel the incomplete run.
 func (a campaignRunStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*runpkg.Run, error) {
 	if refusal := a.startRefusal(c); refusal != nil {
 		return nil, refusal
 	}
-	return a.srv.StartRunForCampaignIssue(ctx, a.startParams(item, c))
+	r, err := a.srv.StartRunForCampaignIssue(ctx, a.startParams(item, c))
+	if err != nil {
+		var incomplete *server.RunStartIncompleteError
+		if errors.As(err, &incomplete) {
+			return nil, &campaigndriver.StartIncompleteError{RunID: incomplete.RunID, Err: err}
+		}
+		return nil, err
+	}
+	return r, nil
 }
+
+// CancelCampaignRun implements campaigndriver.RunCanceller (#5266): the
+// driver cancels a minted run that ended unlinked through
+// server.Server.CancelCampaignRun, a state transition to cancelled, never a
+// delete.
+func (a campaignRunStarter) CancelCampaignRun(ctx context.Context, runID uuid.UUID) error {
+	return a.srv.CancelCampaignRun(ctx, runID)
+}
+
+var _ campaigndriver.RunCanceller = campaignRunStarter{}
 
 // startRefusal maps a refused server.ResolveCampaignAutoStart onto the
 // driver's campaign-level *campaigndriver.StartRefusal, or returns nil when the
@@ -4522,8 +4545,9 @@ func (a campaignRunStarter) startRefusal(c *campaign.Campaign) *campaigndriver.S
 // #4526): the campaign driver is the starter that marks a run for
 // `fishhawk-mcp host-dispatch`, whatever its runner kind (the dispatcher
 // itself only spawns local runs). The operator item-start path
-// (handleStartCampaignItemRun) and the webhook path never reach this starter
-// and stay unmarked.
+// (handleStartCampaignItemRun) never reaches this starter and is marked only
+// by its own explicit auto_dispatch:true (#5266); the webhook path stays
+// unmarked.
 func (a campaignRunStarter) startParams(item *campaign.Item, c *campaign.Campaign) server.StartRunForCampaignIssueParams {
 	workflowID := a.workflowID
 	if item.Expedite != nil && item.Expedite.Workflow != "" {

@@ -1920,10 +1920,15 @@ to the campaign's parallel budget.
   dispatcher never acts at one. Contract:
   `backend/internal/campaigndriver/README.md`.
 - **Hand-driven campaigns.** The driver starts eligible items of EVERY
-  `running` campaign. An operator who drives a campaign by hand with
-  `fishhawk_start_campaign_item_run` should set
-  `FISHHAWK_DEV_CAMPAIGN_DRIVER=0` first, so the driver does not start the
-  items they meant to start themselves.
+  `running` campaign, and since #5266 a campaign created under the dev driver
+  opens `running` at `fishhawk_start_campaign`, so its eligible items are
+  auto-started on the next tick with no hand-started first item. An operator
+  who drives a campaign by hand with `fishhawk_start_campaign_item_run` should
+  set `FISHHAWK_DEV_CAMPAIGN_DRIVER=0` BEFORE `fishhawk_start_campaign` (and
+  reload), so the driver does not start the items they meant to start
+  themselves. A hand start that races the driver anyway cannot double-mint:
+  both starters claim the item before minting, and the loser mints nothing
+  and gets 409 `item_not_eligible` with `start_in_progress`.
 - **Takes effect at reload.** The flag applies from the next `scripts/dev up`
   or reload.
 - **Opting out.** `FISHHAWK_DEV_CAMPAIGN_DRIVER=0` drops the flag; fishhawkd's

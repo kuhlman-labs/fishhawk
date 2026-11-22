@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,6 +133,148 @@ type fakeCampaignRepo struct {
 	holdErr      error
 	releaseErr   error
 	releaseCalls int
+
+	// Item start claims (#5266), with the Postgres adapter's semantics against
+	// the caller's clock: linked, live claim held, expired reclaim, claim_lost
+	// and the idempotent claim-scoped release. claimErr fails
+	// ClaimCampaignItemStart before any read; linkErr fails
+	// LinkClaimedCampaignItemRun before any write. claimCalls, linkCalls and
+	// claimReleaseCalls count invocations. ctxChecked makes the claim, link,
+	// release, item-list and campaign-transition methods return ctx.Err() on a
+	// done context, the pgx behaviour a client-disconnect test needs to see.
+	claims            map[uuid.UUID]*campaign.StartClaim
+	claimErr          error
+	linkErr           error
+	claimCalls        int
+	linkCalls         int
+	claimReleaseCalls int
+	ctxChecked        bool
+	// afterTransItem, when set, runs after a SUCCESSFUL TransitionCampaignItem
+	// releases the fake's mutex (the X1 client-disconnect seam).
+	afterTransItem func()
+}
+
+// ClaimCampaignItemStart mirrors the Postgres adapter (#5266): under the
+// fake's mutex (the item lock) it reads the caller's clock once, refuses a
+// linked item naming its run, refuses a live claim naming its holder, and
+// otherwise inserts a fresh claim or replaces an expired one.
+func (f *fakeCampaignRepo) ClaimCampaignItemStart(ctx context.Context, p campaign.ClaimCampaignItemStartParams) (*campaign.StartClaim, error) {
+	if p.Starter != campaign.StarterOperator && p.Starter != campaign.StarterCampaignDriver || p.Clock == nil {
+		return nil, campaign.ErrStartClaimInvalid
+	}
+	if f.ctxChecked && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimCalls++
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
+	it := f.findItemLocked(p.ItemID)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	now := p.Clock()
+	if now.IsZero() {
+		return nil, campaign.ErrStartClaimInvalid
+	}
+	if it.RunID != nil {
+		w := *it.RunID
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictLinked, WinnerRunID: &w}
+	}
+	if f.claims == nil {
+		f.claims = map[uuid.UUID]*campaign.StartClaim{}
+	}
+	if held := f.claims[it.ID]; held != nil && held.ExpiresAt.After(now) {
+		cp := *held
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictClaimed, HeldClaim: &cp}
+	}
+	cl := &campaign.StartClaim{ItemID: it.ID, ClaimID: uuid.New(), Starter: p.Starter, ClaimedAt: now, ExpiresAt: now.Add(campaign.ItemStartClaimTTL)}
+	f.claims[it.ID] = cl
+	cp := *cl
+	return &cp, nil
+}
+
+// LinkClaimedCampaignItemRun mirrors the Postgres adapter (#5266): an
+// idempotent re-link of the same run, a linked-to-other refusal, a
+// claim_lost refusal when the caller's claim is gone, else it consumes the
+// claim and links.
+func (f *fakeCampaignRepo) LinkClaimedCampaignItemRun(ctx context.Context, p campaign.LinkClaimedCampaignItemRunParams) (*campaign.Item, error) {
+	if p.ClaimID == uuid.Nil || p.RunID == uuid.Nil {
+		return nil, campaign.ErrStartClaimInvalid
+	}
+	if f.ctxChecked && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.linkCalls++
+	if f.linkErr != nil {
+		return nil, f.linkErr
+	}
+	it := f.findItemLocked(p.ItemID)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	held := f.claims[it.ID]
+	if it.RunID != nil {
+		if *it.RunID == p.RunID {
+			if held != nil && held.ClaimID == p.ClaimID {
+				delete(f.claims, it.ID)
+			}
+			return it, nil
+		}
+		w := *it.RunID
+		return nil, &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictLinked, WinnerRunID: &w}
+	}
+	if held == nil || held.ClaimID != p.ClaimID {
+		conflict := &campaign.ItemStartConflictError{ItemID: it.ID, Reason: campaign.StartConflictClaimLost}
+		if held != nil {
+			cp := *held
+			conflict.HeldClaim = &cp
+		}
+		return nil, conflict
+	}
+	delete(f.claims, it.ID)
+	rid := p.RunID
+	it.RunID = &rid
+	it.UpdatedAt = time.Now().UTC()
+	return it, nil
+}
+
+// ReleaseCampaignItemStart deletes the caller's claim only (item AND claim
+// id); idempotent.
+func (f *fakeCampaignRepo) ReleaseCampaignItemStart(ctx context.Context, itemID, claimID uuid.UUID) error {
+	if f.ctxChecked && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimReleaseCalls++
+	if held := f.claims[itemID]; held != nil && held.ClaimID == claimID {
+		delete(f.claims, itemID)
+	}
+	return nil
+}
+
+// claimCount returns how many item start claims the fake currently holds.
+func (f *fakeCampaignRepo) claimCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.claims)
+}
+
+// findItemLocked returns the item with that id; the caller holds f.mu.
+func (f *fakeCampaignRepo) findItemLocked(id uuid.UUID) *campaign.Item {
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID == id {
+				return it
+			}
+		}
+	}
+	return nil
 }
 
 func newFakeCampaignRepo() *fakeCampaignRepo {
@@ -212,7 +355,10 @@ func (f *fakeCampaignRepo) GetCampaignByIdempotencyKey(_ context.Context, repo, 
 
 // TransitionCampaign moves a campaign to the target state, mirroring the
 // Postgres adapter's idempotent same-state + InvalidTransitionError contract.
-func (f *fakeCampaignRepo) TransitionCampaign(_ context.Context, id uuid.UUID, to campaign.State) (*campaign.Campaign, error) {
+func (f *fakeCampaignRepo) TransitionCampaign(ctx context.Context, id uuid.UUID, to campaign.State) (*campaign.Campaign, error) {
+	if f.ctxChecked && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.transCmpCalls++
@@ -233,7 +379,16 @@ func (f *fakeCampaignRepo) TransitionCampaign(_ context.Context, id uuid.UUID, t
 
 // TransitionCampaignItem moves an item (found by id across all campaigns) to
 // the target state with the same idempotent/InvalidTransition contract.
-func (f *fakeCampaignRepo) TransitionCampaignItem(_ context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error) {
+func (f *fakeCampaignRepo) TransitionCampaignItem(_ context.Context, id uuid.UUID, to campaign.ItemState) (out *campaign.Item, outErr error) {
+	// Registered BEFORE the unlock defer, so it runs AFTER the mutex is
+	// released (deferred calls run last-in, first-out).
+	if hook := f.afterTransItem; hook != nil {
+		defer func() {
+			if outErr == nil {
+				hook()
+			}
+		}()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.transItemCalls++
@@ -540,7 +695,10 @@ func (f *fakeCampaignRepo) ListCampaigns(_ context.Context, fil campaign.ListCam
 	return matched[fil.Offset:end], nil
 }
 
-func (f *fakeCampaignRepo) ListCampaignItemsForCampaign(_ context.Context, id uuid.UUID) ([]*campaign.Item, error) {
+func (f *fakeCampaignRepo) ListCampaignItemsForCampaign(ctx context.Context, id uuid.UUID) ([]*campaign.Item, error) {
+	if f.ctxChecked && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.itemsCalls++
@@ -690,6 +848,9 @@ func postCampaign(t *testing.T, s *Server, body string) *httptest.ResponseRecord
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	s.handleCreateCampaign(w, withAuth(req))
+	// Join the detached campaign_started board sweep (#5266) so no sweep
+	// goroutine outlives the call and races a later test's seam swap.
+	s.waitCampaignBoardSweeps()
 	return w
 }
 
@@ -702,6 +863,9 @@ func postCampaignWithKey(t *testing.T, s *Server, body, key string) *httptest.Re
 	req.Header.Set("Idempotency-Key", key)
 	w := httptest.NewRecorder()
 	s.handleCreateCampaign(w, withAuth(req))
+	// Join the detached campaign_started board sweep (#5266) so no sweep
+	// goroutine outlives the call and races a later test's seam swap.
+	s.waitCampaignBoardSweeps()
 	return w
 }
 
@@ -4115,8 +4279,20 @@ func newCampaignStartServer(t *testing.T, crepo *fakeCampaignRepo) (*Server, *fa
 }
 
 // postStartItemRun POSTs a start body to handleStartCampaignItemRun with an
-// operator identity (scope bypass).
+// operator identity (scope bypass), then joins the detached campaign_started
+// board sweep (#5266) so no sweep goroutine outlives the call and races a
+// later test's seam swap.
 func postStartItemRun(t *testing.T, s *Server, campaignID uuid.UUID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := postStartItemRunUnjoined(t, s, campaignID, body)
+	s.waitCampaignBoardSweeps()
+	return w
+}
+
+// postStartItemRunUnjoined is postStartItemRun WITHOUT the board-sweep join,
+// for the test that proves the start returns while the sweep is still
+// blocked. That test must join the sweep itself before it ends.
+func postStartItemRunUnjoined(t *testing.T, s *Server, campaignID uuid.UUID, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+campaignID.String()+"/runs", strings.NewReader(body))
 	req.SetPathValue("campaign_id", campaignID.String())
@@ -5224,6 +5400,8 @@ func TestDeriveCampaignAfterChange_CampaignStart_SweepsToUpNext_CrossBoundary(t 
 		t.Fatalf("list items: %v", err)
 	}
 	s.deriveCampaignAfterChange(context.Background(), c, items)
+	// The campaign_started sweep is detached since #5266; wait on its group.
+	s.waitCampaignBoardSweeps()
 
 	// The campaign advanced pending -> running.
 	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
@@ -5513,16 +5691,24 @@ func TestStartCampaignItemRun_RestartThenDownstreamFailure_ReAdmittable(t *testi
 	crepo := newFakeCampaignRepo()
 	s, _, aud := newCampaignStartServer(t, crepo)
 	c, item := seedRestartableCampaign(crepo)
-	// The post-restart run-link write fails, aborting after RestartCampaignItem
-	// already reset the item.
-	crepo.setRunErr = errInjected
+	// The post-restart claimed link fails, aborting after RestartCampaignItem
+	// already reset the item (#5266: the fresh start links through
+	// LinkClaimedCampaignItemRun; SetCampaignItemRun stays for the reset).
+	crepo.linkErr = errInjected
 
 	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("first start = %d, want 500 (link failure; body=%s)", w.Code, w.Body.String())
 	}
-	if code := decodeCampaignError(t, w); code != "internal_error" {
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "internal_error" {
 		t.Errorf("error code = %q, want internal_error", code)
+	}
+	// #5266: the first start's minted run was abandoned (cancelled) and its
+	// claim released, so the re-admit below is not refused start_in_progress.
+	assertAbandonedRunCancelled(t, s, details)
+	if n := crepo.claimCount(); n != 0 {
+		t.Errorf("claims left = %d, want 0 (released after the failed link)", n)
 	}
 	if crepo.restartCalls != 1 {
 		t.Errorf("restartCalls = %d, want 1 (item restarted once)", crepo.restartCalls)
@@ -5541,7 +5727,7 @@ func TestStartCampaignItemRun_RestartThenDownstreamFailure_ReAdmittable(t *testi
 
 	// Recover: clear the injected link failure and re-issue the verb. The now-pending
 	// item is Eligible, so it is admitted WITHOUT a second restart.
-	crepo.setRunErr = nil
+	crepo.linkErr = nil
 	w2 := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
 	if w2.Code != http.StatusCreated {
 		t.Fatalf("re-admit start = %d, want 201 (body=%s)", w2.Code, w2.Body.String())
@@ -6257,6 +6443,34 @@ func TestStartCampaignItemRun_TransitionFailure_RollsBackLink(t *testing.T) {
 	if it.RunID != nil {
 		t.Errorf("item run_id = %v, want nil after rollback", it.RunID)
 	}
+	// #5266: the unlinked minted run is abandoned (cancelled), never left live.
+	_, details := decodeCampaignErrorDetails(t, w)
+	assertAbandonedRunCancelled(t, s, details)
+}
+
+// assertAbandonedRunCancelled asserts an item-start failure response names its
+// abandoned run under cancelled_run_id (never cancel_failed_run_id) and that
+// the run reads back cancelled from the server's run repository (#5266).
+func assertAbandonedRunCancelled(t *testing.T, s *Server, details map[string]any) {
+	t.Helper()
+	if _, bad := details["cancel_failed_run_id"]; bad {
+		t.Errorf("details carry cancel_failed_run_id = %v, want only cancelled_run_id", details["cancel_failed_run_id"])
+	}
+	raw, ok := details["cancelled_run_id"].(string)
+	if !ok || raw == "" {
+		t.Fatalf("details.cancelled_run_id = %v, want the abandoned run id (details=%v)", details["cancelled_run_id"], details)
+	}
+	runID, err := uuid.Parse(raw)
+	if err != nil {
+		t.Fatalf("cancelled_run_id %q: %v", raw, err)
+	}
+	got, err := s.cfg.RunRepo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("get abandoned run %s: %v", runID, err)
+	}
+	if got.State != run.StateCancelled {
+		t.Errorf("abandoned run %s state = %q, want cancelled", runID, got.State)
+	}
 }
 
 // errInjected is a sentinel for the repo error-injection tests.
@@ -6318,18 +6532,86 @@ func TestStartCampaignItemRun_RunStartFails_BadGateway(t *testing.T) {
 	}
 }
 
-// TestStartCampaignItemRun_LinkFails_500 covers a SetCampaignItemRun failure
-// after the run minted → 500 (the link step's error branch).
+// TestStartCampaignItemRun_LinkFails_500 covers a claimed-link failure after
+// the run minted → 500 (the link step's error branch). Since #5266 the minted
+// run is abandoned: the body names it under run_id and cancelled_run_id, the
+// run reads back cancelled, and no claim is left holding the item.
 func TestStartCampaignItemRun_LinkFails_500(t *testing.T) {
 	crepo := newFakeCampaignRepo()
 	s, _, _ := newCampaignStartServer(t, crepo)
 	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
 		cItem("issue:100", nil, campaign.ItemStatePending),
 	})
-	crepo.setRunErr = errInjected
+	crepo.linkErr = errInjected
 	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	_, details := decodeCampaignErrorDetails(t, w)
+	if details["run_id"] == nil || details["run_id"] != details["cancelled_run_id"] {
+		t.Errorf("details.run_id = %v, cancelled_run_id = %v, want the same minted run", details["run_id"], details["cancelled_run_id"])
+	}
+	assertAbandonedRunCancelled(t, s, details)
+	if n := crepo.claimCount(); n != 0 {
+		t.Errorf("claims left = %d, want 0", n)
+	}
+}
+
+// TestStartCampaignItemRun_ClaimError_500_MintsNothing covers the claim's
+// default arm in startClaimedCampaignItemRun (#5266): a claim error that is
+// neither a conflict nor ErrNotFound is a 500 internal_error, and the start
+// stops before the mint and the link.
+func TestStartCampaignItemRun_ClaimError_500_MintsNothing(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	crepo.claimErr = errInjected
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusInternalServerError || decodeCampaignError(t, w) != "internal_error" {
+		t.Fatalf("status/code = %d/%s, want 500 internal_error (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	if msg := decodeCampaignErrorMessage(t, w); msg != "claim campaign item start failed" {
+		t.Errorf("message = %q, want the claim-failure message", msg)
+	}
+	if crepo.claimCalls != 1 {
+		t.Errorf("claimCalls = %d, want 1 (the claim arm, not a pre-claim refusal)", crepo.claimCalls)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0 on a claim error", n)
+	}
+	if crepo.linkCalls != 0 {
+		t.Errorf("linkCalls = %d, want 0 on a claim error", crepo.linkCalls)
+	}
+	if it := crepo.itemsByCmp[c.ID][0]; it.RunID != nil || it.State != campaign.ItemStatePending {
+		t.Errorf("item = {run_id:%v state:%s}, want unlinked + pending", it.RunID, it.State)
+	}
+}
+
+// TestStartCampaignItemRun_ClaimItemNotFound_404_MintsNothing covers the
+// claim's campaign.ErrNotFound arm (#5266): the item the gate found is gone
+// when the claim locks it, so the start is a 404 campaign_item_not_found that
+// mints nothing. claimCalls proves the claim arm answered, not the gate.
+func TestStartCampaignItemRun_ClaimItemNotFound_404_MintsNothing(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	crepo.claimErr = campaign.ErrNotFound
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusNotFound || decodeCampaignError(t, w) != "campaign_item_not_found" {
+		t.Fatalf("status/code = %d/%s, want 404 campaign_item_not_found (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	if crepo.claimCalls != 1 {
+		t.Errorf("claimCalls = %d, want 1 (the claim arm, not the gate's 404)", crepo.claimCalls)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0 on a missing claimed item", n)
+	}
+	if crepo.linkCalls != 0 {
+		t.Errorf("linkCalls = %d, want 0 on a missing claimed item", crepo.linkCalls)
 	}
 }
 
@@ -6359,6 +6641,9 @@ func TestStartCampaignItemRun_TransitionInvalid_409(t *testing.T) {
 	if it := crepo.itemsByCmp[c.ID][0]; it.RunID != nil {
 		t.Errorf("item run_id = %v, want nil after rollback", it.RunID)
 	}
+	// #5266: the unlinked minted run is abandoned (cancelled).
+	_, details := decodeCampaignErrorDetails(t, w)
+	assertAbandonedRunCancelled(t, s, details)
 }
 
 // TestStartCampaignItemRun_ReconcileOnRead_GetRunError_StillReturns200 covers
@@ -11333,6 +11618,10 @@ func TestStartCampaignItemRun_ExpeditedWorkflowMismatch(t *testing.T) {
 	if crepo.setRunCalls != 0 {
 		t.Errorf("SetCampaignItemRun calls = %d, want 0", crepo.setRunCalls)
 	}
+	// #5266: refused before the claim-before-mint core, so no claim or link.
+	if crepo.claimCalls != 0 || crepo.linkCalls != 0 {
+		t.Errorf("claimCalls/linkCalls = %d/%d, want 0/0", crepo.claimCalls, crepo.linkCalls)
+	}
 }
 
 func TestStartCampaignItemRun_ExpeditedRecordedWorkflowMints(t *testing.T) {
@@ -11345,5 +11634,693 @@ func TestStartCampaignItemRun_ExpeditedRecordedWorkflowMints(t *testing.T) {
 	}
 	if n := len(rrepo.runs); n != 1 {
 		t.Errorf("runs minted = %d, want 1", n)
+	}
+}
+
+// --- #5266: create-open, detached board sweep, run-bound refusals, auto_dispatch ---
+
+// epicBoardProvider is ONE registered workmgmt provider that serves both the
+// create's EpicChildren query and the board Transitioner, because both
+// register under the default conventions' provider id. When block is
+// non-nil every Transition waits on it (or its context), so a test can prove
+// a caller does not wait on the board sweep.
+type epicBoardProvider struct {
+	fakeEpicProvider
+	mu    sync.Mutex
+	moves []workmgmt.TransitionRequest
+	block chan struct{}
+}
+
+func (p *epicBoardProvider) Transition(ctx context.Context, req workmgmt.TransitionRequest) (*workmgmt.TransitionResult, error) {
+	if req.Trigger != lifecycleCampaignStarted {
+		// Only the campaign_started sweep is under test; the run_started
+		// move a mint makes is answered at once and not recorded.
+		return &workmgmt.TransitionResult{Moved: true, From: "Up Next", To: "In Progress"}, nil
+	}
+	if p.block != nil {
+		select {
+		case <-p.block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	p.mu.Lock()
+	p.moves = append(p.moves, req)
+	p.mu.Unlock()
+	return &workmgmt.TransitionResult{Moved: true, From: "Backlog", To: "Up Next"}, nil
+}
+
+func (p *epicBoardProvider) moveCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.moves)
+}
+
+func registerEpicBoardProvider(t *testing.T, result *workmgmt.EpicChildrenResult) *epicBoardProvider {
+	t.Helper()
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+	p := &epicBoardProvider{fakeEpicProvider: fakeEpicProvider{name: workmgmt.Default().Provider, result: result}}
+	workmgmt.Register(p)
+	return p
+}
+
+// countingGitHubClient is a GitHub client whose server counts EVERY request
+// and answers the installation route; anything else 404s.
+func countingGitHubClient(t *testing.T) (*githubclient.Client, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if strings.HasSuffix(r.URL.Path, "/installation") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":4242}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}, &hits
+}
+
+func postCampaignAs(t *testing.T, s *Server, body string, id Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateCampaign(w, withIdentity(req, id))
+	// Join the detached campaign_started board sweep (#5266) so no sweep
+	// goroutine outlives the call and races a later test's seam swap.
+	s.waitCampaignBoardSweeps()
+	return w
+}
+
+func postStartItemRunAs(t *testing.T, s *Server, campaignID uuid.UUID, body string, id Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+campaignID.String()+"/runs", strings.NewReader(body))
+	req.SetPathValue("campaign_id", campaignID.String())
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleStartCampaignItemRun(w, withIdentity(req, id))
+	// Join the detached campaign_started board sweep (#5266) so no sweep
+	// goroutine outlives the call and races a later test's seam swap.
+	s.waitCampaignBoardSweeps()
+	return w
+}
+
+// runBoundCampaignWriter is an mcp:run:<uuid> identity that HOLDS
+// write:campaigns, so the scope gate admits it and only the run-bound
+// refusal stands between it and the handler body.
+func runBoundCampaignWriter() Identity {
+	return Identity{Subject: "mcp:run:" + uuid.NewString(), TokenID: "tok-run", Scopes: []string{"write:campaigns"}, AccountID: testOperatorAccountID}
+}
+
+// operatorCampaignWriter is the same scoped token identity, but operator-owned.
+func operatorCampaignWriter() Identity {
+	return Identity{Subject: "github:operator", TokenID: "tok-op", Scopes: []string{"write:campaigns"}, AccountID: testOperatorAccountID}
+}
+
+// e2eDriverStarter is the campaign driver's RunStarter over the server, the
+// serve.go campaignRunStarter shape: the driver always stamps auto_dispatch.
+type e2eDriverStarter struct{ s *Server }
+
+func (a e2eDriverStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*run.Run, error) {
+	return a.s.StartRunForCampaignIssue(ctx, StartRunForCampaignIssueParams{
+		Repo: c.Repo, IssueRef: item.IssueRef, WorkflowID: "feature_change",
+		RunnerKind: run.RunnerKindLocal, WorkingDir: c.WorkingDir, AutoDispatch: true,
+	})
+}
+
+// TestCreateCampaign_DriverRuns_OpensRunning_PickedUpByNextTick_E2E crosses
+// HTTP create -> Assemble/Persist -> real Postgres -> GET /status ->
+// campaigndriver.Ticker.Tick -> RunStarter -> link -> GET /status (#5266):
+// on a driver-run deployment the campaign opens running at create, and ONE
+// driver tick starts its first eligible item with no hand-started item.
+func TestCreateCampaign_DriverRuns_OpensRunning_PickedUpByNextTick_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	crepo := campaign.NewPostgresRepository(pool)
+	rrepo := run.NewPostgresRepository(pool)
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	ghFake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := ghFake.server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+	aud := &campaignAuditRecorder{}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: gh,
+		CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","working_dir":"`+seededCampaignWorkingDir+`"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created: %v", err)
+	}
+	if created.State != string(campaign.StateRunning) {
+		t.Fatalf("created state = %q, want running (opened at create on a driver-run deployment)", created.State)
+	}
+	before := getCampaignStatusBody(t, s, created.ID)
+	if before.Campaign.State != string(campaign.StateRunning) {
+		t.Errorf("status before tick = %q, want running", before.Campaign.State)
+	}
+	for _, it := range before.Items {
+		if it.RunID != nil {
+			t.Fatalf("item %s linked before any tick: %v", it.IssueRef, *it.RunID)
+		}
+	}
+
+	tk := &campaigndriver.Ticker{Campaigns: crepo, Runs: rrepo, Starter: e2eDriverStarter{s: s}, Audit: aud}
+	tk.Tick(context.Background())
+
+	after := getCampaignStatusBody(t, s, created.ID)
+	var first *campaignItemResponse
+	for i := range after.Items {
+		if after.Items[i].IssueRef == "issue:100" {
+			first = &after.Items[i]
+		}
+	}
+	if first == nil || first.RunID == nil || first.State != string(campaign.ItemStateRunning) {
+		t.Fatalf("issue:100 after one tick = %+v, want running with a linked run", first)
+	}
+	got, err := rrepo.GetRun(context.Background(), *first.RunID)
+	if err != nil {
+		t.Fatalf("get started run: %v", err)
+	}
+	if !got.AutoDispatch {
+		t.Errorf("driver-started run auto_dispatch = false, want true (the driver stamps it)")
+	}
+}
+
+// TestCreateCampaign_DriverOff_StaysPending: with no campaign driver the
+// create keeps today's pending campaign and emits no campaign_advanced.
+func TestCreateCampaign_DriverOff_StaysPending(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, AuditRepo: aud, GitHub: recordingInstallGitHubClient(t, 7788, &installRecorder{})})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.State != string(campaign.StatePending) {
+		t.Errorf("created state = %q, want pending (driver off)", created.State)
+	}
+	if got := crepo.campaigns[created.ID].State; got != campaign.StatePending {
+		t.Errorf("persisted state = %q, want pending", got)
+	}
+	if crepo.transCmpCalls != 0 || aud.count(categoryCampaignAdvanced) != 0 {
+		t.Errorf("transCmpCalls/campaign_advanced = %d/%d, want 0/0", crepo.transCmpCalls, aud.count(categoryCampaignAdvanced))
+	}
+}
+
+// TestCreateCampaign_DriverRuns_OpenTransitionFails_StaysPendingTruthfully:
+// a create-open transition failure never unwinds the create and the 201 body
+// reports the pending state the row actually holds.
+func TestCreateCampaign_DriverRuns_OpenTransitionFails_StaysPendingTruthfully(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	crepo.transCmpErr = errInjected
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, AuditRepo: aud, GitHub: recordingInstallGitHubClient(t, 7788, &installRecorder{}),
+		CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.State != string(campaign.StatePending) {
+		t.Errorf("created state = %q, want pending (the open transition failed)", created.State)
+	}
+	if crepo.transCmpCalls != 1 {
+		t.Errorf("transCmpCalls = %d, want 1 (the open was attempted)", crepo.transCmpCalls)
+	}
+	if n := aud.count(categoryCampaignAdvanced); n != 0 {
+		t.Errorf("campaign_advanced = %d, want 0 on a failed open", n)
+	}
+	if len(crepo.campaigns) != 1 {
+		t.Errorf("campaigns = %d, want 1 (create not unwound)", len(crepo.campaigns))
+	}
+}
+
+// TestCreateCampaign_DriverRuns_SweepsQueuedItemsToUpNext: create-open sweeps
+// every still-queued item onto Up Next (campaign_started), detached.
+func TestCreateCampaign_DriverRuns_SweepsQueuedItemsToUpNext(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	p := registerEpicBoardProvider(t, smallDAG())
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, AuditRepo: aud, GitHub: recordingInstallGitHubClient(t, 7788, &installRecorder{}),
+		CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	s.waitCampaignBoardSweeps()
+	if n := p.moveCount(); n != 2 {
+		t.Fatalf("board moves = %d, want 2 (both queued items)", n)
+	}
+	for _, mv := range p.moves {
+		if mv.Trigger != lifecycleCampaignStarted || mv.CanonicalState != "up_next" {
+			t.Errorf("move = %s/%s, want campaign_started/up_next", mv.Trigger, mv.CanonicalState)
+		}
+	}
+	if n := aud.count(categoryCampaignAdvanced); n != 1 {
+		t.Errorf("campaign_advanced = %d, want 1 (pending -> running at create)", n)
+	}
+}
+
+// TestCreateCampaign_DriverRuns_ItemListError_StillOpensRunning covers
+// openCampaignForDriver's item-list failure arm (#5266): the open has already
+// committed, so the 201 reports the running campaign and only the board sweep
+// is skipped. The repo returns a SNAPSHOT from CreateCampaign, as Postgres
+// does, so the 201 body reads the opened row and not an alias of the created
+// one that the fake's transition would mutate in place.
+func TestCreateCampaign_DriverRuns_ItemListError_StillOpensRunning(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	p := registerEpicBoardProvider(t, smallDAG())
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: snapshotCreateCampaignRepo{crepo}, AuditRepo: aud, GitHub: recordingInstallGitHubClient(t, 7788, &installRecorder{}),
+		CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+	// The create's only item list is the create-open sweep's.
+	crepo.itemsErrOnCall = 1
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	s.waitCampaignBoardSweeps()
+	if crepo.itemsCalls != 1 {
+		t.Fatalf("itemsCalls = %d, want 1 (the injected error must hit the create-open sweep list)", crepo.itemsCalls)
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.State != string(campaign.StateRunning) {
+		t.Errorf("created state = %q, want running (the open committed before the list failed)", created.State)
+	}
+	if got := crepo.campaigns[created.ID].State; got != campaign.StateRunning {
+		t.Errorf("persisted state = %q, want running", got)
+	}
+	if n := p.moveCount(); n != 0 {
+		t.Errorf("board moves = %d, want 0 (the sweep is skipped on a list error)", n)
+	}
+	if n := aud.count(categoryCampaignAdvanced); n != 1 {
+		t.Errorf("campaign_advanced = %d, want 1 (pending -> running at create)", n)
+	}
+}
+
+// snapshotCreateCampaignRepo returns a copy from CreateCampaign, breaking the
+// fake's aliasing between the created campaign and its stored row.
+type snapshotCreateCampaignRepo struct{ *fakeCampaignRepo }
+
+func (r snapshotCreateCampaignRepo) CreateCampaign(ctx context.Context, p campaign.CreateCampaignParams) (*campaign.Campaign, error) {
+	c, err := r.fakeCampaignRepo.CreateCampaign(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	cp := *c
+	return &cp, nil
+}
+
+// TestStartCampaignItemRun_FirstStart_DoesNotWaitOnBoardSweep: the first
+// item start's pending -> running derive spawns the campaign_started sweep
+// DETACHED, so the handler returns while the board provider is still blocked.
+func TestStartCampaignItemRun_FirstStart_DoesNotWaitOnBoardSweep(t *testing.T) {
+	p := registerEpicBoardProvider(t, nil)
+	p.block = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(p.block) }) }
+	t.Cleanup(release)
+
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+		cItem("issue:102", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postStartItemRunUnjoined(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	}()
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-done:
+	case <-time.After(10 * time.Second):
+		release()
+		<-done
+		t.Fatal("item start did not return within 10s while the board sweep was blocked (the sweep ran synchronously)")
+	}
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if n := p.moveCount(); n != 0 {
+		t.Errorf("board moves before release = %d, want 0 (sweep still blocked)", n)
+	}
+	release()
+	s.waitCampaignBoardSweeps()
+	if n := p.moveCount(); n != 2 {
+		t.Errorf("board moves after release = %d, want 2 (the two still-queued items)", n)
+	}
+}
+
+// TestStartCampaignItemRun_AutoDispatchTrue_StampsRun_StatusShowsHostDispatch:
+// an explicit auto_dispatch:true reaches the persisted run and the status
+// read classifies the item as awaiting the host dispatcher.
+func TestStartCampaignItemRun_AutoDispatchTrue_StampsRun_StatusShowsHostDispatch(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	// A real Postgres run repo: the status read's awaiting block lists the
+	// run's stages, which the in-memory fake run repo does not implement.
+	rrepo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s.cfg.RunRepo = rrepo
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local","auto_dispatch":true}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.Run.AutoDispatch {
+		t.Errorf("201 run.auto_dispatch = false, want true")
+	}
+	if persisted, err := rrepo.GetRun(context.Background(), body.Run.ID); err != nil || !persisted.AutoDispatch {
+		t.Fatalf("persisted run = %+v (err %v), want auto_dispatch true", persisted, err)
+	}
+	if kind, reason := campaignStatusAwaiting(t, s, c.ID); kind != awaitingKindHostDispatcher || reason != awaitingReasonHostDispatch {
+		t.Errorf("status awaiting = %s/%s, want %s/%s", kind, reason, awaitingKindHostDispatcher, awaitingReasonHostDispatch)
+	}
+}
+
+// campaignStatusAwaiting GETs /status (raw JSON) and returns the single
+// item's awaiting kind and reason.
+func campaignStatusAwaiting(t *testing.T, s *Server, campaignID uuid.UUID) (string, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+campaignID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", campaignID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	var st struct {
+		Items []struct {
+			Awaiting *struct {
+				Kind   string `json:"kind"`
+				Reason string `json:"reason"`
+			} `json:"awaiting"`
+		} `json:"items"`
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d (body=%s)", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if len(st.Items) != 1 || st.Items[0].Awaiting == nil {
+		t.Fatalf("status = %s, want one item with an awaiting block", w.Body.String())
+	}
+	return st.Items[0].Awaiting.Kind, st.Items[0].Awaiting.Reason
+}
+
+// TestStartCampaignItemRun_AutoDispatchOmitted_LeavesRunUnmarked_EvenOnDriverDeployment:
+// nothing infers the mark from the driver posture (ADR-104 Q3).
+func TestStartCampaignItemRun_AutoDispatchOmitted_LeavesRunUnmarked_EvenOnDriverDeployment(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	// A real Postgres run repo: the status read's awaiting block lists the
+	// run's stages, which the in-memory fake run repo does not implement.
+	rrepo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s.cfg.RunRepo = rrepo
+	s.cfg.CampaignAutoStartRunnerKind = run.RunnerKindLocal
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if persisted, err := rrepo.GetRun(context.Background(), body.Run.ID); err != nil || persisted.AutoDispatch {
+		t.Fatalf("persisted run = %+v (err %v), want auto_dispatch false", persisted, err)
+	}
+	if kind, reason := campaignStatusAwaiting(t, s, c.ID); kind != awaitingKindHuman || reason != awaitingReasonOperatorDispatch {
+		t.Errorf("status awaiting = %s/%s, want %s/%s", kind, reason, awaitingKindHuman, awaitingReasonOperatorDispatch)
+	}
+}
+
+// assertItemStartRefusedRunToken asserts a 403 run_token_forbidden that
+// reached no claim, minted no run and left the item unlinked.
+func assertItemStartRefusedRunToken(t *testing.T, w *httptest.ResponseRecorder, crepo *fakeCampaignRepo, rrepo *fakeRepo, c *campaign.Campaign) {
+	t.Helper()
+	if w.Code != http.StatusForbidden || decodeCampaignError(t, w) != "run_token_forbidden" {
+		t.Fatalf("start = %d %s, want 403 run_token_forbidden", w.Code, w.Body.String())
+	}
+	if crepo.claimCalls != 0 {
+		t.Errorf("claimCalls = %d, want 0 (refused before any claim)", crepo.claimCalls)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	if it := crepo.itemsByCmp[c.ID][0]; it.RunID != nil || it.State != campaign.ItemStatePending {
+		t.Errorf("item = {run_id:%v state:%s}, want unlinked + pending", it.RunID, it.State)
+	}
+}
+
+func seedOneEligibleItem(crepo *fakeCampaignRepo) *campaign.Campaign {
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+	return c
+}
+
+// TestStartCampaignItemRun_RunBoundTokenAutoDispatch_Refused403 (T5/X2): a
+// run-bound token holding write:campaigns may not stamp the mark.
+func TestStartCampaignItemRun_RunBoundTokenAutoDispatch_Refused403(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := seedOneEligibleItem(crepo)
+	w := postStartItemRunAs(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local","auto_dispatch":true}`, runBoundCampaignWriter())
+	assertItemStartRefusedRunToken(t, w, crepo, rrepo, c)
+}
+
+// TestStartCampaignItemRun_RunBoundTokenUnflagged_Refused403 (X2): the route
+// is an operator verb, so an UNFLAGGED run-bound start is refused too.
+func TestStartCampaignItemRun_RunBoundTokenUnflagged_Refused403(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := seedOneEligibleItem(crepo)
+	w := postStartItemRunAs(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`, runBoundCampaignWriter())
+	assertItemStartRefusedRunToken(t, w, crepo, rrepo, c)
+}
+
+// TestStartCampaignItemRun_OperatorToken_SameFixture_Starts is the X2 twin:
+// the same scoped token identity, operator-owned, starts the same fixture
+// (flagged and unflagged), so the run-bound refusal is the only thing in the
+// refused path.
+func TestStartCampaignItemRun_OperatorToken_SameFixture_Starts(t *testing.T) {
+	for _, body := range []string{
+		`{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`,
+		`{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local","auto_dispatch":true}`,
+	} {
+		crepo := newFakeCampaignRepo()
+		s, rrepo, _ := newCampaignStartServer(t, crepo)
+		c := seedOneEligibleItem(crepo)
+		w := postStartItemRunAs(t, s, c.ID, body, operatorCampaignWriter())
+		if w.Code != http.StatusCreated {
+			t.Fatalf("%s = %d %s, want 201", body, w.Code, w.Body.String())
+		}
+		if n := len(rrepo.runs); n != 1 {
+			t.Errorf("%s: runs minted = %d, want 1", body, n)
+		}
+	}
+}
+
+// TestStartCampaignItemRun_LiveClaimHeld_409StartInProgress_MintsNothing pins
+// that the handler routes through the claim-before-mint core: a live driver
+// claim refuses the operator start with start_in_progress and no run.
+func TestStartCampaignItemRun_LiveClaimHeld_409StartInProgress_MintsNothing(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := seedOneEligibleItem(crepo)
+	it := crepo.itemsByCmp[c.ID][0]
+	now := time.Now().UTC()
+	crepo.claims = map[uuid.UUID]*campaign.StartClaim{it.ID: {
+		ItemID: it.ID, ClaimID: uuid.New(), Starter: campaign.StarterCampaignDriver,
+		ClaimedAt: now, ExpiresAt: now.Add(campaign.ItemStartClaimTTL),
+	}}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("start = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "item_not_eligible" || details["start_in_progress"] != true || details["claim_starter"] != campaign.StarterCampaignDriver {
+		t.Errorf("code/details = %s/%v, want item_not_eligible with start_in_progress and claim_starter campaign_driver", code, details)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	if it.RunID != nil {
+		t.Errorf("item linked to %v, want unlinked", *it.RunID)
+	}
+}
+
+// TestStartCampaignItemRun_AlreadyLinked_409CarriesRunID (X3): the HTTP
+// eligibility gate's refusal of an item already linked (running) names the
+// linked run in details.run_id so the caller drives it.
+func TestStartCampaignItemRun_AlreadyLinked_409CarriesRunID(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	linked := uuid.New()
+	running := cItem("issue:100", nil, campaign.ItemStateRunning)
+	running.RunID = &linked
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{running})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("start = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "item_not_eligible" || details["run_id"] != linked.String() {
+		t.Errorf("code/details = %s/%v, want item_not_eligible with run_id %s", code, details, linked)
+	}
+	if crepo.claimCalls != 0 || len(rrepo.runs) != 0 {
+		t.Errorf("claimCalls/runs = %d/%d, want 0/0", crepo.claimCalls, len(rrepo.runs))
+	}
+}
+
+// TestStartCampaignItemRun_ClientDisconnectAfterStart_TailLands (X1): the
+// request context is cancelled right after the running transition commits;
+// the post-start tail runs on the core's detached start context, so the
+// campaign_issue_started marker and the pending -> running derive still land.
+// The fake repo and the audit recorder both refuse a done context.
+func TestStartCampaignItemRun_ClientDisconnectAfterStart_TailLands(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	crepo.ctxChecked = true
+	s, _, _ := newCampaignStartServer(t, crepo)
+	aud := &ctxAuditRecorder{campaignAuditRecorder: &campaignAuditRecorder{}}
+	s.cfg.AuditRepo = aud
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	reqCtx, disconnect := context.WithCancel(context.Background())
+	defer disconnect()
+	crepo.afterTransItem = disconnect
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+c.ID.String()+"/runs",
+		strings.NewReader(`{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)).WithContext(reqCtx)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleStartCampaignItemRun(w, withAuth(req))
+	s.waitCampaignBoardSweeps()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if reqCtx.Err() == nil {
+		t.Fatal("request context was never cancelled; the fixture did not simulate a disconnect")
+	}
+	if n := aud.count(categoryCampaignIssueStarted); n != 1 {
+		t.Errorf("campaign_issue_started = %d, want 1 (emitted on the detached start context)", n)
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
+		t.Errorf("campaign state = %q, want running (derive ran on the detached start context)", got)
+	}
+	if n := aud.count(categoryCampaignAdvanced); n != 1 {
+		t.Errorf("campaign_advanced = %d, want 1", n)
+	}
+}
+
+const runBoundCreateBody = `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`
+
+// TestCreateCampaign_RunBoundToken_Refused403_CreatesNothing (U2): a
+// run-bound token holding write:campaigns, on a driver-run deployment, is
+// refused before anything is read, created or opened.
+func TestCreateCampaign_RunBoundToken_Refused403_CreatesNothing(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	gh, hits := countingGitHubClient(t)
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, AuditRepo: aud, GitHub: gh, CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+
+	w := postCampaignAs(t, s, runBoundCreateBody, runBoundCampaignWriter())
+	if w.Code != http.StatusForbidden || decodeCampaignError(t, w) != "run_token_forbidden" {
+		t.Fatalf("create = %d %s, want 403 run_token_forbidden", w.Code, w.Body.String())
+	}
+	if n := len(crepo.campaigns); n != 0 {
+		t.Errorf("campaigns = %d, want 0", n)
+	}
+	if n := aud.count(categoryCampaignAdvanced); n != 0 {
+		t.Errorf("campaign_advanced = %d, want 0", n)
+	}
+	if n := hits.Load(); n != 0 || fp.called {
+		t.Errorf("github hits = %d, provider called = %v, want 0/false (nothing read)", n, fp.called)
+	}
+}
+
+// TestCreateCampaign_OperatorToken_SameFixture_Creates is the U2 twin: the
+// same body and scopes under an operator identity create the campaign and
+// open it running, so the fixture is valid and the run-bound refusal is the
+// only thing in the refused path.
+func TestCreateCampaign_OperatorToken_SameFixture_Creates(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	gh, hits := countingGitHubClient(t)
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, AuditRepo: aud, GitHub: gh, CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+
+	w := postCampaignAs(t, s, runBoundCreateBody, operatorCampaignWriter())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s, want 201", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.State != string(campaign.StateRunning) {
+		t.Errorf("state = %q, want running (opened at create)", created.State)
+	}
+	if len(crepo.campaigns) != 1 || aud.count(categoryCampaignAdvanced) != 1 {
+		t.Errorf("campaigns/campaign_advanced = %d/%d, want 1/1", len(crepo.campaigns), aud.count(categoryCampaignAdvanced))
+	}
+	if hits.Load() == 0 || !fp.called {
+		t.Errorf("github hits = %d, provider called = %v, want >0/true (the fixture reaches the forge)", hits.Load(), fp.called)
 	}
 }

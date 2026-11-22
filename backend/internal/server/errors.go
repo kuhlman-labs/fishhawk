@@ -171,6 +171,18 @@ var redactableDetailKeys = map[string]struct{}{
 	// constants) — never error text or third-party content — so it satisfies
 	// the membership rule above.
 	"default_branch_unresolved_reason": {},
+	// cancelled_run_id / cancel_failed_run_id: the outcome key a campaign item
+	// start's 5xx (500 campaign_run_start_incomplete, 500 internal_error on a
+	// link or running-transition failure) carries for the minted run it
+	// abandoned (#5266): cancelled_run_id ONLY when the cancel succeeded,
+	// cancel_failed_run_id otherwise. Each value is a product-owned run
+	// identifier the handler minted itself, on the `run_id` footing — never
+	// derived from an error, a subprocess or a third-party response — so both
+	// satisfy the membership rule above. Without them the default-deny
+	// redactor strips exactly the fact the operator must act on: whether the
+	// abandoned run still needs fishhawk_cancel_run.
+	"cancelled_run_id":     {},
+	"cancel_failed_run_id": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of

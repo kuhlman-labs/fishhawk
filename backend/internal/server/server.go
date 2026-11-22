@@ -151,10 +151,14 @@ type Config struct {
 	// CampaignAutoStartRunnerKind is the runner kind the campaign driver
 	// auto-starts item runs with (#4525). serve.go sets it to the
 	// --auto-start-runner-kind value ONLY when the campaign driver actually
-	// starts, and leaves it empty otherwise. Non-empty, it lets GET
+	// starts, and leaves it empty otherwise. It has two readers, both through
+	// Server.campaignDriverRuns: non-empty, it lets GET
 	// /v0/campaigns/{id}/status report an auto_start_refusal block for a
-	// running campaign ResolveCampaignAutoStart refuses; empty (driver off,
-	// and every fake-backed test) omits the block.
+	// running campaign ResolveCampaignAutoStart refuses, and it makes POST
+	// /v0/campaigns open a new campaign running at create (#5266) so the
+	// driver starts its eligible items on its next tick. Empty (driver off,
+	// and every fake-backed test) omits the block and leaves a new campaign
+	// pending.
 	CampaignAutoStartRunnerKind string
 
 	// SigningRepo issues + persists per-run Ed25519 keys for the
@@ -1296,6 +1300,14 @@ type Server struct {
 	// budget. Shutdown drains it alongside bgReviews / bgGroomingApply.
 	bgBranchSweeps sync.WaitGroup
 
+	// bgCampaignBoardSweeps tracks the DETACHED campaign_started board sweep
+	// (#5266): the pending -> running edge moves the campaign's still-queued
+	// items onto the board's Up Next column on a goroutine in this group under
+	// campaignBoardSweepBudget, so neither create-open nor the first item
+	// start waits on per-item board round-trips. Shutdown drains it alongside
+	// bgBranchSweeps, bounded by the shutdown context.
+	bgCampaignBoardSweeps sync.WaitGroup
+
 	// bgRefinementFiling tracks the DETACHED refinement filing (#4153):
 	// handleFileRefinementSession returns 202 once its synchronous gate
 	// passes and runs refinement.ExecuteFilingWith on a goroutine in this
@@ -1790,6 +1802,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.bgReportApply.Wait()
 		s.bgUpkeepInflight.Wait()
 		s.bgBranchSweeps.Wait()
+		s.bgCampaignBoardSweeps.Wait()
 		s.bgRefinementFiling.Wait()
 		s.bgMergeQueuePump.Wait()
 		close(done)
@@ -1845,6 +1858,11 @@ func (s *Server) waitUpkeepInflight() { s.bgUpkeepInflight.Wait() }
 // (E68.67 / #3562) has finished — the deterministic sync point tests use to
 // assert on the run_branches_swept row. Production code never calls it.
 func (s *Server) waitBranchSweeps() { s.bgBranchSweeps.Wait() }
+
+// waitCampaignBoardSweeps blocks until every detached campaign_started board
+// sweep (#5266) has finished — the deterministic sync point tests use to
+// assert on the board moves. Production code never calls it.
+func (s *Server) waitCampaignBoardSweeps() { s.bgCampaignBoardSweeps.Wait() }
 
 // waitRefinementFiling blocks until every detached refinement filing (#4153)
 // has finished — the deterministic sync point tests use to assert on the

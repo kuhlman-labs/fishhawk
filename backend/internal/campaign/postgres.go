@@ -905,6 +905,170 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 	return out
 }
 
+// --- Item start claims (#5266) ---
+//
+// campaign_item_start_claims (migration 0119) is a hand-written-pgx child
+// table of campaign_items, on the migration 0106 precedent: new
+// campaign_items columns would change every sqlc SELECT * / RETURNING * scan
+// of that table, so no sqlc query is added (the plan gate ratified this; a
+// later need for one goes through a scope amendment). Every claim write takes
+// the campaign_items row lock FIRST (LockCampaignItemForUpdate), then the
+// claim row — the package lock order.
+
+const startClaimColumns = `item_id, claim_id, starter, claimed_at, expires_at`
+
+func scanStartClaim(row pgx.Row) (*StartClaim, error) {
+	var c StartClaim
+	if err := row.Scan(&c.ItemID, &c.ClaimID, &c.Starter, &c.ClaimedAt, &c.ExpiresAt); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// heldStartClaim reads the item's claim row, or (nil, nil) when it has none.
+// Callers hold the item row lock, so the read cannot race a claim write.
+func heldStartClaim(ctx context.Context, tx pgx.Tx, itemID uuid.UUID) (*StartClaim, error) {
+	c, err := scanStartClaim(tx.QueryRow(ctx,
+		`SELECT `+startClaimColumns+` FROM campaign_item_start_claims WHERE item_id = $1`, itemID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read campaign item start claim: %w", err)
+	}
+	return c, nil
+}
+
+func validStarter(s string) bool {
+	return s == StarterOperator || s == StarterCampaignDriver
+}
+
+func (r *postgresRepo) ClaimCampaignItemStart(ctx context.Context, p ClaimCampaignItemStartParams) (*StartClaim, error) {
+	if !validStarter(p.Starter) {
+		return nil, fmt.Errorf("%w: starter %q is not %q or %q", ErrStartClaimInvalid, p.Starter, StarterOperator, StarterCampaignDriver)
+	}
+	if p.Clock == nil {
+		return nil, fmt.Errorf("%w: nil clock", ErrStartClaimInvalid)
+	}
+	var result *StartClaim
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+		item, err := q.LockCampaignItemForUpdate(ctx, p.ItemID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		// X4: the clock is read only once the item lock is held, so a lock
+		// wait never eats into the claim's TTL.
+		now := p.Clock()
+		if now.IsZero() {
+			return fmt.Errorf("%w: zero clock reading", ErrStartClaimInvalid)
+		}
+		if item.RunID != nil {
+			winner := *item.RunID
+			return &ItemStartConflictError{ItemID: p.ItemID, Reason: StartConflictLinked, WinnerRunID: &winner}
+		}
+		// Insert, or replace an EXPIRED claim (crash recovery). A live claim
+		// fails the WHERE, so no row returns and the holder is reported.
+		claim, err := scanStartClaim(tx.QueryRow(ctx,
+			`INSERT INTO campaign_item_start_claims (`+startClaimColumns+`)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (item_id) DO UPDATE SET
+  claim_id = EXCLUDED.claim_id,
+  starter = EXCLUDED.starter,
+  claimed_at = EXCLUDED.claimed_at,
+  expires_at = EXCLUDED.expires_at
+WHERE campaign_item_start_claims.expires_at <= EXCLUDED.claimed_at
+RETURNING `+startClaimColumns,
+			p.ItemID, uuid.New(), p.Starter, now, now.Add(ItemStartClaimTTL)))
+		if errors.Is(err, pgx.ErrNoRows) {
+			held, herr := heldStartClaim(ctx, tx, p.ItemID)
+			if herr != nil {
+				return herr
+			}
+			return &ItemStartConflictError{ItemID: p.ItemID, Reason: StartConflictClaimed, HeldClaim: held}
+		}
+		if err != nil {
+			return fmt.Errorf("insert campaign item start claim: %w", err)
+		}
+		result = claim
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (r *postgresRepo) LinkClaimedCampaignItemRun(ctx context.Context, p LinkClaimedCampaignItemRunParams) (*Item, error) {
+	if p.ClaimID == uuid.Nil || p.RunID == uuid.Nil {
+		return nil, fmt.Errorf("%w: nil claim or run id", ErrStartClaimInvalid)
+	}
+	var result *Item
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+		item, err := q.LockCampaignItemForUpdate(ctx, p.ItemID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		consume := func() (bool, error) {
+			tag, err := tx.Exec(ctx,
+				`DELETE FROM campaign_item_start_claims WHERE item_id = $1 AND claim_id = $2`, p.ItemID, p.ClaimID)
+			if err != nil {
+				return false, fmt.Errorf("consume campaign item start claim: %w", err)
+			}
+			return tag.RowsAffected() > 0, nil
+		}
+		if item.RunID != nil {
+			if *item.RunID != p.RunID {
+				winner := *item.RunID
+				return &ItemStartConflictError{ItemID: p.ItemID, Reason: StartConflictLinked, WinnerRunID: &winner}
+			}
+			// Idempotent re-link of the same run: drop any claim row left.
+			if _, err := consume(); err != nil {
+				return err
+			}
+			result = rowToCampaignItem(item)
+			return nil
+		}
+		consumed, err := consume()
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			held, herr := heldStartClaim(ctx, tx, p.ItemID)
+			if herr != nil {
+				return herr
+			}
+			return &ItemStartConflictError{ItemID: p.ItemID, Reason: StartConflictClaimLost, HeldClaim: held}
+		}
+		runID := p.RunID
+		updated, err := q.SetCampaignItemRun(ctx, campaigndb.SetCampaignItemRunParams{ID: p.ItemID, RunID: &runID})
+		if err != nil {
+			return fmt.Errorf("set campaign item run: %w", err)
+		}
+		result = rowToCampaignItem(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (r *postgresRepo) ReleaseCampaignItemStart(ctx context.Context, itemID, claimID uuid.UUID) error {
+	if _, err := r.pool.Exec(ctx,
+		`DELETE FROM campaign_item_start_claims WHERE item_id = $1 AND claim_id = $2`, itemID, claimID); err != nil {
+		return fmt.Errorf("release campaign item start claim: %w", err)
+	}
+	return nil
+}
+
 // Compile-time check that postgresRepo implements Repository.
 var _ Repository = (*postgresRepo)(nil)
 

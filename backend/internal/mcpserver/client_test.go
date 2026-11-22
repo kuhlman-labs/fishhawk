@@ -22,6 +22,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
@@ -234,7 +235,7 @@ func TestStartCampaignItemRun_DecodesRunnerKindResolution(t *testing.T) {
 	}
 	r := newResolver(srv, nil)
 
-	res, err := r.api.StartCampaignItemRun(context.Background(), uuid.New(), "issue:1", "feature_change", "", "", "")
+	res, err := r.api.StartCampaignItemRun(context.Background(), uuid.New(), "issue:1", "feature_change", "", "", "", false)
 	if err != nil {
 		t.Fatalf("StartCampaignItemRun: %v", err)
 	}
@@ -5562,5 +5563,91 @@ func TestRunMirror_DecodesDefaultBranch(t *testing.T) {
 	}
 	if absent.DefaultBranch != "" || absent.DefaultBranchUnresolvedReason != "" {
 		t.Errorf("keys omitted (older backend / list read) must decode to empty; got %q / %q", absent.DefaultBranch, absent.DefaultBranchUnresolvedReason)
+	}
+}
+
+// TestCampaignItemStartClientTimeout_Wired pins the item-start client (#5266):
+// its own instance, wired with campaignItemStartClientTimeout, which must
+// exceed the handler's worst-case post-claim time (the start budget plus the
+// cleanup budget, U3) so the client is not what gives up on a start the
+// backend is still bounding.
+func TestCampaignItemStartClientTimeout_Wired(t *testing.T) {
+	worst := campaign.ItemStartBudget + campaign.ItemStartCleanupBudget
+	if campaignItemStartClientTimeout <= worst {
+		t.Fatalf("campaignItemStartClientTimeout = %s, want STRICTLY GREATER than campaign.ItemStartBudget + campaign.ItemStartCleanupBudget = %s",
+			campaignItemStartClientTimeout, worst)
+	}
+	c := newAPIClient(config{backendURL: "http://example.invalid", apiToken: "t"})
+	if c.httpCampaignItemStart == nil {
+		t.Fatal("newAPIClient built no httpCampaignItemStart client")
+	}
+	if c.httpCampaignItemStart.Timeout != campaignItemStartClientTimeout {
+		t.Errorf("httpCampaignItemStart.Timeout = %s, want %s", c.httpCampaignItemStart.Timeout, campaignItemStartClientTimeout)
+	}
+	if c.httpCampaignItemStart == c.http || c.httpCampaignItemStart == c.httpLong || c.httpCampaignItemStart == c.httpIssueSet {
+		t.Error("httpCampaignItemStart shares another client's instance — its timeout would be coupled to a different budget")
+	}
+}
+
+// TestStartCampaignItemRun_RoutesThroughTheItemStartClient proves the
+// ROUTING: the sentinel transport sits on httpCampaignItemStart only, so a
+// StartCampaignItemRun still routed through c.http would reach the stub and
+// return a run instead of the sentinel.
+func TestStartCampaignItemRun_RoutesThroughTheItemStartClient(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"run":{"id":"` + uuid.NewString() + `"},"item":{"issue_ref":"issue:1"}}`))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
+	c.httpCampaignItemStart = &http.Client{Transport: sentinelRoundTripper{}}
+	_, err := c.StartCampaignItemRun(context.Background(), uuid.New(), "issue:1", "feature_change", "", "", "", false)
+	if err == nil {
+		t.Fatal("StartCampaignItemRun succeeded — it did NOT route through httpCampaignItemStart")
+	}
+	if !errors.Is(err, errSentinelTransport) {
+		t.Fatalf("error = %v, want the httpCampaignItemStart sentinel", err)
+	}
+}
+
+// TestStartCampaignItemRun_SendsAutoDispatchOnlyWhenTrue reads the RAW request
+// body: true sends auto_dispatch:true; false omits the key entirely (the
+// backend's default), so an older backend's strict decoder never sees it.
+func TestStartCampaignItemRun_SendsAutoDispatchOnlyWhenTrue(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flag    bool
+		present bool
+	}{
+		{"true sends the opt-in", true, true},
+		{"false omits the key", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw []byte
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"run":{"id":"r1"},"item":{"issue_ref":"issue:1"}}`))
+			}))
+			t.Cleanup(stub.Close)
+			c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
+			if _, err := c.StartCampaignItemRun(context.Background(), uuid.New(), "issue:1", "feature_change", "", "", "", tc.flag); err != nil {
+				t.Fatalf("StartCampaignItemRun: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("decode raw body %q: %v", raw, err)
+			}
+			v, ok := body["auto_dispatch"]
+			if ok != tc.present {
+				t.Fatalf("auto_dispatch present = %v in %s, want %v", ok, raw, tc.present)
+			}
+			if tc.present && v != true {
+				t.Fatalf("auto_dispatch = %v, want true", v)
+			}
+		})
 	}
 }

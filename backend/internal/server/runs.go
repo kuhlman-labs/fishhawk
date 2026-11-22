@@ -2171,10 +2171,32 @@ type StartRunForCampaignIssueParams struct {
 	// so binds no checkout.
 	WorkingDir string
 	// AutoDispatch stamps the ADR-104 Q3 host-dispatcher mark on the minted
-	// run (E88.2 / #4526). The campaign driver's starter sets it true; the
-	// operator item-start path leaves it false.
+	// run (E88.2 / #4526). The campaign driver's starter stamps it true; the
+	// operator item start passes its request's explicit auto_dispatch opt-in
+	// (#5266, ADR-104 Q3 "by operator flag"), so an operator-started item run
+	// is marked only when the operator asked for it. Nothing infers the mark
+	// from the deployment's driver posture.
 	AutoDispatch bool
 }
+
+// RunStartIncompleteError is CreateRunForTrigger's post-mint failure: the run
+// row RunID was persisted by RunRepo.CreateRun, but creating its stages failed
+// (#5266). A campaign item starter matches it with errors.As to cancel the run
+// it can no longer link, instead of leaving an unlinked, possibly
+// host-dispatch-marked run behind. Error() keeps the pre-#5266 text
+// "create stages failed: <cause>" and Unwrap returns the cause, so every other
+// caller sees the same diagnostic and the same wrapped error.
+type RunStartIncompleteError struct {
+	RunID uuid.UUID
+	Err   error
+}
+
+func (e *RunStartIncompleteError) Error() string {
+	return fmt.Sprintf("create stages failed: %v", e.Err)
+}
+
+// Unwrap returns the stage-creation cause.
+func (e *RunStartIncompleteError) Unwrap() error { return e.Err }
 
 // hydrateCampaignIssueContext best-effort fetches a campaign item's issue into
 // a *run.IssueContext for caching on the run row (#1721). Returns nil (and
@@ -2292,7 +2314,9 @@ type CreateRunForTriggerParams struct {
 // it so stage seeding, the deploy-first Advance, and the run_started board
 // edge are never duplicated. Returns the created run; on failure the error is
 // prefixed "create run failed" or "create stages failed" so callers can
-// surface the existing diagnostic.
+// surface the existing diagnostic. The stage-creation failure — its only error
+// return AFTER RunRepo.CreateRun persisted the row — is a
+// *RunStartIncompleteError naming that run (#5266).
 func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerParams) (*run.Run, error) {
 	// Build the forge credential scope from the best-effort App installation
 	// (#713) for the required-checks capture below. A nil installation → a
@@ -2391,7 +2415,11 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 	if p.HaveStageDefs {
 		createdStages, err = webhook.CreateStagesFromSpec(ctx, s.cfg.RunRepo, created.ID, p.WorkflowDef.Stages)
 		if err != nil {
-			return nil, fmt.Errorf("create stages failed: %w", err)
+			// The run row already committed: return the typed post-mint
+			// failure so a campaign starter can cancel the run it cannot
+			// link (#5266). Its Error() keeps the "create stages failed"
+			// text, so every other caller sees the same diagnostic.
+			return nil, &RunStartIncompleteError{RunID: created.ID, Err: err}
 		}
 	}
 

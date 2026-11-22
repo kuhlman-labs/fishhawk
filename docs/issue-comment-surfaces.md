@@ -2999,6 +2999,34 @@ Notes:
   reason, runner_kind, runner_kind_source, detail}`) once per campaign and
   reason while the campaign stays running. The operator-facing surface is the
   `auto_start_refusal` block on `GET /v0/campaigns/{id}/status`.
+- The campaign **item-run abandon** record — `campaign_item_run_abandoned`
+  (#5266) — is likewise a **system-actor GLOBAL-chain audit kind, NOT an
+  issue-comment surface**. Nothing in `issuecomment` posts it. It has TWO
+  writers, the two campaign item starters, both of which claim the item before
+  minting: the operator item start (`POST /v0/campaigns/{campaign_id}/runs`,
+  `server.Server.abandonCampaignItemRun` in
+  `backend/internal/server/campaign_item_start.go`) and the campaign driver
+  (`campaigndriver.Ticker.abandon`). Either records it when a run it MINTED
+  ends unlinked from its item, after cancelling that run. Payload
+  `{campaign_id, issue_ref, item_id, run_id, starter, reason, winner_run_id?,
+  cancelled}`: `starter` is `operator` or `campaign_driver`; `reason` is one of
+  `claim_conflict` (the claimed link found the item linked to another run, or
+  this start's claim replaced — `winner_run_id` names the winner when known),
+  `link_failed` (the link failed for any other reason), `transition_failed`
+  (the item's running transition failed after the link, so the item was
+  unlinked again) or `start_incomplete` (the run row committed but its stages
+  could not be created). **Record after cancel:** the cancel (a transition to
+  `cancelled`, never a delete) acts FIRST and never depends on the audit; the
+  row is appended afterwards with `cancelled` the TRUE outcome. If the append
+  fails, the writer WARN-logs every payload field and the HTTP response or
+  driver flow is unchanged (the operator response names the run as
+  `cancelled_run_id` only when the cancel succeeded, `cancel_failed_run_id`
+  otherwise). The row carries no run id of its own, so no per-run audit read
+  returns it. Unlike `campaign_auto_start_refused` it is NOT intended to be
+  run-bound-readable under ADR-106: `winner_run_id` names ANOTHER starter's
+  run, so it is withheld-intent from run-bound (`mcp:run:*`) readers; the
+  registry-flag withhold on the global feed is the ADR-106 follow-up (E89
+  #4537), not this change.
 - The campaign auto-driver audit kinds — `campaign_gate_acted` and
   `campaign_gate_paged` (E25.6 / #1445, ADR-047 Track C) — are **audit-only
   kinds with no dedicated Notifier method and are NOT issue-comment surfaces**.

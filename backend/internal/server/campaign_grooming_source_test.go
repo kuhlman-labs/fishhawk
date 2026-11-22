@@ -1234,6 +1234,8 @@ func TestCreateCampaign_GroomingSource_BoardSweepFiresOverTheRatifiedQueue(t *te
 		t.Fatalf("get campaign: %v", err)
 	}
 	boardServer.deriveCampaignAfterChange(context.Background(), c, items)
+	// The campaign_started sweep is detached since #5266; wait on its group.
+	boardServer.waitCampaignBoardSweeps()
 
 	// One move per STILL-QUEUED item (the dispatched rank-1 item is naturally
 	// excluded), each to Up Next under the existing campaign_started trigger.
@@ -1328,6 +1330,7 @@ func TestCreateCampaign_GroomingSource_RepoCauseNeverReachesTheCaller(t *testing
 			req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
 			w := httptest.NewRecorder()
 			f.server.handleCreateCampaign(w, withAuth(req))
+			f.server.waitCampaignBoardSweeps()
 
 			if w.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tc.wantStatus, w.Body.String())

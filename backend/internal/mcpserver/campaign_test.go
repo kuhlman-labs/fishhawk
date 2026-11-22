@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -5319,4 +5320,420 @@ func TestGetCampaignStatus_HostDispatchCapped_ThroughRealDispatcherAndServer(t *
 	reset := time.Date(lh.clock.Year(), lh.clock.Month(), lh.clock.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour).Format(time.RFC3339)
 	hdoContainsAll(t, "next_step", blk.NextStep, "--daily-cap 1", reset, "fishhawk_dispatch_stage")
 	hdoContainsNone(t, "next_step", blk.NextStep, "no operator action is needed")
+}
+
+// --- #5266: item-start claim refusals, abandoned runs and lost responses ---
+
+// itemStartErrEnvelope renders the backend error envelope for the fake
+// item-start route.
+func itemStartErrEnvelope(t *testing.T, code, message string, details map[string]any) string {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"error": map[string]any{
+		"code": code, "message": message, "details": details, "error_ref": "req-5266",
+	}})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return string(raw)
+}
+
+// startItemAgainst runs the real tool handler against the fake backend's
+// item-start route answering status with body, and returns the tool error.
+func startItemAgainst(t *testing.T, status int, body string) error {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunStatus = status
+	fb.startCampaignItemRunErr = body
+	r := newResolver(srv, nil)
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:100", WorkflowID: "feature_change",
+	})
+	if err == nil {
+		t.Fatalf("startCampaignItemRun succeeded against a %d answer, want an error", status)
+	}
+	return err
+}
+
+func requireContains(t *testing.T, err error, wants ...string) {
+	t.Helper()
+	for _, w := range wants {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q\n  does not contain %q", err.Error(), w)
+		}
+	}
+}
+
+func requireNotContains(t *testing.T, err error, nots ...string) {
+	t.Helper()
+	for _, n := range nots {
+		if strings.Contains(err.Error(), n) {
+			t.Errorf("error %q\n  must not contain %q", err.Error(), n)
+		}
+	}
+}
+
+// TestStartCampaignItemRun_TransportTimeout_ReportsUnknownOutcome: a backend
+// slower than the item-start client is a lost response, so the start may have
+// landed; the error says so and names the status read.
+func TestStartCampaignItemRun_TransportTimeout_ReportsUnknownOutcome(t *testing.T) {
+	release := make(chan struct{})
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() { close(release); stub.Close() })
+	r := &runResolver{api: newAPIClient(config{backendURL: stub.URL, apiToken: "t"}), getenv: envFuncFromMap(nil)}
+	r.api.httpCampaignItemStart = &http.Client{Timeout: 50 * time.Millisecond}
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:100", WorkflowID: "feature_change",
+	})
+	if err == nil {
+		t.Fatal("startCampaignItemRun succeeded against a stalled backend")
+	}
+	requireContains(t, err, "outcome unknown", "may already exist", "item_not_eligible", "fishhawk_get_campaign_status", "fishhawk_list_runs")
+}
+
+// TestStartCampaignItemRun_Unmapped5xx_ReportsUnknownOutcome: a 5xx the switch
+// does not map (and that names no abandoned run) is not definitive.
+func TestStartCampaignItemRun_Unmapped5xx_ReportsUnknownOutcome(t *testing.T) {
+	err := startItemAgainst(t, http.StatusInternalServerError,
+		itemStartErrEnvelope(t, "internal_error", "something broke", map[string]any{"item_id": uuid.NewString()}))
+	requireContains(t, err, "outcome unknown", "fishhawk_get_campaign_status", "fishhawk_list_runs")
+}
+
+// TestStartCampaignItemRun_UndecodableSuccessBody_ReportsUnknownOutcome: a 201
+// whose body cannot be decoded means the start likely LANDED; the caller is
+// told to read the status, never that it failed.
+func TestStartCampaignItemRun_UndecodableSuccessBody_ReportsUnknownOutcome(t *testing.T) {
+	err := startItemAgainst(t, http.StatusCreated, "{not json")
+	requireContains(t, err, "outcome unknown", "decode response", "fishhawk_get_campaign_status")
+}
+
+// TestStartCampaignItemRun_RunStartIncomplete_Cancelled_NamesRunAndSaysRestartable.
+func TestStartCampaignItemRun_RunStartIncomplete_Cancelled_NamesRunAndSaysRestartable(t *testing.T) {
+	runID := uuid.NewString()
+	err := startItemAgainst(t, http.StatusInternalServerError, itemStartErrEnvelope(t, "campaign_run_start_incomplete",
+		"the backend minted a run for the campaign item but could not create its stages; the run was not linked to the item",
+		map[string]any{"run_id": runID, "issue_ref": "issue:100", "cancelled_run_id": runID}))
+	requireContains(t, err, "campaign_run_start_incomplete", runID, "cancelled it", "can be started again", "fishhawk_get_campaign_status")
+	requireNotContains(t, err, "outcome unknown", "still live")
+}
+
+// TestStartCampaignItemRun_RunStartIncomplete_CancelFailed_NamesLiveRunAndCancelRun.
+func TestStartCampaignItemRun_RunStartIncomplete_CancelFailed_NamesLiveRunAndCancelRun(t *testing.T) {
+	runID := uuid.NewString()
+	err := startItemAgainst(t, http.StatusInternalServerError, itemStartErrEnvelope(t, "campaign_run_start_incomplete",
+		"the backend minted a run for the campaign item but could not create its stages; the run was not linked to the item",
+		map[string]any{"run_id": runID, "issue_ref": "issue:100", "cancel_failed_run_id": runID}))
+	requireContains(t, err, "campaign_run_start_incomplete", runID, "still live", "fishhawk_cancel_run", "fishhawk_get_campaign_status")
+	requireNotContains(t, err, "cancelled it", "can be started again", "outcome unknown")
+}
+
+// TestStartCampaignItemRun_RunStartFailed502_StaysDefinitive: a 502 is a
+// pre-mint failure (nothing was minted), so the mapped case wins over the
+// >=500 outcome-unknown branch.
+func TestStartCampaignItemRun_RunStartFailed502_StaysDefinitive(t *testing.T) {
+	err := startItemAgainst(t, http.StatusBadGateway, itemStartErrEnvelope(t, "campaign_run_start_failed",
+		"could not start a run for the campaign item", map[string]any{"issue_ref": "issue:100"}))
+	requireContains(t, err, "campaign_run_start_failed", "workflow_id exists")
+	requireNotContains(t, err, "outcome unknown")
+}
+
+// TestStartCampaignItemRun_StartInProgress409_SaysDoNotRetry: another
+// starter's live claim holds the item; this call minted nothing.
+func TestStartCampaignItemRun_StartInProgress409_SaysDoNotRetry(t *testing.T) {
+	err := startItemAgainst(t, http.StatusConflict, itemStartErrEnvelope(t, "item_not_eligible",
+		"another start of this item is in progress; poll fishhawk_get_campaign_status for its run_id instead of retrying",
+		map[string]any{"campaign_id": uuid.NewString(), "issue_ref": "issue:100", "item_state": "pending",
+			"start_in_progress": true, "claim_starter": "campaign_driver", "claim_expires_at": "2026-11-21T12:10:00Z"}))
+	requireContains(t, err, "in progress", "campaign_driver", "minted nothing", "Do not retry", "fishhawk_get_campaign_status", "carries a run_id")
+	requireNotContains(t, err, "start the ref its next_action names")
+}
+
+// TestStartCampaignItemRun_ClaimBudgetShort409_SaysNothingMinted: this
+// start's OWN claim was too short to start under (X4), so it is not "another
+// starter" and the item may be started again after a status read.
+func TestStartCampaignItemRun_ClaimBudgetShort409_SaysNothingMinted(t *testing.T) {
+	err := startItemAgainst(t, http.StatusConflict, itemStartErrEnvelope(t, "item_not_eligible",
+		"this start's item claim no longer covers the start and cleanup budgets, so no run was minted",
+		map[string]any{"campaign_id": uuid.NewString(), "issue_ref": "issue:100", "item_state": "pending",
+			"start_in_progress": true, "claim_starter": "operator", "claim_expires_at": "2026-11-21T12:10:00Z", "claim_budget_short": true}))
+	requireContains(t, err, "own item claim", "no run was minted", "fishhawk_get_campaign_status")
+	requireNotContains(t, err, "Do not retry", "another start of this item")
+}
+
+// TestStartCampaignItemRun_AlreadyLinked409_NamesRun: the item already carries
+// a run (X3), so the error names it to drive rather than the generic DAG text.
+func TestStartCampaignItemRun_AlreadyLinked409_NamesRun(t *testing.T) {
+	runID := uuid.NewString()
+	err := startItemAgainst(t, http.StatusConflict, itemStartErrEnvelope(t, "item_not_eligible",
+		"item is running", map[string]any{"campaign_id": uuid.NewString(), "issue_ref": "issue:100", "item_state": "running", "run_id": runID}))
+	requireContains(t, err, "already linked to run "+runID, "drive that run")
+	requireNotContains(t, err, "start the ref its next_action names", "cancel")
+}
+
+// TestStartCampaignItemRun_PlainNotEligible409_KeepsDAGText: a refusal with no
+// claim keys keeps the pre-#5266 text.
+func TestStartCampaignItemRun_PlainNotEligible409_KeepsDAGText(t *testing.T) {
+	err := startItemAgainst(t, http.StatusConflict, itemStartErrEnvelope(t, "item_not_eligible",
+		"blocked on issue:99", map[string]any{"campaign_id": uuid.NewString(), "issue_ref": "issue:100", "item_state": "pending"}))
+	requireContains(t, err, "item_not_eligible: blocked on issue:99", "start the ref its next_action names")
+}
+
+// TestStartCampaignItemRun_ClaimLost409_Cancelled_SaysCancelled.
+func TestStartCampaignItemRun_ClaimLost409_Cancelled_SaysCancelled(t *testing.T) {
+	minted, winner := uuid.NewString(), uuid.NewString()
+	err := startItemAgainst(t, http.StatusConflict, itemStartErrEnvelope(t, "item_not_eligible",
+		"another starter won this campaign item while this start was minting; the run this call minted was abandoned",
+		map[string]any{"campaign_id": uuid.NewString(), "issue_ref": "issue:100", "claim_lost": true, "cancelled_run_id": minted, "run_id": winner}))
+	requireContains(t, err, "minted run "+minted, "cancelled run "+minted, "linked to run "+winner)
+	requireNotContains(t, err, "still live", "fishhawk_cancel_run")
+}
+
+// TestStartCampaignItemRun_ClaimLost409_CancelFailed_NeverSaysCancelled: the
+// cancel failed, so the error must never claim the run was cancelled.
+func TestStartCampaignItemRun_ClaimLost409_CancelFailed_NeverSaysCancelled(t *testing.T) {
+	minted := uuid.NewString()
+	err := startItemAgainst(t, http.StatusConflict, itemStartErrEnvelope(t, "item_not_eligible",
+		"another starter won this campaign item while this start was minting; the run this call minted was abandoned",
+		map[string]any{"campaign_id": uuid.NewString(), "issue_ref": "issue:100", "claim_lost": true, "cancel_failed_run_id": minted}))
+	requireContains(t, err, "minted run "+minted, "still live", "fishhawk_cancel_run")
+	requireNotContains(t, err, "cancelled")
+}
+
+// TestStartCampaignItemRun_AbandonedOn500_NamesTheRunsOutcome: a link or
+// transition failure is an unmapped code that still names its abandoned run,
+// so the outcome is definitive, not unknown.
+func TestStartCampaignItemRun_AbandonedOn500_NamesTheRunsOutcome(t *testing.T) {
+	minted := uuid.NewString()
+	err := startItemAgainst(t, http.StatusInternalServerError, itemStartErrEnvelope(t, "internal_error",
+		"link campaign item to run failed", map[string]any{"item_id": uuid.NewString(), "run_id": minted, "cancelled_run_id": minted}))
+	requireContains(t, err, "internal_error", "cancelled run "+minted, "fishhawk_get_campaign_status")
+	requireNotContains(t, err, "outcome unknown")
+}
+
+// TestStartCampaignItemRun_RunTokenForbidden_Mapped: X2 refuses every
+// run-bound subject on the item start.
+func TestStartCampaignItemRun_RunTokenForbidden_Mapped(t *testing.T) {
+	err := startItemAgainst(t, http.StatusForbidden, itemStartErrEnvelope(t, "run_token_forbidden",
+		"a run-bound agent token may not start a campaign item run", nil))
+	requireContains(t, err, "run_token_forbidden", "operator action", "operator token")
+	requireNotContains(t, err, "outcome unknown")
+}
+
+// TestStartCampaignItemRun_AutoDispatchInput_ReachesTheRequest: the tool
+// input's auto_dispatch reaches the POST body; omitted, it stays false.
+func TestStartCampaignItemRun_AutoDispatchInput_ReachesTheRequest(t *testing.T) {
+	for _, flag := range []bool{true, false} {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		if _, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+			CampaignID: uuid.NewString(), IssueRef: "issue:1", WorkflowID: "feature_change", AutoDispatch: flag,
+		}); err != nil {
+			t.Fatalf("startCampaignItemRun(auto_dispatch=%v): %v", flag, err)
+		}
+		if fb.startCampaignItemRunBody.AutoDispatch != flag {
+			t.Errorf("POST body auto_dispatch = %v, want %v", fb.startCampaignItemRunBody.AutoDispatch, flag)
+		}
+	}
+}
+
+// itemStartFullPathSpec is a minimal valid workflow spec the GitHub stub
+// serves to the item start's GetWorkflowSpec.
+const itemStartFullPathSpec = `version: "0.5"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+type itemStartFullPathTokens struct{}
+
+func (itemStartFullPathTokens) Token(context.Context, int64) (string, error) { return "ghs_t", nil }
+
+// itemStartFullPath is the T6 rig (#5266): server.New behind httptest over
+// pgtest campaign and run repos and a local GitHub API stub behind a real
+// githubclient.Client, driven by the REAL newAPIClient.
+type itemStartFullPath struct {
+	campaigns campaign.Repository
+	runs      runpkg.Repository
+	r         *runResolver
+}
+
+func newItemStartFullPath(t *testing.T) *itemStartFullPath {
+	t.Helper()
+	pool := pgtest.NewPool(t)
+	f := &itemStartFullPath{campaigns: campaign.NewPostgresRepository(pool), runs: runpkg.NewPostgresRepository(pool)}
+	specJSON := `{"path":".fishhawk/workflows.yaml","sha":"spec_sha","content":"` +
+		base64.StdEncoding.EncodeToString([]byte(itemStartFullPathSpec)) + `","encoding":"base64","type":"file"}`
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":12345,"app_id":1}`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, specJSON)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[]`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"number":100,"title":"Campaign item","body":"body","state":"open"}`)
+	})
+	gh := httptest.NewServer(mux)
+	t.Cleanup(gh.Close)
+
+	const bearer = "fhk_item_start_full_path"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:campaigns", "read:campaigns", "read:runs"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		CampaignRepo: f.campaigns, RunRepo: f.runs, APITokenRepo: tokRepo,
+		GitHub: &githubclient.Client{
+			BaseURL: gh.URL, Tokens: itemStartFullPathTokens{},
+			HTTP:   &http.Client{Timeout: 5 * time.Second},
+			AppJWT: func() (string, error) { return "gha_app_jwt", nil },
+		},
+	})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+	f.r = &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer}), getenv: envFuncFromMap(nil)}
+	return f
+}
+
+// seed creates a running campaign bound to a local absolute checkout with
+// one pending item, through the pg repository.
+func (f *itemStartFullPath) seed(t *testing.T) (*campaign.Campaign, *campaign.Item) {
+	t.Helper()
+	ctx := context.Background()
+	c, err := f.campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", WorkingDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	item, err := f.campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:100"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if c, err = f.campaigns.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("campaign->running: %v", err)
+	}
+	return c, item
+}
+
+// TestStartCampaignItemRun_FullPath_AutoDispatchReachesPersistedRunAndStatus
+// (T6) crosses the MCP tool input -> the real client serialization -> the real
+// handler -> the pg run row's AutoDispatch -> GET /status awaiting. A second
+// start of the started item crosses the eligibility gate (X3) and must name
+// the linked run.
+func TestStartCampaignItemRun_FullPath_AutoDispatchReachesPersistedRunAndStatus(t *testing.T) {
+	f := newItemStartFullPath(t)
+	for _, tc := range []struct {
+		name       string
+		flag       bool
+		wantKind   string
+		wantReason string
+	}{
+		{"auto_dispatch true", true, "host_dispatcher", "host_dispatch"},
+		{"auto_dispatch omitted", false, "human", "operator_dispatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c, _ := f.seed(t)
+			_, out, err := f.r.startCampaignItemRun(ctx, nil, StartCampaignItemRunInput{
+				CampaignID: c.ID.String(), IssueRef: "issue:100", WorkflowID: "feature_change", AutoDispatch: tc.flag,
+			})
+			if err != nil {
+				t.Fatalf("startCampaignItemRun through the real server: %v", err)
+			}
+			if out.Run.AutoDispatch != tc.flag || out.Run.RunnerKind != "local" {
+				t.Fatalf("tool output run auto_dispatch/runner_kind = %v/%q, want %v/local", out.Run.AutoDispatch, out.Run.RunnerKind, tc.flag)
+			}
+			runID, err := uuid.Parse(out.Run.ID)
+			if err != nil {
+				t.Fatalf("run id %q: %v", out.Run.ID, err)
+			}
+			persisted, err := f.runs.GetRun(ctx, runID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if persisted.AutoDispatch != tc.flag {
+				t.Fatalf("persisted run AutoDispatch = %v, want %v", persisted.AutoDispatch, tc.flag)
+			}
+			_, st, err := f.r.getCampaignStatus(ctx, nil, GetCampaignStatusInput{CampaignID: c.ID.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus: %v", err)
+			}
+			if len(st.Items) != 1 || st.Items[0].RunID != out.Run.ID {
+				t.Fatalf("status items = %+v, want the one item linked to %s", st.Items, out.Run.ID)
+			}
+			blk := st.Items[0].Awaiting
+			if blk == nil || blk.Kind != tc.wantKind || blk.Reason != tc.wantReason {
+				t.Fatalf("awaiting = %+v, want %s/%s", blk, tc.wantKind, tc.wantReason)
+			}
+
+			// X3: the started item is refused at the eligibility gate, and the
+			// 409 names its linked run across the real wire.
+			_, _, err = f.r.startCampaignItemRun(ctx, nil, StartCampaignItemRunInput{
+				CampaignID: c.ID.String(), IssueRef: "issue:100", WorkflowID: "feature_change",
+			})
+			if err == nil {
+				t.Fatal("second start of a running item succeeded")
+			}
+			requireContains(t, err, "item_not_eligible", "already linked to run "+out.Run.ID)
+		})
+	}
+}
+
+// TestStartCampaignItemRun_FullPath_ClaimHeld_ReportsStartInProgress seeds a
+// live driver claim through the pg repository: the real handler refuses
+// before minting, and the tool error, crossing the real client and renderer,
+// says another start is in progress and names the status read. It pins the
+// 409 detail keys across the wire.
+func TestStartCampaignItemRun_FullPath_ClaimHeld_ReportsStartInProgress(t *testing.T) {
+	f := newItemStartFullPath(t)
+	ctx := context.Background()
+	c, item := f.seed(t)
+	if _, err := f.campaigns.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+		ItemID: item.ID, Starter: campaign.StarterCampaignDriver, Clock: func() time.Time { return time.Now().UTC() },
+	}); err != nil {
+		t.Fatalf("seed driver claim: %v", err)
+	}
+	_, _, err := f.r.startCampaignItemRun(ctx, nil, StartCampaignItemRunInput{
+		CampaignID: c.ID.String(), IssueRef: "issue:100", WorkflowID: "feature_change",
+	})
+	if err == nil {
+		t.Fatal("start under a live driver claim succeeded")
+	}
+	requireContains(t, err, "another start of this item is in progress", "campaign_driver", "Do not retry", "fishhawk_get_campaign_status")
+	runs, err := f.runs.ListRuns(ctx, runpkg.ListRunsFilter{Repo: "kuhlman-labs/fishhawk", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs minted under a held claim = %d, want 0", len(runs))
+	}
+}
+
+// TestStartCampaignItemRun_Unmapped4xx_StaysDefinitive: an unmapped 4xx is a
+// refusal the backend decided before minting, so it is never outcome unknown.
+func TestStartCampaignItemRun_Unmapped4xx_StaysDefinitive(t *testing.T) {
+	err := startItemAgainst(t, http.StatusBadRequest, itemStartErrEnvelope(t, "validation_failed",
+		"workflow_id is required", map[string]any{"field": "workflow_id"}))
+	requireContains(t, err, "validation_failed", "workflow_id is required")
+	requireNotContains(t, err, "outcome unknown")
 }

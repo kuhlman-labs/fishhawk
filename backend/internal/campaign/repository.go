@@ -229,6 +229,136 @@ type ListCampaignsFilter struct {
 	Offset    int
 }
 
+// --- Item start claims (#5266) ---
+
+// Starters a StartClaim may name. The campaign_item_start_claims.starter
+// column CHECK (migration 0119) admits exactly these two values.
+const (
+	// StarterOperator is the operator item start
+	// (POST /v0/campaigns/{campaign_id}/runs).
+	StarterOperator = "operator"
+	// StarterCampaignDriver is the backend campaign driver's auto-start.
+	StarterCampaignDriver = "campaign_driver"
+)
+
+// Item start claim lifetime and the budgets that keep a LIVE starter's claim
+// from being stolen (#5266).
+//
+// ItemStartBudget bounds the start a claimant runs after it claims: the mint,
+// the claimed link and the running transition. ItemStartCleanupBudget bounds
+// the cleanup a failed start runs: the transition-failure unlink, the claim
+// release, the run cancel and the abandon audit append. Cleanup runs on its
+// OWN context, context.WithTimeout(context.WithoutCancel(ctx),
+// ItemStartCleanupBudget), created where cleanup begins and never derived from
+// the start's possibly expired context, so a start that used up its budget
+// still releases, cancels and records.
+//
+// THE INVARIANT: the worst-case post-claim wall clock, ItemStartWorstCase
+// (ItemStartBudget + ItemStartCleanupBudget, 4m30s), is under HALF of
+// ItemStartClaimTTL, so a live starter's claim cannot expire under it unless
+// the process stalls for more than the remaining 5m30s past its own
+// deadlines. Even then the claim-bound link refuses StartConflictClaimLost, so
+// the item still gets exactly one linked run.
+// TestItemStartBudgets_WorstCasePostClaimUnderHalfTheClaimTTL pins the ratio.
+// A crashed starter blocks its item for at most ItemStartClaimTTL.
+const (
+	ItemStartClaimTTL      = 10 * time.Minute
+	ItemStartBudget        = 4 * time.Minute
+	ItemStartCleanupBudget = 30 * time.Second
+	ItemStartWorstCase     = ItemStartBudget + ItemStartCleanupBudget
+)
+
+// ErrStartClaimInvalid is returned by ClaimCampaignItemStart and
+// LinkClaimedCampaignItemRun for malformed params (an unknown starter, a nil
+// clock or a zero clock reading, a nil claim or run id). Nothing is written.
+var ErrStartClaimInvalid = errors.New("campaign: invalid item start claim params")
+
+// StartClaim is a campaign_item_start_claims row: a starter's TTL reservation
+// of an item, taken BEFORE it mints a run so a losing starter never mints
+// (#5266). ClaimedAt and ExpiresAt are fishhawkd-clock values, compared only
+// against the caller's own clock (docs/agents/testing.md, #3048).
+type StartClaim struct {
+	ItemID    uuid.UUID
+	ClaimID   uuid.UUID
+	Starter   string
+	ClaimedAt time.Time
+	ExpiresAt time.Time
+}
+
+// Covers reports whether the claim's remaining lifetime at now is at least
+// need. A starter checks it BEFORE minting with need = its start budget plus
+// its cleanup budget (ItemStartWorstCase in production); a claim that does
+// not cover the post-claim work is released and the start refused rather than
+// minted under a claim that could expire mid-start (#5266 X4).
+func (c *StartClaim) Covers(now time.Time, need time.Duration) bool {
+	if c == nil {
+		return false
+	}
+	return c.ExpiresAt.Sub(now) >= need
+}
+
+// ClaimCampaignItemStartParams is the input to
+// Repository.ClaimCampaignItemStart.
+type ClaimCampaignItemStartParams struct {
+	ItemID uuid.UUID
+	// Starter is StarterOperator or StarterCampaignDriver.
+	Starter string
+	// Clock is the caller's (fishhawkd) clock. The adapter reads it ONCE,
+	// AFTER the item row lock is granted, and stamps ClaimedAt from that
+	// reading and ExpiresAt = ClaimedAt + ItemStartClaimTTL (#5266 X4). A
+	// claimant that waited on the lock therefore gets a full TTL from the
+	// moment it actually holds the item, and the expiry comparison against a
+	// live claim uses the same post-lock reading.
+	Clock func() time.Time
+}
+
+// LinkClaimedCampaignItemRunParams is the input to
+// Repository.LinkClaimedCampaignItemRun.
+type LinkClaimedCampaignItemRunParams struct {
+	ItemID  uuid.UUID
+	ClaimID uuid.UUID
+	RunID   uuid.UUID
+}
+
+// StartConflictReason says why an item start claim or claimed link was
+// refused.
+type StartConflictReason string
+
+const (
+	// StartConflictLinked means the item already has a run (WinnerRunID).
+	StartConflictLinked StartConflictReason = "linked"
+	// StartConflictClaimed means another live claim holds the item (HeldClaim).
+	StartConflictClaimed StartConflictReason = "claimed"
+	// StartConflictClaimLost means this starter's claim was replaced or released
+	// before its link; HeldClaim is the replacing claim when one exists.
+	StartConflictClaimLost StartConflictReason = "claim_lost"
+)
+
+// ItemStartConflictError is the refusal ClaimCampaignItemStart and
+// LinkClaimedCampaignItemRun return when another starter owns the item.
+// Match it with errors.As. Nothing is written on a refusal.
+type ItemStartConflictError struct {
+	ItemID uuid.UUID
+	Reason StartConflictReason
+	// WinnerRunID is the run the item is linked to (StartConflictLinked).
+	WinnerRunID *uuid.UUID
+	// HeldClaim is the claim holding the item (StartConflictClaimed, and
+	// StartConflictClaimLost when another claim replaced this one).
+	HeldClaim *StartClaim
+}
+
+func (e *ItemStartConflictError) Error() string {
+	msg := fmt.Sprintf("campaign item %s start refused: %s", e.ItemID, e.Reason)
+	if e.WinnerRunID != nil {
+		msg += fmt.Sprintf(" (linked to run %s)", *e.WinnerRunID)
+	}
+	if e.HeldClaim != nil {
+		msg += fmt.Sprintf(" (held by %s claim %s until %s)",
+			e.HeldClaim.Starter, e.HeldClaim.ClaimID, e.HeldClaim.ExpiresAt.UTC().Format(time.RFC3339Nano))
+	}
+	return msg
+}
+
 // Repository persists campaigns and campaign items and applies
 // state-machine transitions atomically.
 //
@@ -284,7 +414,52 @@ type Repository interface {
 	// SetCampaignItemRun attaches (or clears) the run linkage on an item.
 	// Idempotent: setting the same run twice is a no-op against
 	// updated_at. Returns ErrNotFound when the item doesn't exist.
+	// It is UNCONDITIONAL — it ignores item start claims — and stays the path
+	// for the unlink (nil), the operator restart reset and the reconcile
+	// relink; a fresh start links through LinkClaimedCampaignItemRun (#5266).
 	SetCampaignItemRun(ctx context.Context, itemID uuid.UUID, runID *uuid.UUID) (*Item, error)
+
+	// ClaimCampaignItemStart reserves an item for one starter BEFORE it mints
+	// a run (#5266), so a losing starter never creates a run the host
+	// dispatcher could admit. LOCK ORDER is the package one: the
+	// campaign_items row (SELECT … FOR UPDATE), then the claim row. Under the
+	// item lock it reads p.Clock once (#5266 X4) and:
+	//
+	//   - item missing                   -> ErrNotFound
+	//   - item already linked to a run   -> *ItemStartConflictError{StartConflictLinked, WinnerRunID}
+	//   - a live claim (expires_at > now) -> *ItemStartConflictError{StartConflictClaimed, HeldClaim}
+	//   - otherwise inserts a fresh claim, or REPLACES an expired one (crash
+	//     recovery), stamped ClaimedAt = now, ExpiresAt = now + ItemStartClaimTTL.
+	//
+	// A claimant that waited on the item lock behind a committing link reads
+	// the committed row and refuses linked. An unknown starter, a nil clock or
+	// a zero reading is ErrStartClaimInvalid (the first two before any read).
+	ClaimCampaignItemStart(ctx context.Context, p ClaimCampaignItemStartParams) (*StartClaim, error)
+
+	// LinkClaimedCampaignItemRun links a minted run to the item ONLY while the
+	// caller still holds its claim, consuming the claim in the same
+	// transaction (#5266). LOCK ORDER: the item row, then the claim row.
+	//
+	//   - item missing                        -> ErrNotFound
+	//   - item linked to p.RunID              -> idempotent re-link: deletes the
+	//     caller's claim row (if still present) and returns the item
+	//   - item linked to another run          -> *ItemStartConflictError{StartConflictLinked, WinnerRunID}
+	//   - the caller's claim row is gone      -> *ItemStartConflictError{StartConflictClaimLost, HeldClaim (the replacer, when one exists)}
+	//   - otherwise deletes the claim and sets run_id = p.RunID.
+	//
+	// An EXPIRED claim that nobody replaced still links: expiry only lets
+	// ANOTHER claimant replace it. A nil ClaimID or RunID is
+	// ErrStartClaimInvalid before any read. Unlike the item read paths, the
+	// returned item does not carry Item.Expedite (like SetCampaignItemRun).
+	LinkClaimedCampaignItemRun(ctx context.Context, p LinkClaimedCampaignItemRunParams) (*Item, error)
+
+	// ReleaseCampaignItemStart deletes the caller's claim (item_id AND
+	// claim_id), freeing the item for the next starter. Idempotent and
+	// claim-scoped: a claim already consumed by a link, already released, or
+	// replaced by another starter's claim is left alone and nil is returned.
+	// It is one DELETE that touches only the claim row, so it never holds a
+	// claim row while waiting on an item row (consistent with the lock order).
+	ReleaseCampaignItemStart(ctx context.Context, itemID, claimID uuid.UUID) error
 
 	// SetCampaignItemAutonomy overwrites the item's autonomy tier — the routing
 	// metadata re-read from the issue's autonomy:* label on the reconcile-on-read

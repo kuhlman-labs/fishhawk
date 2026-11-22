@@ -16,9 +16,13 @@
 //     and transitioned with a campaign_advanced entry when it changes.
 //   - START: items partitioned Eligible by the E25.3 pure engine
 //     (campaign.NextEligible) are started — bounded by a concurrency cap
-//     counting currently-running items — via the RunStarter seam, linked to
-//     their item (SetCampaignItemRun), transitioned to running, and recorded
-//     with a campaign_issue_started entry. A RunStarter that returns a
+//     counting currently-running items. Each start first CLAIMS the item
+//     (campaign_item_start_claims, #5266) so a losing starter never mints,
+//     then mints via the RunStarter seam, links the run only while the claim
+//     is still held (LinkClaimedCampaignItemRun), transitions the item to
+//     running, and records a campaign_issue_started entry. A minted run that
+//     ends unlinked is cancelled through the optional RunCanceller seam and
+//     recorded as campaign_item_run_abandoned. A RunStarter that returns a
 //     *StartRefusal (#4525) ends the campaign's START pass for the tick: no
 //     item of it starts, and one campaign_auto_start_refused entry is recorded
 //     per (campaign, reason).
@@ -115,6 +119,27 @@ const (
 	categoryCampaignAutoStartRefused = "campaign_auto_start_refused"
 )
 
+// CategoryCampaignItemRunAbandoned is the GLOBAL-chain record that a campaign
+// item start minted a run it could not link and cancelled it (#5266). The
+// driver and the operator item start (server/campaign_item_start.go) both
+// write it, with starter campaign_driver or operator. It is registered in
+// audit.KnownCategories as INTERNAL (actor system, not an issue-comment
+// surface) and is intended WITHHELD from run-bound readers, because its
+// payload names winner_run_id, another starter's run. The global feed's
+// interim run-bound deny-list (server/reads.go
+// withholdScopeOverlapFromRunBound) does not yet name it; the ADR-106
+// registry-flag follow-up (E89 #4537) owns the withhold.
+const CategoryCampaignItemRunAbandoned = "campaign_item_run_abandoned"
+
+// The campaign_item_run_abandoned reasons: why a minted run ended unlinked.
+// The server's operator item start uses the same four tokens.
+const (
+	abandonClaimConflict    = "claim_conflict"
+	abandonLinkFailed       = "link_failed"
+	abandonTransitionFailed = "transition_failed"
+	abandonStartIncomplete  = "start_incomplete"
+)
+
 // Decision-required marker categories and the run-level gate token (E88.4 /
 // #4528). Exported so the server's campaign status read names them without a
 // string copy. Unlike the campaign-level markers above, both ride the RUN chain
@@ -180,14 +205,55 @@ func (e *StartRefusal) Error() string {
 	return "campaign auto-start refused: " + e.Reason
 }
 
+// StartIncompleteError is the error a RunStarter returns when the run row
+// committed but its stages could not be created (#5266): the run exists, so
+// the driver cancels it (reason start_incomplete) instead of only logging. The
+// serve.go adapter maps *server.RunStartIncompleteError onto it, so the driver
+// never imports server.
+type StartIncompleteError struct {
+	RunID uuid.UUID
+	Err   error
+}
+
+// Error implements error.
+func (e *StartIncompleteError) Error() string {
+	return "campaign run start incomplete (run " + e.RunID.String() + "): " + e.Err.Error()
+}
+
+// Unwrap returns the stage-creation cause.
+func (e *StartIncompleteError) Unwrap() error { return e.Err }
+
+// RunCanceller is the OPTIONAL capability the driver uses to cancel a minted
+// run that ended unlinked (#5266): a lost claim, a link failure, a
+// running-transition failure or an incomplete start. It is found by a type
+// assertion on Ticker.Starter (the CampaignGateActor precedent), so a
+// RunStarter without it still compiles; the driver then records the abandon
+// with cancelled false and WARN-logs that the run was left uncancelled. The
+// serve.go adapter delegates to server.Server.CancelCampaignRun, a state
+// transition to cancelled, never a delete.
+type RunCanceller interface {
+	CancelCampaignRun(ctx context.Context, runID uuid.UUID) error
+}
+
 // CampaignStore is the slice of campaign.Repository the driver uses: list the
-// running campaigns and their items, link an item to its run, and apply
-// item/campaign state transitions. Satisfied by campaign.Repository; extracted
-// as an interface so unit tests substitute the campaign fake.
+// running campaigns and their items, claim an item start and link a run to it
+// while the claim is held (#5266), unlink an item, and apply item/campaign
+// state transitions. Satisfied by campaign.Repository; extracted as an
+// interface so unit tests substitute the campaign fake.
 type CampaignStore interface {
 	ListCampaigns(ctx context.Context, f campaign.ListCampaignsFilter) ([]*campaign.Campaign, error)
 	ListCampaignItemsForCampaign(ctx context.Context, campaignID uuid.UUID) ([]*campaign.Item, error)
+	// SetCampaignItemRun is used only for the transition-failure unlink (nil);
+	// a fresh start links through LinkClaimedCampaignItemRun.
 	SetCampaignItemRun(ctx context.Context, itemID uuid.UUID, runID *uuid.UUID) (*campaign.Item, error)
+	// ClaimCampaignItemStart reserves an item BEFORE the driver mints a run;
+	// a *campaign.ItemStartConflictError means another starter owns it.
+	ClaimCampaignItemStart(ctx context.Context, p campaign.ClaimCampaignItemStartParams) (*campaign.StartClaim, error)
+	// LinkClaimedCampaignItemRun links the minted run only while the claim is
+	// still held, consuming it.
+	LinkClaimedCampaignItemRun(ctx context.Context, p campaign.LinkClaimedCampaignItemRunParams) (*campaign.Item, error)
+	// ReleaseCampaignItemStart deletes the caller's own claim; idempotent.
+	ReleaseCampaignItemStart(ctx context.Context, itemID, claimID uuid.UUID) error
 	TransitionCampaignItem(ctx context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error)
 	TransitionCampaign(ctx context.Context, id uuid.UUID, to campaign.State) (*campaign.Campaign, error)
 	// PauseCampaignItem transitions a running item to paused, recording the
@@ -374,8 +440,22 @@ type Ticker struct {
 	// DefaultMaxParallel when <= 0.
 	MaxParallel int
 
-	// Now sources the current time for audit timestamps. nil → time.Now.
+	// Now sources the current time for audit timestamps and item start
+	// claims. nil → time.Now. The claim's stamps are compared only against
+	// this clock and the server's, which are the same source in one fishhawkd.
 	Now func() time.Time
+
+	// StartBudget bounds an item start after its claim (#5266): the mint, the
+	// claimed link, the running transition and the campaign_issue_started
+	// emit, on a context detached from the tick's cancellation. Zero means
+	// campaign.ItemStartBudget (what serve.go leaves).
+	StartBudget time.Duration
+
+	// CleanupBudget bounds a failed start's cleanup (U3): the
+	// transition-failure unlink, the claim release, the RunCanceller cancel
+	// and the abandon emit, which run on their OWN context, never derived from
+	// the start context. Zero means campaign.ItemStartCleanupBudget.
+	CleanupBudget time.Duration
 
 	// refusedMu guards refused: the (campaign, reason) pairs whose
 	// campaign_auto_start_refused entry was recorded (#4525). A key is set only
@@ -1045,13 +1125,12 @@ func (t *Ticker) deriveAndTransition(ctx context.Context, logger *slog.Logger, c
 	})
 }
 
-// start dispatches eligible items up to the per-campaign concurrency budget
-// (effective max minus currently-running items), starting each via the
-// RunStarter seam, linking it to its item, transitioning it to running, and
-// emitting a campaign_issue_started entry. Idempotent: an item that already
-// has a run, or is no longer in a startable state, is skipped. A *StartRefusal
-// from the starter ends the pass for the whole campaign (recordStartRefusal);
-// any other starter error is per-item and the next eligible item is tried.
+// start dispatches up to the concurrency budget of Eligible items, each
+// through startItem. Idempotent: an item that already has a run, or is no
+// longer in a startable state, is skipped. A *StartRefusal from the starter
+// ends the pass for the whole campaign (recordStartRefusal); any other
+// per-item failure, including a claim another starter holds, leaves the
+// budget unspent and the next eligible item is tried.
 func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, items []*campaign.Item) {
 	elig := campaign.NextEligible(items)
 	budget := t.effectiveMaxParallel() - len(elig.Running)
@@ -1078,74 +1157,283 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 		if it.RunID != nil || !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateRunning) {
 			continue
 		}
+		switch t.startItem(ctx, logger, c, it) {
+		case itemStarted:
+			budget--
+		case itemCampaignRefused:
+			return
+		}
+	}
+}
 
-		runRow, err := t.Starter.StartCampaignRun(ctx, it, c)
-		if err != nil {
-			// A campaign-level refusal (#4525) is not transient and applies to
-			// every item of the campaign: record it (once per campaign+reason)
-			// and end the START pass so no further item is attempted.
-			var refusal *StartRefusal
-			if errors.As(err, &refusal) {
-				t.recordStartRefusal(ctx, logger, c, it, refusal)
-				return
-			}
-			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: start run for item failed; will retry next tick",
+// itemStartResult is startItem's outcome for the START loop.
+type itemStartResult int
+
+const (
+	// itemSkipped: nothing started (a claim conflict, a transient error or an
+	// abandoned run); the budget is unspent and the next item is tried.
+	itemSkipped itemStartResult = iota
+	// itemStarted: the item is linked to its run and running.
+	itemStarted
+	// itemCampaignRefused: the starter returned a *StartRefusal; the
+	// campaign's START pass ends.
+	itemCampaignRefused
+)
+
+// startItem starts one item with claim-before-mint (#5266):
+//
+//  1. Claim (tick context) as campaign_driver on the driver's clock. A
+//     conflict (linked, or another live claim) is an INFO skip that mints
+//     nothing; any other error WARN-logs. A claim whose remaining lifetime
+//     does not cover the start plus cleanup budgets is released and skipped
+//     rather than minted (X4).
+//  2. The start runs on context.WithTimeout(context.WithoutCancel(ctx),
+//     StartBudget), so a cancelled tick context does not abort it halfway.
+//     The detach is best-effort up to process exit: serve.go runs the ticker
+//     on an unjoined goroutine and nothing waits for an in-flight start at
+//     shutdown, so a process exit mid-start (for example between the CreateRun
+//     commit and the claimed link) kills it with no cleanup, leaving an
+//     unlinked marked run and a claim that blocks the item until its TTL. See
+//     the README's U4c residuals.
+//  3. Mint. A *StartIncompleteError abandons the run (start_incomplete); a
+//     *StartRefusal releases the claim and ends the campaign's pass; any other
+//     error, or a nil run, releases the claim and skips.
+//  4. Claimed link. A conflict abandons the run (claim_conflict, naming the
+//     winner when known); any other error abandons it (link_failed).
+//  5. Running transition. A failure unlinks the item and abandons the run
+//     (transition_failed), so the next tick retries the item.
+//  6. campaign_issue_started is emitted on the same start context (X1).
+//
+// Every cleanup act runs on its own context (cleanupContext, U3), never the
+// possibly expired start context.
+func (t *Ticker) startItem(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item) itemStartResult {
+	claim, err := t.Campaigns.ClaimCampaignItemStart(ctx, campaign.ClaimCampaignItemStartParams{
+		ItemID:  it.ID,
+		Starter: campaign.StarterCampaignDriver,
+		Clock:   t.now,
+	})
+	if err != nil {
+		var conflict *campaign.ItemStartConflictError
+		if errors.As(err, &conflict) {
+			logger.LogAttrs(ctx, slog.LevelInfo, "campaigndriver: item start held by another starter; skipping without minting",
 				slog.String("campaign_id", c.ID.String()),
 				slog.String("item_id", it.ID.String()),
 				slog.String("issue_ref", it.IssueRef),
-				slog.String("error", err.Error()))
-			continue
+				slog.String("conflict", err.Error()))
+			return itemSkipped
 		}
-		if runRow == nil {
-			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: starter returned nil run; item left un-started",
-				slog.String("campaign_id", c.ID.String()),
-				slog.String("item_id", it.ID.String()))
-			continue
-		}
-		// The campaign starts again, so a later refusal is news: forget the
-		// recorded ones.
-		t.clearStartRefusals(c.ID)
-
-		if _, err := t.Campaigns.SetCampaignItemRun(ctx, it.ID, &runRow.ID); err != nil {
-			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: link item to run failed",
-				slog.String("campaign_id", c.ID.String()),
-				slog.String("item_id", it.ID.String()),
-				slog.String("run_id", runRow.ID.String()),
-				slog.String("error", err.Error()))
-			continue
-		}
-		if _, err := t.Campaigns.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
-			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: transition item to running failed; unlinking run so the item retries next tick",
-				slog.String("campaign_id", c.ID.String()),
-				slog.String("item_id", it.ID.String()),
-				slog.String("run_id", runRow.ID.String()),
-				slog.String("error", err.Error()))
-			// The link committed but the running transition did not, leaving the
-			// item linked-but-not-running. NextEligible classifies that item as
-			// Running (RunID set, non-terminal), so without a rollback it is
-			// never settled (advance requires state running) nor re-dispatched
-			// (start only acts on Eligible) — it is permanently stranded against
-			// the contract that a transient per-item error stays retryable. Roll
-			// the link back so the next tick re-partitions it as Eligible and
-			// retries. Best-effort: an unlink failure is logged and the item
-			// then waits for manual repair rather than being silently
-			// half-started.
-			if _, uerr := t.Campaigns.SetCampaignItemRun(ctx, it.ID, nil); uerr != nil {
-				logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: unlink after failed running transition also failed; item left linked-but-not-running",
-					slog.String("campaign_id", c.ID.String()),
-					slog.String("item_id", it.ID.String()),
-					slog.String("run_id", runRow.ID.String()),
-					slog.String("error", uerr.Error()))
-			}
-			continue
-		}
-		budget--
-		t.emit(ctx, logger, c.ID, categoryCampaignIssueStarted, map[string]any{
-			"campaign_id": c.ID.String(),
-			"issue_ref":   it.IssueRef,
-			"run_id":      runRow.ID.String(),
-		})
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: claim item start failed; will retry next tick",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("issue_ref", it.IssueRef),
+			slog.String("error", err.Error()))
+		return itemSkipped
 	}
+	startBudget, cleanupBudget := t.startBudget(), t.cleanupBudget()
+	if !claim.Covers(t.now(), startBudget+cleanupBudget) {
+		t.releaseClaimDetached(ctx, logger, c, it, claim)
+		logger.LogAttrs(ctx, slog.LevelInfo, "campaigndriver: item start claim does not cover the start and cleanup budgets; released without minting",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("expires_at", claim.ExpiresAt.UTC().Format(time.RFC3339Nano)))
+		return itemSkipped
+	}
+
+	startCtx, cancelStart := context.WithTimeout(context.WithoutCancel(ctx), startBudget)
+	defer cancelStart()
+
+	runRow, err := t.Starter.StartCampaignRun(startCtx, it, c)
+	if err != nil {
+		var incomplete *StartIncompleteError
+		if errors.As(err, &incomplete) {
+			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: run minted but its stages could not be created; abandoning it",
+				slog.String("campaign_id", c.ID.String()),
+				slog.String("item_id", it.ID.String()),
+				slog.String("run_id", incomplete.RunID.String()),
+				slog.String("error", err.Error()))
+			t.cleanupAbandoned(ctx, logger, c, it, claim, incomplete.RunID, abandonStartIncomplete, nil, false)
+			return itemSkipped
+		}
+		t.releaseClaimDetached(ctx, logger, c, it, claim)
+		// A campaign-level refusal (#4525) is not transient and applies to
+		// every item of the campaign: record it (once per campaign+reason)
+		// and end the START pass so no further item is attempted.
+		var refusal *StartRefusal
+		if errors.As(err, &refusal) {
+			t.recordStartRefusal(ctx, logger, c, it, refusal)
+			return itemCampaignRefused
+		}
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: start run for item failed; will retry next tick",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("issue_ref", it.IssueRef),
+			slog.String("error", err.Error()))
+		return itemSkipped
+	}
+	if runRow == nil {
+		t.releaseClaimDetached(ctx, logger, c, it, claim)
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: starter returned nil run; item left un-started",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()))
+		return itemSkipped
+	}
+	// The campaign starts again, so a later refusal is news: forget the
+	// recorded ones.
+	t.clearStartRefusals(c.ID)
+
+	if _, err := t.Campaigns.LinkClaimedCampaignItemRun(startCtx, campaign.LinkClaimedCampaignItemRunParams{
+		ItemID: it.ID, ClaimID: claim.ClaimID, RunID: runRow.ID,
+	}); err != nil {
+		reason, winner := abandonLinkFailed, (*uuid.UUID)(nil)
+		var conflict *campaign.ItemStartConflictError
+		if errors.As(err, &conflict) {
+			reason, winner = abandonClaimConflict, conflict.WinnerRunID
+		}
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: link item to run failed; abandoning the minted run",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("reason", reason),
+			slog.String("error", err.Error()))
+		t.cleanupAbandoned(ctx, logger, c, it, claim, runRow.ID, reason, winner, false)
+		return itemSkipped
+	}
+	if _, err := t.Campaigns.TransitionCampaignItem(startCtx, it.ID, campaign.ItemStateRunning); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: transition item to running failed; unlinking and abandoning the run so the item retries next tick",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		// The link committed but the running transition did not, leaving the
+		// item linked-but-not-running. NextEligible classifies that item as
+		// Running (RunID set, non-terminal), so without a rollback it is
+		// never settled (advance requires state running) nor re-dispatched
+		// (start only acts on Eligible). The cleanup unlinks it so the next
+		// tick re-partitions it as Eligible, and cancels the minted run.
+		t.cleanupAbandoned(ctx, logger, c, it, claim, runRow.ID, abandonTransitionFailed, nil, true)
+		return itemSkipped
+	}
+	// X1: the started marker rides the same detached, bounded start context,
+	// so a tick cancelled after the transition still records it.
+	t.emit(startCtx, logger, c.ID, categoryCampaignIssueStarted, map[string]any{
+		"campaign_id": c.ID.String(),
+		"issue_ref":   it.IssueRef,
+		"run_id":      runRow.ID.String(),
+	})
+	return itemStarted
+}
+
+// cleanupContext returns the context a failed start's cleanup runs on (U3):
+// detached from parent's cancellation and deadline and bounded by
+// CleanupBudget alone. Callers pass the TICK context, never the start
+// context, so a start that used up its budget still releases, cancels and
+// records.
+func (t *Ticker) cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), t.cleanupBudget())
+}
+
+// releaseClaimDetached releases this start's claim on its own cleanup context.
+func (t *Ticker) releaseClaimDetached(parent context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, claim *campaign.StartClaim) {
+	ctx, cancel := t.cleanupContext(parent)
+	defer cancel()
+	t.releaseClaim(ctx, logger, c, it, claim)
+}
+
+// releaseClaim deletes this start's own claim. Release is idempotent and
+// claim-scoped, so it is safe on every failure path (after a successful link
+// the claim is already consumed and this is a no-op). A failure WARN-logs; the
+// claim then blocks the item until it expires.
+func (t *Ticker) releaseClaim(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, claim *campaign.StartClaim) {
+	if err := t.Campaigns.ReleaseCampaignItemStart(ctx, it.ID, claim.ClaimID); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: release item start claim failed; the claim blocks the item until it expires",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("claim_id", claim.ClaimID.String()),
+			slog.String("expires_at", claim.ExpiresAt.UTC().Format(time.RFC3339Nano)),
+			slog.String("error", err.Error()))
+	}
+}
+
+// cleanupAbandoned runs a failed start's cleanup on one cleanup context (U3):
+// the transition-failure unlink when unlink is set, the abandon (cancel, then
+// emit) and the claim release.
+func (t *Ticker) cleanupAbandoned(parent context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, claim *campaign.StartClaim, runID uuid.UUID, reason string, winner *uuid.UUID, unlink bool) {
+	ctx, cancel := t.cleanupContext(parent)
+	defer cancel()
+	if unlink {
+		if _, err := t.Campaigns.SetCampaignItemRun(ctx, it.ID, nil); err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: unlink after failed running transition also failed; item left linked-but-not-running",
+				slog.String("campaign_id", c.ID.String()),
+				slog.String("item_id", it.ID.String()),
+				slog.String("run_id", runID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+	t.abandon(ctx, logger, c, it, runID, reason, winner)
+	t.releaseClaim(ctx, logger, c, it, claim)
+}
+
+// abandon cancels a minted run that ended unlinked through the optional
+// RunCanceller seam FIRST, then records campaign_item_run_abandoned with the
+// TRUE outcome (#5266). The cancel never depends on the audit; an emit failure
+// WARN-logs every payload field. A Starter without the seam records cancelled
+// false and WARN-logs that the run was left uncancelled. It returns whether
+// the cancel succeeded.
+//
+// What the cancel does NOT do (U4c): it only moves the run to cancelled. It
+// does not unwind a stage the host dispatcher admitted while the marked run
+// was unlinked (from its CreateRun commit until the claimed link, and from a
+// transition-failure unlink until this cancel), nor the run_started board
+// move; later dispatcher ticks refuse the run as terminal. A CreateRun whose
+// commit raced the start deadline and then returned an error leaves a
+// committed, unlinked, marked run whose id the driver never learns, so nobody
+// cancels it (X6c).
+func (t *Ticker) abandon(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runID uuid.UUID, reason string, winner *uuid.UUID) bool {
+	cancelled := false
+	if rc, ok := t.Starter.(RunCanceller); ok {
+		if err := rc.CancelCampaignRun(ctx, runID); err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: cancelling an abandoned campaign item run failed; the run is left live for operator cancellation",
+				slog.String("campaign_id", c.ID.String()),
+				slog.String("item_id", it.ID.String()),
+				slog.String("run_id", runID.String()),
+				slog.String("reason", reason),
+				slog.String("error", err.Error()))
+		} else {
+			cancelled = true
+		}
+	} else {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: abandoned run left uncancelled; the starter has no RunCanceller seam",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("reason", reason))
+	}
+	payload := map[string]any{
+		"campaign_id": c.ID.String(),
+		"issue_ref":   it.IssueRef,
+		"item_id":     it.ID.String(),
+		"run_id":      runID.String(),
+		"starter":     campaign.StarterCampaignDriver,
+		"reason":      reason,
+		"cancelled":   cancelled,
+	}
+	winnerStr := ""
+	if winner != nil {
+		winnerStr = winner.String()
+		payload["winner_run_id"] = winnerStr
+	}
+	if !t.emit(ctx, logger, c.ID, CategoryCampaignItemRunAbandoned, payload) {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: campaign_item_run_abandoned not recorded; the abandon is recorded only in this log line",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("issue_ref", it.IssueRef),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("starter", campaign.StarterCampaignDriver),
+			slog.String("reason", reason),
+			slog.String("winner_run_id", winnerStr),
+			slog.Bool("cancelled", cancelled))
+	}
+	return cancelled
 }
 
 // recordStartRefusal records a campaign-level StartRefusal (#4525) as one
@@ -1297,6 +1585,20 @@ func mapRunTerminalToItem(s run.State) (campaign.ItemState, bool) {
 	default:
 		return "", false
 	}
+}
+
+func (t *Ticker) startBudget() time.Duration {
+	if t.StartBudget > 0 {
+		return t.StartBudget
+	}
+	return campaign.ItemStartBudget
+}
+
+func (t *Ticker) cleanupBudget() time.Duration {
+	if t.CleanupBudget > 0 {
+		return t.CleanupBudget
+	}
+	return campaign.ItemStartCleanupBudget
 }
 
 func (t *Ticker) effectiveMaxParallel() int {

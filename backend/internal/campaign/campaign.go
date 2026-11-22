@@ -26,8 +26,11 @@ import (
 //
 // A campaign is the parent record; campaign items are children. The
 // campaign state is a reduction of its items: it becomes Running when its
-// first item dispatches, Succeeded when every item succeeds, Failed on a
-// terminal item failure, and Cancelled when manually halted.
+// first item dispatches — or at create, on a deployment that runs the
+// campaign driver, which opens a new campaign running so the driver (which
+// lists only running campaigns) picks it up on its next tick (#5266) —
+// Succeeded when every item succeeds, Failed on a terminal item failure, and
+// Cancelled when manually halted.
 type State string
 
 // Campaign states. Terminal states (Succeeded, Failed, Cancelled) admit no

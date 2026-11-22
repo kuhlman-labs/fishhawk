@@ -777,6 +777,19 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, "write:campaigns") {
 		return
 	}
+	// A run-bound (mcp:run:*) subject may not create a campaign (#5266 U2):
+	// refused right after the scope gate and BEFORE the body decode, the
+	// idempotency lookup, any forge read (the issue-set resolution and the
+	// admission screen's spec fetch), Persist and create-open — the
+	// campaign_hotfix.go precedent. Unconditional, not only on a driver-run
+	// deployment: a run-bound create was never a supported operator path (the
+	// runner egress proxy already denies the route), and a deployment's driver
+	// posture can change at restart while its campaigns persist.
+	if _, runBound := runBoundTokenRunID(IdentityFrom(r.Context())); runBound {
+		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
+			"a run-bound agent token may not create a campaign; on a deployment that runs the campaign driver a created campaign opens running and its eligible items start without a further operator verb, so creation is an operator action", nil)
+		return
+	}
 	if s.cfg.CampaignRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "campaign_repo_unconfigured",
 			"campaigns endpoint requires a configured campaign repository", nil)
@@ -1008,6 +1021,13 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"persist campaign failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	// Create-open (#5266): on a driver-run deployment the campaign opens
+	// running in this request, so the driver starts its eligible items on its
+	// next tick. A transition failure leaves it pending, truthfully.
+	if s.campaignDriverRuns() {
+		created = s.openCampaignForDriver(r.Context(), created)
 	}
 
 	// The audit entry is a SECOND copy of the provenance, for the chain. It is
@@ -2515,6 +2535,14 @@ type startCampaignItemRunRequest struct {
 	// DisallowUnknownFields decoder makes declaring the field mandatory for it
 	// to be accepted at all.
 	WorkingDir string `json:"working_dir,omitempty"`
+	// AutoDispatch is the operator's explicit opt-in to the ADR-104 Q3
+	// host-dispatcher mark on the minted item run (#5266), mirroring POST
+	// /v0/runs (runRequest.AutoDispatch): optional, default false, "by operator
+	// flag". true lets a fishhawk-mcp host dispatcher spawn the run's parked
+	// local stages; omitted leaves the run unmarked for operator dispatch.
+	// Nothing infers it from the deployment's driver posture. A run-bound
+	// subject never reaches it: the route refuses every run-bound token.
+	AutoDispatch bool `json:"auto_dispatch,omitempty"`
 }
 
 // handleStartCampaignItemRun implements POST /v0/campaigns/{campaign_id}/runs:
@@ -2528,7 +2556,7 @@ type startCampaignItemRunRequest struct {
 // run via Server.StartRunForCampaignIssue (carrying runner_kind so the local
 // loop gets runner_kind:local, and working_dir so the minted run binds the
 // operator's checkout that every later runner-spawning verb inherits — E48.69 /
-// #2498), links it with SetCampaignItemRun, transitions the item pending →
+// #2498), links it (claim-bound since #5266), transitions the item pending →
 // running, and derives/advances the campaign so a pending campaign moves to
 // running on its first dispatch. A non-empty non-absolute working_dir 400s
 // validation_failed, mirroring POST /v0/runs.
@@ -2551,6 +2579,19 @@ type startCampaignItemRunRequest struct {
 // The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
 // unconfigured deployment answers 503 (not 401), matching the other campaign
 // write handlers and the 503-vs-404 route-registration idiom.
+//
+// Since #5266 the mint, link and running transition go through the
+// claim-before-mint core (startClaimedCampaignItemRun): the item is claimed in
+// campaign_item_start_claims before any run is minted, so a start that races
+// the campaign driver (or another operator) mints at most one run; a minted
+// run that ends unlinked is cancelled and audited campaign_item_run_abandoned.
+// The post-start tail (the campaign_issue_started emit and the pending /
+// awaiting_human derive) runs on the core's detached, bounded start context
+// (X1), so a client disconnect after the start cannot drop it. The route is an
+// operator verb: EVERY run-bound (mcp:run:*) subject is refused 403
+// run_token_forbidden before any read, claim or mint (#5266 X2), flagged with
+// auto_dispatch or not. The optional auto_dispatch field stamps the ADR-104 Q3
+// host-dispatcher mark by explicit operator flag only.
 func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.CampaignRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "campaign_repo_unconfigured",
@@ -2558,6 +2599,15 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !s.requireWriteScope(w, r, "write:campaigns") {
+		return
+	}
+	// Starting a campaign item run is an operator verb (#5266 X2): EVERY
+	// run-bound (mcp:run:*) subject is refused, whether or not it sets
+	// auto_dispatch, right after the scope gate and before the body decode,
+	// any campaign read, claim or mint — the campaign_hotfix.go precedent.
+	if _, runBound := runBoundTokenRunID(IdentityFrom(r.Context())); runBound {
+		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
+			"a run-bound agent token may not start a campaign item run; starting an item (and its auto_dispatch host-dispatcher opt-in) is an operator action", nil)
 		return
 	}
 	id, err := uuid.Parse(r.PathValue("campaign_id"))
@@ -2835,11 +2885,7 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		s.writeError(w, r, http.StatusConflict, "item_not_eligible",
-			ineligibilityDetail(item, items), map[string]any{
-				"campaign_id": id.String(),
-				"issue_ref":   req.IssueRef,
-				"item_state":  string(item.State),
-			})
+			ineligibilityDetail(item, items), itemNotEligibleDetails(id, req.IssueRef, item))
 		return
 	}
 
@@ -2902,11 +2948,7 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 				// A concurrent restart/dispatch already moved the item off its
 				// terminal state — it is no longer restartable.
 				s.writeError(w, r, http.StatusConflict, "item_not_eligible",
-					ineligibilityDetail(item, items), map[string]any{
-						"campaign_id": id.String(),
-						"issue_ref":   req.IssueRef,
-						"item_state":  string(item.State),
-					})
+					ineligibilityDetail(item, items), itemNotEligibleDetails(id, req.IssueRef, item))
 			case errors.Is(rerr, campaign.ErrCampaignNotFound):
 				// The CAMPAIGN row vanished (concurrently deleted) — reported under
 				// the campaign-shaped code, never the item-shaped one, so the
@@ -2960,94 +3002,44 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	// run we could not link.
 	if !campaign.ValidCampaignItemTransition(item.State, campaign.ItemStateRunning) {
 		s.writeError(w, r, http.StatusConflict, "item_not_eligible",
-			ineligibilityDetail(item, items), map[string]any{
-				"campaign_id": id.String(),
-				"issue_ref":   req.IssueRef,
-				"item_state":  string(item.State),
-			})
+			ineligibilityDetail(item, items), itemNotEligibleDetails(id, req.IssueRef, item))
 		return
 	}
 
-	// Mint the run via the reused seam, carrying the LADDER-RESOLVED runner kind
-	// (#4485) so a local campaign's item runs get runner_kind:local without the
-	// caller re-typing it. A resolution failure (installation/spec) surfaces
-	// 502 — the same upstream-dependency class as the create handler's
-	// epic_children_query_failed — leaving the item un-started for a retry.
-	runRow, err := s.StartRunForCampaignIssue(r.Context(), StartRunForCampaignIssueParams{
-		Repo:        c.Repo,
-		IssueRef:    req.IssueRef,
-		WorkflowID:  req.WorkflowID,
-		WorkflowRef: req.WorkflowRef,
-		RunnerKind:  runnerKind,
-		// The LADDER-RESOLVED checkout (E48.87 / #2527), not req.WorkingDir: an
-		// item run that passed none inherits the campaign's binding here, and the
-		// minted run row therefore records the resolution that actually applied.
-		WorkingDir: workingDir,
+	// Claim, mint, link and transition through the claim-before-mint core
+	// (#5266). The mint carries the LADDER-RESOLVED runner kind (#4485) so a
+	// local campaign's item runs get runner_kind:local without the caller
+	// re-typing it, and the operator's explicit auto_dispatch opt-in (ADR-104
+	// Q3) — one call site for both the eligible and the restart path, with
+	// nothing inferring the mark from the deployment's driver posture. A
+	// pre-mint resolution failure (installation/spec) surfaces 502, leaving
+	// the item un-started (its claim released) for a retry.
+	runRow, updatedItem, ok := s.startClaimedCampaignItemRun(w, r, itemStartRequest{
+		Campaign: c,
+		Item:     item,
+		Params: StartRunForCampaignIssueParams{
+			Repo:        c.Repo,
+			IssueRef:    req.IssueRef,
+			WorkflowID:  req.WorkflowID,
+			WorkflowRef: req.WorkflowRef,
+			RunnerKind:  runnerKind,
+			// The LADDER-RESOLVED checkout (E48.87 / #2527), not req.WorkingDir: an
+			// item run that passed none inherits the campaign's binding here, and the
+			// minted run row therefore records the resolution that actually applied.
+			WorkingDir:   workingDir,
+			AutoDispatch: req.AutoDispatch,
+		},
+		Budgets: itemStartBudgets{Start: campaign.ItemStartBudget, Cleanup: campaign.ItemStartCleanupBudget},
+		// The post-start tail runs on the core's detached, bounded start
+		// context (#5266 X1), never r.Context(): the run, link and running
+		// transition already committed, so a client disconnect must not drop
+		// the campaign_issue_started marker or the campaign derive.
+		OnStarted: func(ctx context.Context, runRow *run.Run, startedItem *campaign.Item) {
+			s.campaignItemStartedTail(ctx, c, startedItem, runRow, runnerKind, kindSource)
+		},
 	})
-	if err != nil {
-		s.writeError(w, r, http.StatusBadGateway, "campaign_run_start_failed",
-			"could not start a run for the campaign item",
-			map[string]any{"error": err.Error(), "issue_ref": req.IssueRef})
+	if !ok {
 		return
-	}
-
-	// Link the item to its run, then transition it to running. On a transition
-	// failure after the link committed, roll the link back so the item
-	// re-partitions as Eligible and the operator can retry — mirroring the
-	// driver's start() rollback (a linked-but-not-running item is classified
-	// Running by NextEligible and would otherwise be stranded).
-	if _, err := s.cfg.CampaignRepo.SetCampaignItemRun(r.Context(), item.ID, &runRow.ID); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"link campaign item to run failed",
-			map[string]any{"error": err.Error(), "item_id": item.ID.String(), "run_id": runRow.ID.String()})
-		return
-	}
-	updatedItem, err := s.cfg.CampaignRepo.TransitionCampaignItem(r.Context(), item.ID, campaign.ItemStateRunning)
-	if err != nil {
-		if _, uerr := s.cfg.CampaignRepo.SetCampaignItemRun(r.Context(), item.ID, nil); uerr != nil {
-			s.cfg.Logger.Warn("campaign item-run unlink after failed running transition also failed; item left linked-but-not-running",
-				"campaign_id", id.String(), "item_id", item.ID.String(), "run_id", runRow.ID.String(), "error", uerr.Error())
-		}
-		var inv campaign.InvalidTransitionError
-		if errors.As(err, &inv) {
-			s.writeError(w, r, http.StatusConflict, "invalid_transition",
-				err.Error(), map[string]any{"item_id": item.ID.String()})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"transition campaign item to running failed",
-			map[string]any{"error": err.Error(), "item_id": item.ID.String()})
-		return
-	}
-
-	// Emit the campaign_issue_started marker (best-effort, global chain).
-	s.emitCampaignAudit(r.Context(), categoryCampaignIssueStarted, map[string]any{
-		"campaign_id": id.String(),
-		"issue_ref":   item.IssueRef,
-		"run_id":      runRow.ID.String(),
-		// The applied runner kind and why it applied (#4485).
-		"runner_kind":        runnerKind,
-		"runner_kind_source": kindSource,
-	})
-
-	// Derive the campaign forward: a pending campaign becomes running on its
-	// first dispatch — and so does an AWAITING_HUMAN one (E72.33 / #3660), so
-	// starting a just-relabelled item moves the campaign back to `running` in the
-	// SAME request instead of leaving it advertising attend_human_led until the
-	// next status poll. This is the START half of the relabel corner; the
-	// relabel-WITHOUT-start half is corrected by the status-read re-derive over
-	// the awaiting_human -> pending transition edge, not by this trigger.
-	// Best-effort — a derivation/transition failure does not unwind the started
-	// run (the run + link + item transition already committed); the next
-	// status-read reconcile re-derives.
-	if c.State == campaign.StatePending || c.State == campaign.StateAwaitingHuman {
-		refreshed, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
-		if lerr != nil {
-			s.cfg.Logger.Warn("re-list items for campaign derivation failed; campaign left pending (status-read reconcile re-derives)",
-				"campaign_id", id.String(), "error", lerr.Error())
-		} else {
-			s.deriveCampaignAfterChange(r.Context(), c, refreshed)
-		}
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, map[string]any{
@@ -3057,6 +3049,57 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		// omitted runner_kind sees which rung of the ladder decided it.
 		"runner_kind_resolution": campaignRunnerKindResolution{RunnerKind: runnerKind, Source: kindSource},
 	})
+}
+
+// campaignItemStartedTail is the operator item start's post-start tail, run
+// on the claim-before-mint core's detached, bounded start context (#5266 X1).
+//
+// It emits the campaign_issue_started marker (best-effort, global chain), then
+// derives the campaign forward: a pending campaign becomes running on its
+// first dispatch — and so does an AWAITING_HUMAN one (E72.33 / #3660), so
+// starting a just-relabelled item moves the campaign back to `running` in the
+// SAME request instead of leaving it advertising attend_human_led until the
+// next status poll. This is the START half of the relabel corner; the
+// relabel-WITHOUT-start half is corrected by the status-read re-derive over
+// the awaiting_human -> pending transition edge, not by this trigger.
+// Best-effort — a derivation/transition failure does not unwind the started
+// run (the run + link + item transition already committed); the next
+// status-read reconcile re-derives.
+func (s *Server) campaignItemStartedTail(ctx context.Context, c *campaign.Campaign, item *campaign.Item, runRow *run.Run, runnerKind, kindSource string) {
+	s.emitCampaignAudit(ctx, categoryCampaignIssueStarted, map[string]any{
+		"campaign_id": c.ID.String(),
+		"issue_ref":   item.IssueRef,
+		"run_id":      runRow.ID.String(),
+		// The applied runner kind and why it applied (#4485).
+		"runner_kind":        runnerKind,
+		"runner_kind_source": kindSource,
+	})
+	if c.State == campaign.StatePending || c.State == campaign.StateAwaitingHuman {
+		refreshed, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(ctx, c.ID)
+		if lerr != nil {
+			s.cfg.Logger.Warn("re-list items for campaign derivation failed; campaign left pending (status-read reconcile re-derives)",
+				"campaign_id", c.ID.String(), "error", lerr.Error())
+			return
+		}
+		s.deriveCampaignAfterChange(ctx, c, refreshed)
+	}
+}
+
+// itemNotEligibleDetails is the details map of an item_not_eligible refusal
+// from the item-start eligibility gates. When the item is already linked to a
+// run (it is running, or settled with its run) the map carries run_id, so the
+// caller learns WHICH run owns the item and can drive it rather than start
+// another (#5266 X3).
+func itemNotEligibleDetails(campaignID uuid.UUID, issueRef string, item *campaign.Item) map[string]any {
+	d := map[string]any{
+		"campaign_id": campaignID.String(),
+		"issue_ref":   issueRef,
+		"item_state":  string(item.State),
+	}
+	if item.RunID != nil {
+		d["run_id"] = item.RunID.String()
+	}
+	return d
 }
 
 // The runner_kind_resolution sources (#4485), one per rung of
@@ -3686,19 +3729,92 @@ func (s *Server) deriveCampaignAfterChange(ctx context.Context, c *campaign.Camp
 	// items onto the board's Up Next column via the campaign_started board hook.
 	// The just-dispatched running item is naturally excluded (it is no longer
 	// pending). Best-effort: each move is a no-op-or-log and never unwinds the
-	// derivation the campaign already recorded.
+	// derivation the campaign already recorded. It runs DETACHED (#5266), so
+	// the first item start never waits on per-item board round-trips.
 	if prevState == campaign.StatePending && newState == campaign.StateRunning {
-		for _, it := range items {
-			if it.State != campaign.ItemStatePending {
-				continue
-			}
-			number, ok := parseIssueTriggerRef(it.IssueRef)
-			if !ok {
-				continue // a non issue:N ref (e.g. a Jira key) has no GitHub issue to board.
-			}
-			s.boardTransitionForCampaignItem(ctx, c, number, lifecycleCampaignStarted)
-		}
+		s.sweepCampaignStartedBoardDetached(ctx, c, items)
 	}
+}
+
+// campaignBoardSweepBudget bounds one detached campaign_started board sweep
+// (#5266): every still-queued item's Up Next move, each a forge round-trip.
+const campaignBoardSweepBudget = 5 * time.Minute
+
+// sweepCampaignStartedBoardDetached moves the campaign's still-pending items
+// onto the board's Up Next column (lifecycleCampaignStarted) on a goroutine
+// tracked by bgCampaignBoardSweeps, on a context detached from the caller's
+// cancellation and bounded by campaignBoardSweepBudget — the
+// sweepRunBranchesDetached shape (#5266). The issue numbers and the campaign
+// value are copied BEFORE spawning, so the goroutine never shares the caller's
+// (possibly aliased, possibly mutated) pointers. A campaign with nothing to
+// move spawns nothing.
+func (s *Server) sweepCampaignStartedBoardDetached(parent context.Context, c *campaign.Campaign, items []*campaign.Item) {
+	if c == nil {
+		return
+	}
+	var numbers []int
+	for _, it := range items {
+		if it == nil || it.State != campaign.ItemStatePending {
+			continue
+		}
+		number, ok := parseIssueTriggerRef(it.IssueRef)
+		if !ok {
+			continue // a non issue:N ref (e.g. a Jira key) has no GitHub issue to board.
+		}
+		numbers = append(numbers, number)
+	}
+	if len(numbers) == 0 {
+		return
+	}
+	cp := *c
+	s.bgCampaignBoardSweeps.Add(1)
+	go func() {
+		defer s.bgCampaignBoardSweeps.Done()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), campaignBoardSweepBudget)
+		defer cancel()
+		for _, number := range numbers {
+			s.boardTransitionForCampaignItem(ctx, &cp, number, lifecycleCampaignStarted)
+		}
+	}()
+}
+
+// openCampaignForDriver opens a just-created campaign running on a deployment
+// that runs the campaign driver (#5266), so the driver — which lists only
+// running campaigns — starts its eligible items on its next tick without a
+// hand-started first item. A campaign that is not pending is returned
+// unchanged. On success it emits campaign_advanced {pending -> running} and
+// spawns the detached campaign_started board sweep over the still-queued
+// items (an item-list failure skips only the sweep). On a transition error it
+// WARN-logs and returns the PENDING campaign, so the create's 201 body stays
+// truthful and the create is never unwound; the campaign then opens on its
+// first item start, as before #5266.
+func (s *Server) openCampaignForDriver(ctx context.Context, created *campaign.Campaign) *campaign.Campaign {
+	if created == nil || created.State != campaign.StatePending {
+		return created
+	}
+	opened, err := s.cfg.CampaignRepo.TransitionCampaign(ctx, created.ID, campaign.StateRunning)
+	if err != nil || opened == nil {
+		errText := "nil campaign"
+		if err != nil {
+			errText = err.Error()
+		}
+		s.cfg.Logger.Warn("open campaign running at create failed; campaign left pending (its first item start opens it)",
+			"campaign_id", created.ID.String(), "error", errText)
+		return created
+	}
+	s.emitCampaignAudit(ctx, categoryCampaignAdvanced, map[string]any{
+		"campaign_id": created.ID.String(),
+		"from":        string(campaign.StatePending),
+		"to":          string(campaign.StateRunning),
+	})
+	items, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(ctx, created.ID)
+	if lerr != nil {
+		s.cfg.Logger.Warn("list items for the create-open board sweep failed; queued items keep their board column",
+			"campaign_id", created.ID.String(), "error", lerr.Error())
+		return opened
+	}
+	s.sweepCampaignStartedBoardDetached(ctx, opened, items)
+	return opened
 }
 
 // recoveryDescendantListLimit bounds each ListRuns page fetching a run's
