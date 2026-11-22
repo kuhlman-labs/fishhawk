@@ -895,8 +895,19 @@ GitHub Actions. The response carries the readiness `rollup`
 drive tick; do not track batch state out-of-band.
 
 **3. Start ONE item — the campaign's `runner_kind:local` and `working_dir`
-apply.** `fishhawk_start_campaign_item_run` (`campaign_id` + `issue_ref` +
-`workflow_id`) when `next_action` is `start_run`. Every item run must be
+apply.** On a deployment that runs the campaign driver, an eligible item needs
+no hand start: the campaign opened `running` at create, and the driver starts
+the item on its next tick, so wait one driver interval and poll
+`fishhawk_get_campaign_status` (#5266). Start by hand only beyond the driver's
+cap or on a driver-off deployment: `fishhawk_start_campaign_item_run`
+(`campaign_id` + `issue_ref` + `workflow_id`) when `next_action` is
+`start_run`. Pass `auto_dispatch: true` when this host's `fishhawk-mcp
+host-dispatch` should drive the hand-started item's parked local stages;
+omitted, the run waits for your dispatch. A concurrent start (yours and the
+driver's) is safe: the backend claims the item before minting, so the loser
+mints nothing and gets `item_not_eligible` with `start_in_progress` — do not
+retry; poll the status until the item carries a `run_id`. A lost response
+reports `outcome unknown`: read the status before starting again. Every item run must be
 `runner_kind:local` — the same execution/tag-mismatch hazard as
 `fishhawk_start_run` (see the `runner_kind:local` section above): a
 `github_actions`-tagged item never dispatches on this host. Bind both once at

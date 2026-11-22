@@ -48,6 +48,13 @@ type apiClient struct {
 	// issueSetClientTimeout for why it is its own client rather than the 30s
 	// short one.
 	httpIssueSet *http.Client
+	// httpCampaignItemStart is the item-start client for StartCampaignItemRun
+	// (#5266). The backend claims the item, then mints, links and transitions
+	// under its own post-claim budgets, so the 30s short client could give up
+	// mid-start and leave the caller unable to tell whether a run exists. See
+	// campaignItemStartClientTimeout. Nil (a test-built literal) falls back to
+	// the short client.
+	httpCampaignItemStart *http.Client
 	// hostLabel resolves this MCP process's host label (#3964 / ADR-087),
 	// sent as the host-dispatch marker's {"host"} body. The server keys the
 	// default local concurrency group `local-implement:<host>` on it. It is
@@ -113,6 +120,20 @@ const refinementDraftClientTimeout = 22 * time.Minute
 // configured budget can rise above the number this constant is set over.
 const issueSetClientTimeout = 11 * time.Minute
 
+// campaignItemStartClientTimeout bounds the MCP client's wait on POST
+// /v0/campaigns/{campaign_id}/runs (#5266). It is a margin over the handler's
+// worst-case POST-CLAIM time: campaign.ItemStartBudget (the mint, the claimed
+// link and the running transition, 4 minutes on the success path) plus
+// campaign.ItemStartCleanupBudget (the release, cancel and abandon audit on
+// their own context, 30 seconds), 4m30s in all.
+// TestCampaignItemStartClientTimeout_Wired pins that this constant exceeds
+// that sum. It is NOT a guarantee: the pre-claim reads (campaign, items,
+// autonomy and dependency refresh through the forge) are unbounded, and an
+// MCP client may impose its own lower tool-call timeout. The backstop is the
+// tool's outcome-unknown error, which names the status read that tells
+// whether the start landed.
+const campaignItemStartClientTimeout = 5 * time.Minute
+
 func newAPIClient(cfg config) *apiClient {
 	return &apiClient{
 		baseURL:  cfg.backendURL,
@@ -124,8 +145,11 @@ func newAPIClient(cfg config) *apiClient {
 		// budgets (refinementDraftBudget vs MaxIssueSetResolutionBudget), so
 		// sharing one would silently couple them.
 		httpIssueSet: &http.Client{Timeout: issueSetClientTimeout},
-		hostLabel:    cfg.hostLabel,
-		hostCapacity: cfg.hostCapacity,
+		// The item-start client is likewise its own instance: its timeout is
+		// pinned against the item-start budgets, not either budget above.
+		httpCampaignItemStart: &http.Client{Timeout: campaignItemStartClientTimeout},
+		hostLabel:             cfg.hostLabel,
+		hostCapacity:          cfg.hostCapacity,
 	}
 }
 
@@ -5976,6 +6000,10 @@ type startCampaignItemRunRequest struct {
 	// (required for a local item, absolute for any kind) before this round-trip;
 	// the backend independently 400s a non-absolute value.
 	WorkingDir string `json:"working_dir,omitempty"`
+	// AutoDispatch is the operator's explicit ADR-104 Q3 host-dispatcher
+	// opt-in (#5266), mirroring POST /v0/runs: optional, default false, and
+	// omitted from the wire unless true.
+	AutoDispatch bool `json:"auto_dispatch,omitempty"`
 }
 
 // StartCampaignItemRunResult mirrors the backend's POST
@@ -6013,7 +6041,18 @@ type campaignRunnerKindResolution struct {
 //   - 409 campaign_not_startable (the campaign is paused, cancelled or
 //     succeeded — a terminal-FAILED campaign is REOPENED by this verb, #2681)
 //   - 409 item_not_eligible (the item is blocked on a dependency, already
-//     running, or terminal — the detail names the blocker)
+//     running, or terminal — the detail names the blocker). Since #5266 the
+//     backend claims the item before minting, and the details tell the cases
+//     apart: details.run_id alone (the item is already linked to that run);
+//     details.start_in_progress with claim_starter / claim_expires_at
+//     (another starter's live claim holds the item, so nothing was minted;
+//     with claim_budget_short this start's own claim was too short to start
+//     under); or cancelled_run_id / cancel_failed_run_id, with claim_lost
+//     when the claim was replaced (this call minted a run, lost the item, and
+//     abandoned the run; cancelled_run_id ONLY when the cancel succeeded, and
+//     details.run_id names the winner when known)
+//   - 403 run_token_forbidden (a run-bound mcp:run:* subject: starting an
+//     item, with or without auto_dispatch, is an operator verb; #5266)
 //   - 400 validation_failed (a non-absolute working_dir; E48.69 / #2498 — the
 //     backend refuses a relative binding the same way POST /v0/runs does — or a
 //     non-absolute binding INHERITED from the campaign row, E48.87 / #2527)
@@ -6021,21 +6060,35 @@ type campaignRunnerKindResolution struct {
 //     passed, or recorded on the campaign (#4485) — whose campaign carries no
 //     working_dir binding and whose call passed none; E48.87 / #2527 — bind it
 //     once at start_campaign, or pass it for this item)
+//   - 500 campaign_run_start_incomplete (#5266: the backend minted run
+//     details.run_id but could not create its stages; it never linked the run
+//     and abandoned it, naming it under cancelled_run_id or
+//     cancel_failed_run_id)
 //   - 502 campaign_run_start_failed (the installation/spec could not be resolved)
 //   - 503 campaign_repo_unconfigured
-func (c *apiClient) StartCampaignItemRun(ctx context.Context, campaignID uuid.UUID, issueRef, workflowID, workflowRef, runnerKind, workingDir string) (*StartCampaignItemRunResult, error) {
+//
+// autoDispatch sends the operator's explicit auto_dispatch:true opt-in
+// (ADR-104 Q3); false omits the field. The request rides
+// httpCampaignItemStart (campaignItemStartClientTimeout), falling back to
+// the short client only for a test-built literal.
+func (c *apiClient) StartCampaignItemRun(ctx context.Context, campaignID uuid.UUID, issueRef, workflowID, workflowRef, runnerKind, workingDir string, autoDispatch bool) (*StartCampaignItemRunResult, error) {
 	body, err := json.Marshal(startCampaignItemRunRequest{
-		IssueRef:    issueRef,
-		WorkflowID:  workflowID,
-		WorkflowRef: workflowRef,
-		RunnerKind:  runnerKind,
-		WorkingDir:  workingDir,
+		IssueRef:     issueRef,
+		WorkflowID:   workflowID,
+		WorkflowRef:  workflowRef,
+		RunnerKind:   runnerKind,
+		WorkingDir:   workingDir,
+		AutoDispatch: autoDispatch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal start campaign item run: %w", err)
 	}
+	client := c.httpCampaignItemStart
+	if client == nil {
+		client = c.http
+	}
 	var res StartCampaignItemRunResult
-	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+campaignID.String()+"/runs", body, &res); err != nil {
+	if _, err := c.doWithStatusUsing(client, ctx, http.MethodPost, "/v0/campaigns/"+campaignID.String()+"/runs", body, nil, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil

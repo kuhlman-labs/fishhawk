@@ -405,7 +405,10 @@ starting each run by hand — the campaign counterpart to fishhawk_start_run
 (which opens a single run). It queries the epic's children + depends_on edges,
 wave-orders them into a DAG, and persists the campaign; poll it afterwards with
 fishhawk_get_campaign_status and hand a paused campaign back with
-fishhawk_resume_campaign.
+fishhawk_resume_campaign. On a deployment that runs the campaign driver the
+campaign opens running at create, and the driver starts its eligible items on
+its next tick, so there is no first item to start by hand; elsewhere it stays
+pending until the first fishhawk_start_campaign_item_run.
 
 Preview first (#5214): call fishhawk_preview_campaign with the same source and
 read its edges[].source and warnings[] before starting. Sequencing stated only
@@ -957,7 +960,9 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 // the backend, which is the only layer that can see the binding. There is
 // deliberately no idempotency_key — the backend does not dedup this start, and
 // the DAG eligibility gate already refuses a re-start against an already-running
-// item.
+// item, while the item-start claim (#5266) refuses a concurrent start before it
+// mints. auto_dispatch is the operator's explicit ADR-104 Q3 host-dispatcher
+// opt-in, never inferred.
 type StartCampaignItemRunInput struct {
 	CampaignID  string `json:"campaign_id" jsonschema:"the campaign UUID (from fishhawk_start_campaign)"`
 	IssueRef    string `json:"issue_ref" jsonschema:"the campaign item's issue ref to start (must be one of the campaign's items and currently startable per the DAG: either eligible, or a deps-satisfied cancelled item, which is restarted with a fresh run)"`
@@ -967,6 +972,9 @@ type StartCampaignItemRunInput struct {
 	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) and is
 	// an OVERRIDE of the campaign's own binding (E48.87 / #2527).
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"OPTIONAL absolute path to the checkout this campaign item's run executes in, OVERRIDING the campaign's own working_dir binding. Needed only when the campaign carries NO binding (bind it once at fishhawk_start_campaign instead of repeating it here): omit it and the item run inherits the campaign's. A local item run whose campaign has no binding and that passes none is refused working_dir_required. A value that differs from the campaign binding is accepted as a deliberate override — use it when this one item genuinely executes in a different checkout. A non-absolute value is refused for any runner_kind. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
+	// AutoDispatch is the operator's explicit host-dispatcher opt-in (#5266,
+	// ADR-104 Q3), threaded to the request body only when true.
+	AutoDispatch bool `json:"auto_dispatch,omitempty" jsonschema:"OPTIONAL, default false. true stamps the ADR-104 host-dispatcher mark on the minted run, so fishhawk-mcp host-dispatch spawns the item run's parked local stages; omit it to leave the run for an operator to dispatch. An operator opt-in: a run-bound agent token is refused run_token_forbidden"`
 }
 
 // StartCampaignItemRunOutput carries the minted run plus the linked campaign
@@ -1043,13 +1051,33 @@ per-item value is refused
 working_dir_required rather than falling through to the client's cwd; a
 non-absolute working_dir is refused for
 any runner_kind. A write tool: needs an operator token with
-write:campaigns scope (a runner-bound token is rejected 403). A running or
+write:campaigns scope (a runner-bound token is rejected 403
+run_token_forbidden, with or without auto_dispatch). A running or
 still-blocked item fails item_not_eligible (the detail names the unmet
-dependency); a deps-satisfied autonomy:low (human-led) item fails item_human_led
+dependency, or the run an already-linked item carries — drive that run); a
+deps-satisfied autonomy:low (human-led) item fails item_human_led
 instead — a human must lead it out of band, do not start an agent run; an
 unknown issue_ref fails campaign_item_not_found; a PAUSED, CANCELLED or
 SUCCEEDED campaign fails campaign_not_startable (a terminal-FAILED one does
 NOT — this verb reopens it).
+
+auto_dispatch is OPTIONAL (default false): pass true when this host's
+fishhawk-mcp host-dispatch should spawn the item run's parked local stages;
+omitted, the run waits for an operator dispatch. On a deployment that runs the
+campaign driver, an eligible item needs no hand start: the driver starts it on
+its next tick, so wait one interval and poll fishhawk_get_campaign_status.
+Start by hand only beyond the driver's cap or on a driver-off deployment. A
+race with the driver is safe: the backend claims the item before minting, so
+only one starter mints. The loser mints nothing and fails item_not_eligible
+"start in progress": do not retry, poll the status until the item carries a
+run_id. If this call minted a run and then lost the item, the error names that
+run and says whether the backend cancelled it.
+
+A lost response (a transport error or client timeout, an unreadable body, or
+an unmapped 5xx) reports "outcome unknown": the run may already exist and be
+linked, so read fishhawk_get_campaign_status before retrying. A run_id on the
+item means the start succeeded; with none, check fishhawk_list_runs before
+starting again.
 `),
 	}, resolver.startCampaignItemRun)
 }
@@ -1097,46 +1125,10 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 		workingDir = filepath.Clean(workingDir)
 	}
 
-	res, err := r.api.StartCampaignItemRun(ctx, id, in.IssueRef, in.WorkflowID, in.WorkflowRef, in.RunnerKind, workingDir)
+	res, err := r.api.StartCampaignItemRun(ctx, id, in.IssueRef, in.WorkflowID, in.WorkflowRef, in.RunnerKind, workingDir, in.AutoDispatch)
 	if err != nil {
-		var ae *apiError
-		if errors.As(err, &ae) {
-			switch ae.Code {
-			case "campaign_not_found":
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"campaign_not_found: no campaign with id %s — pass the id fishhawk_start_campaign returned", id)
-			case "campaign_item_not_found":
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"campaign_item_not_found: %s — no campaign item with issue_ref %q; read its items via fishhawk_get_campaign_status", ae.Message, in.IssueRef)
-			case "item_not_eligible":
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"item_not_eligible: %s — only an eligible item can be started; poll fishhawk_get_campaign_status and start the ref its next_action names", ae.Message)
-			case "item_human_led":
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"item_human_led: %s — this item is deps-satisfied but autonomy:low (human-led); a human must lead it out of band (do not start an agent run), then re-poll fishhawk_get_campaign_status", ae.Message)
-			case "campaign_not_startable":
-				// The two remaining causes, named truthfully (#2681): a terminal-FAILED
-				// campaign is NOT one of them — this verb reopens it.
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"campaign_not_startable: %s — a PAUSED campaign must be resumed first (fishhawk_resume_campaign); a CANCELLED or SUCCEEDED campaign is closed, so drive the issue standalone with fishhawk_start_run (the campaign will not track it)", ae.Message)
-			case "working_dir_required":
-				// The rung-3 refusal, relocated server-side (E48.87 / #2527)
-				// because only the backend can see the campaign's binding. Render
-				// BOTH remedies: bind it once for the whole campaign, or pass it
-				// for this one item.
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"working_dir_required: %s — this local item run has no checkout to execute in. Either bind working_dir ONCE on the campaign at fishhawk_start_campaign (every item run then inherits it), or pass an absolute working_dir for this item; resolve your own checkout, you are running inside one", ae.Message)
-			case "campaign_run_start_failed":
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"campaign_run_start_failed: %s — could not resolve the installation or workflow spec; ensure the GitHub App is installed and the workflow_id exists at workflow_ref", ae.Message)
-			case "campaign_repo_unconfigured":
-				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired", ae.Message)
-			}
-		}
-		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
-	}
-	// Checkout hygiene (#5214) on the binding the minted run actually carries,
+		return nil, StartCampaignItemRunOutput{}, startCampaignItemRunError(id, in.IssueRef, err)
+	} // Checkout hygiene (#5214) on the binding the minted run actually carries,
 	// else this call's explicit value. Set BEFORE bounding (approval condition
 	// C2), so the warnings count against the byte budget and the floor tier
 	// carries them.
@@ -1161,6 +1153,143 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("bound start_campaign_item_run response: %w", berr)
 	}
 	return nil, bounded, nil
+}
+
+// startCampaignItemRunError renders a fishhawk_start_campaign_item_run
+// failure. The code switch runs FIRST, so every mapped code stays definitive
+// (including 502 campaign_run_start_failed, which mints nothing). Then a
+// response that names an abandoned run (cancelled_run_id /
+// cancel_failed_run_id on an otherwise unmapped code) reports that run's true
+// outcome. Only after both does the outcome-unknown branch (#5266) take a
+// lost response: a non-apiError (transport error or client timeout,
+// unreadable body, undecodable 2xx) or an unmapped 5xx, where the start may
+// already have minted and linked a run.
+func startCampaignItemRunError(id uuid.UUID, issueRef string, err error) error {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		switch ae.Code {
+		case "campaign_not_found":
+			return fmt.Errorf(
+				"campaign_not_found: no campaign with id %s — pass the id fishhawk_start_campaign returned", id)
+		case "campaign_item_not_found":
+			return fmt.Errorf(
+				"campaign_item_not_found: %s — no campaign item with issue_ref %q; read its items via fishhawk_get_campaign_status", ae.Message, issueRef)
+		case "item_not_eligible":
+			return itemNotEligibleStartError(id, ae)
+		case "item_human_led":
+			return fmt.Errorf(
+				"item_human_led: %s — this item is deps-satisfied but autonomy:low (human-led); a human must lead it out of band (do not start an agent run), then re-poll fishhawk_get_campaign_status", ae.Message)
+		case "campaign_not_startable":
+			// The two remaining causes, named truthfully (#2681): a terminal-FAILED
+			// campaign is NOT one of them — this verb reopens it.
+			return fmt.Errorf(
+				"campaign_not_startable: %s — a PAUSED campaign must be resumed first (fishhawk_resume_campaign); a CANCELLED or SUCCEEDED campaign is closed, so drive the issue standalone with fishhawk_start_run (the campaign will not track it)", ae.Message)
+		case "working_dir_required":
+			// The rung-3 refusal, relocated server-side (E48.87 / #2527)
+			// because only the backend can see the campaign's binding. Render
+			// BOTH remedies: bind it once for the whole campaign, or pass it
+			// for this one item.
+			return fmt.Errorf(
+				"working_dir_required: %s — this local item run has no checkout to execute in. Either bind working_dir ONCE on the campaign at fishhawk_start_campaign (every item run then inherits it), or pass an absolute working_dir for this item; resolve your own checkout, you are running inside one", ae.Message)
+		case "campaign_run_start_failed":
+			return fmt.Errorf(
+				"campaign_run_start_failed: %s — could not resolve the installation or workflow spec; ensure the GitHub App is installed and the workflow_id exists at workflow_ref", ae.Message)
+		case "campaign_repo_unconfigured":
+			return fmt.Errorf(
+				"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired", ae.Message)
+		case "campaign_run_start_incomplete":
+			// The backend minted a run, failed to create its stages, never
+			// linked it, and abandoned it (#5266). The outcome key says
+			// whether the cancel landed.
+			runID := detailString(ae.Details, "run_id")
+			if cancelled := detailString(ae.Details, "cancelled_run_id"); cancelled != "" {
+				return fmt.Errorf(
+					"campaign_run_start_incomplete: %s — the backend minted run %s but could not create its stages, did not link it to the item, and cancelled it, so the item can be started again; confirm with fishhawk_get_campaign_status for campaign %s first (error_ref %s)", ae.Message, cancelled, id, ae.ErrorRef)
+			}
+			if live := detailString(ae.Details, "cancel_failed_run_id"); live != "" {
+				return fmt.Errorf(
+					"campaign_run_start_incomplete: %s — the backend minted run %s but could not create its stages and did not link it to the item; its cancel FAILED, so run %s is still live: cancel it with fishhawk_cancel_run before starting the item again, and check fishhawk_get_campaign_status for campaign %s (error_ref %s)", ae.Message, live, live, id, ae.ErrorRef)
+			}
+			return fmt.Errorf(
+				"campaign_run_start_incomplete: %s — the backend minted run %q but could not create its stages and did not link it; the response named no cancel outcome, so check fishhawk_get_run_status for that run and fishhawk_get_campaign_status for campaign %s before starting the item again (error_ref %s)", ae.Message, runID, id, ae.ErrorRef)
+		case "run_token_forbidden":
+			return fmt.Errorf(
+				"run_token_forbidden: %s — starting a campaign item run (with or without the auto_dispatch opt-in) is an operator action, and a run-bound agent token is refused; use an operator token with write:campaigns", ae.Message)
+		}
+		if msg, ok := abandonedItemRunClause(ae); ok {
+			return fmt.Errorf("%s: %s — %s; check fishhawk_get_campaign_status for campaign %s before starting the item again (error_ref %s)", ae.Code, ae.Message, msg, id, ae.ErrorRef)
+		}
+		if ae.StatusCode < 500 {
+			return fmt.Errorf("start campaign item run: %w", err)
+		}
+	}
+	return fmt.Errorf(
+		"outcome unknown: start campaign item run %s: %w — the response was lost or unmapped, so the run may already exist and be linked to the item, and a blind retry may be refused item_not_eligible. Check fishhawk_get_campaign_status for campaign %s: a run_id on the item means the start succeeded, so drive that run; with no run_id, check fishhawk_list_runs for the repo before starting again",
+		issueRef, err, id)
+}
+
+// itemNotEligibleStartError renders a 409 item_not_eligible by the detail
+// keys the backend's claim-before-mint start sets (#5266): an abandoned
+// minted run (cancelled_run_id / cancel_failed_run_id), another starter's
+// live claim (start_in_progress), or an item already linked to a run
+// (run_id alone). Any other refusal keeps the plain DAG text.
+func itemNotEligibleStartError(id uuid.UUID, ae *apiError) error {
+	if msg, ok := abandonedItemRunClause(ae); ok {
+		return fmt.Errorf("item_not_eligible: %s — %s", ae.Message, msg)
+	}
+	if detailBool(ae.Details, "start_in_progress") {
+		if detailBool(ae.Details, "claim_budget_short") {
+			return fmt.Errorf(
+				"item_not_eligible: %s — this start's own item claim no longer covered the start and cleanup budgets, so no run was minted and the claim was released; poll fishhawk_get_campaign_status for campaign %s before starting the item again", ae.Message, id)
+		}
+		starter := detailString(ae.Details, "claim_starter")
+		if starter == "" {
+			starter = "another starter"
+		}
+		return fmt.Errorf(
+			"item_not_eligible: %s — another start of this item is in progress (claimed by %s until %s) and this call minted nothing. Do not retry: poll fishhawk_get_campaign_status for campaign %s until the item carries a run_id, then drive that run", ae.Message, starter, detailString(ae.Details, "claim_expires_at"), id)
+	}
+	if runID := detailString(ae.Details, "run_id"); runID != "" {
+		return fmt.Errorf(
+			"item_not_eligible: %s — the item is already linked to run %s; drive that run (fishhawk_get_run_status %s) instead of starting another", ae.Message, runID, runID)
+	}
+	return fmt.Errorf(
+		"item_not_eligible: %s — only an eligible item can be started; poll fishhawk_get_campaign_status and start the ref its next_action names", ae.Message)
+}
+
+// abandonedItemRunClause names a run this call minted and the backend then
+// abandoned (#5266), by the response's outcome key: cancelled_run_id ONLY
+// when the cancel succeeded, cancel_failed_run_id when the run is still live.
+// It never says the run was cancelled for cancel_failed_run_id. ok is false
+// when the response names no abandoned run.
+func abandonedItemRunClause(ae *apiError) (string, bool) {
+	winner := ""
+	if w := detailString(ae.Details, "run_id"); w != "" && ae.Code == "item_not_eligible" {
+		winner = " (the item is linked to run " + w + "; drive that run)"
+	}
+	if cancelled := detailString(ae.Details, "cancelled_run_id"); cancelled != "" {
+		return "this call minted run " + cancelled + " but it ended unlinked from the item" + winner +
+			", so the backend cancelled run " + cancelled, true
+	}
+	if live := detailString(ae.Details, "cancel_failed_run_id"); live != "" {
+		return "this call minted run " + live + " but it ended unlinked from the item" + winner +
+			", and the backend's cancel of it FAILED: run " + live + " is still live, so stop it with fishhawk_cancel_run", true
+	}
+	return "", false
+}
+
+// detailString reads a string detail value; a missing or non-string value
+// reads "".
+func detailString(details map[string]any, key string) string {
+	v, _ := details[key].(string)
+	return v
+}
+
+// detailBool reads a boolean detail value; a missing or non-bool value reads
+// false.
+func detailBool(details map[string]any, key string) bool {
+	v, _ := details[key].(bool)
+	return v
 }
 
 // registerGetCampaignStatus wires the fishhawk_get_campaign_status tool (read-only).
