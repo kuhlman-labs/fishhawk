@@ -5521,6 +5521,9 @@ type CampaignRollup struct {
 	Failed    []string `json:"failed"`
 	Cancelled []string `json:"cancelled"`
 	Paused    []string `json:"paused"`
+	// Replanning holds items whose run an approver rejected at the plan gate
+	// (#5379): non-terminal, awaiting fishhawk_start_campaign_item_run.
+	Replanning []string `json:"replanning"`
 }
 
 // CampaignNextAction mirrors the backend's `campaignNextActionPayload`: the

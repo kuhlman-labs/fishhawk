@@ -79,6 +79,7 @@ const statusWire = {
     failed: [],
     cancelled: [],
     paused: ['issue:1442'],
+    replanning: [],
   },
   next_action: {
     action: 'resume',

@@ -5651,3 +5651,38 @@ func TestStartCampaignItemRun_SendsAutoDispatchOnlyWhenTrue(t *testing.T) {
 		})
 	}
 }
+
+// TestGetCampaignStatus_ReplanningDecodesAndRoutes is the R3 JSON-boundary pin
+// (#5379): a served campaign-status body carrying a non-empty `replanning`
+// array decodes into CampaignRollup.Replanning, and that decoded rollup drives
+// the MCP action selector to fishhawk_start_campaign_item_run (not
+// fishhawk_start_run). A mistagged or missing json field leaves Replanning nil
+// and the selector suggests fishhawk_start_run.
+func TestGetCampaignStatus_ReplanningDecodesAndRoutes(t *testing.T) {
+	id := uuid.New()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v0/campaigns/"+id.String()+"/status" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"campaign":{"id":"` + id.String() + `","state":"running"},` +
+			`"items":[{"issue_ref":"issue:100","state":"replanning"}],` +
+			`"rollup":{"eligible":[],"human_led":[],"blocked":[],"running":[],"done":[],"failed":[],"cancelled":[],"paused":[],"replanning":["issue:100"]},` +
+			`"next_action":{"action":"start_run","issue_ref":"issue:100"}}`))
+	}))
+	defer ts.Close()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+	st, err := c.GetCampaignStatus(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetCampaignStatus: %v", err)
+	}
+	if !reflect.DeepEqual(st.Rollup.Replanning, []string{"issue:100"}) {
+		t.Fatalf("Rollup.Replanning = %v, want [issue:100]", st.Rollup.Replanning)
+	}
+	na := campaignNextActionsFor(st.Rollup, st.NextAction, st.Items)
+	if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_start_campaign_item_run" {
+		t.Errorf("actions = %+v, want fishhawk_start_campaign_item_run (not fishhawk_start_run)", na.Actions)
+	}
+}
