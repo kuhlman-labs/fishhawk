@@ -1005,6 +1005,49 @@ func TestCreateRunForTrigger_StageCreateError(t *testing.T) {
 	}
 }
 
+// TestCreateRunForTrigger_StageCreationFailure_ReturnsRunStartIncompleteError
+// pins the typed post-mint failure (#5266): a stage-creation failure AFTER
+// CreateRun persisted the row is a *RunStartIncompleteError naming THAT run
+// (read back from the repository), whose Error() keeps the pre-#5266
+// "create stages failed: <cause>" text and whose Unwrap reaches the cause. A
+// campaign starter relies on the run id to cancel the run it cannot link.
+func TestCreateRunForTrigger_StageCreationFailure_ReturnsRunStartIncompleteError(t *testing.T) {
+	repo := newFakeRepo()
+	cause := errors.New("disk full")
+	repo.createStageErr = cause
+	s := newServer(t, repo)
+
+	parsed, err := spec.ParseBytes([]byte(minimalSpecYAML))
+	if err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	_, err = s.CreateRunForTrigger(context.Background(), CreateRunForTriggerParams{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSHA:   "abc",
+		TriggerSource: run.TriggerCLI,
+		HaveStageDefs: true,
+		WorkflowDef:   parsed.Workflows["trivial"],
+	})
+	var incomplete *RunStartIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("err = %v (%T), want a *RunStartIncompleteError", err, err)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("errors.Is(err, cause) = false, want the stage-creation cause unwrapped")
+	}
+	if want := "create stages failed: "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("Error() = %q, want the %q prefix preserved", err.Error(), want)
+	}
+	stored, gerr := repo.GetRun(context.Background(), incomplete.RunID)
+	if gerr != nil {
+		t.Fatalf("RunID %s does not name a persisted run: %v", incomplete.RunID, gerr)
+	}
+	if stored.Repo != "x/y" {
+		t.Errorf("persisted run repo = %q, want x/y", stored.Repo)
+	}
+}
+
 // TestCreateRun_UpstreamRunID_CrossBoundary pins the deploy-gate cross-run
 // reference (E23.11 / #1417) end-to-end across the create path: request
 // payload -> handleCreateRun -> CreateRunForTrigger -> run.CreateRunParams ->
@@ -1794,9 +1837,10 @@ func TestGetRun_SurfacesReviewHeadMismatch(t *testing.T) {
 
 // TestStartRunForCampaignIssue_ThreadsAutoDispatch pins that the campaign
 // start seam passes the starter's ADR-104 Q3 mark (E88.2 / #4526) onto the
-// CREATED run, read back from the repository: the campaign driver's true
-// lands as auto_dispatch, and the operator item-start path's false leaves the
-// run unmarked.
+// CREATED run, read back from the repository: a true (the campaign driver, or
+// an operator item start that sent auto_dispatch:true, #5266) lands as
+// auto_dispatch, and a false (an operator item start that omitted the opt-in)
+// leaves the run unmarked.
 func TestStartRunForCampaignIssue_ThreadsAutoDispatch(t *testing.T) {
 	for _, marked := range []bool{true, false} {
 		t.Run(fmt.Sprintf("auto_dispatch=%v", marked), func(t *testing.T) {

@@ -404,6 +404,22 @@ import "sort"
 // issue ref and server-constant reason, runner kind and detail, never a
 // working_dir or other run's data — INTERNAL, actor system, not an
 // issue-comment surface.
+// #5266 added campaign_item_run_abandoned, the global-chain record that a
+// campaign item start (the operator item start in server/campaign_item_start.go
+// or the campaign driver) minted a run it could not link and cancelled it:
+// reason claim_conflict (another starter won the item), link_failed,
+// transition_failed or start_incomplete, with `cancelled` the TRUE outcome of
+// the cancel, which runs FIRST (the row is appended after it; an append
+// failure WARN-logs every payload field). It is a GLOBAL-CHAIN INTERNAL kind,
+// actor system, not an issue-comment surface (the campaign_auto_start_refused
+// precedent). Unlike campaign_auto_start_refused it is NOT run-bound-readable
+// under ADR-106: its payload names winner_run_id, ANOTHER starter's run, so it
+// is intended WITHHELD from run-bound (mcp:run:*) readers. It carries no run
+// id on the row itself (RunID nil), so no per-run audit read returns it; the
+// only read that could reach it is the global feed, whose interim run-bound
+// deny-list (server/reads.go withholdScopeOverlapFromRunBound) does not yet
+// name it. That file is not edited here (#5266 approval condition X5); the
+// ADR-106 registry-flag follow-up (E89 #4537) owns the withhold.
 // E88.4 / #4528 added campaign_gate_decision_required and
 // campaign_gate_decision_cleared, the campaign driver's RUN-chain record that
 // its gate actor returned a DecisionRequired outcome (once per occurrence key:
@@ -483,6 +499,7 @@ var KnownCategories = map[string]struct{}{
 	"campaign_issue_started":                  {},
 	"campaign_item_added":                     {}, // E83.100 / #4234: POST /v0/campaigns/{id}/hotfix added one EXPEDITED item (kind, workflow, reason, optional dispatch hold), recorded before commit (server/campaign_hotfix.go) — INTERNAL
 	"campaign_item_autonomy_refreshed":        {},
+	"campaign_item_run_abandoned":             {}, // #5266: a campaign item start cancelled a minted run it could not link (server/campaign_item_start.go, campaigndriver) — INTERNAL, global chain, withheld-intent from run-bound readers (names winner_run_id)
 	"campaign_items_appended":                 {}, // E86.47 / #4358: POST /v0/campaigns/{id}/items appended issues to an existing campaign, recorded before commit (server/campaign_append.go) — INTERNAL
 	"campaign_paused":                         {},
 	"captain_assigned":                        {},
