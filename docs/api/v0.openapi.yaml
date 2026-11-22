@@ -2654,7 +2654,8 @@ components:
             0116), read-only after create: `true` when the run's STARTER
             marked it for `fishhawk-mcp host-dispatch` — the campaign driver
             stamps every run it starts, and an operator may opt in with
-            `auto_dispatch: true` on `POST /v0/runs` — or when the run was
+            `auto_dispatch: true` on `POST /v0/runs` or on
+            `POST /v0/campaigns/{campaign_id}/runs` (#5266) — or when the run was
             minted from a marked parent (a CI-retry, operator-recovery or
             decomposition child inherits it). A webhook-started run is never
             marked. The dispatcher spawns the parked stages of a marked local
@@ -7062,7 +7063,9 @@ components:
         run for one eligible campaign item. There is deliberately NO
         idempotency_key — the backend does not dedup this create-link-transition
         sequence, and the DAG eligibility gate already refuses a re-start
-        against an already-running item.
+        against an already-running item. A concurrent start of the same item
+        (another operator call, or the campaign driver) is serialized by the
+        item start claim (#5266), so at most one run is linked to the item.
       required: [issue_ref, workflow_id]
       properties:
         issue_ref:
@@ -7109,6 +7112,20 @@ components:
             here is refused with 400 `validation_failed` (`details.field` =
             `working_dir`), the same guard POST /v0/runs applies. Omit it when
             the campaign carries a binding.
+        auto_dispatch:
+          type: boolean
+          default: false
+          description: >-
+            OPTIONAL operator opt-in to the ADR-104 Q3 host-dispatcher mark
+            (#5266), mirroring `auto_dispatch` on POST /v0/runs: `true` stamps
+            `auto_dispatch` on the minted item run, so `fishhawk-mcp
+            host-dispatch` may spawn its parked local stages. Omitted or
+            `false` leaves the run unmarked for operator dispatch. Nothing
+            infers the mark from the deployment's campaign-driver posture.
+            Persisted at create and echoed back as `auto_dispatch` on the
+            Run resource. A run-bound (`mcp:run:*`) token cannot reach this
+            field: the route refuses every run-bound subject with 403
+            `run_token_forbidden`.
 
     StartCampaignItemRunResult:
       type: object
@@ -23719,6 +23736,31 @@ paths:
         duplicate at `201`. The scope is `(repo, key)` so two callers picking
         the same key for different repos don't collide; no header = always
         create. Mirrors the `POST /v0/runs` idempotency contract.
+
+        **Initial state (#5266).** On a deployment that runs the campaign
+        driver (`fishhawkd serve --enable-campaign-driver`), a newly created
+        campaign opens `running` in the SAME request: the create emits
+        `campaign_advanced` (`pending` → `running`), the 201 body reports
+        `state: running`, and the campaign's still-queued items are moved to
+        the board's Up Next column by a detached, bounded sweep that the
+        response does not wait on. The driver, which lists only `running`
+        campaigns, then starts the eligible items on its next tick, so on such
+        a deployment creation under `write:campaigns` implies run-start
+        authority over the campaign's eligible items. The controls are the
+        driver's existing gates: DAG order and the `autonomy:low` human-led
+        partition, the dispatch hold, the per-campaign concurrency cap, the
+        auto-start refusals and the item start claim (ADR-047 Amendment A1).
+        A failed open transition is logged and the campaign is returned
+        `pending`, truthfully; it then opens on its first item start. On a
+        deployment without the driver the campaign is created `pending`, as
+        before. An idempotent replay returns the stored campaign unchanged
+        and opens nothing.
+
+        **Run-bound tokens (#5266).** A run-bound agent token (`mcp:run:*`
+        subject) is refused `403 run_token_forbidden` right after the scope
+        gate, before the body is read and before any forge read, write or
+        open: creating a campaign is an operator action. The refusal applies
+        on every deployment, with or without the driver.
       tags: [campaigns]
       parameters:
         - in: header
@@ -23942,7 +23984,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Campaign' }
         '201':
-          description: Campaign created.
+          description: |
+            Campaign created. Its `state` is `running` on a deployment that
+            runs the campaign driver (opened at create, #5266), or `pending`
+            otherwise or when the open transition failed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Campaign' }
@@ -23971,7 +24016,10 @@ paths:
             replay into a refusal.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+          description: |
+            `insufficient_scope` — bearer token missing `write:campaigns`;
+            `run_token_forbidden` — a run-bound (`mcp:run:*`) subject, refused
+            before anything is read, created or opened (#5266).
         '404':
           description: |
             `grooming_run_not_found` — no grooming run with that id is visible
@@ -24624,6 +24672,37 @@ paths:
         CLOSED (502 / 503, nothing started). It runs only for a caller whose
         account owns the campaign (or it is untenanted) and who can see the
         repo; any other caller skips it and the start behaves as before.
+
+        **Claim before mint (#5266, ADR-047 Amendment A1).** After the DAG
+        gate, the start reserves the item with a TTL claim (10 minutes, on the
+        fishhawkd clock) BEFORE it mints a run, and links the minted run only
+        while it still holds that claim. The campaign driver claims the same
+        way, so a start that races the driver or another operator call mints
+        at most one run: the loser is refused `409 item_not_eligible` before
+        it mints anything. The post-claim work runs detached from the client
+        connection, so a disconnect never stops a start halfway: the mint, the
+        claimed link, the running transition and the post-start tail (the
+        `campaign_issue_started` marker and the campaign derive) share one
+        4-minute start budget, and a failed start's cleanup (unlink, claim
+        release, run cancel, abandon audit) runs on its own 30-second context.
+        A minted run that ends UNLINKED (the claim was lost, the link or the
+        running transition failed, or its stages could not be created) is
+        cancelled — a transition to `cancelled`, never a delete — and audited
+        as `campaign_item_run_abandoned` with the true cancel outcome. The
+        response names that run under `details.cancelled_run_id` ONLY when the
+        cancel succeeded, and under `details.cancel_failed_run_id` otherwise
+        (cancel that run with `POST /v0/runs/{run_id}/cancel`); a response
+        never carries both.
+
+        **`auto_dispatch` (#5266, ADR-104 Q3).** The optional
+        `auto_dispatch: true` stamps the host-dispatcher mark on the minted
+        run, mirroring `POST /v0/runs`. Omitted, the run is unmarked, even on
+        a deployment that runs the campaign driver.
+
+        **Run-bound tokens (#5266).** Starting an item is an operator verb:
+        EVERY run-bound (`mcp:run:*`) subject is refused
+        `403 run_token_forbidden` right after the scope gate, whether or not
+        it sets `auto_dispatch`, before any campaign read, claim or mint.
       tags: [campaigns]
       parameters:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -24657,7 +24736,11 @@ paths:
             item. Nothing is written on either refusal.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+          description: |
+            `insufficient_scope` — bearer token missing `write:campaigns`;
+            `run_token_forbidden` — a run-bound (`mcp:run:*`) subject, refused
+            before any read, claim or mint, with or without `auto_dispatch`
+            (#5266).
         '404':
           description: |
             `campaign_not_found` — no campaign with that id;
@@ -24668,19 +24751,57 @@ paths:
             or cancelled/succeeded (closed; drive the issue standalone). A
             terminal-FAILED campaign is NOT refused — it is reopened (#2681);
             `item_not_eligible` — the item is blocked on a
-            dependency (the detail names it), already running, or terminal;
+            dependency (the detail names it), already running, or terminal.
+            `details` carries `campaign_id` and `issue_ref` (plus `item_state`
+            outside shape (c)), and since #5266 one of these shapes:
+            (a) ALREADY LINKED — `details.run_id` names the run that owns the
+            item (from the eligibility gate when the item is running or settled
+            with its run, or from the claim when the item was linked
+            concurrently); drive that run instead of starting another.
+            (b) CLAIMED — `details.start_in_progress: true` with
+            `details.claim_starter` (`operator` or `campaign_driver`) and
+            `details.claim_expires_at`: another start of this item holds a live
+            claim. Do not retry; poll `GET /v0/campaigns/{campaign_id}/status`
+            until the item carries a `run_id`. `details.claim_budget_short:
+            true` additionally marks this start's OWN claim, released unused
+            because its remaining lifetime no longer covered the start and
+            cleanup budgets. No run was minted in (a) or (b).
+            (c) CLAIM LOST — the run this call minted lost the item to another
+            starter while minting: `details.claim_lost: true` when its claim
+            was replaced, `details.run_id` the winning run when known, and the
+            minted run under `details.cancelled_run_id` or
+            `details.cancel_failed_run_id` (it was abandoned, see above);
             `item_human_led` — the item is deps-satisfied but `autonomy:low`
             (human-led); a human must lead it out of band (do not start an agent
             run) — the detail does not name a ref to start;
             `invalid_transition` — a concurrent change made the running
-            transition illegal; `campaign_item_workflow_mismatch` — the item is
+            transition illegal (the item was unlinked again and the minted run
+            abandoned, named under `details.cancelled_run_id` or
+            `details.cancel_failed_run_id`); `campaign_item_workflow_mismatch`
+            — the item is
             EXPEDITED (E83.100 / #4234) and `workflow_id` differs from its
             recorded workflow (`details.recorded_workflow`, `details.got`),
             refused before any mutation.
+        '500':
+          description: |
+            `campaign_run_start_incomplete` (#5266) — the backend minted the
+            run (`details.run_id`, with `details.issue_ref`) but could not
+            create its stages, so it was not linked to the item. The run was
+            abandoned: `details.cancelled_run_id` when it was cancelled (the
+            item can be started again), `details.cancel_failed_run_id` when the
+            cancel failed (the run is still live; cancel it before retrying).
+            `internal_error` — the claim, the claimed link or the running
+            transition failed in the store; after a mint the details carry
+            `run_id` / `item_id` and the abandoned run's outcome key.
         '502':
           description: |
             `campaign_run_start_failed` — the installation or workflow spec
-            could not be resolved; `campaign_dependency_refresh_failed` — the
+            could not be resolved or the run could not be created; no run was
+            linked and the item's claim is released, so the item can be started
+            again. One residual (#5266): a run row whose commit raced the
+            4-minute start budget and then returned an error is left committed
+            and unlinked, unnamed by this response and uncancelled;
+            `campaign_dependency_refresh_failed` — the
             target's dependencies could not be re-read from the tracker, so
             nothing was started.
         '503':
