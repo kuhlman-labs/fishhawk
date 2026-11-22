@@ -489,16 +489,18 @@ type Repository interface {
 	// preserved). This is the driver's gate-handoff entry point (E25.7).
 	PauseCampaignItem(ctx context.Context, id uuid.UUID, reason PauseReason) (*Item, error)
 
-	// RestartCampaignItem resets an item in a restartable TERMINAL state
-	// (cancelled or failed) back to pending and clears its run link, atomically
-	// under the same SELECT … FOR UPDATE lock as the other transitions — the
+	// RestartCampaignItem resets an item in a restartable state — terminal
+	// cancelled or failed, or the non-terminal plan-rejected replanning state
+	// (#5379) — back to pending and clears its run link, atomically under the
+	// same SELECT … FOR UPDATE lock as the other transitions — the
 	// operator-driven restart reset behind fishhawk_start_campaign_item_run
 	// (#1729). It deliberately lives OUTSIDE the campaignItemTransitions table
 	// (transition.go), which treats every terminal state as terminal
-	// (ValidCampaignItemTransition returns false for any terminal `from`): a
-	// restart is an operator reset, not a lifecycle transition, so it enforces
-	// its OWN guard here — `from` must be in {cancelled, failed} — and returns
-	// InvalidTransitionError for any other state (including running/succeeded)
+	// (ValidCampaignItemTransition returns false for any terminal `from`) and
+	// has no replanning → pending edge: a restart is an operator reset, not a
+	// lifecycle transition, so it enforces its OWN guard here — `from` must be
+	// in {cancelled, failed, replanning} — and returns InvalidTransitionError
+	// for any other state (including running/succeeded/pending/blocked/paused)
 	// and ErrNotFound for a missing item. A concurrent second call re-reads the
 	// now-pending row under the lock and is rejected. On success the item is
 	// pending with run_id NULL, ready to fall through the mint/link/transition
@@ -585,7 +587,8 @@ type Repository interface {
 	SettleCampaignItemOutOfBand(ctx context.Context, id uuid.UUID) (*Item, error)
 
 	// SettleCampaignItemForClosedIssue settles a NOT-YET-RUN item (pending or
-	// blocked) off a CLOSED issue and stamps campaign_items.resolved_by =
+	// blocked), or a plan-rejected replanning item (#5379) whose rejected run is
+	// no longer live, off a CLOSED issue and stamps campaign_items.resolved_by =
 	// ResolvedByIssueClosed in the SAME statement (#3563 / migration 0085),
 	// under the same SELECT … FOR UPDATE lock as the other item transitions.
 	//
@@ -601,9 +604,11 @@ type Repository interface {
 	// offers it as Restartable — start_run on an abandoned issue, the exact
 	// thing the marker exists to prevent.
 	//
-	// Guards: `from` must be in {pending, blocked} and `to` in {succeeded,
-	// cancelled}; any other pair is InvalidTransitionError{Kind:"campaign_item"}
-	// and a missing item is ErrNotFound. The marker is always
+	// Guards: `from` must be in {pending, blocked, replanning} and `to` in
+	// {succeeded, cancelled}; any other pair is
+	// InvalidTransitionError{Kind:"campaign_item"} and a missing item is
+	// ErrNotFound. The run link is never touched, so a replanning item keeps
+	// its rejected run as provenance. The marker is always
 	// ResolvedByIssueClosed, normalized so an out-of-set value can never trip
 	// the migration-0085 CHECK.
 	SettleCampaignItemForClosedIssue(ctx context.Context, id uuid.UUID, to ItemState) (*Item, error)

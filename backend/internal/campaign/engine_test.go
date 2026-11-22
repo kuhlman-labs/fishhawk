@@ -697,3 +697,138 @@ func TestDeriveState_AwaitingHumanReDerivesPendingOnRelabel(t *testing.T) {
 		t.Errorf("derive after reverting the label = %q, want awaiting_human (one change per relabel)", got)
 	}
 }
+
+// TestNextEligible_ReplanningBucketed pins the #5379 NextEligible arm: a
+// replanning item (its run rejected at the plan gate, the rejected run still
+// linked) lands in Replanning — never Eligible (the driver keys on Eligible and
+// must never auto-dispatch it) and never Running. Without the arm the item
+// falls into the Running catch-all (RunID set, non-terminal state), so
+// Replanning would be empty and Running would hold the ref.
+func TestNextEligible_ReplanningBucketed(t *testing.T) {
+	rejected := uuid.New()
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateReplanning, &rejected),
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{Replanning: []string{"issue:1"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v (replanning is never Eligible or Running)", got, want)
+	}
+}
+
+// TestNextEligible_ReplanningHumanLedDiverted: a replanning item relabelled
+// autonomy:low is human-led work, so it is diverted to HumanLed and never
+// offered an agent restart — mirroring Restartable's autonomy conjunct. An
+// autonomous replanning sibling stays in Replanning.
+func TestNextEligible_ReplanningHumanLedDiverted(t *testing.T) {
+	r1, r2 := uuid.New(), uuid.New()
+	items := []*campaign.Item{
+		{IssueRef: "issue:1", State: campaign.ItemStateReplanning, RunID: &r1, Autonomy: "low"},
+		{IssueRef: "issue:2", State: campaign.ItemStateReplanning, RunID: &r2, Autonomy: "medium"},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		HumanLed:   []string{"issue:1"},
+		Replanning: []string{"issue:2"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
+// TestNextEligible_ReplanningHasNoDependsOnConjunct pins the documented
+// absence of a depends_on check on the replanning arm: the item already ran,
+// so its dependencies were satisfied when it started, and a dependency that
+// is not succeeded here (an unreachable shape in production) still leaves the
+// item in Replanning rather than Blocked.
+func TestNextEligible_ReplanningHasNoDependsOnConjunct(t *testing.T) {
+	rejected := uuid.New()
+	items := []*campaign.Item{
+		item("issue:2", campaign.ItemStateReplanning, &rejected, "issue:999"),
+	}
+	got := campaign.NextEligible(items)
+	if !reflect.DeepEqual(got.Replanning, []string{"issue:2"}) {
+		t.Errorf("replanning = %v, want [issue:2] (no depends_on conjunct)", got.Replanning)
+	}
+	if len(got.Blocked) != 0 {
+		t.Errorf("blocked = %v, want none", got.Blocked)
+	}
+}
+
+// TestDeriveState_Replanning pins the #5379 derivation: a replanning item is
+// PROGRESS and NON-terminal, so a campaign holding one derives running — never
+// pending, never succeeded, never failed — and never awaiting_human while the
+// replanning item is agent-restartable.
+func TestDeriveState_Replanning(t *testing.T) {
+	rejected := uuid.New()
+	replanning := func(ref string) *campaign.Item {
+		return item(ref, campaign.ItemStateReplanning, &rejected)
+	}
+	cases := []struct {
+		name string
+		// guard names the control this fixture isolates.
+		guard string
+		items []*campaign.Item
+		want  campaign.State
+	}{
+		{
+			// The single-item campaign whose only plan was rejected: no other item
+			// supplies progress, so the replanning progress conjunct is the only
+			// thing between this campaign and the pending default.
+			name:  "single replanning item derives running",
+			guard: "anyReplanning progress",
+			items: []*campaign.Item{replanning("issue:1")},
+			want:  campaign.StateRunning,
+		},
+		{
+			name:  "replanning beside succeeded siblings derives running, not succeeded",
+			guard: "replanning is not succeeded",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateSucceeded, nil),
+				replanning("issue:2"),
+				item("issue:3", campaign.ItemStateSucceeded, nil),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// Every OTHER item is terminal and one failed: were replanning terminal,
+			// anyFailed && allTerminal would derive failed.
+			name:  "replanning beside a terminal failed sibling derives running, not failed",
+			guard: "replanning is non-terminal",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateFailed, nil, "issue:999"),
+				replanning("issue:2"),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// An open human-led item and a replanning item: no Eligible,
+			// Restartable, Running or Paused item, so len(e.Replanning)==0 is the
+			// only conjunct keeping the awaiting_human arm from firing.
+			name:  "replanning beside a human-led item derives running, not awaiting_human",
+			guard: "len(e.Replanning) == 0",
+			items: []*campaign.Item{
+				humanLedItem("issue:1", campaign.ItemStatePending),
+				replanning("issue:2"),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// A replanning item relabelled autonomy:low is HumanLed in the
+			// partition, so the only open work is human-led.
+			name:  "human-led replanning item alone derives awaiting_human",
+			guard: "replanning autonomy:low is HumanLed",
+			items: []*campaign.Item{
+				{IssueRef: "issue:1", State: campaign.ItemStateReplanning, RunID: &rejected, Autonomy: "low"},
+			},
+			want: campaign.StateAwaitingHuman,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := campaign.DeriveState(tc.items); got != tc.want {
+				t.Errorf("DeriveState = %q, want %q (guard under test: %s)", got, tc.want, tc.guard)
+			}
+		})
+	}
+}

@@ -36,7 +36,8 @@ func TestState_IsTerminal(t *testing.T) {
 }
 
 // TestItemState_IsTerminal table-tests the item terminal classifier:
-// succeeded/failed/cancelled are terminal; pending/blocked/running are not.
+// succeeded/failed/cancelled are terminal; pending/blocked/running/paused/
+// replanning are not.
 func TestItemState_IsTerminal(t *testing.T) {
 	cases := []struct {
 		state ItemState
@@ -46,6 +47,9 @@ func TestItemState_IsTerminal(t *testing.T) {
 		{ItemStateBlocked, false},
 		{ItemStateRunning, false},
 		{ItemStatePaused, false}, // paused is a non-terminal overlay
+		// replanning (#5379) is NON-terminal: a rejected plan awaits an operator
+		// restart and must never read as a terminal failure.
+		{ItemStateReplanning, false},
 		{ItemStateSucceeded, true},
 		{ItemStateFailed, true},
 		{ItemStateCancelled, true},

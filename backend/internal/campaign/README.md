@@ -9,7 +9,7 @@ The package mirrors `backend/internal/run/`:
 - Domain types in `campaign.go`: `Campaign` (id, repo, epic_ref, state) + `CampaignItem` (id, campaign_id, issue_ref, `depends_on []string`, `run_id *uuid.UUID`, state, and `Expedite` for a hotfix-added item — see "Expedited items and the dispatch hold") + `DispatchHold`.
 - Two state machines in `transition.go`, governed by transition tables:
   - campaign: `pending → running → {succeeded,failed,cancelled}`
-  - item: `pending → blocked → running → {succeeded,failed,cancelled}` (`blocked` = depends_on edges unsatisfied)
+  - item: `pending → blocked → running → {succeeded,failed,cancelled}` (`blocked` = depends_on edges unsatisfied), plus the non-terminal `paused` and `replanning` (see "The `replanning` item state")
   - Refused edges surface `InvalidTransitionError` (kind `campaign`/`campaign_item`).
 - The `Repository` interface (`repository.go`) + postgres adapter (`postgres.go`, sqlc-generated `db/` from `queries.sql`) carries the same FOR-UPDATE transition atomicity as `run.Repository`; `fake.go` is the embeddable `BaseFake`.
 
@@ -69,16 +69,16 @@ No driving yet in the E25.2 keystone (that lands E25.3+): the keystone delivers 
 
 **Engine** (`engine.go`):
 
-- `NextEligible([]*Item) Eligibility` partitions items into eligible/blocked/running/done/failed from each item's `State`, `DependsOn`, and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively.
+- `NextEligible([]*Item) Eligibility` partitions items into eligible/human-led/blocked/running/paused/replanning/restartable/done/failed/cancelled from each item's `State`, `DependsOn`, `Autonomy`, `ResolvedBy` and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively.
 - `DeriveState([]*Item) State` reduces item states to the campaign state, emitting `pending`/`running`/`awaiting_human`/`succeeded`/`failed` — `cancelled` and `paused` are operator/driver-set overlays owned by Track C, never derived.
 
 ### `awaiting_human`: the derived non-terminal state (E72.33 / #3660)
 
 A campaign whose only remaining OPEN items are human-led (`autonomy:low`) had no state to report. `DeriveState` emitted `running` forever, because the auto-driver never dispatches an `autonomy:low` item and no item state implied a stop — so the campaign advertised the truthful `attend_human_led` under a state claiming work was in flight.
 
-**The predicate, and it is an IFF holding at every derive.** `state == awaiting_human` **iff** the `NextEligible` partition has **no** `Eligible`, `Restartable`, `Running` or `Paused` item **and** `>= 1` `HumanLed` item. It is computed from the SAME partition the server distills `next_action` from (`baseCampaignNextAction`), which is what makes the derived state and the advertised action structurally unable to contradict each other — the class of contradiction #2681 exists to prevent.
+**The predicate, and it is an IFF holding at every derive.** `state == awaiting_human` **iff** the `NextEligible` partition has **no** `Eligible`, `Restartable`, `Replanning`, `Running` or `Paused` item **and** `>= 1` `HumanLed` item. It is computed from the SAME partition the server distills `next_action` from (`baseCampaignNextAction`), which is what makes the derived state and the advertised action structurally unable to contradict each other — the class of contradiction #2681 exists to prevent.
 
-Each exclusion is load-bearing: a `Running` or `Paused` item means the engine genuinely has work; an `Eligible` item is auto-dispatchable; and a `Restartable` item (deps-satisfied, non-human-led, cancelled-or-failed) has an operator forward path that `baseCampaignNextAction` outranks `HumanLed` with, so deriving `awaiting_human` there would advertise `start_run` under a state claiming only humans are owed work. `Blocked` is deliberately NOT excluded: with none of those four buckets populated, every blocked item is waiting (transitively) on the human-led work, so the campaign is genuinely parked on a human.
+Each exclusion is load-bearing: a `Running` or `Paused` item means the engine genuinely has work; an `Eligible` item is auto-dispatchable; and a `Restartable` item (deps-satisfied, non-human-led, cancelled-or-failed) has an operator forward path that `baseCampaignNextAction` outranks `HumanLed` with, so deriving `awaiting_human` there would advertise `start_run` under a state claiming only humans are owed work. A `Replanning` item (#5379) is excluded for the same reason: the operator restart verb is its forward path. `Blocked` is deliberately NOT excluded: with none of those five buckets populated, every blocked item is waiting (transitively) on the human-led work, so the campaign is genuinely parked on a human.
 
 **The iff is what makes the state self-correcting rather than sticky**, and the transition table (`transition.go`) carries the reverse edges that let the persisted row FOLLOW the derivation — `deriveCampaignAfterChange` silently DROPS a derivation whose transition the table refuses:
 
@@ -107,6 +107,23 @@ UPDATE campaigns SET state = 'running' WHERE state = 'awaiting_human';
 ```
 
 Without it an `awaiting_human` row is STRANDED under the old code: `campaigndriver` sweeps only `running` campaigns, and `handleStartCampaignItemRun`'s pre-#3660 gate admits only `pending`/`running`/`failed` — so the campaign would be neither swept nor startable. The widened CHECK itself is harmless to leave applied (it accepts every value the narrower one did, and nothing writes the new value once the Go is reverted).
+
+## The `replanning` item state (#5379)
+
+An approver who REJECTS a campaign item's plan fails the plan stage (category D, reason `run.FailureReasonGateRejected`), so the run fails. Before #5379 the item then settled `failed`: a deliberate rejection read as a failure, a single-item campaign derived terminal `failed`, and the item was offered only as a generic restart. `replanning` is the state such an item settles to instead. The producers — `campaigndriver.advance` and the server's reconcile-on-read pass — live outside this package; this package owns the state, its edges, its partition and its derivation.
+
+- **Non-terminal, run link kept.** `ItemState.IsTerminal` is false for it. The item keeps its `run_id` — the rejected run — as provenance.
+- **Never auto-dispatched.** `NextEligible` puts it in `Eligibility.Replanning`, never `Eligible`. Its arm sits BEFORE the `Running` catch-all, because the item carries a `RunID` and a non-terminal state and would otherwise be counted running. The operator decides when the replan starts, so a rejection made to re-scope the issue is not raced by a fresh run on the next driver tick. A replanning item carrying `autonomy:low` goes to `HumanLed` instead, so human-led work is never offered an agent restart. There is no `depends_on` conjunct: the item already ran, so its dependencies succeeded, and `succeeded` is terminal.
+- **Never fails the campaign.** `DeriveState` counts it as progress, so a campaign holding one derives `running` — not `pending`, and not `failed` even beside a terminal failed sibling, since `allTerminal` stays false. `awaitingHumanOnly` requires `len(Replanning) == 0`.
+- **Edges.** `running → replanning` (the settle), `replanning → cancelled` (the operator cancel cascade) and `replanning → succeeded` (the issue-closed settle). Deliberately ABSENT: `replanning → failed` (a rejected plan is not a failure) and `replanning → pending`/`running` (the replan is the restart bypass below, not a table edge — an edge would reach `pending` with the rejected run still linked).
+- **Restart.** `RestartCampaignItem`'s own from-guard admits `{cancelled, failed, replanning}`; it clears the run link and resets the item to `pending`, outside the transition table exactly as for cancelled/failed. `ReopenCampaignForItemRestart` is unchanged: a replanning item is non-terminal, so it cannot leave its campaign terminal-failed.
+- **Issue closed.** `SettleCampaignItemForClosedIssue`'s from-guard admits `{pending, blocked, replanning}`. It never touches the run link, so a settled replanning item keeps its rejected run. `SettleCampaignItemOutOfBand` stays terminal-only.
+
+**Migration 0120** drops and re-adds `campaign_items_state_check` with `'replanning'`. Its down migration first rewrites every `replanning` row to `failed` — the pre-change reading, which `NextEligible` still offers as Restartable, so no row strands — and then restores the 0040 CHECK. **A CODE-ONLY revert — the Go reverted while 0120 stays applied — must FIRST run the same UPDATE**, or pre-change code meets an item state it does not know:
+
+```sql
+UPDATE campaign_items SET state = 'failed' WHERE state = 'replanning';
+```
 
 ## Issue-closed resolution: `resolved_by` and the dropped DAG gate (E72.24 / #3563)
 

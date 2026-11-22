@@ -132,11 +132,34 @@ func TestCampaignItemTransitions_AllowedAndForbidden(t *testing.T) {
 		// only running can reach paused (not pending/blocked directly)
 		{ItemStatePending, ItemStatePaused, false},
 		{ItemStateBlocked, ItemStatePaused, false},
+		// running → replanning (#5379): the settle of a run whose plan an
+		// approver rejected. Only running reaches it.
+		{ItemStateRunning, ItemStateReplanning, true},
+		{ItemStatePending, ItemStateReplanning, false},
+		{ItemStateBlocked, ItemStateReplanning, false},
+		{ItemStatePaused, ItemStateReplanning, false},
+		// replanning → cancelled (operator cancel cascade) | succeeded
+		// (issue-closed settle of a closed-as-completed issue).
+		{ItemStateReplanning, ItemStateCancelled, true},
+		{ItemStateReplanning, ItemStateSucceeded, true},
+		// DELIBERATELY ABSENT: a rejected plan is never turned into a failure,
+		// and the replan is the RestartCampaignItem guard bypass, not a table
+		// edge (an edge would reach pending with the rejected run still linked).
+		{ItemStateReplanning, ItemStateFailed, false},
+		{ItemStateReplanning, ItemStatePending, false},
+		{ItemStateReplanning, ItemStateRunning, false},
+		{ItemStateReplanning, ItemStateBlocked, false},
+		{ItemStateReplanning, ItemStatePaused, false},
+		// terminals cannot reach replanning
+		{ItemStateFailed, ItemStateReplanning, false},
+		{ItemStateCancelled, ItemStateReplanning, false},
+		{ItemStateSucceeded, ItemStateReplanning, false},
 		// same-state idempotent no-ops
 		{ItemStatePending, ItemStatePending, true},
 		{ItemStateBlocked, ItemStateBlocked, true},
 		{ItemStateRunning, ItemStateRunning, true},
 		{ItemStatePaused, ItemStatePaused, true},
+		{ItemStateReplanning, ItemStateReplanning, true},
 		{ItemStateSucceeded, ItemStateSucceeded, true},
 		{ItemStateFailed, ItemStateFailed, true},
 		{ItemStateCancelled, ItemStateCancelled, true},
