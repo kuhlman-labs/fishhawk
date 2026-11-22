@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -792,6 +793,20 @@ const mcvDockerLaunch125Text = "docker: Error response from daemon: failed to cr
 // (testdata/wire/merge_candidate_post_launch_exit125_report.json) carries it.
 const mcvPostLaunchCommandText = "verify: the command itself exited 125\n"
 
+// mcvToolchainMismatchText is a FIXED stale-gate-image refusal (#5453): what
+// scripts/test lint prints inside the gate container when check-gate-image
+// --host exits 3 on an image whose go is older than a go.work directive, after
+// which the script exits 75. The shared golden
+// testdata/wire/merge_candidate_toolchain_mismatch_report.json carries it as
+// the tail; TestMergeCandidateVerify_StaleGateImageRealScript drives the REAL
+// script for the same case.
+const mcvToolchainMismatchText = "check-gate-image: host go go1.26.0 (GOTOOLCHAIN=local, which never switches) is older than go.work:3 `go 1.27.0`, so `go` refuses the module — deploy/gate-image/Dockerfile:12 GO_VERSION 1.27.4 is the pinned Go: rebuild the gate image or put go1.27.4 first on PATH\n" +
+	"check-gate-image: 1 host toolchain violation(s) against coherent pins (exit 3: the host/image toolchain, not the tree)\n" +
+	"scripts/test: host_toolchain_mismatch: lint REFUSED — the host golangci-lint/gofmt/go above differ from this checkout's gate-image pins (deploy/gate-image/Dockerfile).\n" +
+	"The change was NOT judged (exit 75, EX_TEMPFAIL). Do not edit files or request a scope amendment to \"fix\" it.\n" +
+	"scripts/test: gate_image_stale: the gate image fishhawk-gate:stale-test carries the toolchain above, not this checkout's deploy/gate-image/Dockerfile pins.\n" +
+	"  docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image\n"
+
 // mcvWireGolden decodes a shared merge-candidate report golden.
 func mcvWireGolden(t *testing.T, name string) map[string]any {
 	t.Helper()
@@ -832,6 +847,9 @@ func TestMergeCandidateVerify_ContainerLaunchMarker(t *testing.T) {
 		{"post_launch_exit_125", mcvPostLaunchCommandText, 125, true, mergeCandidateFailed, "verify_failed", "merge_candidate_post_launch_exit125_report.json"},
 		{"post_launch_exit_126", mcvPostLaunchCommandText, 126, true, mergeCandidateFailed, "verify_failed", ""},
 		{"post_launch_exit_127", mcvPostLaunchCommandText, 127, true, mergeCandidateFailed, "verify_failed", ""},
+		// #5453: the in-gate script's own exit 75 (a stale gate image) is the
+		// change NOT judged — never failed / verify_failed.
+		{"post_launch_exit_75_toolchain_mismatch", mcvToolchainMismatchText, verifyExitTempFail, true, mergeCandidateNotExecuted, mcReasonTempFail, "merge_candidate_toolchain_mismatch_report.json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
@@ -914,4 +932,85 @@ func TestMergeCandidateVerify_ContainerLaunchMarker(t *testing.T) {
 			t.Errorf("the runtime text's credential shipped in the tail: %q", ship.MergeCandidateOutputTail)
 		}
 	})
+}
+
+// TestMergeCandidateVerify_StaleGateImageRealScript is the RUNNER end of the
+// #5453 cross-boundary chain (scripts -> runner gate -> upload wire ->
+// backend handler). It drives the REAL merge-candidate pass on the container
+// path with an image named fishhawk-gate:stale-test; the scripted runtime
+// answers the gate exec by running the REAL `scripts/test lint` of this
+// workspace under exactly the FISHHAWK_GATE_CONTAINER, FISHHAWK_GATE_IMAGE_REF
+// and GOTOOLCHAIN values the runner put in the recorded argv, with a fake go
+// one minor below go.work's directive and golangci-lint/gofmt ON the pins
+// (staleGoFixture), and returns the script's real output after the launch
+// marker with its real exit code. The pass must ship not_executed /
+// verify_infra_tempfail naming the image, the GO_VERSION pin and the rebuild
+// command, and the fake golangci-lint `run` (which exits 1) must never run.
+// With check (d) disabled the script reaches that run and exits 1, so the
+// pass ships failed / verify_failed; with the runner's FISHHAWK_GATE_IMAGE_REF
+// pin removed the tail names only the <unnamed> fallback.
+func TestMergeCandidateVerify_StaleGateImageRealScript(t *testing.T) {
+	root := requireBashForLintHost(t)
+	fx, pins, _, _ := staleGoFixture(t, root)
+	dispatch, tipA, _, _ := mcvRepo(t)
+	st := containerState(lintHostStaleImage, "/nonexistent/daemon.sock", io.Discard)
+	var (
+		g       *gateExecScript
+		runLogs []string
+		passed  [][]string
+	)
+	g = scriptGateExec(t, func(label string, n int) (string, int, bool) {
+		if label != "gate_run" {
+			return serviceHappyPath(label, n)
+		}
+		argv := g.argv[label]
+		var extra []string
+		for _, k := range []string{"FISHHAWK_GATE_CONTAINER", gateiso.GateImageRefEnvKey, "GOTOOLCHAIN"} {
+			if v, ok := lastEnvValue(argv, k); ok {
+				extra = append(extra, k+"="+v)
+			}
+		}
+		passed = append(passed, extra)
+		res := runRealLintLegEnv(t, root, fx, extra)
+		runLogs = append(runLogs, res.runLog)
+		out := res.out
+		if nonce := launchMarkerNonce(argv); nonce != "" {
+			out = gateiso.LaunchMarkerLine(nonce) + "\n" + out
+		}
+		return out, res.code, false
+	})
+	code, ship := runMCVWithState(t, mcvCfg(dispatch, mcvVerifyCmd),
+		mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}, st)
+	if code != exitOK {
+		t.Errorf("exit = %d, want exitOK", code)
+	}
+	if g.counts["gate_run"] == 0 {
+		t.Fatalf("the gate never ran: %q", g.order)
+	}
+	wantEnv := []string{"FISHHAWK_GATE_CONTAINER=1", gateiso.GateImageRefEnvKey + "=" + lintHostStaleImage, "GOTOOLCHAIN=local"}
+	if !reflect.DeepEqual(passed[0], wantEnv) {
+		t.Errorf("the runner's gate argv carried %q, want %q", passed[0], wantEnv)
+	}
+	tail := lintHostHygiene(ship.MergeCandidateOutputTail)
+	if ship.MergeCandidateResult != mergeCandidateNotExecuted || ship.MergeCandidateReason != mcReasonTempFail {
+		t.Fatalf("result/reason = %q/%q, want %s/%s (a stale gate image is never the change's fault); tail:\n%s",
+			ship.MergeCandidateResult, ship.MergeCandidateReason, mergeCandidateNotExecuted, mcReasonTempFail, tail)
+	}
+	for _, want := range []string{
+		"gate_image_stale: the gate image " + lintHostStaleImage,
+		"GO_VERSION " + pins.goVersion,
+		"docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image",
+	} {
+		if !strings.Contains(ship.MergeCandidateOutputTail, want) {
+			t.Errorf("shipped tail lacks %q; tail:\n%s", want, tail)
+		}
+	}
+	if strings.Contains(ship.MergeCandidateOutputTail, "fishhawk-gate-launched:") {
+		t.Errorf("the launch marker leaked into the shipped tail")
+	}
+	for i, l := range runLogs {
+		if l != "" {
+			t.Errorf("gate run %d: the fake golangci-lint run executed behind a stale-image go (run log %q)", i+1, l)
+		}
+	}
 }

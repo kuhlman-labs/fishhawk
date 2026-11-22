@@ -15,7 +15,7 @@ it.
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
 | Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run EXCEPT one whose review round a later stage retry superseded (#3593) | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review; a retry-superseded verdict is skipped and writes no row |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off, crew escalation sent, crew escalation round-bound exhausted) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject page is recorded-and-skipped |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off, crew escalation sent, crew escalation round-bound exhausted, fix-up re-open awaiting an operator dispatch) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject or acceptance-dispatch page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command — including the ADR-123 D4 refusal reply on a workflow-v2 gate (#4755), on a v0/v1 approval gate not on the legacy `approvers` path (`cause: approvals_predicate_gate`, #5300), or on an unverifiable gate, which names the supported channels (MCP, CLI, web UI) and records nothing | No (every command gets its own reply) |
@@ -482,7 +482,8 @@ Notes:
       than left implicit; a run-less-anchor page surface is not in E77.6.
     - Neither kind is RESOLVABLE: `pageEventResolved` returns false for both, so
       a later approval or fix-up never records-and-skips a crew-escalation page.
-      Only a reviewer-reject page is resolvable.
+      Only a reviewer-reject page and the #5308 acceptance dispatch page are
+      resolvable.
   - **Acceptance scenario-corpus reports (E72.4, #3328)** — two kinds written
     by `server/pullrequest.go` on the acceptance runner's post-verdict report,
     each followed by an anchor rebuild (no new comment surface, no page-class
@@ -618,7 +619,8 @@ Notes:
   `NotifyPageClassForRun` (no anchor / PR-comment / PR-review rebuild) is now
   invoked directly at each currently-batched page-class append site
   (`server`: `plan.go` plan-review reject, `trace.go` implement-review reject,
-  `scope_amendment.go` request, `acceptance.go` paged triage) so the page
+  `scope_amendment.go` request, `acceptance.go` paged triage and the #5308 fix-up
+  re-open page) so the page
   posts within the event's own transaction window. It shares `firePings` with
   the per-transition path, so the source-`Sequence` dedup makes the extra call
   idempotent — a ping recorded under either path never re-fires under the
@@ -1777,10 +1779,40 @@ Notes:
   reason}`). This kind is REUSED for the #1682 invalidation rather than adding a
   new issue-comment surface. Since #4804 the fix-up push handler fires the
   orchestrator advance only after this re-open, so the re-opened stage is
-  re-armed; that adds no audit kind or comment. Both sites have no page-class
-  ping of their own — the status refresh rides the `notifyStatusUpdate` hook
-  (like the PR-upload handler), not a dedicated comment. Listed here so a future reader grepping the
+  re-armed; that adds no audit kind or comment. Neither site's
+  `acceptance_reopened` row pages on its own — the status refresh rides the
+  `notifyStatusUpdate` hook (like the PR-upload handler), not a dedicated
+  comment. The one fix-up re-open that waits on an operator has its own
+  page-class kind, `acceptance_reopen_awaiting_operator` (#5308, next bullet). Listed here so a future reader grepping the
   acceptance audit categories doesn't mistake it for a comment surface.
+- The fix-up re-open operator page — `acceptance_reopen_awaiting_operator`
+  (#5308) — is a **system-actor, stage-scoped audit kind that is PINGS-ONLY:
+  no dedicated Notifier method, no `activityCategories` entry and no anchor
+  timeline render**. WRITER: `server/acceptance.go::pageAcceptanceReopenAwaitingOperator`,
+  called by `succeedFixupPushStage` AFTER the #4804 advance with the stage id
+  `reopenAcceptanceOnFixupPush` returned. It writes one row only when the
+  POST-advance acceptance stage is `awaiting_host_dispatch` on a run that is
+  not host-dispatched (`acceptanceReopenAwaitsOperator`: `hostDispatchKind` is
+  not `host_dispatcher`, the same classification the campaign awaiting block
+  uses). It writes none for an auto_dispatch local run (the host dispatcher
+  spawns it, #5298), a github_actions run whose advance dispatched acceptance, a
+  plan that re-short-circuited it to `succeeded`, a `pending` acceptance held
+  behind a gated implement edge, the decomposed-parent fan-in hold or an open
+  review gate, or a fix-up that re-opened nothing. PAYLOAD `{stage_id,
+  stage_state, head_sha, runner_kind, auto_dispatch, reason}`. PROJECTION:
+  `ping.go::pageClassEvents` turns it into the page-class kind
+  `acceptance_awaiting_operator_dispatch` ("🔁 A fix-up push re-opened the
+  acceptance stage and no dispatcher will run it — dispatch acceptance against
+  the new head."), fired immediately by the pings-only `notifyPageClass` after
+  the append (#1786). RESOLUTION: `pageEventResolved` treats a later
+  `acceptance_dispatched` or `acceptance_outcome_recorded` as resolving it, so a
+  not-yet-posted page is recorded-and-skipped rather than posted stale. DEDUP:
+  the ping by the row's `Sequence`, the row by the fix-up's `(stage_id,
+  head_sha)` dedup (a re-delivered report writes no second row). Best-effort: a
+  failed read or append loses the page permanently, and the `next_actions`
+  acceptance-dispatch lead plus the status refresh remain. An auto_dispatch local
+  run whose dispatcher refuses or is not running is NOT covered here; the #5500
+  awaiting-block overlay owns it.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper

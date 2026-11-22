@@ -174,6 +174,16 @@ func TestKnownCategoryList_NonEmptyAndSorted(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_AcceptanceReopenAwaitingOperator pins the #5308 category:
+// server/acceptance.go appends it when a fix-up push re-opened an acceptance
+// stage no dispatcher will run, and an unregistered category would redden
+// TestKnownCategoriesCoversEmittedCategories and be un-awaitable.
+func TestKnownCategories_AcceptanceReopenAwaitingOperator(t *testing.T) {
+	if !IsKnownCategory("acceptance_reopen_awaiting_operator") {
+		t.Fatal("acceptance_reopen_awaiting_operator is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_EscalationFired registers the E53.4 / #2227 category so
 // an operator can await it. An unregistered category is an un-awaitable audit
 // stream, which would leave "the operator sees why a gate got stricter" only

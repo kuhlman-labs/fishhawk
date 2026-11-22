@@ -48,7 +48,7 @@
 #   --no-tests early return deleted from cmd_verify          -> i9
 #   `_verify_gate_image_pins` CALL deleted from cmd_verify   -> i10c
 #   _verify_gate_image_pins skip guard deleted               -> i10a
-#   pre-run check-gate-image call made permissive (`|| true`) -> i11 i11b
+#   pre-run check-gate-image call made permissive (`|| true`) -> i11 i11b i11c
 #   pull-failure guard made a fall-through                   -> i12b
 #   sha256: ID validation made permissive                    -> i17
 #   missing check-gate-image guard deleted                   -> i14
@@ -137,7 +137,10 @@ PIN_GO="$(dockerfile_arg GO_VERSION)"
 PIN_GL="$(dockerfile_arg GOLANGCI_LINT_VERSION)"
 PIN_HELM="$(dockerfile_arg HELM_VERSION)"
 PIN_CJ="$(dockerfile_arg CHECK_JSONSCHEMA_VERSION)"
-if [ -z "$PIN_GO" ] || [ -z "$PIN_GL" ] || [ -z "$PIN_HELM" ] || [ -z "$PIN_CJ" ]; then
+PIN_NODE="$(dockerfile_arg NODE_VERSION)"
+PIN_PNPM="$(dockerfile_arg PNPM_VERSION)"
+if [ -z "$PIN_GO" ] || [ -z "$PIN_GL" ] || [ -z "$PIN_HELM" ] || [ -z "$PIN_CJ" ] \
+  || [ -z "$PIN_NODE" ] || [ -z "$PIN_PNPM" ]; then
   echo "test-in-gate-image: cannot read the ARG pins from deploy/gate-image/Dockerfile" >&2
   exit 1
 fi
@@ -147,6 +150,8 @@ fi
 #   FAKE_STATE dir         per-case scratch: log, inner.argv, inner.lock, pulled
 #   FAKE_LOCK path         the harness-owned verify lock, probed by the INNER run
 #   FAKE_GO/GL/HELM/CJ     versions the probe reports (default: the pins)
+#   FAKE_NODE/FAKE_PNPM    node / pnpm versions the probe reports (default: the
+#                          NODE_VERSION / PNPM_VERSION pins, #5267)
 #   FAKE_ID                what `image inspect` prints as the ID
 #   FAKE_INSPECT_MISSING=1 inspect fails until a successful pull
 #   FAKE_INSPECT_MISSING=once  only the FIRST inspect fails, whatever pull did
@@ -215,6 +220,8 @@ case "$1" in
     printf 'golangci-lint=golangci-lint has version %s built with go1.25.5\n' "${FAKE_GL#v}"
     printf 'helm=%s+g0000000\n' "$FAKE_HELM"
     printf 'check-jsonschema=check-jsonschema, version %s\n' "$FAKE_CJ"
+    printf 'node=v%s\n' "$FAKE_NODE"
+    printf 'pnpm=%s\n' "$FAKE_PNPM"
     printf 'docker=absent\n'
     exit 0 ;;
 esac
@@ -267,6 +274,7 @@ st() {
   ( cd "$root" && env PATH="$p" FAKE_STATE="$st" FAKE_LOCK="$LOCK" \
       FAKE_GO="${FAKE_GO:-$PIN_GO}" FAKE_GL="${FAKE_GL:-$PIN_GL}" \
       FAKE_HELM="${FAKE_HELM:-$PIN_HELM}" FAKE_CJ="${FAKE_CJ:-$PIN_CJ}" \
+      FAKE_NODE="${FAKE_NODE:-$PIN_NODE}" FAKE_PNPM="${FAKE_PNPM:-$PIN_PNPM}" \
       FISHHAWK_VERIFY_LOCK_PATH="$LOCK" FISHHAWK_GATE_CACHE_DIR="${CASE_CACHE:-$CACHE}" \
       "$root/scripts/test" "$@" ) > "$out" 2>&1
   rc=$?
@@ -406,6 +414,11 @@ assert_absent "i11: the lock is released" "$LOCK"
 FAKE_GL="v0.0.1" st i11b "$FX" docker lint --in-gate-image
 assert_eq "i11b: lint with a mismatching golangci-lint exits 1" 1 "$rc"
 assert_absent "i11b: the inner command NEVER ran" "$st/inner.argv"
+
+FAKE_PNPM="0.0.1" st i11c "$FX" docker lint --in-gate-image
+assert_eq "i11c: lint with a mismatching pnpm exits 1 (#5267)" 1 "$rc"
+assert_contains "i11c: check-gate-image named pnpm" "$out" "pnpm reports 0.0.1"
+assert_absent "i11c: the inner command NEVER ran" "$st/inner.argv"
 
 # --- i12/i13/i17: image resolution -------------------------------------------
 FAKE_INSPECT_MISSING=1 FAKE_PULL_RC=1 st i12 "$FX" docker verify --in-gate-image

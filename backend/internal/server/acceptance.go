@@ -120,6 +120,18 @@ const (
 	// its own — the status refresh rides notifyStatusUpdate. Open-set string
 	// (audit_entries.category has no CHECK), so no migration.
 	CategoryAcceptanceReopened = "acceptance_reopened"
+	// CategoryAcceptanceReopenAwaitingOperator is the operator-awaiting marker
+	// for a fix-up re-open of a settled acceptance stage that no dispatcher will
+	// run (#5308): after the #4804 orchestrator advance the stage is parked at
+	// awaiting_host_dispatch on a run that is not host-dispatched. One chained,
+	// stage-scoped system entry, written by pageAcceptanceReopenAwaitingOperator
+	// (server/acceptance.go) from succeedFixupPushStage. PINGS-ONLY: it has no
+	// anchor timeline render (no activityCategories entry, no Notifier method);
+	// issuecomment.pageClassEvents projects it, keyed on this literal, to the
+	// acceptance_awaiting_operator_dispatch page, and
+	// TestShipPullRequest_FixupPushAfterSettledAcceptance_PagesOperatorWhenNoDispatcher
+	// reddens on a rename of either side. Open-set string, no migration.
+	CategoryAcceptanceReopenAwaitingOperator = "acceptance_reopen_awaiting_operator"
 	// CategoryAcceptanceVerdictUnshipped records that an acceptance stage
 	// settled `succeeded` (its trace upload landed) but the runner's verdict
 	// ship FAILED so NO acceptance_outcome_recorded entry exists for the
@@ -1767,16 +1779,22 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 // refuses a non-succeeded (already-pending) stage, so a second delivery cannot
 // double-reopen. Best-effort: every failure WARN-logs and never unwinds the
 // fix-up push success.
-func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUID, newHeadSHA string) {
+//
+// It returns the re-opened acceptance stage's id and true ONLY after
+// run.ReopenAcceptanceStage succeeds (whether or not the audit append or the
+// republish that follows lands), and (uuid.Nil, false) on every no-op or refusal
+// path. succeedFixupPushStage feeds that pair to
+// pageAcceptanceReopenAwaitingOperator AFTER its advance (#5308).
+func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUID, newHeadSHA string) (uuid.UUID, bool) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
-		return
+		return uuid.Nil, false
 	}
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"fixup acceptance invalidation: list stages failed; skipping reopen",
 			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
-		return
+		return uuid.Nil, false
 	}
 	var acceptance *run.Stage
 	for _, st := range stages {
@@ -1791,7 +1809,7 @@ func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUI
 	// returns here; acceptanceFixupInEpisodeRefusal (merge_readiness.go) marks
 	// that episode's eventual verdict stale from the fixup_pushed row (#5163).
 	if acceptance == nil || acceptance.State != run.StageStateSucceeded {
-		return
+		return uuid.Nil, false
 	}
 	hasVerdict, err := s.acceptanceStageHasVerdict(ctx, runID, acceptance.ID)
 	if err != nil {
@@ -1800,12 +1818,12 @@ func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUI
 			slog.String("run_id", runID.String()),
 			slog.String("acceptance_stage_id", acceptance.ID.String()),
 			slog.String("error", err.Error()))
-		return
+		return uuid.Nil, false
 	}
 	if !hasVerdict {
 		// Outcome-less succeeded acceptance stage — the #1567 operator-reopen
 		// path owns it, not a fix-up invalidation.
-		return
+		return uuid.Nil, false
 	}
 
 	dec, err := run.ReopenAcceptanceStage(ctx, s.cfg.RunRepo, acceptance.ID)
@@ -1817,7 +1835,7 @@ func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUI
 			slog.String("run_id", runID.String()),
 			slog.String("acceptance_stage_id", acceptance.ID.String()),
 			slog.String("error", err.Error()))
-		return
+		return uuid.Nil, false
 	}
 
 	subject := "system:fixup-acceptance-invalidation"
@@ -1850,6 +1868,103 @@ func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUI
 		_, _ = s.recomputeAndForcePublishAuditComplete(ctx, runID)
 	}
 	s.notifyStatusUpdate(ctx, runID, "acceptance_reopened")
+	return dec.Stage.ID, true
+}
+
+// acceptanceReopenAwaitsOperator reports whether a fix-up re-opened acceptance
+// stage, read AFTER the #4804 orchestrator advance, is waiting on an operator
+// dispatch that no dispatcher will perform (#5308). It is pure.
+//
+// Only awaiting_host_dispatch pages: that is the park the orchestrator writes
+// when a local run's acceptance is ready to spawn. A `pending` acceptance after
+// the advance is HELD behind something else, not waiting for an operator: a
+// github_actions run whose implement gate is open (the advance dispatches it),
+// a decomposed parent under the fan-in hold (released by the parent's verify-only
+// implement pass), or an acceptance behind an open review gate. Those never page.
+//
+// Of the parked runs, an auto_dispatch local run is excluded: the host dispatcher
+// spawns it (#5298), the same hostDispatchKind classification the campaign
+// awaiting block uses, so the page and that block cannot disagree. A dispatcher
+// that refuses or is not running is invisible to the server and is left to the
+// #5500 awaiting-block overlay (mcpserver/host_dispatch_overlay.go).
+func acceptanceReopenAwaitsOperator(r *run.Run, st *run.Stage) bool {
+	if st.State != run.StageStateAwaitingHostDispatch {
+		return false
+	}
+	if kind, _ := hostDispatchKind(r); kind == awaitingKindHostDispatcher {
+		return false
+	}
+	return true
+}
+
+// pageAcceptanceReopenAwaitingOperator pages the operator when a fix-up push
+// re-opened a settled acceptance stage and, after the orchestrator advance, no
+// dispatcher will run it (#5308). It is called by succeedFixupPushStage AFTER
+// advance() with the stage reopenAcceptanceOnFixupPush returned, because only the
+// post-advance stage state tells parked from dispatched from re-short-circuited.
+//
+// It appends one CategoryAcceptanceReopenAwaitingOperator row naming the
+// acceptance stage, then fires the pings-only notifyPageClass so the page posts
+// within the report's own window (#1786). issuecomment.pageClassEvents projects
+// the row to the acceptance_awaiting_operator_dispatch page; a later
+// acceptance_dispatched or acceptance_outcome_recorded resolves it.
+//
+// Best-effort and never unwinds the fix-up push. A failed read or append loses
+// the page permanently (nothing re-derives it later): a read failure fails toward
+// NO page, since an unreadable run gives no basis to claim no dispatcher will run
+// it. The fallback is the next_actions acceptance-dispatch lead and the status
+// refresh, both of which still show the re-opened acceptance.
+func (s *Server) pageAcceptanceReopenAwaitingOperator(ctx context.Context, runID, stageID uuid.UUID, headSHA string) {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return
+	}
+	r, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance reopen page: get run failed; skipping page",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return
+	}
+	st, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance reopen page: get acceptance stage failed; skipping page",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if !acceptanceReopenAwaitsOperator(r, st) {
+		return
+	}
+
+	subject := "system:fixup-acceptance-invalidation"
+	actorKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":      stageID.String(),
+		"stage_state":   string(st.State),
+		"head_sha":      headSHA,
+		"runner_kind":   string(r.RunnerKind),
+		"auto_dispatch": r.AutoDispatch,
+		"reason":        "a fix-up push re-opened the settled acceptance stage and no dispatcher will run it; an operator must dispatch acceptance against the new head",
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryAcceptanceReopenAwaitingOperator,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance reopen page: append awaiting-operator audit failed; skipping page",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	s.notifyPageClass(ctx, runID, "fixup_acceptance_reopen")
 }
 
 // acceptanceStageHasVerdict reports whether the run's audit chain carries an

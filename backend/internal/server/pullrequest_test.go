@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -1773,12 +1774,54 @@ type fixupRearmOpts struct {
 	// allSkipPlan wires Orchestrator.Artifacts with an approved plan whose every
 	// acceptance criterion is skip_expected with a basis (#4804 condition E1).
 	allSkipPlan bool
+	// autoDispatch sets run.AutoDispatch, so a LOCAL run is host-dispatched: the
+	// host dispatcher spawns its parked acceptance (#5298), and the #5308 page must
+	// stay silent.
+	autoDispatch bool
+	// fanInHeldParent makes the run a decomposed parent whose fan-in verify is
+	// unsettled (a child run exists, the consolidated PR is open, the hook answers
+	// not settled), so Advance HOLDS the re-opened acceptance pending (#4785;
+	// orchestrator.go consolidateBeforeAcceptance). SYNTHETIC: it pins that a
+	// held-pending acceptance never pages (#5308 P1).
+	fanInHeldParent bool
+}
+
+// fixupRearmUnsettledFanIn is the FanInVerifyGate that always answers "not
+// settled", which makes Advance hold a decomposed parent's acceptance pending.
+type fixupRearmUnsettledFanIn struct{}
+
+func (fixupRearmUnsettledFanIn) FanInVerifySettled(context.Context, uuid.UUID, string, string) (orchestrator.FanInVerifyAnswer, error) {
+	return orchestrator.FanInVerifyAnswer{Settled: false}, nil
+}
+
+// fixupRearmNoopConsolidatedReview satisfies the orchestrator's
+// ConsolidatedReviewDispatcher without starting the verify-only pass.
+type fixupRearmNoopConsolidatedReview struct{}
+
+func (fixupRearmNoopConsolidatedReview) DispatchConsolidatedReview(context.Context, uuid.UUID, string, string) {
+}
+
+// fixupPageSpy is the seam's issuecomment.Channel. On every pings-only
+// NotifyPageClassForRun it records the page-class KIND tokens the real audit
+// chain projects AT THAT MOMENT, so a test can assert both how many times the
+// immediate ping fired and that it fired AFTER the awaiting-operator row was
+// appended (a ping that beat the append would observe no such kind).
+type fixupPageSpy struct {
+	pageClassRecorder
+	kindsAtCall [][]string
+	snapshot    func() []string
+}
+
+func (p *fixupPageSpy) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) error {
+	p.kindsAtCall = append(p.kindsAtCall, p.snapshot())
+	return p.pageClassRecorder.NotifyPageClassForRun(ctx, runID)
 }
 
 type fixupRearmSeam struct {
 	s              *Server
 	rr             *orchestratorRepo
 	au             *auditFake
+	spy            *fixupPageSpy
 	priv           ed25519.PrivateKey
 	runRow         *run.Run
 	impl, acc, rev *run.Stage
@@ -1807,6 +1850,7 @@ func newFixupRearmSeam(t *testing.T, o fixupRearmOpts) *fixupRearmSeam {
 		runRow.InstallationID = ptrInt64(99)
 	}
 	runRow.RunnerKindResolved = true
+	runRow.AutoDispatch = o.autoDispatch
 
 	planStage := rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
 	impl := rr.seedStage(runRow.ID, 2, run.StageStateRunning)
@@ -1864,8 +1908,37 @@ func newFixupRearmSeam(t *testing.T, o fixupRearmOpts) *fixupRearmSeam {
 		RunRepo:      repo,
 		Orchestrator: orch,
 	})
-	priv, _ := sf.issue(t, runRow.ID)
-	return &fixupRearmSeam{s: s, rr: rr, au: au, priv: priv, runRow: runRow, impl: impl, acc: acc, rev: rev}
+	if o.fanInHeldParent {
+		// Set AFTER New: the server wires itself as the orchestrator's fan-in hooks.
+		parentID := runRow.ID
+		child := rr.seedRun()
+		child.DecomposedFrom = &parentID
+		orch.FanInVerify = fixupRearmUnsettledFanIn{}
+		orch.ConsolidatedReview = fixupRearmNoopConsolidatedReview{}
+		orch.DefaultBranch = defaultbranch.Static("main")
+	}
+	f := &fixupRearmSeam{s: s, rr: rr, au: au, runRow: runRow, impl: impl, acc: acc, rev: rev}
+	f.spy = &fixupPageSpy{snapshot: func() []string { return f.pageKinds(t) }}
+	s.issueNotifier = f.spy
+	f.priv, _ = sf.issue(t, runRow.ID)
+	return f
+}
+
+// pageKinds projects the run's REAL audit chain and stages through the same
+// issuecomment.PageClassEventKinds the ping and push channels fire, so the
+// server-written category and the issuecomment projection are checked against
+// each other across the package boundary.
+func (f *fixupRearmSeam) pageKinds(t *testing.T) []string {
+	t.Helper()
+	entries, err := f.au.ListForRun(t.Context(), f.runRow.ID)
+	if err != nil {
+		t.Fatalf("list run chain: %v", err)
+	}
+	stages, err := f.rr.ListStagesForRun(t.Context(), f.runRow.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	return issuecomment.PageClassEventKinds(entries, stages)
 }
 
 // postFixup posts a signed fixup_pushed report at the new head.
@@ -2121,6 +2194,220 @@ func TestShipPullRequest_FixupPushAfterSettledAcceptance_AllSkipPlan_ReShortCirc
 	if n := len(f.rows(t, CategoryAcceptanceDispatched)); n != 0 {
 		t.Errorf("acceptance_dispatched rows = %d, want 0 (a short-circuit spawns nothing)", n)
 	}
+}
+
+// acceptanceAwaitingOperatorKind is the page kind issuecomment projects for
+// CategoryAcceptanceReopenAwaitingOperator. It is spelled as a literal here, not
+// imported, because the projection lives in another package: a rename on either
+// side reddens the seam tests below.
+const acceptanceAwaitingOperatorKind = "acceptance_awaiting_operator_dispatch"
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_PagesOperatorWhenNoDispatcher
+// is the #5308 done-means. A classic fix-up push lands after a verdict-ful
+// acceptance settled on a LOCAL run that is not auto_dispatch: the advance parks
+// the re-opened acceptance at awaiting_host_dispatch and nothing will spawn it,
+// so the run records acceptance_reopen_awaiting_operator, the real
+// issuecomment projection turns it into the dispatch page, and the pings-only
+// immediate hook fires once after the append (P2).
+//
+// Counterfactuals: (CF1) replace the page call in succeedFixupPushStage with
+// `_ = reopenedStageID`: no row, the want-1 assertion and the spy go RED.
+// (CF-notify) delete the notifyPageClass call: the row lands but the spy sees no
+// call. (CF4) rename the pageClassEvents case label: PageClassEventKinds lacks
+// the kind.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_PagesOperatorWhenNoDispatcher(t *testing.T) {
+	t.Run("local_no_auto_dispatch", func(t *testing.T) {
+		f := newFixupRearmSeam(t, fixupRearmOpts{})
+		f.assertFixupOK(t, f.postFixup(t))
+
+		if got := f.state(t, f.acc); got != run.StageStateAwaitingHostDispatch {
+			t.Fatalf("acceptance = %q, want awaiting_host_dispatch (parked, nothing will spawn it)", got)
+		}
+		reopened := f.rows(t, CategoryAcceptanceReopened)
+		if len(reopened) != 1 {
+			t.Fatalf("acceptance_reopened rows = %d, want 1", len(reopened))
+		}
+		rows := f.rows(t, CategoryAcceptanceReopenAwaitingOperator)
+		if len(rows) != 1 {
+			t.Fatalf("acceptance_reopen_awaiting_operator rows = %d, want 1", len(rows))
+		}
+		row := rows[0]
+		if row.StageID == nil || *row.StageID != f.acc.ID {
+			t.Errorf("row StageID = %v, want the acceptance stage %s", row.StageID, f.acc.ID)
+		}
+		if got := auditPayloadString(row.Payload, "stage_id"); got != f.acc.ID.String() {
+			t.Errorf("payload stage_id = %q, want %q", got, f.acc.ID)
+		}
+		if got := auditPayloadString(row.Payload, "head_sha"); got != fixupRearmNewHead {
+			t.Errorf("payload head_sha = %q, want the fix-up head %q", got, fixupRearmNewHead)
+		}
+		if got := auditPayloadString(row.Payload, "stage_state"); got != string(run.StageStateAwaitingHostDispatch) {
+			t.Errorf("payload stage_state = %q, want awaiting_host_dispatch", got)
+		}
+		if row.Sequence <= reopened[0].Sequence {
+			t.Errorf("awaiting-operator seq %d is not above acceptance_reopened seq %d", row.Sequence, reopened[0].Sequence)
+		}
+		if got := f.pageKinds(t); !containsString(got, acceptanceAwaitingOperatorKind) {
+			t.Errorf("PageClassEventKinds = %v, want it to contain %q (the projection must key on the server's category)", got, acceptanceAwaitingOperatorKind)
+		}
+
+		// P2: the immediate pings-only hook fired exactly once, AFTER the append.
+		if n := len(f.spy.pageClass); n != 1 {
+			t.Fatalf("notifyPageClass calls = %d, want exactly 1", n)
+		}
+		if !containsString(f.spy.kindsAtCall[0], acceptanceAwaitingOperatorKind) {
+			t.Errorf("page kinds at notify time = %v, want %q (the ping must follow the append)", f.spy.kindsAtCall[0], acceptanceAwaitingOperatorKind)
+		}
+
+		// A re-delivered identical report is short-circuited by the
+		// (stage_id, head_sha) dedup: no second row, no second ping.
+		f.postFixup(t)
+		if n := len(f.rows(t, CategoryAcceptanceReopenAwaitingOperator)); n != 1 {
+			t.Errorf("rows after a re-delivered report = %d, want 1", n)
+		}
+		if n := len(f.spy.pageClass); n != 1 {
+			t.Errorf("notifyPageClass calls after a re-delivered report = %d, want 1", n)
+		}
+	})
+}
+
+// TestShipPullRequest_FixupPushAfterSettledAcceptance_NoPageWhenDispatcherOwns
+// pins every shape on which the re-opened acceptance is NOT waiting for an
+// operator, so paging would be a false alarm (#5308 and approval condition P1).
+// Each subtest asserts the re-open DID happen (one acceptance_reopened row, so a
+// no-op re-open cannot mask the predicate), the acceptance state the arm
+// reached, zero awaiting-operator rows, no page kind on the projected chain and
+// no notifyPageClass call.
+//
+// Counterfactuals: (CF2) mutate `kind == awaitingKindHostDispatcher` to
+// `kind == "never-a-kind"`: local_auto_dispatch parks at awaiting_host_dispatch,
+// so only the dispatcher arm suppresses it, and it goes RED. (CF3) replace
+// `st.State != run.StageStateAwaitingHostDispatch` with `false`: every other
+// shape here (dispatched, succeeded, and the three held-pending ones) is then
+// admitted and goes RED. (CF-P1) re-adding a StageStatePending arm reddens the
+// three held-pending subtests only.
+func TestShipPullRequest_FixupPushAfterSettledAcceptance_NoPageWhenDispatcherOwns(t *testing.T) {
+	cases := []struct {
+		name      string
+		opts      fixupRearmOpts
+		wantState run.StageState
+	}{
+		// The host dispatcher spawns it (#5298).
+		{"local_auto_dispatch", fixupRearmOpts{autoDispatch: true}, run.StageStateAwaitingHostDispatch},
+		// The advance dispatched it.
+		{"github_actions_dispatched", fixupRearmOpts{githubActions: true}, run.StageStateDispatched},
+		// The advance re-short-circuited it.
+		{"all_skip_short_circuit", fixupRearmOpts{allSkipPlan: true}, run.StageStateSucceeded},
+		// Held pending behind an open implement gate (synthetic, #4804 E4).
+		{"github_actions_gated_implement", fixupRearmOpts{githubActions: true, gatedImplement: true}, run.StageStatePending},
+		// Held pending by the decomposed-parent fan-in hold.
+		{"decomposed_parent_fan_in_hold", fixupRearmOpts{fanInHeldParent: true}, run.StageStatePending},
+		// Held pending behind an open review gate (synthetic, #4804 E4).
+		{"review_first", fixupRearmOpts{reviewFirst: true}, run.StageStatePending},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixupRearmSeam(t, tc.opts)
+			f.assertFixupOK(t, f.postFixup(t))
+
+			if got := f.state(t, f.acc); got != tc.wantState {
+				t.Fatalf("acceptance = %q, want %q (the arm under test is not isolated)", got, tc.wantState)
+			}
+			if n := len(f.rows(t, CategoryAcceptanceReopened)); n != 1 {
+				t.Fatalf("acceptance_reopened rows = %d, want 1 (the re-open must have happened)", n)
+			}
+			if n := len(f.rows(t, CategoryAcceptanceReopenAwaitingOperator)); n != 0 {
+				t.Errorf("acceptance_reopen_awaiting_operator rows = %d, want 0", n)
+			}
+			if got := f.pageKinds(t); containsString(got, acceptanceAwaitingOperatorKind) {
+				t.Errorf("PageClassEventKinds = %v, must not contain %q", got, acceptanceAwaitingOperatorKind)
+			}
+			if n := len(f.spy.pageClass); n != 0 {
+				t.Errorf("notifyPageClass calls = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// pageHelperFailGetRunRepo / pageHelperFailGetStageRepo inject the two read failures of
+// pageAcceptanceReopenAwaitingOperator on top of the seam's repository.
+type pageHelperFailGetRunRepo struct{ *fixupReopenTransitioner }
+
+func (pageHelperFailGetRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
+	return nil, errors.New("injected get run failure")
+}
+
+type pageHelperFailGetStageRepo struct{ *fixupReopenTransitioner }
+
+func (pageHelperFailGetStageRepo) GetStage(context.Context, uuid.UUID) (*run.Stage, error) {
+	return nil, errors.New("injected get stage failure")
+}
+
+// TestPageAcceptanceReopenAwaitingOperator_BestEffortBranches pins every
+// defensive branch of the page helper. The acceptance stage is parked
+// awaiting_host_dispatch on a non-auto_dispatch local run, so the predicate
+// WOULD page; each subtest breaks one dependency and asserts no row and no ping
+// (a failed read or append loses the page: next_actions and the status refresh
+// are the fallback), and that the failure is WARN-logged and never panics.
+//
+// Counterfactuals: delete the `return` after the GetRun / GetStage error and the
+// helper dereferences a nil run or stage (RED); delete the `return` after the
+// append error and the ping fires over a row that was never written (RED); delete
+// the nil-repo guard and the unwired server panics (RED).
+func TestPageAcceptanceReopenAwaitingOperator_BestEffortBranches(t *testing.T) {
+	setup := func(t *testing.T) (*fixupRearmSeam, *bytes.Buffer) {
+		t.Helper()
+		f := newFixupRearmSeam(t, fixupRearmOpts{})
+		f.acc.State = run.StageStateAwaitingHostDispatch
+		var buf bytes.Buffer
+		f.s.cfg.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+		return f, &buf
+	}
+	assertSilent := func(t *testing.T, f *fixupRearmSeam, buf *bytes.Buffer, wantLog string) {
+		t.Helper()
+		if n := len(f.rows(t, CategoryAcceptanceReopenAwaitingOperator)); n != 0 {
+			t.Errorf("awaiting-operator rows = %d, want 0", n)
+		}
+		if n := len(f.spy.pageClass); n != 0 {
+			t.Errorf("notifyPageClass calls = %d, want 0 (no row, no page)", n)
+		}
+		if !strings.Contains(buf.String(), wantLog) {
+			t.Errorf("log %q does not contain %q", buf.String(), wantLog)
+		}
+	}
+
+	t.Run("get_run_error", func(t *testing.T) {
+		f, buf := setup(t)
+		f.s.cfg.RunRepo = pageHelperFailGetRunRepo{&fixupReopenTransitioner{orchestratorRepo: f.rr}}
+		f.s.pageAcceptanceReopenAwaitingOperator(t.Context(), f.runRow.ID, f.acc.ID, fixupRearmNewHead)
+		assertSilent(t, f, buf, "get run failed")
+	})
+	t.Run("get_stage_error", func(t *testing.T) {
+		f, buf := setup(t)
+		f.s.cfg.RunRepo = pageHelperFailGetStageRepo{&fixupReopenTransitioner{orchestratorRepo: f.rr}}
+		f.s.pageAcceptanceReopenAwaitingOperator(t.Context(), f.runRow.ID, f.acc.ID, fixupRearmNewHead)
+		assertSilent(t, f, buf, "get acceptance stage failed")
+	})
+	t.Run("append_error", func(t *testing.T) {
+		f, buf := setup(t)
+		f.au.appendErrCategory = CategoryAcceptanceReopenAwaitingOperator
+		f.s.pageAcceptanceReopenAwaitingOperator(t.Context(), f.runRow.ID, f.acc.ID, fixupRearmNewHead)
+		assertSilent(t, f, buf, "append awaiting-operator audit failed")
+	})
+	t.Run("unwired_repos", func(t *testing.T) {
+		f, _ := setup(t)
+		f.s.cfg.RunRepo = nil
+		f.s.pageAcceptanceReopenAwaitingOperator(t.Context(), f.runRow.ID, f.acc.ID, fixupRearmNewHead)
+		f.s.cfg.RunRepo = &fixupReopenTransitioner{orchestratorRepo: f.rr}
+		f.s.cfg.AuditRepo = nil
+		f.s.pageAcceptanceReopenAwaitingOperator(t.Context(), f.runRow.ID, f.acc.ID, fixupRearmNewHead)
+		if n := len(f.rows(t, CategoryAcceptanceReopenAwaitingOperator)); n != 0 {
+			t.Errorf("awaiting-operator rows = %d, want 0", n)
+		}
+		if n := len(f.spy.pageClass); n != 0 {
+			t.Errorf("notifyPageClass calls = %d, want 0", n)
+		}
+	})
 }
 
 // TestShipPullRequest_FixupPushOutcome_RejectsMissingCoords pins the #794
@@ -5943,7 +6230,9 @@ func mcvLaunchGolden(t *testing.T, name string) []byte {
 }
 
 // TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens is the
-// BACKEND half of the #5408 cross-boundary pair (ADR-102 Amendment A1). The
+// BACKEND half of the #5408 cross-boundary pair (ADR-102 Amendment A1), and
+// of the #5453 stale-gate-image golden
+// (merge_candidate_toolchain_mismatch_report.json, toolchain_mismatch*). The
 // runner half, TestMergeCandidateVerify_ContainerLaunchMarker, drives the real
 // merge-candidate pass on the container path and asserts it ships these
 // shared files' fields (testdata/wire/merge_candidate_launch_failed_report.json
@@ -6003,6 +6292,95 @@ func TestShipPullRequest_MergeCandidateVerified_ContainerLaunchGoldens(t *testin
 			t.Errorf("stage_fixup_triggered rows = %d, want 1", n)
 		}
 	})
+	// #5453: a stale gate image (scripts/test lint's exit 75 after
+	// check-gate-image --host exits 3) ships not_executed /
+	// verify_infra_tempfail. Under a fix-up-DELEGATING workflow it records the
+	// row naming the image, the GO_VERSION pin and the rebuild command, routes
+	// NO fix-up, leaves the head unverified, and the real merge handler then
+	// refuses that head 409 merge_candidate_unverified (approval condition Z4:
+	// a tree-authored exit 3 / 75 can never merge).
+	t.Run("toolchain_mismatch", func(t *testing.T) {
+		golden := mcvLaunchGolden(t, "merge_candidate_toolchain_mismatch_report.json")
+		f, g := newMCVShipGateFixture(t, mcvDelegatedV0SpecYAML)
+		f.seedRebased(mcvHead, mcvHead, false)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, golden)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp.Result != mergeCandidateResultNotExecuted || resp.FixupRouted || resp.FixupRefusal != "" {
+			t.Errorf("response = %+v, want not_executed with no routed fix-up and no refusal", resp)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 0 (a stale gate image is no verdict on the tree)", n)
+		}
+		rows := mcvVerdictRows(f.au)
+		if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted || rows[0].Reason != "verify_infra_tempfail" || rows[0].HeadSHA != mcvHead {
+			t.Fatalf("merge_candidate_verified rows = %+v, want one not_executed / verify_infra_tempfail row", rows)
+		}
+		for _, want := range []string{
+			"gate_image_stale: the gate image fishhawk-gate:stale-test",
+			"GO_VERSION 1.27.4",
+			"docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image",
+		} {
+			if !strings.Contains(rows[0].OutputTail, want) {
+				t.Errorf("recorded output tail lacks %q:\n%s", want, rows[0].OutputTail)
+			}
+		}
+		if got := f.stageState(t, f.impl.ID); got == run.StageStateRunning {
+			t.Errorf("implement state = %q, want settled out of running", got)
+		}
+		state, err := f.s.mergeCandidateVerifyState(t.Context(), f.runRow(t), mcvHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.State != mergeCandidateStateUnverified {
+			t.Errorf("mergeCandidateVerifyState = %+v, want unverified: a stale-image pass is never merge-eligible", state)
+		}
+		env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+		if d := env.Error.Details; d["head_sha"] != mcvHead || d["verify_state"] != mergeCandidateStateUnverified {
+			t.Errorf("merge refusal details = %v, want head %s, verify_state unverified", d, mcvHead)
+		}
+	})
+	// The done-means counterfactual's BACKEND half: the SAME tail posted as
+	// failed / verify_failed (what the runner ships when scripts/test has no
+	// exit-75 classification, i.e. the probe is absent) routes exactly one
+	// fix-up for a change with no defect — the misclassification #5453 closes.
+	t.Run("toolchain_mismatch_unprobed", func(t *testing.T) {
+		var golden struct {
+			Tail string `json:"merge_candidate_output_tail"`
+		}
+		if err := json.Unmarshal(mcvLaunchGolden(t, "merge_candidate_toolchain_mismatch_report.json"), &golden); err != nil || golden.Tail == "" {
+			t.Fatalf("golden tail = %q, err = %v", golden.Tail, err)
+		}
+		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, mcvReportBody(mcvHead, mergeCandidateResultFailed, "verify_failed", golden.Tail))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp.Result != mergeCandidateResultFailed || !resp.FixupRouted {
+			t.Fatalf("response = %+v, want failed with one routed fix-up", resp)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 1 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 1", n)
+		}
+	})
+}
+
+// newMCVShipGateFixture is newMCVShipFixture over newMCGateFixture's forge
+// wiring (GitHub fake, PR URL, installation, gate merger), so one fixture can
+// ship a merge-candidate report through the real /pull-request handler and
+// then drive the real merge handler at the same head (#5453).
+func newMCVShipGateFixture(t *testing.T, specYAML string) (*mcvShipFixture, *mcGateFixture) {
+	t.Helper()
+	g := newMCGateFixture(t, specYAML)
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	g.s.cfg.SigningRepo = sf
+	g.s.cfg.ArtifactRepo = ar
+	priv, _ := sf.issue(t, g.runID)
+	return &mcvShipFixture{mcvFixture: g.mcvFixture, sf: sf, ar: ar, priv: priv}, g
 }
 
 // TestShipPullRequest_MergeCandidateVerified_RefusalArms: a report with no
