@@ -241,13 +241,13 @@ Both values are injected **after** sanitization, through `runBoundedGateArgv`'s 
 
 Consequences, all deliberate:
 
-- the **#960 verified tree is the FULL form's** — captured only after the full run passed — so the tree that gets pushed is the fully-verified one — with the ONE #4229 exception below. A green-scoped / red-full iteration returns *no* verified tree at all;
+- the **#960 verified tree is the FULL form's** — captured only after the full run passed — so the tree that gets pushed is the fully-verified one — with the ONE #4229 exception below. A green-scoped / red-full iteration returns *no* verified tree at all (a decomposition child's eligible implement gate is the other exception: see "Slice gate" below);
 - a green-scoped / red-full pair is an **ordinary iteration failure**: with budget remaining the agent is re-invoked with the FULL output; with the budget exhausted the stage demotes to category A exactly as before #3315. A break in a package the scope did not name is still caught **before push**, never deferred to CI;
 - both absorbs (the #972/#2645 infra-flake retry, the #3316 auto-format absorb) evaluate whichever form produced the failure, because the outcome and output have been replaced;
 - an **EMPTY** package set skips the pre-pass entirely, so a non-Go change pays exactly one full verify per iteration — what it paid before;
 - a tolerant infra `skipped` outcome does **not** trigger the full re-verify: it is not a pass, and re-running the full form over gate plumbing that just failed buys nothing.
 
-`runVerifyGateCommitted` (the `max_iterations == 0` single-shot gate) and the #960 strict pre-push re-verify are **always full-form** and never carry the packages variable.
+The #960 strict pre-push re-verify is **always full-form** and never carries the packages variable. `runVerifyGateCommitted` (the `max_iterations == 0` single-shot gate) is full-form everywhere except on a decomposition child's eligible implement gate (see "Slice gate" below).
 
 **The one exception: outside-only flake absorption ([#4229](https://github.com/kuhlman-labs/fishhawk/issues/4229)).** By maintainer ruling, a tree whose FULL verify failed at the fix budget's terminal failure ONLY in packages outside the change (outside the plan scope AND the diff's changed packages), with `scripts/test`'s nonce-gated attest reporting passing patch coverage and test-class module failures, becomes the verified tree after ONE passing scoped re-run of those packages. That tree has NOT passed the full test loop; every touched package passed in the failed full run, and the full ADR-090 merge-candidate verify still runs before merge. Contract, refusal reasons and residuals: `cmd/fishhawk-runner/README.md` § "Outside-only flake absorption at exhaustion".
 
@@ -256,6 +256,78 @@ Consequences, all deliberate:
 **Every verify log line names its form.** One iteration can emit two `verify_run` events, so `verify_form_outcome` (`{"form":"scoped"|"full","outcome":…}`) plus the once-per-loop `verify_scope_resolved` line make a green/red pair legible instead of contradictory.
 
 **The lock is a contention guard, not an adversarial control.** The agent's own shell environment is not the runner's, so an agent can set either variable in its own shell. What it cannot do is narrow the **authoritative** gate: the runner invokes that one itself with the packages variable unset. The shell half of the contract — the `--packages` flag, the lock's kind encoding, the wait budget and every degrade — is documented in `scripts/README.md`.
+
+## Slice gate: one scoped verify per decomposition child ([E110.56 / #5498](https://github.com/kuhlman-labs/fishhawk/issues/5498))
+
+A decomposed run used to pay the #3315 scoped pre-pass plus the mandatory full re-verify in every child, then a full merge-candidate pass at fan-in. The slice gate lets a decomposition child's implement gate run ONE scoped verify over the slice's **reverse-import reach**. The parent's fan-in merge-candidate pass stays the single full verify and the merge precondition (ADR-090 D3/D5; ADR-096 D4 as kept by ADR-098). That pass always verifies with a nil (full) package scope, and its `merge_candidate_verified` rows carry `gate_shape: "full"` with `gate_shape_source: "contracted"`.
+
+**Where it applies.** Only a decomposition child's **non-fix-up implement** stage (`sliceGateApplies`): its verify-fix loop verifies and its single-shot gate verify. These paths stay byte-unchanged and emit no `verify_slice_gate` event:
+
+- the #960 pre-push strict re-verify and its in-place re-runs, which stay full on a child;
+- the #4229 absorb re-run, which keeps its outside-package scope;
+- every child fix-up;
+- the merge-candidate pass, diff coverage and counterfactuals.
+
+The hook context is call-local to the one deciding verify call, so no other caller can inherit it.
+
+**Inputs.** The server serves `slice_gate` on `/prompt` and `/prompt-render` for a child implement stage only. `full_gate_paths` is the union of the workflow spec path and the declared `verdict_transfer` `global_surface`, `doc_check_inputs` and `opaque_paths`; `inert_paths` is `inert_paths`. An `unavailable_reason` reports a surface the server cannot serve. An absent key means not offered, and the gate is full.
+
+**Phase 1 (`planSliceGate`, `slicegate.go`).** Rules apply in order, each over the whole scope, and the first match decides:
+
+1. the key is absent → `slice_gate_not_offered`;
+2. an unavailable reason passes through: `surface_undeclared`, `invalid_surface:<entry>`, `surface_incomplete` or `surface_unreadable`;
+3. an empty scope (the `git add -A` fallback) → `empty_scope`;
+4. a scope path that is empty or absolute, that carries a comma, tab, newline, CR, NUL or backslash, or that is not in clean form (a `..` or `.` segment, a doubled slash) → `undecodable_path`;
+5. a trailing-slash directory prefix or any glob metacharacter `* ? [ ] { }` → `non_concrete_scope_entry:<entry>`;
+6. `go.work`, `go.work.sum`, `go.mod` or `go.sum` at any depth → `go_module_file:<path>`;
+7. a root-anchored doublestar match on `full_gate_paths` → `global_surface:<path>`. Matching uses the same `doublestar.Match` semantics as `backend/internal/basedelta`, pinned from both modules by `testdata/wire/slice_gate_prompt.json`.
+
+Anything else is eligible.
+
+**Isolation (ADR-063).** The hook resolves the gate-isolation selection through the same memoized `gateIsolation.selection` the gate exec reads, before any load. The host reach load runs only on a host path: `clone` (which includes the unconfigured host exec) or `clone-sandbox`, and only under a non-hosted profile. A hosted profile, a container path, a refused selection or any other value widens to `gate_isolation_not_host:<hosted|container|refused|path|unknown>`, and no host `go list` runs.
+
+**Reach load (`slicereach.go`).** The loader starts its `sliceReachLoadTimeout` bound (2 minutes) before it touches the clone. The bound covers every metadata read, the walk and the `go list`. It is not charged to the #4023 gate budget and is not clipped by it: the load runs after materialization and before the verify phase starts. The steps are:
+
+- Before any metadata read, the loader refuses a symlinked or non-regular `go.work`, `go.work.sum`, `go.mod` or `go.sum` at the root, at each `use` directory and at each filesystem `replace` target. It uses the predicate the container module seed uses (`gateiso.RequireRegularModuleMetadata`). Each read is size-capped and ctx-bounded.
+- It refuses a `use` or `replace` that resolves outside the clone.
+- It walks every `.go` file with an imports-only parse that ignores build constraints, refusing a symlinked or non-regular file.
+- It runs one `go list -e -json` whose env appends these pins last: `GOWORK`, `GOPROXY=off`, `GOTOOLCHAIN=local`, `GOFLAGS=`, `CGO_ENABLED=0`, `GONOPROXY=`, `GOPRIVATE=`, `GONOSUMDB=`, `GONOSUMCHECK=`, `GOINSECURE=`, `GOENV=off` and `GOCACHEPROG=`. With those pins, a module that is not already cached is never fetched, and the load widens instead.
+
+The edges are the union of the `go list` and walk imports, tests included.
+
+**Phase 2 (`sliceGateResolveReach`).** This step maps the scope onto that graph:
+
+- A `.go` path seeds its own package dir.
+- Any other path seeds every ancestor dir that is a package. With none, a path matching `inert_paths` contributes nothing. This is a deliberate departure from ADR-124 D3, which says an inert entry never removes a path from graph reach. The slice gate also has no ADR-098 D2 data-read edges and no shared-artifact rule.
+- The reach is the reverse-import fixed point of the seeds, restricted to the dirs `go list` reported.
+
+**Reuse.** The hook caches one result per (tree SHA, scope digest). In-place re-runs (temp-fail, lock contention, infra flake, skipped gate, the #4036 flake re-run) reuse it without reloading. After the #3316 auto-format absorb, `carry()` reuses the result once for the reformatted tree. With the cache, the worst-case added wall time is one load bound per distinct committed tree.
+
+**Closed reason vocabulary.** Every widening is the full form, with one of these fixed tokens and never file bytes, parser text or go-command output:
+
+| Source | Reasons |
+|---|---|
+| phase 1 | `slice_gate_not_offered`, the served `unavailable_reason`, `empty_scope`, `undecodable_path`, `non_concrete_scope_entry:<entry>`, `go_module_file:<path>`, `global_surface:<path>` |
+| isolation | `gate_isolation_not_host:<selection>` |
+| workspace | `reach_unsupported_workspace`, `reach_unsupported_workspace:metadata_not_regular:<root\|use\|replace>`, `reach_dir_outside_clone:<importpath>` |
+| load | `reach_load_failed:` + one of `load_timeout`, `metadata_too_large:<path>`, `gomod_unreadable:<path>`, `unparsable_go_file:<path>`, `import_not_package:<importpath>`, `go_list_exit`, `go_list_malformed_json`, `go_list_stdout_cap`, `package_error:<importpath>`, `no_module:<importpath>`, `no_packages`, `unwalked_package_dir:<importpath>` |
+| mapping | `unmapped_go_path:<path>`, `unclassified_path:<path>`, `no_reach_packages`, `reach_is_everything`, `reach_too_large` (joined value over 64 KiB), `undecodable_path` (a package dir with a comma, tab, newline or CR) |
+
+Every reason is bounded to 256 bytes.
+
+**Evidence.** Each hooked gate decision appends a `verify_slice_gate` event. The event carries the shape (`slice_scoped` or `full`), the reason, at most 50 package dirs, the package count and the iteration. On the loop path, `verify_summary` also gains `gate_shape`, `gate_shape_reason` and `gate_packages_count`. Those fields are trace-only: `gate_evidence`'s `verify_summary` digest does not carry them, so the implement review sees the shape only through the scoped-shape detail sentence. The single-shot path emits no `verify_summary`, so there `gate_shape` reaches no `gate_evidence` digest at all, and the `verify_slice_gate` event is the only record.
+
+**Residuals.** The fan-in full pass backstops each of these. They cost a later, slower failure routed as a parent fix-up, never a merge escape.
+
+- Tests that read other packages' source as data are invisible to the import graph. Examples are the wire-contract parity scans and the audit-category emission scan.
+- Declared-inert docs that Go tests read as data contribute no reach. A repository that wants them to force full declares them in `global_surface` or `doc_check_inputs` instead.
+- A host-excluded dir (for example one whose only file has a build tag the host never sets) is traversed but not emitted. The walk closes the import-graph half of the GOOS/tag gap, not the execution half.
+- Patch coverage is skipped in the scoped form and enforced only at fan-in.
+- `vendor/` and nested-module metadata that the Lstat predicate does not cover stay bounded only by the load timeout.
+
+**When the saving holds.** The saving depends on a warm module cache and a host gate path. A cold cache widens through `package_error`, and a container or hosted selection widens through `gate_isolation_not_host`. In the post-merge split of `slice_scoped` from `full` by reason, a high share of either is the signal that the slice gate is not paying for itself.
+
+The verify-fix loop arm (the skipped full re-verify, the nonce rule and the outside-relation outcomes) is documented in `cmd/fishhawk-runner/README.md` § "Committed-tree verify-fix loop (#651)".
 
 ## Gate isolation (ADR-063 / [E51.1 / #2134](https://github.com/kuhlman-labs/fishhawk/issues/2134))
 
