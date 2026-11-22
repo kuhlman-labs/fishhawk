@@ -144,3 +144,12 @@ mints itself. This fits ADR-104 Q1, where the runner credential "may be the
 forwarded token", and it narrows Q4's description of the dispatcher token
 reaching the runner. **Narrower than ADR-104 Q4; proposed amendment for Captain
 ratification.** The ADR file is not edited by this delivery.
+
+## A child the dispatcher never spawned (#5497)
+
+A dispatchable decomposition child that no dispatcher spawned (the dispatcher
+is down, refusing, or was never started) pages `child_dispatch_stalled` after
+fishhawkd's `--stall-watch-threshold` (default 30m), unless a live fan-out holds
+it behind its concurrency cap. An `auto_dispatch` child is not exempt: a stalled
+dispatcher is exactly the case. The remedy is `fishhawk_run_children` on the
+parent. See `backend/internal/stallwatch/README.md`.

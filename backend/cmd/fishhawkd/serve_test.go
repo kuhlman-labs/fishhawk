@@ -8944,3 +8944,87 @@ func TestMCPRouteServerConfig_SetsRequestBearerSource(t *testing.T) {
 		t.Error("StoredLoginPresent set on the /mcp route, want nil")
 	}
 }
+
+// serveUsageEntry drives runServe -h and returns one flag's PrintDefaults
+// entry (header line excluded), or fails when the flag is not registered.
+func serveUsageEntry(t *testing.T, header string) string {
+	t.Helper()
+	var sink bytes.Buffer
+	if code := runServe([]string{"-h"}, &sink); code != exitFailure {
+		t.Fatalf("runServe(-h) = %d, want %d", code, exitFailure)
+	}
+	usage := sink.String()
+	i := strings.Index(usage, header)
+	if i < 0 {
+		t.Fatalf("runServe usage does not register %q; got:\n%s", strings.TrimSpace(header), usage)
+	}
+	entry := usage[i+len(header):]
+	if j := strings.Index(entry, "\n  -"); j >= 0 {
+		entry = entry[:j]
+	}
+	return entry
+}
+
+// TestServeRegistersStallWatchFlags pins the four --stall-watch-* flags
+// (#5497) on the flag set runServe itself builds: registered, typed and
+// defaulted (disabled, 30m, 5m, 168h), with the enable flag's usage saying it
+// is off by default and page-only.
+func TestServeRegistersStallWatchFlags(t *testing.T) {
+	t.Setenv("FISHHAWKD_ENABLE_STALL_WATCH", "")
+	enable := serveUsageEntry(t, "  -enable-stall-watch\n")
+	if strings.Contains(enable, "(default true)") {
+		t.Errorf("--enable-stall-watch defaults on; entry %q", enable)
+	}
+	if !strings.Contains(enable, "Off by default") || !strings.Contains(enable, "never retries") {
+		t.Errorf("--enable-stall-watch usage lost its off-by-default / page-only text; got %q", enable)
+	}
+	for flagName, want := range map[string]time.Duration{
+		"stall-watch-threshold": 30 * time.Minute,
+		"stall-watch-interval":  5 * time.Minute,
+		"stall-watch-lookback":  168 * time.Hour,
+	} {
+		entry := serveUsageEntry(t, "  -"+flagName+" duration\n")
+		if w := "(default " + want.String() + ")"; !strings.Contains(entry, w) {
+			t.Errorf("--%s entry = %q, want %s", flagName, entry, w)
+		}
+	}
+}
+
+// TestServe_StallWatchDegenerateConfigRefusesToBoot: with the watch enabled,
+// each degenerate duration refuses to boot and names the stall watch, and
+// the same durations with the watch disabled do not trip the check.
+func TestServe_StallWatchDegenerateConfigRefusesToBoot(t *testing.T) {
+	t.Setenv("FISHHAWKD_ENABLE_STALL_WATCH", "")
+	for name, args := range map[string][]string{
+		"zero threshold":           {"-stall-watch-threshold", "0s"},
+		"zero interval":            {"-stall-watch-interval", "0s"},
+		"lookback below threshold": {"-stall-watch-threshold", "2h", "-stall-watch-lookback", "1h"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var log bytes.Buffer
+			code := runServe(append([]string{"-enable-stall-watch"}, args...), &log)
+			if code != exitFailure {
+				t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log.String())
+			}
+			if !strings.Contains(log.String(), "stall watch config pre-check refused startup") {
+				t.Errorf("refusal log did not name the stall watch pre-check; log:\n%s", log.String())
+			}
+		})
+	}
+}
+
+// TestStallWatchConfigError pins the pure pre-check in both directions.
+func TestStallWatchConfigError(t *testing.T) {
+	if err := stallWatchConfigError(30*time.Minute, 5*time.Minute, 168*time.Hour); err != nil {
+		t.Errorf("shipped defaults refused: %v", err)
+	}
+	for name, d := range map[string][3]time.Duration{
+		"zero threshold":   {0, 5 * time.Minute, time.Hour},
+		"zero interval":    {30 * time.Minute, 0, time.Hour},
+		"lookback too low": {30 * time.Minute, 5 * time.Minute, 29 * time.Minute},
+	} {
+		if err := stallWatchConfigError(d[0], d[1], d[2]); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}

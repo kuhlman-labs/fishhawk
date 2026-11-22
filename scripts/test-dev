@@ -10143,6 +10143,21 @@ else
   fail "HD-f1 cmd_up must pass \"\${campaign_driver_flags[@]}\" (from _campaign_driver_flags) to serve"
 fi
 
+# SW-f1 the stall-watch flag and its opt-out (#5497).
+sw_f_on="$(unset FISHHAWK_DEV_STALL_WATCH; _stall_watch_flags)"
+sw_f_off="$(FISHHAWK_DEV_STALL_WATCH=0; _stall_watch_flags)"
+if [[ "$sw_f_on" == "--enable-stall-watch" && -z "$sw_f_off" ]]; then
+  pass "SW-f1 _stall_watch_flags prints --enable-stall-watch by default and nothing under FISHHAWK_DEV_STALL_WATCH=0"
+else
+  fail "SW-f1 stall watch flags (default=[${sw_f_on}] off=[${sw_f_off}])"
+fi
+if print -r -- "$hd_up_body" | grep_q 'stall_watch_flags=(${(f)"$(_stall_watch_flags)"})' \
+   && print -r -- "$hd_up_body" | grep_q 'serve --enable-child-completion-sweeper .*"${stall_watch_flags\[@\]}"'; then
+  pass "SW-f1 cmd_up builds stall_watch_flags from the helper and passes them to serve"
+else
+  fail "SW-f1 cmd_up must pass \"\${stall_watch_flags[@]}\" (from _stall_watch_flags) to serve"
+fi
+
 # HD-s3c the argv identity table (exact tokens, never substring containment).
 hd_tbl_ok=1
 for hd_row in "1|/x/fishhawk-mcp host-dispatch --state-dir d" "0|fishhawk-mcp --transport http" \
