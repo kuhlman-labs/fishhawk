@@ -2570,3 +2570,65 @@ func TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC(t *te
 		}
 	})
 }
+
+// TestMergeCandidateVerified_GateShapeOnlyOnExecutedResults (#5498, R6/S9):
+// a passed or failed merge_candidate_verified row carries gate_shape "full"
+// with gate_shape_source "contracted"; a not_executed row and an operator
+// re-run's void row carry NEITHER key. Rows are read back from the appended
+// chain (committed state) and decoded into map[string]any, so absent and
+// empty differ.
+func TestMergeCandidateVerified_GateShapeOnlyOnExecutedResults(t *testing.T) {
+	ctx := context.Background()
+	decode := func(t *testing.T, e audit.ChainAppendParams) map[string]any {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal(e.Payload, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	for _, result := range []string{mergeCandidateResultPassed, mergeCandidateResultFailed, mergeCandidateResultNotExecuted} {
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		f.seedTrigger(mcvHead)
+		if _, err := f.s.recordMergeCandidateVerified(ctx, f.runID, f.impl.ID, result, "", "", audit.ActorAgent, "runner"); err != nil {
+			t.Fatalf("%s: %v", result, err)
+		}
+		rows := auditEntries(f.au, CategoryMergeCandidateVerified)
+		if len(rows) != 1 {
+			t.Fatalf("%s: rows = %d, want 1", result, len(rows))
+		}
+		m := decode(t, rows[0])
+		shape, hasShape := m["gate_shape"]
+		source, hasSource := m["gate_shape_source"]
+		if result == mergeCandidateResultNotExecuted {
+			if hasShape || hasSource {
+				t.Errorf("not_executed row carries gate_shape=%v gate_shape_source=%v; want both keys absent", shape, source)
+			}
+			continue
+		}
+		if shape != "full" || source != "contracted" {
+			t.Errorf("%s row: gate_shape=%v (present %v) gate_shape_source=%v (present %v); want full/contracted",
+				result, shape, hasShape, source, hasSource)
+		}
+		if result != mergeCandidateResultFailed {
+			continue
+		}
+		if err := f.s.voidFailedMergeCandidateVerdict(ctx, f.runID, mcvHead, mcvOperator(), "infra"); err != nil {
+			t.Fatalf("void: %v", err)
+		}
+		rows = auditEntries(f.au, CategoryMergeCandidateVerified)
+		if len(rows) != 2 {
+			t.Fatalf("after void: rows = %d, want 2", len(rows))
+		}
+		void := decode(t, rows[1])
+		if _, ok := void["voids_sequence"]; !ok {
+			t.Fatalf("second row is not the void row: %v", void)
+		}
+		if _, ok := void["gate_shape"]; ok {
+			t.Errorf("void row carries gate_shape %v; want absent", void["gate_shape"])
+		}
+		if _, ok := void["gate_shape_source"]; ok {
+			t.Errorf("void row carries gate_shape_source %v; want absent", void["gate_shape_source"])
+		}
+	}
+}

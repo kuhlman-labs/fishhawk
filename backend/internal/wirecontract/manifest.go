@@ -146,6 +146,16 @@ func SeedManifest() Manifest {
 				Mode:     ModeExact,
 			},
 			{
+				// promptResponse.slice_gate (#5498): the decomposition-child
+				// slice-gate config. ModeExact: flat leaves, and the member
+				// bytes are ALSO pinned by the shared golden
+				// testdata/wire/slice_gate_prompt.json.
+				Name: "slice_gate_config", Anchor: "#5498",
+				Emitter:  Endpoint{File: promptFile, Type: "sliceGateConfig"},
+				Consumer: Endpoint{File: uploadFile, Type: "SliceGateConfig"},
+				Mode:     ModeExact,
+			},
+			{
 				Name: "fixup_apply_patch", Anchor: "#1165",
 				Emitter:  Endpoint{File: promptFile, Type: "fixupApplyPatch"},
 				Consumer: Endpoint{File: uploadFile, Type: "FixupApplyPatch"},

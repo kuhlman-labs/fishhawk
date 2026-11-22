@@ -96,6 +96,22 @@ type promptResponse struct {
 	// testdata/wire/gate_container_prompt.json. A tag drift silently drops
 	// the declaration: the runner decodes nil and runs the operator's image.
 	GateContainer *gateContainerConfig `json:"gate_container,omitempty"`
+	// SliceGate is the decomposition-child slice-gate config (#5498): the
+	// declared verdict-transfer surface reduced to the paths that force the
+	// full gate and the declared-inert paths, or the reason it is unavailable
+	// (resolveSliceGateConfig, slice_gate.go). Nil — the key omitted,
+	// byte-identical to before — for every stage that is not a NON-fix-up
+	// implement stage of a decomposition child, and for a merge-candidate
+	// verify pass; the runner then keeps today's full gate
+	// (slice_gate_not_offered).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the runner's upload.FetchedPrompt.SliceGate / SliceGateConfig
+	// (runner/internal/upload/upload.go) — the slice_gate_config ModeExact
+	// pair in backend/internal/wirecontract, plus the shared golden
+	// testdata/wire/slice_gate_prompt.json. A tag drift fails safe: the
+	// runner decodes nil and runs the full gate.
+	SliceGate *sliceGateConfig `json:"slice_gate,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Runners that are older than this should exit with a version-skew error
 	// rather than proceeding to invoke the agent.
@@ -2169,6 +2185,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		ForgeWrites:          s.forgeWritesPolicy(),
 		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
 		GateContainer:        s.resolveGateContainerConfig(r.Context(), runRow, stage),
+		SliceGate:            s.resolveSliceGateConfig(r.Context(), runRow, stage, fixup, mergeCandidate),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
@@ -2990,6 +3007,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		ForgeWrites:          s.forgeWritesPolicy(),
 		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
 		GateContainer:        s.resolveGateContainerConfig(r.Context(), runRow, stage),
+		SliceGate:            s.resolveSliceGateConfig(r.Context(), runRow, stage, fixup, mergeCandidate),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
@@ -4126,6 +4144,19 @@ type gateContainerConfig struct {
 	Dockerfile string `json:"dockerfile,omitempty"`
 	Context    string `json:"context,omitempty"`
 	Source     string `json:"source"`
+}
+
+// sliceGateConfig is promptResponse.slice_gate (#5498). FullGatePaths are
+// root-anchored doublestar patterns (the workflow spec path, G, doc-check and
+// opaque); a scope path matching one forces the full gate. InertPaths are the
+// declared-inert patterns. UnavailableReason, when set, is the only member:
+// surface_undeclared, invalid_surface:<entry>, surface_incomplete or
+// surface_unreadable, and the runner runs the full gate with it as the
+// reason.
+type sliceGateConfig struct {
+	FullGatePaths     []string `json:"full_gate_paths,omitempty"`
+	InertPaths        []string `json:"inert_paths,omitempty"`
+	UnavailableReason string   `json:"unavailable_reason,omitempty"`
 }
 
 // resolveGateContainerConfig returns the stage's effective `gate_container`

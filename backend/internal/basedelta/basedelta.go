@@ -111,14 +111,8 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 	if c.Loader == nil {
 		return undecidable("no_loader")
 	}
-	if in.Surface == nil {
-		return undecidable(reasonSurfaceUndeclared)
-	}
-	if bad, ok := in.Surface.firstInvalid(); ok {
-		return undecidable(reasonInvalidSurface + ":" + bad)
-	}
-	if in.Surface.incomplete() {
-		return undecidable(reasonSurfaceIncomplete)
+	if r := in.Surface.Refusal(); r != "" {
+		return undecidable(r)
 	}
 	if len(in.DeltaPaths) == 0 {
 		return undecidable("empty_delta")
