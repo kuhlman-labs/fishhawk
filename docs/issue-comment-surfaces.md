@@ -2953,7 +2953,13 @@ Notes:
   state_reason:"completed"}` — it carries `settled_via`/`state_reason` and
   OMITS `run_id` (there is no run), distinguishing it from the run-linked
   settle whose payload carries `run_id` + `outcome` and no `settled_via`.
-  Same GLOBAL chain, same system actor, still best-effort. They remain
+  Same GLOBAL chain, same system actor, still best-effort. **As of #5379 a
+  run-linked settle's `outcome` may be the NON-terminal `replanning`** — the
+  linked run failed because an approver rejected its plan — and a later
+  issue-closed settle of that replanning item carries `run_id`,
+  `settled_via:"issue_closed"`, `prior_state:"replanning"` and an `outcome` of
+  `succeeded` or `cancelled`; that one entry is appended AUDIT-FIRST (before
+  the state change, which an append failure withholds). They remain
   best-effort and are still NOT issue-comment surfaces. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for a comment surface.
 - The campaign **grooming-source provenance** marker —

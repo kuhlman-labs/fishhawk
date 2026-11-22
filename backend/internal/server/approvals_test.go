@@ -652,6 +652,13 @@ func TestSubmitApproval_Reject_FailsCategoryD(t *testing.T) {
 		*tr.Completion.FailureCategory != run.FailureD {
 		t.Errorf("transition completion = %+v", tr.Completion)
 	}
+	// Producer/consumer seam (#5379): the reject writes exactly the reason
+	// run.PlanRejected keys on, so a campaign item whose plan was rejected
+	// settles `replanning` rather than failed.
+	if tr.Completion == nil || tr.Completion.FailureReason == nil ||
+		*tr.Completion.FailureReason != run.FailureReasonGateRejected {
+		t.Errorf("transition FailureReason = %v, want %q", tr.Completion, run.FailureReasonGateRejected)
+	}
 	assertDecisionThenOneStamp(t, au.appended, "approval_submitted")
 }
 

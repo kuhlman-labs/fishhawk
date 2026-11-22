@@ -333,6 +333,10 @@ type campaignRollupPayload struct {
 	// Paused holds items the auto-driver handed off to a human (E25.7). Like
 	// the other slices it is always an array (never null).
 	Paused []string `json:"paused"`
+	// Replanning holds items whose run an approver rejected at the plan gate
+	// (#5379): non-terminal, awaiting the operator's restart verb, and never
+	// folded into failed or cancelled. Always an array (never null).
+	Replanning []string `json:"replanning"`
 }
 
 // campaignNextActionPayload tells the operator-agent what to do next with
@@ -544,6 +548,9 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 		Failed:    nz(e.Failed),
 		Cancelled: cancelled,
 		Paused:    nz(e.Paused),
+		// Replanning (#5379) is its own slice — a rejected plan is neither a
+		// failure nor a cancellation, so it is never folded into either.
+		Replanning: nz(e.Replanning),
 	}
 }
 
@@ -561,26 +568,34 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //     whenever ANY autonomous item is dispatchable it is surfaced first, so a
 //     failed or human-led item never stalls DAG-independent autonomous work
 //     (#1838: a quarantined failed item leaves its eligible siblings dispatchable).
-//  3. else any restartable (cancelled OR failed, deps-satisfied, non-human-led)
+//  3. else any replanning item -> "start_run" on the first replanning ref
+//     (#5379). An approver rejected the item's plan; its run_id still names the
+//     rejected run, and fishhawk_start_campaign_item_run mints a fresh run whose
+//     plan prompt carries the rejection as prior-rejection feedback. Ranked
+//     BELOW Eligible (a rejected item never pre-empts fresh DAG-independent
+//     work — the same reason the driver does not auto-dispatch it) and directly
+//     above Restartable, so it fires only when no item is paused or eligible.
+//  4. else any restartable (cancelled OR failed, deps-satisfied, non-human-led)
 //     item -> "start_run" on the first restartable ref. A cancelled (#1729) or
 //     failed (#1838) item with a satisfied DAG position has a forward path via
 //     the operator restart verb: surfaced as start_run so dependents no longer
 //     stay blocked forever. Ranked below Eligible (a fresh unstarted item is
 //     preferred over a restart) and above HumanLed.
-//  4. else any human-led item -> "attend_human_led" on the first human-led ref.
-//     Fires ONLY when len(Eligible)==0 && len(Restartable)==0 && len(HumanLed)>0
+//  5. else any human-led item -> "attend_human_led" on the first human-led ref.
+//     Fires ONLY when len(Eligible)==0 && len(Replanning)==0 &&
+//     len(Restartable)==0 && len(HumanLed)>0
 //     — every deps-satisfied item that remains is autonomy:low, reserved for
 //     human leadership, so the operator (not an auto-driver) must pick it up.
-//  5. else any failed item -> "attention" on the first failed ref. Only a
+//  6. else any failed item -> "attention" on the first failed ref. Only a
 //     GENUINELY-STUCK failed item reaches here — deps-unsatisfied or human-led,
 //     so NextEligible left it in Failed rather than diverting it to Restartable
 //     (#1838). It cannot be auto-restarted (no satisfied forward path), so the
 //     operator must resolve its run manually. Ranked below the dispatch arms so a
 //     stuck failure never suppresses still-actionable sibling work.
-//  6. else any running or blocked item -> "wait".
-//  7. else (every item terminal done/cancelled) -> "complete".
+//  7. else any running or blocked item -> "wait".
+//  8. else (every item terminal done/cancelled) -> "complete".
 //
-// TERMINAL POST-FILTER (#2681). The seven arms above read ONLY the item
+// TERMINAL POST-FILTER (#2681). The eight arms above read ONLY the item
 // partition, so a campaign that has itself gone TERMINAL could still advertise
 // a verb the campaign-state gate refuses — the wedge this filter closes. When
 // state.IsTerminal() the base action is rewritten:
@@ -588,7 +603,8 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //   - start_run on a Restartable item under a FAILED campaign is KEPT (with a
 //     reopen-flavoured detail): handleStartCampaignItemRun now admits a
 //     terminal-failed campaign and reopens it atomically, so this verb is
-//     genuinely legal;
+//     genuinely legal. start_run on a Replanning item is NOT kept (#5379): the
+//     reopen admits only a restartable item, so it falls to `closed`;
 //   - complete is KEPT: a terminal campaign whose every item is done advertises
 //     no verb at all, so it is already truthful;
 //   - everything else becomes the `closed` action, which advertises no campaign
@@ -624,20 +640,27 @@ func computeCampaignNextAction(state campaign.State, e campaign.Eligibility) cam
 		// Counts mirror the WIRE rollup the operator reads: toCampaignRollupPayload
 		// folds Restartable back into the cancelled slice, so this fold matches.
 		cancelled := len(e.Cancelled) + len(e.Restartable)
+		counts := fmt.Sprintf("%d succeeded, %d failed, %d cancelled", len(e.Done), len(e.Failed), cancelled)
+		if len(e.Replanning) > 0 {
+			// Replanning is its own wire slice (#5379); count it only when present
+			// so the pre-#5379 detail stays byte-identical.
+			counts += fmt.Sprintf(", %d replanning", len(e.Replanning))
+		}
 		return campaignNextActionPayload{
 			Action: "closed",
 			// Carry the ref the base arm named (when it named one) so the operator
 			// still has the stranded issue to drive standalone.
 			IssueRef: base.IssueRef,
 			Detail: fmt.Sprintf(
-				"the campaign is %s and can start no further item runs (%d succeeded, %d failed, %d cancelled); drive any remaining issue standalone with fishhawk_start_run — the campaign will not track its outcome",
-				state, len(e.Done), len(e.Failed), cancelled),
+				"the campaign is %s and can start no further item runs (%s); drive any remaining issue standalone with fishhawk_start_run — the campaign will not track its outcome",
+				state, counts),
 		}
 	}
 }
 
-// baseCampaignNextAction is the item-partition-only computation: the seven-arm
-// precedence documented on computeCampaignNextAction, unchanged since #1838. It
+// baseCampaignNextAction is the item-partition-only computation: the eight-arm
+// precedence documented on computeCampaignNextAction (#1838; the replanning arm
+// is #5379). It
 // is split out so the terminal post-filter reads as a filter over a stable base
 // rather than as seven more interleaved conditions.
 func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
@@ -653,6 +676,12 @@ func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 			Action:   "start_run",
 			IssueRef: e.Eligible[0],
 			Detail:   "this item's dependencies are satisfied and it has no run yet",
+		}
+	case len(e.Replanning) > 0:
+		return campaignNextActionPayload{
+			Action:   "start_run",
+			IssueRef: e.Replanning[0],
+			Detail:   replanningDetail,
 		}
 	case len(e.Restartable) > 0:
 		return campaignNextActionPayload{
@@ -684,6 +713,9 @@ func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 		}
 	}
 }
+
+// replanningDetail is the start_run detail for a replanning item (#5379).
+const replanningDetail = "an approver rejected this item's plan, so it is replanning (not failed); its run_id names the rejected run. fishhawk_start_campaign_item_run mints a fresh run whose plan prompt carries the rejection reason as prior-rejection feedback"
 
 // humanLedRefsInDetail bounds how many human-led refs the attend_human_led
 // detail enumerates, so a large campaign's detail stays readable. Refs past the
@@ -2866,10 +2898,15 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	// non-human-led CANCELLED (#1729) or FAILED (#1838) item: it has no eligible
 	// forward path (cancelled/failed is terminal for auto-dispatch) but the
 	// operator verb resets it. RestartCampaignItem accepts both from-states
-	// (postgres.go).
+	// (postgres.go). A REPLANNING item (#5379 — its plan was rejected) is
+	// admitted through the same restart branch: RestartCampaignItem also accepts
+	// replanning, clearing the rejected run's link and resetting to pending, and
+	// the fresh run's plan prompt carries the rejection as prior-rejection
+	// feedback.
 	elig := campaign.NextEligible(items)
 	isRestartable := containsRef(elig.Restartable, req.IssueRef)
-	if !containsRef(elig.Eligible, req.IssueRef) && !isRestartable {
+	isReplanning := containsRef(elig.Replanning, req.IssueRef)
+	if !containsRef(elig.Eligible, req.IssueRef) && !isRestartable && !isReplanning {
 		// A deps-satisfied autonomy:low item is human-led (#1551 / E32.4): it is
 		// refused with a DISTINCT item_human_led code whose detail names the
 		// human-led reason and does NOT tell the caller to start a ref (its
@@ -2914,7 +2951,11 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	// ReopenCampaignForItemRestart, ONE transaction holding row locks on the
 	// campaign and the item, so no concurrent reconcile-on-read can observe a
 	// running campaign whose every item is still terminal.
-	if isRestartable {
+	//
+	// A replanning item (#5379) takes this branch too, but never the reopen: a
+	// replanning item keeps its campaign running (DeriveState), and the
+	// defensive check above already refused one under a failed campaign.
+	if isRestartable || isReplanning {
 		priorState := string(item.State)
 		priorRunID := ""
 		if item.RunID != nil {
@@ -3216,6 +3257,25 @@ func firstUnmetDependency(item *campaign.Item, items []*campaign.Item) (string, 
 // campaign repo's state-guarded SELECT FOR UPDATE transitions, so a concurrent
 // re-poll cannot double-transition — a second pass over an already-settled item
 // is a no-op (its state is no longer running/pending) and emits nothing.
+// failedRunSettleTarget picks the on-read settle target for a running item
+// whose settle-off run (runID) is terminal-failed (#5379): `replanning` when
+// run.PlanRejected holds over that run's stages (an approver rejected its plan),
+// `failed` otherwise. A stage-read error degrades to failed, WARN-logged — the
+// pre-#5379 reading, which NextEligible still offers as Restartable. Mirrors
+// campaigndriver's failedRunSettleTarget so both settle paths agree.
+func (s *Server) failedRunSettleTarget(ctx context.Context, c *campaign.Campaign, it *campaign.Item, runID uuid.UUID) campaign.ItemState {
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.Warn("reconcile-on-read: list stages of failed run failed; item settles failed",
+			"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_id", runID.String(), "error", err.Error())
+		return campaign.ItemStateFailed
+	}
+	if run.PlanRejected(stages) {
+		return campaign.ItemStateReplanning
+	}
+	return campaign.ItemStateFailed
+}
+
 func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) bool {
 	settledAny := false
 	// Pass 1: run-linked terminal settle. Needs a run repository to read run
@@ -3263,6 +3323,12 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 						relinkID = &id
 					}
 				}
+			}
+			// Plan-rejected settle (#5379): when the run the item settles off
+			// failed because an approver rejected its plan, the item is
+			// `replanning` (awaiting the operator's restart verb), not failed.
+			if target == campaign.ItemStateFailed {
+				target = s.failedRunSettleTarget(ctx, c, it, *relinkID)
 			}
 			if !campaign.ValidCampaignItemTransition(it.State, target) {
 				continue
@@ -3481,12 +3547,20 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			(it.State == campaign.ItemStatePending || it.State == campaign.ItemStateBlocked)
 		isClassB := it.RunID != nil &&
 			(it.State == campaign.ItemStateCancelled || it.State == campaign.ItemStateFailed)
-		// Autonomy-relevant: every state where NextEligible partitions on the tier.
-		// Class A/B are a subset, so this predicate governs the whole fetch set.
+		// Replanning class (#5379): a run-linked item whose plan an approver
+		// rejected, awaiting the operator's replan. Its issue may be re-scoped
+		// and then delivered (or abandoned) outside the campaign, so a closure
+		// settles it — completed -> succeeded, not_planned/duplicate ->
+		// cancelled — or it would strand non-terminal forever.
+		isReplanning := it.RunID != nil && it.State == campaign.ItemStateReplanning
+		// Autonomy-relevant: every state where NextEligible partitions on the tier
+		// (replanning too: a relabelled autonomy:low replanning item is HumanLed).
+		// The settle classes are a subset, so this predicate governs the fetch set.
 		autonomyRelevant := it.State == campaign.ItemStatePending ||
 			it.State == campaign.ItemStateBlocked ||
 			it.State == campaign.ItemStateFailed ||
-			it.State == campaign.ItemStateCancelled
+			it.State == campaign.ItemStateCancelled ||
+			it.State == campaign.ItemStateReplanning
 		if !autonomyRelevant {
 			continue
 		}
@@ -3518,7 +3592,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		// or a closed one whose state_reason the fail-closed classifier does not
 		// recognise, is left unsettled (but its tier is still refreshed below
 		// from the same fetch).
-		if !isClassA && !isClassB {
+		if !isClassA && !isClassB && !isReplanning {
 			continue
 		}
 		target, ok := classifyClosedIssueOutcome(issue.State, issue.StateReason)
@@ -3565,6 +3639,34 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			"settled_via":  "issue_closed",
 			"state_reason": cand.stateReason,
 			"resolved_by":  campaign.ResolvedByIssueClosed,
+		}
+		if it.State == campaign.ItemStateReplanning {
+			// Replanning class (#5379): replanning -> succeeded/cancelled are
+			// table edges, and SettleCampaignItemForClosedIssue admits a
+			// replanning from-state, stamping resolved_by=issue_closed in the
+			// same statement while RETAINING the rejected run's link
+			// (provenance). Not SettleCampaignItemOutOfBand, which stays
+			// terminal-only. AUDIT-FIRST: the campaign_issue_settled entry is
+			// appended BEFORE the state change and is its durable record; an
+			// append error leaves the item replanning for the next read, so no
+			// settle ever lands unaudited.
+			if !campaign.ValidCampaignItemTransition(it.State, cand.target) {
+				continue
+			}
+			payload["run_id"] = it.RunID.String()
+			payload["prior_state"] = string(campaign.ItemStateReplanning)
+			if err := s.appendCampaignAuditFirst(ctx, categoryCampaignIssueSettled, payload); err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: audit-first append for replanning issue-closed settle failed; item left replanning",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
+				continue
+			}
+			if _, err := s.cfg.CampaignRepo.SettleCampaignItemForClosedIssue(ctx, it.ID, cand.target); err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: replanning issue-closed settle failed after its audit entry; left for next read",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "target", string(cand.target), "error", err.Error())
+				continue
+			}
+			settledAny = true
+			continue
 		}
 		if it.RunID != nil {
 			// Class B (out-of-band terminal delivery, #2029): a cancelled/failed
@@ -3919,6 +4021,30 @@ func mapRunTerminalToItemState(st run.State) (campaign.ItemState, bool) {
 // mirroring the campaigndriver emit posture. Best-effort: a nil AuditRepo, a
 // marshal error, or an append error logs and never unwinds the transition it
 // records.
+// appendCampaignAuditFirst appends a campaign audit entry and RETURNS the
+// append error, for an audit-first caller that must not change state unless its
+// record landed (the replanning issue-closed settle, #5379). Unlike
+// emitCampaignAudit it never swallows a failure. An unwired AuditRepo is a nil
+// no-op, exactly as for emitCampaignAudit.
+func (s *Server) appendCampaignAuditFirst(ctx context.Context, category string, payload map[string]any) error {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal campaign audit payload: %w", err)
+	}
+	systemKind := audit.ActorSystem
+	_, err = s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   body,
+		AccountID: identityAccountID(ctx),
+	})
+	return err
+}
+
 func (s *Server) emitCampaignAudit(ctx context.Context, category string, payload map[string]any) {
 	if s.cfg.AuditRepo == nil {
 		return

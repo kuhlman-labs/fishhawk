@@ -42,6 +42,9 @@ const itemStateStyles: Record<CampaignItemState, string> = {
   blocked: 'bg-neutral-200 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400',
   running: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
   paused: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  // A rejected plan awaiting the operator's replan (#5379) — not a failure, so
+  // it never shares the failed rose badge.
+  replanning: 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300',
   succeeded: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300',
   failed: 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300',
   cancelled: 'bg-neutral-200 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400',
@@ -267,6 +270,7 @@ const ROLLUP_BUCKETS: Array<{ key: keyof CampaignRollup; label: string }> = [
   { key: 'failed', label: 'failed' },
   { key: 'cancelled', label: 'cancelled' },
   { key: 'paused', label: 'paused' },
+  { key: 'replanning', label: 'replanning' },
 ];
 
 function RollupSection({ rollup }: { rollup: CampaignRollup }) {

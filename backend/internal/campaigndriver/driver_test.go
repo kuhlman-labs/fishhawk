@@ -879,6 +879,117 @@ func TestTick_SettleFailed_AllTerminal_TransitionsCampaignFailed(t *testing.T) {
 	}
 }
 
+// --- #5379: a plan-rejected run settles its item `replanning` -------------
+
+// stagedRunReader adds the OPTIONAL StageLister capability to fakeRunReader so
+// advance can classify a failed run's stages. fakeRunReader itself lacks it,
+// which is what the no-capability fallback test relies on.
+type stagedRunReader struct {
+	*fakeRunReader
+	stages  map[uuid.UUID][]*run.Stage
+	listErr error
+}
+
+func (s *stagedRunReader) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.stages[id], nil
+}
+
+// failedPlanRun seeds a terminal-failed run whose plan stage failed category D
+// with reason, behind the StageLister capability.
+func failedPlanRun(reader *stagedRunReader, reason string) *run.Run {
+	r := reader.put(run.StateFailed)
+	catD := run.FailureD
+	reader.stages[r.ID] = []*run.Stage{{
+		ID: uuid.New(), RunID: r.ID, Type: run.StageTypePlan, State: run.StageStateFailed,
+		FailureCategory: &catD, FailureReason: &reason,
+	}}
+	return r
+}
+
+// TestTick_PlanRejectedRun_SettlesReplanning_NeverDispatched pins #5379 at the
+// driver seam (R4a): a running item whose run failed because an approver
+// rejected its plan settles `replanning` (not failed), the campaign stays
+// running, the settle entry's outcome reads "replanning", and across TWO ticks
+// the starter is never called for it — the operator, not the driver, starts
+// the replan. Deleting the failedRunSettleTarget call site in advance turns the
+// state assertion RED (the item settles failed and the campaign derives
+// terminal failed). The no-dispatch invariant is defended in depth —
+// NextEligible's Replanning arm (pinned by campaign engine_test), the START
+// pass's linked/edge guard, and the claim's linked refusal — so the
+// claim-call assertion goes RED only when the first two are both bypassed.
+func TestTick_PlanRejectedRun_SettlesReplanning_NeverDispatched(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := &stagedRunReader{fakeRunReader: newFakeRunReader(), stages: map[uuid.UUID][]*run.Stage{}}
+	rejected := failedPlanRun(reader, run.FailureReasonGateRejected)
+	it := store.seedItem(c, "issue:7", campaign.ItemStateRunning, nil, &rejected.ID)
+	au := &fakeAudit{}
+	starter := &fakeStarter{reader: reader.fakeRunReader}
+	tk := &Ticker{Campaigns: store, Runs: reader, Starter: starter, Audit: au, MaxParallel: 4, Now: fixedNow}
+
+	for tick := 1; tick <= 2; tick++ {
+		tk.Tick(context.Background())
+		if it.State != campaign.ItemStateReplanning {
+			t.Fatalf("tick %d: item state = %s, want replanning", tick, it.State)
+		}
+		if it.RunID == nil || *it.RunID != rejected.ID {
+			t.Fatalf("tick %d: item run_id = %v, want the rejected run %s kept as provenance", tick, it.RunID, rejected.ID)
+		}
+		if c.State != campaign.StateRunning {
+			t.Fatalf("tick %d: campaign state = %s, want running (replanning is not a failure)", tick, c.State)
+		}
+		if len(starter.calls) != 0 || store.claimCalls != 0 {
+			t.Fatalf("tick %d: starter calls = %d, claim calls = %d, want 0 and 0 (a replanning item is never auto-dispatched)", tick, len(starter.calls), store.claimCalls)
+		}
+	}
+	settled := au.byCategory(categoryCampaignIssueSettled)
+	if len(settled) != 1 || settled[0].payload["outcome"] != string(campaign.ItemStateReplanning) {
+		t.Fatalf("settled audit = %+v, want exactly one with outcome replanning", settled)
+	}
+}
+
+// TestTick_FailedRunSettleTarget_FallsBackToFailed pins every non-replanning
+// arm of failedRunSettleTarget: a plan failed by an SLA timeout, a stage-read
+// error, and a RunReader without the StageLister capability all settle the
+// item failed exactly as before #5379.
+func TestTick_FailedRunSettleTarget_FallsBackToFailed(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func() (RunReader, uuid.UUID)
+	}{
+		{"sla timeout plan", func() (RunReader, uuid.UUID) {
+			r := &stagedRunReader{fakeRunReader: newFakeRunReader(), stages: map[uuid.UUID][]*run.Stage{}}
+			return r, failedPlanRun(r, "sla_timeout: 4h0m0s elapsed (deadline 4h)").ID
+		}},
+		{"stage read error", func() (RunReader, uuid.UUID) {
+			r := &stagedRunReader{fakeRunReader: newFakeRunReader(), stages: map[uuid.UUID][]*run.Stage{}, listErr: errors.New("db down")}
+			return r, failedPlanRun(r, run.FailureReasonGateRejected).ID
+		}},
+		{"reader lacks the capability", func() (RunReader, uuid.UUID) {
+			r := newFakeRunReader()
+			return r, r.put(run.StateFailed).ID
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			c := store.seedCampaign(campaign.StateRunning)
+			reader, runID := tc.build()
+			it := store.seedItem(c, "issue:7", campaign.ItemStateRunning, nil, &runID)
+			tk := &Ticker{Campaigns: store, Runs: reader, Starter: &fakeStarter{}, Audit: &fakeAudit{}, MaxParallel: 4, Now: fixedNow}
+
+			tk.Tick(context.Background())
+
+			if it.State != campaign.ItemStateFailed {
+				t.Fatalf("item state = %s, want failed", it.State)
+			}
+		})
+	}
+}
+
 // --- (f) TERMINAL-STATE MAPPING (one assertion per branch) ------------------
 
 func TestTick_TerminalStateMapping(t *testing.T) {

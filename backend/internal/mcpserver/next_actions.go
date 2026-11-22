@@ -4299,6 +4299,22 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction, items 
 		// ELIGIBLE item keeps the established fishhawk_start_run (pinned by
 		// campaign_test.go): there is no item to restart, so a plain run on the
 		// issue ref advances the campaign.
+		//
+		// A REPLANNING item (#5379 — its plan was rejected) is in rollup.Replanning
+		// and also needs the campaign-item verb: its run is linked and failed, so
+		// only the restart handler resets it and mints the replan.
+		if slices.Contains(rollup.Replanning, na.IssueRef) {
+			return &NextActions{
+				State: "campaign_start_run",
+				Actions: []SuggestedAction{{
+					Action:       "fishhawk_start_campaign_item_run",
+					Params:       map[string]string{"issue_ref": na.IssueRef},
+					Precondition: "this campaign item is replanning — an approver rejected its plan, and its run_id names the rejected run (rollup replanning); pass the campaign_id and workflow_id fishhawk_start_campaign_item_run requires",
+					Consumes:     consumesNewRun,
+					Reason:       "replan campaign item " + na.IssueRef + " — fishhawk_start_campaign_item_run resets the replanning item and mints a fresh, re-linked run whose plan prompt carries the rejection reason as prior-rejection feedback; re-scope the issue body first if the rejection asked for it. The generic fishhawk_start_run would neither restart nor link it",
+				}},
+			}
+		}
 		if slices.Contains(rollup.Cancelled, na.IssueRef) {
 			return &NextActions{
 				State: "campaign_start_run",
