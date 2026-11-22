@@ -2942,6 +2942,14 @@ _campaign_driver_flags() {
   return 0
 }
 
+# Prints `--enable-stall-watch` unless FISHHAWK_DEV_STALL_WATCH=0 (#5497).
+_stall_watch_flags() {
+  if [[ "${FISHHAWK_DEV_STALL_WATCH:-1}" != "0" ]]; then
+    print -r -- "--enable-stall-watch"
+  fi
+  return 0
+}
+
 # PURE. Arg: one `ps -o args=` line. True only when the FIRST token's basename,
 # with any extension stripped, EQUALS fishhawk-mcp AND the SECOND token EQUALS
 # host-dispatch — the exact-token rule of _parse_live_runs, never substring
@@ -3734,7 +3742,15 @@ cmd_up() {
   # drops the flag. scripts/test-dev pins it.
   local -a campaign_driver_flags
   campaign_driver_flags=(${(f)"$(_campaign_driver_flags)"})
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${auto_start_flags[@]}" "${merge_outcome_flags[@]}" "${campaign_driver_flags[@]}" >> "$LOG_FILE" 2>&1 &
+  #
+  # --enable-stall-watch (#5497): the page-only stall watch pages the operator
+  # when a failed stage, or a dispatchable decomposition child, has seen no
+  # operator or driver act past --stall-watch-threshold (default 30m). It never
+  # retries, revives or dispatches. FISHHAWK_DEV_STALL_WATCH=0 drops the flag.
+  # scripts/test-dev pins both arms.
+  local -a stall_watch_flags
+  stall_watch_flags=(${(f)"$(_stall_watch_flags)"})
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${auto_start_flags[@]}" "${merge_outcome_flags[@]}" "${campaign_driver_flags[@]}" "${stall_watch_flags[@]}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"

@@ -218,13 +218,23 @@ func (p *PushChannel) firePushes(ctx context.Context, runID uuid.UUID) error {
 
 	var latencyCtx *pushnotify.GateLatency
 	sinks := p.dispatcher.SinkNames()
+	parents := &stallParentMemo{runs: p.runs, r: runRow}
 	for _, ev := range events {
 		if _, done := claimed[ev.sequence]; done {
 			continue
 		}
-		// A reviewer reject the operator already arbitrated is stale: claim
-		// it (so it never fires later) without sending, mirroring firePings.
-		if pageEventResolved(ev, entries) {
+		// A stall page's parent arm (#5497) needs the parent row. A read error
+		// claims and sends nothing: fail toward silence, as above.
+		parent, err := parents.get(ctx, ev)
+		if err != nil {
+			p.warn(ctx, "push: get decomposition parent failed; skipping", runID, err)
+			return nil
+		}
+		// A reviewer reject the operator already arbitrated, or a stall page
+		// whose episode has ended or whose parent is terminal (#5497, read
+		// from the stages, run row and parent row), is stale: claim it (so it
+		// never fires later) without sending, mirroring firePings.
+		if pageEventResolved(ev, entries, stages, runRow, parent) {
 			if err := p.appendClaim(ctx, runID, ev, nil, "resolved"); err != nil {
 				p.warn(ctx, "push: claim append failed; not sending", runID, err,
 					slog.Int64("source_sequence", ev.sequence))

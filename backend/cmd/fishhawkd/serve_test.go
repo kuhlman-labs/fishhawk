@@ -73,6 +73,7 @@ import (
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scheduler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stallwatch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -8942,5 +8943,211 @@ func TestMCPRouteServerConfig_SetsRequestBearerSource(t *testing.T) {
 	}
 	if cfg.StoredLoginPresent != nil {
 		t.Error("StoredLoginPresent set on the /mcp route, want nil")
+	}
+}
+
+// serveUsageEntry drives runServe -h and returns one flag's PrintDefaults
+// entry (header line excluded), or fails when the flag is not registered.
+func serveUsageEntry(t *testing.T, header string) string {
+	t.Helper()
+	var sink bytes.Buffer
+	if code := runServe([]string{"-h"}, &sink); code != exitFailure {
+		t.Fatalf("runServe(-h) = %d, want %d", code, exitFailure)
+	}
+	usage := sink.String()
+	i := strings.Index(usage, header)
+	if i < 0 {
+		t.Fatalf("runServe usage does not register %q; got:\n%s", strings.TrimSpace(header), usage)
+	}
+	entry := usage[i+len(header):]
+	if j := strings.Index(entry, "\n  -"); j >= 0 {
+		entry = entry[:j]
+	}
+	return entry
+}
+
+// TestServeRegistersStallWatchFlags pins the four --stall-watch-* flags
+// (#5497) on the flag set runServe itself builds: registered, typed and
+// defaulted (disabled, 30m, 5m, 168h), with the enable flag's usage saying it
+// is off by default and page-only.
+func TestServeRegistersStallWatchFlags(t *testing.T) {
+	t.Setenv("FISHHAWKD_ENABLE_STALL_WATCH", "")
+	enable := serveUsageEntry(t, "  -enable-stall-watch\n")
+	if strings.Contains(enable, "(default true)") {
+		t.Errorf("--enable-stall-watch defaults on; entry %q", enable)
+	}
+	if !strings.Contains(enable, "Off by default") || !strings.Contains(enable, "never retries") {
+		t.Errorf("--enable-stall-watch usage lost its off-by-default / page-only text; got %q", enable)
+	}
+	for flagName, want := range map[string]time.Duration{
+		"stall-watch-threshold": 30 * time.Minute,
+		"stall-watch-interval":  5 * time.Minute,
+		"stall-watch-lookback":  168 * time.Hour,
+	} {
+		entry := serveUsageEntry(t, "  -"+flagName+" duration\n")
+		if w := "(default " + want.String() + ")"; !strings.Contains(entry, w) {
+			t.Errorf("--%s entry = %q, want %s", flagName, entry, w)
+		}
+	}
+}
+
+// TestServe_StallWatchDegenerateConfigRefusesToBoot: with the watch enabled,
+// each degenerate duration refuses to boot and names the stall watch, and
+// the same durations with the watch disabled do not trip the check. The
+// disabled arm needs a LATER deterministic boot refusal to stop runServe
+// before it serves: a --single-tenant-provider with no account key fails the
+// single-tenant bootstrap, which runs after the stall-watch pre-check.
+func TestServe_StallWatchDegenerateConfigRefusesToBoot(t *testing.T) {
+	t.Setenv("FISHHAWKD_ENABLE_STALL_WATCH", "")
+	t.Setenv("FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY", "")
+	const stallRefusal = "stall watch config pre-check refused startup"
+	const laterRefusal = "single-tenant profile bootstrap failed"
+	for name, args := range map[string][]string{
+		"zero threshold":           {"-stall-watch-threshold", "0s"},
+		"zero interval":            {"-stall-watch-interval", "0s"},
+		"lookback below threshold": {"-stall-watch-threshold", "2h", "-stall-watch-lookback", "1h"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var log bytes.Buffer
+			code := runServe(append([]string{"-enable-stall-watch"}, args...), &log)
+			if code != exitFailure {
+				t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log.String())
+			}
+			if !strings.Contains(log.String(), stallRefusal) {
+				t.Errorf("refusal log did not name the stall watch pre-check; log:\n%s", log.String())
+			}
+		})
+		t.Run(name+" disabled", func(t *testing.T) {
+			var log bytes.Buffer
+			code := runServe(append(append([]string{}, args...), "-single-tenant-provider", "github"), &log)
+			if code != exitFailure {
+				t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log.String())
+			}
+			if strings.Contains(log.String(), stallRefusal) {
+				t.Errorf("the disabled watch's durations tripped the pre-check; log:\n%s", log.String())
+			}
+			if !strings.Contains(log.String(), laterRefusal) {
+				t.Errorf("boot did not reach the later single-tenant refusal; log:\n%s", log.String())
+			}
+		})
+	}
+}
+
+// TestStallWatchScanner pins the adapter both ways: stallwatch.Params map
+// field for field onto server.StallScanParams (distinct durations, so a
+// Threshold/Lookback swap is visible), and the server report and error map
+// back onto stallwatch.Report.
+func TestStallWatchScanner(t *testing.T) {
+	now := time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)
+	scanErr := errors.New("scan failed")
+	var got server.StallScanParams
+	scan := stallWatchScanner(func(_ context.Context, p server.StallScanParams) (server.StallScanReport, error) {
+		got = p
+		return server.StallScanReport{Scanned: 3, Paged: 2, Skipped: 1}, scanErr
+	})
+	rep, err := scan(context.Background(), stallwatch.Params{Threshold: 30 * time.Minute, Lookback: 168 * time.Hour, Now: now})
+	if want := (server.StallScanParams{Threshold: 30 * time.Minute, Lookback: 168 * time.Hour, Now: now}); got != want {
+		t.Errorf("server params = %+v, want %+v", got, want)
+	}
+	if want := (stallwatch.Report{Scanned: 3, Paged: 2, Skipped: 1}); rep != want {
+		t.Errorf("report = %+v, want %+v", rep, want)
+	}
+	if !errors.Is(err, scanErr) {
+		t.Errorf("err = %v, want the scan's error", err)
+	}
+}
+
+// TestServeGo_StallWatchTickerWiring pins the stallwatch.Ticker literal in
+// runServe (#5497): each scanner slot adapts its OWN server scan, and each
+// duration field reads its own flag. A swap of either pair compiles and
+// passes every behavioural test, so the parsed body is the only witness.
+func TestServeGo_StallWatchTickerWiring(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	render := func(e ast.Expr) string {
+		switch x := e.(type) {
+		case *ast.StarExpr:
+			if id, ok := x.X.(*ast.Ident); ok {
+				return "*" + id.Name
+			}
+		case *ast.CallExpr:
+			fun, ok := x.Fun.(*ast.Ident)
+			if !ok || len(x.Args) != 1 {
+				return ""
+			}
+			if sel, ok := x.Args[0].(*ast.SelectorExpr); ok {
+				if recv, ok := sel.X.(*ast.Ident); ok {
+					return fun.Name + "(" + recv.Name + "." + sel.Sel.Name + ")"
+				}
+			}
+		}
+		return ""
+	}
+	var literals []map[string]string
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		sel, ok := lit.Type.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Ticker" {
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "stallwatch" {
+			return true
+		}
+		fields := map[string]string{}
+		for _, el := range lit.Elts {
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				if k, ok := kv.Key.(*ast.Ident); ok {
+					fields[k.Name] = render(kv.Value)
+				}
+			}
+		}
+		literals = append(literals, fields)
+		return true
+	})
+	if len(literals) != 1 {
+		t.Fatalf("runServe builds %d stallwatch.Ticker literals, want 1", len(literals))
+	}
+	want := map[string]string{
+		"FailedStages": "stallWatchScanner(srv.ScanFailedStageStalls)",
+		"Children":     "stallWatchScanner(srv.ScanUndispatchedChildStalls)",
+		"Threshold":    "*stallWatchThreshold",
+		"Lookback":     "*stallWatchLookback",
+		"Interval":     "*stallWatchInterval",
+	}
+	for k, v := range want {
+		if got := literals[0][k]; got != v {
+			t.Errorf("stallwatch.Ticker.%s = %q, want %q", k, got, v)
+		}
+	}
+}
+
+// TestStallWatchConfigError pins the pure pre-check in both directions.
+func TestStallWatchConfigError(t *testing.T) {
+	if err := stallWatchConfigError(30*time.Minute, 5*time.Minute, 168*time.Hour); err != nil {
+		t.Errorf("shipped defaults refused: %v", err)
+	}
+	for name, d := range map[string][3]time.Duration{
+		"zero threshold":   {0, 5 * time.Minute, time.Hour},
+		"zero interval":    {30 * time.Minute, 0, time.Hour},
+		"lookback too low": {30 * time.Minute, 5 * time.Minute, 29 * time.Minute},
+	} {
+		if err := stallWatchConfigError(d[0], d[1], d[2]); err == nil {
+			t.Errorf("%s accepted", name)
+		}
 	}
 }

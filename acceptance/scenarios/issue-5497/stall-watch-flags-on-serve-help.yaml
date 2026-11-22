@@ -1,0 +1,14 @@
+id: scenario:issue-5497/stall-watch-flags-on-serve-help
+statement: The fishhawkd serve command's help output lists --enable-stall-watch, whose usage text describes it as off by default, and lists --stall-watch-threshold, --stall-watch-interval and --stall-watch-lookback with their defaults shown (30m, 5m and 168h, which the flag package prints as 30m0s, 5m0s and 168h0m0s).
+verify_hint: 'CLI stdout/stderr: run the fishhawkd binary''s serve subcommand with -h and read the four flags, their defaults and the enable flag''s usage text. Placement next to the --dispatch-watchdog-* flags is a source-order note only (the help output sorts flags), not part of this check.'
+steps: 'Posture B: target /healthz git_sha c62290a3e equals the sanctioned checkout HEAD c62290a3ea06c5165a1f2364c3b4489addd5161f. Built fishhawkd from that checkout (cd backend && GOFLAGS=-buildvcs=false go build -o /tmp/fhacc5497b/bin/ ./cmd/fishhawkd). Ran /tmp/fhacc5497b/bin/fishhawkd serve -h and grepped for stall-watch. The full help output is hashed as sha256:2414ac6b....'
+assertions:
+    expected: Four flags listed, the enable flag off by default, defaults 30m0s, 5m0s and 168h0m0s.
+    observed_at_record: '-enable-stall-watch: ''start the stall watch ticker (#5497); pages the operator when a failed stage, or a dispatchable decomposition child, has seen no operator or driver act past --stall-watch-threshold. Page-only: it never retries, revives or dispatches. Off by default''. -stall-watch-threshold duration (default 30m0s); -stall-watch-interval duration (default 5m0s); -stall-watch-lookback duration (default 168h0m0s).'
+    repro_handle: cd backend && go build -o /tmp/b/ ./cmd/fishhawkd && /tmp/b/fishhawkd serve -h 2>&1 | grep -A2 stall-watch
+origin:
+    issue: 5497
+    pr: 5532
+    run_id: e05dd517-ef20-47e0-ae91-add60849b881
+    head_sha: c62290a3ea06c5165a1f2364c3b4489addd5161f
+    recorded_at: 2026-11-22T20:22:01Z

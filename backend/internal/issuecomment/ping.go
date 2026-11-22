@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -68,6 +69,70 @@ type pageEvent struct {
 	// message is the one-line comment body (sans the anchor link, which
 	// firePings appends).
 	message string
+	// stageID and episodeKey are set only for the two stall-watch kinds
+	// (#5497): the stage the row names and the condition episode it was
+	// written for. pageEventResolved compares episodeKey with the named
+	// stage's CURRENT episode, so a row from an ended episode never posts.
+	stageID    uuid.UUID
+	episodeKey string
+	// nextAction is the stall row's next_action when it is in the closed
+	// stallNextActions set, else "". The parent arm of stallPageResolved
+	// reads it (a fishhawk_resume_run page needs a live parent).
+	nextAction string
+}
+
+// Stall-watch page kinds (#5497). The kind tokens differ from the server's
+// audit categories (stage_failed_awaiting_operator,
+// child_dispatch_awaiting_operator) so each case label in this file stays
+// unique; the category literals are duplicated below because this package
+// cannot import server.
+const (
+	pageKindFailedStageStalled   = "failed_stage_stalled"
+	pageKindChildDispatchStalled = "child_dispatch_stalled"
+)
+
+// stallNextActions is the closed next-action set a stall row may name. A
+// payload next_action outside it renders the generic remedy line instead, so
+// no payload string reaches the comment body.
+var stallNextActions = map[string]struct{}{
+	"fishhawk_retry_stage":  {},
+	"fishhawk_revive_run":   {},
+	"fishhawk_resume_run":   {},
+	"fishhawk_run_children": {},
+}
+
+// FailedStageStallEpisode derives the condition-episode key of a failed stage
+// (#5497). ok is true only when the stage is failed and carries EndedAt. The
+// key is "<stage_id>/<ended_at RFC3339Nano UTC>/<self_retry_count>": ended_at
+// is stamped by the failed transition, and RetryStageState clears it and bumps
+// self_retry_count on every re-open (retry_stage, revive_run and resume_run's
+// in-place reset), so a retried-and-refailed stage is a NEW episode. It is the
+// ONE derivation the server's stall-watch writer and this package's
+// resolution share. No stage-transition audit row exists to key on, so the
+// stage row's own per-transition stamps identify the episode.
+func FailedStageStallEpisode(st *run.Stage) (string, bool) {
+	if st == nil || st.State != run.StageStateFailed || st.EndedAt == nil {
+		return "", false
+	}
+	return fmt.Sprintf("%s/%s/%d", st.ID, st.EndedAt.UTC().Format(time.RFC3339Nano), st.SelfRetryCount), true
+}
+
+// ChildDispatchStallEpisode derives the condition-episode key of an
+// undispatched decomposition-child implement stage (#5497). ok is true only
+// when the stage is pending or awaiting_host_dispatch. The key is
+// "<stage_id>/<self_retry_count>/<dispatched_at RFC3339Nano UTC, or never>":
+// dispatched_at is the per-attempt clock migration 0072's trigger re-stamps on
+// every entry into dispatched, so a re-dispatch that returns to pending
+// without a retry bump is still a new episode.
+func ChildDispatchStallEpisode(st *run.Stage) (string, bool) {
+	if st == nil || (st.State != run.StageStatePending && st.State != run.StageStateAwaitingHostDispatch) {
+		return "", false
+	}
+	dispatched := "never"
+	if st.DispatchedAt != nil {
+		dispatched = st.DispatchedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("%s/%d/%s", st.ID, st.SelfRetryCount, dispatched), true
 }
 
 // pageClassEvents projects the page-class events out of the run's audit
@@ -211,6 +276,19 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				kind:     "acceptance_awaiting_operator_dispatch",
 				message:  "🔁 A fix-up push re-opened the acceptance stage and no dispatcher will run it — dispatch acceptance against the new head.",
 			})
+		case "stage_failed_awaiting_operator":
+			// #5497 (server.CategoryStageFailedAwaitingOperator): the stall
+			// watch found a failed stage with no operator or driver act past its
+			// threshold. Pings-only, like acceptance_reopen_awaiting_operator.
+			if ev, ok := stallPageEvent(e, pageKindFailedStageStalled, stages); ok {
+				out = append(out, ev)
+			}
+		case "child_dispatch_awaiting_operator":
+			// #5497 (server.CategoryChildDispatchAwaitingOperator): the stall
+			// watch found a dispatchable decomposition child nobody dispatched.
+			if ev, ok := stallPageEvent(e, pageKindChildDispatchStalled, stages); ok {
+				out = append(out, ev)
+			}
 		case "ci_failure_retry_dispatched":
 			out = append(out, pageEvent{
 				sequence: e.Sequence,
@@ -266,9 +344,204 @@ func PageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
 	return out
 }
 
+// UnresolvedPageClassEventKinds returns the KIND tokens firePings would post
+// before its per-sequence dedup: the projected events pageEventResolved does
+// not suppress. Like PageClassEventKinds it exposes only the kind tokens. The
+// run state is not consulted (see UnresolvedPageClassEventKindsForRun).
+//
+// Added for #5497: the stall-watch writer lives in backend/internal/server, so
+// its re-entry tests feed the PERSISTED chain and the CURRENT stages here to
+// prove an ended episode's row would not post.
+func UnresolvedPageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
+	return UnresolvedPageClassEventKindsForRun(nil, entries, stages)
+}
+
+// UnresolvedPageClassEventKindsForRun is UnresolvedPageClassEventKinds with the
+// run row, so the run-state arm of pageEventResolved (a cancelled run
+// resolves a stall page) applies too. A nil run skips that arm. The parent
+// arm is not applied (no parent row is passed).
+func UnresolvedPageClassEventKindsForRun(r *run.Run, entries []*audit.Entry, stages []*run.Stage) []string {
+	events := pageClassEvents(entries, stages)
+	out := make([]string, 0, len(events))
+	for _, ev := range events {
+		if pageEventResolved(ev, entries, stages, r, nil) {
+			continue
+		}
+		out = append(out, ev.kind)
+	}
+	return out
+}
+
+// stallPageEvent builds the page for a stall-watch row (#5497). It emits an
+// event only when the payload decodes to a stage_id that parses as a UUID and
+// a non-empty episode_key. The message is built ONLY from server-owned text: a
+// fixed lead per kind, the stage TYPE read from the matching live stage (never
+// from the payload), the next action only when it is in the closed
+// stallNextActions set, and for the child kind the parent run id only when
+// next_action_target parses as a UUID (rendered in canonical form). The
+// payload's reason, quiet_since and every other string never reach the body.
+func stallPageEvent(e *audit.Entry, kind string, stages []*run.Stage) (pageEvent, bool) {
+	if len(e.Payload) == 0 {
+		return pageEvent{}, false
+	}
+	var p struct {
+		StageID          string `json:"stage_id"`
+		EpisodeKey       string `json:"episode_key"`
+		NextAction       string `json:"next_action"`
+		NextActionTarget string `json:"next_action_target"`
+	}
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		return pageEvent{}, false
+	}
+	stageID, err := uuid.Parse(p.StageID)
+	if err != nil || p.EpisodeKey == "" {
+		return pageEvent{}, false
+	}
+	action := ""
+	if _, ok := stallNextActions[p.NextAction]; ok {
+		action = p.NextAction
+	}
+	var msg string
+	switch kind {
+	case pageKindFailedStageStalled:
+		lead := "⏳ A failed stage"
+		if t := stallStageTypeLabel(stages, stageID); t != "" {
+			lead = "⏳ A failed " + t + " stage"
+		}
+		msg = lead + " has had no operator or driver action past the stall threshold"
+		if action != "" {
+			msg += " — run `" + action + "` to recover it."
+		} else {
+			msg += " — open the run for the remedy."
+		}
+	default:
+		msg = "⏳ A decomposition child's implement stage is dispatchable and has not been dispatched past the stall threshold"
+		parent, perr := uuid.Parse(p.NextActionTarget)
+		switch {
+		case action != "" && perr == nil:
+			msg += " — run `" + action + "` on parent run " + parent.String() + "."
+		case action != "":
+			msg += " — run `" + action + "` on its parent run."
+		default:
+			msg += " — open the run for the remedy."
+		}
+	}
+	return pageEvent{
+		sequence:   e.Sequence,
+		kind:       kind,
+		message:    msg,
+		stageID:    stageID,
+		episodeKey: p.EpisodeKey,
+		nextAction: action,
+	}, true
+}
+
+// stallStageTypeLabel returns the closed-set type of the live stage with id,
+// or "" when it is absent or not a known type.
+func stallStageTypeLabel(stages []*run.Stage, id uuid.UUID) string {
+	st := stageByID(stages, id)
+	if st == nil {
+		return ""
+	}
+	switch st.Type {
+	case run.StageTypePlan, run.StageTypeImplement, run.StageTypeReview,
+		run.StageTypeDeploy, run.StageTypeAcceptance:
+		return string(st.Type)
+	default:
+		return ""
+	}
+}
+
+// stageByID returns the stage with id, or nil.
+func stageByID(stages []*run.Stage, id uuid.UUID) *run.Stage {
+	for _, st := range stages {
+		if st != nil && st.ID == id {
+			return st
+		}
+	}
+	return nil
+}
+
+// stallPageResolved is the resolution arm for both stall kinds (#5497). The
+// page is resolved when the named stage is absent, when its condition has
+// ended (the episode helper returns !ok), when the stage's CURRENT episode
+// differs from the row's (a later episode, which the stall watch pages afresh
+// only once it is itself past the threshold), or when the run state puts the
+// remedy out of reach. Stage stamps are unchanged by TransitionRun, so the run
+// state is read separately: a failed-stage page is resolved on a cancelled or
+// succeeded run (neither can be retried or revived), and a child-dispatch
+// page on any terminal run (the child can no longer be dispatched). A nil run
+// skips the run-state arm.
+//
+// The parent arm reads what the writer reads: the server withholds a
+// fishhawk_resume_run page, and every child-dispatch page, under a terminal
+// decomposition parent, so a row written while the parent was live resolves
+// once the parent is terminal (the child's own stamps and state unchanged). A
+// nil parent skips that arm; stallParentMemo loads it only when this arm
+// needs it. Supersession is not re-read here (stallwatch README § Residuals).
+// Episode identity only moves forward and a terminal parent stays terminal,
+// so a resolved row stays resolved.
+func stallPageResolved(ev pageEvent, stages []*run.Stage, r, parent *run.Run) bool {
+	st := stageByID(stages, ev.stageID)
+	if st == nil {
+		return true
+	}
+	if stallResolutionReadsParent(ev) && parent != nil && parent.State.IsTerminal() {
+		return true
+	}
+	var key string
+	var ok bool
+	switch ev.kind {
+	case pageKindFailedStageStalled:
+		key, ok = FailedStageStallEpisode(st)
+		if r != nil && (r.State == run.StateCancelled || r.State == run.StateSucceeded) {
+			return true
+		}
+	default:
+		key, ok = ChildDispatchStallEpisode(st)
+		if r != nil && r.State.IsTerminal() {
+			return true
+		}
+	}
+	return !ok || key != ev.episodeKey
+}
+
+// stallResolutionReadsParent reports whether a stall page's resolution reads
+// the decomposition parent's state: a child-dispatch page (its remedy runs on
+// the parent) and a fishhawk_resume_run page (resume re-drives the child
+// under its live parent). It mirrors the server writer's parent checks.
+func stallResolutionReadsParent(ev pageEvent) bool {
+	return ev.kind == pageKindChildDispatchStalled ||
+		(ev.kind == pageKindFailedStageStalled && ev.nextAction == "fishhawk_resume_run")
+}
+
+// stallParentMemo loads a decomposition child's parent row at most once per
+// fire, and only when an unresolved stall page's resolution reads it
+// (stallResolutionReadsParent). A non-child run, or an event that does not
+// read the parent, returns nil with no read.
+type stallParentMemo struct {
+	runs   run.Repository
+	r      *run.Run
+	loaded bool
+	parent *run.Run
+}
+
+func (m *stallParentMemo) get(ctx context.Context, ev pageEvent) (*run.Run, error) {
+	if m.loaded || m.runs == nil || m.r == nil || m.r.DecomposedFrom == nil || !stallResolutionReadsParent(ev) {
+		return m.parent, nil
+	}
+	p, err := m.runs.GetRun(ctx, *m.r.DecomposedFrom)
+	if err != nil {
+		return nil, err
+	}
+	m.parent, m.loaded = p, true
+	return p, nil
+}
+
 // pageEventResolved reports whether a resolvable page event (a reviewer
-// reject, or the #5308 acceptance dispatch page) has already been resolved by
-// a LATER audit entry, in which case firePings
+// reject, the #5308 acceptance dispatch page, or a #5497 stall page) has
+// already been resolved by a LATER audit entry or, for a stall page, by the
+// end of its episode, in which case firePings
 // records the dedup row but SKIPS the actual comment: the page would arrive
 // stale (the operator has already acted on the concern). This matters for
 // the new immediate-dispatch path (#1786) — under the old batched path the
@@ -276,8 +549,8 @@ func PageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
 // resolved it, whereas an immediate ping could still fire moments before
 // the resolving entry lands on a later re-render.
 //
-// Only the reviewer-reject kinds and the #5308 acceptance dispatch page are
-// resolvable; every other page class (a must_page_human park, a CI failure, an
+// Only the reviewer-reject kinds, the #5308 acceptance dispatch page and the
+// two #5497 stall kinds are resolvable; every other page class (a must_page_human park, a CI failure, an
 // acceptance triage page, either crew escalation kind) always pages and returns
 // false.
 //
@@ -290,8 +563,20 @@ func PageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
 //     acceptance_dispatched (the operator dispatched acceptance) OR a later
 //     acceptance_outcome_recorded (a verdict or short-circuit landed), so a
 //     late ping cannot announce a wait that has already ended.
-func pageEventResolved(ev pageEvent, entries []*audit.Entry) bool {
+//   - failed_stage_stalled and child_dispatch_stalled (#5497) — resolved by
+//     stallPageResolved over the CURRENT stages, run row and parent row: the
+//     episode the row names has ended, or the run can no longer take the
+//     named remedy.
+//
+// stages and r are the caller's already-loaded stage list and run row (both
+// firePings and PushChannel.firePushes have them); parent is the
+// decomposition parent from stallParentMemo, nil when not read. Only the
+// stall arm reads them; a nil r skips its run-state check and a nil parent
+// its parent check.
+func pageEventResolved(ev pageEvent, entries []*audit.Entry, stages []*run.Stage, r, parent *run.Run) bool {
 	switch ev.kind {
+	case pageKindFailedStageStalled, pageKindChildDispatchStalled:
+		return stallPageResolved(ev, stages, r, parent)
 	case "plan_review_rejected":
 		return hasLaterCategory(entries, ev.sequence, "approval_submitted")
 	case "implement_review_rejected":
@@ -560,15 +845,22 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 	if err != nil {
 		return fmt.Errorf("issuecomment: load pings: %w", err)
 	}
+	parents := &stallParentMemo{runs: n.runs, r: ctxv.run}
 	for _, ev := range events {
 		if _, done := pinged[ev.sequence]; done {
 			continue
+		}
+		// A stall page's parent arm (#5497) needs the parent row; a read
+		// error posts nothing and records nothing, so the next fire retries.
+		parent, err := parents.get(ctx, ev)
+		if err != nil {
+			return fmt.Errorf("issuecomment: load decomposition parent: %w", err)
 		}
 		// A reviewer-reject page the operator has already arbitrated is
 		// stale: record the dedup row so it never fires later, but skip the
 		// comment (#1786). The source-Sequence dedup gate above is unchanged,
 		// so a ping already recorded under the old batched path stays deduped.
-		if pageEventResolved(ev, entries) {
+		if pageEventResolved(ev, entries, stages, ctxv.run, parent) {
 			if err := n.appendPingAudit(ctx, ctxv.run.ID, ev); err != nil {
 				return err
 			}

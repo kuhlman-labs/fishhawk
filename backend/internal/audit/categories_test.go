@@ -184,6 +184,18 @@ func TestKnownCategories_AcceptanceReopenAwaitingOperator(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_StallWatchPages pins the two #5497 stall-watch page
+// categories: server/stall_watch.go and server/stall_watch_children.go append
+// them, and an unregistered category would redden
+// TestKnownCategoriesCoversEmittedCategories and be un-awaitable.
+func TestKnownCategories_StallWatchPages(t *testing.T) {
+	for _, c := range []string{"stage_failed_awaiting_operator", "child_dispatch_awaiting_operator"} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
+	}
+}
+
 // TestKnownCategories_EscalationFired registers the E53.4 / #2227 category so
 // an operator can await it. An unregistered category is an un-awaitable audit
 // stream, which would leave "the operator sees why a gate got stricter" only

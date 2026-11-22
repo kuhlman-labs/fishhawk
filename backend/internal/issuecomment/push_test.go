@@ -677,6 +677,100 @@ func TestPushChannel_ResolvedRejectClaimedNotSent(t *testing.T) {
 	}
 }
 
+// H1 (#5497): firePushes passes its already-loaded stages and run row to
+// pageEventResolved, so a stall page whose episode ended (the stage was
+// retried and re-failed) is claimed suppressed=resolved and never enqueued,
+// while the same row against the live episode is delivered.
+func TestPushChannel_ResolvedStallPageClaimedNotSent(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		refail     bool
+		wantSent   int
+		suppressed any
+	}{
+		{"live episode delivers", false, 1, nil},
+		{"ended episode is suppressed", true, 0, "resolved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &recordingSink{name: "count"}
+			h := newPushHarness(t, pushnotify.Options{}, sink)
+			c := run.FailureC
+			ended := pushT0
+			st := &run.Stage{ID: uuid.New(), RunID: h.runID, Type: run.StageTypeImplement, State: run.StageStateFailed,
+				FailureCategory: &c, EndedAt: &ended}
+			key, _ := FailedStageStallEpisode(st)
+			h.au.seed(h.runID, &st.ID, "stage_failed_awaiting_operator", pushT0.Add(time.Minute), map[string]any{
+				"stage_id": st.ID.String(), "episode_key": key, "next_action": "fishhawk_retry_stage",
+			})
+			if tc.refail {
+				later := pushT0.Add(time.Hour)
+				st.EndedAt = &later
+				st.SelfRetryCount = 1
+			}
+			h.runs.stages[h.runID] = []*run.Stage{st}
+			_ = h.ch.NotifyPageClassForRun(context.Background(), h.runID)
+			h.drain(t)
+			if c := sink.count(); c != tc.wantSent {
+				t.Errorf("deliveries = %d, want %d", c, tc.wantSent)
+			}
+			rows := h.rows(t, CategoryPushNotificationSent)
+			if len(rows) != 1 || rows[0]["suppressed"] != tc.suppressed || rows[0]["event"] != "failed_stage_stalled" {
+				t.Errorf("claim rows = %v, want one failed_stage_stalled claim with suppressed=%v", rows, tc.suppressed)
+			}
+		})
+	}
+}
+
+// Concern 986dc02f (M4): firePushes reads the decomposition parent for a
+// child-dispatch stall page. With the child's state and stage stamps
+// unchanged, a terminal parent claims the page suppressed=resolved and
+// enqueues nothing; a live parent delivers it.
+func TestPushChannel_StallPageUnderTerminalParentClaimedNotSent(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		parent     run.State
+		unreadable bool
+		wantSent   int
+		wantClaims int
+		suppressed any
+	}{
+		{"live parent delivers", run.StateRunning, false, 1, 1, nil},
+		{"terminal parent is suppressed", run.StateCancelled, false, 0, 1, "resolved"},
+		// A parent read error claims and sends nothing (fail toward silence).
+		{"unreadable parent sends and claims nothing", run.StateRunning, true, 0, 0, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &recordingSink{name: "count"}
+			h := newPushHarness(t, pushnotify.Options{}, sink)
+			parentID := uuid.New()
+			if !tc.unreadable {
+				h.runs.runs[parentID] = &run.Run{ID: parentID, State: tc.parent}
+			}
+			h.runs.runs[h.runID].State = run.StateRunning
+			h.runs.runs[h.runID].DecomposedFrom = &parentID
+			st := &run.Stage{ID: uuid.New(), RunID: h.runID, Type: run.StageTypeImplement, State: run.StageStatePending}
+			key, _ := ChildDispatchStallEpisode(st)
+			h.au.seed(h.runID, &st.ID, "child_dispatch_awaiting_operator", pushT0.Add(time.Minute), map[string]any{
+				"stage_id": st.ID.String(), "episode_key": key, "next_action": "fishhawk_run_children",
+				"next_action_target": parentID.String(),
+			})
+			h.runs.stages[h.runID] = []*run.Stage{st}
+			_ = h.ch.NotifyPageClassForRun(context.Background(), h.runID)
+			h.drain(t)
+			if c := sink.count(); c != tc.wantSent {
+				t.Errorf("deliveries = %d, want %d", c, tc.wantSent)
+			}
+			rows := h.rows(t, CategoryPushNotificationSent)
+			if len(rows) != tc.wantClaims {
+				t.Fatalf("claim rows = %v, want %d", rows, tc.wantClaims)
+			}
+			if tc.wantClaims == 1 && (rows[0]["suppressed"] != tc.suppressed || rows[0]["event"] != "child_dispatch_stalled") {
+				t.Errorf("claim rows = %v, want one child_dispatch_stalled claim with suppressed=%v", rows, tc.suppressed)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------
 // Outcome recording (constraint 3).
 // ---------------------------------------------------------------------

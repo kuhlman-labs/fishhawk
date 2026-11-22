@@ -95,6 +95,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stallwatch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/userreport"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
@@ -1999,6 +2000,19 @@ func runServe(args []string, logSink io.Writer) int {
 	dispatchWatchdogInterval := fs.Duration("dispatch-watchdog-interval",
 		60*time.Second,
 		"dispatch watchdog scan interval")
+	// Stall watch (#5497): page-only, beside the dispatch watchdog's knobs.
+	enableStallWatch := fs.Bool("enable-stall-watch",
+		envOr("FISHHAWKD_ENABLE_STALL_WATCH", "false") == "true",
+		"start the stall watch ticker (#5497); pages the operator when a failed stage, or a dispatchable decomposition child, has seen no operator or driver act past --stall-watch-threshold. Page-only: it never retries, revives or dispatches. Off by default")
+	stallWatchThreshold := fs.Duration("stall-watch-threshold",
+		stallwatch.DefaultThreshold,
+		"how long a failed stage or an undispatched decomposition child may go with no operator or driver act before the stall watch pages")
+	stallWatchInterval := fs.Duration("stall-watch-interval",
+		stallwatch.DefaultInterval,
+		"stall watch scan interval")
+	stallWatchLookback := fs.Duration("stall-watch-lookback",
+		stallwatch.DefaultLookback,
+		"how far back the stall watch scans terminal-failed runs, by created_at and failure time; must be at least --stall-watch-threshold")
 	enableReactionPoller := fs.Bool("enable-reaction-poller",
 		envOr("FISHHAWKD_ENABLE_REACTION_POLLER", "false") == "true",
 		"start the reaction-polling worker (#360); polls Fishhawk plan comments for approval-shaped reactions GitHub doesn't deliver via webhooks. Off by default — only useful when there's a GitHub App + audit repo wired")
@@ -2791,6 +2805,16 @@ func runServe(args []string, logSink io.Writer) int {
 	if *enableDispatchWatchdog {
 		if err := dispatchWatchdogCapabilityError(cfg.RunRepo); err != nil {
 			logger.Error("dispatch watchdog capability pre-check refused startup", slog.String("error", err.Error()))
+			return exitFailure
+		}
+	}
+
+	// Stall watch config pre-check (#5497): a degenerate threshold, interval
+	// or lookback refuses to boot rather than run a never- or always-firing
+	// watch.
+	if *enableStallWatch {
+		if err := stallWatchConfigError(*stallWatchThreshold, *stallWatchInterval, *stallWatchLookback); err != nil {
+			logger.Error("stall watch config pre-check refused startup", slog.String("error", err.Error()))
 			return exitFailure
 		}
 	}
@@ -3832,6 +3856,32 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Info("dispatch watchdog started",
 				slog.Duration("interval", *dispatchWatchdogInterval),
 				slog.Duration("timeout", *dispatchWatchdogTimeout))
+		}
+	}
+
+	// Stall watch (#5497): page-only. Same off-by-default and
+	// warn-and-skip posture as the dispatch watchdog.
+	if *enableStallWatch {
+		if cfg.RunRepo == nil || cfg.AuditRepo == nil {
+			logger.Warn("--enable-stall-watch set but RunRepo or AuditRepo unconfigured; ticker not started")
+		} else {
+			ticker := &stallwatch.Ticker{
+				FailedStages: stallWatchScanner(srv.ScanFailedStageStalls),
+				Children:     stallWatchScanner(srv.ScanUndispatchedChildStalls),
+				Threshold:    *stallWatchThreshold,
+				Lookback:     *stallWatchLookback,
+				Interval:     *stallWatchInterval,
+				Logger:       logger,
+			}
+			go func() {
+				if err := ticker.Run(ctx); err != nil {
+					logger.Error("stall watch exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("stall watch started",
+				slog.Duration("interval", *stallWatchInterval),
+				slog.Duration("threshold", *stallWatchThreshold),
+				slog.Duration("lookback", *stallWatchLookback))
 		}
 	}
 
@@ -5612,4 +5662,21 @@ func crewResponderRegistry(index *decisionindex.Store) (server.CrewResponderRegi
 	return server.NewCrewResponderRegistry(map[crewmessage.Role]server.CrewResponder{
 		crewmessage.RoleHistorian: historian,
 	})
+}
+
+// stallWatchConfigError validates the --stall-watch-* durations through the
+// ticker's own Validate, so the boot refusal and the ticker agree (#5497).
+func stallWatchConfigError(threshold, interval, lookback time.Duration) error {
+	noop := func(context.Context, stallwatch.Params) (stallwatch.Report, error) { return stallwatch.Report{}, nil }
+	return (&stallwatch.Ticker{FailedStages: noop, Children: noop,
+		Threshold: threshold, Interval: interval, Lookback: lookback}).Validate()
+}
+
+// stallWatchScanner adapts a server stall scan to the stallwatch.Scanner
+// signature; stallwatch does not import server.
+func stallWatchScanner(scan func(context.Context, server.StallScanParams) (server.StallScanReport, error)) stallwatch.Scanner {
+	return func(ctx context.Context, p stallwatch.Params) (stallwatch.Report, error) {
+		r, err := scan(ctx, server.StallScanParams{Threshold: p.Threshold, Lookback: p.Lookback, Now: p.Now})
+		return stallwatch.Report{Scanned: r.Scanned, Paged: r.Paged, Skipped: r.Skipped}, err
+	}
 }
