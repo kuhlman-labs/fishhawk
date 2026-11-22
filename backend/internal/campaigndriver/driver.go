@@ -124,8 +124,11 @@ const (
 // driver and the operator item start (server/campaign_item_start.go) both
 // write it, with starter campaign_driver or operator. It is registered in
 // audit.KnownCategories as INTERNAL (actor system, not an issue-comment
-// surface) and is withheld from run-bound readers: its payload names
-// winner_run_id, another starter's run.
+// surface) and is intended WITHHELD from run-bound readers, because its
+// payload names winner_run_id, another starter's run. The global feed's
+// interim run-bound deny-list (server/reads.go
+// withholdScopeOverlapFromRunBound) does not yet name it; the ADR-106
+// registry-flag follow-up (E89 #4537) owns the withhold.
 const CategoryCampaignItemRunAbandoned = "campaign_item_run_abandoned"
 
 // The campaign_item_run_abandoned reasons: why a minted run ended unlinked.
@@ -1185,9 +1188,13 @@ const (
 //     does not cover the start plus cleanup budgets is released and skipped
 //     rather than minted (X4).
 //  2. The start runs on context.WithTimeout(context.WithoutCancel(ctx),
-//     StartBudget), so a shutdown mid-start completes or cleans up rather than
-//     leaving a half-minted marked run (a bounded shutdown delay of at most
-//     StartBudget + CleanupBudget).
+//     StartBudget), so a cancelled tick context does not abort it halfway.
+//     The detach is best-effort up to process exit: serve.go runs the ticker
+//     on an unjoined goroutine and nothing waits for an in-flight start at
+//     shutdown, so a process exit mid-start (for example between the CreateRun
+//     commit and the claimed link) kills it with no cleanup, leaving an
+//     unlinked marked run and a claim that blocks the item until its TTL. See
+//     the README's U4c residuals.
 //  3. Mint. A *StartIncompleteError abandons the run (start_incomplete); a
 //     *StartRefusal releases the claim and ends the campaign's pass; any other
 //     error, or a nil run, releases the claim and skips.

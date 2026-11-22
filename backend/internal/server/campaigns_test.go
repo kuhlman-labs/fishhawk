@@ -6557,6 +6557,64 @@ func TestStartCampaignItemRun_LinkFails_500(t *testing.T) {
 	}
 }
 
+// TestStartCampaignItemRun_ClaimError_500_MintsNothing covers the claim's
+// default arm in startClaimedCampaignItemRun (#5266): a claim error that is
+// neither a conflict nor ErrNotFound is a 500 internal_error, and the start
+// stops before the mint and the link.
+func TestStartCampaignItemRun_ClaimError_500_MintsNothing(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	crepo.claimErr = errInjected
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusInternalServerError || decodeCampaignError(t, w) != "internal_error" {
+		t.Fatalf("status/code = %d/%s, want 500 internal_error (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	if msg := decodeCampaignErrorMessage(t, w); msg != "claim campaign item start failed" {
+		t.Errorf("message = %q, want the claim-failure message", msg)
+	}
+	if crepo.claimCalls != 1 {
+		t.Errorf("claimCalls = %d, want 1 (the claim arm, not a pre-claim refusal)", crepo.claimCalls)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0 on a claim error", n)
+	}
+	if crepo.linkCalls != 0 {
+		t.Errorf("linkCalls = %d, want 0 on a claim error", crepo.linkCalls)
+	}
+	if it := crepo.itemsByCmp[c.ID][0]; it.RunID != nil || it.State != campaign.ItemStatePending {
+		t.Errorf("item = {run_id:%v state:%s}, want unlinked + pending", it.RunID, it.State)
+	}
+}
+
+// TestStartCampaignItemRun_ClaimItemNotFound_404_MintsNothing covers the
+// claim's campaign.ErrNotFound arm (#5266): the item the gate found is gone
+// when the claim locks it, so the start is a 404 campaign_item_not_found that
+// mints nothing. claimCalls proves the claim arm answered, not the gate.
+func TestStartCampaignItemRun_ClaimItemNotFound_404_MintsNothing(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	crepo.claimErr = campaign.ErrNotFound
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusNotFound || decodeCampaignError(t, w) != "campaign_item_not_found" {
+		t.Fatalf("status/code = %d/%s, want 404 campaign_item_not_found (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	if crepo.claimCalls != 1 {
+		t.Errorf("claimCalls = %d, want 1 (the claim arm, not the gate's 404)", crepo.claimCalls)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0 on a missing claimed item", n)
+	}
+	if crepo.linkCalls != 0 {
+		t.Errorf("linkCalls = %d, want 0 on a missing claimed item", crepo.linkCalls)
+	}
+}
+
 // TestStartCampaignItemRun_TransitionInvalid_409 covers the start handler's
 // errors.As(err, &inv) arm: an InvalidTransitionError from the running
 // transition maps to 409 invalid_transition (not the generic 500) and STILL
@@ -11849,6 +11907,60 @@ func TestCreateCampaign_DriverRuns_SweepsQueuedItemsToUpNext(t *testing.T) {
 	if n := aud.count(categoryCampaignAdvanced); n != 1 {
 		t.Errorf("campaign_advanced = %d, want 1 (pending -> running at create)", n)
 	}
+}
+
+// TestCreateCampaign_DriverRuns_ItemListError_StillOpensRunning covers
+// openCampaignForDriver's item-list failure arm (#5266): the open has already
+// committed, so the 201 reports the running campaign and only the board sweep
+// is skipped. The repo returns a SNAPSHOT from CreateCampaign, as Postgres
+// does, so the 201 body reads the opened row and not an alias of the created
+// one that the fake's transition would mutate in place.
+func TestCreateCampaign_DriverRuns_ItemListError_StillOpensRunning(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	p := registerEpicBoardProvider(t, smallDAG())
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: snapshotCreateCampaignRepo{crepo}, AuditRepo: aud, GitHub: recordingInstallGitHubClient(t, 7788, &installRecorder{}),
+		CampaignAutoStartRunnerKind: run.RunnerKindLocal})
+	// The create's only item list is the create-open sweep's.
+	crepo.itemsErrOnCall = 1
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	s.waitCampaignBoardSweeps()
+	if crepo.itemsCalls != 1 {
+		t.Fatalf("itemsCalls = %d, want 1 (the injected error must hit the create-open sweep list)", crepo.itemsCalls)
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.State != string(campaign.StateRunning) {
+		t.Errorf("created state = %q, want running (the open committed before the list failed)", created.State)
+	}
+	if got := crepo.campaigns[created.ID].State; got != campaign.StateRunning {
+		t.Errorf("persisted state = %q, want running", got)
+	}
+	if n := p.moveCount(); n != 0 {
+		t.Errorf("board moves = %d, want 0 (the sweep is skipped on a list error)", n)
+	}
+	if n := aud.count(categoryCampaignAdvanced); n != 1 {
+		t.Errorf("campaign_advanced = %d, want 1 (pending -> running at create)", n)
+	}
+}
+
+// snapshotCreateCampaignRepo returns a copy from CreateCampaign, breaking the
+// fake's aliasing between the created campaign and its stored row.
+type snapshotCreateCampaignRepo struct{ *fakeCampaignRepo }
+
+func (r snapshotCreateCampaignRepo) CreateCampaign(ctx context.Context, p campaign.CreateCampaignParams) (*campaign.Campaign, error) {
+	c, err := r.fakeCampaignRepo.CreateCampaign(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	cp := *c
+	return &cp, nil
 }
 
 // TestStartCampaignItemRun_FirstStart_DoesNotWaitOnBoardSweep: the first
