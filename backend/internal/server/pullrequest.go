@@ -1924,12 +1924,21 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 	// commit. Invalidate + re-open the settled acceptance stage so the operator
 	// re-validates against the final commit rather than merging with stale
 	// evidence. No-op for a pre-acceptance fix-up (guarded inside).
-	s.reopenAcceptanceOnFixupPush(r.Context(), runID, pr.HeadSHA)
+	reopenedStageID, reopened := s.reopenAcceptanceOnFixupPush(r.Context(), runID, pr.HeadSHA)
 	// #4804: the deferred orchestrator advance fires only AFTER the re-open, so
 	// the walk reaches the re-opened acceptance as the next pending stage instead
 	// of walking a later review past it and stranding it pending. A no-op unless
 	// this report won a gateless edge.
 	advance()
+	// #5308: page the operator when the re-opened acceptance is left waiting on a
+	// dispatch no dispatcher will perform. The check runs AFTER the #4804 advance
+	// because only the post-advance stage state tells parked from dispatched from
+	// re-short-circuited. Idempotent: a re-delivered report is short-circuited by
+	// the (stage_id, head_sha) dedup, and a second re-open is refused, so reopened
+	// is false.
+	if reopened {
+		s.pageAcceptanceReopenAwaitingOperator(r.Context(), runID, reopenedStageID, pr.HeadSHA)
+	}
 
 	// #1682 AC3: re-post fishhawk_audit_complete for the NEW head. The local
 	// runner does not round-trip a GitHub `synchronize` webhook, so without

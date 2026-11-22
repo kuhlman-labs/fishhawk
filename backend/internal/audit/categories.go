@@ -436,10 +436,20 @@ import "sort"
 // text and are not withheld. This comment is an INTERIM registration under
 // ADR-106's existing audit-category mechanism, not ADR-106 registry option B;
 // all three take the mandatory run-bound flag when #4599 / E89 #4537 lands.
+// #5308 added acceptance_reopen_awaiting_operator, the stage-scoped system row
+// server/acceptance.go appends when a fix-up push re-opened a settled
+// acceptance stage that no dispatcher will run. It is a PAGE-CLASS marker
+// projected by issuecomment.pageClassEvents (pings-only: no activityCategories
+// entry, no Notifier method). It is INTENDED run-bound READABLE, because its
+// payload names only this run's own stage id, stage state, head SHA, runner
+// kind, auto_dispatch flag and a server-written reason, so
+// withholdScopeOverlapFromRunBound needs no entry for it. It takes the
+// mandatory run-bound flag when #4599 / E89 #4537 lands.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
 	"acceptance_recorded":                     {},
+	"acceptance_reopen_awaiting_operator":     {},
 	"acceptance_reopened":                     {},
 	"acceptance_scenario_regression":          {},
 	"acceptance_scenario_retirement_dropped":  {},
