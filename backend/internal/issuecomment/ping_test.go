@@ -140,6 +140,31 @@ func TestPageClassEvents_NoAdvisoryRejectArbitratedEvent(t *testing.T) {
 	}
 }
 
+// TestPageClassEvents_AcceptanceReopenAwaitingOperator pins the #5308
+// projection: one acceptance_reopen_awaiting_operator entry yields exactly one
+// acceptance_awaiting_operator_dispatch event at the entry's sequence, and the
+// acceptance_reopened row that precedes it on a real chain (the status-refresh
+// marker, not a page) yields none on its own.
+func TestPageClassEvents_AcceptanceReopenAwaitingOperator(t *testing.T) {
+	got := pageClassEvents([]*audit.Entry{
+		{Sequence: 20, Category: "acceptance_reopened"},
+		{Sequence: 21, Category: "acceptance_reopen_awaiting_operator"},
+	}, nil)
+	if len(got) != 1 {
+		t.Fatalf("events = %+v, want exactly one", got)
+	}
+	if got[0].kind != "acceptance_awaiting_operator_dispatch" || got[0].sequence != 21 {
+		t.Errorf("event = %+v, want acceptance_awaiting_operator_dispatch at sequence 21", got[0])
+	}
+	if !strings.Contains(got[0].message, "dispatch acceptance") {
+		t.Errorf("message %q does not tell the operator to dispatch acceptance", got[0].message)
+	}
+
+	if ev := pageClassEvents([]*audit.Entry{{Sequence: 20, Category: "acceptance_reopened"}}, nil); len(ev) != 0 {
+		t.Errorf("acceptance_reopened alone is not page-class; got %+v", ev)
+	}
+}
+
 // fixupEntry builds a stage_fixup_triggered audit entry (the implement-reject
 // resolver).
 func fixupEntry(seq int64) *audit.Entry {
@@ -153,6 +178,7 @@ func fixupEntry(seq int64) *audit.Entry {
 func TestPageEventResolved(t *testing.T) {
 	planReject := pageEvent{sequence: 11, kind: "plan_review_rejected"}
 	implReject := pageEvent{sequence: 11, kind: "implement_review_rejected"}
+	acceptanceAwaitingPage := pageEvent{sequence: 11, kind: "acceptance_awaiting_operator_dispatch"}
 
 	cases := []struct {
 		name    string
@@ -212,6 +238,33 @@ func TestPageEventResolved(t *testing.T) {
 			name:    "non-reviewer-reject kind never resolvable (always pages)",
 			ev:      pageEvent{sequence: 11, kind: "scope_amendment"},
 			entries: []*audit.Entry{approvalDecisionEntry(12, "approve"), fixupEntry(13)},
+			want:    false,
+		},
+		{
+			name:    "acceptance dispatch page resolved by a later acceptance_dispatched (#5308)",
+			ev:      acceptanceAwaitingPage,
+			entries: []*audit.Entry{{Sequence: 12, Category: "acceptance_dispatched"}},
+			want:    true,
+		},
+		{
+			name:    "acceptance dispatch page resolved by a later acceptance_outcome_recorded (#5308)",
+			ev:      acceptanceAwaitingPage,
+			entries: []*audit.Entry{{Sequence: 12, Category: "acceptance_outcome_recorded"}},
+			want:    true,
+		},
+		{
+			name: "acceptance dispatch page NOT resolved by an earlier or equal-sequence acceptance_dispatched (#5308)",
+			ev:   acceptanceAwaitingPage,
+			entries: []*audit.Entry{
+				{Sequence: 10, Category: "acceptance_dispatched"},
+				{Sequence: 11, Category: "acceptance_dispatched"},
+			},
+			want: false,
+		},
+		{
+			name:    "acceptance dispatch page NOT resolved by an unrelated later category (#5308)",
+			ev:      acceptanceAwaitingPage,
+			entries: []*audit.Entry{{Sequence: 12, Category: "fixup_pushed"}, fixupEntry(13), approvalDecisionEntry(14, "approve")},
 			want:    false,
 		},
 	}

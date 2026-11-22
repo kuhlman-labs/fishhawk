@@ -483,6 +483,46 @@ re-open then stranded the acceptance `pending` (the #4801 stall). Pinned by
 synthetic structural guards: `ReviewFirstOrder_OpensReviewGateAcceptanceWaits`,
 which is order-independent, and `GatedImplement_DoesNotAdvance`.
 
+**Operator page (#5308).** A fix-up re-open that no dispatcher will run used to
+raise no page-class signal. `succeedFixupPushStage` now calls
+`pageAcceptanceReopenAwaitingOperator` AFTER the #4804 advance, with the stage id
+`reopenAcceptanceOnFixupPush` returned, because only the post-advance stage state
+tells parked from dispatched from re-short-circuited. The pure predicate
+`acceptanceReopenAwaitsOperator` pages ONLY when the stage is
+`awaiting_host_dispatch` AND `hostDispatchKind(run)` is not `host_dispatcher`
+(the classification the campaign awaiting block uses, so the two cannot
+disagree). The outcomes: (1) a not-host-dispatched run (local, `auto_dispatch`
+off, or non-local) parked at `awaiting_host_dispatch` PAGES: one stage-scoped
+`acceptance_reopen_awaiting_operator` row, then `notifyPageClass`, projected by
+`issuecomment.pageClassEvents` to `acceptance_awaiting_operator_dispatch`.
+(2) An `auto_dispatch` local run does not page: the host dispatcher spawns the
+parked stage (#5298). (3) A github_actions run whose advance dispatched
+acceptance does not page. (4) A plan that re-short-circuited acceptance to
+`succeeded` does not page. (5) A fix-up that re-opened nothing does not page. A
+`pending` acceptance never pages either: it is HELD behind something else, not
+waiting on an operator, whether behind a gated implement edge, the
+decomposed-parent fan-in hold (released by the parent's verify-only IMPLEMENT
+pass) or an open review gate. A later `acceptance_dispatched` or
+`acceptance_outcome_recorded` resolves the page (`pageEventResolved`), so a
+not-yet-posted ping is recorded-and-skipped rather than posted stale. The row is
+best-effort. A failed `GetRun` / `GetStage` read fails toward NO page (an
+unreadable run gives no basis to claim no dispatcher will run it), a failed
+append skips the ping, and either way the page is LOST PERMANENTLY: nothing
+re-derives it later. The fallback is the `next_actions` acceptance-dispatch lead
+and the status refresh, which still show the re-opened acceptance. SCOPE: this
+covers only the not-host-dispatched half of the issue. An `auto_dispatch` local
+run whose dispatcher refuses or is not running is invisible to the server and is
+left to the #5500 awaiting-block overlay
+(`backend/internal/mcpserver/host_dispatch_overlay.go`). Pinned by
+`pullrequest_test.go`'s `TestShipPullRequest_FixupPushAfterSettledAcceptance_PagesOperatorWhenNoDispatcher`
+(one row naming the acceptance stage, the real `PageClassEventKinds` projection
+and exactly one `notifyPageClass` after the append), `_NoPageWhenDispatcherOwns`
+(zero rows, no page kind and no ping on each of the auto_dispatch, dispatched,
+short-circuit, gated-implement, fan-in-hold and review-first shapes) and
+`TestPageAcceptanceReopenAwaitingOperator_BestEffortBranches`, plus
+`issuecomment`'s `TestPageClassEvents_AcceptanceReopenAwaitingOperator` and
+`TestPageEventResolved`.
+
 Two operator-visible consequences follow in an acceptance-before-review
 workflow. (1) After a fix-up push, a follow-on classic fix-up is refused by
 `run.blockingAcceptanceStage` (`fixup_not_applicable`) until acceptance is
@@ -515,7 +555,9 @@ below.
 - A `fixup_pushed` report that finds the implement stage already out of
   `running` takes no edge, so it fires no advance (#4804). A re-open on that path
   still leaves acceptance `pending`, and the #4801 `next_actions` acceptance
-  dispatch lead is still the remedy.
+  dispatch lead is still the remedy. It raises no #5308 page either: that page
+  fires only for a post-advance `awaiting_host_dispatch` park, and a `pending`
+  acceptance counts as held, not parked.
 - The forced held-check republish inside `reopenAcceptanceOnFixupPush` computes
   its title while the stage is still `pending`. The unforced republish after the
   #4804 advance dedups on (head, state), so the title can name `pending` while

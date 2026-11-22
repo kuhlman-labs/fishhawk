@@ -43,6 +43,11 @@ import (
 //     (E77.6 / #3740). Both page at EVERY autonomy tier, `low` included,
 //     because the refusal is keyed to server.PageEventCrewEscalation rather
 //     than to a `page_human_on` list.
+//   - a fix-up push re-opened the settled acceptance stage and no dispatcher
+//     will run it (#5308): the server wrote acceptance_reopen_awaiting_operator
+//     after the orchestrator advance left the stage parked on a run that is
+//     not host-dispatched. Resolved by a later acceptance_dispatched or
+//     acceptance_outcome_recorded (pageEventResolved).
 //
 // Dedup is per source audit event: each ping records the originating
 // entry's audit Sequence on CategoryAnchorPingPosted, so a re-render of
@@ -190,6 +195,22 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 					message:  "🛑 A crew role escalated a disagreement to the captain — your ruling is needed before it binds anything.",
 				})
 			}
+		case "acceptance_reopen_awaiting_operator":
+			// #5308 (server.CategoryAcceptanceReopenAwaitingOperator): a fix-up
+			// push re-opened a settled acceptance stage and, after the
+			// orchestrator advance, no dispatcher will run it, so it waits on an
+			// operator dispatch. The server writes the row only on that case
+			// (never for an auto_dispatch local run, a dispatched stage or a
+			// short-circuit), so the projection needs no further gate. Pings-only:
+			// like crew_message_sent above it has no activityCategories entry, so
+			// the anchor timeline stays quiet. The kind token differs from the
+			// category so each case label in this file is unique; the literal is
+			// duplicated here because this package cannot import server.
+			out = append(out, pageEvent{
+				sequence: e.Sequence,
+				kind:     "acceptance_awaiting_operator_dispatch",
+				message:  "🔁 A fix-up push re-opened the acceptance stage and no dispatcher will run it — dispatch acceptance against the new head.",
+			})
 		case "ci_failure_retry_dispatched":
 			out = append(out, pageEvent{
 				sequence: e.Sequence,
@@ -245,8 +266,9 @@ func PageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
 	return out
 }
 
-// pageEventResolved reports whether a reviewer-reject page event has
-// already been resolved by a LATER audit entry, in which case firePings
+// pageEventResolved reports whether a resolvable page event (a reviewer
+// reject, or the #5308 acceptance dispatch page) has already been resolved by
+// a LATER audit entry, in which case firePings
 // records the dedup row but SKIPS the actual comment: the page would arrive
 // stale (the operator has already acted on the concern). This matters for
 // the new immediate-dispatch path (#1786) — under the old batched path the
@@ -254,15 +276,20 @@ func PageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
 // resolved it, whereas an immediate ping could still fire moments before
 // the resolving entry lands on a later re-render.
 //
-// Only reviewer-reject kinds are resolvable; every other page class (a
-// must_page_human park, a CI failure, an acceptance triage page, either crew
-// escalation kind) always pages and returns false.
+// Only the reviewer-reject kinds and the #5308 acceptance dispatch page are
+// resolvable; every other page class (a must_page_human park, a CI failure, an
+// acceptance triage page, either crew escalation kind) always pages and returns
+// false.
 //
 //   - plan_review_rejected — resolved by a later approval_submitted entry
 //     (the operator arbitrated the plan gate).
 //   - implement_review_rejected — resolved by a later stage_fixup_triggered
 //     (the operator routed the concern back to the agent) OR a later
 //     approval_submitted entry.
+//   - acceptance_awaiting_operator_dispatch (#5308) — resolved by a later
+//     acceptance_dispatched (the operator dispatched acceptance) OR a later
+//     acceptance_outcome_recorded (a verdict or short-circuit landed), so a
+//     late ping cannot announce a wait that has already ended.
 func pageEventResolved(ev pageEvent, entries []*audit.Entry) bool {
 	switch ev.kind {
 	case "plan_review_rejected":
@@ -270,6 +297,9 @@ func pageEventResolved(ev pageEvent, entries []*audit.Entry) bool {
 	case "implement_review_rejected":
 		return hasLaterCategory(entries, ev.sequence, "stage_fixup_triggered") ||
 			hasLaterCategory(entries, ev.sequence, "approval_submitted")
+	case "acceptance_awaiting_operator_dispatch":
+		return hasLaterCategory(entries, ev.sequence, "acceptance_dispatched") ||
+			hasLaterCategory(entries, ev.sequence, "acceptance_outcome_recorded")
 	default:
 		return false
 	}
