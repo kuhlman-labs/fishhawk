@@ -2583,7 +2583,11 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// NON-TERMINAL run only; the list route pays no per-row read. Best-effort:
 	// a resolver error warn-logs and sets dispatch_hold_unavailable rather
 	// than failing the read, because the host-dispatch marker re-checks the
-	// hold fail closed.
+	// hold fail closed. An INHERITED hold read by a run-bound mcp:run: caller
+	// withholds the ancestor's reason and held_by (emptied): that text lives
+	// on another run's chain, and the run-bound audit categories are readable
+	// as same-run payload only (audit/categories.go). The held state,
+	// held_run_id, held_at and audit_sequence stay.
 	if !got.State.IsTerminal() {
 		hold, herr := s.resolveRunDispatchHold(r.Context(), got)
 		if herr != nil {
@@ -2591,6 +2595,9 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 				"run_id", runID.String(), "error", herr.Error())
 			resp.DispatchHoldUnavailable = true
 		} else {
+			if hold != nil && hold.Inherited && strings.HasPrefix(IdentityFrom(r.Context()).Subject, "mcp:run:") {
+				hold.Reason, hold.HeldBy = "", ""
+			}
 			resp.DispatchHold = hold
 		}
 	}

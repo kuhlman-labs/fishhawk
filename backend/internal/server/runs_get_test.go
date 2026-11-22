@@ -4333,8 +4333,43 @@ func TestGetRun_DispatchHold(t *testing.T) {
 		c := f.childOf(p.ID)
 		f.aud.seed(t, p.ID, CategoryRunDispatchHoldSet, "parent hold")
 		resp, _ := get(t, f, c.ID)
-		if resp.DispatchHold == nil || !resp.DispatchHold.Inherited || resp.DispatchHold.HeldRunID != p.ID.String() {
+		if resp.DispatchHold == nil || !resp.DispatchHold.Inherited || resp.DispatchHold.HeldRunID != p.ID.String() ||
+			resp.DispatchHold.Reason != "parent hold" || resp.DispatchHold.HeldBy != "github:seed" {
 			t.Fatalf("dispatch_hold = %+v", resp.DispatchHold)
+		}
+	})
+	// A run-bound mcp:run: caller reading its own run: an INHERITED hold
+	// withholds the ancestor's reason and held_by (another run's chain); the
+	// held state and held_run_id stay. Its OWN hold keeps both (same-run).
+	t.Run("run-bound caller", func(t *testing.T) {
+		getAs := func(t *testing.T, f *runHoldFixture, id uuid.UUID) runResponse {
+			t.Helper()
+			req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+id.String(), nil)
+			req.SetPathValue("run_id", id.String())
+			req = withIdentity(req, Identity{Subject: "mcp:run:" + id.String(), TokenID: "tok-run", Scopes: []string{"read:runs"}})
+			w := httptest.NewRecorder()
+			f.s.handleGetRun(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("GET = %d %s", w.Code, w.Body.String())
+			}
+			var resp runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			return resp
+		}
+		f := newRunHoldFixture(t)
+		p := f.rr.seedRun()
+		c := f.childOf(p.ID)
+		f.aud.seed(t, p.ID, CategoryRunDispatchHoldSet, "parent hold")
+		resp := getAs(t, f, c.ID)
+		if h := resp.DispatchHold; h == nil || !h.Inherited || h.HeldRunID != p.ID.String() || h.Reason != "" || h.HeldBy != "" {
+			t.Fatalf("inherited dispatch_hold for a run-bound caller = %+v; want held, held_run_id %s, reason and held_by withheld", h, p.ID)
+		}
+		own := f.rr.seedRun()
+		f.aud.seed(t, own.ID, CategoryRunDispatchHoldSet, "own hold")
+		if h := getAs(t, f, own.ID).DispatchHold; h == nil || h.Inherited || h.Reason != "own hold" || h.HeldBy != "github:seed" {
+			t.Fatalf("own dispatch_hold for a run-bound caller = %+v; want reason and held_by kept", h)
 		}
 	})
 	t.Run("absent when unheld", func(t *testing.T) {

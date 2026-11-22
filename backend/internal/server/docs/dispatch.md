@@ -166,7 +166,10 @@ same tick its predecessor integrates.
   the explicit operator override, so every bypass is on the chain.
 - **Reads.** `GET /v0/runs/{run_id}` projects `dispatch_hold` (own or
   inherited) for a non-terminal run, or `dispatch_hold_unavailable` on a read
-  error (the read still answers 200; the marker re-checks fail closed). The
+  error (the read still answers 200; the marker re-checks fail closed). For a
+  run-bound `mcp:run:` caller an INHERITED hold's `reason` and `held_by` are
+  emptied: they come from another run's chain, and the hold's audit categories
+  are run-bound readable as same-run payload only. The
   campaign status `awaiting` block attaches it for a readable caller and reads
   `human`/`dispatch_held` for a block waiting on a dispatch or on its
   children; a running stage keeps `in_flight`.

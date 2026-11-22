@@ -2678,7 +2678,10 @@ components:
             ancestor's (`inherited: true`, at most 8 hops). Served by `GET
             /v0/runs/{run_id}` ONLY, for a non-terminal run; the list
             endpoint and a terminal run do no hold read. Omitted when the run
-            is not held. Set with `POST /v0/runs/{run_id}/dispatch-hold`.
+            is not held. Set with `POST /v0/runs/{run_id}/dispatch-hold`. For a
+            run-bound `mcp:run:` caller an INHERITED hold carries `reason` and
+            `held_by` as empty strings: they are another run's operator text
+            and actor.
         dispatch_hold_unavailable:
           type: boolean
           description: |

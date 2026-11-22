@@ -1859,3 +1859,40 @@ func TestHostDispatcher_DispatchHoldUnavailableRefusesStaleRespawn(t *testing.T)
 		})
 	}
 }
+
+// E110.50 / #5486 L(f): a hold set between the dispatcher's run read and its
+// marker POST reaches the dispatcher as a marker 409 run_dispatch_held whose
+// details carry the operator's reason. The recorded detail, and the overlay
+// next_step built from it, name the held run and carry no reason: the detail
+// is rebuilt from the hold's ids, not from the error text.
+func TestHostDispatcher_MarkerRunDispatchHeldDetailOmitsReason(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(nil)
+	parent := uuid.NewString()
+	h.b.marker = func(_, _ string) (int, string) {
+		return 409, fmt.Sprintf(`{"error":{"code":"run_dispatch_held","message":"held","details":{"held_run_id":%q,"inherited":true,"held_by":"github:operator","reason":%q}}}`,
+			parent, hdHoldReason)
+	}
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseRunDispatchHeld {
+		t.Fatalf("marker-held attempt = %+v; want run_dispatch_held, no spawn", o)
+	}
+	if h.b.count(isMarkerReq) != 1 {
+		t.Fatalf("marker POSTs = %d; want 1 (the hold landed after the run read)", h.b.count(isMarkerReq))
+	}
+	for _, want := range []string{parent, "inherited true", "github:operator", "fishhawk_hold_dispatch"} {
+		if !strings.Contains(o.Detail, want) {
+			t.Errorf("detail %q does not name %q", o.Detail, want)
+		}
+	}
+	if strings.Contains(o.Detail, hdHoldReason) {
+		t.Fatalf("detail %q embeds the operator's hold reason", o.Detail)
+	}
+	st := hdoStatus()
+	st.RunRefusals = map[string]hostDispatchRunRefusal{r.ID: {RunID: r.ID, StageID: r.Stages[0].ID, Code: o.Refusal,
+		Detail: boundHostDispatchText(o.Detail), FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow.Add(-10 * time.Second)}}
+	_, v := observeHostDispatch(hostDispatchProbe{found: true, dir: "/state", st: st}, r.ID, r.Stages[0].ID, hdoNow)
+	if !strings.Contains(v.NextStep, parent) || strings.Contains(v.NextStep, hdHoldReason) {
+		t.Fatalf("next_step %q; want the held run named and no hold reason", v.NextStep)
+	}
+}

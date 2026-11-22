@@ -404,6 +404,17 @@ func hdRunDispatchHeldDetail(hold *RunDispatchHold) string {
 		whose, boundHostDispatchText(hold.HeldRunID), hold.Inherited, boundHostDispatchText(hold.HeldBy), boundHostDispatchText(hold.HeldRunID))
 }
 
+// runDispatchHoldFromDetails reads a marker 409 run_dispatch_held refusal's
+// details into the fields hdRunDispatchHeldDetail renders (held_run_id,
+// inherited, held_by). It never reads details.reason.
+func runDispatchHoldFromDetails(details map[string]any) *RunDispatchHold {
+	hold := &RunDispatchHold{}
+	hold.HeldRunID, _ = details["held_run_id"].(string)
+	hold.Inherited, _ = details["inherited"].(bool)
+	hold.HeldBy, _ = details["held_by"].(string)
+	return hold
+}
+
 // hdLineageLockProbeFailedDetail is the refusal detail for an undecidable
 // lineage-lock probe; the probe error leads with its discriminator and remedy.
 func hdLineageLockProbeFailedDetail(err error) string {
@@ -728,6 +739,13 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		var ae *apiError
 		if errors.As(hderr, &ae) && ae.Code != "" {
 			code = ae.Code
+		}
+		if code == hdRefuseRunDispatchHeld {
+			// A hold set between the run read and this POST (E110.50 /
+			// #5486 L(f)). The 409's details carry the operator's free-text
+			// reason, which hderr.Error() would append, so the recorded
+			// detail is rebuilt from the hold's ids only.
+			return fail(code, hdRunDispatchHeldDetail(runDispatchHoldFromDetails(ae.Details)))
 		}
 		return fail(code, hderr.Error())
 	}

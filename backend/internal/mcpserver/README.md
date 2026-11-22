@@ -138,7 +138,12 @@ is benign, and neither sets `CampaignRefused`, so a held run charges no
 per-tick budget and spawns on the first tick after the clear. The refusal
 detail names the held run, `inherited`, `held_by` and the clear remedy; the
 hold `reason` is operator free text and appears only as the
-`run.dispatch_hold.reason` data field, never in a detail or next_step. The
+`run.dispatch_hold.reason` data field, never in a detail or next_step. A
+hold set after the run read reaches the dispatcher as a marker 409
+`run_dispatch_held`; that refusal comes after the gate admitted the attempt and
+the `run_auto_driven` act (`Held`), and its detail is rebuilt from the 409's
+ids, never from the error text that carries `details.reason`
+(`TestHostDispatcher_MarkerRunDispatchHeldDetailOmitsReason`). The
 backend marker enforces the same hold (409 `run_dispatch_held`) for every
 other spawner, so a queued slot waiter re-posting the marker stops on it
 (`TestSlotWaiter_StopsOnRunDispatchHeld`). Pinned by

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,14 +23,27 @@ import (
 // stamps every appended entry with its 1-based append index as Sequence (on
 // the append's return and on every category read), the way the real chain
 // orders entries, and can fail the hold categories' reads in isolation.
+// holdListFailAfter > 0 lets that many hold-category reads succeed and fails
+// every later one (the verb's post-act re-read). beforeAppend runs before
+// each verb append; appends are serialized so a concurrent append's Sequence
+// is its own.
 type holdAudit struct {
 	*auditFake
-	holdListErr error
+	holdListErr       error
+	holdListFailAfter int
+	holdReads         int
+	beforeAppend      func()
+	appendMu          sync.Mutex
 }
 
 func newHoldAudit() *holdAudit { return &holdAudit{auditFake: &auditFake{stampSequence: true}} }
 
 func (h *holdAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if h.beforeAppend != nil {
+		h.beforeAppend()
+	}
+	h.appendMu.Lock()
+	defer h.appendMu.Unlock()
 	e, err := h.auditFake.AppendChained(ctx, p)
 	if err != nil {
 		return nil, err
@@ -40,8 +55,17 @@ func (h *holdAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams
 }
 
 func (h *holdAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
-	if h.holdListErr != nil && (category == CategoryRunDispatchHoldSet || category == CategoryRunDispatchHoldCleared) {
-		return nil, h.holdListErr
+	if category == CategoryRunDispatchHoldSet || category == CategoryRunDispatchHoldCleared {
+		if h.holdListErr != nil {
+			return nil, h.holdListErr
+		}
+		h.mu.Lock()
+		h.holdReads++
+		n := h.holdReads
+		h.mu.Unlock()
+		if h.holdListFailAfter > 0 && n > h.holdListFailAfter {
+			return nil, errors.New("holdAudit: injected hold read error after the own-state read")
+		}
 	}
 	return h.auditFake.ListForRunByCategory(ctx, runID, category)
 }
@@ -325,6 +349,99 @@ func TestRunDispatchHold_ClearInheritedIsNoop(t *testing.T) {
 	}
 }
 
+// TestRunDispatchHold_PostActReadFailureReportsUnavailable: the append
+// committed but the effective-hold re-read failed. The verb answers 200
+// changed:true with the row's audit_sequence and dispatch_hold_unavailable,
+// never a 500 (which the client reads as "nothing recorded"), and exactly
+// one row is committed.
+func TestRunDispatchHold_PostActReadFailureReportsUnavailable(t *testing.T) {
+	check := func(t *testing.T, f *runHoldFixture, runID uuid.UUID, body string, before int, wantCategory string) {
+		t.Helper()
+		w := f.postHold(t, runID.String(), body, holdOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("= %d %s, want 200", w.Code, w.Body.String())
+		}
+		resp := decodeHoldResponse(t, w)
+		if !resp.Changed || resp.AuditSequence == 0 || !resp.DispatchHoldUnavailable || resp.DispatchHold != nil {
+			t.Fatalf("response = %+v; want changed, a non-zero audit_sequence, dispatch_hold_unavailable and no dispatch_hold", resp)
+		}
+		rows := f.aud.holdRows(runID)
+		if len(rows) != before+1 || rows[len(rows)-1].Category != wantCategory {
+			t.Fatalf("chain = %+v; want exactly one new %s row", rows, wantCategory)
+		}
+	}
+	t.Run("set, hold re-read fails", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		r := f.rr.seedRun()
+		f.aud.holdListFailAfter = 2 // the own-state pre-check's two category reads
+		check(t, f, r.ID, `{"action":"set","reason":"hold"}`, 0, CategoryRunDispatchHoldSet)
+	})
+	t.Run("clear on a child, ancestor re-read fails", func(t *testing.T) {
+		f := newRunHoldFixture(t)
+		p := f.rr.seedRun()
+		c := f.childOf(p.ID)
+		f.aud.seed(t, c.ID, CategoryRunDispatchHoldSet, "child hold")
+		f.s = New(Config{Addr: "127.0.0.1:0", RunRepo: &holdGetRunErrRepo{orchestratorRepo: f.rr, failID: p.ID}, AuditRepo: f.aud})
+		check(t, f, c.ID, `{"action":"clear","reason":"release"}`, 1, CategoryRunDispatchHoldCleared)
+	})
+}
+
+// TestRunDispatchHold_ConcurrentSetsLatestRowDecides: two simultaneous sets
+// both pass the own-state pre-check before either appends (a barrier on the
+// append), so the chain gains a redundant second set row, the accepted
+// pre-check-then-append race. The hold stays active and the LATEST row
+// decides: the effective hold is the higher-sequence row, with its reason. A
+// later clear then releases it.
+func TestRunDispatchHold_ConcurrentSetsLatestRowDecides(t *testing.T) {
+	f := newRunHoldFixture(t)
+	r := f.rr.seedRun()
+	var arrived sync.WaitGroup
+	arrived.Add(2)
+	release := make(chan struct{})
+	go func() { arrived.Wait(); close(release) }()
+	f.aud.beforeAppend = func() {
+		arrived.Done()
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	var wg sync.WaitGroup
+	got := make([]*httptest.ResponseRecorder, 2)
+	for i := range got {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got[i] = f.postHold(t, r.ID.String(), fmt.Sprintf(`{"action":"set","reason":"set %d"}`, i), holdOperator)
+		}()
+	}
+	wg.Wait()
+	f.aud.beforeAppend = nil
+	for i, w := range got {
+		if w.Code != http.StatusOK || !decodeHoldResponse(t, w).Changed {
+			t.Fatalf("set %d = %d %s; want 200 changed:true (both passed the pre-check)", i, w.Code, w.Body.String())
+		}
+	}
+	rows := f.aud.holdRows(r.ID)
+	if len(rows) != 2 || rows[0].Category != CategoryRunDispatchHoldSet || rows[1].Category != CategoryRunDispatchHoldSet {
+		t.Fatalf("chain = %+v; want two set rows", rows)
+	}
+	var latest runDispatchHoldAuditPayload
+	if err := json.Unmarshal(rows[1].Payload, &latest); err != nil {
+		t.Fatal(err)
+	}
+	hold, err := f.s.resolveRunDispatchHold(context.Background(), r)
+	if err != nil || hold == nil || hold.AuditSequence != 2 || hold.Reason != latest.Reason {
+		t.Fatalf("effective hold = %+v (%v); want active at sequence 2 with the latest row's reason %q", hold, err, latest.Reason)
+	}
+	if w := f.postHold(t, r.ID.String(), `{"action":"clear","reason":"release"}`, holdOperator); w.Code != http.StatusOK || !decodeHoldResponse(t, w).Changed {
+		t.Fatalf("clear = %d %s", w.Code, w.Body.String())
+	}
+	if hold, err := f.s.resolveRunDispatchHold(context.Background(), r); err != nil || hold != nil {
+		t.Fatalf("after clear = %+v (%v); want not held", hold, err)
+	}
+}
+
 // TestRunDispatchHold_ClearAllowedOnTerminalRun: clear is always allowed, so
 // a hold left on a run that went terminal can still be released.
 func TestRunDispatchHold_ClearAllowedOnTerminalRun(t *testing.T) {
@@ -422,7 +539,7 @@ func TestResolveRunDispatchHold_Ancestry(t *testing.T) {
 		leaf := chain[len(chain)-1] // 9 hops below chain[0]
 		f.aud.seed(t, chain[0].ID, CategoryRunDispatchHoldSet, "root")
 		check(t, f, leaf, result{})
-		check(t, f, chain[1], result{held: true, inherited: true, heldRun: chain[0].ID}) // 8 hops
+		check(t, f, chain[maxCampaignAncestorDepth], result{held: true, inherited: true, heldRun: chain[0].ID}) // exactly 8 hops
 	})
 	t.Run("audit read error is returned", func(t *testing.T) {
 		f := newRunHoldFixture(t)
