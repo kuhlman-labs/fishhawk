@@ -1,14 +1,14 @@
 id: scenario:issue-5485/runner-cli-usage-and-failure-exits
 statement: '`fishhawk-runner lineage-lock-status` exits 2 with nothing on stdout when --run-id or --working-dir is missing, and exits 1 with nothing on stdout and a lineage_lock_status_failed event on stderr when --working-dir is not a git checkout.'
 verify_hint: CLI exit code, stdout and stderr of the subcommand with a flag omitted, and with a plain temp directory as --working-dir.
-steps: Posture B with the runner built from the sanctioned checkout. Ran lineage-lock-status with only --working-dir, with only --run-id, and with --working-dir set to a plain non-git dir /tmp/fhacc5485/plain. Captured exit code, stdout bytes and stderr each time.
+steps: Posture B, with fishhawk-runner built from the sanctioned checkout. Ran lineage-lock-status with only --working-dir, with only --run-id, and with --working-dir set to the plain non-git dir /tmp/fhv5485/plain. Captured the exit code, stdout byte count and stderr each time.
 assertions:
-    expected: exit 2 with empty stdout for a missing flag; exit 1 with empty stdout and lineage_lock_status_failed on stderr for a non-git dir
-    observed_at_record: 'Missing --run-id: exit 2, 0 stdout bytes, stderr {event:lineage_lock_status_usage}. Missing --working-dir: exit 2, 0 bytes. Non-git: exit 1, 0 bytes, stderr {"event":"lineage_lock_status_failed","detail":"worktreesDir: rev-parse --git-common-dir: exit status 128: fatal: not a git repository..."}'
-    repro_handle: fishhawk-runner lineage-lock-status --working-dir /tmp/fhacc5485/plain --run-id 5e1a9c3b-1234-4abc-8def-0123456789ab
+    expected: exit 2 with empty stdout for a missing flag; exit 1 with empty stdout and lineage_lock_status_failed on stderr
+    observed_at_record: 'Missing --run-id: exit 2, empty stdout. Missing --working-dir: exit 2, empty stdout. Non-git dir: exit 1, empty stdout, stderr {"event":"lineage_lock_status_failed","detail":"worktreesDir: rev-parse --git-common-dir: exit status 128: fatal: not a git repository..."}.'
+    repro_handle: fishhawk-runner lineage-lock-status --working-dir /tmp/plain --run-id 5e1a9c3b-1234-4abc-8def-0123456789ab; echo $?
 origin:
     issue: 5485
     pr: 5521
     run_id: 2cf39578-aef7-48e3-857b-e224d24c711b
-    head_sha: c1f113706ea8377bbee91d31267b42f419850d73
-    recorded_at: 2026-11-22T04:46:13Z
+    head_sha: 62e2167f6ff92a222b2fa80e41900c26eeecad75
+    recorded_at: 2026-11-22T13:14:37Z

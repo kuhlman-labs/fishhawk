@@ -2,13 +2,14 @@ id: scenario:issue-5485/runner-cli-reports-lineage-lock-state
 statement: Run against a git checkout, `fishhawk-runner lineage-lock-status --working-dir <checkout> --run-id <uuid>` exits 0 and prints one JSON object whose lock_path lies under the checkout's git common dir at fishhawk-worktrees/run-<first 8 characters of the run id>.lock, with present false and held false when no lock file exists. After a live process's pid and the run id are written to that lock_path, the same command prints present true, held true, and that holder_pid and holder_run_id. After the pid is replaced with that of an exited process, it prints present true and held false.
 verify_hint: 'CLI stdout and exit code: build fishhawk-runner, git init a temp checkout, run the subcommand, write `<pid>\n<run id>\n` to the reported lock_path (a live pid such as a background sleep, then an exited one), and re-run it each time.'
 steps: 'Posture B: built fishhawk-runner from the sanctioned checkout c1f113706 (cd runner && go build ./cmd/fishhawk-runner). git init /tmp/fhacc5485/co. Ran fishhawk-runner lineage-lock-status --working-dir /tmp/fhacc5485/co --run-id 5e1a9c3b-1234-4abc-8def-0123456789ab. Started sleep 120 in the background and wrote ''<pid>\n<run id>\n'' to the reported lock_path, then re-ran. Replaced the pid with that of an exited `sh -c ''exit 0''` and re-ran. Also ran it from a linked worktree of the checkout.'
+steps_carried_from: head c1f113706ea8377bbee91d31267b42f419850d73 recorded_at 2026-11-22T04:46:13Z
 assertions:
-    expected: lock_path under the git common dir at fishhawk-worktrees/run-<8>.lock; false/false absent; true/true with holder for a live pid; true/false for an exited pid
-    observed_at_record: 'Absent: exit 0, one JSON line {root:5e1a9c3b, lock_path:/private/tmp/fhacc5485/co/.git/fishhawk-worktrees/run-5e1a9c3b.lock, present:false, held:false, holder_pid:0, holder_run_id:""}. Live: present:true, held:true, holder_pid:52024, holder_run_id equal to the run id. Exited: present:true, held:false, holder_pid:52027. The linked worktree resolves the same lock_path under the common dir.'
-    repro_handle: fishhawk-runner lineage-lock-status --working-dir /tmp/fhacc5485/co --run-id 5e1a9c3b-1234-4abc-8def-0123456789ab
+    expected: Exit 0; JSON lock_path at <git common dir>/fishhawk-worktrees/run-<8>.lock; false/false, then true/true with the holder, then true/false
+    observed_at_record: 'lock_path=/private/tmp/fhv5485/co/.git/fishhawk-worktrees/run-5e1a9c3b.lock, under the git common dir. Exit 0 and one JSON object each run: present false/held false with no file; present true/held true with holder_pid=<sleep pid> and holder_run_id=<run id> for the live pid; present true/held false for the exited pid. A linked worktree resolved to the same common-dir path.'
+    repro_handle: fishhawk-runner lineage-lock-status --working-dir <git checkout> --run-id 5e1a9c3b-1234-4abc-8def-0123456789ab
 origin:
     issue: 5485
     pr: 5521
     run_id: 2cf39578-aef7-48e3-857b-e224d24c711b
-    head_sha: c1f113706ea8377bbee91d31267b42f419850d73
-    recorded_at: 2026-11-22T04:46:13Z
+    head_sha: 62e2167f6ff92a222b2fa80e41900c26eeecad75
+    recorded_at: 2026-11-22T13:14:37Z
