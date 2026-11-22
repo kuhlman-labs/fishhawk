@@ -1651,6 +1651,31 @@ func TestHostDispatcher_LineageLockCheckedAfterCampaignHold(t *testing.T) {
 	}
 }
 
+// #5485: the round hold (1b) precedes the lineage-lock probe (1c), so a
+// round-held acceptance whose lock is also held refuses for the round with no
+// probe exec; once the round settles the probe runs and the lock defers it.
+func TestHostDispatcher_LineageLockCheckedAfterRoundHold(t *testing.T) {
+	h := newHDHarness(t)
+	r := featureChangeAcceptanceRun(h, hdIntPtr(2), nil)
+	h.hdStartRound(r, 2)
+	h.setLock(hdHeldLock)
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseImplementReviewInFlight {
+		t.Fatalf("doubly held acceptance = %+v; want implement_review_in_flight", o)
+	}
+	if n := h.probeCalls(); n != 0 {
+		t.Fatalf("lineage lock probe ran %d time(s); want 0 (the round hold comes first)", n)
+	}
+	h.assertNothingPosted(t, "doubly held acceptance")
+	h.hdVerdict(r, "approve", 0)
+	h.hdVerdict(r, "approve", 0)
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseLineageLockHeld || o.StageType != "acceptance" {
+		t.Fatalf("settled round, held lock = %+v; want lineage_lock_held on acceptance", o)
+	}
+	if n := h.probeCalls(); n != 1 {
+		t.Fatalf("lineage lock probe ran %d time(s) after the round settled; want 1", n)
+	}
+}
+
 // #5485: the default probe execs the runner with the spawn's scrubbed env, so
 // the dispatcher bearer never reaches the probe process.
 func TestHostDispatcher_LineageLockProbeEnvExcludesDispatcherToken(t *testing.T) {

@@ -181,16 +181,19 @@ carries: `--working-dir`, `--run-id`, `--decomposed-from` from
 `runs.decomposed_from`, and `--parallel-isolate` exactly when the spawn is a
 child's implement stage. The runner answers with its own path rule and
 live-holder predicate (runner README, `lineage-lock-status`), so this module
-copies neither. A live holder refuses `lineage_lock_held`, naming the lock path,
-holder pid and holder run. A probe that cannot decide refuses
+copies neither. A live holder refuses `lineage_lock_held`, naming the holder
+pid, holder run and lock path, in that order, so the 300-byte detail bound
+(`hostDispatchTextMax`) cuts the path first; a holder run id that is not a
+canonical UUID is blanked to `unknown`. A probe that cannot decide refuses
 `lineage_lock_probe_failed`, fail closed. Both are deferrals: nothing is
 reserved, recorded, marked or spawned, the candidate counts against the
 per-tick cap and is deprioritised, and the stage spawns on the first tick that
 evaluates the run after the lock frees. The probe exec carries the spawn's
 scrubbed env (`hostDispatchRunnerEnv`), never the dispatcher bearer. Its
-timeout is 5s, so with the per-tick cap counting every probed candidate a tick
-spends at most per-tick cap × 5s on probes (20s at the default cap of 4), well
-under the 60s QueueTTL a queued stage's re-POST must beat. The status overlay
+timeout is 5s plus a 1s `WaitDelay` for a git grandchild holding the pipes, so
+with the per-tick cap counting every probed candidate a tick spends at most
+per-tick cap × 6s on hung probes (24s at the default cap of 4), well under the
+60s QueueTTL a queued stage's re-POST must beat. The status overlay
 reads `lineage_lock_held` as waiting for 15 minutes
 (`hostDispatchLineageLockStuckAfter`), then as refusing (the holder may be
 wedged). Accepted risks:
@@ -208,6 +211,15 @@ wedged). Accepted risks:
   itself, which `evaluate` already proved non-terminal.
 - A stale lockfile whose pid the OS reused reads held, as it does for the
   runner's own acquire; the overlay escalates it after 15 minutes.
+- `--per-tick-cap` has no upper limit. The probe bound stays well under the
+  60s QueueTTL only for a cap of 8 or less (48s); at 10 or more, serial hung
+  probes can outlast a queued stage's re-POST window.
+- The probe trusts the lockfile's contents, as `acquireLineageLock` does. A
+  process that can write `<git-common-dir>/fishhawk-worktrees/` can plant
+  `run-<root>.lock` with a live pid (pid 1 reads alive) and defer the lineage's
+  spawns, read as waiting for 15 minutes and then escalated. The forged pid
+  reaches the refusal detail and the escalated next_step; the run id does only
+  when it is a canonical UUID, and both are control-stripped and bounded.
 - Live verification of the acceptance-then-auto-route sequence decides on the
   ABSENCE of a `lineage_lock_contention` failure on the routed fix-up; a
   `lineage_lock_held` log line is corroboration only.

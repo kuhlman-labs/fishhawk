@@ -369,14 +369,22 @@ func hdRoundHoldDetail(hold string) string {
 	return "the implement review round is in flight; acceptance dispatches on the first tick after the round settles"
 }
 
-// hdLineageLockHeldDetail is the refusal detail for a held lineage lock.
+// hdLineageLockHeldDetail is the refusal detail for a held lineage lock. The
+// holder and the guarantee precede the lock path, so the hostDispatchTextMax
+// cut drops the path first.
 func hdLineageLockHeldDetail(lock hostDispatchLineageLock) string {
 	holderRun := lock.HolderRunID
 	if holderRun == "" {
 		holderRun = "unknown"
 	}
-	return fmt.Sprintf("the run's lineage lock %s is held by live pid %d (run %s), typically the previous stage's runner tearing down its preview; the stage spawns on the first tick that evaluates the run after the holder releases the lock",
-		lock.LockPath, lock.HolderPID, holderRun)
+	return fmt.Sprintf("the run's lineage lock is held by live pid %d (run %s), typically the previous stage's runner tearing down its preview; the stage spawns on the first tick that evaluates the run after the holder releases the lock; lock %s",
+		lock.HolderPID, holderRun, lock.LockPath)
+}
+
+// hdLineageLockProbeFailedDetail is the refusal detail for an undecidable
+// lineage-lock probe; the probe error leads with its discriminator and remedy.
+func hdLineageLockProbeFailedDetail(err error) string {
+	return "lineage lock probe undecided, stage not spawned: " + err.Error()
 }
 
 // evaluate decides one candidate run and walks the pre-marker sequence when it
@@ -557,7 +565,7 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 	lock := h.lineageLock(ctx, hostDispatchLineageLockInputFor(run, isChild))
 	if lock.Err != nil {
 		o.CampaignRefused = true
-		return h.refuse(o, hdRefuseLineageLockProbeFailed, "the lineage lock probe could not decide, so the stage is not spawned: "+lock.Err.Error())
+		return h.refuse(o, hdRefuseLineageLockProbeFailed, hdLineageLockProbeFailedDetail(lock.Err))
 	}
 	if lock.Held {
 		o.CampaignRefused = true

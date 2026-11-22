@@ -1443,8 +1443,9 @@ func TestObserveHostDispatch_LineageLockHeld(t *testing.T) {
 		if obs.State != hostDispatchStateRefusing || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonRefused {
 			t.Fatalf("state %q verdict %s/%s; want refusing human/refused (next_step %q)", obs.State, v.Kind, v.Reason, v.NextStep)
 		}
-		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseLineageLockHeld, holder, "since "+hdoNow.Add(-16*time.Minute).Format(time.RFC3339), "kill the pid by hand")
-		hdoContainsNone(t, "next_step", v.NextStep, "no operator action is needed")
+		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseLineageLockHeld, holder, "since "+hdoNow.Add(-16*time.Minute).Format(time.RFC3339),
+			"first tick that evaluates the run after the lock frees", "kill the pid by hand")
+		hdoContainsNone(t, "next_step", v.NextStep, "no operator action is needed", "on its next tick")
 	})
 	t.Run("probe failure reads refusing", func(t *testing.T) {
 		obs, v := observeHostDispatch(probe(hdRefuseLineageLockProbeFailed, time.Minute), runID, stageID, hdoNow)

@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // host_dispatch_lineage_lock.go is the host dispatcher's lineage-lock probe
@@ -29,10 +32,17 @@ const hostDispatchLineageLockSubcommand = "lineage-lock-status"
 
 // hostDispatchLineageLockProbeTimeout bounds one probe exec. Every candidate
 // that reaches the probe counts against the per-tick cap, so a tick spends at
-// most PerTickCap × this on probes: 4 × 5s = 20s at the default cap, well under
-// the server's 60s concurrency QueueTTL that a queued stage's re-POST must beat.
-// A var so a test can shorten it.
+// most PerTickCap × (this + hostDispatchLineageLockWaitDelay) on hung probes:
+// 4 × 6s = 24s at the default cap, well under the server's 60s concurrency
+// QueueTTL that a queued stage's re-POST must beat. PerTickCap has no upper
+// limit, so the bound stays well under the QueueTTL only for a cap of 8 or less
+// (48s); at 10 it reaches 60s (mcpserver README, accepted risks). A var so a
+// test can shorten it.
 var hostDispatchLineageLockProbeTimeout = 5 * time.Second
+
+// hostDispatchLineageLockWaitDelay is how long a killed probe's Wait waits for
+// a grandchild (git) still holding its pipes.
+const hostDispatchLineageLockWaitDelay = time.Second
 
 // hostDispatchLineageLockStdoutMax bounds the probe's stdout.
 const hostDispatchLineageLockStdoutMax = 64 << 10
@@ -128,42 +138,46 @@ func probeHostDispatchLineageLock(ctx context.Context, binary string, env []stri
 	cmd.Env = env
 	// A killed probe's grandchild (git) may still hold the pipes; stop
 	// waiting for them shortly after the kill.
-	cmd.WaitDelay = time.Second
+	cmd.WaitDelay = hostDispatchLineageLockWaitDelay
 	stdout := &hdCappedBuffer{max: hostDispatchLineageLockStdoutMax}
 	stderr := &hdCappedBuffer{max: hostDispatchTextMax}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
+	// Each message leads with the discriminator and remedy, then the stderr
+	// tail, then the paths, so the hostDispatchTextMax cut on the refusal
+	// detail drops the paths first.
 	tail := boundHostDispatchText(stderr.buf.String())
-	withTail := func(msg string) error {
+	compose := func(msg string, paths ...string) error {
 		if tail != "" {
 			msg += "; stderr: " + tail
 		}
-		return errors.New(msg)
+		return errors.New(strings.Join(append([]string{msg}, paths...), "; "))
 	}
+	runner := "runner " + binary
 	if runErr != nil {
 		if errors.Is(pctx.Err(), context.DeadlineExceeded) {
-			return hostDispatchLineageLock{Err: withTail(fmt.Sprintf(
-				"%s %s timed out after %s; check the host for a hung git or fishhawk-runner process",
-				binary, hostDispatchLineageLockSubcommand, timeout))}
+			return hostDispatchLineageLock{Err: compose(fmt.Sprintf(
+				"%s timed out after %s; check the host for a hung git or fishhawk-runner process",
+				hostDispatchLineageLockSubcommand, timeout), runner)}
 		}
 		var ee *exec.ExitError
 		if !errors.As(runErr, &ee) {
 			return hostDispatchLineageLock{Err: fmt.Errorf(
-				"could not exec %s %s: %w; deploy fishhawk-runner beside fishhawk-mcp",
-				binary, hostDispatchLineageLockSubcommand, runErr)}
+				"could not exec %s: deploy fishhawk-runner beside fishhawk-mcp; %w",
+				hostDispatchLineageLockSubcommand, runErr)}
 		}
 		switch code := ee.ExitCode(); code {
 		case 2:
-			return hostDispatchLineageLock{Err: withTail(fmt.Sprintf(
-				"%s %s exited 2 (usage): this fishhawk-runner does not support the %s subcommand or its flags; deploy a fishhawk-runner that supports %s beside fishhawk-mcp",
-				binary, hostDispatchLineageLockSubcommand, hostDispatchLineageLockSubcommand, hostDispatchLineageLockSubcommand))}
+			return hostDispatchLineageLock{Err: compose(fmt.Sprintf(
+				"%s exited 2 (usage): this fishhawk-runner does not support the subcommand or its flags; deploy one that supports %s beside fishhawk-mcp",
+				hostDispatchLineageLockSubcommand, hostDispatchLineageLockSubcommand), runner)}
 		case 1:
-			return hostDispatchLineageLock{Err: withTail(fmt.Sprintf(
-				"%s %s exited 1: the runner could not resolve the lineage lock under working_dir %q (not a git checkout, or the lockfile could not be read)",
-				binary, hostDispatchLineageLockSubcommand, in.WorkingDir))}
+			return hostDispatchLineageLock{Err: compose(fmt.Sprintf(
+				"%s exited 1: working_dir is not a git checkout or the lockfile is unreadable",
+				hostDispatchLineageLockSubcommand), fmt.Sprintf("working_dir %q", in.WorkingDir), runner)}
 		default:
-			return hostDispatchLineageLock{Err: withTail(fmt.Sprintf(
-				"%s %s exited %d", binary, hostDispatchLineageLockSubcommand, code))}
+			return hostDispatchLineageLock{Err: compose(fmt.Sprintf(
+				"%s exited %d", hostDispatchLineageLockSubcommand, code), runner)}
 		}
 	}
 	if stdout.overflow {
@@ -180,7 +194,19 @@ func probeHostDispatchLineageLock(ctx context.Context, binary string, env []stri
 		return hostDispatchLineageLock{Err: fmt.Errorf("%s verdict has an empty lock_path", hostDispatchLineageLockSubcommand)}
 	}
 	return hostDispatchLineageLock{
-		Held: *w.Held, HolderPID: w.HolderPID, HolderRunID: w.HolderRunID,
+		Held: *w.Held, HolderPID: w.HolderPID, HolderRunID: hostDispatchLockHolderRunID(w.HolderRunID),
 		LockPath: w.LockPath, Root: w.Root,
 	}
+}
+
+// hostDispatchLockHolderRunID blanks a holder run id that is not a canonical
+// UUID. The lockfile's second line is free text any writer to the worktrees
+// directory controls, and the id is embedded in the refusal detail and the
+// overlay's operator guidance; a blank id renders as "unknown".
+func hostDispatchLockHolderRunID(s string) string {
+	u, err := uuid.Parse(s)
+	if err != nil || u.String() != strings.ToLower(s) {
+		return ""
+	}
+	return s
 }

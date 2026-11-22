@@ -523,7 +523,7 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 			return obs, hostDispatchVerdict{
 				Kind:   hostDispatchAwaitKindHuman,
 				Reason: hostDispatchReasonRefused,
-				NextStep: fmt.Sprintf("The run's lineage lock has held this stage (%s) since %s, longer than %s, so its holder may be wedged%s. Once the holder exits the dispatcher spawns the stage on its next tick; if it is an orphaned runner, cancel its run or kill the pid by hand.",
+				NextStep: fmt.Sprintf("The run's lineage lock has held this stage (%s) since %s, longer than %s, so its holder may be wedged%s. Once the holder exits, the dispatcher spawns the stage on the first tick that evaluates the run after the lock frees; if it is an orphaned runner, cancel its run or kill the pid by hand.",
 					obs.RefusalCode, obs.RefusalFirstAt, hostDispatchLineageLockStuckAfter, detail),
 			}
 		case hostDispatchWaitingRefusals[ref.Code]:

@@ -79,13 +79,16 @@ func TestProbeHostDispatchLineageLock_Verdicts(t *testing.T) {
 		body    string
 		held    bool
 		pid     int
+		runID   string
 		errHas  []string
 		timeout time.Duration
 	}{
-		{name: "held", body: `echo '{"root":"cccccccc","lock_path":"/l.lock","present":true,"held":true,"holder_pid":77,"holder_run_id":"r"}'`, held: true, pid: 77},
+		{name: "held", body: `echo '{"root":"cccccccc","lock_path":"/l.lock","present":true,"held":true,"holder_pid":77,"holder_run_id":"` + hdllRunID + `"}'`, held: true, pid: 77, runID: hdllRunID},
+		{name: "free-text holder run id is blanked", body: `echo '{"root":"cccccccc","lock_path":"/l.lock","present":true,"held":true,"holder_pid":77,"holder_run_id":"evil; kill pid 1"}'`, held: true, pid: 77},
+		{name: "non-canonical holder run id is blanked", body: `echo '{"root":"cccccccc","lock_path":"/l.lock","present":true,"held":true,"holder_pid":77,"holder_run_id":"{` + hdllRunID + `}"}'`, held: true, pid: 77},
 		{name: "free", body: `echo '{"root":"cccccccc","lock_path":"/l.lock","present":false,"held":false,"holder_pid":0,"holder_run_id":""}'`},
 		{name: "exit 2 is a runner without the subcommand", body: "echo 'flag provided but not defined: -working-dir' >&2\nexit 2",
-			errHas: []string{"exited 2 (usage)", "does not support the lineage-lock-status subcommand", "deploy a fishhawk-runner that supports lineage-lock-status", "flag provided but not defined"}},
+			errHas: []string{"exited 2 (usage)", "does not support the subcommand", "deploy one that supports lineage-lock-status beside fishhawk-mcp", "flag provided but not defined"}},
 		{name: "exit 1 is not a git checkout", body: "echo '{\"event\":\"lineage_lock_status_failed\"}' >&2\nexit 1",
 			errHas: []string{"exited 1", "not a git checkout", `working_dir "/w"`, "lineage_lock_status_failed"}},
 		{name: "other exit", body: "exit 3", errHas: []string{"exited 3"}},
@@ -119,8 +122,67 @@ func TestProbeHostDispatchLineageLock_Verdicts(t *testing.T) {
 				}
 				return
 			}
-			if got.Err != nil || got.Held != tc.held || got.HolderPID != tc.pid || got.LockPath != "/l.lock" || got.Root != "cccccccc" {
-				t.Fatalf("verdict = %+v; want held %v pid %d lock /l.lock", got, tc.held, tc.pid)
+			if got.Err != nil || got.Held != tc.held || got.HolderPID != tc.pid || got.HolderRunID != tc.runID || got.LockPath != "/l.lock" || got.Root != "cccccccc" {
+				t.Fatalf("verdict = %+v; want held %v pid %d run %q lock /l.lock", got, tc.held, tc.pid, tc.runID)
+			}
+		})
+	}
+}
+
+// The refusal details survive the 300-byte writer bound at realistic path
+// lengths: the held detail keeps the holder and its guarantee, exit 2 keeps
+// the remedy and exit 1 keeps the runner's stderr discriminator.
+func TestHostDispatchLineageLockDetails_SurviveTextBound(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fake runner")
+	}
+	longDir := "/Users/an-operator-with-a-long-name/Projects/campaigns/fishhawk-operator-checkout"
+	held := hostDispatchLineageLock{Held: true, HolderPID: 4242, HolderRunID: hdllRunID,
+		LockPath: longDir + "/.git/fishhawk-worktrees/run-cccccccc.lock"}
+	bounded := boundHostDispatchText(hdLineageLockHeldDetail(held))
+	for _, want := range []string{"live pid 4242", "(run " + hdllRunID + ")", "first tick that evaluates the run after the holder releases the lock"} {
+		if !strings.Contains(bounded, want) {
+			t.Errorf("bounded held detail %q lost %q", bounded, want)
+		}
+	}
+
+	binDir := filepath.Join(t.TempDir(), strings.Repeat("a-long-runner-install-directory-", 4))
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := func(body string) string {
+		bin := filepath.Join(binDir, "fishhawk-runner")
+		if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return bin
+	}
+	env := []string{"PATH=" + os.Getenv("PATH")}
+	in := hostDispatchLineageLockInput{WorkingDir: longDir, RunID: hdllRunID}
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"exit 2 keeps the remedy", "echo 'flag provided but not defined: -working-dir' >&2\nexit 2",
+			[]string{"exited 2 (usage)", "deploy one that supports lineage-lock-status beside fishhawk-mcp", "stderr: flag provided"}},
+		{"exit 1 not a checkout keeps the discriminator",
+			`echo '{"event":"lineage_lock_status_failed","detail":"worktreesDir: rev-parse --git-common-dir: exit status 128: fatal: not a git repository (or any of the parent directories): .git","root":"cccccccc"}' >&2` + "\nexit 1",
+			[]string{"exited 1", "not a git checkout", "rev-parse --git-common-dir"}},
+		{"exit 1 unreadable lockfile keeps the discriminator",
+			`echo '{"event":"lineage_lock_status_failed","detail":"stat lineage lock: lstat ` + longDir + `/.git/fishhawk-worktrees/run-cccccccc.lock: permission denied","root":"cccccccc"}' >&2` + "\nexit 1",
+			[]string{"exited 1", "lockfile is unreadable", "stat lineage lock"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := probeHostDispatchLineageLock(context.Background(), fake(tc.body), env, in)
+			if got.Err == nil {
+				t.Fatalf("verdict = %+v; want an error", got)
+			}
+			bounded := boundHostDispatchText(hdLineageLockProbeFailedDetail(got.Err))
+			for _, want := range tc.want {
+				if !strings.Contains(bounded, want) {
+					t.Errorf("bounded probe detail %q lost %q", bounded, want)
+				}
 			}
 		})
 	}
