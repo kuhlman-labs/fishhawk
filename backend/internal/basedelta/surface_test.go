@@ -3,6 +3,7 @@ package basedelta
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -436,5 +437,39 @@ func TestWorkflowSpecPathMatchesProduct(t *testing.T) {
 	t.Parallel()
 	if WorkflowSpecPath != githubclient.WorkflowSpecPath {
 		t.Fatalf("WorkflowSpecPath = %q, githubclient.WorkflowSpecPath = %q", WorkflowSpecPath, githubclient.WorkflowSpecPath)
+	}
+}
+
+// TestSurfaceRefusal pins the exported surface guard and its parity with
+// Classify: each row's Classify reason is the undecidable prefix plus
+// Refusal(), so basedelta.go's guard and the slice-gate consumer cannot drift.
+func TestSurfaceRefusal(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		s    *Surface
+		want string
+	}{
+		{"nil", nil, "surface_undeclared"},
+		{"malformed", &Surface{Global: []string{"go.mod"}, Inert: []string{"/abs/**"}}, "invalid_surface:/abs/**"},
+		{"empty_global", &Surface{Inert: []string{"docs/**"}}, "surface_incomplete"},
+		{"usable", &Surface{Global: []string{"go.mod"}, Inert: []string{"docs/**"}}, ""},
+	} {
+		if got := tc.s.Refusal(); got != tc.want {
+			t.Errorf("%s: Refusal() = %q, want %q", tc.name, got, tc.want)
+		}
+		res := oneWS(baseGraph()).Classify(context.Background(), Input{
+			DeltaPaths: []string{"backend/internal/a/a.go"}, PRPaths: []string{"backend/internal/d/d.go"},
+			Workspaces: []string{"ws"}, Surface: tc.s,
+		})
+		if tc.want == "" {
+			if res.Reason != ReasonIndependent {
+				t.Errorf("%s: usable surface Classify = %q, want %q", tc.name, res.Reason, ReasonIndependent)
+			}
+			continue
+		}
+		if res.Reason != PrefixUndecidable+tc.want {
+			t.Errorf("%s: Classify reason = %q, want %q (the Refusal() value)", tc.name, res.Reason, PrefixUndecidable+tc.want)
+		}
 	}
 }

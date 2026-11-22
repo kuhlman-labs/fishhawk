@@ -331,6 +331,7 @@ var agentSpawnSiteAllowlist = map[string]allowedSpawnSite{
 	"internal/hostload/hostload.go:defaultRunCommand":   {1, "ps / sysctl host-load probe"},
 
 	"internal/gateiso/dockerconfig.go:ProbeCredentialHelper": {1, "docker credential helper probe (docker-credential-<name> get; name regex-validated, cannot be the coding agent)"},
+	"cmd/fishhawk-runner/slicereach.go:sliceReachGoList":     {1, "go list (sliceReachGoBin test seam, else go on PATH)"},
 }
 
 // TestNoAgentSpawnOutsideAdapters is the source-scan ratchet behind the

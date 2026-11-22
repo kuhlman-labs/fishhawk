@@ -392,6 +392,80 @@ See `docs/ARCHITECTURE.md` §4's Verified-SHA invariant bullet.
 
 Full behavior in `docs/ARCHITECTURE.md` §4 step 5; the prompt-wire seam (`verify_command` / `verify_timeout_seconds` / `verify_max_iterations`, #504/#651) is in `backend/internal/prompt/README.md` ("Verify wire").
 
+### Slice gate on a decomposition child ([#5498](https://github.com/kuhlman-labs/fishhawk/issues/5498))
+
+A decomposition child's **non-fix-up implement** stage (`sliceGateApplies`)
+replaces the scoped pre-pass plus the (c2) full re-verify with ONE hooked
+verify over the slice's reverse-import reach. The parent's fan-in
+merge-candidate pass stays the single full verify and the merge precondition.
+Contract and reason vocabulary: [runner/README.md](../../README.md) § slice
+gate. The wiring lives in `slicegatehook.go`.
+
+- **Arm.** On each non-absorb iteration (after any mid-loop re-fold),
+  `planSliceGate` runs over the current scope. If eligible, the loop runs one
+  `runVerifyCommittedTreeEnv` with a call-local hook ctx and a nil package set.
+  The hook resolves the reach on the materialized clone, after the #4023
+  `runTimeout` and before `startVerify`. The (c2) re-verify is skipped, so this
+  verify is the deciding one and its tree is the #960 verified tree. form is
+  `scoped` when the hook returned packages, else `full`. If phase 1 is not
+  eligible, today's scoped pre-pass plus (c2) runs byte-for-byte.
+- **Nonce.** Every hooked verify carries a fresh #4229 absorb nonce. It becomes
+  `decidingNonce` only when the hook widened to full, so a widened child keeps
+  today's outside-only absorb. A scoped deciding verify never absorbs:
+  `decideFlakeAbsorb` refuses any non-full form.
+- **Outside relation.** Failure classification keeps the declared `scopePkgs`.
+  A reverse-dependency failure on a scoped verify is therefore `outside`, as on
+  today's (c2) full form. If the fix agent changes the tree, an exhausted
+  budget ends category A. If it changes nothing, the #4036 flake re-run
+  reproduces the failure and the stage ends category C with the
+  `verify_failure_outside_change` lead.
+- **Per-tree reach cache.** One reach state lives per loop (and per
+  single-shot call), keyed on (tree SHA, scope digest). In-place re-runs on an
+  identical committed tree reuse the result with no reload: skipped-gate,
+  temp-fail, lock-contention, infra-flake and the #4036 flake re-run. After the
+  #3316 auto-format absorb commits its reformat, `carry()` reuses the result
+  once for the reformatted tree. An empty tree SHA never caches.
+- **Load bound.** The load runs under `sliceReachLoadTimeout` (2 minutes),
+  started before any metadata read. It is neither charged to nor clipped by the
+  #4023 gate budget, so the worst case adds one bound per distinct verified tree.
+- **Isolation (ADR-063).** The hook first reads the memoized gate-isolation
+  selection (`sliceGateSelectionFn`), which records no gate evidence. The reach
+  load runs only on a host path, `clone` (including the unconfigured host exec)
+  or `clone-sandbox`, under a non-hosted profile. A hosted profile, a container
+  path, a refused selection or any other path widens to
+  `full`/`gate_isolation_not_host:<selection>` and never runs the host
+  `go list`.
+- **Single-shot gate.** `runVerifyGateCommitted` (`max_iterations` 0) applies
+  the same phase-1 plan. All four of its verify calls share one hook ctx: the
+  initial run, the lock/temp-fail re-run, the infra-absorb re-run and the
+  skipped-gate re-run. Re-runs therefore hit the reach cache, and every form
+  label and timeout reason comes from the hook's decision. It still emits no
+  `verify_summary`, so the `verify_slice_gate` event is its only gate-shape
+  record.
+- **Unchanged paths.** These callers have no hook, keep their scope
+  byte-for-byte and emit no `verify_slice_gate` event: the #960 pre-push strict
+  re-verify in `openPRAndShipArtifact` and its in-place re-runs (a child still
+  gets a full pre-push re-verify), the #4229 absorb re-run (its
+  `absorbing.dirs` scope), every child fix-up, the merge-candidate pass, diff
+  coverage and counterfactuals.
+- **Evidence.** Each gate decision appends a `verify_slice_gate` event and logs
+  `verify_slice_gate_resolved`, but only when `sliceGateApplies` holds.
+  `verify_summary` gains `gate_shape`, `gate_shape_reason` and
+  `gate_packages_count`, which are **trace-only**. gate_evidence's
+  verify_summary digest (`verifySummaryEvidence`: outcome, iterations,
+  max_iterations, detail) does not carry them. On a slice-scoped pass, the
+  scoped-shape sentence (patch coverage and the full test loop run in the
+  parent's fan-in pass) becomes `detail`, or is appended to an existing passed
+  detail. That sentence is the implement review's only view of the shape on
+  the loop path. On the single-shot path, gate_shape reaches no gate_evidence
+  digest at all.
+- **Where the saving holds.** The saving depends on a warm module cache and a
+  host gate path. A high share of `package_error` or `gate_isolation_not_host`
+  reasons in the post-merge slice_scoped/full split means the gate is mostly
+  running full.
+- The `gateBudgetVerifyForms` comment in `stagephase.go` is not updated here;
+  that is a named follow-up.
+
 ## Outside-only flake absorption at exhaustion ([#4229](https://github.com/kuhlman-labs/fishhawk/issues/4229))
 
 Maintainer ruling (b) on #4229 relaxes the #960 / #3315 "the verified tree passed the full test loop" guarantee in ONE place: step 7 of `runVerifyFixLoop`, helpers in `verifyabsorb.go`. At the fix budget's TERMINAL failure (`iter == max_iterations`, after the infra, auto-format, lock-contention and #4036 flake-re-run branches had priority), a FULL-form verify failure confined to packages the change did not touch is re-run ONCE, scoped to exactly those packages, and the stage proceeds on that tree if the re-run passes.

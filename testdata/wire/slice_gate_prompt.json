@@ -1,0 +1,15 @@
+{
+  "config": {"full_gate_paths":[".fishhawk/workflows.yaml","Makefile","build/**","notes/**","vendor-blobs/**"],"inert_paths":["docs/**"]},
+  "unavailable": {"unavailable_reason":"surface_incomplete"},
+  "cases": [
+    {"path":".fishhawk/workflows.yaml","full":true},
+    {"path":"Makefile","full":true},
+    {"path":"build/gate/Dockerfile","full":true},
+    {"path":"notes/release.md","full":true},
+    {"path":"vendor-blobs/a/b.bin","full":true},
+    {"path":"sub/Makefile","full":false},
+    {"path":"buildx/y.txt","full":false},
+    {"path":"docs/guide.md","full":false},
+    {"path":"m1/a/a.go","full":false}
+  ]
+}

@@ -7316,3 +7316,75 @@ func TestLivePassWait_Clamp(t *testing.T) {
 		}
 	}
 }
+
+// TestSliceGateConfigGoldenDecode pins the DECODE side of the slice_gate
+// contract (#5498): the shared golden testdata/wire/slice_gate_prompt.json's
+// `config` and `unavailable` blocks, served as the prompt's slice_gate
+// through the real FetchPrompt, decode into SliceGateConfig with every field
+// populated and re-marshal BYTE-EQUAL to the block. The backend's
+// TestSliceGateConfigMatchesSharedGolden asserts its emitted bytes against
+// the same blocks, so a tag rename on either side reddens one of the two. A
+// response without the key decodes nil (not offered).
+func TestSliceGateConfigGoldenDecode(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "slice_gate_prompt.json"))
+	if err != nil {
+		t.Fatalf("read shared slice_gate golden: %v", err)
+	}
+	var golden struct {
+		Config      json.RawMessage `json:"config"`
+		Unavailable json.RawMessage `json:"unavailable"`
+	}
+	if err := json.Unmarshal(b, &golden); err != nil {
+		t.Fatalf("decode shared slice_gate golden: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		raw  json.RawMessage
+		want SliceGateConfig
+	}{
+		{"config", golden.Config, SliceGateConfig{
+			FullGatePaths: []string{".fishhawk/workflows.yaml", "Makefile", "build/**", "notes/**", "vendor-blobs/**"},
+			InertPaths:    []string{"docs/**"},
+		}},
+		{"unavailable", golden.Unavailable, SliceGateConfig{UnavailableReason: "surface_incomplete"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.raw) == 0 {
+				t.Fatalf("golden has no %q block", tc.name)
+			}
+			fb, srv := newFakeBackend(t)
+			priv, _ := makeKey(t, fb)
+			fb.promptBody = `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h","slice_gate":` + string(tc.raw) + `}`
+			got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+			if err != nil {
+				t.Fatalf("FetchPrompt: %v", err)
+			}
+			if got.SliceGate == nil || !reflect.DeepEqual(*got.SliceGate, tc.want) {
+				t.Fatalf("SliceGate = %+v, want %+v", got.SliceGate, tc.want)
+			}
+			re, err := json.Marshal(got.SliceGate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, tc.raw); err != nil {
+				t.Fatal(err)
+			}
+			if string(re) != compact.String() {
+				t.Errorf("re-marshal = %s, golden = %s", re, compact.String())
+			}
+		})
+	}
+	t.Run("absent", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		priv, _ := makeKey(t, fb)
+		fb.promptBody = `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h"}`
+		got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+		if err != nil {
+			t.Fatalf("FetchPrompt: %v", err)
+		}
+		if got.SliceGate != nil {
+			t.Errorf("SliceGate = %+v, want nil when the key is absent", got.SliceGate)
+		}
+	})
+}

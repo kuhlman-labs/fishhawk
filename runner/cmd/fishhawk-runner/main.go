@@ -701,7 +701,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, promptHeldCommitReviewObligation, promptSupportsReviewObligationResume, promptPlanRevision, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, promptHeldCommitReviewObligation, promptSupportsReviewObligationResume, promptPlanRevision, promptSliceGate, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -792,6 +792,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		cfg.promptFile = path
 		cfg.decomposedFromRunID = decomposedFromRunID
+		cfg.sliceGate = promptSliceGate
 		runSliceIndex = sliceIndex
 		cfg.scopeFiles = scopeFiles
 		cfg.commitAuthorName = commitAuthorName
@@ -4267,13 +4268,13 @@ type reasoningEffort struct {
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, heldCommitReviewObligation *upload.ReviewObligation, supportsReviewObligationResume bool, planRevision bool, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, heldCommitReviewObligation *upload.ReviewObligation, supportsReviewObligationResume bool, planRevision bool, sliceGate *upload.SliceGateConfig, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -4288,20 +4289,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, false, nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, got.HeldCommitReviewObligation, got.SupportsReviewObligationResume, got.PlanRevision, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, got.HeldCommitReviewObligation, got.SupportsReviewObligationResume, got.PlanRevision, got.SliceGate, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -5944,6 +5945,15 @@ func verifyFailureExcerpt(out string) string {
 //     (the re-run is not counted in attempts). Every refusal of a candidate
 //     emits verify_flake_absorb_refused. Helpers live in verifyabsorb.go.
 //
+//  8. SLICE GATE (#5498): on a decomposition child's non-fix-up implement
+//     stage, an iteration that planSliceGate admits runs ONE verify under a
+//     call-local hook ctx that narrows it to the slice's reverse-import reach
+//     (or widens it to full); (c2) is skipped and that verify decides. Its
+//     fresh absorb nonce is the deciding nonce only when the hook widened. One
+//     reach state per loop caches by (tree, scope) so in-place re-runs reuse
+//     it, and the auto-format absorb carries it once. Ineligible iterations
+//     keep steps 2-7 byte-for-byte. Wiring: slicegatehook.go.
+//
 // Failure handling splits on WHERE HEAD is when the failing op runs, symmetric
 // with runVerifyGateCommitted (#816):
 //
@@ -6037,6 +6047,21 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	// verify below; only the LAST sample is retained, so the classification at
 	// the ladder tail judges the deciding verify's host conditions.
 	hostProbe := newHostLoadProbe(*cfg, logSink)
+
+	// Slice gate (#5498): a decomposition child's NON-fix-up implement gate
+	// runs ONE hooked verify over the slice's reverse-import reach instead of
+	// the scoped pre-pass plus the (c2) full re-verify. sliceGateApplies is
+	// decided once; ONE reach state lives for the loop so an in-place re-run
+	// on an identical committed tree reuses its result (the tree-keyed cache).
+	sliceApplies := sliceGateApplies("implement", cfg.decomposedFromRunID, cfg.fixup)
+	var (
+		sliceReach   *sliceGateReach
+		sliceLast    sliceGateDecision // the last gate decision, for verify_summary
+		sliceDecided bool
+	)
+	if sliceApplies {
+		sliceReach = newSliceGateReach(scopeFiles, sliceGateInert(*cfg))
+	}
 
 	var (
 		passed          bool
@@ -6200,6 +6225,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			disp    gateDisposition
 		)
 		decidingNonce = ""
+		sliceEligible := false
 		if absorbing != nil {
 			// The absorb re-run (step 7): SCOPED to the outside packages
 			// only — no host-load sample, no (c2), not counted in attempts,
@@ -6208,16 +6234,55 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
 			logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormScoped, outcome)
 		} else {
-			// (c) Verify against the committed tree. With a scope set in force this
-			// is the SCOPED form — a fast pre-pass over the touched packages, NOT
-			// the authority.
-			form = verifyFormName(scopePkgs)
-			res.Events = append(res.Events, hostProbe.sample(ctx)...)
-			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
-			res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
-			attempts++
-			lastOutput = out
-			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+			// Slice gate phase 1 over the CURRENT scope (after any re-fold).
+			if sliceApplies {
+				sliceDecision := sliceGatePlanFor(*cfg, scopeFiles)
+				sliceEligible = sliceDecision.eligible()
+				if !sliceEligible {
+					sliceLast, sliceDecided = sliceDecision, true
+					res.Events = append(res.Events, logSliceGateDecision(logSink, *cfg, iter+1, sliceDecision, sliceReach.loadCount()))
+				}
+			}
+			if sliceEligible {
+				// (c') The slice-gate arm: ONE verify whose package set the
+				// call-local hook resolves on the materialized clone. It is the
+				// deciding verify; (c2) below is skipped. A fresh #4229 absorb
+				// nonce rides every hooked verify, but it is kept as the
+				// deciding nonce only when the hook WIDENED to full
+				// (decideFlakeAbsorb refuses any non-full form).
+				res.Events = append(res.Events, hostProbe.sample(ctx)...)
+				nonce := newVerifyAbsorbNonce()
+				var nonceEnv []string
+				if nonce != "" {
+					nonceEnv = []string{verifyAbsorbNonceEnvVar + "=" + nonce}
+				}
+				sliceReach.setScope(scopeFiles)
+				ev, out, outcome, disp = runVerifyCommittedTreeEnv(withSliceGateReach(ctx, sliceReach), cfg.verifyCmd, repoDir, headSHA, timeout, nil, nonceEnv...)
+				res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
+				attempts++
+				lastOutput = out
+				form = verifyFormFull
+				if d, ok := sliceReach.take(); ok {
+					sliceLast, sliceDecided = d, true
+					form = sliceGateForm(d)
+					res.Events = append(res.Events, logSliceGateDecision(logSink, *cfg, iter+1, d, sliceReach.loadCount()))
+				}
+				if form == verifyFormFull {
+					decidingNonce = nonce
+				}
+				logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+			} else {
+				// (c) Verify against the committed tree. With a scope set in force this
+				// is the SCOPED form — a fast pre-pass over the touched packages, NOT
+				// the authority.
+				form = verifyFormName(scopePkgs)
+				res.Events = append(res.Events, hostProbe.sample(ctx)...)
+				ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+				res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
+				attempts++
+				lastOutput = out
+				logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+			}
 		}
 
 		// (c2) FULL re-verify on the passing iteration (#3315). A scoped pass
@@ -6248,7 +6313,10 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// Each (c2) run carries a FRESH absorb nonce (#4229): scripts/test
 		// prints its attest only with it, and only this full form can decide
 		// an absorb at exhaustion. Any other verify leaves decidingNonce "".
-		if absorbing == nil && len(scopePkgs) > 0 && outcome == "passed" {
+		//
+		// A slice-gate deciding verify (#5498) skips (c2): it IS the deciding
+		// verify, and its tree is the #960 verified tree.
+		if absorbing == nil && !sliceEligible && len(scopePkgs) > 0 && outcome == "passed" {
 			form = verifyFormFull
 			res.Events = append(res.Events, hostProbe.sample(ctx)...)
 			nonce := newVerifyAbsorbNonce()
@@ -6554,6 +6622,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 							"detail":    detail,
 						}),
 					})
+					// The reformat changes the tree SHA but not the reach
+					// (#5498): let the repeat reuse the cached result once.
+					sliceReach.carry()
 					iter--
 					continue
 				}
@@ -6808,6 +6879,12 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			summary["patch_coverage"] = absorbed.patchCoverage
 		}
 	}
+	if sliceApplies && sliceDecided {
+		// Trace-only gate-shape fields (#5498); gate_evidence's verify_summary
+		// digest does not carry them, so a slice-scoped pass also appends the
+		// scoped-shape sentence to detail.
+		sliceGateSummary(summary, sliceLast)
+	}
 	res.Events = append(res.Events, agent.Event{
 		Kind:    "verify_summary",
 		Payload: agent.MakePayload(summary),
@@ -7058,12 +7135,43 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// judges the deciding execution's host conditions.
 	hostProbe := newHostLoadProbe(cfg, logSink)
 
+	// Slice gate (#5498). A decomposition child's non-fix-up implement gate
+	// that phase 1 admits runs EVERY verify below (the initial run and the
+	// lock/temp-fail, infra-absorb and skipped-gate re-runs) under ONE
+	// call-local hook ctx, so the re-runs on the same committed tree hit the
+	// reach cache; every form label and timeout reason below comes from the
+	// hook's decision (gateForm), never a hard-coded full. Anything else keeps
+	// today's nil (full) call byte-for-byte. The single-shot path emits NO
+	// verify_summary (verifyHeadJudgedRedThenUnjudged reads its absence), so
+	// the verify_slice_gate event is its only gate-shape record.
+	gateCtx := ctx
+	var sliceReach *sliceGateReach
+	var events []agent.Event
+	gateDecision := sliceGateDecision{Shape: sliceGateShapeFull}
+	if sliceGateApplies("implement", cfg.decomposedFromRunID, cfg.fixup) {
+		plan := sliceGatePlanFor(cfg, scopeFiles)
+		if plan.eligible() {
+			sliceReach = newSliceGateReach(scopeFiles, sliceGateInert(cfg))
+			gateCtx = withSliceGateReach(ctx, sliceReach)
+		} else {
+			events = append(events, logSliceGateDecision(logSink, cfg, 0, plan, 0))
+		}
+	}
+	gateForm := func() string { return sliceGateForm(gateDecision) }
+	takeSliceDecision := func() {
+		if d, ok := sliceReach.take(); ok {
+			gateDecision = d
+			events = append(events, logSliceGateDecision(logSink, cfg, 0, d, sliceReach.loadCount()))
+		}
+	}
+
 	// (d) Verify against the committed scope-only tree.
-	// nil scope set = the FULL verify form (#3315). runVerifyGateCommitted is
-	// the single-shot authoritative gate; it is never narrowed.
-	events := hostProbe.sample(ctx)
-	ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+	// nil scope set = the FULL verify form (#3315); only the slice-gate hook
+	// above may narrow it.
+	events = append(events, hostProbe.sample(ctx)...)
+	ev, out, outcome, disp := runVerifyCommittedTree(gateCtx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 	events = append(events, stampVerifyRunChangeID(ev, changeID))
+	takeSliceDecision()
 
 	// Infrastructure-failure absorb (#972, widened by #2645): a failed verify
 	// whose output carries a diff-independent infra signature
@@ -7089,7 +7197,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	timedOut := outcome == "failed" && disp == gateTimedOut
 	verifyAttempts := 1
 	if timedOut {
-		events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+		events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, gateForm(), timeout))
 	}
 	// Verify-lock contention (#3948) and temporary failure (#4022), both read
 	// from the exit-code disposition: exit 73 (gateLockRefused) and exit 75
@@ -7121,14 +7229,15 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			events = append(events, logVerifyTempFailRerun(logSink, cfg, 1, tempFailState.reruns))
 		}
 		events = append(events, hostProbe.sample(ctx)...)
-		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+		ev, out, outcome, disp = runVerifyCommittedTree(gateCtx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 		events = append(events, stampVerifyRunChangeID(ev, changeID))
+		takeSliceDecision()
 		verifyAttempts++
 		refused = outcome == "failed" && disp == gateRefused
 		unavailable = outcome == "failed" && disp.hostUnavailable()
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
-			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, gateForm(), timeout))
 		}
 	}
 	if !lockContended && !tempFailed && !refused && !unavailable && !timedOut && outcome == "failed" && isVerifyInfraFailure(out) {
@@ -7144,8 +7253,9 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			}),
 		})
 		events = append(events, hostProbe.sample(ctx)...)
-		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+		ev, out, outcome, disp = runVerifyCommittedTree(gateCtx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 		events = append(events, stampVerifyRunChangeID(ev, changeID))
+		takeSliceDecision()
 		// The re-run's own disposition decides (f): a host that went away
 		// between the two runs is classified as unavailable, not as a red
 		// tree, and an absorb re-run that itself timed out is a timed-out
@@ -7155,7 +7265,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		verifyAttempts++
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
-			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, gateForm(), timeout))
 		}
 	}
 	// A gate that never ran the command (outcome "skipped", #3983) is re-run
@@ -7165,14 +7275,15 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	if skipDetail, infra := reverifySkipGateInfraDetail(ctx, ev, disp); outcome == "skipped" && infra {
 		events = append(events, logVerifyGateSkippedRerun(logSink, cfg, 1, skipDetail))
 		events = append(events, hostProbe.sample(ctx)...)
-		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+		ev, out, outcome, disp = runVerifyCommittedTree(gateCtx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 		events = append(events, stampVerifyRunChangeID(ev, changeID))
+		takeSliceDecision()
 		verifyAttempts++
 		refused = outcome == "failed" && disp == gateRefused
 		unavailable = outcome == "failed" && disp.hostUnavailable()
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
-			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, gateForm(), timeout))
 		}
 	}
 
@@ -7232,7 +7343,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			// an infra literal is still reported as what it is. The output
 			// already ends with the trailer.
 			return events, "", fmt.Errorf("%w: %w: %s\n%s",
-				gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut, gateTimedOutReason(ctx, cfg.verifyCmd, verifyFormFull, timeout, verifyAttempts), out)
+				gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut, gateTimedOutReason(ctx, cfg.verifyCmd, gateForm(), timeout, verifyAttempts), out)
 		}
 		if disp == gateLockRefused {
 			// Category C (retryable in place): the verify command kept exiting
@@ -7797,6 +7908,15 @@ func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA 
 	if err != nil {
 		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1,
 			"clone: "+strings.TrimSpace(err.Error()), "skipped"), "", "skipped", gateExecuted
+	}
+	// Slice gate (#5498): a CALL-LOCAL hook ctx (only the deciding verify of
+	// a decomposition child's non-fix-up implement gate carries one) replaces
+	// the package set with the slice's reverse-import reach on this clone, or
+	// nil (the full form) on any refusal. After the #4023 runTimeout above and
+	// before startVerify below, so the reach load is neither charged to nor
+	// clipped by the gate budget; sliceReachLoadTimeout bounds it.
+	if sg := sliceGateReachFrom(ctx); sg != nil {
+		scopePkgs = sg.resolve(ctx, wt, treeSHA)
 	}
 
 	// Owner marker always; package set only when one was derived. verifyScopeEnv

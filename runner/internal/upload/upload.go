@@ -717,6 +717,20 @@ type FetchedPrompt struct {
 	// drift decodes nil and silently runs the operator's image instead of
 	// the declared one.
 	GateContainer *GateContainerConfig `json:"gate_container,omitempty"`
+	// SliceGate is the decomposition-child slice-gate config (#5498): the
+	// repository's declared forced-full paths and inert paths, or the reason
+	// the slice gate is unavailable. The backend serves it ONLY on a
+	// non-fix-up implement stage of a decomposition child that is not a
+	// merge-candidate verify pass; nil means not offered, and the runner then
+	// keeps today's full gate (slice_gate_not_offered).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to
+	// the backend's promptResponse.SliceGate
+	// (backend/internal/server/prompt.go) — the slice_gate_config ModeExact
+	// pair in backend/internal/wirecontract, plus the shared golden
+	// testdata/wire/slice_gate_prompt.json. A drift decodes nil, which fails
+	// safe to the full gate.
+	SliceGate *SliceGateConfig `json:"slice_gate,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Non-empty only when the backend is a release build. The runner compares
 	// this against its own version and exits with exitVersionSkew when it is
@@ -1353,6 +1367,25 @@ type GateContainerConfig struct {
 	Dockerfile string `json:"dockerfile,omitempty"`
 	Context    string `json:"context,omitempty"`
 	Source     string `json:"source"`
+}
+
+// SliceGateConfig is FetchedPrompt.SliceGate (#5498). FullGatePaths are
+// root-anchored doublestar patterns (the workflow spec path, the declared
+// global surface, doc-check inputs and opaque paths): a scope path matching
+// one forces the full gate. InertPaths are the declared-inert patterns.
+// UnavailableReason, when set, is the only member (surface_undeclared,
+// invalid_surface:<entry>, surface_incomplete or surface_unreadable) and the
+// runner runs the full gate with it as the reason.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (names AND options) MUST stay
+// byte-identical to the backend's sliceGateConfig
+// (backend/internal/server/prompt.go) — the slice_gate_config ModeExact pair
+// in backend/internal/wirecontract, plus the shared golden
+// testdata/wire/slice_gate_prompt.json.
+type SliceGateConfig struct {
+	FullGatePaths     []string `json:"full_gate_paths,omitempty"`
+	InertPaths        []string `json:"inert_paths,omitempty"`
+	UnavailableReason string   `json:"unavailable_reason,omitempty"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an
