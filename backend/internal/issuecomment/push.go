@@ -222,9 +222,11 @@ func (p *PushChannel) firePushes(ctx context.Context, runID uuid.UUID) error {
 		if _, done := claimed[ev.sequence]; done {
 			continue
 		}
-		// A reviewer reject the operator already arbitrated is stale: claim
-		// it (so it never fires later) without sending, mirroring firePings.
-		if pageEventResolved(ev, entries) {
+		// A reviewer reject the operator already arbitrated, or a stall page
+		// whose episode has ended (#5497, read from the stages and run row
+		// already loaded above), is stale: claim it (so it never fires later)
+		// without sending, mirroring firePings.
+		if pageEventResolved(ev, entries, stages, runRow) {
 			if err := p.appendClaim(ctx, runID, ev, nil, "resolved"); err != nil {
 				p.warn(ctx, "push: claim append failed; not sending", runID, err,
 					slog.Int64("source_sequence", ev.sequence))
