@@ -565,6 +565,18 @@ func canonPath(p string) string {
 	return filepath.Clean(p)
 }
 
+// lineageLockPath is the lineage lockfile for root: run-<root>.lock under the
+// repository's shared fishhawk-worktrees dir (worktreesDir). It only computes
+// the path; it creates nothing. acquireLineageLock and the read-only
+// `lineage-lock-status` subcommand (#5485) both derive the path here.
+func lineageLockPath(ctx context.Context, repoDir, root string) (string, error) {
+	wtDir, err := worktreesDir(ctx, repoDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(wtDir, "run-"+root+".lock"), nil
+}
+
 // acquireLineageLock serializes same-lineage stages with an O_EXCL
 // lockfile keyed to the lineage root. Decomposition drives a lineage's
 // stages strictly sequentially, so a held lock by a LIVE process means a
@@ -587,15 +599,18 @@ func canonPath(p string) string {
 // reclaimed and the acquire retried. Anything else fails loud with an error
 // naming the holder pid, its run id and its state, so an operator driving over
 // HTTP MCP can diagnose the wedge without ps.
+//
+// The lock path comes from lineageLockPath, the single lock-path definition
+// this acquirer shares with the read-only `lineage-lock-status` subcommand
+// (#5485), so the host dispatcher's probe reads the very file acquired here.
 func acquireLineageLock(ctx context.Context, repoDir, root, runID string, client runStateClient, logSink io.Writer) (func(), error) {
-	wtDir, err := worktreesDir(ctx, repoDir)
+	lockPath, err := lineageLockPath(ctx, repoDir, root)
 	if err != nil {
 		return nil, fmt.Errorf("acquireLineageLock: %w", err)
 	}
-	if err := os.MkdirAll(wtDir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("acquireLineageLock: mkdir worktrees dir: %w", err)
 	}
-	lockPath := filepath.Join(wtDir, "run-"+root+".lock")
 	for attempt := 0; attempt < 2; attempt++ {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err == nil {

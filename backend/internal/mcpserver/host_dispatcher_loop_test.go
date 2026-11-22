@@ -20,6 +20,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 // host_dispatcher_loop_test.go drives the host-dispatcher tick loop (E88.2 /
@@ -123,6 +125,7 @@ func (lh *hdLoopHarness) loop(mut func(*HostDispatcherConfig)) *hostDispatchLoop
 	l.core.spawn = lh.spawner.spawn
 	l.core.probe = func(context.Context, string) runnerLivenessVerdict { return lh.probe }
 	l.core.environ = func() []string { return []string{"PATH=/usr/bin"} }
+	l.core.lineageLock = lh.lineageLock
 	l.now = func() time.Time { return lh.clock }
 	l.lockHeld = func() bool { return true }
 	l.terminate = func(runID string) int {
@@ -1413,5 +1416,41 @@ func TestBoundHostDispatchText(t *testing.T) {
 		if got := boundHostDispatchText(in); got != want {
 			t.Errorf("boundHostDispatchText(%q) = %q; want %q", in, got, want)
 		}
+	}
+}
+
+// #5485 done-means: a re-opened implement stage whose lineage lock is still
+// held by a live runner (the succeeded acceptance tearing down its preview) is
+// deferred by a real tick with no marker and no spawn, and recorded in
+// run_refusals; the first tick after the lock frees spawns it exactly once and
+// clears the entry.
+func TestTick_LineageLockHeldDefersReopenedImplementUntilFreed(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	r := lh.add(0, func(r *hdRun) {
+		r.Stages = []Stage{
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 1, Type: "plan", State: "succeeded", UpdatedAt: lh.clock},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 2, Type: "implement", State: "awaiting_host_dispatch", UpdatedAt: lh.clock},
+			{ID: uuid.NewString(), RunID: r.ID, Sequence: 3, Type: "acceptance", State: "succeeded", UpdatedAt: lh.clock},
+		}
+	})
+	lh.setLock(hdHeldLock)
+	l := lh.loop(nil)
+	lh.tick(l)
+	if lh.spawner.n() != 0 || lh.b.count(isMarkerReq) != 0 {
+		t.Fatalf("held tick: spawns=%d markers=%d; want 0, 0", lh.spawner.n(), lh.b.count(isMarkerReq))
+	}
+	ref, ok := hdMustStatus(t, lh.dir).RunRefusals[r.ID]
+	if !ok || ref.Code != hdRefuseLineageLockHeld || ref.StageID != r.Stages[1].ID {
+		t.Fatalf("run_refusals entry = %+v (present %v); want %s for the implement stage", ref, ok, hdRefuseLineageLockHeld)
+	}
+
+	lh.setLock(hostDispatchLineageLock{LockPath: hdHeldLock.LockPath})
+	lh.clock = lh.clock.Add(30 * time.Second)
+	lh.tick(l)
+	if lh.spawner.n() != 1 || lh.spawner.spawns[0].Run != r.ID {
+		t.Fatalf("freed tick: spawns=%d; want exactly 1 for run %s", lh.spawner.n(), r.ID)
+	}
+	if _, ok := hdMustStatus(t, lh.dir).RunRefusals[r.ID]; ok {
+		t.Fatal("the run_refusals entry survived the spawn")
 	}
 }
