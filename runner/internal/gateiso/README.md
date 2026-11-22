@@ -785,7 +785,10 @@ container has been given.
   own `go.mod` go reads), a `go.work` `use` directory or a directory `replace`
   target (in `go.work` or in any workspace module's `go.mod`) resolving
   outside the `EvalSymlinks`-resolved checkout, or a metadata file that does
-  not parse; (4) runs `go mod download all` under
+  not parse. The metadata-type half of (3) is exported as
+  `RequireRegularModuleMetadata(dir)`, a delegate to the same Lstat predicate,
+  whose second consumer is the runner's slice-gate reach load (#5498,
+  `runner/cmd/fishhawk-runner/slicereach.go`); (4) runs `go mod download all` under
   `baseEnv` — the runner passes its SANITIZED gate env (`sanitizedGateEnv`,
   ADR-029), never `os.Environ()`, so no runner credential reaches the go
   process — with `GOMODCACHE=dest`, a throwaway `GOCACHE`/`GOPATH` under the
