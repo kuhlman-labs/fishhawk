@@ -75,6 +75,10 @@ type pageEvent struct {
 	// stage's CURRENT episode, so a row from an ended episode never posts.
 	stageID    uuid.UUID
 	episodeKey string
+	// nextAction is the stall row's next_action when it is in the closed
+	// stallNextActions set, else "". The parent arm of stallPageResolved
+	// reads it (a fishhawk_resume_run page needs a live parent).
+	nextAction string
 }
 
 // Stall-watch page kinds (#5497). The kind tokens differ from the server's
@@ -354,12 +358,13 @@ func UnresolvedPageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) 
 
 // UnresolvedPageClassEventKindsForRun is UnresolvedPageClassEventKinds with the
 // run row, so the run-state arm of pageEventResolved (a cancelled run
-// resolves a stall page) applies too. A nil run skips that arm.
+// resolves a stall page) applies too. A nil run skips that arm. The parent
+// arm is not applied (no parent row is passed).
 func UnresolvedPageClassEventKindsForRun(r *run.Run, entries []*audit.Entry, stages []*run.Stage) []string {
 	events := pageClassEvents(entries, stages)
 	out := make([]string, 0, len(events))
 	for _, ev := range events {
-		if pageEventResolved(ev, entries, stages, r) {
+		if pageEventResolved(ev, entries, stages, r, nil) {
 			continue
 		}
 		out = append(out, ev.kind)
@@ -427,6 +432,7 @@ func stallPageEvent(e *audit.Entry, kind string, stages []*run.Stage) (pageEvent
 		message:    msg,
 		stageID:    stageID,
 		episodeKey: p.EpisodeKey,
+		nextAction: action,
 	}, true
 }
 
@@ -465,11 +471,22 @@ func stageByID(stages []*run.Stage, id uuid.UUID) *run.Stage {
 // state is read separately: a failed-stage page is resolved on a cancelled or
 // succeeded run (neither can be retried or revived), and a child-dispatch
 // page on any terminal run (the child can no longer be dispatched). A nil run
-// skips the run-state arm. Episode identity only moves forward, so a resolved
-// row stays resolved.
-func stallPageResolved(ev pageEvent, stages []*run.Stage, r *run.Run) bool {
+// skips the run-state arm.
+//
+// The parent arm reads what the writer reads: the server withholds a
+// fishhawk_resume_run page, and every child-dispatch page, under a terminal
+// decomposition parent, so a row written while the parent was live resolves
+// once the parent is terminal (the child's own stamps and state unchanged). A
+// nil parent skips that arm; stallParentMemo loads it only when this arm
+// needs it. Supersession is not re-read here (stallwatch README § Residuals).
+// Episode identity only moves forward and a terminal parent stays terminal,
+// so a resolved row stays resolved.
+func stallPageResolved(ev pageEvent, stages []*run.Stage, r, parent *run.Run) bool {
 	st := stageByID(stages, ev.stageID)
 	if st == nil {
+		return true
+	}
+	if stallResolutionReadsParent(ev) && parent != nil && parent.State.IsTerminal() {
 		return true
 	}
 	var key string
@@ -487,6 +504,38 @@ func stallPageResolved(ev pageEvent, stages []*run.Stage, r *run.Run) bool {
 		}
 	}
 	return !ok || key != ev.episodeKey
+}
+
+// stallResolutionReadsParent reports whether a stall page's resolution reads
+// the decomposition parent's state: a child-dispatch page (its remedy runs on
+// the parent) and a fishhawk_resume_run page (resume re-drives the child
+// under its live parent). It mirrors the server writer's parent checks.
+func stallResolutionReadsParent(ev pageEvent) bool {
+	return ev.kind == pageKindChildDispatchStalled ||
+		(ev.kind == pageKindFailedStageStalled && ev.nextAction == "fishhawk_resume_run")
+}
+
+// stallParentMemo loads a decomposition child's parent row at most once per
+// fire, and only when an unresolved stall page's resolution reads it
+// (stallResolutionReadsParent). A non-child run, or an event that does not
+// read the parent, returns nil with no read.
+type stallParentMemo struct {
+	runs   run.Repository
+	r      *run.Run
+	loaded bool
+	parent *run.Run
+}
+
+func (m *stallParentMemo) get(ctx context.Context, ev pageEvent) (*run.Run, error) {
+	if m.loaded || m.runs == nil || m.r == nil || m.r.DecomposedFrom == nil || !stallResolutionReadsParent(ev) {
+		return m.parent, nil
+	}
+	p, err := m.runs.GetRun(ctx, *m.r.DecomposedFrom)
+	if err != nil {
+		return nil, err
+	}
+	m.parent, m.loaded = p, true
+	return p, nil
 }
 
 // pageEventResolved reports whether a resolvable page event (a reviewer
@@ -515,16 +564,19 @@ func stallPageResolved(ev pageEvent, stages []*run.Stage, r *run.Run) bool {
 //     acceptance_outcome_recorded (a verdict or short-circuit landed), so a
 //     late ping cannot announce a wait that has already ended.
 //   - failed_stage_stalled and child_dispatch_stalled (#5497) — resolved by
-//     stallPageResolved over the CURRENT stages and run row: the episode the
-//     row names has ended, or the run can no longer take the named remedy.
+//     stallPageResolved over the CURRENT stages, run row and parent row: the
+//     episode the row names has ended, or the run can no longer take the
+//     named remedy.
 //
 // stages and r are the caller's already-loaded stage list and run row (both
-// firePings and PushChannel.firePushes have them). Only the stall arm reads
-// them; a nil r skips its run-state check.
-func pageEventResolved(ev pageEvent, entries []*audit.Entry, stages []*run.Stage, r *run.Run) bool {
+// firePings and PushChannel.firePushes have them); parent is the
+// decomposition parent from stallParentMemo, nil when not read. Only the
+// stall arm reads them; a nil r skips its run-state check and a nil parent
+// its parent check.
+func pageEventResolved(ev pageEvent, entries []*audit.Entry, stages []*run.Stage, r, parent *run.Run) bool {
 	switch ev.kind {
 	case pageKindFailedStageStalled, pageKindChildDispatchStalled:
-		return stallPageResolved(ev, stages, r)
+		return stallPageResolved(ev, stages, r, parent)
 	case "plan_review_rejected":
 		return hasLaterCategory(entries, ev.sequence, "approval_submitted")
 	case "implement_review_rejected":
@@ -793,15 +845,22 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 	if err != nil {
 		return fmt.Errorf("issuecomment: load pings: %w", err)
 	}
+	parents := &stallParentMemo{runs: n.runs, r: ctxv.run}
 	for _, ev := range events {
 		if _, done := pinged[ev.sequence]; done {
 			continue
+		}
+		// A stall page's parent arm (#5497) needs the parent row; a read
+		// error posts nothing and records nothing, so the next fire retries.
+		parent, err := parents.get(ctx, ev)
+		if err != nil {
+			return fmt.Errorf("issuecomment: load decomposition parent: %w", err)
 		}
 		// A reviewer-reject page the operator has already arbitrated is
 		// stale: record the dedup row so it never fires later, but skip the
 		// comment (#1786). The source-Sequence dedup gate above is unchanged,
 		// so a ping already recorded under the old batched path stays deduped.
-		if pageEventResolved(ev, entries, stages, ctxv.run) {
+		if pageEventResolved(ev, entries, stages, ctxv.run, parent) {
 			if err := n.appendPingAudit(ctx, ctxv.run.ID, ev); err != nil {
 				return err
 			}

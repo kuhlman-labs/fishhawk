@@ -1841,7 +1841,9 @@ Notes:
   `ChildDispatchStallEpisode` return `!ok`), when its current episode key
   differs from the row's (a later episode), or when the run state puts the
   remedy out of reach: a cancelled or succeeded run for the failed-stage page,
-  any terminal run for the child page. Episode keys come from the stage row's
+  any terminal run for the child page, and a terminal decomposition parent for
+  the child page or a `fishhawk_resume_run` page (the parent is loaded at most
+  once per fire, only for such a page). Episode keys come from the stage row's
   own per-transition stamps (`ended_at` + `self_retry_count`;
   `self_retry_count` + `dispatched_at`), since no stage-transition audit row
   exists. Both `firePings` and the push channel's `firePushes` apply it, so a

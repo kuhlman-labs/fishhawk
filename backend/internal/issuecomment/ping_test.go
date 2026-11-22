@@ -275,7 +275,7 @@ func TestPageEventResolved(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pageEventResolved(tc.ev, tc.entries, nil, nil); got != tc.want {
+			if got := pageEventResolved(tc.ev, tc.entries, nil, nil, nil); got != tc.want {
 				t.Errorf("pageEventResolved = %v, want %v", got, tc.want)
 			}
 		})
@@ -845,7 +845,7 @@ func TestPageClassEvents_CrewEscalationExhausted(t *testing.T) {
 	if pageEventResolved(got[0], []*audit.Entry{
 		{Sequence: 20, Category: "approval_submitted"},
 		{Sequence: 21, Category: "stage_fixup_triggered"},
-	}, nil, nil) {
+	}, nil, nil, nil) {
 		t.Error("a crew escalation must never be treated as resolved by a later approval/fixup")
 	}
 }
@@ -1061,32 +1061,46 @@ func TestPageEventResolved_StallKinds(t *testing.T) {
 		return []*run.Stage{&cp}
 	}
 	running := &run.Run{State: run.StateRunning}
+	failedRun := &run.Run{State: run.StateFailed}
+	resumeEv := pageClassEvents([]*audit.Entry{failedStallEntry(7, failed, "fishhawk_resume_run")}, nil)[0]
+	reviveEv := pageClassEvents([]*audit.Entry{failedStallEntry(8, failed, "fishhawk_revive_run")}, nil)[0]
+	deadParent := &run.Run{State: run.StateFailed}
 	cases := []struct {
 		name   string
 		ev     pageEvent
 		stages []*run.Stage
 		r      *run.Run
+		parent *run.Run
 		want   bool
 	}{
-		{"failed: same episode still failed", failedEv, []*run.Stage{failed}, running, false},
-		{"failed: same episode on a failed (revivable) run", failedEv, []*run.Stage{failed}, &run.Run{State: run.StateFailed}, false},
-		{"failed: retried to pending", failedEv, clone(failed, func(s *run.Stage) { s.State = run.StageStatePending; s.EndedAt = nil; s.SelfRetryCount++ }), running, true},
-		{"failed: re-failed with bumped count", failedEv, clone(failed, func(s *run.Stage) { s.SelfRetryCount++ }), running, true},
-		{"failed: stage absent", failedEv, nil, running, true},
-		{"failed: run cancelled, stamps unchanged", failedEv, []*run.Stage{failed}, &run.Run{State: run.StateCancelled}, true},
-		{"failed: run succeeded, stamps unchanged", failedEv, []*run.Stage{failed}, &run.Run{State: run.StateSucceeded}, true},
-		{"failed: nil run skips the run-state arm", failedEv, []*run.Stage{failed}, nil, false},
-		{"child: still pending, same key", childEv, []*run.Stage{child}, running, false},
-		{"child: dispatched", childEv, clone(child, func(s *run.Stage) { s.State = run.StageStateDispatched }), running, true},
-		{"child: back to pending with a new DispatchedAt", childEv, clone(child, func(s *run.Stage) { d := stallT0; s.DispatchedAt = &d }), running, true},
-		{"child: bumped", childEv, clone(child, func(s *run.Stage) { s.SelfRetryCount++ }), running, true},
-		{"child: stage absent", childEv, nil, running, true},
-		{"child: run failed, stamps unchanged", childEv, []*run.Stage{child}, &run.Run{State: run.StateFailed}, true},
-		{"child: run cancelled, stamps unchanged", childEv, []*run.Stage{child}, &run.Run{State: run.StateCancelled}, true},
+		{"failed: same episode still failed", failedEv, []*run.Stage{failed}, running, nil, false},
+		{"failed: same episode on a failed (revivable) run", failedEv, []*run.Stage{failed}, &run.Run{State: run.StateFailed}, nil, false},
+		{"failed: retried to pending", failedEv, clone(failed, func(s *run.Stage) { s.State = run.StageStatePending; s.EndedAt = nil; s.SelfRetryCount++ }), running, nil, true},
+		{"failed: re-failed with bumped count", failedEv, clone(failed, func(s *run.Stage) { s.SelfRetryCount++ }), running, nil, true},
+		{"failed: stage absent", failedEv, nil, running, nil, true},
+		{"failed: run cancelled, stamps unchanged", failedEv, []*run.Stage{failed}, &run.Run{State: run.StateCancelled}, nil, true},
+		{"failed: run succeeded, stamps unchanged", failedEv, []*run.Stage{failed}, &run.Run{State: run.StateSucceeded}, nil, true},
+		{"failed: nil run skips the run-state arm", failedEv, []*run.Stage{failed}, nil, nil, false},
+		{"child: still pending, same key", childEv, []*run.Stage{child}, running, nil, false},
+		{"child: dispatched", childEv, clone(child, func(s *run.Stage) { s.State = run.StageStateDispatched }), running, nil, true},
+		{"child: back to pending with a new DispatchedAt", childEv, clone(child, func(s *run.Stage) { d := stallT0; s.DispatchedAt = &d }), running, nil, true},
+		{"child: bumped", childEv, clone(child, func(s *run.Stage) { s.SelfRetryCount++ }), running, nil, true},
+		{"child: stage absent", childEv, nil, running, nil, true},
+		{"child: run failed, stamps unchanged", childEv, []*run.Stage{child}, &run.Run{State: run.StateFailed}, nil, true},
+		{"child: run cancelled, stamps unchanged", childEv, []*run.Stage{child}, &run.Run{State: run.StateCancelled}, nil, true},
+		// Concern 986dc02f: the parent arm, every stamp and the child's own
+		// state unchanged.
+		{"failed: resume_run under a live parent", resumeEv, []*run.Stage{failed}, failedRun, running, false},
+		{"failed: resume_run, parent went terminal", resumeEv, []*run.Stage{failed}, failedRun, deadParent, true},
+		{"failed: resume_run, nil parent skips the parent arm", resumeEv, []*run.Stage{failed}, failedRun, nil, false},
+		{"failed: revive_run does not read the parent", reviveEv, []*run.Stage{failed}, failedRun, deadParent, false},
+		{"failed: retry_stage does not read the parent", failedEv, []*run.Stage{failed}, running, deadParent, false},
+		{"child: live parent", childEv, []*run.Stage{child}, running, running, false},
+		{"child: parent went terminal", childEv, []*run.Stage{child}, running, &run.Run{State: run.StateSucceeded}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pageEventResolved(tc.ev, nil, tc.stages, tc.r); got != tc.want {
+			if got := pageEventResolved(tc.ev, nil, tc.stages, tc.r, tc.parent); got != tc.want {
 				t.Errorf("pageEventResolved = %v, want %v", got, tc.want)
 			}
 		})
@@ -1182,6 +1196,71 @@ func TestFirePings_StallPageOnCancelledRunNotPosted(t *testing.T) {
 			}
 			if n := len(h.au.rowsFor(CategoryAnchorPingPosted)); n != 1 {
 				t.Errorf("anchor_ping_posted rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// stallParentRuns serves a decomposition parent beside the harness's run row
+// and counts the parent reads.
+type stallParentRuns struct {
+	*forgeTestRuns
+	parent *run.Run
+	err    error
+	reads  int
+}
+
+func (r *stallParentRuns) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if r.parent != nil && id == r.parent.ID {
+		r.reads++
+		if r.err != nil {
+			return nil, r.err
+		}
+		return r.parent, nil
+	}
+	return r.forgeTestRuns.GetRun(ctx, id)
+}
+
+// Concern 986dc02f (M4): a fishhawk_resume_run page written while the parent
+// was live, on a failed child whose state and stage stamps are unchanged, is
+// resolved and never posted once the parent is terminal. The live-parent arm
+// posts. A parent read error posts and records nothing.
+func TestFirePings_StallResumePageUnderTerminalParentNotPosted(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		parent    run.State
+		readErr   error
+		wantPosts int
+		wantPings int
+		wantErr   bool
+	}{
+		{"live parent posts", run.StateRunning, nil, 1, 1, false},
+		{"terminal parent suppressed", run.StateFailed, nil, 0, 1, false},
+		{"parent read error retries later", run.StateRunning, errors.New("db down"), 0, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := gitlabRun()
+			row.State = run.StateFailed
+			parent := &run.Run{ID: uuid.New(), State: tc.parent}
+			row.DecomposedFrom = &parent.ID
+			st := stallFailedStage(stallT0, 0)
+			ops := &fakeForgeOps{}
+			h := stallPingHarness(t, row, []*run.Stage{st}, ops)
+			runs := &stallParentRuns{forgeTestRuns: h.n.runs.(*forgeTestRuns), parent: parent, err: tc.readErr}
+			h.n.runs = runs
+			h.au.seeded = append(h.au.seeded, withRun(failedStallEntry(1, st, "fishhawk_resume_run"), row.ID))
+			err := h.n.NotifyPageClassForRun(context.Background(), row.ID)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("notify err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if n := len(ops.callsFor("PostIssueComment")); n != tc.wantPosts {
+				t.Errorf("posts = %d, want %d", n, tc.wantPosts)
+			}
+			if n := len(h.au.rowsFor(CategoryAnchorPingPosted)); n != tc.wantPings {
+				t.Errorf("anchor_ping_posted rows = %d, want %d", n, tc.wantPings)
+			}
+			if runs.reads != 1 {
+				t.Errorf("parent reads = %d, want 1", runs.reads)
 			}
 		})
 	}

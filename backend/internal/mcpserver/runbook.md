@@ -523,7 +523,8 @@ dispatches on its own. The page names the one legal remedy:
   stage is dispatchable, but which nothing has spawned: `fishhawk_run_children`
   on the parent. It does not page while a live fan-out holds the child behind
   its cap, while a live slot waiter holds it, or while the host memory hold is
-  held.
+  held. It never pages a child on a non-local `runner_kind` or under a
+  terminal parent.
 
 Any user- or agent-kind audit row on the run (or, for a child, on its parent)
 restarts the clock. A page whose episode has ended, for example because the

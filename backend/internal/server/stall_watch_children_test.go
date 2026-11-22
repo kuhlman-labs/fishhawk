@@ -118,7 +118,7 @@ func newChildStallFixture(t *testing.T, subDeps [][]int, capN int) *childStallFi
 	f.s = New(Config{Addr: "127.0.0.1:0", RunRepo: f.runs, AuditRepo: f.au, ArtifactRepo: f.art,
 		HostAdmissionHold: f.hold, Concurrency: f.conc})
 	f.s.issueNotifier = f.ntf
-	f.parent = f.addRun(run.StateRunning, stallNow.Add(-72*time.Hour), nil)
+	f.parent = f.addRun(run.StateRunning, stallNow.Add(-72*time.Hour), func(r *run.Run) { r.RunnerKind = run.RunnerKindLocal })
 	planStage := f.addStage(f.parent.ID, 0, run.StageTypePlan, run.StageStateSucceeded, nil)
 	subs := make([]plan.SubPlanSummary, len(subDeps))
 	for i, deps := range subDeps {
@@ -134,7 +134,8 @@ func newChildStallFixture(t *testing.T, subDeps [][]int, capN int) *childStallFi
 	return f
 }
 
-// addChild mints a decomposition child at sliceIdx with one implement stage.
+// addChild mints a decomposition child at sliceIdx with one agent-executed
+// implement stage, its runner_kind the un-resolved local hint it inherits.
 // Its run is created, and its stage last updated, updatedAgo before stallNow.
 func (f *childStallFixture) addChild(sliceIdx int, state run.State, stageState run.StageState, updatedAgo time.Duration) (*run.Run, *run.Stage) {
 	pid := f.parent.ID
@@ -144,9 +145,13 @@ func (f *childStallFixture) addChild(sliceIdx int, state run.State, stageState r
 		r.DecomposedFrom = &pid
 		r.SliceIndex = &idx
 		r.AutoDispatch = true
+		r.RunnerKind = run.RunnerKindLocal
 		r.UpdatedAt = at
 	})
-	st := f.addStage(c.ID, 0, run.StageTypeImplement, stageState, func(st *run.Stage) { st.UpdatedAt = at })
+	st := f.addStage(c.ID, 0, run.StageTypeImplement, stageState, func(st *run.Stage) {
+		st.UpdatedAt = at
+		st.ExecutorKind = run.ExecutorAgent
+	})
 	return c, st
 }
 
@@ -248,6 +253,60 @@ func TestScanUndispatchedChildStalls_DispatchablePastThresholdPagesOnce(t *testi
 	}
 	if st2 := f.liveStages(t, child.ID)[0]; st2.State != run.StageStateAwaitingHostDispatch {
 		t.Errorf("stage state = %s, want unchanged awaiting_host_dispatch", st2.State)
+	}
+}
+
+// Concern 76a08b07: a child whose dispatch does not route through the
+// host-dispatch marker cannot take fishhawk_run_children (a local host
+// spawn), so it never pages. Each arm is otherwise the page-eligible
+// dispatchableWave1 fixture, which pages with the local hint
+// (_DispatchablePastThresholdPagesOnce).
+func TestScanUndispatchedChildStalls_NonHostDispatchedRunnerKindNoPage(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		childKind     string
+		childResolved bool
+		parentKind    string
+		parentLocked  bool
+	}{
+		{"child locked github_actions", run.RunnerKindGitHubActions, true, run.RunnerKindGitHubActions, true},
+		{"child locked gitlab_ci", run.RunnerKindGitLabCI, true, run.RunnerKindGitLabCI, true},
+		{"child hint github_actions, un-resolved", run.RunnerKindGitHubActions, false, run.RunnerKindGitHubActions, false},
+		{"child hint local, parent locked github_actions", run.RunnerKindLocal, false, run.RunnerKindGitHubActions, true},
+		{"child locked to an unknown kind", "nomad", true, run.RunnerKindLocal, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newChildStallFixture(t, [][]int{nil, {0}}, 0)
+			f.parent.RunnerKind, f.parent.RunnerKindResolved = tc.parentKind, tc.parentLocked
+			child, _ := f.dispatchableWave1(2 * time.Hour)
+			child.RunnerKind, child.RunnerKindResolved = tc.childKind, tc.childResolved
+			f.scanChildren(t, stallNow)
+			f.wantNoChildPage(t)
+		})
+	}
+}
+
+// Concern 76a08b07: the marker admits only an agent-executed stage.
+func TestScanUndispatchedChildStalls_NonAgentExecutorNoPage(t *testing.T) {
+	f := newChildStallFixture(t, [][]int{nil, {0}}, 0)
+	child, st := f.dispatchableWave1(2 * time.Hour)
+	f.mutateStage(child.ID, st.ID, func(s *run.Stage) { s.ExecutorKind = run.ExecutorHuman })
+	f.scanChildren(t, stallNow)
+	f.wantNoChildPage(t)
+}
+
+// Concern 8b18a4a6: a terminal parent's fan-out can never dispatch the child
+// (restart_blockers.go's exclusion), so the child, still pending under it,
+// never pages. The running-parent control is _DispatchablePastThresholdPagesOnce.
+func TestScanUndispatchedChildStalls_TerminalParentNoPage(t *testing.T) {
+	for _, state := range []run.State{run.StateFailed, run.StateSucceeded, run.StateCancelled} {
+		t.Run(string(state), func(t *testing.T) {
+			f := newChildStallFixture(t, [][]int{nil, {0}}, 0)
+			f.dispatchableWave1(2 * time.Hour)
+			f.parent.State = state
+			f.scanChildren(t, stallNow)
+			f.wantNoChildPage(t)
+		})
 	}
 }
 

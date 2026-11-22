@@ -24,6 +24,12 @@ import (
 //
 //   - its run is non-terminal and its implement stage is pending or
 //     awaiting_host_dispatch (issuecomment.ChildDispatchStallEpisode ok);
+//   - the marker's eligibility checks would admit it: its dispatch routes
+//     through the host-dispatch marker (childWaveGateApplies: a local
+//     runner_kind by the child's lock or hint and the parent's lock), and the
+//     stage is agent-executed;
+//   - its parent run is non-terminal (a terminal parent's fan-out can never
+//     dispatch it, as restart_blockers.go reads it);
 //   - it is not queued for a local concurrency slot with a live waiter (that
 //     waiter spawns it on admission);
 //   - the host-dispatch marker's wave-order and dependency-coverage guards
@@ -36,11 +42,11 @@ import (
 //     parent's newest plan_decomposed effective_max_parallel > 0, the
 //     in-flight siblings (see childStallInFlight) must be below the cap.
 //
-// It mirrors only those marker guards plus the host memory hold, not every
-// marker refusal: the campaign dispatch hold, the deploy- and
-// failed-stage-ahead holds and the fishhawk_run_children max_parallel
-// override are not read, so such a child can still page (documented in
-// backend/internal/stallwatch/README.md).
+// It mirrors only those marker checks plus the host memory hold, not every
+// marker refusal. Known unread refusals are the campaign dispatch hold, the
+// deploy- and failed-stage-ahead holds and the fishhawk_run_children
+// max_parallel override; a child behind one can still page
+// (backend/internal/stallwatch/README.md § Residuals).
 //
 // While Config.HostAdmissionHold reports held, the marker refuses every new
 // admission, so the scan pages no child at all (M2).
@@ -213,6 +219,29 @@ func (s *Server) scanUndispatchedChildStall(ctx context.Context, child *run.Run,
 		return false, nil
 	}
 	parentID := *child.DecomposedFrom
+
+	// The marker's eligibility refusals (host_dispatch.go): a child whose
+	// dispatch does not route through the host-dispatch marker (a non-local
+	// runner_kind, by its own lock, hint or its parent's lock:
+	// childWaveGateApplies), and a non-agent executor stage. Neither can take
+	// fishhawk_run_children, a local host spawn.
+	if hosted, err := s.childWaveGateApplies(ctx, child); err != nil {
+		return false, fmt.Errorf("runner_kind routing: %w", err)
+	} else if !hosted {
+		return false, nil
+	}
+	if stage.ExecutorKind != run.ExecutorAgent {
+		return false, nil
+	}
+	// A terminal parent's fan-out can never dispatch the child (the same
+	// exclusion restart_blockers.go applies), so its remedy is out of reach.
+	parent, err := s.cfg.RunRepo.GetRun(ctx, parentID)
+	if err != nil {
+		return false, fmt.Errorf("get decomposition parent: %w", err)
+	}
+	if parent.State.IsTerminal() {
+		return false, nil
+	}
 
 	// The marker's wave-order and coverage guards (read-only).
 	if blocked, err := s.guardDecompositionWaveOrder(ctx, child); err != nil {

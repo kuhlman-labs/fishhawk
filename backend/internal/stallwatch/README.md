@@ -71,6 +71,15 @@ parent. A child pages only when all of these hold:
 
 - its run is non-terminal and its implement stage is `pending` or
   `awaiting_host_dispatch`;
+- the host-dispatch marker's eligibility checks admit it: its dispatch routes
+  through the marker (`childWaveGateApplies`: a local `runner_kind` by the
+  child's lock or inherited hint, and by the parent's lock when the child is
+  un-resolved), and the stage is agent-executed. A `github_actions` or
+  `gitlab_ci` child, or a non-agent stage, cannot take `fishhawk_run_children`
+  (a local host spawn), so it never pages;
+- its parent run is non-terminal. A terminal parent's fan-out can never
+  dispatch it (the exclusion `restart_blockers.go` applies), which also keeps
+  orphans awaiting `fishhawkd reconcile-orphan-children` from paging;
 - it is not queued for a concurrency slot with a live waiter;
 - the host-dispatch marker's wave-order guard (`guardDecompositionWaveOrder`)
   and dependency-coverage guard (`resolveDependentChildBase`, i.e.
@@ -81,11 +90,11 @@ parent. A child pages only when all of these hold:
   the marker refuses every new admission, so no child pages at all;
 - it is not held behind a live fan-out's cap (below).
 
-The child predicate mirrors those marker guards only, not every one. The
-campaign dispatch hold, the deploy- and failed-stage-ahead holds and the
-`max_parallel` override are not read (see residuals). A host-dispatched
-(`auto_dispatch`) child still pages: a dispatcher that is down or refusing is
-exactly the stall.
+The child predicate mirrors those marker checks only, not every marker
+refusal. The known unread ones are the campaign dispatch hold, the deploy- and
+failed-stage-ahead holds and the `max_parallel` override (see residuals). A
+host-dispatched (`auto_dispatch`) child still pages: a dispatcher that is down
+or refusing is exactly the stall.
 
 ### Cap deferral
 
@@ -118,8 +127,13 @@ A later tick in the same episode is a dedup no-op. The projection
 the stage is gone, out of the condition, or carries a different key. It also
 reads run state, which `TransitionRun` changes without touching the stage
 stamps: a failed-stage page resolves once its run is cancelled or succeeded (a
-failed run stays revivable), and a child page once its run is terminal. A
-resolved row is recorded as pinged without posting.
+failed run stays revivable), and a child page once its run is terminal. It
+reads the decomposition parent where the writer does: a child page, or a
+`fishhawk_resume_run` page, resolves once the parent is terminal, with the
+child's own state and stamps unchanged. `firePings` and `firePushes` load the
+parent at most once per fire, and only when such a page is unposted. A parent
+read error posts and records nothing, so the next fire retries. A resolved row
+is recorded as pinged without posting.
 
 ## The quiet clock
 
@@ -170,6 +184,12 @@ operator who is visibly acting on the run.
   a campaign hotfix hold pages after the threshold.
 - **Unread marker holds.** A child whose implement stage sits behind a failed or
   non-succeeded-deploy stage is not withheld. The failed stage pages on its own.
+- **Supersession is write-time only.** A failed run superseded (M1) after its
+  page row landed, but before the page posted (a forge outage or a failed
+  `notifyPageClass`), still posts `fishhawk_revive_run` or
+  `fishhawk_resume_run`. The resolver does not re-read supersession: that is
+  two `ListRuns` reads per render. The superseded run stays revivable, so the
+  page is stale but still names a legal remedy.
 
 ## Counterfactuals
 
@@ -192,10 +212,17 @@ it.
 | host memory hold (M2) | ignore `Held` | `_HostAdmissionHoldNoPage` |
 | concurrency read error | treat it as no waiter | `_ConcurrencyReadErrorSkips` |
 | episode gate | page outside pending / awaiting | `_DispatchedOrRunningNoPage` |
+| runner_kind routing | ignore `childWaveGateApplies`'s false | `_NonHostDispatchedRunnerKindNoPage` (5 arms, each otherwise page-eligible) |
+| agent executor | skip the `ExecutorKind` check | `_NonAgentExecutorNoPage` |
+| terminal parent | skip the parent-state check | `_TerminalParentNoPage` (failed, succeeded, cancelled) |
 | per-child skip | fail the scan on one child | `_ReadErrorSkipsOnlyThatChild` |
 | ticker config | each `Validate` arm made `false` | `stallwatch.TestRun_RefusesDegenerateConfig` |
 | scanner isolation | drop `recover` / stop on an error | `stallwatch.TestTick_FailingScannerDoesNotStopTheOther` |
 | boot refusal | skip the serve.go pre-check | `fishhawkd.TestServe_StallWatchDegenerateConfigRefusesToBoot` (boots and hangs) |
+| pre-check enable guard | run the pre-check with the watch disabled | `_StallWatchDegenerateConfigRefusesToBoot/* disabled` (a later single-tenant refusal stops boot) |
+| scanner wiring | swap the Ticker's scanners, or its Threshold and Lookback | `fishhawkd.TestServeGo_StallWatchTickerWiring` |
+| adapter mapping | swap Threshold and Lookback in `stallWatchScanner` | `fishhawkd.TestStallWatchScanner` |
+| parent resolution | drop the parent arm of `stallPageResolved` | `issuecomment.TestPageEventResolved_StallKinds`, `TestFirePings_StallResumePageUnderTerminalParentNotPosted`, `TestPushChannel_StallPageUnderTerminalParentClaimedNotSent` |
 
 The failed-stage scanner's counterfactuals (threshold, act clock, list-then-append
 dedup, episode resolution, implement-only parent exclusion, park budget, revive
