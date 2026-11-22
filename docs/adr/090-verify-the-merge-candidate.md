@@ -6,7 +6,6 @@ date: 2026-10-09
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4170
 supersedes: ["ADR-043"]
 superseded_by: ["ADR-092", "ADR-093", "ADR-096"]
-amends: ["ADR-124"]
 amended_by: ["ADR-142"]
 applies_to: []
 ---
@@ -357,6 +356,6 @@ Ratification: Captain, 2026-11-21 (#5498); final text confirmed before the #5498
 - A slice review sees a scoped gate only through the scoped-shape detail sentence. The consolidated implement review keeps D5's parent-level verify evidence.
 - The post-merge split of `slice_scoped` from `full` by reason measures whether the gate pays for itself. A high share of `gate_isolation_not_host` or `package_error` says it does not.
 
-**Relation to ADR-124.** This amendment amends ADR-124 (D3 and D5) for the slice-gate consumer only. It supersedes nothing.
+**Relation to ADR-124.** This amendment narrows ADR-124 (D3 and D5) for the slice-gate consumer only, and ADR-124's in-body Amendment A1 states the same change from that record's side. No front-matter edge is added: an `amends` edge to ADR-124 would make decision-record selection follow ADR-090's supersession links from the basedelta area into superseded records. It supersedes nothing.
 
 **Implementation.** #5498 (PR #5520).

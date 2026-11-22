@@ -7,7 +7,6 @@ issue: https://github.com/kuhlman-labs/fishhawk/issues/4754
 supersedes: []
 superseded_by: []
 amends: ["ADR-098"]
-amended_by: ["ADR-090"]
 applies_to: []
 ---
 
@@ -97,3 +96,9 @@ The decision:
 - **What the declaration does not do.** It makes the doc-transfer case POSSIBLE, but does not deliver it. Today the documentation paths (`docs/api/**`, `site/**`, `docs/adr/**`, `docs/ARCHITECTURE.md`) are in G, and a G match refuses transfer at once. Doc-only transfers need #4317's G/D split and data-edge implementation. Even then, "doc-only" is not blanket permission: a declared-inert path still passes the G, doc-leg, data-read and shared-artifact checks, and an overlapping documentation glob never overrides G.
 - **Ordering.** Implementation is #4657. Its PR merges once its implementation matches this v2.1 text.
 - **Record metadata.** amends: ["ADR-098"]; supersedes: []; applies_to: []. ADR-098 gains `amended_by: ["ADR-124"]`.
+
+## Amendment A1: a second, weaker consumer (Captain decision 2026-11-21 on #5498; text ratified at merge)
+
+Ratification: Captain, 2026-11-21 (#5498); final text confirmed before the #5498 pull request (#5520) merges.
+
+The decomposition-child slice gate (ADR-090 Amendment A3) reads this declaration as a second consumer, explicitly weaker than verdict transfer. Decision 3's sentence "An inert declaration never removes a path from graph reach, data-read edges or the shared-artifact rule" governs verdict transfer only. For the slice gate, a declared-inert path under no package directory contributes nothing, and there are no data-read edges and no shared-artifact rule. The parent's fan-in full pass is the backstop. Decision 5's tier-I protection covers the declaration for both consumers, and decision 5's enforce-mode precondition does not apply to the slice gate. Decisions 1 to 7 govern verdict transfer unchanged.
