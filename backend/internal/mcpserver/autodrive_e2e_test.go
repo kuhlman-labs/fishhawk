@@ -350,6 +350,11 @@ func (h *adE2EHarness) newDispatchLoop() *hostDispatchLoop {
 	l.core.spawn = h.spawner.spawn
 	l.core.probe = func(context.Context, string) runnerLivenessVerdict { return runnerDead }
 	l.core.environ = func() []string { return []string{"PATH=/usr/bin"} }
+	// The lineage lock (#5485) reads free: this e2e drives the auto-drive
+	// chain, not the probe, which host_dispatch_lineage_lock_test.go covers.
+	l.core.lineageLock = func(context.Context, hostDispatchLineageLockInput) hostDispatchLineageLock {
+		return hostDispatchLineageLock{LockPath: "/lineage.lock"}
+	}
 	l.lockHeld = func() bool { return true }
 	l.terminate = func(string) int { return 0 }
 	return l

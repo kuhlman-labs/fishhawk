@@ -22,6 +22,8 @@ verification for offline dependencies and infrastructure exit 75.
   packages. The runner performs full verification of the passing SHA; its
   outside-only failure absorption is narrowly defined in
   [runner documentation](../../runner/README.md), not a general skip license.
+  A decomposition child's implement gate is the exception: it runs the scoped
+  slice gate, and the parent's fan-in merge-candidate pass is the full verify.
 - The per-repository lock is shared across worktrees and isolated runner clones.
   A shell refusal (exit 73) is final for that invocation. Do not poll or retry;
   use `scripts/test single` for focused work. Runner wait/displacement rules are

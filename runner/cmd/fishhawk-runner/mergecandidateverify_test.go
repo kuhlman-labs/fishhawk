@@ -1014,3 +1014,47 @@ func TestMergeCandidateVerify_StaleGateImageRealScript(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeCandidateVerify_FanInStaysFullForChildCfg (#5498, test 28): the
+// parent's fan-in merge-candidate pass is the single FULL verify. Even with a
+// child id and an offered slice-gate config on cfg, the verify seam receives a
+// nil (full) scope and a ctx carrying NO slice-gate hook, and the verify child
+// sees no package set.
+func TestMergeCandidateVerify_FanInStaysFullForChildCfg(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	var (
+		calls   int
+		hooked  bool
+		scopes  [][]string
+		origMCV = mergeCandidateVerifyFn
+	)
+	mergeCandidateVerifyFn = func(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string, gateDisposition) {
+		calls++
+		scopes = append(scopes, scopePkgs)
+		if sliceGateReachFrom(ctx) != nil {
+			hooked = true
+		}
+		return origMCV(ctx, verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+	}
+	t.Cleanup(func() { mergeCandidateVerifyFn = origMCV })
+
+	cfg := mcvCfg(dispatch, `printf 'pkgs=[%s]\n' "${FISHHAWK_VERIFY_PACKAGES-unset}"`)
+	cfg.decomposedFromRunID = "parent-run"
+	cfg.sliceGate = &upload.SliceGateConfig{FullGatePaths: []string{"Makefile"}, InertPaths: []string{"docs/**"}}
+	_, ship := runMCV(t, cfg, mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"})
+	if ship.MergeCandidateResult != mergeCandidatePassed {
+		t.Fatalf("result = %q (%s)", ship.MergeCandidateResult, ship.MergeCandidateReason)
+	}
+	if calls != 1 {
+		t.Fatalf("verify invocations = %d, want 1", calls)
+	}
+	if scopes[0] != nil {
+		t.Errorf("the fan-in pass ran a SCOPED form %v, want the FULL form (nil scope)", scopes[0])
+	}
+	if hooked {
+		t.Errorf("the fan-in pass ctx carried a slice-gate hook; it must never be narrowed")
+	}
+	if !strings.Contains(ship.MergeCandidateOutputTail, "pkgs=[unset]") {
+		t.Errorf("verify env carried a package set, want the full form: %q", ship.MergeCandidateOutputTail)
+	}
+}

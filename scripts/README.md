@@ -1131,6 +1131,10 @@ deviation from the issue's literal wording. The #2124 pre-test
 snapshot/digest machinery is therefore left completely **un-armed** in scoped
 mode rather than armed and weakened — no `--emit-changed-snapshot` call is made
 at all — and the full committed-tree gate still runs it in full.
+For a decomposition child's implement stage, the full committed-tree gate is
+the parent's fan-in merge-candidate pass. The child's slice gate runs one
+scoped verify over the slice's reverse-import reach, so patch coverage is
+enforced only at fan-in (#5498; `runner/README.md` § "Slice gate").
 
 **Fail-safe direction: WIDEN, never narrow.** `_verify_scope_buckets` returns
 non-zero after printing a one-line reason, and `cmd_verify` then falls through to

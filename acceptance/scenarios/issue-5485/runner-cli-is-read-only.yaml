@@ -1,0 +1,15 @@
+id: scenario:issue-5485/runner-cli-is-read-only
+statement: 'Running `fishhawk-runner lineage-lock-status` never creates, removes or rewrites lineage state: a checkout without a fishhawk-worktrees directory still has none afterwards, and a stale lock file (exited pid) is byte-identical after the command.'
+verify_hint: 'CLI run followed by inspecting the checkout''s git common dir: directory absence, and the lock file''s bytes before and after.'
+steps: Posture B. On a fresh git init /tmp/fhacc5485/co with no lock dir, ran lineage-lock-status and then checked .git for fishhawk-worktrees. Later wrote a stale lock (exited pid plus run id), recorded its sha256 and stat mtime/size, ran the command, and compared.
+steps_carried_from: head c1f113706ea8377bbee91d31267b42f419850d73 recorded_at 2026-11-22T04:46:13Z
+assertions:
+    expected: No dir created; the stale lock is byte-identical
+    observed_at_record: .git held no fishhawk-worktrees after the probe. Before and after the probe the stale lock's sha256 was 63d453ae9d98e34cde6afd1366fbe154f62c8f588a08902768d2a3ee133460d8 and its mtime/size 1795353118/43, both unchanged. The command reported held=false and did not reclaim the lock.
+    repro_handle: shasum -a256 <lock>; fishhawk-runner lineage-lock-status ...; shasum -a256 <lock>
+origin:
+    issue: 5485
+    pr: 5521
+    run_id: 2cf39578-aef7-48e3-857b-e224d24c711b
+    head_sha: 62e2167f6ff92a222b2fa80e41900c26eeecad75
+    recorded_at: 2026-11-22T13:14:37Z

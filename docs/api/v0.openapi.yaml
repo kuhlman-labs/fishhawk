@@ -26737,6 +26737,52 @@ paths:
                         type: string
                         enum: [stage, workflow]
                         description: Which level declared the block — the stage's own `gate_container` or the workflow-level one.
+                  slice_gate:
+                    type: object
+                    description: |
+                      The decomposition-child slice-gate config (#5498): the
+                      run's DECLARED workflow-v2 `verdict_transfer` surface
+                      (ADR-124), resolved from its cached admission spec and
+                      reduced to the two lists the runner's one-sided slice
+                      question needs. Present ONLY on a NON-fix-up implement
+                      stage of a decomposition child (the run carries
+                      `decomposed_from_run_id`) that is not a merge-candidate
+                      verify pass. Absent everywhere else — byte-identical to
+                      before #5498 — and absence is FAIL-SAFE: the runner
+                      records `slice_gate_not_offered` and runs today's full
+                      gate. A usable declaration serves `full_gate_paths` and
+                      `inert_paths`; a refused or unreadable one serves ONLY
+                      `unavailable_reason`, and the runner runs the full gate
+                      with that reason. Shared-artifact dirs are deliberately
+                      not served: the slice gate is a second, explicitly
+                      weaker consumer of the surface (it departs from ADR-124
+                      D3's inert rule), and the parent's fan-in
+                      merge-candidate pass stays the full verify.
+                    properties:
+                      full_gate_paths:
+                        type: array
+                        items:
+                          type: string
+                        description: Sorted, de-duplicated root-anchored doublestar patterns whose match on any scope path forces the full gate — the workflow spec path (`.fishhawk/workflows.yaml`, always), `global_surface`, `doc_check_inputs` and `opaque_paths`. Absent when `unavailable_reason` is set.
+                      inert_paths:
+                        type: array
+                        items:
+                          type: string
+                        description: The declared `inert_paths` patterns. A scope path under no package directory that matches one contributes no tests. Absent when none are declared or `unavailable_reason` is set.
+                      unavailable_reason:
+                        type: string
+                        maxLength: 256
+                        description: |
+                          Why the slice gate is unavailable; when set it is the
+                          only member. One of `surface_undeclared` (no
+                          `verdict_transfer` block, or no cached spec),
+                          `invalid_surface:<entry>` (the first malformed
+                          declared entry, bounded to 256 bytes with control
+                          characters dropped), `surface_incomplete` (no
+                          `global_surface` entry) or `surface_unreadable` (the
+                          cached spec does not parse). The first three are
+                          exactly the refusals the base-delta classifier
+                          returns (`basedelta.Surface.Refusal`).
                   implement_model:
                     type: string
                     description: |
@@ -27507,6 +27553,52 @@ paths:
                         type: string
                         enum: [stage, workflow]
                         description: Which level declared the block — the stage's own `gate_container` or the workflow-level one.
+                  slice_gate:
+                    type: object
+                    description: |
+                      The decomposition-child slice-gate config (#5498): the
+                      run's DECLARED workflow-v2 `verdict_transfer` surface
+                      (ADR-124), resolved from its cached admission spec and
+                      reduced to the two lists the runner's one-sided slice
+                      question needs. Present ONLY on a NON-fix-up implement
+                      stage of a decomposition child (the run carries
+                      `decomposed_from_run_id`) that is not a merge-candidate
+                      verify pass. Absent everywhere else — byte-identical to
+                      before #5498 — and absence is FAIL-SAFE: the runner
+                      records `slice_gate_not_offered` and runs today's full
+                      gate. A usable declaration serves `full_gate_paths` and
+                      `inert_paths`; a refused or unreadable one serves ONLY
+                      `unavailable_reason`, and the runner runs the full gate
+                      with that reason. Shared-artifact dirs are deliberately
+                      not served: the slice gate is a second, explicitly
+                      weaker consumer of the surface (it departs from ADR-124
+                      D3's inert rule), and the parent's fan-in
+                      merge-candidate pass stays the full verify.
+                    properties:
+                      full_gate_paths:
+                        type: array
+                        items:
+                          type: string
+                        description: Sorted, de-duplicated root-anchored doublestar patterns whose match on any scope path forces the full gate — the workflow spec path (`.fishhawk/workflows.yaml`, always), `global_surface`, `doc_check_inputs` and `opaque_paths`. Absent when `unavailable_reason` is set.
+                      inert_paths:
+                        type: array
+                        items:
+                          type: string
+                        description: The declared `inert_paths` patterns. A scope path under no package directory that matches one contributes no tests. Absent when none are declared or `unavailable_reason` is set.
+                      unavailable_reason:
+                        type: string
+                        maxLength: 256
+                        description: |
+                          Why the slice gate is unavailable; when set it is the
+                          only member. One of `surface_undeclared` (no
+                          `verdict_transfer` block, or no cached spec),
+                          `invalid_surface:<entry>` (the first malformed
+                          declared entry, bounded to 256 bytes with control
+                          characters dropped), `surface_incomplete` (no
+                          `global_surface` entry) or `surface_unreadable` (the
+                          cached spec does not parse). The first three are
+                          exactly the refusals the base-delta classifier
+                          returns (`basedelta.Surface.Refusal`).
                   implement_model:
                     type: string
                     description: Backend-resolved implement model id (#1013), echoed on implement stages so the runner pins the agent spawn to it (`--model <implement_model>`). Resolved through the implement-model ladder (operator gate decision < plan `model_recommendation.implement_model` < spec `executor.model` < deployment default). Absent when no rung supplied a model — the runner leaves the model unset and the agent spawns on the adapter's built-in default, byte-identical to today.
