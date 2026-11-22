@@ -375,6 +375,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	if len(args) > 0 && args[0] == "specialist-job" {
 		return runSpecialistJob(args[1:], logSink)
 	}
+	// lineage-lock-status subcommand (#5485): the host dispatcher's read-only
+	// lineage lock probe. Before parseFlags, which requires the stage flags.
+	if len(args) > 0 && args[0] == lineageLockStatusSubcommand {
+		return runLineageLockStatus(args[1:], os.Stdout, logSink)
+	}
 
 	cfg, err := parseFlags(args, logSink)
 	if err != nil {
