@@ -164,6 +164,15 @@ type config struct {
 	// Drives shared-branch routing in openPRAndShipArtifact.
 	decomposedFromRunID string
 
+	// sliceGate is set at runtime (not a flag) from the fetched prompt's
+	// slice_gate member (#5498): the decomposition-child slice-gate config
+	// (full-gate and inert path patterns, or an unavailable reason). nil means
+	// the server did not offer it, so the gate keeps today's scoped pre-pass plus
+	// full re-verify with reason slice_gate_not_offered. Read only by the
+	// implement gate (slicegatehook.go); see the verify-fix loop section of
+	// runner/cmd/fishhawk-runner/README.md.
+	sliceGate *upload.SliceGateConfig
+
 	// pinnedBaseSHA is set at runtime (not a flag) by run() before the agent
 	// is invoked (#3973): the base the implement stage starts from — the
 	// standalone #3454 advance tip, a decomposition child's wave-base tip, or
