@@ -356,22 +356,88 @@ func TestRunVerifyFixLoop_SliceGateReverseDepFailureIsOutside(t *testing.T) {
 	}
 }
 
-// (31) S4: in-place re-runs on an identical committed tree reuse the reach; a
-// fix iteration (new tree) reloads.
+// sliceGateStep is one scripted verify invocation: its output and exit code.
+type sliceGateStep struct {
+	out  string
+	code int
+}
+
+// sliceGateStepRecorder is sliceGateSeqRecorder with per-invocation output:
+// invocation n prints steps[n-1].out and exits steps[n-1].code (the last step
+// repeats). Each output is a file, so no shell quoting touches it.
+func sliceGateStepRecorder(t *testing.T, steps ...sliceGateStep) (cmd, logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath = filepath.Join(dir, "calls.log")
+	var arms strings.Builder
+	for i, st := range steps {
+		outPath := filepath.Join(dir, fmt.Sprintf("out%d", i+1))
+		mustWrite(t, outPath, st.out)
+		arm := fmt.Sprintf("%d)", i+1)
+		if i == len(steps)-1 {
+			arm = "*)"
+		}
+		fmt.Fprintf(&arms, "%s cat %q; exit %d;; ", arm, outPath, st.code)
+	}
+	script := filepath.Join(dir, "verify.sh")
+	mustWrite(t, script, fmt.Sprintf(`#!/bin/sh
+printf 'pkgs=[%%s] nonce=[%%s]\n' "$%s" "$%s" >> %q
+n=$(wc -l < %q | tr -d ' ')
+case "$n" in %s esac
+`, verifyPackagesEnvVar, verifyAbsorbNonceEnvVar, logPath, logPath, arms.String()))
+	return "sh " + script, logPath
+}
+
+// (31) S4: in-place re-runs on an identical committed tree reuse the reach; the
+// #3316 auto-format absorb's reformatted tree reuses it once through the
+// loop's carry() call; a fix iteration (new tree) reloads.
 func TestRunVerifyFixLoop_SliceGateReachOncePerTree(t *testing.T) {
+	ab := []string{"[a,b]", "[a,b]"}
 	for _, tc := range []struct {
 		name      string
-		codes     []int
+		steps     []sliceGateStep
 		fix       bool
+		setup     func(t *testing.T, repo string)
+		wantPkgs  []string
 		wantLoads int
+		wantEvent string // a trace event kind the re-run path must emit once
 	}{
-		{"temp-fail", []int{75, 0}, false, 1},
-		{"lock-contention", []int{73, 0}, false, 1},
-		{"fix iteration", []int{1, 0}, true, 2},
+		{name: "temp-fail", steps: []sliceGateStep{{"", 75}, {"", 0}}, wantPkgs: ab, wantLoads: 1, wantEvent: "verify_infra_tempfail_retry"},
+		{name: "lock-contention", steps: []sliceGateStep{{"", 73}, {"", 0}}, wantPkgs: ab, wantLoads: 1},
+		{name: "infra flake", steps: []sliceGateStep{{golangciLintLockSignature + "\n", 3}, {"", 0}}, wantPkgs: ab, wantLoads: 1, wantEvent: "verify_infra_flake_retry"},
+		{
+			// The formatter rewrites the in-scope a/a.go, so the re-verify
+			// gates a DIFFERENT committed tree; carry() reuses the reach.
+			name: "auto-format", steps: []sliceGateStep{{gofmtOnlyLintOutput + "\n", 3}, {"", 0}},
+			setup: func(t *testing.T, _ string) {
+				stubFormatter(t, `printf 'package a\n\n// formatted\n' > "$2"; exit 0`)
+			},
+			wantPkgs: ab, wantLoads: 1, wantEvent: "verify_autoformatted",
+		},
+		{
+			// The first gate's clone cannot be materialized, so neither the
+			// load nor the verify runs; the one re-run loads once.
+			name: "skipped gate", steps: []sliceGateStep{{"", 0}},
+			setup: func(t *testing.T, _ string) {
+				calls := 0
+				swapMaterializer(t, func(ctx context.Context, repoDir, headSHA, parent string) (string, error) {
+					calls++
+					if calls == 1 {
+						return "", errors.New("git clone --no-hardlinks: fatal: No space left on device")
+					}
+					return materializeGateCheckout(ctx, repoDir, headSHA, parent)
+				})
+			},
+			wantPkgs: []string{"[a,b]"}, wantLoads: 1, wantEvent: "verify_gate_skipped_retry",
+		},
+		{name: "fix iteration", steps: []sliceGateStep{{"", 1}, {"", 0}}, fix: true, wantPkgs: ab, wantLoads: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := sliceGateLoopRepo(t)
-			cmd, logPath := sliceGateSeqRecorder(t, tc.codes...)
+			if tc.setup != nil {
+				tc.setup(t, repo)
+			}
+			cmd, logPath := sliceGateStepRecorder(t, tc.steps...)
 			cfg := sliceGateChildCfg(repo, cmd)
 			loads := sliceGateCountLoads(t)
 			inv := &fakeInvoker{canned: agent.Result{OK: true}}
@@ -384,13 +450,56 @@ func TestRunVerifyFixLoop_SliceGateReachOncePerTree(t *testing.T) {
 			if !res.OK {
 				t.Fatalf("want a pass: %s\n%s", res.FailureReason, log)
 			}
-			if got := sliceGatePkgs(readVerifyFormLog(t, logPath)); !reflect.DeepEqual(got, []string{"[a,b]", "[a,b]"}) {
-				t.Errorf("verify invocations = %q, want two identical [a,b]", got)
+			if got := sliceGatePkgs(readVerifyFormLog(t, logPath)); !reflect.DeepEqual(got, tc.wantPkgs) {
+				t.Errorf("verify invocations = %q, want %q\n%s", got, tc.wantPkgs, log)
 			}
 			if *loads != tc.wantLoads {
-				t.Errorf("reach loads = %d, want %d", *loads, tc.wantLoads)
+				t.Errorf("reach loads = %d, want %d\n%s", *loads, tc.wantLoads, log)
+			}
+			if tc.wantEvent != "" {
+				if n := countEvents(res.Events, tc.wantEvent); n != 1 {
+					t.Errorf("%s events = %d, want 1 (the re-run path under test)\n%s", tc.wantEvent, n, log)
+				}
+			}
+			if !tc.fix && inv.callIdx != 0 {
+				t.Errorf("fix agent invocations = %d, want 0 for an in-place re-run", inv.callIdx)
 			}
 		})
+	}
+}
+
+// (33) a PASSED #4036 flake re-run on a slice-scoped verify: the reverse-dep
+// failure is outside the change, the fix agent changes nothing, and the
+// identical tree passes. The loop's verify_summary detail carries BOTH the
+// flake re-run text (main.go's verifyFlakeRerunDetail assignment) and the
+// scoped-shape sentence sliceGateSummary appends after it.
+func TestRunVerifyFixLoop_SliceGateDetailAppendsToExisting(t *testing.T) {
+	const bFail = "--- FAIL: TestB (0.00s)\nFAIL\nFAIL\texample.com/sg/b\t0.01s\n"
+	repo := sliceGateLoopRepo(t)
+	cmd, logPath := sliceGateStepRecorder(t, sliceGateStep{bFail, 1}, sliceGateStep{"", 0})
+	cfg := sliceGateChildCfg(repo, cmd)
+	loads := sliceGateCountLoads(t)
+
+	res, tree, log := sliceGateRunLoop(t, &cfg, &fakeInvoker{canned: agent.Result{OK: true}})
+	if !res.OK || tree == "" {
+		t.Fatalf("ok=%v tree=%q, want the passed flake re-run\n%s", res.OK, tree, log)
+	}
+	if got := sliceGatePkgs(readVerifyFormLog(t, logPath)); !reflect.DeepEqual(got, []string{"[a,b]", "[a,b]"}) {
+		t.Errorf("verify invocations = %q, want two scoped [a,b]", got)
+	}
+	if *loads != 1 {
+		t.Errorf("reach loads = %d, want 1 (the no-op fix left the tree identical)", *loads)
+	}
+	s := sliceGateSummaryOf(t, res)
+	d, _ := s["detail"].(string)
+	if !strings.HasPrefix(d, verifyFlakeRerunLead) || !strings.Contains(d, "TestB") {
+		t.Errorf("detail = %q, want it to open with the flake re-run text naming TestB", d)
+	}
+	if !strings.HasSuffix(d, "; "+sliceGateScopedDetail) {
+		t.Errorf("detail = %q, want the scoped-shape sentence appended after the flake text", d)
+	}
+	if s["gate_shape"] != sliceGateShapeScoped {
+		t.Errorf("gate_shape = %v, want slice_scoped", s["gate_shape"])
 	}
 }
 

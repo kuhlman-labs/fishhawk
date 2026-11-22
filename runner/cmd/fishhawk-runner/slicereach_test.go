@@ -1,15 +1,20 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -310,6 +315,7 @@ func TestSliceReach_EnvPinned(t *testing.T) {
 		"GOINSECURE":   "example.com/*",
 		"GOENV":        filepath.Join(dir, "goenv"),
 		"GOCACHEPROG":  "/bin/false",
+		"GOSUMDB":      "sum.golang.org http://127.0.0.1:1",
 	} {
 		t.Setenv(k, v)
 	}
@@ -329,6 +335,7 @@ func TestSliceReach_EnvPinned(t *testing.T) {
 		"GOINSECURE":   "",
 		"GOENV":        "off",
 		"GOCACHEPROG":  "",
+		"GOSUMDB":      "off",
 	}
 	for k, v := range want {
 		have, ok := env[k]
@@ -380,6 +387,96 @@ func TestSliceReach_PrivateModuleMakesNoNetworkAttempt(t *testing.T) {
 		t.Fatalf("the reach load ran git (a direct fetch attempt): %q", data)
 	}
 	sliceReachWantReason(t, got, "reach_load_failed:package_error:example.com/m1/a")
+}
+
+// sliceReachSeedModCache populates a fresh GOMODCACHE with example.com/cached
+// v1.0.0 from a hand-built file:// proxy, with no network and no checksum
+// database, so the reach load finds the module already cached.
+func sliceReachSeedModCache(t *testing.T, goBin string) string {
+	t.Helper()
+	proxy := t.TempDir()
+	at := filepath.Join(proxy, "example.com", "cached", "@v")
+	if err := os.MkdirAll(at, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mod := "module example.com/cached\n\ngo 1.22\n"
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	for name, body := range map[string]string{"go.mod": mod, "c.go": "package cached\n"} {
+		w, err := zw.Create("example.com/cached@v1.0.0/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{
+		"list":        []byte("v1.0.0\n"),
+		"v1.0.0.info": []byte(`{"Version":"v1.0.0","Time":"2024-01-01T00:00:00Z"}`),
+		"v1.0.0.mod":  []byte(mod),
+		"v1.0.0.zip":  zbuf.Bytes(),
+	} {
+		if err := os.WriteFile(filepath.Join(at, name), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := t.TempDir()
+	cmd := exec.Command(goBin, "mod", "download", "example.com/cached@v1.0.0")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(),
+		"GOPROXY=file://"+filepath.ToSlash(proxy), "GOSUMDB=off", "GOMODCACHE="+cache,
+		"GOFLAGS=-modcacherw", "GOWORK=off", "GO111MODULE=on", "GOTOOLCHAIN=local", "GOENV=off",
+		"GONOPROXY=", "GOPRIVATE=", "GONOSUMDB=", "GOINSECURE=")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("seeding the module cache: %v\n%s", err, out)
+	}
+	return cache
+}
+
+// TestSliceReach_WorkspaceMissingSumMakesNoSumDBAttempt: in workspace mode a
+// missing go.sum / go.work.sum line is not a hard error, so the go command
+// verifies a CACHED module against the checksum database, and under
+// GOPROXY=off that client dials the database directly. The parent GOSUMDB
+// points at a recording in-test server; the GOSUMDB=off pin keeps it silent.
+func TestSliceReach_WorkspaceMissingSumMakesNoSumDBAttempt(t *testing.T) {
+	real, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("no go toolchain on PATH")
+	}
+	cache := sliceReachSeedModCache(t, real)
+	var mu sync.Mutex
+	var hits []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.URL.Path)
+		mu.Unlock()
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	root := sliceReachWriteFixture(t, map[string]string{
+		"go.work":   "go 1.22\n\nuse ./m1\n",
+		"m1/go.mod": "module example.com/m1\n\ngo 1.22\n\nrequire example.com/cached v1.0.0\n",
+		// No go.sum and no go.work.sum: the sum lines are omitted on purpose.
+		"m1/a/a.go": "package a\n\nimport _ \"example.com/cached\"\n",
+		"m1/b/b.go": "package b\n",
+	})
+	sliceReachSetGoBin(t, real)
+	t.Setenv("GOMODCACHE", cache)
+	t.Setenv("GOSUMDB", "sum.golang.org "+srv.URL)
+	got := sliceReachRun(t, root)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 0 {
+		t.Fatalf("the reach load contacted the checksum database (reason %q): %q", got.reason, hits)
+	}
+	sliceReachWantReason(t, got, "")
+	if !got.emittable["m1/a"] || !got.emittable["m1/b"] {
+		t.Fatalf("emittable = %v, want m1/a and m1/b", got.emittable)
+	}
 }
 
 // (16) TestSliceReach_NonZeroExitIsFull.

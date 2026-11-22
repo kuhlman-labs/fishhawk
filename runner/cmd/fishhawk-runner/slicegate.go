@@ -257,7 +257,10 @@ func sliceGateResolveReach(imports map[string][]string, emittable map[string]boo
 				seeds[dir] = true
 				seeded = true
 			}
-			if dir == "." {
+			// path.Dir is a fixed point at "." (relative) and "/" (absolute);
+			// stopping at both keeps the walk bounded even for an absolute path
+			// phase 1 would have refused.
+			if dir == "." || dir == "/" {
 				break
 			}
 			dir = path.Dir(dir)

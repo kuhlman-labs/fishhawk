@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -145,10 +146,24 @@ func TestSliceGateResolveReach(t *testing.T) {
 		{"unmapped go path", []string{"m1/a/a.go", "m1/zz/z.go"}, nil, "unmapped_go_path:m1/zz/z.go"},
 		{"traversal-only seed", []string{"m3/w/w.go"}, nil, "no_reach_packages"},
 		{"reach is everything", []string{"m1/a/a.go", "m1/c/c.go"}, nil, "reach_is_everything"},
+		// Phase 1 refuses an absolute path, but phase 2 must still terminate
+		// on one: path.Dir("/") is "/", so the ancestor walk stops there.
+		{"absolute non-go path terminates", []string{"/x.json"}, nil, "unclassified_path:/x.json"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pkgs, reason := sliceGateResolveReach(imports, emittable, tc.scope, inert)
+			done := make(chan struct{})
+			var pkgs []string
+			var reason string
+			go func() {
+				defer close(done)
+				pkgs, reason = sliceGateResolveReach(imports, emittable, tc.scope, inert)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("sliceGateResolveReach(%q) did not terminate", tc.scope)
+			}
 			if !reflect.DeepEqual(pkgs, tc.wantPkgs) || reason != tc.wantReason {
 				t.Fatalf("sliceGateResolveReach(%q) = (%q, %q), want (%q, %q)", tc.scope, pkgs, reason, tc.wantPkgs, tc.wantReason)
 			}

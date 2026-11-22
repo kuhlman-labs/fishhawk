@@ -22,7 +22,8 @@ package main
 //   - use/replace containment inside the EvalSymlinks'd clone root (R4);
 //   - a constraint-agnostic go/parser walk that Lstats every .go file (S9/R3);
 //   - the egress pins of approval condition Q1 (no GOPRIVATE/GONOPROXY direct
-//     fetch, no go env file, no GOCACHEPROG).
+//     fetch, no go env file, no GOCACHEPROG) plus GOSUMDB=off (no checksum
+//     database lookup).
 
 import (
 	"bytes"
@@ -464,7 +465,10 @@ func sliceReachParseFile(p string) ([]string, bool) {
 // inherited flags or cgo (basedelta parity) and, per approval condition Q1, no
 // direct-fetch or insecure-fetch pattern (GONOPROXY/GOPRIVATE match a module
 // that would otherwise be fetched DIRECT even under GOPROXY=off), no go env
-// file and no GOCACHEPROG helper process.
+// file and no GOCACHEPROG helper process. GOSUMDB=off closes the checksum
+// database: in workspace mode a missing go.sum / go.work.sum line is not a
+// hard error, so the go command verifies a cached module against the
+// database, and under GOPROXY=off its client dials the database directly.
 func sliceReachPinnedEnv(gowork string) []string {
 	return []string{
 		"GOWORK=" + gowork,
@@ -479,6 +483,7 @@ func sliceReachPinnedEnv(gowork string) []string {
 		"GOINSECURE=",
 		"GOENV=off",
 		"GOCACHEPROG=",
+		"GOSUMDB=off",
 	}
 }
 

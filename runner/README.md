@@ -291,7 +291,7 @@ Anything else is eligible.
 - Before any metadata read, the loader refuses a symlinked or non-regular `go.work`, `go.work.sum`, `go.mod` or `go.sum` at the root, at each `use` directory and at each filesystem `replace` target. It uses the predicate the container module seed uses (`gateiso.RequireRegularModuleMetadata`). Each read is size-capped and ctx-bounded.
 - It refuses a `use` or `replace` that resolves outside the clone.
 - It walks every `.go` file with an imports-only parse that ignores build constraints, refusing a symlinked or non-regular file.
-- It runs one `go list -e -json` whose env appends these pins last: `GOWORK`, `GOPROXY=off`, `GOTOOLCHAIN=local`, `GOFLAGS=`, `CGO_ENABLED=0`, `GONOPROXY=`, `GOPRIVATE=`, `GONOSUMDB=`, `GONOSUMCHECK=`, `GOINSECURE=`, `GOENV=off` and `GOCACHEPROG=`. With those pins, a module that is not already cached is never fetched, and the load widens instead.
+- It runs one `go list -e -json` whose env appends these pins last: `GOWORK`, `GOPROXY=off`, `GOTOOLCHAIN=local`, `GOFLAGS=`, `CGO_ENABLED=0`, `GONOPROXY=`, `GOPRIVATE=`, `GONOSUMDB=`, `GONOSUMCHECK=`, `GOINSECURE=`, `GOENV=off`, `GOCACHEPROG=` and `GOSUMDB=off`. With those pins, a module that is not already cached is never fetched, and the load widens instead. `GOSUMDB=off` matters in workspace mode: there a missing `go.sum` or `go.work.sum` line is not a hard error, so the go command checks even a cached module against the checksum database, and under `GOPROXY=off` it dials that database directly.
 
 The edges are the union of the `go list` and walk imports, tests included.
 
@@ -310,7 +310,7 @@ The edges are the union of the `go list` and walk imports, tests included.
 | phase 1 | `slice_gate_not_offered`, the served `unavailable_reason`, `empty_scope`, `undecodable_path`, `non_concrete_scope_entry:<entry>`, `go_module_file:<path>`, `global_surface:<path>` |
 | isolation | `gate_isolation_not_host:<selection>` |
 | workspace | `reach_unsupported_workspace`, `reach_unsupported_workspace:metadata_not_regular:<root\|use\|replace>`, `reach_dir_outside_clone:<importpath>` |
-| load | `reach_load_failed:` + one of `load_timeout`, `metadata_too_large:<path>`, `gomod_unreadable:<path>`, `unparsable_go_file:<path>`, `import_not_package:<importpath>`, `go_list_exit`, `go_list_malformed_json`, `go_list_stdout_cap`, `package_error:<importpath>`, `no_module:<importpath>`, `no_packages`, `unwalked_package_dir:<importpath>` |
+| load | `reach_load_failed:` + one of `load_timeout`, `metadata_too_large:<path>`, `gomod_unreadable:<path>`, `unparsable_go_file:<path>`, `walk_failed:<path>`, `import_not_package:<importpath>`, `go_list_exit`, `go_list_malformed_json`, `go_list_stdout_cap`, `package_error:<importpath>`, `no_module:<importpath>`, `no_packages`, `unwalked_package_dir:<importpath>` |
 | mapping | `unmapped_go_path:<path>`, `unclassified_path:<path>`, `no_reach_packages`, `reach_is_everything`, `reach_too_large` (joined value over 64 KiB), `undecodable_path` (a package dir with a comma, tab, newline or CR) |
 
 Every reason is bounded to 256 bytes.
@@ -323,7 +323,7 @@ Every reason is bounded to 256 bytes.
 - Declared-inert docs that Go tests read as data contribute no reach. A repository that wants them to force full declares them in `global_surface` or `doc_check_inputs` instead.
 - A host-excluded dir (for example one whose only file has a build tag the host never sets) is traversed but not emitted. The walk closes the import-graph half of the GOOS/tag gap, not the execution half.
 - Patch coverage is skipped in the scoped form and enforced only at fan-in.
-- `vendor/` and nested-module metadata that the Lstat predicate does not cover stay bounded only by the load timeout.
+- Only the load timeout bounds two file classes the Lstat checks miss. The first is `vendor/` and nested-module metadata that the predicate does not cover. The second is the non-`.go` source files (`.c`, `.s`, `.h` and similar) that the host `go list` opens in each listed package dir to read build-constraint headers. The walk Lstats only `.go` files, so a FIFO or symlink with one of those extensions reaches the go subprocess. The worst case is a `reach_load_failed:load_timeout` that widens to full once per tree.
 
 **When the saving holds.** The saving depends on a warm module cache and a host gate path. A cold cache widens through `package_error`, and a container or hosted selection widens through `gate_isolation_not_host`. In the post-merge split of `slice_scoped` from `full` by reason, a high share of either is the signal that the slice gate is not paying for itself.
 
