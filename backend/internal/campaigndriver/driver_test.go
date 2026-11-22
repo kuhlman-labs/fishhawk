@@ -913,22 +913,30 @@ func failedPlanRun(reader *stagedRunReader, reason string) *run.Run {
 // driver seam (R4a): a running item whose run failed because an approver
 // rejected its plan settles `replanning` (not failed), the campaign stays
 // running, the settle entry's outcome reads "replanning", and across TWO ticks
-// the starter is never called for it — the operator, not the driver, starts
-// the replan. Deleting the failedRunSettleTarget call site in advance turns the
-// state assertion RED (the item settles failed and the campaign derives
-// terminal failed). The no-dispatch invariant is defended in depth —
-// NextEligible's Replanning arm (pinned by campaign engine_test), the START
-// pass's linked/edge guard, and the claim's linked refusal — so the
-// claim-call assertion goes RED only when the first two are both bypassed.
+// the starter and the claim are never called for it — the operator, not the
+// driver, starts the replan.
+//
+// A pending sibling under MaxParallel=1 makes the NextEligible Replanning arm
+// observable here: with the arm, the replanning item holds no concurrency
+// slot, so the sibling starts on tick 1. Deleting the arm drops the item into
+// the Running catch-all (it carries a RunID and a non-terminal state), the
+// budget reads 0, and the sibling-start assertion goes RED. Deleting the
+// failedRunSettleTarget call site turns the state assertion RED (the item
+// settles failed). The no-dispatch assertion itself is defended in depth —
+// the arm keeps the item out of Eligible, and START re-checks RunID and the
+// running edge before it claims — so it goes RED only when the arm is
+// mutated to Eligible AND the START re-check is removed (run as a paired
+// counterfactual; no single mutation reaches it).
 func TestTick_PlanRejectedRun_SettlesReplanning_NeverDispatched(t *testing.T) {
 	store := newFakeStore()
 	c := store.seedCampaign(campaign.StateRunning)
 	reader := &stagedRunReader{fakeRunReader: newFakeRunReader(), stages: map[uuid.UUID][]*run.Stage{}}
 	rejected := failedPlanRun(reader, run.FailureReasonGateRejected)
 	it := store.seedItem(c, "issue:7", campaign.ItemStateRunning, nil, &rejected.ID)
+	sibling := store.seedItem(c, "issue:8", campaign.ItemStatePending, nil, nil)
 	au := &fakeAudit{}
 	starter := &fakeStarter{reader: reader.fakeRunReader}
-	tk := &Ticker{Campaigns: store, Runs: reader, Starter: starter, Audit: au, MaxParallel: 4, Now: fixedNow}
+	tk := &Ticker{Campaigns: store, Runs: reader, Starter: starter, Audit: au, MaxParallel: 1, Now: fixedNow}
 
 	for tick := 1; tick <= 2; tick++ {
 		tk.Tick(context.Background())
@@ -941,8 +949,14 @@ func TestTick_PlanRejectedRun_SettlesReplanning_NeverDispatched(t *testing.T) {
 		if c.State != campaign.StateRunning {
 			t.Fatalf("tick %d: campaign state = %s, want running (replanning is not a failure)", tick, c.State)
 		}
-		if len(starter.calls) != 0 || store.claimCalls != 0 {
-			t.Fatalf("tick %d: starter calls = %d, claim calls = %d, want 0 and 0 (a replanning item is never auto-dispatched)", tick, len(starter.calls), store.claimCalls)
+		for _, id := range starter.calls {
+			if id == it.ID {
+				t.Fatalf("tick %d: starter called for the replanning item (a replanning item is never auto-dispatched)", tick)
+			}
+		}
+		if len(starter.calls) != 1 || starter.calls[0] != sibling.ID || store.claimCalls != 1 {
+			t.Fatalf("tick %d: starter calls = %v, claim calls = %d, want exactly the sibling %s once (the replanning item holds no MaxParallel=1 slot)",
+				tick, starter.calls, store.claimCalls, sibling.ID)
 		}
 	}
 	settled := au.byCategory(categoryCampaignIssueSettled)

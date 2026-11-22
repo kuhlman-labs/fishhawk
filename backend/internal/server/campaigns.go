@@ -3649,7 +3649,11 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			// terminal-only. AUDIT-FIRST: the campaign_issue_settled entry is
 			// appended BEFORE the state change and is its durable record; an
 			// append error leaves the item replanning for the next read, so no
-			// settle ever lands unaudited.
+			// settle ever lands unaudited. The entry is at-least-once: a settle
+			// write failing after the append, or refused because a concurrent
+			// write moved the item first, leaves the entry standing and the
+			// next read may append again. The item row is authoritative
+			// (docs/issue-comment-surfaces.md).
 			if !campaign.ValidCampaignItemTransition(it.State, cand.target) {
 				continue
 			}

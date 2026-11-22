@@ -2959,7 +2959,13 @@ Notes:
   issue-closed settle of that replanning item carries `run_id`,
   `settled_via:"issue_closed"`, `prior_state:"replanning"` and an `outcome` of
   `succeeded` or `cancelled`; that one entry is appended AUDIT-FIRST (before
-  the state change, which an append failure withholds). They remain
+  the state change, which an append failure withholds). It is AT-LEAST-ONCE,
+  not exactly-once: a state write that fails after the append leaves the item
+  `replanning` and the next read appends again, and a concurrent write landing
+  between append and settle (an operator cancel, or a second reader's settle)
+  makes the repository refuse the settle, leaving an entry for a change that
+  never landed. The item row is authoritative; nothing counts these entries.
+  They remain
   best-effort and are still NOT issue-comment surfaces. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for a comment surface.
 - The campaign **grooming-source provenance** marker —

@@ -113,6 +113,10 @@ type fakeCampaignRepo struct {
 	// SettleCampaignItemForClosedIssue call (under the fake's mutex) so a test
 	// can observe what was already audited before the state change (#5379).
 	onSettleClosedIssue func()
+	// settleClosedIssueErr, when set, fails every SettleCampaignItemForClosedIssue
+	// call after the hook and the counter run, so a test can observe a state
+	// write failing AFTER its audit-first append landed (#5379).
+	settleClosedIssueErr error
 
 	// afterReopen, when set, is invoked AFTER ReopenCampaignForItemRestart
 	// releases the fake's mutex and commits both mutations — the seam the
@@ -570,6 +574,9 @@ func (f *fakeCampaignRepo) SettleCampaignItemForClosedIssue(_ context.Context, i
 	f.settleClosedIssueCalls++
 	if f.onSettleClosedIssue != nil {
 		f.onSettleClosedIssue()
+	}
+	if f.settleClosedIssueErr != nil {
+		return nil, f.settleClosedIssueErr
 	}
 	for _, items := range f.itemsByCmp {
 		for _, it := range items {
@@ -12597,6 +12604,88 @@ func TestCampaignStatus_ReplanningIssueClosed_AuditFailLeavesItem(t *testing.T) 
 	}
 	if crepo.settleClosedIssueCalls != 0 {
 		t.Errorf("settleClosedIssueCalls = %d, want 0", crepo.settleClosedIssueCalls)
+	}
+}
+
+// TestCampaignStatus_ReplanningIssueClosed_SettleFailAfterAppend pins the
+// accepted AT-LEAST-ONCE semantics of the audit-first replanning settle
+// (#5379): when the campaign_issue_settled append lands but the
+// SettleCampaignItemForClosedIssue write then fails, the entry is NOT rolled
+// back, the item stays replanning with no resolved_by marker, and every later
+// read appends another entry until the write lands. Once it lands, the item is
+// succeeded and no further entry is appended. The item row, not the entry
+// count, is authoritative (docs/issue-comment-surfaces.md). Moving the append
+// after the settle (settle-first) records zero entries on the failing reads.
+func TestCampaignStatus_ReplanningIssueClosed_SettleFailAfterAppend(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateFailed)
+	item := cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, runID)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	crepo.settleClosedIssueErr = errInjected
+
+	for read := 1; read <= 2; read++ {
+		_ = getCampaignStatusBody(t, s, c.ID)
+		if item.State != campaign.ItemStateReplanning || item.ResolvedBy != "" {
+			t.Fatalf("read %d: item = %s resolved_by=%q, want replanning with no marker (state write failed)", read, item.State, item.ResolvedBy)
+		}
+		if got := aud.count(categoryCampaignIssueSettled); got != read {
+			t.Fatalf("read %d: campaign_issue_settled entries = %d, want %d (audit-first, one per attempt)", read, got, read)
+		}
+	}
+
+	crepo.settleClosedIssueErr = nil
+	_ = getCampaignStatusBody(t, s, c.ID)
+	if item.State != campaign.ItemStateSucceeded || item.ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Fatalf("after recovery: item = %s resolved_by=%q, want succeeded resolved_by=%q", item.State, item.ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	_ = getCampaignStatusBody(t, s, c.ID)
+	if got := aud.count(categoryCampaignIssueSettled); got != 3 {
+		t.Errorf("campaign_issue_settled entries after the write landed = %d, want 3 (two failed attempts + the landed one; none after)", got)
+	}
+	if crepo.settleClosedIssueCalls != 3 {
+		t.Errorf("settleClosedIssueCalls = %d, want 3", crepo.settleClosedIssueCalls)
+	}
+}
+
+// TestCampaignStatus_ReplanningIssueClosed_RacedSettleRefused pins the other
+// at-least-once path (#5379): a concurrent write moves the item off replanning
+// between the audit-first append and the settle (an operator cancel, or a
+// second reader's settle landing first). The repository's from-guard refuses
+// the settle, the concurrent state stands untouched, and the appended entry
+// stays on the chain describing a settle that did not land.
+func TestCampaignStatus_ReplanningIssueClosed_RacedSettleRefused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateFailed)
+	item := cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, runID)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	// The operator cancel lands after this reader's snapshot and append.
+	crepo.onSettleClosedIssue = func() { item.State = campaign.ItemStateCancelled }
+
+	_ = getCampaignStatusBody(t, s, c.ID)
+
+	if crepo.settleClosedIssueCalls != 1 {
+		t.Fatalf("settleClosedIssueCalls = %d, want 1", crepo.settleClosedIssueCalls)
+	}
+	if item.State != campaign.ItemStateCancelled || item.ResolvedBy != "" {
+		t.Errorf("item = %s resolved_by=%q, want the concurrent cancel to stand unmarked", item.State, item.ResolvedBy)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["outcome"] != string(campaign.ItemStateSucceeded) || p["prior_state"] != string(campaign.ItemStateReplanning) {
+		t.Errorf("settled payload = %v, want the attempted replanning -> succeeded entry retained", p)
 	}
 }
 
