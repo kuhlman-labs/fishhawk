@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
@@ -1925,6 +1926,159 @@ func TestGetRun_Drive_StageListError_FailsOpen(t *testing.T) {
 	resp, raw := getRunResponse(t, s, seeded.ID)
 	if _, present := raw["next_action"]; !present || resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
 		t.Errorf("next_action = %+v (present=%v), want fail-open surfaced on a stage-list read error", resp.NextAction, present)
+	}
+}
+
+// --- dispatcher-queued next_action suppression (#5267) ----------------------
+
+// driveQueuedConcurrency answers StatusForStages from a map (or an error) and
+// records every stage id it was asked about; every other concurrency.Store
+// method panics through the nil embedded interface.
+type driveQueuedConcurrency struct {
+	concurrency.Store
+	statuses map[uuid.UUID]concurrency.Status
+	err      error
+	asked    []uuid.UUID
+}
+
+func (c *driveQueuedConcurrency) StatusForStages(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]concurrency.Status, error) {
+	c.asked = append(c.asked, ids...)
+	if c.err != nil {
+		return nil, c.err
+	}
+	out := map[uuid.UUID]concurrency.Status{}
+	for _, id := range ids {
+		if st, ok := c.statuses[id]; ok {
+			out[id] = st
+		}
+	}
+	return out, nil
+}
+
+// seedStageRowReturning appends a stage row like seedStageRow and returns it,
+// so a test can key the concurrency fake on its id.
+func seedStageRowReturning(r *driveStaleRepo, runID uuid.UUID, typ run.StageType, state run.StageState) *run.Stage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := &run.Stage{ID: uuid.New(), RunID: runID, Type: typ, State: state}
+	r.stagesByRun[runID] = append(r.stagesByRun[runID], st)
+	return st
+}
+
+// TestGetRun_Drive_HostDispatcherQueued_NextAction pins the third suppression
+// shape on GET /v0/runs/{id} (#5267): on an auto_dispatch run whose
+// host-spawnable plan/implement stage the host dispatcher has queued for a
+// local concurrency slot with a LIVE waiter, the run_plan_stage /
+// run_implement_stage next_action is omitted (auto_advanced still lists the
+// entry), and every degrade fails OPEN to the #1961 surface. The implement
+// stage sits at awaiting_host_dispatch, so the #1961 check alone would SURFACE
+// the action: only the new control can suppress it.
+func TestGetRun_Drive_HostDispatcherQueued_NextAction(t *testing.T) {
+	queuedLive := concurrency.Status{State: concurrency.SlotQueued, GroupKey: "host:h:default", Limit: 1, Position: 2, WaiterLive: true}
+	queuedStale := queuedLive
+	queuedStale.WaiterLive = false
+	held := concurrency.Status{State: concurrency.SlotHeld, GroupKey: "host:h:default", Limit: 1, WaiterLive: true}
+	cases := []struct {
+		name         string
+		autoDispatch bool
+		action       string
+		stageType    run.StageType
+		stageState   run.StageState
+		status       *concurrency.Status // nil: no slot row for the stage
+		storeErr     error
+		noStore      bool
+		wantAction   bool // true => next_action surfaced; false => omitted
+	}{
+		{"queued_live_awaiting_host_dispatch_omitted", true, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, &queuedLive, nil, false, false},
+		{"queued_live_pending_omitted", true, "run_implement_stage", run.StageTypeImplement, run.StageStatePending, &queuedLive, nil, false, false},
+		{"queued_live_plan_stage_omitted", true, "run_plan_stage", run.StageTypePlan, run.StageStatePending, &queuedLive, nil, false, false},
+		{"waiter_not_live_surfaced", true, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, &queuedStale, nil, false, true},
+		{"unmarked_run_surfaced", false, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, &queuedLive, nil, false, true},
+		{"store_error_surfaced", true, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, &queuedLive, errors.New("slot store down"), false, true},
+		{"nil_store_surfaced", true, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, nil, nil, true, true},
+		{"no_slot_row_surfaced", true, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, nil, nil, false, true},
+		{"holding_surfaced", true, "run_implement_stage", run.StageTypeImplement, run.StageStateAwaitingHostDispatch, &held, nil, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, seeded := newDriveStaleServer(t)
+			seeded.AutoDispatch = tc.autoDispatch
+			seedHostDispatchNextAction(t, au, seeded.ID, tc.action)
+			if tc.stageType == run.StageTypeImplement {
+				seedStageRow(repo, seeded.ID, run.StageTypePlan, run.StageStateSucceeded)
+			}
+			st := seedStageRowReturning(repo, seeded.ID, tc.stageType, tc.stageState)
+			if !tc.noStore {
+				store := &driveQueuedConcurrency{statuses: map[uuid.UUID]concurrency.Status{}, err: tc.storeErr}
+				if tc.status != nil {
+					store.statuses[st.ID] = *tc.status
+				}
+				s.cfg.Concurrency = store
+			}
+
+			resp, raw := getRunResponse(t, s, seeded.ID)
+			_, present := raw["next_action"]
+			if tc.wantAction {
+				if !present || resp.NextAction == nil || resp.NextAction.Action != tc.action {
+					t.Errorf("next_action = %+v (present=%v), want %s surfaced (fail-open)", resp.NextAction, present, tc.action)
+				}
+			} else if present {
+				t.Errorf("next_action present (%+v), want omitted: the host dispatcher owns this queued dispatch", resp.NextAction)
+			}
+			if len(resp.AutoAdvanced) != 1 {
+				t.Errorf("auto_advanced = %+v, want the recorded entry still listed", resp.AutoAdvanced)
+			}
+		})
+	}
+}
+
+// TestHostDispatcherQueuedStages_OnlyHostSpawnableStates pins that the
+// dispatcher-queued control applies ONLY while a stage is pending or
+// awaiting_host_dispatch (#5267, approval condition K4b): a plan/implement
+// stage at any later state is never marked (and never asked about), even when
+// the slot store reports it queued with a live waiter, and a non-dispatch stage
+// type is never marked either. A later-state stage's next_action is decided by
+// the #1961 branch alone.
+func TestHostDispatcherQueuedStages_OnlyHostSpawnableStates(t *testing.T) {
+	queuedLive := concurrency.Status{State: concurrency.SlotQueued, GroupKey: "host:h:default", Limit: 1, Position: 1, WaiterLive: true}
+	runID := uuid.New()
+	spawnable := []*run.Stage{
+		{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateAwaitingHostDispatch},
+		{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan, State: run.StageStatePending},
+	}
+	var later []*run.Stage
+	for _, state := range []run.StageState{
+		run.StageStateDispatched, run.StageStateRunning, run.StageStateAwaitingApproval,
+		run.StageStateAwaitingChildren, run.StageStateAwaitingInput, run.StageStateAwaitingScopeDecision,
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled, run.StageStateSuperseded,
+	} {
+		later = append(later, &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: state})
+	}
+	otherType := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeReview, State: run.StageStatePending}
+
+	all := append(append(append([]*run.Stage{}, spawnable...), later...), otherType, nil)
+	store := &driveQueuedConcurrency{statuses: map[uuid.UUID]concurrency.Status{}}
+	for _, st := range all {
+		if st != nil {
+			store.statuses[st.ID] = queuedLive
+		}
+	}
+	s := New(Config{Addr: "127.0.0.1:0", Concurrency: store})
+
+	got := s.hostDispatcherQueuedStages(context.Background(), &run.Run{ID: runID, AutoDispatch: true}, all)
+	want := map[uuid.UUID]bool{spawnable[0].ID: true, spawnable[1].ID: true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("marked = %v, want only the two host-spawnable stages %v", got, want)
+	}
+	for _, st := range append(later, otherType) {
+		if got[st.ID] {
+			t.Errorf("%s stage at %s marked dispatcher-queued, want never hidden by this control", st.Type, st.State)
+		}
+		for _, id := range store.asked {
+			if id == st.ID {
+				t.Errorf("%s stage at %s was read from the slot store, want only host-spawnable stages asked", st.Type, st.State)
+			}
+		}
 	}
 }
 
