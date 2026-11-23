@@ -1109,3 +1109,78 @@ func TestPreviewCampaign_Screens_AbsentWhenClean(t *testing.T) {
 		}
 	}
 }
+
+// TestPreviewCampaign_AdmissionScreen_ScreensOnlyDriverWorkflow is the #5267
+// cross-boundary test, through the real router (POST /v0/campaigns/preview):
+// forge spec fetch → spec parse → screen → wire response. screenSpecYAML's
+// feature_change forbids `.github/workflows/**` and docs_change forbids
+// `.fishhawk/**`, and the item names one path from each. The former
+// every-workflow union flagged BOTH paths; the fix flags only the path the
+// driver's workflow forbids and names that workflow as
+// admission_screen.workflow_id (decoded from the raw body, so a json tag typo
+// fails here too).
+func TestPreviewCampaign_AdmissionScreen_ScreensOnlyDriverWorkflow(t *testing.T) {
+	cases := map[string]struct {
+		driverWorkflow string
+		wantWorkflowID string
+		want           campaignScreenFinding
+	}{
+		"default driver workflow": {
+			wantWorkflowID: "feature_change",
+			want: campaignScreenFinding{
+				Issue: 100, Kind: campaignScreenKindForbiddenPath, Path: ".github/workflows/ci.yml",
+				Location: "body", ForbiddenPattern: ".github/workflows/**",
+			},
+		},
+		"configured driver workflow": {
+			driverWorkflow: "docs_change",
+			wantWorkflowID: "docs_change",
+			want: campaignScreenFinding{
+				Issue: 100, Kind: campaignScreenKindForbiddenPath, Path: ".fishhawk/workflows.yaml",
+				Location: "body", ForbiddenPattern: ".fishhawk/**",
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+				Children: []workmgmt.EpicChild{{
+					Number: 100, Title: "spec and ci",
+					Body: "Edit `.fishhawk/workflows.yaml` and `.github/workflows/ci.yml`.",
+				}},
+			}})
+			tokens := stubToken("write:campaigns")
+			s := New(Config{
+				CampaignRepo:             newFakeCampaignRepo(),
+				APITokenRepo:             tokens,
+				GitHub:                   screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML)),
+				CampaignDriverWorkflowID: tc.driverWorkflow,
+			})
+			req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/preview",
+				strings.NewReader(`{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+tokens.tok.PlainText)
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+
+			rep := decodePreview(t, w)
+			sc := rep.AdmissionScreen
+			if sc == nil || !sc.Advisory || !sc.ForbiddenPathsScreened ||
+				!reflect.DeepEqual(sc.Findings, []campaignScreenFinding{tc.want}) {
+				t.Fatalf("admission_screen = %+v, want exactly the one finding %+v", sc, tc.want)
+			}
+			var raw struct {
+				AdmissionScreen struct {
+					WorkflowID string `json:"workflow_id"`
+				} `json:"admission_screen"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+				t.Fatalf("decode raw body: %v", err)
+			}
+			if raw.AdmissionScreen.WorkflowID != tc.wantWorkflowID {
+				t.Errorf("admission_screen.workflow_id = %q, want %q (body=%s)",
+					raw.AdmissionScreen.WorkflowID, tc.wantWorkflowID, w.Body.String())
+			}
+		})
+	}
+}

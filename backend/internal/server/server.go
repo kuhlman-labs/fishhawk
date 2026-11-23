@@ -161,6 +161,15 @@ type Config struct {
 	// pending.
 	CampaignAutoStartRunnerKind string
 
+	// CampaignDriverWorkflowID is the workflow the campaign driver starts
+	// each item run under: serve.go sets it to the
+	// --campaign-driver-workflow-id value. Its reader is the advisory
+	// campaign admission screen (#5267), which screens THIS workflow's
+	// implement-stage forbidden_paths and reports it as
+	// admission_screen.workflow_id. Empty (every fake-backed test) means
+	// webhook.DefaultWorkflowID (feature_change), the flag's default.
+	CampaignDriverWorkflowID string
+
 	// SigningRepo issues + persists per-run Ed25519 keys for the
 	// trace bundle signing flow. Wired by the
 	// /v0/runs/{id}/signing-key handler; nil leaves it 503.
