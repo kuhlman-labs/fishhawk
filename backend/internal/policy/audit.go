@@ -84,13 +84,14 @@ const (
 	// pass --check-base-ref, or emitted no diff). We can't evaluate
 	// path-based constraints against an absent diff meaningfully; emit
 	// skipped so the SPA renders the reason rather than "policy passed
-	// · no constraints" which is misleading. A bundle or git_diff that
-	// could not be READ is SkipBundleUnreadable, never this (#5535).
+	// · no constraints" which is misleading. A bundle, manifest or
+	// git_diff that could not be READ is SkipBundleUnreadable, never this
+	// (#5535).
 	SkipNoDiffInBundle SkipReason = "no_diff_in_bundle"
-	// SkipBundleUnreadable: the trace bundle, or its git_diff event,
-	// could not be read (a malformed line, a malformed git_diff payload,
-	// a truncated gzip stream, or a line or total size over the reader's
-	// bounds). The verdict is UNDETERMINABLE, so it is recorded
+	// SkipBundleUnreadable: the trace bundle, its manifest or its
+	// git_diff event could not be read (a malformed line, a missing or
+	// malformed manifest, a malformed git_diff payload, a truncated gzip
+	// stream, or a line or total size over the reader's bounds). The verdict is UNDETERMINABLE, so it is recorded
 	// passed:false by EmitEvaluationUndeterminable, the one skip reason
 	// that is not a pass (#5535).
 	SkipBundleUnreadable SkipReason = "bundle_unreadable"

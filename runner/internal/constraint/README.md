@@ -38,7 +38,7 @@ The backend **always** writes a `policy_evaluated` audit entry — including on 
 
 When evaluation can't run meaningfully, the audit payload's `skip_reason` field (`spec_unavailable` / `spec_unparseable` / `workflow_not_in_spec` / `stage_not_in_spec` / `no_diff_in_bundle` / `bundle_unreadable`) carries the structured cause; `<PolicySection>` renders a dedicated "Policy evaluation skipped · <reason>" arm instead of a misleading pass state.
 
-A skip is recorded `passed: true` with one exception: `bundle_unreadable` (#5535), written when the bundle or its `git_diff` event could not be read, is recorded `passed: false` because the verdict is undeterminable. The backend also fails that implement stage retryable category C rather than advancing it. `no_diff_in_bundle` now means only a cleanly read bundle with no `git_diff` event.
+A skip is recorded `passed: true` with one exception: `bundle_unreadable` (#5535), written when the bundle, its manifest or its `git_diff` event could not be read, is recorded `passed: false` because the verdict is undeterminable. The backend also fails that implement stage retryable category C rather than advancing it. `no_diff_in_bundle` now means only a cleanly read bundle with no `git_diff` event.
 
 ## Deferred outcomes (#297)
 

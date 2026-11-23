@@ -411,7 +411,8 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	// before any repository lookup that can flap. reEvaluatePolicy returns
 	// early on a GetStage/GetRun error, so deriving the decision only from
 	// its result would let a flapping lookup route an unreadable bundle to
-	// the no-violations advance below. Both are the same ExtractDiff error.
+	// the no-violations advance below. Both are the same
+	// bundleUnreadableError (a manifest or diff read error).
 	var (
 		violations    []policy.Violation
 		unreadableErr error
@@ -577,9 +578,10 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		// against an orphan on run 8ae65577. Fix-up re-reviews are consolidated
 		// onto the fixup_pushed /pull-request report (maybeBackstopFixupReReview),
 		// which sources its diff from ComparePatch(base, pushedHead) — the commit
-		// the PR will merge. A manifest read error leaves today's behavior
-		// unchanged: an older bundle without the flag is indistinguishable from a
-		// non-fix-up one, and over-reviewing is the safe direction. This skip
+		// the PR will merge. An older bundle without the flag is
+		// indistinguishable from a non-fix-up one, and over-reviewing is the
+		// safe direction; a manifest READ error is an unreadable bundle
+		// (#5535) and skips the review with a WARN below. This skip
 		// falls through to the fixupPushGated deferral below, which keeps the
 		// stage in `running` for the push report to drive terminally.
 		manifest, merr := bundle.ExtractManifest(bundleBytes)
@@ -589,19 +591,19 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
 			)
-		} else if diff, derr := bundle.ExtractDiff(bundleBytes); bundleDiffUnreadable(derr) {
-			// #5535: an unreadable bundle skips the review. Say so: a
-			// silently skipped review is how an unreadable bundle once
-			// advanced with no review at all. The trace handler's
-			// bundle_unreadable arm fails an implement stage before this
-			// hook; reaching it means that arm could not.
+		} else if uerr := bundleUnreadableError(bundleBytes); uerr != nil {
+			// #5535: an unreadable bundle (manifest or diff) skips the
+			// review. Say so: a silently skipped review is how an unreadable
+			// bundle once advanced with no review at all. The trace
+			// handler's bundle_unreadable arm fails an implement stage
+			// before this hook; reaching it means that arm could not.
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 				"trace upload: implement review skipped — bundle unreadable (#5535)",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
-				slog.String("error", bundleErrDetail(derr)),
+				slog.String("error", bundleErrDetail(uerr)),
 			)
-		} else if derr == nil {
+		} else if diff, derr := bundle.ExtractDiff(bundleBytes); derr == nil {
 			// Surface runner-reported scope_drift to the reviewer so an
 			// operator-staged required file in a drifted path is not
 			// false-rejected as missing (#695). Best-effort: an extraction
@@ -1164,7 +1166,7 @@ func (s *Server) notifyPageClass(ctx context.Context, runID uuid.UUID, source st
 // stuck on "pending" (#247).
 //
 // The returned error is non-nil only for an unreadable bundle (#5535,
-// bundleDiffUnreadable): it records policy_evaluated passed:false with
+// bundleUnreadableError): it records policy_evaluated passed:false with
 // skip_reason bundle_unreadable, never a pass, and returns the read error.
 // That check runs before the GetRun lookup so a flapping run read cannot
 // drop the not-passed row; the trace handler makes the fail-closed stage
@@ -1185,15 +1187,16 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 
 	// Diff extraction: ErrNoDiffEvent is the genuine absent-event case,
 	// emit skipped with no_diff_in_bundle so the SPA can render the
-	// reason rather than "pending" (#283). Any OTHER ExtractDiff error
-	// means the bundle or its git_diff could not be read (#5535): the
+	// reason rather than "pending" (#283). Any OTHER ExtractDiff error,
+	// or any ExtractManifest error, means the bundle, its manifest or its
+	// git_diff could not be read (#5535, bundleUnreadableError): the
 	// verdict is undeterminable, so it is recorded passed:false
 	// bundle_unreadable and the error is returned, never a skip->pass.
-	diff, diffErr := bundle.ExtractDiff(bundleBytes)
-	if bundleDiffUnreadable(diffErr) {
-		s.emitPolicyUndeterminable(ctx, runID, stageID, stageType, diffErr)
-		return nil, diffErr
+	if readErr := bundleUnreadableError(bundleBytes); readErr != nil {
+		s.emitPolicyUndeterminable(ctx, runID, stageID, stageType, readErr)
+		return nil, readErr
 	}
+	diff, diffErr := bundle.ExtractDiff(bundleBytes)
 	if diffErr != nil {
 		s.emitPolicySkipped(ctx, runID, stageID, stageType, policy.SkipNoDiffInBundle, diffErr.Error())
 		return nil, nil
@@ -1610,19 +1613,30 @@ func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, r
 
 // bundleDiffUnreadable reports whether an ExtractDiff (or ExtractManifest)
 // error means the bundle could not be READ (#5535): a malformed line, a
-// malformed git_diff payload, a truncated gzip stream, or a line or total
-// size over bundle.MaxLineBytes / bundle.MaxDecompressedBytes. Only the
-// genuine bundle.ErrNoDiffEvent (a cleanly read bundle with no git_diff
-// event) is the no-changes path; every other error fails closed.
+// missing or malformed manifest, a malformed git_diff payload, a truncated
+// gzip stream, or a line or total size over bundle.MaxLineBytes /
+// bundle.MaxDecompressedBytes. Only the genuine bundle.ErrNoDiffEvent (a
+// cleanly read bundle with no git_diff event) is the no-changes path;
+// every other error fails closed.
 func bundleDiffUnreadable(err error) bool {
 	return err != nil && !errors.Is(err, bundle.ErrNoDiffEvent)
 }
 
-// bundleUnreadableError returns the bundle's read error when
-// bundleDiffUnreadable holds for it, and nil otherwise. It reads only the
-// bundle bytes, so the trace handler's fail-closed decision cannot be
-// skipped by a repository lookup that flaps (#5535).
+// bundleUnreadableError returns the bundle's read error when the bundle
+// is unreadable, and nil otherwise. A bundle is unreadable when ANY
+// ExtractManifest error occurs (a whole-bundle read failure,
+// bundle.ErrNoManifest, or a `bundle: parse manifest` payload error) or
+// when bundleDiffUnreadable holds for its ExtractDiff error. The manifest
+// carries the agent_failed and push_and_open_pr / push_to_shared_branch /
+// push_fixup signals, so a bundle whose manifest alone is unreadable is as
+// undeterminable as one whose diff is: it fails category C with a named
+// reason rather than being held in running by the push gates. It reads
+// only the bundle bytes, so the trace handler's fail-closed decision
+// cannot be skipped by a repository lookup that flaps (#5535).
 func bundleUnreadableError(bundleBytes []byte) error {
+	if _, err := bundle.ExtractManifest(bundleBytes); err != nil {
+		return err
+	}
 	if _, err := bundle.ExtractDiff(bundleBytes); bundleDiffUnreadable(err) {
 		return err
 	}
@@ -1633,19 +1647,48 @@ func bundleUnreadableError(bundleBytes []byte) error {
 // reason and policy_evaluated skip_detail reflect (#5535).
 const maxBundleErrDetailBytes = 512
 
+// bundleParseErrPrefix starts every bundle error that wraps a decode
+// error over runner-supplied bytes: `bundle: parse line`, `bundle: parse
+// manifest` and `bundle: parse git_diff payload`.
+const bundleParseErrPrefix = "bundle: parse "
+
+// bundleDecodeClass reduces a decode error to a fixed class string. A
+// decode error quotes the bytes it failed on (encoding/json echoes a
+// number literal in UnmarshalTypeError and a character in SyntaxError;
+// time.ParseError quotes a whole non-RFC3339 `ts` string), so none of its
+// text is reflected (#5535 B5).
+func bundleDecodeClass(err error) string {
+	var (
+		syntaxErr *json.SyntaxError
+		typeErr   *json.UnmarshalTypeError
+		timeErr   *time.ParseError
+	)
+	switch {
+	case errors.As(err, &syntaxErr):
+		return "invalid JSON"
+	case errors.As(err, &typeErr):
+		return "a JSON value of the wrong type"
+	case errors.As(err, &timeErr):
+		return "an unparseable timestamp"
+	default:
+		return "an undecodable value"
+	}
+}
+
 // bundleErrDetail renders a bundle read error for the stage reason and
-// the policy_evaluated skip_detail: a JSON type error's echoed literal is
-// reduced to its kind (encoding/json quotes a number literal verbatim in
-// UnmarshalTypeError.Value), control characters become '?', invalid UTF-8
-// is replaced, and the result is cut at maxBundleErrDetailBytes on a rune
-// boundary. The error is reflected from runner-supplied bytes, so it is
-// never echoed raw or unbounded.
+// the policy_evaluated skip_detail. A `bundle: parse ...` error keeps its
+// own fixed prefix and has EVERY wrapped decode error reduced to a fixed
+// class string (bundleDecodeClass), so no runner-chosen bytes are echoed;
+// the other bundle read errors (gzip, flate, the size bounds,
+// ErrNoManifest) carry only fixed library text. Control characters then
+// become '?', invalid UTF-8 is replaced, and the result is cut at
+// maxBundleErrDetailBytes on a rune boundary, so the detail is never raw
+// or unbounded.
 func bundleErrDetail(err error) string {
 	msg := err.Error()
-	var typeErr *json.UnmarshalTypeError
-	if errors.As(err, &typeErr) && typeErr.Value != "" {
-		kind, _, _ := strings.Cut(typeErr.Value, " ")
-		msg = strings.Replace(msg, typeErr.Value, kind, 1)
+	if inner := errors.Unwrap(err); inner != nil && strings.HasPrefix(msg, bundleParseErrPrefix) &&
+		strings.HasSuffix(msg, inner.Error()) {
+		msg = strings.TrimSuffix(msg, inner.Error()) + bundleDecodeClass(inner)
 	}
 	msg = strings.ToValidUTF8(msg, "?")
 	var b strings.Builder

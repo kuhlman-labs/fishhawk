@@ -9827,16 +9827,23 @@ func TestShipPullRequest_SupplementalStartedIncomplete_NoEdge(t *testing.T) {
 // handler). A trace-time bundle_unreadable failure followed by a successful
 // /pull-request report for the same implement stage leaves the stage failed
 // category C with its reason unchanged: the report cannot succeed a stage
-// whose review never ran. No review gate is opened for it either (B6): no
-// stage reaches awaiting_approval and no review audit is written. The PR
-// artifact itself is recorded (the runner did open the PR).
+// whose review never ran. No review gate is opened for it either (B6): the
+// human review stage seeded after it stays pending (un-initialized), no
+// stage reaches awaiting_approval and no review audit is written. The
+// implement stage does not require approval, so had the report driven it
+// terminal the orchestrator would have advanced into the review stage. The
+// PR artifact itself is recorded (the runner did open the PR).
 func TestShipPullRequest_AfterBundleUnreadableFailure_StageStaysFailed(t *testing.T) {
 	s, sf, ar, au, rr := newPRServerWithOrch(t)
 	s.cfg.TraceStore = newTraceStoreFake()
 	runRow := rr.seedRun()
 	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	implStage.Type = run.StageTypeImplement
-	implStage.RequiresApproval = true
+	reviewStage := rr.seedStage(runRow.ID, 1, run.StageStatePending)
+	reviewStage.Type = run.StageTypeReview
+	reviewStage.ExecutorKind = run.ExecutorHuman
+	reviewStage.ExecutorRef = ""
+	reviewStage.RequiresApproval = true
 	priv, _ := sf.issue(t, runRow.ID)
 
 	var raw bytes.Buffer
@@ -9873,6 +9880,13 @@ func TestShipPullRequest_AfterBundleUnreadableFailure_StageStaysFailed(t *testin
 	}
 	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC || got.FailureReason == nil || *got.FailureReason != reason {
 		t.Errorf("failure = %v / %v, want C with the reason unchanged", got.FailureCategory, got.FailureReason)
+	}
+	review, err := rr.GetStage(t.Context(), reviewStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if review.State != run.StageStatePending {
+		t.Errorf("human review stage = %q after the PR report, want pending: a review gate was initialized for a failed implement stage", review.State)
 	}
 	for _, st := range rr.stagesByRunID[runRow.ID] {
 		if st.State == run.StageStateAwaitingApproval {

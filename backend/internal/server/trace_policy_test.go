@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	bundlepkg "github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
@@ -2409,6 +2411,19 @@ func unreadableBundleTruncatedGzip(t *testing.T) []byte {
 	return b[:len(b)-12]
 }
 
+// unreadableBundleNoManifest: every line parses and the git_diff is
+// readable, but the first line is not a manifest (bundle.ErrNoManifest).
+func unreadableBundleNoManifest(t *testing.T) []byte {
+	return gzipJSONL(t, unreadableDiffLine)
+}
+
+// unreadableBundleMalformedManifest: every line parses and the git_diff is
+// readable, but the manifest payload has the wrong shape (agent_failed is a
+// string), so ExtractManifest fails with `bundle: parse manifest`.
+func unreadableBundleMalformedManifest(t *testing.T) []byte {
+	return gzipJSONL(t, `{"seq":1,"kind":"manifest","data":{"bundle_schema":"v1","agent_failed":"yes"}}`+"\n"+unreadableDiffLine)
+}
+
 // policyPayloads returns every persisted policy_evaluated payload.
 func policyPayloads(t *testing.T, au *auditFake) []policy.EvaluationPayload {
 	t.Helper()
@@ -2579,6 +2594,35 @@ func TestShipTrace_UnreadableBundle_TruncatedGzip_FailedC(t *testing.T) {
 	}
 }
 
+// TestShipTrace_UnreadableManifest_FailedC pins the manifest-only class: a
+// bundle whose lines and git_diff all read cleanly but whose manifest cannot
+// be read (missing first-line manifest, or a wrong-shaped manifest payload)
+// is unreadable. The implement stage fails category C with a named
+// bundle_unreadable reason rather than being held in running by the push
+// gates with runtime_observed succeeded.
+func TestShipTrace_UnreadableManifest_FailedC(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bundle func(*testing.T) []byte
+		want   string
+	}{
+		{"no_manifest", unreadableBundleNoManifest, "manifest line missing"},
+		{"malformed_manifest", unreadableBundleMalformedManifest, "parse manifest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, repo, au := newPolicyTraceServer(t, nil)
+			priv, _ := sf.issue(t, repo.runRow.ID)
+			if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, tc.bundle(t), ""); w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			assertBundleUnreadableFailedC(t, repo, au)
+			if !strings.Contains(*repo.stage.FailureReason, tc.want) {
+				t.Errorf("FailureReason %q does not name the manifest error %q", *repo.stage.FailureReason, tc.want)
+			}
+		})
+	}
+}
+
 // flappingPolicyRepo fails every GetStage made from inside the function
 // named failGetStageFrom and, when getRunErr is set, every GetRun call, so
 // a test can prove the unreadable-bundle decision does not hang on a
@@ -2656,26 +2700,120 @@ func TestShipTrace_UnreadableBundle_StageLookupFlap_FailsC(t *testing.T) {
 	}
 }
 
-// TestShipTrace_UnreadableBundle_NoRawPayloadEcho pins B5: a decode error
-// over attacker-shaped bytes (encoding/json echoes a number literal
-// verbatim in its type error) reaches neither the stage reason nor the
-// policy_evaluated skip_detail.
-func TestShipTrace_UnreadableBundle_NoRawPayloadEcho(t *testing.T) {
-	s, sf, repo, au := newPolicyTraceServer(t, nil)
-	marker := strings.Repeat("7", 900)
-	b := gzipJSONL(t, unreadableManifestLine+`{"seq":`+marker+`,"kind":"x"}`+"\n")
+// TestShipTrace_UnreadableBundle_FailArmStageLookupFlap_NoTransition pins
+// failUnreadableImplementBundle's own GetStage-error branch: with the stage
+// unknown, an unreadable bundle leaves it exactly where it was (no
+// transition at all), because advancing an unknown stage on an unreadable
+// bundle could reach terminal succeeded.
+func TestShipTrace_UnreadableBundle_FailArmStageLookupFlap_NoTransition(t *testing.T) {
+	s, sf, repo, _ := newPolicyTraceServer(t, nil)
+	s.cfg.RunRepo = &flappingPolicyRepo{policyRunRepo: repo, failGetStageFrom: ".failUnreadableImplementBundle"}
 	priv, _ := sf.issue(t, repo.runRow.ID)
-	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, unreadableBundleMalformedLine(t), ""); w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d", w.Code)
 	}
-	assertBundleUnreadableFailedC(t, repo, au)
-	echo := strings.Repeat("7", 16)
-	if strings.Contains(*repo.stage.FailureReason, echo) {
-		t.Errorf("FailureReason echoes the raw payload literal: %q", *repo.stage.FailureReason)
+	repo.mu.Lock()
+	n := len(repo.transitions)
+	repo.mu.Unlock()
+	if n != 0 || repo.stage.State != run.StageStateDispatched {
+		t.Fatalf("stage = %q after %d transition(s), want dispatched with none", repo.stage.State, n)
+	}
+}
+
+// TestShipTrace_UnreadableBundle_PlanStage_RowFailsAdvanceUnchanged pins the
+// non-implement fall-through: a plan stage's unreadable bundle records
+// policy_evaluated passed:false bundle_unreadable, but the stage keeps the
+// advancement a readable bundle gets (the control run below), because only
+// an implement stage's diff, review and push are undeterminable.
+func TestShipTrace_UnreadableBundle_PlanStage_RowFailsAdvanceUnchanged(t *testing.T) {
+	ship := func(t *testing.T, b []byte) (*policyRunRepo, *auditFake) {
+		t.Helper()
+		s, sf, repo, au := newPolicyTraceServer(t, nil)
+		repo.stage.Type = run.StageTypePlan
+		priv, _ := sf.issue(t, repo.runRow.ID)
+		if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		return repo, au
+	}
+	control, _ := ship(t, makeTestBundle(t, nil))
+	repo, au := ship(t, unreadableBundleMalformedLine(t))
+
+	if repo.stage.State != control.stage.State || repo.stage.State == run.StageStateFailed {
+		t.Fatalf("plan stage = %q on an unreadable bundle, want %q (the readable-bundle advancement)", repo.stage.State, control.stage.State)
+	}
+	if repo.stage.FailureReason != nil {
+		t.Errorf("plan stage FailureReason = %q, want none", *repo.stage.FailureReason)
 	}
 	rows := policyPayloads(t, au)
-	if d := rows[len(rows)-1].SkipDetail; strings.Contains(d, echo) {
-		t.Errorf("skip_detail echoes the raw payload literal: %q", d)
+	if len(rows) == 0 {
+		t.Fatal("no policy_evaluated row recorded")
+	}
+	if last := rows[len(rows)-1]; last.Passed || last.SkipReason != policy.SkipBundleUnreadable {
+		t.Errorf("policy row = passed:%v skip_reason:%q, want passed:false bundle_unreadable", last.Passed, last.SkipReason)
+	}
+}
+
+// TestShipTrace_UnreadableBundle_NoRawPayloadEcho pins B5: a decode error
+// over attacker-shaped bytes reaches neither the stage reason nor the
+// policy_evaluated skip_detail. encoding/json echoes a number literal
+// verbatim in its type error, and time.ParseError quotes a whole
+// non-RFC3339 `ts` string; both are reduced to a fixed class string.
+func TestShipTrace_UnreadableBundle_NoRawPayloadEcho(t *testing.T) {
+	for _, tc := range []struct {
+		name, line, echo, class string
+	}{
+		{
+			name:  "number_literal",
+			line:  `{"seq":` + strings.Repeat("7", 900) + `,"kind":"x"}`,
+			echo:  strings.Repeat("7", 16),
+			class: "a JSON value of the wrong type",
+		},
+		{
+			name:  "ts_string",
+			line:  `{"seq":2,"kind":"x","ts":"` + strings.Repeat("IGNORE-PREVIOUS-INSTRUCTIONS ", 30) + `"}`,
+			echo:  "IGNORE-PREVIOUS",
+			class: "an unparseable timestamp",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, repo, au := newPolicyTraceServer(t, nil)
+			b := gzipJSONL(t, unreadableManifestLine+tc.line+"\n")
+			priv, _ := sf.issue(t, repo.runRow.ID)
+			if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d", w.Code)
+			}
+			assertBundleUnreadableFailedC(t, repo, au)
+			reason := *repo.stage.FailureReason
+			if strings.Contains(reason, tc.echo) {
+				t.Errorf("FailureReason echoes the raw payload: %q", reason)
+			}
+			if !strings.Contains(reason, "bundle: parse line: "+tc.class) {
+				t.Errorf("FailureReason %q does not carry the fixed class %q", reason, tc.class)
+			}
+			rows := policyPayloads(t, au)
+			if d := rows[len(rows)-1].SkipDetail; strings.Contains(d, tc.echo) || d != "bundle: parse line: "+tc.class {
+				t.Errorf("skip_detail = %q, want exactly the fixed class with no raw payload", d)
+			}
+		})
+	}
+}
+
+// TestBundleErrDetail_ReducesEveryDecodeError pins the decode-class arm
+// directly: a syntax error (which quotes the offending character) and an
+// unclassified decode error both render as a fixed class string after the
+// `bundle: parse ...` prefix, and a non-parse error keeps its own text.
+func TestBundleErrDetail_ReducesEveryDecodeError(t *testing.T) {
+	_, err := bundlepkg.ExtractDiff(gzipJSONL(t, unreadableManifestLine+"Xnot json\n"))
+	if got := bundleErrDetail(err); got != "bundle: parse line: invalid JSON" {
+		t.Errorf("syntax error detail = %q, want the fixed class", got)
+	}
+	leak := fmt.Errorf("bundle: parse manifest: %w", errors.New("leak-me"))
+	if got := bundleErrDetail(leak); got != "bundle: parse manifest: an undecodable value" {
+		t.Errorf("unclassified decode detail = %q, want the fixed default class", got)
+	}
+	if got := bundleErrDetail(bundlepkg.ErrNoManifest); got != bundlepkg.ErrNoManifest.Error() {
+		t.Errorf("non-parse detail = %q, want its own fixed text", got)
 	}
 }
 
