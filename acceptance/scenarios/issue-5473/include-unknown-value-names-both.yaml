@@ -1,0 +1,14 @@
+id: scenario:issue-5473/include-unknown-value-names-both
+statement: GET /v0/runs/{run_id}?include=bogus returns 400 validation_failed, and details.allowed lists both campaign_link and dispatch_budget.
+verify_hint: 'HTTP: GET /v0/runs/{run_id}?include=bogus returns 400 with error.code validation_failed and error.details.allowed containing campaign_link and dispatch_budget'
+steps: 'Against http://localhost:8090: POST /v0/dev/fixtures {"scenario":"implement-running"}; read run_id. GET /v0/runs/{run_id}?include=bogus. Control: GET /v0/runs/{run_id}?include=campaign_link,dispatch_budget.'
+assertions:
+    expected: 400 validation_failed with details.allowed containing campaign_link and dispatch_budget.
+    observed_at_record: 400 {"error":{"code":"validation_failed","message":"include must be campaign_link or dispatch_budget","details":{"allowed":["campaign_link","dispatch_budget"],"field":"include","got":"bogus"}}}; control 200.
+    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run_id>?include=bogus'
+origin:
+    issue: 5473
+    pr: 5556
+    run_id: d367cbf0-956d-4b45-a610-33f4847585e0
+    head_sha: fe4aeb6f88bfb2d95d06fa8dbfb5f7060f0df32f
+    recorded_at: 2026-11-23T14:25:07Z
