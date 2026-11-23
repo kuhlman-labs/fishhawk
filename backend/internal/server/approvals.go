@@ -2372,8 +2372,11 @@ func (s *Server) advanceStage(ctx context.Context, stage *run.Stage, decision ap
 	case approval.DecisionApprove:
 		return s.casTransitionFromObserved(ctx, stage, run.StageStateSucceeded)
 	case approval.DecisionReject:
+		// run.FailureReasonGateRejected is the shared constant the campaign
+		// settle classifier (run.PlanRejected, #5379) keys on: a plan stage
+		// failed with it settles its campaign item `replanning`, not failed.
 		return run.FailStage(ctx, s.cfg.RunRepo, stage.ID,
-			run.FailureD, "gate rejected by approver")
+			run.FailureD, run.FailureReasonGateRejected)
 	}
 	// Unreachable — decision was validated earlier.
 	return nil, errors.New("approval: unknown decision (programmer error)")

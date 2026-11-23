@@ -601,7 +601,9 @@ func (t *Ticker) processCampaign(ctx context.Context, logger *slog.Logger, c *ca
 }
 
 // advance settles every running item whose linked run has reached a terminal
-// run state, emitting a campaign_issue_settled entry per settle. Returns
+// run state, emitting a campaign_issue_settled entry per settle. A failed run
+// whose plan an approver rejected settles the item `replanning` (#5379, see
+// failedRunSettleTarget), and the entry's outcome then reads "replanning". Returns
 // whether any item was settled this pass (so the caller re-derives the
 // campaign state). Idempotent: a non-running item, an item with no run, or an
 // item whose run is still in flight is skipped, so a re-tick over an
@@ -645,6 +647,9 @@ func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.C
 				slog.String("run_state", string(runRow.State)))
 			continue
 		}
+		if target == campaign.ItemStateFailed {
+			target = t.failedRunSettleTarget(ctx, logger, c, it, runRow.ID)
+		}
 		if !campaign.ValidCampaignItemTransition(it.State, target) {
 			continue
 		}
@@ -665,6 +670,48 @@ func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.C
 		})
 	}
 	return settledAny
+}
+
+// StageLister is the OPTIONAL capability advance reads a failed run's stages
+// through (#5379). It is runtime-asserted on Ticker.Runs (the codebase's
+// capability-assert convention) rather than added to RunReader, so every
+// narrow RunReader fake keeps compiling. run.Repository satisfies it, and
+// production wires cfg.RunRepo (backend/cmd/fishhawkd/serve.go).
+type StageLister interface {
+	ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*run.Stage, error)
+}
+
+// failedRunSettleTarget picks the settle target for a running item whose linked
+// run reached terminal failed (#5379): `replanning` when an approver rejected
+// the run's plan (run.PlanRejected over its stages) — a deliberate reject is
+// awaiting the operator's replan, not a failure — and `failed` otherwise. It
+// degrades to failed, WARN-logged, when Runs lacks the StageLister capability
+// or the stage read errors, so a missing capability can never strand the item.
+// The START pass never dispatches a replanning item (it starts only Eligible,
+// and NextEligible buckets replanning as Replanning); the operator's restart
+// verb mints the fresh run.
+func (t *Ticker) failedRunSettleTarget(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runID uuid.UUID) campaign.ItemState {
+	lister, ok := t.Runs.(StageLister)
+	if !ok {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: run reader cannot list stages; failed run settles item failed",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runID.String()))
+		return campaign.ItemStateFailed
+	}
+	stages, err := lister.ListStagesForRun(ctx, runID)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: list stages of failed run failed; item settles failed",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return campaign.ItemStateFailed
+	}
+	if run.PlanRejected(stages) {
+		return campaign.ItemStateReplanning
+	}
+	return campaign.ItemStateFailed
 }
 
 // driveGate hands one running item's non-terminal run to the GateActor so it

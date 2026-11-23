@@ -221,8 +221,19 @@ export interface AuditEntry {
 export type CampaignState =
   'pending' | 'running' | 'paused' | 'awaiting_human' | 'succeeded' | 'failed' | 'cancelled';
 
+/**
+ * `replanning` (#5379) is non-terminal: an approver rejected the item's plan
+ * and it awaits the operator's restart verb; it is never a failure.
+ */
 export type CampaignItemState =
-  'pending' | 'blocked' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
+  | 'pending'
+  | 'blocked'
+  | 'running'
+  | 'paused'
+  | 'replanning'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
 
 export type PausePolicy = 'pause_campaign' | 'pause_item';
 
@@ -310,6 +321,8 @@ export interface CampaignRollup {
   failed: string[];
   cancelled: string[];
   paused: string[];
+  /** Items whose plan an approver rejected (#5379); never folded into failed. */
+  replanning: string[];
 }
 
 export interface CampaignNextAction {

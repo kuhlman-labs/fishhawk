@@ -727,6 +727,65 @@ func TestPostgres_TransitionCampaignItem(t *testing.T) {
 	}
 }
 
+// TestPostgres_TransitionCampaignItem_Replanning is the #5379 round trip
+// against the real migration-0120 CHECK: a running item settles to
+// replanning and the row persists (the widened campaign_items_state_check
+// admits it) with the rejected run still linked; replanning → failed is
+// refused by the transition table and commits nothing; replanning →
+// cancelled (the operator cancel cascade) is admitted.
+func TestPostgres_TransitionCampaignItem_Replanning(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:5379"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+		t.Fatalf("link run: %v", err)
+	}
+	if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+	if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateReplanning); err != nil {
+		t.Fatalf("running→replanning: %v", err)
+	}
+	got, err := repo.GetCampaignItem(ctx, it.ID)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if got.State != campaign.ItemStateReplanning {
+		t.Errorf("persisted state = %q, want replanning", got.State)
+	}
+	if got.RunID == nil || *got.RunID != r.ID {
+		t.Errorf("persisted run_id = %v, want %s (the rejected run stays linked)", got.RunID, r.ID)
+	}
+
+	var ite campaign.InvalidTransitionError
+	if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateFailed); !errors.As(err, &ite) {
+		t.Errorf("replanning→failed err = %v, want InvalidTransitionError", err)
+	}
+	if got, _ := repo.GetCampaignItem(ctx, it.ID); got.State != campaign.ItemStateReplanning {
+		t.Errorf("state after refused replanning→failed = %q, want replanning (nothing written)", got.State)
+	}
+
+	if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateCancelled); err != nil {
+		t.Errorf("replanning→cancelled: %v", err)
+	}
+	if got, _ := repo.GetCampaignItem(ctx, it.ID); got.State != campaign.ItemStateCancelled {
+		t.Errorf("state after replanning→cancelled = %q, want cancelled", got.State)
+	}
+}
+
 // TestPostgres_ConcurrentTransitionCampaignItem_ExactlyOneWins is the
 // campaign_item analogue of the campaign concurrency test: it covers the
 // LockCampaignItemForUpdate serialization path that CI cannot infer from the
@@ -1520,6 +1579,20 @@ func TestPostgres_RestartCampaignItem(t *testing.T) {
 		t.Errorf("restart(failed) = state %q run_id %v, want pending/nil", rf.State, rf.RunID)
 	}
 
+	// replanning → pending, the rejected run's link cleared (#5379). The
+	// replanning row itself proves the widened 0120 CHECK. The COMMITTED row is
+	// re-read: the from-guard's effect is the reset, not only a nil error.
+	replanning := mkLinkedItem(t, "issue:replanning", campaign.ItemStateReplanning)
+	if got, _ := repo.GetCampaignItem(ctx, replanning.ID); got.State != campaign.ItemStateReplanning || got.RunID == nil {
+		t.Fatalf("seeded replanning row = state %q run_id %v, want replanning with the rejected run linked", got.State, got.RunID)
+	}
+	if _, err := repo.RestartCampaignItem(ctx, replanning.ID); err != nil {
+		t.Errorf("restart(replanning): %v", err)
+	}
+	if got, _ := repo.GetCampaignItem(ctx, replanning.ID); got.State != campaign.ItemStatePending || got.RunID != nil {
+		t.Errorf("persisted replanning restart = state %q run_id %v, want pending/nil", got.State, got.RunID)
+	}
+
 	// succeeded → InvalidTransitionError (not a restartable state).
 	succeeded := mkLinkedItem(t, "issue:succeeded", campaign.ItemStateSucceeded)
 	var ite campaign.InvalidTransitionError
@@ -1782,6 +1855,49 @@ func TestPostgres_SettleCampaignItemForClosedIssue(t *testing.T) {
 			// The run link is untouched by this arm (a class-A item has none).
 			if got.RunID != nil {
 				t.Errorf("persisted run_id = %v, want nil (class A is run-less)", got.RunID)
+			}
+		})
+	}
+
+	// --- A replanning item (#5379): its plan was rejected, so it holds a link
+	// to the rejected run. Both closure outcomes settle it, stamp the marker,
+	// and RETAIN the run link as provenance. The committed row is re-read.
+	for _, tc := range []struct {
+		name string
+		to   campaign.ItemState
+	}{
+		{"replanning_to_succeeded", campaign.ItemStateSucceeded},
+		{"replanning_to_cancelled", campaign.ItemStateCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+				Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+			})
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			it := mkItem(t, "issue:"+tc.name, campaign.ItemStatePending)
+			if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+				t.Fatalf("link run: %v", err)
+			}
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+				t.Fatalf("→running: %v", err)
+			}
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateReplanning); err != nil {
+				t.Fatalf("→replanning: %v", err)
+			}
+			if _, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, tc.to); err != nil {
+				t.Errorf("settle: %v", err)
+			}
+			got, err := repo.GetCampaignItem(ctx, it.ID)
+			if err != nil {
+				t.Fatalf("re-read: %v", err)
+			}
+			if got.State != tc.to || got.ResolvedBy != campaign.ResolvedByIssueClosed {
+				t.Errorf("persisted = state %q resolved_by %q, want %q / %q", got.State, got.ResolvedBy, tc.to, campaign.ResolvedByIssueClosed)
+			}
+			if got.RunID == nil || *got.RunID != r.ID {
+				t.Errorf("persisted run_id = %v, want %s (the rejected run, retained as provenance)", got.RunID, r.ID)
 			}
 		})
 	}

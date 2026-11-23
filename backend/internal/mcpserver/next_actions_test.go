@@ -1895,6 +1895,28 @@ func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
 	}
 }
 
+// TestCampaignNextActionsFor_StartRun_Replanning pins the #5379 routing: a
+// start_run on a ref in rollup.Replanning (its plan was rejected) surfaces
+// fishhawk_start_campaign_item_run — the only verb reaching the restart
+// handler — never the generic fishhawk_start_run. Deleting the
+// rollup.Replanning check falls through to fishhawk_start_run.
+func TestCampaignNextActionsFor_StartRun_Replanning(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Replanning: []string{"#41"}}, caNextAction("start_run", "#41"), nil)
+	if na.State != "campaign_start_run" || len(na.Actions) == 0 {
+		t.Fatalf("next actions = %+v, want campaign_start_run with an action", na)
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_start_campaign_item_run" {
+		t.Errorf("action = %q, want fishhawk_start_campaign_item_run for a replanning item", got.Action)
+	}
+	if got.Params["issue_ref"] != "#41" {
+		t.Errorf("issue_ref param = %q, want #41", got.Params["issue_ref"])
+	}
+	if !strings.Contains(got.Reason, "prior-rejection feedback") || !strings.Contains(got.Precondition, "replanning") {
+		t.Errorf("action = %+v, want a replan-specific precondition and reason", got)
+	}
+}
+
 // TestCampaignNextActionsFor_AttendHumanLed asserts the attend_human_led arm
 // returns the classified campaign_attend_human_led state (NOT the unclassified
 // fallback) with a non-dispatch, page-the-human suggested action that consumes

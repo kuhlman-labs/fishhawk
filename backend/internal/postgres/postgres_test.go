@@ -9579,3 +9579,72 @@ func TestMigrateDown_CampaignItemStartClaimsReversal(t *testing.T) {
 		t.Error("campaign_item_start_claims missing after re-applying 0119")
 	}
 }
+
+// TestMigrateDown_CampaignItemsReplanningReversal pins 0120 (#5379): after
+// MigrateUp a 'replanning' campaign item is insertable (the widened
+// campaign_items_state_check); rolling 0120 back rewrites that live row to
+// 'failed' — the pre-0120 reading, still offered Restartable — leaves every
+// other row's state alone, and restores the narrower CHECK, which then refuses
+// a new 'replanning' row. The replanning row is inserted BEFORE the rollback,
+// so a down migration without its UPDATE fails to re-add the narrower CHECK.
+// MigrateUp again re-admits the state.
+func TestMigrateDown_CampaignItemsReplanningReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	campaignID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'o/r', 'issue:1', 'running')`, campaignID); err != nil {
+		t.Fatalf("seed campaign: %v", err)
+	}
+	insertItem := func(ref, state string) (uuid.UUID, error) {
+		id := uuid.New()
+		_, err := pool.Exec(ctx,
+			`INSERT INTO campaign_items (id, campaign_id, issue_ref, state) VALUES ($1, $2, $3, $4)`,
+			id, campaignID, ref, state)
+		return id, err
+	}
+	replanningID, err := insertItem("issue:2", "replanning")
+	if err != nil {
+		t.Fatalf("insert replanning item after MigrateUp: %v (0120 must widen campaign_items_state_check)", err)
+	}
+	runningID, err := insertItem("issue:3", "running")
+	if err != nil {
+		t.Fatalf("insert running item: %v", err)
+	}
+
+	downThrough(t, url, "0120")
+
+	stateOf := func(id uuid.UUID) string {
+		var s string
+		if err := pool.QueryRow(ctx, `SELECT state FROM campaign_items WHERE id = $1`, id).Scan(&s); err != nil {
+			t.Fatalf("read item state: %v", err)
+		}
+		return s
+	}
+	if got := stateOf(replanningID); got != "failed" {
+		t.Errorf("replanning item after rolling back 0120 = %q, want failed", got)
+	}
+	if got := stateOf(runningID); got != "running" {
+		t.Errorf("running item after rolling back 0120 = %q, want running (untouched)", got)
+	}
+	var pgErr *pgconn.PgError
+	if _, err := insertItem("issue:4", "replanning"); !errors.As(err, &pgErr) || pgErr.ConstraintName != "campaign_items_state_check" {
+		t.Errorf("insert replanning item after rolling back 0120: err = %v, want a campaign_items_state_check violation", err)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if _, err := insertItem("issue:5", "replanning"); err != nil {
+		t.Errorf("insert replanning item after re-applying 0120: %v", err)
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -108,6 +109,14 @@ type fakeCampaignRepo struct {
 	settleOOBCalls int
 	// settleClosedIssueCalls counts SettleCampaignItemForClosedIssue calls (#3563).
 	settleClosedIssueCalls int
+	// onSettleClosedIssue, when set, runs at the start of each
+	// SettleCampaignItemForClosedIssue call (under the fake's mutex) so a test
+	// can observe what was already audited before the state change (#5379).
+	onSettleClosedIssue func()
+	// settleClosedIssueErr, when set, fails every SettleCampaignItemForClosedIssue
+	// call after the hook and the counter run, so a test can observe a state
+	// write failing AFTER its audit-first append landed (#5379).
+	settleClosedIssueErr error
 
 	// afterReopen, when set, is invoked AFTER ReopenCampaignForItemRestart
 	// releases the fake's mutex and commits both mutations — the seam the
@@ -454,7 +463,10 @@ func (f *fakeCampaignRepo) RestartCampaignItem(_ context.Context, id uuid.UUID) 
 			if it.ID != id {
 				continue
 			}
-			if it.State != campaign.ItemStateCancelled && it.State != campaign.ItemStateFailed {
+			// Mirrors the Postgres from-guard: cancelled, failed, or (#5379)
+			// replanning.
+			if it.State != campaign.ItemStateCancelled && it.State != campaign.ItemStateFailed &&
+				it.State != campaign.ItemStateReplanning {
 				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(campaign.ItemStatePending)}
 			}
 			it.State = campaign.ItemStatePending
@@ -560,12 +572,21 @@ func (f *fakeCampaignRepo) SettleCampaignItemForClosedIssue(_ context.Context, i
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settleClosedIssueCalls++
+	if f.onSettleClosedIssue != nil {
+		f.onSettleClosedIssue()
+	}
+	if f.settleClosedIssueErr != nil {
+		return nil, f.settleClosedIssueErr
+	}
 	for _, items := range f.itemsByCmp {
 		for _, it := range items {
 			if it.ID != id {
 				continue
 			}
-			if it.State != campaign.ItemStatePending && it.State != campaign.ItemStateBlocked {
+			// Mirrors the Postgres from-guard: pending, blocked, or (#5379)
+			// replanning; the run link is never touched (provenance retained).
+			if it.State != campaign.ItemStatePending && it.State != campaign.ItemStateBlocked &&
+				it.State != campaign.ItemStateReplanning {
 				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(to)}
 			}
 			if to != campaign.ItemStateSucceeded && to != campaign.ItemStateCancelled {
@@ -9324,6 +9345,17 @@ func TestCampaignStatus_AdvertisedActionIsLegal(t *testing.T) {
 			wantAction: "start_run",
 		},
 		{
+			// #5379: a replanning item's advertised start_run must be a verb the
+			// start handler admits (it restarts the item onto a fresh run).
+			name:  "running with a replanning item -> start_run (the #5379 replan)",
+			state: campaign.StateRunning,
+			items: []*campaign.Item{
+				cItemWithRun("issue:150", nil, campaign.ItemStateReplanning, uuid.New()),
+			},
+			startRef:   "issue:150",
+			wantAction: "start_run",
+		},
+		{
 			name:  "TERMINAL-FAILED with a restartable item -> start_run (the #2681 recovery)",
 			state: campaign.StateFailed,
 			items: []*campaign.Item{
@@ -12322,5 +12354,546 @@ func TestCreateCampaign_OperatorToken_SameFixture_Creates(t *testing.T) {
 	}
 	if hits.Load() == 0 || !fp.called {
 		t.Errorf("github hits = %d, provider called = %v, want >0/true (the fixture reaches the forge)", hits.Load(), fp.called)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// replanning: a plan-rejected run settles its item replanning (#5379)
+// ---------------------------------------------------------------------------
+
+// stagedFakeRepo adds a working ListStagesForRun to fakeRepo (whose own
+// implementation errors), so the on-read settle can classify a failed run.
+type stagedFakeRepo struct {
+	*fakeRepo
+	stages  map[uuid.UUID][]*run.Stage
+	listErr error
+}
+
+func (r *stagedFakeRepo) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*run.Stage, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return r.stages[id], nil
+}
+
+// seedFailedPlanRun seeds a terminal-failed run whose plan stage failed
+// category D with reason.
+func seedFailedPlanRun(t *testing.T, rrepo *stagedFakeRepo, reason string) uuid.UUID {
+	t.Helper()
+	id := seedTerminalRun(t, rrepo.fakeRepo, run.StateFailed)
+	catD := run.FailureD
+	rrepo.stages[id] = []*run.Stage{{
+		ID: uuid.New(), RunID: id, Type: run.StageTypePlan, State: run.StageStateFailed,
+		FailureCategory: &catD, FailureReason: &reason,
+	}}
+	return id
+}
+
+func campaignAuditPayloads(t *testing.T, aud *campaignAuditRecorder, category string) []map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	var out []map[string]any
+	for _, e := range aud.entries {
+		if e.Category != category {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode %s payload: %v", category, err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestCampaignStatus_PlanRejectedRun_ReadsReplanning pins the on-read settle
+// (#5379): a single-item campaign whose only run failed because its plan was
+// rejected reads the item `replanning` (run_id kept), rollup.replanning=[ref]
+// with failed/cancelled empty, the campaign running (not failed), and
+// next_action start_run on the ref. Deleting the failedRunSettleTarget call in
+// pass 1 settles the item failed and the campaign derives terminal failed.
+func TestCampaignStatus_PlanRejectedRun_ReadsReplanning(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := &stagedFakeRepo{fakeRepo: newFakeRepo(), stages: map[uuid.UUID][]*run.Stage{}}
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud})
+	runID := seedFailedPlanRun(t, rrepo, run.FailureReasonGateRejected)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateRunning, runID),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStateReplanning) {
+		t.Fatalf("items = %+v, want one replanning item", st.Items)
+	}
+	if st.Items[0].RunID == nil || *st.Items[0].RunID != runID {
+		t.Errorf("run_id = %v, want the rejected run %s kept", st.Items[0].RunID, runID)
+	}
+	if !reflect.DeepEqual(st.Rollup.Replanning, []string{"issue:100"}) {
+		t.Errorf("rollup.replanning = %v, want [issue:100]", st.Rollup.Replanning)
+	}
+	if len(st.Rollup.Failed) != 0 || len(st.Rollup.Cancelled) != 0 {
+		t.Errorf("rollup failed/cancelled = %v/%v, want both empty (replanning is never folded)", st.Rollup.Failed, st.Rollup.Cancelled)
+	}
+	if st.Campaign.State != string(campaign.StateRunning) {
+		t.Errorf("campaign state = %q, want running (a rejected plan is not a failure)", st.Campaign.State)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" || st.NextAction.Detail != replanningDetail {
+		t.Errorf("next_action = %+v, want start_run issue:100 with the replanning detail", st.NextAction)
+	}
+	settled := campaignAuditPayloads(t, aud, categoryCampaignIssueSettled)
+	if len(settled) != 1 || settled[0]["outcome"] != string(campaign.ItemStateReplanning) {
+		t.Errorf("campaign_issue_settled = %v, want one with outcome replanning", settled)
+	}
+}
+
+// TestCampaignStatus_FailedRunSettle_FallsBackToFailed pins the non-replanning
+// arms of the on-read classifier: a plan failed by an SLA timeout and a
+// stage-read error both settle the item failed, exactly as before #5379.
+func TestCampaignStatus_FailedRunSettle_FallsBackToFailed(t *testing.T) {
+	cases := []struct {
+		name    string
+		reason  string
+		listErr error
+	}{
+		{"sla timeout plan", "sla_timeout: 4h0m0s elapsed (deadline 4h)", nil},
+		{"stage read error", run.FailureReasonGateRejected, errors.New("db down")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			rrepo := &stagedFakeRepo{fakeRepo: newFakeRepo(), stages: map[uuid.UUID][]*run.Stage{}}
+			s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: &campaignAuditRecorder{}})
+			runID := seedFailedPlanRun(t, rrepo, tc.reason)
+			rrepo.listErr = tc.listErr
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+				cItemWithRun("issue:100", nil, campaign.ItemStateRunning, runID),
+			})
+			c.State = campaign.StateRunning
+
+			st := getCampaignStatusBody(t, s, c.ID)
+			if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStateFailed) {
+				t.Fatalf("items = %+v, want one failed item", st.Items)
+			}
+			if len(st.Rollup.Replanning) != 0 {
+				t.Errorf("rollup.replanning = %v, want empty", st.Rollup.Replanning)
+			}
+		})
+	}
+}
+
+// TestCampaignStatus_RollupReplanning_SerializesEmptyArray pins the wire shape
+// (R3): a campaign with no replanning item serializes `"replanning":[]`, never
+// null or absent.
+func TestCampaignStatus_RollupReplanning_SerializesEmptyArray(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: crepo, AuditRepo: &campaignAuditRecorder{}})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d (body=%s)", w.Code, w.Body.String())
+	}
+	var raw struct {
+		Rollup map[string]json.RawMessage `json:"rollup"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, ok := raw.Rollup["replanning"]; !ok || string(got) != "[]" {
+		t.Errorf("rollup.replanning = %s (present=%v), want []", got, ok)
+	}
+}
+
+// TestCampaignStatus_ReplanningIssueClosed settles a replanning item off its
+// issue closure (#5379, R4b): completed -> succeeded and not_planned ->
+// cancelled, each through SettleCampaignItemForClosedIssue with
+// resolved_by=issue_closed, the rejected run_id retained, and the
+// campaign_issue_settled entry ALREADY appended when the state change runs
+// (audit-first). Deleting the replanning class leaves the item replanning.
+func TestCampaignStatus_ReplanningIssueClosed(t *testing.T) {
+	cases := []struct {
+		reason string
+		want   campaign.ItemState
+	}{
+		{"completed", campaign.ItemStateSucceeded},
+		{"not_planned", campaign.ItemStateCancelled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			rrepo := newFakeRepo()
+			aud := &campaignAuditRecorder{}
+			ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+				100: {state: "closed", stateReason: tc.reason},
+			}}
+			s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+			runID := seedTerminalRun(t, rrepo, run.StateFailed)
+			item := cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, runID)
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+			c.State = campaign.StateRunning
+			auditedBeforeSettle := -1
+			crepo.onSettleClosedIssue = func() { auditedBeforeSettle = aud.count(categoryCampaignIssueSettled) }
+
+			st := getCampaignStatusBody(t, s, c.ID)
+
+			// Re-read the committed item, not only the response.
+			if item.State != tc.want || item.ResolvedBy != campaign.ResolvedByIssueClosed {
+				t.Fatalf("item = %s resolved_by=%q, want %s resolved_by=%q", item.State, item.ResolvedBy, tc.want, campaign.ResolvedByIssueClosed)
+			}
+			if item.RunID == nil || *item.RunID != runID {
+				t.Errorf("item run_id = %v, want the rejected run %s retained", item.RunID, runID)
+			}
+			if len(st.Items) != 1 || st.Items[0].State != string(tc.want) {
+				t.Errorf("status items = %+v, want %s", st.Items, tc.want)
+			}
+			if crepo.settleClosedIssueCalls != 1 || crepo.settleOOBCalls != 0 {
+				t.Errorf("settleClosedIssue/OOB calls = %d/%d, want 1/0", crepo.settleClosedIssueCalls, crepo.settleOOBCalls)
+			}
+			if auditedBeforeSettle != 1 {
+				t.Errorf("campaign_issue_settled entries at the state change = %d, want 1 (audit-first)", auditedBeforeSettle)
+			}
+			p := settledAuditPayload(t, aud)
+			if p["outcome"] != string(tc.want) || p["resolved_by"] != campaign.ResolvedByIssueClosed ||
+				p["run_id"] != runID.String() || p["prior_state"] != string(campaign.ItemStateReplanning) {
+				t.Errorf("settled payload = %v", p)
+			}
+		})
+	}
+}
+
+// failingSettleAudit refuses every campaign_issue_settled append so the
+// audit-first guard on the replanning issue-closed settle is observable.
+type failingSettleAudit struct{ *campaignAuditRecorder }
+
+func (a failingSettleAudit) AppendGlobalChained(ctx context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	if p.Category == categoryCampaignIssueSettled {
+		return nil, errInjected
+	}
+	return a.campaignAuditRecorder.AppendGlobalChained(ctx, p)
+}
+
+// TestCampaignStatus_ReplanningIssueClosed_AuditFailLeavesItem pins the
+// audit-first refusal: when the campaign_issue_settled append fails, the
+// replanning item is NOT settled (no unaudited state change). Deleting the
+// append-error guard settles it succeeded.
+func TestCampaignStatus_ReplanningIssueClosed_AuditFailLeavesItem(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo,
+		AuditRepo: failingSettleAudit{&campaignAuditRecorder{}}, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateFailed)
+	item := cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, runID)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+
+	_ = getCampaignStatusBody(t, s, c.ID)
+
+	if item.State != campaign.ItemStateReplanning {
+		t.Errorf("item state = %s, want replanning (audit append failed, settle withheld)", item.State)
+	}
+	if crepo.settleClosedIssueCalls != 0 {
+		t.Errorf("settleClosedIssueCalls = %d, want 0", crepo.settleClosedIssueCalls)
+	}
+}
+
+// TestCampaignStatus_ReplanningIssueClosed_SettleFailAfterAppend pins the
+// accepted AT-LEAST-ONCE semantics of the audit-first replanning settle
+// (#5379): when the campaign_issue_settled append lands but the
+// SettleCampaignItemForClosedIssue write then fails, the entry is NOT rolled
+// back, the item stays replanning with no resolved_by marker, and every later
+// read appends another entry until the write lands. Once it lands, the item is
+// succeeded and no further entry is appended. The item row, not the entry
+// count, is authoritative (docs/issue-comment-surfaces.md). Moving the append
+// after the settle (settle-first) records zero entries on the failing reads.
+func TestCampaignStatus_ReplanningIssueClosed_SettleFailAfterAppend(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateFailed)
+	item := cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, runID)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	crepo.settleClosedIssueErr = errInjected
+
+	for read := 1; read <= 2; read++ {
+		_ = getCampaignStatusBody(t, s, c.ID)
+		if item.State != campaign.ItemStateReplanning || item.ResolvedBy != "" {
+			t.Fatalf("read %d: item = %s resolved_by=%q, want replanning with no marker (state write failed)", read, item.State, item.ResolvedBy)
+		}
+		if got := aud.count(categoryCampaignIssueSettled); got != read {
+			t.Fatalf("read %d: campaign_issue_settled entries = %d, want %d (audit-first, one per attempt)", read, got, read)
+		}
+	}
+
+	crepo.settleClosedIssueErr = nil
+	_ = getCampaignStatusBody(t, s, c.ID)
+	if item.State != campaign.ItemStateSucceeded || item.ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Fatalf("after recovery: item = %s resolved_by=%q, want succeeded resolved_by=%q", item.State, item.ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	_ = getCampaignStatusBody(t, s, c.ID)
+	if got := aud.count(categoryCampaignIssueSettled); got != 3 {
+		t.Errorf("campaign_issue_settled entries after the write landed = %d, want 3 (two failed attempts + the landed one; none after)", got)
+	}
+	if crepo.settleClosedIssueCalls != 3 {
+		t.Errorf("settleClosedIssueCalls = %d, want 3", crepo.settleClosedIssueCalls)
+	}
+}
+
+// TestCampaignStatus_ReplanningIssueClosed_RacedSettleRefused pins the other
+// at-least-once path (#5379): a concurrent write moves the item off replanning
+// between the audit-first append and the settle (an operator cancel, or a
+// second reader's settle landing first). The repository's from-guard refuses
+// the settle, the concurrent state stands untouched, and the appended entry
+// stays on the chain describing a settle that did not land.
+func TestCampaignStatus_ReplanningIssueClosed_RacedSettleRefused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateFailed)
+	item := cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, runID)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	// The operator cancel lands after this reader's snapshot and append.
+	crepo.onSettleClosedIssue = func() { item.State = campaign.ItemStateCancelled }
+
+	_ = getCampaignStatusBody(t, s, c.ID)
+
+	if crepo.settleClosedIssueCalls != 1 {
+		t.Fatalf("settleClosedIssueCalls = %d, want 1", crepo.settleClosedIssueCalls)
+	}
+	if item.State != campaign.ItemStateCancelled || item.ResolvedBy != "" {
+		t.Errorf("item = %s resolved_by=%q, want the concurrent cancel to stand unmarked", item.State, item.ResolvedBy)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["outcome"] != string(campaign.ItemStateSucceeded) || p["prior_state"] != string(campaign.ItemStateReplanning) {
+		t.Errorf("settled payload = %v, want the attempted replanning -> succeeded entry retained", p)
+	}
+}
+
+// TestStartCampaignItemRun_RestartsReplanningItem pins the start-verb admission
+// (#5379): POST /runs on a replanning item returns 201, restarts it through
+// RestartCampaignItem onto a NEW run, and campaign_issue_restarted records
+// prior_state=replanning. Deleting the Replanning membership check refuses it
+// 409 item_not_eligible.
+func TestStartCampaignItemRun_RestartsReplanningItem(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, aud := newCampaignStartServer(t, crepo)
+	rejected := uuid.New()
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateReplanning, rejected),
+	})
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Item.State != string(campaign.ItemStateRunning) || body.Item.RunID == nil || *body.Item.RunID == rejected {
+		t.Errorf("item = %+v, want running linked to a fresh run (not %s)", body.Item, rejected)
+	}
+	if crepo.restartCalls != 1 || crepo.reopenCalls != 0 {
+		t.Errorf("restart/reopen calls = %d/%d, want 1/0", crepo.restartCalls, crepo.reopenCalls)
+	}
+	restarted := campaignAuditPayloads(t, aud, "campaign_issue_restarted")
+	if len(restarted) != 1 || restarted[0]["prior_state"] != string(campaign.ItemStateReplanning) ||
+		restarted[0]["prior_run_id"] != rejected.String() {
+		t.Errorf("campaign_issue_restarted = %v, want one with prior_state replanning, prior_run_id %s", restarted, rejected)
+	}
+}
+
+// TestComputeCampaignNextAction_ReplanningPrecedence pins R2: the replanning
+// arm ranks BELOW Eligible (and Paused) and directly ABOVE Restartable, so a
+// rejected item never pre-empts fresh DAG-independent work. Deleting the arm
+// reports the restartable ref in the second row; moving it above Eligible
+// reports the replanning ref in the first.
+func TestComputeCampaignNextAction_ReplanningPrecedence(t *testing.T) {
+	cases := []struct {
+		name    string
+		e       campaign.Eligibility
+		wantRef string
+	}{
+		{"eligible outranks replanning", campaign.Eligibility{Eligible: []string{"issue:1"}, Replanning: []string{"issue:2"}}, "issue:1"},
+		{"replanning outranks restartable", campaign.Eligibility{Replanning: []string{"issue:2"}, Restartable: []string{"issue:3"}}, "issue:2"},
+		{"replanning outranks human-led", campaign.Eligibility{Replanning: []string{"issue:2"}, HumanLed: []string{"issue:4"}}, "issue:2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeCampaignNextAction(campaign.StateRunning, tc.e)
+			if got.Action != "start_run" || got.IssueRef != tc.wantRef {
+				t.Errorf("next_action = %+v, want start_run %s", got, tc.wantRef)
+			}
+		})
+	}
+	// Paused outranks replanning.
+	if got := computeCampaignNextAction(campaign.StateRunning, campaign.Eligibility{Paused: []string{"issue:5"}, Replanning: []string{"issue:2"}}); got.Action != "resume" {
+		t.Errorf("paused + replanning next_action = %+v, want resume", got)
+	}
+	// A terminal campaign never advertises start_run on a replanning item (the
+	// reopen admits only a restartable one); the closed detail counts it.
+	got := computeCampaignNextAction(campaign.StateFailed, campaign.Eligibility{Replanning: []string{"issue:2"}})
+	if got.Action != "closed" || !strings.Contains(got.Detail, "1 replanning") {
+		t.Errorf("terminal replanning next_action = %+v, want closed counting 1 replanning", got)
+	}
+}
+
+// TestSubmitApproval_RejectPlan_SettlesCampaignItemReplanning is the R5a seam:
+// an approver rejects the campaign item's plan stage through the REAL approvals
+// handler (with the orchestrator walking the run to failed), run.PlanRejected
+// holds over the resulting stages, and the next campaign status read settles
+// the item replanning — no hand-written FailStage.
+func TestSubmitApproval_RejectPlan_SettlesCampaignItemReplanning(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	plan := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval) // Type plan
+	rr.seedStage(r.ID, 1, run.StageStatePending)
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	s := New(Config{
+		Addr: "127.0.0.1:0", ApprovalRepo: newFakeApprovalRepo(), RunRepo: rr,
+		AuditRepo: aud, CampaignRepo: crepo, Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateRunning, r.ID),
+	})
+	c.State = campaign.StateRunning
+
+	if w := submitApproval(t, s, plan.ID, `{"decision":"reject","comment":"re-scope the issue first"}`); w.Code != http.StatusOK {
+		t.Fatalf("reject = %d (body=%s)", w.Code, w.Body.String())
+	}
+	got, err := rr.GetRun(t.Context(), r.ID)
+	if err != nil || got.State != run.StateFailed {
+		t.Fatalf("run after reject = %+v (err=%v), want failed", got, err)
+	}
+	stages, err := rr.ListStagesForRun(t.Context(), r.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if !run.PlanRejected(stages) {
+		t.Fatalf("run.PlanRejected = false over the rejected run's stages %+v", stages)
+	}
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStateReplanning) {
+		t.Fatalf("items = %+v, want the item replanning after its plan was rejected", st.Items)
+	}
+	if st.Campaign.State != string(campaign.StateRunning) {
+		t.Errorf("campaign state = %q, want running", st.Campaign.State)
+	}
+}
+
+// TestCampaignItem_PlanRejected_ReplanningThenRestart_E2E is the #5379
+// cross-boundary done-means over REAL Postgres (campaign + run repos): one
+// driver tick mints and links the item's run; the plan stage is then failed
+// with run.FailureReasonGateRejected and the run failed (what the reject
+// handler + orchestrator write); the status read shows the SHIPPED wire values
+// (state `replanning`, rollup key `replanning`, campaign running, next_action
+// start_run); a second tick mints NO run; and POST /runs restarts the item onto
+// a different run. It crosses run stage persistence -> run.PlanRejected ->
+// the widened campaign_items CHECK -> NextEligible/DeriveState -> HTTP -> the
+// driver START pass -> the restart verb.
+func TestCampaignItem_PlanRejected_ReplanningThenRestart_E2E(t *testing.T) {
+	ctx := context.Background()
+	s, crepo, rrepo, aud := newCampaignStartServerPG(t)
+	c, err := crepo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", WorkingDir: seededCampaignWorkingDir,
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	if _, err := crepo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:100"}); err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if _, err := crepo.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("campaign->running: %v", err)
+	}
+
+	tk := &campaigndriver.Ticker{Campaigns: crepo, Runs: rrepo, Starter: e2eDriverStarter{s: s}, Audit: aud}
+	tk.Tick(ctx)
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Items) != 1 || st.Items[0].RunID == nil || st.Items[0].State != string(campaign.ItemStateRunning) {
+		t.Fatalf("after tick 1 items = %+v, want one running item with a linked run", st.Items)
+	}
+	rejectedRun := *st.Items[0].RunID
+
+	stages, err := rrepo.ListStagesForRun(ctx, rejectedRun)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	var planID uuid.UUID
+	for _, sg := range stages {
+		if sg.Type == run.StageTypePlan {
+			planID = sg.ID
+		}
+	}
+	if planID == uuid.Nil {
+		t.Fatalf("no plan stage among %+v", stages)
+	}
+	if _, err := run.FailStage(ctx, rrepo, planID, run.FailureD, run.FailureReasonGateRejected); err != nil {
+		t.Fatalf("fail plan stage: %v", err)
+	}
+	if cur, _ := rrepo.GetRun(ctx, rejectedRun); cur != nil && cur.State == run.StatePending {
+		if _, err := rrepo.TransitionRun(ctx, rejectedRun, run.StateRunning); err != nil {
+			t.Fatalf("run->running: %v", err)
+		}
+	}
+	if _, err := rrepo.TransitionRun(ctx, rejectedRun, run.StateFailed); err != nil {
+		t.Fatalf("run->failed: %v", err)
+	}
+
+	st = getCampaignStatusBody(t, s, c.ID)
+	if st.Items[0].State != "replanning" || st.Items[0].RunID == nil || *st.Items[0].RunID != rejectedRun {
+		t.Fatalf("item = %+v, want state replanning with run_id %s", st.Items[0], rejectedRun)
+	}
+	if !containsRef(st.Rollup.Replanning, "issue:100") || containsRef(st.Rollup.Failed, "issue:100") || containsRef(st.Rollup.Cancelled, "issue:100") {
+		t.Errorf("rollup = %+v, want issue:100 only in replanning", st.Rollup)
+	}
+	if st.Campaign.State != string(campaign.StateRunning) {
+		t.Errorf("campaign state = %q, want running (not failed)", st.Campaign.State)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" {
+		t.Errorf("next_action = %+v, want start_run issue:100", st.NextAction)
+	}
+
+	tk.Tick(ctx)
+	st = getCampaignStatusBody(t, s, c.ID)
+	if st.Items[0].State != "replanning" || *st.Items[0].RunID != rejectedRun {
+		t.Fatalf("after tick 2 item = %+v, want still replanning on %s (the driver never dispatches it)", st.Items[0], rejectedRun)
+	}
+	if n := aud.count("campaign_issue_started"); n != 1 {
+		t.Errorf("campaign_issue_started = %d, want 1 (only tick 1 minted)", n)
+	}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("restart = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Item.State != string(campaign.ItemStateRunning) || body.Item.RunID == nil || *body.Item.RunID == rejectedRun {
+		t.Errorf("restarted item = %+v, want running on a run other than %s", body.Item, rejectedRun)
 	}
 }

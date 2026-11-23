@@ -8,8 +8,9 @@ package campaign
 // Eligibility is the partition of a campaign's items by readiness, computed by
 // NextEligible. Every slice holds issue refs (Item.IssueRef). An item appears
 // in exactly one slice. Eligible items are the ones a scheduler may dispatch
-// next; Blocked items wait on an unsatisfied dependency; Running/Done/Failed/
-// Cancelled reflect items already linked to a run or terminal.
+// next; Blocked items wait on an unsatisfied dependency; Running/Paused/
+// Replanning/Done/Failed/Cancelled reflect items already linked to a run or
+// terminal.
 type Eligibility struct {
 	// Eligible items have no run yet and every dependency already succeeded —
 	// they are ready to dispatch autonomously.
@@ -70,6 +71,19 @@ type Eligibility struct {
 	// for Running. It is never re-dispatched until a resume flips it back to
 	// running.
 	Paused []string
+	// Replanning items (#5379) settled `replanning` because an approver rejected
+	// the plan of their run. Like Paused, a replanning item carries a RunID (the
+	// rejected run, kept as provenance) and a non-terminal state, so it is
+	// classified BEFORE the Running catch-all. It is never Eligible: the
+	// auto-driver keys on Eligible, and the operator decides when the replan
+	// starts. Its forward path is the operator restart verb, which
+	// RestartCampaignItem admits. There is no depends_on conjunct: the item
+	// already ran, so its dependencies were satisfied when it started, and
+	// succeeded is terminal, so they stay satisfied. A replanning item carrying
+	// Autonomy=="low" (relabelled human-led after it ran) is diverted to
+	// HumanLed instead, mirroring Restartable's autonomy conjunct: human-led
+	// work is never offered an agent restart.
+	Replanning []string
 }
 
 // NextEligible partitions a campaign's items into eligible / blocked /
@@ -102,6 +116,10 @@ type Eligibility struct {
 // deps-satisfied, non-autonomy:low failed item is diverted to Restartable too
 // (#1838) — mirroring the cancelled arm — so its dependents are not blocked
 // forever; a deps-unsatisfied or human-led failed item stays in Failed.
+//
+// A replanning item (#5379) is reported in Replanning — never Eligible and
+// never Running, although it carries a RunID and a non-terminal state — unless
+// it carries Autonomy=="low", which diverts it to HumanLed.
 func NextEligible(items []*Item) Eligibility {
 	var e Eligibility
 
@@ -156,6 +174,19 @@ func NextEligible(items []*Item) Eligibility {
 			// MUST be classified before the Running catch-all below or it would
 			// be mis-counted as Running. Never re-dispatched until resumed.
 			e.Paused = append(e.Paused, ref)
+		case it.State == ItemStateReplanning:
+			// Replanning (#5379): the item's run was rejected at the plan gate.
+			// Like Paused it carries a RunID and a non-terminal state, so it MUST
+			// be classified before the Running catch-all below. Never Eligible:
+			// the operator restart verb is its forward path. A human-led
+			// (autonomy:low) item goes to HumanLed so it is never offered an
+			// agent restart. No depends_on check: the item already started, so
+			// its dependencies succeeded, and succeeded is terminal.
+			if it.Autonomy == "low" {
+				e.HumanLed = append(e.HumanLed, ref)
+			} else {
+				e.Replanning = append(e.Replanning, ref)
+			}
 		case it.State == ItemStateSucceeded:
 			e.Done = append(e.Done, ref)
 		case it.State == ItemStateRunning || (it.RunID != nil && !it.State.IsTerminal()):
@@ -198,14 +229,14 @@ func depsSatisfied(deps []string, done map[string]bool) bool {
 //     failed item fails the WHOLE campaign only when no forward progress
 //     remains — every item has reached a terminal state; #1838);
 //   - else the NextEligible partition has >= 1 HumanLed item and NO Eligible,
-//     Restartable, Running or Paused item => awaiting_human (E72.33 / #3660):
+//     Restartable, Replanning, Running or Paused item => awaiting_human (E72.33 / #3660):
 //     the engine has no dispatchable work left and the only open items are
 //     human-led, so reporting `running` forever was a state/action
 //     contradiction;
-//   - any progress (some running, succeeded, or failed) => running (a failed
-//     item ALONGSIDE pending/eligible/running work keeps the campaign running so
-//     the still-actionable siblings can be driven — the failed item is
-//     quarantined, not campaign-terminal);
+//   - any progress (some running, replanning, succeeded, or failed) => running
+//     (a failed item ALONGSIDE pending/eligible/running work keeps the campaign
+//     running so the still-actionable siblings can be driven — the failed item
+//     is quarantined, not campaign-terminal);
 //   - otherwise (all pending, or pending/blocked with no progress) => pending.
 //
 // THE awaiting_human ARM (E72.33 / #3660) is computed from NextEligible — the
@@ -224,6 +255,9 @@ func depsSatisfied(deps []string, done map[string]bool) bool {
 //     operator forward path that baseCampaignNextAction outranks HumanLed with,
 //     so deriving awaiting_human there would advertise start_run under a state
 //     claiming only humans are owed work.
+//   - Replanning (#5379): for the same reason as Restartable — a plan-rejected
+//     item has an operator forward path (the restart verb), so the campaign is
+//     not parked on human-led work alone.
 //
 // Because the predicate is an IFF over the partition, the arm STOPS FIRING as
 // soon as any excluded bucket becomes non-empty — the mechanism the reverse
@@ -231,13 +265,20 @@ func depsSatisfied(deps []string, done map[string]bool) bool {
 // persisted row follow.
 //
 // A Blocked item is deliberately NOT excluded: with no Eligible/Restartable/
-// Running/Paused item, every blocked item is waiting (transitively) on the
+// Replanning/Running/Paused item, every blocked item is waiting (transitively) on the
 // human-led work, so the campaign is genuinely parked on a human.
 //
 // INTENDED BEHAVIOR CHANGE: an all-human-led campaign that has NOT started now
 // derives awaiting_human where it previously derived pending. That is the honest
 // reading — the engine will never dispatch any of its items — and the
 // awaiting_human → pending edge makes it fully reversible on a relabel.
+//
+// A REPLANNING item (#5379) is progress: the campaign has started work, and the
+// rejected plan is waiting on the operator, not failed. It sets anyReplanning,
+// which the progress arm reads, so a campaign holding one derives running —
+// never pending, and never failed: replanning is non-terminal, so allTerminal
+// stays false and the terminal-failed arm cannot fire even beside a failed
+// sibling.
 //
 // The quarantine rule (anyFailed && allTerminal -> Failed, otherwise a failed
 // item is progress -> Running) is the #1838 fix: previously a single failed item
@@ -260,7 +301,7 @@ func DeriveState(items []*Item) State {
 	if len(items) == 0 {
 		return StatePending
 	}
-	var anyFailed, anyRunning, anySucceeded bool
+	var anyFailed, anyRunning, anySucceeded, anyReplanning bool
 	allSucceeded := true
 	allTerminal := true
 	for _, it := range items {
@@ -271,6 +312,8 @@ func DeriveState(items []*Item) State {
 			anyRunning = true
 		case ItemStateSucceeded:
 			anySucceeded = true
+		case ItemStateReplanning:
+			anyReplanning = true
 		}
 		if it.State != ItemStateSucceeded {
 			allSucceeded = false
@@ -287,17 +330,18 @@ func DeriveState(items []*Item) State {
 		// actionable — the campaign cannot make further progress, so it is failed.
 		return StateFailed
 	case awaitingHumanOnly(items):
-		// No Eligible/Restartable/Running/Paused item and at least one HumanLed
+		// No Eligible/Restartable/Replanning/Running/Paused item and >= 1 HumanLed
 		// item: the engine has nothing to dispatch and the only open work is
 		// human-led (E72.33 / #3660). Strictly BELOW the two terminal arms — an
 		// all-succeeded or genuinely terminal-failed campaign keeps its terminal
 		// state — and ABOVE the progress arm, because a campaign whose agent work
 		// is finished must stop reporting `running` forever.
 		return StateAwaitingHuman
-	case anyRunning || anySucceeded || anyFailed:
-		// Some work is in flight, partially done, OR a failed item sits alongside
-		// still-actionable siblings (pending/eligible/running) — the campaign is
-		// running so those siblings can be driven; the failed item is quarantined.
+	case anyRunning || anyReplanning || anySucceeded || anyFailed:
+		// Some work is in flight, partially done, awaiting an operator replan, OR
+		// a failed item sits alongside still-actionable siblings
+		// (pending/eligible/running) — the campaign is running so those siblings
+		// can be driven; the failed item is quarantined.
 		return StateRunning
 	default:
 		// No progress, nothing running/failed: still pending.
@@ -306,8 +350,8 @@ func DeriveState(items []*Item) State {
 }
 
 // awaitingHumanOnly reports the awaiting_human predicate over the NextEligible
-// partition: >= 1 HumanLed item AND no Eligible, Restartable, Running or Paused
-// item. It is the FORWARD half of the iff documented on DeriveState; the reverse
+// partition: >= 1 HumanLed item AND no Eligible, Restartable, Replanning,
+// Running or Paused item. It is the FORWARD half of the iff documented on DeriveState; the reverse
 // half is the transition table admitting awaiting_human → pending / running so
 // the persisted row can follow the derivation once the predicate stops holding.
 func awaitingHumanOnly(items []*Item) bool {
@@ -315,6 +359,7 @@ func awaitingHumanOnly(items []*Item) bool {
 	return len(e.HumanLed) > 0 &&
 		len(e.Eligible) == 0 &&
 		len(e.Restartable) == 0 &&
+		len(e.Replanning) == 0 &&
 		len(e.Running) == 0 &&
 		len(e.Paused) == 0
 }

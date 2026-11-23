@@ -3,6 +3,12 @@ package run_test
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -742,4 +748,86 @@ func TestFailStageCASExhaustsRetries(t *testing.T) {
 // tenant account, matching its pre-promotion effective behavior.
 func (*memRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// TestPlanRejected pins the #5379 classifier: only a plan stage failed
+// category D with exactly run.FailureReasonGateRejected is a plan rejection.
+// A permissive body (`return true`) turns the SLA-timeout, implement-reject,
+// category-A and no-reason rows RED; dropping the StageTypePlan conjunct turns
+// the implement-reject row RED.
+func TestPlanRejected(t *testing.T) {
+	catA, catD := run.FailureA, run.FailureD
+	reject := run.FailureReasonGateRejected
+	sla := "sla_timeout: 4h0m0s elapsed (deadline 4h)"
+	mk := func(typ run.StageType, state run.StageState, cat *run.FailureCategory, reason *string) *run.Stage {
+		return &run.Stage{ID: uuid.New(), Type: typ, State: state, FailureCategory: cat, FailureReason: reason}
+	}
+	cases := []struct {
+		name   string
+		stages []*run.Stage
+		want   bool
+	}{
+		{"rejected plan", []*run.Stage{mk(run.StageTypePlan, run.StageStateFailed, &catD, &reject)}, true},
+		{"rejected plan after a nil entry", []*run.Stage{nil, mk(run.StageTypePlan, run.StageStateFailed, &catD, &reject)}, true},
+		{"sla timeout plan", []*run.Stage{mk(run.StageTypePlan, run.StageStateFailed, &catD, &sla)}, false},
+		{"implement stage reject", []*run.Stage{
+			mk(run.StageTypePlan, run.StageStateSucceeded, nil, nil),
+			mk(run.StageTypeImplement, run.StageStateFailed, &catD, &reject),
+		}, false},
+		{"category A plan failure", []*run.Stage{mk(run.StageTypePlan, run.StageStateFailed, &catA, &reject)}, false},
+		{"plan failed D with no reason", []*run.Stage{mk(run.StageTypePlan, run.StageStateFailed, &catD, nil)}, false},
+		{"plan failed with no category", []*run.Stage{mk(run.StageTypePlan, run.StageStateFailed, nil, &reject)}, false},
+		{"plan awaiting approval", []*run.Stage{mk(run.StageTypePlan, run.StageStateAwaitingApproval, nil, nil)}, false},
+		{"no stages", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := run.PlanRejected(tc.stages); got != tc.want {
+				t.Errorf("PlanRejected = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFailureReasonGateRejected_SoleProducer is the #5379 negative pin (R5b):
+// run.PlanRejected treats FailureReasonGateRejected as proof of an approver's
+// plan reject, so no production Go file other than this package's declaration
+// may spell the literal (a FailStage caller reusing it for another cause would
+// settle a campaign item `replanning` for a failure no approver made). The
+// only producer passes the constant (server.advanceStage).
+func TestFailureReasonGateRejected_SoleProducer(t *testing.T) {
+	root := filepath.Join("..", "..") // backend/
+	var hits []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		// Parse rather than grep so a comment naming the reason (retry.go
+		// documents it) is not a producer: only a string literal is.
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			if v, uerr := strconv.Unquote(lit.Value); uerr == nil && v == run.FailureReasonGateRejected {
+				hits = append(hits, filepath.ToSlash(path))
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	want := filepath.ToSlash(filepath.Join(root, "internal", "run", "failure.go"))
+	if len(hits) != 1 || hits[0] != want {
+		t.Errorf("files with a %q string literal = %v, want only %s: pass run.FailureReasonGateRejected instead, and only for an approver's gate reject", run.FailureReasonGateRejected, hits, want)
+	}
 }

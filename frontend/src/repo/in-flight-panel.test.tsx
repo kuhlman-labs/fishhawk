@@ -88,6 +88,7 @@ const CAMPAIGN_STATUS: CampaignStatus = {
     failed: [],
     cancelled: [],
     paused: [],
+    replanning: [],
   },
   next_action: { action: 'wait' },
 };

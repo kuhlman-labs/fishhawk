@@ -403,13 +403,14 @@ func (r *postgresRepo) PauseCampaignItem(ctx context.Context, id uuid.UUID, reas
 	return result, nil
 }
 
-// RestartCampaignItem resets a restartable-terminal item (cancelled or failed)
-// to pending and clears its run link, atomically under SELECT … FOR UPDATE. It
-// mirrors TransitionCampaignItem/PauseCampaignItem's lock posture but bypasses
-// the campaignItemTransitions terminal guard on purpose (a restart is an
-// operator reset, not a lifecycle transition — see the Repository doc): it
-// enforces its own from ∈ {cancelled, failed} check under the lock, then reuses
-// the generated SetCampaignItemRun{nil} + UpdateCampaignItemState{pending}
+// RestartCampaignItem resets a restartable item (cancelled, failed, or the
+// non-terminal plan-rejected replanning state, #5379) to pending and clears its
+// run link, atomically under SELECT … FOR UPDATE. It mirrors
+// TransitionCampaignItem/PauseCampaignItem's lock posture but bypasses the
+// campaignItemTransitions table on purpose (a restart is an operator reset,
+// not a lifecycle transition — see the Repository doc): it enforces its own
+// from ∈ {cancelled, failed, replanning} check under the lock, then reuses the
+// generated SetCampaignItemRun{nil} + UpdateCampaignItemState{pending}
 // queries. Any other from — running/succeeded/pending/blocked/paused — is
 // rejected InvalidTransitionError; a missing item is ErrNotFound.
 func (r *postgresRepo) RestartCampaignItem(ctx context.Context, id uuid.UUID) (*Item, error) {
@@ -424,9 +425,11 @@ func (r *postgresRepo) RestartCampaignItem(ctx context.Context, id uuid.UUID) (*
 			return fmt.Errorf("lock campaign item: %w", err)
 		}
 		from := ItemState(current.State)
-		// Restart is only defined from a restartable terminal state. This guard
-		// stands in for the transition table, which refuses every terminal from.
-		if from != ItemStateCancelled && from != ItemStateFailed {
+		// Restart is only defined from a restartable state: terminal
+		// cancelled/failed, or replanning (#5379). This guard stands in for the
+		// transition table, which refuses every terminal from and deliberately
+		// has no replanning → pending edge.
+		if from != ItemStateCancelled && from != ItemStateFailed && from != ItemStateReplanning {
 			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(ItemStatePending)}
 		}
 		// Clear the run link first, then reset the state to pending. Both go
@@ -582,16 +585,19 @@ func (r *postgresRepo) SettleCampaignItemOutOfBand(ctx context.Context, id uuid.
 }
 
 // SettleCampaignItemForClosedIssue settles a NOT-YET-RUN item (pending or
-// blocked) off a CLOSED issue, stamping the resolved_by provenance marker
-// ATOMICALLY with the state write, under SELECT … FOR UPDATE (see the
-// Repository doc for the full contract).
+// blocked) or a plan-rejected replanning item (#5379) off a CLOSED issue,
+// stamping the resolved_by provenance marker ATOMICALLY with the state write,
+// under SELECT … FOR UPDATE (see the Repository doc for the full contract). It
+// never touches the run link, so a replanning item keeps its rejected run as
+// provenance.
 //
 // `to` is the classifier's target: succeeded for a closed-as-completed issue,
 // cancelled for a not_planned/duplicate closure. Both edges are already
 // admitted by campaignItemTransitions, so this is NOT a guard bypass like
 // RestartCampaignItem / SettleCampaignItemOutOfBand — it exists for the ATOMIC
 // marker write, which UpdateCampaignItemState cannot do. Any `from` other than
-// {pending, blocked}, or any `to` other than {succeeded, cancelled}, is
+// {pending, blocked, replanning}, or any `to` other than {succeeded,
+// cancelled}, is
 // rejected InvalidTransitionError{Kind:"campaign_item"}; a missing item is
 // ErrNotFound.
 //
@@ -610,11 +616,12 @@ func (r *postgresRepo) SettleCampaignItemForClosedIssue(ctx context.Context, id 
 			return fmt.Errorf("lock campaign item: %w", err)
 		}
 		from := ItemState(current.State)
-		// The issue-closed settle is only defined from a not-yet-run state onto a
+		// The issue-closed settle is only defined from a not-yet-run state, or a
+		// replanning item whose rejected run is no longer live (#5379), onto a
 		// terminal delivery/abandonment outcome. Anything else — a running item
 		// (pass 1's), an already-settled one, a paused one, or a `to` outside the
 		// two outcomes — is refused rather than silently coerced.
-		if from != ItemStatePending && from != ItemStateBlocked {
+		if from != ItemStatePending && from != ItemStateBlocked && from != ItemStateReplanning {
 			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(to)}
 		}
 		if to != ItemStateSucceeded && to != ItemStateCancelled {

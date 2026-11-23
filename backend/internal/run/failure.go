@@ -239,3 +239,37 @@ func reanchorTarget(err error) (StageState, bool) {
 	}
 	return sce.Actual, true
 }
+
+// FailureReasonGateRejected is the category-D FailureReason an approver's
+// reject writes on the gated stage. Its SOLE producer is the reject leg of
+// server.advanceStage (backend/internal/server/approvals.go); every other
+// category-D writer uses a different reason (the SLA ticker writes
+// "sla_timeout: ..."), and TestFailureReasonGateRejected_SoleProducer pins
+// that no other non-test Go file spells the literal. PlanRejected keys on it
+// to tell a deliberate plan reject from every other plan failure (#5379), so
+// a new writer reusing it for a non-reject cause would misclassify a run.
+const FailureReasonGateRejected = "gate rejected by approver"
+
+// PlanRejected reports whether stages (one run's stages) carry a plan stage an
+// approver rejected at its gate: Type plan, State failed, FailureCategory D and
+// FailureReason exactly FailureReasonGateRejected. It is false for a plan stage
+// failed by an SLA timeout (category D, "sla_timeout: ..." reason), for a
+// non-plan stage rejected at its gate (a review/deploy reject), for a plan
+// stage failed in category A/B/C, and for a failed plan stage with no recorded
+// category or reason. The campaign settle paths (campaigndriver.advance and the
+// server's on-read reconcile) call it on a terminal-failed run to settle its
+// item `replanning` instead of `failed` (#5379).
+func PlanRejected(stages []*Stage) bool {
+	for _, s := range stages {
+		if s == nil || s.Type != StageTypePlan || s.State != StageStateFailed {
+			continue
+		}
+		if s.FailureCategory == nil || *s.FailureCategory != FailureD {
+			continue
+		}
+		if s.FailureReason != nil && *s.FailureReason == FailureReasonGateRejected {
+			return true
+		}
+	}
+	return false
+}
