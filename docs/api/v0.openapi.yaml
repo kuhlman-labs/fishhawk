@@ -3639,7 +3639,7 @@ components:
           required: [workflow_id, period, period_start, period_end, limit_usd, spent_usd, enforcement]
           properties:
             workflow_id: { type: string }
-            period: { type: string, enum: [daily, weekly, monthly] }
+            period: { type: string, enum: [weekly, monthly] }
             period_start: { type: string, format: date-time }
             period_end: { type: string, format: date-time }
             limit_usd:
@@ -20909,7 +20909,10 @@ paths:
         repository's current default-branch spec for a GitHub run (a forge
         read per call), else the run's cached admission spec. A failed live
         read falls back to the cached admission spec (this display never
-        gates). A workflow with multiple budgets reports the GOVERNING one:
+        gates). A run-bound `mcp:run:` caller is always served the cached
+        admission spec and triggers no forge read, so an in-runner agent
+        cannot spend the App installation's rate limit by looping this read.
+        A workflow with multiple budgets reports the GOVERNING one:
         the first blocking budget over its effective limit (the budget the
         dispatcher blocks on), else the first declared.
       tags: [runs]

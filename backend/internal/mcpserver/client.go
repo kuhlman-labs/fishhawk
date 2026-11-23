@@ -1053,7 +1053,7 @@ type runDispatchBudget struct {
 // runDispatchBudgetDetail mirrors the backend dispatchBudgetDetail.
 type runDispatchBudgetDetail struct {
 	WorkflowID  string `json:"workflow_id" jsonschema:"the run's workflow id"`
-	Period      string `json:"period" jsonschema:"daily | weekly | monthly"`
+	Period      string `json:"period" jsonschema:"weekly | monthly"`
 	PeriodStart string `json:"period_start" jsonschema:"the period window start (RFC 3339)"`
 	PeriodEnd   string `json:"period_end" jsonschema:"the period window end, when the budget rolls over (RFC 3339)"`
 	// LimitUSD is the EFFECTIVE limit (FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD

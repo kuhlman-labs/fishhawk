@@ -53,6 +53,18 @@ type dbRunRepo struct {
 	sumErr   error
 	sumCalls int
 	stages   map[uuid.UUID][]*run.Stage
+	// getRunErr injects a GetRun error per run id (an ancestor read failure).
+	getRunErr map[uuid.UUID]error
+}
+
+func (r *dbRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	err := r.getRunErr[id]
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return r.fakeRepo.GetRun(ctx, id)
 }
 
 func (r *dbRunRepo) SumWorkflowCostInRange(_ context.Context, _, _ string, from, to time.Time) (float64, error) {
@@ -264,6 +276,40 @@ func TestDispatchBudget_LiveSpecUnreadable_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestDispatchBudget_UndecidableAdmissionSpec_LiveReadFailed_Clears pins the
+// D2 verdict when the live read fails AND the admission spec cannot be
+// evaluated: an empty runs.workflow_spec (a legacy row), an unparseable one,
+// or one without the run's workflow. admissionSpecBudgets yields no budgets,
+// so the admission spec "declares no blocking budget" and the verdict CLEARS
+// with source admission_spec_fallback, exactly as for an advisory-only
+// admission spec (D2: fail closed ONLY when the admission spec declares a
+// blocking budget). The live spec here is blocking and over its limit, so a
+// fail-closed reading of D2 would answer 503 budget_check_failed instead;
+// that alternative is an operator ruling, not this test's.
+func TestDispatchBudget_UndecidableAdmissionSpec_LiveReadFailed_Clears(t *testing.T) {
+	for _, tc := range []struct{ name, admission string }{
+		{"empty_admission_spec", ""},
+		{"unparseable_admission_spec", "version: [\n"},
+		{"workflow_absent_from_admission_spec", strings.Replace(dbSpec(dbBlocking(10)), "feature_change", "other_flow", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDBFixture(t, dbSpec(dbBlocking(10)), dbOpts{})
+			f.spent(15)
+			f.gh.specStatus = http.StatusInternalServerError
+			f.gh.specBody = `{"message":"boom"}`
+			r := f.seedRun(tc.admission, nil)
+			wantStatus(t, f.verdict(t, r), dispatchBudgetClear, dispatchBudgetSourceAdmissionFallback)
+			if f.gh.specCalls == 0 {
+				t.Fatal("live spec was never read; the row does not exercise the read-failure fallback")
+			}
+			w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), r.ID, "include=dispatch_budget")
+			if w.Code != http.StatusOK {
+				t.Fatalf("GET status = %d, want 200 clear:\n%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 type errEnvelope struct {
 	Error struct {
 		Code    string         `json:"code"`
@@ -341,7 +387,7 @@ func TestDispatchBudget_VerdictMatchesBudgetTier(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			st, err := f.s.runBudgetStatus(context.Background(), r.ID)
+			st, err := f.s.runBudgetStatus(context.Background(), r.ID, true)
 			if err != nil || st == nil {
 				t.Fatalf("runBudgetStatus = %+v, %v", st, err)
 			}
@@ -479,6 +525,45 @@ func TestDispatchBudget_BrokenAncestry_NoExemption(t *testing.T) {
 		}
 		wantStatus(t, f.verdict(t, cur), dispatchBudgetBlocked, dispatchBudgetSourceLive)
 	})
+}
+
+// TestDispatchBudget_EightHopAncestorIsExempt: the walk reaches a bound
+// ancestor exactly maxCampaignAncestorDepth hops up; only the ninth hop is
+// refused (depth_9 above).
+func TestDispatchBudget_EightHopAncestorIsExempt(t *testing.T) {
+	f := newDBFixture(t, dbSpec(dbBlocking(10)), dbOpts{})
+	f.spent(15)
+	root := f.seedRun(dbSpec(dbBlocking(10)), nil)
+	f.bind(root.ID, root.Repo, root.WorkflowID)
+	cur := root
+	for i := 0; i < maxCampaignAncestorDepth; i++ {
+		parent := cur.ID
+		cur = f.seedRun(dbSpec(dbBlocking(10)), func(r *run.Run) { r.DecomposedFrom = &parent })
+	}
+	got := f.verdict(t, cur)
+	if got.Status != dispatchBudgetExempt || got.OverrideRunID != root.ID.String() {
+		t.Fatalf("%d-hop descendant verdict = %+v, want exempt via %s", maxCampaignAncestorDepth, got, root.ID)
+	}
+}
+
+// TestDispatchBudget_AncestorReadError_FailsClosed: an ancestor GetRun error
+// other than run.ErrNotFound is a binding read error, not a missing parent. A
+// verdict that would be blocked is undecided (override_binding_unreadable),
+// never a guessed blocked or exempt; a clear verdict still clears.
+func TestDispatchBudget_AncestorReadError_FailsClosed(t *testing.T) {
+	f := newDBFixture(t, dbSpec(dbBlocking(10)), dbOpts{})
+	f.spent(15)
+	root := f.seedRun(dbSpec(dbBlocking(10)), nil)
+	f.bind(root.ID, root.Repo, root.WorkflowID)
+	child := f.seedRun(dbSpec(dbBlocking(10)), func(r *run.Run) { id := root.ID; r.DecomposedFrom = &id })
+	f.repo.getRunErr = map[uuid.UUID]error{root.ID: errors.New("pg: connection reset")}
+	_, err := f.s.dispatchBudgetFor(context.Background(), child, dbNow)
+	var bce *budgetCheckError
+	if !errors.As(err, &bce) || bce.Reason != budgetCheckBindingUnreadable {
+		t.Fatalf("err = %v, want override_binding_unreadable", err)
+	}
+	f.spent(1)
+	wantStatus(t, f.verdict(t, child), dispatchBudgetClear, dispatchBudgetSourceLive)
 }
 
 // TestDispatchBudget_BindingReadError_FailsClosed (C5).

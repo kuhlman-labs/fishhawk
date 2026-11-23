@@ -279,23 +279,28 @@ override arm now also binds the grant to the run (below).
   GOVERNING budget: the first blocking budget Over at its effective limit,
   else `Budgets[0]`. `budget.tier` and the dispatcher verdict therefore agree.
   An exempt run still reads tier `over`: the tier describes the budget, not
-  the run.
+  the run. A run-bound `mcp:run:` caller is the exception: it is served the
+  cached admission spec and triggers no forge read, so an in-runner agent
+  cannot spend the App installation's rate limit by looping the route (its
+  display can then lag a default-branch budget edit).
 - **Access.** Either include value is refused `403 run_token_forbidden` for a
   run-bound `mcp:run:` subject; an unknown value is `400 validation_failed`
   listing `campaign_link` and `dispatch_budget`.
 - **Tests** (`dispatch_budget_test.go`): `TestDispatchBudget_*` (live raise and
   advisory switch, each unreadable mode with the fallback rows,
+  `UndecidableAdmissionSpec_LiveReadFailed_Clears`,
   `NoLiveSource_EvaluatesAdmissionSpec`, `EveryBudgetEvaluated`,
   `VerdictMatchesBudgetTier`, `ExemptionsDecidedBeforeLiveRead`, the override,
-  descendant, ParentRunID, broken-ancestry, repo/workflow match and
-  binding-read rows, `VerifyPassStageListed`); `TestGetRun_IncludeDispatchBudget_*`
+  descendant, eight-hop, ParentRunID, broken-ancestry, repo/workflow match,
+  binding-read and ancestor-read rows, `VerifyPassStageListed`); `TestGetRun_IncludeDispatchBudget_*`
   and `TestGetRun_Include_UnknownValueListsBoth` (`runs_test.go`);
   `TestCreateRun_BlockingBudget_Override_*`,
   `TestCreateRun_CannotNominateParentForBudgetExemption`,
   `TestCreateRun_Replay_DoesNotReappendBudgetOverride`
   (`budget_admission_test.go`); `TestRecoverRun_BlockingBudget_Override_BindsRecoveryRun`;
   `TestRunBudgetOverrideBound_WithheldFromRunBoundAuditRead`;
-  `TestGetRunBudget_LiveSpecAndGoverningBudget`. The dispatcher half is in
+  `TestGetRunBudget_LiveSpecAndGoverningBudget`,
+  `TestGetRunBudget_RunBoundCallerMakesNoForgeRead`. The dispatcher half is in
   [`backend/internal/mcpserver/README.md`](../../mcpserver/README.md).
 
 ## Superseded merge-candidate pass refusal (`host_dispatch.go`, [#4811](https://github.com/kuhlman-labs/fishhawk/issues/4811))

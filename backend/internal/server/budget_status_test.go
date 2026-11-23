@@ -374,13 +374,13 @@ func TestGetRunBudget_LiveSpecAndGoverningBudget(t *testing.T) {
 	f.spent(15)
 	r := f.seedRun(dbSpec(dbBlocking(10)), nil)
 
-	st, err := f.s.runBudgetStatus(context.Background(), r.ID)
+	st, err := f.s.runBudgetStatus(context.Background(), r.ID, true)
 	if err != nil || st == nil || st.LimitUSD != 20 {
 		t.Fatalf("after a live raise: %+v, %v; want limit_usd 20", st, err)
 	}
 
 	f.setLive(dbSpec(dbBudget{"monthly", 100, "advisory"}, dbBudget{"weekly", 10, "blocking"}))
-	st, err = f.s.runBudgetStatus(context.Background(), r.ID)
+	st, err = f.s.runBudgetStatus(context.Background(), r.ID, true)
 	if err != nil || st == nil || st.Period != "weekly" || st.Tier != "over" || st.Enforcement != "blocking" {
 		t.Fatalf("governing budget: %+v, %v; want weekly blocking over", st, err)
 	}
@@ -393,5 +393,50 @@ func TestGetRunBudget_LiveSpecAndGoverningBudget(t *testing.T) {
 	}
 	if string(raw["limit_usd"]) != "10" {
 		t.Errorf("fallback limit_usd = %s, want the cached 10", raw["limit_usd"])
+	}
+}
+
+// TestGetRunBudget_RunBoundCallerMakesNoForgeRead: a run-bound mcp:run: caller
+// is served the cached admission spec's budget and the route makes ZERO forge
+// calls for it (no installation lookup, no spec read), so an in-runner agent
+// looping the read cannot spend the installation's rate limit. An operator
+// caller on the same run still reads the live default-branch spec.
+func TestGetRunBudget_RunBoundCallerMakesNoForgeRead(t *testing.T) {
+	f := newDBFixture(t, dbSpec(dbBlocking(20)), dbOpts{})
+	f.spent(15)
+	r := f.seedRun(dbSpec(dbBlocking(10)), nil)
+	get := func(id Identity) map[string]json.RawMessage {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+r.ID.String()+"/budget", nil)
+		req.SetPathValue("run_id", r.ID.String())
+		w := httptest.NewRecorder()
+		f.s.handleGetRunBudget(w, withIdentity(req, id))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("decode: %v\n%s", err, w.Body.String())
+		}
+		return raw
+	}
+
+	runToken := Identity{Subject: "mcp:run:" + r.ID.String(), TokenID: "mcp-tok", Scopes: []string{"read:runs"}, AccountID: testOperatorAccountID}
+	for i := 0; i < 3; i++ {
+		raw := get(runToken)
+		if string(raw["limit_usd"]) != "10" {
+			t.Fatalf("run-bound limit_usd = %s, want the cached admission 10", raw["limit_usd"])
+		}
+	}
+	if f.gh.specCalls != 0 || f.gh.installationCalls != 0 {
+		t.Fatalf("run-bound GET /budget read the forge (spec %d, installation %d), want 0", f.gh.specCalls, f.gh.installationCalls)
+	}
+
+	raw := get(testOperatorIdentity())
+	if string(raw["limit_usd"]) != "20" {
+		t.Errorf("operator limit_usd = %s, want the live 20", raw["limit_usd"])
+	}
+	if f.gh.specCalls != 1 {
+		t.Errorf("operator GET /budget spec reads = %d, want 1", f.gh.specCalls)
 	}
 }
