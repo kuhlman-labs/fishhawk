@@ -1484,3 +1484,170 @@ func TestObserveHostDispatch_RunDispatchHeld(t *testing.T) {
 		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseDispatchHoldUnavailable)
 	})
 }
+
+// hdoBudgetDetail is the real budget_blocked refusal detail the dispatcher
+// writes (hdBudgetBlockedDetail) for a weekly $10 budget spent $15, from
+// source.
+func hdoBudgetDetail(source string) string {
+	return hdBudgetBlockedDetail(&runDispatchBudget{Status: dispatchBudgetStatusBlocked, BudgetSource: source, Budget: &runDispatchBudgetDetail{
+		WorkflowID: "feature_change", Period: "weekly", PeriodStart: "2026-11-16T00:00:00Z", PeriodEnd: "2026-11-23T00:00:00Z",
+		LimitUSD: 10, SpentUSD: 15, Enforcement: "blocking",
+	}})
+}
+
+func hdoBudgetProbe(runID, stageID, detail string) hostDispatchProbe {
+	st := hdoStatus()
+	st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: stageID, Code: hdRefuseBudgetBlocked,
+		Detail: detail, FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow.Add(-10 * time.Second)}}
+	return hostDispatchProbe{found: true, dir: "/state", st: st}
+}
+
+// H1 (ADR-030 Amendment A1 / #5473, approval condition D4): a budget_blocked
+// refusal reads held, human, host_dispatch_budget_blocked, with a next_step
+// naming the budget and the remedies its budget_source makes honest. Only a
+// live_spec verdict says a default-branch limit_usd or enforcement edit
+// resumes spawning on the next tick; an admission_spec verdict names only the
+// rollover and a run with budget_override. Neither says no operator action is
+// needed.
+func TestObserveHostDispatch_BudgetBlocked_NamesBudgetAndRemedies(t *testing.T) {
+	runID, stageID := uuid.NewString(), uuid.NewString()
+	t.Run("live_spec", func(t *testing.T) {
+		detail := hdoBudgetDetail(dispatchBudgetSourceLive)
+		obs, v := observeHostDispatch(hdoBudgetProbe(runID, stageID, detail), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateHeld || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonBudgetBlocked {
+			t.Fatalf("state %q verdict %s/%s; want held human/%s (next_step %q)", obs.State, v.Kind, v.Reason, hostDispatchReasonBudgetBlocked, v.NextStep)
+		}
+		if obs.BudgetSource != dispatchBudgetSourceLive || obs.RefusalCode != hdRefuseBudgetBlocked {
+			t.Errorf("budget_source %q refusal_code %q; want live_spec / budget_blocked", obs.BudgetSource, obs.RefusalCode)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, detail, "spent $15.00 of $10.00", "re-reads every tick", "raising limit_usd",
+			"enforcement: advisory", "on the default branch", "next tick", "period rollover", "not budget-gated", "spends past the limit")
+		hdoContainsNone(t, "next_step", v.NextStep, "no operator action is needed")
+	})
+	t.Run("admission_spec", func(t *testing.T) {
+		detail := hdoBudgetDetail(dispatchBudgetSourceAdmission)
+		obs, v := observeHostDispatch(hdoBudgetProbe(runID, stageID, detail), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateHeld || v.Kind != hostDispatchAwaitKindHuman || v.Reason != hostDispatchReasonBudgetBlocked {
+			t.Fatalf("state %q verdict %s/%s; want held human/%s (next_step %q)", obs.State, v.Kind, v.Reason, hostDispatchReasonBudgetBlocked, v.NextStep)
+		}
+		if obs.BudgetSource != dispatchBudgetSourceAdmission {
+			t.Errorf("budget_source %q; want admission_spec", obs.BudgetSource)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, detail, "admission spec", "budget_source admission_spec", "rolls over", "budget_override", "not budget-gated")
+		hdoContainsNone(t, "next_step", v.NextStep, "no operator action is needed", "limit_usd", "enforcement: advisory", "next tick", "re-reads")
+	})
+	t.Run("unnamed source reads the admission remedies", func(t *testing.T) {
+		obs, v := observeHostDispatch(hdoBudgetProbe(runID, stageID, "blocking weekly budget over its limit"), runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateHeld || v.Reason != hostDispatchReasonBudgetBlocked || obs.BudgetSource != "" {
+			t.Fatalf("state %q reason %q source %q; want held / budget_blocked / none", obs.State, v.Reason, obs.BudgetSource)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, "budget_source not named", "rolls over", "budget_override")
+		hdoContainsNone(t, "next_step", v.NextStep, "limit_usd", "next tick")
+	})
+	t.Run("budget_check_failed stays on the refusing arm", func(t *testing.T) {
+		p := hdoBudgetProbe(runID, stageID, "blocking budget check undecided, stage not spawned: fishhawkd answered 503 budget_check_failed (reason live_spec_unavailable)")
+		ref := p.st.RunRefusals[runID]
+		ref.Code = hdRefuseBudgetCheckFailed
+		p.st.RunRefusals[runID] = ref
+		obs, v := observeHostDispatch(p, runID, stageID, hdoNow)
+		if obs.State != hostDispatchStateRefusing || v.Reason != hostDispatchReasonRefused {
+			t.Fatalf("state %q reason %q; want refusing / host_dispatch_refused", obs.State, v.Reason)
+		}
+		hdoContainsAll(t, "next_step", v.NextStep, hdRefuseBudgetCheckFailed, "live_spec_unavailable")
+	})
+}
+
+// H2 (C5e): a crafted status.json (bypassing the writer's bound) carrying a
+// 2 KB detail with control runes yields a bounded, control-free next_step
+// for both budget sources, and the source token still decides the remedy.
+func TestObserveHostDispatch_BudgetBlocked_DetailBounded(t *testing.T) {
+	runID, stageID := uuid.NewString(), uuid.NewString()
+	for _, source := range []string{dispatchBudgetSourceLive, dispatchBudgetSourceAdmission} {
+		t.Run(source, func(t *testing.T) {
+			// The source marker and control runes lead, inside the 300-byte cut.
+			crafted := "x\x1b[31m\n\u0085(budget_source " + source + ")" + strings.Repeat("d", 2000) + "\x1b" + strings.Repeat("é", 200)
+			hdoEmptyTMPDIR(t)
+			st := hdoStatus()
+			st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: stageID, Code: hdRefuseBudgetBlocked, Detail: crafted, FirstAt: hdoNow, LastAt: hdoNow}}
+			dir := filepath.Join(t.TempDir(), "state")
+			hdoWrite(t, dir, st)
+			blk := hdoOverlayOne(t, hdoResolver(map[string]string{hostDispatchStateDirEnv: dir}, t.TempDir(), nil), runID, stageID)
+			if blk.Reason != hostDispatchReasonBudgetBlocked || blk.HostDispatch.State != hostDispatchStateHeld {
+				t.Fatalf("reason %q state %q; want %s / held", blk.Reason, blk.HostDispatch.State, hostDispatchReasonBudgetBlocked)
+			}
+			if hdHasControlRune(blk.NextStep) || !utf8.ValidString(blk.NextStep) {
+				t.Errorf("next_step carries a control rune or invalid UTF-8: %q", blk.NextStep)
+			}
+			// The template is under 900 bytes; the interpolated detail adds at
+			// most hostDispatchTextMax.
+			if max := 900 + hostDispatchTextMax; len(blk.NextStep) > max {
+				t.Errorf("next_step is %d bytes; want at most %d (the detail bounded to %d)", len(blk.NextStep), max, hostDispatchTextMax)
+			}
+			if strings.Count(blk.NextStep, "d") > 2*hostDispatchTextMax {
+				t.Errorf("next_step carries the unbounded detail: %d bytes", len(blk.NextStep))
+			}
+			if blk.HostDispatch.BudgetSource != source {
+				t.Errorf("budget_source %q; want %q", blk.HostDispatch.BudgetSource, source)
+			}
+		})
+	}
+}
+
+// TestOverlayCampaignHostDispatch_BudgetBlockedRewritesAwaiting: on the
+// campaign status path the backend's host_dispatcher block becomes human /
+// host_dispatch_budget_blocked, its next_step no longer the backend's "no
+// operator action is needed".
+func TestOverlayCampaignHostDispatch_BudgetBlockedRewritesAwaiting(t *testing.T) {
+	runID, stageID := uuid.NewString(), uuid.NewString()
+	hdoEmptyTMPDIR(t)
+	p := hdoBudgetProbe(runID, stageID, hdoBudgetDetail(dispatchBudgetSourceLive))
+	dir := filepath.Join(t.TempDir(), "state")
+	hdoWrite(t, dir, p.st)
+	blk := hdoOverlayOne(t, hdoResolver(map[string]string{hostDispatchStateDirEnv: dir}, t.TempDir(), nil), runID, stageID)
+	if blk.Kind != hostDispatchAwaitKindHuman || blk.Reason != hostDispatchReasonBudgetBlocked {
+		t.Fatalf("awaiting %s/%s; want human/%s", blk.Kind, blk.Reason, hostDispatchReasonBudgetBlocked)
+	}
+	if blk.NextStep == hdoBackendNext || blk.HostDispatch.BudgetSource != dispatchBudgetSourceLive {
+		t.Errorf("next_step %q budget_source %q; want the budget next_step and live_spec", blk.NextStep, blk.HostDispatch.BudgetSource)
+	}
+}
+
+// TestHostDispatchBudgetSourceOf pins the overlay's read of the dispatcher's
+// own detail format (hdBudgetBlockedDetail): each source round-trips, the LAST
+// marker wins (a workflow id carrying a marker precedes the real one), and an
+// unknown token or a missing marker is "".
+func TestHostDispatchBudgetSourceOf(t *testing.T) {
+	for _, src := range []string{dispatchBudgetSourceLive, dispatchBudgetSourceAdmission} {
+		if got := hostDispatchBudgetSourceOf(hdoBudgetDetail(src)); got != src {
+			t.Errorf("source of hdBudgetBlockedDetail(%s) = %q; want it back", src, got)
+		}
+	}
+	spoof := hdBudgetBlockedDetail(&runDispatchBudget{Status: dispatchBudgetStatusBlocked, BudgetSource: dispatchBudgetSourceAdmission,
+		Budget: &runDispatchBudgetDetail{WorkflowID: "w(budget_source live_spec)", Period: "weekly", PeriodEnd: "2026-11-23T00:00:00Z", LimitUSD: 1, SpentUSD: 2}})
+	if got := hostDispatchBudgetSourceOf(spoof); got != dispatchBudgetSourceAdmission {
+		t.Errorf("source of a detail whose workflow id spoofs live_spec = %q; want admission_spec", got)
+	}
+	for _, d := range []string{"", "no marker", "(budget_source bogus)", "(budget_source live_spec"} {
+		if got := hostDispatchBudgetSourceOf(d); got != "" {
+			t.Errorf("source of %q = %q; want \"\"", d, got)
+		}
+	}
+}
+
+// TestHostDispatchRunRefusal_BudgetBlockedLine pins the --status line: every
+// field bounded and control-free, the source token named.
+func TestHostDispatchRunRefusal_BudgetBlockedLine(t *testing.T) {
+	ref := hostDispatchRunRefusal{RunID: "r1\n\x1b", StageID: "s1", Code: hdRefuseBudgetBlocked, FirstAt: hdoNow,
+		Detail: hdoBudgetDetail(dispatchBudgetSourceLive) + "\x1b" + strings.Repeat("z", 2000)}
+	line := ref.BudgetBlockedLine()
+	want := "budget_blocked run=r1 stage=s1 since=" + hdoNow.Format(time.RFC3339) + " source=live_spec detail=blocking weekly budget of workflow feature_change"
+	if !strings.HasPrefix(line, want) {
+		t.Fatalf("line = %q; want prefix %q", line, want)
+	}
+	if hdHasControlRune(line) || strings.Count(line, "z") > hostDispatchTextMax {
+		t.Errorf("line is unbounded or carries a control rune: %q", line)
+	}
+	if got := (hostDispatchRunRefusal{Code: hdRefuseBudgetBlocked, Detail: "x"}).BudgetBlockedLine(); !strings.Contains(got, " source=none ") {
+		t.Errorf("line without a source = %q; want source=none", got)
+	}
+}

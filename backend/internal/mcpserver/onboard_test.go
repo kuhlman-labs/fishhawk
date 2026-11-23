@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -2530,6 +2533,9 @@ func assertHostRungsNotApplicable(t *testing.T, out DoctorOutput, reason string)
 	if m := out.ModelCredential; m == nil || m.Status != modelCredentialNotApplicable || m.Reason != reason || m.LoggedIn != nil || m.Note == "" {
 		t.Errorf("model_credential = %+v, want not_applicable reason %s with a note", m, reason)
 	}
+	if b := out.HostDispatchBudget; b == nil || b.Status != hostDispatchBudgetNotApplicable || b.Reason != reason || b.Note == "" || len(b.Refusals) != 0 || len(b.PathsTried) != 0 {
+		t.Errorf("host_dispatch_budget = %+v, want not_applicable reason %s with a note and nothing probed", b, reason)
+	}
 }
 
 // TestDoctor_CredentialRung_Sources covers each source on the stdio posture.
@@ -2655,10 +2661,132 @@ func TestDoctor_IdentityFields_E2E_ThroughRealServer(t *testing.T) {
 func TestDoctorToolDescription_DescribesHostRungs(t *testing.T) {
 	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
 	for _, want := range []string{
-		"five rungs", "credential —", "model_credential —", "env:FISHHAWK_API_TOKEN", "mcp_route_request_bearer",
+		"six rungs", "credential —", "model_credential —", "env:FISHHAWK_API_TOKEN", "mcp_route_request_bearer",
 		"shadowed_stored_login", "report.scopes.subject", "claude auth status --json", "within 72h",
 		"not_applicable", "run_bound_token", "not_local_stdio_process", "no expiry reported",
 	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
+
+// H3 (ADR-030 Amendment A1 / #5473): the host_dispatch_budget doctor rung.
+// not_applicable for a run-bound bearer with no status file read (the file
+// below would otherwise read blocked); absent; ok; blocked listing each
+// budget_blocked refusal with its budget_source; unverified (unreadable or
+// stale); and a crafted oversized detail rendered bounded. At most 8 entries
+// are listed and the rest counted.
+func TestDoctor_HostDispatchBudgetRung(t *testing.T) {
+	blockedEntry := func(runID, detail string) hostDispatchRunRefusal {
+		return hostDispatchRunRefusal{RunID: runID, StageID: "s-" + runID, Code: hdRefuseBudgetBlocked, Detail: detail,
+			FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow.Add(-10 * time.Second)}
+	}
+	liveDetail := hdoBudgetDetail(dispatchBudgetSourceLive)
+	admDetail := hdoBudgetDetail(dispatchBudgetSourceAdmission)
+	withRefusals := func(refs ...hostDispatchRunRefusal) HostDispatcherStatus {
+		st := hdoStatus()
+		st.RunRefusals = map[string]hostDispatchRunRefusal{}
+		for _, r := range refs {
+			st.RunRefusals[r.RunID] = r
+		}
+		return st
+	}
+	crafted := "\x1b[31m\n\u0085(budget_source live_spec)" + strings.Repeat("d", 2000)
+	many := make([]hostDispatchRunRefusal, 0, 10)
+	for i := 0; i < 10; i++ {
+		many = append(many, blockedEntry(fmt.Sprintf("run-%02d", i), liveDetail))
+	}
+	stale := withRefusals(blockedEntry("run-a", liveDetail))
+	stale.LastTickAt, stale.LastCompleteTickAt = hdoNow.Add(-time.Hour), hdoNow.Add(-time.Hour)
+	for _, tc := range []struct {
+		name     string
+		runBound bool
+		write    any // nil: no file; []byte: raw
+		want     string
+		check    func(t *testing.T, rung *hostDispatchBudgetRung)
+	}{
+		{"run-bound bearer is not_applicable with no read", true, withRefusals(blockedEntry("run-a", liveDetail)), hostDispatchBudgetNotApplicable,
+			func(t *testing.T, rung *hostDispatchBudgetRung) {
+				if rung.Reason != hostRungRunBoundToken || len(rung.Refusals) != 0 || rung.StatusPath != "" || len(rung.PathsTried) != 0 {
+					t.Errorf("rung = %+v; want run_bound_token and nothing read", rung)
+				}
+			}},
+		{"absent", false, nil, hostDispatchBudgetAbsent, func(t *testing.T, rung *hostDispatchBudgetRung) {
+			if len(rung.PathsTried) == 0 || !strings.Contains(rung.Note, hostDispatchStateDirEnv) {
+				t.Errorf("rung = %+v; want paths_tried and the env var named", rung)
+			}
+		}},
+		{"ok", false, withRefusals(hostDispatchRunRefusal{RunID: "run-w", Code: hdRefuseWorkingDirAbsent, FirstAt: hdoNow}), hostDispatchBudgetOK, nil},
+		{"blocked", false, withRefusals(blockedEntry("run-b", admDetail), blockedEntry("run-a", liveDetail)), hostDispatchBudgetBlocked,
+			func(t *testing.T, rung *hostDispatchBudgetRung) {
+				if len(rung.Refusals) != 2 || rung.More != 0 {
+					t.Fatalf("refusals = %+v more %d; want 2 and 0", rung.Refusals, rung.More)
+				}
+				a, b := rung.Refusals[0], rung.Refusals[1]
+				if a.RunID != "run-a" || a.StageID != "s-run-a" || a.Since != hdoNow.Add(-time.Minute).Format(time.RFC3339) || a.BudgetSource != dispatchBudgetSourceLive || a.Detail != liveDetail {
+					t.Errorf("refusals[0] = %+v; want run-a, its stage, since, live_spec and the detail", a)
+				}
+				if b.RunID != "run-b" || b.BudgetSource != dispatchBudgetSourceAdmission {
+					t.Errorf("refusals[1] = %+v; want run-b with admission_spec", b)
+				}
+				for _, w := range []string{"live_spec", "limit_usd", "next tick", "admission_spec", "rollover", "budget_override", "not budget-gated"} {
+					if !strings.Contains(rung.Note, w) {
+						t.Errorf("note %q lacks %q", rung.Note, w)
+					}
+				}
+			}},
+		{"at most 8 listed", false, withRefusals(many...), hostDispatchBudgetBlocked, func(t *testing.T, rung *hostDispatchBudgetRung) {
+			if len(rung.Refusals) != hostDispatchBudgetRungMax || rung.More != 2 || rung.Refusals[0].RunID != "run-00" {
+				t.Errorf("refusals %d more %d first %q; want 8, 2, run-00", len(rung.Refusals), rung.More, rung.Refusals[0].RunID)
+			}
+		}},
+		{"unreadable file is unverified", false, []byte("{not json"), hostDispatchBudgetUnverified, nil},
+		{"stale file is unverified", false, stale, hostDispatchBudgetUnverified, func(t *testing.T, rung *hostDispatchBudgetRung) {
+			if len(rung.Refusals) != 0 || !strings.Contains(rung.Note, "stale") {
+				t.Errorf("rung = %+v; want no refusals and a stale note", rung)
+			}
+		}},
+		{"crafted oversized detail is bounded", false, withRefusals(blockedEntry("run-c", crafted)), hostDispatchBudgetBlocked,
+			func(t *testing.T, rung *hostDispatchBudgetRung) {
+				d := rung.Refusals[0].Detail
+				if len(d) > hostDispatchTextMax || hdHasControlRune(d) || !utf8.ValidString(d) {
+					t.Errorf("detail is %d bytes (control rune %v); want <= %d and control-free", len(d), hdHasControlRune(d), hostDispatchTextMax)
+				}
+				if rung.Refusals[0].BudgetSource != dispatchBudgetSourceLive {
+					t.Errorf("budget_source %q; want live_spec", rung.Refusals[0].BudgetSource)
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			dir := filepath.Join(t.TempDir(), "state")
+			switch w := tc.write.(type) {
+			case nil:
+			case []byte:
+				hdoWriteRaw(t, dir, w)
+			default:
+				hdoWrite(t, dir, w)
+			}
+			r := hdoResolver(map[string]string{hostDispatchStateDirEnv: dir}, t.TempDir(), nil)
+			r.runBoundToken = tc.runBound
+			rung := r.hostDispatchBudgetRung()
+			if rung.Status != tc.want || rung.Note == "" {
+				t.Fatalf("status = %q (note %q); want %q with a note", rung.Status, rung.Note, tc.want)
+			}
+			if tc.check != nil {
+				tc.check(t, rung)
+			}
+		})
+	}
+}
+
+// TestDoctorToolDescription_DescribesHostDispatchBudget: the wire-visible
+// description documents the rung, its statuses and both budget sources.
+func TestDoctorToolDescription_DescribesHostDispatchBudget(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{"six rungs", "host_dispatch_budget —", "budget_blocked", "ok (", "blocked (", "absent (", "unverified (",
+		"not_applicable (", "live_spec", "admission_spec", "budget_override", "not budget-gated"} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)
 		}

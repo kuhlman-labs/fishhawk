@@ -125,6 +125,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Preview/dev-mode host-dispatch refusal (`devmode.go`, E72.13 / #3500)
 - Interim host memory hold (`host_dispatch.go`, E85.11 / [#4330](https://github.com/kuhlman-labs/fishhawk/issues/4330))
 - Operator per-run dispatch hold (`run_dispatch_hold.go`, E110.50 / [#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486)): `POST /v0/runs/{run_id}/dispatch-hold`, audit-derived state, ancestry inheritance, the `409 run_dispatch_held` marker guard, no per-dispatch override, accepted risks
+- Blocking budget at host dispatch (`dispatch_budget.go`, ADR-030 Amendment A1 / [#5473](https://github.com/kuhlman-labs/fishhawk/issues/5473)): `GET /v0/runs/{run_id}?include=dispatch_budget`, exemptions first, the live default-branch source and its admission-spec fallback, `503 budget_check_failed`, DecomposedFrom-only override inheritance, the operator-only `run_budget_override_bound` row, the verify-pass exemption, `budget.tier` parity
 - Decomposition wave-order host-dispatch guard (`decomposition_dispatch_guard.go`, E48.99 / #2546)
 - Per-wave integration guard + `base_branch` derivation (`decomposition_dispatch_guard.go`, E50.13 / #2363)
 - Decomposed-parent fix-up policy increment (#4391)
