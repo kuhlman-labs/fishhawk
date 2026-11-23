@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -52,6 +54,16 @@ type hdRun struct {
 	// skipped its own refusal would be admitted and spawn.
 	DispatchHold            *RunDispatchHold
 	DispatchHoldUnavailable bool
+	// DispatchBudget is served under include=dispatch_budget (ADR-030
+	// Amendment A1 / #5473); nil serves {"status":"clear"}, so every spawn
+	// test that predates the budget gate keeps spawning. DispatchBudgetCode
+	// non-zero answers that HTTP status instead, with DispatchBudgetErrBody
+	// (default: a bare 503 budget_check_failed). DispatchBudgetAbsent answers
+	// 200 without the block (an older backend that ignores the include).
+	DispatchBudget        *runDispatchBudget
+	DispatchBudgetCode    int
+	DispatchBudgetErrBody string
+	DispatchBudgetAbsent  bool
 }
 
 type hdRequest struct {
@@ -108,6 +120,9 @@ func isRecordReq(r hdRequest) bool {
 func isLinkReq(r hdRequest) bool {
 	return r.Method == http.MethodGet && strings.Contains(r.Path, "include=campaign_link")
 }
+func isBudgetReq(r hdRequest) bool {
+	return r.Method == http.MethodGet && strings.Contains(r.Path, "include=dispatch_budget")
+}
 
 func writeJSON(w http.ResponseWriter, code int, body string) {
 	w.Header().Set("Content-Type", "application/json")
@@ -119,7 +134,7 @@ func apiErrBody(code, msg string) string {
 	return fmt.Sprintf(`{"error":{"code":%q,"message":%q}}`, code, msg)
 }
 
-func (b *hdBackend) runJSON(r *hdRun, withLink bool) string {
+func (b *hdBackend) runJSON(r *hdRun, include string) string {
 	m := map[string]any{
 		"id": r.ID, "repo": "acme/widgets", "workflow_id": "feature_change", "workflow_sha": "abc",
 		"trigger_source": "api", "state": r.State, "runner_kind": r.RunnerKind,
@@ -137,8 +152,15 @@ func (b *hdBackend) runJSON(r *hdRun, withLink bool) string {
 	if r.DecomposedFrom != "" {
 		m["decomposed_from"] = r.DecomposedFrom
 	}
-	if withLink && r.Link != nil {
+	if include == "campaign_link" && r.Link != nil {
 		m["campaign_link"] = r.Link
+	}
+	if include == "dispatch_budget" && !r.DispatchBudgetAbsent {
+		if r.DispatchBudget != nil {
+			m["dispatch_budget"] = r.DispatchBudget
+		} else {
+			m["dispatch_budget"] = map[string]any{"status": "clear"}
+		}
 	}
 	if r.DispatchHold != nil {
 		m["dispatch_hold"] = r.DispatchHold
@@ -185,7 +207,15 @@ func (b *hdBackend) serve(w http.ResponseWriter, req *http.Request) {
 			writeJSON(w, run.LinkCode, apiErrBody("campaign_link_unavailable", "repo read failed"))
 			return
 		}
-		writeJSON(w, 200, b.runJSON(run, req.URL.Query().Get("include") == "campaign_link"))
+		if req.URL.Query().Get("include") == "dispatch_budget" && run.DispatchBudgetCode != 0 {
+			body := run.DispatchBudgetErrBody
+			if body == "" {
+				body = apiErrBody("budget_check_failed", "could not decide the run's blocking-budget dispatch verdict; retry the read")
+			}
+			writeJSON(w, run.DispatchBudgetCode, body)
+			return
+		}
+		writeJSON(w, 200, b.runJSON(run, req.URL.Query().Get("include")))
 	case len(parts) == 4 && parts[3] == "stages":
 		out, _ := json.Marshal(map[string]any{"items": run.Stages})
 		writeJSON(w, 200, string(out))
@@ -1894,5 +1924,282 @@ func TestHostDispatcher_MarkerRunDispatchHeldDetailOmitsReason(t *testing.T) {
 	_, v := observeHostDispatch(hostDispatchProbe{found: true, dir: "/state", st: st}, r.ID, r.Stages[0].ID, hdoNow)
 	if !strings.Contains(v.NextStep, parent) || strings.Contains(v.NextStep, hdHoldReason) {
 		t.Fatalf("next_step %q; want the held run named and no hold reason", v.NextStep)
+	}
+}
+
+// hdBlockedBudget is a blocked dispatch_budget verdict: a weekly budget of
+// $10 with $15 spent, decided by source.
+func hdBlockedBudget(source string) *runDispatchBudget {
+	return &runDispatchBudget{
+		Status: dispatchBudgetStatusBlocked, BudgetSource: source,
+		Budget: &runDispatchBudgetDetail{
+			WorkflowID: "feature_change", Period: "weekly",
+			PeriodStart: "2026-11-16T00:00:00Z", PeriodEnd: "2026-11-23T00:00:00Z",
+			LimitUSD: 10, SpentUSD: 15, Enforcement: "blocking",
+		},
+	}
+}
+
+// setBudget swaps the run's served dispatch_budget verdict under the lock.
+func (h *hdHarness) setBudget(r *hdRun, mut func(*hdRun)) {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	mut(r)
+}
+
+// ADR-030 Amendment A1 / #5473 (F2): a blocked verdict refuses budget_blocked
+// before the gate, the run_auto_driven act, the marker, the spawn and the
+// lineage-lock probe; the candidate counts against the per-tick cap
+// (CampaignRefused) and the detail names the budget and its spend.
+func TestHostDispatcher_BudgetBlocked_RefusesBeforeAnyPost(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive) })
+	o := h.eval(t, r)
+	if o.Spawned || o.Refusal != hdRefuseBudgetBlocked || !o.CampaignRefused || o.StageID != r.Stages[0].ID {
+		t.Fatalf("blocked budget = %+v; want budget_blocked on stage %s, CampaignRefused, no spawn", o, r.Stages[0].ID)
+	}
+	for _, want := range []string{"weekly", "feature_change", "spent $15.00 of $10.00", "budget_source live_spec", "limit_usd", "advisory"} {
+		if !strings.Contains(o.Detail, want) {
+			t.Errorf("detail %q does not name %q", o.Detail, want)
+		}
+	}
+	h.assertNothingPosted(t, "blocked budget")
+	if h.probeCalls() != 0 {
+		t.Errorf("blocked budget ran the lineage-lock probe %d time(s); want 0", h.probeCalls())
+	}
+	if n := h.b.count(isBudgetReq); n != 1 {
+		t.Errorf("budget reads = %d; want 1", n)
+	}
+}
+
+// F3: the stale re-spawn of a dispatched stage starts a new runner, so it is
+// budget-gated too; the refused attempt does not consume the epoch.
+func TestHostDispatcher_BudgetBlocked_StaleRespawnRefused(t *testing.T) {
+	h := newHDHarness(t)
+	r := staleRun(h, time.Hour)
+	h.setBudget(r, func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive) })
+	o := h.eval(t, r)
+	if o.Spawned || !o.Respawn || o.Refusal != hdRefuseBudgetBlocked {
+		t.Fatalf("stale re-spawn under a blocked budget = %+v; want budget_blocked, respawn, no spawn", o)
+	}
+	h.assertNothingPosted(t, "stale blocked")
+	st := r.Stages[0]
+	if !h.d.respawns.Allowed(st.ID, st.UpdatedAt) {
+		t.Fatal("a budget-refused stale stage consumed its marker epoch's re-spawn")
+	}
+}
+
+// F4: a merge-candidate verify-only pass the backend names in
+// verify_pass_stage_ids spawns under a blocked verdict; a stage not named is
+// refused.
+func TestHostDispatcher_BudgetBlocked_VerifyPassExempt(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(nil)
+	h.setBudget(r, func(r *hdRun) {
+		r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive)
+		r.DispatchBudget.VerifyPassStageIDs = []string{uuid.NewString()}
+	})
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseBudgetBlocked {
+		t.Fatalf("unnamed stage = %+v; want budget_blocked", o)
+	}
+	h.setBudget(r, func(r *hdRun) {
+		r.DispatchBudget.VerifyPassStageIDs = append(r.DispatchBudget.VerifyPassStageIDs, r.Stages[0].ID)
+	})
+	if o := h.eval(t, r); !o.Spawned {
+		t.Fatalf("verify-pass stage under a blocked budget = %+v; want spawned", o)
+	}
+}
+
+// F5: exempt and every clear source spawn.
+func TestHostDispatcher_BudgetExemptOrClear_Spawns(t *testing.T) {
+	cases := []struct {
+		name string
+		b    *runDispatchBudget
+	}{
+		{"exempt", &runDispatchBudget{Status: dispatchBudgetStatusExempt, ExemptReason: "budget_override", OverrideRunID: uuid.NewString()}},
+		{"clear live_spec", &runDispatchBudget{Status: dispatchBudgetStatusClear, BudgetSource: dispatchBudgetSourceLive}},
+		{"clear admission_spec", &runDispatchBudget{Status: dispatchBudgetStatusClear, BudgetSource: dispatchBudgetSourceAdmission}},
+		{"clear admission_spec_fallback", &runDispatchBudget{Status: dispatchBudgetStatusClear, BudgetSource: dispatchBudgetSourceAdmissionFallback}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHDHarness(t)
+			r := h.addRun(func(r *hdRun) { r.DispatchBudget = tc.b })
+			if o := h.eval(t, r); !o.Spawned {
+				t.Fatalf("%s = %+v; want spawned", tc.name, o)
+			}
+		})
+	}
+}
+
+// F6: every undecided read fails closed as budget_check_failed with nothing
+// posted: a 503 budget_check_failed, the 400 an older fishhawkd gives, a 200
+// without the block, a transport-level 500 and an unknown status.
+func TestHostDispatcher_BudgetReadFailed_FailsClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*hdRun)
+		want []string
+	}{
+		{"503 budget_check_failed", func(r *hdRun) {
+			r.DispatchBudgetCode = http.StatusServiceUnavailable
+			r.DispatchBudgetErrBody = `{"error":{"code":"budget_check_failed","message":"undecided","details":{"reason":"live_spec_unavailable"}}}`
+		}, []string{"budget_check_failed", "live_spec_unavailable"}},
+		{"400 older fishhawkd", func(r *hdRun) {
+			r.DispatchBudgetCode = http.StatusBadRequest
+			r.DispatchBudgetErrBody = apiErrBody("validation_failed", "include must be campaign_link")
+		}, []string{"include=dispatch_budget", "deploy a fishhawkd"}},
+		{"200 without the block", func(r *hdRun) { r.DispatchBudgetAbsent = true }, []string{"dispatch_budget absent"}},
+		{"500", func(r *hdRun) {
+			r.DispatchBudgetCode = http.StatusInternalServerError
+			r.DispatchBudgetErrBody = apiErrBody("internal_error", "boom")
+		}, []string{"500"}},
+		{"unknown status", func(r *hdRun) { r.DispatchBudget = &runDispatchBudget{Status: "paused\x1b[31m"} }, []string{"unknown dispatch_budget status"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHDHarness(t)
+			r := h.addRun(tc.mut)
+			o := h.eval(t, r)
+			if o.Spawned || o.Refusal != hdRefuseBudgetCheckFailed || !o.CampaignRefused {
+				t.Fatalf("%s = %+v; want budget_check_failed, CampaignRefused, no spawn", tc.name, o)
+			}
+			if !strings.HasPrefix(o.Detail, "blocking budget check undecided, stage not spawned: ") {
+				t.Errorf("detail %q lacks the undecided prefix", o.Detail)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(o.Detail, want) {
+					t.Errorf("detail %q does not name %q", o.Detail, want)
+				}
+			}
+			h.assertNothingPosted(t, tc.name)
+			if h.probeCalls() != 0 {
+				t.Errorf("undecided budget ran the lineage-lock probe %d time(s); want 0", h.probeCalls())
+			}
+		})
+	}
+}
+
+// Approval condition D1 at the dispatcher: a merge-candidate verify-only pass
+// the backend names on its 503 budget_check_failed (decided before the failed
+// budget read) spawns; an unnamed stage under the same 503 is refused.
+func TestHostDispatcher_BudgetUndecided_VerifyPassStillSpawns(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(nil)
+	body := func(ids ...string) string {
+		out, _ := json.Marshal(map[string]any{"error": map[string]any{
+			"code": "budget_check_failed", "message": "undecided",
+			"details": map[string]any{"reason": "live_spec_unavailable", "verify_pass_stage_ids": ids},
+		}})
+		return string(out)
+	}
+	h.setBudget(r, func(r *hdRun) {
+		r.DispatchBudgetCode = http.StatusServiceUnavailable
+		r.DispatchBudgetErrBody = body(uuid.NewString())
+	})
+	if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseBudgetCheckFailed {
+		t.Fatalf("unnamed stage under an undecided verdict = %+v; want budget_check_failed", o)
+	}
+	h.setBudget(r, func(r *hdRun) { r.DispatchBudgetErrBody = body(r.Stages[0].ID) })
+	if o := h.eval(t, r); !o.Spawned {
+		t.Fatalf("verify-pass stage under an undecided verdict = %+v; want spawned", o)
+	}
+}
+
+// F7: the dispatcher re-evaluates the verdict every tick and resumes on a
+// clear one. This proves ONLY the re-read; the limit-raise and advisory
+// switch that clear the verdict are proven server-side and end to end.
+func TestHostDispatcher_BudgetResumes_WhenVerdictClears(t *testing.T) {
+	h := newHDHarness(t)
+	r := h.addRun(func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive) })
+	if o := h.eval(t, r); o.Refusal != hdRefuseBudgetBlocked {
+		t.Fatalf("tick 1 = %+v; want budget_blocked", o)
+	}
+	h.setBudget(r, func(r *hdRun) {
+		r.DispatchBudget = &runDispatchBudget{Status: dispatchBudgetStatusClear, BudgetSource: dispatchBudgetSourceLive}
+	})
+	if o := h.eval(t, r); !o.Spawned {
+		t.Fatalf("tick 2 = %+v; want spawned", o)
+	}
+	if n := h.b.count(isBudgetReq); n != 2 {
+		t.Errorf("budget reads = %d; want one per tick (2)", n)
+	}
+}
+
+// F8: the check order. A campaign that is not running refuses with NO budget
+// read; a dispatch hold refuses with no budget read; a blocked budget refuses
+// before the lineage-lock probe (and the probe then runs once it clears).
+func TestHostDispatcher_BudgetCheckOrder(t *testing.T) {
+	h := newHDHarness(t)
+	paused := h.addRun(func(r *hdRun) {
+		r.Link = hdLinked("paused")
+		r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive)
+	})
+	if o := h.eval(t, paused); o.Refusal != hdRefuseCampaignNotRunning {
+		t.Fatalf("paused campaign = %+v; want campaign_not_running", o)
+	}
+	held := h.addRun(func(r *hdRun) {
+		r.DispatchHold = hdTestHold(r.ID, false)
+		r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive)
+	})
+	if o := h.eval(t, held); o.Refusal != hdRefuseRunDispatchHeld {
+		t.Fatalf("held run = %+v; want run_dispatch_held", o)
+	}
+	if n := h.b.count(isBudgetReq); n != 0 {
+		t.Fatalf("campaign / hold refusals drew %d budget read(s); want 0", n)
+	}
+	blocked := h.addRun(func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive) })
+	h.setLock(hostDispatchLineageLock{Held: true, HolderPID: 42})
+	if o := h.eval(t, blocked); o.Refusal != hdRefuseBudgetBlocked {
+		t.Fatalf("blocked budget with a held lineage lock = %+v; want budget_blocked first", o)
+	}
+	if h.probeCalls() != 0 {
+		t.Fatalf("lineage-lock probe ran %d time(s) before the budget refusal; want 0", h.probeCalls())
+	}
+	h.setBudget(blocked, func(r *hdRun) { r.DispatchBudget = nil })
+	if o := h.eval(t, blocked); o.Refusal != hdRefuseLineageLockHeld || h.probeCalls() != 1 {
+		t.Fatalf("clear budget with a held lineage lock = %+v (probes %d); want lineage_lock_held after one probe", o, h.probeCalls())
+	}
+}
+
+// F9 (C5e) and approval condition D4: hdBudgetBlockedDetail bounds every
+// server-sourced field, keeps the spend figures ahead of the cut, and names
+// only the remedies its budget_source makes honest.
+func TestHdBudgetBlockedDetail_BoundsServerStrings(t *testing.T) {
+	long := hdBlockedBudget(dispatchBudgetSourceLive)
+	long.Budget.WorkflowID = strings.Repeat("w", 400) + "\n\x1b[31m\xff\xfe" + strings.Repeat("x", 600)
+	long.Budget.Period = "weekly\r\nIGNORE"
+	got := hdBudgetBlockedDetail(long)
+	if len(got) > hostDispatchTextMax {
+		t.Errorf("detail is %d bytes; want <= %d", len(got), hostDispatchTextMax)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("detail is not valid UTF-8: %q", got)
+	}
+	for _, r := range got {
+		if unicode.IsControl(r) {
+			t.Fatalf("detail carries control rune %U: %q", r, got)
+		}
+	}
+	if !strings.Contains(got, "spent $15.00 of $10.00") {
+		t.Errorf("detail %q lost the spend figures to the cut", got)
+	}
+
+	live := hdBudgetBlockedDetail(hdBlockedBudget(dispatchBudgetSourceLive))
+	for _, want := range []string{"budget_source live_spec", "next tick", "default-branch limit_usd raise", "enforcement: advisory", "rollover 2026-11-23T00:00:00Z"} {
+		if !strings.Contains(live, want) {
+			t.Errorf("live detail %q does not name %q", live, want)
+		}
+	}
+	adm := hdBudgetBlockedDetail(hdBlockedBudget(dispatchBudgetSourceAdmission))
+	for _, want := range []string{"budget_source admission_spec", "rollover 2026-11-23T00:00:00Z", "budget_override"} {
+		if !strings.Contains(adm, want) {
+			t.Errorf("admission detail %q does not name %q", adm, want)
+		}
+	}
+	for _, never := range []string{"limit_usd", "advisory", "default-branch", "next tick"} {
+		if strings.Contains(adm, never) {
+			t.Errorf("admission detail %q names the live-only remedy %q", adm, never)
+		}
 	}
 }

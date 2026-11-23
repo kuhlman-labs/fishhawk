@@ -83,7 +83,7 @@ func (lh *hdLoopHarness) serve(w http.ResponseWriter, req *http.Request) {
 				continue
 			}
 			var m map[string]any
-			_ = json.Unmarshal([]byte(lh.b.runJSON(r, false)), &m)
+			_ = json.Unmarshal([]byte(lh.b.runJSON(r, "")), &m)
 			lh.mu.Lock()
 			m["created_at"] = lh.created[id].Format(time.RFC3339Nano)
 			lh.mu.Unlock()
@@ -1493,5 +1493,56 @@ func TestTick_RunDispatchHoldParksChildrenUntilCleared(t *testing.T) {
 	}
 	if _, ok := hdMustStatus(t, lh.dir).RunRefusals[child.ID]; ok {
 		t.Fatal("the run_refusals entry survived the spawn")
+	}
+}
+
+// ADR-030 Amendment A1 / #5473 (F10): a budget_blocked refusal is recorded
+// in run_refusals with its bounded detail, BudgetRefusals returns only the
+// budget_blocked entries sorted by run id, and a later clear verdict spawns
+// and clears the entry.
+func TestHostDispatchLoop_BudgetBlocked_RecordedInRunRefusals(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	a := lh.add(0, func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive) })
+	b := lh.add(time.Minute, func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceAdmission) })
+	other := lh.add(2*time.Minute, func(r *hdRun) { r.Link = hdLinked("paused") })
+	l := lh.loop(nil)
+	lh.tick(l)
+	st := hdMustStatus(t, lh.dir)
+	for _, r := range []*hdRun{a, b} {
+		ref := st.RunRefusals[r.ID]
+		if ref.Code != hdRefuseBudgetBlocked || ref.StageID != r.Stages[0].ID || !strings.Contains(ref.Detail, "spent $15.00 of $10.00") {
+			t.Fatalf("run %s entry = %+v; want budget_blocked on stage %s with the spend", r.ID, ref, r.Stages[0].ID)
+		}
+		if len(ref.Detail) > hostDispatchTextMax {
+			t.Fatalf("run %s detail is %d bytes; want <= %d", r.ID, len(ref.Detail), hostDispatchTextMax)
+		}
+	}
+	if st.RunRefusals[other.ID].Code != hdRefuseCampaignNotRunning {
+		t.Fatalf("paused run entry = %+v; want campaign_not_running", st.RunRefusals[other.ID])
+	}
+	got := st.BudgetRefusals()
+	wantIDs := []string{a.ID, b.ID}
+	sort.Strings(wantIDs)
+	if len(got) != 2 || got[0].RunID != wantIDs[0] || got[1].RunID != wantIDs[1] {
+		t.Fatalf("BudgetRefusals = %+v; want exactly %v in run-id order", got, wantIDs)
+	}
+	if lh.spawner.n() != 0 {
+		t.Fatalf("spawns = %d; want 0 under a blocked budget", lh.spawner.n())
+	}
+
+	lh.b.mu.Lock()
+	a.DispatchBudget = &runDispatchBudget{Status: dispatchBudgetStatusClear, BudgetSource: dispatchBudgetSourceLive}
+	lh.b.mu.Unlock()
+	lh.clock = lh.clock.Add(30 * time.Second)
+	lh.tick(l)
+	if lh.spawner.n() != 1 || lh.spawner.spawns[0].Run != a.ID {
+		t.Fatalf("tick 2 spawns = %+v; want A spawned", lh.spawner.spawns)
+	}
+	st = hdMustStatus(t, lh.dir)
+	if _, ok := st.RunRefusals[a.ID]; ok {
+		t.Fatalf("A's budget entry survived the clear verdict's spawn: %+v", st.RunRefusals[a.ID])
+	}
+	if got := st.BudgetRefusals(); len(got) != 1 || got[0].RunID != b.ID {
+		t.Fatalf("tick 2 BudgetRefusals = %+v; want only B", got)
 	}
 }

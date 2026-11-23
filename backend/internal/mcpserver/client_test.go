@@ -5686,3 +5686,122 @@ func TestGetCampaignStatus_ReplanningDecodesAndRoutes(t *testing.T) {
 		t.Errorf("actions = %+v, want fishhawk_start_campaign_item_run (not fishhawk_start_run)", na.Actions)
 	}
 }
+
+// dispatchBudgetTestClient serves every request with code and body, recording
+// the request URI.
+func dispatchBudgetTestClient(t *testing.T, code int, body string) (*apiClient, *string) {
+	t.Helper()
+	var uri string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uri = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(ts.Close)
+	return &apiClient{baseURL: ts.URL, token: "t", http: ts.Client()}, &uri
+}
+
+// ADR-030 Amendment A1 / #5473: the mirror decodes every json tag of the
+// backend's dispatchBudgetPayload (a mismatched tag would decode to zero).
+func TestGetRunDispatchBudget_DecodesEveryField(t *testing.T) {
+	id := uuid.New()
+	vp, over := uuid.NewString(), uuid.NewString()
+	body := fmt.Sprintf(`{"id":%q,"dispatch_budget":{"status":"blocked","budget_source":"live_spec","exempt_reason":"budget_override","override_run_id":%q,
+"budget":{"workflow_id":"feature_change","period":"weekly","period_start":"2026-11-16T00:00:00Z","period_end":"2026-11-23T00:00:00Z","limit_usd":10.5,"spent_usd":15.25,"enforcement":"blocking"},
+"verify_pass_stage_ids":[%q]}}`, id, over, vp)
+	c, uri := dispatchBudgetTestClient(t, http.StatusOK, body)
+	got, err := c.GetRunDispatchBudget(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *uri != "/v0/runs/"+id.String()+"?include=dispatch_budget" {
+		t.Errorf("request = %s; want include=dispatch_budget", *uri)
+	}
+	want := &runDispatchBudget{
+		Status: "blocked", BudgetSource: "live_spec", ExemptReason: "budget_override", OverrideRunID: over,
+		Budget: &runDispatchBudgetDetail{WorkflowID: "feature_change", Period: "weekly", PeriodStart: "2026-11-16T00:00:00Z",
+			PeriodEnd: "2026-11-23T00:00:00Z", LimitUSD: 10.5, SpentUSD: 15.25, Enforcement: "blocking"},
+		VerifyPassStageIDs: []string{vp},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decoded = %+v (budget %+v); want %+v (budget %+v)", got, got.Budget, want, want.Budget)
+	}
+}
+
+// F1: a 400 (an older fishhawkd that rejects the include value) names the
+// include and the deploy remedy.
+func TestGetRunDispatchBudget_OlderServer400NamesRemedy(t *testing.T) {
+	c, _ := dispatchBudgetTestClient(t, http.StatusBadRequest, `{"error":{"code":"validation_failed","message":"include must be campaign_link"}}`)
+	_, err := c.GetRunDispatchBudget(context.Background(), uuid.New())
+	if err == nil {
+		t.Fatal("400 answered no error")
+	}
+	for _, want := range []string{"include=dispatch_budget", "deploy a fishhawkd that serves include=dispatch_budget", "validation_failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusBadRequest {
+		t.Errorf("error %v does not wrap the 400 apiError", err)
+	}
+}
+
+// F1: a 200 without the block is errDispatchBudgetAbsent, never a clear.
+func TestGetRunDispatchBudget_AbsentBlockIsError(t *testing.T) {
+	c, _ := dispatchBudgetTestClient(t, http.StatusOK, `{"id":"x","state":"running"}`)
+	got, err := c.GetRunDispatchBudget(context.Background(), uuid.New())
+	if !errors.Is(err, errDispatchBudgetAbsent) || got != nil {
+		t.Fatalf("absent block = %+v, %v; want nil, errDispatchBudgetAbsent", got, err)
+	}
+}
+
+// F1 / approval condition D1: a 503 budget_check_failed is a typed undecided
+// error carrying the backend's reason and the verify-pass stages; a 503 with
+// another code is not.
+func TestGetRunDispatchBudget_503CarriesReason(t *testing.T) {
+	vp := uuid.NewString()
+	c, _ := dispatchBudgetTestClient(t, http.StatusServiceUnavailable,
+		fmt.Sprintf(`{"error":{"code":"budget_check_failed","message":"undecided","details":{"run_id":"r","reason":"live_spec_not_found","verify_pass_stage_ids":[%q]},"error_ref":"req-7"}}`, vp))
+	_, err := c.GetRunDispatchBudget(context.Background(), uuid.New())
+	var ue *dispatchBudgetUndecidedError
+	if !errors.As(err, &ue) {
+		t.Fatalf("503 budget_check_failed = %v; want *dispatchBudgetUndecidedError", err)
+	}
+	if ue.Reason != "live_spec_not_found" || !reflect.DeepEqual(ue.VerifyPassStageIDs, []string{vp}) {
+		t.Fatalf("undecided = %+v; want reason live_spec_not_found, verify-pass [%s]", ue, vp)
+	}
+	for _, want := range []string{"budget_check_failed", "reason live_spec_not_found", "error_ref=req-7"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+
+	other, _ := dispatchBudgetTestClient(t, http.StatusServiceUnavailable, `{"error":{"code":"run_repo_unconfigured","message":"x"}}`)
+	_, err = other.GetRunDispatchBudget(context.Background(), uuid.New())
+	if err == nil || errors.As(err, &ue) {
+		t.Fatalf("503 run_repo_unconfigured = %v; want a plain error, not undecided", err)
+	}
+}
+
+// C5a: a create / recover 201's budget_override_binding decodes onto Run, so
+// fishhawk_start_run surfaces a recorded:false remedy.
+func TestRunDecode_BudgetOverrideBinding(t *testing.T) {
+	var r Run
+	if err := json.Unmarshal([]byte(`{"id":"x","budget_override_binding":{"recorded":false,"remedy":"dispatch them by hand with fishhawk_dispatch_stage"}}`), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.BudgetOverrideBinding == nil || r.BudgetOverrideBinding.Recorded || !strings.Contains(r.BudgetOverrideBinding.Remedy, "fishhawk_dispatch_stage") {
+		t.Fatalf("budget_override_binding = %+v; want recorded false with the remedy", r.BudgetOverrideBinding)
+	}
+	out, _ := json.Marshal(r)
+	if !strings.Contains(string(out), `"budget_override_binding":{"recorded":false,"remedy":`) {
+		t.Errorf("re-encoded run %s drops the binding", out)
+	}
+	var plain Run
+	_ = json.Unmarshal([]byte(`{"id":"x"}`), &plain)
+	if plain.BudgetOverrideBinding != nil || plain.DispatchBudget != nil {
+		t.Errorf("plain read decoded binding %+v / budget %+v; want both nil", plain.BudgetOverrideBinding, plain.DispatchBudget)
+	}
+}

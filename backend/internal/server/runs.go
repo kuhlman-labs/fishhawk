@@ -2625,6 +2625,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 				slog.String("reason", bce.Reason),
 				slog.String("error", errString(bce.Err)))
 			details := map[string]any{"run_id": runID.String(), "reason": bce.Reason}
+			if len(bce.VerifyPassStageIDs) > 0 {
+				// Server-computed stage UUIDs only (never the raw cause, D5(c)):
+				// the dispatcher spawns these verify-only passes even though
+				// the budget verdict is undecided (D1).
+				details["verify_pass_stage_ids"] = bce.VerifyPassStageIDs
+			}
 			s.writeError(w, r, http.StatusServiceUnavailable, budgetCheckFailedCode,
 				"could not decide the run's blocking-budget dispatch verdict; retry the read",
 				details)
