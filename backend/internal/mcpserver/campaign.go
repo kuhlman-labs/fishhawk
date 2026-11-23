@@ -535,10 +535,14 @@ it found something, on the valid, dangling and cycle reports alike.
   0 heads the order and no limit can exclude it (0 means no cap).
 - preview.admission_screen is the same ADVISORY screen fishhawk_start_campaign
   runs: items labelled runnable:no (no agent run is expected) and items whose
-  title or body names a path the repo's implement-stage forbidden_paths forbid
-  (an implement agent cannot edit it). forbidden_paths_screened:false means the
-  forbidden-path class could not run. The preview writes no audit row. Drop or
-  re-scope a flagged item, or plan to lead it by hand.
+  title or body names a path the implement-stage forbidden_paths forbid (an
+  implement agent cannot edit it). The forbidden-path class screens the one
+  workflow named by admission_screen.workflow_id: the campaign driver's
+  workflow, feature_change by default. It covers only the driver workflow, not
+  a workflow chosen later per item. forbidden_paths_screened:false means the
+  forbidden-path class could not run, including when the spec does not define
+  that workflow. The preview writes no audit row. Drop or re-scope a flagged
+  item, or plan to lead it by hand.
 - preview.path_overlap lists pairs of items whose title or body name the same
   file path while no depends_on chain orders them. class code means their plans
   may conflict: add a native blocked-by link so the later item plans after the

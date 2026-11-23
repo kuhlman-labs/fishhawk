@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2473,8 +2474,15 @@ func TestGetCampaignStatus_Closed_E2E_ThroughRealServer(t *testing.T) {
 	if !strings.Contains(out2.NextAction.Detail, "REOPENS") {
 		t.Errorf("decoded detail = %q, want the reopen-flavoured detail", out2.NextAction.Detail)
 	}
-	// The restartable item is folded into the wire cancelled slice, so the
-	// classifier routes it to the campaign-item restart verb.
+	// The failed restartable item rides rollup.failed, the slice of its own
+	// state (#5267), never rollup.cancelled; the classifier routes a failed or
+	// cancelled restartable ref to the campaign-item restart verb.
+	if !slices.Contains(out2.Rollup.Failed, "issue:201") {
+		t.Errorf("decoded rollup.failed = %v, want issue:201 (a restartable failed item rides failed, #5267)", out2.Rollup.Failed)
+	}
+	if slices.Contains(out2.Rollup.Cancelled, "issue:201") {
+		t.Errorf("decoded rollup.cancelled = %v, must not contain issue:201 (a failed item is never shown as cancelled, #5267)", out2.Rollup.Cancelled)
+	}
 	if out2.NextActions == nil || out2.NextActions.State != "campaign_start_run" {
 		t.Fatalf("next_actions = %+v, want State campaign_start_run", out2.NextActions)
 	}
@@ -3727,7 +3735,7 @@ func TestStartCampaign_AdmissionScreen_SurvivesDecode(t *testing.T) {
 	}
 	const base = `"id":"` + "00000000-0000-0000-0000-000000000001" + `","repo":"x/y","epic_ref":"#25","state":"pending","pause_policy":"pause_campaign","created_at":"2026-09-24T00:00:00Z","updated_at":"2026-09-24T00:00:00Z"`
 
-	r := newResolver(serve(`{`+base+`,"admission_screen":{"advisory":true,"forbidden_paths_screened":true,"findings":[`+
+	r := newResolver(serve(`{`+base+`,"admission_screen":{"advisory":true,"forbidden_paths_screened":true,"workflow_id":"feature_change","findings":[`+
 		`{"issue":100,"kind":"not_runnable_declared"},`+
 		`{"issue":101,"kind":"forbidden_path","path":".gitlab-ci.yml","location":"body","forbidden_pattern":".gitlab-ci.yml"}]}}`), nil)
 	_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
@@ -3742,6 +3750,11 @@ func TestStartCampaign_AdmissionScreen_SurvivesDecode(t *testing.T) {
 	if sc == nil || !sc.Advisory || !sc.ForbiddenPathsScreened || len(sc.Findings) != 2 ||
 		sc.Findings[0] != want[0] || sc.Findings[1] != want[1] {
 		t.Fatalf("decoded AdmissionScreen = %+v, want advisory+screened findings %+v", sc, want)
+	}
+	// #5267: workflow_id names the screened workflow; a json tag drifting from
+	// the server's decodes to empty.
+	if sc.WorkflowID != "feature_change" {
+		t.Errorf("decoded AdmissionScreen.WorkflowID = %q, want feature_change", sc.WorkflowID)
 	}
 
 	r2 := newResolver(serve(`{`+base+`}`), nil)
@@ -5094,6 +5107,11 @@ func TestPreviewCampaign_E2E_ScreensThroughRegisteredTool(t *testing.T) {
 		}
 		if got := dig(t, m, "preview", "admission_screen", "findings", 0, "kind"); got != "not_runnable_declared" {
 			t.Errorf("admission_screen.findings[0].kind = %v, want not_runnable_declared", got)
+		}
+		// #5267 / K2: the server's workflow_id tag survives the real
+		// server-to-MCP boundary and names the driver workflow (the default).
+		if got := dig(t, m, "preview", "admission_screen", "workflow_id"); got != "feature_change" {
+			t.Errorf("admission_screen.workflow_id = %v, want feature_change", got)
 		}
 		if got := dig(t, m, "preview", "path_overlap", "pairs", 0, "items", 0); got != "issue:103" {
 			t.Errorf("path_overlap.pairs[0].items[0] = %v, want issue:103", got)
