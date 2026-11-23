@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,7 +35,7 @@ type DoctorInput struct {
 // answered, which is a false claim about provenance. HostLabel (#4212) is the
 // second such locally-computed sibling, under the same rule, Credential and
 // ModelCredential (#5227) are the third and fourth, and HostCapacity (#4241)
-// is the fifth.
+// is the fifth. HostDispatchBudget (#5473) is the sixth.
 type DoctorOutput struct {
 	Report            OnboardingReadinessReport `json:"report"`
 	RunnerCredentials *runnerCredentialsRung    `json:"runner_credentials,omitempty" jsonschema:"computed LOCALLY by this MCP server about its OWN process environment (NOT served by fishhawkd): whether the RUNNER-held GitLab push credential a local runner would inherit is present; reports PRESENCE only and says nothing about a gitlab_ci runner"`
@@ -46,6 +47,108 @@ type DoctorOutput struct {
 	// bearer is not run-bound, and otherwise report not_applicable.
 	Credential      *credentialSourceRung `json:"credential,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): where this server's bearer came from (env:FISHHAWK_API_TOKEN, stored_login, stored_login_refreshed, mcp_route_request_bearer) and whether an env token is shadowing a stored login. Never a credential value. The subject the bearer acts as is report.scopes.subject"`
 	ModelCredential *modelCredentialRung  `json:"model_credential,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): whether the claude model CLI a local runner execs is signed in on this host, from claude auth status --json (loggedIn, authMethod and loginExpiresAt only)"`
+	// HostDispatchBudget (ADR-030 Amendment A1 / #5473) is the sixth
+	// locally-computed sibling, under the same provenance rule and the same
+	// HOST-LOCAL posture as Credential.
+	HostDispatchBudget *hostDispatchBudgetRung `json:"host_dispatch_budget,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd) from the host dispatcher's status.json: the runs a blocking periodic budget holds (budget_blocked refusals), with each verdict's budget_source"`
+}
+
+// host_dispatch_budget rung statuses (#5473).
+const (
+	hostDispatchBudgetNotApplicable = "not_applicable"
+	hostDispatchBudgetAbsent        = "absent"
+	hostDispatchBudgetUnverified    = "unverified"
+	hostDispatchBudgetOK            = "ok"
+	hostDispatchBudgetBlocked       = "blocked"
+)
+
+// hostDispatchBudgetRungMax bounds the refusals the rung lists; the rest are
+// counted in more.
+const hostDispatchBudgetRungMax = 8
+
+// hostDispatchBudgetRung is the LOCALLY-computed doctor rung naming the runs a
+// blocking periodic budget holds (ADR-030 Amendment A1 / #5473). It probes the
+// dispatcher's state-dir ladder (the env rung, else the cwd rung, then
+// TMPDIR) with NO run read, so a run's working_dir rung is never consulted.
+// Every string from status.json is bounded by boundHostDispatchText.
+// Unexported for the export-surface reason runnerCredentialsRung documents.
+type hostDispatchBudgetRung struct {
+	Status     string                      `json:"status" jsonschema:"ok (a dispatcher status was read and no run is budget_blocked), blocked (refusals lists the runs a blocking budget holds), absent (no status file on the ladder), unverified (the status file could not be read or is stale), or not_applicable (not the operator's stdio fishhawk-mcp process, or a run-bound token: no status file is read)"`
+	Reason     string                      `json:"reason,omitempty" jsonschema:"on not_applicable: not_local_stdio_process or run_bound_token"`
+	StatusPath string                      `json:"status_path,omitempty" jsonschema:"the status.json read"`
+	PathsTried []string                    `json:"paths_tried,omitempty" jsonschema:"the state dirs probed, in order"`
+	Refusals   []hostDispatchBudgetRefusal `json:"refusals,omitempty" jsonschema:"on blocked: at most 8 budget_blocked refusals, sorted by run id"`
+	More       int                         `json:"more,omitempty" jsonschema:"budget_blocked refusals past the 8 listed"`
+	Note       string                      `json:"note" jsonschema:"the human sentence, naming the remedies"`
+}
+
+// hostDispatchBudgetRefusal is one budget_blocked refusal on the rung.
+type hostDispatchBudgetRefusal struct {
+	RunID        string `json:"run_id"`
+	StageID      string `json:"stage_id,omitempty"`
+	Since        string `json:"since,omitempty" jsonschema:"RFC 3339: the first refusal of the unbroken run"`
+	BudgetSource string `json:"budget_source,omitempty" jsonschema:"live_spec (the default branch's current spec decided; a limit_usd raise or enforcement: advisory there applies on the next tick) or admission_spec (the run's admission spec decided; only the period rollover or a run with budget_override clears it); omitted when the detail names none"`
+	Detail       string `json:"detail,omitempty" jsonschema:"the dispatcher's bounded refusal detail: the budget, its period, its spend and its remedies"`
+}
+
+// hostDispatchBudgetRung renders the host_dispatch_budget rung. In a posture
+// the host-local rungs do not run in it returns not_applicable before any
+// file is read.
+func (r *runResolver) hostDispatchBudgetRung() *hostDispatchBudgetRung {
+	if reason := r.hostRungNotApplicableReason(); reason != "" {
+		return &hostDispatchBudgetRung{Status: hostDispatchBudgetNotApplicable, Reason: reason,
+			Note: notApplicableNote(reason, "no host dispatcher status file is read")}
+	}
+	now := r.hostDispatchClock()
+	lad := r.newHostDispatchLadder(now)
+	for _, dir := range r.hostDispatchCallRungs() {
+		lad.probe(dir)
+	}
+	if r.hostDispatchEnv(hostDispatchStateDirEnv) == "" {
+		lad.probe(hostDispatchDefaultRung())
+	}
+	found := lad.result()
+	rung := &hostDispatchBudgetRung{PathsTried: hostDispatchBoundedPaths(found.tried)}
+	if !found.found {
+		rung.Status = hostDispatchBudgetAbsent
+		rung.Note = fmt.Sprintf("No host dispatcher status file found at %s, so no budget_blocked refusal can be read. If a dispatcher runs with another --state-dir, set %s in this MCP server's environment.",
+			strings.Join(rung.PathsTried, ", "), hostDispatchStateDirEnv)
+		return rung
+	}
+	rung.StatusPath = boundHostDispatchText(filepath.Join(found.dir, hostDispatchStatusFile))
+	if found.readErr != "" {
+		rung.Status = hostDispatchBudgetUnverified
+		rung.Note = "The host dispatcher status file at " + rung.StatusPath + " could not be read: " + boundHostDispatchText(found.readErr)
+		return rung
+	}
+	if found.st.State(now) == hostDispatchStateStale {
+		rung.Status = hostDispatchBudgetUnverified
+		rung.Note = "The host dispatcher status file at " + rung.StatusPath + " is stale (last tick at " + hostDispatchRFC3339(found.st.LastTickAt) + "), so its refusals may not describe a running dispatcher."
+		return rung
+	}
+	refs := found.st.BudgetRefusals()
+	if len(refs) == 0 {
+		rung.Status = hostDispatchBudgetOK
+		rung.Note = "No run is refused budget_blocked by the host dispatcher."
+		return rung
+	}
+	rung.Status = hostDispatchBudgetBlocked
+	if len(refs) > hostDispatchBudgetRungMax {
+		rung.More = len(refs) - hostDispatchBudgetRungMax
+		refs = refs[:hostDispatchBudgetRungMax]
+	}
+	for _, ref := range refs {
+		detail := boundHostDispatchText(ref.Detail)
+		rung.Refusals = append(rung.Refusals, hostDispatchBudgetRefusal{
+			RunID:        boundHostDispatchText(ref.RunID),
+			StageID:      boundHostDispatchText(ref.StageID),
+			Since:        hostDispatchRFC3339(ref.FirstAt),
+			BudgetSource: hostDispatchBudgetSourceOf(detail),
+			Detail:       detail,
+		})
+	}
+	rung.Note = "A blocking periodic budget holds these runs: the host dispatcher refuses their new spawns budget_blocked. On a live_spec verdict, raising limit_usd or setting enforcement: advisory on the default branch lets it spawn them on its next tick; on an admission_spec verdict only the period rollover or a new run with budget_override clears it. A hand fishhawk_dispatch_stage is not budget-gated and spends past the limit."
+	return rung
 }
 
 // Credential source labels (#5227). They are duplicated as literals in
@@ -599,10 +702,10 @@ work_item_provider rung (see below):
               fishhawkd; absence means the backend cannot answer, which is
               NOT the same claim as unregistered.
 
-Alongside the report key the output carries five rungs, each a SIBLING key,
+Alongside the report key the output carries six rungs, each a SIBLING key,
 never a field inside it: runner_credentials, host_label, host_capacity,
-credential and model_credential, computed LOCALLY by this MCP server about its
-own process and NOT served by fishhawkd:
+credential, model_credential and host_dispatch_budget, computed LOCALLY by this
+MCP server about its own process and NOT served by fishhawkd:
 
   - runner_credentials — a GitLab run needs TWO credentials: fishhawkd's
               FISHHAWKD_GITLAB_TOKEN (what the app rung covers) and the RUNNER
@@ -685,6 +788,21 @@ own process and NOT served by fishhawkd:
               in-runner agent token they report status not_applicable with
               reason not_local_stdio_process or run_bound_token, and nothing is
               exec'd or read.
+  - host_dispatch_budget — the runs a blocking periodic budget holds (ADR-030
+              Amendment A1): the host dispatcher's budget_blocked refusals,
+              read from its status.json on the state-dir ladder
+              (FISHHAWK_HOST_DISPATCH_STATE_DIR, else the cwd checkout's
+              .fishhawk/cache/host-dispatch, then TMPDIR) with no run read.
+              status is ok (no run is budget_blocked) | blocked (refusals lists
+              at most 8 entries {run_id, stage_id, since, budget_source,
+              detail}; more counts the rest) | absent (no status file) |
+              unverified (unreadable or stale) | not_applicable (the same
+              host-local posture as credential). budget_source live_spec means
+              the default branch's current spec decided, so raising limit_usd
+              or setting enforcement: advisory there applies on the
+              dispatcher's next tick; admission_spec means only the period
+              rollover or a new run with budget_override clears it. A hand
+              fishhawk_dispatch_stage is not budget-gated.
 
 The report's forge field names the family that answered (github|gitlab). repo
 is owner/name on GitHub, or a namespace/project path on GitLab — nested groups
@@ -844,6 +962,10 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 	// process or for a run-bound bearer, before anything is read or exec'd.
 	out.Credential = r.credentialRung(report.Scopes.Subject)
 	out.ModelCredential = r.modelCredentialRung(ctx)
+	// The sixth LOCALLY-computed rung (#5473): the runs a blocking periodic
+	// budget holds, from the host dispatcher's status.json. Host-local, with
+	// no run read.
+	out.HostDispatchBudget = r.hostDispatchBudgetRung()
 	return nil, out, nil
 }
 

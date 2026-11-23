@@ -276,7 +276,7 @@ budgets:
 
 - **`period`** — `weekly` resets at the start of the ISO week; `monthly` on the first of the month. Boundaries are timezone-aware, computed in the backend's `FISHHAWKD_BUDGET_TIMEZONE` (default UTC).
 - **`limit_usd`** — the ceiling, summed from each run's recorded cost total across the workflow's runs created within the current period.
-- **`enforcement`** — `advisory` (default) appends a `budget_alert` audit entry and posts an advisory comment on the triggering issue when period spend crosses `warn_at` and again at 100%, each deduped so either tier fires at most once per period; runs never block. `blocking` refuses a **new** run at admission once the period spend exhausts `limit_usd`, never touching an in-flight run — admission-time refusal is not yet implemented, so a `blocking` budget currently records spend and produces no automatic refusal.
+- **`enforcement`** — `advisory` (default) appends a `budget_alert` audit entry and posts an advisory comment on the triggering issue when period spend crosses `warn_at` and again at 100%, each deduped so either tier fires at most once per period; runs never block. `blocking` refuses a **new** run at admission once the period spend exhausts `limit_usd` (`402 budget_exhausted`; an operator can force past with `budget_override`). It also gates the host dispatcher (ADR-030 Amendment A1): while the period spend stays over, the dispatcher refuses each later spawn of an admitted run `budget_blocked`. A running stage finishes, a run admitted with `budget_override` and its decomposition children are exempt, a merge-candidate verify-only pass is exempt, and a hand `fishhawk_dispatch_stage` is not gated. The dispatcher reads the default branch's current budgets on every tick, so raising `limit_usd` or switching to `advisory` there applies on its next tick, and lowering a limit or making a budget `blocking` parks in-flight runs' later stages just as fast. A GitLab run, or a deployment with no GitHub client, is evaluated against its admission spec, so only the period rollover clears it.
 - **`warn_at`** — the fraction at which the advisory warning fires ahead of the 100% crossing. Absent means only the 100% threshold is surfaced.
 
 > Cost honesty caveat: bundles that report no known usage undercount spend, so a ceiling may be crossed later than true spend would imply. Period spend is a lower bound on actual spend, and the advisory comment repeats the caveat so a reader does not treat the figure as exact.
@@ -1485,7 +1485,7 @@ The incident hotfix workflow (ADR-053, E35.5 / #1602) ships as [`examples/workfl
 | `budget.max_tokens` (plan / implement / acceptance) | 200000 / 500000 / — | 150000 / 300000 / 150000 | **no**: declared, calibration-pending (#2328) | states intent only |
 | `executor.verify.timeout` | `15m` | `15m`, **unchanged** | yes | a gate killed by its timeout reads as a verify failure with no failing test (#3383) |
 | `on_ci_failure.max_retries` | 1 | 1 | yes | one self-heal on a routine CI regression |
-| periodic `budgets` | weekly, advisory, $50 | **none** | — | advisory changes nothing for the run; blocking is designed to refuse a new run at admission, which would refuse an incident fix |
+| periodic `budgets` | weekly, advisory, $50 | **none** | — | advisory changes nothing for the run; blocking refuses a new run at admission and parks an admitted run's later host-dispatched stages, which would refuse or stall an incident fix |
 | `reviewers` | two advisory agents + `human: 1` | the same | — | dual review runs concurrently, so it costs no wall-clock |
 
 The emergency cadence is enforced by `max_stage_runtime`, `max_files_changed` and `limit_usd`. The tighter `max_runtime` and `max_tokens` values state intent only and enforce nothing until #2328's calibration lands. `TestHotfixChangeExample_TighterThanFeatureChange` pins the strict-less comparisons, including `limit_usd`, and pins the unchanged verify timeout.
@@ -1762,7 +1762,7 @@ merge_method: merge
 | `required_upstream` items | `review_merged`, `ci_green` | closed set; deploy-only |
 | `diff_coverage.format` | `lcov` | only member |
 | `diff_coverage.min_new_line_coverage` | integer 0–100 | compared with `>=` |
-| `budget.enforcement`, `budgets[].enforcement` | `advisory` \| `blocking` | advisory warns; blocking refuses a new run at admission |
+| `budget.enforcement`, `budgets[].enforcement` | `advisory` \| `blocking` | advisory warns; `budgets[]` blocking refuses a new run at admission and parks an admitted run's later host-dispatched stages; stage `budget` blocking cancels the run |
 | `concurrency.group` | `^[a-z0-9][a-z0-9._-]{0,62}$` | repository-scoped, added to the default set; absent = the host implement group `local-implement:<host>` |
 | `concurrency.limit` | integer 1–64 (default `1`) | the admitting stage's limit governs |
 | `concurrency.groups` | 1–8 entries `{group, scope, limit}` | mutually exclusive with `group`/`limit`; all-or-nothing; added to the default set; host `verify` and `capacity` reserved |

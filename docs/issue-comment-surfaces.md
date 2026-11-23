@@ -1336,6 +1336,24 @@ Notes:
   continuations are never gated, so neither kind is emitted for them. Listed
   here only so a future reader grepping the audit categories doesn't mistake
   them for comment surfaces.
+- The host-dispatch budget-override binding — `run_budget_override_bound`
+  (#5473 / ADR-030 Amendment A1) — is an **internal, OPERATOR-ONLY, system-actor
+  audit kind, NOT an issue-comment surface**. Nothing in `issuecomment` posts
+  it; it has no Notifier method and no `activityCategories` entry. Unlike
+  `run_admitted_budget_override` it is a RUN-chain row: when a create
+  (`handleCreateRun`) or recover (`handleRecoverRun`) admits a run past an
+  exhausted blocking budget with `budget_override`, `bindBudgetOverride`
+  (`server/dispatch_budget.go`) appends one row to the NEW run's chain, payload
+  `{workflow_id, repo, period, limit_usd, spent, admitted_via: create|recover}`.
+  The host-dispatch budget verdict reads it to exempt that run and its
+  `DecomposedFrom` descendants from `budget_blocked`. It carries spend figures,
+  so `server/reads.go` `withholdScopeOverlapFromRunBound` withholds it from
+  run-bound (`mcp:run:`) audit reads; that entry is interim under ADR-106 and
+  survives a revert of #5473, because rows written before the revert outlive
+  it. A failed append is not an audit row at all: the 201's
+  `budget_override_binding.recorded: false` carries the remedy. Listed here
+  only so a future reader grepping the audit categories doesn't mistake it for
+  a comment surface.
 - The escalating periodic-budget plan-gate audit kinds —
   `plan_violates_periodic_budget` and `plan_periodic_budget_tier_acknowledged`
   (#1371) — are **internal, system-actor audit kinds, NOT issue-comment
