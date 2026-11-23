@@ -155,15 +155,50 @@ serialization boundary (real POST and GET handlers, Postgres audit chain, real
 client decode into `fetchRunDriveView`),
 `TestRunDispatchHold_RealServerRefusesDispatcher`.
 
+**The blocking-budget verdict** (ADR-030 Amendment A1 / [#5473](https://github.com/kuhlman-labs/fishhawk/issues/5473)).
+After the campaign-link read and before the implement review round hold, the
+lineage-lock probe and the gate, every selected stage, fresh or stale
+re-spawn, reads `GET /v0/runs/{id}?include=dispatch_budget`
+(`GetRunDispatchBudget`). `hdBudgetRefusal` spawns on `clear` and `exempt`
+and refuses `budget_blocked` on `blocked`, except for a stage the backend
+lists in `verify_pass_stage_ids` (a merge-candidate verify-only pass). An
+unknown status refuses `budget_check_failed`. A transport error, a non-2xx
+answer, a 200 without the block (`errDispatchBudgetAbsent`) or a 503
+`budget_check_failed` refuses `budget_check_failed` (fail closed; the next tick
+retries), unless the 503's `details.verify_pass_stage_ids` names the stage:
+the backend decides both exemptions before its budget read (approval condition
+D1), so an override-bound run and a verify-only pass spawn while the live read
+fails. A 400 from an older fishhawkd names the deploy remedy. Both codes are
+non-benign and set `CampaignRefused`, so the candidate counts against the
+per-tick cap and moves last. The `budget_blocked` detail
+(`hdBudgetBlockedDetail`, each server field cut at 64 bytes by
+`hdBoundBudgetField`) leads with the budget and spend (`blocking <period>
+budget of workflow <id> is over its limit: spent $X of $Y in <start>..<end>
+(budget_source <src>)`) and then the remedies that source makes honest
+(approval condition D4): `live_spec` names a default-branch `limit_usd` raise,
+`enforcement: advisory` or the rollover; `admission_spec` names only the
+rollover or a new run with `budget_override`. Nothing in flight is touched.
+`HostDispatcherStatus.BudgetRefusals()` returns the `budget_blocked`
+`run_refusals` entries sorted by run id. Pinned by
+`TestHostDispatcher_Budget*`, `TestHdBudgetBlockedDetail_BoundsServerStrings`,
+`TestHostDispatchLoop_BudgetBlocked_RecordedInRunRefusals`,
+`TestGetRunDispatchBudget_*` (`client_test.go`) and, across the real server
+with a GitHub stub serving the live spec, `autodrive_e2e_budget_test.go`
+(`TestAutoDriveE2E_BlockingBudgetHoldsSpawnUntilLiveLimitRaise`,
+`_AdvisoryBudgetStillSpawns`, `_OverrideBoundRunSpawnsUnderExhaustedBudget`,
+`_VerifyPassSpawnsUnderExhaustedBudget`). The server half is in
+[`backend/internal/server/docs/dispatch.md`](../server/docs/dispatch.md).
+
 **The single pre-marker sequence.** For each candidate, in order: the argv is
 composed (`composeStageRunnerArgv`, or `childRunnerArgv` for a child), then
 (1) the campaign-link read (`GET /v0/runs/{id}?include=campaign_link`)
 proceeds only when the run is unlinked, or linked with every campaign
 `running`. A read error is `campaign_link_unavailable` and an unresolved
 ancestry is `campaign_link_unresolved`, both fail closed. Any other campaign
-state is `campaign_not_running`. Then, for a spawnable acceptance stage, the
-implement review round hold (#5298, below), then, for every selected stage, the
-lineage-lock hold (#5485, below). (2) The loop's gate (`hostDispatchLoop.Admit`)
+state is `campaign_not_running`. Then, for every selected stage, the
+blocking-budget verdict (#5473, above), then, for a spawnable acceptance stage,
+the implement review round hold (#5298, below), then, for every selected stage,
+the lineage-lock hold (#5485, below). (2) The loop's gate (`hostDispatchLoop.Admit`)
 checks the pause file, max in-flight and, when an operator set one, the daily
 cap, then reserves the
 ledger entry and persists it. (3) `run_auto_driven` is recorded with
@@ -264,8 +299,8 @@ wedged). Accepted risks:
 `path_outside_allowed_roots`, `working_dir_absent`,
 `nothing_dispatchable`, `in_flight`, `stale_runner_live`,
 `stale_runner_unknown`, `stale_respawn_cap_reached`, `run_dispatch_held`,
-`dispatch_hold_unavailable`, the three campaign codes,
-`implement_review_in_flight`, `implement_review_not_started`,
+`dispatch_hold_unavailable`, the three campaign codes, `budget_blocked`,
+`budget_check_failed`, `implement_review_in_flight`, `implement_review_not_started`,
 `review_status_read_failed`, `lineage_lock_held`, `lineage_lock_probe_failed`,
 `paused`, `cap_reached:max_in_flight`, `cap_reached:daily` (only possible when
 an operator set `--daily-cap`), `ledger_write_failed`, `record_act_failed`, `concurrency_slot_queued`,
@@ -400,7 +435,19 @@ It adds no server API or wire type.
   advance) is provisionally `host_dispatch_unverified` naming both stage ids;
   `paused` / `pause_check_failed` (the mid-tick Admit race,
   `hostDispatchPausedRefusals`) read paused; `cap_reached:daily` reads human /
-  `host_dispatch_capped`; the deliberate holds `campaign_not_running`,
+  `host_dispatch_capped`; `budget_blocked` (#5473, its own arm, ahead of the
+  holds) reads human / `host_dispatch_budget_blocked`, state `held`, with
+  `host_dispatch.budget_source` read from the detail's `(budget_source <src>)`
+  token (`hostDispatchBudgetSourceOf`: the last marker wins, closed set, else omitted) by `hostDispatchBudgetBlockedVerdict`. Its next_step carries the bounded
+  detail and the remedies that source makes honest (approval condition D4): on
+  `live_spec` the dispatcher re-reads the default branch every tick, so a
+  `limit_usd` raise or `enforcement: advisory` there, or the period rollover,
+  lets it spawn on its next tick; on `admission_spec` (or an unnamed
+  source) only the rollover or a new run with `budget_override` applies, and a
+  default-branch edit does not change it. Both
+  say a hand `fishhawk_dispatch_stage` is not budget-gated and spends past the
+  limit, and neither says no operator action is needed;
+  `budget_check_failed` takes the default arm; the deliberate holds `campaign_not_running`,
   `campaign_dispatch_held` and `run_dispatch_held` (`hostDispatchHoldRefusals`)
   read human / `host_dispatch_refused` cause-first, with no hand-dispatch
   advice (`run_dispatch_held`'s next_step names `fishhawk_hold_dispatch`
@@ -438,8 +485,9 @@ It adds no server API or wire type.
   until that stall gets a non-benign code (the #5298 acceptance stall now has
   one: the round hold codes above). A new stall or
   hold code reaches the overlay only by being non-benign and joining the right
-  code set or arm above (a hold code joins `hostDispatchHoldRefusals`, as #5473 and
-  #5486 would); an unknown non-benign code reads refusing.
+  code set or arm above (a hold code joins `hostDispatchHoldRefusals`, as #5486
+  did; #5473's `budget_blocked` took its own arm); an unknown non-benign code
+  reads refusing.
 - *Run status.* `fishhawk_get_run_status` gains `host_dispatch` (the same
   observation, `runHostDispatchFor`) for a run the dispatcher would consider
   (local, non-terminal, a pending or `awaiting_host_dispatch` dispatchable
@@ -800,8 +848,9 @@ Three thin tools wrap the E29 onboarding engine so a connecting Claude Code agen
   - `host_capacity` — `{capacity?, source, capacity_group, variable, note, remediation?}` ([#4241](https://github.com/kuhlman-labs/fishhawk/issues/4241), `hostcapacity.go`): the **fifth LOCALLY-computed rung**, a sibling of `report`. It reports the host capacity this process declares on the host-dispatch marker for `capacity_group` = `host:<label>:capacity` (keyed on the `host_label` rung's label; `host:unknown:capacity` with none). `source` is `env` (`FISHHAWK_HOST_CAPACITY` is an integer in 1..64, sent as the marker's `capacity` on every request) | `default` (unset: nothing is sent and the server uses 3) | `invalid` (any other value, including set-but-empty: `capacity` is absent, the note carries the error, and `remediation` names the variable and the range, because every marker from this process fails closed before any request). The capacity is per request, not stored, so two processes on one label with different values each admit against their own; the note on `env` says to set the same value everywhere. Not host-local-gated: on fishhawkd's `/mcp` route it reports the daemon's environment, which is the value that route's markers send. Built by `newHostCapacityRung` (`onboard.go`) from `apiClient.hostCapacityResolution`.
   - `credential` — `{status, reason?, source?, variable?, shadowed_stored_login?, note, remediation?}` ([#5227](https://github.com/kuhlman-labs/fishhawk/issues/5227)): the **third LOCALLY-computed rung**, a sibling of `report`. It names where this server's bearer came from — `Config.CredentialSource`: `env:FISHHAWK_API_TOKEN` (fishhawk-mcp `loadConfig` rung 1; `variable` names it), `stored_login` (rung 2), `stored_login_refreshed` (rung 2b), or `mcp_route_request_bearer` (fishhawkd's `/mcp` route, `mcpRouteServerConfig`) — and never the bearer itself. The subject it acts as is the SERVED `report.scopes.subject` (with `report.scopes.credential_kind`); the note names it. On the env source the rung calls the optional `Config.StoredLoginPresent` seam: `true` sets `shadowed_stored_login: true`, `status: warn` and a remediation to unset `FISHHAWK_API_TOKEN` in the launch environment and reconnect (`/mcp`); `false` sets it false; a seam error leaves it ABSENT, never false. fishhawk-mcp's seam is a lazy closure over `credstore.Load` that returns a bool and drops the credential, called only at doctor time, so rung 1 still never touches the store at startup.
   - `model_credential` — `{status, reason?, logged_in?, auth_method?, expires_at?, note, remediation?}` ([#5227](https://github.com/kuhlman-labs/fishhawk/issues/5227), `model_credential.go`): the **fourth LOCALLY-computed rung**. It runs `claude auth status --json` (5s timeout, package-level `claudeLookPath` / `claudeAuthStatusOutput` seams) and decodes ONLY `loggedIn`, `authMethod` and `loginExpiresAt` into pointer fields, so account fields are never held and a missing key is distinct from its zero value. `not_available`: claude not on PATH. `unknown`: the exec failed or timed out, the output did not decode, or `loggedIn` was absent. A non-zero exit is decoded too, because the CLI exits 1 when signed out and exec returns stdout beside the `*exec.ExitError`: only a `loggedIn:false` body is read (as `warn`); any other body on a non-zero exit stays `unknown`. `warn`: signed out, expired, or expiring within 72h, with a remediation naming `claude auth login` on the host. `ok`: signed in beyond 72h, or signed in with an absent or unparseable expiry (note: no expiry reported). The `claude auth status` JSON is an undocumented third-party shape; drift degrades to `unknown`.
+  - `host_dispatch_budget` — `{status, reason?, status_path?, paths_tried?, refusals?[{run_id, stage_id?, since?, budget_source?, detail?}], more?, note}` (ADR-030 Amendment A1 / [#5473](https://github.com/kuhlman-labs/fishhawk/issues/5473), `onboard.go` `hostDispatchBudgetRung`): the **sixth LOCALLY-computed rung**, a sibling of `report`. It reads the host dispatcher's status.json and lists the runs a blocking periodic budget holds. It probes the state-dir ladder (`FISHHAWK_HOST_DISPATCH_STATE_DIR` alone when set, else the cwd rung, then TMPDIR) with NO run read, so no run's working_dir rung is consulted. `status` is `not_applicable` (reason `not_local_stdio_process` or `run_bound_token`, decided before any file read, under the same host-local gating as `credential`), `absent` (no status file on the ladder), `unverified` (unreadable or stale), `ok` (no `budget_blocked` refusal) or `blocked`. On `blocked`, `refusals` carries at most 8 `HostDispatcherStatus.BudgetRefusals()` entries `{run_id, stage_id, since, budget_source, detail}` (the rest counted in `more`), each string bounded by `boundHostDispatchText`; `budget_source` is parsed from the detail's `(budget_source <src>)` marker (`hostDispatchBudgetSourceOf`: the last marker wins, the value must be in the closed set, otherwise it is omitted). The note names the remedies by source: a `live_spec` verdict clears on the next tick after a default-branch `limit_usd` raise or `enforcement: advisory`; an `admission_spec` verdict clears only at rollover or for a new run with `budget_override`; a hand `fishhawk_dispatch_stage` is not budget-gated and spends past the limit. Pinned by `TestDoctor_HostDispatchBudgetRung` (`onboard_test.go`).
 
-  **Host-local gating (#5227 approval condition S1).** `credential` and `model_credential` run only when `Config.LocalHostRungs` is true, which only `backend/cmd/fishhawk-mcp/main.go` sets, and only on its stdio default (`mcpServerConfig`: `LocalHostRungs: !httpTransport`). It is false on fishhawkd's `/mcp` route and on `--transport http`. When it is off, or when the bearer is run-bound (an `fhm_` in-runner agent token, `isRunBoundToken`, derived once in `NewServer` from the prefix alone), both rungs report `status: not_applicable` with `reason` `not_local_stdio_process` or `run_bound_token`, BEFORE the presence seam is called or the model CLI is exec'd, so an in-runner agent never learns whether an operator login exists. Pinned per posture by `TestDoctor_HostRungs_{StdioOperator,MCPRoute,RunBoundToken}` through a real `NewServer`; `TestDoctor_IdentityFields_E2E_ThroughRealServer` drives a real `server.New` readiness response into the rendered `report.scopes.subject` / `credential_kind`.
+  **Host-local gating (#5227 approval condition S1).** `credential` and `model_credential` (and, since #5473, `host_dispatch_budget`) run only when `Config.LocalHostRungs` is true, which only `backend/cmd/fishhawk-mcp/main.go` sets, and only on its stdio default (`mcpServerConfig`: `LocalHostRungs: !httpTransport`). It is false on fishhawkd's `/mcp` route and on `--transport http`. When it is off, or when the bearer is run-bound (an `fhm_` in-runner agent token, `isRunBoundToken`, derived once in `NewServer` from the prefix alone), each of them reports `status: not_applicable` with `reason` `not_local_stdio_process` or `run_bound_token`, BEFORE the presence seam is called, the model CLI is exec'd or a status file is read, so an in-runner agent never learns whether an operator login exists. Pinned per posture by `TestDoctor_HostRungs_{StdioOperator,MCPRoute,RunBoundToken}` through a real `NewServer`; `TestDoctor_IdentityFields_E2E_ThroughRealServer` drives a real `server.New` readiness response into the rendered `report.scopes.subject` / `credential_kind`.
 
   `repo` is `owner/name` on GitHub or a `namespace/project` path (nested groups allowed) on GitLab; it falls back to `GITHUB_REPOSITORY`, then to GitLab CI's `CI_PROJECT_PATH` (its predefined `path_with_namespace`) when omitted (a fast local fail when none is present, before the HTTP hop). The optional `forge` input (`github` | `gitlab`) is passed through as `&forge=`; omitted, it defaults to `gitlab` ONLY when `CI_PROJECT_PATH` supplied the repo, otherwise the backend resolves the family from its account registry and defaults to `github` — so pass `forge: gitlab` for a GitLab project whose namespace is not registered (a nested path on the github family is a 400 naming that remedy). Pinned by `TestDoctor_ForgePassthrough`, `_RepoFromCIProjectPath`, `_GitHubRepositoryOutranksCIProjectPath`, `_ForgeInputOverridesEnvDefault`. The endpoint gates on **authentication only** (401 anonymous) — scope adequacy is itself a reported field, so a scope-gapped token still gets a report naming its gap rather than a 403. Backend 4xx map onto clean tool errors: `authentication_required` (401, with a `FISHHAWK_API_TOKEN` pointer) and `validation_failed` (400, malformed repo or forge — the backend's message, which names both shapes, is wrapped rather than restated).
 

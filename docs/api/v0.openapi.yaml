@@ -2670,6 +2670,23 @@ components:
             by `GET /v0/runs/{run_id}` ONLY when called with
             `include=campaign_link`; omitted on every other read, which is
             byte-identical to a read without the parameter.
+        dispatch_budget:
+          $ref: '#/components/schemas/RunDispatchBudget'
+          description: |
+            The host dispatcher's blocking-budget verdict for the run
+            (ADR-030 Amendment A1 / #5473). Served by `GET /v0/runs/{run_id}`
+            ONLY when called with `include=dispatch_budget`; omitted on every
+            other read.
+        budget_override_binding:
+          $ref: '#/components/schemas/RunBudgetOverrideBinding'
+          description: |
+            Set ONLY on the 201 of `POST /v0/runs` and
+            `POST /v0/runs/{run_id}/recover` when the run was admitted past an
+            exhausted blocking budget with `budget_override` (ADR-030
+            Amendment A1 / #5473): whether the grant's dispatch exemption was
+            recorded. Omitted on every other response, including a replayed
+            create (the `run_budget_override_bound` audit row is the source of
+            truth).
         dispatch_hold:
           $ref: '#/components/schemas/RunDispatchHold'
           description: |
@@ -3576,6 +3593,83 @@ components:
         html_url:
           type: string
           description: Link to the alert on GitHub.
+
+    RunDispatchBudget:
+      type: object
+      required: [status]
+      description: |
+        The host dispatcher's blocking-budget verdict (ADR-030 Amendment A1 /
+        #5473), served under `GET /v0/runs/{run_id}?include=dispatch_budget`.
+        The dispatcher refuses a spawn `budget_blocked` on `blocked` (except
+        a stage named in `verify_pass_stage_ids`) and spawns on `clear` or
+        `exempt`.
+
+        Exemptions are decided BEFORE any budget read: a run whose own
+        chain, or a `decomposed_from` ancestor's (at most 8 hops; never
+        `parent_run_id`), carries a `run_budget_override_bound` row for the
+        same repo and workflow is `exempt`, with no spec read. Otherwise the
+        verdict evaluates every budget of the repository's CURRENT
+        default-branch `.fishhawk/workflows.yaml` (GitHub, with a configured
+        GitHub client) at the EFFECTIVE limit (`FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD`
+        when set). A GitLab run, or a server with no GitHub client, evaluates
+        the run's cached admission spec. When a configured live read fails,
+        the admission spec decides: one that declares a blocking budget
+        answers 503 `budget_check_failed`; one that declares none is `clear`
+        (`admission_spec_fallback`).
+      properties:
+        status:
+          type: string
+          enum: [clear, blocked, exempt]
+        budget_source:
+          type: string
+          enum: [live_spec, admission_spec_fallback, admission_spec]
+          description: |
+            Which spec decided a `clear` or `blocked` verdict. Omitted on
+            `exempt`, which is decided before any spec read.
+        exempt_reason:
+          type: string
+          enum: [budget_override]
+        override_run_id:
+          type: string
+          format: uuid
+          description: The run whose `run_budget_override_bound` row exempts this run (itself or a `decomposed_from` ancestor).
+        budget:
+          type: object
+          description: The offending blocking budget; present on `blocked` only.
+          required: [workflow_id, period, period_start, period_end, limit_usd, spent_usd, enforcement]
+          properties:
+            workflow_id: { type: string }
+            period: { type: string, enum: [weekly, monthly] }
+            period_start: { type: string, format: date-time }
+            period_end: { type: string, format: date-time }
+            limit_usd:
+              type: number
+              description: The EFFECTIVE limit, the one `GET /v0/runs/{run_id}/budget` reports.
+            spent_usd: { type: number }
+            enforcement: { type: string, enum: [blocking] }
+        verify_pass_stage_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: |
+            The run's implement stages (pending, awaiting_host_dispatch or
+            dispatched) that are merge-candidate verify-only passes (a live
+            `stage_merge_candidate_verify_triggered` row). The dispatcher
+            spawns them even on `blocked`. An unreadable trigger is not listed.
+
+    RunBudgetOverrideBinding:
+      type: object
+      required: [recorded]
+      properties:
+        recorded:
+          type: boolean
+          description: true when the `run_budget_override_bound` row was appended.
+        remedy:
+          type: string
+          description: |
+            Present when `recorded` is false: the run is admitted but its later
+            host-dispatched stages are refused `budget_blocked` until the period
+            rolls over, `limit_usd` is raised or enforcement is set to advisory;
+            dispatch them by hand with `fishhawk_dispatch_stage`.
 
     CampaignLink:
       type: object
@@ -15308,7 +15402,10 @@ paths:
             raising `limit_usd`, switching the budget to
             `enforcement: advisory`, or retrying with
             `budget_override: true`. In-flight runs and CI-retry /
-            decomposition-child continuations are never gated.
+            decomposition-child continuations are never gated at
+            admission; their later host-dispatched stages are gated by the
+            dispatch-time check (`include=dispatch_budget`, ADR-030
+            Amendment A1 / #5473).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15482,6 +15579,14 @@ paths:
         blocks it FAILS CLOSED: a campaign read error answers 503
         `campaign_link_unavailable`, never a guessed `unlinked`. Without the
         parameter the read is unchanged and performs no campaign read.
+
+        `include=dispatch_budget` (ADR-030 Amendment A1 / #5473) is opt-in:
+        it adds the `dispatch_budget` block (see `RunDispatchBudget`), the
+        host dispatcher's blocking-budget verdict. For a GitHub run it reads
+        the repository's default-branch spec through the forge per call. It
+        FAILS CLOSED: an undecided verdict answers 503 `budget_check_failed`
+        with `details.reason`, never a guessed `clear`. Both values may be
+        requested together.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -15489,12 +15594,13 @@ paths:
           in: query
           required: false
           description: |
-            Optional. The only value is `campaign_link` (repeated or
-            comma-joined values must all be `campaign_link`). Refused 403
-            `run_token_forbidden` for a run-bound `mcp:run:<id>` token.
+            Optional. `campaign_link` and/or `dispatch_budget` (repeated or
+            comma-joined; every value must be one of the two). Either value is
+            refused 403 `run_token_forbidden` for a run-bound `mcp:run:<id>`
+            token.
           schema:
             type: string
-            enum: [campaign_link]
+            enum: [campaign_link, dispatch_budget]
       responses:
         '200':
           description: Run details.
@@ -15502,7 +15608,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '400':
-          description: '`include` carries a value other than `campaign_link` (`validation_failed`, naming the field). No store is read.'
+          description: '`include` carries a value other than `campaign_link` or `dispatch_budget` (`validation_failed`, naming the field, with `details.allowed` listing both). No store is read.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15512,7 +15618,8 @@ paths:
             `repo_forbidden` (see above), `account_forbidden` (the run
             belongs to another workspace account), or `run_token_forbidden`
             — a run-bound `mcp:run:<id>` token asked for
-            `include=campaign_link`, which only an operator or
+            `include=campaign_link` or `include=dispatch_budget` (the message
+            names the value refused), which only an operator or
             host-dispatcher token may read.
           content:
             application/json:
@@ -15525,7 +15632,18 @@ paths:
             (`campaign_link_unavailable`: no campaign repository, or a
             campaign item, ancestor run, campaign or campaign-account read
             failed). Retry the read; a consumer must not treat it as
-            unlinked.
+            unlinked. Or `include=dispatch_budget` could not be decided
+            (`budget_check_failed`): `details.reason` is one of
+            `live_spec_installation_unresolved`, `live_spec_unavailable`,
+            `live_spec_not_found`, `live_spec_invalid`,
+            `workflow_absent_from_live_spec` (a failed live read while the
+            admission spec declares a blocking budget), `spend_sum_failed` or
+            `override_binding_unreadable`. The body carries only the
+            enumerated reason and `verify_pass_stage_ids` (present when
+            non-empty: the merge-candidate verify-only implement passes,
+            decided before any budget read, which the host dispatcher still
+            spawns); the raw cause is logged server-side with the run id. A
+            consumer must not treat it as clear.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -20784,8 +20902,19 @@ paths:
 
         When the workflow declares no budget the response is **200 with
         an empty object** (`{}`) rather than a 404, so clients branch on
-        the presence of `period`. A workflow with multiple budgets
-        surfaces only the first.
+        the presence of `period`.
+
+        The budgets come from the same source as the host dispatcher's
+        `include=dispatch_budget` verdict (ADR-030 Amendment A1 / #5473): the
+        repository's current default-branch spec for a GitHub run (a forge
+        read per call), else the run's cached admission spec. A failed live
+        read falls back to the cached admission spec (this display never
+        gates). A run-bound `mcp:run:` caller is always served the cached
+        admission spec and triggers no forge read, so an in-runner agent
+        cannot spend the App installation's rate limit by looping this read.
+        A workflow with multiple budgets reports the GOVERNING one:
+        the first blocking budget over its effective limit (the budget the
+        dispatcher blocks on), else the first declared.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }

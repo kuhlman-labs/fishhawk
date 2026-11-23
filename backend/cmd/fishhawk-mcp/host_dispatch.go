@@ -210,6 +210,13 @@ func hostDispatchStatus(stateDir string, stdout, stderr io.Writer, now time.Time
 		_, _ = fmt.Fprintf(stdout, " run_refusals=%d", n)
 	}
 	_, _ = fmt.Fprintln(stdout)
+	// ADR-030 Amendment A1 / #5473: one line per run a blocking periodic
+	// budget holds, after the byte-unchanged summary line, naming the budget
+	// source that decided it. The exit code does not change: a budget hold is
+	// a deliberate refusal, not a dispatcher failure.
+	for _, ref := range st.BudgetRefusals() {
+		_, _ = fmt.Fprintln(stdout, ref.BudgetBlockedLine())
+	}
 	if state == "stale" || state == "failing" {
 		return exitFailure
 	}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,8 +22,9 @@ import (
 // does:
 //
 //	operator dispatch hold (fail closed) -> campaign-link read (fail closed)
-//	-> review round and lineage-lock holds -> gate (caps + pause, injected)
-//	-> record run_auto_driven (fail closed) -> host-dispatch marker -> spawn
+//	-> blocking-budget verdict (fail closed) -> review round and lineage-lock
+//	holds -> gate (caps + pause, injected) -> record run_auto_driven (fail
+//	closed) -> host-dispatch marker -> spawn
 //
 // The core has NO goroutines and never acts on its own: the tick loop
 // (host_dispatcher_loop.go, slice 3) is its only caller, so every marker POST
@@ -92,7 +95,21 @@ const (
 	// evaluated normally on the first tick after the clear.
 	hdRefuseRunDispatchHeld         = "run_dispatch_held"
 	hdRefuseDispatchHoldUnavailable = "dispatch_hold_unavailable"
+
+	// The blocking-budget verdict (ADR-030 Amendment A1 / #5473): a blocking
+	// periodic budget of the run's workflow is over its limit (budget_blocked),
+	// or the backend could not decide the verdict (budget_check_failed, fail
+	// closed). Neither is benign: each is logged once per unbroken run and
+	// recorded in run_refusals, and each sets CampaignRefused, so the candidate
+	// counts against the per-tick cap and moves last next tick.
+	hdRefuseBudgetBlocked     = "budget_blocked"
+	hdRefuseBudgetCheckFailed = budgetCheckFailedCode
 )
+
+// hdBudgetFieldMax bounds each server-sourced field of a budget_blocked
+// detail, so a long workflow id cannot push the spend figures past the
+// hostDispatchTextMax cut.
+const hdBudgetFieldMax = 64
 
 // defaultHostDispatchStaleAfter is how long a 'dispatched' stage this process
 // is not running may sit before the core probes its runner's liveness. It
@@ -147,7 +164,8 @@ type hostDispatchOutcome struct {
 	QueueEpisode bool
 	// CampaignRefused marks a refusal after the campaign-link read and before
 	// the gate: for campaign state, for the implement review round hold on an
-	// acceptance stage (#5298), or for the lineage-lock hold (#5485). The tick
+	// acceptance stage (#5298), for the lineage-lock hold (#5485), or for the
+	// blocking-budget verdict (budget_blocked / budget_check_failed, #5473). The tick
 	// counts it against the per-tick cap, which therefore bounds the
 	// campaign-link reads and the lineage-lock probes, and moves the run last
 	// next time; it never skips it without a fresh read.
@@ -415,6 +433,73 @@ func runDispatchHoldFromDetails(details map[string]any) *RunDispatchHold {
 	return hold
 }
 
+// hdBudgetRefusal decides the blocking-budget verdict for stageID: "", ""
+// spawns, anything else refuses with that code and detail. A nil block and a
+// clear or exempt verdict spawn; a blocked verdict refuses budget_blocked,
+// except for a merge-candidate verify-only pass the backend named in
+// verify_pass_stage_ids (it re-verifies an already-built head and is exempt).
+// An unknown status refuses budget_check_failed (fail closed).
+func hdBudgetRefusal(b *runDispatchBudget, stageID string) (code, detail string) {
+	if b == nil {
+		return "", ""
+	}
+	switch b.Status {
+	case dispatchBudgetStatusClear, dispatchBudgetStatusExempt:
+		return "", ""
+	case dispatchBudgetStatusBlocked:
+	default:
+		return hdRefuseBudgetCheckFailed, "blocking budget check undecided, stage not spawned: unknown dispatch_budget status " + strconv.Quote(hdBoundBudgetField(b.Status))
+	}
+	if slices.Contains(b.VerifyPassStageIDs, stageID) {
+		return "", ""
+	}
+	return hdRefuseBudgetBlocked, hdBudgetBlockedDetail(b)
+}
+
+// hdBudgetUndecidedExempt reports whether an undecided verdict (err) still
+// admits stageID: the backend decides the verify-pass exemption BEFORE any
+// budget read (approval condition D1) and names those stages on its 503
+// budget_check_failed, so a verify-only pass spawns even when the budget read
+// fails. Every other error refuses budget_check_failed.
+func hdBudgetUndecidedExempt(err error, stageID string) bool {
+	var ue *dispatchBudgetUndecidedError
+	return errors.As(err, &ue) && slices.Contains(ue.VerifyPassStageIDs, stageID)
+}
+
+// hdBudgetCheckFailedDetail is the budget_check_failed refusal detail.
+func hdBudgetCheckFailedDetail(err error) string {
+	return "blocking budget check undecided, stage not spawned: " + err.Error()
+}
+
+// hdBoundBudgetField is boundHostDispatchText's semantics (invalid UTF-8 and
+// control runes dropped) cut at hdBudgetFieldMax bytes.
+func hdBoundBudgetField(s string) string {
+	return boundHostDispatchTextTo(s, hdBudgetFieldMax)
+}
+
+// hdBudgetBlockedDetail renders a blocked verdict: the budget and its spend
+// first, so the hostDispatchTextMax cut drops remedy text last, then the
+// budget_source and the remedies that source makes honest (approval condition
+// D4). Only a live_spec verdict says a default-branch limit or enforcement
+// edit resumes spawning; an admission-spec verdict names the rollover and a
+// per-run budget_override only. Every server-sourced field is bounded.
+func hdBudgetBlockedDetail(b *runDispatchBudget) string {
+	var d runDispatchBudgetDetail
+	if b.Budget != nil {
+		d = *b.Budget
+	}
+	end := hdBoundBudgetField(d.PeriodEnd)
+	out := fmt.Sprintf("blocking %s budget of workflow %s is over its limit: spent $%.2f of $%.2f in %s..%s (budget_source %s)",
+		hdBoundBudgetField(d.Period), hdBoundBudgetField(d.WorkflowID), d.SpentUSD, d.LimitUSD,
+		hdBoundBudgetField(d.PeriodStart), end, hdBoundBudgetField(b.BudgetSource))
+	if b.BudgetSource == dispatchBudgetSourceLive {
+		out += "; spawns on the next tick after a default-branch limit_usd raise or enforcement: advisory, or at rollover " + end
+	} else {
+		out += "; admission spec decides (no live spec read): spawns at rollover " + end + " or as a new run with budget_override"
+	}
+	return boundHostDispatchText(out)
+}
+
 // hdLineageLockProbeFailedDetail is the refusal detail for an undecidable
 // lineage-lock probe; the probe error leads with its discriminator and remedy.
 func hdLineageLockProbeFailedDetail(err error) string {
@@ -434,14 +519,18 @@ func hdLineageLockProbeFailedDetail(err error) string {
 // reads not_eligible, whatever its working_dir.
 //
 // After the stage read and argv composition come the campaign-link read, then
-// (#5298) the implement review round hold on a fresh acceptance spawn
+// (ADR-030 Amendment A1 / #5473) the blocking-budget verdict on every selected
+// stage, fresh or stale re-spawn (budget_blocked, or budget_check_failed when
+// the backend cannot decide it; a merge-candidate verify-only pass the
+// backend names is exempt), then (#5298) the implement review round hold on a fresh acceptance spawn
 // (implement_review_in_flight, implement_review_not_started, or
 // review_status_read_failed when the round cannot be read), then (#5485) the
 // lineage-lock hold on every selected stage, fresh or stale re-spawn
 // (lineage_lock_held, or lineage_lock_probe_failed when the probe cannot
 // decide), then the gate. A held campaign therefore refuses for campaign state
-// before the round hold, the round hold before the lineage-lock probe, and both
-// holds precede every reservation, act, marker and spawn.
+// before the budget read, the budget before the round hold, the round hold
+// before the lineage-lock probe, and all of them precede every reservation,
+// act, marker and spawn.
 //
 // The operator per-run dispatch hold (E110.50 / #5486) is decided earlier:
 // right after the stage selection and the in-flight checks of the stale path,
@@ -584,6 +673,29 @@ func (h *hostDispatcher) evaluate(ctx context.Context, runID uuid.UUID) hostDisp
 		return h.refuse(o, hdRefuseCampaignUnavailable, lerr.Error())
 	}
 	if code, detail := campaignPermits(link); code != "" {
+		o.CampaignRefused = true
+		return h.refuse(o, code, detail)
+	}
+
+	// (1a) The blocking-budget verdict (ADR-030 Amendment A1 / #5473), after
+	// the campaign-link read so a paused or held campaign refuses for campaign
+	// state first (and pays no budget read), and before the round hold, the
+	// lineage-lock probe and the gate, so a blocked stage takes no
+	// reservation and posts nothing. It applies to every selected stage, fresh
+	// or stale re-spawn, because both start a new agent runner; every
+	// in-flight case has already returned, so nothing running is touched. The
+	// backend decides the exemptions (an override-bound run, a merge-candidate
+	// verify-only pass) before its budget read. An undecided verdict refuses
+	// budget_check_failed (fail closed; the next tick retries) unless the
+	// backend named this stage a verify-only pass. The candidate counts
+	// against the per-tick cap (CampaignRefused).
+	budget, bErr := h.r.api.GetRunDispatchBudget(ctx, runID)
+	if bErr != nil {
+		if !hdBudgetUndecidedExempt(bErr, disp.ID) {
+			o.CampaignRefused = true
+			return h.refuse(o, hdRefuseBudgetCheckFailed, hdBudgetCheckFailedDetail(bErr))
+		}
+	} else if code, detail := hdBudgetRefusal(budget, disp.ID); code != "" {
 		o.CampaignRefused = true
 		return h.refuse(o, code, detail)
 	}

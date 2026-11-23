@@ -1034,7 +1034,7 @@
             "advisory",
             "blocking"
           ],
-          "description": "advisory (default): emit a budget_alert audit entry + issue comment on warn_at and 100% crossings; never blocks. blocking: refuse a NEW run at admission once the period spend exhausts limit_usd; in-flight runs are untouched and an operator can override."
+          "description": "advisory (default): emit a budget_alert audit entry + issue comment on warn_at and 100% crossings; never blocks. blocking: refuse a NEW run at admission once the period spend exhausts limit_usd (an operator can override with budget_override), and, while the period spend stays over, refuse the host dispatcher's later spawns of an admitted run (ADR-030 Amendment A1). Running stages finish, an override-admitted run and its decomposition children are exempt, and a hand dispatch is not gated. The dispatcher re-reads the default branch's budgets every tick, so raising limit_usd or switching to advisory there applies on its next tick; a GitLab run is evaluated against its admission spec."
         },
         "warn_at": {
           "type": "number",

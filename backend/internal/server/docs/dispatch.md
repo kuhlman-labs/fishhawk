@@ -189,6 +189,120 @@ same tick its predecessor integrates.
   (`runs_get_test.go`); `TestCampaignItemAwaiting_DispatchHeld`
   (`campaign_item_awaiting_test.go`).
 
+## Blocking budget at host dispatch (`dispatch_budget.go`, ADR-030 Amendment A1 / [#5473](https://github.com/kuhlman-labs/fishhawk/issues/5473))
+
+The ADR-104 host dispatcher reads `GET /v0/runs/{run_id}?include=dispatch_budget`
+before every spawn. It refuses `budget_blocked` while a blocking periodic
+budget of the run's workflow is over its limit, and `budget_check_failed`
+while the verdict is undecided. Nothing in flight is stopped. Admission's
+refusal (`budget_admission.go`, the webhook dispatcher) is unchanged; its
+override arm now also binds the grant to the run (below).
+
+- **Verdict.** `dispatch_budget` is `{status, budget_source, exempt_reason,
+  override_run_id, budget, verify_pass_stage_ids}`. `status` is `clear`,
+  `blocked` or `exempt`. `budget` is the offending budget on `blocked`:
+  `{workflow_id, period, period_start, period_end, limit_usd, spent_usd,
+  enforcement}`, where `limit_usd` is the EFFECTIVE limit
+  (`effectiveBudgetLimit`, `FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD`).
+- **Order (`dispatchBudgetFor`).** (1) The exemptions are decided FIRST, before
+  any budget read (approval condition D1): the verify-pass stages are listed,
+  then the override binding is walked. A bound run reads `exempt` with no
+  budget read, so it spawns even when the live read would fail. (2)
+  `currentWorkflowBudgets` resolves the budgets. (3) No blocking budget, or a
+  RunRepo without `webhook.CostSummer`, clears. (4) Every budget runs through
+  `webhook.CheckBlockingBudget` at its effective limit, not only `Budgets[0]`;
+  a sum error is undecided (`spend_sum_failed`). (5) Over a blocking budget is
+  `blocked`. A binding read error is held from step 1 and answers
+  `override_binding_unreadable` only when the verdict would not be clear.
+- **Live source (ruling C1).** A GitHub run on a server with a GitHub client
+  reads the repository's CURRENT default-branch `.fishhawk/workflows.yaml`
+  (`GetWorkflowSpec` with an empty ref, the read `StartRunForCampaignIssue` and
+  `campaign_hotfix.go` make), so a `limit_usd` raise, an `enforcement:
+  advisory` switch or a period rollover readmits an in-flight run on the next
+  tick, and a lowered limit or a new blocking budget parks one. Only the
+  budgets come from the live spec: stages, verify, slot routing, prompts and
+  alerts keep `runs.workflow_spec`. A GitLab run, or a server with no GitHub
+  client, has no server-side spec read and evaluates the cached admission spec
+  (`budget_source admission_spec`). A non-default
+  `--campaign-driver-workflow-ref` is not honoured: the read is the default
+  branch.
+- **Read failure (approval condition D2).** A failed live read
+  (`live_spec_installation_unresolved`, `live_spec_unavailable` (a forge error
+  or rate limit), `live_spec_not_found`, `live_spec_invalid`,
+  `workflow_absent_from_live_spec`) falls back to the run's admission spec. An
+  admission spec that declares a blocking budget fails closed: `503
+  budget_check_failed` with `details.reason`. One that declares none clears
+  with `budget_source admission_spec_fallback` (WARN-logged), so an
+  advisory-only repository never stalls on a read error. `budget_source` names
+  the deciding source on every clear or blocked verdict: `live_spec`,
+  `admission_spec_fallback` or `admission_spec`.
+- **503 body (approval condition D5(c)).** `details` carries `run_id`, the
+  enumerated `reason` and, when present, `verify_pass_stage_ids`. The raw
+  cause is WARN-logged server-side with the run id and never reaches the body.
+- **Override exemption (ruling C2).** An ADR-030 `budget_override` admission
+  binds the grant to the created run with one `run_budget_override_bound`
+  run-chain row (actor system, payload `{workflow_id, repo, period, limit_usd,
+  spent, admitted_via: create|recover}`), appended post-replay by
+  `bindBudgetOverride`. `budgetOverrideBinding` walks the run, then
+  `budgetExemptionParent`, which is `DecomposedFrom` ONLY, never
+  `ParentRunID`: a recovery, CI-retry or follow-up run needs its own override.
+  The row must name the same repo and `workflow_id` as the run. The walk takes
+  at most `maxCampaignAncestorDepth` hops; a missing parent, a cycle or the
+  depth bound stops it with a WARN and no exemption. A plain create cannot
+  nominate a parent: `createRunRequest` has no lineage field and decodes with
+  `DisallowUnknownFields`, and every non-decomposition create path leaves
+  `DecomposedFrom` nil (only `lineage.go` / `consolidate.go` children carry
+  it). Runs admitted with an override before #5473 have no row and are not
+  exempt.
+- **Binding failure.** An append error leaves the run admitted but unbound
+  (fail-safe): the create / recover 201 carries `budget_override_binding
+  {recorded: false, remedy}` and the server WARN-logs with the run id. The run
+  is not abandoned, because the admitted override is already recorded globally
+  (`run_admitted_budget_override`); only the dispatch exemption is lost, and
+  the stages stay hand-dispatchable. A replayed create returns no block.
+- **Confidentiality (approval condition D3).** `run_budget_override_bound` is
+  INTERNAL and OPERATOR-ONLY (`audit/categories.go`): `reads.go`
+  `withholdScopeOverlapFromRunBound` withholds it from run-bound audit reads
+  because it carries spend figures. Both are interim under ADR-106. A revert
+  of #5473 KEEPS the deny-list entry and the registration, because rows
+  persisted before the revert outlive it; a revert that drops them must re-add
+  the entry by hand.
+- **Verify-pass exemption.** `verify_pass_stage_ids` lists the run's implement
+  stages in `pending`, `awaiting_host_dispatch` or `dispatched` for which
+  `isMergeCandidateVerifyPass` holds (a live
+  `stage_merge_candidate_verify_triggered` row, written only by the server; an
+  unreadable trigger is not exempt). The list rides on a blocked verdict and on
+  the 503, so a verify-only pass spawns even when the budget read fails.
+- **Display parity.** `GET /v0/runs/{run_id}/budget` resolves the same source
+  (one forge read per call; a read error WARN-logs and falls back to the
+  cached admission spec, since the display is never a gate) and reports the
+  GOVERNING budget: the first blocking budget Over at its effective limit,
+  else `Budgets[0]`. `budget.tier` and the dispatcher verdict therefore agree.
+  An exempt run still reads tier `over`: the tier describes the budget, not
+  the run. A run-bound `mcp:run:` caller is the exception: it is served the
+  cached admission spec and triggers no forge read, so an in-runner agent
+  cannot spend the App installation's rate limit by looping the route (its
+  display can then lag a default-branch budget edit).
+- **Access.** Either include value is refused `403 run_token_forbidden` for a
+  run-bound `mcp:run:` subject; an unknown value is `400 validation_failed`
+  listing `campaign_link` and `dispatch_budget`.
+- **Tests** (`dispatch_budget_test.go`): `TestDispatchBudget_*` (live raise and
+  advisory switch, each unreadable mode with the fallback rows,
+  `UndecidableAdmissionSpec_LiveReadFailed_Clears`,
+  `NoLiveSource_EvaluatesAdmissionSpec`, `EveryBudgetEvaluated`,
+  `VerdictMatchesBudgetTier`, `ExemptionsDecidedBeforeLiveRead`, the override,
+  descendant, eight-hop, ParentRunID, broken-ancestry, repo/workflow match,
+  binding-read and ancestor-read rows, `VerifyPassStageListed`); `TestGetRun_IncludeDispatchBudget_*`
+  and `TestGetRun_Include_UnknownValueListsBoth` (`runs_test.go`);
+  `TestCreateRun_BlockingBudget_Override_*`,
+  `TestCreateRun_CannotNominateParentForBudgetExemption`,
+  `TestCreateRun_Replay_DoesNotReappendBudgetOverride`
+  (`budget_admission_test.go`); `TestRecoverRun_BlockingBudget_Override_BindsRecoveryRun`;
+  `TestRunBudgetOverrideBound_WithheldFromRunBoundAuditRead`;
+  `TestGetRunBudget_LiveSpecAndGoverningBudget`,
+  `TestGetRunBudget_RunBoundCallerMakesNoForgeRead`. The dispatcher half is in
+  [`backend/internal/mcpserver/README.md`](../../mcpserver/README.md).
+
 ## Superseded merge-candidate pass refusal (`host_dispatch.go`, [#4811](https://github.com/kuhlman-labs/fishhawk/issues/4811))
 
 The host-dispatch marker's arm of the stale-pass supersede
