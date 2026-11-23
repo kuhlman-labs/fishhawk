@@ -163,8 +163,9 @@ type campaignResponse struct {
 	// declared `runnable:no` and candidates whose title/body names a path the
 	// repo's implement-stage forbidden_paths forbid. Carried by the create
 	// response and by the preview response (#5221); never persisted, so
-	// GET/list omit it, and omitted when the screen found nothing. It never
-	// blocks or alters the create or the preview.
+	// GET/list omit it, and omitted when the screen found nothing — except a
+	// findings-empty block when the spec does not define the driver workflow
+	// (#5267). It never blocks or alters the create or the preview.
 	AdmissionScreen *campaignAdmissionScreenPayload `json:"admission_screen,omitempty"`
 	// Warnings names every item whose depends_on relies on a legacy free-text
 	// `Depends on:` line rather than the tracker's native relation (#4028).
@@ -1104,9 +1105,13 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	resp.Warnings = legacyDependencyWarnings(result)
 	// The admission screen block (#3649): rendered on the create response (the
 	// preview carries it too, #5221), plus one best-effort audit copy that only
-	// create writes. Nil = nothing found → no key, no audit.
+	// create writes. Nil = nothing found → no key, no audit. A findings-empty
+	// block (the driver workflow is undefined in the spec, #5267) renders on
+	// the response only: the audit stays a copy of at least one finding.
 	if admissionScreen != nil {
 		resp.AdmissionScreen = admissionScreen
+	}
+	if admissionScreen != nil && len(admissionScreen.Findings) > 0 {
 		s.emitCampaignAudit(r.Context(), categoryCampaignAdmissionScreened, map[string]any{
 			"campaign_id":              created.ID.String(),
 			"repo":                     created.Repo,

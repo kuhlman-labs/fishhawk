@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -766,6 +767,151 @@ func TestNextActions_HostDispatcherOwnsQueuedStage(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestNextActions_HostDispatcherQueued_E2E_ThroughRealServer joins the two
+// halves of #5267 sub-point 2 across the real boundary: a REAL Postgres run,
+// audit and concurrency store behind the REAL server.Handler() over httptest,
+// read by the REAL MCP apiClient inside fishhawk_get_run_status and rendered by
+// nextActionsFor. The auto_dispatch run's implement stage is QUEUED behind
+// another stage's slot through the real host-dispatch marker (so its waiter is
+// live), and its drive audit names run_implement_stage. The server must drop
+// that next_action and the MCP classifier must answer exactly one re-poll — so
+// a regression in hostDispatcherQueuedStages, or drift in the concurrency
+// block's status / waiter_live wire tags, turns this RED instead of putting
+// run_implement_stage back at actions[0] while both per-layer suites stay
+// green.
+//
+// The companion arm ages the queue row past QueueTTL (waiter_live false): the
+// SAME fixture then surfaces run_implement_stage at actions[0] again (the
+// fail-open shape), which proves the first arm's silence comes from the live
+// waiter and not from a drive entry the read never saw.
+func TestNextActions_HostDispatcherQueued_E2E_ThroughRealServer(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runmodel.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	parkImplement := func(params runmodel.CreateRunParams) *runmodel.Stage {
+		t.Helper()
+		row, err := runRepo.CreateRun(ctx, params)
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		if _, err := runRepo.TransitionRun(ctx, row.ID, runmodel.StateRunning); err != nil {
+			t.Fatalf("run to running: %v", err)
+		}
+		planSt, err := runRepo.CreateStage(ctx, runmodel.CreateStageParams{
+			RunID: row.ID, Sequence: 0, Type: runmodel.StageTypePlan,
+			ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create plan stage: %v", err)
+		}
+		for _, to := range []runmodel.StageState{runmodel.StageStateDispatched, runmodel.StageStateRunning, runmodel.StageStateSucceeded} {
+			if _, err := runRepo.TransitionStage(ctx, planSt.ID, to, nil); err != nil {
+				t.Fatalf("plan stage to %s: %v", to, err)
+			}
+		}
+		st, err := runRepo.CreateStage(ctx, runmodel.CreateStageParams{
+			RunID: row.ID, Sequence: 1, Type: runmodel.StageTypeImplement,
+			ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create implement stage: %v", err)
+		}
+		if st, err = runRepo.TransitionStage(ctx, st.ID, runmodel.StageStateAwaitingHostDispatch, nil); err != nil {
+			t.Fatalf("park implement stage: %v", err)
+		}
+		return st
+	}
+	base := runmodel.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource: runmodel.TriggerCLI, RunnerKind: runmodel.RunnerKindLocal,
+	}
+	holder := parkImplement(base)
+	queuedParams := base
+	queuedParams.Drive, queuedParams.AutoDispatch = true, true
+	queued := parkImplement(queuedParams)
+
+	payload, err := json.Marshal(drive.Advance{
+		Rule: drive.RulePlanApprovedDispatch, From: "plan:approved", To: "implement:dispatched",
+		NextAction: &drive.NextAction{Action: "run_implement_stage", Detail: "dispatch the stage from the operator host"},
+	})
+	if err != nil {
+		t.Fatalf("marshal advance: %v", err)
+	}
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: queued.RunID, Timestamp: time.Now().UTC(), Category: drive.Category, Payload: payload,
+	}); err != nil {
+		t.Fatalf("append %s: %v", drive.Category, err)
+	}
+
+	const bearer = "fhk_dispatcher_queued_e2e"
+	srv := server.New(server.Config{
+		RunRepo: runRepo, AuditRepo: auditRepo, Concurrency: concurrency.NewPostgresStore(pool),
+		APITokenRepo: &stubMCPAPITokens{tok: &apitoken.Token{
+			ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:runs"}, PlainText: bearer,
+		}},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	c.hostLabel = fixedHostLabel("h1")
+
+	// The holder takes the one local-implement:h1 slot; the auto_dispatch
+	// run's marker then queues behind it with a live waiter.
+	if res, err := c.HostDispatchStage(ctx, holder.RunID, holder.ID); err != nil || !res.Transitioned {
+		t.Fatalf("holder marker = %+v, %v, want an admission", res, err)
+	}
+	if _, err := c.HostDispatchStage(ctx, queued.RunID, queued.ID); err == nil {
+		t.Fatal("queued marker admitted, want the typed queued error (the slot is held)")
+	} else if _, ok := asConcurrencySlotQueued(err); !ok {
+		t.Fatalf("queued marker err = %v, want the typed queued error", err)
+	}
+
+	r := &runResolver{api: c, getenv: envFuncFromMap(nil)}
+	read := func(t *testing.T) GetRunStatusOutput {
+		t.Helper()
+		_, out, err := r.getRunStatus(ctx, nil, GetRunStatusInput{RunID: queued.RunID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.DriveStatus == nil || len(out.DriveStatus.AutoAdvanced) != 1 {
+			t.Fatalf("drive_status = %+v, want the seeded auto-advance read back (the fixture reached the drive surface)", out.DriveStatus)
+		}
+		if out.NextActions == nil || out.NextActions.State != "implement_pending" {
+			t.Fatalf("next_actions = %+v, want implement_pending", out.NextActions)
+		}
+		return out
+	}
+
+	// Arm 1: queued with a live waiter → no drive next_action, one re-poll.
+	out := read(t)
+	if out.DriveStatus.NextAction != nil {
+		t.Errorf("drive_status.next_action = %+v, want nil: the server must drop a dispatch the host dispatcher owns", out.DriveStatus.NextAction)
+	}
+	names := actionNames(out.NextActions)
+	if len(out.NextActions.Actions) != 1 || out.NextActions.Actions[0].Action != "fishhawk_get_run_status" {
+		t.Fatalf("next_actions actions = %v, want exactly [fishhawk_get_run_status] (a second dispatch would double-drive the queued stage)", names)
+	}
+	if !strings.Contains(out.NextActions.Actions[0].Reason, "the host dispatcher owns this dispatch") {
+		t.Errorf("re-poll reason = %q, want it to name the host dispatcher", out.NextActions.Actions[0].Reason)
+	}
+
+	// Arm 2 (companion): the waiter goes away — the queue row ages past
+	// QueueTTL on the DB clock — and the SAME run surfaces the dispatch again.
+	if _, err := pool.Exec(ctx, `UPDATE stage_concurrency_slots SET last_seen_at = now() - interval '2 minutes' WHERE stage_id = $1`, queued.ID); err != nil {
+		t.Fatalf("backdate queued slot row: %v", err)
+	}
+	out = read(t)
+	if out.DriveStatus.NextAction == nil || out.DriveStatus.NextAction.Action != "run_implement_stage" {
+		t.Errorf("drive_status.next_action = %+v, want run_implement_stage surfaced once the waiter is not live (fail open)", out.DriveStatus.NextAction)
+	}
+	names = actionNames(out.NextActions)
+	if len(names) == 0 || names[0] != "run_implement_stage" {
+		t.Errorf("next_actions actions = %v, want run_implement_stage at actions[0] once nothing owns the dispatch", names)
 	}
 }
 

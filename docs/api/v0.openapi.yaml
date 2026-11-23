@@ -6149,10 +6149,15 @@ components:
         refuses, excludes or reorders an item. It rides the `POST /v0/campaigns`
         create response and the `POST /v0/campaigns/preview` report (#5221);
         like `satisfied_dependencies` it is NOT persisted, so GET/list/status
-        omit it, and it is omitted when the screen found nothing. Only create
-        appends the `campaign_admission_screened` audit row; the preview
-        writes none. Class 2 degrades
-        silently (fail-open, `forbidden_paths_screened: false`) when the spec
+        omit it, and it is omitted when the screen found nothing. The one
+        exception is a driver workflow the default-branch spec does not
+        define: the block is then rendered even with no finding
+        (`findings: []`, `forbidden_paths_screened: false`, `workflow_id`
+        naming the unscreened workflow), so the operator sees it on the
+        response and not only in a server log line. Only create appends the
+        `campaign_admission_screened` audit row, and only for a block with at
+        least one finding; the preview writes none. Class 2 degrades
+        fail-open (`forbidden_paths_screened: false`) when the spec
         cannot be fetched or parsed, does not define the driver workflow, or
         that workflow declares no forbidden paths; issue prose is noisy, so
         false positives are expected.
@@ -6163,7 +6168,7 @@ components:
           description: Always `true` — the screen reports and never blocks the create or changes the preview.
         findings:
           type: array
-          description: Sorted by issue, then kind, then path; capped at 50.
+          description: Sorted by issue, then kind, then path; capped at 50. Empty (never null) only on the block a driver workflow the spec does not define renders.
           items:
             $ref: '#/components/schemas/CampaignAdmissionFinding'
         forbidden_paths_screened:

@@ -38,8 +38,10 @@ import (
 // ADVISORY in every direction: the screen never refuses, never excludes an
 // item, never changes item state or the assembled DAG, and every degrade
 // (unwired forge client, unreadable/unparseable spec, the driver's workflow
-// absent from the spec, no forbidden paths) is FAIL-OPEN with a logged reason — class 2 is silently
-// skipped and the create proceeds. Issue prose is far noisier than
+// absent from the spec, no forbidden paths) is FAIL-OPEN with a logged reason
+// — class 2 is skipped and the create proceeds. The driver workflow being
+// absent is the one degrade the response also names on its own: a
+// findings-empty block (#5267). Issue prose is far noisier than
 // acceptance-criterion prose, so false positives are expected; each finding
 // carries the exact token and its location so an operator can dismiss it in
 // one read.
@@ -235,12 +237,14 @@ func (s *Server) campaignScreenWorkflowID() string {
 // transport, or an unresolved/zero credential scope — a non-GitHub work-item
 // provider leaves scope zero and the client refuses before any network call);
 // a parse error; a spec that does not define the workflow; and a workflow
-// declaring no implement-stage forbidden_paths.
-func (s *Server) resolveCampaignForbiddenPaths(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) ([]string, string, bool) {
-	workflowID := s.campaignScreenWorkflowID()
+// declaring no implement-stage forbidden_paths. workflowUndefined is true ONLY
+// on the spec-does-not-define-the-workflow degrade, so screenCampaignAdmission
+// can report that one on the response even when nothing else was found.
+func (s *Server) resolveCampaignForbiddenPaths(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (forbidden []string, workflowID string, ok, workflowUndefined bool) {
+	workflowID = s.campaignScreenWorkflowID()
 	if s.cfg.GitHub == nil {
 		s.logAdmissionScreenSkip(ctx, repo, "github client not configured")
-		return nil, workflowID, false
+		return nil, workflowID, false, false
 	}
 	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, scope, repo, "")
 	if err != nil {
@@ -249,23 +253,23 @@ func (s *Server) resolveCampaignForbiddenPaths(ctx context.Context, scope forge.
 			reason = "no workflow spec on the default branch"
 		}
 		s.logAdmissionScreenSkip(ctx, repo, reason)
-		return nil, workflowID, false
+		return nil, workflowID, false, false
 	}
 	parsed, err := spec.ParseBytes(fc.Content)
 	if err != nil {
 		s.logAdmissionScreenSkip(ctx, repo, "parse workflow spec failed: "+err.Error())
-		return nil, workflowID, false
+		return nil, workflowID, false, false
 	}
 	forbidden, defined := workflowForbiddenPaths(parsed, workflowID)
 	if !defined {
 		s.logAdmissionScreenSkip(ctx, repo, fmt.Sprintf("workflow %q not defined in the default-branch spec", workflowID))
-		return nil, workflowID, false
+		return nil, workflowID, false, true
 	}
 	if len(forbidden) == 0 {
 		s.logAdmissionScreenSkip(ctx, repo, fmt.Sprintf("no implement-stage forbidden_paths declared in workflow %q", workflowID))
-		return nil, workflowID, false
+		return nil, workflowID, false, false
 	}
-	return forbidden, workflowID, true
+	return forbidden, workflowID, true, false
 }
 
 func (s *Server) logAdmissionScreenSkip(ctx context.Context, repo forge.RepoRef, reason string) {
@@ -280,12 +284,20 @@ func (s *Server) logAdmissionScreenSkip(ctx context.Context, repo forge.RepoRef,
 // the optional items subset is applied by campaign.FilterToSubset before
 // campaign.Assemble, and Assemble admits every child it is handed. Returns nil
 // when there is nothing to report — the caller then omits the admission_screen
-// key and the audit.
+// key and the audit. A driver workflow the default-branch spec does not define
+// IS something to report (#5267 condition K4a): the screen then returns a
+// findings-empty block (findings [], forbidden_paths_screened false,
+// workflow_id naming the unscreened workflow) so the operator sees it on the
+// response, not only in a server log line. Every other degrade stays silent
+// when nothing was found.
 func (s *Server) screenCampaignAdmission(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, children []workmgmt.EpicChild) *campaignAdmissionScreenPayload {
-	forbidden, workflowID, screened := s.resolveCampaignForbiddenPaths(ctx, scope, repo)
+	forbidden, workflowID, screened, workflowUndefined := s.resolveCampaignForbiddenPaths(ctx, scope, repo)
 	findings, truncated := evaluateCampaignAdmissionScreen(children, forbidden)
 	if len(findings) == 0 {
-		return nil
+		if !workflowUndefined {
+			return nil
+		}
+		findings = []campaignScreenFinding{}
 	}
 	return &campaignAdmissionScreenPayload{
 		Advisory:               true,

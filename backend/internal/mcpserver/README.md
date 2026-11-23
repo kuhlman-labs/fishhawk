@@ -3976,7 +3976,8 @@ per-tool contract). Internals not covered there:
   `TestPreviewCampaign_OutputSchema_ExactlyOneHumanLedBlock` (the advertised schema has exactly one
   human_led-named property, and `preview` has none).
   **Advisory screens (#5221).** `CampaignPreview` mirrors the backend's two ADVISORY blocks, present on the valid,
-  dangling and cycle reports alike and only when they found something. `admission_screen` reuses the create's
+  dangling and cycle reports alike and only when they found something (`admission_screen` also renders findings-empty,
+  `forbidden_paths_screened:false`, when the spec does not define the driver workflow, #5267). `admission_screen` reuses the create's
   `campaignAdmissionScreen` mirror: the same #3649 screen, with no audit row on the preview. `path_overlap`
   (`campaignPreviewPathOverlap` / `campaignPreviewPathOverlapPair`, unexported) is `{advisory, pairs[{items, paths (max 10),
   paths_truncated?, class, remedy}], total_pairs, truncated?}`: unordered item pairs whose title or body name the same file path,
