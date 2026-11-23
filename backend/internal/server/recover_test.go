@@ -3325,3 +3325,70 @@ func TestRecoverRun_DecompositionChild_SliceOwnership(t *testing.T) {
 		f.assertNothingWritten(t)
 	})
 }
+
+// bindFailRecoverAudit fails only the run_budget_override_bound append.
+type bindFailRecoverAudit struct{ *recoverAuditRepo }
+
+func (a bindFailRecoverAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryRunBudgetOverrideBound {
+		return nil, errors.New("injected bind append failure")
+	}
+	return a.recoverAuditRepo.AppendChained(ctx, p)
+}
+
+// TestRecoverRun_BlockingBudget_Override_BindsRecoveryRun (D3): an
+// override-admitted recovery binds the grant to the RECOVERY run's own chain
+// (it never inherits its parent's exemption, ruling C2).
+func TestRecoverRun_BlockingBudget_Override_BindsRecoveryRun(t *testing.T) {
+	s, rr, au := newRecoverBudgetServer(t, 100)
+	parent, _, _ := seedRecoverableParent(rr.recoverRepo, run.StageStateFailed, failureCat(run.FailureB))
+	parent.WorkflowSpec = []byte(recoverBudgetSpecYAML)
+
+	w := postRecover(t, s, parent.ID.String(), `{"budget_override":true}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == CategoryRunBudgetOverrideBound {
+			if p.RunID != resp.ID {
+				t.Errorf("binding appended to run %s, want the recovery run %s", p.RunID, resp.ID)
+			}
+			var pl budgetOverrideBoundPayload
+			_ = json.Unmarshal(p.Payload, &pl)
+			if pl.AdmittedVia != "recover" {
+				t.Errorf("admitted_via = %q, want recover", pl.AdmittedVia)
+			}
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%s appends = %d, want 1", CategoryRunBudgetOverrideBound, n)
+	}
+	if resp.BudgetOverrideBinding == nil || !resp.BudgetOverrideBinding.Recorded {
+		t.Errorf("budget_override_binding = %+v, want recorded:true", resp.BudgetOverrideBinding)
+	}
+}
+
+// TestRecoverRun_BindingAppendFails_Surfaced (D3, C5a).
+func TestRecoverRun_BindingAppendFails_Surfaced(t *testing.T) {
+	rr := &budgetRecoverRepo{recoverRepo: newRecoverRepo(), spent: 100}
+	au := &recoverAuditRepo{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ScopeAmendmentRepo: newFakeScopeAmendmentRepo(), AuditRepo: bindFailRecoverAudit{au}})
+	parent, _, _ := seedRecoverableParent(rr.recoverRepo, run.StageStateFailed, failureCat(run.FailureB))
+	parent.WorkflowSpec = []byte(recoverBudgetSpecYAML)
+
+	w := postRecover(t, s, parent.ID.String(), `{"budget_override":true}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if b := resp.BudgetOverrideBinding; b == nil || b.Recorded || !strings.Contains(b.Remedy, "fishhawk_dispatch_stage") {
+		t.Fatalf("budget_override_binding = %+v, want recorded:false with the remedy", b)
+	}
+}

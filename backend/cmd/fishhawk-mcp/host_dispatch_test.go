@@ -284,3 +284,59 @@ func TestHostDispatchStatus_PreChangeFileReadsLive(t *testing.T) {
 		}
 	}
 }
+
+// H4 (ADR-030 Amendment A1 / #5473): --status prints the summary line
+// byte-unchanged, then one bounded budget_blocked line per entry (sorted by
+// run id) naming its budget source; other refusal codes print no line and
+// the exit code is unchanged.
+func TestHostDispatchStatus_PrintsBudgetBlockedRefusals(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	st := mcpserver.HostDispatcherStatus{PID: 7, LastTickAt: now.Add(-30 * time.Second), LastCompleteTickAt: now.Add(-30 * time.Second), IntervalSeconds: 30}
+	entry := func(run, code, detail string) map[string]any {
+		return map[string]any{"run_id": run, "stage_id": "s-" + run, "code": code, "detail": detail, "first_at": now.Add(-time.Minute), "last_at": now.Add(-30 * time.Second)}
+	}
+	live := "blocking weekly budget of workflow feature_change is over its limit: spent $15.00 of $10.00 in 2026-11-16T00:00:00Z..2026-11-23T00:00:00Z (budget_source live_spec); spawns on the next tick"
+	crafted := "\x1b[31m\nspent $15.00 of $10.00 (budget_source admission_spec)" + strings.Repeat("d", 2000)
+	refusals := map[string]any{
+		"b": entry("b", "budget_blocked", crafted),
+		"a": entry("a", "budget_blocked", live),
+		"c": entry("c", "working_dir_absent", ""),
+	}
+
+	// The summary line with the same refusal count and no budget entry is the
+	// pre-change output.
+	dir0 := t.TempDir()
+	writeStatusWith(t, dir0, st, map[string]any{"run_refusals": map[string]any{
+		"a": entry("a", "working_dir_absent", ""), "b": entry("b", "working_dir_absent", ""), "c": entry("c", "working_dir_absent", "")}})
+	_, base, _ := runHD(t, testHostDispatchDeps(&hostDispatchRecorder{}, nil, now), "--status", "--state-dir", dir0)
+	if strings.Count(base, "\n") != 1 {
+		t.Fatalf("baseline out=%q; want exactly the summary line", base)
+	}
+
+	dir := t.TempDir()
+	writeStatusWith(t, dir, st, map[string]any{"run_refusals": refusals})
+	code, out, stderr := runHD(t, testHostDispatchDeps(&hostDispatchRecorder{}, nil, now), "--status", "--state-dir", dir)
+	if code != exitOK {
+		t.Fatalf("code=%d stderr=%q; want 0 (a budget hold is not a dispatcher failure)", code, stderr)
+	}
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("out=%q; want the summary line plus two budget_blocked lines", out)
+	}
+	if lines[0]+"\n" != base {
+		t.Errorf("summary line = %q; want it byte-unchanged %q", lines[0], base)
+	}
+	since := now.Add(-time.Minute).Format(time.RFC3339)
+	if want := "budget_blocked run=a stage=s-a since=" + since + " source=live_spec detail=" + live; lines[1] != want {
+		t.Errorf("line 1 = %q; want %q", lines[1], want)
+	}
+	if want := "budget_blocked run=b stage=s-b since=" + since + " source=admission_spec detail=[31mspent $15.00 of $10.00"; !strings.HasPrefix(lines[2], want) {
+		t.Errorf("line 2 = %q; want prefix %q", lines[2], want)
+	}
+	if strings.ContainsAny(lines[2], "\x1b\r") || strings.Count(lines[2], "d") > 300 {
+		t.Errorf("line 2 is unbounded or carries a control rune: %q", lines[2])
+	}
+	if strings.Contains(out, "run=c") {
+		t.Errorf("out=%q; a non-budget refusal must print no budget line", out)
+	}
+}

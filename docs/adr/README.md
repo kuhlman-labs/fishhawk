@@ -353,6 +353,7 @@ touched):
 
 Amendments recorded under the upkeep rule since:
 
+- ADR-030: no edge added. Its in-body ["Amendment A1: blocking budgets are also enforced when the host dispatcher spawns a stage"](030-periodic-cost-budgets-in-workflow-spec.md#amendment-a1-accepted-2026-11-22--blocking-budgets-are-also-enforced-when-the-host-dispatcher-spawns-a-stage) (ratified by the Captain 2026-11-22 on #5473 with rulings C1 and C2, recorded with #5473; final text confirmed at merge) extends the blocking point to host-dispatch spawn time and also extends ADR-104's dispatcher contract without editing ADR-104. It changes no front-matter field, so `index.json` is unchanged. The #687 tracker body does not yet carry A1, so the record is not a verbatim transcription until that body is updated.
 - ADR-047: no edge added. Its in-body "Amendment A1: campaign item starts claim before minting, and driver-run campaigns open running at create" (Captain ruling 2026-11-21 on #5266, recorded with #5266; final text confirmed at merge) is part of the body; it changes no front-matter field, so `index.json` is unchanged. The #1437 tracker body does not yet carry A1, so the record is not a verbatim transcription until that body is updated.
 - ADR-103: `amends: [ADR-050]` ("Adopt **Option D**, as a new ADR that amends
   ADR-050"; "It supersedes nothing. It amends ADR-050 D4 (a new Rule-of-Two

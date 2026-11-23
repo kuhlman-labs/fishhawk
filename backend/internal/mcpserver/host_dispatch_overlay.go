@@ -52,8 +52,13 @@ const (
 	hostDispatchReasonRefused    = "host_dispatch_refused"
 	hostDispatchReasonAbsent     = "host_dispatcher_absent"
 	hostDispatchReasonUnverified = "host_dispatch_unverified"
-	hostDispatchStatusCmd        = "fishhawk-mcp host-dispatch --status"
-	hostDispatchCampaignHeldCode = "campaign_dispatch_held"
+	// hostDispatchReasonBudgetBlocked: a blocking periodic budget of the
+	// run's workflow is over its limit, so the dispatcher refuses new spawns
+	// budget_blocked (ADR-030 Amendment A1 / #5473). An operator decides
+	// whether to raise the limit, wait for the rollover or work past it.
+	hostDispatchReasonBudgetBlocked = "host_dispatch_budget_blocked"
+	hostDispatchStatusCmd           = "fishhawk-mcp host-dispatch --status"
+	hostDispatchCampaignHeldCode    = "campaign_dispatch_held"
 	// hostDispatchAwaitKindSystem byte-matches the server's awaitingKindSystem
 	// (backend/internal/server/campaign_item_awaiting.go).
 	hostDispatchAwaitKindSystem = "system"
@@ -147,6 +152,7 @@ type hostDispatchObservation struct {
 	DailyCap           int      `json:"daily_cap,omitempty"`
 	SpawnsToday        int      `json:"spawns_today,omitempty"`
 	CapResetsAt        string   `json:"cap_resets_at,omitempty" jsonschema:"RFC 3339: when the daily cap resets (00:00:00Z)"`
+	BudgetSource       string   `json:"budget_source,omitempty" jsonschema:"on a budget_blocked refusal: the spec that decided the blocking-budget verdict, live_spec (the default branch's current spec, re-read every tick) or admission_spec (the run's admission spec: only the period rollover or a run with budget_override clears it); omitted when the refusal does not name it"`
 	Detail             string   `json:"detail,omitempty" jsonschema:"why the state was chosen"`
 }
 
@@ -489,6 +495,12 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 			return hostDispatchPausedVerdict(obs, dir, pauseCheck)
 		case ref.Code == hdRefuseCapDaily:
 			return hostDispatchCappedVerdict(obs, st, now)
+		case ref.Code == hdRefuseBudgetBlocked:
+			// ADR-030 Amendment A1 / #5473: a blocking periodic budget holds
+			// the stage. Before the hold arm so it gets its own reason and
+			// the remedies its budget_source makes honest. budget_check_failed
+			// stays on the default refusing arm.
+			return hostDispatchBudgetBlockedVerdict(obs, ref)
 		case hostDispatchHoldRefusals[ref.Code]:
 			obs.State = hostDispatchStateHeld
 			next := fmt.Sprintf("The linked campaign is not running%s; the dispatcher holds this stage until it is resumed (fishhawk_resume_campaign). Do not dispatch past the hold.", detail)
@@ -565,6 +577,76 @@ func observeHostDispatch(p hostDispatchProbe, runID, stageID string, now time.Ti
 	}
 	obs.State = hostDispatchStateLive
 	return obs, hostDispatchVerdict{}
+}
+
+// hostDispatchBudgetSourceOf returns the budget_source a budget_blocked
+// refusal detail names (hdBudgetBlockedDetail renders "(budget_source <src>)"
+// after the budget's fields), or "" when the detail names none or an unknown
+// token. The LAST marker wins, since every server-sourced field precedes it.
+// The result is a closed-set token, never detail text.
+func hostDispatchBudgetSourceOf(detail string) string {
+	const marker = "(budget_source "
+	i := strings.LastIndex(detail, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := detail[i+len(marker):]
+	j := strings.IndexByte(rest, ')')
+	if j < 0 {
+		return ""
+	}
+	switch src := rest[:j]; src {
+	case dispatchBudgetSourceLive, dispatchBudgetSourceAdmission, dispatchBudgetSourceAdmissionFallback:
+		return src
+	}
+	return ""
+}
+
+// BudgetBlockedLine renders a budget_blocked refusal as the one line
+// `fishhawk-mcp host-dispatch --status` prints for it (ADR-030 Amendment A1 /
+// #5473): `budget_blocked run=<id> stage=<id> since=<first_at>
+// source=<budget_source> detail=<detail>`. Every field read from status.json
+// is bounded by boundHostDispatchText (a crafted file bypasses the writer's
+// bound); source is the closed-set token the detail names, or "none". A
+// method, so the export surface is unchanged.
+func (r hostDispatchRunRefusal) BudgetBlockedLine() string {
+	detail := boundHostDispatchText(r.Detail)
+	src := hostDispatchBudgetSourceOf(detail)
+	if src == "" {
+		src = "none"
+	}
+	return fmt.Sprintf("%s run=%s stage=%s since=%s source=%s detail=%s",
+		hdRefuseBudgetBlocked, boundHostDispatchText(r.RunID), boundHostDispatchText(r.StageID),
+		hostDispatchRFC3339(r.FirstAt), src, detail)
+}
+
+// hostDispatchBudgetBlockedVerdict is the budget_blocked arm (ADR-030
+// Amendment A1 / #5473): held, human, host_dispatch_budget_blocked. The
+// next_step carries the bounded refusal detail (the budget, its period and
+// spend) and the remedies the verdict's budget_source makes honest (approval
+// condition D4). Only a live_spec verdict says a default-branch limit_usd or
+// enforcement edit lets the dispatcher spawn on its next tick; any other
+// source (admission_spec, or none named) names only the period rollover and a
+// run started with budget_override. Both say a hand dispatch is not
+// budget-gated. It never says no operator action is needed.
+func hostDispatchBudgetBlockedVerdict(obs hostDispatchObservation, ref hostDispatchRunRefusal) (hostDispatchObservation, hostDispatchVerdict) {
+	obs.State = hostDispatchStateHeld
+	detail := boundHostDispatchText(ref.Detail)
+	obs.BudgetSource = hostDispatchBudgetSourceOf(detail)
+	const handDispatch = " A hand fishhawk_dispatch_stage is not budget-gated: it spawns the stage now and spends past the limit."
+	var next string
+	if obs.BudgetSource == dispatchBudgetSourceLive {
+		next = fmt.Sprintf("A blocking periodic budget of this run's workflow is over its limit, so the host dispatcher refuses new spawns of this stage (%s: %s), since %s. The verdict comes from the default branch's current .fishhawk/workflows.yaml (budget_source %s), which the dispatcher re-reads every tick: raising limit_usd or setting enforcement: advisory there on the default branch lets it spawn the stage on its next tick, and so does the period rollover.",
+			hdRefuseBudgetBlocked, detail, obs.RefusalFirstAt, dispatchBudgetSourceLive)
+	} else {
+		src := obs.BudgetSource
+		if src == "" {
+			src = "not named"
+		}
+		next = fmt.Sprintf("A blocking periodic budget of this run's workflow is over its limit, so the host dispatcher refuses new spawns of this stage (%s: %s), since %s. The verdict comes from the run's admission spec (budget_source %s), so an edit to the default branch's spec does not change it: the stage spawns after the period rolls over, or start a new run with budget_override to work past the limit.",
+			hdRefuseBudgetBlocked, detail, obs.RefusalFirstAt, src)
+	}
+	return obs, hostDispatchVerdict{Kind: hostDispatchAwaitKindHuman, Reason: hostDispatchReasonBudgetBlocked, NextStep: next + handDispatch}
 }
 
 // hostDispatchReviewRoundNextStep is the routine next_step for an implement

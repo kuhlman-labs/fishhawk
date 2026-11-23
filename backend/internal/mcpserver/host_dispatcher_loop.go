@@ -272,6 +272,11 @@ func (s HostDispatcherStatus) State(now time.Time) string {
 // hostDispatchTextMax bytes. The writer applies it to run_refusals detail and
 // the overlay re-applies it on read, so both share one limit.
 func boundHostDispatchText(s string) string {
+	return boundHostDispatchTextTo(s, hostDispatchTextMax)
+}
+
+// boundHostDispatchTextTo is boundHostDispatchText cut at max bytes.
+func boundHostDispatchTextTo(s string, max int) string {
 	var b strings.Builder
 	for _, r := range strings.ToValidUTF8(s, "") {
 		if unicode.IsControl(r) {
@@ -280,14 +285,28 @@ func boundHostDispatchText(s string) string {
 		b.WriteRune(r)
 	}
 	out := b.String()
-	if len(out) <= hostDispatchTextMax {
+	if len(out) <= max {
 		return out
 	}
-	cut := hostDispatchTextMax
+	cut := max
 	for cut > 0 && !utf8.RuneStart(out[cut]) {
 		cut--
 	}
 	return out[:cut]
+}
+
+// BudgetRefusals returns the run_refusals entries refused budget_blocked
+// (ADR-030 Amendment A1 / #5473), sorted by run id: the runs a blocking
+// periodic budget is holding. A method, so the export surface is unchanged.
+func (s HostDispatcherStatus) BudgetRefusals() []hostDispatchRunRefusal {
+	var out []hostDispatchRunRefusal
+	for _, ref := range s.RunRefusals {
+		if ref.Code == hdRefuseBudgetBlocked {
+			out = append(out, ref)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RunID < out[j].RunID })
+	return out
 }
 
 // ReadHostDispatcherStatus reads <stateDir>/status.json. A missing file
