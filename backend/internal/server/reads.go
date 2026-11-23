@@ -843,6 +843,17 @@ func withholdDelegationShadow(entries []*audit.Entry, requestedCategory string) 
 // by E89 #4537), and is guarded until then by
 // TestWithholdScopeOverlapFromRunBound_ScopeAmendmentRefusedWithheld.
 //
+// `run_budget_override_bound` entries (#5473, ADR-030 Amendment A1) are
+// withheld because they carry spend figures (the exhausted budget's limit and
+// period spend) and no run-bound reader needs them: the host dispatcher reads
+// them server-side through the AuditRepo. This entry is INTERIM under ADR-106
+// (it MUST migrate into the per-category registry flag with escape_recorded,
+// owned by E89 #4537) and is guarded by
+// TestRunBudgetOverrideBound_WithheldFromRunBoundAuditRead. A rollback of
+// #5473 KEEPS this entry and the category registration: rows written before
+// the revert outlive it, so reverting it would expose their spend figures to
+// run-bound reads. A revert that drops it must re-add it by hand.
+//
 // It returns a NEW slice and never filters in place: the input may be a
 // repository's shared backing array.
 func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []*audit.Entry {
@@ -852,7 +863,7 @@ func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []
 	out := make([]*audit.Entry, 0, len(entries))
 	for _, e := range entries {
 		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden || e.Category == CategoryEscapeRecorded ||
-			e.Category == CategoryScopeAmendmentRefused) {
+			e.Category == CategoryScopeAmendmentRefused || e.Category == CategoryRunBudgetOverrideBound) {
 			continue
 		}
 		out = append(out, e)

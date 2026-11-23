@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -22,7 +23,9 @@ import (
 //
 // When the run's workflow declares no budget the endpoint returns 200
 // with an empty object instead of this shape, so callers branch on the
-// presence of `period` rather than on the status code.
+// presence of `period` rather than on the status code. The budgets are read
+// from the host dispatcher's source (runBudgetStatus), which for a GitHub run
+// is a forge read per call.
 type budgetStatusResponse struct {
 	Period      string   `json:"period"`
 	PeriodStart string   `json:"period_start"`
@@ -35,17 +38,29 @@ type budgetStatusResponse struct {
 	Enforcement string   `json:"enforcement"`
 }
 
-// runBudgetStatus evaluates the current-period status of the FIRST
-// periodic budget on the run's cached workflow spec, reusing the same
-// chain checkBudgetAlerts runs (spec parse -> budget.PeriodRange ->
-// SumWorkflowCostInRange -> budget.Evaluate).
+// runBudgetStatus evaluates the current-period status of the run's GOVERNING
+// periodic budget, reusing the same chain checkBudgetAlerts runs
+// (budget.PeriodRange -> SumWorkflowCostInRange -> budget.Evaluate).
+//
+// The budgets come from the same source as the host dispatcher's
+// include=dispatch_budget verdict (ADR-030 Amendment A1, ruling C1):
+// currentWorkflowBudgets, the repository's current default-branch spec for a
+// GitHub run on a server with a GitHub client, else the cached admission spec.
+// A failed live read WARN-logs and falls back to the cached admission spec:
+// this display is never a gate, and in that state the dispatcher is refusing
+// budget_check_failed, so there is no verdict to disagree with.
+//
+// The governing budget is the first enforcement-blocking budget that is Over
+// at its effective limit (exactly the budget webhook.CheckBlockingBudget
+// blocks on), else Budgets[0] as before, so budget.tier and the dispatcher's
+// verdict agree.
 //
 // Returns (nil, nil) — "no budget to report" — when the RunRepo is
-// unconfigured or doesn't implement runCostSummer, the run has no cached
-// WorkflowSpec, the spec doesn't parse, the workflow is absent from the
-// spec, the workflow declares no budgets, or the budget's period is
-// unrecognized. A run-lookup failure (including run.ErrNotFound) and a
-// cost-sum failure are returned as errors for the handler to map.
+// unconfigured or doesn't implement runCostSummer, the source yields no
+// budgets (no cached spec, a parse failure, an absent workflow, none
+// declared), or the budget's period is unrecognized. A run-lookup failure
+// (including run.ErrNotFound) and a cost-sum failure are returned as errors
+// for the handler to map.
 func (s *Server) runBudgetStatus(ctx context.Context, runID uuid.UUID) (*budgetStatusResponse, error) {
 	if s.cfg.RunRepo == nil {
 		return nil, nil
@@ -58,28 +73,28 @@ func (s *Server) runBudgetStatus(ctx context.Context, runID uuid.UUID) (*budgetS
 	if err != nil {
 		return nil, err
 	}
-	if len(runRow.WorkflowSpec) == 0 {
-		return nil, nil
-	}
-	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	budgets, _, err := s.currentWorkflowBudgets(ctx, runRow)
 	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"run budget: live spec read failed; reporting the cached admission spec's budget",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		budgets, _, _ = admissionSpecBudgets(runRow)
+	}
+	if len(budgets) == 0 {
 		return nil, nil
 	}
-	wf, ok := parsed.Workflows[runRow.WorkflowID]
-	if !ok || len(wf.Budgets) == 0 {
-		return nil, nil
-	}
-
-	// The display shape carries a single block; the first budget is the
-	// one the dogfood workflows declare. A workflow with multiple
-	// budgets surfaces only the first here (documented on the endpoint).
-	b := wf.Budgets[0]
 
 	loc := s.cfg.BudgetLocation
 	if loc == nil {
 		loc = time.UTC
 	}
 	now := time.Now()
+
+	b, err := s.governingBudget(ctx, summer, runRow, budgets, now, loc)
+	if err != nil {
+		return nil, err
+	}
 
 	// Apply the operator's calibration override (#1371) on a copy of the
 	// budget so spend is evaluated against — and limit_usd/fraction/tier
@@ -121,6 +136,29 @@ func (s *Server) runBudgetStatus(ctx context.Context, runID uuid.UUID) (*budgetS
 		AckRequired: budget.AckRequired(tier),
 		Enforcement: enforcement,
 	}, nil
+}
+
+// governingBudget selects the budget the display reports: the first
+// enforcement-blocking budget that is Over at its effective limit (the one
+// webhook.CheckBlockingBudget blocks on, so the tier agrees with the host
+// dispatcher's verdict), else budgets[0]. budgets is non-empty. A cost-sum
+// failure is returned.
+func (s *Server) governingBudget(ctx context.Context, summer runCostSummer, runRow *run.Run, budgets []spec.PeriodicBudget, now time.Time, loc *time.Location) (spec.PeriodicBudget, error) {
+	for _, b := range budgets {
+		if b.Enforcement != spec.EnforcementBlocking {
+			continue
+		}
+		eb := b
+		eb.LimitUSD = s.effectiveBudgetLimit(b)
+		d, ok, err := evaluateWorkflowBudget(ctx, summer, runRow.Repo, runRow.WorkflowID, eb, now, loc)
+		if err != nil {
+			return spec.PeriodicBudget{}, err
+		}
+		if ok && d.Over {
+			return b, nil
+		}
+	}
+	return budgets[0], nil
 }
 
 // handleGetRunBudget implements GET /v0/runs/{run_id}/budget. Returns

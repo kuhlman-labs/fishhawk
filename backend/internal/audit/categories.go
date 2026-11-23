@@ -497,6 +497,20 @@ import "sort"
 // comment is an INTERIM registration under ADR-106's existing audit-category
 // mechanism, not ADR-106 registry option B; both take the mandatory run-bound
 // flag when #4599 / E89 #4537 lands.
+// #5473 (ADR-030 Amendment A1) added run_budget_override_bound, the run-chain
+// row (actor system) binding an ADR-030 budget_override grant to the run it
+// admitted (server/dispatch_budget.go bindBudgetOverride, at create and at
+// recover). The host-dispatch budget evaluator walks it through DecomposedFrom
+// to exempt that run and its decomposition descendants. It is INTERNAL and
+// OPERATOR-ONLY, not an issue-comment surface (no Notifier method, no
+// activityCategories entry), and NOT run-bound readable: its same-run payload
+// carries spend figures (period, limit_usd, spent) and no run-bound reader
+// needs it, so server/reads.go withholdScopeOverlapFromRunBound carries a
+// deny-list entry for it. Both this comment and that entry are INTERIM under
+// ADR-106's existing audit-category mechanism, not ADR-106 registry option B;
+// the entry migrates into the per-category registry flag when E89 #4537
+// lands. A revert of #5473 KEEPS this registration and the deny-list entry,
+// because rows persisted before the revert outlive it.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -759,6 +773,7 @@ var KnownCategories = map[string]struct{}{
 	"reviewer_capability_unavailable":         {},
 	"run_admitted_applies_to_override":        {},
 	"run_admitted_budget_override":            {},
+	"run_budget_override_bound":               {}, // #5473 (ADR-030 A1): an override grant bound to the run it admitted (server/dispatch_budget.go) — INTERNAL, OPERATOR-ONLY (withheld from run-bound reads in server/reads.go; interim ADR-106)
 	"run_auto_advanced":                       {},
 	"run_auto_driven":                         {},
 	"run_branches_swept":                      {},
