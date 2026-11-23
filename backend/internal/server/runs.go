@@ -2784,7 +2784,9 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 					"run_id", runID.String(), "error", serr.Error())
 				stages = nil
 			}
-			applyDriveSurfaces(&resp, got, entries, stages)
+			// The dispatcher-queued map (#5267) is best-effort too: every read
+			// degrade yields nil, which fails OPEN to the #1961 surface.
+			applyDriveSurfaces(&resp, got, entries, stages, s.hostDispatcherQueuedStages(r.Context(), got, stages))
 		}
 	}
 	// Delegation surface (ADR-040 / #1026): evaluated on the single-run
@@ -3676,7 +3678,14 @@ func delegationPayloadFrom(res *delegation.Result, major int) *runDelegationPayl
 // a parked run_implement_stage entry no longer lags a stage behind after
 // implement dispatches/succeeds (#1961). derived_status distillation is
 // unchanged.
-func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Entry, stages []*run.Stage) {
+//
+// dispatcherQueued marks the host-spawnable stages the host dispatcher has
+// queued for a local concurrency slot with a live waiter
+// (hostDispatcherQueuedStages, #5267); a dispatch action naming such a stage is
+// SUPPRESSED too, because the dispatcher already owns that dispatch and a
+// second one from the operator host would double-drive the stage. nil (an
+// unmarked run, or any read degrade) suppresses nothing.
+func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Entry, stages []*run.Stage, dispatcherQueued map[uuid.UUID]bool) {
 	if len(entries) == 0 {
 		return
 	}
@@ -3704,7 +3713,7 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 	if latest == nil || runRow.State.IsTerminal() {
 		return
 	}
-	if latest.NextAction != nil && !nextActionStale(latest.NextAction.Action, stages) {
+	if latest.NextAction != nil && !nextActionStale(latest.NextAction.Action, stages, dispatcherQueued) {
 		resp.NextAction = &runNextActionPayload{
 			Action: latest.NextAction.Action,
 			Detail: latest.NextAction.Detail,
@@ -3767,6 +3776,14 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 // suppressed; a retried stage re-opened to pending naturally re-surfaces the
 // action.
 //
+// A still-host-spawnable stage is SUPPRESSED as well when dispatcherQueued
+// marks it (#5267): on an auto_dispatch run the host dispatcher has queued
+// that stage for a local concurrency slot and a live waiter is re-posting it,
+// so the dispatch the action names is already in hand. The map is consulted
+// ONLY for a stage in {pending, awaiting_host_dispatch}; a stage at any later
+// state is decided by the #1961 branch alone. An unmarked stage (nil map, no
+// live waiter, a holding slot) surfaces the action as before.
+//
 // The NO-MATCHING-ROW fall-through splits on whether the stage list carries any
 // evidence at all (#3014), and the two branches point OPPOSITE ways on purpose:
 //
@@ -3783,7 +3800,7 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 //     stageNextAction both pass nil when ListStagesForRun errors). It keeps
 //     failing OPEN toward surfacing, so a degraded read never silently hides a
 //     dispatch the operator genuinely owes.
-func nextActionStale(action string, stages []*run.Stage) bool {
+func nextActionStale(action string, stages []*run.Stage, dispatcherQueued map[uuid.UUID]bool) bool {
 	var wantType run.StageType
 	switch action {
 	case "run_plan_stage":
@@ -3799,7 +3816,9 @@ func nextActionStale(action string, stages []*run.Stage) bool {
 		}
 		switch st.State {
 		case run.StageStatePending, run.StageStateAwaitingHostDispatch:
-			return false // still host-spawnable → the dispatch is genuinely next
+			// Still host-spawnable: the dispatch is genuinely next unless the
+			// host dispatcher already holds it in a live slot queue (#5267).
+			return dispatcherQueued[st.ID]
 		default:
 			return true // advanced past the spawnable states → the recorded action is stale
 		}
@@ -3808,6 +3827,48 @@ func nextActionStale(action string, stages []*run.Stage) bool {
 		return false // no evidence (read-error degrade) → fail toward surfacing
 	}
 	return true // the run declares no stage of this type → the action names a stage that will never exist
+}
+
+// hostDispatcherQueuedStages marks the run's host-spawnable plan and
+// implement stages that the host dispatcher has QUEUED for a local
+// concurrency slot with a live waiter (#5267). Those are the stages a
+// run_plan_stage / run_implement_stage next_action would invite the operator
+// to dispatch a second time: the dispatcher re-posts a queued stage every tick
+// (inside the queue TTL), so waiter_live stays true while it runs and goes
+// false within one TTL after it stops, which re-surfaces the action.
+//
+// Every degrade fails OPEN (returns nil or leaves the stage unmarked, so the
+// action surfaces): a run without the auto_dispatch mark, a nil stage list, no
+// stage in {pending, awaiting_host_dispatch}, a nil or erroring concurrency
+// store (stageConcurrencyBlocks' own best-effort posture), a stage with no
+// slot row, a queued row whose waiter is not live, and a holding row.
+func (s *Server) hostDispatcherQueuedStages(ctx context.Context, runRow *run.Run, stages []*run.Stage) map[uuid.UUID]bool {
+	if runRow == nil || !runRow.AutoDispatch {
+		return nil
+	}
+	var ids []uuid.UUID
+	for _, st := range stages {
+		if st == nil || (st.Type != run.StageTypePlan && st.Type != run.StageTypeImplement) {
+			continue
+		}
+		switch st.State {
+		case run.StageStatePending, run.StageStateAwaitingHostDispatch:
+			ids = append(ids, st.ID)
+		}
+	}
+	blocks := s.stageConcurrencyBlocks(ctx, ids)
+	var out map[uuid.UUID]bool
+	for _, id := range ids {
+		b := blocks[id]
+		if b == nil || b.Status != stageConcurrencyStatusQueued || !b.WaiterLive {
+			continue
+		}
+		if out == nil {
+			out = make(map[uuid.UUID]bool, len(ids))
+		}
+		out[id] = true
+	}
+	return out
 }
 
 const (

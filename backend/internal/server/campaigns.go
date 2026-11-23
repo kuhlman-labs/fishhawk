@@ -163,8 +163,9 @@ type campaignResponse struct {
 	// declared `runnable:no` and candidates whose title/body names a path the
 	// repo's implement-stage forbidden_paths forbid. Carried by the create
 	// response and by the preview response (#5221); never persisted, so
-	// GET/list omit it, and omitted when the screen found nothing. It never
-	// blocks or alters the create or the preview.
+	// GET/list omit it, and omitted when the screen found nothing — except a
+	// findings-empty block when the spec does not define the driver workflow
+	// (#5267). It never blocks or alters the create or the preview.
 	AdmissionScreen *campaignAdmissionScreenPayload `json:"admission_screen,omitempty"`
 	// Warnings names every item whose depends_on relies on a legacy free-text
 	// `Depends on:` line rather than the tracker's native relation (#4028).
@@ -522,11 +523,13 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 // shape is a stable array (never null) for each partition.
 //
 // The engine's Restartable partition (deps-satisfied, non-human-led cancelled
-// items restartable via the operator verb, #1729) has NO dedicated wire slice:
-// it is FOLDED BACK into the `cancelled` array so the CampaignRollup wire
-// contract (OpenAPI + the fishhawk-mcp client struct) is unchanged. A
-// restartable item is still a cancelled item to a rollup reader; the restart
-// signal reaches the operator through next_action (start_run), not a new slice.
+// or failed items restartable via the operator verb, #1729/#1838) has NO
+// dedicated wire slice: each restartable item rides the slice of its OWN state
+// (#5267). A restartable failed item (Eligibility.RestartableFailed) goes in
+// `failed`, and a restartable cancelled item goes in `cancelled`, so a failed
+// item is never shown as cancelled. The CampaignRollup wire contract (OpenAPI
+// + the fishhawk-mcp client struct) is unchanged; the restart signal reaches
+// the operator through next_action (start_run), not a new slice.
 func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 	nz := func(s []string) []string {
 		if s == nil {
@@ -534,18 +537,25 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 		}
 		return s
 	}
-	// Restartable items are cancelled items on the wire — fold them back into
-	// the cancelled slice so the rollup shape is unchanged (#1729).
+	// Bucket each Restartable ref by its own state, preserving Restartable's
+	// order within each slice (#5267).
+	failed := make([]string, 0, len(e.Failed)+len(e.RestartableFailed))
+	failed = append(failed, e.Failed...)
+	failed = append(failed, e.RestartableFailed...)
 	cancelled := make([]string, 0, len(e.Cancelled)+len(e.Restartable))
 	cancelled = append(cancelled, e.Cancelled...)
-	cancelled = append(cancelled, e.Restartable...)
+	for _, ref := range e.Restartable {
+		if !containsRef(e.RestartableFailed, ref) {
+			cancelled = append(cancelled, ref)
+		}
+	}
 	return campaignRollupPayload{
 		Eligible:  nz(e.Eligible),
 		HumanLed:  nz(e.HumanLed),
 		Blocked:   nz(e.Blocked),
 		Running:   nz(e.Running),
 		Done:      nz(e.Done),
-		Failed:    nz(e.Failed),
+		Failed:    failed,
 		Cancelled: cancelled,
 		Paused:    nz(e.Paused),
 		// Replanning (#5379) is its own slice — a rejected plan is neither a
@@ -638,9 +648,11 @@ func computeCampaignNextAction(state campaign.State, e campaign.Eligibility) cam
 		return base
 	default:
 		// Counts mirror the WIRE rollup the operator reads: toCampaignRollupPayload
-		// folds Restartable back into the cancelled slice, so this fold matches.
-		cancelled := len(e.Cancelled) + len(e.Restartable)
-		counts := fmt.Sprintf("%d succeeded, %d failed, %d cancelled", len(e.Done), len(e.Failed), cancelled)
+		// buckets each Restartable item by its own state (#5267), so a restartable
+		// failed item counts as failed and a restartable cancelled one as cancelled.
+		failed := len(e.Failed) + len(e.RestartableFailed)
+		cancelled := len(e.Cancelled) + len(e.Restartable) - len(e.RestartableFailed)
+		counts := fmt.Sprintf("%d succeeded, %d failed, %d cancelled", len(e.Done), failed, cancelled)
 		if len(e.Replanning) > 0 {
 			// Replanning is its own wire slice (#5379); count it only when present
 			// so the pre-#5379 detail stays byte-identical.
@@ -1093,9 +1105,13 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	resp.Warnings = legacyDependencyWarnings(result)
 	// The admission screen block (#3649): rendered on the create response (the
 	// preview carries it too, #5221), plus one best-effort audit copy that only
-	// create writes. Nil = nothing found → no key, no audit.
+	// create writes. Nil = nothing found → no key, no audit. A findings-empty
+	// block (the driver workflow is undefined in the spec, #5267) renders on
+	// the response only: the audit stays a copy of at least one finding.
 	if admissionScreen != nil {
 		resp.AdmissionScreen = admissionScreen
+	}
+	if admissionScreen != nil && len(admissionScreen.Findings) > 0 {
 		s.emitCampaignAudit(r.Context(), categoryCampaignAdmissionScreened, map[string]any{
 			"campaign_id":              created.ID.String(),
 			"repo":                     created.Repo,

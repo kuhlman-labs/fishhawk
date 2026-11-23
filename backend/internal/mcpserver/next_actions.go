@@ -2464,11 +2464,24 @@ func ciCancelledNextActions(run *Run, da *RunNextAction) *NextActions {
 // the poll cadence is derived from (E48.62 / #2489). Pass nil when no stage row
 // is in hand — the derivation then yields the floor, which is the honest answer
 // for something that has not started.
+//
+// On an auto_dispatch run whose stage the host dispatcher has QUEUED for a
+// local concurrency slot with a live waiter (hostDispatcherOwnsStage, #5267),
+// the move is a poll, not a dispatch: the dispatcher re-POSTs the stage every
+// tick and spawns it on admission, so a second dispatch from the operator host
+// would double-drive it. The stage state names (plan_pending,
+// implement_pending, acceptance_pending) are unchanged; only the actions are.
 func dispatchOrPollActions(run *Run, stageType string, stage *Stage) []SuggestedAction {
 	if run.RunnerKind == "github_actions" {
 		return []SuggestedAction{pollAction(run,
 			derivedStageWaitPollInterval(run, stage),
 			fmt.Sprintf("runner_kind github_actions auto-dispatches the %s stage — nothing to run from the operator host; re-poll until it starts", stageType))}
+	}
+	if hostDispatcherOwnsStage(run, stage) {
+		c := stage.Concurrency
+		return []SuggestedAction{pollAction(run,
+			derivedStageWaitPollInterval(run, stage),
+			fmt.Sprintf("the host dispatcher owns this dispatch: the run is auto_dispatch and its %s stage is queued for a local concurrency slot (group %s, queue position %d) with a live waiter that spawns it on admission — do not dispatch it from the operator host (a second dispatch would double-drive the stage); re-poll until it starts", stageType, c.Group, c.Position))}
 	}
 	if stageType == "implement" {
 		return []SuggestedAction{
@@ -2522,6 +2535,24 @@ func dispatchOrPollActions(run *Run, stageType string, stage *Stage) []Suggested
 		Consumes:     consumesNone,
 		Reason:       reason,
 	}}
+}
+
+// hostDispatcherOwnsStage reports whether the ADR-104 host dispatcher owns the
+// dispatch of a not-yet-started stage (#5267): the run carries the
+// auto_dispatch mark, the stage is still pending or awaiting_host_dispatch,
+// and its concurrency block says it is QUEUED for a local slot with a waiter
+// that refreshed the queue row within the queue TTL. Every other shape reads
+// false, so the dispatch actions surface: an unmarked run, a nil stage or
+// concurrency block, a holding slot, a stale or absent waiter_live (no waiter
+// will spawn the stage, so the operator must), and a stage at any later status.
+func hostDispatcherOwnsStage(run *Run, stage *Stage) bool {
+	if run == nil || !run.AutoDispatch || stage == nil || stage.Concurrency == nil {
+		return false
+	}
+	if stage.State != "pending" && stage.State != "awaiting_host_dispatch" {
+		return false
+	}
+	return stage.Concurrency.Status == concurrencyStatusAwaitingSlot && stage.Concurrency.waiterLive()
 }
 
 // acceptanceStageNextActions is the acceptance-stage arm of the classifier
@@ -4286,10 +4317,14 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction, items 
 		// BOTH an ELIGIBLE item (deps satisfied, no run yet) and a RESTARTABLE
 		// item — a deps-satisfied, non-human-led CANCELLED (#1729) or FAILED
 		// (#1838) item the operator can restart. The two need DIFFERENT verbs, so
-		// the arm splits on the rollup: restartable items are folded into the wire
-		// cancelled slice (toCampaignRollupPayload appends Restartable onto
-		// Cancelled), so an item in rollup.Cancelled is the restart path and one in
-		// rollup.Eligible is a fresh start.
+		// the arm splits on the rollup: a start_run ref outside Eligible and
+		// Replanning is restartable, and a restartable item rides the wire slice of
+		// its own state (#5267: toCampaignRollupPayload puts a restartable failed
+		// item in failed and a restartable cancelled one in cancelled), so an item
+		// in rollup.Cancelled OR rollup.Failed is the restart path and one in
+		// rollup.Eligible is a fresh start. Checking both slices is also correct
+		// against a pre-#5267 server, which folds every restartable item into
+		// cancelled.
 		//
 		// A restartable item MUST use fishhawk_start_campaign_item_run — the ONLY
 		// verb that reaches the restart handler (handleStartCampaignItemRun), which
@@ -4315,13 +4350,13 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction, items 
 				}},
 			}
 		}
-		if slices.Contains(rollup.Cancelled, na.IssueRef) {
+		if slices.Contains(rollup.Cancelled, na.IssueRef) || slices.Contains(rollup.Failed, na.IssueRef) {
 			return &NextActions{
 				State: "campaign_start_run",
 				Actions: []SuggestedAction{{
 					Action:       "fishhawk_start_campaign_item_run",
 					Params:       map[string]string{"issue_ref": na.IssueRef},
-					Precondition: "this campaign item is a deps-satisfied, non-human-led cancelled/failed item flagged restartable (folded into the wire cancelled slice); pass the campaign_id and workflow_id fishhawk_start_campaign_item_run requires",
+					Precondition: "this campaign item is a deps-satisfied, non-human-led cancelled/failed item flagged restartable (it rides the wire cancelled or failed slice of its own state); pass the campaign_id and workflow_id fishhawk_start_campaign_item_run requires",
 					Consumes:     consumesNewRun,
 					Reason:       "restart campaign item " + na.IssueRef + " — fishhawk_start_campaign_item_run resets the deps-satisfied cancelled/failed item and mints a fresh, re-linked run through the restart handler (#1729/#1838) so its dependents no longer stay blocked; the generic fishhawk_start_run would neither restart nor link it",
 				}},

@@ -142,15 +142,38 @@ func TestNextEligible_FailedRestartablePartition(t *testing.T) {
 	}
 	got := campaign.NextEligible(items)
 	want := campaign.Eligibility{
-		Done:        []string{"issue:1"},
-		Restartable: []string{"issue:2"},
-		Failed:      []string{"issue:3", "issue:4"},
+		Done:              []string{"issue:1"},
+		Restartable:       []string{"issue:2"},
+		RestartableFailed: []string{"issue:2"},
+		Failed:            []string{"issue:3", "issue:4"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
 	}
 	if len(got.Eligible) != 0 {
 		t.Errorf("eligible = %v, want none (a failed item is never Eligible)", got.Eligible)
+	}
+}
+
+// TestNextEligible_RestartableFailedSubset is the #5267 done-means for the
+// RestartableFailed field: with one failed and one cancelled restartable item,
+// Restartable holds both (membership is unchanged) and RestartableFailed holds
+// only the failed one, so the wire rollup can bucket each restartable item by
+// its own state instead of folding a failed one into cancelled.
+func TestNextEligible_RestartableFailedSubset(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		{IssueRef: "issue:2", State: campaign.ItemStateCancelled, DependsOn: []string{"issue:1"}},
+		{IssueRef: "issue:3", State: campaign.ItemStateFailed, DependsOn: []string{"issue:1"}},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Done:              []string{"issue:1"},
+		Restartable:       []string{"issue:2", "issue:3"},
+		RestartableFailed: []string{"issue:3"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
 	}
 }
 
@@ -512,8 +535,9 @@ func TestNextEligible_IssueClosedMarkerDoesNotSuppressFailed(t *testing.T) {
 	}
 	got := campaign.NextEligible(items)
 	want := campaign.Eligibility{
-		Done:        []string{"issue:1"},
-		Restartable: []string{"issue:2"},
+		Done:              []string{"issue:1"},
+		Restartable:       []string{"issue:2"},
+		RestartableFailed: []string{"issue:2"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)

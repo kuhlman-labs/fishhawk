@@ -238,7 +238,9 @@ func (s *Server) stageNextAction(ctx context.Context, runID uuid.UUID) *runNextA
 	if serr != nil {
 		stages = nil
 	}
+	// The dispatcher-queued map suppresses a dispatch the host dispatcher
+	// already owns (#5267); it is nil on every read degrade (fail-open).
 	var resp runResponse
-	applyDriveSurfaces(&resp, got, entries, stages)
+	applyDriveSurfaces(&resp, got, entries, stages, s.hostDispatcherQueuedStages(ctx, got, stages))
 	return resp.NextAction
 }

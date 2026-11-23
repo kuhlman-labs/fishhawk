@@ -2063,7 +2063,7 @@ func runServe(args []string, logSink io.Writer) int {
 		"campaign-driver scan interval; 60s is the upper bound on campaign-advancement latency after a run terminates")
 	campaignDriverWorkflowID := fs.String("campaign-driver-workflow-id",
 		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_ID", "feature_change"),
-		"workflow id the campaign driver starts for each eligible campaign issue. A campaign carries no workflow context (E25.2), so the driver fetches this workflow from the repo's spec at --campaign-driver-workflow-ref. An expedited (hotfix) item runs under the workflow its hotfix recorded instead (#4234).")
+		"workflow id the campaign driver starts for each eligible campaign issue. A campaign carries no workflow context (E25.2), so the driver fetches this workflow from the repo's spec at --campaign-driver-workflow-ref. An expedited (hotfix) item runs under the workflow its hotfix recorded instead (#4234). The value also selects the workflow whose implement-stage forbidden_paths the advisory campaign admission screen checks, reported as admission_screen.workflow_id (#5267).")
 	campaignDriverWorkflowRef := fs.String("campaign-driver-workflow-ref",
 		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_REF", ""),
 		"git ref the campaign driver fetches the workflow spec at (empty = the repo's default branch). The fetched blob SHA becomes each started run's workflow_sha.")
@@ -3713,6 +3713,9 @@ func runServe(args []string, logSink io.Writer) int {
 	// only when the driver really runs, and reused at the ticker start site.
 	startCampaignDriver, campaignDriverSkipReason := campaignDriverStartDecision(*enableCampaignDriver, cfg)
 	cfg.CampaignAutoStartRunnerKind = campaignAutoStartStatusKind(startCampaignDriver, *autoStartRunnerKind)
+	// The advisory admission screen checks the driver's workflow (#5267).
+	// Pinned by TestServeGo_CampaignDriverWorkflowIDWiring.
+	cfg.CampaignDriverWorkflowID = *campaignDriverWorkflowID
 
 	srv = newServer(cfg)
 

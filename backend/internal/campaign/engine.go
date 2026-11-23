@@ -52,8 +52,9 @@ type Eligibility struct {
 	// dependency has succeeded AND its autonomy tier is not "low" (human-led work
 	// is never auto-surfaced for restart); otherwise it stays in Cancelled/Failed.
 	// computeCampaignNextAction surfaces a Restartable item as start_run; the wire
-	// rollup folds it back into the cancelled slice so the rollup contract is
-	// unchanged.
+	// rollup buckets each Restartable item by its own state (#5267): a failed
+	// one rides the failed slice (RestartableFailed names it) and a cancelled
+	// one the cancelled slice, so the rollup's wire shape is unchanged.
 	//
 	// ONE FURTHER SUPPRESSION on the cancelled arm (#3563): an item carrying
 	// ResolvedByIssueClosed was cancelled BECAUSE its issue was closed
@@ -65,6 +66,13 @@ type Eligibility struct {
 	// handleStartCampaignItemRun gates on this very NextEligible call, so the
 	// verb refuses an issue-closed cancellation without a second guard.
 	Restartable []string
+	// RestartableFailed is the subset of Restartable whose item state is failed
+	// (#5267). It lets a reader bucket each restartable item by its own state:
+	// a ref in Restartable but not here is a restartable CANCELLED item. It
+	// adds no membership — every ref here is also in Restartable, and every
+	// consumer keyed on Restartable (next_action precedence, DeriveState, the
+	// restart verb's DAG gate) is unchanged.
+	RestartableFailed []string
 	// Paused items were handed off to a human by the auto-driver (E25.7). A
 	// paused item carries a RunID and a non-terminal state, so it must be
 	// classified BEFORE the Running catch-all — otherwise it would be mistaken
@@ -115,7 +123,9 @@ type Eligibility struct {
 // A failed item is likewise terminal for auto-dispatch (never Eligible), but a
 // deps-satisfied, non-autonomy:low failed item is diverted to Restartable too
 // (#1838) — mirroring the cancelled arm — so its dependents are not blocked
-// forever; a deps-unsatisfied or human-led failed item stays in Failed.
+// forever; a deps-unsatisfied or human-led failed item stays in Failed. A
+// diverted failed item is also listed in RestartableFailed (#5267), the
+// subset of Restartable a reader buckets as failed.
 //
 // A replanning item (#5379) is reported in Replanning — never Eligible and
 // never Running, although it carries a RunID and a non-terminal state — unless
@@ -143,10 +153,13 @@ func NextEligible(items []*Item) Eligibility {
 			// divert it to Restartable so next_action surfaces it as start_run and
 			// its dependents no longer stay blocked forever. A deps-unsatisfied
 			// item, or an autonomy:low (human-led) one, stays in Failed. Exactly one
-			// of Restartable / Failed holds each failed item.
+			// of Restartable / Failed holds each failed item. A diverted ref is
+			// also recorded in RestartableFailed so the wire rollup can bucket it
+			// as failed rather than cancelled (#5267).
 			switch {
 			case depsSatisfied(it.DependsOn, done) && it.Autonomy != "low":
 				e.Restartable = append(e.Restartable, ref)
+				e.RestartableFailed = append(e.RestartableFailed, ref)
 			default:
 				e.Failed = append(e.Failed, ref)
 			}

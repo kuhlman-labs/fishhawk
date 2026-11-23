@@ -1502,6 +1502,8 @@ The spawn seam is CAPTURED into the waiter spec synchronously (`slotWaiterSpec.s
 | `fishhawk_drive_run` | stops `stopped_reason: awaiting_concurrency_slot` (not `host_dispatch_failed`) with a `dispatch` step noting the queue; `next_actions` (`driveSlotQueuedActions`) lead with `fishhawk_await_stage` on the stage, then `fishhawk_drive_run` to resume once it settles. A waiter the drive STARTED spawns through the drive's own `spawn` closure; on `already_waiting` the existing waiter's inputs govern (residual below) |
 | `fishhawk_run_children` | records the child `queued: true` with its `concurrency_slot` and `dispatched: false`, counts it in `queued_count`, and spends one unit of the per-invocation budget on it, like a spawned child (§ "`effective_cap` is a per-invocation dispatch budget" below) |
 
+**The host dispatcher owns a queued stage on an `auto_dispatch` run (#5267).** `dispatchOrPollActions` (`next_actions.go`) returns a single `fishhawk_get_run_status` poll, not `fishhawk_dispatch_stage` / `fishhawk_run_stage`, when `hostDispatcherOwnsStage` holds: the run carries `auto_dispatch`, the stage is still `pending` or `awaiting_host_dispatch`, and its `concurrency` block is `awaiting_concurrency_slot` with `waiter_live: true`. The reason starts `the host dispatcher owns this dispatch:` and names the stage type, group and queue position: a second dispatch from the operator host would double-drive the stage. This covers the plan, implement and acceptance pending arms, and the review-hint arms that pass non-dispatch actions through. The state names (`plan_pending` / `implement_pending` / `acceptance_pending`) are unchanged. An unmarked run, a waiter that is not live, a holding slot and a stage at any later status keep the dispatch actions. Pinned by `TestNextActions_HostDispatcherOwnsQueuedStage` and `TestHostDispatcherOwnsStage_OnlyPendingOrAwaitingHostDispatch`; the server suppresses the matching drive `next_action` (`backend/internal/server/docs/review.md`).
+
 `fishhawk_await_children` holds through the queue: a child whose implement stage is queued with a LIVE waiter (`childQueuedWithLiveWaiter`) is in flight, not `children_dispatchable`, so the `run_children` / `await_children` loop does not spin. A child whose waiter died (`waiter_live: false`) is announced again, and re-invoking `run_children` re-queues it. A second call on a still-queued stage reports `waiter: already_waiting` and spawns nothing more (the registry dedupe).
 
 **Live-waiter guard on `transitioned:false` (`liveWaiterOwnsSpawn`, concern 86b55541).** `fishhawk_run_stage` and `fishhawk_drive_run` normally proceed to spawn on a 200 `transitioned:false` (the dead-runner re-dispatch). That is wrong when this process's own slot waiter was admitted between the verb's stage read and its marker POST: the waiter spawns, the verb's un-nonced marker gets the idempotent `transitioned:false`, and a proceed would spawn a SECOND runner. So each verb opens a window on the registry (`slotWaiters.mark()`: `run_stage` at the top of the call, `drive_run` before each iteration's stage read), and on `transitioned:false` checks `slotWaiters.heldSince(stage, mark)`: a waiter live now, or one that exited after the mark (the registry records each stage's last exit against a monotonic sequence). When it holds, the verb spawns NOTHING and returns the queued shape: `run_stage` returns `outcome: awaiting_concurrency_slot` with `concurrency_slot: {waiter: already_waiting}` and the `fishhawk_await_stage` `next_step`; `drive_run` stops `awaiting_concurrency_slot` with `driveSlotQueuedActions`. The guard keys on a waiter having HELD the stage in the window, not on its admission: that waiter may own the spawn, but it may also have exited without admission (cap expiry, a terminal refusal, or another session dispatched the stage). So the returned text (`liveWaiterHeldNote`) says the waiter MAY own the spawn: if no runner appears, re-invoke the verb after the waiter exits. A `transitioned:false` with no such waiter keeps the proceed. Pinned by `TestRunStage_LiveWaiterOwnsSpawnOnTransitionedFalse`, `TestDriveRun_LiveWaiterOwnsSpawnOnTransitionedFalse` (live through the marker, exited inside the window, and the no-waiter proceed) and `TestSlotWaiterRegistry_HeldSince`. `fishhawk_dispatch_stage` keeps its pre-existing proceed on `transitioned:false` (the same window against a waiter in this process is not guarded there), and `fishhawk_run_children` already skips a `transitioned:false` child. The window is per process: a waiter in ANOTHER MCP process is invisible to the registry.
@@ -3878,8 +3880,10 @@ per-tool contract). Internals not covered there:
 - **Advisory `admission_screen` on the create output (#3649).** The `Campaign` wire struct carries
   `AdmissionScreen` (`*campaignAdmissionScreen`, `json:"admission_screen,omitempty"`), mirroring the backend's
   never-persisted block: `{advisory, findings[{issue, kind, path?, location?, forbidden_pattern?}],
-  forbidden_paths_screened, truncated?}`, `kind` being `not_runnable_declared` (a `runnable:no` label) or
-  `forbidden_path` (a title/body token the repo's implement-stage `forbidden_paths` forbid). On the `Campaign` object
+  forbidden_paths_screened, workflow_id?, truncated?}`, `kind` being `not_runnable_declared` (a `runnable:no` label) or
+  `forbidden_path` (a title/body token the implement-stage `forbidden_paths` of ONE workflow forbid). `workflow_id`
+  (#5267) names that workflow: the campaign driver's, `feature_change` by default. The screen covers only the driver
+  workflow, not a workflow chosen later per item. On the `Campaign` object
   it is create-response-only: it rides `StartCampaignOutput.Campaign` unchanged — no new tool, no `campaign.go`
   change. The same block also rides the preview report (`CampaignPreview.AdmissionScreen`, #5221; see the
   `fishhawk_preview_campaign` bullet below), and only the create appends the `campaign_admission_screened` audit row.
@@ -3888,7 +3892,16 @@ per-tool contract). Internals not covered there:
   the frozen export surface, the same convention as `campaignSatisfiedDependency`. ADVISORY: the campaign was created
   regardless; a later `fishhawk_get_campaign_status` never carries it. Pinned by
   `TestStartCampaign_AdmissionScreen_SurvivesDecode`, which decodes LITERAL backend-shaped wire JSON (not a round-trip
-  of the client's own struct) through the real client.
+  of the client's own struct) through the real client, `workflow_id` included; `TestPreviewCampaign_E2E_ScreensThroughRegisteredTool`
+  pins `preview.admission_screen.workflow_id` across the real server-to-MCP boundary.
+- **Campaign `start_run` restart routing (#1729 / #1838 / #5267).** The server surfaces both an eligible item and a
+  restartable (deps-satisfied, non-human-led cancelled or failed) item as `start_run`. `campaignNextActionsFor`'s
+  `start_run` arm splits on the rollup: a ref in `rollup.replanning`, `rollup.cancelled` OR `rollup.failed` routes to
+  `fishhawk_start_campaign_item_run` (the only verb that reaches the restart handler), and a ref in `rollup.eligible`
+  to `fishhawk_start_run`. The server buckets each restartable item by its own state (a restartable failed item rides
+  `failed`), and a pre-#5267 server folded every restartable item into `cancelled`; checking both slices is correct
+  against either. Pinned by `TestCampaignNextActionsFor_StartRun_RestartableFailed` and, across the real server,
+  arm 2 of `TestGetCampaignStatus_Closed_E2E_ThroughRealServer`.
 - **`provider` selector + the two new gate-code arms (#3645).** `fishhawk_start_campaign` takes an OPTIONAL `provider`
   — the WORK-ITEM PROVIDER ID (`github_projects` | `gitlab` | `jira`) this campaign is assembled against, overriding
   the repo's conventions-resolved provider for that call. It is forwarded VERBATIM (the backend is the registry
@@ -3963,7 +3976,8 @@ per-tool contract). Internals not covered there:
   `TestPreviewCampaign_OutputSchema_ExactlyOneHumanLedBlock` (the advertised schema has exactly one
   human_led-named property, and `preview` has none).
   **Advisory screens (#5221).** `CampaignPreview` mirrors the backend's two ADVISORY blocks, present on the valid,
-  dangling and cycle reports alike and only when they found something. `admission_screen` reuses the create's
+  dangling and cycle reports alike and only when they found something (`admission_screen` also renders findings-empty,
+  `forbidden_paths_screened:false`, when the spec does not define the driver workflow, #5267). `admission_screen` reuses the create's
   `campaignAdmissionScreen` mirror: the same #3649 screen, with no audit row on the preview. `path_overlap`
   (`campaignPreviewPathOverlap` / `campaignPreviewPathOverlapPair`, unexported) is `{advisory, pairs[{items, paths (max 10),
   paths_truncated?, class, remedy}], total_pairs, truncated?}`: unordered item pairs whose title or body name the same file path,
