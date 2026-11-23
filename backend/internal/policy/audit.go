@@ -23,9 +23,10 @@ const CategoryPolicyEvaluated = "policy_evaluated"
 // need to cross-reference the workflow spec to interpret it.
 //
 // SkipReason + SkipDetail are populated only when EmitEvaluationSkipped
-// fires — e.g., when the run has no cached spec to evaluate against,
-// when the bundle's diff event is malformed, or when the stage type
-// isn't in the workflow spec. In those cases the auditable signal is
+// or EmitEvaluationUndeterminable fires — e.g., when the run has no cached
+// spec to evaluate against, when the bundle carries no diff event, when the
+// bundle could not be read (bundle_unreadable, recorded passed:false), or
+// when the stage type isn't in the workflow spec. In those cases the auditable signal is
 // "we tried and here's why we couldn't evaluate" rather than nothing
 // at all (#283).
 type EvaluationPayload struct {
@@ -78,13 +79,22 @@ const (
 	// the matched workflow definition. Same as above but at the
 	// stage level.
 	SkipStageNotInSpec SkipReason = "stage_not_in_spec"
-	// SkipNoDiffInBundle: the trace bundle didn't carry a parseable
-	// git_diff event (runner didn't pass --check-base-ref, or the
-	// event was malformed). We can't evaluate path-based constraints
-	// against an empty diff meaningfully; emit skipped so the SPA
-	// renders the reason rather than "policy passed · no
-	// constraints" which is misleading.
+	// SkipNoDiffInBundle: the trace bundle was read cleanly but carried
+	// no git_diff event at all (bundle.ErrNoDiffEvent: the runner didn't
+	// pass --check-base-ref, or emitted no diff). We can't evaluate
+	// path-based constraints against an absent diff meaningfully; emit
+	// skipped so the SPA renders the reason rather than "policy passed
+	// · no constraints" which is misleading. A bundle, manifest or
+	// git_diff that could not be READ is SkipBundleUnreadable, never this
+	// (#5535).
 	SkipNoDiffInBundle SkipReason = "no_diff_in_bundle"
+	// SkipBundleUnreadable: the trace bundle, its manifest or its
+	// git_diff event could not be read (a malformed line, a missing or
+	// malformed manifest, a malformed git_diff payload, a truncated gzip
+	// stream, or a line or total size over the reader's bounds). The verdict is UNDETERMINABLE, so it is recorded
+	// passed:false by EmitEvaluationUndeterminable, the one skip reason
+	// that is not a pass (#5535).
+	SkipBundleUnreadable SkipReason = "bundle_unreadable"
 )
 
 // DiffEntry is the per-file shape that lands in the payload. Mirrors
@@ -168,7 +178,8 @@ func EmitEvaluation(
 
 // EmitEvaluationSkipped records an audit entry signaling that a
 // policy evaluation was attempted but couldn't be carried out — the
-// spec was missing, the diff was malformed, etc. The audit category
+// spec was missing, the bundle carried no diff event, etc. An unreadable
+// bundle is not a skip-pass: it goes through EmitEvaluationUndeterminable. The audit category
 // stays `policy_evaluated` (so consumers index on one name); the
 // payload's `skip_reason` + `skip_detail` carry the structured cause
 // for the SPA to render and for compliance review.
@@ -217,6 +228,52 @@ func EmitEvaluationSkipped(
 		Payload:   payload,
 	}); err != nil {
 		return fmt.Errorf("policy: append skipped audit entry: %w", err)
+	}
+	return nil
+}
+
+// EmitEvaluationUndeterminable records a policy_evaluated entry for a
+// stage whose trace bundle could not be read (#5535). It writes the same
+// payload shape as EmitEvaluationSkipped (empty diff, applied
+// constraints and violations; skip_reason SkipBundleUnreadable; detail
+// as skip_detail) but with Passed=false: an unreadable bundle evaluated
+// NOTHING, and recording that as a pass is how an unreadable implement
+// bundle was audited as a passed policy. The caller bounds and sanitizes
+// detail before passing it.
+//
+// The post-CI re-evaluation leaves every row with a non-empty
+// skip_reason untouched, so this row is never re-evaluated into a pass.
+func EmitEvaluationUndeterminable(
+	ctx context.Context,
+	repo audit.Repository,
+	runID uuid.UUID,
+	stageID uuid.UUID,
+	stageType string,
+	detail string,
+) error {
+	payload, err := json.Marshal(EvaluationPayload{
+		StageType:  stageType,
+		Diff:       []DiffEntry{},
+		Applied:    Constraints{},
+		Violations: []Violation{},
+		Passed:     false,
+		SkipReason: SkipBundleUnreadable,
+		SkipDetail: detail,
+	})
+	if err != nil {
+		return fmt.Errorf("policy: marshal undeterminable audit payload: %w", err)
+	}
+
+	systemKind := audit.ActorSystem
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryPolicyEvaluated,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("policy: append undeterminable audit entry: %w", err)
 	}
 	return nil
 }

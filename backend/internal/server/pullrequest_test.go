@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -9819,4 +9820,87 @@ func TestShipPullRequest_SupplementalStartedIncomplete_NoEdge(t *testing.T) {
 		}
 		p.assertAdvancedOnce(t)
 	})
+}
+
+// TestShipPullRequest_AfterBundleUnreadableFailure_StageStaysFailed is the
+// #5535 cross-boundary seam (trace handler -> run repo -> /pull-request
+// handler). A trace-time bundle_unreadable failure followed by a successful
+// /pull-request report for the same implement stage leaves the stage failed
+// category C with its reason unchanged: the report cannot succeed a stage
+// whose review never ran. No review gate is opened for it either (B6): the
+// human review stage seeded after it stays pending (un-initialized), no
+// stage reaches awaiting_approval and no review audit is written. The
+// implement stage does not require approval, so had the report driven it
+// terminal the orchestrator would have advanced into the review stage. The
+// PR artifact itself is recorded (the runner did open the PR).
+func TestShipPullRequest_AfterBundleUnreadableFailure_StageStaysFailed(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	s.cfg.TraceStore = newTraceStoreFake()
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	reviewStage := rr.seedStage(runRow.ID, 1, run.StageStatePending)
+	reviewStage.Type = run.StageTypeReview
+	reviewStage.ExecutorKind = run.ExecutorHuman
+	reviewStage.ExecutorRef = ""
+	reviewStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	var raw bytes.Buffer
+	raw.WriteString(`{"seq":1,"kind":"manifest","data":{"bundle_schema":"v1","push_and_open_pr":true}}` + "\n")
+	raw.WriteString("not a json line\n")
+	raw.WriteString(`{"seq":3,"kind":"git_diff","data":{"files":[{"path":"a.go","status":"M"}],"num_files":1}}` + "\n")
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write(raw.Bytes())
+	_ = zw.Close()
+
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, gz.Bytes(), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d:\n%s", w.Code, w.Body.String())
+	}
+	failed, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.State != run.StageStateFailed || failed.FailureReason == nil ||
+		!strings.HasPrefix(*failed.FailureReason, "bundle_unreadable: ") {
+		t.Fatalf("after trace: stage = %q / %v, want failed bundle_unreadable", failed.State, failed.FailureReason)
+	}
+	reason := *failed.FailureReason
+
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, validPRBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("pull-request status = %d:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage = %q after the PR report, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC || got.FailureReason == nil || *got.FailureReason != reason {
+		t.Errorf("failure = %v / %v, want C with the reason unchanged", got.FailureCategory, got.FailureReason)
+	}
+	review, err := rr.GetStage(t.Context(), reviewStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if review.State != run.StageStatePending {
+		t.Errorf("human review stage = %q after the PR report, want pending: a review gate was initialized for a failed implement stage", review.State)
+	}
+	for _, st := range rr.stagesByRunID[runRow.ID] {
+		if st.State == run.StageStateAwaitingApproval {
+			t.Errorf("stage %s reached awaiting_approval: a review gate opened for a failed stage", st.ID)
+		}
+	}
+	au.mu.Lock()
+	for _, e := range au.appended {
+		if strings.Contains(e.Category, "review") {
+			t.Errorf("review audit %q written for a failed implement stage", e.Category)
+		}
+	}
+	au.mu.Unlock()
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want the 1 PR artifact recorded", len(ar.all))
+	}
 }

@@ -787,7 +787,9 @@ func TestShipTrace_GatelessStage_TransitionsStraightToSucceeded(t *testing.T) {
 	s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: rr}
 
 	priv, _ := sf.issue(t, stage.RunID)
-	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	// A READABLE bundle (no git_diff event, the no_diff_in_bundle skip): an
+	// unreadable one fails an implement stage closed since #5535.
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, makeTestBundle(t, nil), "")
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -820,7 +822,9 @@ func TestShipTrace_GatelessStage_NoOrchestrator_StillTransitionsToSucceeded(t *t
 	// No orchestrator wired.
 
 	priv, _ := sf.issue(t, stage.RunID)
-	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	// A READABLE bundle (no git_diff event, the no_diff_in_bundle skip): an
+	// unreadable one fails an implement stage closed since #5535.
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, makeTestBundle(t, nil), "")
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -16135,5 +16139,160 @@ func TestReviewedHead_PlanRoundUnchanged(t *testing.T) {
 	}
 	if want := `{"configured_agents":2,"authority":"advisory","seed_unresolved":"seed_not_recorded"}`; raws[0] != want {
 		t.Errorf("plan_review_started payload = %s, want byte-identical %s (no reviewed_head)", raws[0], want)
+	}
+}
+
+// gateBundle gzips a manifest carrying the given push flags followed by
+// rest verbatim, so a #5535 gate fixture is unreadable BY CONSTRUCTION.
+func gateBundle(t *testing.T, m bundle.Manifest, rest string) []byte {
+	t.Helper()
+	mdata, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestLine, err := json.Marshal(map[string]any{"seq": 1, "kind": bundle.EventKindManifest, "data": json.RawMessage(mdata)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(append(append(manifestLine, '\n'), rest...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+const gateValidDiffLine = `{"seq":3,"kind":"git_diff","data":{"files":[{"path":"a.go","status":"M"}],"num_files":1}}` + "\n"
+
+// unreadableGateFixtures returns, for one manifest, the three #5535
+// unreadable shapes: a malformed line (the whole bundle, manifest
+// included, is unreadable), a malformed git_diff payload (manifest
+// readable) and a truncated gzip stream.
+func unreadableGateFixtures(t *testing.T, m bundle.Manifest) map[string][]byte {
+	t.Helper()
+	full := gateBundle(t, m, gateValidDiffLine)
+	return map[string][]byte{
+		"malformed line":     gateBundle(t, m, "not a json line\n"+gateValidDiffLine),
+		"malformed git_diff": gateBundle(t, m, `{"seq":2,"kind":"git_diff","data":{"files":"oops"}}`+"\n"),
+		"truncated gzip":     full[:len(full)-12],
+	}
+}
+
+// TestPushAndOpenPRGated_UnreadableDiffHolds pins #5535 B1: an unreadable
+// bundle HOLDS the stage (true) whether the manifest read or the git_diff
+// read fails, while the genuine no-event and empty-diff no-changes cases
+// keep returning false.
+func TestPushAndOpenPRGated_UnreadableDiffHolds(t *testing.T) {
+	s := &Server{}
+	for name, b := range unreadableGateFixtures(t, bundle.Manifest{BundleSchema: "v1", PushAndOpenPR: true}) {
+		if !s.pushAndOpenPRGated(b) {
+			t.Errorf("%s: want held (true) on an unreadable bundle", name)
+		}
+	}
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	if s.pushAndOpenPRGated(makePushPRBundle(t, true, 0, t0, t0.Add(time.Minute))) {
+		t.Error("empty diff: want NOT gated (false)")
+	}
+	if s.pushAndOpenPRGated(gateBundle(t, bundle.Manifest{BundleSchema: "v1", PushAndOpenPR: true}, "")) {
+		t.Error("no git_diff event: want NOT gated (false)")
+	}
+}
+
+// TestFixupPushGated_UnreadableDiffHolds extends TestFixupPushGated with the
+// #5535 unreadable shapes and the no-event carve-out.
+func TestFixupPushGated_UnreadableDiffHolds(t *testing.T) {
+	s := &Server{}
+	for name, b := range unreadableGateFixtures(t, bundle.Manifest{BundleSchema: "v1", PushFixup: true}) {
+		if !s.fixupPushGated(b) {
+			t.Errorf("%s: want held (true) on an unreadable bundle", name)
+		}
+	}
+	if s.fixupPushGated(gateBundle(t, bundle.Manifest{BundleSchema: "v1", PushFixup: true}, "")) {
+		t.Error("no git_diff event: want NOT gated (false)")
+	}
+}
+
+// TestChildPushGated_UnreadableManifestHolds pins the child gate's manifest
+// arm: a whole-bundle read failure holds a child stage even though its
+// manifest flag cannot be read.
+func TestChildPushGated_UnreadableManifestHolds(t *testing.T) {
+	s := &Server{}
+	fx := unreadableGateFixtures(t, bundle.Manifest{BundleSchema: "v1"})
+	for _, name := range []string{"malformed line", "truncated gzip"} {
+		if !s.childPushGated(fx[name]) {
+			t.Errorf("%s: want held (true) when the manifest cannot be read", name)
+		}
+	}
+}
+
+// TestShipTrace_PushAndOpenPR_OversizedEventLine_StaysRunning is the #5535
+// incident end to end: a push_and_open_pr bundle whose extra event line is
+// ~5 MiB (over the old 4 MiB reader cap) still holds the stage `running`
+// for its PR, and policy evaluates the real 2-file diff.
+func TestShipTrace_PushAndOpenPR_OversizedEventLine_StaysRunning(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	// Cache a spec so policy evaluates the diff rather than skipping as
+	// spec_unavailable.
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = []byte(testWorkflowSpec)
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	big, err := json.Marshal(map[string]any{"seq": 5, "kind": "agent_output", "data": map[string]string{"text": strings.Repeat("x", 5*1024*1024)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Above the old 4 MiB cap by construction; below the 16 MiB
+	// bundle.MaxLineBytes, which the reader itself enforces.
+	if len(big) <= 4*1024*1024 {
+		t.Fatalf("fixture line = %d bytes, want over the old 4 MiB cap", len(big))
+	}
+	files := `[{"path":"file0.go","status":"modified"},{"path":"file1.go","status":"modified"}]`
+	b := gateBundle(t, bundle.Manifest{BundleSchema: "v1", PushAndOpenPR: true},
+		string(big)+"\n"+`{"seq":6,"kind":"git_diff","data":{"files":`+files+`,"num_files":2}}`+"\n")
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+	})
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Fatalf("stage = %q (reason %v), want running (held for the PR)", got.State, got.FailureReason)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	found := false
+	for _, e := range au.appended {
+		if e.Category != policy.CategoryPolicyEvaluated {
+			continue
+		}
+		found = true
+		var p policy.EvaluationPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		if p.SkipReason != "" || len(p.Diff) != 2 {
+			t.Errorf("policy row skip_reason=%q diff=%d, want no skip and the 2-file diff", p.SkipReason, len(p.Diff))
+		}
+	}
+	if !found {
+		t.Error("no policy_evaluated row")
 	}
 }

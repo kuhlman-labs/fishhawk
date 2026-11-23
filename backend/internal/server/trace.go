@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -405,12 +407,33 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var violations []policy.Violation
+	// #5535: decide bundle readability ONCE, from the bundle bytes alone,
+	// before any repository lookup that can flap. reEvaluatePolicy returns
+	// early on a GetStage/GetRun error, so deriving the decision only from
+	// its result would let a flapping lookup route an unreadable bundle to
+	// the no-violations advance below. Both are the same
+	// bundleUnreadableError (a manifest or diff read error).
+	var (
+		violations    []policy.Violation
+		unreadableErr error
+	)
 	if s.cfg.RunRepo != nil {
-		violations = s.reEvaluatePolicy(r, runID, stageID, body)
+		unreadableErr = bundleUnreadableError(body)
+		var policyErr error
+		violations, policyErr = s.reEvaluatePolicy(r, runID, stageID, body)
+		if unreadableErr == nil {
+			unreadableErr = policyErr
+		}
 	}
 	if s.cfg.RunRepo != nil {
 		switch {
+		case unreadableErr != nil && s.failUnreadableImplementBundle(r, runID, stageID, unreadableErr, body):
+			// #5535: an implement stage whose bundle could not be read has
+			// an undeterminable diff, review and policy verdict. It is
+			// failed retryable category C (or left alone when the stage is
+			// unknown or already failed) instead of being advanced as a
+			// no-changes pass. A non-implement stage falls through to the
+			// arms below unchanged; only its policy verdict changed.
 		case len(violations) == 0:
 			// A gating review round shutdown stopped, or a prior process lost,
 			// decides nothing: answer that instead of the ordinary 202.
@@ -555,9 +578,10 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 		// against an orphan on run 8ae65577. Fix-up re-reviews are consolidated
 		// onto the fixup_pushed /pull-request report (maybeBackstopFixupReReview),
 		// which sources its diff from ComparePatch(base, pushedHead) — the commit
-		// the PR will merge. A manifest read error leaves today's behavior
-		// unchanged: an older bundle without the flag is indistinguishable from a
-		// non-fix-up one, and over-reviewing is the safe direction. This skip
+		// the PR will merge. An older bundle without the flag is
+		// indistinguishable from a non-fix-up one, and over-reviewing is the
+		// safe direction; a manifest READ error is an unreadable bundle
+		// (#5535) and skips the review with a WARN below. This skip
 		// falls through to the fixupPushGated deferral below, which keeps the
 		// stage in `running` for the push report to drive terminally.
 		manifest, merr := bundle.ExtractManifest(bundleBytes)
@@ -566,6 +590,18 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				"trace upload: fix-up implement re-review deferred to the push report (#2884)",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
+			)
+		} else if uerr := bundleUnreadableError(bundleBytes); uerr != nil {
+			// #5535: an unreadable bundle (manifest or diff) skips the
+			// review. Say so: a silently skipped review is how an unreadable
+			// bundle once advanced with no review at all. The trace
+			// handler's bundle_unreadable arm fails an implement stage
+			// before this hook; reaching it means that arm could not.
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"trace upload: implement review skipped — bundle unreadable (#5535)",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", bundleErrDetail(uerr)),
 			)
 		} else if diff, derr := bundle.ExtractDiff(bundleBytes); derr == nil {
 			// Surface runner-reported scope_drift to the reviewer so an
@@ -909,18 +945,29 @@ func (s *Server) planArtifactExists(ctx context.Context, stageID uuid.UUID) bool
 //
 // A false flag — every non-PR-opening stage (plan/review, --no-pr local
 // runs, decomposed children) and every older bundle — returns false so the
-// prior trace-driven transition is byte-identical. An empty or absent diff
-// is the no-changes path: the agent made no edits, so the runner opens no
-// PR and never POSTs to /pull-request; gating it would hang the stage in
+// prior trace-driven transition is byte-identical. Only a READABLE
+// manifest plus a genuine ErrNoDiffEvent (an absent git_diff) or an empty
+// diff is the no-changes path: the agent made no edits, so the runner opens
+// no PR and never POSTs to /pull-request; gating it would hang the stage in
 // running, so it returns false and the caller advances the stage as before.
+//
+// An unreadable bundle (#5535) fails closed and HOLDS the stage: a
+// manifest or git_diff read error is not evidence of no changes, so it
+// returns true rather than letting the caller advance the stage to
+// terminal with no push, PR or review. The trace handler fails such an
+// implement stage category C before this gate runs; holding is the
+// backstop when it could not.
 func (*Server) pushAndOpenPRGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
-	if err != nil || !manifest.PushAndOpenPR {
+	if err != nil {
+		return bundleDiffUnreadable(err)
+	}
+	if !manifest.PushAndOpenPR {
 		return false
 	}
 	diff, err := bundle.ExtractDiff(bundleBytes)
 	if err != nil {
-		return false
+		return bundleDiffUnreadable(err)
 	}
 	return len(diff.ChangedFiles) > 0
 }
@@ -941,11 +988,13 @@ func (*Server) pushAndOpenPRGated(bundleBytes []byte) bool {
 // diff_failed), and advancing on it moved a gateless child to terminal
 // succeeded before its push failed. A false flag — every non-child stage and
 // every older bundle — returns false so the prior trace-driven transition is
-// byte-identical.
+// byte-identical. An unreadable bundle (#5535) fails closed and HOLDS the
+// stage, exactly like pushAndOpenPRGated: a manifest read error is not
+// evidence that no report follows.
 func (*Server) childPushGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
 	if err != nil {
-		return false
+		return bundleDiffUnreadable(err)
 	}
 	return manifest.PushToSharedBranch
 }
@@ -962,20 +1011,26 @@ func (*Server) childPushGated(bundleBytes []byte) bool {
 //     follow, so a /pull-request "fixup_pushed"/"failed" report is guaranteed).
 //
 // A false flag — every non-fix-up stage and every older bundle — returns false
-// so the prior trace-driven transition is byte-identical. An empty or absent
+// so the prior trace-driven transition is byte-identical. Only a READABLE
+// manifest plus a genuine ErrNoDiffEvent (an absent git_diff) or an empty
 // diff is the no-changes path: the fix-up made no edits, so the runner pushes
 // nothing and never POSTs to /pull-request; gating it would hang the stage in
 // running, so it returns false and the caller advances the stage as before
 // (matching the push_and_open_pr empty-diff case; a decomposed child's
-// childPushGated deliberately has no such carve-out, #4079).
+// childPushGated deliberately has no such carve-out, #4079). An unreadable
+// bundle (#5535) fails closed and HOLDS the stage, exactly like
+// pushAndOpenPRGated.
 func (*Server) fixupPushGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
-	if err != nil || !manifest.PushFixup {
+	if err != nil {
+		return bundleDiffUnreadable(err)
+	}
+	if !manifest.PushFixup {
 		return false
 	}
 	diff, err := bundle.ExtractDiff(bundleBytes)
 	if err != nil {
-		return false
+		return bundleDiffUnreadable(err)
 	}
 	return len(diff.ChangedFiles) > 0
 }
@@ -1109,7 +1164,14 @@ func (s *Server) notifyPageClass(ctx context.Context, runID uuid.UUID, source st
 // one is empty. The SPA reads that entry to render the policy
 // section (#233); a missing entry is what makes the section
 // stuck on "pending" (#247).
-func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) []policy.Violation {
+//
+// The returned error is non-nil only for an unreadable bundle (#5535,
+// bundleUnreadableError): it records policy_evaluated passed:false with
+// skip_reason bundle_unreadable, never a pass, and returns the read error.
+// That check runs before the GetRun lookup so a flapping run read cannot
+// drop the not-passed row; the trace handler makes the fail-closed stage
+// decision from the bundle bytes itself (bundleUnreadableError).
+func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bundleBytes []byte) ([]policy.Violation, error) {
 	ctx := r.Context()
 	logger := s.cfg.Logger
 
@@ -1118,28 +1180,34 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: get stage failed",
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
-		return nil
+		return nil, nil
 	}
+
+	stageType := string(stage.Type)
+
+	// Diff extraction: ErrNoDiffEvent is the genuine absent-event case,
+	// emit skipped with no_diff_in_bundle so the SPA can render the
+	// reason rather than "pending" (#283). Any OTHER ExtractDiff error,
+	// or any ExtractManifest error, means the bundle, its manifest or its
+	// git_diff could not be read (#5535, bundleUnreadableError): the
+	// verdict is undeterminable, so it is recorded passed:false
+	// bundle_unreadable and the error is returned, never a skip->pass.
+	if readErr := bundleUnreadableError(bundleBytes); readErr != nil {
+		s.emitPolicyUndeterminable(ctx, runID, stageID, stageType, readErr)
+		return nil, readErr
+	}
+	diff, diffErr := bundle.ExtractDiff(bundleBytes)
+	if diffErr != nil {
+		s.emitPolicySkipped(ctx, runID, stageID, stageType, policy.SkipNoDiffInBundle, diffErr.Error())
+		return nil, nil
+	}
+
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: get run failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
-		return nil
-	}
-
-	stageType := string(stage.Type)
-
-	// Diff extraction: ErrNoDiffEvent is a known-empty case, emit
-	// skipped with no_diff_in_bundle so the SPA can render the
-	// reason rather than "pending" (#283). Other ExtractDiff errors
-	// also flow through the skip path — the diff is unparseable, but
-	// the audit story is "we tried; here's why we couldn't."
-	diff, diffErr := bundle.ExtractDiff(bundleBytes)
-	if diffErr != nil {
-		reason := policy.SkipNoDiffInBundle
-		s.emitPolicySkipped(ctx, runID, stageID, stageType, reason, diffErr.Error())
-		return nil
+		return nil, nil
 	}
 
 	// Constraints: load from the cached spec on the run row (#283).
@@ -1152,7 +1220,7 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 			slog.String("skip_reason", string(skipReason)),
 			slog.String("detail", skipDetail))
 		s.emitPolicySkipped(ctx, runID, stageID, stageType, skipReason, skipDetail)
-		return nil
+		return nil, nil
 	}
 
 	// Verification signal (#1886 / ADR-059): derived from the same
@@ -1202,9 +1270,9 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: emit evaluation failed",
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
-		return nil
+		return nil, nil
 	}
-	return violations
+	return violations, nil
 }
 
 // verificationSignalFromBundle derives the policy verification signal
@@ -1543,6 +1611,169 @@ func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, r
 	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
 }
 
+// bundleDiffUnreadable reports whether an ExtractDiff (or ExtractManifest)
+// error means the bundle could not be READ (#5535): a malformed line, a
+// missing or malformed manifest, a malformed git_diff payload, a truncated
+// gzip stream, or a line or total size over bundle.MaxLineBytes /
+// bundle.MaxDecompressedBytes. Only the genuine bundle.ErrNoDiffEvent (a
+// cleanly read bundle with no git_diff event) is the no-changes path;
+// every other error fails closed.
+func bundleDiffUnreadable(err error) bool {
+	return err != nil && !errors.Is(err, bundle.ErrNoDiffEvent)
+}
+
+// bundleUnreadableError returns the bundle's read error when the bundle
+// is unreadable, and nil otherwise. A bundle is unreadable when ANY
+// ExtractManifest error occurs (a whole-bundle read failure,
+// bundle.ErrNoManifest, or a `bundle: parse manifest` payload error) or
+// when bundleDiffUnreadable holds for its ExtractDiff error. The manifest
+// carries the agent_failed and push_and_open_pr / push_to_shared_branch /
+// push_fixup signals, so a bundle whose manifest alone is unreadable is as
+// undeterminable as one whose diff is: it fails category C with a named
+// reason rather than being held in running by the push gates. It reads
+// only the bundle bytes, so the trace handler's fail-closed decision
+// cannot be skipped by a repository lookup that flaps (#5535).
+func bundleUnreadableError(bundleBytes []byte) error {
+	if _, err := bundle.ExtractManifest(bundleBytes); err != nil {
+		return err
+	}
+	if _, err := bundle.ExtractDiff(bundleBytes); bundleDiffUnreadable(err) {
+		return err
+	}
+	return nil
+}
+
+// maxBundleErrDetailBytes bounds the read error a bundle_unreadable stage
+// reason and policy_evaluated skip_detail reflect (#5535).
+const maxBundleErrDetailBytes = 512
+
+// bundleParseErrPrefix starts every bundle error that wraps a decode
+// error over runner-supplied bytes: `bundle: parse line`, `bundle: parse
+// manifest` and `bundle: parse git_diff payload`.
+const bundleParseErrPrefix = "bundle: parse "
+
+// bundleDecodeClass reduces a decode error to a fixed class string. A
+// decode error quotes the bytes it failed on (encoding/json echoes a
+// number literal in UnmarshalTypeError and a character in SyntaxError;
+// time.ParseError quotes a whole non-RFC3339 `ts` string), so none of its
+// text is reflected (#5535 B5).
+func bundleDecodeClass(err error) string {
+	var (
+		syntaxErr *json.SyntaxError
+		typeErr   *json.UnmarshalTypeError
+		timeErr   *time.ParseError
+	)
+	switch {
+	case errors.As(err, &syntaxErr):
+		return "invalid JSON"
+	case errors.As(err, &typeErr):
+		return "a JSON value of the wrong type"
+	case errors.As(err, &timeErr):
+		return "an unparseable timestamp"
+	default:
+		return "an undecodable value"
+	}
+}
+
+// bundleErrDetail renders a bundle read error for the stage reason and
+// the policy_evaluated skip_detail. A `bundle: parse ...` error keeps its
+// own fixed prefix and has EVERY wrapped decode error reduced to a fixed
+// class string (bundleDecodeClass), so no runner-chosen bytes are echoed;
+// the other bundle read errors (gzip, flate, the size bounds,
+// ErrNoManifest) carry only fixed library text. Control characters then
+// become '?', invalid UTF-8 is replaced, and the result is cut at
+// maxBundleErrDetailBytes on a rune boundary, so the detail is never raw
+// or unbounded.
+func bundleErrDetail(err error) string {
+	msg := err.Error()
+	if inner := errors.Unwrap(err); inner != nil && strings.HasPrefix(msg, bundleParseErrPrefix) &&
+		strings.HasSuffix(msg, inner.Error()) {
+		msg = strings.TrimSuffix(msg, inner.Error()) + bundleDecodeClass(inner)
+	}
+	msg = strings.ToValidUTF8(msg, "?")
+	var b strings.Builder
+	for _, r := range msg {
+		if unicode.IsControl(r) {
+			r = '?'
+		}
+		if b.Len()+utf8.RuneLen(r) > maxBundleErrDetailBytes {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// bundleUnreadableReasonPrefix starts every stage failure reason the trace
+// handler stamps for an unreadable implement bundle (#5535).
+const bundleUnreadableReasonPrefix = "bundle_unreadable: "
+
+// bundleUnreadableTraceReason is the category-C failure reason for an
+// implement stage whose trace bundle could not be read (#5535). It names
+// the bounded read error and the recovery.
+func bundleUnreadableTraceReason(err error) string {
+	return bundleUnreadableReasonPrefix +
+		"the implement trace bundle could not be read (" + bundleErrDetail(err) + "), " +
+		"so its diff, the implement review and the policy verdict are undeterminable; " +
+		"the stage was failed rather than advanced as a no-changes pass. " +
+		"A run branch the runner pushed after the trace carries the agent's verified work; " +
+		"otherwise the verified tree survives only as the runner checkout's `fishhawk verify wip` commit. " +
+		"Inspect it before retrying the stage in place (retryable; see #5535)"
+}
+
+// emitPolicyUndeterminable wraps policy.EmitEvaluationUndeterminable with a
+// bounded, sanitized detail and logs an append failure at WARN, like
+// emitPolicySkipped.
+func (s *Server) emitPolicyUndeterminable(ctx context.Context, runID, stageID uuid.UUID, stageType string, readErr error) {
+	if err := policy.EmitEvaluationUndeterminable(ctx, s.cfg.AuditRepo,
+		runID, stageID, stageType, bundleErrDetail(readErr)); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "policy: emit undeterminable audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// failUnreadableImplementBundle is the trace handler's fail-closed arm for
+// an unreadable bundle (#5535). It returns true when it handled the upload
+// and the handler must not advance the stage:
+//
+//   - an implement stage that is not yet failed is failed retryable
+//     category C with a bundle_unreadable reason;
+//   - an implement stage that is ALREADY failed (the redacted re-upload of
+//     the same bundle) is left alone: no second transition, no second
+//     advanceAfterFailure and no second runtime_observed emission;
+//   - a stage that cannot be read is left where it is, because advancing
+//     an unknown stage on an unreadable bundle could reach terminal
+//     succeeded.
+//
+// It returns false for a non-implement stage, which keeps its existing
+// advancement; only its policy verdict changed.
+func (s *Server) failUnreadableImplementBundle(r *http.Request, runID, stageID uuid.UUID, readErr error, bundleBytes []byte) bool {
+	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"trace upload: unreadable bundle and stage lookup failed — leaving the stage unadvanced (#5535)",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("read_error", bundleErrDetail(readErr)),
+			slog.String("error", err.Error()))
+		return true
+	}
+	if stage.Type != run.StageTypeImplement {
+		return false
+	}
+	if stage.State == run.StageStateFailed {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+			"trace upload: unreadable bundle for an already-failed implement stage — no further transition (#5535)",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()))
+		return true
+	}
+	s.failStageCategoryC(r, runID, stageID, bundleUnreadableTraceReason(readErr), bundleBytes)
+	return true
+}
+
 // noDiffCaptured reports whether a failed policy re-evaluation is the
 // #691 staging-bug signature: an implement stage whose bundle carries
 // a PRESENT-but-empty git_diff event, where that empty diff is the
@@ -1553,9 +1784,10 @@ func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, r
 // It returns false — preserving the genuine category-B
 // classification — when:
 //   - the stage isn't an implement stage,
-//   - the bundle has no git_diff event at all (ExtractDiff errors;
-//     that case is the no_diff_in_bundle skip→pass path and never
-//     reaches a policy failure here),
+//   - ExtractDiff errors: a bundle with no git_diff event at all
+//     (ErrNoDiffEvent) is the no_diff_in_bundle skip→pass path, and an
+//     unreadable bundle (#5535) is the handler's earlier
+//     bundle_unreadable arm; neither reaches a policy failure here,
 //   - the diff is non-empty, or
 //   - any violation is something other than the empty-diff
 //     required_outcomes case. The load-bearing carve-out is the

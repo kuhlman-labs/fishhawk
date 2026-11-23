@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
@@ -2355,5 +2356,193 @@ func TestExtractGateEvidence_NoFixupCommitClaimsIsNil(t *testing.T) {
 	}
 	if ge.FixupCommitClaims != nil {
 		t.Errorf("FixupCommitClaims = %+v, want nil", ge.FixupCommitClaims)
+	}
+}
+
+// gzipRaw gzips raw verbatim so a test controls every byte of the
+// decompressed stream (line endings, an unterminated last line).
+func gzipRaw(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// oversizedEventLine is a valid event Line whose JSON encoding is ~5 MiB:
+// above the old 4 MiB bufio.Scanner cap and below MaxLineBytes by
+// construction (#5535).
+func oversizedEventLine(t *testing.T) Line {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"text": strings.Repeat("x", 5*1024*1024)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Line{Seq: 2, Kind: "agent_output", Data: payload}
+}
+
+// TestReadEvents_LineOverOldScannerCap pins #5535: a bundle whose single
+// event line exceeds the old 4 MiB Scanner cap still yields every line,
+// and its git_diff, instead of making the whole bundle unreadable.
+func TestReadEvents_LineOverOldScannerCap(t *testing.T) {
+	big := oversizedEventLine(t)
+	// Above the old 4 MiB cap by construction; below the 16 MiB
+	// MaxLineBytes, which the reader itself enforces.
+	if n := len(big.Data); n <= 4*1024*1024 {
+		t.Fatalf("fixture line = %d bytes, want over the old 4 MiB cap", n)
+	}
+	diff := makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}, [2]string{"b.go", "A"})
+	diff.Seq = 3
+	b := packLines(t, []Line{
+		{Seq: 1, Kind: EventKindManifest, Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		big,
+		diff,
+	})
+	lines, err := ReadEvents(b)
+	if err != nil {
+		t.Fatalf("ReadEvents = %v, want nil", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3", len(lines))
+	}
+	if !bytes.Equal(lines[1].Data, big.Data) {
+		t.Errorf("oversized line data was not carried intact")
+	}
+	d, err := ExtractDiff(b)
+	if err != nil {
+		t.Fatalf("ExtractDiff = %v, want nil", err)
+	}
+	if len(d.ChangedFiles) != 2 {
+		t.Errorf("ChangedFiles = %d, want 2", len(d.ChangedFiles))
+	}
+}
+
+// TestReadBundleLine_EnforcesCap pins the per-line bound: a line one byte
+// over max is ErrLineTooLong and a line exactly at max is accepted, both
+// when it is newline-terminated and when it is the final unterminated
+// line. A buffer smaller than the line exercises the ErrBufferFull
+// accumulation.
+func TestReadBundleLine_EnforcesCap(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{"at cap terminated", strings.Repeat("a", 16) + "\n", false},
+		{"at cap unterminated", strings.Repeat("a", 16), false},
+		{"over cap terminated", strings.Repeat("a", 17) + "\n", true},
+		{"over cap unterminated", strings.Repeat("a", 17), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			br := bufio.NewReaderSize(strings.NewReader(tc.in), 16)
+			got, err := readBundleLine(br, 16)
+			if tc.wantErr {
+				if !errors.Is(err, ErrLineTooLong) {
+					t.Fatalf("err = %v, want ErrLineTooLong", err)
+				}
+				return
+			}
+			if err != nil || string(got) != strings.Repeat("a", 16) {
+				t.Fatalf("got %q, %v; want the 16-byte line", got, err)
+			}
+		})
+	}
+}
+
+// TestReadEvents_LineCapIsUnreadable pins the real MaxLineBytes through
+// ReadEvents and ExtractDiff: one line over it makes the bundle
+// unreadable (ErrLineTooLong), never a no-diff bundle.
+func TestReadEvents_LineCapIsUnreadable(t *testing.T) {
+	if MaxLineBytes != 16*1024*1024 {
+		t.Fatalf("MaxLineBytes = %d, want 16 MiB (#5535 approval condition B4)", MaxLineBytes)
+	}
+	raw := []byte(`{"seq":1,"kind":"manifest","data":{}}` + "\n" + strings.Repeat("y", MaxLineBytes+1) + "\n")
+	_, err := ExtractDiff(gzipRaw(t, raw))
+	if !errors.Is(err, ErrLineTooLong) {
+		t.Fatalf("ExtractDiff err = %v, want ErrLineTooLong", err)
+	}
+	if errors.Is(err, ErrNoDiffEvent) {
+		t.Fatalf("an over-cap line must not read as ErrNoDiffEvent")
+	}
+}
+
+// TestReadEvents_DecompressedTotalCap pins the total decompressed bound:
+// a stream one byte over maxTotal fails with ErrDecompressedTooLarge and a
+// stream exactly at it reads. The real constant is pinned by value; the
+// behavior is exercised at a small bound so the test stays cheap.
+func TestReadEvents_DecompressedTotalCap(t *testing.T) {
+	if MaxDecompressedBytes != 256*1024*1024 {
+		t.Fatalf("MaxDecompressedBytes = %d, want 256 MiB (#5535 approval condition B4)", MaxDecompressedBytes)
+	}
+	line := `{"seq":1,"kind":"manifest","data":{}}` + "\n"
+	raw := []byte(line + line)
+	b := gzipRaw(t, raw)
+
+	lines, err := readEvents(b, MaxLineBytes, int64(len(raw)))
+	if err != nil || len(lines) != 2 {
+		t.Fatalf("at the bound: lines = %d, err = %v; want 2, nil", len(lines), err)
+	}
+	_, err = readEvents(b, MaxLineBytes, int64(len(raw)-1))
+	if !errors.Is(err, ErrDecompressedTooLarge) {
+		t.Fatalf("over the bound: err = %v, want ErrDecompressedTooLarge", err)
+	}
+}
+
+// TestReadEvents_ScannerParity pins bufio.ScanLines parity for the new
+// reader: CRLF endings are stripped, a final unterminated line is
+// returned, a trailing newline yields no extra line, and an empty line is
+// still a parse error.
+func TestReadEvents_ScannerParity(t *testing.T) {
+	l1 := `{"seq":1,"kind":"manifest","data":{}}`
+	l2 := `{"seq":2,"kind":"x"}`
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"crlf", l1 + "\r\n" + l2 + "\r\n", 2},
+		{"unterminated final line", l1 + "\n" + l2, 2},
+		{"trailing newline", l1 + "\n" + l2 + "\n", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lines, err := ReadEvents(gzipRaw(t, []byte(tc.raw)))
+			if err != nil {
+				t.Fatalf("ReadEvents = %v", err)
+			}
+			if len(lines) != tc.want || lines[1].Kind != "x" {
+				t.Fatalf("lines = %+v, want %d with the second kind x", lines, tc.want)
+			}
+		})
+	}
+	_, err := ReadEvents(gzipRaw(t, []byte(l1+"\n\n"+l2+"\n")))
+	if err == nil || !strings.Contains(err.Error(), "parse line") {
+		t.Fatalf("empty line: err = %v, want a parse-line error", err)
+	}
+}
+
+// TestReadEvents_TruncatedGzipIsReadError pins that a gzip stream cut
+// mid-body is a read error, and that ExtractDiff never reports it as the
+// genuine ErrNoDiffEvent no-changes case.
+func TestReadEvents_TruncatedGzipIsReadError(t *testing.T) {
+	diff := makeDiffLine(t, "origin/main", [2]string{"a.go", "M"})
+	b := packLines(t, []Line{
+		{Seq: 1, Kind: EventKindManifest, Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		diff,
+	})
+	cut := b[:len(b)-12]
+	_, err := ExtractDiff(cut)
+	if err == nil {
+		t.Fatal("ExtractDiff on a truncated gzip = nil, want a read error")
+	}
+	if errors.Is(err, ErrNoDiffEvent) {
+		t.Fatalf("truncated gzip read as ErrNoDiffEvent: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bundle: read:") {
+		t.Errorf("err = %v, want a `bundle: read:` error", err)
 	}
 }

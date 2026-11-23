@@ -728,34 +728,141 @@ type PolicyViolationEvidence struct {
 	Files      []string `json:"files,omitempty"`
 }
 
+// MaxLineBytes bounds one decompressed JSONL line in ReadEvents (#5535).
+// It replaced the fixed 4 MiB bufio.Scanner cap, which refused a bundle
+// whose single event line (a large model-output or tool-result event)
+// exceeded it and so made EVERY extractor fail on an otherwise valid
+// bundle. 16 MiB is well above any practical event, including the
+// runner's 256 KiB-capped git_diff patch, and bounds the per-line buffer
+// a hostile bundle can force. A line over the bound fails with
+// ErrLineTooLong, which the trace handler treats as an unreadable bundle
+// and fails closed. The gzipped upload itself is bounded separately by
+// the runner's bundle.MaxBundleBytes / the server's maxTraceBundleBytes
+// (64 MiB); this bounds the DECOMPRESSED line.
+const MaxLineBytes = 16 * 1024 * 1024
+
+// MaxDecompressedBytes bounds the total decompressed size ReadEvents
+// will read from one bundle (#5535). gzip expands highly repetitive input
+// by orders of magnitude, so the 64 MiB upload bound alone does not bound
+// decompressed memory. A bundle that inflates past this bound fails with
+// ErrDecompressedTooLarge, which the trace handler treats as an
+// unreadable bundle and fails closed.
+const MaxDecompressedBytes = 256 * 1024 * 1024
+
+// readBufferBytes is the bufio.Reader buffer ReadEvents reads lines
+// through; a longer line is accumulated across ReadSlice chunks.
+const readBufferBytes = 64 * 1024
+
+// ErrLineTooLong means one decompressed bundle line exceeded
+// MaxLineBytes. The bundle is unreadable as a whole: ReadEvents returns
+// no lines.
+var ErrLineTooLong = errors.New("bundle: line exceeds MaxLineBytes")
+
+// ErrDecompressedTooLarge means the bundle decompressed past
+// MaxDecompressedBytes. The bundle is unreadable as a whole: ReadEvents
+// returns no lines.
+var ErrDecompressedTooLarge = errors.New("bundle: decompressed size exceeds MaxDecompressedBytes")
+
 // ReadEvents decompresses bundleBytes and returns every JSONL line
-// (manifest, events, trailer) as a Line. Use ExtractDiff for the
-// policy re-eval path; this function is for tests / future readers.
+// (manifest, events, trailer) as a Line. Every Extract* reader parses
+// through it, so a read error here makes the whole bundle unreadable to
+// every caller.
+//
+// Lines are read from a bufio.Reader and accumulated across ReadSlice
+// chunks, bounded per line by MaxLineBytes (ErrLineTooLong) and in total
+// by MaxDecompressedBytes (ErrDecompressedTooLarge). Line splitting keeps
+// bufio.ScanLines parity: a trailing "\n" and one trailing "\r" are
+// stripped, a final unterminated line is still returned, a trailing
+// newline at EOF yields no extra line, and an empty line is a
+// `bundle: parse line` error. A read error, including gzip truncation,
+// wraps as `bundle: read: %w`.
 func ReadEvents(bundleBytes []byte) ([]Line, error) {
+	return readEvents(bundleBytes, MaxLineBytes, MaxDecompressedBytes)
+}
+
+// readEvents is ReadEvents with injectable bounds so the tests can pin
+// both limits without building a 256 MiB stream.
+func readEvents(bundleBytes []byte, maxLine int, maxTotal int64) ([]Line, error) {
 	zr, err := gzip.NewReader(byteReader(bundleBytes))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadGzip, err)
 	}
 	defer func() { _ = zr.Close() }()
 
+	// One byte past the bound lets the reader tell "exactly at the
+	// bound" from "over it": lr.N reaches 0 only when the stream had
+	// more than maxTotal bytes.
+	lr := &io.LimitedReader{R: zr, N: maxTotal + 1}
+	br := bufio.NewReaderSize(lr, readBufferBytes)
+	overTotal := func() bool { return lr.N <= 0 }
+
 	var out []Line
-	scanner := bufio.NewScanner(zr)
-	// Bundle lines can carry diffs / model output bigger than the
-	// default 64 KiB scanner buffer. Cap at 4 MiB per line, which
-	// is well over the practical event size and well under the
-	// bundle's overall MaxBundleBytes.
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
+	for {
+		raw, rerr := readBundleLine(br, maxLine)
+		if overTotal() {
+			return nil, fmt.Errorf("bundle: read: %w", ErrDecompressedTooLarge)
+		}
+		if rerr == io.EOF {
+			return out, nil
+		}
+		if rerr != nil {
+			return nil, fmt.Errorf("bundle: read: %w", rerr)
+		}
 		var line Line
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
+		if err := json.Unmarshal(raw, &line); err != nil {
 			return nil, fmt.Errorf("bundle: parse line: %w", err)
 		}
 		out = append(out, line)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("bundle: read: %w", err)
+}
+
+// readBundleLine returns the next line from br without its trailing
+// "\n" (and one trailing "\r"), accumulating bufio.Reader.ReadSlice
+// chunks across bufio.ErrBufferFull. It returns ErrLineTooLong once the
+// accumulated line exceeds max bytes, and io.EOF only when no bytes
+// remain, so a final unterminated line is still returned. The returned
+// slice is a copy and stays valid across later reads.
+func readBundleLine(br *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		// ReadSlice's bytes are only valid until the next read: copy.
+		line = append(line, chunk...)
+		// The bound counts the line's content, not its "\n" terminator,
+		// and is checked per chunk so at most max plus one buffer is held.
+		content := len(line)
+		if err == nil {
+			content--
+		}
+		if content > max {
+			return nil, ErrLineTooLong
+		}
+		switch {
+		case err == nil:
+			return trimLineEnding(line), nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case err == io.EOF:
+			if len(line) == 0 {
+				return nil, io.EOF
+			}
+			return trimLineEnding(line), nil
+		default:
+			return nil, err
+		}
 	}
-	return out, nil
+}
+
+// trimLineEnding strips a trailing "\n" and then one trailing "\r"
+// (bufio.ScanLines parity).
+func trimLineEnding(line []byte) []byte {
+	if n := len(line); n > 0 && line[n-1] == '\n' {
+		line = line[:n-1]
+	}
+	if n := len(line); n > 0 && line[n-1] == '\r' {
+		line = line[:n-1]
+	}
+	return line
 }
 
 // ExtractManifest returns the parsed first-line manifest. Used by

@@ -4,7 +4,9 @@ Backend-side reader for the runner's gzipped JSONL trace bundle.
 
 ## Trace bundle reader
 
-`ReadEvents` parses gzipped JSONL bundle bytes.
+`ReadEvents` parses gzipped JSONL bundle bytes. Every `Extract*` reader parses through it, so a read error makes the whole bundle unreadable to every caller.
+
+**Read bounds (#5535).** `ReadEvents` reads lines from a `bufio.Reader`, accumulating `ReadSlice` chunks across `bufio.ErrBufferFull`. It used to use a `bufio.Scanner` with a fixed 4 MiB line cap. One event line over that cap made every extractor fail on an otherwise valid bundle, and the trace handler then advanced the implement stage as a no-changes pass. Two bounds now apply. `MaxLineBytes` (16 MiB) caps one decompressed line, and a longer line fails with `ErrLineTooLong`. `MaxDecompressedBytes` (256 MiB) caps the total decompressed stream, read through an `io.LimitedReader`, and a larger stream fails with `ErrDecompressedTooLarge`. The 64 MiB upload bound (`maxTraceBundleBytes`) covers only the gzipped bytes, and gzip can expand repetitive input far past it. Line splitting keeps `bufio.ScanLines` parity: a trailing `\r\n` or `\n` is stripped, a final unterminated line is returned, a trailing newline adds no line, and an empty line is a `bundle: parse line` error. Any read error other than `ErrNoDiffEvent` is an unreadable bundle, which the trace handler fails closed (`backend/internal/server/docs/review.md`). The runner-side reader limit is #3020.
 
 `ExtractDiff` returns the `policy.Diff` carried in the runner's `git_diff` event — including the optional unified-diff `patch` text (size-capped, redacted; surfaced to the implement-review prompt, never read by the policy engine; #585) alongside the name-status `ChangedFiles`. Older bundles without the field decode to an empty `Patch`.
 

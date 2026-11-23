@@ -398,3 +398,52 @@ func TestEmitEvaluation_EmptyDiff(t *testing.T) {
 		t.Errorf("Passed = false, want true on empty diff with no constraints")
 	}
 }
+
+// TestEmitEvaluationUndeterminable_RecordsNotPassed pins #5535: an
+// unreadable bundle's policy_evaluated row is passed:false with
+// skip_reason bundle_unreadable and the detail carried verbatim, never
+// the passed:true shape EmitEvaluationSkipped writes.
+func TestEmitEvaluationUndeterminable_RecordsNotPassed(t *testing.T) {
+	repo := &fakeAuditRepo{}
+	runID, stageID := uuid.New(), uuid.New()
+	const detail = "bundle: parse line: invalid character 'n' looking for beginning of value"
+	if err := EmitEvaluationUndeterminable(context.Background(), repo, runID, stageID, "implement", detail); err != nil {
+		t.Fatalf("EmitEvaluationUndeterminable = %v", err)
+	}
+	if repo.called != 1 {
+		t.Fatalf("AppendChained called %d times, want 1", repo.called)
+	}
+	if repo.captured.Category != CategoryPolicyEvaluated {
+		t.Errorf("category = %q, want %q", repo.captured.Category, CategoryPolicyEvaluated)
+	}
+	if repo.captured.StageID == nil || *repo.captured.StageID != stageID || repo.captured.RunID != runID {
+		t.Errorf("run/stage ids not carried: %+v", repo.captured)
+	}
+	var p EvaluationPayload
+	if err := json.Unmarshal(repo.captured.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Passed {
+		t.Errorf("passed = true, want false for an undeterminable verdict")
+	}
+	if p.SkipReason != SkipBundleUnreadable {
+		t.Errorf("skip_reason = %q, want %q", p.SkipReason, SkipBundleUnreadable)
+	}
+	if p.SkipDetail != detail {
+		t.Errorf("skip_detail = %q, want %q", p.SkipDetail, detail)
+	}
+	if p.StageType != "implement" || len(p.Diff) != 0 || len(p.Violations) != 0 {
+		t.Errorf("payload shape = %+v, want the skipped shape", p)
+	}
+	// The passed key must be present on the wire as false.
+	if !bytes.Contains(repo.captured.Payload, []byte(`"passed":false`)) {
+		t.Errorf("payload %s lacks \"passed\":false", repo.captured.Payload)
+	}
+}
+
+func TestEmitEvaluationUndeterminable_AppendError(t *testing.T) {
+	repo := &fakeAuditRepo{appendChainedErr: errors.New("boom")}
+	if err := EmitEvaluationUndeterminable(context.Background(), repo, uuid.New(), uuid.New(), "implement", "x"); err == nil {
+		t.Fatal("want the append error surfaced")
+	}
+}
