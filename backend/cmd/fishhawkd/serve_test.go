@@ -8546,6 +8546,54 @@ func TestServeGo_AutoStartRunnerKindWiring(t *testing.T) {
 	}
 }
 
+// TestServeGo_CampaignDriverWorkflowIDWiring walks the PARSED runServe body
+// (#5267): cfg.CampaignDriverWorkflowID must be assigned from
+// *campaignDriverWorkflowID so the advisory campaign admission screen checks
+// the workflow the driver actually starts. The default deployment
+// (feature_change) behaves identically without the assignment, so only this
+// pin sees a deleted call site.
+func TestServeGo_CampaignDriverWorkflowIDWiring(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	var wired bool
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		x, ok := n.(*ast.AssignStmt)
+		if !ok || len(x.Lhs) != 1 || len(x.Rhs) != 1 {
+			return true
+		}
+		lhs, ok := x.Lhs[0].(*ast.SelectorExpr)
+		if !ok || lhs.Sel.Name != "CampaignDriverWorkflowID" {
+			return true
+		}
+		if recv, ok := lhs.X.(*ast.Ident); !ok || recv.Name != "cfg" {
+			return true
+		}
+		star, ok := x.Rhs[0].(*ast.StarExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := star.X.(*ast.Ident); ok && id.Name == "campaignDriverWorkflowID" {
+			wired = true
+		}
+		return true
+	})
+	if !wired {
+		t.Error("runServe does not assign cfg.CampaignDriverWorkflowID = *campaignDriverWorkflowID; the campaign admission screen would check feature_change instead of --campaign-driver-workflow-id")
+	}
+}
+
 // --- TestCampaignDriver_AutoStartLocal_EndToEnd harness (#4525) ---
 //
 // Store approach (approval condition C5): no store-backed campaign or run

@@ -236,12 +236,55 @@ func screenGitHub(t *testing.T, fake *fakeGitHubForRuns) *githubclient.Client {
 
 var screenRepo = forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}
 
-func TestResolveCampaignForbiddenPaths_UnionAcrossWorkflows(t *testing.T) {
-	s := New(Config{GitHub: screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))})
-	got, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.FromGitHubInstallationID(12345), screenRepo)
-	want := []string{".fishhawk/**", ".github/workflows/**", ".gitlab-ci.yml"}
-	if !ok || !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v ok=%v, want %v ok=true", got, ok, want)
+// TestResolveCampaignForbiddenPaths_ScreensOneWorkflow pins the #5267 fix:
+// the screen checks ONLY the campaign driver's workflow, never the union of
+// every workflow in the spec. screenSpecYAML's two workflows forbid different
+// paths, so a union would return .fishhawk/** for the default config and
+// .github/workflows/** for docs_change.
+func TestResolveCampaignForbiddenPaths_ScreensOneWorkflow(t *testing.T) {
+	cases := map[string]struct {
+		driverWorkflow string
+		want           []string
+		wantWorkflowID string
+		wantOK         bool
+	}{
+		"default config screens feature_change": {
+			driverWorkflow: "",
+			want:           []string{".github/workflows/**", ".gitlab-ci.yml"},
+			wantWorkflowID: "feature_change",
+			wantOK:         true,
+		},
+		"blank config screens feature_change": {
+			driverWorkflow: "   ",
+			want:           []string{".github/workflows/**", ".gitlab-ci.yml"},
+			wantWorkflowID: "feature_change",
+			wantOK:         true,
+		},
+		"driver workflow docs_change": {
+			driverWorkflow: "docs_change",
+			want:           []string{".fishhawk/**", ".gitlab-ci.yml"},
+			wantWorkflowID: "docs_change",
+			wantOK:         true,
+		},
+		"driver workflow absent from the spec fails open": {
+			driverWorkflow: "routine_change",
+			want:           nil,
+			wantWorkflowID: "routine_change",
+			wantOK:         false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := New(Config{
+				GitHub:                   screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML)),
+				CampaignDriverWorkflowID: tc.driverWorkflow,
+			})
+			got, workflowID, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.FromGitHubInstallationID(12345), screenRepo)
+			if ok != tc.wantOK || !reflect.DeepEqual(got, tc.want) || workflowID != tc.wantWorkflowID {
+				t.Fatalf("got %v workflow=%q ok=%v, want %v workflow=%q ok=%v",
+					got, workflowID, ok, tc.want, tc.wantWorkflowID, tc.wantOK)
+			}
+		})
 	}
 }
 
@@ -249,9 +292,12 @@ func TestResolveCampaignForbiddenPaths_UnionAcrossWorkflows(t *testing.T) {
 // deleted guard reaches s.cfg.GitHub.GetWorkflowSpec on a nil pointer.
 func TestResolveCampaignForbiddenPaths_NilForgeClient_FailsOpen(t *testing.T) {
 	s := New(Config{})
-	got, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.FromGitHubInstallationID(12345), screenRepo)
+	got, workflowID, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.FromGitHubInstallationID(12345), screenRepo)
 	if ok || got != nil {
 		t.Fatalf("got %v ok=%v, want nil ok=false", got, ok)
+	}
+	if workflowID != "feature_change" {
+		t.Errorf("workflowID = %q, want feature_change on the degrade too", workflowID)
 	}
 }
 
@@ -259,27 +305,39 @@ func TestResolveCampaignForbiddenPaths_FailOpenBranches(t *testing.T) {
 	cases := map[string]struct {
 		mutate func(*fakeGitHubForRuns)
 		reason string
+		// workflow, when set, is the workflow id the logged reason must name
+		// (the text handler escapes the %q quotes, so it is matched apart).
+		workflow       string
+		driverWorkflow string
 	}{
-		"not found": {func(f *fakeGitHubForRuns) {
+		"not found": {mutate: func(f *fakeGitHubForRuns) {
 			f.specStatus, f.specBody = http.StatusNotFound, `{"message":"Not Found"}`
-		}, "no workflow spec on the default branch"},
-		"transport error": {func(f *fakeGitHubForRuns) {
+		}, reason: "no workflow spec on the default branch"},
+		"transport error": {mutate: func(f *fakeGitHubForRuns) {
 			f.specStatus, f.specBody = http.StatusInternalServerError, `{"message":"boom"}`
-		}, "fetch workflow spec failed"},
-		"unparseable spec": {func(f *fakeGitHubForRuns) { *f = *newFakeGitHubForRuns("version: [not: a spec") },
-			"parse workflow spec failed"},
-		"no implement": {func(f *fakeGitHubForRuns) { *f = *newFakeGitHubForRuns(screenSpecNoImplementYAML) },
-			"no implement-stage forbidden_paths declared"},
-		"no forbidden": {func(f *fakeGitHubForRuns) { *f = *newFakeGitHubForRuns(screenSpecNoForbiddenYAML) },
-			"no implement-stage forbidden_paths declared"},
+		}, reason: "fetch workflow spec failed"},
+		"unparseable spec": {mutate: func(f *fakeGitHubForRuns) { *f = *newFakeGitHubForRuns("version: [not: a spec") },
+			reason: "parse workflow spec failed"},
+		// screenSpecNoImplementYAML declares only plan_only, so the default
+		// feature_change is absent: the missing-workflow degrade.
+		"no implement": {mutate: func(f *fakeGitHubForRuns) { *f = *newFakeGitHubForRuns(screenSpecNoImplementYAML) },
+			reason: "not defined in the default-branch spec", workflow: "feature_change"},
+		"driver workflow not defined": {mutate: func(*fakeGitHubForRuns) {},
+			reason: "not defined in the default-branch spec", workflow: "routine_change", driverWorkflow: "routine_change"},
+		"no forbidden": {mutate: func(f *fakeGitHubForRuns) { *f = *newFakeGitHubForRuns(screenSpecNoForbiddenYAML) },
+			reason: "no implement-stage forbidden_paths declared in workflow", workflow: "feature_change"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			fake := newFakeGitHubForRuns(screenSpecYAML)
 			tc.mutate(fake)
 			var logs bytes.Buffer
-			s := New(Config{GitHub: screenGitHub(t, fake), Logger: slog.New(slog.NewTextHandler(&logs, nil))})
-			got, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.FromGitHubInstallationID(12345), screenRepo)
+			s := New(Config{
+				GitHub:                   screenGitHub(t, fake),
+				Logger:                   slog.New(slog.NewTextHandler(&logs, nil)),
+				CampaignDriverWorkflowID: tc.driverWorkflow,
+			})
+			got, _, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.FromGitHubInstallationID(12345), screenRepo)
 			if ok || got != nil {
 				t.Fatalf("got %v ok=%v, want nil ok=false", got, ok)
 			}
@@ -288,6 +346,9 @@ func TestResolveCampaignForbiddenPaths_FailOpenBranches(t *testing.T) {
 			}
 			if !strings.Contains(logs.String(), tc.reason) {
 				t.Errorf("logged skip reason missing %q: %s", tc.reason, logs.String())
+			}
+			if tc.workflow != "" && !strings.Contains(logs.String(), tc.workflow) {
+				t.Errorf("logged skip reason does not name workflow %q: %s", tc.workflow, logs.String())
 			}
 		})
 	}
@@ -298,7 +359,7 @@ func TestResolveCampaignForbiddenPaths_FailOpenBranches(t *testing.T) {
 func TestResolveCampaignForbiddenPaths_ZeroScope_FailsOpen(t *testing.T) {
 	fake := newFakeGitHubForRuns(screenSpecYAML)
 	s := New(Config{GitHub: screenGitHub(t, fake)})
-	got, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.CredentialScope{}, screenRepo)
+	got, _, ok := s.resolveCampaignForbiddenPaths(context.Background(), forge.CredentialScope{}, screenRepo)
 	if ok || got != nil {
 		t.Fatalf("got %v ok=%v, want nil ok=false", got, ok)
 	}
@@ -369,5 +430,42 @@ func TestCreateCampaign_AdmissionScreen_DegradedStillReportsNotRunnable(t *testi
 	if sc == nil || sc.ForbiddenPathsScreened || !sc.Advisory || len(sc.Findings) != 1 ||
 		sc.Findings[0].Kind != campaignScreenKindNotRunnable {
 		t.Fatalf("admission_screen = %+v, want one not_runnable_declared, screened=false", sc)
+	}
+	if sc.WorkflowID != "feature_change" {
+		t.Errorf("admission_screen.workflow_id = %q, want feature_change on a degraded block", sc.WorkflowID)
+	}
+}
+
+// A driver workflow the spec does not define degrades class 2 FAIL-OPEN, and
+// the operator sees it on the block itself (#5267 condition K4a): the create
+// still succeeds, the class-1 finding is still reported, and the block says
+// forbidden_paths_screened false and names the unscreened workflow — not just
+// a server log line. The item names a path BOTH spec workflows forbid, so a
+// degrade that fell back to another workflow would report a forbidden_path
+// finding and flip screened to true.
+func TestCreateCampaign_AdmissionScreen_DriverWorkflowMissing_ReportedOnBlock(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 100, Title: "x", Body: "edit `.gitlab-ci.yml`", NotRunnable: true}},
+	}})
+	s := New(Config{
+		CampaignRepo:             newFakeCampaignRepo(),
+		GitHub:                   screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML)),
+		CampaignDriverWorkflowID: "routine_change",
+	})
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	sc := created.AdmissionScreen
+	if sc == nil || sc.ForbiddenPathsScreened || !sc.Advisory || len(sc.Findings) != 1 ||
+		sc.Findings[0].Kind != campaignScreenKindNotRunnable {
+		t.Fatalf("admission_screen = %+v, want one not_runnable_declared, screened=false", sc)
+	}
+	if sc.WorkflowID != "routine_change" {
+		t.Errorf("admission_screen.workflow_id = %q, want routine_change (the unscreened driver workflow)", sc.WorkflowID)
 	}
 }
