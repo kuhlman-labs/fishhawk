@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -2366,4 +2369,348 @@ func TestLoadStageConstraintsFromCache_AgentInstructionPaths_FailClosed(t *testi
 			t.Errorf("AgentInstructionPaths = %+v, want nil for a plan stage", c.AgentInstructionPaths)
 		}
 	})
+}
+
+// gzipJSONL gzips raw JSONL verbatim so a #5535 fixture is unreadable BY
+// CONSTRUCTION, never by calling the control under test.
+func gzipJSONL(t *testing.T, raw string) []byte {
+	t.Helper()
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+const unreadableManifestLine = `{"seq":1,"kind":"manifest","data":{"bundle_schema":"v1"}}` + "\n"
+
+const unreadableDiffLine = `{"seq":3,"kind":"git_diff","data":{"kind":"name_status","base_ref":"origin/main","files":[{"path":"backend/main.go","status":"M"}],"num_files":1}}` + "\n"
+
+// unreadableBundleMalformedLine: a non-JSON second line makes the WHOLE
+// bundle unreadable (ExtractManifest fails first), the #5535 incident class.
+func unreadableBundleMalformedLine(t *testing.T) []byte {
+	return gzipJSONL(t, unreadableManifestLine+"not a json line\n"+unreadableDiffLine)
+}
+
+// unreadableBundleMalformedGitDiff: a readable manifest, but the git_diff
+// payload has the wrong shape (files is a string).
+func unreadableBundleMalformedGitDiff(t *testing.T) []byte {
+	return gzipJSONL(t, unreadableManifestLine+`{"seq":2,"kind":"git_diff","data":{"files":"oops"}}`+"\n")
+}
+
+// unreadableBundleTruncatedGzip: a valid bundle with its gzip stream cut
+// mid-body.
+func unreadableBundleTruncatedGzip(t *testing.T) []byte {
+	b := gzipJSONL(t, unreadableManifestLine+unreadableDiffLine)
+	return b[:len(b)-12]
+}
+
+// policyPayloads returns every persisted policy_evaluated payload.
+func policyPayloads(t *testing.T, au *auditFake) []policy.EvaluationPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []policy.EvaluationPayload
+	for _, e := range au.appended {
+		if e.Category != policy.CategoryPolicyEvaluated {
+			continue
+		}
+		var p policy.EvaluationPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode policy payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// assertBundleUnreadableFailedC pins the #5535 fail-closed outcome: the
+// implement stage is failed category C with a bundle_unreadable reason
+// naming the read error, it never reached succeeded or awaiting_approval,
+// and the last policy_evaluated row is passed:false bundle_unreadable.
+func assertBundleUnreadableFailedC(t *testing.T, repo *policyRunRepo, au *auditFake) {
+	t.Helper()
+	if repo.stage.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", repo.stage.State)
+	}
+	if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureC {
+		t.Fatalf("FailureCategory = %v, want C", repo.stage.FailureCategory)
+	}
+	if repo.stage.FailureReason == nil || !strings.HasPrefix(*repo.stage.FailureReason, "bundle_unreadable: ") {
+		t.Fatalf("FailureReason = %v, want a bundle_unreadable: reason", repo.stage.FailureReason)
+	}
+	if !strings.Contains(*repo.stage.FailureReason, "bundle: ") || !strings.Contains(*repo.stage.FailureReason, "#5535") {
+		t.Errorf("FailureReason %q does not name the read error and #5535", *repo.stage.FailureReason)
+	}
+	repo.mu.Lock()
+	for _, tr := range repo.transitions {
+		if tr.To == run.StageStateSucceeded || tr.To == run.StageStateAwaitingApproval {
+			t.Errorf("stage transitioned to %q on an unreadable bundle", tr.To)
+		}
+	}
+	repo.mu.Unlock()
+	rows := policyPayloads(t, au)
+	if len(rows) == 0 {
+		t.Fatal("no policy_evaluated row recorded")
+	}
+	last := rows[len(rows)-1]
+	if last.Passed || last.SkipReason != policy.SkipBundleUnreadable {
+		t.Errorf("policy row = passed:%v skip_reason:%q, want passed:false bundle_unreadable", last.Passed, last.SkipReason)
+	}
+	if last.SkipDetail == "" || len(last.SkipDetail) > maxBundleErrDetailBytes {
+		t.Errorf("skip_detail = %q, want a non-empty bounded read error", last.SkipDetail)
+	}
+}
+
+func TestShipTrace_UnreadableBundle_MalformedLine_FailedC(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	repo.runRow.State = run.StateRunning
+	s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: repo, Audit: au}
+	b := unreadableBundleMalformedLine(t)
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("raw status = %d:\n%s", w.Code, w.Body.String())
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+	if !strings.Contains(*repo.stage.FailureReason, "parse line") {
+		t.Errorf("FailureReason %q does not name the parse-line error", *repo.stage.FailureReason)
+	}
+
+	// B2: the redacted variant of the SAME bundle arrives while the stage is
+	// STILL failed. It must change nothing: no further stage transition, no
+	// second advanceAfterFailure / orchestrator Advance (no run transition,
+	// no further orchestrator audit), no second runtime_observed.
+	reason := *repo.stage.FailureReason
+	repo.mu.Lock()
+	stageTransitions, runTransitions := len(repo.transitions), len(repo.runTransitions)
+	repo.mu.Unlock()
+	nonUpload := func() int {
+		au.mu.Lock()
+		defer au.mu.Unlock()
+		n := 0
+		for _, e := range au.appended {
+			if e.Category != "trace_uploaded" && e.Category != policy.CategoryPolicyEvaluated {
+				n++
+			}
+		}
+		return n
+	}
+	otherAudit := nonUpload()
+	runtimeObserved := countTraceAuditCategory(au, "runtime_observed")
+
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "redacted", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("redacted status = %d:\n%s", w.Code, w.Body.String())
+	}
+	repo.mu.Lock()
+	gotStage, gotRun := len(repo.transitions), len(repo.runTransitions)
+	repo.mu.Unlock()
+	if gotStage != stageTransitions {
+		t.Errorf("redacted re-upload made %d further stage transition(s), want 0", gotStage-stageTransitions)
+	}
+	if gotRun != runTransitions {
+		t.Errorf("redacted re-upload made %d further run transition(s), want 0 (second Advance)", gotRun-runTransitions)
+	}
+	if got := nonUpload(); got != otherAudit {
+		t.Errorf("redacted re-upload appended %d further non-upload audit entries, want 0 (second advanceAfterFailure)", got-otherAudit)
+	}
+	if got := countTraceAuditCategory(au, "runtime_observed"); got != runtimeObserved {
+		t.Errorf("runtime_observed = %d after the re-upload, want %d", got, runtimeObserved)
+	}
+	if repo.stage.State != run.StageStateFailed || *repo.stage.FailureReason != reason {
+		t.Errorf("stage after redacted re-upload = %q / %q, want failed with the reason unchanged", repo.stage.State, *repo.stage.FailureReason)
+	}
+}
+
+// TestShipTrace_UnreadableBundle_RetryThenStaleUpload is the RetryStage
+// seam. The category-C failure is retryable (failed -> pending). A STALE
+// upload of the same unreadable bundle arriving after the retry finds a
+// stage that is no longer failed, so the intended outcome is that it fails
+// the retried stage category C again: an unreadable bundle can never
+// advance a stage, whatever its state, and the operator retries again.
+func TestShipTrace_UnreadableBundle_RetryThenStaleUpload(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	b := unreadableBundleMalformedLine(t)
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("raw status = %d", w.Code)
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+
+	dec, err := run.RetryStage(context.Background(), repo, repo.stage.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage on the bundle_unreadable stage = %v, want nil (category C is retryable)", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Fatalf("post-retry state = %q, want pending", dec.Stage.State)
+	}
+
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "redacted", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("stale redacted status = %d", w.Code)
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+}
+
+func TestShipTrace_UnreadableBundle_MalformedGitDiff_FailedC(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, unreadableBundleMalformedGitDiff(t), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+	if !strings.Contains(*repo.stage.FailureReason, "parse git_diff payload") {
+		t.Errorf("FailureReason %q does not name the git_diff payload error", *repo.stage.FailureReason)
+	}
+}
+
+func TestShipTrace_UnreadableBundle_TruncatedGzip_FailedC(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, unreadableBundleTruncatedGzip(t), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+	if !strings.Contains(*repo.stage.FailureReason, "bundle: read:") {
+		t.Errorf("FailureReason %q does not name the read error", *repo.stage.FailureReason)
+	}
+}
+
+// flappingPolicyRepo fails every GetStage made from inside the function
+// named failGetStageFrom and, when getRunErr is set, every GetRun call, so
+// a test can prove the unreadable-bundle decision does not hang on a
+// repository read (#5535 B1). Failing by caller, not by call count, keeps
+// the injected failure on the lookup under test rather than on whichever
+// handler read happens to come first.
+type flappingPolicyRepo struct {
+	*policyRunRepo
+	failGetStageFrom string
+	getRunErr        error
+}
+
+// calledFrom reports whether a function whose name ends in fn is on the
+// caller's stack.
+func calledFrom(fn string) bool {
+	pcs := make([]uintptr, 32)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(3, pcs)])
+	for {
+		f, more := frames.Next()
+		if strings.HasSuffix(f.Function, fn) {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+func (f *flappingPolicyRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	if f.failGetStageFrom != "" && calledFrom(f.failGetStageFrom) {
+		return nil, errors.New("get stage flapped")
+	}
+	return f.policyRunRepo.GetStage(ctx, id)
+}
+
+func (f *flappingPolicyRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if f.getRunErr != nil {
+		return nil, f.getRunErr
+	}
+	return f.policyRunRepo.GetRun(ctx, id)
+}
+
+// TestShipTrace_UnreadableBundle_GetRunError_NotSucceeded pins B1: a GetRun
+// error, which makes reEvaluatePolicy return early, cannot let an
+// unreadable bundle reach a terminal pass. The stage fails C and the
+// not-passed policy row is still recorded (the readability check runs
+// before the run lookup).
+func TestShipTrace_UnreadableBundle_GetRunError_NotSucceeded(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	s.cfg.RunRepo = &flappingPolicyRepo{policyRunRepo: repo, getRunErr: errors.New("get run flapped")}
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, unreadableBundleMalformedLine(t), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if repo.stage.State == run.StageStateSucceeded || repo.stage.State == run.StageStateAwaitingApproval {
+		t.Fatalf("stage = %q on an unreadable bundle with GetRun failing", repo.stage.State)
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+}
+
+// TestShipTrace_UnreadableBundle_StageLookupFlap_FailsC isolates the
+// handler's byte-derived decision: reEvaluatePolicy's GetStage fails, so
+// reEvaluatePolicy reports nothing, and the stage must still be failed C
+// from the bundle bytes alone rather than held or advanced.
+func TestShipTrace_UnreadableBundle_StageLookupFlap_FailsC(t *testing.T) {
+	s, sf, repo, _ := newPolicyTraceServer(t, nil)
+	s.cfg.RunRepo = &flappingPolicyRepo{policyRunRepo: repo, failGetStageFrom: ".reEvaluatePolicy"}
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, unreadableBundleMalformedLine(t), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if repo.stage.State != run.StageStateFailed || repo.stage.FailureReason == nil ||
+		!strings.HasPrefix(*repo.stage.FailureReason, "bundle_unreadable: ") {
+		t.Fatalf("stage = %q / %v, want failed with a bundle_unreadable reason", repo.stage.State, repo.stage.FailureReason)
+	}
+}
+
+// TestShipTrace_UnreadableBundle_NoRawPayloadEcho pins B5: a decode error
+// over attacker-shaped bytes (encoding/json echoes a number literal
+// verbatim in its type error) reaches neither the stage reason nor the
+// policy_evaluated skip_detail.
+func TestShipTrace_UnreadableBundle_NoRawPayloadEcho(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	marker := strings.Repeat("7", 900)
+	b := gzipJSONL(t, unreadableManifestLine+`{"seq":`+marker+`,"kind":"x"}`+"\n")
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	assertBundleUnreadableFailedC(t, repo, au)
+	echo := strings.Repeat("7", 16)
+	if strings.Contains(*repo.stage.FailureReason, echo) {
+		t.Errorf("FailureReason echoes the raw payload literal: %q", *repo.stage.FailureReason)
+	}
+	rows := policyPayloads(t, au)
+	if d := rows[len(rows)-1].SkipDetail; strings.Contains(d, echo) {
+		t.Errorf("skip_detail echoes the raw payload literal: %q", d)
+	}
+}
+
+// TestBundleErrDetail_SanitizesAndBounds pins the control-character and
+// length arms of bundleErrDetail directly.
+func TestBundleErrDetail_SanitizesAndBounds(t *testing.T) {
+	got := bundleErrDetail(errors.New("bad\x1b[31m\x00line\n\xff"))
+	for _, r := range got {
+		if unicode.IsControl(r) {
+			t.Fatalf("detail %q keeps a control character", got)
+		}
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("detail %q is not valid UTF-8", got)
+	}
+	long := bundleErrDetail(errors.New(strings.Repeat("é", 1000)))
+	if len(long) > maxBundleErrDetailBytes || !utf8.ValidString(long) {
+		t.Fatalf("detail len = %d (valid=%v), want <= %d and valid UTF-8", len(long), utf8.ValidString(long), maxBundleErrDetailBytes)
+	}
+}
+
+// TestShipTrace_NoDiffEvent_StillSkipPass pins the carve-out: a cleanly read
+// bundle with NO git_diff event keeps passed:true no_diff_in_bundle and
+// advances, rather than failing as unreadable.
+func TestShipTrace_NoDiffEvent_StillSkipPass(t *testing.T) {
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	priv, _ := sf.issue(t, repo.runRow.ID)
+	if w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, makeTestBundle(t, nil), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if repo.stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+	}
+	rows := policyPayloads(t, au)
+	if len(rows) != 1 || !rows[0].Passed || rows[0].SkipReason != policy.SkipNoDiffInBundle {
+		t.Fatalf("policy rows = %+v, want one passed:true no_diff_in_bundle", rows)
+	}
 }
