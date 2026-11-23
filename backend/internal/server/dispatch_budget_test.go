@@ -591,6 +591,47 @@ func TestGetRun_IncludeDispatchBudget_SumErrorIs503(t *testing.T) {
 	}
 }
 
+// TestGetRun_IncludeDispatchBudget_503CarriesVerifyPassStageIDs (approval
+// condition D1, amendments 0f18ebd4 / a09939e2): an undecided verdict's 503
+// carries the verify-pass stage ids THROUGH writeError's 5xx default-deny
+// redactor, so the dispatcher can still spawn a verify-only pass while the
+// live read errors. The raw cause never reaches the body (D5(c)), and a run
+// with no verify pass carries no key.
+func TestGetRun_IncludeDispatchBudget_503CarriesVerifyPassStageIDs(t *testing.T) {
+	f := newDBFixture(t, dbSpec(dbBlocking(10)), dbOpts{})
+	f.au.stampSequence = true
+	f.spent(15)
+	f.gh.specStatus = http.StatusInternalServerError
+	f.gh.specBody = `{"message":"secret-forge-cause"}`
+
+	vp := f.seedRun(dbSpec(dbBlocking(10)), nil)
+	sid := f.seedVerifyPass(vp.ID, false)
+	w := getRunAsWithQuery(t, f.s, testOperatorIdentity(), vp.ID, "include=dispatch_budget")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	env := decodeErrEnvelope(t, w)
+	if env.Error.Code != budgetCheckFailedCode || env.Error.Details["reason"] != budgetCheckLiveUnavailable {
+		t.Fatalf("503 = %+v, want budget_check_failed reason %s", env.Error, budgetCheckLiveUnavailable)
+	}
+	ids, _ := env.Error.Details["verify_pass_stage_ids"].([]any)
+	if len(ids) != 1 || ids[0] != sid.String() {
+		t.Fatalf("503 details.verify_pass_stage_ids = %v, want [%s]:\n%s", env.Error.Details["verify_pass_stage_ids"], sid, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret-forge-cause") {
+		t.Errorf("503 body leaked the raw cause:\n%s", w.Body.String())
+	}
+
+	plain := f.seedRun(dbSpec(dbBlocking(10)), nil)
+	w = getRunAsWithQuery(t, f.s, testOperatorIdentity(), plain.ID, "include=dispatch_budget")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("plain run status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if _, ok := decodeErrEnvelope(t, w).Error.Details["verify_pass_stage_ids"]; ok {
+		t.Errorf("503 of a run with no verify pass carries verify_pass_stage_ids:\n%s", w.Body.String())
+	}
+}
+
 // TestGetRun_IncludeDispatchBudget_RunTokenForbidden (E2).
 func TestGetRun_IncludeDispatchBudget_RunTokenForbidden(t *testing.T) {
 	f := newDBFixture(t, dbSpec(dbBlocking(10)), dbOpts{noGitHub: true})

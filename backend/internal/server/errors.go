@@ -183,6 +183,15 @@ var redactableDetailKeys = map[string]struct{}{
 	// abandoned run still needs fishhawk_cancel_run.
 	"cancelled_run_id":     {},
 	"cancel_failed_run_id": {},
+	// verify_pass_stage_ids: the merge-candidate verify-only implement passes
+	// a 503 budget_check_failed carries (ADR-030 Amendment A1 / #5473,
+	// approval condition D1), which the host dispatcher still spawns when the
+	// blocking-budget verdict is undecided. Its value is a list of
+	// product-owned stage UUIDs the server computed from its own stage rows
+	// (dispatch_budget.go verifyPassStageIDs via isMergeCandidateVerifyPass) —
+	// never error, subprocess or third-party text — so it satisfies the
+	// membership rule above on the `stage_id` precedent.
+	"verify_pass_stage_ids": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of

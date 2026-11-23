@@ -15639,8 +15639,11 @@ paths:
             `workflow_absent_from_live_spec` (a failed live read while the
             admission spec declares a blocking budget), `spend_sum_failed` or
             `override_binding_unreadable`. The body carries only the
-            enumerated reason; the raw cause is logged server-side with the
-            run id. A consumer must not treat it as clear.
+            enumerated reason and `verify_pass_stage_ids` (present when
+            non-empty: the merge-candidate verify-only implement passes,
+            decided before any budget read, which the host dispatcher still
+            spawns); the raw cause is logged server-side with the run id. A
+            consumer must not treat it as clear.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

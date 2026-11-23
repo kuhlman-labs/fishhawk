@@ -446,6 +446,18 @@ type Run struct {
 	// #371-class hand-maintained-wire-mirror trap.
 	DispatchHold            *RunDispatchHold `json:"dispatch_hold,omitempty" jsonschema:"the run's effective operator dispatch hold (its own, or an ancestor's with inherited true): new host dispatches of this run are parked until it is cleared with fishhawk_hold_dispatch action clear. Omitted when not held"`
 	DispatchHoldUnavailable bool             `json:"dispatch_hold_unavailable,omitempty" jsonschema:"true when the backend could not read the run's dispatch hold; the host dispatcher and the dispatch marker both fail closed on it"`
+	// DispatchBudget mirrors the backend's include=dispatch_budget block
+	// (ADR-030 Amendment A1 / #5473): the host dispatcher's blocking-budget
+	// verdict. It is served only when the read asked for it
+	// (GetRunDispatchBudget), so it is nil on every other read. The json tags
+	// MUST byte-match the backend's dispatchBudgetPayload.
+	DispatchBudget *runDispatchBudget `json:"dispatch_budget,omitempty" jsonschema:"the host dispatcher's blocking-budget verdict (clear, blocked or exempt, with the budget source); present only on a read that requested include=dispatch_budget"`
+	// BudgetOverrideBinding mirrors the backend's budget_override_binding
+	// block: set ONLY on the 201 of a create or recover that admitted the run
+	// past an exhausted blocking budget with budget_override. recorded false
+	// means the run is admitted but its dispatch exemption was not recorded,
+	// and remedy names the fix (fishhawk_dispatch_stage by hand).
+	BudgetOverrideBinding *runBudgetOverrideBinding `json:"budget_override_binding,omitempty" jsonschema:"on a run just admitted past an exhausted blocking budget with budget_override: whether its host-dispatch budget exemption was recorded (recorded false carries a remedy: the host dispatcher will refuse its later stages budget_blocked, so dispatch them by hand with fishhawk_dispatch_stage)"`
 	// PredictedRuntimeMinutes mirrors the backend runResponse
 	// .predicted_runtime_minutes (E48.62 / #2489): the approved plan's own
 	// runtime prediction, stamped onto the run row at plan approval. The
@@ -674,6 +686,18 @@ func init() {
 		pathClassification{Path: "run.campaign_link", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
 			return []retrievalPointer{pointerREST("/v0/runs/" + runID + "?include=campaign_link").retrievalPointer}
 		}},
+		// The blocking-budget verdict (ADR-030 Amendment A1 / #5473) and the
+		// override-binding status (#5473). Neither ever reaches the run-status
+		// read: dispatch_budget is served only on a read that asks for
+		// include=dispatch_budget (GetRunDispatchBudget, the host dispatcher's
+		// own read), and budget_override_binding only on a create or recover
+		// 201. Both are small fixed-shape blocks, so they are tierNever like
+		// the adjacent decode-mirror rows (stages[].agent_timeout_seconds):
+		// each rides along without a skeleton-ledger entry, so it neither
+		// bypasses the budget nor perturbs the diagnosis-skeleton size and
+		// the floor's pointer union that the bound assertions pin.
+		pathClassification{Path: "run.dispatch_budget", Tier: tierNever},
+		pathClassification{Path: "run.budget_override_binding", Tier: tierNever},
 	)
 }
 
@@ -983,6 +1007,133 @@ func (c *apiClient) GetRunCampaignLink(ctx context.Context, id uuid.UUID) (*runC
 		return nil, errCampaignLinkAbsent
 	}
 	return r.CampaignLink, nil
+}
+
+// dispatch_budget statuses and budget sources: closed sets mirroring the
+// backend (backend/internal/server/dispatch_budget.go).
+const (
+	dispatchBudgetStatusClear   = "clear"
+	dispatchBudgetStatusBlocked = "blocked"
+	dispatchBudgetStatusExempt  = "exempt"
+
+	// dispatchBudgetSourceLive: the repository's CURRENT default-branch spec
+	// decided the verdict, so a default-branch limit or enforcement edit
+	// applies on the next tick.
+	dispatchBudgetSourceLive = "live_spec"
+	// dispatchBudgetSourceAdmissionFallback: a configured live read failed and
+	// the run's admission spec declares no blocking budget, so it cleared.
+	dispatchBudgetSourceAdmissionFallback = "admission_spec_fallback"
+	// dispatchBudgetSourceAdmission: no server-side spec read exists for the
+	// run (a GitLab run, or no GitHub client); the cached admission spec
+	// decided, so only a period rollover changes the verdict.
+	dispatchBudgetSourceAdmission = "admission_spec"
+
+	// budgetCheckFailedCode is the backend's 503 code for an undecided
+	// verdict.
+	budgetCheckFailedCode = "budget_check_failed"
+)
+
+// runDispatchBudget mirrors the backend dispatchBudgetPayload (ADR-030
+// Amendment A1 / #5473). The json tags MUST byte-match the backend or the
+// field silently decodes to its zero value (the #371-class wire-mirror trap);
+// TestGetRunDispatchBudget_DecodesEveryField pins the decode of every tag.
+// Unexported like runCampaignLink: nothing outside this package names it.
+type runDispatchBudget struct {
+	Status        string `json:"status" jsonschema:"clear | blocked | exempt"`
+	BudgetSource  string `json:"budget_source,omitempty" jsonschema:"which spec decided a clear or blocked verdict: live_spec (the default branch's current spec), admission_spec_fallback (the live read failed and the admission spec declares no blocking budget) or admission_spec (no server-side spec read for this forge); omitted on exempt"`
+	ExemptReason  string `json:"exempt_reason,omitempty" jsonschema:"budget_override on an exempt verdict"`
+	OverrideRunID string `json:"override_run_id,omitempty" jsonschema:"the run whose run_budget_override_bound row exempts this run (itself or a decomposed_from ancestor)"`
+	// Budget is the offending blocking budget on a blocked verdict.
+	Budget *runDispatchBudgetDetail `json:"budget,omitempty" jsonschema:"the offending blocking budget; present on blocked only"`
+	// VerifyPassStageIDs are the run's merge-candidate verify-only implement
+	// passes, which the dispatcher spawns even on a blocked verdict.
+	VerifyPassStageIDs []string `json:"verify_pass_stage_ids,omitempty" jsonschema:"implement stages that are merge-candidate verify-only passes; the host dispatcher spawns them even on blocked"`
+}
+
+// runDispatchBudgetDetail mirrors the backend dispatchBudgetDetail.
+type runDispatchBudgetDetail struct {
+	WorkflowID  string `json:"workflow_id" jsonschema:"the run's workflow id"`
+	Period      string `json:"period" jsonschema:"daily | weekly | monthly"`
+	PeriodStart string `json:"period_start" jsonschema:"the period window start (RFC 3339)"`
+	PeriodEnd   string `json:"period_end" jsonschema:"the period window end, when the budget rolls over (RFC 3339)"`
+	// LimitUSD is the EFFECTIVE limit (FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD
+	// when set), the one GET /v0/runs/{id}/budget reports.
+	LimitUSD    float64 `json:"limit_usd" jsonschema:"the effective limit in USD"`
+	SpentUSD    float64 `json:"spent_usd" jsonschema:"spend in the period in USD"`
+	Enforcement string  `json:"enforcement" jsonschema:"blocking"`
+}
+
+// runBudgetOverrideBinding mirrors the backend budgetOverrideBindingStatus.
+type runBudgetOverrideBinding struct {
+	Recorded bool   `json:"recorded" jsonschema:"true when the run's dispatch exemption (run_budget_override_bound) was recorded"`
+	Remedy   string `json:"remedy,omitempty" jsonschema:"present when recorded is false: the remedy for the unrecorded exemption"`
+}
+
+// errDispatchBudgetAbsent is returned when a backend answered an
+// include=dispatch_budget read with 200 but without the block. A consumer
+// gating on the verdict must fail closed on it, never guess clear.
+var errDispatchBudgetAbsent = errors.New("dispatch_budget absent from the run read: the backend does not serve include=dispatch_budget; deploy a fishhawkd that serves include=dispatch_budget")
+
+// dispatchBudgetUndecidedError is GetRunDispatchBudget's error for a verdict
+// the backend could not decide (503 budget_check_failed). Reason is the
+// backend's enumerated details.reason. VerifyPassStageIDs carries the
+// merge-candidate verify-only passes the backend decided BEFORE the failed
+// budget read (approval condition D1), which the dispatcher still spawns.
+type dispatchBudgetUndecidedError struct {
+	Reason             string
+	VerifyPassStageIDs []string
+	Err                error
+}
+
+func (e *dispatchBudgetUndecidedError) Error() string {
+	reason := e.Reason
+	if reason == "" {
+		reason = "unspecified"
+	}
+	msg := "fishhawkd answered 503 " + budgetCheckFailedCode + " (reason " + reason + ")"
+	var ae *apiError
+	if errors.As(e.Err, &ae) && ae.ErrorRef != "" {
+		msg += " error_ref=" + ae.ErrorRef
+	}
+	return msg
+}
+
+func (e *dispatchBudgetUndecidedError) Unwrap() error { return e.Err }
+
+// GetRunDispatchBudget calls GET /v0/runs/{id}?include=dispatch_budget
+// (ADR-030 Amendment A1 / #5473) and returns the run's blocking-budget
+// verdict. A transport error, a non-2xx answer or an absent block is an
+// error, never a guessed clear: the host dispatcher fails closed on it. A 503
+// budget_check_failed is a *dispatchBudgetUndecidedError carrying the
+// backend's reason and verify-pass stages. A 400 (an older fishhawkd that
+// rejects the include value) names the deploy remedy.
+func (c *apiClient) GetRunDispatchBudget(ctx context.Context, id uuid.UUID) (*runDispatchBudget, error) {
+	var r Run
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+id.String()+"?include=dispatch_budget", nil, &r); err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) {
+			switch {
+			case ae.StatusCode == http.StatusServiceUnavailable && ae.Code == budgetCheckFailedCode:
+				out := &dispatchBudgetUndecidedError{Err: err}
+				out.Reason, _ = ae.Details["reason"].(string)
+				if ids, ok := ae.Details["verify_pass_stage_ids"].([]any); ok {
+					for _, v := range ids {
+						if s, ok := v.(string); ok && s != "" {
+							out.VerifyPassStageIDs = append(out.VerifyPassStageIDs, s)
+						}
+					}
+				}
+				return nil, out
+			case ae.StatusCode == http.StatusBadRequest:
+				return nil, fmt.Errorf("fishhawkd refused include=dispatch_budget (HTTP 400 %s): it predates the host-dispatch blocking-budget verdict; deploy a fishhawkd that serves include=dispatch_budget: %w", ae.Code, err)
+			}
+		}
+		return nil, err
+	}
+	if r.DispatchBudget == nil {
+		return nil, errDispatchBudgetAbsent
+	}
+	return r.DispatchBudget, nil
 }
 
 func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
@@ -5472,7 +5623,7 @@ type CampaignItem struct {
 	// the backend's, passed through verbatim except on the operator's stdio
 	// fishhawk-mcp, where a host_dispatcher block is overlaid from the host
 	// dispatcher's status.json (#5402, host_dispatch_overlay.go).
-	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read). dispatch_hold is the item run's operator dispatch hold (its own or an ancestor's), shown to the same caller; with it a block waiting on a dispatch or on its children reads human/dispatch_held (clear it with fishhawk_hold_dispatch action clear), and a running stage keeps in_flight. On the operator's stdio fishhawk-mcp a host_dispatcher block is overlaid from the host dispatcher's status.json and carries host_dispatch (the dispatcher's state): it stays host_dispatcher/host_dispatch when the dispatcher is live or will retry on its own, becomes host_dispatcher/host_dispatch_unverified when it could not be checked, and becomes human with host_dispatch_paused, host_dispatch_capped, host_dispatch_refused or host_dispatcher_absent (no status file found, or a stale one) when an operator must act; next_step names the remedy. An acceptance stage held for the implement review round reads system/in_flight, whether the round is in flight or expected but not yet started: that reading comes from the dispatcher's refusal (implement_review_in_flight or implement_review_not_started) or, before the dispatcher's first tick, from the round itself, and past 30 minutes the next_step names fishhawk_get_run_status and fishhawk_rerun_review. The overlay is absent over HTTP /mcp"`
+	Awaiting *campaignItemAwaiting `json:"awaiting,omitempty" jsonschema:"status read only: what a running item with a non-terminal linked run waits on. kind host_dispatcher | human | system with a closed-set reason; decision is the campaign driver's current decision marker, shown only to a caller that may read decision sources (decision_withheld otherwise; decision_unavailable when a source could not be read). dispatch_hold is the item run's operator dispatch hold (its own or an ancestor's), shown to the same caller; with it a block waiting on a dispatch or on its children reads human/dispatch_held (clear it with fishhawk_hold_dispatch action clear), and a running stage keeps in_flight. On the operator's stdio fishhawk-mcp a host_dispatcher block is overlaid from the host dispatcher's status.json and carries host_dispatch (the dispatcher's state): it stays host_dispatcher/host_dispatch when the dispatcher is live or will retry on its own, becomes host_dispatcher/host_dispatch_unverified when it could not be checked, and becomes human with host_dispatch_paused, host_dispatch_capped, host_dispatch_refused, host_dispatch_budget_blocked (a blocking periodic budget of the item's workflow is over its limit, so the dispatcher refuses new spawns budget_blocked; next_step names the budget, its period, its spend and its budget_source, and the remedies: on a live_spec verdict raise limit_usd or set enforcement advisory on the default branch, or wait for the period rollover; on an admission_spec verdict only the rollover or a per-run budget_override applies; a hand fishhawk_dispatch_stage is not budget-gated) or host_dispatcher_absent (no status file found, or a stale one) when an operator must act; next_step names the remedy. An acceptance stage held for the implement review round reads system/in_flight, whether the round is in flight or expected but not yet started: that reading comes from the dispatcher's refusal (implement_review_in_flight or implement_review_not_started) or, before the dispatcher's first tick, from the round itself, and past 30 minutes the next_step names fishhawk_get_run_status and fishhawk_rerun_review. The overlay is absent over HTTP /mcp"`
 }
 
 // campaignItemAwaiting mirrors the backend's `CampaignItemAwaiting` schema
