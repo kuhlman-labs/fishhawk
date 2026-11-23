@@ -2,13 +2,14 @@ id: scenario:issue-5473/include-dispatch-budget-advisory-clear
 statement: GET /v0/runs/{run_id}?include=dispatch_budget, called with an operator token on a run whose workflow declares only advisory budgets, returns 200. Its dispatch_budget block has status clear and a budget_source of live or admission_spec. The same read without the include carries no dispatch_budget field.
 verify_hint: 'HTTP: GET /v0/runs/{run_id}?include=dispatch_budget on any feature_change run (this repo''s weekly budget is advisory) returns 200 with body.dispatch_budget.status == clear and budget_source in {live, admission_spec}. A preview with no GitHub client reports admission_spec. GET /v0/runs/{run_id} then has no dispatch_budget key.'
 steps: 'Against http://localhost:8090: POST /v0/dev/fixtures {"scenario":"implement-running"}; read run_id (feature_change run, repo kuhlman-labs/fishhawk). GET /v0/runs/{run_id}?include=dispatch_budget with no bearer (the dev preview''s operator-level read path; the same read with a run-bound fhm_ token is refused 403). Then GET /v0/runs/{run_id} without include.'
+steps_carried_from: head fe4aeb6f88bfb2d95d06fa8dbfb5f7060f0df32f recorded_at 2026-11-23T14:25:07Z
 assertions:
-    expected: 200, dispatch_budget.status clear, budget_source naming the deciding source; no dispatch_budget without include.
-    observed_at_record: '200; dispatch_budget = {"status":"clear","budget_source":"admission_spec_fallback"}. Plain GET: 200 with no dispatch_budget key. The run''s default_branch_unresolved_reason is no_installation.'
-    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run_id>?include=dispatch_budget'
+    expected: 200, status clear, budget_source naming the deciding source; no dispatch_budget without include
+    observed_at_record: 'include: 200 with dispatch_budget {"status":"clear","budget_source":"admission_spec_fallback"}; without include: 200, no dispatch_budget key'
+    repro_handle: curl http://localhost:8090/v0/runs/33cab928-c082-491b-9f22-cb6badc26efb?include=dispatch_budget
 origin:
     issue: 5473
     pr: 5556
     run_id: d367cbf0-956d-4b45-a610-33f4847585e0
-    head_sha: fe4aeb6f88bfb2d95d06fa8dbfb5f7060f0df32f
-    recorded_at: 2026-11-23T14:25:07Z
+    head_sha: 9ede4623a81ba9e16d983d77f7b1f3c582a6dc7e
+    recorded_at: 2026-11-23T15:19:01Z

@@ -2,13 +2,14 @@ id: scenario:issue-5473/include-run-token-forbidden
 statement: GET /v0/runs/{run_id}?include=dispatch_budget called with a run-bound agent token returns 403 run_token_forbidden.
 verify_hint: 'HTTP: with a run-bound (mcp:run:) bearer, GET /v0/runs/{run_id}?include=dispatch_budget returns 403 with error.code run_token_forbidden'
 steps: 'Against http://localhost:8090: POST /v0/dev/fixtures {"scenario":"implement-running"}; read run_id. POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over ''{}'' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> run-bound fhm_ bearer. GET /v0/runs/{run_id}?include=dispatch_budget with [REDACTED:authorization-bearer]; control GET /v0/runs/{run_id} with the same bearer.'
+steps_carried_from: head fe4aeb6f88bfb2d95d06fa8dbfb5f7060f0df32f recorded_at 2026-11-23T14:25:07Z
 assertions:
-    expected: 403 run_token_forbidden.
-    observed_at_record: 403 {"error":{"code":"run_token_forbidden","message":"a run-bound token cannot read include=dispatch_budget; use an operator or host-dispatcher token","details":{"field":"include"}}}; control 200.
-    repro_handle: 'curl -s -H ''Authorization: Bearer <fhm_ token>'' ''http://localhost:8090/v0/runs/<run_id>?include=dispatch_budget'''
+    expected: 403 run_token_forbidden
+    observed_at_record: control 200; include=dispatch_budget 403 error.code run_token_forbidden ('a run-bound token cannot read include=dispatch_budget; use an operator or host-dispatcher token')
+    repro_handle: 'curl -H ''Authorization: Bearer <fhm_>'' http://localhost:8090/v0/runs/33cab928-c082-491b-9f22-cb6badc26efb?include=dispatch_budget'
 origin:
     issue: 5473
     pr: 5556
     run_id: d367cbf0-956d-4b45-a610-33f4847585e0
-    head_sha: fe4aeb6f88bfb2d95d06fa8dbfb5f7060f0df32f
-    recorded_at: 2026-11-23T14:25:07Z
+    head_sha: 9ede4623a81ba9e16d983d77f7b1f3c582a6dc7e
+    recorded_at: 2026-11-23T15:19:01Z
