@@ -685,6 +685,120 @@ func TestNextActions_HostDispatchClassification(t *testing.T) {
 	}
 }
 
+// naQueuedConcurrency builds a stage concurrency block QUEUED for a local slot
+// (awaiting_concurrency_slot) with the given waiter_live; status overrides the
+// queued status when non-empty.
+func naQueuedConcurrency(status string, waiterLive bool) *StageConcurrency {
+	if status == "" {
+		status = concurrencyStatusAwaitingSlot
+	}
+	return &StageConcurrency{Status: status, Group: "local-implement:host-a", Position: 2, WaiterLive: &waiterLive}
+}
+
+// TestNextActions_HostDispatcherOwnsQueuedStage is the #5267 sub-point 2
+// done-means for the MCP classifier: on an auto_dispatch run whose plan,
+// implement or acceptance stage the host dispatcher has QUEUED for a local
+// concurrency slot with a live waiter, the pending arm returns exactly one
+// re-poll whose reason says the host dispatcher owns the dispatch, and never
+// fishhawk_dispatch_stage or fishhawk_run_stage (a second dispatch would
+// double-drive the stage). Each fail-open shape (waiter_live false, an unmarked
+// run, a holding slot) keeps the dispatch actions. The state names are
+// unchanged.
+func TestNextActions_HostDispatcherOwnsQueuedStage(t *testing.T) {
+	arms := []struct {
+		name      string
+		stages    func(c *StageConcurrency) []Stage
+		wantState string
+	}{
+		{"plan", func(c *StageConcurrency) []Stage {
+			p := naStage("plan", "awaiting_host_dispatch")
+			p.Concurrency = c
+			return []Stage{p}
+		}, "plan_pending"},
+		{"implement", func(c *StageConcurrency) []Stage {
+			i := naStage("implement", "awaiting_host_dispatch")
+			i.Concurrency = c
+			return []Stage{naStage("plan", "succeeded"), i}
+		}, "implement_pending"},
+		{"acceptance", func(c *StageConcurrency) []Stage {
+			a := naStage("acceptance", "awaiting_host_dispatch")
+			a.Concurrency = c
+			return []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded"), a}
+		}, "acceptance_pending"},
+	}
+	shapes := []struct {
+		name         string
+		autoDispatch bool
+		conc         *StageConcurrency
+		wantPoll     bool
+	}{
+		{"queued_live_waiter_polls", true, naQueuedConcurrency("", true), true},
+		{"waiter_not_live_keeps_dispatch", true, naQueuedConcurrency("", false), false},
+		{"unmarked_run_keeps_dispatch", false, naQueuedConcurrency("", true), false},
+		{"holding_slot_keeps_dispatch", true, naQueuedConcurrency(concurrencyStatusHolding, true), false},
+	}
+	for _, arm := range arms {
+		for _, sh := range shapes {
+			t.Run(arm.name+"/"+sh.name, func(t *testing.T) {
+				run := naRun("running")
+				run.RunnerKind = "local"
+				run.AutoDispatch = sh.autoDispatch
+				na := nextActionsFor(run, arm.stages(sh.conc), nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+				if na == nil || na.State != arm.wantState {
+					t.Fatalf("state = %+v, want %q (the state name is unchanged)", na, arm.wantState)
+				}
+				names := actionNames(na)
+				hasDispatch := slices.Contains(names, "fishhawk_dispatch_stage") || slices.Contains(names, "fishhawk_run_stage")
+				if sh.wantPoll {
+					if len(na.Actions) != 1 || na.Actions[0].Action != "fishhawk_get_run_status" {
+						t.Fatalf("actions = %v, want exactly [fishhawk_get_run_status] (the host dispatcher owns this dispatch)", names)
+					}
+					reason := na.Actions[0].Reason
+					for _, want := range []string{"the host dispatcher owns this dispatch", arm.name, "local-implement:host-a", "position 2", "double-drive"} {
+						if !strings.Contains(reason, want) {
+							t.Errorf("reason = %q, want it to contain %q", reason, want)
+						}
+					}
+					return
+				}
+				if !hasDispatch {
+					t.Errorf("actions = %v, want a dispatch verb (fail open: nothing owns the dispatch)", names)
+				}
+			})
+		}
+	}
+}
+
+// TestHostDispatcherOwnsStage_OnlyPendingOrAwaitingHostDispatch pins approval
+// condition K4(b) on the MCP side: the suppression applies only while the
+// stage is pending or awaiting_host_dispatch. A stage at any later status is
+// never treated as dispatcher-owned, whatever its concurrency block says.
+func TestHostDispatcherOwnsStage_OnlyPendingOrAwaitingHostDispatch(t *testing.T) {
+	run := naRun("running")
+	run.AutoDispatch = true
+	for _, state := range []string{"pending", "awaiting_host_dispatch"} {
+		st := naStage("implement", state)
+		st.Concurrency = naQueuedConcurrency("", true)
+		if !hostDispatcherOwnsStage(run, &st) {
+			t.Errorf("state %s: hostDispatcherOwnsStage = false, want true", state)
+		}
+	}
+	for _, state := range []string{"dispatched", "running", "succeeded", "failed", "cancelled"} {
+		st := naStage("implement", state)
+		st.Concurrency = naQueuedConcurrency("", true)
+		if hostDispatcherOwnsStage(run, &st) {
+			t.Errorf("state %s: hostDispatcherOwnsStage = true, want false (a later status is never hidden)", state)
+		}
+	}
+	if hostDispatcherOwnsStage(run, nil) {
+		t.Error("nil stage: hostDispatcherOwnsStage = true, want false")
+	}
+	bare := naStage("implement", "awaiting_host_dispatch")
+	if hostDispatcherOwnsStage(run, &bare) {
+		t.Error("nil concurrency block: hostDispatcherOwnsStage = true, want false")
+	}
+}
+
 // TestNextActions_PlanLocalDispatchUnchanged pins condition (1): the
 // plan-local branch is byte-unchanged — a parked LOCAL plan stage still
 // offers the single fishhawk_run_stage action and never dispatch_stage.
@@ -1860,6 +1974,23 @@ func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 	}
 }
 
+// TestCampaignNextActionsFor_StartRun_RestartableFailed is the #5267 consumer
+// pin: a restartable FAILED item rides the wire failed slice of its own state,
+// and the start_run arm must still route it to fishhawk_start_campaign_item_run,
+// never the generic fishhawk_start_run that neither restarts nor links it.
+func TestCampaignNextActionsFor_StartRun_RestartableFailed(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Failed: []string{"#41"}}, caNextAction("start_run", "#41"), nil)
+	if na.State != "campaign_start_run" {
+		t.Errorf("State = %q, want campaign_start_run", na.State)
+	}
+	if len(na.Actions) != 1 || na.Actions[0].Action != "fishhawk_start_campaign_item_run" {
+		t.Fatalf("actions = %v, want exactly [fishhawk_start_campaign_item_run] for a restartable failed item", actionNames(na))
+	}
+	if na.Actions[0].Params["issue_ref"] != "#41" {
+		t.Errorf("issue_ref param = %q, want #41", na.Actions[0].Params["issue_ref"])
+	}
+}
+
 // TestCampaignNextActionsFor_StartRun_Restartable asserts a RESTARTABLE
 // failed/cancelled item (server-side computeCampaignNextAction surfaces both
 // eligible and restartable as start_run, #1729/#1838) surfaces
@@ -1869,8 +2000,9 @@ func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 // test asserting it would pass while the advertised failed-item recovery path
 // stays unexercised.
 func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
-	// Restartable items are folded into the wire cancelled slice
-	// (toCampaignRollupPayload).
+	// A restartable CANCELLED item rides the wire cancelled slice
+	// (toCampaignRollupPayload buckets each restartable item by its own state,
+	// #5267; a pre-#5267 server folds every restartable item here).
 	na := campaignNextActionsFor(CampaignRollup{Cancelled: []string{"#40"}}, caNextAction("start_run", "#40"), nil)
 	if na.State != "campaign_start_run" {
 		t.Errorf("State = %q, want campaign_start_run", na.State)

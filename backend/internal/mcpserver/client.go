@@ -5518,10 +5518,11 @@ type Campaign struct {
 	SatisfiedDependencies []campaignSatisfiedDependency `json:"satisfied_dependencies,omitempty" jsonschema:"depends_on edges elided at assembly because the target was already closed-and-completed (its work landed, so the dependency is satisfied). Present only on the create response, only when at least one edge was elided"`
 	// AdmissionScreen is the ADVISORY campaign admission screen (#3649):
 	// candidates declared `runnable:no` and candidates whose title/body names a
-	// path the repo's implement-stage forbidden_paths forbid. Typed struct (NOT
+	// path the driver workflow's implement-stage forbidden_paths forbid (#5267:
+	// one workflow, named by workflow_id). Typed struct (NOT
 	// map[string]any / json.RawMessage) so the reflection-built output schema
 	// stays an object. CREATE-response-only and never blocking.
-	AdmissionScreen *campaignAdmissionScreen `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen: candidates declared runnable:no, and candidates whose title/body names a path the repo's implement-stage forbidden_paths forbid. Present only on the create response, only when the screen found something; it never blocks or alters the campaign"`
+	AdmissionScreen *campaignAdmissionScreen `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen: candidates declared runnable:no, and candidates whose title/body names a path the implement-stage forbidden_paths of the workflow named by workflow_id forbid (the campaign driver's workflow, feature_change by default; it covers only the driver workflow, not a workflow chosen later per item). Present only on the create response, only when the screen found something; it never blocks or alters the campaign"`
 	// Warnings names every item whose depends_on relies on a legacy free-text
 	// `Depends on:` line rather than the tracker's native relation (#4028).
 	// Typed struct so the reflection-built output schema stays an object array.
@@ -5550,8 +5551,12 @@ type campaignDependencyWarning struct {
 type campaignAdmissionScreen struct {
 	Advisory               bool                       `json:"advisory" jsonschema:"always true: the screen reports and never blocks a create or changes a preview's valid, waves or items"`
 	Findings               []campaignAdmissionFinding `json:"findings" jsonschema:"the findings, sorted by issue then kind then path"`
-	ForbiddenPathsScreened bool                       `json:"forbidden_paths_screened" jsonschema:"whether the forbidden_path class ran; false when the repo's implement-stage forbidden_paths could not be resolved"`
-	Truncated              bool                       `json:"truncated,omitempty" jsonschema:"true when the findings were capped"`
+	ForbiddenPathsScreened bool                       `json:"forbidden_paths_screened" jsonschema:"whether the forbidden_path class ran; false when the screened workflow's implement-stage forbidden_paths could not be resolved, including a driver workflow the default-branch spec does not define"`
+	// WorkflowID mirrors the backend campaignAdmissionScreenPayload.workflow_id
+	// (#5267). The json tag MUST byte-match the backend or the field silently
+	// decodes to empty (the #371-class wire-mirror trap).
+	WorkflowID string `json:"workflow_id,omitempty" jsonschema:"the workflow whose implement-stage forbidden_paths the forbidden_path class screened: the campaign driver's workflow, feature_change by default. Set even when forbidden_paths_screened is false. The screen covers only the driver workflow, not a workflow chosen later per item"`
+	Truncated  bool   `json:"truncated,omitempty" jsonschema:"true when the findings were capped"`
 }
 
 // campaignAdmissionFinding mirrors the backend's campaignScreenFinding (#3649).
@@ -5982,7 +5987,7 @@ type CampaignPreview struct {
 	// structs (NOT map[string]any / json.RawMessage) so the reflection-built
 	// output schema stays an object; unexported types keep them off the frozen
 	// export surface.
-	AdmissionScreen *campaignAdmissionScreen    `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen, the same #3649 screen fishhawk_start_campaign runs: items declared runnable:no, and items whose title/body names a path the repo's implement-stage forbidden_paths forbid. The preview writes no audit row; only the create appends campaign_admission_screened. Present only when the screen found something; it never changes valid, waves or items"`
+	AdmissionScreen *campaignAdmissionScreen    `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen, the same #3649 screen fishhawk_start_campaign runs: items declared runnable:no, and items whose title/body names a path the implement-stage forbidden_paths of the workflow named by workflow_id forbid (the campaign driver's workflow, feature_change by default; it covers only the driver workflow, not a workflow chosen later per item). The preview writes no audit row; only the create appends campaign_admission_screened. Present only when the screen found something; it never changes valid, waves or items"`
 	PathOverlap     *campaignPreviewPathOverlap `json:"path_overlap,omitempty" jsonschema:"ADVISORY path overlap: pairs of items whose title or body name the same file path and that no in-set depends_on chain orders, so their plans may conflict. Lexical over issue prose. Present only when a pair exists; it never changes valid, waves or items"`
 }
 
