@@ -40,6 +40,22 @@ const categoryPlanSurfaceSweep = "plan_surface_sweep"
 // repository path an acceptance criterion named and the implement-stage
 // forbidden_paths glob that forbids it. Both carry omitempty for the same
 // reason Category does — every existing finding's payload stays byte-identical.
+//
+// ForbiddenInScope (#5499) is set ONLY by the same rule: true when the plan
+// itself puts the forbidden path in play as something to change — scoped
+// (top-level, sub-plan or split phase, directory and glob tokens matched
+// against the files under them), named as a change target by the criterion's
+// own statement or verify_hint, or named by an approach step. The review
+// prompt asserts UNENFORCEABLE CRITERION only then and otherwise renders the
+// reviewer-judged FORBIDDEN PATH NAMED advisory. Its wire key is written by
+// MarshalJSON and read by UnmarshalJSON below, never by the struct tag: every
+// forbidden-criterion finding carries forbidden_in_scope, false included, so
+// a reader can tell "not in play" from a row written before #5499. Such a
+// legacy row (forbidden_pattern present, forbidden_in_scope ABSENT) decodes as
+// true, so the re-dispatch path (redispatchPlanRound -> loadPlanGatePayload ->
+// planGateEvidence) keeps its asserted UNENFORCEABLE CRITERION line rather
+// than demoting a true positive to the advisory. Every other finding omits
+// the key, so its payload stays byte-identical.
 type SurfaceSweepFinding struct {
 	Pattern          string   `json:"pattern"`
 	TriggerPath      string   `json:"trigger_path"`
@@ -48,6 +64,46 @@ type SurfaceSweepFinding struct {
 	Category         string   `json:"category,omitempty"`
 	ForbiddenPath    string   `json:"forbidden_path,omitempty"`
 	ForbiddenPattern string   `json:"forbidden_pattern,omitempty"`
+	ForbiddenInScope bool     `json:"-"`
+}
+
+// surfaceSweepFindingWire is SurfaceSweepFinding without its JSON methods,
+// so the two below can delegate every other key to the struct tags.
+type surfaceSweepFindingWire SurfaceSweepFinding
+
+// MarshalJSON writes forbidden_in_scope on every finding that carries a
+// forbidden_pattern, false included, and on no other finding.
+func (f SurfaceSweepFinding) MarshalJSON() ([]byte, error) {
+	aux := struct {
+		surfaceSweepFindingWire
+		ForbiddenInScope *bool `json:"forbidden_in_scope,omitempty"`
+	}{surfaceSweepFindingWire: surfaceSweepFindingWire(f)}
+	if f.ForbiddenPattern != "" {
+		inScope := f.ForbiddenInScope
+		aux.ForbiddenInScope = &inScope
+	}
+	return json.Marshal(aux)
+}
+
+// UnmarshalJSON reads forbidden_in_scope by PRESENCE, not by its zero value:
+// an absent key on a finding with a forbidden_pattern is a pre-#5499 row and
+// decodes as true (P1 of #5499), so a legacy true positive stays asserted.
+func (f *SurfaceSweepFinding) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		surfaceSweepFindingWire
+		ForbiddenInScope *bool `json:"forbidden_in_scope"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*f = SurfaceSweepFinding(aux.surfaceSweepFindingWire)
+	switch {
+	case aux.ForbiddenInScope != nil:
+		f.ForbiddenInScope = *aux.ForbiddenInScope
+	case f.ForbiddenPattern != "":
+		f.ForbiddenInScope = true
+	}
+	return nil
 }
 
 // CrossSliceClaim records which member files of a lockstep pattern one
