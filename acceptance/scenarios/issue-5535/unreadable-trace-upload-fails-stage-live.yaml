@@ -1,0 +1,13 @@
+id: scenario:issue-5535/unreadable-trace-upload-fails-stage-live
+statement: 'Against the preview (FISHHAWKD_DEV_FIXTURES=1), seed the implement-running fixture, mint a signing key (POST /v0/runs/{run_id}/signing-key), sign a gzip trace bundle whose second JSONL line is malformed (POST /v0/dev/sign), and POST it to /v0/runs/{run_id}/trace. GET the run''s stages: the implement stage is failed, category C, with a reason starting bundle_unreadable. GET the audit: policy_evaluated has passed:false with skip_reason bundle_unreadable, and the stage never reached succeeded.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"} returned run 3729e3c1-5e7b-4f20-92ca-fdbf88e193bc with implement stage 232b513a-3e0d-4b87-83c7-a7198bb0bd67 (GET stages showed implement running). 2) POST /v0/runs/{run}/signing-key {} returned a private_key. 3) Built a gzip bundle: line 1 {"seq":0,"kind":"manifest","data":{bundle_schema v1, run_id, stage_id, agent claude-code}}; line 2 the malformed ''{"seq":1,"ts":"...","kind":"git_diff","data":{THIS IS NOT JSON''. POST /v0/dev/sign with the bundle body and X-Fishhawk-Dev-Private-Key returned a signature. 4) POST /v0/runs/{run}/trace?stage_id={implement}&variant=raw with X-Fishhawk-Signature (variant is required; without it the route answers 400). 5) GET /v0/runs/{run}/stages. 6) GET /v0/runs/{run}/audit.'
+assertions:
+    expected: Implement failed, category C, reason starting bundle_unreadable; policy_evaluated passed:false skip_reason bundle_unreadable; never succeeded.
+    observed_at_record: 'The trace upload returned 202. The implement stage is failed with failure_category C and failure_reason ''bundle_unreadable: the implement trace bundle could not be read (bundle: parse line: invalid character ''T'' looking for beginning of object key string), so its diff, the implement review and the policy verdict are undeterminable; the stage was failed rather than advanced as a no-changes pass...''. The audit trail is trace_uploaded (seq 28), then policy_evaluated passed:false skip_reason bundle_unreadable (seq 29), then stage_infra_parked C (seq 30), with no succeeded transition. Hashes: stages sha256:10db7b13..., audit sha256:bc69febd....'
+    repro_handle: POST http://localhost:8090/v0/runs/{run}/trace?stage_id={impl}&variant=raw (signed malformed bundle), then GET /v0/runs/{run}/stages
+origin:
+    issue: 5535
+    pr: 5550
+    run_id: 6e7e687e-6dc1-4bf3-831f-4a42e88c9e7d
+    head_sha: 0258c7377d205b555f7153b288bb576eb520c7a4
+    recorded_at: 2026-11-23T13:39:46Z
