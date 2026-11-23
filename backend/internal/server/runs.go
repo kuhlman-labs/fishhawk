@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -246,6 +247,17 @@ type runResponse struct {
 	// #4526). Nil (omitted) on every other read, so a read without the include
 	// is byte-identical and costs no extra query.
 	CampaignLink *campaignLinkPayload `json:"campaign_link,omitempty"`
+	// DispatchBudget is the host dispatcher's blocking-budget verdict, served
+	// ONLY when GET /v0/runs/{id} is called with include=dispatch_budget
+	// (ADR-030 Amendment A1 / #5473). Nil (omitted) on every other read. The
+	// MCP client mirror decodes this block; the json tags MUST byte-match.
+	DispatchBudget *dispatchBudgetPayload `json:"dispatch_budget,omitempty"`
+	// BudgetOverrideBinding reports whether an override-admitted run's
+	// dispatch exemption (run_budget_override_bound) was recorded. Set ONLY on
+	// the 201 of POST /v0/runs and POST /v0/runs/{id}/recover when the run was
+	// admitted past an exhausted blocking budget; nil (omitted) on every other
+	// response, including a replayed create.
+	BudgetOverrideBinding *budgetOverrideBindingStatus `json:"budget_override_binding,omitempty"`
 	// DispatchHold is the run's EFFECTIVE operator dispatch hold (E110.50 /
 	// #5486): its own, or the nearest held DecomposedFrom / ParentRunID
 	// ancestor's (inherited true). Served on the single-run read of a
@@ -1933,8 +1945,13 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// is not new spend, so it is neither refused when the period has
 	// since been exhausted nor re-credited with a second
 	// run_admitted_budget_override grant.
-	if haveStageDefs && !s.checkBlockingBudget(w, r, req.Repo, req.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
-		return
+	var budgetGrant *budgetOverrideGrant
+	if haveStageDefs {
+		admit, grant := s.checkBlockingBudget(w, r, req.Repo, req.WorkflowID, workflowDef.Budgets, req.BudgetOverride)
+		if !admit {
+			return
+		}
+		budgetGrant = grant
 	}
 
 	// applies_to routing admission gate (E53.3 / #2226 / ADR-066 fork 4).
@@ -2047,7 +2064,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))
+	// Bind an override-admitted grant to the created run (ADR-030 Amendment
+	// A1): the run_budget_override_bound row is what exempts this run, and its
+	// DecomposedFrom descendants, from the host dispatcher's budget check.
+	// POST-REPLAY like the gate above, so a replayed Idempotency-Key binds
+	// nothing twice. A failed append is surfaced (recorded:false + remedy),
+	// never fatal: the run stays admitted and unbound, which is fail-safe.
+	resp := toRunResponse(created)
+	binding := s.bindBudgetOverride(r.Context(), created.ID, budgetGrant, "create")
+	resp.BudgetOverrideBinding = binding
+	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
 // StartRunForCampaignIssue resolves the workflow context for a campaign's
@@ -2544,9 +2570,10 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
 		return
 	}
-	// include=campaign_link (E88.2 / #4526) is validated BEFORE any read, so a
-	// malformed or refused include touches no store.
-	includeCampaignLink, ok := s.parseRunInclude(w, r)
+	// include=campaign_link (E88.2 / #4526) and include=dispatch_budget
+	// (#5473) are validated BEFORE any read, so a malformed or refused include
+	// touches no store.
+	includes, ok := s.parseRunInclude(w, r)
 	if !ok {
 		return
 	}
@@ -2564,7 +2591,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := toRunResponse(got)
-	if includeCampaignLink {
+	if includes.campaignLink {
 		// Opt-in and FAIL CLOSED: unlike the best-effort blocks below, a read
 		// error answers 503 rather than omitting the block, because the host
 		// dispatcher gates every spawn on this answer and an omitted or
@@ -2578,6 +2605,32 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp.CampaignLink = link
+	}
+	if includes.dispatchBudget {
+		// Opt-in and FAIL CLOSED like campaign_link: the host dispatcher gates
+		// every spawn on this verdict, so an undecided one answers 503
+		// budget_check_failed rather than a guessed clear. The body carries
+		// only the enumerated reason (and the verify-pass stages, which the
+		// dispatcher still admits, approval condition D1); the raw cause is
+		// logged here with the run id.
+		verdict, berr := s.dispatchBudgetFor(r.Context(), got, time.Now())
+		if berr != nil {
+			var bce *budgetCheckError
+			if !errors.As(berr, &bce) {
+				bce = &budgetCheckError{Reason: budgetCheckLiveUnavailable, Err: berr}
+			}
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"dispatch budget verdict undecided; answering 503 budget_check_failed",
+				slog.String("run_id", runID.String()),
+				slog.String("reason", bce.Reason),
+				slog.String("error", errString(bce.Err)))
+			details := map[string]any{"run_id": runID.String(), "reason": bce.Reason}
+			s.writeError(w, r, http.StatusServiceUnavailable, budgetCheckFailedCode,
+				"could not decide the run's blocking-budget dispatch verdict; retry the read",
+				details)
+			return
+		}
+		resp.DispatchBudget = verdict
 	}
 	// dispatch_hold (E110.50 / #5486) on the single-run read of a
 	// NON-TERMINAL run only; the list route pays no per-row read. Best-effort:
@@ -2842,8 +2895,8 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
-// runIncludeCampaignLink is the one GET /v0/runs/{run_id} include value
-// (E88.2 / #4526).
+// runIncludeCampaignLink is a GET /v0/runs/{run_id} include value (E88.2 /
+// #4526); runIncludeDispatchBudget (dispatch_budget.go) is the other.
 const runIncludeCampaignLink = "campaign_link"
 
 // Campaign-link statuses served under include=campaign_link.
@@ -2883,34 +2936,59 @@ type campaignLinkEntry struct {
 	State      string    `json:"state"`
 }
 
+// runIncludes is the set of GET /v0/runs/{run_id} include values requested.
+type runIncludes struct {
+	campaignLink   bool
+	dispatchBudget bool
+}
+
+// runIncludeAllowed lists every GET /v0/runs/{run_id} include value, in the
+// order a refusal names them.
+var runIncludeAllowed = []string{runIncludeCampaignLink, runIncludeDispatchBudget}
+
 // parseRunInclude validates GET /v0/runs/{run_id}'s include query (E88.2 /
-// #4526) and reports whether campaign_link was requested. Every value (repeated
-// or comma-separated) must be campaign_link, else 400 validation_failed. The
-// include is refused 403 run_token_forbidden for a run-bound mcp:run: subject:
-// a stage agent has no use for campaign membership, and the read walks runs
-// outside the token's own run. Returns false when it wrote a refusal.
-func (s *Server) parseRunInclude(w http.ResponseWriter, r *http.Request) (bool, bool) {
+// #4526, #5473) and reports which values were requested. Every value
+// (repeated or comma-separated) must be campaign_link or dispatch_budget, else
+// 400 validation_failed naming both. Either value is refused 403
+// run_token_forbidden for a run-bound mcp:run: subject, and the message names
+// the refused value(s): a stage agent has no use for campaign membership or
+// the dispatcher's budget verdict, and both reads walk runs outside the
+// token's own run. Returns false when it wrote a refusal.
+func (s *Server) parseRunInclude(w http.ResponseWriter, r *http.Request) (runIncludes, bool) {
+	var out runIncludes
 	values, present := r.URL.Query()["include"]
 	if !present {
-		return false, true
+		return out, true
 	}
 	for _, v := range values {
 		for _, tok := range strings.Split(v, ",") {
-			if strings.TrimSpace(tok) != runIncludeCampaignLink {
+			switch strings.TrimSpace(tok) {
+			case runIncludeCampaignLink:
+				out.campaignLink = true
+			case runIncludeDispatchBudget:
+				out.dispatchBudget = true
+			default:
 				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-					"include must be campaign_link",
-					map[string]any{"field": "include", "got": v, "allowed": []string{runIncludeCampaignLink}})
-				return false, false
+					"include must be campaign_link or dispatch_budget",
+					map[string]any{"field": "include", "got": v, "allowed": runIncludeAllowed})
+				return runIncludes{}, false
 			}
 		}
 	}
 	if strings.HasPrefix(IdentityFrom(r.Context()).Subject, "mcp:run:") {
+		var refused []string
+		if out.campaignLink {
+			refused = append(refused, runIncludeCampaignLink)
+		}
+		if out.dispatchBudget {
+			refused = append(refused, runIncludeDispatchBudget)
+		}
 		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
-			"a run-bound token cannot read include=campaign_link; use an operator or host-dispatcher token",
+			"a run-bound token cannot read include="+strings.Join(refused, ",")+"; use an operator or host-dispatcher token",
 			map[string]any{"field": "include"})
-		return false, false
+		return runIncludes{}, false
 	}
-	return true, true
+	return out, true
 }
 
 // campaignLinkFor resolves the include=campaign_link block for got (E88.2 /

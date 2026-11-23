@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -362,5 +363,35 @@ func assertJSONFloat(t *testing.T, raw map[string]json.RawMessage, key string, w
 	}
 	if got != want {
 		t.Errorf("%s = %g, want %g", key, got, want)
+	}
+}
+
+// TestGetRunBudget_LiveSpecAndGoverningBudget (B3, ruling C1): the display
+// reads the dispatcher's live source, reports the governing (blocking-over)
+// budget, and falls back to the cached spec on a live-read failure.
+func TestGetRunBudget_LiveSpecAndGoverningBudget(t *testing.T) {
+	f := newDBFixture(t, dbSpec(dbBlocking(20)), dbOpts{})
+	f.spent(15)
+	r := f.seedRun(dbSpec(dbBlocking(10)), nil)
+
+	st, err := f.s.runBudgetStatus(context.Background(), r.ID)
+	if err != nil || st == nil || st.LimitUSD != 20 {
+		t.Fatalf("after a live raise: %+v, %v; want limit_usd 20", st, err)
+	}
+
+	f.setLive(dbSpec(dbBudget{"monthly", 100, "advisory"}, dbBudget{"weekly", 10, "blocking"}))
+	st, err = f.s.runBudgetStatus(context.Background(), r.ID)
+	if err != nil || st == nil || st.Period != "weekly" || st.Tier != "over" || st.Enforcement != "blocking" {
+		t.Fatalf("governing budget: %+v, %v; want weekly blocking over", st, err)
+	}
+
+	f.gh.specStatus = http.StatusInternalServerError
+	f.gh.specBody = `{"message":"boom"}`
+	code, raw := getRunBudget(t, f.s, r.ID.String())
+	if code != http.StatusOK {
+		t.Fatalf("live-read failure: status %d, want 200 from the cached spec", code)
+	}
+	if string(raw["limit_usd"]) != "10" {
+		t.Errorf("fallback limit_usd = %s, want the cached 10", raw["limit_usd"])
 	}
 }

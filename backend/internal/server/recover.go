@@ -312,7 +312,8 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	// Blocking periodic-budget admission gate (#688 / ADR-030):
 	// recovery is new spend. checkBlockingBudget writes the error
 	// response (and the audit) on refusal.
-	if !s.checkBlockingBudget(w, r, parent.Repo, parent.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
+	admit, budgetGrant := s.checkBlockingBudget(w, r, parent.Repo, parent.WorkflowID, workflowDef.Budgets, req.BudgetOverride)
+	if !admit {
 		return
 	}
 
@@ -416,7 +417,14 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	// unwinding the created run.
 	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, inheritedPaths, exemptPaths, req.Reason, id.Subject)
 
-	s.writeJSON(w, r, http.StatusCreated, toRunResponse(child))
+	// Bind an override-admitted grant to the recovery run (ADR-030 Amendment
+	// A1). The recovery is a ParentRunID child, so it never inherits its
+	// parent's exemption (ruling C2): only its own grant exempts it. A failed
+	// append is surfaced as recorded:false with a remedy, never fatal.
+	resp := toRunResponse(child)
+	binding := s.bindBudgetOverride(r.Context(), child.ID, budgetGrant, "recover")
+	resp.BudgetOverrideBinding = binding
+	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
 // codeResumeUnsupportedDecomposed is the 422 refusal for a category-B
