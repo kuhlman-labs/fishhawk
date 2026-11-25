@@ -39,6 +39,13 @@ const (
 	gateEvidenceTailBytes = 4096
 )
 
+// gateEvidenceFailuresBytes bounds each non-passed verify run's failure-signal
+// excerpt (#5529): failureSignalExcerpt over the WHOLE redacted output, so a
+// failing row that scrolled out of the 30-line / 4KB tail above (a harness's
+// column-0 `FAIL: <case>` among hundreds of `PASS: ` rows) still reaches the
+// implement review.
+const gateEvidenceFailuresBytes = 4096
+
 // diffCoverageMaxUncovered bounds the uncovered-file sample carried in the
 // diff-coverage evidence (#1888). The list exists to make the violation
 // actionable, not to be exhaustive — a stage that leaves 400 files
@@ -555,6 +562,11 @@ type bindingAssertionEvidence struct {
 // bounded, redacted tail of the command's combined output; on the
 // gates' skip paths it carries the skip reason (e.g. "worktree_tmp:
 // ..."), so a skipped outcome is never reason-less.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
+// VerifyRunEvidence (#5529). The json tags MUST stay identical; the pair is
+// registered in backend/internal/wirecontract's manifest and the marshaled
+// bytes are pinned by the shared golden testdata/wire/gate_verify_run_failures.json.
 type verifyRunEvidence struct {
 	Command       string `json:"command"`
 	ExitCode      int    `json:"exit_code"`
@@ -563,6 +575,14 @@ type verifyRunEvidence struct {
 	TreeSHA       string `json:"tree_sha,omitempty"`
 	OutputTail    string `json:"output_tail,omitempty"`
 	TailTruncated bool   `json:"tail_truncated,omitempty"`
+	// Failures is the failure-signal excerpt (#5529) of a NON-passed run:
+	// failureSignalExcerpt over the WHOLE redacted output, bounded to
+	// gateEvidenceFailuresBytes. It carries the go-test FAIL/panic/race lines,
+	// compiler diagnostics and a harness's column-0 `FAIL: ` row with context,
+	// including rows the OutputTail lost. Empty for a passed run and when the
+	// output carries no signal line; additive/omitempty, so older bundles
+	// decode to "".
+	Failures string `json:"failures,omitempty"`
 	// Superseded is true when a LATER verify_run iteration superseded this
 	// one in the verify-fix loop (#651/#800), so it is NOT the committed-tree
 	// result — the loop re-ran the SAME gate on a newer tree and only the
@@ -695,7 +715,12 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, records .
 			if json.Unmarshal(e.Payload, &w) != nil {
 				continue
 			}
-			tail, truncated := boundEvidenceTail(redactEvidenceText(w.Output))
+			redacted := redactEvidenceText(w.Output)
+			tail, truncated := boundEvidenceTail(redacted)
+			var failures string
+			if w.Outcome != "passed" {
+				failures = failureSignalExcerpt(redacted, gateEvidenceFailuresBytes)
+			}
 			payload.VerifyRuns = append(payload.VerifyRuns, verifyRunEvidence{
 				Command:       w.Command,
 				ExitCode:      w.ExitCode,
@@ -704,6 +729,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, records .
 				TreeSHA:       w.TreeSHA,
 				OutputTail:    tail,
 				TailTruncated: truncated,
+				Failures:      failures,
 			})
 		case "verify_summary":
 			var w struct {

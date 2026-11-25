@@ -78,6 +78,14 @@ var (
 	signalPkgFailRe  = regexp.MustCompile(`^FAIL(\t|\s|$)`)
 	parseTestFailRe  = regexp.MustCompile(`^\s*--- FAIL: (\S+)`)
 	parsePkgFailRe   = regexp.MustCompile(`^FAIL\t(\S+)(.*)$`)
+	// signalHarnessFailRe matches a shell / Python test harness's failing-case
+	// row at column 0: `FAIL: <case>` (#5529). The repository's scripts/test-*
+	// harnesses each define `fail() { print "FAIL: $1" }` and end with
+	// `Results: N passed, M failed`, so a red pass prints one such row among
+	// hundreds of `PASS: ` rows. The go-test pattern above (`^FAIL(\t|\s|$)`)
+	// needs whitespace after FAIL, so `FAIL:` never matched it. Column 0 only:
+	// an indented `    FAIL: x` assertion message and `FAILED: x` are not rows.
+	signalHarnessFailRe = regexp.MustCompile(`^FAIL: `)
 )
 
 // isFailureSignalLine reports whether one output line (no trailing newline)
@@ -242,14 +250,23 @@ func capSignalLine(line string) (rendered string, kept int) {
 // can report an exact elided count), the number of signal lines kept, and the
 // number omitted over budget.
 func retainFailureSignalLines(region string, budget int) (block string, retainedSrcBytes, kept, omitted int) {
-	return retainSignalLines(region, budget, isFailureSignalLine)
+	return retainSignalLines(region, budget, isFailureSignalLine, nil)
 }
 
 // retainSignalLines is retainFailureSignalLines over an arbitrary signal
-// predicate. retainFailureSignalLines passes isFailureSignalLine, so the
-// verify-fix prompt's #4036 selection is byte-identical; failureSignalExcerpt
-// passes the wider isMergeCandidateSignalLine.
-func retainSignalLines(region string, budget int, isSignal func(string) bool) (block string, retainedSrcBytes, kept, omitted int) {
+// predicate. retainFailureSignalLines passes isFailureSignalLine and no
+// deferred class, so the verify-fix prompt's #4036 selection is byte-identical;
+// failureSignalExcerpt passes the wider isMergeCandidateSignalLine and
+// isHarnessFailRow as the deferred class.
+//
+// isDeferred (nil = none) names a signal class that is reserved only AFTER
+// every other signal line (#5529): pass 1 reserves the non-deferred lines in
+// order of appearance, then fills what remains with the deferred ones, again
+// in order of appearance. Many early harness `FAIL: ` rows therefore cannot
+// evict a later go-test `--- FAIL:` / `FAIL<TAB><pkg>` / `panic:` line. The
+// rendered block keeps source order (it is sorted by line index), and a
+// deferred row that did not fit is counted in omitted like any other.
+func retainSignalLines(region string, budget int, isSignal, isDeferred func(string) bool) (block string, retainedSrcBytes, kept, omitted int) {
 	lines := strings.SplitAfter(region, "\n")
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
@@ -269,21 +286,26 @@ func retainSignalLines(region string, budget int, isSignal func(string) bool) (b
 	}
 
 	used := 0
+	// signals holds the non-deferred class first, then the deferred one, each
+	// in order of appearance: it is also the order context is spent in.
 	var signals []int
-	full := false
-	for i, raw := range lines {
-		if !isSignal(strings.TrimSuffix(raw, "\n")) {
-			continue
+	for _, deferredClass := range []bool{false, true} {
+		full := false
+		for i, raw := range lines {
+			line := strings.TrimSuffix(raw, "\n")
+			if !isSignal(line) || (isDeferred != nil && isDeferred(line)) != deferredClass {
+				continue
+			}
+			p := render(raw)
+			if full || used+len(p.rendered)+len(verifyFixSignalSeparator) > budget {
+				full = true
+				omitted++
+				continue
+			}
+			used += len(p.rendered) + len(verifyFixSignalSeparator)
+			picked[i] = p
+			signals = append(signals, i)
 		}
-		p := render(raw)
-		if full || used+len(p.rendered)+len(verifyFixSignalSeparator) > budget {
-			full = true
-			omitted++
-			continue
-		}
-		used += len(p.rendered) + len(verifyFixSignalSeparator)
-		picked[i] = p
-		signals = append(signals, i)
 	}
 	if len(signals) == 0 {
 		return "", 0, 0, omitted
@@ -337,15 +359,34 @@ var compileErrorLineRe = regexp.MustCompile(`^\S+\.go:\d+:\d+: `)
 
 // isMergeCandidateSignalLine is the merge-candidate excerpt's signal set: the
 // shared go-test set (isFailureSignalLine) plus a column-0 compiler / vet
-// diagnostic. go test prints a `[build failed]` package's compiler errors
-// where the BUILD finished, which under a parallel `go test ./...` can be far
-// above that package's `FAIL<TAB><pkg> [build failed]` line, outside its
-// 2-line context window (#4250 approval condition C1). The wider set is used
-// ONLY by failureSignalExcerpt; the verify-fix prompt keeps the #4036 set. A
-// golangci-lint diagnostic shares the format and is retained too — on a
-// failed merge-candidate pass it names a real failure.
+// diagnostic plus a column-0 harness `FAIL: <case>` row (#5529). go test
+// prints a `[build failed]` package's compiler errors where the BUILD
+// finished, which under a parallel `go test ./...` can be far above that
+// package's `FAIL<TAB><pkg> [build failed]` line, outside its 2-line context
+// window (#4250 approval condition C1). A golangci-lint diagnostic shares the
+// format and is retained too — on a failed merge-candidate pass it names a
+// real failure. A shell / Python test harness prints one `FAIL: <case>` row
+// per failing case among hundreds of `PASS: ` rows, so its failing row is
+// exactly what a 4 KiB output tail loses.
+//
+// The wider set feeds two consumers, both intended: failureSignalExcerpt (the
+// merge_candidate_verified failures excerpt and the gate-evidence per-run
+// failures) and, through the stored excerpt, the ADR-090 D6 implement fix-up
+// prompt (server's merge_candidate_fixup_evidence.go sets
+// prompt.MergeCandidateFailure.Failures, rendered as untrusted verify output by
+// the prompt package's mergecandidatefailure.go), so the agent repairing a red
+// merge candidate sees the failing harness row. The verify-fix prompt's
+// #4036 selection keeps isFailureSignalLine and stays byte-identical.
 func isMergeCandidateSignalLine(line string) bool {
-	return isFailureSignalLine(line) || compileErrorLineRe.MatchString(strings.TrimSuffix(line, "\r"))
+	line = strings.TrimSuffix(line, "\r")
+	return isFailureSignalLine(line) || compileErrorLineRe.MatchString(line) || signalHarnessFailRe.MatchString(line)
+}
+
+// isHarnessFailRow reports whether a line is a column-0 harness `FAIL: <case>`
+// row (#5529): the class retainSignalLines reserves AFTER the go-test and
+// compiler signal classes, so a flood of harness rows cannot evict them.
+func isHarnessFailRow(line string) bool {
+	return signalHarnessFailRe.MatchString(strings.TrimSuffix(line, "\r"))
 }
 
 // failureSignalExcerptMarker renders the trusted-shape line that closes an
@@ -358,12 +399,16 @@ func failureSignalExcerptMarker(omitted, budget int) string {
 // output, every failure-signal line plus its context, within budget bytes
 // (#4250). The signal set is the shared go-test set — `--- FAIL:`,
 // `FAIL<TAB><pkg>`, `panic:`, `WARNING: DATA RACE` — widened by a column-0
-// compiler/vet diagnostic (isMergeCandidateSignalLine), each with
+// compiler/vet diagnostic and a column-0 harness `FAIL: <case>` row
+// (isMergeCandidateSignalLine, #5529), each with
 // verifyFixSignalContextBefore (2) lines of context before and
 // verifyFixSignalContextAfter (4) after, which captures the
 // `<file>_test.go:NN:` assertion lines go test prints immediately after a
 // non-verbose `--- FAIL:` line. Selection is retainSignalLines (#4036):
-// signals in order until the budget is spent, then context.
+// signals in order until the budget is spent, then context. Harness `FAIL: `
+// rows are the deferred class (isHarnessFailRow): they fill only the budget the
+// go-test and compiler signal lines left, so many early harness rows cannot
+// evict a later `--- FAIL:` / `panic:` line (#5529).
 //
 // When signal lines did not all fit, the excerpt ends with a marker naming how
 // many were omitted. The marker's worst case (every signal line omitted) is
@@ -386,7 +431,7 @@ func failureSignalExcerpt(out string, budget int) string {
 	if room <= 0 {
 		return ""
 	}
-	block, _, _, omitted := retainSignalLines(out, room, isMergeCandidateSignalLine)
+	block, _, _, omitted := retainSignalLines(out, room, isMergeCandidateSignalLine, isHarnessFailRow)
 	if omitted == 0 {
 		return block
 	}

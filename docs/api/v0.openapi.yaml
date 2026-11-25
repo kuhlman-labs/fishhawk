@@ -8656,11 +8656,14 @@ components:
             `merge_candidate_verified` only, non-passed results only (#4250):
             the failure-signal excerpt — every go-test failure-signal line
             (`--- FAIL:`, `FAIL<TAB><pkg>`, `panic:`, `WARNING: DATA RACE`, and
-            a column-0 `<file>.go:<line>:<col>:` compiler/vet diagnostic) with
-            2 lines of context before and 4 after, extracted from the WHOLE
-            output rather than its tail, so an early module's failure that
-            scrolled out of `merge_candidate_output_tail` is still named. A
-            closing marker counts signal lines omitted over the budget.
+            a column-0 `<file>.go:<line>:<col>:` compiler/vet diagnostic, and a
+            shell or Python test harness's column-0 `FAIL: <case>` row, #5529)
+            with 2 lines of context before and 4 after, extracted from the
+            WHOLE output rather than its tail, so an early module's failure
+            that scrolled out of `merge_candidate_output_tail` is still named.
+            Harness rows fill only the budget the go-test and compiler lines
+            leave. A closing marker counts signal lines omitted over the
+            budget.
             UNTRUSTED, like the tail: runner-redacted, bounded to its first
             8 KiB, re-bounded server-side, recorded on the audit row as
             `failures` with `output_untrusted: true`, and NEVER embedded in a

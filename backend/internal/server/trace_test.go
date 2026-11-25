@@ -4854,6 +4854,98 @@ func TestGateEvidenceForReview_PropagatesSuperseded(t *testing.T) {
 	}
 }
 
+// TestGateEvidenceForReview_MapsVerifyRunFailures pins the bundle→prompt
+// mapping for a verify run's failure-signal lines (#5529).
+func TestGateEvidenceForReview_MapsVerifyRunFailures(t *testing.T) {
+	ev := bundle.GateEvidence{
+		VerifyRuns: []bundle.VerifyRunEvidence{
+			{Command: "scripts/test verify", ExitCode: 1, Outcome: "failed", Failures: "FAIL: case alpha should hold\n"},
+		},
+	}
+	got := gateEvidenceForReview(ev, nil)
+	if len(got.VerifyRuns) != 1 || got.VerifyRuns[0].Failures != "FAIL: case alpha should hold\n" {
+		t.Errorf("VerifyRuns = %+v, want Failures carried onto the prompt run", got.VerifyRuns)
+	}
+}
+
+// TestVerifyRunFailures_GateEvidence_EndToEnd crosses every seam of #5529 on
+// the SHARED golden the runner's composer marshals byte-equal: runner wire
+// bytes -> bundle.ExtractGateEvidence -> gateEvidenceForReview -> the rendered
+// implement-review prompt, where the failing harness row (absent from the
+// output tail) must sit inside an UNTRUSTED VERIFY OUTPUT envelope under the
+// failure-signal header. Deleting the Failures mapping or the render line
+// reddens it.
+func TestVerifyRunFailures_GateEvidence_EndToEnd(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_verify_run_failures.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	gatePayload := []byte(`{"verify_runs":[` + string(bytes.TrimSpace(golden)) + `]}`)
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	var raw bytes.Buffer
+	for _, l := range []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: gatePayload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	} {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+
+	// Seam 1: runner wire JSON -> bundle.GateEvidence.
+	ev, err := bundle.ExtractGateEvidence(gz.Bytes())
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if len(ev.VerifyRuns) != 1 || !strings.Contains(ev.VerifyRuns[0].Failures, "FAIL: case alpha should hold") {
+		t.Fatalf("bundle.GateEvidence.VerifyRuns = %+v, want Failures carrying the harness row", ev.VerifyRuns)
+	}
+	// Seam 2: bundle.GateEvidence -> prompt.GateEvidence.
+	pe := gateEvidenceForReview(ev, nil)
+	// Seam 3: prompt.GateEvidence -> the rendered reviewer text.
+	got, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: &plan.Plan{PlanVersion: "standard_v1", Summary: "verify-run failures e2e"},
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: pe,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	const header = "failure-signal lines from the whole output"
+	const begin, end = "<<<BEGIN UNTRUSTED VERIFY OUTPUT>>>", "<<<END UNTRUSTED VERIFY OUTPUT>>>"
+	iHeader := strings.Index(got, header)
+	if iHeader < 0 {
+		t.Fatalf("rendered prompt has no failure-signal header:\n%s", got)
+	}
+	iBegin := strings.Index(got[iHeader:], begin)
+	iEnd := strings.Index(got[iHeader:], end)
+	iRow := strings.Index(got[iHeader:], "FAIL: case alpha should hold")
+	if iBegin < 0 || iEnd < 0 || iRow < iBegin || iRow > iEnd {
+		t.Errorf("the failing harness row is not inside the failure-signal envelope (begin=%d row=%d end=%d):\n%s", iBegin, iRow, iEnd, got[iHeader:])
+	}
+}
+
 // TestGateEvidenceForReview_MapsScopeExemptions pins the bundle→prompt mapping
 // for the scope self-exemptions (#1153): each validated path/reason crosses
 // gateEvidenceForReview into prompt.GateScopeExemption so writeGateEvidence can

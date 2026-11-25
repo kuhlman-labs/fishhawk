@@ -959,6 +959,93 @@ func TestFailureSignalExcerpt_CompileErrorIsASignal(t *testing.T) {
 	}
 }
 
+// TestIsMergeCandidateSignalLine_HarnessFailRow (#5529): a shell / Python test
+// harness's column-0 `FAIL: <case>` row is a merge-candidate signal. An
+// indented assertion message, `FAILED:` and the harness's PASS / Results rows
+// are not.
+func TestIsMergeCandidateSignalLine_HarnessFailRow(t *testing.T) {
+	cases := []struct {
+		line string
+		want bool
+	}{
+		{"FAIL: case alpha should hold", true},
+		{"FAIL: case alpha should hold\r", true},
+		{"FAIL: ", true},
+		{"    FAIL: case alpha (indented assertion message)", false},
+		{"FAILED: case alpha", false},
+		{"FAIL:no-space", false},
+		{"PASS: case alpha", false},
+		{"Results: 3 passed, 1 failed", false},
+	}
+	for _, tc := range cases {
+		if got := isMergeCandidateSignalLine(tc.line); got != tc.want {
+			t.Errorf("isMergeCandidateSignalLine(%q) = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}
+
+// TestIsFailureSignalLine_HarnessFailRowNotInVerifyFixSet pins the #4036
+// verify-fix prompt's selection byte-identical (#5529): the harness row widens
+// ONLY the merge-candidate set, so isFailureSignalLine and the verify-fix
+// retention stay as they were.
+func TestIsFailureSignalLine_HarnessFailRowNotInVerifyFixSet(t *testing.T) {
+	if isFailureSignalLine("FAIL: case x") {
+		t.Error("isFailureSignalLine now treats a harness `FAIL: ` row as a signal — the #4036 verify-fix selection changed")
+	}
+	region := "FAIL: case x\nPASS: case y\n"
+	if block, _, kept, omitted := retainFailureSignalLines(region, 4096); block != "" || kept != 0 || omitted != 0 {
+		t.Errorf("retainFailureSignalLines kept a harness row: block=%q kept=%d omitted=%d", block, kept, omitted)
+	}
+	if isHarnessFailRow("--- FAIL: TestX (0.00s)") || isHarnessFailRow("FAIL\tm/x\t0.1s") {
+		t.Error("isHarnessFailRow claimed a go-test signal line")
+	}
+}
+
+// TestFailureSignalExcerpt_HarnessRowsDoNotCrowdOutGoTestSignals is approval
+// condition K3 (#5529): 200 early column-0 harness `FAIL: ` rows, each long
+// enough that they cannot all fit, followed by one `--- FAIL: TestReal`. The
+// go-test signal class is reserved FIRST, so it survives under BOTH the 8 KiB
+// merge-candidate budget and the 4 KiB gate-evidence budget; the harness rows
+// fill the remainder, stay in source order before it, and the rows that did
+// not fit are counted in the omitted marker.
+func TestFailureSignalExcerpt_HarnessRowsDoNotCrowdOutGoTestSignals(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, "FAIL: x%03d %s\n", i, strings.Repeat("p", 90))
+	}
+	b.WriteString("--- FAIL: TestReal (0.00s)\n")
+	out := b.String()
+
+	for _, budget := range []int{upload.MaxMergeCandidateFailuresBytes, gateEvidenceFailuresBytes} {
+		t.Run(fmt.Sprintf("budget_%d", budget), func(t *testing.T) {
+			got := failureSignalExcerpt(out, budget)
+			if len(got) > budget {
+				t.Errorf("excerpt = %d bytes, over the %d budget", len(got), budget)
+			}
+			if !strings.Contains(got, "--- FAIL: TestReal (0.00s)\n") {
+				t.Fatalf("the go-test signal was evicted by harness rows:\n%s", got)
+			}
+			if !strings.Contains(got, "FAIL: x000 ") {
+				t.Errorf("the earliest harness row was not retained in the remainder:\n%s", got)
+			}
+			if strings.Index(got, "FAIL: x000 ") > strings.Index(got, "--- FAIL: TestReal") {
+				t.Errorf("source order lost: the harness rows must precede the go-test line:\n%s", got)
+			}
+			if !strings.Contains(got, "more failure-signal line(s) omitted over the") {
+				t.Errorf("the omitted harness rows were not counted:\n%s", got)
+			}
+		})
+	}
+
+	// The deferred class is the ONLY thing separating the two orders: with it
+	// cleared, retainSignalLines is pure appearance order and the go-test line
+	// is evicted (the counterfactual the K3 condition names).
+	block, _, _, omitted := retainSignalLines(out, gateEvidenceFailuresBytes, isMergeCandidateSignalLine, nil)
+	if strings.Contains(block, "--- FAIL: TestReal") || omitted == 0 {
+		t.Errorf("control: appearance order should evict the go-test line (omitted=%d)", omitted)
+	}
+}
+
 // TestParseVerifyFailures_LossyCoversEveryList: lossy is set when ANY list
 // overflows (the merge-candidate summary reads it), while pkgsLossy — what
 // verifyFailureScopeRelation reads — still tracks packages alone.
