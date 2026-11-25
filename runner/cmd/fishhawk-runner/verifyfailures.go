@@ -259,13 +259,17 @@ func retainFailureSignalLines(region string, budget int) (block string, retained
 // failureSignalExcerpt passes the wider isMergeCandidateSignalLine and
 // isHarnessFailRow as the deferred class.
 //
-// isDeferred (nil = none) names a signal class that is reserved only AFTER
-// every other signal line (#5529): pass 1 reserves the non-deferred lines in
-// order of appearance, then fills what remains with the deferred ones, again
-// in order of appearance. Many early harness `FAIL: ` rows therefore cannot
-// evict a later go-test `--- FAIL:` / `FAIL<TAB><pkg>` / `panic:` line. The
-// rendered block keeps source order (it is sorted by line index), and a
-// deferred row that did not fit is counted in omitted like any other.
+// isDeferred (nil = none) names a signal class that yields to every other
+// signal line AND its context (#5529). The budget is then spent in this order:
+// (1) the non-deferred signal lines, (2) their context, (3) the deferred
+// signal lines, (4) the deferred lines' context. Many harness `FAIL: ` rows
+// therefore cannot evict a go-test `--- FAIL:` / `FAIL<TAB><pkg>` / `panic:`
+// line or the assertion lines around it. A deferred row already shown as
+// context in (2) is kept, not omitted, and not paid for twice. (4) is skipped
+// when (2) did not all fit, so context stops at the first line over budget,
+// which also keeps the block within the reserved separators. The rendered
+// block keeps source order (it is sorted by line index), and a deferred row
+// that did not fit is counted in omitted like any other.
 func retainSignalLines(region string, budget int, isSignal, isDeferred func(string) bool) (block string, retainedSrcBytes, kept, omitted int) {
 	lines := strings.SplitAfter(region, "\n")
 	if n := len(lines); n > 0 && lines[n-1] == "" {
@@ -286,14 +290,17 @@ func retainSignalLines(region string, budget int, isSignal, isDeferred func(stri
 	}
 
 	used := 0
-	// signals holds the non-deferred class first, then the deferred one, each
-	// in order of appearance: it is also the order context is spent in.
+	// signals holds the kept signal lines, the non-deferred class first.
 	var signals []int
-	for _, deferredClass := range []bool{false, true} {
+	reserve := func(deferredClass bool) {
 		full := false
 		for i, raw := range lines {
 			line := strings.TrimSuffix(raw, "\n")
 			if !isSignal(line) || (isDeferred != nil && isDeferred(line)) != deferredClass {
+				continue
+			}
+			if _, ok := picked[i]; ok {
+				signals = append(signals, i)
 				continue
 			}
 			p := render(raw)
@@ -306,9 +313,6 @@ func retainSignalLines(region string, budget int, isSignal, isDeferred func(stri
 			picked[i] = p
 			signals = append(signals, i)
 		}
-	}
-	if len(signals) == 0 {
-		return "", 0, 0, omitted
 	}
 
 	addContext := func(j int) bool {
@@ -326,13 +330,27 @@ func retainSignalLines(region string, budget int, isSignal, isDeferred func(stri
 		picked[j] = p
 		return true
 	}
-context:
-	for _, i := range signals {
-		for j := i - verifyFixSignalContextBefore; j <= i+verifyFixSignalContextAfter; j++ {
-			if !addContext(j) {
-				break context
+	// spendContext reports whether every window of the given signals fit.
+	spendContext := func(of []int) bool {
+		for _, i := range of {
+			for j := i - verifyFixSignalContextBefore; j <= i+verifyFixSignalContextAfter; j++ {
+				if !addContext(j) {
+					return false
+				}
 			}
 		}
+		return true
+	}
+
+	reserve(false)
+	first := len(signals)
+	allFit := spendContext(signals)
+	reserve(true)
+	if len(signals) == 0 {
+		return "", 0, 0, omitted
+	}
+	if allFit {
+		spendContext(signals[first:])
 	}
 
 	idx := make([]int, 0, len(picked))
@@ -384,7 +402,8 @@ func isMergeCandidateSignalLine(line string) bool {
 
 // isHarnessFailRow reports whether a line is a column-0 harness `FAIL: <case>`
 // row (#5529): the class retainSignalLines reserves AFTER the go-test and
-// compiler signal classes, so a flood of harness rows cannot evict them.
+// compiler signal lines and their context, so a flood of harness rows cannot
+// evict either.
 func isHarnessFailRow(line string) bool {
 	return signalHarnessFailRe.MatchString(strings.TrimSuffix(line, "\r"))
 }
@@ -407,8 +426,9 @@ func failureSignalExcerptMarker(omitted, budget int) string {
 // non-verbose `--- FAIL:` line. Selection is retainSignalLines (#4036):
 // signals in order until the budget is spent, then context. Harness `FAIL: `
 // rows are the deferred class (isHarnessFailRow): they fill only the budget the
-// go-test and compiler signal lines left, so many early harness rows cannot
-// evict a later `--- FAIL:` / `panic:` line (#5529).
+// go-test and compiler signal lines AND their context left, so many harness
+// rows cannot evict a `--- FAIL:` / `panic:` line or its assertion lines
+// (#5529).
 //
 // When signal lines did not all fit, the excerpt ends with a marker naming how
 // many were omitted. The marker's worst case (every signal line omitted) is

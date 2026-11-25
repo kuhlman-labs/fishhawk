@@ -1004,7 +1004,8 @@ func TestIsFailureSignalLine_HarnessFailRowNotInVerifyFixSet(t *testing.T) {
 // TestFailureSignalExcerpt_HarnessRowsDoNotCrowdOutGoTestSignals is approval
 // condition K3 (#5529): 200 early column-0 harness `FAIL: ` rows, each long
 // enough that they cannot all fit, followed by one `--- FAIL: TestReal`. The
-// go-test signal class is reserved FIRST, so it survives under BOTH the 8 KiB
+// go-test signal class and its context are reserved FIRST, so the `--- FAIL:`
+// row and the assertion line after it survive under BOTH the 8 KiB
 // merge-candidate budget and the 4 KiB gate-evidence budget; the harness rows
 // fill the remainder, stay in source order before it, and the rows that did
 // not fit are counted in the omitted marker.
@@ -1014,6 +1015,7 @@ func TestFailureSignalExcerpt_HarnessRowsDoNotCrowdOutGoTestSignals(t *testing.T
 		fmt.Fprintf(&b, "FAIL: x%03d %s\n", i, strings.Repeat("p", 90))
 	}
 	b.WriteString("--- FAIL: TestReal (0.00s)\n")
+	b.WriteString("    real_test.go:42: got 1, want 2\n")
 	out := b.String()
 
 	for _, budget := range []int{upload.MaxMergeCandidateFailuresBytes, gateEvidenceFailuresBytes} {
@@ -1024,6 +1026,9 @@ func TestFailureSignalExcerpt_HarnessRowsDoNotCrowdOutGoTestSignals(t *testing.T
 			}
 			if !strings.Contains(got, "--- FAIL: TestReal (0.00s)\n") {
 				t.Fatalf("the go-test signal was evicted by harness rows:\n%s", got)
+			}
+			if !strings.Contains(got, "    real_test.go:42: got 1, want 2\n") {
+				t.Errorf("the go-test context was evicted by harness rows:\n%s", got)
 			}
 			if !strings.Contains(got, "FAIL: x000 ") {
 				t.Errorf("the earliest harness row was not retained in the remainder:\n%s", got)
@@ -1043,6 +1048,27 @@ func TestFailureSignalExcerpt_HarnessRowsDoNotCrowdOutGoTestSignals(t *testing.T
 	block, _, _, omitted := retainSignalLines(out, gateEvidenceFailuresBytes, isMergeCandidateSignalLine, nil)
 	if strings.Contains(block, "--- FAIL: TestReal") || omitted == 0 {
 		t.Errorf("control: appearance order should evict the go-test line (omitted=%d)", omitted)
+	}
+}
+
+// TestRetainSignalLines_DeferredClassAfterContext pins the two edges of
+// spending go-test context before harness rows (#5529).
+func TestRetainSignalLines_DeferredClassAfterContext(t *testing.T) {
+	retain := func(region string, budget int) (string, int, int) {
+		block, _, kept, omitted := retainSignalLines(region, budget, isMergeCandidateSignalLine, isHarnessFailRow)
+		return block, kept, omitted
+	}
+	// A harness row already shown as go-test context is kept, not omitted: 24
+	// bytes is exactly the go-test line, its separator and that one row.
+	region := "FAIL: a\n--- FAIL: T\n"
+	if block, kept, omitted := retain(region, 24); block != region || kept != 2 || omitted != 0 {
+		t.Errorf("shown row: block=%q kept=%d omitted=%d, want the region, 2, 0", block, kept, omitted)
+	}
+	// Once go-test context is over budget, no later context is spent.
+	region = "hb\nFAIL: h\n" + strings.Repeat("x\n", 7) + "--- FAIL: T\n" + strings.Repeat("a", 200) + "\n"
+	want := "FAIL: h\n" + verifyFixSignalSeparator + "x\nx\n--- FAIL: T\n"
+	if block, _, _ := retain(region, 100); block != want {
+		t.Errorf("trimmed context: block=%q, want %q", block, want)
 	}
 }
 
