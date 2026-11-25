@@ -1,0 +1,14 @@
+id: scenario:issue-5566/gate-stale-names-arm-selector
+statement: 'On the committed tree, whenever the offline gate `(cd backend && go run ./internal/agenteval/catchrategate)` fails mode (4b), its stderr carries the unchanged `STALE arm(s) <list>:` prefix and, on the same line, a selector `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=<sel>`, where <sel> is exactly the listed arms closed over the comparison pairs and sorted. If the committed evidence is fresh (exit 0 with `catchrategate: PASS` on stdout), the criterion is decided instead by driving the real catchrategate CLI against a fixture copy with one arm''s input mutated, as TestRun_PassesAfterArmSubsetRePin does. The gate''s decision is unchanged.'
+verify_hint: 'CLI exit code and stderr of `(cd backend && go run ./internal/agenteval/catchrategate)` run from the checkout root: exit status 1, and stderr contains both strings.'
+steps: 'Posture B (the verify_hint is a repository-local CLI) in the sanctioned checkout /tmp/fishhawk-acceptance-tree-2b9fb0bb-... (HEAD ecaed1ecf, equal to the preview /healthz git_sha): (cd backend && GOFLAGS=-buildvcs=false GOPROXY=off go run ./internal/agenteval/catchrategate), with stdout and stderr captured separately. Also ran go test -run TestRun_PassesAfterArmSubsetRePin ./internal/agenteval/catchrategate/.'
+assertions:
+    expected: exit 1; the stderr line has both the STALE prefix and the matching closed, sorted selector
+    observed_at_record: exit 1 and empty stdout. The stderr FAIL line contains 'STALE arm(s) architect:' and, on the same line, 'FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect' (architect is in no comparison pair, so the closure is just {architect}). The rule lines are unchanged. The offline test passed.
+    repro_handle: (cd backend && go run ./internal/agenteval/catchrategate)
+origin:
+    issue: 5566
+    pr: 5570
+    run_id: 2b9fb0bb-0473-4448-b464-9478563d0f7c
+    head_sha: ecaed1ecf52a083ccfb218affa521238b7630a74
+    recorded_at: 2026-11-25T03:25:38Z
