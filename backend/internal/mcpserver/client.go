@@ -5650,8 +5650,32 @@ type campaignItemAwaiting struct {
 	// #5486): the item run's effective operator dispatch hold, shown to a
 	// caller that may read decision sources. With it the backend reads
 	// human/dispatch_held unless the stage is in flight or at a gate.
-	DispatchHold *RunDispatchHold         `json:"dispatch_hold,omitempty"`
-	HostDispatch *hostDispatchObservation `json:"host_dispatch,omitempty"`
+	DispatchHold *RunDispatchHold `json:"dispatch_hold,omitempty"`
+	// HostDispatcher mirrors the backend block's host_dispatcher (#5489): the
+	// server's own read of the host dispatcher from its heartbeats, present
+	// when the backend classified the block from them. HostDispatch is the
+	// stdio overlay's host-local read (#5402); both may be present.
+	HostDispatcher *campaignItemAwaitingHostDispatcher `json:"host_dispatcher,omitempty"`
+	HostDispatch   *hostDispatchObservation            `json:"host_dispatch,omitempty"`
+}
+
+// campaignItemAwaitingHostDispatcher mirrors the backend's
+// `CampaignItemAwaitingHostDispatcher` wire schema
+// (server hostDispatcherObservation): the dispatcher state the backend read
+// from the heartbeats visible to the item run's account (#5489). Every field
+// but state is omitted when empty or zero.
+type campaignItemAwaitingHostDispatcher struct {
+	State           string    `json:"state" jsonschema:"live | waiting | in_flight | held | refusing | capped | paused | stale | absent"`
+	Host            string    `json:"host,omitempty" jsonschema:"the deciding dispatcher's host label (its host-dispatcher/<host> token subject)"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at,omitzero" jsonschema:"when the server received the deciding heartbeat (server clock)"`
+	RefusalCode     string    `json:"refusal_code,omitempty" jsonschema:"this run's latest refusal code from the heartbeat"`
+	RefusalDetail   string    `json:"refusal_detail,omitempty" jsonschema:"the refusal detail, bounded to 300 bytes at ingest"`
+	RefusalFirstAt  time.Time `json:"refusal_first_at,omitzero"`
+	TickFailureCode string    `json:"tick_failure_code,omitempty" jsonschema:"the failing early return of the dispatcher's latest tick"`
+	DailyCap        int       `json:"daily_cap,omitempty"`
+	SpawnsToday     int       `json:"spawns_today,omitempty"`
+	CapResetsAt     time.Time `json:"cap_resets_at,omitzero" jsonschema:"when the daily cap resets (00:00:00Z)"`
+	BudgetSource    string    `json:"budget_source,omitempty" jsonschema:"on a budget-blocked run: live_spec, admission_spec or admission_spec_fallback"`
 }
 
 // campaignItemAwaitingDecision is the current (uncleared) decision marker:
