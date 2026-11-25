@@ -116,3 +116,26 @@ Ratification: Captain, 2026-11-18 (this issue, #5472); final text confirmed by t
 3. Q7's `--status` keeps `spawns_today` as an observation. The status file and `--status` name a daily limit (`daily_cap`) only when one is set.
 
 **Consequences.** Host capacity is bounded by max in-flight and the per-tick cap. Per-stage loops are bounded server-side by the fix-up ceiling, the retry budget and Q2's one re-spawn per marker epoch. The ledger format is unchanged: `spawns_today` was always persisted, and the new status field is omitempty, so a reverted binary reads every state dir and status file as before. A spend-based backstop, such as pausing at the weekly budget's exceeded tier, is a separate decision this amendment does not make. Q1–Q5, the rest of Q6 and Q7, and the Decision text above stand unchanged.
+
+## Amendment A2: the dispatcher publishes a heartbeat, and campaign status classifies from it (ratified by the Captain, 2026-11-24 (issue #5489))
+
+Ratification: Captain, 2026-11-24, at the #5489 plan gate ("ratified, proceed"). Implemented by PR #5572. The text was recorded by the campaign-8 first officer.
+
+**Context.** Q7 asks campaign status to tell "awaiting the host dispatcher" apart from "awaiting a human". Before this amendment, only the stdio MCP overlay could do that, by reading the host-local status file. The server could not see the dispatcher at all, so the Web UI and every non-local reader showed a dispatcher-held item as awaiting a human. ADR-030 Amendment A1 (#5473) added a `budget_blocked` dispatcher verdict that the server also could not observe.
+
+**Decision.**
+1. **A heartbeat route.** Each tick, the dispatcher hands a snapshot to an asynchronous, latest-wins publisher, which POSTs it to `POST /v0/host-dispatchers/heartbeat`. A failed publish never fails a tick. It is logged once per distinct HTTP status and code, without the per-request error ref.
+2. **Q4's route allowlist widens by this one route.** Only a valid `host-dispatcher/<host>` token holding `write:runs` may write a heartbeat. The host label comes from the token subject, and the tenant account from the token; neither comes from the body. The scope profile is unchanged.
+3. **Persistence.** The server upserts one row per (account, host) into `host_dispatcher_heartbeats` (migration 0121), partitioned by account under the 0089 RLS pattern.
+4. **The snapshot.** It carries: interval, start and last-tick times; paused; the current tick failure code; the daily cap and spawns today; in flight; and per-run refusals. Each refusal has a code, a bounded detail, first and last times, and a disposition from the closed set waiting | in_flight | held | budget_blocked | paused | capped | refusing. A `budget_blocked` entry also carries a closed-set `budget_source`.
+5. **Ingest is bounded, not brittle.** A structurally malformed heartbeat is refused with 400. A single refusal entry with an off-grammar code, disposition or budget source is DROPPED; the rest is stored, and the response reports `dropped_refusals`, which the dispatcher logs once per distinct non-zero count. An off-grammar `tick_failure_code` is folded to `invalid_tick_failure_code`. Dispatcher-authored text is data, never instructions.
+6. **Classification (Q7).** The campaign awaiting block classifies host-dispatcher state from the item run's account's fresh heartbeats: absent, stale, paused, capped, refusing, budget_blocked, held or live.
+   - A heartbeat is fresh within `StaleTicks` intervals, with the interval clamped so a huge one cannot keep a dead dispatcher fresh, and no more than `FutureSkew` ahead of now.
+   - No fresh heartbeat reads `human/host_dispatcher_absent`.
+   - Review-round codes map to `waiting`, so those items stay kind `host_dispatcher`. The stdio overlay still refines them, including its 30-minute orphaned-round escalation.
+7. **Advisory only.** The heartbeat informs a read. No dispatch, approval or merge authority changes, and no gate reads it.
+
+**Consequences.**
+- **Residuals.** An untenanted run cannot see a tenanted dispatcher's heartbeat, so it reads `host_dispatcher_absent`; this is a conservative false alarm. Until the dispatcher binary is rebuilt, every item reads absent. `budget_blocked` and `held` are covered by unit rows, not the end-to-end test.
+- **Rollback.** Revert #5572. Migration 0121 has a down migration, and a reverted dispatcher simply stops publishing.
+- **Unchanged.** Q1–Q6, the rest of Q4 and Q7, and Amendment A1 stand unchanged.
