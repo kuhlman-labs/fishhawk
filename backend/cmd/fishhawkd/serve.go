@@ -51,6 +51,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/dispatcherheartbeat"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -2776,6 +2777,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// when either repository lacks the capability.
 		scopeamendment.InstallLapseHooks(cfg.RunRepo, cfg.ScopeAmendmentRepo, logger)
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)
+		// Host-dispatcher heartbeats (#5489): POST /v0/host-dispatchers/heartbeat
+		// writes, the campaign status awaiting block reads. Nil (no pool) keeps
+		// the endpoint 503 and the awaiting block on its legacy classification.
+		cfg.HostDispatcherHeartbeatRepo = dispatcherheartbeat.NewPostgresRepository(pool)
 		cfg.RefinementRepo = resolveRefinementRepo(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
 		// OAuth AS credential store (ADR-076 slice 3, #2436). Wired whenever a
