@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { CampaignDetail } from './campaign-detail';
 
@@ -86,6 +86,183 @@ const statusWire = {
     issue_ref: 'issue:1442',
     detail: 'the auto-driver paged a human at a run gate; handle the gate then POST /resume',
   },
+};
+
+/*
+ * The per-item awaiting block (E88.4 / #4528) with the heartbeat-classified
+ * host_dispatcher observation (#5489). Every host_dispatcher key below is one
+ * of the json tags on hostDispatcherObservation in
+ * backend/internal/server/campaign_item_host_dispatcher.go — the same list
+ * TestAwaitingReasons_DocumentedAndGuided pins against the OpenAPI
+ * CampaignItemAwaitingHostDispatcher properties. The next_step strings are
+ * the server constants from hostDispatcherNextSteps.
+ */
+const RUN_P = '33333333-3333-3333-3333-333333333333';
+const RUN_S = '44444444-4444-4444-4444-444444444444';
+const RUN_C = '55555555-5555-5555-5555-555555555555';
+const RUN_BB = '66666666-6666-6666-6666-666666666666';
+const RUN_R = '77777777-7777-7777-7777-777777777777';
+const RUN_T = '88888888-8888-8888-8888-888888888888';
+const RUN_L = '99999999-9999-9999-9999-999999999999';
+const RUN_N = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+const STAGE = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+
+const PAUSED_NEXT_STEP =
+  'The host dispatcher named in host_dispatcher.host is paused and spawns nothing. Resume it on that host with `fishhawk-mcp host-dispatch --resume --state-dir <dir>`, or dispatch the stage by hand with fishhawk_dispatch_stage.';
+const STALE_NEXT_STEP =
+  "The host dispatcher's last heartbeat (host_dispatcher.last_heartbeat_at from host_dispatcher.host) is stale: it is stopped, hung or cannot reach the server. Check `fishhawk-mcp host-dispatch --status --state-dir <dir>` on that host and restart it, or dispatch the stage by hand with fishhawk_dispatch_stage.";
+const CAPPED_NEXT_STEP =
+  'The host dispatcher reached its daily spawn cap (host_dispatcher.daily_cap) and resumes at host_dispatcher.cap_resets_at. Wait for the reset, raise the cap on that host, or dispatch the stage by hand with fishhawk_dispatch_stage.';
+const BUDGET_NEXT_STEP =
+  'The host dispatcher refuses this run on the budget it was admitted under (host_dispatcher.budget_source), which stays fixed for this run. Wait for the budget period to roll over, or start a new run with budget_override. A hand fishhawk_dispatch_stage is not budget-gated.';
+const REFUSING_NEXT_STEP =
+  'The host dispatcher refuses to spawn this stage (host_dispatcher.refusal_code, or tick_failure_code for a failing tick). Fix the named cause on that host, read `fishhawk-mcp host-dispatch --status --state-dir <dir>` there, or dispatch the stage by hand with fishhawk_dispatch_stage.';
+
+function runningItem(id: string, ref: string, runId: string, awaiting?: Record<string, unknown>) {
+  return {
+    id,
+    issue_ref: ref,
+    depends_on: [],
+    run_id: runId,
+    state: 'running',
+    created_at: '2026-11-24T09:00:00Z',
+    updated_at: '2026-11-24T09:30:00Z',
+    ...(awaiting ? { awaiting } : {}),
+  };
+}
+
+function hostDispatchAwaiting(runId: string, rest: Record<string, unknown>) {
+  return {
+    run_id: runId,
+    stage_id: STAGE,
+    stage_type: 'implement',
+    stage_state: 'awaiting_host_dispatch',
+    ...rest,
+  };
+}
+
+const awaitingWire = {
+  ...statusWire,
+  items: [
+    runningItem(
+      'item-p',
+      'issue:2001',
+      RUN_P,
+      hostDispatchAwaiting(RUN_P, {
+        kind: 'human',
+        reason: 'host_dispatch_paused',
+        next_step: PAUSED_NEXT_STEP,
+        host_dispatcher: {
+          state: 'paused',
+          host: 'dev-mac',
+          // Fresh, so the line does not show it: only a stale heartbeat's time
+          // is the operator's evidence.
+          last_heartbeat_at: '2026-11-24T09:59:30Z',
+        },
+      }),
+    ),
+    runningItem(
+      'item-s',
+      'issue:2002',
+      RUN_S,
+      hostDispatchAwaiting(RUN_S, {
+        kind: 'human',
+        reason: 'host_dispatcher_absent',
+        next_step: STALE_NEXT_STEP,
+        host_dispatcher: {
+          state: 'stale',
+          host: 'old-host',
+          last_heartbeat_at: '2026-11-24T09:50:00Z',
+        },
+      }),
+    ),
+    runningItem(
+      'item-c',
+      'issue:2003',
+      RUN_C,
+      hostDispatchAwaiting(RUN_C, {
+        kind: 'human',
+        reason: 'host_dispatch_capped',
+        next_step: CAPPED_NEXT_STEP,
+        host_dispatcher: {
+          state: 'capped',
+          host: 'dev-mac',
+          last_heartbeat_at: '2026-11-24T09:59:30Z',
+          daily_cap: 1,
+          spawns_today: 1,
+          cap_resets_at: '2026-11-25T00:00:00Z',
+        },
+      }),
+    ),
+    runningItem(
+      'item-bb',
+      'issue:2004',
+      RUN_BB,
+      hostDispatchAwaiting(RUN_BB, {
+        kind: 'human',
+        reason: 'host_dispatch_budget_blocked',
+        next_step: BUDGET_NEXT_STEP,
+        host_dispatcher: {
+          state: 'held',
+          host: 'dev-mac',
+          last_heartbeat_at: '2026-11-24T09:59:30Z',
+          refusal_code: 'budget_blocked',
+          refusal_first_at: '2026-11-24T09:10:00Z',
+          budget_source: 'admission_spec',
+        },
+      }),
+    ),
+    runningItem(
+      'item-r',
+      'issue:2005',
+      RUN_R,
+      hostDispatchAwaiting(RUN_R, {
+        kind: 'human',
+        reason: 'host_dispatch_refused',
+        next_step: REFUSING_NEXT_STEP,
+        host_dispatcher: {
+          state: 'refusing',
+          host: 'dev-mac',
+          last_heartbeat_at: '2026-11-24T09:59:30Z',
+          refusal_code: 'path_outside_allowed_roots',
+          refusal_detail: 'working_dir /srv/x is outside the allowed roots',
+          refusal_first_at: '2026-11-24T09:20:00Z',
+        },
+      }),
+    ),
+    runningItem(
+      'item-t',
+      'issue:2006',
+      RUN_T,
+      hostDispatchAwaiting(RUN_T, {
+        kind: 'human',
+        reason: 'host_dispatch_refused',
+        // Server text is rendered as text: markup in it must stay literal.
+        next_step: '<b>not bold</b>',
+        host_dispatcher: {
+          state: 'refusing',
+          host: 'dev-mac',
+          tick_failure_code: 'ledger_read_failed',
+        },
+      }),
+    ),
+    runningItem(
+      'item-l',
+      'issue:2007',
+      RUN_L,
+      hostDispatchAwaiting(RUN_L, {
+        kind: 'host_dispatcher',
+        reason: 'host_dispatch',
+        next_step: 'The host dispatcher spawns this stage on its next tick.',
+        host_dispatcher: {
+          state: 'live',
+          host: 'dev-mac',
+          last_heartbeat_at: '2026-11-24T09:59:30Z',
+        },
+      }),
+    ),
+    runningItem('item-n', 'issue:2008', RUN_N),
+  ],
 };
 
 function stubFetch(body: unknown, status = 200) {
@@ -234,6 +411,115 @@ describe('<CampaignDetail> (cross-boundary: fetch → client → render)', () =>
     renderDetail();
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(/no campaign with that id/i);
+    });
+  });
+
+  describe('awaiting column (E88.4 / #4528, host dispatcher #5489)', () => {
+    // The awaiting cell of the run-grid row for one issue.
+    async function awaitingCell(issueRef: string) {
+      await waitFor(() => {
+        expect(screen.getByRole('columnheader', { name: 'Awaiting' })).toBeInTheDocument();
+      });
+      const row = screen
+        .getAllByRole('row')
+        .find((r) => within(r).queryByText(issueRef, { selector: 'td' }));
+      if (!row) throw new Error(`no run-grid row for ${issueRef}`);
+      const cells = within(row).getAllByRole('cell');
+      return cells[3];
+    }
+
+    it('renders a paused dispatcher: kind, reason, next_step and the state with its host', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2001');
+      expect(within(cell).getByText('human')).toBeInTheDocument();
+      expect(within(cell).getByText('host_dispatch_paused')).toBeInTheDocument();
+      expect(within(cell).getByText(PAUSED_NEXT_STEP)).toBeInTheDocument();
+      const line = within(cell).getByTestId('host-dispatcher-state');
+      expect(within(line).getByText('paused')).toBeInTheDocument();
+      expect(within(line).getByText('dev-mac')).toBeInTheDocument();
+      // A fresh heartbeat's time is not alarm evidence: only stale shows it.
+      expect(within(line).queryByText(/last heartbeat/)).not.toBeInTheDocument();
+      expect(within(line).queryByText('2026-11-24T09:59:30Z')).not.toBeInTheDocument();
+    });
+
+    it('renders a stale dispatcher with its last_heartbeat_at', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2002');
+      expect(within(cell).getByText('host_dispatcher_absent')).toBeInTheDocument();
+      const line = within(cell).getByTestId('host-dispatcher-state');
+      expect(within(line).getByText('stale')).toBeInTheDocument();
+      expect(within(line).getByText('old-host')).toBeInTheDocument();
+      expect(within(line).getByText('last heartbeat')).toBeInTheDocument();
+      const at = within(line).getByText('2026-11-24T09:50:00Z');
+      expect(at.tagName).toBe('TIME');
+      expect(at).toHaveAttribute('datetime', '2026-11-24T09:50:00Z');
+    });
+
+    it('renders a capped dispatcher with cap_resets_at', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2003');
+      expect(within(cell).getByText('host_dispatch_capped')).toBeInTheDocument();
+      const line = within(cell).getByTestId('host-dispatcher-state');
+      expect(within(line).getByText('capped')).toBeInTheDocument();
+      expect(within(line).getByText('resets')).toBeInTheDocument();
+      expect(within(line).getByText('2026-11-25T00:00:00Z')).toBeInTheDocument();
+    });
+
+    it('renders a budget-blocked item with its budget_source and refusal code', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2004');
+      expect(within(cell).getByText('host_dispatch_budget_blocked')).toBeInTheDocument();
+      expect(within(cell).getByText(BUDGET_NEXT_STEP)).toBeInTheDocument();
+      const line = within(cell).getByTestId('host-dispatcher-state');
+      expect(within(line).getByText('held')).toBeInTheDocument();
+      expect(within(line).getByText('budget source')).toBeInTheDocument();
+      expect(within(line).getByText('admission_spec')).toBeInTheDocument();
+      expect(within(line).getByText('budget_blocked')).toBeInTheDocument();
+    });
+
+    it('renders a refusing dispatcher with its refusal_code', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2005');
+      const line = within(cell).getByTestId('host-dispatcher-state');
+      expect(within(line).getByText('refusing')).toBeInTheDocument();
+      expect(within(line).getByText('refusal')).toBeInTheDocument();
+      expect(within(line).getByText('path_outside_allowed_roots')).toBeInTheDocument();
+    });
+
+    it('renders a failing tick with its tick_failure_code, and server text as text, never HTML', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2006');
+      const line = within(cell).getByTestId('host-dispatcher-state');
+      expect(within(line).getByText('tick failure')).toBeInTheDocument();
+      expect(within(line).getByText('ledger_read_failed')).toBeInTheDocument();
+      expect(within(cell).getByText('<b>not bold</b>')).toBeInTheDocument();
+      expect(cell.querySelector('b')).toBeNull();
+    });
+
+    it('renders a live host_dispatcher item with its kind and reason and no alarm line', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2007');
+      expect(within(cell).getByText('host_dispatcher')).toBeInTheDocument();
+      expect(within(cell).getByText('host_dispatch')).toBeInTheDocument();
+      expect(
+        within(cell).getByText('The host dispatcher spawns this stage on its next tick.'),
+      ).toBeInTheDocument();
+      expect(within(cell).queryByTestId('host-dispatcher-state')).not.toBeInTheDocument();
+      expect(within(cell).queryByText('dev-mac')).not.toBeInTheDocument();
+    });
+
+    it('renders an empty awaiting cell for an item with no awaiting block', async () => {
+      stubFetch(awaitingWire);
+      renderDetail();
+      const cell = await awaitingCell('issue:2008');
+      expect(cell).toBeEmptyDOMElement();
     });
   });
 

@@ -50,8 +50,8 @@ const (
 )
 
 // Awaiting reasons. host_dispatch pairs with host_dispatcher; in_flight,
-// children and no_active_stage with system; the rest (dispatch_held
-// included) with human.
+// children and no_active_stage with system; the rest (dispatch_held and the
+// heartbeat reasons in campaign_item_host_dispatcher.go included) with human.
 const (
 	awaitingReasonHostDispatch          = "host_dispatch"
 	awaitingReasonOperatorDispatch      = "operator_dispatch"
@@ -85,6 +85,13 @@ var awaitingNextSteps = map[string]string{
 	awaitingReasonChildren:              "The stage waits on its child runs; drive them with fishhawk_run_children or fishhawk_await_children.",
 	awaitingReasonNoActiveStage:         "No stage is active; read fishhawk_get_run_status next_actions.",
 	awaitingReasonDispatchHeld:          "An operator dispatch hold parks this run's next dispatch (dispatch_hold names the held run); clear it with fishhawk_hold_dispatch action clear. Do not dispatch past it.",
+	// The heartbeat reasons (#5489). The block carries the state-keyed text
+	// from hostDispatcherNextSteps; these are the reason-level defaults.
+	awaitingReasonHostDispatchPaused:        "The host dispatcher is paused and spawns nothing; resume it on its host, or dispatch the stage with fishhawk_dispatch_stage. host_dispatcher names the host.",
+	awaitingReasonHostDispatchCapped:        "The host dispatcher reached its daily spawn cap; it resumes at host_dispatcher.cap_resets_at, or dispatch the stage with fishhawk_dispatch_stage.",
+	awaitingReasonHostDispatchRefused:       "The host dispatcher refuses or holds this run (host_dispatcher.refusal_code or tick_failure_code); fix the named cause, or dispatch the stage with fishhawk_dispatch_stage.",
+	awaitingReasonHostDispatchBudgetBlocked: "The host dispatcher refuses this run on its workflow budget (host_dispatcher.budget_source). A hand fishhawk_dispatch_stage is not budget-gated.",
+	awaitingReasonHostDispatcherAbsent:      "No fresh host dispatcher heartbeat is visible (host_dispatcher.state absent or stale); start or restart `fishhawk-mcp host-dispatch` on the host, or dispatch the stage with fishhawk_dispatch_stage.",
 }
 
 // campaignItemAwaitingPayload mirrors docs/api/v0.openapi.yaml's
@@ -106,6 +113,11 @@ type campaignItemAwaitingPayload struct {
 	// DispatchHold is the item run's EFFECTIVE operator dispatch hold
 	// (E110.50 / #5486), read for a READABLE caller only; omitted when none.
 	DispatchHold *runDispatchHoldPayload `json:"dispatch_hold,omitempty"`
+	// HostDispatcher is the heartbeat observation (#5489) for a block the
+	// server classified from the dispatchers' heartbeats: a READABLE caller's
+	// host_dispatcher/host_dispatch block, after the dispatch hold, with the
+	// heartbeat store wired. Omitted otherwise.
+	HostDispatcher *hostDispatcherObservation `json:"host_dispatcher,omitempty"`
 }
 
 // campaignItemAwaitingDecision is the current (uncleared) decision marker the
@@ -308,7 +320,12 @@ func latestAuditEntry(entries []*audit.Entry) *audit.Entry {
 // campaignItemAwaitingForStatus builds one item's awaiting block, or nil when
 // the item is not running, has no linked run, its run is terminal, or a run
 // or stage read failed (WARN-logged; the status read never fails on it).
-func (s *Server) campaignItemAwaitingForStatus(ctx context.Context, c *campaign.Campaign, it *campaign.Item, readable bool, pending *campaignPendingAmendmentsPayload) *campaignItemAwaitingPayload {
+//
+// loadHeartbeats is the status call's heartbeat loader
+// (hostDispatcherHeartbeatLoaderForStatus; nil when unwired). It is called
+// for a READABLE caller only, after the dispatch hold, and only while the
+// block still reads host_dispatcher/host_dispatch.
+func (s *Server) campaignItemAwaitingForStatus(ctx context.Context, c *campaign.Campaign, it *campaign.Item, readable bool, pending *campaignPendingAmendmentsPayload, loadHeartbeats hostDispatcherHeartbeatLoader) *campaignItemAwaitingPayload {
 	if s.cfg.RunRepo == nil || it.State != campaign.ItemStateRunning || it.RunID == nil {
 		return nil
 	}
@@ -341,6 +358,15 @@ func (s *Server) campaignItemAwaitingForStatus(ctx context.Context, c *campaign.
 				"campaign_id", c.ID.String(), "run_id", runID.String(), "error", herr.Error())
 		}
 		blk = applyAwaitingDispatchHold(blk, hold, herr)
+		// The dispatchers' server heartbeats (#5489): read AFTER the hold, so
+		// an operator hold (server truth) wins as dispatch_held and triggers
+		// no heartbeat read.
+		var hberr error
+		blk, hberr = applyHostDispatcherHeartbeat(blk, r.AccountID, loadHeartbeats, s.nowFunc())
+		if hberr != nil {
+			s.cfg.Logger.Warn("campaign status: host dispatcher heartbeat read failed; awaiting decision unavailable",
+				"campaign_id", c.ID.String(), "run_id", runID.String(), "error", hberr.Error())
+		}
 	}
 	return &blk
 }

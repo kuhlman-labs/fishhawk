@@ -36,6 +36,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/dispatcherheartbeat"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
@@ -561,6 +562,14 @@ type Config struct {
 	// (the audit payload remains the authoritative record) and leaves
 	// the ID-addressed fix-up path returning 503.
 	ConcernRepo concern.Repository
+
+	// HostDispatcherHeartbeatRepo persists each host dispatcher's latest
+	// per-tick heartbeat, one row per (account, host) (#5489, ADR-104
+	// Amendment A2). POST /v0/host-dispatchers/heartbeat writes it; the
+	// campaign status awaiting block reads it. Nil leaves the endpoint
+	// answering 503 not_configured and the awaiting block on its legacy
+	// classification.
+	HostDispatcherHeartbeatRepo dispatcherheartbeat.Repository
 
 	// GateMerger is the forge-resolved merge seam the local auto-driver
 	// endpoint (POST /v0/runs/{run_id}/auto-drive, #1700) and POST

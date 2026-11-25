@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 )
 
 // host_dispatcher_loop_test.go drives the host-dispatcher tick loop (E88.2 /
@@ -44,6 +47,9 @@ type hdLoopHarness struct {
 	onDriveView func(runID string)
 	// listCode non-zero answers the run list with that status.
 	listCode int
+	// heartbeat, when set, answers POST /v0/host-dispatchers/heartbeat (the
+	// request is still recorded in b.reqs); nil answers 200.
+	heartbeat http.HandlerFunc
 }
 
 func newHDLoopHarness(t *testing.T) *hdLoopHarness {
@@ -60,6 +66,22 @@ func newHDLoopHarness(t *testing.T) *hdLoopHarness {
 }
 
 func (lh *hdLoopHarness) serve(w http.ResponseWriter, req *http.Request) {
+	if req.Method == http.MethodPost && req.URL.Path == hostdispatcher.HeartbeatRoute {
+		body, _ := io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		lh.b.mu.Lock()
+		lh.b.reqs = append(lh.b.reqs, hdRequest{Method: req.Method, Path: req.URL.Path, Body: string(body)})
+		lh.b.mu.Unlock()
+		lh.mu.Lock()
+		h := lh.heartbeat
+		lh.mu.Unlock()
+		if h != nil {
+			h(w, req)
+			return
+		}
+		writeJSON(w, http.StatusOK, `{"dropped_refusals":0}`)
+		return
+	}
 	if req.Method == http.MethodGet && req.URL.Path == "/v0/runs" {
 		lh.mu.Lock()
 		lh.listQuery = append(lh.listQuery, req.URL.RawQuery)
@@ -1544,5 +1566,496 @@ func TestHostDispatchLoop_BudgetBlocked_RecordedInRunRefusals(t *testing.T) {
 	}
 	if got := st.BudgetRefusals(); len(got) != 1 || got[0].RunID != b.ID {
 		t.Fatalf("tick 2 BudgetRefusals = %+v; want only B", got)
+	}
+}
+
+// --- server heartbeat (#5489) ------------------------------------------------
+
+// hdHeartbeatDelivery is one publish attempt seen by the delivery hook.
+type hdHeartbeatDelivery struct {
+	hb  hostdispatcher.Heartbeat
+	err error
+}
+
+// hdLockedLog is a goroutine-safe log sink: the tick and the publisher both log.
+type hdLockedLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *hdLockedLog) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *hdLockedLog) count(sub string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.Count(w.b.String(), sub)
+}
+
+// hdStartPublisher wires the delivery hook and starts the real publisher; the
+// returned channel receives every publish attempt. Cleanup cancels and waits.
+func hdStartPublisher(t *testing.T, l *hostDispatchLoop) (<-chan hdHeartbeatDelivery, context.CancelFunc, <-chan struct{}) {
+	t.Helper()
+	got := make(chan hdHeartbeatDelivery, 16)
+	l.heartbeatDelivered = func(hb hostdispatcher.Heartbeat, err error) { got <- hdHeartbeatDelivery{hb, err} }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := l.startHeartbeatPublisher(ctx)
+	t.Cleanup(func() { cancel(); <-done })
+	return got, cancel, done
+}
+
+func hdAwaitDelivery(t *testing.T, got <-chan hdHeartbeatDelivery, label string) hdHeartbeatDelivery {
+	t.Helper()
+	select {
+	case d := <-got:
+		return d
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: no heartbeat delivered within 5s", label)
+	}
+	return hdHeartbeatDelivery{}
+}
+
+func hdHeartbeatPosts(b *hdBackend) []hdRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []hdRequest
+	for _, q := range b.reqs {
+		if q.Method == http.MethodPost && q.Path == hostdispatcher.HeartbeatRoute {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// TestHostDispatchLoop_PublishesHeartbeatEachTick (#5489 test 25): a live, a
+// paused and a failing tick each deliver one POST whose paused /
+// tick_failure_code match status.json, every body passes the server's
+// structural Validate, and every request the loop made passes
+// hostdispatcher.RouteAllowed: the dispatcher-side request pin for the loop
+// (TestHostDispatcher_RequestsStayOnServerAllowlist drives the core and never
+// sees the heartbeat).
+func TestHostDispatchLoop_PublishesHeartbeatEachTick(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	lh.add(0, nil)
+	l := lh.loop(nil)
+	got, _, _ := hdStartPublisher(t, l)
+
+	lh.tick(l)
+	live := hdAwaitDelivery(t, got, "live tick")
+	if live.err != nil || live.hb.Paused || live.hb.TickFailureCode != "" {
+		t.Fatalf("live tick heartbeat = %+v err %v; want unpaused, no tick failure", live.hb, live.err)
+	}
+	if st := hdMustStatus(t, lh.dir); !live.hb.LastTickAt.Equal(st.LastTickAt) || live.hb.SpawnsToday != st.SpawnsToday || live.hb.InFlight != st.InFlight {
+		t.Fatalf("live heartbeat %+v disagrees with status.json %+v", live.hb, st)
+	}
+
+	if err := SetHostDispatcherPaused(lh.dir, true); err != nil {
+		t.Fatal(err)
+	}
+	lh.clock = lh.clock.Add(30 * time.Second)
+	lh.tick(l)
+	paused := hdAwaitDelivery(t, got, "paused tick")
+	if st := hdMustStatus(t, lh.dir); !paused.hb.Paused || !st.Paused || !paused.hb.LastTickAt.Equal(st.LastTickAt) {
+		t.Fatalf("paused tick heartbeat paused=%v (status.json paused=%v); want both true", paused.hb.Paused, st.Paused)
+	}
+
+	if err := SetHostDispatcherPaused(lh.dir, false); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(lh.dir, hostDispatchLedgerFile)
+	target := filepath.Join(t.TempDir(), "ledger.json")
+	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(path)
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	lh.clock = lh.clock.Add(30 * time.Second)
+	lh.tick(l)
+	failing := hdAwaitDelivery(t, got, "failing tick")
+	st := hdMustStatus(t, lh.dir)
+	if st.LastTickFailure == nil || failing.hb.TickFailureCode != hdRefuseLedgerRead || st.LastTickFailure.Code != hdRefuseLedgerRead || failing.hb.Paused {
+		t.Fatalf("failing tick heartbeat tick_failure_code %q paused %v (status.json %+v); want %s", failing.hb.TickFailureCode, failing.hb.Paused, st.LastTickFailure, hdRefuseLedgerRead)
+	}
+
+	posts := hdHeartbeatPosts(lh.b)
+	if len(posts) != 3 {
+		t.Fatalf("heartbeat POSTs = %d; want 3 (one per tick)", len(posts))
+	}
+	for i, q := range posts {
+		var hb hostdispatcher.Heartbeat
+		dec := json.NewDecoder(strings.NewReader(q.Body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&hb); err != nil {
+			t.Fatalf("POST %d body does not decode strictly as hostdispatcher.Heartbeat: %v\n%s", i, err, q.Body)
+		}
+		if err := hb.Validate(); err != nil {
+			t.Fatalf("POST %d body fails the server's Validate: %v\n%s", i, err, q.Body)
+		}
+	}
+	lh.b.mu.Lock()
+	defer lh.b.mu.Unlock()
+	for _, q := range lh.b.reqs {
+		p, _, _ := strings.Cut(q.Path, "?")
+		if !hostdispatcher.RouteAllowed(q.Method, p) {
+			t.Errorf("loop request %s %s is outside the server's host-dispatcher allowlist", q.Method, q.Path)
+		}
+	}
+}
+
+// TestHostDispatchRefusalDisposition (#5489 test 26) pins the heartbeat
+// disposition per code, in the overlay's arm order. The review-round holds
+// read waiting, not in_flight (condition H2).
+func TestHostDispatchRefusalDisposition(t *testing.T) {
+	now := hdoNow
+	rows := []struct {
+		code string
+		age  time.Duration
+		want hostdispatcher.Disposition
+	}{
+		{"paused", time.Minute, hostdispatcher.DispositionPaused},
+		{"pause_check_failed", time.Minute, hostdispatcher.DispositionPaused},
+		{"cap_reached:daily", time.Minute, hostdispatcher.DispositionCapped},
+		{"budget_blocked", time.Minute, hostdispatcher.DispositionBudgetBlocked},
+		{"budget_check_failed", time.Minute, hostdispatcher.DispositionRefusing},
+		{"campaign_not_running", time.Minute, hostdispatcher.DispositionHeld},
+		{"campaign_dispatch_held", time.Minute, hostdispatcher.DispositionHeld},
+		{"run_dispatch_held", time.Minute, hostdispatcher.DispositionHeld},
+		{"dispatch_hold_unavailable", time.Minute, hostdispatcher.DispositionRefusing},
+		{"implement_review_in_flight", time.Minute, hostdispatcher.DispositionWaiting},
+		{"implement_review_not_started", 45 * time.Minute, hostdispatcher.DispositionWaiting},
+		{"lineage_lock_held", time.Minute, hostdispatcher.DispositionWaiting},
+		{"lineage_lock_held", 20 * time.Minute, hostdispatcher.DispositionRefusing},
+		{"concurrency_slot_queued", time.Minute, hostdispatcher.DispositionWaiting},
+		{"cap_reached:max_in_flight", time.Minute, hostdispatcher.DispositionWaiting},
+		{"path_outside_allowed_roots", time.Minute, hostdispatcher.DispositionRefusing},
+		{"working_dir_unbound", time.Minute, hostdispatcher.DispositionRefusing},
+		{"some_new_code", time.Minute, hostdispatcher.DispositionRefusing},
+	}
+	for _, r := range rows {
+		if got := hostDispatchRefusalDisposition(r.code, now.Add(-r.age), now); got != r.want {
+			t.Errorf("hostDispatchRefusalDisposition(%q, first seen %s ago) = %q; want %q", r.code, r.age, got, r.want)
+		}
+	}
+}
+
+// TestHostDispatchLoop_HeartbeatBudgetSource (#5489 test 27): a budget_blocked
+// refusal publishes disposition budget_blocked with the budget_source its
+// detail names; a detail naming none publishes no budget_source. A tick
+// driven without the publisher leaves its snapshot in the mailbox.
+func TestHostDispatchLoop_HeartbeatBudgetSource(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	a := lh.add(0, func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceLive) })
+	b := lh.add(time.Minute, func(r *hdRun) { r.DispatchBudget = hdBlockedBudget(dispatchBudgetSourceAdmission) })
+	l := lh.loop(nil)
+	lh.tick(l)
+	hb := <-l.heartbeats
+	bySrc := map[string]hostdispatcher.RunRefusal{}
+	for _, ref := range hb.RunRefusals {
+		bySrc[ref.RunID] = ref
+	}
+	for _, c := range []struct {
+		id, src string
+	}{{a.ID, dispatchBudgetSourceLive}, {b.ID, dispatchBudgetSourceAdmission}} {
+		ref := bySrc[c.id]
+		if ref.Disposition != hostdispatcher.DispositionBudgetBlocked || ref.BudgetSource != c.src || !hostdispatcher.RefusalValid(ref) {
+			t.Fatalf("run %s heartbeat entry = %+v; want budget_blocked with budget_source %s, on-grammar", c.id, ref, c.src)
+		}
+	}
+
+	l.runRefusals = map[string]hostDispatchRunRefusal{a.ID: {RunID: a.ID, Code: hdRefuseBudgetBlocked, Detail: "budget over its limit", FirstAt: lh.clock, LastAt: lh.clock}}
+	snap := l.heartbeatSnapshot()
+	if len(snap.RunRefusals) != 1 || snap.RunRefusals[0].Disposition != hostdispatcher.DispositionBudgetBlocked || snap.RunRefusals[0].BudgetSource != "" {
+		t.Fatalf("no-marker budget entry = %+v; want budget_blocked with no budget_source", snap.RunRefusals)
+	}
+}
+
+// TestHostDispatchLoop_HeartbeatPublishFailureNeverFailsTick (#5489 test 28):
+// a 500 then a 404 never fail a tick, status.json is still rewritten, a
+// repeated failure is logged once, a distinct one is logged, and after a
+// success the same failure is logged again. Each 5xx carries a fresh
+// error_ref, as the server's writeError sets the per-request id on every
+// 5xx, so "repeated" means the same status and code, not the same string.
+func TestHostDispatchLoop_HeartbeatPublishFailureNeverFailsTick(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	log := &hdLockedLog{}
+	l := lh.loop(func(c *HostDispatcherConfig) { c.Log = log })
+	got, _, _ := hdStartPublisher(t, l)
+	var reqN int
+	answer := func(code int) {
+		lh.mu.Lock()
+		defer lh.mu.Unlock()
+		lh.heartbeat = func(w http.ResponseWriter, _ *http.Request) {
+			if code == http.StatusOK {
+				writeJSON(w, code, `{"dropped_refusals":0}`)
+				return
+			}
+			if code >= http.StatusInternalServerError {
+				reqN++
+				writeJSON(w, code, fmt.Sprintf(`{"error":{"code":"internal_error","message":"failed to store the heartbeat","error_ref":"req-%d"}}`, reqN))
+				return
+			}
+			writeJSON(w, code, apiErrBody("not_found", "no such route"))
+		}
+	}
+	var prev5xx string
+	const line = "heartbeat publish failed"
+	steps := []struct {
+		code    int
+		wantErr bool
+		logged  int
+	}{
+		{http.StatusInternalServerError, true, 1},
+		{http.StatusInternalServerError, true, 1},
+		{http.StatusNotFound, true, 2},
+		{http.StatusOK, false, 2},
+		{http.StatusInternalServerError, true, 3},
+	}
+	for i, step := range steps {
+		answer(step.code)
+		lh.clock = lh.clock.Add(30 * time.Second)
+		if err := l.tick(context.Background()); err != nil {
+			t.Fatalf("tick %d returned %v under a %d heartbeat; want nil", i+1, err, step.code)
+		}
+		if st := hdMustStatus(t, lh.dir); !st.LastTickAt.Equal(lh.clock) {
+			t.Fatalf("tick %d: status.json last_tick_at = %s; want %s (still rewritten)", i+1, st.LastTickAt, lh.clock)
+		}
+		d := hdAwaitDelivery(t, got, fmt.Sprintf("tick %d", i+1))
+		if (d.err != nil) != step.wantErr {
+			t.Fatalf("tick %d publish err = %v; want error=%v", i+1, d.err, step.wantErr)
+		}
+		if step.code >= http.StatusInternalServerError {
+			// The fixture must vary the error string, or the dedupe key is
+			// untested.
+			if msg := d.err.Error(); !strings.Contains(msg, "error_ref=req-") || msg == prev5xx {
+				t.Fatalf("tick %d 5xx error %q; want a fresh error_ref (previous %q)", i+1, msg, prev5xx)
+			}
+			prev5xx = d.err.Error()
+		}
+		if n := log.count(line); n != step.logged {
+			t.Fatalf("after tick %d (%d): %d %q lines; want %d\n%s", i+1, step.code, n, line, step.logged, log.b.String())
+		}
+	}
+	if n := len(hdHeartbeatPosts(lh.b)); n != len(steps) {
+		t.Fatalf("heartbeat POSTs = %d; want %d (every tick publishes again)", n, len(steps))
+	}
+}
+
+// TestHostDispatchLoop_HeartbeatLogsDroppedRefusals: a 200 whose
+// dropped_refusals is non-zero is logged once per distinct count (a repeat is
+// not logged again, a zero resets it), and a dropped count is never a
+// publish error.
+func TestHostDispatchLoop_HeartbeatLogsDroppedRefusals(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	log := &hdLockedLog{}
+	l := lh.loop(func(c *HostDispatcherConfig) { c.Log = log })
+	got, _, _ := hdStartPublisher(t, l)
+	const line = "run_refusals entries dropped as off-grammar"
+	steps := []struct{ dropped, logged int }{
+		{0, 0}, {2, 1}, {2, 1}, {1, 2}, {0, 2}, {1, 3},
+	}
+	for i, step := range steps {
+		lh.mu.Lock()
+		lh.heartbeat = func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, fmt.Sprintf(`{"dropped_refusals":%d}`, step.dropped))
+		}
+		lh.mu.Unlock()
+		lh.clock = lh.clock.Add(30 * time.Second)
+		lh.tick(l)
+		if d := hdAwaitDelivery(t, got, fmt.Sprintf("tick %d", i+1)); d.err != nil {
+			t.Fatalf("tick %d publish err = %v under dropped_refusals %d; want nil", i+1, d.err, step.dropped)
+		}
+		if n := log.count(line); n != step.logged {
+			t.Fatalf("after tick %d (dropped_refusals %d): %d %q lines; want %d\n%s", i+1, step.dropped, n, line, step.logged, log.b.String())
+		}
+	}
+	if !strings.Contains(log.b.String(), "with 2 run_refusals entries dropped") {
+		t.Fatalf("log names no dropped count:\n%s", log.b.String())
+	}
+}
+
+// hdStallHeartbeat makes the heartbeat handler block until release is closed
+// or the request is cancelled; entered receives once per request. release
+// is idempotent and also runs at cleanup.
+func hdStallHeartbeat(t *testing.T, lh *hdLoopHarness) (entered chan struct{}, releaseFn func()) {
+	t.Helper()
+	entered = make(chan struct{}, 16)
+	release := make(chan struct{})
+	var once sync.Once
+	releaseFn = func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseFn)
+	lh.mu.Lock()
+	lh.heartbeat = func(w http.ResponseWriter, req *http.Request) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-req.Context().Done():
+			return
+		}
+		writeJSON(w, http.StatusOK, `{"dropped_refusals":0}`)
+	}
+	lh.mu.Unlock()
+	return entered, releaseFn
+}
+
+// TestHostDispatchLoop_HeartbeatStallNeverDelaysTick (#5489 test 29): with
+// the heartbeat handler stalled, three ticks each return in under 1s (the POST
+// timeout is 5s). After release the next delivered POST carries tick 3's
+// last_tick_at and at most two POSTs were sent: the stalled one, then the
+// latest (tick 2's snapshot was replaced in the mailbox).
+func TestHostDispatchLoop_HeartbeatStallNeverDelaysTick(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	l := lh.loop(nil)
+	entered, release := hdStallHeartbeat(t, lh)
+	got, _, _ := hdStartPublisher(t, l)
+
+	var ticks []time.Time
+	for i := range 3 {
+		lh.clock = lh.clock.Add(30 * time.Second)
+		ticks = append(ticks, lh.clock)
+		start := time.Now()
+		lh.tick(l)
+		if d := time.Since(start); d >= time.Second {
+			t.Fatalf("tick %d took %s under a stalled heartbeat; want < 1s", i+1, d)
+		}
+		if i == 0 {
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the publisher never POSTed tick 1's heartbeat")
+			}
+		}
+	}
+	release()
+	first := hdAwaitDelivery(t, got, "stalled POST")
+	if !first.hb.LastTickAt.Equal(ticks[0]) || first.err != nil {
+		t.Fatalf("first delivery last_tick_at %s err %v; want tick 1 (%s), no error", first.hb.LastTickAt, first.err, ticks[0])
+	}
+	latest := hdAwaitDelivery(t, got, "latest POST")
+	if !latest.hb.LastTickAt.Equal(ticks[2]) {
+		t.Fatalf("next delivery last_tick_at %s; want tick 3's %s (latest wins)", latest.hb.LastTickAt, ticks[2])
+	}
+	select {
+	case d := <-got:
+		t.Fatalf("a third POST was delivered (last_tick_at %s); want at most two", d.hb.LastTickAt)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if n := len(hdHeartbeatPosts(lh.b)); n != 2 {
+		t.Fatalf("heartbeat POSTs = %d; want 2", n)
+	}
+}
+
+// TestHostDispatchLoop_HeartbeatPublisherStopsOnCancel (#5489 test 30):
+// cancelling the publisher's context during a stalled POST makes the
+// goroutine exit within 1s, well before the 5s POST timeout.
+func TestHostDispatchLoop_HeartbeatPublisherStopsOnCancel(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	l := lh.loop(nil)
+	entered, _ := hdStallHeartbeat(t, lh)
+	_, cancel, done := hdStartPublisher(t, l)
+	lh.tick(l)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the publisher never POSTed")
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("publisher still running %s after cancel; want exit within 1s", time.Since(start))
+	}
+}
+
+// TestRunHostDispatcherLoop_PreCancelledNoHeartbeat: run() with a
+// pre-cancelled context starts and stops the publisher without a POST.
+func TestRunHostDispatcherLoop_PreCancelledNoHeartbeat(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	l := lh.loop(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := l.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if n := len(hdHeartbeatPosts(lh.b)); n != 0 {
+		t.Fatalf("heartbeat POSTs = %d after a pre-cancelled run; want 0", n)
+	}
+}
+
+// TestRunHostDispatcherLoop_RunStartsHeartbeatPublisher: run() on a live
+// context starts the publisher itself, so its first tick reaches the server
+// as a heartbeat POST with no test-side publisher; after a cancel run returns
+// within 2s. Every other publishing test starts the publisher by hand.
+func TestRunHostDispatcherLoop_RunStartsHeartbeatPublisher(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	l := lh.loop(nil)
+	posted := make(chan struct{}, 16)
+	lh.mu.Lock()
+	lh.heartbeat = func(w http.ResponseWriter, _ *http.Request) {
+		posted <- struct{}{}
+		writeJSON(w, http.StatusOK, `{"dropped_refusals":0}`)
+	}
+	lh.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- l.run(ctx) }()
+	select {
+	case <-posted:
+	case err := <-errc:
+		t.Fatalf("run returned %v before any heartbeat POST", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-errc
+		t.Fatal("run() sent no heartbeat POST within 5s; it must start the publisher")
+	}
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run still running 2s after cancel")
+	}
+}
+
+// TestHostDispatchLoop_HeartbeatBoundsRunRefusals (#5489 test 31): 300
+// refusals publish the 256 with the newest last_at, newest first, and the
+// snapshot passes the server's Validate. A paused tick leaves run_refusals
+// untouched, so the seeded map reaches the snapshot.
+func TestHostDispatchLoop_HeartbeatBoundsRunRefusals(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	l := lh.loop(nil)
+	l.runRefusals = map[string]hostDispatchRunRefusal{}
+	for i := range 300 {
+		id := uuid.NewString()
+		at := lh.clock.Add(-time.Duration(i) * time.Second)
+		l.runRefusals[id] = hostDispatchRunRefusal{RunID: id, Code: hdRefuseSlotQueued, FirstAt: at, LastAt: at}
+	}
+	if err := SetHostDispatcherPaused(lh.dir, true); err != nil {
+		t.Fatal(err)
+	}
+	lh.tick(l)
+	hb := <-l.heartbeats
+	if len(hb.RunRefusals) != hostdispatcher.MaxRunRefusals {
+		t.Fatalf("run_refusals = %d entries; want %d", len(hb.RunRefusals), hostdispatcher.MaxRunRefusals)
+	}
+	oldestKept := lh.clock.Add(-time.Duration(hostdispatcher.MaxRunRefusals-1) * time.Second)
+	for i, ref := range hb.RunRefusals {
+		if ref.LastAt.Before(oldestKept) {
+			t.Fatalf("entry %d last_at %s is older than the 256th newest (%s)", i, ref.LastAt, oldestKept)
+		}
+		if i > 0 && ref.LastAt.After(hb.RunRefusals[i-1].LastAt) {
+			t.Fatalf("entry %d is newer than entry %d; want newest first", i, i-1)
+		}
+	}
+	if err := hb.Validate(); err != nil {
+		t.Fatalf("bounded heartbeat fails Validate: %v", err)
 	}
 }

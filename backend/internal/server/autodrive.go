@@ -1671,12 +1671,10 @@ func (s *Server) serverCheckAwaitingHumanHold(ctx context.Context, runRow *run.R
 
 // fixupNoChangeRepeatNote is the decision_required note for the #5390
 // no-change guard: the count and ids, the fact that nothing was auto-routed,
-// and the remedies (E5). Re-routing one sharper concern is exactly the case
-// the guard's first-window-only limitation affects (#5496).
+// and the remedies (E5).
 func fixupNoChangeRepeatNote(e *fixupNoChangeRepeatError) string {
 	return fmt.Sprintf("the last fix-up pass routed exactly the %d open implement concern(s) [%s] and produced no commit; no fix-up was auto-routed. "+
-		"Remedies: re-route ONE sharper concern with fishhawk_fixup_stage and an operator_concern naming the exact change "+
-		"(a second no-change pass on this stage is not detected, follow-up #5496); "+
+		"Remedies: re-route ONE sharper concern with fishhawk_fixup_stage and an operator_concern naming the exact change; "+
 		"or finish the change on the run branch, fishhawk_vouch_commit it, and THEN close the concerns with fishhawk_resolve_concerns (with evidence), a waive or a defer, because the no-change veto keeps them open; "+
 		"or waive or defer them",
 		len(e.ConcernIDs), strings.Join(e.ConcernIDs, ", "))

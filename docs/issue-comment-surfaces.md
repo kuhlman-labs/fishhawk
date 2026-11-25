@@ -2176,9 +2176,12 @@ Notes:
 - The fix-up no-changes audit kind — `fixup_no_changes` (#856) — is an **internal,
   system-actor audit kind, not an issue-comment surface**. Nothing in `issuecomment`
   posts it; it has no Notifier method.
-  `server/pullrequest.go::succeedFixupNoChangesStage` writes it once
-  (idempotency-guarded **stage-keyed**, since no commit landed and there is no
-  `head_sha` to dedup on) when a fix-up re-dispatch reports
+  `server/pullrequest.go::succeedFixupNoChangesStage` writes it once per fix-up
+  routing window (idempotency-guarded **window-keyed**, #5496, since no commit
+  landed and there is no `head_sha` to dedup on: one row per
+  `stage_fixup_triggered` window, a stage with no trigger falls back to
+  stage-keyed, and a not-running stage with any row is a replay) when a fix-up
+  re-dispatch reports
   `{outcome:"fixup_no_changes"}` after producing no changes on the EXISTING PR
   branch, with a `system` (or operator, on the bearer path) actor and payload
   `{run_id, stage_id, branch, base_sha, files_changed_count, auth_method}` (no
