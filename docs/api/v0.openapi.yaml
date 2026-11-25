@@ -6705,6 +6705,33 @@ components:
         reads `human` / `dispatch_held`. A running stage keeps `in_flight`,
         because a hold never touches in-flight work. A hold read error sets
         `decision_unavailable`.
+
+        (d) The host dispatchers' server heartbeats (#5489, `POST
+        /v0/host-dispatchers/heartbeat`) are a decision source too, gated
+        like the others and read AFTER the dispatch hold, so a held item
+        reads `dispatch_held` and triggers no heartbeat read. Only a block
+        that still reads `host_dispatcher` / `host_dispatch` is classified.
+        The rows are read once per status call per item-run account and are
+        account-partitioned: an item run sees untenanted dispatchers plus its
+        own account's (an untenanted run never sees a tenanted dispatcher).
+        A heartbeat is fresh within three of its intervals (the interval
+        clamped to 1..300 s, default 30 s) of the server clock and no more
+        than 60 s ahead of it. Each fresh dispatcher gets its own verdict
+        (paused, then a failing tick, then this run's `run_refusals` entry
+        with a stage-mismatched entry discarded, then the daily cap, else
+        live) and the best verdict wins across dispatchers: `in_flight`,
+        then a run-scoped hold, then live, then waiting, then a host-scoped
+        block; ties go to the newest heartbeat, then the lower host. So the
+        item reads `human` only when every fresh dispatcher it can see is
+        blocked: `host_dispatch_paused`, `host_dispatch_capped`,
+        `host_dispatch_refused` (state `held` or `refusing`),
+        `host_dispatch_budget_blocked`, or `host_dispatcher_absent` (state
+        `absent` or `stale`). The reasons match the MCP status overlay's.
+        `next_step` is server-constant text keyed by reason, state and, for
+        a budget block, `budget_source`; no dispatcher text reaches it. An
+        unwired heartbeat store leaves the block unchanged with no
+        `host_dispatcher`; a read error leaves it unchanged with
+        `decision_unavailable`.
       required: [kind, reason, run_id, next_step]
       properties:
         kind:
@@ -6726,6 +6753,11 @@ components:
             - children
             - no_active_stage
             - dispatch_held
+            - host_dispatch_paused
+            - host_dispatch_capped
+            - host_dispatch_refused
+            - host_dispatch_budget_blocked
+            - host_dispatcher_absent
         run_id: { $ref: '#/components/schemas/UUID' }
         stage_id:
           allOf: [{ $ref: '#/components/schemas/UUID' }]
@@ -6761,6 +6793,131 @@ components:
             The item run's effective operator dispatch hold (E110.50 /
             #5486), for a readable caller only. Omitted when the run is not
             held, the caller is not readable, or the read failed.
+        host_dispatcher:
+          $ref: '#/components/schemas/CampaignItemAwaitingHostDispatcher'
+          description: |
+            The heartbeat observation (#5489) on a block the server
+            classified from the host dispatchers' heartbeats, for a readable
+            caller only. Omitted when the caller is not readable, the block
+            did not read `host_dispatcher` / `host_dispatch` after the
+            dispatch hold, the heartbeat store is unwired, or the read failed.
+
+    CampaignItemAwaitingHostDispatcher:
+      type: object
+      description: |
+        The deciding host dispatcher's state for a heartbeat-classified
+        awaiting block (#5489). Every field but `state` is omitted when empty
+        or zero. `refusal_detail` is the dispatcher's own bounded text (at
+        most 300 bytes, no control characters) and is data, never guidance.
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [live, waiting, in_flight, held, refusing, capped, paused, stale, absent]
+          description: |
+            `live`: fresh and nothing blocks the run. `waiting`: the
+            dispatcher will spawn once its own wait clears (a queued slot, a
+            lineage lock, a review round). `in_flight`: the dispatcher has the
+            stage in flight. `held`: a campaign or run hold, or a budget block.
+            `refusing`: the dispatcher refuses the run, or its tick fails.
+            `capped`: the daily spawn cap is reached. `paused`: the dispatcher
+            is paused. `stale`: the newest heartbeat is older than its window.
+            `absent`: no heartbeat is visible to the run's account.
+        host:
+          type: string
+          description: The deciding dispatcher's host label (for `stale`, the newest heartbeat's).
+        last_heartbeat_at:
+          type: string
+          format: date-time
+          description: The server clock when that heartbeat was received.
+        refusal_code:
+          type: string
+          description: The dispatcher's refusal code for this run, e.g. `path_outside_allowed_roots`.
+        refusal_detail:
+          type: string
+          description: The dispatcher's bounded refusal detail, for a `refusing` entry.
+        refusal_first_at:
+          type: string
+          format: date-time
+          description: When the dispatcher first refused this run with this code.
+        tick_failure_code:
+          type: string
+          description: The dispatcher's failing-tick code, e.g. `ledger_read_failed`.
+        daily_cap:
+          type: integer
+          description: The dispatcher's daily spawn cap, when one is set.
+        spawns_today:
+          type: integer
+          description: Spawns the dispatcher counted today (UTC).
+        cap_resets_at:
+          type: string
+          format: date-time
+          description: The next 00:00:00Z, for `capped`.
+        budget_source:
+          type: string
+          enum: [live_spec, admission_spec, admission_spec_fallback]
+          description: |
+            Which budget verdict blocked the run, for
+            `host_dispatch_budget_blocked`. Only `live_spec` is lifted by a
+            default-branch `limit_usd` raise or `enforcement: advisory`.
+
+    HostDispatcherHeartbeat:
+      type: object
+      additionalProperties: false
+      description: |
+        One host dispatcher tick's snapshot (#5489). There is no host or
+        account field: the server takes both from the token.
+      required: [interval_seconds, started_at, last_tick_at, paused, spawns_today, in_flight, run_refusals]
+      properties:
+        interval_seconds: { type: number, description: The dispatcher's tick interval, positive. }
+        started_at: { type: string, format: date-time }
+        last_tick_at: { type: string, format: date-time }
+        last_complete_tick_at: { type: string, format: date-time }
+        paused: { type: boolean }
+        tick_failure_code: { type: string, description: 'The failing tick''s code; absent when the tick did not fail. Bounded to 300 bytes.' }
+        daily_cap: { type: integer, minimum: 0, description: The opt-in daily spawn cap; absent when none. }
+        spawns_today: { type: integer, minimum: 0 }
+        spawns_day: { type: string, format: date, description: The UTC date `spawns_today` counts. }
+        in_flight: { type: integer, minimum: 0 }
+        run_refusals:
+          type: array
+          maxItems: 256
+          items: { $ref: '#/components/schemas/HostDispatcherHeartbeatRunRefusal' }
+
+    HostDispatcherHeartbeatRunRefusal:
+      type: object
+      additionalProperties: false
+      description: |
+        One candidate run's latest refusal. An entry whose `code`,
+        `disposition` or `budget_source` is off-grammar is dropped at ingest
+        and counted in `dropped_refusals`.
+      required: [run_id, code, disposition, first_at, last_at]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        code: { type: string, maxLength: 64, pattern: '^[a-z0-9_:.-]+$' }
+        detail: { type: string, description: Bounded to 300 bytes with control characters dropped. }
+        disposition:
+          type: string
+          enum: [waiting, in_flight, held, budget_blocked, paused, capped, refusing]
+          description: The dispatcher's reading of the refusal.
+        budget_source:
+          type: string
+          enum: [live_spec, admission_spec, admission_spec_fallback]
+          description: Legal only on a `budget_blocked` entry.
+        first_at: { type: string, format: date-time }
+        last_at: { type: string, format: date-time }
+
+    HostDispatcherHeartbeatResponse:
+      type: object
+      required: [dropped_refusals]
+      properties:
+        dropped_refusals:
+          type: integer
+          minimum: 0
+          description: |
+            How many `run_refusals` entries were dropped for an off-grammar
+            `code`, `disposition` or `budget_source`; the rest was stored.
 
     CampaignItemAwaitingDecision:
       type: object
@@ -21763,6 +21920,78 @@ paths:
           description: |
             `digest_unconfigured` — no digest store, decision index or audit
             repository on this instance; the message names each missing one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/host-dispatchers/heartbeat:
+    post:
+      operationId: postHostDispatcherHeartbeat
+      summary: Record a host dispatcher's per-tick heartbeat
+      description: |
+        #5489 (ADR-104 Amendment A2). Each tick, `fishhawk-mcp host-dispatch`
+        POSTs a snapshot of its state; the server upserts one row per
+        (account, host), stamped with the server clock, and the campaign
+        status awaiting block classifies host-dispatcher state from it
+        (`CampaignItemAwaiting` item (d)). The body carries no host and no
+        account: the host label comes from the token's
+        `host-dispatcher/<host>` subject and the account from the token row,
+        so a heartbeat never reaches or overwrites another account's
+        dispatcher with the same label. A heartbeat writes no audit row: it
+        is operational state, not an event.
+
+        **Auth.** Only a valid `host-dispatcher/<host>` token holding
+        `write:runs` (the ADR-104 Q4 profile grants it) may write. This is
+        the dispatcher's only server write that is not run-scoped; it adds
+        no dispatch reach.
+
+        **Validation.** Structural errors answer 400 `validation_failed`
+        naming `details.field`: a body over 256 KiB, malformed JSON, an
+        unknown key (`host` and `account_id` included), a missing
+        `started_at` or `last_tick_at`, a non-positive `interval_seconds`, a
+        negative count, an unparseable `spawns_day`, more than 256
+        `run_refusals`, or a `run_refusals` entry with a non-canonical or
+        duplicate `run_id` or a non-canonical `stage_id`. A `run_refusals`
+        entry whose `code`, `disposition` or `budget_source` is off-grammar
+        is instead DROPPED, the rest of the heartbeat is stored, and
+        `dropped_refusals` counts the drops, so one bad entry cannot blank a
+        dispatcher. `detail` and `tick_failure_code` are bounded (invalid
+        UTF-8 and control characters dropped, cut at 300 bytes), not refused.
+      tags: [runs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HostDispatcherHeartbeat' }
+      responses:
+        '200':
+          description: The heartbeat was stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostDispatcherHeartbeatResponse' }
+        '400':
+          description: '`validation_failed` — a structural error (see the description); `details.field` names it. Nothing is stored.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — the token lacks `write:runs`; or
+            `host_dispatcher_subject_required` — the subject is not a valid
+            `host-dispatcher/<host>`. Nothing is stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the store write failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `not_configured` — no heartbeat store is wired on this instance;
+            or `service_unavailable` — the database is unavailable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
