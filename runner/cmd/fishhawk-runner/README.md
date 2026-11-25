@@ -425,16 +425,39 @@ gate. The wiring lives in `slicegatehook.go`.
   temp-fail, lock-contention, infra-flake and the #4036 flake re-run. After the
   #3316 auto-format absorb commits its reformat, `carry()` reuses the result
   once for the reformatted tree. An empty tree SHA never caches.
-- **Load bound.** The load runs under `sliceReachLoadTimeout` (2 minutes),
-  started before any metadata read. It is neither charged to nor clipped by the
-  #4023 gate budget, so the worst case adds one bound per distinct verified tree.
-- **Isolation (ADR-063).** The hook first reads the memoized gate-isolation
-  selection (`sliceGateSelectionFn`), which records no gate evidence. The reach
-  load runs only on a host path, `clone` (including the unconfigured host exec)
-  or `clone-sandbox`, under a non-hosted profile. A hosted profile, a container
-  path, a refused selection or any other path widens to
-  `full`/`gate_isolation_not_host:<selection>` and never runs the host
-  `go list`.
+- **Load bound.** The host load runs under `sliceReachLoadTimeout` (2
+  minutes), started before any metadata read. The container reach exec runs
+  under `sliceReachContainerTimeout` (4 minutes), which bounds that exec only:
+  the credential probe, image resolution, the passwd read, the cache-volume
+  prepare and the seed keep their own bounds. Neither is charged to nor clipped
+  by the #4023 gate budget, so the worst case adds one load per distinct
+  verified tree.
+- **Isolation (ADR-063; ADR-090 A3.7, amended on #5524).** The hook first
+  reads the memoized gate-isolation selection (`sliceGateSelectionFn`), which
+  records no gate evidence, and `sliceGateLoaderFor` picks the loader. A hosted
+  profile refuses first, whatever the path. Under a non-hosted profile, a host
+  path, `clone` (including the unconfigured host exec) or `clone-sandbox`, gets
+  the host load (`sliceGateLoadFn`), and the `container` path gets the
+  in-image load (`sliceGateContainerLoadFn`, `slicereachcontainer.go`). A
+  hosted profile, a refused selection or any other path widens to
+  `full`/`gate_isolation_not_host:<selection>`, and neither load runs.
+- **Container reach load.** `sliceReachLoadContainer` re-checks the selection,
+  then runs one `runGateInContainer` exec of a fixed `sh -c` script over the
+  mounted clone, marked `withLaunchMarker`, `withoutGateServices` and
+  `withSeedHandoff`. It is not a gate verdict, so it calls no
+  `markSeamReached`. The exec's completed seed is handed to the deciding
+  verify on the same clone, so a tree pays one seed. The host parses only the
+  one result line carrying the exec's nonce. A non-executed disposition, a
+  non-zero exit, a timeout and an unparseable result each widen with a named
+  `reach_container_*` or `reach_load_failed:load_timeout` reason.
+- **`slicereachhelper/`.** The stdlib-only `package main` the container route
+  embeds (`//go:embed slicereachhelper/main.go`) and the image's `go` runs. It
+  ports `slicereach.go`, re-implementing the Lstat predicate and reading
+  `go.work` and `go.mod` through `go work edit -json` and `go mod edit -json`.
+  `main_test.go` drives `run()` in-process, `TestHelper_StdlibOnly` refuses
+  any non-stdlib import, and `slicereachparity_test.go` builds the lone file
+  outside any module and compares its result with `sliceReachLoad`'s on
+  shared fixtures.
 - **Single-shot gate.** `runVerifyGateCommitted` (`max_iterations` 0) applies
   the same phase-1 plan. All four of its verify calls share one hook ctx: the
   initial run, the lock/temp-fail re-run, the infra-absorb re-run and the
@@ -459,10 +482,12 @@ gate. The wiring lives in `slicegatehook.go`.
   detail. That sentence is the implement review's only view of the shape on
   the loop path. On the single-shot path, gate_shape reaches no gate_evidence
   digest at all.
-- **Where the saving holds.** The saving depends on a warm module cache and a
-  host gate path. A high share of `package_error` or `gate_isolation_not_host`
-  reasons in the post-merge slice_scoped/full split means the gate is mostly
-  running full.
+- **Where the saving holds.** On a host path the saving depends on a warm
+  host module cache. On the container path each distinct tree pays one extra
+  container exec, and a tree that cannot yield a reach pays image resolution
+  and a container start before it widens. A high share of `package_error`,
+  `gate_isolation_not_host` or `reach_container_*` reasons in the post-merge
+  slice_scoped/full split means the gate is mostly running full.
 - The `gateBudgetVerifyForms` comment in `stagephase.go` is not updated here;
   that is a named follow-up.
 
