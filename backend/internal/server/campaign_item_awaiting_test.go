@@ -18,7 +18,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/dispatcherheartbeat"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -620,11 +623,11 @@ func TestCampaignItemAwaitingForStatus_TerminalRunOmitted(t *testing.T) {
 	done.State = run.StateFailed
 	f.rr.seedStage(done.ID, 1, run.StageStateRunning)
 	it := &campaign.Item{IssueRef: "issue:9", State: campaign.ItemStateRunning, RunID: idp(done.ID)}
-	if blk := f.s.campaignItemAwaitingForStatus(context.Background(), f.c, it, true, nil); blk != nil {
+	if blk := f.s.campaignItemAwaitingForStatus(context.Background(), f.c, it, true, nil, nil); blk != nil {
 		t.Fatalf("awaiting = %+v for a terminal run, want nil", blk)
 	}
 	live := &campaign.Item{IssueRef: "issue:1", State: campaign.ItemStateRunning, RunID: idp(f.host.ID)}
-	if blk := f.s.campaignItemAwaitingForStatus(context.Background(), f.c, live, true, nil); blk == nil {
+	if blk := f.s.campaignItemAwaitingForStatus(context.Background(), f.c, live, true, nil, nil); blk == nil {
 		t.Fatal("awaiting = nil for a running run, want a block (the fixture must reach the guard)")
 	}
 }
@@ -894,7 +897,7 @@ func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
 	t.Run("pending stage of a marked run reads dispatch_held", func(t *testing.T) {
 		f := newAwaitingFixture(t)
 		f.au.seed(f.host.ID, 9, CategoryRunDispatchHoldSet, "")
-		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), true, nil)
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), true, nil, nil)
 		if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonDispatchHeld ||
 			blk.NextStep != awaitingNextSteps[awaitingReasonDispatchHeld] || blk.DispatchHold == nil ||
 			blk.DispatchHold.HeldRunID != f.host.ID.String() || blk.DispatchHold.Inherited {
@@ -907,7 +910,7 @@ func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
 	t.Run("unmarked run's operator_dispatch reads dispatch_held", func(t *testing.T) {
 		f := newAwaitingFixture(t)
 		f.au.seed(f.manual.ID, 9, CategoryRunDispatchHoldSet, "")
-		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.manual), true, nil)
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.manual), true, nil, nil)
 		if blk == nil || blk.Reason != awaitingReasonDispatchHeld || blk.DispatchHold == nil {
 			t.Fatalf("awaiting = %+v", blk)
 		}
@@ -916,7 +919,7 @@ func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
 		f := newAwaitingFixture(t)
 		p := mk(f, run.StageStateAwaitingChildren)
 		f.au.seed(p.ID, 9, CategoryRunDispatchHoldSet, "")
-		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(p), true, nil)
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(p), true, nil, nil)
 		if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonDispatchHeld || blk.DispatchHold == nil {
 			t.Fatalf("awaiting = %+v", blk)
 		}
@@ -925,7 +928,7 @@ func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
 		f := newAwaitingFixture(t)
 		r := mk(f, run.StageStateRunning)
 		f.au.seed(r.ID, 9, CategoryRunDispatchHoldSet, "")
-		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(r), true, nil)
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(r), true, nil, nil)
 		if blk == nil || blk.Kind != awaitingKindSystem || blk.Reason != awaitingReasonInFlight || blk.DispatchHold == nil {
 			t.Fatalf("awaiting = %+v", blk)
 		}
@@ -933,7 +936,7 @@ func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
 	t.Run("unreadable caller gets no hold read", func(t *testing.T) {
 		f := newAwaitingFixture(t)
 		f.au.seed(f.host.ID, 9, CategoryRunDispatchHoldSet, "")
-		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), false, nil)
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), false, nil, nil)
 		if blk == nil || blk.Reason != awaitingReasonHostDispatch || blk.DispatchHold != nil || !blk.DecisionWithheld {
 			t.Fatalf("awaiting = %+v", blk)
 		}
@@ -944,9 +947,201 @@ func TestCampaignItemAwaiting_DispatchHeld(t *testing.T) {
 	t.Run("hold read error sets decision_unavailable", func(t *testing.T) {
 		f := newAwaitingFixture(t)
 		f.s.cfg.AuditRepo = holdErrAwaitingAudit{f.au}
-		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), true, &campaignPendingAmendmentsPayload{})
+		blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, item(f.host), true, &campaignPendingAmendmentsPayload{}, nil)
 		if blk == nil || !blk.DecisionUnavailable || blk.DispatchHold != nil || blk.Reason != awaitingReasonHostDispatch {
 			t.Fatalf("awaiting = %+v", blk)
 		}
 	})
+}
+
+// --- Host dispatcher heartbeat classification (#5489) ---
+
+// hbAwaitingFixture is newAwaitingFixture with a heartbeat MemoryRepository
+// wired and the server clock frozen at hdhNow.
+func hbAwaitingFixture(t *testing.T) (*awaitingFixture, *dispatcherheartbeat.MemoryRepository) {
+	t.Helper()
+	f := newAwaitingFixture(t)
+	mem := dispatcherheartbeat.NewMemoryRepository()
+	f.s.cfg.HostDispatcherHeartbeatRepo = mem
+	f.s.nowFunc = func() time.Time { return hdhNow }
+	return f, mem
+}
+
+// seedPausedHeartbeat stores a fresh paused heartbeat for host under account.
+func seedPausedHeartbeat(t *testing.T, repo dispatcherheartbeat.Repository, account, host string) {
+	t.Helper()
+	rec := hdhRec(host, 0, func(hb *hostdispatcher.Heartbeat) { hb.Paused = true })
+	rec.AccountID = account
+	if err := repo.Upsert(context.Background(), rec); err != nil {
+		t.Fatalf("seed heartbeat: %v", err)
+	}
+}
+
+// statusRawAwaiting returns issue_ref -> the raw awaiting key map.
+func statusRawAwaiting(t *testing.T, w *httptest.ResponseRecorder) map[string]map[string]json.RawMessage {
+	t.Helper()
+	out := map[string]map[string]json.RawMessage{}
+	for _, it := range statusItemsRaw(t, w) {
+		var ref string
+		_ = json.Unmarshal(it["issue_ref"], &ref)
+		var blk map[string]json.RawMessage
+		if raw, ok := it["awaiting"]; ok {
+			if err := json.Unmarshal(raw, &blk); err != nil {
+				t.Fatalf("decode awaiting: %v", err)
+			}
+		}
+		out[ref] = blk
+	}
+	return out
+}
+
+func TestCampaignStatus_HostDispatcherHeartbeat_ThroughHandler(t *testing.T) {
+	f, mem := hbAwaitingFixture(t)
+	seedPausedHeartbeat(t, mem, "", "e2e-host")
+	w := callCampaignStatusAs(f.s, f.c.ID, gateViewReadIdentity())
+	got, _ := statusAwaitingByRef(t, w)
+	host := got["issue:1"]
+	if host == nil || host.Kind != awaitingKindHuman || host.Reason != awaitingReasonHostDispatchPaused ||
+		host.NextStep != hdhText(awaitingReasonHostDispatchPaused, hostDispatcherStatePaused, "") ||
+		host.HostDispatcher == nil || host.HostDispatcher.State != hostDispatcherStatePaused || host.HostDispatcher.Host != "e2e-host" {
+		t.Fatalf("host item awaiting = %+v (host_dispatcher %+v)", host, host.HostDispatcher)
+	}
+	if manual := got["issue:2"]; manual == nil || manual.Reason != awaitingReasonOperatorDispatch || manual.HostDispatcher != nil {
+		t.Fatalf("operator_dispatch item = %+v, want it untouched by the heartbeat", manual)
+	}
+	var hd map[string]json.RawMessage
+	if err := json.Unmarshal(statusRawAwaiting(t, w)["issue:1"]["host_dispatcher"], &hd); err != nil {
+		t.Fatalf("decode host_dispatcher: %v", err)
+	}
+	documented := map[string]bool{}
+	for _, k := range hostDispatcherObservationKeys() {
+		documented[k] = true
+	}
+	for k := range hd {
+		if !documented[k] {
+			t.Errorf("host_dispatcher key %q is not in the documented field list", k)
+		}
+	}
+}
+
+func TestCampaignStatus_HostDispatcherHeartbeat_UnreadableCallerUnchanged(t *testing.T) {
+	f, mem := hbAwaitingFixture(t)
+	seedPausedHeartbeat(t, mem, "", "e2e-host")
+	w := callCampaignStatusAs(f.s, f.c.ID, Identity{Subject: "github:op", TokenID: "tok-x", Scopes: []string{"read:runs"}})
+	raw := statusRawAwaiting(t, w)["issue:1"]
+	if _, ok := raw["host_dispatcher"]; ok {
+		t.Fatalf("unreadable caller got a host_dispatcher key: %v", raw)
+	}
+	got, _ := statusAwaitingByRef(t, w)
+	if blk := got["issue:1"]; blk == nil || blk.Reason != awaitingReasonHostDispatch || !blk.DecisionWithheld {
+		t.Fatalf("awaiting = %+v, want the unchanged host_dispatch block with decision_withheld", blk)
+	}
+	if n := mem.ListCalls(); n != 0 {
+		t.Fatalf("ListCalls = %d for an unreadable caller, want 0", n)
+	}
+}
+
+func TestCampaignStatus_HostDispatcherHeartbeat_UnwiredLegacy(t *testing.T) {
+	f := newAwaitingFixture(t)
+	w := callCampaignStatusAs(f.s, f.c.ID, gateViewReadIdentity())
+	raw := statusRawAwaiting(t, w)["issue:1"]
+	if _, ok := raw["host_dispatcher"]; ok {
+		t.Fatalf("unwired store produced a host_dispatcher key: %v", raw)
+	}
+	got, _ := statusAwaitingByRef(t, w)
+	if blk := got["issue:1"]; blk == nil || blk.Kind != awaitingKindHostDispatcher || blk.Reason != awaitingReasonHostDispatch || blk.DecisionUnavailable {
+		t.Fatalf("awaiting = %+v, want the unchanged host_dispatch block without decision_unavailable", blk)
+	}
+}
+
+func TestCampaignStatus_HostDispatcherHeartbeat_ReadErrorUnavailable(t *testing.T) {
+	f, mem := hbAwaitingFixture(t)
+	mem.ListErr = errors.New("heartbeats down")
+	got, _ := statusAwaitingByRef(t, callCampaignStatusAs(f.s, f.c.ID, gateViewReadIdentity()))
+	blk := got["issue:1"]
+	if blk == nil || blk.Reason != awaitingReasonHostDispatch || !blk.DecisionUnavailable || blk.HostDispatcher != nil {
+		t.Fatalf("awaiting = %+v, want the unchanged block with decision_unavailable", blk)
+	}
+	if gate := got["issue:3"]; gate == nil || gate.DecisionUnavailable {
+		t.Fatalf("gate item = %+v: a heartbeat error must not mark a non-host_dispatcher block", gate)
+	}
+}
+
+func TestCampaignStatus_HostDispatcherHeartbeat_ReadOncePerStatus(t *testing.T) {
+	f, mem := hbAwaitingFixture(t)
+	cr := f.s.cfg.CampaignRepo.(*holdCampaignRepo)
+	mk := func(marked bool) *run.Run {
+		r := seedPARun(f.rr.pendingAmendRunRepo, "acme/widgets", nil, nil)
+		r.AutoDispatch, r.RunnerKind = marked, run.RunnerKindLocal
+		f.rr.seedStage(r.ID, 1, run.StageStatePending)
+		return r
+	}
+	a, b := mk(true), mk(true)
+	two := cr.seedCampaignWithItems("acme/widgets", "issue:20", []*campaign.Item{
+		{IssueRef: "issue:21", State: campaign.ItemStateRunning, RunID: idp(a.ID), Position: 0},
+		{IssueRef: "issue:22", State: campaign.ItemStateRunning, RunID: idp(b.ID), Position: 1},
+	})
+	got, _ := statusAwaitingByRef(t, callCampaignStatusAs(f.s, two.ID, gateViewReadIdentity()))
+	if got["issue:21"] == nil || got["issue:22"] == nil || got["issue:21"].Reason != awaitingReasonHostDispatcherAbsent ||
+		got["issue:22"].Reason != awaitingReasonHostDispatcherAbsent {
+		t.Fatalf("awaiting = %+v / %+v, want both heartbeat-classified absent", got["issue:21"], got["issue:22"])
+	}
+	if n := mem.ListCalls(); n != 1 {
+		t.Fatalf("ListCalls = %d for two items sharing an account, want 1", n)
+	}
+	humanOnly := cr.seedCampaignWithItems("acme/widgets", "issue:30", []*campaign.Item{
+		{IssueRef: "issue:31", State: campaign.ItemStateRunning, RunID: idp(mk(false).ID)},
+	})
+	callCampaignStatusAs(f.s, humanOnly.ID, gateViewReadIdentity())
+	if n := mem.ListCalls(); n != 1 {
+		t.Fatalf("ListCalls = %d after a campaign with no host_dispatcher item, want still 1", n)
+	}
+}
+
+func TestCampaignItemAwaiting_DispatchHoldBeforeHeartbeat(t *testing.T) {
+	f, mem := hbAwaitingFixture(t)
+	seedPausedHeartbeat(t, mem, "", "e2e-host")
+	f.au.seed(f.host.ID, 9, CategoryRunDispatchHoldSet, "")
+	ctx := context.Background()
+	it := &campaign.Item{IssueRef: "issue:1", State: campaign.ItemStateRunning, RunID: idp(f.host.ID)}
+	blk := f.s.campaignItemAwaitingForStatus(ctx, f.c, it, true, nil, f.s.hostDispatcherHeartbeatLoaderForStatus(ctx))
+	if blk == nil || blk.Kind != awaitingKindHuman || blk.Reason != awaitingReasonDispatchHeld || blk.DispatchHold == nil || blk.HostDispatcher != nil {
+		t.Fatalf("awaiting = %+v, want human/dispatch_held with no host_dispatcher", blk)
+	}
+	if n := mem.ListCalls(); n != 0 {
+		t.Fatalf("ListCalls = %d for a held item, want 0", n)
+	}
+}
+
+// TestCampaignStatus_HostDispatcherHeartbeat_AccountIsolation reads through
+// the REAL Postgres heartbeat repository: an item run sees only untenanted
+// heartbeats plus its own account's.
+func TestCampaignStatus_HostDispatcherHeartbeat_AccountIsolation(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := dispatcherheartbeat.NewPostgresRepository(pool)
+	f := newAwaitingFixture(t)
+	f.s.cfg.HostDispatcherHeartbeatRepo = repo
+	f.s.nowFunc = func() time.Time { return hdhNow }
+	acctX := uuid.NewString()
+	seedPausedHeartbeat(t, repo, acctX, "tenant-host")
+	reason := func() string {
+		t.Helper()
+		got, _ := statusAwaitingByRef(t, callCampaignStatusAs(f.s, f.c.ID, gateViewReadIdentity()))
+		if got["issue:1"] == nil {
+			t.Fatal("issue:1 has no awaiting block")
+		}
+		return got["issue:1"].Reason
+	}
+	if r := reason(); r != awaitingReasonHostDispatcherAbsent {
+		t.Fatalf("untenanted run with only an account-X heartbeat reads %q, want %q", r, awaitingReasonHostDispatcherAbsent)
+	}
+	f.host.AccountID = acctX
+	if r := reason(); r != awaitingReasonHostDispatchPaused {
+		t.Fatalf("account-X run with an account-X heartbeat reads %q, want %q", r, awaitingReasonHostDispatchPaused)
+	}
+	f.host.AccountID = ""
+	seedPausedHeartbeat(t, repo, "", "shared-host")
+	if r := reason(); r != awaitingReasonHostDispatchPaused {
+		t.Fatalf("untenanted run with an untenanted heartbeat reads %q, want %q", r, awaitingReasonHostDispatchPaused)
+	}
 }

@@ -345,14 +345,64 @@ is the 30s default), so a huge value cannot keep a dead file live.
 host-dispatch` reads it as its `--state-dir` default, and the status overlay
 below reads it as its exclusive rung.
 
+**Server heartbeat ([#5489](https://github.com/kuhlman-labs/fishhawk/issues/5489), ADR-104 Amendment A2).**
+Each tick also publishes a `hostdispatcher.Heartbeat` to `POST
+/v0/host-dispatchers/heartbeat` under the dispatcher's own
+`host-dispatcher/<host>` token; the server takes the host label from the token
+subject and the account from the token, so the body names neither.
+- *Asynchronous, latest wins.* `tick` defers `offerHeartbeat` immediately before
+  `writeStatus`, so it runs after the status write, inside the deferred tail:
+  paused and failing ticks publish too. `offerHeartbeat` builds the snapshot
+  from memory under the tick's lock (no I/O) and sends it to a one-slot mailbox
+  without blocking; a snapshot the publisher has not taken yet is replaced. One
+  publisher goroutine (`startHeartbeatPublisher`, started by `run` before its
+  first tick and stopped before `run` returns) POSTs each snapshot under a 5s
+  timeout derived from `run`'s own cancellable context, so a stalled server
+  delays neither a tick nor shutdown. A tick driven without the publisher (most
+  tests) leaves its snapshot in the mailbox and never POSTs.
+- *Failures.* A transport error, a 403 or 404 from an older server, or a 5xx
+  never fails a tick. It is logged once per distinct error, and a success
+  resets the dedupe. An HTTP failure keys on its status and code, not its
+  string, because every 5xx carries a fresh per-request `error_ref`. A 200
+  whose `dropped_refusals` is non-zero is logged once per distinct count: the
+  server dropped those entries as off-grammar and reads their runs as `live`.
+- *Snapshot.* `interval_seconds`, `started_at`, `last_tick_at`,
+  `last_complete_tick_at`, `paused`, the current tick's `tick_failure_code`,
+  `daily_cap`, `spawns_today`, `spawns_day`, `in_flight` and `run_refusals`.
+  The refusals are sorted newest `last_at` first (then run id) and capped at
+  `hostdispatcher.MaxRunRefusals` (256). Each carries the disposition
+  `hostDispatchRefusalDisposition` assigns (`host_dispatch_overlay.go`, in the
+  overlay's own arm order): the paused set `paused`, `cap_reached:daily`
+  `capped`, `budget_blocked` `budget_blocked`, the hold set `held`, the
+  implement review round holds `waiting` (so the backend keeps them
+  `host_dispatcher` and the overlay below still applies the review-round text
+  and the 30-minute orphan escalation), `lineage_lock_held` `waiting` for 15
+  minutes then `refusing`, the waiting set `waiting`, and every other code
+  (`budget_check_failed`, `dispatch_hold_unavailable`,
+  `path_outside_allowed_roots`, ...) `refusing`. A `budget_blocked` entry also
+  carries the closed-set `budget_source` its detail names
+  (`hostDispatchBudgetSourceOf`), or none.
+- *Request pin.* `TestHostDispatchLoop_PublishesHeartbeatEachTick` checks
+  every request the loop makes, the heartbeat included, against
+  `hostdispatcher.RouteAllowed`;
+  `TestHostDispatcher_RequestsStayOnServerAllowlist` drives the core and never
+  sees the heartbeat. `TestHostDispatcherHeartbeatE2E_AwaitingNamesDispatcherState`
+  drives the real loop, token, HTTP and Postgres store through to the campaign
+  status awaiting block.
+
 **Status overlay (#5402).** The backend's campaign awaiting block says the
 host dispatcher "spawns this stage on its next tick" for every
 `host_dispatcher` item; it cannot know whether a dispatcher runs, is paused,
 capped or refusing, because that state lives only in the host-local
 status.json. `host_dispatch_overlay.go` is the interim MCP-local mechanism, under
 the Captain's 2026-11-20 ruling (c), that reads it; the server heartbeat
-([#5489](https://github.com/kuhlman-labs/fishhawk/issues/5489)) supersedes it.
-It adds no server API or wire type.
+([#5489](https://github.com/kuhlman-labs/fishhawk/issues/5489)) now classifies
+from the backend (below), so a block the backend classified from the heartbeat
+(human `host_dispatch_paused`, `host_dispatch_capped`, `host_dispatch_refused`,
+`host_dispatch_budget_blocked` or `host_dispatcher_absent`) passes through with
+the backend's `host_dispatcher` block, and this overlay refines only the blocks
+the backend still classifies `host_dispatcher`. It adds no server API or wire
+type.
 
 - *Enable gate.* It runs only when `hostDispatchOverlayEnabled`:
   `Config.LocalHostRungs` (the operator's own stdio `fishhawk-mcp`) and a bearer

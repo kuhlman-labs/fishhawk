@@ -19,6 +19,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 )
 
 // host_dispatcher_loop.go is the tick loop of the ADR-104 host dispatcher
@@ -682,7 +684,28 @@ type hostDispatchLoop struct {
 	// runRefusals is each candidate run's latest non-benign refusal, keyed by
 	// run id; writeStatus copies it into status.json's run_refusals.
 	runRefusals map[string]hostDispatchRunRefusal
+
+	// The server heartbeat (#5489). heartbeats is a one-slot latest-wins
+	// mailbox: offerHeartbeat replaces a snapshot the publisher has not taken
+	// yet, so a slow or stalled POST never delays a tick. publishHeartbeat is
+	// the publish seam (default postHeartbeat); heartbeatTimeout bounds one
+	// POST (hostDispatchHeartbeatTimeout). heartbeatDelivered is a test-only
+	// hook run after each publish attempt (nil in production).
+	// heartbeatLastErr is the dedupe key (heartbeatErrKey) of the last logged
+	// publish error and heartbeatLastDropped the last logged dropped_refusals
+	// count, both owned by the publisher goroutine.
+	heartbeats           chan hostdispatcher.Heartbeat
+	publishHeartbeat     func(ctx context.Context, hb hostdispatcher.Heartbeat) (dropped int, err error)
+	heartbeatTimeout     time.Duration
+	heartbeatDelivered   func(hb hostdispatcher.Heartbeat, err error)
+	heartbeatLastErr     string
+	heartbeatLastDropped int
+	// logMu serialises logf: the tick and the heartbeat publisher both log.
+	logMu sync.Mutex
 }
+
+// hostDispatchHeartbeatTimeout bounds one heartbeat POST (#5489).
+const hostDispatchHeartbeatTimeout = 5 * time.Second
 
 func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string) *hostDispatchLoop {
 	l := &hostDispatchLoop{
@@ -696,7 +719,11 @@ func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string
 		lastEvaluated: map[string]uint64{},
 		ownRuns:       map[string]bool{},
 		runRefusals:   map[string]hostDispatchRunRefusal{},
+
+		heartbeats:       make(chan hostdispatcher.Heartbeat, 1),
+		heartbeatTimeout: hostDispatchHeartbeatTimeout,
 	}
+	l.publishHeartbeat = l.postHeartbeat
 	l.lockHeld = func() bool { return false }
 	l.core = newHostDispatcher(r, binary, l, l)
 	l.core.staleAfter = cfg.StaleAfter
@@ -711,11 +738,23 @@ func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string
 }
 
 func (l *hostDispatchLoop) logf(format string, args ...any) {
+	l.logMu.Lock()
+	defer l.logMu.Unlock()
 	_, _ = fmt.Fprintf(l.cfg.Log, "fishhawk-mcp host-dispatch: "+format+"\n", args...)
 }
 
 func (l *hostDispatchLoop) run(ctx context.Context) error {
 	l.status.StartedAt = l.now().UTC()
+	// The heartbeat publisher runs on run's own cancellable context: a cancel
+	// aborts an in-flight POST, and run returns only after the publisher
+	// exits. Started before the first tick, so a pre-cancelled context starts
+	// and stops it without a POST.
+	pubCtx, stopPublisher := context.WithCancel(ctx)
+	published := l.startHeartbeatPublisher(pubCtx)
+	defer func() {
+		stopPublisher()
+		<-published
+	}()
 	ticker := time.NewTicker(l.cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -816,6 +855,159 @@ func (l *hostDispatchLoop) rollDay() {
 	}
 }
 
+// heartbeatSnapshot builds the server heartbeat (#5489) from l.status and
+// l.runRefusals: memory only, no I/O. The caller holds l.mu. run_refusals are
+// sorted newest last_at first, then by run id, and capped at
+// hostdispatcher.MaxRunRefusals. Each entry carries
+// hostDispatchRefusalDisposition's disposition and, on a budget_blocked
+// entry, the closed-set budget_source its detail names. The body names no
+// host and no account: the server takes both from the token.
+func (l *hostDispatchLoop) heartbeatSnapshot() hostdispatcher.Heartbeat {
+	st := l.status
+	interval := st.IntervalSeconds
+	if !(interval > 0) {
+		interval = hostDispatchDefaultInterval.Seconds()
+	}
+	started := st.StartedAt
+	if started.IsZero() {
+		// tick() driven without run() (tests): the heartbeat requires one.
+		started = st.LastTickAt
+	}
+	hb := hostdispatcher.Heartbeat{
+		IntervalSeconds:    interval,
+		StartedAt:          started,
+		LastTickAt:         st.LastTickAt,
+		LastCompleteTickAt: st.LastCompleteTickAt,
+		Paused:             st.Paused,
+		DailyCap:           st.DailyCap,
+		SpawnsToday:        st.SpawnsToday,
+		SpawnsDay:          st.SpawnsDay,
+		InFlight:           st.InFlight,
+		RunRefusals:        make([]hostdispatcher.RunRefusal, 0, min(len(l.runRefusals), hostdispatcher.MaxRunRefusals)),
+	}
+	if st.LastTickFailure != nil {
+		hb.TickFailureCode = st.LastTickFailure.Code
+	}
+	refs := make([]hostDispatchRunRefusal, 0, len(l.runRefusals))
+	for _, ref := range l.runRefusals {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if !refs[i].LastAt.Equal(refs[j].LastAt) {
+			return refs[i].LastAt.After(refs[j].LastAt)
+		}
+		return refs[i].RunID < refs[j].RunID
+	})
+	if len(refs) > hostdispatcher.MaxRunRefusals {
+		refs = refs[:hostdispatcher.MaxRunRefusals]
+	}
+	now := l.now()
+	for _, ref := range refs {
+		disp := hostDispatchRefusalDisposition(ref.Code, ref.FirstAt, now)
+		out := hostdispatcher.RunRefusal{
+			RunID: ref.RunID, StageID: ref.StageID, Code: ref.Code, Detail: ref.Detail,
+			Disposition: disp, FirstAt: ref.FirstAt, LastAt: ref.LastAt,
+		}
+		if disp == hostdispatcher.DispositionBudgetBlocked {
+			out.BudgetSource = hostDispatchBudgetSourceOf(ref.Detail)
+		}
+		hb.RunRefusals = append(hb.RunRefusals, out)
+	}
+	return hb
+}
+
+// offerHeartbeat hands this tick's snapshot to the publisher without blocking
+// (#5489): when the one-slot mailbox is full, the pending snapshot is drained
+// and replaced, so the latest wins. The caller holds l.mu, so this is the only
+// sender.
+func (l *hostDispatchLoop) offerHeartbeat() {
+	hb := l.heartbeatSnapshot()
+	for {
+		select {
+		case l.heartbeats <- hb:
+			return
+		default:
+		}
+		select {
+		case <-l.heartbeats:
+		default:
+		}
+	}
+}
+
+// startHeartbeatPublisher runs the one publisher goroutine until ctx is done
+// and returns a channel closed when it exits. Each snapshot is POSTed under a
+// hostDispatchHeartbeatTimeout deadline derived from ctx, so a cancel aborts an
+// in-flight POST.
+func (l *hostDispatchLoop) startHeartbeatPublisher(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case hb := <-l.heartbeats:
+				l.publishOnce(ctx, hb)
+			}
+		}
+	}()
+	return done
+}
+
+// publishOnce POSTs one snapshot. A failure (transport, a 403 or 404 from an
+// older server, a 5xx) never fails a tick: it is logged once per distinct
+// heartbeatErrKey, and a success resets the dedupe. A success whose
+// dropped_refusals is non-zero is logged once per distinct count: a dropped
+// entry's run reads live on the server while this dispatcher refuses it.
+func (l *hostDispatchLoop) publishOnce(ctx context.Context, hb hostdispatcher.Heartbeat) {
+	pctx, cancel := context.WithTimeout(ctx, l.heartbeatTimeout)
+	dropped, err := l.publishHeartbeat(pctx, hb)
+	cancel()
+	if err != nil {
+		if key := heartbeatErrKey(err); key != l.heartbeatLastErr {
+			l.heartbeatLastErr = key
+			l.logf("heartbeat publish failed (ticks continue; logged once per distinct error): %v", err)
+		}
+	} else {
+		l.heartbeatLastErr = ""
+		if dropped != l.heartbeatLastDropped {
+			l.heartbeatLastDropped = dropped
+			if dropped > 0 {
+				l.logf("heartbeat stored with %d run_refusals entries dropped as off-grammar; the server reads those runs as live (check that the dispatcher and server versions match; logged once per distinct count)", dropped)
+			}
+		}
+	}
+	if l.heartbeatDelivered != nil {
+		l.heartbeatDelivered(hb, err)
+	}
+}
+
+// heartbeatErrKey is publishOnce's dedupe key. An *apiError keys on status and
+// code, never on Error(): that appends the error_ref every 5xx carries, which
+// is the per-request id and so differs on every tick.
+func heartbeatErrKey(err error) string {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return fmt.Sprintf("http %d %s", ae.StatusCode, ae.Code)
+	}
+	return err.Error()
+}
+
+// postHeartbeat is the default publish seam: POST hostdispatcher.HeartbeatRoute
+// under the dispatcher's own token, returning the response's dropped_refusals.
+func (l *hostDispatchLoop) postHeartbeat(ctx context.Context, hb hostdispatcher.Heartbeat) (int, error) {
+	body, err := json.Marshal(hb)
+	if err != nil {
+		return 0, err
+	}
+	var resp hostdispatcher.HeartbeatResponse
+	if err := l.api.do(ctx, http.MethodPost, hostdispatcher.HeartbeatRoute, body, &resp); err != nil {
+		return 0, err
+	}
+	return resp.DroppedRefusals, nil
+}
+
 // tick is one dispatcher round. A tick error is logged and never spawns; only
 // a lost state-dir lock is returned (the loop must stop). Every non-paused
 // early return records last_tick_failure; only a tick that finishes its
@@ -825,6 +1017,10 @@ func (l *hostDispatchLoop) tick(ctx context.Context) error {
 	defer l.mu.Unlock()
 	l.status.LastTickAt = l.now().UTC()
 	l.status.LastTickFailure = nil
+	// Deferred calls run last-in first-out: offerHeartbeat runs after
+	// writeStatus, inside the deferred tail, so a paused or failing tick
+	// publishes too (#5489).
+	defer l.offerHeartbeat()
 	defer l.writeStatus()
 
 	if !l.lockHeld() {

@@ -17,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 )
 
 // host_dispatch_overlay_test.go pins the stdio host-dispatch status overlay
@@ -1649,5 +1651,61 @@ func TestHostDispatchRunRefusal_BudgetBlockedLine(t *testing.T) {
 	}
 	if got := (hostDispatchRunRefusal{Code: hdRefuseBudgetBlocked, Detail: "x"}).BudgetBlockedLine(); !strings.Contains(got, " source=none ") {
 		t.Errorf("line without a source = %q; want source=none", got)
+	}
+}
+
+// hdoHeartbeatBlockFor is the awaiting (kind, reason) the backend's heartbeat
+// classifier (server campaign_item_host_dispatcher.go, #5489 step 5c, pinned
+// server-side by TestClassifyHostDispatcherHeartbeat) gives a run-scoped entry
+// of disposition d on a fresh, healthy dispatcher.
+func hdoHeartbeatBlockFor(d hostdispatcher.Disposition) (kind, reason string) {
+	switch d {
+	case hostdispatcher.DispositionWaiting:
+		return hostDispatchAwaitKind, hostDispatchReasonDispatch
+	case hostdispatcher.DispositionInFlight:
+		return hostDispatchAwaitKindSystem, hostDispatchReasonInFlight
+	case hostdispatcher.DispositionBudgetBlocked:
+		return hostDispatchAwaitKindHuman, hostDispatchReasonBudgetBlocked
+	case hostdispatcher.DispositionPaused:
+		return hostDispatchAwaitKindHuman, hostDispatchReasonPaused
+	case hostdispatcher.DispositionCapped:
+		return hostDispatchAwaitKindHuman, hostDispatchReasonCapped
+	}
+	return hostDispatchAwaitKindHuman, hostDispatchReasonRefused
+}
+
+// TestOverlayCampaignHostDispatch_HeartbeatReviewRoundKeepsOrphanEscalation
+// pins #5489 condition H2: a review-round refusal first seen more than 30
+// minutes ago is published with disposition waiting, so the backend's
+// heartbeat-classified block stays kind host_dispatcher and the stdio overlay
+// still rewrites it with the orphan escalation naming fishhawk_get_run_status
+// and fishhawk_rerun_review.
+func TestOverlayCampaignHostDispatch_HeartbeatReviewRoundKeepsOrphanEscalation(t *testing.T) {
+	for _, code := range []string{hdRefuseImplementReviewInFlight, hdRefuseImplementReviewNotStarted} {
+		t.Run(code, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			runID, stageID := uuid.NewString(), uuid.NewString()
+			firstAt := hdoNow.Add(-31 * time.Minute)
+			disp := hostDispatchRefusalDisposition(code, firstAt, hdoNow)
+			kind, reason := hdoHeartbeatBlockFor(disp)
+			st := hdoStatus()
+			st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: stageID, Code: code, FirstAt: firstAt, LastAt: hdoNow.Add(-10 * time.Second)}}
+			dir := filepath.Join(t.TempDir(), "state")
+			hdoWrite(t, dir, st)
+			item := hdoItem(runID, stageID)
+			item.Awaiting.Kind, item.Awaiting.Reason = kind, reason
+			item.Awaiting.StageType, item.Awaiting.StageState = "acceptance", "pending"
+			item.Awaiting.HostDispatcher = &campaignItemAwaitingHostDispatcher{State: string(disp), Host: "h", RefusalCode: code}
+			items := []CampaignItem{item}
+			hdoResolver(map[string]string{hostDispatchStateDirEnv: dir}, t.TempDir(), nil).overlayCampaignHostDispatch(context.Background(), items)
+			blk := items[0].Awaiting
+			if blk.HostDispatch == nil {
+				t.Fatalf("disposition %q gave the block %s/%s, which the overlay does not refine; want waiting (kind %s)", disp, kind, reason, hostDispatchAwaitKind)
+			}
+			hdoContainsAll(t, "orphan next_step", blk.NextStep, "may be orphaned", "fishhawk_get_run_status", "fishhawk_rerun_review")
+			if blk.HostDispatcher == nil || blk.HostDispatcher.RefusalCode != code {
+				t.Fatalf("backend host_dispatcher block = %+v; want it kept beside the overlay's", blk.HostDispatcher)
+			}
+		})
 	}
 }
