@@ -477,27 +477,28 @@ func (s *Server) firstOfficerAutoDriveHold(ctx context.Context, runID uuid.UUID,
 // approve) and nothing is submitted or appended here; the campaign driver's
 // trackDecision records the campaign_gate_decision_required marker.
 //
-// Fail-closed: a list error or an undecodable newest plan artifact returns
-// the same decline, because the plan cannot be shown to declare no new
-// decision (the posture of delegatedApproveWouldAdvance's unreadable modes).
+// It is a thin mapper over architecturalDecisionHoldFor, the one predicate
+// shared with the REST delegated-approval guard
+// refuseDelegatedArchitecturalDecision (#5507), so the auto-drive arm and
+// POST /v0/stages/{id}/approvals with delegated:true cannot disagree on which
+// plan gates belong to the captain.
 //
-// held=false (the arm proceeds) when stage is nil, when it is not a plan
-// stage (an implement gate's plan already passed its own plan gate), when the
-// artifact store is unwired (nothing to read, the firstOfficerHoldRefusal
-// nil-ConcernRepo convention; production always wires it), or when the stage
-// carries no standard_v1 plan artifact (a PROPOSE stage's report has no
-// declaration field).
+// Fail-closed: a list error or an undecodable newest plan artifact
+// (architecturalHoldUnreadable) returns the same decline, because the plan
+// cannot be shown to declare no new decision (the posture of
+// delegatedApproveWouldAdvance's unreadable modes).
+//
+// held=false (the arm proceeds) on architecturalHoldNone: see
+// architecturalDecisionHoldFor for the cases.
 //
 // The Note never echoes the planner-authored decision_summary or rationale:
 // it reaches the operator agent through fishhawk_drive_run, where planner
 // text is an injection surface. The captain reads the declaration on the plan
 // gate's plan_warnings advisory.
 func (s *Server) architecturalDecisionAutoDriveHold(ctx context.Context, stage *run.Stage) (AutoDriveOutcome, bool) {
-	if stage == nil || stage.Type != run.StageTypePlan || s.cfg.ArtifactRepo == nil {
-		return AutoDriveOutcome{}, false
-	}
-	p, err := s.gatedPlanArtifact(ctx, stage.ID)
-	if err != nil {
+	hold, err := s.architecturalDecisionHoldFor(ctx, stage)
+	switch hold {
+	case architecturalHoldUnreadable:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: gated plan artifact unreadable; declining delegated approve",
 			slog.String("run_id", stage.RunID.String()), slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
@@ -508,17 +509,63 @@ func (s *Server) architecturalDecisionAutoDriveHold(ctx context.Context, stage *
 			Note: "the gated plan artifact could not be read, so it cannot be shown to declare no new " +
 				"architectural decision (fail-closed); the plan gate goes to the captain and no delegated approval was submitted",
 		}, true
-	}
-	if p == nil || !p.NewArchitecturalDecision.Declared() {
+	case architecturalHoldDeclared:
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
+			Action:           delegation.ActionApprove,
+			Note: "the plan declares a new architectural decision; the captain decides whether the direction needs an ADR " +
+				"(named on the plan gate's plan_warnings advisory); no delegated approval was submitted",
+		}, true
+	default:
 		return AutoDriveOutcome{}, false
 	}
-	return AutoDriveOutcome{
-		DecisionRequired: true,
-		DecisionState:    operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain,
-		Action:           delegation.ActionApprove,
-		Note: "the plan declares a new architectural decision; the captain decides whether the direction needs an ADR " +
-			"(named on the plan gate's plan_warnings advisory); no delegated approval was submitted",
-	}, true
+}
+
+// architecturalHold classifies a gated stage for the delegated-approval
+// architectural-decision hold (#5265 / #5507).
+type architecturalHold int
+
+const (
+	// architecturalHoldNone: the stage is not held (a delegated approve may
+	// proceed past this check).
+	architecturalHoldNone architecturalHold = iota
+	// architecturalHoldDeclared: the newest standard_v1 plan artifact declares
+	// a well-formed new_architectural_decision (plan.NewArchitecturalDecision
+	// Declared()).
+	architecturalHoldDeclared
+	// architecturalHoldUnreadable: the plan artifacts could not be listed or
+	// the newest one does not decode, so the plan cannot be shown to declare
+	// no new decision; callers fail closed.
+	architecturalHoldUnreadable
+)
+
+// architecturalDecisionHoldFor is the ONE predicate behind both the #5265
+// auto-drive may_approve hold (architecturalDecisionAutoDriveHold) and the
+// #5507 REST delegated-approval guard (refuseDelegatedArchitecturalDecision).
+//
+// It returns architecturalHoldNone when stage is nil, when it is not a plan
+// stage (an implement gate's plan already passed its own plan gate), when the
+// artifact store is unwired (nothing to read, the firstOfficerHoldRefusal
+// nil-ConcernRepo convention; production always wires it in
+// backend/cmd/fishhawkd/serve.go), when the stage carries no standard_v1 plan
+// artifact (a PROPOSE stage's report has no declaration field), or when the
+// newest plan's declaration is absent or not Declared() (the one shared
+// definition the plan-gate advisory also uses). A list or decode error
+// returns architecturalHoldUnreadable with the error, for the caller to log;
+// a well-formed declaration returns architecturalHoldDeclared.
+func (s *Server) architecturalDecisionHoldFor(ctx context.Context, stage *run.Stage) (architecturalHold, error) {
+	if stage == nil || stage.Type != run.StageTypePlan || s.cfg.ArtifactRepo == nil {
+		return architecturalHoldNone, nil
+	}
+	p, err := s.gatedPlanArtifact(ctx, stage.ID)
+	if err != nil {
+		return architecturalHoldUnreadable, err
+	}
+	if p == nil || !p.NewArchitecturalDecision.Declared() {
+		return architecturalHoldNone, nil
+	}
+	return architecturalHoldDeclared, nil
 }
 
 // gatedPlanArtifact returns the newest standard_v1 plan-kind artifact on the
