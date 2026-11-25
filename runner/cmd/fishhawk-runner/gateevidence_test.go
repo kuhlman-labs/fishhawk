@@ -422,6 +422,148 @@ func TestComposeGateEvidence_CountsFlakeRetries(t *testing.T) {
 	}
 }
 
+// --- #5529: per-run failure-signal lines from the WHOLE output ---
+
+// failuresFixtureOutput is a failing output whose signal rows all sit OUTSIDE
+// the 30-line tail: a go-test failure and a package FAIL line, a harness
+// column-0 `FAIL: ` row, then 40 passing rows.
+func failuresFixtureOutput() string {
+	var b strings.Builder
+	b.WriteString("--- FAIL: TestEarly (0.00s)\n")
+	b.WriteString("FAIL\tgithub.com/x/early\t0.1s\n")
+	b.WriteString("FAIL: harness row\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&b, "PASS: case %02d\n", i)
+	}
+	return b.String()
+}
+
+// TestComposeGateEvidence_FailedRunCarriesFailureSignalLines: a failed run's
+// Failures holds every signal row the 30-line tail lost; a SUPERSEDED failing
+// iteration keeps its own.
+func TestComposeGateEvidence_FailedRunCarriesFailureSignalLines(t *testing.T) {
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 1, failuresFixtureOutput(), "failed"),
+		verifyRunEvent("scripts/test verify", "h2", "t2", 0, "ok", "passed"),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 1))
+	if len(p.VerifyRuns) != 2 {
+		t.Fatalf("verify_runs = %d, want 2", len(p.VerifyRuns))
+	}
+	vr := p.VerifyRuns[0]
+	// Precondition: the tail holds none of the rows, and says it was cut.
+	for _, row := range []string{"--- FAIL: TestEarly", "FAIL\tgithub.com/x/early", "FAIL: harness row"} {
+		if strings.Contains(vr.OutputTail, row) {
+			t.Fatalf("precondition: the 30-line tail must not hold %q:\n%s", row, vr.OutputTail)
+		}
+	}
+	if !vr.TailTruncated {
+		t.Fatal("precondition: TailTruncated = false, want true")
+	}
+	for _, row := range []string{"--- FAIL: TestEarly", "FAIL\tgithub.com/x/early", "FAIL: harness row"} {
+		if !strings.Contains(vr.Failures, row) {
+			t.Errorf("Failures missing %q:\n%s", row, vr.Failures)
+		}
+	}
+	if !vr.Superseded {
+		t.Fatal("precondition: the failing first run must be superseded by the passing second")
+	}
+	if p.VerifyRuns[1].Failures != "" {
+		t.Errorf("a passed terminal run carries Failures %q", p.VerifyRuns[1].Failures)
+	}
+}
+
+// TestComposeGateEvidence_PassedRunCarriesNoFailures: a PASSED run whose output
+// contains a `FAIL: ` row (an expected-failure fixture line) carries no
+// Failures and the marshaled payload has no `failures` key.
+func TestComposeGateEvidence_PassedRunCarriesNoFailures(t *testing.T) {
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 0, "FAIL: expected-failure fixture row\nok\n", "passed"),
+	}
+	ev := composeGateEvidence(events, 1)
+	p := decodeEvidence(t, ev)
+	if got := p.VerifyRuns[0].Failures; got != "" {
+		t.Errorf("a passed run carries Failures %q", got)
+	}
+	if bytes.Contains(ev.Payload, []byte(`"failures"`)) {
+		t.Errorf("a passed run's payload carries a failures key: %s", ev.Payload)
+	}
+}
+
+// TestComposeGateEvidence_FailuresRedacted: a credential-shaped token in a
+// failing row never reaches Failures; the redaction marker does.
+func TestComposeGateEvidence_FailuresRedacted(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("z", 36)
+	out := "FAIL: leaked " + secret + " in a case row\n" + strings.Repeat("PASS: ok\n", 40)
+	p := decodeEvidence(t, composeGateEvidence([]agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 1, out, "failed"),
+	}, 1))
+	got := p.VerifyRuns[0].Failures
+	if strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED:github-pat-classic]") {
+		t.Errorf("Failures not redacted: %q", got)
+	}
+}
+
+// TestComposeGateEvidence_FailuresBounded: 300 failing rows stay within
+// gateEvidenceFailuresBytes and the excerpt ends with the omitted-count marker.
+func TestComposeGateEvidence_FailuresBounded(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 300; i++ {
+		fmt.Fprintf(&b, "FAIL: case %03d %s\n", i, strings.Repeat("p", 40))
+	}
+	p := decodeEvidence(t, composeGateEvidence([]agent.Event{
+		verifyRunEvent("scripts/test verify", "h1", "t1", 1, b.String(), "failed"),
+	}, 1))
+	got := p.VerifyRuns[0].Failures
+	if len(got) == 0 || len(got) > gateEvidenceFailuresBytes {
+		t.Fatalf("Failures = %d bytes, want 1..%d", len(got), gateEvidenceFailuresBytes)
+	}
+	if !strings.HasSuffix(got, "over the 4096-byte budget ...]\n") || !strings.Contains(got, "failure-signal line(s) omitted") {
+		t.Errorf("Failures does not end with the omitted-count marker:\n...%s", got[len(got)-120:])
+	}
+}
+
+// gateVerifyRunFailuresEvent is the ONE fixed verify_run the shared golden
+// testdata/wire/gate_verify_run_failures.json pins: a failed run whose
+// harness `FAIL: ` row scrolled out of the 30-line tail.
+func gateVerifyRunFailuresEvent() agent.Event {
+	var b strings.Builder
+	b.WriteString(">>> scripts/test-dev\n")
+	b.WriteString("FAIL: case alpha should hold\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&b, "PASS: case %02d\n", i)
+	}
+	b.WriteString("\nResults: 40 passed, 1 failed\n")
+	return verifyRunEvent("scripts/test verify",
+		"0123456789abcdef0123456789abcdef01234567",
+		"89abcdef0123456789abcdef0123456789abcdef", 1, b.String(), "failed")
+}
+
+// TestVerifyRunEvidence_MatchesSharedWireGolden pins the runner half of the
+// #5529 cross-module contract on FIXED BYTES: composeGateEvidence over the
+// fixed event marshals its verify run byte-equal to the shared golden the
+// backend's bundle and server tests decode.
+func TestVerifyRunEvidence_MatchesSharedWireGolden(t *testing.T) {
+	want, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_verify_run_failures.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	p := decodeEvidence(t, composeGateEvidence([]agent.Event{gateVerifyRunFailuresEvent()}, 1))
+	if len(p.VerifyRuns) != 1 {
+		t.Fatalf("verify_runs = %d, want 1", len(p.VerifyRuns))
+	}
+	got, err := json.Marshal(p.VerifyRuns[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, bytes.TrimSpace(want)) {
+		t.Fatalf("verify run bytes drifted from the shared golden:\n got %s\nwant %s", got, bytes.TrimSpace(want))
+	}
+	if p.VerifyRuns[0].Failures == "" || strings.Contains(p.VerifyRuns[0].OutputTail, "FAIL: case alpha") {
+		t.Errorf("fixture lost its shape: failures=%q tail=%q", p.VerifyRuns[0].Failures, p.VerifyRuns[0].OutputTail)
+	}
+}
+
 func TestComposeGateEvidence_AbsorbedRunMarkedSuperseded(t *testing.T) {
 	// Absorbed-then-passed: the verify-fix loop ran the gate, it failed, the
 	// agent fixed the tree, and the re-run passed (#1205). The first

@@ -134,6 +134,12 @@ func runMergeCandidateVerifyStage(ctx context.Context, cfg config, req mergeCand
 	})
 
 	res := mergeCandidateVerify(ctx, cfg, req, client, issued, logSink)
+	// The failing-row excerpt is logged BEFORE the report is shipped (#5529),
+	// so the row reaches the runner log even when the report fails to deliver.
+	// res.Failures is already redacted and bounded, and empty on a passed pass.
+	if res.Failures != "" {
+		logEvent(logSink, "merge_candidate_verify_failure_signal", map[string]string{"head_sha": res.HeadSHA, "failures": res.Failures})
+	}
 
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeCandidateReportTimeout)
 	defer cancel()
@@ -263,7 +269,9 @@ type mergeCandidateOutputEvidence struct {
 //   - tail: its last upload.MaxMergeCandidateOutputTailBytes bytes;
 //   - failures (#4250): failureSignalExcerpt over the WHOLE redacted output,
 //     bounded to upload.MaxMergeCandidateFailuresBytes, so a FAIL in an early
-//     module (backend runs first) that scrolled out of the tail still ships;
+//     module (backend runs first) that scrolled out of the tail still ships.
+//     Its signal set includes a shell / Python harness's column-0 `FAIL: `
+//     row (#5529), so a harness-only red pass is no longer empty;
 //   - summary (#4250 approval condition C2): parseVerifyFailures over the same
 //     whole redacted output, nil when it names nothing.
 //

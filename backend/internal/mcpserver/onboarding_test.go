@@ -465,6 +465,14 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		"acceptance_undecidable",
 		"succeeded_acceptance_undecidable",
 		"**nothing to arbitrate**",
+		// #5529 / approval condition K4: the red-verify paragraph names the
+		// failing-row evidence locations and the flake procedure, so a red pass
+		// is diagnosed from the row, not from the pass count.
+		"read the failing row",
+		"merge_candidate_verified",
+		"merge_candidate_verify_failure_signal",
+		"`failures` field",
+		"rerun_failed_verify",
 		// E34.4 refinement intake loop anchors (incl. the rejection/re-draft path).
 		"Refinement intake loop",
 		"Rejection / re-draft path",
