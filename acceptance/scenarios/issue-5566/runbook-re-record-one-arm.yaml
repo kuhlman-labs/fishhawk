@@ -1,0 +1,14 @@
+id: scenario:issue-5566/runbook-re-record-one-arm
+statement: docs/compliance/planreview-catchrate-evidence.md has a 'Re-record one arm' section. It explains how to read the gate's STALE list and printed selector to choose ARMS, the comparison-pair rule, what PIN_REASON does in a subset recording, and the refusals.
+verify_hint: 'CLI stdout of printing the run-book file: a heading `## Re-record one arm` followed by those four topics.'
+steps: 'Posture B: printed docs/compliance/planreview-catchrate-evidence.md from line 186 (''## Re-record one arm'') to the next heading, in the sanctioned checkout.'
+assertions:
+    expected: A heading followed by the four topics
+    observed_at_record: 'The section covers reading the selector off the gate and check-script FAIL lines (with examples) and the comparison-pair rule (a stale with_conventions prints with_conventions,without_conventions). It covers PIN_REASON: only the selected baseline entries are re-pinned and the others are kept byte for byte. It has a refusal table with remedies, including the R3 rule. It also covers provenance, cost and the worked command.'
+    repro_handle: sed -n '186,290p' docs/compliance/planreview-catchrate-evidence.md
+origin:
+    issue: 5566
+    pr: 5570
+    run_id: 2b9fb0bb-0473-4448-b464-9478563d0f7c
+    head_sha: ecaed1ecf52a083ccfb218affa521238b7630a74
+    recorded_at: 2026-11-25T03:25:38Z
