@@ -2,7 +2,7 @@
 
 The ADR-104 host-dispatcher identity (E88.2 / #4526). Leaf package (standard
 library only): the subject grammar, the ratified scope profile, the clamp, the route
-allowlist and the record-act source tag. Server enforcement lives in
+allowlist, the record-act source tag and the server heartbeat wire type (#5489). Server enforcement lives in
 `backend/internal/server/middleware.go` (`bearerAuth`), `actor.go` and
 `autodrive_http.go`; minting in `backend/cmd/fishhawkd/token.go`; the migration
 exclusion in `backend/internal/tokenmigrate`. The dispatcher loop itself is
@@ -89,6 +89,7 @@ instead of per-handler refusals. A dispatcher subject may call only the routes
 | `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch` | the host-dispatch marker |
 | `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` | the category-C report for a failed spawn or a reaped runner |
 | `POST /v0/stages/{stage_id}/acceptance-admission` | acceptance admission before an acceptance spawn |
+| `POST /v0/host-dispatchers/heartbeat` | the per-tick server heartbeat (#5489; see below) |
 
 Every other route answers 403 `host_dispatcher_route_forbidden`, including
 the ones a dispatcher token's scopes would otherwise pass: run minting
@@ -112,8 +113,11 @@ full operator set and asserts each one: an allowlisted route passes
 refused dispatcher `cancel` leaves the run running). On the client side,
 `TestHostDispatcher_RequestsStayOnServerAllowlist`
 (`backend/internal/mcpserver/host_dispatcher_test.go`) asserts every request
-the core makes is on the allowlist. Widening the list changes all three, and
-this table, together.
+the core makes is on the allowlist, and
+`TestHostDispatchLoop_PublishesHeartbeatEachTick`
+(`backend/internal/mcpserver/host_dispatcher_loop_test.go`) asserts the same
+for the loop's heartbeat publish, which the core never makes. Widening the list
+changes these pins, and this table, together.
 
 The audit row is justified by the scope grant, not by a route ruling:
 `read:audit` is already in `Scopes()` (ADR-104 Q4, "read runs and their audit
@@ -133,6 +137,63 @@ fingerprints, never matched bytes. Agent and operator free text (reasons,
 review summaries) is credential-scanned best effort only, the same posture as
 every other `read:audit` reader. It cannot approve, merge, mint, recover,
 cancel or decide a gate.
+
+## Server heartbeat (#5489, ADR-104 Amendment A2)
+
+Each tick, the dispatcher POSTs a `Heartbeat` (`heartbeat.go`) to
+`POST /v0/host-dispatchers/heartbeat` (`HeartbeatRoute`). The server
+(`backend/internal/server/host_dispatcher_heartbeat.go`) upserts one row per
+(token account, subject host) into `host_dispatcher_heartbeats` (migration
+0121, `backend/internal/dispatcherheartbeat`), stamped with fishhawkd's clock.
+The body carries no host and no account: the host comes from the
+`host-dispatcher/<host>` subject and the account from the token row, and a
+`host` or `account_id` key is refused as an unknown field.
+
+The route needs `write:runs` (in the profile) and a valid dispatcher subject.
+It is the dispatcher's only server write that is not run-scoped: it rewrites
+the dispatcher's own heartbeat row and adds no dispatch reach. It writes no
+audit row, because a heartbeat is state, not an event.
+
+Fields: `interval_seconds`, `started_at`, `last_tick_at`,
+`last_complete_tick_at` (omitted when unknown), `paused`, `tick_failure_code`,
+`daily_cap`, `spawns_today`, `spawns_day` (UTC `YYYY-MM-DD`), `in_flight` and
+`run_refusals`. Each refusal carries `run_id`, `stage_id`, `code`, `detail`,
+`disposition`, `budget_source`, `first_at` and `last_at`.
+
+- `disposition` is the dispatcher's reading of the refusal, a closed set:
+  `waiting`, `in_flight`, `held`, `budget_blocked`, `paused`, `capped`,
+  `refusing`.
+- `budget_source` is `live_spec`, `admission_spec` or
+  `admission_spec_fallback`, and is legal only on a `budget_blocked` entry.
+
+Ingest rules, applied in this order:
+
+1. **Structural errors are a 400** (`Validate`): malformed JSON, an unknown
+   key, a missing or non-positive `interval_seconds`, a missing `started_at` or
+   `last_tick_at`, a negative count, an unparseable `spawns_day`, more than
+   `MaxRunRefusals` (256) entries, a `run_id` or non-empty `stage_id` that is
+   not a lowercase 8-4-4-4-12 UUID, or a duplicate `run_id`. A body over
+   256 KiB is a 400 with field `body`.
+2. **One bad entry never blanks a dispatcher** (`DropInvalidRefusals`): an
+   entry whose `code` is not 1–64 bytes of `[a-z0-9_:.-]`, whose
+   `disposition` is outside its set, or whose `budget_source` is outside its
+   set or sits on a non-`budget_blocked` entry is dropped. The rest is stored,
+   and the 200 response body (`HeartbeatResponse`) reports
+   `{"dropped_refusals": <n>}`. The dispatcher logs a non-zero count once per
+   distinct count, because a dropped entry's run reads `live` on the server.
+3. **Free text is bounded, not refused** (`BoundFields`, `BoundText`): each
+   `detail` and the `tick_failure_code` lose invalid UTF-8 and control runes and
+   are cut at 300 bytes on a rune boundary, the dispatcher's own
+   `boundHostDispatchText` rule. A `tick_failure_code` still outside the `code`
+   grammar after that is stored as `invalid_tick_failure_code`
+   (`TickFailureCodeInvalid`): the field reaches every item the record decides,
+   so it carries a code, never free text.
+
+Readers judge freshness on the server-stamped `received_at`, never on
+`last_tick_at`. A heartbeat is fresh for `StaleAfter(interval_seconds)`, which
+is three intervals with the interval clamped to [1, 300] s, or 30 s when it is
+absent or not positive. A `received_at` more than `FutureSkew` (60 s) ahead of
+the reader's clock reads stale. These are the status.json reader's constants.
 
 ## Runner credential custody (narrower than ADR-104 Q4)
 

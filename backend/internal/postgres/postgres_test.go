@@ -9648,3 +9648,85 @@ func TestMigrateDown_CampaignItemsReplanningReversal(t *testing.T) {
 		t.Errorf("insert replanning item after re-applying 0120: %v", err)
 	}
 }
+
+// TestMigrate_0121_HostDispatcherHeartbeats_Constraints pins 0121 (#5489): an
+// empty or slash-bearing host label names host_dispatcher_heartbeats_label_check;
+// the same label under two accounts inserts two rows (the key is per account);
+// the same label twice in the untenanted partition names
+// host_dispatcher_heartbeats_key_idx (COALESCE makes NULLs collide); the table
+// is under ENABLE + FORCE row-level security with the 0089 predicates; and
+// rolling 0121 back drops the table and lands on 0120.
+func TestMigrate_0121_HostDispatcherHeartbeats_Constraints(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	const insert = `INSERT INTO host_dispatcher_heartbeats (account_id, host_label, payload, received_at) VALUES ($1, $2, '{}'::jsonb, $3)`
+
+	var pgErr *pgconn.PgError
+	for _, label := range []string{"", "a/b", "has space", strings.Repeat("a", 65)} {
+		if _, err := pool.Exec(ctx, insert, nil, label, t0); !errors.As(err, &pgErr) || pgErr.ConstraintName != "host_dispatcher_heartbeats_label_check" {
+			t.Errorf("label %q: err = %v, want a host_dispatcher_heartbeats_label_check violation", label, err)
+		}
+	}
+	acctX, acctY := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, insert, acctX, "devbox", t0); err != nil {
+		t.Fatalf("insert devbox under account X: %v", err)
+	}
+	if _, err := pool.Exec(ctx, insert, acctY, "devbox", t0); err != nil {
+		t.Errorf("insert devbox under account Y: %v, want a second row (the key is per account)", err)
+	}
+	if _, err := pool.Exec(ctx, insert, nil, "devbox", t0); err != nil {
+		t.Errorf("insert untenanted devbox: %v", err)
+	}
+	if _, err := pool.Exec(ctx, insert, nil, "devbox", t0); !errors.As(err, &pgErr) || pgErr.ConstraintName != "host_dispatcher_heartbeats_key_idx" {
+		t.Errorf("second untenanted devbox: err = %v, want a host_dispatcher_heartbeats_key_idx violation", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_dispatcher_heartbeats (host_label, payload) VALUES ('nostamp', '{}'::jsonb)`); err == nil {
+		t.Error("insert without received_at succeeded; want NOT NULL with no DEFAULT (the server clock stamps it)")
+	}
+
+	var rowSec, forceSec bool
+	if err := pool.QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'host_dispatcher_heartbeats'`,
+	).Scan(&rowSec, &forceSec); err != nil {
+		t.Fatalf("read pg_class RLS flags: %v", err)
+	}
+	if !rowSec || !forceSec {
+		t.Errorf("relrowsecurity=%v relforcerowsecurity=%v, want true/true (0121 ENABLE + FORCE)", rowSec, forceSec)
+	}
+	policy := func(tbl, name string) (string, string) {
+		var qual, check string
+		if err := pool.QueryRow(ctx,
+			`SELECT pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid) FROM pg_policy
+			  WHERE polrelid = $1::regclass AND polname = $2`, tbl, name).Scan(&qual, &check); err != nil {
+			t.Fatalf("read policy %s on %s: %v", name, tbl, err)
+		}
+		return qual, check
+	}
+	gotQ, gotC := policy("host_dispatcher_heartbeats", "host_dispatcher_heartbeats_tenant_isolation")
+	wantQ, wantC := policy("captain_read_watermarks", "captain_read_watermarks_tenant_isolation")
+	if gotQ != wantQ || gotC != wantC {
+		t.Errorf("0121 policy drifted from 0089's:\n USING %q\n want  %q\n CHECK %q\n want  %q", gotQ, wantQ, gotC, wantC)
+	}
+
+	pool.Close()
+	downThrough(t, url, "0121")
+	check, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect after down: %v", err)
+	}
+	defer check.Close()
+	var n int
+	if err := check.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'host_dispatcher_heartbeats'`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("host_dispatcher_heartbeats after rolling back 0121: count %d (%v), want dropped", n, err)
+	}
+}

@@ -1334,6 +1334,11 @@ On the operator's stdio fishhawk-mcp, every awaiting block of kind
 host_dispatcher is overlaid from the host dispatcher's status.json (paused,
 capped, refusing, stale or absent read as human with the remedy in next_step;
 unverified when it could not be checked) and carries a host_dispatch block.
+A block the backend classified from the dispatcher's server heartbeat (#5489:
+human host_dispatch_paused, host_dispatch_capped, host_dispatch_refused,
+host_dispatch_budget_blocked or host_dispatcher_absent) passes through with
+the backend's host_dispatcher block; the status.json overlay refines the
+blocks the backend still classifies host_dispatcher.
 An acceptance stage held for the implement review round reads system/in_flight
 (#5298): from the dispatcher's implement_review_in_flight or
 implement_review_not_started refusal or, before its first tick, from a pre-tick

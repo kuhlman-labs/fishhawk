@@ -9199,3 +9199,27 @@ func TestStallWatchConfigError(t *testing.T) {
 		}
 	}
 }
+
+// TestServeGo_WiresHostDispatcherHeartbeatRepo pins the production wiring of
+// the host-dispatcher heartbeat store (#5489). A nil repository is the legacy
+// path (the endpoint answers 503 and the awaiting block stays unchanged), so
+// without this line production would silently never see a heartbeat and no
+// server-package test could tell. The assignment must sit in the pool-wired
+// repository block, after the ConcernRepo wiring.
+func TestServeGo_WiresHostDispatcherHeartbeatRepo(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	body := string(src)
+	const want = "cfg.HostDispatcherHeartbeatRepo = dispatcherheartbeat.NewPostgresRepository(pool)"
+	at := strings.Index(body, want)
+	if at < 0 {
+		t.Fatalf("serve.go does not assign %s; host-dispatcher heartbeats would answer 503 and the campaign awaiting block would never read them", want)
+	}
+	concern := strings.Index(body, "cfg.ConcernRepo = concern.NewPostgresRepository(pool)")
+	repos := strings.Index(body, `logger.Info("repositories configured`)
+	if concern < 0 || repos < 0 || at < concern || at > repos {
+		t.Errorf("the heartbeat repo assignment (offset %d) is outside the pool-wired repository block (ConcernRepo at %d, block end at %d)", at, concern, repos)
+	}
+}
