@@ -2233,10 +2233,14 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	// for every caller; the decision sources gated by the same predicate as
 	// pending_amendments, computed once per read.
 	readable := campaignAmendmentsReadable(IdentityFrom(r.Context()))
+	// The host dispatcher heartbeat loader (#5489): built once per status
+	// call, lazy and memoised per item-run account. campaignItemAwaitingForStatus
+	// calls it only for a readable caller's host_dispatcher block.
+	loadHeartbeats := s.hostDispatcherHeartbeatLoaderForStatus(r.Context())
 	out := make([]campaignItemResponse, 0, len(items))
 	for _, it := range items {
 		resp := toCampaignItemResponse(it)
-		resp.Awaiting = s.campaignItemAwaitingForStatus(r.Context(), c, it, readable, pending)
+		resp.Awaiting = s.campaignItemAwaitingForStatus(r.Context(), c, it, readable, pending, loadHeartbeats)
 		out = append(out, resp)
 	}
 	body := map[string]any{
