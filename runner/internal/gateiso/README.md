@@ -771,8 +771,8 @@ take one of the two postures below. Every container exec gets a fresh EMPTY set 
 directories (`NewVisibleCaches`: `fishhawk-gatecache-*` under the OS temp dir,
 0700, empty `gocache` + `gomodcache`), populated HOST-side, mounted for that
 one exec, and removed afterwards. The one exception is the slice gate's reach
-exec (#5524, `withSeedHandoff` in `gateisolation.go`): when it runs to
-completion, its seeded set is handed to the next container exec on the same
+exec (#5524, `withSeedHandoff` in `gateisolation.go`): once its seed
+succeeds, whatever the exec's outcome, its seeded set is handed to the next container exec on the same
 clone, the deciding verify, which mounts it WITHOUT seeding and removes it
 afterwards. A handoff left for another dir is removed unused, and
 `cleanup()` removes any leftover (`TestRunGateInContainer_SeedHandoff`). Host
@@ -844,9 +844,11 @@ seeding never opens a directory a container has been given.
 or more per stage: scoped verify, full verify, diff_coverage, plus fix
 iterations and absorbs). A decomposition child's slice gate adds one reach exec
 per distinct tree on the container path (#5524). It provisions no gate service
-(`withoutGateServices`), and when it runs to completion it hands its seeded
-caches to the deciding verify on the same clone (`withSeedHandoff`), so that
-tree still pays one seed. `GOCACHE` and the lint cache are cold on the FIRST
+(`withoutGateServices`), and once its seed succeeds it hands its seeded
+caches to the deciding verify on the same clone, whatever the exec's outcome
+(`withSeedHandoff`), so that tree still pays one seed. Its helper builds in a
+fresh per-exec `GOCACHE` (a cold helper compile, about 2s), never the cache
+volume. `GOCACHE` and the lint cache are cold on the FIRST
 container exec of each runner process and warm afterwards under
 `FISHHAWK_GATE_CACHE=process`; under `off` (or a degraded step) they are cold
 on every exec, the pre-#3967 cost. Process mode adds a `volume create`, a

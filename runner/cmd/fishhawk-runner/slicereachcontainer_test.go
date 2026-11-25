@@ -113,22 +113,88 @@ func TestSliceReachLoadContainer_FailureModes(t *testing.T) {
 	}
 }
 
-// TestSliceReachLoadContainer_CtxBound: a parent ctx that expires while the
-// exec blocks on it is still a load timeout when the exec reports it so.
-func TestSliceReachLoadContainer_CtxBound(t *testing.T) {
-	sliceGateWithSelection(t, sliceReachTestContainerSel)
-	prev := sliceReachContainerTimeout
-	sliceReachContainerTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { sliceReachContainerTimeout = prev })
-	sliceReachStubExec(t, func(c sliceReachExecCall, _ string) (string, int, gateDisposition) {
-		select {
-		case <-c.ctx.Done():
-		case <-time.After(c.timeout):
-		}
-		return "", -1, gateTimedOut
-	})
-	if _, _, reason := sliceReachLoadContainer(context.Background(), t.TempDir()); reason != "reach_load_failed:load_timeout" {
-		t.Fatalf("reason = %q, want reach_load_failed:load_timeout", reason)
+// TestSliceReachLoadContainer_FailedExecHandsSeedOn (approval condition M1
+// over the failure arms): through the REAL runGateInContainer, a reach exec
+// whose seed succeeded but whose exec then fails to launch, times out, or
+// loses its parent ctx widens with the reason that actually results AND still
+// hands its seed to the deciding verify on the same clone, so the tree pays
+// exactly one host-side seed across the reach exec plus the verify.
+func TestSliceReachLoadContainer_FailedExecHandsSeedOn(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		reach    func(ctx context.Context, cancel context.CancelFunc, marker string) (string, int, bool)
+		want     string
+		wantKill bool
+	}{
+		{"launch failure", func(context.Context, context.CancelFunc, string) (string, int, bool) {
+			return "docker: Error response from daemon: oci runtime\n", 125, false
+		}, "reach_container_unavailable:launch_failed", false},
+		{"exec timeout", func(_ context.Context, _ context.CancelFunc, marker string) (string, int, bool) {
+			return marker + "go: still loading\n", -1, true
+		}, "reach_load_failed:load_timeout", true},
+		{"parent ctx cancelled", func(ctx context.Context, cancel context.CancelFunc, marker string) (string, int, bool) {
+			// Like execBoundedHostArgv: a parent cancellation mid-exec is
+			// (-1, timedOut=false), so the script's "exit" is -1.
+			cancel()
+			<-ctx.Done()
+			return marker, -1, false
+		}, "reach_container_exit:-1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sliceReachQuietLog(t)
+			st := containerState("img:1", "/nonexistent/daemon.sock", &strings.Builder{})
+			installGateState(t, st)
+			scriptAuxExec(t, nil)
+			seeds := sliceReachCountSeeds(t, 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var kills, verifies int
+			prev := execBoundedHostArgvFn
+			execBoundedHostArgvFn = func(c context.Context, argv []string, _ string, _ []string, _ time.Duration) (string, int, bool) {
+				if n := len(argv); n >= 3 && argv[n-3] == "rm" && argv[n-2] == "-f" {
+					kills++
+					return "", 0, false
+				}
+				marker := ""
+				if n := sliceReachArgvLaunchNonce(argv); n != "" {
+					marker = gateiso.LaunchMarkerLine(n) + "\n"
+				}
+				for _, a := range argv {
+					if strings.HasPrefix(a, sliceReachHelperEnv+"=") {
+						return tc.reach(c, cancel, marker)
+					}
+				}
+				verifies++
+				return marker + "verify ok", 0, false
+			}
+			t.Cleanup(func() { execBoundedHostArgvFn = prev })
+			root := t.TempDir()
+			if _, _, reason := sliceReachLoadContainer(ctx, root); reason != tc.want {
+				t.Fatalf("reason = %q, want %q", reason, tc.want)
+			}
+			if (kills > 0) != tc.wantKill {
+				t.Errorf("container kills = %d, want kill %v", kills, tc.wantKill)
+			}
+			st.seedHandoffMu.Lock()
+			h := st.seedHandoff
+			st.seedHandoffMu.Unlock()
+			if h == nil || h.dir != root {
+				t.Errorf("seed handoff after the failed reach exec = %+v, want one for %s", h, root)
+			}
+			out, code, disp := runBoundedGateArgvDisposed(withLaunchMarker(withDecidingGate(context.Background())), []string{"true"}, root,
+				filepath.Join(t.TempDir(), "lc"), time.Minute)
+			if code != 0 || disp != gateExecuted || !strings.Contains(out, "verify ok") || verifies != 1 {
+				t.Fatalf("verify (out, code, disp, verifies) = (%q, %d, %s, %d)", out, code, disp, verifies)
+			}
+			if seeds[root] != 1 {
+				t.Errorf("seed calls on the tree across the failed reach exec plus the verify = %d, want exactly 1", seeds[root])
+			}
+			if h != nil {
+				if _, err := os.Stat(h.vc.Root); !os.IsNotExist(err) {
+					t.Errorf("handed-off caches %s not removed after the verify consumed them (err %v)", h.vc.Root, err)
+				}
+			}
+		})
 	}
 }
 
@@ -175,7 +241,7 @@ func TestSliceReachLoadContainer_ExecRequestShape(t *testing.T) {
 		t.Fatalf("exec calls = %d, want 1", len(*calls))
 	}
 	c := (*calls)[0]
-	want := []string{"sh", "-c", `set -eu; d=$(mktemp -d); printf "%s" "$FISHHAWK_SLICE_REACH_HELPER_B64" | base64 -d > "$d/main.go"; cd "$d"; exec env GOWORK=off GOFLAGS= CGO_ENABLED=0 GOENV=off go run ./main.go /work`}
+	want := []string{"sh", "-c", `set -eu; d=$(mktemp -d); printf "%s" "$FISHHAWK_SLICE_REACH_HELPER_B64" | base64 -d > "$d/main.go"; cd "$d"; exec env GOWORK=off GOFLAGS= CGO_ENABLED=0 GOENV=off GOCACHE="$d/gocache" go run ./main.go /work`}
 	if !reflect.DeepEqual(c.argv, want) {
 		t.Errorf("argv = %q, want %q", c.argv, want)
 	}
@@ -296,8 +362,9 @@ func TestSliceReachParseContainerOutput(t *testing.T) {
 // TestSliceReachContainerScript_Hermetic runs the EXACT in-container script
 // under /bin/sh with the real mktemp and base64 and a fake `go` on PATH that
 // records its argv, env, cwd and the decoded main.go, then relays a result
-// line. The caller's env presets the opposite of every pinned key, so only
-// the script's own `env` pins can produce the asserted values.
+// line. The caller's env presets the opposite of every pinned key (GOCACHE
+// at the gate cache volume's path), so only the script's own `env` pins can
+// produce the asserted values.
 func TestSliceReachContainerScript_Hermetic(t *testing.T) {
 	for _, tool := range []string{"/bin/sh", "mktemp", "base64"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -324,6 +391,7 @@ printf 'FISHHAWK_SLICE_REACH_RESULT %s {"reason":"reach_unsupported_workspace"}\
 		sliceReachHelperEnv + "=" + base64.StdEncoding.EncodeToString(sliceReachHelperSource),
 		sliceReachNonceEnv + "=" + nonce,
 		"GOWORK=/elsewhere/go.work", "GOFLAGS=-mod=mod", "CGO_ENABLED=1", "GOENV=/elsewhere/env",
+		"GOCACHE=" + gateiso.GateGoCache,
 	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -350,8 +418,13 @@ printf 'FISHHAWK_SLICE_REACH_RESULT %s {"reason":"reach_unsupported_workspace"}\
 		}
 	}
 	pwd, _ := os.ReadFile(filepath.Join(rec, "pwd"))
-	if p := strings.TrimSpace(string(pwd)); p == "" || p == cmd.Dir || strings.HasPrefix(p, cmd.Dir+"/") {
+	p := strings.TrimSpace(string(pwd))
+	if p == "" || p == cmd.Dir || strings.HasPrefix(p, cmd.Dir+"/") {
 		t.Errorf("go ran in %q, want the fresh mktemp dir, not the start dir %q", p, cmd.Dir)
+	}
+	// GOCACHE is the exec's own fresh dir, never the inherited cache volume.
+	if got, want := env["GOCACHE"], p+"/gocache"; p == "" || got != want {
+		t.Errorf("go saw GOCACHE=%q, want %q (a fresh dir under the mktemp dir)", got, want)
 	}
 	if _, _, reason := sliceReachParseContainerOutput(string(out), nonce); reason != "reach_unsupported_workspace" {
 		t.Errorf("relayed output %q parsed to %q, want reach_unsupported_workspace", out, reason)
@@ -588,7 +661,7 @@ func TestSliceReachContainer_RealGateImage(t *testing.T) {
 		t.Skip("FISHHAWK_SLICE_REACH_TEST_IMAGE not set")
 	}
 	sliceReachQuietLog(t)
-	st, err := configureGateIsolation(fakeEnv(map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.Probes{}, &strings.Builder{})
+	st, err := configureGateIsolation(fakeEnv(map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.DefaultProbes(), &strings.Builder{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,10 +670,30 @@ func TestSliceReachContainer_RealGateImage(t *testing.T) {
 	if sel.Path != gateiso.PathContainer || !sel.Runtime.Safe {
 		t.Skipf("no safe container runtime: %+v", sel)
 	}
+	// The REAL seed, counted: the reach exec plus the verify below pay one.
+	seeds := 0
+	prevSeed := seedModCacheFn
+	seedModCacheFn = func(ctx context.Context, run gateiso.SeedExecFunc, checkout, hostModCache string, dest *gateiso.VisibleCaches, baseEnv []string, timeout time.Duration) (gateiso.SeedReport, error) {
+		seeds++
+		return prevSeed(ctx, run, checkout, hostModCache, dest, baseEnv, timeout)
+	}
+	t.Cleanup(func() { seedModCacheFn = prevSeed })
 	root := sliceReachWriteFixture(t, sliceReachBaseFiles())
 	hostImports, hostEmit, hostReason := sliceReachLoad(context.Background(), root)
 	imports, emittable, reason := sliceReachLoadContainer(context.Background(), root)
-	if reason != hostReason || !reflect.DeepEqual(emittable, hostEmit) || len(imports) != len(hostImports) {
+	gotImp, _ := sliceReachParityNormalize(imports, nil)
+	wantImp, _ := sliceReachParityNormalize(hostImports, nil)
+	if reason != hostReason || !reflect.DeepEqual(emittable, hostEmit) || !reflect.DeepEqual(gotImp, wantImp) {
 		t.Fatalf("in-image (%v, %v, %q) != host (%v, %v, %q)", imports, emittable, reason, hostImports, hostEmit, hostReason)
+	}
+	// The deciding verify on the same clone mounts the reach exec's
+	// handed-off caches in a second real container and seeds nothing.
+	out, code, disp := runBoundedGateArgvDisposed(withLaunchMarker(withDecidingGate(context.Background())),
+		[]string{"go", "list", "-deps", "example.com/m1/d"}, root, filepath.Join(t.TempDir(), "lc"), 2*time.Minute)
+	if code != 0 || disp != gateExecuted || !strings.Contains(out, "example.com/m1/a") {
+		t.Fatalf("verify on the handed-off caches (out, code, disp) = (%q, %d, %s)", out, code, disp)
+	}
+	if seeds != 1 {
+		t.Errorf("real seed calls across the reach exec plus the verify = %d, want exactly 1", seeds)
 	}
 }

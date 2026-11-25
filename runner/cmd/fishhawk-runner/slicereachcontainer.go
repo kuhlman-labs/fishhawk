@@ -48,8 +48,12 @@ const (
 	sliceReachNonceEnv = "FISHHAWK_SLICE_REACH_NONCE"
 	// sliceReachContainerScript is the fixed in-container program: decode the
 	// helper into a fresh temp dir and run it with the image's go over /work
-	// (gateiso.MountWork), outside any module.
-	sliceReachContainerScript = `set -eu; d=$(mktemp -d); printf "%s" "$FISHHAWK_SLICE_REACH_HELPER_B64" | base64 -d > "$d/main.go"; cd "$d"; exec env GOWORK=off GOFLAGS= CGO_ENABLED=0 GOENV=off go run ./main.go ` + gateiso.MountWork
+	// (gateiso.MountWork), outside any module. GOCACHE is a fresh dir under
+	// that temp dir, never the gate's (shared, writable) cache volume, so a
+	// build-cache entry an earlier gate exec planted cannot stand in for the
+	// helper the host then trusts to choose the test scope. The cost is a
+	// cold helper compile per reach exec (about 2s in the gate image).
+	sliceReachContainerScript = `set -eu; d=$(mktemp -d); printf "%s" "$FISHHAWK_SLICE_REACH_HELPER_B64" | base64 -d > "$d/main.go"; cd "$d"; exec env GOWORK=off GOFLAGS= CGO_ENABLED=0 GOENV=off GOCACHE="$d/gocache" go run ./main.go ` + gateiso.MountWork
 	// sliceReachResultCap bounds the result line's JSON document.
 	sliceReachResultCap = 32 << 20
 

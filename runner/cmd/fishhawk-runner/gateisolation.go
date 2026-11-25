@@ -1197,9 +1197,10 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // gate_container_timing line splitting cache / seed / service / exec time.
 // Two call-local markers serve only the slice gate's reach exec (#5524):
 // withoutGateServices provisions no gate service (wantService), and
-// withSeedHandoff stashes the exec's seeded caches for the NEXT exec on the
-// same dir — the deciding verify — which then skips its own seed, so a tree
-// pays one host-side seed. Every other caller is unmarked and byte-unchanged.
+// withSeedHandoff stashes the exec's seeded caches, once its seed succeeded
+// and whatever the exec's outcome, for the NEXT exec on the same dir — the
+// deciding verify — which then skips its own seed, so a tree pays one
+// host-side seed. Every other caller is unmarked and byte-unchanged.
 // Deliberate residual: a legitimate tree whose `replace`
 // target sits outside the checkout draws ErrSeedCheckout too and reaches the
 // fix agent with the refusing message rather than parking category C.
@@ -1397,6 +1398,14 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		defer cancel()
 		_, _, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
 	}
+	// A reach exec whose seed succeeded hands that seed to the verify on this
+	// dir (#5524) WHATEVER the exec's outcome — run to completion, launch
+	// failure or timeout (its container is already gone) — so a reach that
+	// widens never costs the tree a second seed. Its caches outlive this call
+	// only through the stash.
+	if handsOffSeed(ctx) {
+		keepCaches = st.stashSeedHandoff(dir, vc)
+	}
 	if nonce != "" {
 		var launched bool
 		out, launched = gateiso.CutLaunchMarker(out, nonce)
@@ -1410,11 +1419,6 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		// (the `rm -f` above has already torn the container down): no
 		// verdict, gateTimedOut (#3383).
 		return out, code, gateTimedOut
-	}
-	// A reach exec that ran to completion hands its seed to the verify on
-	// this dir (#5524); its caches outlive this call only through the stash.
-	if handsOffSeed(ctx) {
-		keepCaches = st.stashSeedHandoff(dir, vc)
 	}
 	return out, code, gateExecuted
 }

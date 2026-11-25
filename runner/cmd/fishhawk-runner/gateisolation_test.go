@@ -2487,7 +2487,8 @@ func TestRunGateInContainer_WithoutGateServicesProvisionsNone(t *testing.T) {
 // TestRunGateInContainer_SeedHandoff (#5524 approval condition M1): an exec
 // marked withSeedHandoff hands its seeded caches to the NEXT exec on the same
 // dir, which runs no seed; the handoff is single-use, a different dir seeds
-// fresh (and drops the stale entry), and cleanup removes a leftover entry.
+// fresh (and drops the stale entry), and st.cleanup() removes a leftover
+// entry's caches from disk.
 func TestRunGateInContainer_SeedHandoff(t *testing.T) {
 	st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
 	installGateState(t, st)
@@ -2539,11 +2540,18 @@ func TestRunGateInContainer_SeedHandoff(t *testing.T) {
 	if left == nil {
 		t.Fatal("no handoff stashed")
 	}
-	if vc := st.takeSeedHandoff(""); vc != nil {
-		t.Errorf("an empty dir took a handoff for %s", left.dir)
+	if _, err := os.Stat(left.vc.Root); err != nil {
+		t.Fatalf("stashed handoff %s missing before cleanup (err %v)", left.vc.Root, err)
 	}
+	st.cleanup()
 	if _, err := os.Stat(left.vc.Root); !os.IsNotExist(err) {
-		t.Errorf("leftover handoff %s not removed (err %v)", left.vc.Root, err)
+		t.Errorf("cleanup() left the leftover handoff %s on disk (err %v)", left.vc.Root, err)
+	}
+	st.seedHandoffMu.Lock()
+	after := st.seedHandoff
+	st.seedHandoffMu.Unlock()
+	if after != nil {
+		t.Errorf("cleanup() left a handoff entry for %s", after.dir)
 	}
 }
 
