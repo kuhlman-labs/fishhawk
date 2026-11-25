@@ -2139,8 +2139,7 @@ func driveFixupNoChangeActions(params map[string]string, concernIDs []string) []
 			Params:       withParams(params, map[string]string{"stage_id": "run.stages[kind=implement].id", "concern_ids": ids, "operator_concern": "<the exact change the agent must make>"}),
 			Precondition: "the last fix-up pass routed exactly these open concerns and produced no commit (fixup_no_changes_unaddressed); no fix-up was auto-routed",
 			Consumes:     consumesFixupBudget,
-			Reason: "re-route ONE sharper concern with an operator_concern naming the exact change, then re-invoke fishhawk_drive_run. " +
-				"This re-route is exactly the case the guard's first-window-only limitation affects: if it also produces no commit, the next delegated pass is not declined (follow-up #5496)",
+			Reason:       "re-route ONE sharper concern with an operator_concern naming the exact change, then re-invoke fishhawk_drive_run",
 		},
 		{
 			Action:       "fishhawk_vouch_commit",

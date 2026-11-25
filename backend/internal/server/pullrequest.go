@@ -1990,8 +1990,9 @@ type pullRequestFixupNoChangesResponse struct {
 // This mirrors succeedFixupPushStage minus the head-keyed dedup and the
 // verifyBranchLineage guard. Both are skipped DELIBERATELY: no new commit
 // landed, so there is no head_sha to key on (the idempotency guard is therefore
-// stage-keyed) and the branch tip is unchanged from the last vouched head (the
-// pull_request_opened or a prior fixup_pushed audit entry already vouched it).
+// keyed on the fix-up routing window, fixupNoChangesReplay, #5496) and the
+// branch tip is unchanged from the last vouched head (the pull_request_opened
+// or a prior fixup_pushed audit entry already vouched it).
 // A foreign commit on the branch is still caught by the next real push's lineage
 // guard and the merge gate (ADR-036). This is a documented trade-off, not a
 // verified claim; a reviewer can challenge it here.
@@ -1999,20 +2000,16 @@ func (s *Server) succeedFixupNoChangesStage(w http.ResponseWriter, r *http.Reque
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
 
-	// Stage-keyed idempotency: a runner retry after a 5xx — or a duplicate
-	// delivery — must not append a second fixup_no_changes audit entry or fire a
-	// redundant status-comment update. Unlike the fixup_pushed path there is no
-	// head_sha to key on (no commit landed), so dedup on the existence of ANY
-	// prior fixup_no_changes audit entry for this stage. Guard first, before
-	// advance/audit/notify. Fail-open on a read error: WARN and fall through so a
-	// transient failure never drops a legitimate report.
-	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, "fixup_no_changes"); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			"fix-up no-changes report: list fixup_no_changes audit entries failed; proceeding without idempotency guard",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
-	} else if auditEntryForStage(entries, stageID) {
+	// Window-keyed idempotency (#5496): a runner retry after a 5xx — or a
+	// duplicate delivery — must not append a second fixup_no_changes audit entry
+	// or fire a redundant status-comment update. Unlike the fixup_pushed path
+	// there is no head_sha to key on (no commit landed), so dedup on the fix-up
+	// routing window: fixupNoChangesReplay answers whether this window's row (or,
+	// on a stage that is not running, any row) already landed. A later no-change
+	// window on the same stage records its own row. Guard first, before
+	// advance/audit/notify. Fail-open on either read error: WARN and fall through
+	// so a transient failure never drops a legitimate report.
+	if s.fixupNoChangesAlreadyRecorded(r.Context(), runID, stage) {
 		s.writeJSON(w, r, http.StatusOK, pullRequestFixupNoChangesResponse{
 			StageID: stageID,
 			Outcome: "fixup_no_changes",
@@ -2270,13 +2267,80 @@ func parkObligationWithholdsBase(o *reviewObligation) bool {
 }
 
 // auditEntryForStage reports whether any of the entries belongs to the given
-// stage. It is the stage-keyed idempotency primitive for outcomes that carry no
-// head_sha to dedup on (fixup_no_changes, #856) — a single prior entry for the
-// stage means the report already landed. Entries are sequence-ascending per
-// ListForRunByCategory's contract; nil/mismatched StageIDs are skipped.
+// stage. It is the stage-keyed idempotency primitive for
+// conflict_resolution_pushed, an outcome with a ceiling of one whose report is
+// stage-unique: a single prior entry for the stage means the report already
+// landed. fixup_no_changes is window-keyed instead (fixupNoChangesReplay,
+// #5496). Entries are sequence-ascending per ListForRunByCategory's contract;
+// nil/mismatched StageIDs are skipped.
 func auditEntryForStage(entries []*audit.Entry, stageID uuid.UUID) bool {
 	for _, e := range entries {
 		if e.StageID != nil && *e.StageID == stageID {
+			return true
+		}
+	}
+	return false
+}
+
+// fixupNoChangesAlreadyRecorded reads the two categories fixupNoChangesReplay
+// needs and reports a replay. Either read failing is FAIL-OPEN, the dedupe's
+// long-standing policy: it WARNs naming the category and reports false, so a
+// transient read failure never drops a legitimate report. The cost is a possible
+// duplicate row, which every reader already tolerates per window.
+func (s *Server) fixupNoChangesAlreadyRecorded(ctx context.Context, runID uuid.UUID, stage *run.Stage) bool {
+	var lists [2][]*audit.Entry
+	for i, category := range []string{CategoryFixupNoChanges, CategoryStageFixupTriggered} {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"fix-up no-changes report: list "+category+" audit entries failed; proceeding without idempotency guard",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+			return false
+		}
+		lists[i] = entries
+	}
+	return fixupNoChangesReplay(lists[0], lists[1], stage)
+}
+
+// fixupNoChangesReplay reports whether a fixup_no_changes report for stage is a
+// replay of a report that already landed (#856), keyed on the fix-up routing
+// window (#5496). The newest same-stage stage_fixup_triggered entry opens the
+// live window. A same-stage fixup_no_changes row sequenced after it is this
+// window's report, so a retry is a replay. A stage with no trigger at all keeps
+// the legacy stage-keyed rule: any same-stage row is a replay.
+//
+// The staleWindow arm: on a stage that is NOT running, any same-stage row is a
+// replay, which preserves the pre-#5496 stage-keyed answer for every
+// non-running stage. It covers pending AND the terminal states (succeeded,
+// failed, cancelled), and the parked awaiting_* states too. Pending is the
+// delayed retry of window N's report after window N+1's trigger re-opened the
+// stage (run.FixupStage leaves it pending until dispatch): admitting it would
+// write a row inside window N+1 and spend that trigger before its pass runs. A
+// terminal or parked stage has no running pass for the report to settle, so a
+// late report there keeps the no-op answer rather than writing a row the
+// settled-stage path would record against a pass that never ran. Only a
+// RUNNING stage whose rows all belong to earlier windows is a new report.
+//
+// noChanges and triggers are ListForRunByCategory results; nil or mismatched
+// StageIDs are skipped.
+func fixupNoChangesReplay(noChanges, triggers []*audit.Entry, stage *run.Stage) bool {
+	var newest int64
+	found := false
+	for _, e := range triggers {
+		if e.StageID != nil && *e.StageID == stage.ID && (!found || e.Sequence > newest) {
+			newest, found = e.Sequence, true
+		}
+	}
+	for _, e := range noChanges {
+		if e.StageID == nil || *e.StageID != stage.ID {
+			continue
+		}
+		if inWindow := !found || e.Sequence > newest; inWindow {
+			return true
+		}
+		if staleWindow := stage.State != run.StageStateRunning; staleWindow {
 			return true
 		}
 	}
@@ -2805,8 +2869,8 @@ type pullRequestConflictResolutionResponse struct {
 // hijacked by. The category constant is shared with the resolver for that
 // reason — a literal here could drift out of the consumption set silently.
 //
-// Structurally this mirrors succeedFixupNoChangesStage's stage-keyed
-// idempotency rather than succeedFixupPushStage's head-keyed dedup, because the
+// Structurally this uses the stage-keyed auditEntryForStage primitive rather
+// than succeedFixupPushStage's head-keyed dedup, because the
 // pass has a ceiling of one and its report is stage-unique: a runner retry
 // after a 5xx must not append a second entry or re-fire the status comment.
 //

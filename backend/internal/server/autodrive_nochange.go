@@ -54,10 +54,9 @@ func (e *fixupNoChangeRepeatError) Error() string {
 // countFixupPasses and fixupRefundedPasses: the arm must not route on
 // unknown evidence.
 //
-// Limitation: succeedFixupNoChangesStage dedupes on ANY prior
-// fixup_no_changes row for the stage, so only the FIRST no-change window per
-// stage writes an outcome row; a later no-change window reads as "no outcome
-// yet" and does not trip the guard (follow-up #5496).
+// Since #5496 each fix-up window writes its own fixup_no_changes row
+// (succeedFixupNoChangesStage's window-keyed dedupe), so the guard reads every
+// no-change window on the stage, not only the first.
 func (s *Server) noChangeRepeatOfOpenSet(ctx context.Context, runID, stageID uuid.UUID, routable, serverCheck []uuid.UUID) (*fixupNoChangeRepeatError, error) {
 	triggers, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
 	if err != nil {
