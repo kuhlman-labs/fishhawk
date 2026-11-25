@@ -8918,10 +8918,22 @@ func newUnattemptedReviewServer(t *testing.T, reviewer PlanReviewer, scopeFiles 
 func seedFixupTriggerConcerns(t *testing.T, au *auditFake, runID, stageID uuid.UUID,
 	concerns []planreview.Concern, reason string, withIDs bool) []string {
 	t.Helper()
+	return seedFixupTriggerRouted(t, au, runID, stageID, concerns, reason, "", withIDs)
+}
+
+// seedFixupTriggerRouted is seedFixupTriggerConcerns plus the free-text
+// operator_concern, the only shared routed text the attempt check reads
+// (#5561). An empty operatorConcern writes no key.
+func seedFixupTriggerRouted(t *testing.T, au *auditFake, runID, stageID uuid.UUID,
+	concerns []planreview.Concern, reason, operatorConcern string, withIDs bool) []string {
+	t.Helper()
 	payload := map[string]any{
 		"stage_id": stageID.String(),
 		"concerns": concerns,
 		"reason":   reason,
+	}
+	if operatorConcern != "" {
+		payload["operator_concern"] = operatorConcern
 	}
 	var ids []string
 	if withIDs {
@@ -9369,7 +9381,7 @@ func TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes(t *testing.T) 
 		"authorization gate as applying to every caller without forge read."
 	realLowNote := "TestOnboardingReadiness_AnonymousBeforeVisibility is a weak ordering pin by the test's " +
 		"own admission (CONDITION 2 disclosure): repoFilterFor also short-circuits anonymous callers."
-	realReason := "CONCERN 1 (sol, medium) — docs/onboarding.md, the opening sentence of the \"Repo " +
+	realRouted := "CONCERN 1 (sol, medium) — docs/onboarding.md, the opening sentence of the \"Repo " +
 		"read-visibility gate (#1512)\" section.\n\nCONCERN 2 (fable, low) — backend/internal/server/README.md, " +
 		"the claim that `_AnonymousBeforeVisibility` \"pins\" ordering.\n\nDo not touch onboarding.go or " +
 		"either test file's logic."
@@ -9379,10 +9391,12 @@ func TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes(t *testing.T) 
 		model:   "claude-opus-4-7",
 	}
 	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, realDoc, realREADME, realImpl, realTest)
-	seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+	// The incident routed this text as `reason`; `reason` is now audit-only
+	// (#5561), so it is replayed on operator_concern, the shared routed channel.
+	seedFixupTriggerRouted(t, au, runRow.ID, implStage.ID, []planreview.Concern{
 		{Severity: "medium", Category: "security", Note: realMediumNote},
 		{Severity: "low", Category: "verification", Note: realLowNote},
-	}, realReason, true)
+	}, "route both concerns", realRouted, true)
 
 	// The incident's actual fix-up delta: only the README was committed.
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
@@ -9429,6 +9443,57 @@ func TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes(t *testing.T) 
 	}
 	if strings.Contains(block, realImpl) {
 		t.Errorf("the not-attempted block names the \"do not touch\" file %s:\n%s", realImpl, block)
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_ReasonIsNotRoutedText pins that
+// "strictly audit-only" holds for the implement REVIEWER too (#5561): a path
+// named only in the fix-up `reason` is not a routed instruction, so it records
+// no mentioned_untouched_files entry; the same sentence in operator_concern
+// still does. The routed note names no path, so an audit entry (an
+// undeterminable-count record) is written on both arms and the assertion reads
+// its committed payload rather than an absence of rows.
+//
+// Counterfactual: build the shared routed text from payload.Reason again and the
+// reason arm goes RED.
+func TestRunImplementReviews_UnattemptedConcern_ReasonIsNotRoutedText(t *testing.T) {
+	text := "also update " + unattemptedScopeB
+	for _, tc := range []struct {
+		name, reason, operatorConcern string
+		want                          []string
+	}{
+		{"reason only", text, "", nil},
+		{"operator_concern", "route it", text, []string{unattemptedScopeB}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-opus-4-7",
+			}
+			s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+			seedFixupTriggerRouted(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+				{Severity: "low", Category: "verification", Note: "tighten the wording"},
+			}, tc.reason, tc.operatorConcern, true)
+
+			s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+			payloads := unattemptedPayloads(t, au)
+			if len(payloads) != 1 {
+				t.Fatalf("fixup_concern_unattempted entries = %d, want exactly 1", len(payloads))
+			}
+			if got := payloads[0].MentionedUntouchedFiles; !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("mentioned_untouched_files = %v, want %v", got, tc.want)
+			}
+			reviewer.mu.Lock()
+			defer reviewer.mu.Unlock()
+			if len(reviewer.calls) == 0 {
+				t.Fatal("the reviewer was never called")
+			}
+			const line = "MENTIONED in the routed instructions as a whole"
+			if got := strings.Contains(reviewer.calls[0], line); got != (tc.want != nil) {
+				t.Errorf("reviewer prompt carries the mentioned-untouched line = %v, want %v", got, tc.want != nil)
+			}
+		})
 	}
 }
 

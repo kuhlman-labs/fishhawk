@@ -30687,9 +30687,13 @@ paths:
                 reason:
                   type: string
                   description: |
-                    Optional operator rationale, recorded on the
+                    Optional operator AUDIT NOTE, recorded on the
                     `stage_fixup_triggered` audit entry (and as the routed
-                    concerns' `state_reason` on the `concern_ids` path).
+                    concerns' `state_reason` on the `concern_ids` path). It is
+                    audit-only (#5561): never rendered into the fix-up prompt,
+                    not a reporting-obligation source and not an
+                    `instruction_targets` key. Anything the agent must act on
+                    goes in `operator_concern`.
                 allow_create:
                   type: array
                   items:
@@ -30804,11 +30808,11 @@ paths:
                   description: |
                     Optional operator declaration that the OPERATOR EXECUTED a
                     reproduction of the concern(s) this pass routes back
-                    (#2551). Its meaning is AUTHORITY, not prose delivery: the
-                    reproduction text still reaches the agent via `reason` (or
-                    `operator_concern`); this field records that the finding was
-                    verified by execution, which a reviewer reading a diff
-                    cannot override. Every concern routed by a pass carrying it
+                    (#2551). Its meaning is AUTHORITY, not prose delivery:
+                    reproduction text the agent must see goes in
+                    `operator_concern` (`reason` never reaches it, #5561); this
+                    field records that the finding was verified by execution,
+                    which a reviewer reading a diff cannot override. Every concern routed by a pass carrying it
                     is therefore EXEMPT from reviewer-confirmation auto-resolve:
                     a later `confirmed` delta-verification verdict is VETOED
                     (`operator_evidence_routed`, surfaced on the gate view as
@@ -30830,9 +30834,11 @@ paths:
                   description: |
                     Optional router-declared target of each routed instruction
                     (E83.37 / #4022): the surface the instruction asks the pass
-                    to change. A key is a routed concern id from `concern_ids`,
-                    `operator_concern`, or `reason`; a value is `code`,
-                    `pr_body`, or `docs`. An instruction with no key is `code`.
+                    to change. A key is a routed concern id from `concern_ids`
+                    or `operator_concern`; a value is `code`, `pr_body`, or
+                    `docs`. An instruction with no key is `code`. A `reason` key
+                    returns 400 `validation_failed` naming `operator_concern`:
+                    `reason` never reaches the fix-up agent (#5561).
                     The target alone decides whether the instruction is
                     unsatisfiable on a fix-up pass: `pr_body` (a pass cannot
                     write the PR body, #2782) puts it on the response's
@@ -30847,8 +30853,9 @@ paths:
                     an instruction this request routes; otherwise 400
                     `validation_failed` (`field: instruction_targets`). Recorded
                     on the `stage_fixup_triggered` payload as `concern_targets`
-                    (aligned with `concerns`), `operator_concern_target` and
-                    `reason_target`, each omitted when every target is `code`.
+                    (aligned with `concerns`) and `operator_concern_target`,
+                    each omitted when every target is `code`; a legacy
+                    `reason_target` is ignored.
                   additionalProperties:
                     type: string
                     enum: [code, pr_body, docs]
