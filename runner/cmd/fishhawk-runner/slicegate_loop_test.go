@@ -503,30 +503,56 @@ func TestRunVerifyFixLoop_SliceGateDetailAppendsToExisting(t *testing.T) {
 	}
 }
 
-// (42) T2: an eligible child whose gate isolation selected the container path
-// runs ONE full verify with the nonce bound, and never loads the reach.
-func TestRunVerifyFixLoop_SliceGateContainerSelectionRunsFull(t *testing.T) {
-	repo := sliceGateLoopRepo(t)
-	cmd, logPath := sliceGateSeqRecorder(t, 0)
-	cfg := sliceGateChildCfg(repo, cmd)
-	sliceGateWithSelection(t, gateiso.Selection{Path: gateiso.PathContainer, Profile: gateiso.ProfileLocal})
-	loads := sliceGateCountLoads(t)
+// (42) #5524: an eligible child whose gate isolation selected the container
+// path loads the reach IN-IMAGE (the container loader, stubbed here) and
+// never on the host. A graph runs ONE scoped verify; a widening reason runs
+// ONE full verify with the absorb nonce bound and that gate_shape_reason.
+func TestRunVerifyFixLoop_SliceGateContainerSelection(t *testing.T) {
+	t.Run("scoped", func(t *testing.T) {
+		repo := sliceGateLoopRepo(t)
+		cmd, logPath := sliceGateSeqRecorder(t, 0)
+		cfg := sliceGateChildCfg(repo, cmd)
+		sliceGateWithSelection(t, gateiso.Selection{Path: gateiso.PathContainer, Profile: gateiso.ProfileLocal})
+		hostLoads := sliceGateCountLoads(t)
+		containerLoads := sliceGateStubContainerLoads(t, "")
 
-	res, _, _ := sliceGateRunLoop(t, &cfg, nil)
-	lines := readVerifyFormLog(t, logPath)
-	if got := sliceGatePkgs(lines); !reflect.DeepEqual(got, []string{"[]"}) {
-		t.Fatalf("verify invocations = %q, want exactly one full []", got)
-	}
-	if strings.Contains(lines[0], "nonce=[]") {
-		t.Errorf("the widened deciding verify must carry the absorb nonce: %q", lines[0])
-	}
-	s := sliceGateSummaryOf(t, res)
-	if s["gate_shape"] != sliceGateShapeFull || s["gate_shape_reason"] != "gate_isolation_not_host:container" {
-		t.Errorf("gate shape = %v / %v", s["gate_shape"], s["gate_shape_reason"])
-	}
-	if *loads != 0 {
-		t.Errorf("reach loads = %d, want 0 off a host path", *loads)
-	}
+		res, _, _ := sliceGateRunLoop(t, &cfg, nil)
+		lines := readVerifyFormLog(t, logPath)
+		if got := sliceGatePkgs(lines); !reflect.DeepEqual(got, []string{"[a,b]"}) {
+			t.Fatalf("verify invocations = %q, want exactly one scoped [a,b]", got)
+		}
+		s := sliceGateSummaryOf(t, res)
+		if s["gate_shape"] != sliceGateShapeScoped {
+			t.Errorf("gate shape = %v / %v, want slice_scoped", s["gate_shape"], s["gate_shape_reason"])
+		}
+		if *hostLoads != 0 || *containerLoads != 1 {
+			t.Errorf("host / container loads = %d / %d, want 0 / 1", *hostLoads, *containerLoads)
+		}
+	})
+	t.Run("widen", func(t *testing.T) {
+		repo := sliceGateLoopRepo(t)
+		cmd, logPath := sliceGateSeqRecorder(t, 0)
+		cfg := sliceGateChildCfg(repo, cmd)
+		sliceGateWithSelection(t, gateiso.Selection{Path: gateiso.PathContainer, Profile: gateiso.ProfileLocal})
+		hostLoads := sliceGateCountLoads(t)
+		containerLoads := sliceGateStubContainerLoads(t, "reach_container_exit:1")
+
+		res, _, _ := sliceGateRunLoop(t, &cfg, nil)
+		lines := readVerifyFormLog(t, logPath)
+		if got := sliceGatePkgs(lines); !reflect.DeepEqual(got, []string{"[]"}) {
+			t.Fatalf("verify invocations = %q, want exactly one full []", got)
+		}
+		if strings.Contains(lines[0], "nonce=[]") {
+			t.Errorf("the widened deciding verify must carry the absorb nonce: %q", lines[0])
+		}
+		s := sliceGateSummaryOf(t, res)
+		if s["gate_shape"] != sliceGateShapeFull || s["gate_shape_reason"] != "reach_container_exit:1" {
+			t.Errorf("gate shape = %v / %v, want full / reach_container_exit:1", s["gate_shape"], s["gate_shape_reason"])
+		}
+		if *hostLoads != 0 || *containerLoads != 1 {
+			t.Errorf("host / container loads = %d / %d, want 0 / 1", *hostLoads, *containerLoads)
+		}
+	})
 }
 
 // (26) S6 + Q2: the single-shot gate.
@@ -669,14 +695,55 @@ func sliceGateStubLoads(t *testing.T) *int {
 	return n
 }
 
-// (41) T2: only a host gate-isolation path under a non-hosted profile loads.
+// sliceGateStubContainerLoads stubs the in-image loader: the [a, b, c] stub
+// graph when reason is "", else that widening reason. It returns the counter.
+func sliceGateStubContainerLoads(t *testing.T, reason string) *int {
+	t.Helper()
+	n := new(int)
+	orig := sliceGateContainerLoadFn
+	sliceGateContainerLoadFn = func(context.Context, string) (map[string][]string, map[string]bool, string) {
+		*n++
+		if reason != "" {
+			return nil, nil, reason
+		}
+		return map[string][]string{"a": nil, "b": {"a"}, "c": nil}, map[string]bool{"a": true, "b": true, "c": true}, ""
+	}
+	t.Cleanup(func() { sliceGateContainerLoadFn = orig })
+	return n
+}
+
+// (43) #5524: the container path under a non-hosted profile loads through the
+// IN-IMAGE loader only: one container load, zero host loads, scoped [a b].
+func TestSliceGateReachHook_ContainerSelectionLoadsInContainer(t *testing.T) {
+	for _, profile := range []gateiso.Profile{gateiso.ProfileLocal, gateiso.ProfileSelfHosted} {
+		t.Run(string(profile), func(t *testing.T) {
+			sliceGateWithSelection(t, gateiso.Selection{Path: gateiso.PathContainer, Profile: profile})
+			hostLoads := sliceGateStubLoads(t)
+			containerLoads := sliceGateStubContainerLoads(t, "")
+			sg := newSliceGateReach([]string{"a/a.go"}, nil)
+			got := sg.resolve(context.Background(), t.TempDir(), "tree")
+			d, _ := sg.take()
+			if !reflect.DeepEqual(got, []string{"a", "b"}) || d.Shape != sliceGateShapeScoped {
+				t.Errorf("got %v (%+v), want scoped [a b]", got, d)
+			}
+			if *hostLoads != 0 || *containerLoads != 1 || sg.loadCount() != 1 {
+				t.Errorf("host / container / counted loads = %d / %d / %d, want 0 / 1 / 1", *hostLoads, *containerLoads, sg.loadCount())
+			}
+		})
+	}
+}
+
+// (41) T2 + #5524: a host path under a non-hosted profile loads on the host;
+// a hosted profile on ANY path (container included), a refused selection and
+// an unknown path widen with gate_isolation_not_host and load through
+// NEITHER loader.
 func TestSliceGateReachHook_IsolationNotHostWidens(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		sel        gateiso.Selection
 		wantReason string
 	}{
-		{"container", gateiso.Selection{Path: gateiso.PathContainer, Profile: gateiso.ProfileLocal}, "gate_isolation_not_host:container"},
+		{"hosted container", gateiso.Selection{Path: gateiso.PathContainer, Profile: gateiso.ProfileHosted}, "gate_isolation_not_host:hosted"},
 		{"refused", gateiso.Selection{Path: gateiso.PathRefused}, "gate_isolation_not_host:refused"},
 		{"hosted clone", gateiso.Selection{Path: gateiso.PathClone, Profile: gateiso.ProfileHosted}, "gate_isolation_not_host:hosted"},
 		{"empty path", gateiso.Selection{Profile: gateiso.ProfileLocal}, "gate_isolation_not_host:unknown"},
@@ -687,17 +754,18 @@ func TestSliceGateReachHook_IsolationNotHostWidens(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			sliceGateWithSelection(t, tc.sel)
 			loads := sliceGateStubLoads(t)
+			containerLoads := sliceGateStubContainerLoads(t, "")
 			sg := newSliceGateReach([]string{"a/a.go"}, nil)
 			got := sg.resolve(context.Background(), t.TempDir(), "tree")
 			d, _ := sg.take()
 			if tc.wantReason != "" {
-				if got != nil || d.Reason != tc.wantReason || *loads != 0 {
-					t.Errorf("got %v reason %q loads %d, want nil / %q / 0", got, d.Reason, *loads, tc.wantReason)
+				if got != nil || d.Reason != tc.wantReason || *loads != 0 || *containerLoads != 0 {
+					t.Errorf("got %v reason %q host/container loads %d/%d, want nil / %q / 0/0", got, d.Reason, *loads, *containerLoads, tc.wantReason)
 				}
 				return
 			}
-			if !reflect.DeepEqual(got, []string{"a", "b"}) || *loads != 1 {
-				t.Errorf("got %v loads %d, want [a b] / 1", got, *loads)
+			if !reflect.DeepEqual(got, []string{"a", "b"}) || *loads != 1 || *containerLoads != 0 {
+				t.Errorf("got %v host/container loads %d/%d, want [a b] / 1/0", got, *loads, *containerLoads)
 			}
 		})
 	}
@@ -732,6 +800,24 @@ func TestSliceGateReachHook_TreeCacheAndCarry(t *testing.T) {
 	sg.resolve(ctx, "", "")
 	if *loads != 5 {
 		t.Errorf("empty tree loads = %d, want 5 (never cached)", *loads)
+	}
+}
+
+// The same per-tree cache on the container route (#5524): a repeat on the same
+// tree reuses the one in-image load; a new tree pays one more.
+func TestSliceGateReachHook_TreeCacheContainerRoute(t *testing.T) {
+	sliceGateWithSelection(t, gateiso.Selection{Path: gateiso.PathContainer, Profile: gateiso.ProfileLocal})
+	hostLoads := sliceGateStubLoads(t)
+	loads := sliceGateStubContainerLoads(t, "")
+	ctx := context.Background()
+	sg := newSliceGateReach([]string{"a/a.go"}, nil)
+	sg.resolve(ctx, "", "t1")
+	if got := sg.resolve(ctx, "", "t1"); !reflect.DeepEqual(got, []string{"a", "b"}) || *loads != 1 {
+		t.Fatalf("same tree got %v loads %d, want [a b] / 1", got, *loads)
+	}
+	sg.resolve(ctx, "", "t2")
+	if *loads != 2 || *hostLoads != 0 || sg.loadCount() != 2 {
+		t.Errorf("new tree container/host/counted loads = %d/%d/%d, want 2/0/2", *loads, *hostLoads, sg.loadCount())
 	}
 }
 

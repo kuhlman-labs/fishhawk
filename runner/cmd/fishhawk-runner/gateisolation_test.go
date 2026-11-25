@@ -2460,6 +2460,93 @@ func TestRunGateInContainer_NoServicesNoServiceCalls(t *testing.T) {
 	}
 }
 
+// TestRunGateInContainer_WithoutGateServicesProvisionsNone (#5524): with
+// FISHHAWK_GATE_SERVICES=postgres configured, an exec marked
+// withoutGateServices (the slice gate's reach exec) runs passwd then the gate
+// and nothing else — no service credential probe, volume, service container
+// or teardown — and its argv carries no DSN and no pg socket mount. The
+// unmarked exec still provisions (TestRunGateInContainer_ServiceLifecycleOrder).
+func TestRunGateInContainer_WithoutGateServicesProvisionsNone(t *testing.T) {
+	serviceContainerState(t, "/nonexistent/daemon.sock", io.Discard, nil)
+	g := scriptGateExec(t, nil)
+	sel := gateIsolation.selection(context.Background())
+	lc := filepath.Join(t.TempDir(), "lc")
+	out, code, disp := runGateInContainer(withoutGateServices(context.Background()), sel, []string{"true"}, t.TempDir(), lc,
+		withIsolatedLintCache(sanitizedGateEnv(), lc), nil, time.Minute)
+	if code != 0 || disp != gateExecuted || out != "gate ok" {
+		t.Fatalf("(out, code, disp) = (%q, %d, %s)", out, code, disp)
+	}
+	if got := strings.Join(g.order, ","); got != "passwd,gate_run" {
+		t.Errorf("call order = %s, want passwd,gate_run (no service provisioned)", got)
+	}
+	if gate := strings.Join(g.argv["gate_run"], " "); strings.Contains(gate, "FISHHAWK_TEST_PG_URL") || strings.Contains(gate, gateiso.MountPgSock) {
+		t.Errorf("a no-service exec carries service wiring: %q", gate)
+	}
+}
+
+// TestRunGateInContainer_SeedHandoff (#5524 approval condition M1): an exec
+// marked withSeedHandoff hands its seeded caches to the NEXT exec on the same
+// dir, which runs no seed; the handoff is single-use, a different dir seeds
+// fresh (and drops the stale entry), and cleanup removes a leftover entry.
+func TestRunGateInContainer_SeedHandoff(t *testing.T) {
+	st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
+	installGateState(t, st)
+	scriptGateExec(t, nil)
+	var seeds []string
+	stubSeed(t, func(checkout string) error { seeds = append(seeds, checkout); return nil })
+	sel := st.selection(context.Background())
+	run := func(ctx context.Context, dir string) {
+		t.Helper()
+		lc := filepath.Join(t.TempDir(), "lc")
+		if _, code, disp := runGateInContainer(ctx, sel, []string{"true"}, dir, lc, withIsolatedLintCache(sanitizedGateEnv(), lc), nil, time.Minute); code != 0 || disp != gateExecuted {
+			t.Fatalf("exec on %s: code %d disp %s", dir, code, disp)
+		}
+	}
+	a, b := t.TempDir(), t.TempDir()
+	run(withSeedHandoff(context.Background()), a)
+	st.seedHandoffMu.Lock()
+	stashed := st.seedHandoff
+	st.seedHandoffMu.Unlock()
+	if stashed == nil || stashed.dir != a {
+		t.Fatalf("handoff after the marked exec = %+v, want one for %s", stashed, a)
+	}
+	run(context.Background(), a)
+	if len(seeds) != 1 {
+		t.Fatalf("seeds after handoff + verify on one dir = %v, want exactly 1", seeds)
+	}
+	if _, err := os.Stat(stashed.vc.Root); !os.IsNotExist(err) {
+		t.Errorf("handed-off caches %s not removed after the consuming exec (err %v)", stashed.vc.Root, err)
+	}
+	run(context.Background(), a)
+	if len(seeds) != 2 {
+		t.Errorf("a second unmarked exec on the dir seeded %d times total, want 2 (single-use)", len(seeds))
+	}
+	run(withSeedHandoff(context.Background()), a)
+	st.seedHandoffMu.Lock()
+	stale := st.seedHandoff
+	st.seedHandoffMu.Unlock()
+	run(context.Background(), b)
+	if len(seeds) != 4 || seeds[3] != b {
+		t.Errorf("a different dir did not seed fresh: %v", seeds)
+	}
+	if _, err := os.Stat(stale.vc.Root); !os.IsNotExist(err) {
+		t.Errorf("stale handoff %s not removed (err %v)", stale.vc.Root, err)
+	}
+	run(withSeedHandoff(context.Background()), b)
+	st.seedHandoffMu.Lock()
+	left := st.seedHandoff
+	st.seedHandoffMu.Unlock()
+	if left == nil {
+		t.Fatal("no handoff stashed")
+	}
+	if vc := st.takeSeedHandoff(""); vc != nil {
+		t.Errorf("an empty dir took a handoff for %s", left.dir)
+	}
+	if _, err := os.Stat(left.vc.Root); !os.IsNotExist(err) {
+		t.Errorf("leftover handoff %s not removed (err %v)", left.vc.Root, err)
+	}
+}
+
 // TestGateIsolationState_ServicesIgnoredOffContainerPath: services configured
 // on a runner whose selection falls back to clone log gate_services_ignored
 // ONCE and provision nothing.
