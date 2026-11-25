@@ -1,0 +1,14 @@
+id: scenario:issue-5499/plan-prompt-lockstep-rule
+statement: A plan stage's served prompt carries a decomposition-time Lockstep-in-one-slice rule inside the Surface-coupling sibling map section, telling the planner to keep every scoped member of one lockstep pattern in a single sub-plan's scope.files.
+verify_hint: 'Rendered prompt: signed GET /v0/stages/{plan_stage_id}/prompt on a seeded plan stage (dev fixture trace-upload-target) returns 200 and the body contains ''Lockstep-in-one-slice rule (when decomposing)'' after the sibling-map pattern lines.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; read run_id and the plan stage id. POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over the bytes 'prompt:{plan_stage_id}'; GET /v0/stages/{plan_stage_id}/prompt with X-Fishhawk-Signature. Searched the prompt field.
+assertions:
+    expected: 200 and the body contains 'Lockstep-in-one-slice rule (when decomposing)' after the sibling-map pattern lines
+    observed_at_record: '200. The ''Surface-coupling sibling map (#763/#1797)'' section lists the lockstep patterns, including MCP tool registration requiring the count test and README, followed by the surface_sweep_exemptions paragraph. The next line is ''Lockstep-in-one-slice rule (when decomposing): keep every member of one pattern above that your plan scopes — its trigger and each sibling — in ONE sub-plan''s scope.files, normally the slice that completes the seam...''.'
+    repro_handle: GET /v0/stages/{plan_stage_id}/prompt signed over 'prompt:{plan_stage_id}'
+origin:
+    issue: 5499
+    pr: 5563
+    run_id: 5b0a8b2e-7906-4f4d-a6d8-cac4359ea498
+    head_sha: 67febc78eac36ec78aa8d88c145407778042e5e8
+    recorded_at: 2026-11-23T20:47:57Z

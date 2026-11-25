@@ -443,6 +443,14 @@ The plan's optional, machine-readable declarations that a path present in the **
 
 **What the gate does with it.** The gate subtracts declared paths from the dropped set: a drop is suppressed for exactly the declared path, and every OTHER dropped path still refuses. When the whole narrowing is declared, the pass is no longer counted as a regression (it no longer refunds the revise budget — a declared drop is not a mistake) and the plan parks at the approval gate as normal, with `declared_removals` recorded in the `plan_scope_regression` audit payload. An entry naming a path that was NOT dropped is a harmless no-op. The whole array is additive-optional within `standard_v1.x`; a plan that omits it validates and diffs exactly as before.
 
+**What reviewers see (#5499).** The same audit payload carries `acknowledged_removals`: one `{path, reason}` entry per declared drop, in `declared_removals` order, an empty array on a clean diff. The reason is stored as bounded data: whitespace collapsed to a single line and cut to at most 200 bytes, ending in a `…[truncated]` marker when cut. The plan-review prompt renders each entry as an `ACKNOWLEDGED REMOVAL` line, not in the high-severity scope-regression block:
+
+```text
+- ACKNOWLEDGED REMOVAL: backend/internal/server/legacy_shim.go — reason (plan-authored, unverified): "The operator's constraint replaces the shim …"
+```
+
+The reason is quoted and labelled plan-authored and unverified, because the gate checks only that the path was dropped and declared, never that the reason is true. The line's HANDLING tells reviewers that a declared reason does not establish that the removal is safe, that a security-relevant removal still warrants a concern, and to challenge a reason by naming work in the plan that still has to change the file. Only when the pass has no undeclared drop does the block also state that the refusal and the revise-budget refund did not fire. In a pass that mixes declared and undeclared drops, the undeclared ones keep the high-severity render.
+
 ### `over_cap`
 
 An optional planner **self-declaration hint** that `scope.files` exceeds the resolved implement-stage `max_files_changed` cap (#2053). The plan-stage prompt injects the resolved cap as a hard planning constraint and asks the planner to keep `scope.files` at or under it; when the work genuinely cannot fit, the planner sets `over_cap: true` as a courtesy so the flag round-trips.

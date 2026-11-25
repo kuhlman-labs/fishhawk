@@ -1,11 +1,16 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // forbiddenPresetGlobs mirrors the shape every shipped preset's implement
@@ -107,6 +112,8 @@ func TestEvaluateForbiddenCriterionRule(t *testing.T) {
 			TriggerPath:      `path ".fishhawk/workflows.yaml" named at acceptance_criteria[ac-1].statement`,
 			ForbiddenPath:    ".fishhawk/workflows.yaml",
 			ForbiddenPattern: ".fishhawk/**",
+			// #5499 J1 (b): "`x` declares …" names the file as a change.
+			ForbiddenInScope: true,
 		}
 		if !reflect.DeepEqual(findings[0], want) {
 			t.Errorf("finding =\n %+v\nwant\n %+v", findings[0], want)
@@ -298,4 +305,259 @@ func TestEvaluateForbiddenCriterionRule(t *testing.T) {
 			t.Fatalf("findings = %+v", findings)
 		}
 	})
+}
+
+// namedOnlyCriteria are the two observed evidence_conflict shapes (#5499):
+// run 01f0b674 named a forbidden file as an OUTPUT VALUE in a statement, and
+// run 39a4e171 named a forbidden runtime-state file as a READ TARGET inside a
+// verify_hint shell command. Neither asks the implement agent to change it.
+var namedOnlyCriteria = []plan.AcceptanceCriterion{
+	{
+		ID:        "ac-output-value",
+		Statement: "`fishhawk init --dry-run` prints `.fishhawk/workflows.yaml` as the file it would write, and exits 0",
+		Source:    plan.CriterionSourceExplicit,
+	},
+	{
+		ID:         "ac-read-target",
+		Statement:  "the run records its stage list",
+		VerifyHint: "run `jq -r '.stages' .fishhawk/state/run.json` and confirm the stage list is non-empty",
+		Source:     plan.CriterionSourceExplicit,
+	},
+}
+
+// TestEvaluateForbiddenCriterionRule_NamedOnlyIsNotAsserted pins #5499 J1: a
+// criterion that only NAMES a forbidden path — as an output value or a
+// runtime-state read target — in a plan whose scope and approach never name
+// it still draws the finding, but with ForbiddenInScope false, so the review
+// prompt renders the advisory rather than the asserted line.
+func TestEvaluateForbiddenCriterionRule_NamedOnlyIsNotAsserted(t *testing.T) {
+	for _, c := range namedOnlyCriteria {
+		t.Run(c.ID, func(t *testing.T) {
+			p := criterionPlan(c)
+			p.Scope.Files = []plan.ScopeFile{{Path: "cli/internal/initcmd/init.go", Operation: plan.FileOpModify}}
+			p.Approach = []plan.ApproachStep{{Step: 1, Description: "Add the dry-run flag to cli/internal/initcmd/init.go."}}
+			findings, _ := evaluateForbiddenCriterionRule(p, forbiddenPresetGlobs, nil)
+			if len(findings) != 1 {
+				t.Fatalf("findings = %+v, want 1 (the gate still measures the named path)", findings)
+			}
+			if findings[0].ForbiddenInScope {
+				t.Errorf("ForbiddenInScope = true, want false: nothing in the plan frames %q as an edit (%+v)", findings[0].ForbiddenPath, findings[0])
+			}
+		})
+	}
+}
+
+// TestEvaluateForbiddenCriterionRule_ScopedPathIsAsserted pins #5499 J1 (a):
+// the SAME criteria, with the path scoped only in a decomposition SUB-PLAN —
+// or covered by a scoped file under a directory/glob token the criterion
+// names — assert. The only difference from the named-only test is scope
+// membership, which is what the control reads.
+func TestEvaluateForbiddenCriterionRule_ScopedPathIsAsserted(t *testing.T) {
+	scopedPlan := func(c plan.AcceptanceCriterion, subPlanFile string) *plan.Plan {
+		p := criterionPlan(c)
+		p.Scope.Files = []plan.ScopeFile{{Path: "cli/internal/initcmd/init.go", Operation: plan.FileOpModify}}
+		p.Decomposition = &plan.Decomposition{Rationale: "x", SubPlans: []plan.SubPlanSummary{
+			{Title: "cli", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "cli/internal/initcmd/init.go", Operation: plan.FileOpModify}}}},
+			{Title: "governance", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: subPlanFile, Operation: plan.FileOpModify}}}},
+		}}
+		return p
+	}
+	for _, tc := range []struct {
+		name string
+		c    plan.AcceptanceCriterion
+		file string
+	}{
+		{"output-value path scoped in a sub-plan", namedOnlyCriteria[0], ".fishhawk/workflows.yaml"},
+		{"read-target path scoped in a sub-plan", namedOnlyCriteria[1], ".fishhawk/state/run.json"},
+		{"glob token covers a scoped file under it", plan.AcceptanceCriterion{
+			ID:        "ac-glob",
+			Statement: "nothing under `.fishhawk/**` is left stale after the migration",
+			Source:    plan.CriterionSourceExplicit,
+		}, ".fishhawk/workflows.yaml"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings, _ := evaluateForbiddenCriterionRule(scopedPlan(tc.c, tc.file), forbiddenPresetGlobs, nil)
+			if len(findings) != 1 {
+				t.Fatalf("findings = %+v, want 1", findings)
+			}
+			if !findings[0].ForbiddenInScope {
+				t.Errorf("ForbiddenInScope = false, want true: a sub-plan scopes %q (%+v)", tc.file, findings[0])
+			}
+		})
+	}
+}
+
+// TestEvaluateForbiddenCriterionRule_ChangePhrasingIsAsserted pins #5499 J1
+// (b): with nothing scoped and no approach step naming the path, a criterion
+// whose own statement or verify_hint names the path as something to change
+// still asserts.
+func TestEvaluateForbiddenCriterionRule_ChangePhrasingIsAsserted(t *testing.T) {
+	for _, c := range []plan.AcceptanceCriterion{
+		{ID: "ac-wired", Statement: "the workflow gate is wired in `.github/workflows/ci.yml`", Source: plan.CriterionSourceExplicit},
+		{ID: "ac-subject", Statement: "deploy/pipelines/verify.yml runs make lint-templates as a required step on every push", Source: plan.CriterionSourceExplicit},
+		{ID: "ac-hint", Statement: "the gate fires", VerifyHint: "confirm a step was added to `.github/workflows/ci.yml`", Source: plan.CriterionSourceExplicit},
+		{ID: "ac-passive", Statement: "after the change `.fishhawk/workflows.yaml` is updated with the new stage", Source: plan.CriterionSourceExplicit},
+	} {
+		t.Run(c.ID, func(t *testing.T) {
+			globs := append([]string{"deploy/pipelines/**"}, forbiddenPresetGlobs...)
+			findings, _ := evaluateForbiddenCriterionRule(criterionPlan(c), globs, nil)
+			if len(findings) != 1 {
+				t.Fatalf("findings = %+v, want 1", findings)
+			}
+			if !findings[0].ForbiddenInScope {
+				t.Errorf("ForbiddenInScope = false, want true: %q names the path as a change", c.Statement+" / "+c.VerifyHint)
+			}
+		})
+	}
+}
+
+// TestEvaluateForbiddenCriterionRule_ApproachNamedIsAsserted pins #5499 J1
+// (c): a named-only criterion asserts when an approach step names the path —
+// exactly, or through a directory token covering it.
+func TestEvaluateForbiddenCriterionRule_ApproachNamedIsAsserted(t *testing.T) {
+	for _, step := range []string{
+		"Regenerate the golden for `.fishhawk/workflows.yaml`.",
+		"Touch nothing outside cli/ and `.fishhawk/`.",
+	} {
+		t.Run(step, func(t *testing.T) {
+			p := criterionPlan(namedOnlyCriteria[0])
+			p.Scope.Files = []plan.ScopeFile{{Path: "cli/internal/initcmd/init.go", Operation: plan.FileOpModify}}
+			p.Approach = []plan.ApproachStep{{Step: 1, Description: step}}
+			findings, _ := evaluateForbiddenCriterionRule(p, forbiddenPresetGlobs, nil)
+			if len(findings) != 1 || !findings[0].ForbiddenInScope {
+				t.Fatalf("findings = %+v, want 1 with ForbiddenInScope true (an approach step names the path)", findings)
+			}
+		})
+	}
+}
+
+// TestNamesPathAsChange covers the J1 (b) keyword classifier's branches.
+func TestNamesPathAsChange(t *testing.T) {
+	for _, tc := range []struct {
+		text, tok string
+		want      bool
+	}{
+		{"`x/y.yml` runs the lint", "x/y.yml", true},                    // subject position
+		{"The file `x/y.yml` holds the step", "x/y.yml", true},          // subject behind fillers
+		{"the gate is wired in `x/y.yml`", "x/y.yml", true},             // change word before
+		{"the block in `x/y.yml` declares a step", "x/y.yml", true},     // change word after
+		{"then `x/y.yml` is updated", "x/y.yml", true},                  // passive change
+		{"the loader says `x/y.yml` is read by init", "x/y.yml", false}, // passive read
+		{"the command prints `x/y.yml`", "x/y.yml", false},              // read word before
+		{"run `jq '.s' x/y.yml` and check it", "x/y.yml", false},        // command argument
+		{"a long sentence that mentions nothing in particular about x/y.yml", "x/y.yml", false},
+		{"added a guard. The output lists `x/y.yml`", "x/y.yml", false}, // clause boundary stops the scan
+		{"", "x/y.yml", false},
+	} {
+		if got := namesPathAsChange(tc.text, tc.tok); got != tc.want {
+			t.Errorf("namesPathAsChange(%q, %q) = %v, want %v", tc.text, tc.tok, got, tc.want)
+		}
+	}
+}
+
+// TestPathCoveredBy covers the J1 (a)/(c) path matcher: exact, glob and
+// directory tokens on either side.
+func TestPathCoveredBy(t *testing.T) {
+	for _, tc := range []struct {
+		tok   string
+		paths []string
+		want  bool
+	}{
+		{".fishhawk/workflows.yaml", []string{".fishhawk/workflows.yaml"}, true},
+		{".fishhawk/**", []string{".fishhawk/workflows.yaml"}, true},
+		{".fishhawk/", []string{".fishhawk/workflows.yaml"}, true},
+		{".fishhawk/workflows.yaml", []string{".fishhawk"}, true},
+		{".fishhawk/workflows.yaml", []string{".fishhawk/*.yaml"}, true},
+		{"./.fishhawk/workflows.yaml", []string{".fishhawk/workflows.yaml"}, true},
+		{".fishhawk/workflows.yaml", []string{".fishhawkx/workflows.yaml", "cli/x.go"}, false},
+		{".fishhawk/**", []string{"cli/x.go"}, false},
+		{"", []string{"cli/x.go"}, false},
+	} {
+		if got := pathCoveredBy(tc.tok, tc.paths); got != tc.want {
+			t.Errorf("pathCoveredBy(%q, %v) = %v, want %v", tc.tok, tc.paths, got, tc.want)
+		}
+	}
+}
+
+// TestForbiddenCriterion_TruePositivesStillAsserted pins #5499 J1's
+// keep-the-true-positive condition end to end: the #3620 seam fixture's
+// criterion and the miss-corpus case
+// seed-synthetic-realmiss-criterion-needs-forbidden-path (read from its
+// committed review_input.json, against the glob its risk entry names) both
+// map through planGateEvidence and prompt.Build to the asserted
+// UNENFORCEABLE CRITERION line carrying the two-merge-request remedy.
+func TestForbiddenCriterion_TruePositivesStillAsserted(t *testing.T) {
+	const remedy = "Operator escape: land the in-repository half in this merge request and edit the forbidden governance file by hand in a second one"
+	assertRendered := func(t *testing.T, p *plan.Plan, findings []SurfaceSweepFinding, wantPath string) {
+		t.Helper()
+		if len(findings) != 1 || !findings[0].ForbiddenInScope || findings[0].ForbiddenPath != wantPath {
+			t.Fatalf("findings = %+v, want one asserted finding for %q", findings, wantPath)
+		}
+		ev := planGateEvidence(nil, &SurfaceSweepPayload{ScannedFiles: len(p.Scope.Files), Findings: findings}, nil, nil, nil)
+		rendered, err := prompt.Build("plan_review", prompt.Trigger{Repo: "x/y", ApprovedPlan: p, PlanGateEvidence: ev})
+		if err != nil {
+			t.Fatalf("prompt.Build: %v", err)
+		}
+		for _, want := range []string{"UNENFORCEABLE CRITERION (acceptance criterion requires a forbidden path)", remedy} {
+			if !strings.Contains(rendered, want) {
+				t.Errorf("plan-review prompt missing %q:\n%s", want, rendered)
+			}
+		}
+		if strings.Contains(rendered, "FORBIDDEN PATH NAMED:") {
+			t.Errorf("a true positive must not render the advisory:\n%s", rendered)
+		}
+	}
+
+	t.Run("#3620 seam fixture", func(t *testing.T) {
+		s, _, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		body := forbiddenCriterionPlanBody(t,
+			[]plan.ScopeFile{{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify}},
+			[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"}, nil)
+		sweep := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if sweep == nil {
+			t.Fatal("runSurfaceSweep = nil")
+		}
+		p, err := plan.Parse(body)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		assertRendered(t, p, sweep.Findings, ".github/workflows/ci.yml")
+	})
+
+	t.Run("miss-corpus seed-synthetic-realmiss-criterion-needs-forbidden-path", func(t *testing.T) {
+		raw, err := os.ReadFile("../agenteval/testdata/planreview-miss-corpus/seed-synthetic-realmiss-criterion-needs-forbidden-path/review_input.json")
+		if err != nil {
+			t.Fatalf("read miss-corpus case: %v", err)
+		}
+		var in struct {
+			Plan plan.Plan `json:"plan"`
+		}
+		if err := json.Unmarshal(raw, &in); err != nil {
+			t.Fatalf("decode miss-corpus case: %v", err)
+		}
+		// The case's own risk entry puts deploy/pipelines/** outside what the
+		// implementing workflow may write.
+		findings, _ := evaluateForbiddenCriterionRule(&in.Plan, []string{"deploy/pipelines/**"}, nil)
+		assertRendered(t, &in.Plan, findings, "deploy/pipelines/verify.yml")
+	})
+
+	// P5 (b) of #5499: one true positive per phrasing class namesPathAsChange
+	// must assert, each isolated so ONLY its own branch of
+	// occurrenceNamesChange decides: nothing scoped, no approach step, and no
+	// other deciding word in the clause. Narrowing a class turns its subtest
+	// RED instead of silently demoting a real edit to the advisory.
+	for _, tc := range []struct {
+		class, statement, path string
+	}{
+		{"change verb right after the path", "the block in `.github/workflows/ci.yml` declares the lint step", ".github/workflows/ci.yml"},
+		{"passive change", "on merge `.fishhawk/workflows.yaml` is updated with the new stage", ".fishhawk/workflows.yaml"},
+		{"subject position", "deploy/pipelines/verify.yml runs make lint-templates as a required step on every push", "deploy/pipelines/verify.yml"},
+		{"change word before the path", "the workflow gate is wired in `.github/workflows/ci.yml`", ".github/workflows/ci.yml"},
+	} {
+		t.Run("phrasing class: "+tc.class, func(t *testing.T) {
+			p := criterionPlan(plan.AcceptanceCriterion{ID: "ac-1", Statement: tc.statement, Source: plan.CriterionSourceExplicit})
+			findings, _ := evaluateForbiddenCriterionRule(p, append([]string{"deploy/pipelines/**"}, forbiddenPresetGlobs...), nil)
+			assertRendered(t, p, findings, tc.path)
+		})
+	}
 }

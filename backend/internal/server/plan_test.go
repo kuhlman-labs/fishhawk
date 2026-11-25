@@ -3118,6 +3118,83 @@ func TestShipPlan_ReviewAgents_ScopeRegressionReachesReviewPrompt(t *testing.T) 
 	}
 }
 
+// TestShipPlan_ReviewAgents_DeclaredRemovalAcknowledgedInReviewPrompt is the
+// #5499 cross-layer seam: a REVISE pass that drops b.go AND declares it in
+// scope_removals with a reason reaches the reviewer prompt as an ACKNOWLEDGED
+// REMOVAL line carrying that reason — handler → audit payload →
+// planGateEvidence → prompt.Build → reviewer call — and NOT as a HIGH-severity
+// DROPPED FILES line. The fixture's ONLY drop is declared, so handing the
+// reviewer every removed file (the pre-#5499 mapping) turns this RED.
+func TestShipPlan_ReviewAgents_DeclaredRemovalAcknowledgedInReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, ar, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	priv, _ := sf.issue(t, runID)
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: stageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+
+	baseBody := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/server/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/internal/server/b.go", Operation: plan.FileOpModify},
+	})
+	schema := "standard_v1"
+	if _, err := ar.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       baseBody,
+		ContentHash:   "basehash",
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+	seedPlanRevised(au, runID, stageID)
+
+	// Ship a NEW plan dropping b.go and DECLARING the drop.
+	const reason = "the R1 replacement obsoletes b.go"
+	var m map[string]any
+	if err := json.Unmarshal(scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/server/a.go", Operation: plan.FileOpModify},
+	}), &m); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	m["scope_removals"] = []any{map[string]any{"path": "backend/internal/server/b.go", "reason": reason}}
+	newBody, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(newBody); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	w := shipPlanRequest(t, s, runID, stageID, priv, newBody, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"ACKNOWLEDGED REMOVAL: backend/internal/server/b.go",
+		fmt.Sprintf("%q", reason),
+		"plan-authored, unverified",
+		"the scope-regression refusal and the revise-budget refund did not fire",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "DROPPED FILES") {
+		t.Errorf("a declared drop must not reach the HIGH-severity block:\n%s", got)
+	}
+}
+
 // TestShipPlan_ReviewAgents_BudgetEvidenceReachesReviewPrompt is the #994
 // seam check: the resolved implement budget runPlanReviews computes via
 // planBudgetEvidence must flow through the trigger mapping into the
@@ -5118,6 +5195,12 @@ func TestPlanGateEvidence_ForbiddenCriterionSeam(t *testing.T) {
 	if got.ForbiddenPath != ".github/workflows/ci.yml" {
 		t.Fatalf("SurfaceSweepFindingEvidence.ForbiddenPath = %q (a drop in planGateEvidence)", got.ForbiddenPath)
 	}
+	// #5499: the fixture's criterion names ci.yml as a change ("is wired
+	// in"), so the sweep asserts and the mapping must carry the bit.
+	if !sweep.Findings[0].ForbiddenInScope || !got.ForbiddenInScope {
+		t.Fatalf("ForbiddenInScope sweep=%v evidence=%v, want true on both (a drop in planGateEvidence)",
+			sweep.Findings[0].ForbiddenInScope, got.ForbiddenInScope)
+	}
 
 	parsedPlan, err := plan.Parse(body)
 	if err != nil {
@@ -5136,10 +5219,14 @@ func TestPlanGateEvidence_ForbiddenCriterionSeam(t *testing.T) {
 		`path ".github/workflows/ci.yml" named at acceptance_criteria[ac-1].statement`,
 		`the glob ".github/workflows/**"`,
 		`{pattern: "acceptance criterion requires a forbidden path", sibling: ".github/workflows/ci.yml"}`,
+		"edit the forbidden governance file by hand in a second one",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("plan-review prompt missing %q:\n%s", want, rendered)
 		}
+	}
+	if strings.Contains(rendered, "FORBIDDEN PATH NAMED:") {
+		t.Errorf("the asserted seam fixture must not render the advisory:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "MISSING SIBLINGS (acceptance criterion requires a forbidden path)") {
 		t.Errorf("forbidden-criterion finding must not render as a MISSING SIBLINGS line:\n%s", rendered)

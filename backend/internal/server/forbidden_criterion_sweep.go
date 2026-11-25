@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bmatcuk/doublestar/v4"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 )
@@ -31,16 +33,33 @@ import (
 // path. The finding rides the existing plan_surface_sweep entry, so the rule
 // introduces no audit category and no issue-comment surface of its own.
 //
-// The heuristic bound, stated honestly: it reads acceptance-criteria prose
-// ONLY. A criterion phrased "the verify gate enforces the new guard" requires
-// a forbidden edit without naming any path and is NOT caught, and
-// summary/approach/risks prose is deliberately not scanned because a plan
-// legitimately discussing the forbidden-paths constraint would self-flag. A
-// criterion that names a forbidden path for a reason OTHER than requiring an
-// edit to it is a false positive, which a plan-declared
-// surface_sweep_exemptions entry {pattern: surfacePatternForbiddenCriterion,
-// sibling: <path>} clears with a reviewer-challengeable reason. Advisory in
-// both directions: never a refusal.
+// The heuristic bound, stated honestly: the gate MEASURES only that a
+// criterion NAMES a forbidden path; it reads acceptance-criteria prose ONLY to
+// find one. A criterion phrased "the verify gate enforces the new guard"
+// requires a forbidden edit without naming any path and is NOT caught, and
+// summary/risks prose is deliberately not scanned because a plan legitimately
+// discussing the forbidden-paths constraint would self-flag.
+//
+// Whether the criterion REQUIRES AN EDIT to the path is a separate question
+// (#5499). The finding's ForbiddenInScope bit asserts it — the review prompt
+// then renders the UNENFORCEABLE CRITERION line — when ANY of these holds:
+// (a) the plan scopes the path (top-level, sub-plan or split-phase
+// scope.files; a directory or glob token such as `.fishhawk/**` matches the
+// scoped files under it); (b) the criterion's own statement or verify_hint
+// names the path as something to change (namesPathAsChange); (c) an approach
+// step names it. Otherwise the bit is false and the prompt renders the
+// FORBIDDEN PATH NAMED advisory, which asks the reviewer to judge. That
+// not-asserted outcome is an INFERENCE, not a measurement: the two observed
+// evidence_conflict runs named the forbidden path as an output value and as a
+// runtime-state read target, so a criterion nothing in the plan frames as an
+// edit is more likely naming the path as data — but the classifier is a
+// keyword heuristic, so the advisory keeps the two-merge-request remedy in
+// front of the reviewer rather than dropping the finding.
+//
+// A criterion that names a forbidden path for a reason OTHER than requiring an
+// edit to it clears via a plan-declared surface_sweep_exemptions entry
+// {pattern: surfacePatternForbiddenCriterion, sibling: <path>} with a
+// reviewer-challengeable reason. Advisory in both directions: never a refusal.
 const (
 	// surfacePatternForbiddenCriterion is the finding's Pattern and the
 	// exemption key a plan declares to suppress it.
@@ -60,6 +79,11 @@ type criterionPathMention struct {
 	// CriterionID is the sort key that makes the finding order deterministic
 	// independently of the location string's shape.
 	CriterionID string
+	// NamedAsChange is J1 (b) of #5499: the criterion's statement or
+	// verify_hint names the path as something to change (namesPathAsChange).
+	// When the same path is named in both fields the mention collapses onto
+	// the statement and this is the OR of both fields.
+	NamedAsChange bool
 }
 
 // The two bounded capture shapes. A path-shaped token is captured ONLY when it
@@ -127,23 +151,198 @@ func extractCriterionPathTokens(text string) []string {
 func planCriterionPathMentions(p *plan.Plan) []criterionPathMention {
 	var out []criterionPathMention
 	for _, c := range p.Verification.AcceptanceCriteria {
-		seen := make(map[string]bool)
+		seen := make(map[string]int)
 		for _, field := range []struct{ suffix, text string }{
 			{"statement", c.Statement},
 			{"verify_hint", c.VerifyHint},
 		} {
 			for _, tok := range extractCriterionPathTokens(field.text) {
-				if seen[tok] {
+				asChange := namesPathAsChange(field.text, tok)
+				if i, ok := seen[tok]; ok {
+					out[i].NamedAsChange = out[i].NamedAsChange || asChange
 					continue
 				}
-				seen[tok] = true
+				seen[tok] = len(out)
 				out = append(out, criterionPathMention{
-					Path:        tok,
-					Location:    fmt.Sprintf("acceptance_criteria[%s].%s", c.ID, field.suffix),
-					CriterionID: c.ID,
+					Path:          tok,
+					Location:      fmt.Sprintf("acceptance_criteria[%s].%s", c.ID, field.suffix),
+					CriterionID:   c.ID,
+					NamedAsChange: asChange,
 				})
 			}
 		}
+	}
+	return out
+}
+
+// pathChangeWords are the verbs that frame a named path as something the
+// change edits ("the gate is wired in `x`", "add a step to `x`").
+// pathReadWords frame it as data: an output value, a read target or a
+// command argument ("prints `x`", "jq '.s' x"). Both are lowercase.
+var (
+	pathChangeWords = wordSet("add adds added adding edit edits edited editing modify modifies modified modifying " +
+		"update updates updated updating change changes changed changing wire wires wired wiring rewrite rewrites " +
+		"rewrote rewritten create creates created creating delete deletes deleted deleting remove removes removed " +
+		"removing rename renames renamed append appends appended insert inserts inserted extend extends extended " +
+		"register registers registered patch patches patched amend amends amended bump bumps bumped declare " +
+		"declares declared configure configures configured gain gains gained")
+	pathReadWords = wordSet("print prints printed printing report reports reported reporting list lists listed " +
+		"listing output outputs read reads reading cat jq grep head tail ls stat show shows shown showing display " +
+		"displays displayed emit emits emitted return returns returned log logs logged echo echoes parse parses " +
+		"parsed load loads loaded inspect inspects inspected query queries queried mention mentions mentioned " +
+		"name names named cite cites cited reference references referenced contain contains containing against " +
+		"value values exists")
+	// pathSubjectFillers may precede a path at the start of a clause without
+	// moving it out of subject position ("The file `x` runs …").
+	pathSubjectFillers = wordSet("the a an file its this that and then also")
+)
+
+// pathChangeLookback bounds how many words before a named path the change /
+// read classification reads.
+const pathChangeLookback = 6
+
+func wordSet(words string) map[string]bool {
+	out := make(map[string]bool)
+	for _, w := range strings.Fields(words) {
+		out[w] = true
+	}
+	return out
+}
+
+// proseWords splits text into lowercase words with surrounding quote and
+// bracket punctuation stripped, dropping words that strip to nothing.
+func proseWords(text string) []string {
+	var out []string
+	for _, w := range strings.Fields(text) {
+		w = strings.ToLower(strings.Trim(w, "`\"'‘’“”()[]{},:;!?"))
+		if w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// clauseStart returns the offset just past the last clause boundary in
+// prefix: a sentence-final punctuation mark followed by a space, a
+// semicolon, a colon or a newline. A path's own dots never end a clause.
+func clauseStart(prefix string) int {
+	start := 0
+	for _, sep := range []string{". ", "? ", "! ", "; ", ": ", "\n"} {
+		if i := strings.LastIndex(prefix, sep); i >= 0 && i+len(sep) > start {
+			start = i + len(sep)
+		}
+	}
+	return start
+}
+
+// namesPathAsChange is J1 (b) of #5499: whether one prose field names tok as
+// something to change. A keyword heuristic, read per occurrence of tok:
+//
+//   - a change verb right after the path ("the block in `x` declares …"), or
+//     a passive one ("`x` is updated"), decides first as a change; a passive
+//     read ("`x` is read by") decides as not a change;
+//   - a path in SUBJECT position — only fillers such as "the" or "file"
+//     before it in its clause — is a change: the criterion states what the
+//     file itself does or holds ("deploy/x.yml runs make lint");
+//   - otherwise the nearest change or read word in the pathChangeLookback
+//     words before it, within its clause, decides ("is wired in `x`" is a
+//     change; "prints `x`" and "jq '.s' x" are not);
+//   - no deciding word means not a change.
+func namesPathAsChange(text, tok string) bool {
+	for off := 0; off < len(text); {
+		i := strings.Index(text[off:], tok)
+		if i < 0 {
+			return false
+		}
+		at := off + i
+		off = at + len(tok)
+		if occurrenceNamesChange(text[:at], text[at+len(tok):]) {
+			return true
+		}
+	}
+	return false
+}
+
+func occurrenceNamesChange(before, after string) bool {
+	next := proseWords(after)
+	if len(next) >= 1 && pathChangeWords[next[0]] {
+		return true
+	}
+	if len(next) >= 2 {
+		switch next[0] {
+		case "is", "are", "was", "were", "be", "been", "gets", "get":
+			if pathChangeWords[next[1]] {
+				return true
+			}
+			if pathReadWords[next[1]] {
+				return false
+			}
+		}
+	}
+	prev := proseWords(before[clauseStart(before):])
+	subject := true
+	for _, w := range prev {
+		if !pathSubjectFillers[w] {
+			subject = false
+			break
+		}
+	}
+	if subject {
+		return true
+	}
+	for n, i := 0, len(prev)-1; i >= 0 && n < pathChangeLookback; i, n = i-1, n+1 {
+		switch {
+		case pathChangeWords[prev[i]]:
+			return true
+		case pathReadWords[prev[i]]:
+			return false
+		}
+	}
+	return false
+}
+
+// pathCoveredBy is J1 (a)/(c) of #5499: whether path tok — a concrete path, a
+// directory or a glob token — is covered by any entry of paths, which may
+// themselves be concrete, directory or glob entries. Exact match, a doublestar
+// glob on either side, or a directory prefix on either side all count, so a
+// criterion naming `.fishhawk/**` is covered by a scoped
+// `.fishhawk/workflows.yaml` and a criterion naming `.fishhawk/workflows.yaml`
+// is covered by an approach step naming `.fishhawk/`.
+func pathCoveredBy(tok string, paths []string) bool {
+	tok = strings.TrimPrefix(toSlashPath(tok), "./")
+	if tok == "" {
+		return false
+	}
+	for _, p := range paths {
+		p = strings.TrimPrefix(toSlashPath(p), "./")
+		if p == "" {
+			continue
+		}
+		if p == tok || pathUnder(p, tok) || pathUnder(tok, p) {
+			return true
+		}
+		if ok, err := doublestar.Match(tok, p); err == nil && ok {
+			return true
+		}
+		if ok, err := doublestar.Match(p, tok); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// pathUnder reports whether path sits under the directory dir.
+func pathUnder(path, dir string) bool {
+	dir = strings.TrimSuffix(dir, "/")
+	return dir != "" && strings.HasPrefix(path, dir+"/")
+}
+
+// planApproachPathTokens returns every path-shaped token the plan's approach
+// steps name, with the same extraction the criteria use.
+func planApproachPathTokens(p *plan.Plan) []string {
+	var out []string
+	for _, st := range p.Approach {
+		out = append(out, extractCriterionPathTokens(st.Description)...)
 	}
 	return out
 }
@@ -219,8 +418,11 @@ func forbiddenGlobFromDetail(detail string, forbidden []string) string {
 // token) pair, sorted by criterion id then token and capped at
 // forbiddenCriterionSweepMaxFindings, each with Pattern, TriggerPath naming
 // the token and its location, MissingSiblings nil (nothing is missing from
-// scope — the path is structurally unreachable), and ForbiddenPath /
-// ForbiddenPattern carrying the token and the glob that forbids it.
+// scope — the path is structurally unreachable), ForbiddenPath /
+// ForbiddenPattern carrying the token and the glob that forbids it, and
+// ForbiddenInScope carrying whether the plan puts that path in play as
+// something to change (J1 of #5499: scoped, named as a change target by the
+// criterion, or named by an approach step).
 func evaluateForbiddenCriterionRule(p *plan.Plan, forbidden []string, exemptions []plan.SurfaceSweepExemption) ([]SurfaceSweepFinding, []AppliedExemption) {
 	if p == nil || len(forbidden) == 0 || len(p.Verification.AcceptanceCriteria) == 0 {
 		return nil, nil
@@ -243,6 +445,19 @@ func evaluateForbiddenCriterionRule(p *plan.Plan, forbidden []string, exemptions
 	matched := forbiddenGlobForPaths(candidates, forbidden)
 	if len(matched) == 0 {
 		return nil, nil
+	}
+
+	// J1 of #5499, per slash-normalized forbidden token: (a) scoped is the
+	// plan's own scope union, and approachNamed is (c), an approach step
+	// naming it. (b) rides each mention as NamedAsChange.
+	scopeUnion := scopedPaths(p)
+	approachTokens := planApproachPathTokens(p)
+	scoped := make(map[string]bool, len(matched))
+	approachNamed := make(map[string]bool, len(matched))
+	for path := range matched {
+		key := toSlashPath(path)
+		scoped[key] = pathCoveredBy(key, scopeUnion)
+		approachNamed[key] = pathCoveredBy(key, approachTokens)
 	}
 
 	// Index the plan's exemptions for this rule by slash-normalized path.
@@ -298,12 +513,20 @@ func evaluateForbiddenCriterionRule(p *plan.Plan, forbidden []string, exemptions
 	}
 	findings := make([]SurfaceSweepFinding, 0, len(hits))
 	for _, m := range hits {
-		findings = append(findings, SurfaceSweepFinding{
+		f := SurfaceSweepFinding{
 			Pattern:          surfacePatternForbiddenCriterion,
 			TriggerPath:      fmt.Sprintf("path %q named at %s", m.Path, m.Location),
 			ForbiddenPath:    toSlashPath(m.Path),
 			ForbiddenPattern: matched[m.Path],
-		})
+			ForbiddenInScope: scoped[toSlashPath(m.Path)],
+		}
+		if m.NamedAsChange {
+			f.ForbiddenInScope = true
+		}
+		if approachNamed[toSlashPath(m.Path)] {
+			f.ForbiddenInScope = true
+		}
+		findings = append(findings, f)
 	}
 	return findings, applied
 }
