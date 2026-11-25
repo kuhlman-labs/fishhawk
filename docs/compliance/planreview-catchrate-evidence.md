@@ -151,6 +151,9 @@ committable.
      scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
    ```
 
+   When the gate names only some arms STALE, re-record just those arms with
+   `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS`, carrying every other arm forward:
+   see "Re-record one arm" below.
 4. **Commit the pair.** Add the "Results" row for the recording and commit it
    with `evidence.json` and `evidence.trials.json` together, signed off (Step
    3).
@@ -179,6 +182,95 @@ committable.
 8. **Hand off the PR.** Push the branch and open or update its PR with the
    gate's PASS output and the Step 4 distribution check in the body, then hand
    it to review. Remove the worktree after the merge.
+
+## Re-record one arm
+
+A STALE refusal names the arm(s) whose fingerprint moved. When the other arms
+are still fresh, re-measure only the stale ones (#5566):
+`FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=<arm,...>` measures the selected arms and
+carries every other arm forward VERBATIM, from `evidence.json` and from
+`evidence.trials.json`. Unset, every arm is measured, as before.
+
+**Read the selector off the failure.** `catchrategate` and
+`scripts/check-review-prompt-eval` both print it:
+
+```text
+catchrategate: FAIL: ... STALE arm(s) architect: ... re-record only those arms: FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect (every other arm is carried forward; ...)
+check-review-prompt-eval: FAIL — STALE arm(s) architect: re-record only those arms with FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect (every other arm is carried forward) per docs/compliance/planreview-catchrate-evidence.md § "Re-record one arm"
+```
+
+Use the printed selector as it is. It already includes each stale arm's
+comparison-pair partner: a stale `with_conventions` prints
+`FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=with_conventions,without_conventions`,
+because the within-run rule compares the two conventions arms from ONE
+recording.
+
+**Every unselected arm must be fresh.** A carried arm is copied, not
+re-measured, so the recorder checks it before any model call. Each refusal
+names the arm(s) and its remedy, and leaves both files byte-identical:
+
+| Refused when | Remedy |
+|---|---|
+| the selector names an arm the arm table does not have | fix the name (the message lists the table's arms) |
+| it selects one arm of a comparison pair (`with_conventions` without `without_conventions`, or the reverse) | select both: the message prints the selector |
+| there is no record, it is a legacy v1 record, or it has no baseline | a full recording (unset the selector) |
+| the record's generator model, catch rule, tolerance or power floor is not this recording's | a full recording |
+| the arm table gained or lost an arm since the record | a full recording |
+| an unselected arm is STALE | add it to the selector (the message prints the widened selector) |
+| an unselected arm was measured on another instrument (`input_digest`, `samples_per_case` or kind differ from the arm table's) | add it to the selector |
+| the sidecar is absent, malformed, from another recording or count-inconsistent | a full recording |
+| the pinned baseline cannot keep judging a carried arm (another generator model or catch rule, or that arm's case set, expectation classes, samples per case or `input_digest` differ) | a full re-pin |
+| without `PIN_REASON`: a SELECTED arm is not comparable to its baseline entry (case set, expectation classes, samples per case or `input_digest`) | set `FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON` to re-pin it |
+
+The last check runs before the model calls too, so a recording that its
+judgement would refuse is refused before it is paid for.
+
+**Pinning.** With `PIN_REASON` set, only the selected arms' baseline entries
+are re-pinned from this measurement. Every other baseline entry is kept byte
+for byte, and the baseline's `pinned_at` and `reason` become this
+recording's (the earlier reason stays in git history). Without it, the
+selected arms are judged against their existing baseline entries, and the
+carried arms are re-judged against theirs, exactly as in a full recording.
+Step 2 says when a recording re-pins.
+
+**Provenance.** Each measured arm carries a per-arm `recorded_at` equal to
+the record's. A carried arm keeps its entry unchanged, so an arm with no
+`recorded_at` was measured before #5566. The record-level `recorded_at` and
+`prompt_fingerprint` are this recording's. The report carries an
+`Arm selection:` line naming the measured arms and each carried arm with its
+`recorded_at` (or `pre-#5566`), and its persona diagnostics mark a carried
+arm as carried forward rather than printing counts for it.
+
+The dry-run subset knobs (`FISHHAWK_AGENTEVAL_PLANREVIEW_CASES` / `_TRIALS`)
+do not combine with a carry-forward: with either set, the selector only
+narrows which arms the never-recordable dry run measures. Without `RECORD=1`
+the selector runs the same checks and judgement and writes nothing.
+
+**Cost.** The architect arm is 414 of the 1,178 trials of the 2026-11-13
+recording (276 catch and 138 clean, about 35%), the conventions pair 288, the
+`security` arm 340 and `security_portability` 136. Scale the `-timeout` to
+the arms selected: `2h` covers the architect arm, against `4h` for a full
+recording.
+
+The worked command for a stale architect arm:
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect \
+  FISHHAWK_AGENTEVAL_DIAG_DIR="$HOME/fishhawk-agenteval-diag" \
+  scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+Add `FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='<issue>: <why>'` when the
+recording re-pins the architect entry.
+
+Then finish as in "The recording sequence", steps 4-8: commit the pair, rebase
+onto `origin/main`, re-run the gate on the rebased tree, scan for secrets and
+hand off the PR. In the Results row, name the measured arms in the "Pinned
+baseline" column (for example `arm subset: architect measured; other arms
+carried forward`) and copy each carried arm's figures from the row that
+measured it.
 
 ## Step 1 — check the corpus loads
 
@@ -983,6 +1075,7 @@ alarm (clean cases).
 | 2026-10-15 | `claude-sonnet-5-5` | 137/144 (0.951) | 135/144 (0.938) | 105/138 (0.761) | 28/138 (0.203) | `security` catch 204/204 (1.000), false alarm 3/136 (0.022; trials: security_lens 0, other_category 2, undecodable 1); `security_portability` false alarm 3/136 (0.022; trials: security_lens 1, other_category 1, undecodable 1) | pinned (#4314: security + security_portability arms added; the #4313 arm set is not comparable) | PASS (delta +0.014) |
 | 2026-10-15 | `claude-sonnet-5-5` | 128/143 (0.895) | 131/143 (0.916) | 118/138 (0.855) | 24/138 (0.174) | `security` catch 204/204 (1.000), false alarm 1/136 (0.007; trials: security_lens 0, other_category 0, undecodable 1); `security_portability` false alarm 7/136 (0.051; trials: security_lens 0, other_category 6, undecodable 1) | pinned (combined re-pin after #4337/#4398/#4399/#4361 and ADR-100/101: conventions corpus +restates-approach-observable, 13 seed-synthetic cases; MaxTokens 8192 with non-fatal truncation; architect index + #4399 record budget; 4 architect trials undecodable; prior pin not comparable) | PASS (delta -0.021) |
 | 2026-11-13 | `claude-sonnet-5-5` | 134/144 (0.931) | 129/144 (0.896) | 247/276 (0.895) | 13/138 (0.094) | `security` catch 195/204 (0.956), false alarm 2/136 (0.015; trials: security_lens 0, other_category 2, undecodable 0); `security_portability` false alarm 4/136 (0.029; trials: security_lens 1, other_category 2, undecodable 1) | pinned (combined re-pin: #4469 harder security catch cases; #4482 conventions 18 cases x 8 and architect 9 cases; #4477/#4480 instrument terms; #4492/#4495/#4497 decision-record index rendering; ADR-127..145; #5171, #5186, #5209, #5244 prompt changes; 4 architect trials undecodable; the d624cd36 pin is not comparable) | PASS (delta -0.035) |
+| 2026-11-25 | `claude-sonnet-5-5` | 134/144 (0.931) | 129/144 (0.896) | 252/276 (0.913) | 16/138 (0.116) | `security` catch 195/204 (0.956), false alarm 2/136 (0.015; trials: security_lens 0, other_category 2, undecodable 0); `security_portability` false alarm 4/136 (0.029; trials: security_lens 1, other_category 2, undecodable 1) | arm subset: architect measured (414 trials, 6 undecodable); other arms carried forward from the 2026-11-13 row. Architect entry re-pinned alone (#5499: plan-review judge inputs changed, acknowledged removals and forbidden-path advisory render; ADR-118 A1 recorded; arm-scoped re-record via #5566) | PASS (delta -0.035, carried) |
 
 The #4314 row's "Other arms" column names `security` catch and false alarm
 (with its security_lens / other_category trial split; the remainder of each

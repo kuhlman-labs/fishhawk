@@ -74,6 +74,23 @@
 // renames leaves a sidecar the old record does not match, which the gate
 // refuses), and CheckCatchRateEvidence refuses a record whose sidecar is
 // absent, malformed, from another recording or count-inconsistent with it.
+//
+// THE ARM SELECTOR (#5566). RecordCatchRateOptions.Arms
+// (FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS, ParseCatchRateArms) re-records part of
+// the arm table: only the selected arms are measured, and every unselected arm
+// is carried forward VERBATIM from the existing record and its sidecar. A
+// selection is resolved, and a carry-forward checked, BEFORE any model call:
+// it is refused (ErrCatchRateArmSelection, naming the arm(s)) for an unknown
+// arm, a split comparison pair, an absent, legacy or baseline-less record, a
+// mixed record-level instrument, an arm-table change, a STALE or
+// instrument-drifted unselected arm, an unbound sidecar, a baseline that
+// cannot keep judging the carried arms, and — without a pin — a selected arm
+// whose baseline entry is not comparable. Each measured arm carries its own
+// recorded_at (omitempty; absent on an entry measured before #5566), so a
+// carried arm can be told from a re-measured one; the gate never reads it. A
+// subset pin re-pins only the selected arms' baseline entries
+// (mergeBaselineArms). The gate's STALE (4b) message prints the selector to
+// use (catchRateArmSelector), closed over the comparison pairs.
 
 package agenteval
 
@@ -279,6 +296,12 @@ type CatchRateEvidenceArm struct {
 	// FalseAlarmPartition is set on a partitioned arm (the security arms)
 	// only: one entry per clean case.
 	FalseAlarmPartition map[string]CatchRateFalseAlarmPartition `json:"false_alarm_partition,omitempty"`
+	// RecordedAt (#5566) is the RFC 3339 time the recording that MEASURED
+	// this arm ran: equal to the record's recorded_at for a measured arm,
+	// earlier for an arm an arm-subset recording carried forward, and absent
+	// on an entry measured before #5566. Provenance only: the gate never
+	// reads it.
+	RecordedAt string `json:"recorded_at,omitempty"`
 }
 
 // CatchRateEvidenceArms is every arm of one measurement, keyed by arm name.
@@ -665,9 +688,283 @@ type RecordCatchRateOptions struct {
 	// refused before any model call unless DryRun is set and PinBaseline is
 	// not, and a subset dry run is reported per case, never judged.
 	Subset CatchRateSubset
+	// Arms selects the arms this recording measures
+	// (FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS, ParseCatchRateArms); empty = every
+	// arm. A selection naming every arm is a full recording; a partial one
+	// carries every unselected arm forward verbatim after the carry-forward
+	// preflight (#5566). With an active Subset it only narrows which arms run.
+	Arms []string
 }
 
-// RecordCatchRateEvidence runs EVERY arm of the arm table against sender
+// CatchRateArmsEnv is the arm selector: a comma-separated list of arm names
+// to re-record, every other arm being carried forward (#5566).
+const CatchRateArmsEnv = "FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS"
+
+// catchRateArmsRunbookSection names the run-book section every selector
+// refusal and the (4b) hint point to.
+const catchRateArmsRunbookSection = `the run-book's "Re-record one arm"`
+
+// ErrCatchRateArmSelection marks a refusal of an arm selection or of its
+// carry-forward (#5566): every such refusal wraps it and leaves the evidence
+// pair byte-identical.
+var ErrCatchRateArmSelection = errors.New("catch-rate arm selection refused")
+
+// ParseCatchRateArms reads the arm selector through getenv. Unset gives nil
+// (every arm). Names are split on commas, trimmed and de-duplicated in
+// first-seen order; a list that is blank after trimming is refused, naming
+// the variable. Names are checked against the arm table by
+// RecordCatchRateEvidence, which builds it.
+func ParseCatchRateArms(getenv func(string) string) ([]string, error) {
+	raw := getenv(CatchRateArmsEnv)
+	if raw == "" {
+		return nil, nil
+	}
+	var arms []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		arms = append(arms, name)
+	}
+	if len(arms) == 0 {
+		return nil, fmt.Errorf("agenteval: %w: %s=%q names no arm (want a comma-separated list of arm names)", ErrCatchRateArmSelection, CatchRateArmsEnv, raw)
+	}
+	return arms, nil
+}
+
+// resolveCatchRateArmSelection resolves arms against the arm table: selected
+// holds every arm the recording measures, partial reports that some arm is
+// carried forward. Empty arms, or a list naming every row, is a full
+// recording. It refuses an unknown arm and a split comparison pair.
+func resolveCatchRateArmSelection(arms []string, rows []catchRateArmRow) (selected map[string]bool, partial bool, err error) {
+	selected = make(map[string]bool, len(rows))
+	if len(arms) == 0 {
+		for _, row := range rows {
+			selected[row.name] = true
+		}
+		return selected, false, nil
+	}
+	known := make(map[string]bool, len(rows))
+	names := make([]string, 0, len(rows))
+	for _, row := range rows {
+		known[row.name] = true
+		names = append(names, row.name)
+	}
+	var unknownArms []string
+	for _, name := range arms {
+		if !known[name] {
+			unknownArms = append(unknownArms, name)
+			continue
+		}
+		selected[name] = true
+	}
+	if len(unknownArms) > 0 {
+		return nil, false, fmt.Errorf("%w: %s names unknown arm(s) %s: the arm table's arms are %s; see %s", ErrCatchRateArmSelection, CatchRateArmsEnv, strings.Join(unknownArms, ", "), strings.Join(names, ", "), catchRateArmsRunbookSection)
+	}
+	if pair, split := catchRateSplitPair(selected); split {
+		return nil, false, fmt.Errorf("%w: %s splits the comparison pair (%s, %s): the within-run rule compares the two arms from ONE recording, so select both or neither — %s; see %s", ErrCatchRateArmSelection, CatchRateArmsEnv, pair.without, pair.with, catchRateArmSelector([]string{pair.with}), catchRateArmsRunbookSection)
+	}
+	return selected, len(selected) < len(rows), nil
+}
+
+// catchRateSplitPair is the first comparison pair the selection splits (one
+// arm selected, the other not).
+func catchRateSplitPair(selected map[string]bool) (catchRateComparisonPair, bool) {
+	for _, pair := range catchRateComparisonPairs {
+		if selected[pair.without] != selected[pair.with] {
+			return pair, true
+		}
+	}
+	return catchRateComparisonPair{}, false
+}
+
+// catchRateArmSelector is the selector that re-records arms: the list closed
+// over catchRateComparisonPairs (an arm of a pair brings its partner), sorted,
+// as "FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=<a,b>".
+func catchRateArmSelector(arms []string) string {
+	set := map[string]bool{}
+	for _, a := range arms {
+		set[a] = true
+	}
+	for _, pair := range catchRateComparisonPairs {
+		if set[pair.without] || set[pair.with] {
+			set[pair.without], set[pair.with] = true, true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for a := range set {
+		out = append(out, a)
+	}
+	sort.Strings(out)
+	return CatchRateArmsEnv + "=" + strings.Join(out, ",")
+}
+
+// catchRateArmRemedy is the remedy every carry-forward refusal names.
+func catchRateArmRemedy(arms []string) string {
+	return fmt.Sprintf("add them to the selector (%s) or unset %s for a full recording; see %s", catchRateArmSelector(arms), CatchRateArmsEnv, catchRateArmsRunbookSection)
+}
+
+// preflightCatchRateCarry is the carry-forward preflight of a PARTIAL arm
+// selection (#5566), run before any model call. It refuses, wrapping
+// ErrCatchRateArmSelection and naming the arm(s): (C6) an absent, legacy or
+// baseline-less record; (C5) a record-level instrument other than the
+// current one; (C-i) an arm-table addition or removal; (C3) a STALE
+// unselected arm; (C4) an instrument-drifted unselected arm; (C7) an
+// existing sidecar that does not bind to the record; (C8) a baseline that
+// cannot keep judging the carried arms; and, without a pin, (R3) a selected
+// arm whose baseline entry is not comparable to the current arm table. On
+// success it returns the carried arm names and the existing sidecar.
+func preflightCatchRateCarry(evidencePath string, existing *CatchRateEvidence, legacy bool, rows []catchRateArmRow, selected map[string]bool, generatorModel string, pinning bool) ([]string, *CatchRateTrials, error) {
+	if existing == nil || existing.Baseline == nil {
+		what := "absent"
+		switch {
+		case legacy:
+			what = "a legacy " + catchRateEvidenceSchemaV1 + " record"
+		case existing != nil:
+			what = "a record with no pinned baseline"
+		}
+		return nil, nil, fmt.Errorf("%w: the existing evidence %q is %s, so there is no arm to carry forward: an arm-subset recording needs a %s record with a baseline — unset %s for a full recording; see %s", ErrCatchRateArmSelection, evidencePath, what, CatchRateEvidenceSchema, CatchRateArmsEnv, catchRateArmsRunbookSection) // (C6)
+	}
+	if existing.GeneratorModel != generatorModel || existing.CatchRuleVersion != catchRuleVersion || existing.Tolerance != DefaultCatchRateRegressionTolerance || existing.MinTrialsPerArm != MinCatchRateTrialsPerArm {
+		return nil, nil, fmt.Errorf("%w: the existing record's instrument (generator model %q, catch rule %s, tolerance %v, floor %d) is not this recording's (%q, %s, %v, %d), so its arms cannot be carried beside newly measured ones — unset %s for a full recording; see %s", ErrCatchRateArmSelection,
+			existing.GeneratorModel, catchRuleLabel(existing.CatchRuleVersion), existing.Tolerance, existing.MinTrialsPerArm,
+			generatorModel, catchRuleLabel(catchRuleVersion), DefaultCatchRateRegressionTolerance, MinCatchRateTrialsPerArm, CatchRateArmsEnv, catchRateArmsRunbookSection) // (C5)
+	}
+	if err := checkArmSet(existing.Arms, rows); err != nil {
+		return nil, nil, fmt.Errorf("%w: the existing record's arm set is not the arm table's (%v): an arm-table change needs a full recording — unset %s; see %s", ErrCatchRateArmSelection, err, CatchRateArmsEnv, catchRateArmsRunbookSection) // (C-i)
+	}
+	var carriedNames, stale, drifted []string
+	for _, row := range rows {
+		if selected[row.name] {
+			continue
+		}
+		carriedNames = append(carriedNames, row.name)
+		carried := existing.Arms[row.name]
+		if carried.PromptFingerprint != row.fingerprint {
+			stale = append(stale, row.name)
+		}
+		if carried.InputDigest != row.inputDigest || carried.SamplesPerCase != row.samples || carried.Kind != row.kind {
+			drifted = append(drifted, row.name)
+		}
+	}
+	if len(stale) > 0 {
+		return nil, nil, fmt.Errorf("%w: unselected arm(s) %s are STALE (the recorded arm fingerprint differs from the current one), so carrying them forward would commit a stale measurement — %s", ErrCatchRateArmSelection, strings.Join(stale, ", "), catchRateArmRemedy(append(selectedNames(rows, selected), stale...))) // (C3)
+	}
+	if len(drifted) > 0 {
+		return nil, nil, fmt.Errorf("%w: unselected arm(s) %s were measured on another instrument (input_digest, samples_per_case or kind differ from the arm table's), so they cannot be carried forward — %s", ErrCatchRateArmSelection, strings.Join(drifted, ", "), catchRateArmRemedy(append(selectedNames(rows, selected), drifted...))) // (C4)
+	}
+	if err := checkCatchRateTrials(CatchRateTrialsPath(evidencePath), existing); err != nil {
+		return nil, nil, fmt.Errorf("%w: the existing trial sidecar does not bind to the record (%v), so the carried arms' trials cannot be carried with them — unset %s for a full recording; see %s", ErrCatchRateArmSelection, err, CatchRateArmsEnv, catchRateArmsRunbookSection) // (C7)
+	}
+	if ok, why := carriedBaselineComparable(existing.Baseline, existing, carriedNames, generatorModel); !ok {
+		return nil, nil, fmt.Errorf("%w: the pinned baseline cannot keep judging the carried arm(s) %s: %s — unset %s for a full re-pin; see %s", ErrCatchRateArmSelection, strings.Join(carriedNames, ", "), why, CatchRateArmsEnv, catchRateArmsRunbookSection) // (C8)
+	}
+	if !pinning {
+		for _, row := range rows {
+			if !selected[row.name] {
+				continue
+			}
+			if ok, why := baselineArmComparable(row.name, rowShapeArm(row), existing.Baseline.Arms[row.name]); !ok {
+				return nil, nil, fmt.Errorf("%w: selected arm %q cannot be judged against its pinned baseline entry (%s), so this recording would be refused after its model calls — set FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON to re-pin it; see %s", ErrCatchRateArmSelection, row.name, why, catchRateArmsRunbookSection) // (R3)
+			}
+		}
+	}
+	trials, err := readCatchRateTrialsStrict(CatchRateTrialsPath(evidencePath))
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: the existing trial sidecar: %v; see %s", ErrCatchRateArmSelection, err, catchRateArmsRunbookSection)
+	}
+	return carriedNames, trials, nil
+}
+
+// selectedNames is the selected arms in arm-table order.
+func selectedNames(rows []catchRateArmRow, selected map[string]bool) []string {
+	var out []string
+	for _, row := range rows {
+		if selected[row.name] {
+			out = append(out, row.name)
+		}
+	}
+	return out
+}
+
+// rowShapeArm is the instrument shape of an arm-table row (case set,
+// expectation classes, samples_per_case, input_digest) as an evidence arm,
+// for baselineArmComparable before the arm is measured.
+func rowShapeArm(row catchRateArmRow) CatchRateEvidenceArm {
+	pc := make(map[string]CaseCatchCounts, len(row.cases))
+	for _, c := range row.cases {
+		pc[c.name] = CaseCatchCounts{Expect: c.expect}
+	}
+	return CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: row.samples, InputDigest: row.inputDigest, PerCase: pc}
+}
+
+// carriedBaselineComparable reports why ref cannot keep judging the carried
+// arms: a generator model or catch rule other than this recording's, or a
+// carried arm whose baseline entry is not comparable to its record entry
+// (baselineArmComparable).
+func carriedBaselineComparable(ref *CatchRateBaseline, existing *CatchRateEvidence, carried []string, generatorModel string) (bool, string) {
+	if ref.GeneratorModel != generatorModel {
+		return false, fmt.Sprintf("the baseline's generator model %q is not this recording's %q", ref.GeneratorModel, generatorModel)
+	}
+	if ref.CatchRuleVersion != catchRuleVersion {
+		return false, fmt.Sprintf("the baseline's catch rule %s is not the current %s", catchRuleLabel(ref.CatchRuleVersion), catchRuleLabel(catchRuleVersion))
+	}
+	for _, name := range carried {
+		if ok, why := baselineArmComparable(name, existing.Arms[name], ref.Arms[name]); !ok {
+			return false, why
+		}
+	}
+	return true, ""
+}
+
+// readCatchRateTrialsStrict decodes a trial sidecar strictly.
+func readCatchRateTrialsStrict(path string) (*CatchRateTrials, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var trials CatchRateTrials
+	if err := decodeStrictJSON(raw, &trials); err != nil {
+		return nil, fmt.Errorf("malformed JSON, unknown field or trailing content: %w", err)
+	}
+	return &trials, nil
+}
+
+// mergeBaselineArms is a SUBSET pin's baseline arms: ref's entries, with only
+// the measured arms overwritten (each cloned).
+func mergeBaselineArms(ref CatchRateEvidenceArms, measured CatchRateEvidenceArms) CatchRateEvidenceArms {
+	out := cloneEvidenceArms(ref)
+	for name, a := range cloneEvidenceArms(measured) {
+		out[name] = a
+	}
+	return out
+}
+
+// renderArmSelection is the report's arm-selection line of a partial
+// recording: the measured arms, then each carried arm with its recorded_at.
+func renderArmSelection(rows []catchRateArmRow, selected map[string]bool, existing *CatchRateEvidence) string {
+	var carried []string
+	for _, row := range rows {
+		if !selected[row.name] {
+			carried = append(carried, fmt.Sprintf("%s (%s)", row.name, carriedRecordedAt(existing.Arms[row.name])))
+		}
+	}
+	return fmt.Sprintf("Arm selection: measured %s; carried forward %s.\n\n", strings.Join(selectedNames(rows, selected), ", "), strings.Join(carried, ", "))
+}
+
+// carriedRecordedAt renders a carried arm's provenance.
+func carriedRecordedAt(a CatchRateEvidenceArm) string {
+	if a.RecordedAt == "" {
+		return "pre-#5566"
+	}
+	return "recorded_at " + a.RecordedAt
+}
+
+// RecordCatchRateEvidence runs EVERY selected arm (opts.Arms; every arm of
+// the arm table by default) against sender
 // (each at its own floor-clearing samples per case), judges the measurement,
 // and — only when it passes and DryRun is off — writes the evidence record
 // AND its trial sidecar (CatchRateTrialsPath) as a pair
@@ -684,10 +981,15 @@ type RecordCatchRateOptions struct {
 // a within-run regression; a regression of any arm against the pinned
 // baseline; and, without PinBaseline, a baseline that is not comparable to
 // this measurement (arm set, case set, expectation class, model, samples,
-// catch rule or case inputs changed — re-pin).
+// catch rule or case inputs changed — re-pin). With a partial Arms selection
+// (and no Subset) it measures only the selected arms and carries every other
+// arm, its sidecar trials and — on a pin — its baseline entry forward
+// verbatim; it refuses, before any model call and wrapping
+// ErrCatchRateArmSelection, an unknown arm, a split comparison pair, and
+// every carry-forward precondition of preflightCatchRateCarry.
 func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generatorModel string, in CatchRateInputs, evidencePath string, now time.Time, opts RecordCatchRateOptions) (string, error) {
 	if opts.Subset.active() && (!opts.DryRun || opts.PinBaseline) {
-		return "", fmt.Errorf("agenteval: %w: %s / %s measure part of the arm table, so the run must be a dry run — unset FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 and FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON, or unset the subset knobs for a full recording; see %s", ErrCatchRateSubsetNotRecordable, CatchRateSubsetCasesEnv, CatchRateSubsetTrialsEnv, catchRateRunbook)
+		return "", fmt.Errorf("agenteval: %w: %s / %s measure part of the arm table, so the run must be a dry run — unset FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 and FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON, or unset the subset knobs for a full recording; to RECORD part of the arm table, re-measure whole arms with %s (every other arm is carried forward); see %s", ErrCatchRateSubsetNotRecordable, CatchRateSubsetCasesEnv, CatchRateSubsetTrialsEnv, CatchRateArmsEnv, catchRateRunbook)
 	}
 	if opts.PinBaseline && strings.TrimSpace(opts.Reason) == "" {
 		return "", fmt.Errorf("agenteval: pinning a catch-rate baseline requires a reason (it is recorded in the evidence); see %s", catchRateRunbook)
@@ -702,6 +1004,10 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	if err := opts.Subset.validate(rows); err != nil {
 		return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
 	}
+	selected, partial, err := resolveCatchRateArmSelection(opts.Arms, rows)
+	if err != nil {
+		return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
+	}
 	existing, legacy, err := readExistingCatchRateEvidence(evidencePath)
 	if err != nil {
 		return "", err
@@ -709,6 +1015,15 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	var ref *CatchRateBaseline
 	if existing != nil {
 		ref = existing.Baseline
+	}
+	// A partial arm selection carries every unselected arm forward; with an
+	// active Subset it only narrows which arms run (an unrecordable dry run).
+	carry := partial && !opts.Subset.active()
+	var existingTrials *CatchRateTrials
+	if carry {
+		if _, existingTrials, err = preflightCatchRateCarry(evidencePath, existing, legacy, rows, selected, generatorModel, opts.PinBaseline); err != nil {
+			return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
+		}
 	}
 	if legacy && !opts.PinBaseline && !opts.DryRun {
 		return "", fmt.Errorf("agenteval: the existing catch-rate evidence %q is a legacy %s record: its baseline is not comparable to an arm-keyed measurement, so this recording must pin a new one (PinBaseline with a reason) — %s; see %s", evidencePath, catchRateEvidenceSchemaV1, catchRateLegacyRepin, catchRateRunbook)
@@ -729,6 +1044,9 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 		Baseline:          ref,
 	}
 	for _, row := range rows {
+		if !selected[row.name] {
+			continue
+		}
 		samples, keep, ok := opts.Subset.forRow(row)
 		if !ok {
 			continue
@@ -738,7 +1056,7 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 			return "", err
 		}
 		reports[row.name] = r
-		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: samples, PromptFingerprint: row.fingerprint, InputDigest: row.inputDigest, PerCase: r.PerCase}
+		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: samples, PromptFingerprint: row.fingerprint, InputDigest: row.inputDigest, PerCase: r.PerCase, RecordedAt: rec.RecordedAt}
 		if row.partition {
 			arm.FalseAlarmPartition = falseAlarmPartitionOf(row, r)
 		}
@@ -747,37 +1065,70 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	if opts.Subset.active() && opts.DryRun {
 		return renderCatchRateSubsetDryRun(opts.Subset, rows, reports), nil
 	}
+	measured := make(CatchRateEvidenceArms, len(rec.Arms))
+	for name, a := range rec.Arms {
+		measured[name] = a
+	}
 	report := ""
+	if carry {
+		// Every unselected arm is carried forward verbatim: the preflight
+		// proved it fresh, on the current instrument and bound to its sidecar.
+		for _, row := range rows {
+			if !selected[row.name] {
+				rec.Arms[row.name] = existing.Arms[row.name]
+			}
+		}
+		report = renderArmSelection(rows, selected, existing)
+	}
 	if legacy {
 		report = fmt.Sprintf("The existing record is a legacy %s record: not comparable; the pin replaces it.\n\n", catchRateEvidenceSchemaV1)
 	}
 	// The pin is judged against the CURRENT baseline too: a measurement that
 	// regresses against the reference cannot become the reference.
 	judged, err := judgeCatchRate(rec, ref, opts.PinBaseline)
-	report += judged + personaDiagnostics(rows, reports)
+	report += judged + personaDiagnostics(rows, reports, rec.Arms)
 	if err != nil {
 		return report, fmt.Errorf("agenteval: catch-rate measurement REFUSED, evidence not written: %w", err)
 	}
 	// The Captain's ZERO-findings assertion: a portability concern naming a
 	// repository-specific control refuses the recording (dry run included).
-	if findings := portabilityFindings(reports[ArmSecurityPortability]); len(findings) > 0 {
-		return report, fmt.Errorf("agenteval: catch-rate measurement REFUSED, evidence not written: %w: %s — the remit-only reviewer was never shown that control; read the concern in the report and rework the remit or the case", ErrPortabilityRepoSpecificFinding, renderPortabilityFindings(findings))
+	// It reads the portability arm only when this recording measured it.
+	if pr, ok := reports[ArmSecurityPortability]; ok {
+		if findings := portabilityFindings(pr); len(findings) > 0 {
+			return report, fmt.Errorf("agenteval: catch-rate measurement REFUSED, evidence not written: %w: %s — the remit-only reviewer was never shown that control; read the concern in the report and rework the remit or the case", ErrPortabilityRepoSpecificFinding, renderPortabilityFindings(findings))
+		}
 	}
 	if opts.PinBaseline {
+		baselineArms := cloneEvidenceArms(rec.Arms)
+		pinned := "this measurement"
+		if carry {
+			// A SUBSET pin re-pins only the measured arms' entries.
+			baselineArms = mergeBaselineArms(ref.Arms, measured)
+			pinned = "the measured arm(s) " + strings.Join(sortedArmNames(measured), ", ")
+		}
 		rec.Baseline = &CatchRateBaseline{
 			PinnedAt:          rec.RecordedAt,
 			Reason:            strings.TrimSpace(opts.Reason),
 			GeneratorModel:    rec.GeneratorModel,
 			PromptFingerprint: rec.PromptFingerprint,
 			CatchRuleVersion:  rec.CatchRuleVersion,
-			Arms:              cloneEvidenceArms(rec.Arms),
+			Arms:              baselineArms,
 		}
-		report += fmt.Sprintf("\nPinned this measurement as the new baseline (reason: %s).\n", rec.Baseline.Reason)
+		report += fmt.Sprintf("\nPinned %s as the new baseline (reason: %s).\n", pinned, rec.Baseline.Reason)
 	}
 	if opts.DryRun {
 		return report + "\nDry run: evidence not written.\n", nil
 	}
 	trials := buildCatchRateTrials(rec, reports)
+	if carry {
+		// The carried arms' trials, verbatim from the existing sidecar; the
+		// sidecar's recorded_at and fingerprint are the new record's.
+		for _, row := range rows {
+			if !selected[row.name] {
+				trials.Arms[row.name] = existingTrials.Arms[row.name]
+			}
+		}
+	}
 	if err := writeCatchRateEvidencePair(evidencePath, rec, trials); err != nil {
 		return report, err
 	}
@@ -1008,7 +1359,9 @@ func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
 //	(3) a wrong schema; (3b) a legacy v1 record, refused naming the #4313
 //	    re-pin recording (#4314 re-pinned separately after it)
 //	(4) a stale prompt fingerprint, or a generator model other than
-//	    generatorModel; (4b) a stale ARM fingerprint, naming every stale arm;
+//	    generatorModel; (4b) a stale ARM fingerprint, naming every stale arm
+//	    and the arm selector that re-records only them, closed over the
+//	    comparison pairs (catchRateArmSelector, #5566);
 //	    (4c) a recorded catch_rule_version other than the current catch rule,
 //	    or an arm input_digest other than the current arm table's (#4326) —
 //	    including a record made before #4326, which carries neither
@@ -1086,7 +1439,7 @@ func CheckCatchRateEvidence(evidencePath string, in CatchRateInputs, generatorMo
 		}
 	}
 	if len(stale) > 0 {
-		return fail("STALE arm(s) %s: the recorded arm fingerprint differs from the current one — that arm's corpus, documents, rendered prompt or the catch rule changed since the measurement: re-measure", strings.Join(stale, ", ")) // (4b)
+		return fail("STALE arm(s) %s: the recorded arm fingerprint differs from the current one — that arm's corpus, documents, rendered prompt or the catch rule changed since the measurement: re-measure — re-record only those arms: %s (every other arm is carried forward; see %s)", strings.Join(stale, ", "), catchRateArmSelector(stale), catchRateArmsRunbookSection) // (4b)
 	}
 	if want := catchRateRecordFingerprint(rowFingerprints(rows), generatorModel); rec.PromptFingerprint != want {
 		return fail("STALE: recorded prompt fingerprint %s != current %s — the schema, model, tolerance, floor or an arm fingerprint changed since the measurement: re-measure", rec.PromptFingerprint, want) // (4)
@@ -1335,15 +1688,22 @@ func absentControlCount(trials []CatchTrial) int {
 // counts; for the security arm, its catch rate per remit lens; and the
 // portability arm's repository-specific findings. "" when the table has no
 // persona arm.
-func personaDiagnostics(rows []catchRateArmRow, reports map[string]CatchRateArmReport) string {
+//
+// An arm absent from reports was carried forward by an arm-subset recording
+// (#5566): it is labelled with its provenance, never shown as measured.
+func personaDiagnostics(rows []catchRateArmRow, reports map[string]CatchRateArmReport, arms CatchRateEvidenceArms) string {
 	var b strings.Builder
 	for _, row := range rows {
 		if row.kind != CatchRateArmKindPersona {
 			continue
 		}
-		r := reports[row.name]
 		if b.Len() == 0 {
 			b.WriteString("\nPersona diagnostics (a security arm's false-alarm rate counts EVERY concern on a clean diff, standard-criteria concerns included — read it beside this partition):\n")
+		}
+		r, measured := reports[row.name]
+		if !measured {
+			fmt.Fprintf(&b, "  %s: carried forward (%s), not measured by this recording\n", row.name, carriedRecordedAt(arms[row.name]))
+			continue
 		}
 		fmt.Fprintf(&b, "  %s false alarms by category, per clean case:\n", row.name)
 		for _, c := range row.cases {
@@ -1691,21 +2051,30 @@ func baselineComparable(rec CatchRateEvidence, b *CatchRateBaseline) (bool, stri
 		return false, fmt.Sprintf("arm set changed (%v pinned, %v measured)", want, got)
 	}
 	for _, name := range sortedArmNames(rec.Arms) {
-		m, p := rec.Arms[name], b.Arms[name]
-		if !sameCaseNames(m.PerCase, p.PerCase) {
-			return false, fmt.Sprintf("arm %q corpus changed (the case sets differ)", name)
+		if ok, why := baselineArmComparable(name, rec.Arms[name], b.Arms[name]); !ok {
+			return false, why
 		}
-		for c, counts := range m.PerCase {
-			if countsExpect(counts) != countsExpect(p.PerCase[c]) {
-				return false, fmt.Sprintf("arm %q case %q expectation class changed", name, c)
-			}
+	}
+	return true, ""
+}
+
+// baselineArmComparable is baselineComparable's per-arm half: the measured
+// arm m and the pinned arm p agree on the case set, each case's expectation
+// class, samples_per_case and input_digest.
+func baselineArmComparable(name string, m, p CatchRateEvidenceArm) (bool, string) {
+	if !sameCaseNames(m.PerCase, p.PerCase) {
+		return false, fmt.Sprintf("arm %q corpus changed (the case sets differ)", name)
+	}
+	for _, c := range sortedCaseNames(m.PerCase) {
+		if countsExpect(m.PerCase[c]) != countsExpect(p.PerCase[c]) {
+			return false, fmt.Sprintf("arm %q case %q expectation class changed", name, c)
 		}
-		if m.SamplesPerCase != p.SamplesPerCase {
-			return false, fmt.Sprintf("arm %q samples_per_case changed (%d pinned, %d measured)", name, p.SamplesPerCase, m.SamplesPerCase)
-		}
-		if m.InputDigest != p.InputDigest {
-			return false, fmt.Sprintf("arm %q case inputs changed (input_digest %s pinned, %s measured): a case's input bytes or catch rule differ from the baseline's", name, orPre4326(p.InputDigest), orPre4326(m.InputDigest))
-		}
+	}
+	if m.SamplesPerCase != p.SamplesPerCase {
+		return false, fmt.Sprintf("arm %q samples_per_case changed (%d pinned, %d measured)", name, p.SamplesPerCase, m.SamplesPerCase)
+	}
+	if m.InputDigest != p.InputDigest {
+		return false, fmt.Sprintf("arm %q case inputs changed (input_digest %s pinned, %s measured): a case's input bytes or catch rule differ from the baseline's", name, orPre4326(p.InputDigest), orPre4326(m.InputDigest))
 	}
 	return true, ""
 }

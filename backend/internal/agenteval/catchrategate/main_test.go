@@ -544,3 +544,46 @@ func TestRun_SecurityCorpusDefault(t *testing.T) {
 		t.Errorf("default fingerprint output %q does not carry the explicit-inputs fingerprint %s", stdout, want)
 	}
 }
+
+// TestRun_PassesAfterArmSubsetRePin is the #5566 done-means through the real
+// CLI: a stale conventions fixture fails the gate naming the stale arm and
+// the pair-closed selector; re-recording only those arms with a pin (every
+// other arm carried forward) makes the gate pass again.
+func TestRun_PassesAfterArmSubsetRePin(t *testing.T) {
+	conv := filepath.Join(t.TempDir(), "conventions.md")
+	b, err := os.ReadFile(testConventions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(conv, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := freshRecord(t, conv)
+	b[len(b)-2] ^= 0x01
+	if err := os.WriteFile(conv, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const selector = "FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=with_conventions,without_conventions"
+	code, _, stderr := runGate("--evidence", path, "--corpus", testCorpus, "--conventions", conv)
+	if code != 1 || !strings.Contains(stderr, "STALE arm(s) with_conventions:") || !strings.Contains(stderr, selector) {
+		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming STALE with_conventions and %s", code, stderr, selector)
+	}
+	arms, err := agenteval.ParseCatchRateArms(func(k string) string {
+		if k == agenteval.CatchRateArmsEnv {
+			return strings.TrimPrefix(selector, agenteval.CatchRateArmsEnv+"=")
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agenteval.RecordCatchRateEvidence(context.Background(), newAllCaughtSender(t), agenteval.DefaultCatchRateGeneratorModel,
+		testInputs(conv), path, time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC),
+		agenteval.RecordCatchRateOptions{PinBaseline: true, Reason: "re-pin the conventions arms", Arms: arms}); err != nil {
+		t.Fatalf("subset re-pin: %v", err)
+	}
+	code, stdout, stderr := runGate("--evidence", path, "--corpus", testCorpus, "--conventions", conv)
+	if code != 0 || !strings.Contains(stdout, "catchrategate: PASS") {
+		t.Fatalf("exit %d after the subset re-pin, stdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}

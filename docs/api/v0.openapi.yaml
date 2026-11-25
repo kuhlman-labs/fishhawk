@@ -19186,8 +19186,8 @@ paths:
         (`fixup_no_changes`). Nothing is re-routed, and the body adds
         `concern_ids` naming the routed ids. Only positive evidence counts (a
         trigger without `concern_ids` never trips it), and a guard audit read
-        failure is a 500. The guard covers only the first no-change window per
-        stage (#5496).
+        failure is a 500. Each no-change window records its own
+        `fixup_no_changes` row, so the guard covers every window (#5496).
 
         The `may_approve` arm parks the same way for the delegated-approval
         states (#2381): it DECLINES with `decision_state: human_quorum_required`
@@ -29151,7 +29151,11 @@ paths:
                     `decision: approve` — a delegated reject is 400
                     (rejection is a human judgment; `reviewer_reject`
                     pages the human). Omitted → behavior byte-identical
-                    to a human submission.
+                    to a human submission. On a plan gate whose newest
+                    `standard_v1` plan artifact declares a
+                    `new_architectural_decision`, a delegated approve is
+                    also refused 403 `architectural_decision_awaiting_captain`
+                    (#5507), after the delegation condition is met.
 
                     A `delegated: true` approval is stored under a DISTINCT
                     operator-agent delegated identity
@@ -29360,6 +29364,27 @@ paths:
               and an agent never requests or mints it; and that without
               delegation the action is taken without `delegated: true`
               under a human credential.
+            - `architectural_decision_awaiting_captain` — #5507:
+              `delegated: true` on a PLAN stage, the delegation condition
+              is met, and the stage's newest `standard_v1` plan artifact
+              declares a well-formed `new_architectural_decision`. Whether
+              the direction needs an ADR is the captain's ruling, so the
+              delegated approve is refused with `details.reason`
+              `declared`. Fail-closed: when the plan artifacts cannot be
+              listed or the newest one does not decode, the same code is
+              returned with `details.reason` `plan_artifact_unreadable`
+              (the raw error is logged, never returned). `details` also
+              carries `run_id`, `stage_id` and a static `next_step` (read
+              the declaration on the plan gate's `plan_warnings`
+              advisory; approve without `delegated: true` under a human
+              credential if no ADR is needed, otherwise reject). Checked
+              PRE-Submit, so no approval row is recorded. Neither the
+              message nor `details` echoes the planner-authored
+              `decision_summary`, `rationale` or `related_adrs`. A
+              non-delegated approve of the same gate is unaffected. The
+              code is the same string as the auto-drive
+              `decision_state` the `may_approve` arm declines with on the
+              same predicate (#5265).
             - `approver_predicate_unmet` — E39.5 / #1710: the stage's
               gate declares an `approvals` block with `min_permission`
               and/or `member_of`, and the submitter's forge-resolved

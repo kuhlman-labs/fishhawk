@@ -591,6 +591,14 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// PRE-Submit like the plan gates so a refusal inserts no approval
 	// row. Delegation covers the approve verb only: a reject is the
 	// reviewer_reject judgment that always pages the human.
+	//
+	// Architectural-decision hold (#5507): AFTER checkDelegation (so
+	// delegation_not_configured / delegation_condition_unmet still win
+	// first) and still PRE-Submit, a delegated approve of a plan gate whose
+	// newest standard_v1 plan declares a new_architectural_decision is
+	// refused 403 architectural_decision_awaiting_captain — the same
+	// predicate the #5265 auto-drive arm declines on. A non-delegated
+	// approve never reaches this block.
 	var delegatedRule string
 	if req.Delegated {
 		if decision != approval.DecisionApprove {
@@ -604,6 +612,9 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		delegatedRule = rule
+		if !s.refuseDelegatedArchitecturalDecision(w, r, stage) {
+			return
+		}
 	}
 
 	// Binding-assertion declaration validation (#1171): when an approve
@@ -5423,6 +5434,65 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 		"the effective operator_agent block does not delegate this action (fail-closed)",
 		delegationRefusalDetails(action, map[string]any{"action": action}))
 	return "", false
+}
+
+// delegatedArchitecturalDecisionNextStep is the static next_step on every
+// architectural_decision_awaiting_captain refusal (#5507).
+const delegatedArchitecturalDecisionNextStep = "read the declaration on the plan gate's plan_warnings advisory " +
+	"(fishhawk_get_gate_view stage_kind plan); if no ADR is needed, approve without delegated:true under a human " +
+	"credential, otherwise reject the plan"
+
+// refuseDelegatedArchitecturalDecision is the REST sibling of the #5265
+// auto-drive may_approve hold (#5507): a delegated:true approve of a PLAN gate
+// whose newest standard_v1 plan artifact declares a new_architectural_decision
+// is refused 403 architectural_decision_awaiting_captain, because whether the
+// direction needs an ADR is the captain's ruling, not something the delegated
+// condition settles. It calls architecturalDecisionHoldFor, the one predicate
+// shared with architecturalDecisionAutoDriveHold, so the two arms cannot
+// disagree; the error code is the auto-drive decision_state string
+// (operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain).
+//
+// Fail-closed: a list error or an undecodable newest plan artifact refuses
+// with the same code and details.reason plan_artifact_unreadable (logged with
+// the raw error, which never reaches the response). Not held (returns true):
+// a non-plan stage, a stage with no standard_v1 plan artifact, a plan without
+// a Declared() declaration, and an unwired ArtifactRepo — the #5265 arm's
+// nil-store convention, kept deliberately so both arms share one predicate
+// (production always wires ArtifactRepo).
+//
+// Called only for delegated submissions, after checkDelegation and before
+// Submit, so a refusal writes no approval row. The message and details never
+// echo the planner-authored decision_summary, rationale or related_adrs: the
+// response reaches the operator agent, where planner text is an injection
+// surface. Returns true to proceed.
+func (s *Server) refuseDelegatedArchitecturalDecision(w http.ResponseWriter, r *http.Request, stage *run.Stage) bool {
+	hold, err := s.architecturalDecisionHoldFor(r.Context(), stage)
+	if hold == architecturalHoldNone {
+		return true
+	}
+	reason := "declared"
+	msg := "the plan declares a new architectural decision; the captain decides whether the direction needs an ADR, " +
+		"so a delegated approval is refused and no approval was recorded"
+	if hold == architecturalHoldUnreadable {
+		reason = "plan_artifact_unreadable"
+		msg = "the gated plan artifact could not be read, so it cannot be shown to declare no new architectural " +
+			"decision (fail-closed); a delegated approval is refused and no approval was recorded"
+		errText := ""
+		if err != nil {
+			errText = err.Error()
+		}
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "approval: gated plan artifact unreadable; refusing delegated approve",
+			slog.String("run_id", stage.RunID.String()), slog.String("stage_id", stage.ID.String()),
+			slog.String("error", errText))
+	}
+	s.writeError(w, r, http.StatusForbidden, operatorrole.DecisionStateArchitecturalDecisionAwaitingCaptain, msg,
+		map[string]any{
+			"run_id":    stage.RunID.String(),
+			"stage_id":  stage.ID.String(),
+			"reason":    reason,
+			"next_step": delegatedArchitecturalDecisionNextStep,
+		})
+	return false
 }
 
 // checkDeployPreflight is the deploy stage's PRE-execution approval gate

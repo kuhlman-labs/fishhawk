@@ -2497,9 +2497,11 @@ func TestShipPullRequest_FixupNoChangesOutcome_DrivesTerminal(t *testing.T) {
 }
 
 // TestShipPullRequest_FixupNoChangesOutcome_IsIdempotent pins the #856 guard:
-// since no commit landed there is no head_sha to key on, so the guard is
-// STAGE-keyed — a runner retry or duplicate delivery of the no-changes report
-// must NOT append a second fixup_no_changes audit entry for the same stage.
+// since no commit landed there is no head_sha to key on. With no
+// stage_fixup_triggered for the stage, the window-keyed dedupe (#5496) falls
+// back to the stage-keyed rule — a runner retry or duplicate delivery of the
+// no-changes report must NOT append a second fixup_no_changes audit entry for
+// the same stage.
 func TestShipPullRequest_FixupNoChangesOutcome_IsIdempotent(t *testing.T) {
 	s, sf, _, au, rr := newPRServerWithOrch(t)
 	runRow := rr.seedRun()
@@ -2535,6 +2537,343 @@ func TestShipPullRequest_FixupNoChangesOutcome_IsIdempotent(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("fixup_no_changes audit entries after duplicate = %d, want 1 (stage-keyed guard must suppress the retry)", n)
+	}
+}
+
+// fixupNoChangesReportBody is the runner's fixup_no_changes report body.
+func fixupNoChangesReportBody(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_no_changes",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"base_sha":            "base-def",
+		"files_changed_count": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// appendFixupWindowTrigger APPENDS (never seeds) a stage_fixup_triggered entry
+// through AppendChained, so with stampSequence set its sequence follows append
+// order. The payload carries a non-empty concerns array so variantModeProved
+// proves the fix-up mode, and a prior_state so fixupTriggerActive decodes it.
+func appendFixupWindowTrigger(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"prior_state": string(run.StageStateAwaitingApproval),
+		"concerns":    []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "tighten the seam"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := stageID
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &sid, Timestamp: time.Now().UTC(),
+		Category: CategoryStageFixupTriggered, Payload: payload,
+	}); err != nil {
+		t.Fatalf("append trigger: %v", err)
+	}
+}
+
+// listStageCategory lists the stage's entries of one category through the
+// fake's ListForRunByCategory, so the stamped sequences are visible.
+func listStageCategory(t *testing.T, au *auditFake, runID, stageID uuid.UUID, category string) []*audit.Entry {
+	t.Helper()
+	all, err := au.ListForRunByCategory(context.Background(), runID, category)
+	if err != nil {
+		t.Fatalf("list %s: %v", category, err)
+	}
+	var out []*audit.Entry
+	for _, e := range all {
+		if e.StageID != nil && *e.StageID == stageID {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestFixupNoChangesReplay pins the window rule (#856, #5496) over the pure
+// helper. Each case isolates one arm: the RUNNING cases cannot be answered by
+// the stale arm, and the not-running cases hold only earlier-window rows so the
+// window arm cannot answer them.
+func TestFixupNoChangesReplay(t *testing.T) {
+	stageID, otherStage := uuid.New(), uuid.New()
+	entry := func(stage *uuid.UUID, seq int64) *audit.Entry {
+		return &audit.Entry{StageID: stage, Sequence: seq}
+	}
+	this := &stageID
+	other := &otherStage
+	for _, tc := range []struct {
+		name      string
+		state     run.StageState
+		noChanges []*audit.Entry
+		triggers  []*audit.Entry
+		want      bool
+	}{
+		{"no trigger, no row", run.StageStateRunning, nil, nil, false},
+		{"no trigger, a row: legacy stage-keyed replay", run.StageStateRunning, []*audit.Entry{entry(this, 5)}, nil, true},
+		{"row after the newest trigger, stage RUNNING: window replay", run.StageStateRunning,
+			[]*audit.Entry{entry(this, 15)}, []*audit.Entry{entry(this, 1), entry(this, 10)}, true},
+		{"rows only before the newest trigger, stage RUNNING: new window", run.StageStateRunning,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(this, 1), entry(this, 10)}, false},
+		{"rows only before the newest trigger, stage PENDING: stale replay", run.StageStatePending,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(this, 1), entry(this, 10)}, true},
+		{"rows only before the newest trigger, stage SUCCEEDED: stale replay", run.StageStateSucceeded,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(this, 1), entry(this, 10)}, true},
+		{"rows only before the newest trigger, stage FAILED: stale replay", run.StageStateFailed,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(this, 1), entry(this, 10)}, true},
+		{"newest trigger found out of order", run.StageStateRunning,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(this, 10), entry(this, 1)}, false},
+		{"other-stage trigger ignored: legacy rule applies", run.StageStateRunning,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(other, 10)}, true},
+		{"other-stage row ignored", run.StageStatePending,
+			[]*audit.Entry{entry(other, 15)}, []*audit.Entry{entry(this, 10)}, false},
+		{"nil StageID trigger ignored: legacy rule applies", run.StageStateRunning,
+			[]*audit.Entry{entry(this, 5)}, []*audit.Entry{entry(nil, 10)}, true},
+		{"nil StageID row ignored", run.StageStatePending,
+			[]*audit.Entry{entry(nil, 15)}, []*audit.Entry{entry(this, 10)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stage := &run.Stage{ID: stageID, State: tc.state}
+			if got := fixupNoChangesReplay(tc.noChanges, tc.triggers, stage); got != tc.want {
+				t.Fatalf("fixupNoChangesReplay = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShipPullRequest_FixupNoChangesOutcome_SecondWindowRecords is the #5496
+// done-means through the real handler: two no-change windows on ONE implement
+// stage each record their own fixup_no_changes row and take the stage out of
+// running, while an in-window duplicate is still a no-op. Both windows then
+// refund against the normal budget.
+func TestShipPullRequest_FixupNoChangesOutcome_SecondWindowRecords(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	au.stampSequence = true
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	body := fixupNoChangesReportBody(t)
+
+	report := func(window string, wantRows int) {
+		t.Helper()
+		w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200:\n%s", window, w.Code, w.Body.String())
+		}
+		if n := countAudit(au, CategoryFixupNoChanges); n != wantRows {
+			t.Fatalf("%s: %d %s rows, want %d", window, n, CategoryFixupNoChanges, wantRows)
+		}
+	}
+	assertParked := func(window string) {
+		t.Helper()
+		got, err := rr.GetStage(t.Context(), implStage.ID)
+		if err != nil {
+			t.Fatalf("GetStage: %v", err)
+		}
+		if got.State != run.StageStateAwaitingApproval {
+			t.Fatalf("%s: stage.State = %q, want awaiting_approval (the report must leave running)", window, got.State)
+		}
+	}
+
+	appendFixupWindowTrigger(t, au, runRow.ID, implStage.ID)
+	report("window 1", 1)
+	assertParked("window 1")
+	report("window 1 duplicate", 1)
+
+	rr.mu.Lock()
+	implStage.State = run.StageStateRunning
+	rr.mu.Unlock()
+	appendFixupWindowTrigger(t, au, runRow.ID, implStage.ID)
+	report("window 2", 2)
+	assertParked("window 2")
+	report("window 2 duplicate", 2)
+
+	triggers := listStageCategory(t, au, runRow.ID, implStage.ID, CategoryStageFixupTriggered)
+	rows := listStageCategory(t, au, runRow.ID, implStage.ID, CategoryFixupNoChanges)
+	if len(triggers) != 2 || len(rows) != 2 {
+		t.Fatalf("triggers = %d, rows = %d, want 2 and 2", len(triggers), len(rows))
+	}
+	if rows[1].Sequence <= triggers[1].Sequence || rows[0].Sequence >= triggers[1].Sequence {
+		t.Fatalf("row sequences %d,%d vs trigger-2 sequence %d: want one row per window", rows[0].Sequence, rows[1].Sequence, triggers[1].Sequence)
+	}
+	refunds, _, err := s.fixupRefundedPasses(t.Context(), runRow.ID, implStage.ID)
+	if err != nil {
+		t.Fatalf("fixupRefundedPasses: %v", err)
+	}
+	if refunds != 2 {
+		t.Fatalf("fixupRefundedPasses = %d, want 2 (both no-change windows refund)", refunds)
+	}
+}
+
+// TestShipPullRequest_FixupNoChangesOutcome_StaleReplayIntoReopenedStage pins
+// the not-running replay arm (#5496) through HTTP: window 1 recorded its row,
+// trigger 2 re-opened the stage to pending, and a delayed retry of window 1's
+// report lands before window 2's pass is dispatched. It must answer the replay
+// 200 and write NOTHING, so trigger 2 stays live for the pass it opened. The
+// fixture without the arm proceeds: the settled-stage variant guard proves the
+// mode from live trigger 2, so a second row would land and spend it.
+func TestShipPullRequest_FixupNoChangesOutcome_StaleReplayIntoReopenedStage(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	au.stampSequence = true
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	body := fixupNoChangesReportBody(t)
+
+	appendFixupWindowTrigger(t, au, runRow.ID, implStage.ID)
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("window 1: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := countAudit(au, CategoryFixupNoChanges); n != 1 {
+		t.Fatalf("window 1: %d rows, want 1", n)
+	}
+
+	// Window 2's trigger re-opens the stage to pending; it is never dispatched.
+	appendFixupWindowTrigger(t, au, runRow.ID, implStage.ID)
+	rr.mu.Lock()
+	implStage.State = run.StageStatePending
+	rr.mu.Unlock()
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("stale retry: status = %d, want the replay 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := countAudit(au, CategoryFixupNoChanges); n != 1 {
+		t.Fatalf("stale retry: %d rows, want 1 (a delayed window-1 report must not record into window 2)", n)
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStatePending {
+		t.Fatalf("stage.State = %q, want pending (the re-opened stage is untouched)", got.State)
+	}
+	active, err := s.fixupTriggerActive(t.Context(), runRow.ID, implStage.ID)
+	if err != nil {
+		t.Fatalf("fixupTriggerActive: %v", err)
+	}
+	if !active {
+		t.Fatal("fixupTriggerActive = false after the stale retry, want true (trigger 2 must stay live)")
+	}
+}
+
+// TestShipPullRequest_FixupNoChangesOutcome_DedupeReadErrorFailsOpen pins the
+// dedupe's fail-open policy for each of its two reads (#5496): the FIRST read of
+// one category fails (firstReadFailAudit), so the variant edge guard's later
+// reads of the same categories succeed and cannot mask the outcome. The report
+// must still advance the stage and record its row, and the WARN must name the
+// failed category, which proves the injection landed on the dedupe's read.
+func TestShipPullRequest_FixupNoChangesOutcome_DedupeReadErrorFailsOpen(t *testing.T) {
+	for _, category := range []string{CategoryFixupNoChanges, CategoryStageFixupTriggered} {
+		t.Run(category, func(t *testing.T) {
+			sf := newSigningFake()
+			inner := newAuditFake()
+			inner.stampSequence = true
+			au := &firstReadFailAudit{auditFake: inner, category: category}
+			rr := newOrchestratorRepo()
+			logs := &syncBuffer{}
+			s := New(Config{
+				Addr:         "127.0.0.1:0",
+				SigningRepo:  sf,
+				ArtifactRepo: newFakeArtifactRepo(),
+				AuditRepo:    au,
+				RunRepo:      rr,
+				Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+				Logger:       slog.New(slog.NewTextHandler(logs, nil)),
+			})
+			runRow := rr.seedRun()
+			implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+			implStage.Type = run.StageTypeImplement
+			implStage.RequiresApproval = true
+			appendFixupWindowTrigger(t, inner, runRow.ID, implStage.ID)
+			priv, _ := sf.issue(t, runRow.ID)
+
+			w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, fixupNoChangesReportBody(t), "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+			}
+			got, err := rr.GetStage(t.Context(), implStage.ID)
+			if err != nil {
+				t.Fatalf("GetStage: %v", err)
+			}
+			if got.State != run.StageStateAwaitingApproval {
+				t.Fatalf("stage.State = %q, want awaiting_approval (fail-open must still advance)", got.State)
+			}
+			if n := countAudit(inner, CategoryFixupNoChanges); n != 1 {
+				t.Fatalf("%d %s rows, want 1 (fail-open must still record)", n, CategoryFixupNoChanges)
+			}
+			if want := "list " + category + " audit entries failed; proceeding without idempotency guard"; !strings.Contains(logs.String(), want) {
+				t.Fatalf("logs do not carry the dedupe WARN %q:\n%s", want, logs.String())
+			}
+		})
+	}
+}
+
+// TestShipPullRequest_FixupNoChangesOutcome_RepeatedWindowsStopAtCeiling bounds
+// the #5496 refund widening (C4): every no-change window now records a row and
+// refunds against the NORMAL budget, but the hard ceiling credits at most
+// maxCeilingRefundCredits (#3335), so a looping no-op agent is hard-stopped at
+// defaultFixupCeiling + maxCeilingRefundCredits = 6 triggered passes. Each
+// window is a REAL operator route through POST /v0/stages/{id}/fixup and a REAL
+// report through POST /v0/runs/{run_id}/pull-request.
+func TestShipPullRequest_FixupNoChangesOutcome_RepeatedWindowsStopAtCeiling(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	au.stampSequence = true
+	cr := newFakeConcernRepo()
+	sf := newSigningFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+		ApprovalRepo: newFakeApprovalRepo(),
+		SigningRepo:  sf,
+		ArtifactRepo: newFakeArtifactRepo(),
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+	})
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	priv, _ := sf.issue(t, runID)
+	body := fixupNoChangesReportBody(t)
+	absolute := defaultFixupCeiling + maxCeilingRefundCredits
+
+	for i := 1; i <= absolute; i++ {
+		w := postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: fmt.Sprintf("window %d: make the exact change", i)})
+		if w.Code != http.StatusOK {
+			t.Fatalf("window %d route: status = %d, want 200 (under the absolute ceiling %d):\n%s", i, w.Code, absolute, w.Body.String())
+		}
+		stage, err := repo.GetStage(t.Context(), impl.ID)
+		if err != nil {
+			t.Fatalf("GetStage: %v", err)
+		}
+		stage.State = run.StageStateRunning
+		if w := shipPRRequest(t, s, runID, impl.ID, priv, body, ""); w.Code != http.StatusOK {
+			t.Fatalf("window %d report: status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+		if got, _ := repo.GetStage(t.Context(), impl.ID); got.State != run.StageStateAwaitingApproval {
+			t.Fatalf("window %d: stage = %s after the report, want awaiting_approval", i, got.State)
+		}
+		if n := countAudit(au, CategoryFixupNoChanges); n != i {
+			t.Fatalf("window %d: %d %s rows, want %d (one per window)", i, n, CategoryFixupNoChanges, i)
+		}
+	}
+
+	w := postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: "one more pass"})
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
+		t.Fatalf("route %d: status = %d, want 422 fixup_ceiling_reached:\n%s", absolute+1, w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), fmt.Sprintf(`"ceiling_refunded_passes":%d`, maxCeilingRefundCredits)) {
+		t.Errorf("ceiling refusal body does not credit exactly %d passes:\n%s", maxCeilingRefundCredits, w.Body.String())
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != absolute {
+		t.Fatalf("%d %s entries, want %d (the absolute cap)", n, CategoryStageFixupTriggered, absolute)
 	}
 }
 

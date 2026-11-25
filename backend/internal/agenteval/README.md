@@ -563,7 +563,7 @@ false-alarm rate (conforming plans) before the architect is enabled.
 | `planreviewcalibrate.go` | the calibration dry run (`CalibrateCatchRateArm`): one arm's per-case 30–80% band table, never written as evidence (E78.11 / #4313) |
 | `planreviewdiag.go` | the live-run diagnostics file (`planreview-diag.jsonl`: per-trial lines, miss classes, arm summaries, credential redaction), the subset dry-run knobs and `RecordCatchRateEvidenceWithDiagnostics`; diagnostic only and NOT a trigger path (E55.21 / #4350) |
 | `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`), and its `--rescore` diagnostic |
-| `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`, which writes the diagnostics file on every run) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
+| `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm, or of the arms `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS` selects (`TestPlanReviewCatchRateLive`, which writes the diagnostics file on every run) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `planreviewpersonalive_test.go` | the double-gated live calibration dry run (`TestCatchRateCalibrationLive`) plus its offline knob and wiring tests |
 | `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
 | `testdata/planreview-persona-corpus/architect/` | the nine architect cases, six catch and three clean (`persona_case.json` + a SYNTHETIC-provenance `case.md` each); the E55.26 / #4453 calibration cut none (run-book Step 1d "Results") |
@@ -664,6 +664,57 @@ planted-defect shapes. When the record goes stale, `catchrategate` exits 1 and
 the standing check fails closed on the next review-prompt change until an
 operator re-measures. Run-book:
 [`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md).
+
+### Re-recording part of the arm table (`FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS`, E110.83 / #5566)
+
+`FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=<arm,...>` (`CatchRateArmsEnv`, read by
+`ParseCatchRateArms` into `RecordCatchRateOptions.Arms`) re-records only the
+named arms. Unset means every arm, as before. The list is split on commas,
+trimmed and de-duplicated; a list that names no arm is refused. A selection
+that names every arm is an ordinary full recording.
+
+- **Carry-forward.** Only the selected arms are measured. Every unselected
+  arm's record entry, its sidecar rows and, on a pin, its baseline entry are
+  carried forward VERBATIM from the committed pair. The record-level
+  `recorded_at` and `prompt_fingerprint` are recomputed as for any recording,
+  so the sidecar still binds (mode 15), and the WHOLE record is judged as
+  today: carried arms against their baseline entries, and without
+  `PIN_REASON` the selected arms against their existing entries. With
+  `PIN_REASON`, only the selected arms' baseline entries are re-pinned
+  (`mergeBaselineArms`); the baseline-level `pinned_at` and `reason` are the
+  new pin's. The report gains an `Arm selection:` line naming the measured
+  arms and each carried arm with its `recorded_at`, or `pre-#5566`.
+- **Per-arm `recorded_at`.** Each arm a recording MEASURES carries
+  `recorded_at` equal to the record's, so a full recording stamps every arm
+  and a subset recording stamps only the selected ones. The field is
+  `omitempty` and the gate never reads it. An absent per-arm `recorded_at`
+  means the arm was measured before #5566. Baseline entries carry it too.
+- **Refusals.** The selection is resolved, and the carry-forward checked,
+  BEFORE any model call. Each refusal wraps `ErrCatchRateArmSelection`, names
+  the arm(s) and the remedy, and leaves the evidence pair byte-identical:
+  (C1) an unknown arm; (C2) a split comparison pair (`with_conventions`
+  without `without_conventions`, or the reverse); (C6) an absent, legacy v1
+  or baseline-less record, so there is nothing to carry; (C5) a record-level
+  instrument (generator model, catch rule, tolerance, floor) other than this
+  recording's; (C-i) an arm-table change (an added or retired arm needs a full
+  recording); (C3) a STALE unselected arm; (C4) an unselected arm whose
+  `input_digest`, `samples_per_case` or kind drifted; (C7) a sidecar that is
+  absent, malformed, from another recording or count-inconsistent; (C8) a
+  baseline that can no longer judge the carried arms; and, without
+  `PIN_REASON`, a selected arm whose baseline entry is not comparable to the
+  arm table (set `PIN_REASON` to re-pin it). The diagnostics summary reads
+  `refused` for each.
+- **With the subset knobs.** When `FISHHAWK_AGENTEVAL_PLANREVIEW_CASES` or
+  `_TRIALS` is set, an arm selection only narrows which arms run: nothing is
+  carried, and the run stays an unjudged, unrecordable dry run. The arm
+  selector is the RECORDABLE way to re-measure part of the table.
+- **The (4b) hint.** The gate's STALE message keeps its `STALE arm(s) <list>:`
+  prefix and then prints the selector to use (`catchRateArmSelector`), closed
+  over the comparison pairs, so a stale `with_conventions` prints
+  `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=with_conventions,without_conventions`.
+  The gate's decision is unchanged.
+
+The run-book's "Re-record one arm" section is the operator procedure.
 
 ### Corpus authoring: `review_input.json` and the catch rule
 
@@ -1672,6 +1723,10 @@ each planted defect; the sidecar says what it wrote when it did not.
 - **Arm-keyed (E78.11 / #4313).** The sidecar's `arms` map mirrors the
   record's; a legacy `planreview-catchrate-trials-v1` sidecar is read by the
   re-score only (its two conventions arms).
+- **Arm subsets (#5566).** An arm-subset recording writes the measured arms'
+  rows and copies every carried arm's rows verbatim from the existing
+  sidecar; the new sidecar takes the new record's `recorded_at` and
+  `prompt_fingerprint`.
 
 ### `CheckCatchRateEvidence` fail-closed modes
 
@@ -1691,7 +1746,9 @@ model, catch rule, arm set, or per arm case set, expectation class,
 conventions fixture. The arm-keyed modes (E78.11 / #4313): (3b) a legacy v1
 record, refused naming the #4313 re-pin recording (#4314 re-pinned separately
 after it); (4b) a stale
-arm fingerprint, naming the arm; (4c, #4326) a recorded `catch_rule_version`
+arm fingerprint, naming the arm and printing the
+`FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=` selector that re-records only the stale
+arms, closed over the comparison pairs (#5566); (4c, #4326) a recorded `catch_rule_version`
 other than the current catch rule, or an arm `input_digest` other than the
 current arm table's — a record made before #4326 carries neither, so it is
 refused naming #4326 and the next recording must re-pin; (6b) false alarms on a catch case, a catch
@@ -1824,7 +1881,9 @@ whether it passes, is refused or aborts. Code: `planreviewdiag.go`.
   `CheckCatchRateEvidence`) never reads the file.
 - **Lines** (schema `planreview-catchrate-diag-v1`), one JSON object per line:
   - `header`: `schema`, `started_at`, `generator_model`, `dry_run`,
-    `pin_baseline`, `subset_cases`, `subset_trials_per_case`, `arms`.
+    `pin_baseline`, `subset_cases`, `subset_trials_per_case`,
+    `measured_arms` (the arm selector as given; absent when every arm is
+    measured), `arms` (the arm table's arms).
   - `trial`, appended as each trial completes: `arm`, `case`, `expect`,
     `trial` (1-based), `outcome`, `caught`, `miss_class`, `verdict` (the
     lenient decode's verdict, `undecodable` when the response has no JSON
@@ -1845,7 +1904,8 @@ whether it passes, is refused or aborts. Code: `planreviewdiag.go`.
       list.
   - `summary`, written on every outcome: `outcome` (`passed`, `not_judged` for
     a subset dry run, `refused` for `ErrCatchRateRegressed`,
-    `ErrPortabilityRepoSpecificFinding` or `ErrCatchRateSubsetNotRecordable`,
+    `ErrPortabilityRepoSpecificFinding`, `ErrCatchRateSubsetNotRecordable` or
+    `ErrCatchRateArmSelection`,
     `error` for anything else, including a transport error or an
     under-powered refusal), `error`, `finished_at`, `trials_written`, and per
     arm: `trials`, `decoded`, `catch_trials`, `caught`, `clean_trials`,
@@ -1889,7 +1949,9 @@ whether it passes, is refused or aborts. Code: `planreviewdiag.go`.
   SET, whatever its value, and is NEVER recordable:
   `RecordCatchRateEvidence` refuses it with
   `ErrCatchRateSubsetNotRecordable` as its first check when `RECORD=1` or
-  `PIN_REASON` is set. A subset dry run is reported per case and is not judged
+  `PIN_REASON` is set; its message names `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS`
+  as the recordable way to re-measure whole arms. A subset dry run is reported
+  per case and is not judged
   (`Subset dry run: NOT judged against the gate and never recordable`).
 - **Streaming and checkpointing.** Each line is ONE unbuffered `Write` on the
   `*os.File`, done before the next trial starts, so a killed or timed-out run
@@ -2025,6 +2087,12 @@ scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestCatchCorpus|
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='first measurement' \
   scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+
+# Live re-record of the stale arm(s) only (opt-in; real model calls; every other arm is carried forward;
+# use the selector catchrategate prints; add FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON to re-pin those arms):
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect \
+  scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 
 # Live subset dry run (opt-in; a few model calls; never recordable; diagnostics only):
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
