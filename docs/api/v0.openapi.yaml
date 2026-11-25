@@ -6873,7 +6873,7 @@ components:
         account field: the server takes both from the token.
       required: [interval_seconds, started_at, last_tick_at, paused, spawns_today, in_flight, run_refusals]
       properties:
-        interval_seconds: { type: number, description: The dispatcher's tick interval, positive. }
+        interval_seconds: { type: number, description: "The dispatcher's tick interval, positive." }
         started_at: { type: string, format: date-time }
         last_tick_at: { type: string, format: date-time }
         last_complete_tick_at: { type: string, format: date-time }
