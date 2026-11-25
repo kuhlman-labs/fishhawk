@@ -1,10 +1,13 @@
-import { Fragment } from 'react';
+import { Fragment, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import type {
   Campaign,
   CampaignItem,
+  CampaignItemAwaiting,
+  CampaignItemAwaitingHostDispatcher,
+  CampaignItemAwaitingKind,
   CampaignItemState,
   CampaignNextAction,
   CampaignRollup,
@@ -329,12 +332,98 @@ function DependencyGraph({ items }: { items: CampaignItem[] }) {
   );
 }
 
+const awaitingKindStyles: Record<CampaignItemAwaitingKind, string> = {
+  human: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  host_dispatcher: 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300',
+  system: 'bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300',
+};
+
+function IsoTime({ iso }: { iso: string }) {
+  return <time dateTime={iso}>{iso}</time>;
+}
+
 /**
- * Per-issue run grid: one row per item showing its state and a link through
- * to the run executing it. The campaign status payload carries run_id, not a
- * PR URL — the pull request lives on the run detail, so the run link is the
- * path to it (made explicit in the column caption). An unlinked item has no
- * run yet, stated rather than rendered as a bare dash.
+ * The deciding host dispatcher's state (#5489), shown only when it is not
+ * `live`: the state, the host, the refusal or failing-tick code, and the one
+ * field the state turns on — last_heartbeat_at for `stale` only (a fresh
+ * heartbeat's time is no evidence), cap_resets_at (set only for `capped`)
+ * and budget_source (set only for a budget block). Timestamps render as the
+ * server's UTC ISO strings, not local time.
+ */
+function HostDispatcherLine({ observation }: { observation: CampaignItemAwaitingHostDispatcher }) {
+  const segments: Array<{ label: string; value: ReactNode }> = [];
+  if (observation.host) segments.push({ label: 'host', value: observation.host });
+  if (observation.refusal_code) {
+    segments.push({ label: 'refusal', value: observation.refusal_code });
+  } else if (observation.tick_failure_code) {
+    segments.push({ label: 'tick failure', value: observation.tick_failure_code });
+  }
+  if (observation.state === 'stale' && observation.last_heartbeat_at) {
+    segments.push({
+      label: 'last heartbeat',
+      value: <IsoTime iso={observation.last_heartbeat_at} />,
+    });
+  }
+  if (observation.cap_resets_at) {
+    segments.push({ label: 'resets', value: <IsoTime iso={observation.cap_resets_at} /> });
+  }
+  if (observation.budget_source) {
+    segments.push({ label: 'budget source', value: observation.budget_source });
+  }
+  return (
+    <p
+      data-testid="host-dispatcher-state"
+      className="flex flex-wrap gap-x-2 font-mono text-xs text-amber-800 dark:text-amber-300"
+    >
+      <span>
+        <span className="text-neutral-500">dispatcher</span> <span>{observation.state}</span>
+      </span>
+      {segments.map(({ label, value }) => (
+        <span key={label}>
+          <span className="text-neutral-500">{label}</span> <span>{value}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+/**
+ * What a running item waits on (E88.4 / #4528): the kind badge, the reason
+ * and the server-constant next_step, plus the host dispatcher line for a
+ * heartbeat-classified block (#5489). Every server string renders as React
+ * text, never as HTML. An item with no awaiting block renders nothing.
+ */
+function AwaitingCell({ awaiting }: { awaiting?: CampaignItemAwaiting | null }) {
+  if (!awaiting) return null;
+  const observation = awaiting.host_dispatcher;
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={cn(
+            'inline-flex rounded-full px-2 py-0.5 font-mono text-xs',
+            awaitingKindStyles[awaiting.kind] ?? awaitingKindStyles.system,
+          )}
+        >
+          {awaiting.kind}
+        </span>
+        <span className="font-mono text-xs">{awaiting.reason}</span>
+      </div>
+      <p className="text-xs text-neutral-600 dark:text-neutral-400">{awaiting.next_step}</p>
+      {observation && observation.state !== 'live' && (
+        <HostDispatcherLine observation={observation} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-issue run grid: one row per item showing its state, a link through to
+ * the run executing it, and what a running item waits on. The campaign status
+ * payload carries run_id, not a PR URL — the pull request lives on the run
+ * detail, so the run link is the path to it (made explicit in the column
+ * caption). An unlinked item has no run yet, stated rather than rendered as a
+ * bare dash.
  */
 function RunGrid({ items }: { items: CampaignItem[] }) {
   return (
@@ -352,12 +441,13 @@ function RunGrid({ items }: { items: CampaignItem[] }) {
               <th className="px-4 py-2 font-medium">Issue</th>
               <th className="px-4 py-2 font-medium">State</th>
               <th className="px-4 py-2 font-medium">Run / PR</th>
+              <th className="px-4 py-2 font-medium">Awaiting</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-neutral-200 dark:divide-neutral-800">
             {items.length === 0 && (
               <tr>
-                <td colSpan={3} className="px-4 py-3 text-sm text-neutral-500">
+                <td colSpan={4} className="px-4 py-3 text-sm text-neutral-500">
                   No items.
                 </td>
               </tr>
@@ -381,6 +471,9 @@ function RunGrid({ items }: { items: CampaignItem[] }) {
                   ) : (
                     <span className="text-neutral-400">no run yet</span>
                   )}
+                </td>
+                <td className="px-4 py-2">
+                  <AwaitingCell awaiting={it.awaiting} />
                 </td>
               </tr>
             ))}

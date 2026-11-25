@@ -389,6 +389,14 @@ badge never survives one.
 `/v0/campaigns/{id}/status` rollup: header, pending-decision, rollup
 buckets, dependency graph, per-issue run grid.
 
+The run grid's **Awaiting** column renders each running item's `awaiting`
+block: a kind badge, the reason and the server's `next_step`, plus a
+host-dispatcher line (#5489) when `host_dispatcher.state` is not `live`. That
+line names the state, the host and `refusal_code` or `tick_failure_code`, plus
+`last_heartbeat_at` when stale, `cap_resets_at` when capped and
+`budget_source` on a budget block. Server text renders as React text, never
+HTML, and an item with no block gets an empty cell.
+
 When the campaign carries a campaign-level `operator_agent` override it
 surfaces a **Delegation override** block listing the set `may_*` knobs
 plus `must_page_human`, captioned that it governs EVERY issue-run
