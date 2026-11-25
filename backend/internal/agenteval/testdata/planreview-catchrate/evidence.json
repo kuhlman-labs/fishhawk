@@ -1,8 +1,8 @@
 {
   "schema": "planreview-catchrate-evidence-v2",
-  "recorded_at": "2026-11-13T19:44:51Z",
+  "recorded_at": "2026-11-25T12:48:53Z",
   "generator_model": "claude-sonnet-5-5",
-  "prompt_fingerprint": "sha256:29d22d0cb6fd3a740b12950e73adf991d4728f639613759ed1d28a6b64967970",
+  "prompt_fingerprint": "sha256:03d57da83685c09f02300ad029893f7f0d1eb3d1d9c792325fa12a1b83aca923",
   "catch_rule_version": "planreview-catch-v5: a trial is caught when the response decodes (extract first '{'..last '}', verdict one of approve|approve_with_concerns|reject) and ONE concern satisfies both halves: its note OR category contains a planted criterion id (miss.json criterion_id) or a declared attribution phrase, AND its note OR category contains some catch probe, each as a case-folded (strings.ToLower) substring; an undecodable response is a miss counted in trials; no probe occurs case-folded in the case's issue title, issue body or plan text (loader mode m); each attribution phrase occurs case-folded in a planted criterion's statement and in no other criterion's statement (loader mode p); no planted id is a case-folded substring of another criterion id (loader mode q); each case declares at least one non-blank defect phrase occurring case-folded in its issue or plan text (loader mode r); v4 widens the per-case probes with the plan-review prompt's own vocabulary (#4355); v5 adds three per-rule options (#4313): a category predicate (the matching concern's trimmed, case-folded category must equal the rule's category), an approach-step anchor (attribution kind step: a word-bounded 'step N' in the note, not followed by a digit, checked after the criterion id and before the attribution phrases), and a clean kind (a decoded trial is false_alarm when any concern satisfies the category predicate, no_false_alarm otherwise; an undecodable trial counts toward the false-alarm rate); a rule declaring none of them classifies exactly as v4",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
@@ -10,37 +10,37 @@
     "architect": {
       "kind": "persona",
       "samples_per_case": 46,
-      "prompt_fingerprint": "sha256:65920d64569884e7b2aa19a65047f170bb1cd2eca4427ce700d384044d87dd44",
-      "input_digest": "sha256:0e5bd8524c42f0da5b9a74e77a5e699d33ebebfd341a64d0ee55dfd67dc0cbe3",
+      "prompt_fingerprint": "sha256:298c9d9ed6710d846e39d5abc11c2f7d123fe32faf8a90f1d443d4fa42eb42de",
+      "input_digest": "sha256:959d36d123c4e15cda5b7cfcb227577fd718ed8b5bbdb484f186079723a30a29",
       "per_case": {
         "adr002-inline-sql-bypasses-sqlc": {
-          "expect": "catch",
-          "trials": 46,
-          "caught": 46,
-          "undecodable": 0
-        },
-        "adr006-production-migrate-down": {
-          "expect": "catch",
-          "trials": 46,
-          "caught": 43,
-          "undecodable": 3
-        },
-        "adr040-superseded-operator-role-reliance": {
-          "expect": "catch",
-          "trials": 46,
-          "caught": 46,
-          "undecodable": 0
-        },
-        "adr046-required-field-in-frozen-major": {
           "expect": "catch",
           "trials": 46,
           "caught": 45,
           "undecodable": 1
         },
+        "adr006-production-migrate-down": {
+          "expect": "catch",
+          "trials": 46,
+          "caught": 46,
+          "undecodable": 0
+        },
+        "adr040-superseded-operator-role-reliance": {
+          "expect": "catch",
+          "trials": 46,
+          "caught": 38,
+          "undecodable": 2
+        },
+        "adr046-required-field-in-frozen-major": {
+          "expect": "catch",
+          "trials": 46,
+          "caught": 44,
+          "undecodable": 2
+        },
         "adr091-merge-without-review-coverage": {
           "expect": "catch",
           "trials": 46,
-          "caught": 45,
+          "caught": 46,
           "undecodable": 0
         },
         "clean-sqlc-query-cli": {
@@ -54,22 +54,23 @@
           "trials": 46,
           "caught": 0,
           "false_alarms": 1,
-          "undecodable": 0
+          "undecodable": 1
         },
         "declared-cross-component-direction": {
           "expect": "clean",
           "trials": 46,
           "caught": 0,
-          "false_alarms": 12,
+          "false_alarms": 14,
           "undecodable": 0
         },
         "undeclared-cross-component-direction": {
           "expect": "catch",
           "trials": 46,
-          "caught": 22,
+          "caught": 33,
           "undecodable": 0
         }
-      }
+      },
+      "recorded_at": "2026-11-25T12:48:53Z"
     },
     "security": {
       "kind": "persona",
@@ -407,46 +408,46 @@
     }
   },
   "baseline": {
-    "pinned_at": "2026-11-13T19:44:51Z",
-    "reason": "combined catch-rate re-pin 2026-11-13: #4469 harder security catch cases (security case set changed); #4482 conventions (18 cases, 8 per case) and architect (9 cases) candidate corpus growth; #4477/#4480 instrument terms (catch_rule_version, input_digest); #4492/#4495/#4497 decision-record index rendering; ADR-127..145 recorded (architect prompt embeds docs/adr/index.json); #5171 run-context verify rule; #5186, #5209, #5244 prompt changes; the d624cd36 baseline is not comparable",
+    "pinned_at": "2026-11-25T12:48:53Z",
+    "reason": "#5499: plan-review judge inputs changed (acknowledged removals, forbidden-path advisory render) and ADR-118 A1 recorded; architect arm re-pinned alone via #5566",
     "generator_model": "claude-sonnet-5-5",
-    "prompt_fingerprint": "sha256:29d22d0cb6fd3a740b12950e73adf991d4728f639613759ed1d28a6b64967970",
+    "prompt_fingerprint": "sha256:03d57da83685c09f02300ad029893f7f0d1eb3d1d9c792325fa12a1b83aca923",
     "catch_rule_version": "planreview-catch-v5: a trial is caught when the response decodes (extract first '{'..last '}', verdict one of approve|approve_with_concerns|reject) and ONE concern satisfies both halves: its note OR category contains a planted criterion id (miss.json criterion_id) or a declared attribution phrase, AND its note OR category contains some catch probe, each as a case-folded (strings.ToLower) substring; an undecodable response is a miss counted in trials; no probe occurs case-folded in the case's issue title, issue body or plan text (loader mode m); each attribution phrase occurs case-folded in a planted criterion's statement and in no other criterion's statement (loader mode p); no planted id is a case-folded substring of another criterion id (loader mode q); each case declares at least one non-blank defect phrase occurring case-folded in its issue or plan text (loader mode r); v4 widens the per-case probes with the plan-review prompt's own vocabulary (#4355); v5 adds three per-rule options (#4313): a category predicate (the matching concern's trimmed, case-folded category must equal the rule's category), an approach-step anchor (attribution kind step: a word-bounded 'step N' in the note, not followed by a digit, checked after the criterion id and before the attribution phrases), and a clean kind (a decoded trial is false_alarm when any concern satisfies the category predicate, no_false_alarm otherwise; an undecodable trial counts toward the false-alarm rate); a rule declaring none of them classifies exactly as v4",
     "arms": {
       "architect": {
         "kind": "persona",
         "samples_per_case": 46,
-        "prompt_fingerprint": "sha256:65920d64569884e7b2aa19a65047f170bb1cd2eca4427ce700d384044d87dd44",
-        "input_digest": "sha256:0e5bd8524c42f0da5b9a74e77a5e699d33ebebfd341a64d0ee55dfd67dc0cbe3",
+        "prompt_fingerprint": "sha256:298c9d9ed6710d846e39d5abc11c2f7d123fe32faf8a90f1d443d4fa42eb42de",
+        "input_digest": "sha256:959d36d123c4e15cda5b7cfcb227577fd718ed8b5bbdb484f186079723a30a29",
         "per_case": {
           "adr002-inline-sql-bypasses-sqlc": {
-            "expect": "catch",
-            "trials": 46,
-            "caught": 46,
-            "undecodable": 0
-          },
-          "adr006-production-migrate-down": {
-            "expect": "catch",
-            "trials": 46,
-            "caught": 43,
-            "undecodable": 3
-          },
-          "adr040-superseded-operator-role-reliance": {
-            "expect": "catch",
-            "trials": 46,
-            "caught": 46,
-            "undecodable": 0
-          },
-          "adr046-required-field-in-frozen-major": {
             "expect": "catch",
             "trials": 46,
             "caught": 45,
             "undecodable": 1
           },
+          "adr006-production-migrate-down": {
+            "expect": "catch",
+            "trials": 46,
+            "caught": 46,
+            "undecodable": 0
+          },
+          "adr040-superseded-operator-role-reliance": {
+            "expect": "catch",
+            "trials": 46,
+            "caught": 38,
+            "undecodable": 2
+          },
+          "adr046-required-field-in-frozen-major": {
+            "expect": "catch",
+            "trials": 46,
+            "caught": 44,
+            "undecodable": 2
+          },
           "adr091-merge-without-review-coverage": {
             "expect": "catch",
             "trials": 46,
-            "caught": 45,
+            "caught": 46,
             "undecodable": 0
           },
           "clean-sqlc-query-cli": {
@@ -460,22 +461,23 @@
             "trials": 46,
             "caught": 0,
             "false_alarms": 1,
-            "undecodable": 0
+            "undecodable": 1
           },
           "declared-cross-component-direction": {
             "expect": "clean",
             "trials": 46,
             "caught": 0,
-            "false_alarms": 12,
+            "false_alarms": 14,
             "undecodable": 0
           },
           "undeclared-cross-component-direction": {
             "expect": "catch",
             "trials": 46,
-            "caught": 22,
+            "caught": 33,
             "undecodable": 0
           }
-        }
+        },
+        "recorded_at": "2026-11-25T12:48:53Z"
       },
       "security": {
         "kind": "persona",
