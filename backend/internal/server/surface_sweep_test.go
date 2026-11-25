@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -1287,6 +1288,8 @@ func TestRunSurfaceSweep_ForbiddenCriterionFinding(t *testing.T) {
 			`"forbidden_pattern":".github/workflows/**"`,
 			`"forbidden_path":".github/workflows/ci.yml"`,
 			`acceptance_criteria[ac-1].statement`,
+			// #5499: "is wired in" names ci.yml as a change, so it asserts.
+			`"forbidden_in_scope":true`,
 		} {
 			if !strings.Contains(raw, want) {
 				t.Errorf("persisted payload missing %q:\n%s", want, raw)
@@ -1304,7 +1307,7 @@ func TestRunSurfaceSweep_ForbiddenCriterionFinding(t *testing.T) {
 			t.Fatalf("want zero findings, got %+v", got)
 		}
 		raw := lastSurfaceSweepRaw(t, au)
-		for _, absent := range []string{`"forbidden_pattern"`, `"forbidden_path"`} {
+		for _, absent := range []string{`"forbidden_pattern"`, `"forbidden_path"`, `"forbidden_in_scope"`} {
 			if strings.Contains(raw, absent) {
 				t.Errorf("clean payload must carry no %s key:\n%s", absent, raw)
 			}
@@ -1386,6 +1389,133 @@ workflows:
         constraints:
           - max_files_changed: 3
 `)
+
+// TestSurfaceSweepEvidence_LegacyRowWithoutForbiddenInScope_StaysAsserted pins
+// P1 of #5499 on the re-dispatch read path (redispatchPlanRound ->
+// loadPlanGatePayload -> planGateEvidence -> prompt.Build). A persisted
+// plan_surface_sweep row written before #5499 carries forbidden_pattern but no
+// forbidden_in_scope key; it must decode as asserted, so a legacy true
+// positive keeps its UNENFORCEABLE CRITERION line. A post-#5499 row carries
+// the key even when false, so "not in play" survives the same round trip as
+// the advisory instead of reading as legacy.
+func TestSurfaceSweepEvidence_LegacyRowWithoutForbiddenInScope_StaysAsserted(t *testing.T) {
+	const assertedLine = "UNENFORCEABLE CRITERION (acceptance criterion requires a forbidden path)"
+	const advisoryLine = "FORBIDDEN PATH NAMED:"
+
+	// redispatchRender seeds raw as the stage's persisted plan_surface_sweep
+	// row and re-renders it the way redispatchPlanRound does.
+	redispatchRender := func(t *testing.T, raw []byte) (*SurfaceSweepPayload, string) {
+		t.Helper()
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		stageID := uuid.New()
+		rid := runRow.ID
+		au.seeded = append(au.seeded, &audit.Entry{
+			RunID:    &rid,
+			StageID:  &stageID,
+			Sequence: 5,
+			Category: categoryPlanSurfaceSweep,
+			Payload:  raw,
+		})
+		var sweep *SurfaceSweepPayload
+		loadPlanGatePayload(context.Background(), s, runRow.ID, categoryPlanSurfaceSweep, stageID, 1, 9, &sweep)
+		if sweep == nil || len(sweep.Findings) != 1 {
+			t.Fatalf("loadPlanGatePayload = %+v, want one decoded finding from:\n%s", sweep, raw)
+		}
+		parsedPlan, err := plan.Parse(forbiddenCriterionPlanBody(t,
+			[]plan.ScopeFile{{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify}},
+			[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"}, nil))
+		if err != nil {
+			t.Fatalf("parse plan: %v", err)
+		}
+		rendered, err := prompt.Build("plan_review", prompt.Trigger{
+			Repo:             "x/y",
+			ApprovedPlan:     parsedPlan,
+			PlanGateEvidence: planGateEvidence(nil, sweep, nil, nil, nil),
+		})
+		if err != nil {
+			t.Fatalf("prompt.Build: %v", err)
+		}
+		return sweep, rendered
+	}
+
+	t.Run("legacy row without the key stays asserted", func(t *testing.T) {
+		// The exact pre-#5499 wire shape: forbidden_pattern, no forbidden_in_scope.
+		legacy := []byte(`{"findings":[{"pattern":"acceptance criterion requires a forbidden path",` +
+			`"trigger_path":"path \".github/workflows/ci.yml\" named at acceptance_criteria[ac-1].statement",` +
+			`"missing_siblings":null,"forbidden_path":".github/workflows/ci.yml","forbidden_pattern":".github/workflows/**"}],` +
+			`"scanned_files":1,"cross_slice_findings":[]}`)
+		sweep, rendered := redispatchRender(t, legacy)
+		if !sweep.Findings[0].ForbiddenInScope {
+			t.Errorf("legacy row decoded ForbiddenInScope=false, want true (absent key on a forbidden-criterion finding is a pre-#5499 row)")
+		}
+		if !strings.Contains(rendered, assertedLine) {
+			t.Errorf("legacy true positive lost its asserted line on re-dispatch:\n%s", rendered)
+		}
+		if strings.Contains(rendered, advisoryLine) {
+			t.Errorf("legacy true positive was demoted to the advisory on re-dispatch:\n%s", rendered)
+		}
+	})
+
+	t.Run("post-change false row stays the advisory", func(t *testing.T) {
+		// Produced by the real sweep: a criterion that only PRINTS the path.
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		body := forbiddenCriterionPlanBody(t,
+			[]plan.ScopeFile{{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify}},
+			[]string{"`fishhawk ci --print` prints `.github/workflows/ci.yml` as the file it reads, and exits 0"}, nil)
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if got == nil || len(got.Findings) != 1 || got.Findings[0].ForbiddenInScope {
+			t.Fatalf("runSurfaceSweep = %+v, want one named-only finding with ForbiddenInScope false", got)
+		}
+		raw := lastSurfaceSweepRaw(t, au)
+		if want := `"forbidden_in_scope":false`; !strings.Contains(raw, want) {
+			t.Fatalf("persisted forbidden-criterion finding must carry %s so it is not read as legacy:\n%s", want, raw)
+		}
+		sweep, rendered := redispatchRender(t, []byte(raw))
+		if sweep.Findings[0].ForbiddenInScope {
+			t.Errorf("explicit forbidden_in_scope:false decoded as true")
+		}
+		if !strings.Contains(rendered, advisoryLine) || strings.Contains(rendered, assertedLine) {
+			t.Errorf("post-change false row must re-render as the advisory only:\n%s", rendered)
+		}
+	})
+
+	t.Run("wrong-typed key fails the decode open", func(t *testing.T) {
+		// A corrupt forbidden_in_scope must not be read as legacy-absent: the
+		// decode fails and loadPlanGatePayload omits the gate's evidence.
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		stageID := uuid.New()
+		rid := runRow.ID
+		au.seeded = append(au.seeded, &audit.Entry{
+			RunID: &rid, StageID: &stageID, Sequence: 5, Category: categoryPlanSurfaceSweep,
+			Payload: []byte(`{"findings":[{"pattern":"acceptance criterion requires a forbidden path","trigger_path":"t",` +
+				`"missing_siblings":null,"forbidden_path":".github/workflows/ci.yml","forbidden_pattern":".github/workflows/**",` +
+				`"forbidden_in_scope":"yes"}],"scanned_files":1,"cross_slice_findings":[]}`),
+		})
+		var sweep *SurfaceSweepPayload
+		loadPlanGatePayload(context.Background(), s, runRow.ID, categoryPlanSurfaceSweep, stageID, 1, 9, &sweep)
+		if sweep != nil {
+			t.Errorf("a wrong-typed forbidden_in_scope decoded to %+v, want the gate evidence omitted (nil)", sweep)
+		}
+	})
+
+	t.Run("finding without forbidden_pattern carries no key", func(t *testing.T) {
+		in := SurfaceSweepFinding{Pattern: "p", TriggerPath: "a.go", MissingSiblings: []string{"b.go"}}
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if want := `{"pattern":"p","trigger_path":"a.go","missing_siblings":["b.go"]}`; string(raw) != want {
+			t.Errorf("path-triggered finding wire = %s, want byte-identical %s", raw, want)
+		}
+		var out SurfaceSweepFinding
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if !reflect.DeepEqual(out, in) {
+			t.Errorf("round trip = %+v, want %+v (ForbiddenInScope must stay false without a forbidden_pattern)", out, in)
+		}
+	})
+}
 
 // TestRunSurfaceSweep_SliceSharedPath_RendersToPlanReview is the #4679
 // cross-layer test: a decomposition whose slices declare overlapping paths by

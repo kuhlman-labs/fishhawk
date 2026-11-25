@@ -1563,6 +1563,47 @@ Detail-text control above. The producer-to-consumer join through the real
 `runAcceptancePrecheck` -> `planGateEvidence` -> `prompt.Build` path is the
 extended #1533 seam test in `backend/internal/server/plan_test.go`.
 
+**Judged gate-evidence lines and the lockstep rule (#5499).** Two
+gate-evidence line kinds record what a gate measured rather than a defect, and
+each carries its own HANDLING instruction:
+
+- `- ACKNOWLEDGED REMOVAL: <path> — reason (plan-authored, unverified): "<reason>"`,
+  rendered by `writeAcknowledgedRemovals` from
+  `ScopeRegressionEvidence.AcknowledgedRemovals` (the drops the plan DECLARED in
+  `scope_removals`). `RemovedFiles` is now the undeclared (regression) set only,
+  so a declared drop never reaches the HIGH `Scope regression` block. Each
+  reason goes through `BoundPlanAuthoredReason` (whitespace collapsed to one
+  line, at most 200 bytes with a ` …[truncated]` marker, idempotent) and is
+  `%q`-quoted; an empty reason renders `not recorded`. The HANDLING says a
+  declared reason does not establish that the removal is safe and a
+  security-relevant removal still warrants a concern. The "refusal and the
+  revise-budget refund did not fire" sentence renders only when the pass has
+  no undeclared drop; a mixed pass keeps the HIGH block unchanged.
+- `- FORBIDDEN PATH NAMED: …`, the forbidden-criterion finding when
+  `SurfaceSweepFindingEvidence.ForbiddenInScope` is false (the plan neither
+  scopes the path, phrases the criterion as a change to it, nor names it in an
+  approach step). It says the gate INFERRED the not-an-edit reading, asks for a
+  high-severity concern only if satisfying the criterion requires changing the
+  path (with the two-merge-request escape), and asks for nothing — no
+  `evidence_conflict` — when the path is an output value, fixture, read target
+  or runtime state. Its label never repeats the finding pattern phrase; that
+  phrase appears only as the quoted exemption key. `ForbiddenInScope` true
+  renders the unchanged `UNENFORCEABLE CRITERION` line.
+
+`judgedLinesPreambleException` renders immediately after
+`allSkipPreambleException` only when either kind is present
+(`planGateEvidenceHasJudgedLines`), so evidence without them renders
+byte-identically. On the plan side, `lockstepOneSliceRule` renders inside the
+Surface-coupling sibling map (after its exemption paragraph), telling a
+decomposing planner to keep every member of one lockstep pattern in one
+sub-plan's `scope.files`, and the Unenforceable-criteria rule names both
+forbidden-path renders. Pinned by
+`TestBuild_PlanReview_GateEvidence_AcknowledgedRemovalsRender`,
+`TestBuild_PlanReview_GateEvidence_AcknowledgedReasonIsBoundedData`,
+`TestBuild_PlanReview_GateEvidence_ForbiddenNamedRendersAdvisory`,
+`TestBuild_PlanReview_GateEvidence_JudgedExceptionOmittedWithoutJudgedLines`
+and `TestBuild_Plan_SurfaceCouplingLockstepRule`.
+
 Caveat, as for the all-skip line: these are prompt INSTRUCTIONS to an LLM
 reviewer, not enforced controls. The tests prove the lines render; they cannot
 prove a reviewer obeys them. Promotion of either rule to a refusal is
