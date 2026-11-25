@@ -591,6 +591,38 @@ func TestPlanPrompt_SurfaceCouplingSiblingMap_NamesLockstepSibling(t *testing.T)
 	}
 }
 
+// TestGetStagePrompt_Plan_LockstepOneSliceRule is the #5499 HTTP-level seam
+// for the planner-side cross-slice coupling rule: the signed GET
+// /v0/stages/{id}/prompt for a plan stage — whose sibling map renders from the
+// static surfacePatterns registry — carries the lockstep-in-one-slice rule.
+func TestGetStagePrompt_Plan_LockstepOneSliceRule(t *testing.T) {
+	s, rr, _, _, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, _, _ := seedRunWithStages(rr)
+	gh.issue = &githubclient.Issue{Number: 5499, Title: "Decomposed change", Body: "ctx"}
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, planStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Lockstep-in-one-slice rule (when decomposing): keep every member of one pattern above that your plan scopes",
+		"in ONE sub-plan's scope.files",
+		"The plan gate's cross-slice coupling check reports a pattern split across slices to the reviewers",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("plan-stage prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+	if i, j := strings.Index(resp.Prompt, "Surface-coupling sibling map"), strings.Index(resp.Prompt, "Lockstep-in-one-slice rule"); i < 0 || j < i {
+		t.Errorf("lockstep rule must render inside the sibling map (map at %d, rule at %d)", i, j)
+	}
+}
+
 // planStageSpecYAMLWithCap builds a feature_change workflow whose implement
 // stage declares max_files_changed = cap, for the plan-prompt file-count
 // constraint integration test (#2053).

@@ -765,6 +765,7 @@ func TestCatchDiagOutcome(t *testing.T) {
 		{ErrCatchRateRegressed, false, "refused"},
 		{ErrPortabilityRepoSpecificFinding, false, "refused"},
 		{ErrCatchRateSubsetNotRecordable, true, "refused"},
+		{ErrCatchRateArmSelection, false, "refused"},
 		{errors.New("connection reset"), false, "error"},
 	} {
 		if got := catchDiagOutcome(tc.err, tc.notJudged); got != tc.want {
@@ -898,5 +899,40 @@ func TestRecordCatchRateEvidenceWithDiagnostics_SubsetNotJudged(t *testing.T) {
 	}
 	if !strings.Contains(report, "NOT judged") {
 		t.Errorf("report:\n%s", report)
+	}
+}
+
+// An arm-selection refusal (#5566) through the diagnostics seam: the header
+// records the selector as measured_arms, and the summary reads refused, not
+// error. Fixture-state mechanism: the split pair is refused before any model
+// call, so the file holds the header and the summary only; with
+// ErrCatchRateArmSelection removed from catchDiagOutcome's refused case the
+// summary reads error, and with the header assignment deleted measured_arms
+// is absent.
+func TestRecordCatchRateEvidenceWithDiagnostics_ArmSelectionRefused(t *testing.T) {
+	path := freshCatchEvidence(t)
+	evidence, trials := snapshotEvidencePair(t, path)
+	all := committedCatchTrials(t)
+	sender := newScriptedCatchSender(t, all, all)
+	diagPath := filepath.Join(t.TempDir(), CatchRateDiagFileName)
+	_, err := RecordCatchRateEvidenceWithDiagnostics(context.Background(), sender, testCatchModel, committedCatchInputs(), path, catchT0.Add(time.Hour),
+		RecordCatchRateOptions{Arms: []string{ArmWithConventions}}, diagPath, CatchRateDiagOptions{})
+	if !errors.Is(err, ErrCatchRateArmSelection) {
+		t.Fatalf("err = %v, want ErrCatchRateArmSelection", err)
+	}
+	if n := sender.total(); n != 0 {
+		t.Errorf("sender called %d times, want 0 (refused before any model call)", n)
+	}
+	assertEvidencePairUnchanged(t, path, evidence, trials)
+	lines := readCatchDiagLines(t, diagPath)
+	got, _ := json.Marshal(lines[0]["measured_arms"])
+	if lines[0]["kind"] != "header" || string(got) != `["with_conventions"]` {
+		t.Errorf("header = %v, want measured_arms [with_conventions]", lines[0])
+	}
+	if n := len(catchDiagTrialLines(lines)); n != 0 {
+		t.Errorf("%d trial lines, want 0", n)
+	}
+	if sum := catchDiagSummaryOf(t, lines); sum["outcome"] != "refused" {
+		t.Errorf("summary outcome = %v, want refused (error %v)", sum["outcome"], sum["error"])
 	}
 }

@@ -2054,15 +2054,58 @@ type PlanGateEvidence struct {
 
 // ScopeRegressionEvidence is the plan_scope_regression result (#1257): on a
 // revise pass, the files the new plan's scope DROPPED relative to the
-// revision-base plan (RemovedFiles) and added (AddedFiles), plus the count
-// of the new plan's scoped paths. Non-empty RemovedFiles is a HIGH-severity
-// signal — a revision narrowed scope, which the runner would then
-// scope_drift-exclude. The render omits the block entirely when the gate did
-// not run (nil) or found no drop (empty RemovedFiles).
+// revision-base plan and added (AddedFiles), plus the count of the new plan's
+// scoped paths.
+//
+// RemovedFiles is the REGRESSION set only (#5499): the drops the plan did NOT
+// declare in scope_removals (every drop, on a legacy pre-#2516 row). Non-empty
+// RemovedFiles is a HIGH-severity signal — a revision narrowed scope, which
+// the runner would then scope_drift-exclude. AcknowledgedRemovals are the
+// drops the plan DECLARED, each with its plan-authored reason; they render as
+// challengeable ACKNOWLEDGED REMOVAL lines, never in the HIGH block. The
+// render omits the section entirely when the gate did not run (nil) or found
+// neither kind of drop.
 type ScopeRegressionEvidence struct {
-	RemovedFiles []string
-	AddedFiles   []string
-	ScannedFiles int
+	RemovedFiles         []string
+	AcknowledgedRemovals []AcknowledgedRemovalEvidence
+	AddedFiles           []string
+	ScannedFiles         int
+}
+
+// AcknowledgedRemovalEvidence is one drop the plan declared in scope_removals
+// (#5499). Reason is PLAN-AUTHORED and unverified; the render passes it
+// through BoundPlanAuthoredReason and quotes it, and an empty Reason (a row
+// written before the reason was recorded) renders as "not recorded".
+type AcknowledgedRemovalEvidence struct {
+	Path   string
+	Reason string
+}
+
+// planAuthoredReasonMaxBytes bounds a plan-authored reason rendered inside the
+// gate-evidence block (#5499), marker included.
+const planAuthoredReasonMaxBytes = 200
+
+// planAuthoredReasonTruncated marks a reason BoundPlanAuthoredReason cut.
+const planAuthoredReasonTruncated = " …[truncated]"
+
+// BoundPlanAuthoredReason renders a plan-authored reason as bounded data
+// (#5499): every run of whitespace, newlines included, collapses to one space,
+// so the reason is a single line; and a reason longer than
+// planAuthoredReasonMaxBytes is cut on a UTF-8 boundary and ends with
+// planAuthoredReasonTruncated, the whole result at most
+// planAuthoredReasonMaxBytes bytes. Idempotent, so the server can persist the
+// bounded string and the renderer can bound it again. The renderer also
+// %q-quotes the result, which escapes any remaining control character.
+func BoundPlanAuthoredReason(reason string) string {
+	reason = strings.Join(strings.Fields(reason), " ")
+	if len(reason) <= planAuthoredReasonMaxBytes {
+		return reason
+	}
+	cut := planAuthoredReasonMaxBytes - len(planAuthoredReasonTruncated)
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut] + planAuthoredReasonTruncated
 }
 
 // BudgetCheckEvidence is the approval-time budget gate's resolved input
@@ -2227,9 +2270,14 @@ type SurfaceSweepExemptionEvidence struct {
 // ForbiddenPath and ForbiddenPattern are set ONLY by the prose-triggered
 // forbidden-criterion rule (#3620): the repository path an acceptance
 // criterion named and the implement-stage forbidden_paths glob that forbids
-// it. When ForbiddenPattern is non-empty the finding renders as a distinct
-// UNENFORCEABLE CRITERION line; when empty the MISSING SIBLINGS and NEW AUDIT
+// it. When ForbiddenPattern is non-empty the finding renders as a
+// forbidden-path line; when empty the MISSING SIBLINGS and NEW AUDIT
 // CATEGORY renders are byte-identical to before the fields existed.
+//
+// ForbiddenInScope (#5499) picks the forbidden-path line: true — the plan
+// scopes the path, the criterion names it as something to change, or an
+// approach step names it — renders the asserted UNENFORCEABLE CRITERION line;
+// false renders the reviewer-judged FORBIDDEN PATH NAMED advisory.
 type SurfaceSweepFindingEvidence struct {
 	Pattern          string
 	TriggerPath      string
@@ -2238,6 +2286,7 @@ type SurfaceSweepFindingEvidence struct {
 	Category         string
 	ForbiddenPath    string
 	ForbiddenPattern string
+	ForbiddenInScope bool
 }
 
 // auditCategoryRegistryPath and auditCategoryVerifyTest name the registry
@@ -5542,6 +5591,7 @@ func buildPlan(t Trigger) string {
 				p.Name, strings.Join(p.Triggers, ", "), strings.Join(p.Siblings, ", "))
 		}
 		b.WriteString("When a listed sibling genuinely needs no change (e.g. you are adding a system-actor render to status_template.go that mentions no @-user, so the notifier.go @-mention peer is untouched), declare that as a machine-readable top-level surface_sweep_exemptions entry — {\"pattern\": \"<the pattern name above>\", \"sibling\": \"<the sibling path>\", \"reason\": \"<why it needs no change>\"} — instead of only prose. The sweep honors a matching (pattern, sibling) entry to suppress the missing-sibling finding while surfacing your reason to reviewers as challengeable, so it is never silent. A non-matching entry is a harmless no-op.\n")
+		b.WriteString(lockstepOneSliceRule)
 	}
 	if len(t.GeneratedSurfaceRelations) > 0 {
 		b.WriteString("\n")
@@ -5691,7 +5741,9 @@ func buildPlan(t Trigger) string {
 		"scope this run's criteria to the in-repository half and record the operator-side edit in `verification.out_of_scope`. The plan gate " +
 		"runs a deterministic `acceptance criterion requires a forbidden path` check over each criterion's `statement` and `verify_hint`, " +
 		"matching every quoted or slash-bearing path token against the run's resolved implement-stage `forbidden_paths` with the SAME matcher " +
-		"the post-implement gate runs, and reports each hit as an ADVISORY UNENFORCEABLE CRITERION finding on the plan-review gate evidence. " +
+		"the post-implement gate runs. It reports a hit as an ADVISORY UNENFORCEABLE CRITERION finding on the plan-review gate evidence when the " +
+		"plan also puts that path in play as something to change — scopes it, phrases the criterion as a change to it, or names it in an " +
+		"approach step — and otherwise as a reviewer-judged FORBIDDEN PATH NAMED advisory. " +
 		"It never refuses the plan; a criterion that merely MENTIONS such a path without requiring an edit to it clears via a " +
 		"`surface_sweep_exemptions` entry {pattern: \"acceptance criterion requires a forbidden path\", sibling: \"<the path>\"} whose reason " +
 		"the reviewer can challenge.\n")
@@ -6797,10 +6849,12 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 	if ev == nil {
 		return
 	}
-	// The scope-regression block renders ONLY when it found a drop, so a
-	// clean (or absent) regression result must not, on its own, trigger the
-	// section header.
-	regressionHasDrops := ev.ScopeRegression != nil && len(ev.ScopeRegression.RemovedFiles) > 0
+	// The scope-regression blocks render ONLY when the gate found a drop —
+	// undeclared (the HIGH block) or declared (the acknowledged block, #5499)
+	// — so a clean (or absent) regression result must not, on its own,
+	// trigger the section header.
+	regressionHasDrops := ev.ScopeRegression != nil &&
+		(len(ev.ScopeRegression.RemovedFiles) > 0 || len(ev.ScopeRegression.AcknowledgedRemovals) > 0)
 	if ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.TestSweep == nil && ev.BudgetCheck == nil && !regressionHasDrops && ev.AcceptancePrecheck == nil {
 		return
 	}
@@ -6811,6 +6865,9 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		"text-level finding, and once recorded you may shortcut the remaining review criteria. " +
 		"A clean result does NOT certify plan quality: every review criterion below still applies.\n\n")
 	b.WriteString(allSkipPreambleException)
+	if planGateEvidenceHasJudgedLines(ev) {
+		b.WriteString(judgedLinesPreambleException)
+	}
 	b.WriteString("Escape valve — gate evidence is ground truth ABOUT WHAT THE GATES MEASURED and normally " +
 		"outranks any text-level reading of the plan, but the evidence itself can be wrong. When the plan/artifact " +
 		"under review DIRECTLY and VERIFIABLY contradicts a specific evidence claim above (e.g. the plan plainly " +
@@ -6831,6 +6888,16 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 			"(the union of top-level scope.files and every decomposition sub-plan scope was diffed). If the revision " +
 			"constraint did not intend to drop them, this is a scope regression — the runner will scope_drift-exclude " +
 			"any edits to these files. Record it as a high-severity concern naming the dropped files.\n")
+		b.WriteString("\n")
+	}
+	if reg := ev.ScopeRegression; reg != nil && len(reg.AcknowledgedRemovals) > 0 {
+		writeAcknowledgedRemovals(b, reg.AcknowledgedRemovals)
+		if len(reg.RemovedFiles) == 0 {
+			// J3 of #5499: only a pass with NO undeclared drop skipped the
+			// refusal and the refund; a mixed pass keeps the HIGH block's
+			// text above as its whole account of what fired.
+			b.WriteString(acknowledgedRemovalsNoRefusalLine)
+		}
 		b.WriteString("\n")
 	}
 
@@ -6918,16 +6985,28 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		} else {
 			for _, f := range sw.Findings {
 				if f.ForbiddenPattern != "" {
-					// #3620 forbidden-criterion rule: prose-triggered, so the
-					// "trigger path" is where the path was named. Nothing is
-					// missing from scope — the path is structurally
-					// unreachable from inside the run, so the remedy is the
-					// two-merge-request escape or an exemption.
-					fmt.Fprintf(b, "- %sUNENFORCEABLE CRITERION (%s): %s, and the implement stage's forbidden_paths constraint forbids it via the glob %q. "+
-						"The implement agent structurally CANNOT satisfy this criterion — forbidden_paths is enforced against the real diff, so every review round will re-raise it. "+
-						"Operator escape: land the in-repository half in this merge request and edit the forbidden governance file by hand in a second one; an acceptance criterion should not demand both in one run. "+
-						"If this criterion does not in fact require editing %q, declare a surface_sweep_exemptions entry {pattern: %q, sibling: %q}.\n",
-						subPlanPrefix(f.SubPlanTitle), f.Pattern, f.TriggerPath, f.ForbiddenPattern,
+					// #5499: the line ASSERTS only when the plan puts the path
+					// in play as something to change (ForbiddenInScope).
+					if f.ForbiddenInScope {
+						// #3620 forbidden-criterion rule: prose-triggered, so the
+						// "trigger path" is where the path was named. Nothing is
+						// missing from scope — the path is structurally
+						// unreachable from inside the run, so the remedy is the
+						// two-merge-request escape or an exemption.
+						fmt.Fprintf(b, "- %sUNENFORCEABLE CRITERION (%s): %s, and the implement stage's forbidden_paths constraint forbids it via the glob %q. "+
+							"The implement agent structurally CANNOT satisfy this criterion — forbidden_paths is enforced against the real diff, so every review round will re-raise it. "+
+							"Operator escape: land the in-repository half in this merge request and edit the forbidden governance file by hand in a second one; an acceptance criterion should not demand both in one run. "+
+							"If this criterion does not in fact require editing %q, declare a surface_sweep_exemptions entry {pattern: %q, sibling: %q}.\n",
+							subPlanPrefix(f.SubPlanTitle), f.Pattern, f.TriggerPath, f.ForbiddenPattern,
+							f.ForbiddenPath, f.Pattern, f.ForbiddenPath)
+						continue
+					}
+					// #5499: the gate measured only that the criterion NAMES
+					// the path; nothing in the plan frames it as an edit, so
+					// the reviewer judges. The label never repeats the
+					// pattern phrase — it appears only as the exemption key.
+					fmt.Fprintf(b, forbiddenPathNamedLine,
+						subPlanPrefix(f.SubPlanTitle), f.TriggerPath, f.ForbiddenPattern,
 						f.ForbiddenPath, f.Pattern, f.ForbiddenPath)
 					continue
 				}
@@ -9031,6 +9110,92 @@ const allSkipPreambleException = "One exception: each acceptance pre-check advis
 	"carries its own HANDLING instruction in place of the rule above — follow that instruction instead. Any OTHER " +
 	"line — including one that merely begins with, or elsewhere contains, the word `ADVISORY` — remains subject to " +
 	"the must-be-a-concern rule above.\n\n"
+
+// lockstepOneSliceRule is the planner-side half of the cross-slice coupling
+// check (#5499): rendered after the surface-coupling sibling map's exemption
+// paragraph, so a decomposing planner keeps each lockstep pattern's files in
+// one slice BEFORE review instead of a reviewer rejecting the split.
+const lockstepOneSliceRule = "Lockstep-in-one-slice rule (when decomposing): keep every member of one pattern above that " +
+	"your plan scopes — its trigger and each sibling — in ONE sub-plan's scope.files, normally the slice that completes the " +
+	"seam. The plan gate's cross-slice coupling check reports a pattern split across slices to the reviewers, and completing " +
+	"a split seam needs a runtime scope amendment that can time out (#1035).\n"
+
+// judgedLinesPreambleException extends allSkipPreambleException (#5499) to the
+// two gate-evidence line kinds that carry their own HANDLING instruction
+// because the gate measured a fact but not a defect: a forbidden path a
+// criterion merely names, and a drop the plan declared in scope_removals. It
+// renders immediately after allSkipPreambleException ONLY when the evidence
+// carries one of them (planGateEvidenceHasJudgedLines), so evidence without
+// either renders byte-identically to before. Like allSkipPreambleException it
+// names the line kinds by their literal labels, not by a generic prefix, and
+// keeps each label non-adjacent to the colon or parenthesis its rendered line
+// carries, so this sentence never matches a rendered line.
+const judgedLinesPreambleException = "A second exception: each line labelled `FORBIDDEN PATH NAMED` or " +
+	"`ACKNOWLEDGED REMOVAL` below records what the gate measured, not a defect, and carries its own HANDLING " +
+	"instruction in place of the must-be-a-concern rule above — follow that instruction instead.\n\n"
+
+// forbiddenPathNamedLine is the FORBIDDEN PATH NAMED advisory (#5499) for a
+// forbidden-criterion finding whose path the plan does not put in play as
+// something to change. Arguments: sub-plan prefix, trigger, glob, path,
+// exemption pattern, exemption path. The label deliberately omits the finding
+// Pattern phrase (J4 a): the phrase claims a requirement the gate did not
+// measure, so it appears only inside the quoted exemption key.
+const forbiddenPathNamedLine = "- %sFORBIDDEN PATH NAMED: %s, which the implement stage's forbidden_paths forbids via the glob %q; " +
+	"the plan does not scope it, the criterion does not phrase it as something to change, and no approach step names it — " +
+	"so the gate INFERRED, without measuring it, that the criterion may name the path as data. " +
+	"HANDLING: the gate measured only that the criterion NAMES %q. Record a high-severity concern ONLY if satisfying the criterion " +
+	"requires the implement agent to change that path; then name the operator escape — land the in-repository half in this merge " +
+	"request and edit the forbidden governance file by hand in a second one. When the criterion names it as an output value, " +
+	"fixture, read target or runtime state, record nothing and raise no `evidence_conflict`. If the criterion does not require " +
+	"editing the path, the plan may also declare a surface_sweep_exemptions entry {pattern: %q, sibling: %q}.\n"
+
+// acknowledgedRemovalsHeader opens the declared-drop block (#5499).
+const acknowledgedRemovalsHeader = "Scope removals acknowledged by the plan (declared in scope_removals — NOT a regression):\n\n"
+
+// acknowledgedRemovalsHandling is the HANDLING sentence every acknowledged
+// block carries (#5499, J2): the reason is plan-authored, so it neither proves
+// the removal safe nor clears a security-relevant one.
+const acknowledgedRemovalsHandling = "HANDLING: do not record a concern merely because a file is listed here. Each reason is " +
+	"plan-authored and unverified: a declared reason does NOT establish that the removal is safe, and a security-relevant " +
+	"removal (a guard, check, test or constraint the change still needs) still warrants a concern. Challenge a reason by " +
+	"naming work in this plan that still has to change the file.\n"
+
+// acknowledgedRemovalsNoRefusalLine renders ONLY when the pass has no
+// undeclared drop (J3 of #5499).
+const acknowledgedRemovalsNoRefusalLine = "Every drop in this pass was declared, so the scope-regression refusal and " +
+	"the revise-budget refund did not fire.\n"
+
+// writeAcknowledgedRemovals renders the declared-drop block (#5499): a
+// header, one ACKNOWLEDGED REMOVAL line per declared drop with its bounded,
+// quoted, plan-authored reason, and the HANDLING sentence.
+func writeAcknowledgedRemovals(b *strings.Builder, acks []AcknowledgedRemovalEvidence) {
+	b.WriteString(acknowledgedRemovalsHeader)
+	for _, a := range acks {
+		reason := "not recorded"
+		if r := BoundPlanAuthoredReason(a.Reason); r != "" {
+			reason = fmt.Sprintf("%q", r)
+		}
+		fmt.Fprintf(b, "- ACKNOWLEDGED REMOVAL: %s — reason (plan-authored, unverified): %s\n", a.Path, reason)
+	}
+	b.WriteString(acknowledgedRemovalsHandling)
+}
+
+// planGateEvidenceHasJudgedLines reports whether ev will render an
+// ACKNOWLEDGED REMOVAL or a FORBIDDEN PATH NAMED line, the two kinds
+// judgedLinesPreambleException covers.
+func planGateEvidenceHasJudgedLines(ev *PlanGateEvidence) bool {
+	if ev.ScopeRegression != nil && len(ev.ScopeRegression.AcknowledgedRemovals) > 0 {
+		return true
+	}
+	if ev.SurfaceSweep != nil {
+		for _, f := range ev.SurfaceSweep.Findings {
+			if f.ForbiddenPattern != "" && !f.ForbiddenInScope {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // acceptanceSurfaceNoneHeadline is the single gate-evidence line rendered when
 // the plan declares `verification.acceptance_surface: none` (E72.1 / #3325).
