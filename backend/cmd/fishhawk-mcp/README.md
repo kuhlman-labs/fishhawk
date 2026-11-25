@@ -144,7 +144,7 @@ The go-sdk's own DNS-rebinding protection (rejecting a non-loopback `Host` heade
 | `--allowed-roots` | `FISHHAWK_MCP_ALLOWED_ROOTS` | OS path-list of absolute checkout roots a spawned run's `working_dir` must resolve inside. Both empty exits 2. |
 | `--state-dir` | `FISHHAWK_HOST_DISPATCH_STATE_DIR`, else `$TMPDIR/fishhawk-host-dispatch` | Ledger, `status.json`, `pause` and `lock`. 0700, owned by you, never a symlink. |
 | `--interval` | `30s` | Tick interval. Above `45s` exits 2, so a queued stage is re-POSTed inside the server's 60 s queue TTL. |
-| `--max-in-flight` | `2` | Stages this dispatcher keeps `dispatched` or `running` (ADR-104 Q6). |
+| `--max-in-flight` | `2` | Stages this dispatcher keeps `dispatched` or `running` (ADR-104 Q6). Keep it at or below `FISHHAWK_HOST_CAPACITY`: every dispatched stage holds a host capacity slot. |
 | `--per-tick-cap` | `4` | Candidates per tick that reach the campaign-link read; bounds reads and marker POSTs. |
 | `--daily-cap` | none (`0`) | Opt-in spawns per UTC day, persisted, rolling over at 00:00:00Z. `0` or absent is no daily cap (ADR-104 A1); a negative value exits 2. |
 | `--stale-after` | `0` (the `drive_run` default) | How long a `dispatched` stage this process is not running may sit before its runner's liveness is probed. |
@@ -156,7 +156,7 @@ The go-sdk's own DNS-rebinding protection (rejecting a non-loopback `Host` heade
 
 **Credential.** Mint a dedicated token with `fishhawkd token issue --subject host-dispatcher/<host>`; without `--scopes` it gets exactly the dispatcher profile. The mode reads it through the same [token-resolution ladder](#token-resolution-ladder-2389--adr-076) as the server modes, so set it as `FISHHAWK_API_TOKEN` for this process: an empty variable falls through to the operator's stored credential, which is the wrong identity for a dispatcher.
 
-**On the local stack.** `scripts/dev up` starts it under `FISHHAWK_DEV_HOST_DISPATCH_TOKEN` with a scrubbed environment, `--state-dir .fishhawk/cache/host-dispatch` and the checkout as the allowed root. `down`, `reload` and `post-merge` pause it, drain it with SIGTERM and wait for it to exit BEFORE their live-run scan. The `up` at the end of every reload restarts it on the rebuilt binary; the [`fishhawk-mcp-shim`](#surviving-rebuilds-fishhawk-mcp-shim) auto-swap does not cover this mode. Operator contract: [`scripts/README.md`](../../../scripts/README.md) § "Host dispatcher" (E88.3 / [#4527](https://github.com/kuhlman-labs/fishhawk/issues/4527)).
+**On the local stack.** `scripts/dev up` starts it under `FISHHAWK_DEV_HOST_DISPATCH_TOKEN` with a scrubbed environment, `--state-dir .fishhawk/cache/host-dispatch` and the checkout as the allowed root. It passes `--max-in-flight`, `--per-tick-cap` and `--daily-cap` from `FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT`, `FISHHAWK_HOST_DISPATCH_PER_TICK_CAP` and `FISHHAWK_HOST_DISPATCH_DAILY_CAP` when set ([#5530](https://github.com/kuhlman-labs/fishhawk/issues/5530)), and carries `FISHHAWK_HOST_CAPACITY` into the scrubbed environment. `down`, `reload` and `post-merge` pause it, drain it with SIGTERM and wait for it to exit BEFORE their live-run scan. The `up` at the end of every reload restarts it on the rebuilt binary; the [`fishhawk-mcp-shim`](#surviving-rebuilds-fishhawk-mcp-shim) auto-swap does not cover this mode. Operator contract: [`scripts/README.md`](../../../scripts/README.md) § "Host dispatcher" (E88.3 / [#4527](https://github.com/kuhlman-labs/fishhawk/issues/4527)).
 
 ## Install (operators)
 
