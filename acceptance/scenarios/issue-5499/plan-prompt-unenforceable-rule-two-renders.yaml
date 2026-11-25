@@ -1,0 +1,14 @@
+id: scenario:issue-5499/plan-prompt-unenforceable-rule-two-renders
+statement: The plan stage's served prompt's Unenforceable-criteria rule states that a forbidden-path hit is reported as an UNENFORCEABLE CRITERION finding only when the plan scopes the path, phrases the criterion as a change to it, or names it in an approach step, and otherwise as a reviewer-judged FORBIDDEN PATH NAMED advisory.
+verify_hint: 'Rendered prompt: signed GET /v0/stages/{plan_stage_id}/prompt on a seeded plan stage returns 200 and the Unenforceable-criteria rule paragraph contains both ''UNENFORCEABLE CRITERION'' and ''FORBIDDEN PATH NAMED'' with the scopes / phrases / approach-step condition.'
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over 'prompt:{plan_stage_id}'; GET /v0/stages/{plan_stage_id}/prompt with X-Fishhawk-Signature. Read the paragraph that starts 'Unenforceable-criteria rule:'.
+assertions:
+    expected: The paragraph contains UNENFORCEABLE CRITERION and FORBIDDEN PATH NAMED with the scopes / phrases / approach-step condition
+    observed_at_record: 'The paragraph reads: ''It reports a hit as an ADVISORY UNENFORCEABLE CRITERION finding on the plan-review gate evidence when the plan also puts that path in play as something to change — scopes it, phrases the criterion as a change to it, or names it in an approach step — and otherwise as a reviewer-judged FORBIDDEN PATH NAMED advisory.'''
+    repro_handle: GET /v0/stages/{plan_stage_id}/prompt signed over 'prompt:{plan_stage_id}'
+origin:
+    issue: 5499
+    pr: 5563
+    run_id: 5b0a8b2e-7906-4f4d-a6d8-cac4359ea498
+    head_sha: 67febc78eac36ec78aa8d88c145407778042e5e8
+    recorded_at: 2026-11-23T20:47:57Z
