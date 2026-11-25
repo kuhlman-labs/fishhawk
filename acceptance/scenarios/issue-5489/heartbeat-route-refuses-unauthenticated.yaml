@@ -1,15 +1,14 @@
 id: scenario:issue-5489/heartbeat-route-refuses-unauthenticated
 statement: 'The heartbeat route exists and is guarded: an unauthenticated POST /v0/host-dispatchers/heartbeat with a well-formed heartbeat body answers 401 with error code authentication_required.'
 verify_hint: 'HTTP: POST /v0/host-dispatchers/heartbeat with no Authorization header and a body such as {"interval_seconds":30,"started_at":"2026-11-23T00:00:00Z","last_tick_at":"2026-11-23T00:00:00Z","paused":false,"spawns_today":0,"in_flight":0}; expect status 401 and error.code authentication_required (a 404 means the route is not registered).'
-steps: 'POST http://localhost:8090/v0/host-dispatchers/heartbeat with no Authorization header and body {"interval_seconds":30,"started_at":"2026-11-23T00:00:00Z","last_tick_at":"2026-11-23T00:00:00Z","paused":false,"spawns_today":0,"in_flight":0}. Control: POST /v0/host-dispatchers/heartbeatx, a path that is not registered.'
-steps_carried_from: head 3fa9043b08fa0250e5a8614c82c2416d95c3cedc recorded_at 2026-11-25T04:02:13Z
+steps: 'POST http://localhost:8090/v0/host-dispatchers/heartbeat with no Authorization header, Content-Type application/json and body {"interval_seconds":30,"started_at":"2026-11-23T00:00:00Z","last_tick_at":"2026-11-23T00:00:00Z","paused":false,"spawns_today":0,"in_flight":0}. Control: the same POST to /v0/host-dispatchers/heartbeatx, a path that is not registered.'
 assertions:
     expected: 401 authentication_required, not 404
-    observed_at_record: 401 {"error":{"code":"authentication_required","message":"an authenticated token is required"}}; control 404 page not found
+    observed_at_record: 401 {"error":{"code":"authentication_required","message":"an authenticated token is required"}}; the control returned 404. Separately, a dispatcher built from this tree with a fictional token logged 'heartbeat publish failed ... HTTP 401 (authentication_required)'.
     repro_handle: 'curl -s -X POST -H ''Content-Type: application/json'' -d ''{"interval_seconds":30,"started_at":"2026-11-23T00:00:00Z","last_tick_at":"2026-11-23T00:00:00Z","paused":false,"spawns_today":0,"in_flight":0}'' http://localhost:8090/v0/host-dispatchers/heartbeat'
 origin:
     issue: 5489
     pr: 5572
     run_id: 459b3450-5f4b-4c56-8717-e71f1427a839
-    head_sha: 89e56072d691f12588aadf860e10ef862c59f6b7
-    recorded_at: 2026-11-25T04:50:17Z
+    head_sha: 301ca9e07438cf91839594b4d40058918f657a17
+    recorded_at: 2026-11-25T13:47:57Z
