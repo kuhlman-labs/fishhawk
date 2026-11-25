@@ -1407,7 +1407,8 @@ func TestDriveRun_DecisionRequired_ArchitecturalDecisionAwaitingCaptain(t *testi
 // assertFixupNoChangeRoster pins the #5390 fixup_no_changes_unaddressed roster:
 // the order, the concern_ids value on the fix-up, resolve and waive actions,
 // the operator_concern param, no budget override, and the E5 vouch-then-close
-// text with the G4 first-window-only limitation reference.
+// text. Since #5496 the guard covers every no-change window, so the fix-up
+// reason no longer cites the first-window-only limitation.
 func assertFixupNoChangeRoster(t *testing.T, na *NextActions, runID uuid.UUID, wantIDs string) {
 	t.Helper()
 	if na == nil || na.State != operatorrole.DecisionStateFixupNoChangesUnaddressed {
@@ -1440,9 +1441,14 @@ func assertFixupNoChangeRoster(t *testing.T, na *NextActions, runID uuid.UUID, w
 	if fixup.Consumes != consumesFixupBudget {
 		t.Errorf("fishhawk_fixup_stage consumes = %q, want %q", fixup.Consumes, consumesFixupBudget)
 	}
-	for _, want := range []string{"ONE sharper concern", "operator_concern", "first-window-only limitation", "#5496"} {
+	for _, want := range []string{"ONE sharper concern", "operator_concern"} {
 		if !strings.Contains(fixup.Reason, want) {
 			t.Errorf("fishhawk_fixup_stage reason must contain %q: %s", want, fixup.Reason)
+		}
+	}
+	for _, stale := range []string{"first-window-only limitation", "#5496"} {
+		if strings.Contains(fixup.Reason, stale) {
+			t.Errorf("fishhawk_fixup_stage reason must not cite the removed limitation %q: %s", stale, fixup.Reason)
 		}
 	}
 	if !strings.Contains(fixup.Precondition, "produced no commit") {

@@ -19025,8 +19025,8 @@ paths:
         (`fixup_no_changes`). Nothing is re-routed, and the body adds
         `concern_ids` naming the routed ids. Only positive evidence counts (a
         trigger without `concern_ids` never trips it), and a guard audit read
-        failure is a 500. The guard covers only the first no-change window per
-        stage (#5496).
+        failure is a 500. Each no-change window records its own
+        `fixup_no_changes` row, so the guard covers every window (#5496).
 
         The `may_approve` arm parks the same way for the delegated-approval
         states (#2381): it DECLINES with `decision_state: human_quorum_required`
