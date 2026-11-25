@@ -3,11 +3,14 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -24,7 +27,8 @@ import (
 //     `runnable:no` label (workmgmt.EpicChild.NotRunnable) — a DECLARATION that
 //     it produces no diff, never an inference from issue content.
 //   - forbidden_path (class 2): the candidate's title or body names a path the
-//     repo's implement-stage forbidden_paths forbid — the same collision the
+//     implement-stage forbidden_paths of the campaign driver's workflow
+//     (feature_change by default; #5267) forbid — the same collision the
 //     #3620 plan-gate forbidden-criterion rule catches, but at assembly rather
 //     than at the plan gate of the one item that reached plan. It reuses that
 //     rule's token extractor (extractCriterionPathTokens) and matcher
@@ -33,9 +37,11 @@ import (
 //
 // ADVISORY in every direction: the screen never refuses, never excludes an
 // item, never changes item state or the assembled DAG, and every degrade
-// (unwired forge client, unreadable/unparseable spec, no implement stage, no
-// forbidden paths) is FAIL-OPEN with a logged reason — class 2 is silently
-// skipped and the create proceeds. Issue prose is far noisier than
+// (unwired forge client, unreadable/unparseable spec, the driver's workflow
+// absent from the spec, no forbidden paths) is FAIL-OPEN with a logged reason
+// — class 2 is skipped and the create proceeds. The driver workflow being
+// absent is the one degrade the response also names on its own: a
+// findings-empty block (#5267). Issue prose is far noisier than
 // acceptance-criterion prose, so false positives are expected; each finding
 // carries the exact token and its location so an operator can dismiss it in
 // one read.
@@ -81,6 +87,12 @@ type campaignAdmissionScreenPayload struct {
 	// fail-open degrade), so a class-1-only block is not mistaken for a
 	// clean class-2 result.
 	ForbiddenPathsScreened bool `json:"forbidden_paths_screened"`
+	// WorkflowID names the workflow whose implement-stage forbidden_paths
+	// class 2 screened (#5267): the campaign driver's workflow, feature_change
+	// by default. Set on every block the screen emits, including one with
+	// forbidden_paths_screened false (it then names the workflow that could
+	// not be screened, e.g. one the spec does not define).
+	WorkflowID string `json:"workflow_id,omitempty"`
 	// Truncated is true when more than campaignAdmissionScreenMaxFindings
 	// findings were produced and the list was capped.
 	Truncated bool `json:"truncated,omitempty"`
@@ -88,7 +100,7 @@ type campaignAdmissionScreenPayload struct {
 
 // evaluateCampaignAdmissionScreen is the PURE evaluator (no receiver, no I/O),
 // mirroring evaluateForbiddenCriterionRule. children are the assembled
-// candidates; forbidden is the union of the repo's implement-stage
+// candidates; forbidden is the screened workflow's implement-stage
 // forbidden_paths (nil when unresolved).
 //
 // Contract (operator condition 1): a NotRunnable candidate ALWAYS yields one
@@ -171,45 +183,68 @@ func evaluateCampaignAdmissionScreen(children []workmgmt.EpicChild, forbidden []
 	return out, false
 }
 
-// forbiddenPathsUnion returns the deduplicated, sorted union of forbidden_paths
-// across EVERY implement stage of EVERY workflow in parsed. A campaign carries
-// no workflow_id (it is supplied per item run), so no single workflow is
-// resolvable at admission; the union is the right direction for an advisory
-// report — the campaign will run SOME workflow from this spec.
-func forbiddenPathsUnion(parsed *spec.Spec) []string {
+// workflowForbiddenPaths returns the deduplicated, sorted forbidden_paths
+// across the implement stages of the ONE workflow workflowID names in parsed,
+// and ok=false when parsed is nil or does not define that workflow. An item
+// runs under the campaign driver's workflow (--campaign-driver-workflow-id;
+// an expedited item's recorded workflow is set only AFTER admission, by the
+// hotfix verb), so the screen checks that workflow alone: screening another
+// workflow's forbidden paths over-reports a path the item's own workflow
+// permits, which was the #5267 defect of the former every-workflow union.
+func workflowForbiddenPaths(parsed *spec.Spec, workflowID string) ([]string, bool) {
 	if parsed == nil {
-		return nil
+		return nil, false
+	}
+	wf, ok := parsed.Workflows[workflowID]
+	if !ok {
+		return nil, false
 	}
 	seen := make(map[string]bool)
 	var out []string
-	for _, wf := range parsed.Workflows {
-		for _, st := range wf.Stages {
-			if st.Type != spec.StageTypeImplement {
-				continue
-			}
-			for _, p := range flattenPathConstraints(st.Constraints).ForbiddenPaths {
-				if !seen[p] {
-					seen[p] = true
-					out = append(out, p)
-				}
+	for _, st := range wf.Stages {
+		if st.Type != spec.StageTypeImplement {
+			continue
+		}
+		for _, p := range flattenPathConstraints(st.Constraints).ForbiddenPaths {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
 			}
 		}
 	}
 	sort.Strings(out)
-	return out
+	return out, true
+}
+
+// campaignScreenWorkflowID is the workflow the admission screen checks: the
+// campaign driver's configured workflow (Config.CampaignDriverWorkflowID, the
+// --campaign-driver-workflow-id value) when set, else
+// webhook.DefaultWorkflowID (feature_change), the flag's default. The screen
+// does not cover a workflow an operator chooses later for one item.
+func (s *Server) campaignScreenWorkflowID() string {
+	if id := strings.TrimSpace(s.cfg.CampaignDriverWorkflowID); id != "" {
+		return id
+	}
+	return webhook.DefaultWorkflowID
 }
 
 // resolveCampaignForbiddenPaths fetches the repo's workflow spec at its DEFAULT
 // branch (empty ref, the form onboarding.go uses) and returns the
-// forbiddenPathsUnion. FAIL-OPEN with a logged one-line reason and ok=false on
-// every degrade: s.cfg.GitHub nil; a fetch error (not found, transport, or an
-// unresolved/zero credential scope — a non-GitHub work-item provider leaves
-// scope zero and the client refuses before any network call); a parse error;
-// and a spec declaring no implement-stage forbidden_paths.
-func (s *Server) resolveCampaignForbiddenPaths(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) ([]string, bool) {
+// workflowForbiddenPaths of campaignScreenWorkflowID, together with that
+// workflow id (returned on EVERY path, so a degraded block still names the
+// workflow it could not screen). FAIL-OPEN with a logged one-line reason and
+// ok=false on every degrade: s.cfg.GitHub nil; a fetch error (not found,
+// transport, or an unresolved/zero credential scope — a non-GitHub work-item
+// provider leaves scope zero and the client refuses before any network call);
+// a parse error; a spec that does not define the workflow; and a workflow
+// declaring no implement-stage forbidden_paths. workflowUndefined is true ONLY
+// on the spec-does-not-define-the-workflow degrade, so screenCampaignAdmission
+// can report that one on the response even when nothing else was found.
+func (s *Server) resolveCampaignForbiddenPaths(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (forbidden []string, workflowID string, ok, workflowUndefined bool) {
+	workflowID = s.campaignScreenWorkflowID()
 	if s.cfg.GitHub == nil {
 		s.logAdmissionScreenSkip(ctx, repo, "github client not configured")
-		return nil, false
+		return nil, workflowID, false, false
 	}
 	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, scope, repo, "")
 	if err != nil {
@@ -218,19 +253,23 @@ func (s *Server) resolveCampaignForbiddenPaths(ctx context.Context, scope forge.
 			reason = "no workflow spec on the default branch"
 		}
 		s.logAdmissionScreenSkip(ctx, repo, reason)
-		return nil, false
+		return nil, workflowID, false, false
 	}
 	parsed, err := spec.ParseBytes(fc.Content)
 	if err != nil {
 		s.logAdmissionScreenSkip(ctx, repo, "parse workflow spec failed: "+err.Error())
-		return nil, false
+		return nil, workflowID, false, false
 	}
-	forbidden := forbiddenPathsUnion(parsed)
+	forbidden, defined := workflowForbiddenPaths(parsed, workflowID)
+	if !defined {
+		s.logAdmissionScreenSkip(ctx, repo, fmt.Sprintf("workflow %q not defined in the default-branch spec", workflowID))
+		return nil, workflowID, false, true
+	}
 	if len(forbidden) == 0 {
-		s.logAdmissionScreenSkip(ctx, repo, "no implement-stage forbidden_paths declared")
-		return nil, false
+		s.logAdmissionScreenSkip(ctx, repo, fmt.Sprintf("no implement-stage forbidden_paths declared in workflow %q", workflowID))
+		return nil, workflowID, false, false
 	}
-	return forbidden, true
+	return forbidden, workflowID, true, false
 }
 
 func (s *Server) logAdmissionScreenSkip(ctx context.Context, repo forge.RepoRef, reason string) {
@@ -245,17 +284,26 @@ func (s *Server) logAdmissionScreenSkip(ctx context.Context, repo forge.RepoRef,
 // the optional items subset is applied by campaign.FilterToSubset before
 // campaign.Assemble, and Assemble admits every child it is handed. Returns nil
 // when there is nothing to report — the caller then omits the admission_screen
-// key and the audit.
+// key and the audit. A driver workflow the default-branch spec does not define
+// IS something to report (#5267 condition K4a): the screen then returns a
+// findings-empty block (findings [], forbidden_paths_screened false,
+// workflow_id naming the unscreened workflow) so the operator sees it on the
+// response, not only in a server log line. Every other degrade stays silent
+// when nothing was found.
 func (s *Server) screenCampaignAdmission(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, children []workmgmt.EpicChild) *campaignAdmissionScreenPayload {
-	forbidden, screened := s.resolveCampaignForbiddenPaths(ctx, scope, repo)
+	forbidden, workflowID, screened, workflowUndefined := s.resolveCampaignForbiddenPaths(ctx, scope, repo)
 	findings, truncated := evaluateCampaignAdmissionScreen(children, forbidden)
 	if len(findings) == 0 {
-		return nil
+		if !workflowUndefined {
+			return nil
+		}
+		findings = []campaignScreenFinding{}
 	}
 	return &campaignAdmissionScreenPayload{
 		Advisory:               true,
 		Findings:               findings,
 		ForbiddenPathsScreened: screened,
+		WorkflowID:             workflowID,
 		Truncated:              truncated,
 	}
 }

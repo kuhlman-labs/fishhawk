@@ -69,7 +69,7 @@ No driving yet in the E25.2 keystone (that lands E25.3+): the keystone delivers 
 
 **Engine** (`engine.go`):
 
-- `NextEligible([]*Item) Eligibility` partitions items into eligible/human-led/blocked/running/paused/replanning/restartable/done/failed/cancelled from each item's `State`, `DependsOn`, `Autonomy`, `ResolvedBy` and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively.
+- `NextEligible([]*Item) Eligibility` partitions items into eligible/human-led/blocked/running/paused/replanning/restartable/done/failed/cancelled from each item's `State`, `DependsOn`, `Autonomy`, `ResolvedBy` and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively. `Eligibility.RestartableFailed` (#5267) is the subset of `Restartable` whose item state is `failed`; it adds no membership, and lets the wire rollup bucket each restartable item by its own state (a failed one rides `failed`, a cancelled one `cancelled`).
 - `DeriveState([]*Item) State` reduces item states to the campaign state, emitting `pending`/`running`/`awaiting_human`/`succeeded`/`failed` — `cancelled` and `paused` are operator/driver-set overlays owned by Track C, never derived.
 
 ### `awaiting_human`: the derived non-terminal state (E72.33 / #3660)

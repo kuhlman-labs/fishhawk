@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -514,6 +515,59 @@ func TestGetRunStage_NextAction_StageListError_FailsOpen(t *testing.T) {
 	resp := decodeRunStageWait(t, w)
 	if resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
 		t.Errorf("next_action = %+v, want fail-open surfaced on a stage-list read error", resp.NextAction)
+	}
+}
+
+// TestGetRunStage_NextAction_HostDispatcherQueued (#5267): stageNextAction
+// applies the same dispatcher-queued suppression as handleGetRun. On an
+// auto_dispatch run whose awaiting_host_dispatch implement stage the host
+// dispatcher has queued for a slot with a live waiter, the run_implement_stage
+// next_action is omitted; with the waiter no longer live it surfaces again.
+func TestGetRunStage_NextAction_HostDispatcherQueued(t *testing.T) {
+	cases := []struct {
+		name       string
+		waiterLive bool
+		wantAction bool
+	}{
+		{"queued_live_omitted", true, false},
+		{"queued_not_live_surfaced", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, runRow, stage := runStageWaitServer(t, run.StageStateAwaitingHostDispatch)
+			rr.orchestratorRepo.mu.Lock()
+			runRow.Drive = true
+			runRow.AutoDispatch = true
+			rr.orchestratorRepo.mu.Unlock()
+			s.cfg.Concurrency = &driveQueuedConcurrency{statuses: map[uuid.UUID]concurrency.Status{
+				stage.ID: {State: concurrency.SlotQueued, GroupKey: "host:h:default", Limit: 1, Position: 1, WaiterLive: tc.waiterLive},
+			}}
+			payload, err := json.Marshal(drive.Advance{
+				Rule:       drive.RulePlanApprovedDispatch,
+				From:       "plan:approved",
+				To:         "implement:awaiting_host_dispatch",
+				NextAction: &drive.NextAction{Action: "run_implement_stage"},
+			})
+			if err != nil {
+				t.Fatalf("marshal advance: %v", err)
+			}
+			au.entries = []*audit.Entry{{Sequence: 1, Timestamp: time.Now().UTC(), Category: drive.Category, Payload: payload}}
+
+			w := getRunStage(t, s, runRow.ID, stage.ID, -1, func(r *http.Request) *http.Request {
+				return withOperatorIdentity(r, "read:runs")
+			})
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+			}
+			resp := decodeRunStageWait(t, w)
+			if tc.wantAction {
+				if resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+					t.Errorf("next_action = %+v, want run_implement_stage surfaced (waiter not live)", resp.NextAction)
+				}
+			} else if resp.NextAction != nil {
+				t.Errorf("next_action = %+v, want omitted: the host dispatcher owns this queued dispatch", resp.NextAction)
+			}
+		})
 	}
 }
 

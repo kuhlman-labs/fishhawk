@@ -2782,7 +2782,12 @@ components:
             suppressed once that stage advances past the host-spawnable
             states `{pending, awaiting_host_dispatch}`, so a parked
             entry no longer names a dispatch the operator already
-            performed (#1961).
+            performed (#1961). Also suppressed on an `auto_dispatch`
+            run while the named stage is still pending or
+            awaiting_host_dispatch but the host dispatcher has QUEUED
+            it for a local concurrency slot with a live waiter, so the
+            surface never invites a second dispatch that would
+            double-drive it (#5267); every degrade fails open.
         auto_advanced:
           type: array
           items:
@@ -6134,19 +6139,28 @@ components:
       description: |
         The ADVISORY campaign admission screen (#3649). Reports, per candidate,
         an explicit `runnable:no` label declaration (`not_runnable_declared`)
-        and any path-shaped token in the issue title/body that the repo's
+        and any path-shaped token in the issue title/body that the
         implement-stage `forbidden_paths` forbid (`forbidden_path`, matched with
-        the post-implement gate's matcher against the UNION of every workflow's
-        implement-stage `forbidden_paths` in the default-branch spec). It never
+        the post-implement gate's matcher against the implement-stage
+        `forbidden_paths` of ONE workflow in the default-branch spec, #5267:
+        the campaign driver's workflow, `feature_change` by default, named by
+        `workflow_id`). The forbidden-path class is advisory and covers only
+        the driver workflow, not a workflow chosen later per item. It never
         refuses, excludes or reorders an item. It rides the `POST /v0/campaigns`
         create response and the `POST /v0/campaigns/preview` report (#5221);
         like `satisfied_dependencies` it is NOT persisted, so GET/list/status
-        omit it, and it is omitted when the screen found nothing. Only create
-        appends the `campaign_admission_screened` audit row; the preview
-        writes none. Class 2 degrades
-        silently (fail-open, `forbidden_paths_screened: false`) when the spec
-        cannot be fetched or parsed or declares no forbidden paths; issue prose
-        is noisy, so false positives are expected.
+        omit it, and it is omitted when the screen found nothing. The one
+        exception is a driver workflow the default-branch spec does not
+        define: the block is then rendered even with no finding
+        (`findings: []`, `forbidden_paths_screened: false`, `workflow_id`
+        naming the unscreened workflow), so the operator sees it on the
+        response and not only in a server log line. Only create appends the
+        `campaign_admission_screened` audit row, and only for a block with at
+        least one finding; the preview writes none. Class 2 degrades
+        fail-open (`forbidden_paths_screened: false`) when the spec
+        cannot be fetched or parsed, does not define the driver workflow, or
+        that workflow declares no forbidden paths; issue prose is noisy, so
+        false positives are expected.
       required: [advisory, findings, forbidden_paths_screened]
       properties:
         advisory:
@@ -6154,16 +6168,27 @@ components:
           description: Always `true` — the screen reports and never blocks the create or changes the preview.
         findings:
           type: array
-          description: Sorted by issue, then kind, then path; capped at 50.
+          description: Sorted by issue, then kind, then path; capped at 50. Empty (never null) only on the block a driver workflow the spec does not define renders.
           items:
             $ref: '#/components/schemas/CampaignAdmissionFinding'
         forbidden_paths_screened:
           type: boolean
           description: |
-            Whether the `forbidden_path` class ran. `false` when the repo's
-            implement-stage `forbidden_paths` could not be resolved, so a
-            block carrying only `not_runnable_declared` findings is not
+            Whether the `forbidden_path` class ran. `false` when the
+            screened workflow's implement-stage `forbidden_paths` could not be
+            resolved (including a driver workflow the spec does not define),
+            so a block carrying only `not_runnable_declared` findings is not
             mistaken for a clean forbidden-path result.
+        workflow_id:
+          type: string
+          description: |
+            The workflow whose implement-stage `forbidden_paths` the
+            `forbidden_path` class screened (#5267): the campaign driver's
+            workflow (`--campaign-driver-workflow-id`), `feature_change` by
+            default. Present on every block, including one with
+            `forbidden_paths_screened: false`, where it names the workflow
+            that could not be screened. The screen covers only the driver
+            workflow, not a workflow chosen later per item.
         truncated:
           type: boolean
           description: Present and `true` when the findings were capped.
@@ -6892,9 +6917,18 @@ components:
         failed:
           type: array
           items: { type: string }
+          description: |
+            Items in state `failed`, including a restartable one (deps
+            satisfied, not `autonomy:low`): a restartable item rides the
+            slice of its own state (#5267), and `next_action` surfaces
+            its restart as `start_run`.
         cancelled:
           type: array
           items: { type: string }
+          description: |
+            Items in state `cancelled`, including a restartable one: a
+            restartable item rides the slice of its own state (#5267), so a
+            restartable failed item is in `failed`, never here.
         paused:
           type: array
           items: { type: string }
@@ -19236,7 +19270,9 @@ paths:
         non-drive runs, terminal runs, any read failure, and when a
         host-dispatch action has been outrun by its named stage
         (suppressed once the stage advances past `{pending,
-        awaiting_host_dispatch}`, #1961) — never fabricated.
+        awaiting_host_dispatch}`, #1961) or, on an `auto_dispatch` run,
+        is owned by the host dispatcher (the stage is queued for a local
+        concurrency slot with a live waiter, #5267) — never fabricated.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -19283,7 +19319,10 @@ paths:
                           any read failure, and when a host-dispatch
                           action has been outrun by its named stage
                           (suppressed once the stage advances past
-                          `{pending, awaiting_host_dispatch}`, #1961).
+                          `{pending, awaiting_host_dispatch}`, #1961),
+                          and on an `auto_dispatch` run whose named stage
+                          the host dispatcher has queued for a local
+                          concurrency slot with a live waiter (#5267).
         '400':
           description: run_id or stage_id is malformed (`validation_failed`).
           content:
