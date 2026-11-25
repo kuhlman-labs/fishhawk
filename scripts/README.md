@@ -4890,6 +4890,13 @@ base ref).
 | 1 | a trigger path changed (or `--always`) and the gate failed: any non-zero exit of `go run`, which reports a program's own exit status as 1 |
 | 2 | the check could NOT decide: a usage error, not inside a git work tree, an unresolvable base ref, no merge base, a failed tracked or untracked enumeration, a failed temp file, no `backend/` module, or `go` absent from PATH when triggered |
 
+On exit 1 the gate's stderr, captured and re-emitted after the gate exits
+while its stdout streams, is followed by a FAIL line that, for a STALE
+refusal, names the stale arms and the `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=`
+selector that re-records only them (every other arm carried forward,
+`docs/compliance/planreview-catchrate-evidence.md` § "Re-record one arm";
+#5566), and otherwise names the run-book.
+
 Every precondition fails CLOSED. That deliberately differs from the
 patch-coverage gate's fail-open preconditions (§ "Fail-open contract"): a
 check that cannot tell whether the prompt changed must not report that it
@@ -4963,10 +4970,11 @@ visible sooner. The base ref goes through `env:`, not an inline
 `scripts/test-review-prompt-eval` drives the REAL script against temp git
 fixture repos under a PATH made only of symlinks to the tools the script
 runs (`bash`, `git`, `mktemp`, `rm`) plus, where a case wants one, a stub
-`go` that records its cwd and argv and exits as told. No network, no
+`go` that records its cwd and argv, writes `$STUB_GO_STDOUT` /
+`$STUB_GO_STDERR` when set and exits as told. No network, no
 Docker, no model, never the real `go`; `origin/main` is seeded with
 `git update-ref`, not a push into a bare repo, so no detached
-`git maintenance` child outlives a fixture (docs/agents/testing.md, #3503). 52
+`git maintenance` child outlives a fixture (docs/agents/testing.md, #3503). 68
 assertions: c1 no trigger → 0, gate not run; c2 committed trigger change +
 passing gate → 0, gate run from `backend/` as
 `run ./internal/agenteval/catchrategate`; c3 failing gate → 1 naming the
@@ -4992,7 +5000,14 @@ naming the run-book; c30 (#4314) an edit to `implementreviewsecurity.go`,
 the security remit or the security convention triggers (and a failing gate
 fails the check), as does a new security-corpus case, while c11's near misses
 include `implementreviewsecurity_test.go` and `.orig` siblings of both
-security documents.
+security documents. The failure text (#5566): s1 a failing gate whose stderr
+names `STALE arm(s) architect:` and its selector → 1, relaying the gate's
+line and printing the script's FAIL line with the selector and the run-book
+section; s1b several stale arms with a pair-closed selector; s1c a
+selector-shaped line BEFORE the STALE list is not the one named; s2 a
+non-STALE failure and s2b a STALE list with no selector → the generic line,
+no `re-record only`; s3 run WITHOUT merging the streams, a passing gate's
+stdout stays on the script's stdout and its stderr on the script's stderr.
 
 Counterfactuals (each run by mutating a branch BODY, never deleting a
 referenced declaration): every exit-2 guard replaced with a fall-through to
@@ -5003,7 +5018,11 @@ directory near misses, a prefix file match reddens `.orig`, dropping
 newline enumeration reddens c15, ignoring `--always` reddens c7, swallowing
 the gate's exit reddens c3, and removing `test-review-prompt-eval` from the
 `_verify_gate_harnesses` list reddens c27, and removing the six E78.11 /
-#4313 persona trigger entries reddens their c10 rows, c28 and c29. The mktemp and flag-shaped-base
+#4313 persona trigger entries reddens their c10 rows, c28 and c29. Disabling
+the STALE branch reddens s1, s1b and s1c, matching the selector over the
+whole stderr reddens s1c, dropping the selector requirement reddens s2b,
+dropping the stderr re-emit reddens s1 and s3, and opening fd 3 INSIDE the
+command substitution (which captures the gate's stdout too) reddens s3. The mktemp and flag-shaped-base
 guards stay exit 2 under deletion (a downstream redirect or ref-resolution
 failure also exits 2), so c19 and c23 assert the guard's own message.
 
