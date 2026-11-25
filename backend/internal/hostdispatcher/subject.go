@@ -145,12 +145,20 @@ func OutsideProfile(requested []string) []string {
 // this list (recover, scope-amendment and crew-escalation decisions, cancel,
 // concurrency promote, ...) is reachable with a dispatcher token. Widening it
 // is a contract change: update the README, the server's route-reach pin and
-// the dispatcher's request pin together.
+// the dispatcher's request pins together. The request pins are
+// TestHostDispatcher_RequestsStayOnServerAllowlist, which drives the core, and
+// TestHostDispatchLoop_PublishesHeartbeatEachTick, which drives the loop's
+// heartbeat publisher (the core never sees that request).
 //
 // GET /v0/runs/{run_id}/audit (#5298) is the dispatcher's read of a run's
 // implement review round before it spawns an acceptance stage. It implements
 // the read:audit scope Scopes() already grants (ADR-104 Q4: "read runs and
 // their audit chain"); it is a read, and adds no write reach.
+//
+// POST /v0/host-dispatchers/heartbeat (#5489, ADR-104 Amendment A2) is the
+// dispatcher's per-tick state snapshot (HeartbeatRoute). It is the
+// dispatcher's only server write that is not run-scoped; it upserts the
+// dispatcher's own (account, host) heartbeat row and adds no dispatch reach.
 var routes = []string{
 	"GET /v0/runs",
 	"GET /v0/runs/{run_id}",
@@ -160,6 +168,7 @@ var routes = []string{
 	"POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure",
 	"POST /v0/stages/{stage_id}/acceptance-admission",
+	"POST " + HeartbeatRoute,
 }
 
 // Routes returns the allowlist as "METHOD /pattern" strings (a fresh slice per

@@ -296,8 +296,10 @@ func hdDriveBearerAt(s *Server, tok, method, path string) (Identity, int, string
 // (hostdispatcher.Routes(), documented in backend/internal/hostdispatcher/
 // README.md): exactly the routes `fishhawk-mcp host-dispatch` calls. Widening
 // it turns TestHostDispatcherProfile_RouteReach RED: update this list, the
-// README and the dispatcher's request pin
-// (mcpserver TestHostDispatcher_RequestsStayOnServerAllowlist) together.
+// README and the dispatcher's request pins together. Those pins are mcpserver
+// TestHostDispatcher_RequestsStayOnServerAllowlist (the core's requests) and
+// TestHostDispatchLoop_PublishesHeartbeatEachTick (the loop's heartbeat
+// publish, #5489, which the core never makes).
 var hdWantAllowlist = []string{
 	"GET /v0/runs",
 	"GET /v0/runs/{run_id}",
@@ -307,6 +309,7 @@ var hdWantAllowlist = []string{
 	"POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch",
 	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure",
 	"POST /v0/stages/{stage_id}/acceptance-admission",
+	"POST /v0/host-dispatchers/heartbeat",
 }
 
 var handleFuncRE = regexp.MustCompile(`mux\.HandleFunc\("((?:GET|POST|PUT|PATCH|DELETE) [^"]+)"`)

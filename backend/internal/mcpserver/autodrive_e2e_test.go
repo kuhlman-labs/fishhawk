@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
@@ -213,6 +214,8 @@ type adE2EHarness struct {
 	orch     *orchestrator.Orchestrator
 	srv      *server.Server
 	ts       *httptest.Server
+	// pool is the harness database (the heartbeat e2e ages a row through it).
+	pool *pgxpool.Pool
 
 	root     string
 	workDir  string
@@ -236,13 +239,24 @@ type adE2EHarness struct {
 }
 
 // newAdE2EHarness stands the stack up and creates a running campaign with one
-// item under specYAML. Nothing is ticked yet.
+// item under specYAML. Nothing is ticked yet. The server heartbeat repository
+// (#5489) is left unwired, so the awaiting block keeps the legacy
+// host_dispatcher classification.
 func newAdE2EHarness(t *testing.T, specYAML string) *adE2EHarness {
+	t.Helper()
+	return newAdE2EHarnessWith(t, specYAML, nil)
+}
+
+// newAdE2EHarnessWith is newAdE2EHarness with configure applied to the server
+// Config before server.New (nil: no change). configure receives the harness
+// database, so it can wire a Postgres-backed repository into the same
+// database (host_dispatcher_heartbeat_e2e_test.go wires the heartbeat store).
+func newAdE2EHarnessWith(t *testing.T, specYAML string, configure func(cfg *server.Config, pool *pgxpool.Pool)) *adE2EHarness {
 	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
 	h := &adE2EHarness{
-		t: t, ctx: ctx, specYAML: specYAML,
+		t: t, ctx: ctx, specYAML: specYAML, pool: pool,
 		runs:       runpkg.NewPostgresRepository(pool),
 		audit:      audit.NewPostgresRepository(pool),
 		artifacts:  artifact.NewPostgresRepository(pool),
@@ -259,7 +273,7 @@ func newAdE2EHarness(t *testing.T, specYAML string) *adE2EHarness {
 		t.Fatalf("mkdir working dir: %v", err)
 	}
 	h.orch = &orchestrator.Orchestrator{Runs: h.runs, Audit: h.audit, Artifacts: h.artifacts}
-	h.srv = server.New(server.Config{
+	cfg := server.Config{
 		RunRepo:             h.runs,
 		AuditRepo:           h.audit,
 		ArtifactRepo:        h.artifacts,
@@ -272,7 +286,11 @@ func newAdE2EHarness(t *testing.T, specYAML string) *adE2EHarness {
 		DefaultBranch:       defaultbranch.Static("main"),
 		GitHubWebhookSecret: []byte(adE2EWebhookSecret),
 		Logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}
+	if configure != nil {
+		configure(&cfg, pool)
+	}
+	h.srv = server.New(cfg)
 	h.ts = httptest.NewServer(h.srv.Handler())
 	t.Cleanup(h.ts.Close)
 

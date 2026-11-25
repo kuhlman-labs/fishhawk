@@ -250,7 +250,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **189 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **190 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -328,6 +328,7 @@ The v0 REST API exposes **189 operations** across the paths below, generated fro
 | `GET` | `/v0/restart-blockers` | Work a daemon restart would orphan right now |
 | `GET` | `/v0/digest` | "Since you last looked" digest for one repository |
 | `POST` | `/v0/digest/mark-read` | Advance the caller's digest read watermark |
+| `POST` | `/v0/host-dispatchers/heartbeat` | Record a host dispatcher's per-tick heartbeat |
 | `GET` | `/v0/handover-brief` | Handover brief for one repository |
 | `GET` | `/v0/schedules` | Scheduled workflows and their due windows for one repository |
 | `POST` | `/v0/triggers/alert` | HMAC-authenticated alert ingress — file (or comment on) an incident issue |

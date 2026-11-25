@@ -196,6 +196,12 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// visibility is a point-read DENY inside the handler, applied BEFORE the
 	// nil-source enabled:false answer (schedules.go).
 	mux.HandleFunc("GET /v0/schedules", s.handleGetSchedules)
+	// Host-dispatcher heartbeat (#5489, ADR-104 Amendment A2): the dispatcher's
+	// per-tick state snapshot, upserted per (token account, subject host). Not
+	// run-scoped, so the run account sweep does not apply; the handler takes
+	// the host from the host-dispatcher/<host> subject and the account from the
+	// token, never from the body (host_dispatcher_heartbeat.go).
+	mux.HandleFunc("POST /v0/host-dispatchers/heartbeat", s.handleHostDispatcherHeartbeat)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
 	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/reports/agent-changes", s.handleAgentChangesReport)

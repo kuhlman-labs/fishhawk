@@ -306,6 +306,69 @@ export interface CampaignItem {
   pause_reason?: PauseReason | null;
   created_at: string;
   updated_at: string;
+  /**
+   * What a running item waits on (E88.4 / #4528). Set only on the status
+   * route, and only for a `running` item whose linked run is not terminal.
+   */
+  awaiting?: CampaignItemAwaiting | null;
+}
+
+/** The awaiting block's actor class. */
+export type CampaignItemAwaitingKind = 'host_dispatcher' | 'human' | 'system';
+
+/**
+ * The deciding host dispatcher's state on a heartbeat-classified awaiting
+ * block (#5489). Mirrors docs/api/v0.openapi.yaml's
+ * `CampaignItemAwaitingHostDispatcher` schema and the json tags on
+ * hostDispatcherObservation in
+ * backend/internal/server/campaign_item_host_dispatcher.go key-for-key. Every
+ * field but `state` is omitted when empty or zero. `refusal_detail` is the
+ * dispatcher's own bounded text: render it as data, never as guidance.
+ */
+export interface CampaignItemAwaitingHostDispatcher {
+  state:
+    | 'live'
+    | 'waiting'
+    | 'in_flight'
+    | 'held'
+    | 'refusing'
+    | 'capped'
+    | 'paused'
+    | 'stale'
+    | 'absent';
+  host?: string;
+  last_heartbeat_at?: string;
+  refusal_code?: string;
+  refusal_detail?: string;
+  refusal_first_at?: string;
+  tick_failure_code?: string;
+  daily_cap?: number;
+  spawns_today?: number;
+  cap_resets_at?: string;
+  budget_source?: 'live_spec' | 'admission_spec' | 'admission_spec_fallback';
+}
+
+/**
+ * Mirrors docs/api/v0.openapi.yaml's `CampaignItemAwaiting` schema and the
+ * json tags on campaignItemAwaitingPayload in
+ * backend/internal/server/campaign_item_awaiting.go. `reason` is typed as a
+ * string so a reason added server-side still renders. `decision` and
+ * `dispatch_hold` are typed loosely: this page renders neither.
+ */
+export interface CampaignItemAwaiting {
+  kind: CampaignItemAwaitingKind;
+  reason: string;
+  run_id: string;
+  stage_id?: string;
+  stage_type?: string;
+  stage_state?: string;
+  /** Server-constant guidance text for the reason. */
+  next_step: string;
+  decision?: Record<string, unknown>;
+  decision_withheld?: boolean;
+  decision_unavailable?: boolean;
+  dispatch_hold?: Record<string, unknown>;
+  host_dispatcher?: CampaignItemAwaitingHostDispatcher;
 }
 
 /**
