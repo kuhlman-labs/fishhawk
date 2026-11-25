@@ -322,7 +322,10 @@ type CatchRateDiagHeader struct {
 	PinBaseline         bool     `json:"pin_baseline"`
 	SubsetCases         []string `json:"subset_cases,omitempty"`
 	SubsetTrialsPerCase int      `json:"subset_trials_per_case,omitempty"`
-	Arms                []string `json:"arms"`
+	// MeasuredArms is the arm selector (RecordCatchRateOptions.Arms) as
+	// given; absent = every arm. Arms lists the arm table's arms either way.
+	MeasuredArms []string `json:"measured_arms,omitempty"`
+	Arms         []string `json:"arms"`
 }
 
 // CatchRateDiagOptions configures a diagnostics writer.
@@ -713,14 +716,15 @@ type catchDiagSummaryLine struct {
 }
 
 // catchDiagOutcome is the summary outcome: passed, not_judged (a subset dry
-// run), refused (the regression, portability or subset refusal) or error.
+// run), refused (the regression, portability, subset or arm-selection
+// refusal) or error.
 func catchDiagOutcome(runErr error, notJudged bool) string {
 	switch {
 	case runErr == nil && notJudged:
 		return "not_judged"
 	case runErr == nil:
 		return "passed"
-	case errors.Is(runErr, ErrCatchRateRegressed), errors.Is(runErr, ErrPortabilityRepoSpecificFinding), errors.Is(runErr, ErrCatchRateSubsetNotRecordable):
+	case errors.Is(runErr, ErrCatchRateRegressed), errors.Is(runErr, ErrPortabilityRepoSpecificFinding), errors.Is(runErr, ErrCatchRateSubsetNotRecordable), errors.Is(runErr, ErrCatchRateArmSelection):
 		return "refused"
 	default:
 		return "error"
@@ -874,6 +878,7 @@ func RecordCatchRateEvidenceWithDiagnostics(ctx context.Context, sender MessageS
 	diagOpts.Header.PinBaseline = opts.PinBaseline
 	diagOpts.Header.SubsetCases = opts.Subset.Cases
 	diagOpts.Header.SubsetTrialsPerCase = opts.Subset.TrialsPerCase
+	diagOpts.Header.MeasuredArms = opts.Arms
 	diag, err := OpenCatchRateDiag(diagPath, diagOpts, catchDiagRules(rows))
 	if err != nil {
 		return "", err

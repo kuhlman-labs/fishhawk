@@ -14,7 +14,10 @@ import (
 // The LIVE plan-review catch-rate measurement (E55.4 / #2245): EVERY arm of
 // the evidence arm table — the two conventions arms, the architect persona
 // arm (E78.11 / #4313) and the security and security_portability persona arms
-// (E80.17 / #4314) — in ONE recording.
+// (E80.17 / #4314) — in ONE recording, unless the arm selector
+// (FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS, #5566) names part of the table: then
+// only the selected arms are measured and every other arm is carried forward
+// verbatim from the committed pair.
 //
 // IT SKIPS IN EVERY IN-LOOP RUN: the runner sanitizes gate-subprocess
 // environments through a default-deny allow-list that names ANTHROPIC_API_KEY
@@ -41,6 +44,7 @@ import (
 //	                                                every run writes <root>/<UTC 20060102T150405Z>/planreview-diag.jsonl
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=<id,...>    subset dry run: only these cases (never recordable)
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=<n>        subset dry run: n samples per case (never recordable)
+//	FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=<arm,...>    re-record only these arms, carrying every other arm forward (recordable; see the run-book's "Re-record one arm")
 //
 // Every function it calls is offline-tested with fake senders. The arms run on
 // DefaultCatchRateGeneratorModel, and this file also carries one OFFLINE wiring
@@ -93,12 +97,17 @@ func TestPlanReviewCatchRateLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subset knobs: %v", err)
 	}
+	arms, err := ParseCatchRateArms(os.Getenv)
+	if err != nil {
+		t.Fatalf("arm selector: %v", err)
+	}
 	reason := os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON")
 	opts := RecordCatchRateOptions{
 		PinBaseline: reason != "",
 		Reason:      reason,
 		DryRun:      os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD") != "1",
 		Subset:      subset,
+		Arms:        arms,
 	}
 	now := time.Now().UTC()
 	diagPath, err := ResolveCatchRateDiagPath(os.Getenv, now)
