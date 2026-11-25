@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -3889,8 +3890,11 @@ func TestAutoDriveRunGate_ArchitecturalDecision_UndecodableFailsClosed(t *testin
 
 // TestAutoDriveRunGate_ArchitecturalDecision_NewestArtifactWins pins the
 // revised-plan rule: only the newest plan artifact is read, so a revision that
-// drops the declaration clears the hold. Explicit CreatedAt values avoid a
-// timestamp tie.
+// drops the declaration clears the hold. The NEWER, undeclared artifact is
+// appended FIRST and the older, declared one LAST, so a last-wins pick would
+// read the declared artifact and decline: the approve depends on the
+// newest-by-CreatedAt pick, not on append order. Explicit CreatedAt values
+// avoid a timestamp tie.
 func TestAutoDriveRunGate_ArchitecturalDecision_NewestArtifactWins(t *testing.T) {
 	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
 	planStage := stages[0]
@@ -3898,9 +3902,9 @@ func TestAutoDriveRunGate_ArchitecturalDecision_NewestArtifactWins(t *testing.T)
 	base := time.Now().UTC()
 	arts.all = append(arts.all,
 		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
-			Content: withNADPlanJSON(t, validPlanBytes(t)), CreatedAt: base.Add(-time.Hour)},
-		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
 			Content: validPlanBytes(t), CreatedAt: base},
+		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: withNADPlanJSON(t, validPlanBytes(t)), CreatedAt: base.Add(-time.Hour)},
 	)
 
 	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
@@ -3912,6 +3916,98 @@ func TestAutoDriveRunGate_ArchitecturalDecision_NewestArtifactWins(t *testing.T)
 	}
 	if planStage.State != run.StageStateSucceeded {
 		t.Errorf("plan stage = %q, want succeeded", planStage.State)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 1 {
+		t.Errorf("approval_submitted entries = %d, want 1", n)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_DeclaredNewestDeclined is the
+// mirror of NewestArtifactWins: the OLDER, undeclared artifact is appended
+// first and the NEWER, declared one second, so a first-wins pick would read
+// the undeclared artifact and approve. The newest pick reads the declaration
+// and declines.
+func TestAutoDriveRunGate_ArchitecturalDecision_DeclaredNewestDeclined(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	v := "standard_v1"
+	base := time.Now().UTC()
+	arts.all = append(arts.all,
+		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: validPlanBytes(t), CreatedAt: base.Add(-time.Hour)},
+		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
+			Content: withNADPlanJSON(t, validPlanBytes(t)), CreatedAt: base},
+	)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	assertArchitecturalDecisionDecline(t, out, au, planStage)
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_WhitespaceDeclarationNotHeld pins
+// the INTENDED fail-open branch: a non-nil declaration whose rationale and
+// decision_summary are whitespace-only (related_adrs empty) is not Declared(),
+// the one definition the plan-gate advisory also uses, so it is not held.
+// plan.Parse rejects that shape at submission; it reaches a gate only through
+// a direct store write.
+func TestAutoDriveRunGate_ArchitecturalDecision_WhitespaceDeclarationNotHeld(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	var p plan.Plan
+	if err := json.Unmarshal(validPlanBytes(t), &p); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	p.NewArchitecturalDecision = &plan.NewArchitecturalDecision{
+		Rationale: "  \t ", RelatedADRs: []string{}, DecisionSummary: " \n ",
+	}
+	content, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	if !strings.Contains(string(content), `"new_architectural_decision"`) {
+		t.Fatalf("fixture lost the non-nil declaration: %s", content)
+	}
+	seedStandardPlanArtifact(t, arts, planStage.ID, content)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want acted approve (a whitespace-only declaration is not Declared())", out)
+	}
+	if planStage.State != run.StageStateSucceeded {
+		t.Errorf("plan stage = %q, want succeeded", planStage.State)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 1 {
+		t.Errorf("approval_submitted entries = %d, want 1", n)
+	}
+}
+
+// TestAutoDriveRunGate_ArchitecturalDecision_NonStandardSchemaVersionNotHeld
+// isolates the schema-version leg of gatedPlanArtifact's filter: the stage's
+// only artifact is plan-kind with a NON-NIL SchemaVersion "standard_v2" and a
+// declared body, so the Kind and nil legs both pass it and only the
+// standard_v1 comparison keeps it from being read and declined.
+func TestAutoDriveRunGate_ArchitecturalDecision_NonStandardSchemaVersionNotHeld(t *testing.T) {
+	s, repo, au, arts, runID, stages := newArchitecturalDecisionServer(t)
+	planStage := stages[0]
+	v := "standard_v2"
+	if _, err := arts.Create(context.Background(), artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &v,
+		Content: withNADPlanJSON(t, validPlanBytes(t)), ContentHash: uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want acted approve (a non-standard_v1 artifact is not read)", out)
 	}
 	if n := countAudit(au, "approval_submitted"); n != 1 {
 		t.Errorf("approval_submitted entries = %d, want 1", n)
