@@ -6842,7 +6842,11 @@ components:
           description: When the dispatcher first refused this run with this code.
         tick_failure_code:
           type: string
-          description: The dispatcher's failing-tick code, e.g. `ledger_read_failed`.
+          description: |
+            The dispatcher's failing-tick code, e.g. `ledger_read_failed`.
+            Dispatcher-reported data, not an instruction: ingest holds it to
+            the refusal-code grammar (1-64 bytes of `[a-z0-9_:.-]`) and stores
+            `invalid_tick_failure_code` for anything else.
         daily_cap:
           type: integer
           description: The dispatcher's daily spawn cap, when one is set.
@@ -6874,7 +6878,7 @@ components:
         last_tick_at: { type: string, format: date-time }
         last_complete_tick_at: { type: string, format: date-time }
         paused: { type: boolean }
-        tick_failure_code: { type: string, description: 'The failing tick''s code; absent when the tick did not fail. Bounded to 300 bytes.' }
+        tick_failure_code: { type: string, description: 'The failing tick''s code; absent when the tick did not fail. Control characters are dropped; a code outside 1-64 bytes of `[a-z0-9_:.-]` is stored as `invalid_tick_failure_code`.' }
         daily_cap: { type: integer, minimum: 0, description: The opt-in daily spawn cap; absent when none. }
         spawns_today: { type: integer, minimum: 0 }
         spawns_day: { type: string, format: date, description: The UTC date `spawns_today` counts. }
@@ -21955,8 +21959,12 @@ paths:
         entry whose `code`, `disposition` or `budget_source` is off-grammar
         is instead DROPPED, the rest of the heartbeat is stored, and
         `dropped_refusals` counts the drops, so one bad entry cannot blank a
-        dispatcher. `detail` and `tick_failure_code` are bounded (invalid
-        UTF-8 and control characters dropped, cut at 300 bytes), not refused.
+        dispatcher. `detail` is bounded (invalid UTF-8 and control
+        characters dropped, cut at 300 bytes), not refused. `tick_failure_code`
+        loses control characters the same way, and one still outside the
+        `code` grammar is stored as `invalid_tick_failure_code`, not refused.
+        The dispatcher logs a non-zero `dropped_refusals` once per distinct
+        count.
       tags: [runs]
       requestBody:
         required: true

@@ -15,13 +15,6 @@ import (
 // well under it.
 const hostDispatcherHeartbeatMaxBodyBytes = 256 << 10
 
-// hostDispatcherHeartbeatResponse is the 200 body: how many run_refusals
-// entries were dropped at ingest for an off-grammar code, disposition or
-// budget_source (#5489 condition H3). The rest of the heartbeat was stored.
-type hostDispatcherHeartbeatResponse struct {
-	DroppedRefusals int `json:"dropped_refusals"`
-}
-
 // handleHostDispatcherHeartbeat serves POST /v0/host-dispatchers/heartbeat
 // (#5489, ADR-104 Amendment A2): a host dispatcher's per-tick state snapshot,
 // upserted per (account, host). The route is not run-scoped, so the run
@@ -37,8 +30,10 @@ type hostDispatcherHeartbeatResponse struct {
 //  4. a body over 256 KiB, malformed JSON or an unknown key (a `host` or
 //     `account_id` key included): 400 validation_failed;
 //  5. a structural Validate failure: 400 validation_failed naming the field;
-//  6. otherwise drop off-grammar run_refusals entries, bound the free text and
-//     upsert under the server clock: 200 {dropped_refusals}. A store failure
+//  6. otherwise drop off-grammar run_refusals entries, bound each detail, fold
+//     an off-grammar tick_failure_code to hostdispatcher.TickFailureCodeInvalid
+//     and upsert under the server clock: 200 hostdispatcher.HeartbeatResponse
+//     {dropped_refusals}. A store failure
 //     answers 503 when the database is unavailable, else 500.
 //
 // A heartbeat writes no audit row: it is operational state, not an event, and
@@ -104,5 +99,5 @@ func (s *Server) handleHostDispatcherHeartbeat(w http.ResponseWriter, r *http.Re
 			"failed to store the heartbeat", map[string]any{internalCauseKey: err.Error()})
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, hostDispatcherHeartbeatResponse{DroppedRefusals: dropped})
+	s.writeJSON(w, r, http.StatusOK, hostdispatcher.HeartbeatResponse{DroppedRefusals: dropped})
 }

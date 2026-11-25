@@ -178,11 +178,16 @@ Ingest rules, applied in this order:
    entry whose `code` is not 1–64 bytes of `[a-z0-9_:.-]`, whose
    `disposition` is outside its set, or whose `budget_source` is outside its
    set or sits on a non-`budget_blocked` entry is dropped. The rest is stored,
-   and the 200 response body reports `{"dropped_refusals": <n>}`.
+   and the 200 response body (`HeartbeatResponse`) reports
+   `{"dropped_refusals": <n>}`. The dispatcher logs a non-zero count once per
+   distinct count, because a dropped entry's run reads `live` on the server.
 3. **Free text is bounded, not refused** (`BoundFields`, `BoundText`): each
    `detail` and the `tick_failure_code` lose invalid UTF-8 and control runes and
    are cut at 300 bytes on a rune boundary, the dispatcher's own
-   `boundHostDispatchText` rule.
+   `boundHostDispatchText` rule. A `tick_failure_code` still outside the `code`
+   grammar after that is stored as `invalid_tick_failure_code`
+   (`TickFailureCodeInvalid`): the field reaches every item the record decides,
+   so it carries a code, never free text.
 
 Readers judge freshness on the server-stamped `received_at`, never on
 `last_tick_at`. A heartbeat is fresh for `StaleAfter(interval_seconds)`, which

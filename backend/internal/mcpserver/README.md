@@ -361,8 +361,11 @@ subject and the account from the token, so the body names neither.
   delays neither a tick nor shutdown. A tick driven without the publisher (most
   tests) leaves its snapshot in the mailbox and never POSTs.
 - *Failures.* A transport error, a 403 or 404 from an older server, or a 5xx
-  never fails a tick. It is logged once per distinct error string, and a
-  success resets the dedupe.
+  never fails a tick. It is logged once per distinct error, and a success
+  resets the dedupe. An HTTP failure keys on its status and code, not its
+  string, because every 5xx carries a fresh per-request `error_ref`. A 200
+  whose `dropped_refusals` is non-zero is logged once per distinct count: the
+  server dropped those entries as off-grammar and reads their runs as `live`.
 - *Snapshot.* `interval_seconds`, `started_at`, `last_tick_at`,
   `last_complete_tick_at`, `paused`, the current tick's `tick_failure_code`,
   `daily_cap`, `spawns_today`, `spawns_day`, `in_flight` and `run_refusals`.

@@ -691,13 +691,15 @@ type hostDispatchLoop struct {
 	// the publish seam (default postHeartbeat); heartbeatTimeout bounds one
 	// POST (hostDispatchHeartbeatTimeout). heartbeatDelivered is a test-only
 	// hook run after each publish attempt (nil in production).
-	// heartbeatLastErr is the last logged publish error, owned by the
-	// publisher goroutine.
-	heartbeats         chan hostdispatcher.Heartbeat
-	publishHeartbeat   func(ctx context.Context, hb hostdispatcher.Heartbeat) error
-	heartbeatTimeout   time.Duration
-	heartbeatDelivered func(hb hostdispatcher.Heartbeat, err error)
-	heartbeatLastErr   string
+	// heartbeatLastErr is the dedupe key (heartbeatErrKey) of the last logged
+	// publish error and heartbeatLastDropped the last logged dropped_refusals
+	// count, both owned by the publisher goroutine.
+	heartbeats           chan hostdispatcher.Heartbeat
+	publishHeartbeat     func(ctx context.Context, hb hostdispatcher.Heartbeat) (dropped int, err error)
+	heartbeatTimeout     time.Duration
+	heartbeatDelivered   func(hb hostdispatcher.Heartbeat, err error)
+	heartbeatLastErr     string
+	heartbeatLastDropped int
 	// logMu serialises logf: the tick and the heartbeat publisher both log.
 	logMu sync.Mutex
 }
@@ -955,32 +957,55 @@ func (l *hostDispatchLoop) startHeartbeatPublisher(ctx context.Context) <-chan s
 
 // publishOnce POSTs one snapshot. A failure (transport, a 403 or 404 from an
 // older server, a 5xx) never fails a tick: it is logged once per distinct
-// error string, and a success resets the dedupe.
+// heartbeatErrKey, and a success resets the dedupe. A success whose
+// dropped_refusals is non-zero is logged once per distinct count: a dropped
+// entry's run reads live on the server while this dispatcher refuses it.
 func (l *hostDispatchLoop) publishOnce(ctx context.Context, hb hostdispatcher.Heartbeat) {
 	pctx, cancel := context.WithTimeout(ctx, l.heartbeatTimeout)
-	err := l.publishHeartbeat(pctx, hb)
+	dropped, err := l.publishHeartbeat(pctx, hb)
 	cancel()
 	if err != nil {
-		if msg := err.Error(); msg != l.heartbeatLastErr {
-			l.heartbeatLastErr = msg
+		if key := heartbeatErrKey(err); key != l.heartbeatLastErr {
+			l.heartbeatLastErr = key
 			l.logf("heartbeat publish failed (ticks continue; logged once per distinct error): %v", err)
 		}
 	} else {
 		l.heartbeatLastErr = ""
+		if dropped != l.heartbeatLastDropped {
+			l.heartbeatLastDropped = dropped
+			if dropped > 0 {
+				l.logf("heartbeat stored with %d run_refusals entries dropped as off-grammar; the server reads those runs as live (check that the dispatcher and server versions match; logged once per distinct count)", dropped)
+			}
+		}
 	}
 	if l.heartbeatDelivered != nil {
 		l.heartbeatDelivered(hb, err)
 	}
 }
 
+// heartbeatErrKey is publishOnce's dedupe key. An *apiError keys on status and
+// code, never on Error(): that appends the error_ref every 5xx carries, which
+// is the per-request id and so differs on every tick.
+func heartbeatErrKey(err error) string {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return fmt.Sprintf("http %d %s", ae.StatusCode, ae.Code)
+	}
+	return err.Error()
+}
+
 // postHeartbeat is the default publish seam: POST hostdispatcher.HeartbeatRoute
-// under the dispatcher's own token.
-func (l *hostDispatchLoop) postHeartbeat(ctx context.Context, hb hostdispatcher.Heartbeat) error {
+// under the dispatcher's own token, returning the response's dropped_refusals.
+func (l *hostDispatchLoop) postHeartbeat(ctx context.Context, hb hostdispatcher.Heartbeat) (int, error) {
 	body, err := json.Marshal(hb)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return l.api.do(ctx, http.MethodPost, hostdispatcher.HeartbeatRoute, body, nil)
+	var resp hostdispatcher.HeartbeatResponse
+	if err := l.api.do(ctx, http.MethodPost, hostdispatcher.HeartbeatRoute, body, &resp); err != nil {
+		return 0, err
+	}
+	return resp.DroppedRefusals, nil
 }
 
 // tick is one dispatcher round. A tick error is logged and never spawns; only

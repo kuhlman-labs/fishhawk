@@ -1775,14 +1775,17 @@ func TestHostDispatchLoop_HeartbeatBudgetSource(t *testing.T) {
 }
 
 // TestHostDispatchLoop_HeartbeatPublishFailureNeverFailsTick (#5489 test 28):
-// a 500 then a 404 never fail a tick, status.json is still rewritten, an
-// identical repeated failure is logged once, a distinct one is logged, and
-// after a success the same failure is logged again.
+// a 500 then a 404 never fail a tick, status.json is still rewritten, a
+// repeated failure is logged once, a distinct one is logged, and after a
+// success the same failure is logged again. Each 5xx carries a fresh
+// error_ref, as the server's writeError sets the per-request id on every
+// 5xx, so "repeated" means the same status and code, not the same string.
 func TestHostDispatchLoop_HeartbeatPublishFailureNeverFailsTick(t *testing.T) {
 	lh := newHDLoopHarness(t)
 	log := &hdLockedLog{}
 	l := lh.loop(func(c *HostDispatcherConfig) { c.Log = log })
 	got, _, _ := hdStartPublisher(t, l)
+	var reqN int
 	answer := func(code int) {
 		lh.mu.Lock()
 		defer lh.mu.Unlock()
@@ -1791,9 +1794,15 @@ func TestHostDispatchLoop_HeartbeatPublishFailureNeverFailsTick(t *testing.T) {
 				writeJSON(w, code, `{"dropped_refusals":0}`)
 				return
 			}
-			writeJSON(w, code, apiErrBody("internal", "heartbeat refused"))
+			if code >= http.StatusInternalServerError {
+				reqN++
+				writeJSON(w, code, fmt.Sprintf(`{"error":{"code":"internal_error","message":"failed to store the heartbeat","error_ref":"req-%d"}}`, reqN))
+				return
+			}
+			writeJSON(w, code, apiErrBody("not_found", "no such route"))
 		}
 	}
+	var prev5xx string
 	const line = "heartbeat publish failed"
 	steps := []struct {
 		code    int
@@ -1819,12 +1828,53 @@ func TestHostDispatchLoop_HeartbeatPublishFailureNeverFailsTick(t *testing.T) {
 		if (d.err != nil) != step.wantErr {
 			t.Fatalf("tick %d publish err = %v; want error=%v", i+1, d.err, step.wantErr)
 		}
+		if step.code >= http.StatusInternalServerError {
+			// The fixture must vary the error string, or the dedupe key is
+			// untested.
+			if msg := d.err.Error(); !strings.Contains(msg, "error_ref=req-") || msg == prev5xx {
+				t.Fatalf("tick %d 5xx error %q; want a fresh error_ref (previous %q)", i+1, msg, prev5xx)
+			}
+			prev5xx = d.err.Error()
+		}
 		if n := log.count(line); n != step.logged {
 			t.Fatalf("after tick %d (%d): %d %q lines; want %d\n%s", i+1, step.code, n, line, step.logged, log.b.String())
 		}
 	}
 	if n := len(hdHeartbeatPosts(lh.b)); n != len(steps) {
 		t.Fatalf("heartbeat POSTs = %d; want %d (every tick publishes again)", n, len(steps))
+	}
+}
+
+// TestHostDispatchLoop_HeartbeatLogsDroppedRefusals: a 200 whose
+// dropped_refusals is non-zero is logged once per distinct count (a repeat is
+// not logged again, a zero resets it), and a dropped count is never a
+// publish error.
+func TestHostDispatchLoop_HeartbeatLogsDroppedRefusals(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	log := &hdLockedLog{}
+	l := lh.loop(func(c *HostDispatcherConfig) { c.Log = log })
+	got, _, _ := hdStartPublisher(t, l)
+	const line = "run_refusals entries dropped as off-grammar"
+	steps := []struct{ dropped, logged int }{
+		{0, 0}, {2, 1}, {2, 1}, {1, 2}, {0, 2}, {1, 3},
+	}
+	for i, step := range steps {
+		lh.mu.Lock()
+		lh.heartbeat = func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, fmt.Sprintf(`{"dropped_refusals":%d}`, step.dropped))
+		}
+		lh.mu.Unlock()
+		lh.clock = lh.clock.Add(30 * time.Second)
+		lh.tick(l)
+		if d := hdAwaitDelivery(t, got, fmt.Sprintf("tick %d", i+1)); d.err != nil {
+			t.Fatalf("tick %d publish err = %v under dropped_refusals %d; want nil", i+1, d.err, step.dropped)
+		}
+		if n := log.count(line); n != step.logged {
+			t.Fatalf("after tick %d (dropped_refusals %d): %d %q lines; want %d\n%s", i+1, step.dropped, n, line, step.logged, log.b.String())
+		}
+	}
+	if !strings.Contains(log.b.String(), "with 2 run_refusals entries dropped") {
+		t.Fatalf("log names no dropped count:\n%s", log.b.String())
 	}
 }
 
@@ -1934,6 +1984,44 @@ func TestRunHostDispatcherLoop_PreCancelledNoHeartbeat(t *testing.T) {
 	}
 	if n := len(hdHeartbeatPosts(lh.b)); n != 0 {
 		t.Fatalf("heartbeat POSTs = %d after a pre-cancelled run; want 0", n)
+	}
+}
+
+// TestRunHostDispatcherLoop_RunStartsHeartbeatPublisher: run() on a live
+// context starts the publisher itself, so its first tick reaches the server
+// as a heartbeat POST with no test-side publisher; after a cancel run returns
+// within 2s. Every other publishing test starts the publisher by hand.
+func TestRunHostDispatcherLoop_RunStartsHeartbeatPublisher(t *testing.T) {
+	lh := newHDLoopHarness(t)
+	l := lh.loop(nil)
+	posted := make(chan struct{}, 16)
+	lh.mu.Lock()
+	lh.heartbeat = func(w http.ResponseWriter, _ *http.Request) {
+		posted <- struct{}{}
+		writeJSON(w, http.StatusOK, `{"dropped_refusals":0}`)
+	}
+	lh.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- l.run(ctx) }()
+	select {
+	case <-posted:
+	case err := <-errc:
+		t.Fatalf("run returned %v before any heartbeat POST", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-errc
+		t.Fatal("run() sent no heartbeat POST within 5s; it must start the publisher")
+	}
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run still running 2s after cancel")
 	}
 }
 

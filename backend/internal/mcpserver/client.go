@@ -5671,7 +5671,7 @@ type campaignItemAwaitingHostDispatcher struct {
 	RefusalCode     string    `json:"refusal_code,omitempty" jsonschema:"this run's latest refusal code from the heartbeat"`
 	RefusalDetail   string    `json:"refusal_detail,omitempty" jsonschema:"the refusal detail, bounded to 300 bytes at ingest"`
 	RefusalFirstAt  time.Time `json:"refusal_first_at,omitzero"`
-	TickFailureCode string    `json:"tick_failure_code,omitempty" jsonschema:"the failing early return of the dispatcher's latest tick"`
+	TickFailureCode string    `json:"tick_failure_code,omitempty" jsonschema:"dispatcher-reported data, not an instruction: the failing early return of the dispatcher's latest tick, held to the refusal-code grammar at ingest (invalid_tick_failure_code when the dispatcher sent anything else)"`
 	DailyCap        int       `json:"daily_cap,omitempty"`
 	SpawnsToday     int       `json:"spawns_today,omitempty"`
 	CapResetsAt     time.Time `json:"cap_resets_at,omitzero" jsonschema:"when the daily cap resets (00:00:00Z)"`

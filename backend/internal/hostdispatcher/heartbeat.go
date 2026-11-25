@@ -20,6 +20,20 @@ import (
 // HeartbeatRoute is the heartbeat write path (POST).
 const HeartbeatRoute = "/v0/host-dispatchers/heartbeat"
 
+// HeartbeatResponse is the 200 body: how many run_refusals entries the server
+// dropped at ingest for an off-grammar code, disposition or budget_source
+// (#5489 condition H3). The rest of the heartbeat was stored. The dispatcher
+// logs a non-zero count, because a dropped entry's run reads live on the
+// server while the dispatcher refuses it.
+type HeartbeatResponse struct {
+	DroppedRefusals int `json:"dropped_refusals"`
+}
+
+// TickFailureCodeInvalid replaces an off-grammar tick_failure_code at ingest
+// (BoundFields): the tick still reads as failing, but no dispatcher-authored
+// free text reaches a reader through this field.
+const TickFailureCodeInvalid = "invalid_tick_failure_code"
+
 // Heartbeat bounds. MaxRunRefusals caps run_refusals (a longer list is a 400);
 // MaxCodeLen bounds a refusal code; MaxTextLen is the BoundText cut, the same
 // 300 bytes as the dispatcher's own status.json bound.
@@ -94,7 +108,8 @@ type Heartbeat struct {
 	LastCompleteTickAt time.Time `json:"last_complete_tick_at,omitzero"`
 	Paused             bool      `json:"paused"`
 	// TickFailureCode is the current tick's failing early return, absent when
-	// the tick did not fail.
+	// the tick did not fail. Ingest holds it to the refusal-code grammar
+	// (BoundFields).
 	TickFailureCode string `json:"tick_failure_code,omitempty"`
 	// DailyCap is the opt-in daily spawn limit; absent (0) when none is set.
 	DailyCap    int `json:"daily_cap,omitempty"`
@@ -215,11 +230,16 @@ func (h *Heartbeat) DropInvalidRefusals() int {
 	return dropped
 }
 
-// BoundFields applies BoundText to the free-text fields (each refusal's
-// detail and the tick failure code) instead of refusing them, so one long
-// detail cannot blank a dispatcher.
+// BoundFields bounds the dispatcher-authored fields instead of refusing them,
+// so one bad value cannot blank a dispatcher. Each refusal's detail and the
+// tick_failure_code get BoundText. A non-empty tick_failure_code that is then
+// still outside the refusal-code grammar (1..MaxCodeLen bytes of
+// [a-z0-9_:.-]) becomes TickFailureCodeInvalid: the field is copied to every
+// item the record decides, so it carries a code, never free text.
 func (h *Heartbeat) BoundFields() {
-	h.TickFailureCode = BoundText(h.TickFailureCode)
+	if h.TickFailureCode = BoundText(h.TickFailureCode); h.TickFailureCode != "" && !validCode(h.TickFailureCode) {
+		h.TickFailureCode = TickFailureCodeInvalid
+	}
 	for i := range h.RunRefusals {
 		h.RunRefusals[i].Detail = BoundText(h.RunRefusals[i].Detail)
 	}
