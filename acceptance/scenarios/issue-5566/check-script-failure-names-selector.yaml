@@ -1,0 +1,14 @@
+id: scenario:issue-5566/check-script-failure-names-selector
+statement: When the gate fails mode (4b), `scripts/check-review-prompt-eval --always` exits 1. Its failure line names the STALE arm(s) exactly as the gate lists them, the matching FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS selector and the run-book's 'Re-record one arm' section, and it still relays the gate's own stderr. On a passing gate, the gate's stdout (the PASS report) still reaches the script's STDOUT, not its stderr.
+verify_hint: 'CLI exit code and combined stdout/stderr of `scripts/check-review-prompt-eval --always` from the checkout root: exit 1, a FAIL line containing `STALE arm(s) architect`, `FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect` and `Re-record one arm`.'
+steps: 'Posture B in the sanctioned checkout: scripts/check-review-prompt-eval --always >cs.out 2>cs.err. Also ran scripts/test-review-prompt-eval: its harness case s3 (approval condition R1) stubs a passing gate and asserts the gate''s stdout lands on the script''s stdout, not on stderr.'
+assertions:
+    expected: exit 1; the FAIL line names the arm, the selector and the section; the gate stderr is relayed; on a pass the gate stdout reaches the script's stdout
+    observed_at_record: 'exit 1. Stderr relays the gate''s FAIL line verbatim, then ''check-review-prompt-eval: FAIL — STALE arm(s) architect: re-record only those arms with FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect (every other arm is carried forward) per docs/compliance/planreview-catchrate-evidence.md § "Re-record one arm"''. Harness: 68 passed, 0 failed, including ''s3 gate stdout on stdout, gate stderr on stderr''. Script line 209 uses the R1 form with fd 3 opened outside the substitution.'
+    repro_handle: scripts/check-review-prompt-eval --always; scripts/test-review-prompt-eval
+origin:
+    issue: 5566
+    pr: 5570
+    run_id: 2b9fb0bb-0473-4448-b464-9478563d0f7c
+    head_sha: ecaed1ecf52a083ccfb218affa521238b7630a74
+    recorded_at: 2026-11-25T03:25:38Z

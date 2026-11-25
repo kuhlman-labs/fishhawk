@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // categoryPlanScopeRegression is the audit-log category for the entry
@@ -40,13 +41,69 @@ const categoryPlanScopeRegression = "plan_scope_regression"
 // Regressed is len(UndeclaredRemovals) > 0 (#2516), NOT len(RemovedFiles) —
 // it is the bit the plan gate's refusal and the revise budget refund both key
 // on, and a DECLARED drop is not a mistake: it neither refuses nor refunds.
+//
+// AcknowledgedRemovals (#5499) is additive: one entry per DECLARED removal, in
+// DeclaredRemovals order, carrying the plan's scope_removals reason bounded by
+// prompt.BoundPlanAuthoredReason (single line, at most 200 bytes, truncation
+// marker). It is what the plan-review prompt renders as ACKNOWLEDGED REMOVAL
+// lines instead of handing a declared drop to the reviewers as a HIGH-severity
+// regression. Marshalled as [] (not null) on a clean diff. A row written
+// before #5499 lacks the key; scopeRegressionEvidence falls back for it.
 type ScopeRegressionPayload struct {
-	RemovedFiles       []string `json:"removed_files"`
-	DeclaredRemovals   []string `json:"declared_removals"`
-	UndeclaredRemovals []string `json:"undeclared_removals"`
-	AddedFiles         []string `json:"added_files"`
-	ScannedFiles       int      `json:"scanned_files"`
-	Regressed          bool     `json:"regressed"`
+	RemovedFiles         []string              `json:"removed_files"`
+	DeclaredRemovals     []string              `json:"declared_removals"`
+	UndeclaredRemovals   []string              `json:"undeclared_removals"`
+	AcknowledgedRemovals []AcknowledgedRemoval `json:"acknowledged_removals"`
+	AddedFiles           []string              `json:"added_files"`
+	ScannedFiles         int                   `json:"scanned_files"`
+	Regressed            bool                  `json:"regressed"`
+}
+
+// AcknowledgedRemoval is one declared scope removal and the plan's reason for
+// it (#5499). Reason is PLAN-AUTHORED and unverified: the gate checked only
+// that the path was dropped and declared, never that the reason is true.
+type AcknowledgedRemoval struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+// scopeRegressionEvidence maps a plan_scope_regression payload into the
+// plan-review prompt's evidence (#5499). Evidence.RemovedFiles is the
+// REGRESSION set only — the undeclared drops — so a drop the plan declared in
+// scope_removals never reaches the HIGH-severity block; it renders as an
+// ACKNOWLEDGED REMOVAL line instead. A legacy pre-#2516 row carries neither
+// split key (absent, not empty), so every drop on it is treated as
+// undeclared, exactly as it was rendered when it was written. A row written
+// between #2516 and #5499 carries declared_removals but no
+// acknowledged_removals; its declared paths map with an empty reason. nil in,
+// nil out.
+func scopeRegressionEvidence(p *ScopeRegressionPayload) *prompt.ScopeRegressionEvidence {
+	if p == nil {
+		return nil
+	}
+	drops := p.UndeclaredRemovals
+	if drops == nil && p.DeclaredRemovals == nil {
+		drops = p.RemovedFiles
+	}
+	ev := &prompt.ScopeRegressionEvidence{
+		RemovedFiles: drops,
+		AddedFiles:   p.AddedFiles,
+		ScannedFiles: p.ScannedFiles,
+	}
+	switch {
+	case p.AcknowledgedRemovals != nil:
+		for _, a := range p.AcknowledgedRemovals {
+			ev.AcknowledgedRemovals = append(ev.AcknowledgedRemovals, prompt.AcknowledgedRemovalEvidence{
+				Path:   a.Path,
+				Reason: a.Reason,
+			})
+		}
+	case p.DeclaredRemovals != nil:
+		for _, path := range p.DeclaredRemovals {
+			ev.AcknowledgedRemovals = append(ev.AcknowledgedRemovals, prompt.AcknowledgedRemovalEvidence{Path: path})
+		}
+	}
+	return ev
 }
 
 // scopedPaths returns the slash-normalized, sorted, de-duplicated UNION of
@@ -167,26 +224,41 @@ func (s *Server) runScopeRegression(ctx context.Context, runID, stageID uuid.UUI
 	// and paths are slash-normalized on both sides so a declaration written
 	// with OS separators still matches. Both lists inherit removed's sorted
 	// order and marshal as [] (not null).
+	//
+	// Each declared removal also carries the plan's reason into
+	// acknowledged_removals (#5499), bounded to one line of at most 200 bytes:
+	// the reason is plan-authored text that the review prompt renders inside
+	// its gate-evidence block, so it is stored and rendered as bounded data.
+	// When two entries name the same path, the first reason wins.
 	declaredSet := make(map[string]bool, len(parsedNew.ScopeRemovals))
+	declaredReason := make(map[string]string, len(parsedNew.ScopeRemovals))
 	for _, sr := range parsedNew.ScopeRemovals {
-		declaredSet[filepath.ToSlash(sr.Path)] = true
+		path := filepath.ToSlash(sr.Path)
+		if declaredSet[path] {
+			continue
+		}
+		declaredSet[path] = true
+		declaredReason[path] = prompt.BoundPlanAuthoredReason(sr.Reason)
 	}
 	declaredRemovals := []string{}
 	undeclaredRemovals := []string{}
+	acknowledged := []AcknowledgedRemoval{}
 	for _, p := range removed {
 		if declaredSet[p] {
 			declaredRemovals = append(declaredRemovals, p)
+			acknowledged = append(acknowledged, AcknowledgedRemoval{Path: p, Reason: declaredReason[p]})
 			continue
 		}
 		undeclaredRemovals = append(undeclaredRemovals, p)
 	}
 
 	result := &ScopeRegressionPayload{
-		RemovedFiles:       removed,
-		DeclaredRemovals:   declaredRemovals,
-		UndeclaredRemovals: undeclaredRemovals,
-		AddedFiles:         added,
-		ScannedFiles:       len(newScoped),
+		RemovedFiles:         removed,
+		DeclaredRemovals:     declaredRemovals,
+		UndeclaredRemovals:   undeclaredRemovals,
+		AcknowledgedRemovals: acknowledged,
+		AddedFiles:           added,
+		ScannedFiles:         len(newScoped),
 		// A DECLARED drop is not a regression: it neither triggers the plan
 		// gate's refusal nor refunds the revise budget (#2516).
 		Regressed: len(undeclaredRemovals) > 0,

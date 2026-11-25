@@ -1,0 +1,14 @@
+id: scenario:issue-5499/declared-drop-recorded-acknowledged
+statement: On a revise pass whose revised plan drops a previously scoped file and declares it in scope_removals with a reason, the plan_scope_regression audit entry lists that file in acknowledged_removals with the bounded plan-authored reason and keeps regressed false.
+verify_hint: 'Persisted audit row: GET /v0/runs/{run_id}/audit?category=plan_scope_regression after shipping a plan, revising the stage through POST /v0/stages/{stage_id}/revise, and shipping a revision that declares the drop. The newest entry''s acknowledged_removals carries {path, reason} and regressed is false. Non-blocking because the multi-step revise drive on the preview is unproven; TestShipPlan_ReviewAgents_DeclaredRemovalAcknowledgedInReviewPrompt and TestRunScopeRegression_AcknowledgedRemovalsCarryReason are the deciding layer.'
+steps: 'Running target: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"}, then POST /v0/stages/{plan}/revise with no bearer (401 authentication_required). Minted a run-bound fhm_ bearer: POST /v0/stages/{plan}/revise returned 403 insufficient_scope write:approvals, and so did MCP fishhawk_revise_plan. The revise drive cannot be armed on the preview. Posture B, as the verify_hint names the Go tests as the deciding layer: in the sanctioned checkout 67febc78e/backend, ran go test ./internal/server ./internal/prompt -count=1 -run ''TestRunScopeRegression_|TestShipPlan_ReviewAgents_DeclaredRemoval|TestBuild_PlanReview_GateEvidence_|...'' with no DB.'
+assertions:
+    expected: The plan_scope_regression entry lists the declared file in acknowledged_removals with the bounded reason, and regressed is false
+    observed_at_record: 'PASS: TestRunScopeRegression_AcknowledgedRemovalsCarryReason, TestRunScopeRegression_DeclaredRemovals, TestRunScopeRegression_RegressingPass, TestRunScopeRegression_CrossSliceMoveIsNotADrop, TestShipPlan_ReviewAgents_DeclaredRemovalAcknowledgedInReviewPrompt, TestBuild_PlanReview_GateEvidence_AcknowledgedRemovalsRender and TestBuild_PlanReview_GateEvidence_AcknowledgedReasonIsBoundedData. Output hash sha256:88608eba...'
+    repro_handle: cd backend && go test ./internal/server -run 'TestRunScopeRegression_AcknowledgedRemovalsCarryReason|TestShipPlan_ReviewAgents_DeclaredRemovalAcknowledgedInReviewPrompt' -v
+origin:
+    issue: 5499
+    pr: 5563
+    run_id: 5b0a8b2e-7906-4f4d-a6d8-cac4359ea498
+    head_sha: 67febc78eac36ec78aa8d88c145407778042e5e8
+    recorded_at: 2026-11-23T20:47:57Z

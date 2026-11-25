@@ -1981,6 +1981,10 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				// key. Pinned by TestPlanGateEvidence_ForbiddenCriterionSeam.
 				ForbiddenPath:    f.ForbiddenPath,
 				ForbiddenPattern: f.ForbiddenPattern,
+				// #5499: dropping this downgrades every asserted
+				// UNENFORCEABLE CRITERION line to the FORBIDDEN PATH NAMED
+				// advisory. Pinned by TestPlanGateEvidence_ForbiddenCriterionSeam.
+				ForbiddenInScope: f.ForbiddenInScope,
 			})
 		}
 		for _, f := range sweep.CrossSliceFindings {
@@ -2027,11 +2031,9 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 		ev.TestSweep = ts
 	}
 	if regression != nil {
-		ev.ScopeRegression = &prompt.ScopeRegressionEvidence{
-			RemovedFiles: regression.RemovedFiles,
-			AddedFiles:   regression.AddedFiles,
-			ScannedFiles: regression.ScannedFiles,
-		}
+		// #5499: only the UNDECLARED drops reach the HIGH-severity block; a
+		// declared drop renders as an ACKNOWLEDGED REMOVAL line.
+		ev.ScopeRegression = scopeRegressionEvidence(regression)
 	}
 	if acceptance != nil {
 		ap := &prompt.AcceptancePrecheckEvidence{
