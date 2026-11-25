@@ -10,18 +10,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hostdispatcher"
 )
 
-// host_dispatch_overlay.go is the stdio status overlay (#5402): the interim,
-// MCP-local way the operator's own fishhawk-mcp process tells the truth about
-// the host dispatcher until the server heartbeat (#5489) supersedes it (the
-// Captain's 2026-11-20 ruling c). The backend's campaign awaiting block says
-// "the host dispatcher spawns this stage on its next tick" for every
-// host_dispatcher item; it cannot know whether a dispatcher is running, paused,
-// capped or refusing, because that state lives only in the dispatcher's
-// host-local status.json. This file reads that file, read-only, and rewrites the
-// block (fishhawk_get_campaign_status) or adds a host_dispatch block
-// (fishhawk_get_run_status).
+// host_dispatch_overlay.go is the stdio status overlay (#5402): the MCP-local
+// way the operator's own fishhawk-mcp process reads the host dispatcher's
+// host-local status.json (the Captain's 2026-11-20 ruling c). The server
+// heartbeat (#5489, ADR-104 Amendment A2) now exists: the dispatcher publishes
+// a per-tick snapshot (host_dispatcher_loop.go offerHeartbeat) and the backend
+// classifies a host_dispatcher item from it, reading paused, capped,
+// budget-blocked, held, refusing, stale or absent as human. A block the
+// backend classified that way passes through unchanged. This overlay remains
+// the host-local refinement of the blocks the backend still classifies
+// host_dispatcher (live and waiting, including the review-round holds that
+// hostDispatchRefusalDisposition publishes as waiting): it reads status.json,
+// read-only, and rewrites the block (fishhawk_get_campaign_status) or adds a
+// host_dispatch block (fishhawk_get_run_status).
 //
 // It runs only when hostDispatchOverlayEnabled: the operator's stdio process
 // (Config.LocalHostRungs) with a non-run-bound bearer. Over fishhawkd's /mcp
@@ -132,6 +137,43 @@ var (
 		hdRefuseImplementReviewNotStarted: true,
 	}
 )
+
+// hostDispatchRefusalDisposition is the heartbeat disposition the dispatcher
+// publishes for one run_refusals entry (#5489): what it will do about the run.
+// It reuses the code sets above in observeHostDispatch's own arm order, so the
+// server's heartbeat verdict and this overlay agree on every code: the paused
+// set reads paused, cap_reached:daily capped, budget_blocked budget_blocked
+// (before the hold set), the hold set held, the review-round set waiting,
+// lineage_lock_held waiting until hostDispatchLineageLockStuckAfter and
+// refusing after, the waiting set waiting, and every other code refusing
+// (budget_check_failed, dispatch_hold_unavailable, path_outside_allowed_roots
+// and working_dir_unbound included).
+//
+// The review-round set reads waiting, NOT in_flight (#5489 condition H2): the
+// backend then keeps the item kind host_dispatcher, so this overlay still
+// applies hostDispatchReviewRoundNextStep and the 30-minute orphan escalation.
+func hostDispatchRefusalDisposition(code string, firstAt, now time.Time) hostdispatcher.Disposition {
+	switch {
+	case hostDispatchPausedRefusals[code]:
+		return hostdispatcher.DispositionPaused
+	case code == hdRefuseCapDaily:
+		return hostdispatcher.DispositionCapped
+	case code == hdRefuseBudgetBlocked:
+		return hostdispatcher.DispositionBudgetBlocked
+	case hostDispatchHoldRefusals[code]:
+		return hostdispatcher.DispositionHeld
+	case hostDispatchReviewRoundRefusals[code]:
+		return hostdispatcher.DispositionWaiting
+	case code == hdRefuseLineageLockHeld:
+		if now.Sub(firstAt) <= hostDispatchLineageLockStuckAfter {
+			return hostdispatcher.DispositionWaiting
+		}
+		return hostdispatcher.DispositionRefusing
+	case hostDispatchWaitingRefusals[code]:
+		return hostdispatcher.DispositionWaiting
+	}
+	return hostdispatcher.DispositionRefusing
+}
 
 // hostDispatchObservation is the overlay's read of the dispatcher for one item
 // or run. Tool output only: plain exported fields, no custom MarshalJSON, so
