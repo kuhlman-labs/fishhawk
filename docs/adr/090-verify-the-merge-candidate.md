@@ -307,7 +307,7 @@ Ratification: Captain, 2026-11-21 (#5498); final text confirmed before the #5498
   - an empty, non-concrete or undecodable scope entry;
   - a `go.work`, `go.work.sum`, `go.mod` or `go.sum` at any depth;
   - a scope path matching the declaration's `global_surface`, `doc_check_inputs` or `opaque_paths`, or the workflow spec path;
-  - a non-host gate path (A3.7);
+  - an isolation selection that admits neither reach load, or a container reach exec that yields no usable result (A3.7);
   - any reach-load, mapping or size failure.
 - **A3.4 D2, as amended.** A child head reported as `child_pushed` is still a runner-gated head report. Its tree was certified by the slice gate, not by the full form. That is safe only because a child head is never merge evidence:
   - `child_pushed` is appended to the CHILD's chain, never to the parent's.
@@ -323,14 +323,22 @@ Ratification: Captain, 2026-11-21 (#5498); final text confirmed before the #5498
   - **ADR-124 D5 (tier I) extends to this consumer.** The declaration now also decides how much of a child's gate runs, so a change to it stays a tier-I change. Shrinking `global_surface`, `doc_check_inputs` or `opaque_paths`, or widening `inert_paths`, narrows child gates as well as transfer. D5's self-coverage holds: the workflow spec path is always a full-gate path. D5's interim controls (the implement-stage `.fishhawk/**` forbidden path and the operator-authored rule) suffice for this consumer, as they do for shadow mode. D5's enforce-mode precondition does not apply, because a slice-gate result never decides a merge.
 
   ADR-124 D1 to D7 govern verdict transfer unchanged.
-- **A3.7 The ADR-063 boundary.** The reach load runs `go list -e -json` and an imports-only parse on the runner host, over the materialized clone. It is a runner metadata load by the runner's own `go` binary, like ADR-096's backend classifier, not a repository-supplied gate command. It therefore does not route through the shared gate-exec helper.
-  - **Where it runs.** Only where ADR-063's selection already runs the gate on the host: `clone`, which includes the unconfigured host exec, or `clone-sandbox`, and only under a non-hosted profile. It reads the same memoized selection the gate exec reads, before any load.
-  - **Where it does not.** A container path, a hosted profile, a refused selection or any other value widens to full with `gate_isolation_not_host:<selection>`, and no host `go list` runs.
+- **A3.7 The ADR-063 boundary (amended 2026-11-23 on #5524).** The reach load runs `go list -e -json` and an imports-only parse over the materialized clone. It runs on the runner host on a host path, and inside the gate image on the container path. Both routes read the same memoized selection the gate exec reads, before any load. This bullet is amended in-body under the Captain's 2026-11-23 option-1 ruling on #5524. The first officer confirms the text before the #5524 change merges. No front-matter edge is added.
+  - **The host load** is a runner metadata load by the runner's own `go` binary, like ADR-096's backend classifier, not a repository-supplied gate command. It therefore does not route through the shared gate-exec helper.
+  - **Where the host load runs.** Only where ADR-063's selection already runs the gate on the host: `clone`, which includes the unconfigured host exec, or `clone-sandbox`, and only under a non-hosted profile. It reads the same memoized selection the gate exec reads, before any load.
   - **Before any metadata read,** the load refuses a symlinked or non-regular `go.work`, `go.work.sum`, `go.mod` or `go.sum` at the root, at each `use` directory and at each filesystem `replace` target. That is the Lstat predicate the container module seed uses. It also refuses any `use` or `replace` that resolves outside the clone.
   - **Env pins.** After ADR-029 sanitization it appends `GOWORK`, `GOPROXY=off`, `GOTOOLCHAIN=local`, `GOFLAGS=`, `CGO_ENABLED=0`, `GONOPROXY=`, `GOPRIVATE=`, `GONOSUMDB=`, `GONOSUMCHECK=`, `GOINSECURE=`, `GOENV=off`, `GOCACHEPROG=` and `GOSUMDB=off`. A module that is not already cached is never fetched; the load widens instead.
   - **Time bound.** One 2-minute bound starts before the load touches the clone and covers every read, the walk and the `go list`. It is not charged to the gate's own timeout.
+  - **Container path.** Under a non-hosted profile, the load runs inside the gate image as one extra container exec over the mounted clone, before the deciding verify.
+    - The runner embeds a stdlib-only helper that ports the host load: the same Lstat predicate, containment checks, walk, `go list` argv, env pins and 2-minute bound. The image's own `go` compiles and runs it.
+    - The exec enters the container half of the gate exec directly, never the host exec switch, and it is not a gate verdict. It has the verify's mounts, `--network=none`, env pins and launch marker, and no gate service.
+    - The host runs no `go list` and no parse over agent-authored files. The only host-side step is ADR-063's unchanged verify seed: the reach exec runs it once and hands its module cache to the deciding verify on the same clone, which runs no seed of its own.
+    - The host accepts one result line framed by a per-exec nonce. It accepts a reason only from the fixed refusal vocabulary and with no graph, and a graph only when it names clean, relative, consistent directories.
+    - A 4-minute bound covers the reach exec only. The credential probe, image resolution, the passwd read, the cache-volume prepare and the seed keep their own existing bounds. None of these is charged to the gate's own timeout.
+  - **Container widening.** These widen to full, never to a gate verdict: a refused or unavailable exec (`reach_container_unavailable:<disposition>`, with a runtime launch failure as `launch_failed`), a non-zero exit (`reach_container_exit:<code>`), a missing, repeated or invalid result line (`reach_container_output_unparseable`) and an exec timeout (`reach_load_failed:load_timeout`). The helper's own refusals keep the host load's tokens.
+  - **Where it does not.** A hosted profile on any path, a refused selection or any other value widens to full with `gate_isolation_not_host:<selection>`, and neither load runs.
 
-  ADR-063's selection rules are unchanged, and so is ADR-149 D3's refusal of host paths for charter work. A charter-driven stage never reaches the load.
+  ADR-063's selection rules are unchanged, and so is ADR-149 D3's refusal of host paths for charter work. A charter-driven stage never runs a host-path load. On the container route it now reaches the in-image load, under ADR-149 D3's confinement.
 - **A3.8 Scheduling.** ADR-092 D1 to D3, as amended by ADR-115 D3, and ADR-093 D3, with ADR-115 D7, are unchanged.
   - The slice gate is a gate verify inside the child's implement stage. It runs under that stage's slots and the per-repository verify lock, and takes no verify-group slot and no queue entry.
   - The fan-in pass and every base-advance and queue pass are admitted and ordered as today.
@@ -344,18 +352,18 @@ Ratification: Captain, 2026-11-21 (#5498); final text confirmed before the #5498
 
 - Tests that read other packages' source as data are invisible to the import graph. Examples are the wire-contract parity scans and the audit-category emission scan.
 - Declared-inert documents that Go tests read as data contribute no reach. ADR-098's Context names four such tests. A repository that wants such documents to force the full gate declares them in `global_surface` or `doc_check_inputs` instead.
-- The reach is computed on the host. A directory whose only files carry a build constraint the host never sets is walked but not emitted. The walk closes the import-graph half of the host-versus-container GOOS and tag gap, not the execution half.
+- On a host path the reach is computed on the host. A directory whose only files carry a build constraint the host never sets is walked but not emitted. The walk closes the import-graph half of the host-versus-container GOOS and tag gap, not the execution half. On the container path the in-image `go list` runs in the image the verify runs in, so that gap does not arise.
 - `vendor/` trees, nested-module metadata and non-`.go` source files outside the Lstat predicate are bounded only by the load timeout.
 - Patch coverage is enforced only at fan-in.
-- The saving needs a host gate path and a warm module cache. A cold cache widens through `package_error`. Where a gate image is configured, ADR-115 D2 puts the gate on the container path, where the slice gate always widens.
+- On a host path the saving needs a warm host module cache; a cold one widens through `package_error`. Where a gate image is configured, ADR-115 D2 puts the gate on the container path. There each distinct tree pays one extra container exec before its verify. A tree that cannot yield a reach (no root `go.mod` or `go.work`, or an image without `go`, `sh`, `mktemp` or `base64`) pays image resolution and a container start before it widens. A reach exec that does not run to completion (a refused seed, a launch failure, a timeout) hands no seed on, so that tree's verify seeds again.
 
 **Consequences.**
 
 - A decomposed run pays one scoped verify per child gate decision plus one full fan-in pass, in place of a scoped and a full verify per child. Child fix-ups still pay the full form.
 - A break the slice gate misses surfaces at the fan-in pass as a parent-level failure. That is later, and harder to attribute to a slice, than a child failure.
 - A slice review sees a scoped gate only through the scoped-shape detail sentence. The consolidated implement review keeps D5's parent-level verify evidence.
-- The post-merge split of `slice_scoped` from `full` by reason measures whether the gate pays for itself. A high share of `gate_isolation_not_host` or `package_error` says it does not.
+- The post-merge split of `slice_scoped` from `full` by reason measures whether the gate pays for itself. A high share of `gate_isolation_not_host`, `reach_container_*` or `package_error` says it does not.
 
 **Relation to ADR-124.** This amendment narrows ADR-124 (D3 and D5) for the slice-gate consumer only, and ADR-124's in-body Amendment A1 states the same change from that record's side. No front-matter edge is added: an `amends` edge to ADR-124 would make decision-record selection follow ADR-090's supersession links from the basedelta area into superseded records. It supersedes nothing.
 
-**Implementation.** #5498 (PR #5520).
+**Implementation.** #5498 (PR #5520); the in-image reach load on the container path (A3.7 as amended), #5524.
