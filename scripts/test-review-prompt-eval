@@ -4,7 +4,8 @@
 # printed reason and whether the gate command was invoked. No network, no
 # Docker, no model, and never the real `go`: every invocation runs under a
 # PATH made only of symlinks to the few tools the script needs plus, where a
-# case wants one, a stub `go` that records its cwd and argv and exits
+# case wants one, a stub `go` that records its cwd and argv, writes
+# $STUB_GO_STDOUT to stdout and $STUB_GO_STDERR to stderr when set, and exits
 # $STUB_GO_EXIT. `origin/main` is seeded with `git update-ref`, not a push into
 # a bare repo, so no detached `git maintenance` child outlives a fixture
 # (AGENTS.md Traps, #3503). House style follows scripts/test-site-voice:
@@ -56,6 +57,8 @@ ln -s "$REAL_GIT" "$WITHGO/git"
 cat > "$WITHGO/go" <<'EOF'
 #!/usr/bin/env bash
 printf '%s|%s\n' "$PWD" "$*" >> "$STUB_GO_LOG"
+[ -n "${STUB_GO_STDOUT:-}" ] && printf '%s\n' "$STUB_GO_STDOUT"
+[ -n "${STUB_GO_STDERR:-}" ] && printf '%s\n' "$STUB_GO_STDERR" >&2
 exit "${STUB_GO_EXIT:-0}"
 EOF
 chmod +x "$WITHGO/go"
@@ -158,6 +161,22 @@ run_check() {
   : > "$tmproot/go.log"
   out="$(cd "$cwd" && PATH="$bin" STUB_GO_LOG="$tmproot/go.log" STUB_GO_EXIT="$goexit" "$CHECK" "$@" 2>&1)"
   status=$?
+  gocalls="$(cat "$tmproot/go.log")"
+}
+
+# run_check_split: run_check without merging the streams — $out_stdout and
+# $out_stderr hold the script's stdout and stderr separately.
+out_stdout=""
+out_stderr=""
+run_check_split() {
+  local cwd="$1" bin="$2" goexit="$3"
+  shift 3
+  : > "$tmproot/go.log"
+  (cd "$cwd" && PATH="$bin" STUB_GO_LOG="$tmproot/go.log" STUB_GO_EXIT="$goexit" "$CHECK" "$@") \
+    > "$tmproot/split.stdout" 2> "$tmproot/split.stderr"
+  status=$?
+  out_stdout="$(cat "$tmproot/split.stdout")"
+  out_stderr="$(cat "$tmproot/split.stderr")"
   gocalls="$(cat "$tmproot/go.log")"
 }
 
@@ -395,6 +414,71 @@ done
 new_repo; commit_change "$repo" backend/internal/agenteval/testdata/planreview-persona-corpus/security/new-case/persona_case.json
 run_check "$repo" "$WITHGO" 0
 expect "c30 security corpus case" 0 "planreview-persona-corpus/security/new-case/persona_case.json" invoked
+
+# s1-s3 — the failure text (#5566). The gate's stderr is captured and
+# re-emitted; a STALE (4b) refusal followed by its selector hint gets a FAIL
+# line naming the stale arms and the selector, anything else the generic line.
+RUNBOOK_LINE='docs/compliance/planreview-catchrate-evidence.md § "Re-record one arm"'
+gate_stale() {
+  printf 'catchrategate: FAIL: agenteval: catch-rate evidence "x": STALE arm(s) %s: the recorded arm fingerprint differs from the current one — re-measure — re-record only those arms: FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=%s (every other arm is carried forward; see the run-book'"'"'s "Re-record one arm")' "$1" "$2"
+}
+# expect_text <name> <want-status> <must-contain> <must-not-contain|''>
+expect_text() {
+  local ok=1
+  [ "$status" -eq "$2" ] || ok=0
+  [[ "$out" == *"$3"* ]] || ok=0
+  if [ -n "$4" ] && [[ "$out" == *"$4"* ]]; then ok=0; fi
+  [[ "$gocalls" == *"/backend|run ./internal/agenteval/catchrategate" ]] || ok=0
+  if [ "$ok" -eq 1 ]; then
+    pass "$1"
+  else
+    fail "$1 (status=$status want=$2 go=[$gocalls] out=$out)"
+  fi
+}
+
+# s1 — a STALE architect refusal: exit 1, the gate's line relayed, and the
+# script's FAIL line naming the arm, the selector and the run-book section.
+new_repo; commit_change "$repo" docs/review/architect-remit.md
+STUB_GO_STDERR="$(gate_stale architect architect)"
+export STUB_GO_STDERR
+run_check "$repo" "$WITHGO" 1
+expect_text "s1 STALE arm relays the gate line" 1 "$STUB_GO_STDERR" ""
+expect_text "s1 STALE arm names the selector" 1 "check-review-prompt-eval: FAIL — STALE arm(s) architect: re-record only those arms with FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect (every other arm is carried forward) per $RUNBOOK_LINE" "does not pass for this change"
+# s1b — several stale arms, the selector closed over the comparison pair.
+STUB_GO_STDERR="$(gate_stale "architect, with_conventions" architect,with_conventions,without_conventions)"
+export STUB_GO_STDERR
+run_check "$repo" "$WITHGO" 1
+expect_text "s1b several STALE arms" 1 "FAIL — STALE arm(s) architect, with_conventions: re-record only those arms with FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect,with_conventions,without_conventions (every other arm" "does not pass for this change"
+# s1c — the selector is read AFTER the STALE list: a selector-shaped line
+# BEFORE it (here a report line) is never the one named.
+STUB_GO_STDERR="report: FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=security"$'\n'"$(gate_stale architect architect)"
+export STUB_GO_STDERR
+run_check "$repo" "$WITHGO" 1
+expect_text "s1c selector after the STALE list" 1 "re-record only those arms with FISHHAWK_AGENTEVAL_PLANREVIEW_ARMS=architect (every" "ARMS=security (every"
+
+# s2 — a non-STALE failure: exit 1, the generic line, no selector text.
+export STUB_GO_STDERR='catchrategate: FAIL: agenteval: catch-rate evidence "x": arm "architect" catch rate regressed'
+run_check "$repo" "$WITHGO" 1
+expect_text "s2 non-STALE failure is generic" 1 "does not pass for this change; record it per docs/compliance/planreview-catchrate-evidence.md" "re-record only"
+# s2b — a STALE list with no selector after it (an older gate): generic.
+export STUB_GO_STDERR='catchrategate: FAIL: STALE arm(s) architect: the recorded arm fingerprint differs from the current one: re-measure'
+run_check "$repo" "$WITHGO" 1
+expect_text "s2b STALE without a selector is generic" 1 "does not pass for this change" "re-record only"
+unset STUB_GO_STDERR
+
+# s3 — streams are kept apart: on a passing gate its stdout stays on the
+# script's stdout and its stderr on the script's stderr.
+export STUB_GO_STDOUT="stub-gate-stdout-line" STUB_GO_STDERR="stub-gate-stderr-line"
+run_check_split "$repo" "$WITHGO" 0
+unset STUB_GO_STDOUT STUB_GO_STDERR
+if [ "$status" -eq 0 ] &&
+  [[ "$out_stdout" == *"stub-gate-stdout-line"* ]] && [[ "$out_stderr" != *"stub-gate-stdout-line"* ]] &&
+  [[ "$out_stderr" == *"stub-gate-stderr-line"* ]] && [[ "$out_stdout" != *"stub-gate-stderr-line"* ]] &&
+  [[ "$out_stdout" == *"PASS — the recorded arm-keyed"* ]]; then
+  pass "s3 gate stdout on stdout, gate stderr on stderr"
+else
+  fail "s3 stream separation (status=$status stdout=[$out_stdout] stderr=[$out_stderr])"
+fi
 
 echo
 echo "test-review-prompt-eval: $PASS passed, $FAIL failed"
