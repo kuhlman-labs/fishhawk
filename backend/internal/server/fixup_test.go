@@ -4842,13 +4842,10 @@ func TestFixupStage_InstructionTargets_Validation(t *testing.T) {
 		}, "is not one of this request's concern_ids"},
 		{"key that is not a uuid", func(routed, _ uuid.UUID) fixupRequest {
 			return fixupRequest{ConcernIDs: []string{routed.String()}, InstructionTargets: map[string]string{"concern-1": "pr_body"}}
-		}, "is not a routed concern id, operator_concern, or reason"},
+		}, "is not a routed concern id or operator_concern"},
 		{"operator_concern key without operator_concern", func(routed, _ uuid.UUID) fixupRequest {
 			return fixupRequest{ConcernIDs: []string{routed.String()}, InstructionTargets: map[string]string{"operator_concern": "pr_body"}}
 		}, "routes no operator_concern"},
-		{"reason key without reason", func(routed, _ uuid.UUID) fixupRequest {
-			return fixupRequest{ConcernIDs: []string{routed.String()}, Reason: "   ", InstructionTargets: map[string]string{"reason": "pr_body"}}
-		}, "carries no reason"},
 		{"same concern named twice", func(routed, _ uuid.UUID) fixupRequest {
 			return fixupRequest{ConcernIDs: []string{routed.String()}, InstructionTargets: map[string]string{
 				routed.String(): "pr_body", strings.ToUpper(routed.String()): "code",
@@ -4872,15 +4869,70 @@ func TestFixupStage_InstructionTargets_Validation(t *testing.T) {
 	}
 }
 
+// TestFixupStage_InstructionTargets_ReasonKeyRefused: `reason` is an audit
+// note the fix-up agent never sees, so it cannot carry a target (#5561). The
+// request routes a valid concern id AND a non-empty reason, so no other guard
+// can be what refuses it.
+//
+// Counterfactual: delete the `case instructionTargetKeyReason:` branch and the
+// key falls into the concern-id default, still 400 but with the generic message
+// and no remedy — RED on the message assertions (the status alone is masked).
+func TestFixupStage_InstructionTargets_ReasonKeyRefused(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "Guard the nil pool.")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:         []string{row.ID.String()},
+		Reason:             "guard the nil pool before the retry",
+		InstructionTargets: map[string]string{"reason": "docs"},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", env.Error.Code)
+	}
+	for _, want := range []string{"never reaches the fix-up agent", "operator_concern"} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("error message lacks %q: %s", want, env.Error.Message)
+		}
+	}
+	if env.Error.Details["field"] != "instruction_targets" || env.Error.Details["got"] != "reason" {
+		t.Errorf("error details = %v, want field instruction_targets / got reason", env.Error.Details)
+	}
+	// Committed state: nothing was triggered and the gate did not move.
+	if n := countAppendedByCategory(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("a refused target wrote %d trigger entries, want 0", n)
+	}
+	after, err := repo.GetStage(t.Context(), stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if after.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want it still awaiting_approval", after.State)
+	}
+}
+
 // TestFixupStage_DeclaredPRBodyTarget_RecordedAndReDerived is the COMMITTED-
 // STATE vehicle for the target (E83.37 / #4022): a concern-id route with a
 // declared pr_body target is posted over HTTP, then the PERSISTED
 // stage_fixup_triggered payload is read back — it must carry the positional
-// concern_targets / reason_target — and the prompt-serve re-derivation
+// concern_targets — and the prompt-serve re-derivation
 // (resolveFixupReportObligations) plus the review join
 // (fixupobligation.Undelivered with a `met` report) run over THAT persisted
-// entry. The pr_body concern is unsatisfiable at all three sites; the docs-
-// targeted reason is not.
+// entry. The pr_body concern is unsatisfiable at all three sites, and the
+// payload's obligation-shaped `reason` yields no obligation at all (#5561).
 //
 // Counterfactual: drop the target fields from writeFixupAudit and the routing
 // response still flags the obligation (it is derived in memory), but the
@@ -4901,7 +4953,6 @@ func TestFixupStage_DeclaredPRBodyTarget_RecordedAndReDerived(t *testing.T) {
 		Reason:     reason,
 		InstructionTargets: map[string]string{
 			second.ID.String(): "pr_body",
-			"reason":           "docs",
 		},
 	})
 	if w.Code != http.StatusOK {
@@ -4920,8 +4971,11 @@ func TestFixupStage_DeclaredPRBodyTarget_RecordedAndReDerived(t *testing.T) {
 	if len(gotTargets) != 2 || gotTargets[0] != "code" || gotTargets[1] != "pr_body" {
 		t.Errorf("persisted concern_targets = %v, want [code pr_body] aligned with concerns", payload["concern_targets"])
 	}
-	if payload["reason_target"] != "docs" {
-		t.Errorf("persisted reason_target = %v, want docs", payload["reason_target"])
+	if _, present := payload["reason_target"]; present {
+		t.Errorf("persisted reason_target = %v, want the key never written", payload["reason_target"])
+	}
+	if payload["reason"] != reason {
+		t.Errorf("persisted reason = %v, want it recorded for audit as %q", payload["reason"], reason)
 	}
 	if _, present := payload["operator_concern_target"]; present {
 		t.Errorf("persisted operator_concern_target present with no operator_concern")
@@ -4929,20 +4983,16 @@ func TestFixupStage_DeclaredPRBodyTarget_RecordedAndReDerived(t *testing.T) {
 
 	// Prompt-serve mode (seq 0) over the persisted entry.
 	declared, seq := s.resolveFixupReportObligations(t.Context(), stage.RunID, stage.ID, 0)
-	if seq <= 0 || len(declared) != 2 {
-		t.Fatalf("re-derived obligations = %+v (seq %d), want the pr_body concern + the run-log reason", declared, seq)
+	if seq <= 0 || len(declared) != 1 {
+		t.Fatalf("re-derived obligations = %+v (seq %d), want only the pr_body concern (reason is never a source)", declared, seq)
 	}
 	if declared[0].ID != resp.PRBodyObligations[0].ID || !declared[0].PRBody || declared[0].Target != fixupobligation.TargetPRBody {
 		t.Errorf("re-derived ob-1 = %+v, want the routing-time id with PRBody true", declared[0])
-	}
-	if declared[1].PRBody || declared[1].Target != fixupobligation.TargetDocs {
-		t.Errorf("re-derived ob-2 = %+v, want the docs-targeted reason, PRBody false", declared[1])
 	}
 	// Review mode pinned to the same sequence, joined against `met` reports.
 	reviewed, _ := s.resolveFixupReportObligations(t.Context(), stage.RunID, stage.ID, seq)
 	findings := fixupobligation.Undelivered(reviewed, []fixupobligation.Report{
 		{ID: "ob-1", Status: fixupobligation.StatusMet},
-		{ID: "ob-2", Status: fixupobligation.StatusMet},
 	})
 	if len(findings) != 1 || findings[0].ID != "ob-1" || findings[0].Status != fixupobligation.StatusUnsatisfiable {
 		t.Errorf("review join = %+v, want exactly ob-1 unsatisfiable", findings)
@@ -5070,10 +5120,10 @@ func TestFixupPRBodySources_MatchPromptServeDerivation(t *testing.T) {
 	}
 
 	// The routing-time derivation over the SAME (concerns, operator_concern,
-	// reason, targets) the trigger recorded.
+	// targets) the trigger recorded.
 	routingObs := fixupobligation.Detect(buildFixupObligationSources(
 		[]planreview.Concern{{Severity: "medium", Category: "process", Note: prBodyInstruction}},
-		"", "route the reporting concern",
+		"",
 		fixupInstructionTargets{Concerns: []fixupobligation.Target{fixupobligation.TargetPRBody}}))
 	if len(routingObs) != 1 {
 		t.Fatalf("routing-time obligations = %+v, want 1", routingObs)
@@ -5099,7 +5149,7 @@ func TestRecordFixupPRBodyUnsatisfiable_FailOpen(t *testing.T) {
 
 	t.Run("nil audit repo returns obligations without appending", func(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0"}) // no AuditRepo
-		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", "", prTargets)
+		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", prTargets)
 		if len(got) != 1 {
 			t.Errorf("obligations = %+v, want the PR-body obligation even with no audit repo", got)
 		}
@@ -5114,7 +5164,7 @@ func TestRecordFixupPRBodyUnsatisfiable_FailOpen(t *testing.T) {
 			AuditRepo: au,
 			Logger:    slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		})
-		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", "", prTargets)
+		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", prTargets)
 		// Fail-open: the obligation set is returned regardless of the append error.
 		if len(got) != 1 {
 			t.Errorf("obligations = %+v, want the PR-body obligation despite an append error", got)
@@ -5141,7 +5191,7 @@ func TestRecordFixupPRBodyUnsatisfiable_FailOpen(t *testing.T) {
 	t.Run("empty routed text detects nothing", func(t *testing.T) {
 		au := newAuditFake()
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
-		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, nil, "", "", fixupInstructionTargets{})
+		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, nil, "", fixupInstructionTargets{})
 		if got != nil {
 			t.Errorf("obligations = %+v, want nil for empty routed text", got)
 		}
@@ -6521,7 +6571,7 @@ func TestFixupStage_TriggerPayloadMatchesPostTransitionDecision(t *testing.T) {
 				t.Fatal(err)
 			}
 			id := Identity{Subject: "op@example.test", Scopes: []string{"write:fixups"}}
-			targets := fixupInstructionTargets{Concerns: []fixupobligation.Target{fixupobligation.TargetPRBody}, Reason: fixupobligation.TargetPRBody}
+			targets := fixupInstructionTargets{Concerns: []fixupobligation.Target{fixupobligation.TargetPRBody}, OperatorConcern: fixupobligation.TargetPRBody}
 			pin := &ResolvedModel{Value: "claude-fable-5-2", Source: ModelSourceOperator}
 			p := fixupActionParams{
 				StageID: stage.ID, Options: c.opts(acc), Selected: selected, ConcernIDs: ids, Indices: nil,
@@ -6552,7 +6602,7 @@ func TestFixupStage_TriggerPayloadMatchesPostTransitionDecision(t *testing.T) {
 			if !bytes.Equal(rows[0].Payload, post) {
 				t.Errorf("preview payload != post-transition payload\npreview: %s\npost:    %s", rows[0].Payload, post)
 			}
-			for _, k := range []string{"remaining_budget", "remaining_ceiling_slots", "forced", "prior_state", "operator_concern_id", "concern_bodies_truncated", "truncated_concern_ids", "concern_targets", "reason_target", "operator_evidence", "delegated", "fixup_model"} {
+			for _, k := range []string{"remaining_budget", "remaining_ceiling_slots", "forced", "prior_state", "operator_concern_id", "concern_bodies_truncated", "truncated_concern_ids", "concern_targets", "operator_concern_target", "operator_evidence", "delegated", "fixup_model"} {
 				if _, ok := written[k]; !ok {
 					t.Errorf("payload missing %q, so it was not compared", k)
 				}

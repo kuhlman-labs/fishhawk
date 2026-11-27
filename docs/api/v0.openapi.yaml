@@ -8145,7 +8145,7 @@ components:
           description: Stable `ob-N` id, the same id the reviewer sees for this obligation.
         source:
           type: string
-          description: The routed channel the instruction arrived on (`concern` | `operator_concern` | `reason`).
+          description: The routed channel the instruction arrived on (`concern` | `operator_concern`).
         text_excerpt:
           type: string
           description: Bounded excerpt of the routed instruction.
@@ -30690,9 +30690,13 @@ paths:
                 reason:
                   type: string
                   description: |
-                    Optional operator rationale, recorded on the
+                    Optional operator AUDIT NOTE, recorded on the
                     `stage_fixup_triggered` audit entry (and as the routed
-                    concerns' `state_reason` on the `concern_ids` path).
+                    concerns' `state_reason` on the `concern_ids` path). It is
+                    audit-only (#5561): never rendered into the fix-up prompt,
+                    not a reporting-obligation source and not an
+                    `instruction_targets` key. Anything the agent must act on
+                    goes in `operator_concern`.
                 allow_create:
                   type: array
                   items:
@@ -30807,11 +30811,11 @@ paths:
                   description: |
                     Optional operator declaration that the OPERATOR EXECUTED a
                     reproduction of the concern(s) this pass routes back
-                    (#2551). Its meaning is AUTHORITY, not prose delivery: the
-                    reproduction text still reaches the agent via `reason` (or
-                    `operator_concern`); this field records that the finding was
-                    verified by execution, which a reviewer reading a diff
-                    cannot override. Every concern routed by a pass carrying it
+                    (#2551). Its meaning is AUTHORITY, not prose delivery:
+                    reproduction text the agent must see goes in
+                    `operator_concern` (`reason` never reaches it, #5561); this
+                    field records that the finding was verified by execution,
+                    which a reviewer reading a diff cannot override. Every concern routed by a pass carrying it
                     is therefore EXEMPT from reviewer-confirmation auto-resolve:
                     a later `confirmed` delta-verification verdict is VETOED
                     (`operator_evidence_routed`, surfaced on the gate view as
@@ -30833,9 +30837,11 @@ paths:
                   description: |
                     Optional router-declared target of each routed instruction
                     (E83.37 / #4022): the surface the instruction asks the pass
-                    to change. A key is a routed concern id from `concern_ids`,
-                    `operator_concern`, or `reason`; a value is `code`,
-                    `pr_body`, or `docs`. An instruction with no key is `code`.
+                    to change. A key is a routed concern id from `concern_ids`
+                    or `operator_concern`; a value is `code`, `pr_body`, or
+                    `docs`. An instruction with no key is `code`. A `reason` key
+                    returns 400 `validation_failed` naming `operator_concern`:
+                    `reason` never reaches the fix-up agent (#5561).
                     The target alone decides whether the instruction is
                     unsatisfiable on a fix-up pass: `pr_body` (a pass cannot
                     write the PR body, #2782) puts it on the response's
@@ -30850,8 +30856,9 @@ paths:
                     an instruction this request routes; otherwise 400
                     `validation_failed` (`field: instruction_targets`). Recorded
                     on the `stage_fixup_triggered` payload as `concern_targets`
-                    (aligned with `concerns`), `operator_concern_target` and
-                    `reason_target`, each omitted when every target is `code`.
+                    (aligned with `concerns`) and `operator_concern_target`,
+                    each omitted when every target is `code`; a legacy
+                    `reason_target` is ignored.
                   additionalProperties:
                     type: string
                     enum: [code, pr_body, docs]
@@ -32560,6 +32567,12 @@ paths:
           RECORD: a filing failure records nothing, so the captain can retry.
           It writes NO repository file (`.fishhawk/**` stays human-authored).
 
+        The already-answered check, the filing and the answer append run under
+        a per-question lock (run + sequence, across server processes; #3891),
+        so concurrent submissions for one question are serialized: a duplicate
+        waits for the first, and when the first recorded its answer the
+        duplicate gets `409` having filed nothing.
+
         Both answer categories are INTERNAL chain-only kinds (no issue-thread
         activity line). Answering is OPTIONAL — nothing gates on it.
 
@@ -32650,7 +32663,12 @@ paths:
         '409':
           description: |
             `divergence_already_answered` — the question already carries an
-            answer; nothing recorded and nothing filed.
+            answer; nothing recorded and nothing filed. A concurrent duplicate
+            submission is serialized behind the first and receives this,
+            having filed nothing, when the first recorded its answer. If the
+            first filed but failed to record (a `500` naming
+            `details.filed_issue`, or a cancelled request), a later
+            submission can file again.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -32665,7 +32683,9 @@ paths:
           description: |
             `internal_error`: an audit read failed, or recording the answer
             failed — after a successful doctrine_change filing, `details.filed_issue`
-            names the durable issue so the captain does not re-file.
+            names the durable issue so the captain does not re-file — or the
+            per-question lock could not be taken, in which case nothing was
+            filed or recorded; retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
