@@ -382,13 +382,17 @@ below); eject/promote and durability are slices 3-4.
   The reconcile takes no lock of its own. The lock order is the merge-intent
   lock first, then the concern store's row locks, never the reverse: a
   caller that runs it under the merge-intent lock nests the row locks inside
-  it and inherits its `fn` deadline. Two callers do: the inline merge
+  it and inherits its `fn` deadline. Three callers do: the inline merge
   endpoint (`inlineBlockingConcernHold`, after the ownership check) and the
   delegated may_merge arm (`delegatedBlockingConcernHold`, in
   `delegatedMergeLocked`) evaluate leg (d) through `openBlockingConcernIDs`
-  inside the lock (#5045). The predicate's callers (the enqueue arm, re-entry
-  and merge-on-pass) evaluate BEFORE they take that lock, and admission and
-  the re-probe run on detached pump or tick contexts. No path takes the
+  inside the lock (#5045), and merge-on-pass re-judges it through
+  `mergeQueueConcernLeg` at `mergeOnPassLocked` step 4b (after the
+  inline-merge rule, before the overlap guard and the fold; #5261). The
+  predicate's callers (the enqueue arm, re-entry and merge-on-pass) evaluate
+  the predicate BEFORE they take that lock, merge-on-pass then also
+  re-judging leg (d) in-lock; admission and the re-probe run on detached
+  pump or tick contexts. No path takes the
   concern row locks and then waits on the merge-intent lock, so the nesting
   has no cycle. Every caller is a POST or pump path
   (the enqueue arm, re-entry, admission, merge-on-pass, the yield re-probe,
@@ -398,8 +402,10 @@ below); eject/promote and durability are slices 3-4.
   (#5045):** every Fishhawk-owned merge path evaluates leg (d): the inline
   merge endpoint (409 `blocking_concern_open`, nothing new recorded) and the
   delegated may_merge arm (observe-only) in-lock, the queue paths through
-  this predicate. Merge-on-pass evaluates it before it takes the lock, so a
-  concern raised in that window is not seen on that pump (a residual). A
+  this predicate. Merge-on-pass evaluates leg (d) both pre-lock (step 4, the
+  predicate) and in-lock (step 4b, #5261). The remaining residual: a concern
+  landing after the last in-lock read (on merge-on-pass, after step 4b) is
+  not seen by that decision. A
   merge made directly on the forge is not held. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
   `review_coverage_incomplete`, `acceptance_not_eligible`,
   `acceptance_stale`, `checks_not_green`, `checks_red`,
@@ -524,7 +530,8 @@ deadline): `backend/internal/mergequeue/README.md`.
   head → readvance; verify failed → eject `verify_failed`, not
   passed/not_required → hold; step 4, `mergeQueueMergeEligibility` at the
   anchor {recorded intent sequence, base}, read through `mergeGateLegsOf`
-  (docs/adr/112 A3.2, #4780): eligible continues; undeterminable (only a
+  (docs/adr/112 A3.2, #4780): eligible continues (leg (d) is judged again
+  in-lock at step 4b below); undeterminable (only a
   non-check leg in the merge variant) → hold `not_mergeable_yet` (an A3
   residual); any non-retryable determined reason, alone or beside a
   retryable one → drop `not_merge_eligible` (re-enter at the tail with
@@ -545,7 +552,19 @@ deadline): `backend/internal/mergequeue/README.md`.
   D8 ruling R3, so a decision after an uncertain dispatch reaches the claim
   and holds `merge_already_dispatched` — intent, same head) and the PR;
   a non-queue `merge_verdict_recorded` newer than the intent → hold
-  `inline_merge_dispatched`; the merge overlap guard (#4119) → a 409 holds
+  `inline_merge_dispatched`; **step 4b, leg (d) in-lock** (#5261): the run
+  re-read under the lock (unreadable or terminal → hold `not_mergeable_yet`)
+  and `mergeQueueConcernLeg` on that fresh row, child-slice reconcile
+  included (its `ImportRolledUp` row locks nest inside the merge-intent
+  lock): an open HIGH or `first_officer` concern on a phase-`passed` entry
+  drops `not_merge_eligible` with step 4's detail byte for byte; on a
+  phase-`merging` entry it holds `not_mergeable_yet`, so the D8 resume,
+  which owns any claim, runs first (the next pump resumes the entry, returns
+  it to `passed` once no claim stands, and step 4 then drops it); a
+  reconcile or ledger-read failure holds `not_mergeable_yet`
+  (`undeterminable: concerns: …`). Each answer records, claims and merges
+  nothing; a merged PR has already settled `pr_merged` at the PR re-read and
+  is never refused; the merge overlap guard (#4119) → a 409 holds
   and appends a deduped, counts-only `merge_queue_overlap_refused`, a 502
   holds, no override; the base re-probe (`CompareCommits(head, base)`
   behind > 0 → readvance; an entry with an established approval wait runs

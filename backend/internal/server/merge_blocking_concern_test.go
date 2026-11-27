@@ -26,6 +26,16 @@ import (
 // merge_blocking_concern_test.go pins #5045: the inline merge endpoint and
 // the delegated may_merge arm evaluate the merge-eligibility blocking-concern
 // leg (d), child-slice reconcile included, INSIDE the run's merge-intent lock.
+// It also pins #5261: merge-on-pass re-judges leg (d) inside that lock too, at
+// mergeOnPassLocked step 4b (the "merge-on-pass (#5261)" section).
+//
+// Counterfactual selectors: a pgtest skipped INSIDE a t.Run subtest reads
+// GREEN to the counterfactual classifier (the parent passes), so the
+// cross-layer test below, whose worlds are built inside subtests, is excluded
+// from every selector. The #5261 merge-on-pass tests build their Postgres
+// world in the TOP-LEVEL test body with no t.Run, so a run without a database
+// skips the top-level test (no_tests_matched, an error, never GREEN); they are
+// the counterfactual-selected tests.
 
 // bcEvents is an ordered, goroutine-safe event log.
 type bcEvents struct {
@@ -708,7 +718,8 @@ func TestAutoDriveMerge_BlockingConcern_NilConcernRepoSkipsWithWarn(t *testing.T
 // TestMergeRunBlockingConcernPG_CrossLayer crosses the HTTP handler, the leg,
 // the real Postgres concern store and the real mergequeue.PostgresStore
 // merge-intent lock. Deliberately excluded from every counterfactual
-// selector: a skipped pgtest reads GREEN.
+// selector: its worlds are built inside t.Run subtests, so a skipped pgtest
+// reads GREEN (see the file comment).
 func TestMergeRunBlockingConcernPG_CrossLayer(t *testing.T) {
 	t.Run("uncopied child HIGH nests the import under the real lock", func(t *testing.T) {
 		ctx := context.Background()
@@ -915,5 +926,358 @@ func TestMergeRun_InlineBlockingConcern_NoImplementStageFailsClosed(t *testing.T
 			}
 			b.requireNothingRecorded(t)
 		})
+	}
+}
+
+// --- merge-on-pass (#5261) -------------------------------------------------
+//
+// Every test below runs on the real-Postgres mqmWorld (merge_queue_merge_test.go,
+// used read-only) and builds that world in its TOP-LEVEL body, with no t.Run,
+// so a run with no database skips the top-level test (no_tests_matched to the
+// counterfactual classifier), never a passing parent. The concern, failure or
+// phase change each test needs is made inside the lock wrapper's onLock hook,
+// AFTER the pre-lock predicate (mergeQueueMergeOnPass step 4) read an empty,
+// readable ledger, so only mergeOnPassLocked step 4b can see it.
+
+// mqmConcernLockQueue runs onLock ONCE, only for runID, then takes the REAL
+// store's merge-intent lock with fn wrapped to set held for fn's duration.
+// Every other method is the embedded store.
+type mqmConcernLockQueue struct {
+	mergequeue.Store
+	runID  uuid.UUID
+	onLock func()
+	held   *atomic.Bool
+	once   *sync.Once
+}
+
+func (q mqmConcernLockQueue) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	if runID == q.runID && q.onLock != nil {
+		q.once.Do(q.onLock)
+	}
+	return q.Store.WithMergeIntentLock(ctx, runID, func(lctx context.Context) error {
+		q.held.Store(true)
+		defer q.held.Store(false)
+		return fn(lctx)
+	})
+}
+
+// mqmFailingListConcerns fails ListOpenByRun only while fail is set.
+type mqmFailingListConcerns struct {
+	concern.Repository
+	fail *atomic.Bool
+}
+
+func (c mqmFailingListConcerns) ListOpenByRun(ctx context.Context, runID uuid.UUID) ([]*concern.Concern, error) {
+	if c.fail.Load() {
+		return nil, errors.New("injected concern ledger read failure")
+	}
+	return c.Repository.ListOpenByRun(ctx, runID)
+}
+
+// mqmImportProbe records whether the merge-intent lock was held at each
+// ImportRolledUp, then delegates.
+type mqmImportProbe struct {
+	concern.Repository
+	held    *atomic.Bool
+	mu      sync.Mutex
+	sawHeld []bool
+}
+
+func (c *mqmImportProbe) ImportRolledUp(ctx context.Context, p concern.ImportRolledUpParams) ([]*concern.Concern, error) {
+	c.mu.Lock()
+	c.sawHeld = append(c.sawHeld, c.held.Load())
+	c.mu.Unlock()
+	return c.Repository.ImportRolledUp(ctx, p)
+}
+
+func (c *mqmImportProbe) imports() []bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]bool(nil), c.sawHeld...)
+}
+
+// mqmFailingGetRun fails GetRun only while fail is set.
+type mqmFailingGetRun struct {
+	run.Repository
+	fail *atomic.Bool
+}
+
+func (r mqmFailingGetRun) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if r.fail.Load() {
+		return nil, errors.New("injected run read failure")
+	}
+	return r.Repository.GetRun(ctx, id)
+}
+
+// bcqLockAt installs mqmConcernLockQueue for r with onLock and returns its
+// held flag.
+func (w *mqmWorld) bcqLockAt(r *mcqRun, onLock func()) *atomic.Bool {
+	held := &atomic.Bool{}
+	w.srv.cfg.MergeQueue = mqmConcernLockQueue{Store: w.store, runID: r.id, onLock: onLock, held: held, once: &sync.Once{}}
+	return held
+}
+
+// bcqOpenIDs reads r's open concern ids back from the real ledger.
+func (w *mqmWorld) bcqOpenIDs(r *mcqRun) []string {
+	w.t.Helper()
+	open, err := concern.NewPostgresRepository(w.pool).ListOpenByRun(context.Background(), r.id)
+	if err != nil {
+		w.t.Fatalf("list open concerns: %v", err)
+	}
+	ids := make([]string, 0, len(open))
+	for _, c := range open {
+		ids = append(ids, c.ID.String())
+	}
+	return ids
+}
+
+// bcqBlockingDetail is the not_merge_eligible drop detail naming ids.
+func bcqBlockingDetail(ids ...string) string {
+	return mergeOnPassNotEligibleDetail([]mergeQueueIneligibility{{Code: mergeQueueReasonBlockingConcernOpen,
+		Detail: "open blocking concern(s) (high severity or first_officer provenance): " + strings.Join(ids, ", ")}})
+}
+
+// bcqRequireNothingWritten asserts no verdict, no authorization row, no merged
+// row, no D1 claim on either ledger, no pinned merge, and the entry still live
+// in phase.
+func (w *mqmWorld) bcqRequireNothingWritten(r *mcqRun, phase mergequeue.Phase) {
+	w.t.Helper()
+	w.requireNoMergeWrites(r)
+	if _, claimed, err := w.srv.mergeDispatchLedger().MergeDispatch(context.Background(), r.id); err != nil || claimed {
+		w.t.Fatalf("store dispatch claim present = %v (%v), want none", claimed, err)
+	}
+	if e := w.active(r); e.State != mergequeue.StateLive || e.Phase != phase {
+		w.t.Fatalf("entry = %s/%s, want live/%s", e.State, e.Phase, phase)
+	}
+}
+
+// TestMergeOnPass_BlockingConcern_RaisedAtLockDrops pins #5261: a reviewer
+// HIGH, and a first_officer MEDIUM, raised after the pre-lock predicate read
+// the ledger but before the lock drops the phase-passed entry
+// not_merge_eligible at step 4b, with step 4's detail byte for byte, writing
+// nothing. The HIGH row runs on the declared approval gate with a qualifying
+// live forge approval, so a 4b placed after the step-6b fold would leave a
+// merge_queue_authorized row. Each row builds its world in this top-level
+// body (no t.Run).
+func TestMergeOnPass_BlockingConcern_RaisedAtLockDrops(t *testing.T) {
+	for _, row := range []struct {
+		name, spec, severity, provenance string
+		declared                         bool
+	}{
+		{name: "reviewer high on the declared approval gate", spec: mqeSpecYAML, severity: "high", declared: true},
+		{name: "first_officer medium", spec: mcvUndelegatedSpecYAML, severity: "medium", provenance: concern.ProvenanceFirstOfficer},
+	} {
+		t.Logf("row: %s", row.name)
+		w := newMQMWorld(t)
+		r, req := w.ready("bcq-raise", "h1", row.spec)
+		if row.declared {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+			w.gh.set(func() { w.gh.reviewsStatus[r.pr] = 500 })
+		}
+		w.bcqLockAt(r, func() { w.raiseConcern(r, row.severity, row.provenance) })
+
+		out := w.decide(req)
+		requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonNotMergeEligible)
+		ids := w.bcqOpenIDs(r)
+		if len(ids) != 1 {
+			t.Fatalf("[%s] open concerns = %v, want the one raised at the lock", row.name, ids)
+		}
+		if out.State != mergequeue.StateDropped || out.Detail != bcqBlockingDetail(ids[0]) || !strings.Contains(out.Detail, ids[0]) {
+			t.Fatalf("[%s] outcome = %s %q, want dropped %q", row.name, out.State, out.Detail, bcqBlockingDetail(ids[0]))
+		}
+		w.bcqRequireNothingWritten(r, mergequeue.PhasePassed)
+
+		// The same concern, now on the ledger before the lock, drops at the
+		// pre-lock step 4 with the identical detail.
+		pre := w.decide(req)
+		requireOutcome(t, pre, mergeOnPassSettle, mergeCandidateQueueReasonNotMergeEligible)
+		if pre.Detail != out.Detail {
+			t.Fatalf("[%s] pre-lock drop detail %q != in-lock drop detail %q", row.name, pre.Detail, out.Detail)
+		}
+	}
+}
+
+// TestMergeOnPass_BlockingConcern_MediumAtLockMerges is the severity control:
+// a reviewer MEDIUM raised at the lock stays advisory, so the same fixture
+// merges (the drop rows above are caused by the concern).
+func TestMergeOnPass_BlockingConcern_MediumAtLockMerges(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-med", "h1", mcvUndelegatedSpecYAML)
+	w.bcqLockAt(r, func() { w.raiseConcern(r, "medium", "") })
+	requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	w.requireMerges(1)
+	if ids := w.bcqOpenIDs(r); len(ids) != 1 {
+		t.Fatalf("open concerns = %v, want the medium raised at the lock", ids)
+	}
+}
+
+// TestMergeOnPass_BlockingConcern_UncopiedChildHighAtLockDrops: a succeeded
+// decomposition child's HIGH with no parent copy, seeded at the lock, is
+// imported by step 4b's reconcile and drops the entry; every ImportRolledUp
+// ran with the merge-intent lock held (lock order: intent lock first, row
+// locks second).
+func TestMergeOnPass_BlockingConcern_UncopiedChildHighAtLockDrops(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-child", "h1", mcvUndelegatedSpecYAML)
+	var src *concern.Concern
+	held := w.bcqLockAt(r, func() { src = mqeSeedLostImport(t, w.mcqFixture, r) })
+	probe := &mqmImportProbe{Repository: concern.NewPostgresRepository(w.pool), held: held}
+	w.srv.cfg.ConcernRepo = probe
+
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonNotMergeEligible)
+	var copies []*concern.Concern
+	for _, c := range mqeParentConcerns(t, w.mcqFixture, r) {
+		if c.RolledUpFrom != nil {
+			copies = append(copies, c)
+		}
+	}
+	if len(copies) != 1 || *copies[0].RolledUpFrom != src.ID {
+		t.Fatalf("parent copies = %+v, want exactly one copy of %s", copies, src.ID)
+	}
+	if out.State != mergequeue.StateDropped || out.Detail != bcqBlockingDetail(copies[0].ID.String()) {
+		t.Fatalf("outcome = %s %q, want dropped naming the copy %s", out.State, out.Detail, copies[0].ID)
+	}
+	w.bcqRequireNothingWritten(r, mergequeue.PhasePassed)
+	saw := probe.imports()
+	if len(saw) == 0 {
+		t.Fatal("ImportRolledUp never ran: the in-lock reconcile did not import the child HIGH")
+	}
+	for i, h := range saw {
+		if !h {
+			t.Fatalf("ImportRolledUp #%d ran without the merge-intent lock held (%v)", i, saw)
+		}
+	}
+}
+
+// TestMergeOnPass_BlockingConcern_ReadFailureAtLockHolds: a ledger read that
+// fails only under the lock holds not_mergeable_yet with step 4's
+// undeterminable text and no expiry yield, writing nothing.
+func TestMergeOnPass_BlockingConcern_ReadFailureAtLockHolds(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-readfail", "h1", mcvUndelegatedSpecYAML)
+	fail := &atomic.Bool{}
+	w.srv.cfg.ConcernRepo = mqmFailingListConcerns{Repository: concern.NewPostgresRepository(w.pool), fail: fail}
+	w.bcqLockAt(r, func() { fail.Store(true) })
+
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonNotMergeable)
+	if !strings.HasPrefix(out.Detail, "undeterminable: concerns: ") || out.ExpiryYield != nil {
+		t.Fatalf("hold detail %q expiry %+v, want the undeterminable concerns text and no expiry yield", out.Detail, out.ExpiryYield)
+	}
+	w.bcqRequireNothingWritten(r, mergequeue.PhasePassed)
+}
+
+// TestMergeOnPass_BlockingConcern_RunReadFailureAtLockHolds: step 4b re-reads
+// the run under the lock; a failed re-read holds not_mergeable_yet (no expiry
+// yield), writing nothing.
+func TestMergeOnPass_BlockingConcern_RunReadFailureAtLockHolds(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-runfail", "h1", mcvUndelegatedSpecYAML)
+	fail := &atomic.Bool{}
+	w.srv.cfg.RunRepo = mqmFailingGetRun{Repository: w.repo, fail: fail}
+	w.bcqLockAt(r, func() { fail.Store(true) })
+
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonNotMergeable)
+	if !strings.HasPrefix(out.Detail, "undeterminable: run: ") || out.ExpiryYield != nil {
+		t.Fatalf("hold detail %q expiry %+v, want the undeterminable run text and no expiry yield", out.Detail, out.ExpiryYield)
+	}
+	w.bcqRequireNothingWritten(r, mergequeue.PhasePassed)
+}
+
+// TestMergeOnPass_BlockingConcern_TerminalRunAtLockHolds: a run that went
+// terminal between the pre-lock read and the lock holds not_mergeable_yet at
+// step 4b's in-lock re-read (no in-lock terminal settle exists there),
+// writing nothing.
+func TestMergeOnPass_BlockingConcern_TerminalRunAtLockHolds(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-terminal", "h1", mcvUndelegatedSpecYAML)
+	w.bcqLockAt(r, func() { w.exec(`UPDATE runs SET state = 'cancelled' WHERE id = $1`, r.id) })
+
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonNotMergeable)
+	if !strings.Contains(out.Detail, "the run is cancelled at the in-lock re-read") {
+		t.Fatalf("hold detail = %q, want the in-lock terminal re-read named", out.Detail)
+	}
+	w.bcqRequireNothingWritten(r, mergequeue.PhasePassed)
+}
+
+// TestMergeOnPass_BlockingConcern_MergingEntryAtLockHolds: a blocking concern
+// on an entry step 1 accepted in phase MERGING holds not_mergeable_yet, never
+// drops (the ADR-093 D8 resume owns any claim). Follow-through: the next pump
+// routes the merging entry to mergeQueueResumeMerge, which with no claim
+// returns it to passed, and the next decision drops it not_merge_eligible.
+func TestMergeOnPass_BlockingConcern_MergingEntryAtLockHolds(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-merging", "h1", mcvUndelegatedSpecYAML)
+	w.bcqLockAt(r, func() {
+		w.exec(`UPDATE merge_candidate_queue_entries SET phase = 'merging' WHERE run_id = $1 AND state = 'live'`, r.id)
+		w.raiseConcern(r, "high", "")
+	})
+
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonNotMergeable)
+	if !strings.Contains(out.Detail, mergeQueueReasonBlockingConcernOpen) {
+		t.Fatalf("hold detail = %q, want blocking_concern_open", out.Detail)
+	}
+	w.bcqRequireNothingWritten(r, mergequeue.PhaseMerging)
+
+	w.pumpBase(r)
+	w.requireState(r, mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible)
+	w.requireMerges(0)
+	if _, claimed, err := w.srv.mergeDispatchLedger().MergeDispatch(context.Background(), r.id); err != nil || claimed {
+		t.Fatalf("store dispatch claim present = %v (%v), want none", claimed, err)
+	}
+}
+
+// TestMergeOnPass_BlockingConcern_AlreadyMergedAtLockSettlesMerged: a PR
+// that merged before the lock settles pr_merged at step 2 even with a HIGH
+// raised at the lock; step 4b never refuses a merged PR.
+func TestMergeOnPass_BlockingConcern_AlreadyMergedAtLockSettlesMerged(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("bcq-merged", "h1", mcvUndelegatedSpecYAML)
+	w.bcqLockAt(r, func() {
+		w.raiseConcern(r, "high", "")
+		w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+	})
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
+	if out.State != mergequeue.StateMerged {
+		t.Fatalf("state = %q, want merged", out.State)
+	}
+	w.requireMerges(0)
+}
+
+// TestMergeOnPass_BlockingConcern_PumpDropsAndAdmitsNext crosses pump ->
+// decision -> the real Postgres merge-intent lock -> leg (d) -> reconcile ->
+// the real concern store -> settle -> merge_candidate_queue_settled: a HIGH
+// raised on A at the lock drops A not_merge_eligible, unmerged, and B is
+// admitted (the line is not wedged).
+func TestMergeOnPass_BlockingConcern_PumpDropsAndAdmitsNext(t *testing.T) {
+	ctx := context.Background()
+	w := newMQMWorld(t)
+	a, _ := w.ready("bcq-pa", "h1", mcvUndelegatedSpecYAML)
+	b := w.seed("bcq-pb", "b0", []byte(mcvUndelegatedSpecYAML))
+	if _, err := w.store.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: b.id, BaseRef: mcqBase, HeadSHA: "b0"}); err != nil {
+		t.Fatalf("enqueue B: %v", err)
+	}
+	w.bcqLockAt(a, func() { w.raiseConcern(a, "high", "") })
+
+	w.pumpBase(a)
+	w.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible)
+	settled := w.settledRows(a)
+	if len(settled) != 1 || settled[0]["reason"] != mergeCandidateQueueReasonNotMergeEligible {
+		t.Fatalf("A merge_candidate_queue_settled rows = %v, want one not_merge_eligible", settled)
+	}
+	w.requireMerges(0)
+	if n := len(w.rows(a, CategoryMergeVerdictRecorded)); n != 0 {
+		t.Fatalf("A merge_verdict_recorded rows = %d, want 0", n)
+	}
+	if _, claimed, err := w.srv.mergeDispatchLedger().MergeDispatch(ctx, a.id); err != nil || claimed {
+		t.Fatalf("A dispatch claim present = %v (%v), want none", claimed, err)
+	}
+	if len(w.rows(b, CategoryMergeCandidateQueueAdmitted)) == 0 {
+		t.Fatal("B was not admitted: the line is wedged")
 	}
 }

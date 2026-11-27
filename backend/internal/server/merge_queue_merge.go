@@ -24,7 +24,9 @@ import (
 // re-checks eligibility at the verified head, then — under the run's
 // merge-intent lock, the SAME lock the inline merge_run tail and the delegated
 // may_merge arm take — re-reads the entry and the PR, refuses a run whose
-// operator merged inline after the entry's intent, runs the merge overlap
+// operator merged inline after the entry's intent, re-evaluates the
+// eligibility predicate's leg (d), blocking concerns with the child-slice
+// reconcile, under the lock (step 4b, #5261), runs the merge overlap
 // guard, re-probes the base tip, runs the ADR-112 forge-approval FOLD at the
 // verified head and writes its merge_queue_authorized evidence row (step 6b,
 // #4619), records the operator's verdict (record-before-commit, from the
@@ -770,6 +772,9 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 	// retryable one; otherwise the retryable legs await the merge gate:
 	// (a) red yields at once, (b) pending and (c) review hold on the epoch's
 	// window (mergeOnPassEnforceGateWait). Never a drop for a retryable leg.
+	// Leg (d), blocking concerns, is judged again under the lock at
+	// mergeOnPassLocked step 4b (#5261); this pre-lock evaluation is kept, so
+	// a determined HIGH drops here without taking the lock.
 	anchor := mergeQueueIntentAnchor{Sequence: req.IntentSequence, BaseRef: e.BaseRef}
 	elig := s.mergeQueueMergeEligibility(ctx, runRow, head, anchor)
 	if !elig.Eligible {
@@ -780,8 +785,7 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 		if y, ok := mergeGateYieldFor(legs, elig); ok && !legs.Other {
 			return mergeOnPassOutcome{Kind: mergeOnPassAwaitGate, Reason: y.Reason, Detail: y.Detail, HeadSHA: head, Yield: y, Immediate: legs.Red}
 		}
-		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible,
-			"the run is no longer merge-queue eligible ("+mergeQueueReasonsText(elig.Reasons)+"); fishhawk_merge_run re-enqueues it at the tail once it is")
+		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible, mergeOnPassNotEligibleDetail(elig.Reasons))
 	}
 
 	// 5. Best-effort audit-check republish at the head the merge lands. The
@@ -810,6 +814,13 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 			slog.String("error", lockErr.Error()))
 	}
 	return out
+}
+
+// mergeOnPassNotEligibleDetail is merge-on-pass's not_merge_eligible drop
+// detail, shared by the pre-lock step 4 and the in-lock step 4b
+// (mergeOnPassLocked, #5261), so both drops read byte for byte the same.
+func mergeOnPassNotEligibleDetail(reasons []mergeQueueIneligibility) string {
+	return "the run is no longer merge-queue eligible (" + mergeQueueReasonsText(reasons) + "); fishhawk_merge_run re-enqueues it at the tail once it is"
 }
 
 // mergeQueueGateWait is the configured merge-gate window (docs/adr/112
@@ -977,6 +988,62 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		if inlineAfterIntent {
 			return held(mergeOnPassReasonInlineMergeDispatched,
 				"the operator merged this run inline after the entry's merge intent; the forge's merge or the PR-resolution webhook settles the entry")
+		}
+	}
+
+	// 4b. Leg (d), blocking concerns, re-judged UNDER the lock (#5261). Step 4
+	// of mergeQueueMergeOnPass evaluated the predicate before this lock was
+	// taken, so a HIGH or first_officer concern raised between that
+	// evaluation and the lock, or a succeeded child's HIGH the late hook left
+	// uncopied, would otherwise merge. This step calls the predicate's own leg,
+	// mergeQueueConcernLeg (openBlockingConcernIDs: the idempotent child-slice
+	// reconcile, then the ledger read). It runs AFTER the in-lock entry and PR
+	// re-reads (a merged PR settled pr_merged at step 2 and is never refused)
+	// and the inline-merge rule (a merge already in flight holds first), and
+	// BEFORE the overlap guard, the base re-probe, the step-6b fold and its
+	// merge_queue_authorized row, the verdict, SetPhase(merging) and the
+	// claim, so a refusal records, claims and merges nothing. The pre-lock
+	// step-4 evaluation is kept: a determined HIGH drops there without the
+	// lock.
+	//
+	// The run is re-read under the lock first and the leg judges that fresh
+	// row (it shadows the pre-lock runRow for this step only), so the
+	// reconcile's terminal-parent rule sees a run that went terminal after the
+	// pre-lock read. No in-lock terminal settle exists at this step: a terminal
+	// or unreadable run holds not_mergeable_yet, and the next pump's pre-lock
+	// run read settles the entry.
+	//
+	// Lock order: the reconcile's ImportRolledUp takes the child-source row
+	// locks (FOR NO KEY UPDATE) INSIDE this merge-intent lock fn: the
+	// merge-intent lock first, the row locks second, as on the inline path.
+	// They are row locks, so no pglock lock is taken under this one.
+	//
+	// The answers. On a phase-passed entry an open blocking concern drops
+	// not_merge_eligible with step 4's detail, byte for byte. On a
+	// phase-MERGING entry (step 1's in-lock acceptance: an earlier decision's
+	// dispatch claim may stand) it HOLDS not_mergeable_yet, because the
+	// ADR-093 D8 resume owns any such claim: the next pump routes the entry to
+	// mergeQueueResumeMerge first, which returns it to passed once no claim
+	// stands, and step 4 (pre-lock) then drops it. A reconcile or ledger-read
+	// failure (an unwired ConcernRepo included, through
+	// openBlockingConcernIDs's error) holds not_mergeable_yet, step 4's
+	// undeterminable answer.
+	{
+		runRow, err := s.cfg.RunRepo.GetRun(ctx, e.RunID)
+		if err != nil {
+			return held(mergeOnPassReasonNotMergeable, mergeQueueReasonsText([]mergeQueueIneligibility{{Code: mergeQueueReasonUndeterminable, Detail: "run: the run could not be re-read under the lock: " + err.Error()}}))
+		}
+		if runRow.State.IsTerminal() {
+			return held(mergeOnPassReasonNotMergeable, "the run is "+string(runRow.State)+" at the in-lock re-read; the next pump's run read settles the entry")
+		}
+		ccode, cdetail, cerr := s.mergeQueueConcernLeg(ctx, runRow)
+		switch {
+		case cerr != nil:
+			return held(mergeOnPassReasonNotMergeable, mergeQueueReasonsText([]mergeQueueIneligibility{{Code: mergeQueueReasonUndeterminable, Detail: "concerns: " + cerr.Error()}}))
+		case ccode != "" && cur.Entry.Phase == mergequeue.PhaseMerging:
+			return held(mergeOnPassReasonNotMergeable, mergeQueueReasonsText([]mergeQueueIneligibility{{Code: ccode, Detail: cdetail}}))
+		case ccode != "":
+			return settle(mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible, mergeOnPassNotEligibleDetail([]mergeQueueIneligibility{{Code: ccode, Detail: cdetail}}))
 		}
 	}
 
