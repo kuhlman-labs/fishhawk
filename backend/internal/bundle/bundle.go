@@ -656,8 +656,16 @@ type BindingAssertionEvidence struct {
 // follow the raw verify_run event payload (verifyRunEvent in
 // runner/cmd/fishhawk-runner/main.go); OutputTail is the composer's
 // bounded (last 30 lines, ~4KB cap), pre-redacted tail of the raw
-// event's output — the raw verify_run keeps the full unredacted
-// output for compliance, only this derived digest is prompt-bound.
+// event's output, and Failures (#5529) the bounded (~4KB), pre-redacted
+// failure-signal excerpt of the WHOLE output for a non-passed run — the raw
+// verify_run keeps the full unredacted output for compliance, only this
+// derived digest is prompt-bound.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrors the runner's verifyRunEvidence
+// (runner/cmd/fishhawk-runner/gateevidence.go). The json tags MUST stay
+// identical; the pair is registered in backend/internal/wirecontract's
+// manifest and the marshaled bytes are pinned by the shared golden
+// testdata/wire/gate_verify_run_failures.json.
 type VerifyRunEvidence struct {
 	Command  string `json:"command"`
 	HeadSHA  string `json:"head_sha,omitempty"`
@@ -671,6 +679,13 @@ type VerifyRunEvidence struct {
 	// bounds — the prompt flags it so a reviewer knows the output is
 	// partial.
 	TailTruncated bool `json:"tail_truncated,omitempty"`
+	// Failures is the failure-signal excerpt (#5529) of a NON-passed run: the
+	// go-test FAIL/panic/race lines, compiler diagnostics and a harness's
+	// column-0 `FAIL: ` row, with context, selected from the WHOLE redacted
+	// output — so it may carry failing rows the OutputTail lost. UNTRUSTED
+	// verify output, like the tail. Additive/omitempty: older bundles decode
+	// to "".
+	Failures string `json:"failures,omitempty"`
 	// Superseded is true when a LATER verify_run iteration superseded this
 	// one in the verify-fix loop (#1205): an earlier absorbed iteration that
 	// ran on a stale tree and was followed by a passing terminal run, so it

@@ -3028,9 +3028,13 @@ _host_dispatch_sleep() {
 # for untrusted execution (acceptenv), and no runner path needs it. Nothing
 # else from .env reaches it: not FISHHAWKD_DATABASE_URL, the webhook or OAuth
 # secrets, the App key file, or the AWS trace-store keys.
+# FISHHAWK_HOST_CAPACITY (#5530) is for the dispatcher itself: its markers send
+# it as `capacity` (ADR-094 D4), and without it the server uses 3. The spawned
+# runners inherit it too; `rg -n FISHHAWK_HOST_CAPACITY runner/` matched nothing
+# when it was added (no runner reads it), and it is a non-secret integer.
 typeset -ga _HD_ENV_PASSTHROUGH
 _HD_ENV_PASSTHROUGH=(USER LOGNAME SHELL LANG XDG_STATE_HOME DOCKER_HOST DOCKER_CONTEXT
-  FISHHAWK_HOST_LABEL FISHHAWK_RUNNER_BIN FISHHAWK_AGENT_BIN FISHHAWK_CODEX_BIN
+  FISHHAWK_HOST_LABEL FISHHAWK_HOST_CAPACITY FISHHAWK_RUNNER_BIN FISHHAWK_AGENT_BIN FISHHAWK_CODEX_BIN
   FISHHAWK_DEPLOYMENT_PROFILE FISHHAWK_FORGE_WRITES
   FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION FISHHAWK_ACCEPTANCE_NET_SANDBOX
   FISHHAWK_IMPLEMENT_SIGNAL_SANDBOX
@@ -3109,6 +3113,40 @@ _host_dispatch_running() {
   return 0
 }
 
+# PURE. Fills _HD_CAP_ARGS with the host-dispatch cap flags set by the three
+# optional FISHHAWK_HOST_DISPATCH_* variables (#5530). Unset or empty adds no
+# flag, so the binary's default holds. A value must be a decimal 1..999999 with
+# no sign, whitespace or leading zero: Go's flag package reads base prefixes, so
+# `010` would mean 8, and the bound (deliberate) stays far from int overflow.
+# The first invalid value empties the array, prints ONE stderr line and returns
+# 1. The operator's value is printed only through ${(qq)v}, with `print -r`.
+# These variables are consumed here and are NOT in _HD_ENV_PASSTHROUGH.
+typeset -ga _HD_CAP_ARGS
+_host_dispatch_cap_args() {
+  local name flag unset_hint v remedy
+  _HD_CAP_ARGS=()
+  for name flag unset_hint in \
+      FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT --max-in-flight 'unset it to keep the default 2 (keep it at or below FISHHAWK_HOST_CAPACITY, default 3)' \
+      FISHHAWK_HOST_DISPATCH_PER_TICK_CAP --per-tick-cap 'unset it to keep the default 4' \
+      FISHHAWK_HOST_DISPATCH_DAILY_CAP --daily-cap 'unset it for no daily cap'; do
+    v="${(P)name:-}"
+    if [[ -z "$v" ]]; then continue; fi
+    if [[ "$v" =~ '^[1-9][0-9]{0,5}$' ]]; then
+      _HD_CAP_ARGS+=("$flag" "$v")
+      continue
+    fi
+    _HD_CAP_ARGS=()
+    if [[ "$v" =~ '^0*[1-9][0-9]{6,}$' ]]; then
+      remedy="is out of range (it sets ${flag}; allowed 1 to 999999) — set it in .env to a number in that range"
+    else
+      remedy="is not a positive integer (it sets ${flag}) — set it in .env to a whole number from 1 to 999999 with no sign or leading zero"
+    fi
+    print -u2 -r -- "host dispatcher not started: ${name}=${(qq)v} ${remedy}, or ${unset_hint}"
+    return 1
+  done
+  return 0
+}
+
 # Start the dispatcher. Degrade-not-abort like _relay_up: every failure prints
 # ONE actionable stderr line and returns non-zero (the caller wraps it in `if !`).
 _host_dispatch_up() {
@@ -3130,6 +3168,8 @@ _host_dispatch_up() {
     print -u2 "host dispatcher not started: ${HD_BIN} is not executable — run 'scripts/dev reload' to build it"
     return 1
   fi
+  # Before any state-dir change: a refused start leaves an operator's pause alone.
+  if ! _host_dispatch_cap_args; then return 1; fi
   mkdir -p "$HD_STATE_DIR" "$LOG_DIR" "${HD_PID_FILE:h}"
   chmod 0700 "$HD_STATE_DIR"
   # An up always starts it resumed, and the identity proof below can only be
@@ -3138,7 +3178,7 @@ _host_dispatch_up() {
   _HD_PAUSE_CREATED=0
   local roots="${FISHHAWK_MCP_ALLOWED_ROOTS:-$REPO_ROOT}"
   _host_dispatch_env "$token"
-  ( _host_dispatch_exec_scrubbed "$HD_BIN" host-dispatch --allowed-roots "$roots" --state-dir "$HD_STATE_DIR" ) >> "$HD_LOG_FILE" 2>&1 &
+  ( _host_dispatch_exec_scrubbed "$HD_BIN" host-dispatch --allowed-roots "$roots" --state-dir "$HD_STATE_DIR" "${_HD_CAP_ARGS[@]}" ) >> "$HD_LOG_FILE" 2>&1 &
   local hd_pid=$!
   # The relay's subshell-safe disown (see _relay_up).
   local disown_err="${HD_LOG_FILE}.disown"
@@ -3152,7 +3192,8 @@ _host_dispatch_up() {
   # Identity proof — the analogue of the fishhawkd start-nonce round-trip (the
   # dispatcher has no listener): its first tick runs at start and writes
   # status.json, which must name the pid this spawn produced.
-  local i=0 status_pid=""
+  local i=0 status_pid="" sizing=""
+  if (( ${#_HD_CAP_ARGS} )); then sizing=" with ${_HD_CAP_ARGS[*]}"; fi
   while (( i < 50 )); do
     if ! _pid_alive "$hd_pid"; then
       print -u2 "host dispatcher exited at start (pid ${hd_pid}) — last ${HD_LOG_FILE} lines:"
@@ -3162,7 +3203,7 @@ _host_dispatch_up() {
     fi
     status_pid="$(_host_dispatch_status_pid "$HD_STATE_DIR")"
     if [[ "$status_pid" == "$hd_pid" ]]; then
-      print "host dispatcher started (pid ${hd_pid}) — logs: ${HD_LOG_FILE}; status: bin/fishhawk-mcp host-dispatch --status --state-dir ${HD_STATE_DIR}"
+      print "host dispatcher started (pid ${hd_pid})${sizing} — logs: ${HD_LOG_FILE}; status: bin/fishhawk-mcp host-dispatch --status --state-dir ${HD_STATE_DIR}"
       return 0
     fi
     _host_dispatch_sleep 0.2

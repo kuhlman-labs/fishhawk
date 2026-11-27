@@ -1920,6 +1920,13 @@ type GateVerifyRun struct {
 	OutputTail string
 	// TailTruncated marks a tail the runner cut to its line/byte bounds.
 	TailTruncated bool
+	// Failures is the failure-signal lines of a NON-passed run, selected from
+	// the WHOLE output (#5529): UNTRUSTED verify output, bounded and
+	// pre-redacted by the runner, that may carry the failing row the
+	// OutputTail lost (a harness's column-0 `FAIL: ` row among hundreds of
+	// passing rows). Rendered only on the parent verify-runs block; empty
+	// renders nothing.
+	Failures string
 	// Superseded marks a verify run the verify-fix loop absorbed and re-ran
 	// (#1205): an earlier iteration on a stale tree followed by a passing
 	// terminal run. The renderer flags it so its failure is NOT read as a
@@ -8245,6 +8252,7 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 				header = "skip reason / output tail (bounded, pre-redacted" + truncNote + ")"
 			}
 			writeUntrustedVerifyOutput(b, "  ", header, vr.OutputTail)
+			writeUntrustedVerifyOutput(b, "  ", "failure-signal lines from the whole output (bounded, pre-redacted)", vr.Failures)
 		}
 		b.WriteString("\n")
 	}
@@ -9771,13 +9779,14 @@ func writeApprovalConditionResponses(b *strings.Builder, r *GateApprovalConditio
 // will emit at least one verify-output envelope, so writeGateEvidence can emit
 // verifyOutputEnvelopeFraming exactly once and ONLY when it frames something
 // (#3192). It mirrors the render guards exactly: a parent VerifyRun renders its
-// tail whenever OutputTail is non-empty (any outcome); a slice run renders its
+// tail whenever OutputTail is non-empty (any outcome) and its failure-signal
+// lines whenever Failures is non-empty (#5529); a slice run renders its
 // tail only when non-passed AND non-empty; a parent or slice summary renders an
 // enveloped detail only when Detail is non-empty. Keeping a no-tail no-detail
 // section free of the paragraph is what preserves prompt-hash replay stability.
 func gateEvidenceHasUntrustedVerifyText(ev *GateEvidence) bool {
 	for _, vr := range ev.VerifyRuns {
-		if vr.OutputTail != "" {
+		if vr.OutputTail != "" || vr.Failures != "" {
 			return true
 		}
 	}
