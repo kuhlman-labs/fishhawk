@@ -770,8 +770,13 @@ lint cache are never host-seeded or mounted from a host cache either, and
 take one of the two postures below. Every container exec gets a fresh EMPTY set of visible cache
 directories (`NewVisibleCaches`: `fishhawk-gatecache-*` under the OS temp dir,
 0700, empty `gocache` + `gomodcache`), populated HOST-side, mounted for that
-one exec, and removed afterwards. Host seeding never opens a directory a
-container has been given.
+one exec, and removed afterwards. The one exception is the slice gate's reach
+exec (#5524, `withSeedHandoff` in `gateisolation.go`): once its seed
+succeeds, whatever the exec's outcome, its seeded set is handed to the next container exec on the same
+clone, the deciding verify, which mounts it WITHOUT seeding and removes it
+afterwards. A handoff left for another dir is removed unused, and
+`cleanup()` removes any leftover (`TestRunGateInContainer_SeedHandoff`). Host
+seeding never opens a directory a container has been given.
 
 - `SeedModCache(ctx, run, checkout, hostModCache, dest, baseEnv, timeout)`
   (1) REFUSES with `ErrDestinationNotEmpty` when `dest.GoModCache` already has
@@ -787,8 +792,11 @@ container has been given.
   outside the `EvalSymlinks`-resolved checkout, or a metadata file that does
   not parse. The metadata-type half of (3) is exported as
   `RequireRegularModuleMetadata(dir)`, a delegate to the same Lstat predicate,
-  whose second consumer is the runner's slice-gate reach load (#5498,
-  `runner/cmd/fishhawk-runner/slicereach.go`); (4) runs `go mod download all` under
+  whose second consumer is the runner's slice-gate host reach load (#5498,
+  `runner/cmd/fishhawk-runner/slicereach.go`). The in-image reach load's
+  stdlib-only helper (#5524, `runner/cmd/fishhawk-runner/slicereachhelper/`)
+  re-implements the same predicate, because it may import nothing outside the
+  standard library; (4) runs `go mod download all` under
   `baseEnv` — the runner passes its SANITIZED gate env (`sanitizedGateEnv`,
   ADR-029), never `os.Environ()`, so no runner credential reaches the go
   process — with `GOMODCACHE=dest`, a throwaway `GOCACHE`/`GOPATH` under the
@@ -819,7 +827,8 @@ container has been given.
   download-and-exec driven by untrusted metadata.
 - `GOCACHE` has NO seed. Under `FISHHAWK_GATE_CACHE=off` (or a degraded
   cache step) it is the per-exec throwaway `gocache` dir: a cold build cache
-  per container exec. Otherwise it lives in the runner process's cache volume
+  per container exec (a verify that takes a reach handoff reuses the reach
+  exec's dir). Otherwise it lives in the runner process's cache volume
   (§ "Persistent cache volume"): cold on the first container exec of the
   process, warm on every later one.
 - `VisibleCaches.Remove` is SYMLINK-SAFE (approval condition 2 of #2134): the
@@ -833,7 +842,13 @@ container has been given.
 
 **Cost, honestly:** module-cache repopulation on EVERY container exec (three
 or more per stage: scoped verify, full verify, diff_coverage, plus fix
-iterations and absorbs). `GOCACHE` and the lint cache are cold on the FIRST
+iterations and absorbs). A decomposition child's slice gate adds one reach exec
+per distinct tree on the container path (#5524). It provisions no gate service
+(`withoutGateServices`), and once its seed succeeds it hands its seeded
+caches to the deciding verify on the same clone, whatever the exec's outcome
+(`withSeedHandoff`), so that tree still pays one seed. Its helper builds in a
+fresh per-exec `GOCACHE` (a cold helper compile, about 2s), never the cache
+volume. `GOCACHE` and the lint cache are cold on the FIRST
 container exec of each runner process and warm afterwards under
 `FISHHAWK_GATE_CACHE=process`; under `off` (or a degraded step) they are cold
 on every exec, the pre-#3967 cost. Process mode adds a `volume create`, a
@@ -846,8 +861,9 @@ there is no cache shared ACROSS runs or stages (by design, § "Persistent
 cache volume"), so the first container exec of every stage is cold; the
 per-exec module-cache repopulation is accepted. The first container exec also pulls the image
 through the daemon inside the gate timeout — pre-pull it. With
-`FISHHAWK_GATE_SERVICES=postgres` every container exec also pays a Postgres
-start (seconds; OUTSIDE the gate timeout, § "Gate services (#2137)").
+`FISHHAWK_GATE_SERVICES=postgres` every gate container exec also pays a
+Postgres start (seconds; OUTSIDE the gate timeout, § "Gate services (#2137)");
+the slice gate's reach exec provisions none.
 
 ## Persistent cache volume (`cachevolume.go`, E51.18 / [#3967](https://github.com/kuhlman-labs/fishhawk/issues/3967))
 
