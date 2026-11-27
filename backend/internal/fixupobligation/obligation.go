@@ -1,5 +1,5 @@
-// Package fixupobligation classifies the operator-authored instructions routed
-// with an implement-stage fix-up pass (#2737) into REPORTING obligations — an
+// Package fixupobligation classifies the instructions routed with an
+// implement-stage fix-up pass (#2737) into REPORTING obligations — an
 // instruction that asks the agent to RECORD something on a report surface (the
 // PR body's `## Notes`, a run log) rather than to change code.
 //
@@ -33,10 +33,13 @@ import (
 	"unicode/utf8"
 )
 
-// SourceKind names which routed channel an obligation's text came from. The
-// three kinds are exactly the operator-authored free-text fields the fix-up
-// trigger records on its stage_fixup_triggered audit entry
-// (backend/internal/server/fixup.go::writeFixupAudit).
+// SourceKind names which routed channel an obligation's text came from. The two
+// kinds are exactly the instruction channels the fix-up trigger records on its
+// stage_fixup_triggered audit entry
+// (backend/internal/server/fixup.go::writeFixupAudit): a routed concern note and
+// the free-text operator_concern. The fix-up `reason` is recorded there too, but
+// it is an audit note the agent never sees, so it is not a source and is never
+// classified (#5561).
 type SourceKind string
 
 const (
@@ -46,8 +49,6 @@ const (
 	// (#1311). Since #2623 it is ALSO minted as a durable concern, so its text
 	// normally appears as a concern note too; Detect dedupes that overlap.
 	SourceOperatorConcern SourceKind = "operator_concern"
-	// SourceReason is the operator's fix-up `reason`.
-	SourceReason SourceKind = "reason"
 )
 
 // Status literals for an agent's per-obligation self-report.
@@ -274,8 +275,7 @@ func containsAny(folded string, needles []string) bool {
 // Detect classifies the routed instructions and returns the declared reporting
 // obligations, assigning ids `ob-1`..`ob-N` in a FIXED order that does NOT
 // depend on how the caller interleaved the sources: every SourceConcern in
-// input order, then SourceOperatorConcern, then SourceReason. Determinism here
-// is load-bearing — the prompt renderer and the review-time re-derivation must
+// input order, then SourceOperatorConcern. Determinism here is load-bearing — the prompt renderer and the review-time re-derivation must
 // mint the same id for the same instruction.
 //
 // A SourceOperatorConcern whose trimmed text already appeared as a
@@ -305,7 +305,7 @@ func Detect(sources []Source) []Obligation {
 	}
 
 	var out []Obligation
-	for _, kind := range []SourceKind{SourceConcern, SourceOperatorConcern, SourceReason} {
+	for _, kind := range []SourceKind{SourceConcern, SourceOperatorConcern} {
 		for _, s := range sources {
 			if s.Kind != kind {
 				continue

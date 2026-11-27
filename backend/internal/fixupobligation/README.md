@@ -28,6 +28,14 @@ transport (the existing fix-up self-report sidecar, #1210) and a deterministic
 undelivered signal (an advisory pre-review audit entry + a distinct
 gate-evidence block, modeled on `operator_scope_path_undelivered`, #1407).
 
+## Which routed text is classified
+
+Two channels: a routed concern note and the free-text `operator_concern`. The
+fix-up `reason` is recorded on the same audit entry but is an **audit note
+only**: it never reaches the fix-up agent, so it is neither a source nor an
+`instruction_targets` key, and no wording in it declares an obligation (#5561).
+Put anything the agent must report in `operator_concern`.
+
 ## Where it is called
 
 Both call sites read the **same** `stage_fixup_triggered` audit entry, via one
@@ -126,8 +134,9 @@ meaning of an absent target), `pr_body`, or `docs` — set by whoever routes the
 instruction: the operator on `POST /v0/stages/{id}/fixup`'s
 `instruction_targets` / `fishhawk_fixup_stage`, recorded on the
 `stage_fixup_triggered` payload as `concern_targets` (positional over
-`concerns`) / `operator_concern_target` / `reason_target`, each omitted when
-every target is `code`. `Detect` sets `Obligation.PRBody = (Target ==
+`concerns`) / `operator_concern_target`, each omitted when every target is
+`code`. `reason_target` is no longer written (#5561): the `reason` key is
+refused, and a legacy payload's `reason_target` is ignored. `Detect` sets `Obligation.PRBody = (Target ==
 pr_body)` at the single detection site, and the flag rides every consumer (the
 routing-time warning, the advisory audit entry, the fix-up prompt bullet, and
 the review-time join), all of which read the targets the trigger recorded. The
@@ -188,7 +197,7 @@ this change is backend-only and advisory (tracked as a #2782 follow-up).
 
 `Detect` assigns `ob-1`..`ob-N` in a **fixed kind order** that does not depend
 on the caller's interleaving: every `concern` in payload order, then
-`operator_concern`, then `reason`. An `operator_concern` whose trimmed text
+`operator_concern`. An `operator_concern` whose trimmed text
 already appeared as a concern note is **skipped** — since #2623 the free-text
 `operator_concern` is also minted as a durable concern, so it arrives on both
 channels and would otherwise draw two ids for one instruction.
@@ -230,7 +239,7 @@ echoes neither field verbatim: an out-of-shape id or status logs `<invalid>`.
 ## Trust boundary on the routed instruction excerpt
 
 An obligation's `Text` is trusted **only when it is operator-authored**. One of
-the three routed channels — the concern note — can carry an *acceptance-derived*
+the two routed channels — the concern note — can carry an *acceptance-derived*
 concern: free text an automated acceptance validator wrote while driving the
 change against a running instance, i.e. attacker-influenceable content (ADR-050 /
 E31.8 / #1613). The classifier will happily detect a "reporting obligation"
@@ -246,8 +255,8 @@ predicate `resolveFixupConcerns` uses for `prompt.FixupConcern.AcceptanceDerived
 (the `operator_concern` dedupe retains the surviving concern's flag, so the
 dedupe can only ever keep the more-quarantined of the two); the trace handler
 copies it onto `prompt.GateFixupReportingObligation` and onto the audit detail's
-`untrusted` field. `operator_concern` and `reason` are operator-authored by
-construction and are never marked.
+`untrusted` field. `operator_concern` is operator-authored by construction and
+is never marked.
 
 | Layer | Control | Pinned by |
 |---|---|---|
