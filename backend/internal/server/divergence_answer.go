@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -61,6 +63,17 @@ const divergenceDoctrineAutonomy = "autonomy:low"
 //     records the answer naming the filed issue. FILE FIRST, THEN RECORD (the
 //     handleDeferConcern orphan-safety ordering): a filing failure records
 //     nothing, so the question stays open and the captain can retry.
+//
+// The check-file-record section (the already-answered re-read, the filing and
+// the answer append) runs under the per-(run, sequence) answer lock,
+// run.DivergenceAnswerLocker (#3891). A concurrent duplicate submission waits
+// for the holder; when the holder recorded its answer, the duplicate then gets
+// 409 divergence_already_answered having filed nothing. If the holder filed
+// but failed to record (an append failure or a cancelled ctx), a queued or
+// later submission can file again: that window predates the lock. When the
+// lock cannot be taken the section never runs and the endpoint answers 500
+// internal_error, nothing filed or recorded. A lapse reported after the
+// section completed is logged at WARN and its outcome stands.
 //
 // It writes NO repository file — the handler holds no content-write seam.
 //
@@ -169,17 +182,73 @@ func (s *Server) handleAnswerDivergence(w http.ResponseWriter, r *http.Request) 
 			map[string]any{"run_id": runID.String(), "sequence": seq})
 		return
 	}
-	answered, err := s.answeredDivergenceSequences(r.Context(), ru)
-	if err != nil {
+	// The check-file-record section runs under the per-(run, sequence) answer
+	// lock (#3891). Everything above it is append-only state (the run row and
+	// the precedent_divergence entry), so only the already-answered re-read,
+	// the filing and the answer append need the exclusion.
+	var (
+		ran     bool
+		resp    divergenceAnswerResponse
+		failure *workItemError
+	)
+	lockErr := s.withDivergenceAnswerLock(r.Context(), runID, seq, func(ctx context.Context) error {
+		ran = true
+		resp, failure = s.recordDivergenceAnswer(ctx, id, ru, target, divergent, seq, answer, req)
+		return nil
+	})
+	if !ran {
+		details := map[string]any{"run_id": runID.String(), "sequence": seq}
+		if lockErr != nil {
+			details["error"] = lockErr.Error()
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"list precedent_divergence_answered entries failed", map[string]any{"error": err.Error()})
+			"serializing the divergence answer failed; nothing was filed or recorded, retry the answer", details)
 		return
 	}
-	if answered[seq] {
-		s.writeError(w, r, http.StatusConflict, "divergence_already_answered",
-			"this divergence question already has an answer",
-			map[string]any{"run_id": runID.String(), "sequence": seq})
+	if lockErr != nil {
+		// The section completed: its outcome (an answer and any filed issue,
+		// or a refusal) is durable, and a retry would 409. Only the exclusion
+		// against a concurrent duplicate may have lapsed.
+		s.cfg.Logger.Warn("divergence answer lock may have lapsed after the answer section completed",
+			slog.String("run_id", runID.String()),
+			slog.Int64("sequence", seq),
+			slog.String("error", lockErr.Error()))
+	}
+	if failure != nil {
+		s.writeError(w, r, failure.status, failure.code, failure.msg, failure.details)
 		return
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// withDivergenceAnswerLock runs fn under the repository's per-(run, sequence)
+// DivergenceAnswerLocker (#3891). A repository without the capability (the
+// in-memory fakes) runs fn unserialized; production is pinned by the
+// compile-time assertion beside run's postgres implementation.
+func (s *Server) withDivergenceAnswerLock(ctx context.Context, runID uuid.UUID, seq int64, fn func(context.Context) error) error {
+	if locker, ok := s.cfg.RunRepo.(run.DivergenceAnswerLocker); ok {
+		return locker.WithDivergenceAnswerLock(ctx, runID, seq, fn)
+	}
+	return fn(ctx)
+}
+
+// recordDivergenceAnswer is the answer verb's check-file-record section, run
+// under the per-question answer lock: it re-reads the answered set (409 when
+// the question already has an answer), files the doctrine_change work item
+// when asked, and appends precedent_divergence_answered. FILE FIRST, THEN
+// RECORD: a filing failure returns before the append, recording nothing. It
+// returns the 200 body, or the error response to write.
+func (s *Server) recordDivergenceAnswer(ctx context.Context, id Identity, ru *run.Run, target *audit.Entry, divergent precedentDivergencePayload, seq int64, answer string, req divergenceAnswerRequest) (divergenceAnswerResponse, *workItemError) {
+	runID := ru.ID
+	answered, err := s.answeredDivergenceSequences(ctx, ru)
+	if err != nil {
+		return divergenceAnswerResponse{}, &workItemError{http.StatusInternalServerError, "internal_error",
+			"list precedent_divergence_answered entries failed", map[string]any{"error": err.Error()}}
+	}
+	if answered[seq] {
+		return divergenceAnswerResponse{}, &workItemError{http.StatusConflict, "divergence_already_answered",
+			"this divergence question already has an answer",
+			map[string]any{"run_id": runID.String(), "sequence": seq}}
 	}
 
 	p := precedentDivergenceAnsweredPayload{
@@ -192,9 +261,9 @@ func (s *Server) handleAnswerDivergence(w http.ResponseWriter, r *http.Request) 
 	resp := divergenceAnswerResponse{RunID: runID.String(), Sequence: seq, Answer: answer}
 
 	if answer == divergenceAnswerDoctrineChange {
-		issue, ok := s.fileDoctrineChange(w, r, ru, target, divergent, req)
-		if !ok {
-			return
+		issue, ferr := s.fileDoctrineChange(ctx, ru, target, divergent, req)
+		if ferr != nil {
+			return divergenceAnswerResponse{}, ferr
 		}
 		p.IssueNumber, p.IssueURL, p.IssueProvider = issue.Number, issue.URL, issue.Provider
 		resp.Issue = issue
@@ -202,16 +271,15 @@ func (s *Server) handleAnswerDivergence(w http.ResponseWriter, r *http.Request) 
 
 	payload, err := json.Marshal(p)
 	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"marshal precedent_divergence_answered payload failed", map[string]any{"error": err.Error()})
-		return
+		return divergenceAnswerResponse{}, &workItemError{http.StatusInternalServerError, "internal_error",
+			"marshal precedent_divergence_answered payload failed", map[string]any{"error": err.Error()}}
 	}
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
 	}
 	actorKind := actorKindForSubject(subject)
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      target.StageID,
 		Timestamp:    time.Now().UTC(),
@@ -226,28 +294,25 @@ func (s *Server) handleAnswerDivergence(w http.ResponseWriter, r *http.Request) 
 			// re-answer doctrine_change and file a duplicate.
 			details["filed_issue"] = resp.Issue.URL
 		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"recording the divergence answer failed", details)
-		return
+		return divergenceAnswerResponse{}, &workItemError{http.StatusInternalServerError, "internal_error",
+			"recording the divergence answer failed", details}
 	}
-	s.writeJSON(w, r, http.StatusOK, resp)
+	return resp, nil
 }
 
 // fileDoctrineChange files the doctrine_change work item through
-// applyAndFileWorkItem. On any failure it writes the error response and
-// returns ok=false, having recorded nothing.
-func (s *Server) fileDoctrineChange(w http.ResponseWriter, r *http.Request, ru *run.Run, entry *audit.Entry, d precedentDivergencePayload, req divergenceAnswerRequest) (*deferFiledIssue, bool) {
+// applyAndFileWorkItem. On any failure it returns the error response to
+// write, having filed and recorded nothing.
+func (s *Server) fileDoctrineChange(ctx context.Context, ru *run.Run, entry *audit.Entry, d precedentDivergencePayload, req divergenceAnswerRequest) (*deferFiledIssue, *workItemError) {
 	owner, name, ok := splitRepoFullName(ru.Repo)
 	if !ok {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"the run has a malformed repo coordinate", map[string]any{"repo": ru.Repo})
-		return nil, false
+		return nil, &workItemError{http.StatusInternalServerError, "internal_error",
+			"the run has a malformed repo coordinate", map[string]any{"repo": ru.Repo}}
 	}
-	conv, err := conventionsLoader(r.Context(), ru.Repo)
+	conv, err := conventionsLoader(ctx, ru.Repo)
 	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not load work-management conventions", map[string]any{"error": err.Error()})
-		return nil, false
+		return nil, &workItemError{http.StatusInternalServerError, "internal_error",
+			"could not load work-management conventions", map[string]any{"error": err.Error()}}
 	}
 	filing := workmgmt.FilingRequest{
 		Type:    divergenceDoctrineType,
@@ -271,19 +336,17 @@ func (s *Server) fileDoctrineChange(w http.ResponseWriter, r *http.Request, ru *
 		target.Scope = forge.FromGitHubInstallationID(*ru.InstallationID)
 	}
 	if target.Scope.IsZero() && s.cfg.GitHub != nil {
-		scope, rerr := s.resolveRepoScope(r.Context(), owner, name)
+		scope, rerr := s.resolveRepoScope(ctx, owner, name)
 		if rerr != nil {
-			s.writeError(w, r, http.StatusBadGateway, "work_item_filing_failed",
+			return nil, &workItemError{http.StatusBadGateway, "work_item_filing_failed",
 				"could not resolve the GitHub App installation for the run's repo",
-				map[string]any{"error": rerr.Error()})
-			return nil, false
+				map[string]any{"error": rerr.Error()}}
 		}
 		target.Scope = scope
 	}
-	item, created, werr := s.applyAndFileWorkItem(r.Context(), filing, conv, target, owner, name)
+	item, created, werr := s.applyAndFileWorkItem(ctx, filing, conv, target, owner, name)
 	if werr != nil {
-		s.writeError(w, r, werr.status, werr.code, werr.msg, werr.details)
-		return nil, false
+		return nil, werr
 	}
 	return &deferFiledIssue{
 		Type:                   item.Type,
@@ -294,7 +357,7 @@ func (s *Server) fileDoctrineChange(w http.ResponseWriter, r *http.Request, ru *
 		AppliedLabels:          created.AppliedLabels,
 		DefaultedLabels:        item.Classification.DefaultedLabels,
 		MissingLabelNamespaces: item.Classification.MissingLabelNamespaces,
-	}, true
+	}, nil
 }
 
 // doctrineChangeLabels returns the caller's labels with every autonomy:*

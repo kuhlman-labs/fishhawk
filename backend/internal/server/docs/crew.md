@@ -304,6 +304,33 @@ gate" is a SEQUENTIAL guarantee. Unlike `recordPrecedentSurfaced`, a
 de-duplication READ failure records nothing (fail toward quiet): a missed
 question is benign, re-asking is the nagging the rule's brakes exist to prevent.
 
+**Answer once per question (#3891).** Unlike the sequential ask-once guard,
+the answer verb (`POST /v0/runs/{run_id}/divergence/{sequence}/answer`,
+`divergence_answer.go`) is serialized: its check-file-record section (the
+already-answered re-read, the doctrine_change filing and the
+`precedent_divergence_answered` append) runs under
+`run.DivergenceAnswerLocker`, a cross-process session advisory lock keyed on
+run + sequence. A concurrent duplicate waits for the holder; when the holder
+recorded its answer, the duplicate then gets 409 `divergence_already_answered`
+having filed nothing. If the holder filed but failed to record (an append
+failure or a cancelled ctx), a queued or later submission can file again; that
+window predates the lock and is out of scope. When the lock cannot be taken
+the section never runs: 500 `internal_error`, nothing filed or recorded, retry.
+A lapse reported after the section completed (`pglock.ErrLockLapsed`) is logged
+at WARN and the durable answer stands. A run repository without the capability
+(the in-memory fakes) runs the section unserialized. Budget: every answer,
+`one_off` included, takes a slot on the pool-wide pglock holder budget shared
+with the merge-intent, consolidated-PR-open and refinement filing locks, and
+under a saturated budget the acquisition wait is bounded only by the request
+ctx. Pins: `TestAnswer_ConcurrentDoctrineChangeFilesOnce`,
+`TestAnswer_LockFailureFilesAndRecordsNothing`,
+`TestAnswer_LockLapseAfterAnswerStands` (`divergence_answer_test.go`; the
+existing `TestAnswer_*` cases pin the unserialized fallback), and
+`TestDivergenceAnswerPG_ConcurrentDoctrineChangeFilesOnce`
+(`divergence_answer_pg_test.go`: two servers on real Postgres, the loser's
+refused `pg_try_advisory_lock` observed before the winner is released). Lock
+contract: `backend/internal/run/README.md` § "Divergence answer lock".
+
 **Best-effort and total.** Every miss returns with no entry and leaves the
 decision and its response untouched: disabled config, an allow-list miss, nil
 `PrecedentIndex` / `AuditRepo` / `RunRepo`, a run read failure, a non-UUID

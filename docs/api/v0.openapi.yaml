@@ -32560,6 +32560,12 @@ paths:
           RECORD: a filing failure records nothing, so the captain can retry.
           It writes NO repository file (`.fishhawk/**` stays human-authored).
 
+        The already-answered check, the filing and the answer append run under
+        a per-question lock (run + sequence, across server processes; #3891),
+        so concurrent submissions for one question are serialized: a duplicate
+        waits for the first, and when the first recorded its answer the
+        duplicate gets `409` having filed nothing.
+
         Both answer categories are INTERNAL chain-only kinds (no issue-thread
         activity line). Answering is OPTIONAL — nothing gates on it.
 
@@ -32650,7 +32656,12 @@ paths:
         '409':
           description: |
             `divergence_already_answered` — the question already carries an
-            answer; nothing recorded and nothing filed.
+            answer; nothing recorded and nothing filed. A concurrent duplicate
+            submission is serialized behind the first and receives this,
+            having filed nothing, when the first recorded its answer. If the
+            first filed but failed to record (a `500` naming
+            `details.filed_issue`, or a cancelled request), a later
+            submission can file again.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -32665,7 +32676,9 @@ paths:
           description: |
             `internal_error`: an audit read failed, or recording the answer
             failed — after a successful doctrine_change filing, `details.filed_issue`
-            names the durable issue so the captain does not re-file.
+            names the durable issue so the captain does not re-file — or the
+            per-question lock could not be taken, in which case nothing was
+            filed or recorded; retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
