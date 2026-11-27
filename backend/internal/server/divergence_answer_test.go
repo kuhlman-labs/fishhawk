@@ -2,13 +2,17 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +20,10 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // divergence_answer_test.go pins POST /v0/runs/{run_id}/divergence/{sequence}/answer
@@ -397,6 +404,313 @@ func TestAnswer_DefensiveBranches(t *testing.T) {
 				t.Errorf("append failure after filing must name the filed issue: %s", w.Body.String())
 			}
 		})
+	}
+}
+
+// TestAnswer_DoctrineChangePreFilingFailures pins the two fileDoctrineChange
+// branches that refuse before the provider is reached (#3891 remapped them
+// onto returned errors): a conventions-load failure is 500 internal_error and
+// an installation-resolve failure is 502 work_item_filing_failed. Each files
+// nothing and records no answer.
+func TestAnswer_DoctrineChangePreFilingFailures(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, h *daHarness) (uuid.UUID, string)
+		status int
+		code   string
+		msg    string
+	}{
+		{"conventions_load_fails", func(t *testing.T, h *daHarness) (uuid.UUID, string) {
+			prev := conventionsLoader
+			conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+				return workmgmt.Conventions{}, errors.New("work-management.yaml: parse error")
+			}
+			t.Cleanup(func() { conventionsLoader = prev })
+			return h.runID, "10"
+		}, http.StatusInternalServerError, "internal_error", "could not load work-management conventions"},
+		{"installation_resolve_fails", func(t *testing.T, h *daHarness) (uuid.UUID, string) {
+			// A run with no recorded installation makes the filing resolve one
+			// through the GitHub App, and the forge answers 500.
+			id := uuid.New()
+			h.repo.seedRun(&run.Run{ID: id, Repo: "kuhlman-labs/fishhawk", State: run.StateRunning})
+			dqSeedDivergence(h.audit, id, uuid.New(), 40, "plan_approval", "reject")
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"boom"}`))
+			}))
+			t.Cleanup(srv.Close)
+			h.s.cfg.GitHub = &githubclient.Client{
+				BaseURL: srv.URL,
+				Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+				HTTP:    &http.Client{Timeout: 5 * time.Second},
+				AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+			}
+			return id, "40"
+		}, http.StatusBadGateway, "work_item_filing_failed", "could not resolve the GitHub App installation"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newDAHarness(t)
+			runID, seq := tc.mutate(t, h)
+			w := h.post(t, runID, seq, divergenceAnswerRequest{Answer: "doctrine_change", ParentEpic: "#389", N: "9"}, withAuth)
+			if w.Code != tc.status || daErrCode(t, w) != tc.code || !strings.Contains(w.Body.String(), tc.msg) {
+				t.Fatalf("status = %d code = %q, want %d %q naming %q:\n%s", w.Code, daErrCode(t, w), tc.status, tc.code, tc.msg, w.Body.String())
+			}
+			if h.fp.called {
+				t.Error("a refusal before the provider filed a work item")
+			}
+			if got := h.answers(runID); len(got) != 0 {
+				t.Fatalf("answer entries = %+v, want none", got)
+			}
+		})
+	}
+}
+
+// ---- #3891: the answer section runs under the per-question answer lock ----
+
+// daLockingRunRepo is approvalRunRepo plus a test-local
+// run.DivergenceAnswerLocker: one sync.Mutex per (run, sequence). On
+// contention it signals contended BEFORE blocking, so a test observes a
+// waiter on the lock without a timer. failErr returns without running fn (an
+// acquisition failure); lapseErr runs fn and then returns it (a lapse
+// reported after the section completed).
+type daLockingRunRepo struct {
+	*approvalRunRepo
+	mu        sync.Mutex
+	locks     map[string]*sync.Mutex
+	contended chan string
+	failErr   error
+	lapseErr  error
+	calls     atomic.Int32
+}
+
+var _ run.DivergenceAnswerLocker = (*daLockingRunRepo)(nil)
+
+func newDALockingRunRepo(inner *approvalRunRepo) *daLockingRunRepo {
+	return &daLockingRunRepo{approvalRunRepo: inner, locks: map[string]*sync.Mutex{}, contended: make(chan string, 4)}
+}
+
+func (r *daLockingRunRepo) WithDivergenceAnswerLock(ctx context.Context, runID uuid.UUID, seq int64, fn func(context.Context) error) error {
+	r.calls.Add(1)
+	if r.failErr != nil {
+		return r.failErr
+	}
+	key := fmt.Sprintf("%s/%d", runID, seq)
+	r.mu.Lock()
+	l, ok := r.locks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		r.locks[key] = l
+	}
+	r.mu.Unlock()
+	if !l.TryLock() {
+		select {
+		case r.contended <- key:
+		default:
+		}
+		l.Lock()
+	}
+	defer l.Unlock()
+	if err := fn(ctx); err != nil {
+		return err
+	}
+	return r.lapseErr
+}
+
+// daBlockingProvider is a concurrency-safe workmgmt.Provider registered under
+// the default provider id. It counts File calls, signals every entry (its
+// 1-based ordinal) on entered, and parks ONLY the first call until
+// releaseFirst, so a test can pin the first answer inside its section.
+type daBlockingProvider struct {
+	mu      sync.Mutex
+	files   int
+	entered chan int
+	release chan struct{}
+	once    sync.Once
+}
+
+func newDABlockingProvider() *daBlockingProvider {
+	p := &daBlockingProvider{entered: make(chan int, 4), release: make(chan struct{})}
+	workmgmt.Register(p)
+	return p
+}
+
+func (p *daBlockingProvider) Name() string { return workmgmt.Default().Provider }
+
+func (p *daBlockingProvider) releaseFirst() { p.once.Do(func() { close(p.release) }) }
+
+func (p *daBlockingProvider) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.files
+}
+
+func (p *daBlockingProvider) File(ctx context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	p.mu.Lock()
+	p.files++
+	n := p.files
+	p.mu.Unlock()
+	select {
+	case p.entered <- n:
+	default:
+	}
+	if n == 1 {
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	num := 4241 + n
+	return &workmgmt.CreatedItem{
+		Provider:      p.Name(),
+		Number:        num,
+		URL:           fmt.Sprintf("https://github.com/kuhlman-labs/fishhawk/issues/%d", num),
+		AppliedLabels: req.Item.Classification.Labels,
+		Boarded:       true,
+	}, nil
+}
+
+// daAwaitResponses collects n responses, failing the test when one does not
+// arrive within the bound, and returns their status codes sorted plus the
+// recorders.
+func daAwaitResponses(t *testing.T, ch <-chan *httptest.ResponseRecorder, n int) ([]int, []*httptest.ResponseRecorder) {
+	t.Helper()
+	var codes []int
+	var recs []*httptest.ResponseRecorder
+	for i := 0; i < n; i++ {
+		select {
+		case w := <-ch:
+			codes = append(codes, w.Code)
+			recs = append(recs, w)
+		case <-time.After(timescale.D(10 * time.Second)):
+			t.Fatalf("answer %d of %d never returned", i+1, n)
+		}
+	}
+	sort.Ints(codes)
+	return codes, recs
+}
+
+// daAssertOneFilingOneAnswer asserts the serialized outcome: statuses {200,
+// 409 divergence_already_answered} and exactly one File call.
+func daAssertOneFilingOneAnswer(t *testing.T, codes []int, recs []*httptest.ResponseRecorder, files int) {
+	t.Helper()
+	if len(codes) != 2 || codes[0] != http.StatusOK || codes[1] != http.StatusConflict {
+		t.Errorf("statuses = %v, want [200 409]: both concurrent answers passed the already-answered check", codes)
+	}
+	for _, w := range recs {
+		if w.Code == http.StatusConflict && daErrCode(t, w) != "divergence_already_answered" {
+			t.Errorf("409 code = %q, want divergence_already_answered", daErrCode(t, w))
+		}
+	}
+	if files != 1 {
+		t.Errorf("File calls = %d, want exactly 1 (a concurrent duplicate filed a second doctrine_change item)", files)
+	}
+}
+
+// TestAnswer_ConcurrentDoctrineChangeFilesOnce (#3891): two concurrent
+// doctrine_change answers for ONE question file exactly one work item and
+// record exactly one answer; the duplicate gets 409.
+//
+// The overlap is FORCED: answer A is pinned inside File (holding the section)
+// by the provider's first-call gate; answer B is then launched, and the test
+// waits for B either to signal contention on the answer lock (the serialized
+// branch) or to enter File a second time (the broken branch). No timer
+// decides either branch; the bound only fails a hung test. Counterfactual:
+// with the server's lock call replaced by a bare fn(ctx), B never touches the
+// locker, passes the re-read because A has not appended, and files again, so
+// the one-filing and {200, 409} assertions go RED.
+func TestAnswer_ConcurrentDoctrineChangeFilesOnce(t *testing.T) {
+	h := newDAHarness(t)
+	locker := newDALockingRunRepo(h.repo)
+	h.s.cfg.RunRepo = locker
+	bp := newDABlockingProvider()
+	t.Cleanup(bp.releaseFirst)
+	body := divergenceAnswerRequest{Answer: "doctrine_change", ParentEpic: "#389", N: "9"}
+
+	results := make(chan *httptest.ResponseRecorder, 2)
+	go func() { results <- h.post(t, h.runID, "10", body, withAuth) }()
+	select {
+	case <-bp.entered:
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("the first answer never reached File")
+	}
+
+	go func() { results <- h.post(t, h.runID, "10", body, withAuth) }()
+	select {
+	case <-locker.contended:
+	case n := <-bp.entered:
+		t.Errorf("File call %d began while the first answer held the section: the duplicate was not serialized", n)
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("the second answer neither contended on the answer lock nor reached File")
+	}
+	bp.releaseFirst()
+
+	codes, recs := daAwaitResponses(t, results, 2)
+	daAssertOneFilingOneAnswer(t, codes, recs, bp.count())
+	if got := h.answers(h.runID); len(got) != 1 {
+		t.Errorf("answer entries = %d, want exactly 1", len(got))
+	}
+}
+
+// TestAnswer_LockFailureFilesAndRecordsNothing (#3891): when the answer lock
+// cannot be taken, the section never runs, so the endpoint answers 500
+// internal_error and nothing is filed or recorded. The status is the vehicle:
+// without the !ran branch the handler answers 200 with an empty body while the
+// no-filing and no-append reads stay green.
+func TestAnswer_LockFailureFilesAndRecordsNothing(t *testing.T) {
+	h := newDAHarness(t)
+	locker := newDALockingRunRepo(h.repo)
+	locker.failErr = errors.New("divergence answer lock: acquire connection: pool closed")
+	h.s.cfg.RunRepo = locker
+
+	w := h.post(t, h.runID, "10", divergenceAnswerRequest{Answer: "doctrine_change", ParentEpic: "#389", N: "9"}, withAuth)
+	if w.Code != http.StatusInternalServerError || daErrCode(t, w) != "internal_error" {
+		t.Fatalf("status = %d code = %q, want 500 internal_error:\n%s", w.Code, daErrCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "nothing was filed or recorded, retry the answer") {
+		t.Errorf("body = %s, want the remedy (the 5xx details are redacted; the lock error is logged)", w.Body.String())
+	}
+	if locker.calls.Load() != 1 {
+		t.Errorf("lock calls = %d, want 1", locker.calls.Load())
+	}
+	if h.fp.called {
+		t.Error("a failed lock acquisition filed a work item")
+	}
+	if got := h.answers(h.runID); len(got) != 0 {
+		t.Fatalf("answer entries = %+v, want none", got)
+	}
+	if q := h.s.openDivergenceFor(dqOperatorCtx(), &run.Run{ID: h.runID}); q == nil || q.Sequence != 10 {
+		t.Fatalf("question = %+v, want seq 10 still open for a retry", q)
+	}
+}
+
+// TestAnswer_LockLapseAfterAnswerStands (#3891): a lapse reported after the
+// section completed leaves the durable answer standing: 200, one filing, one
+// answer entry, and a WARN naming the run and sequence.
+func TestAnswer_LockLapseAfterAnswerStands(t *testing.T) {
+	h := newDAHarness(t)
+	locker := newDALockingRunRepo(h.repo)
+	locker.lapseErr = fmt.Errorf("divergence answer lock: %w", pglock.ErrLockLapsed)
+	h.s.cfg.RunRepo = locker
+	var logs bytes.Buffer
+	h.s.cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	w := h.post(t, h.runID, "10", divergenceAnswerRequest{Answer: "doctrine_change", ParentEpic: "#389", N: "9"}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the answer is durable):\n%s", w.Code, w.Body.String())
+	}
+	if !h.fp.called {
+		t.Error("doctrine_change filed nothing")
+	}
+	if got := h.answers(h.runID); len(got) != 1 || got[0].IssueNumber != 4242 {
+		t.Fatalf("answer entries = %+v, want one naming issue 4242", got)
+	}
+	out := logs.String()
+	for _, want := range []string{"level=WARN", "may have lapsed", h.runID.String(), "sequence=10"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log missing %q:\n%s", want, out)
+		}
 	}
 }
 
