@@ -8145,7 +8145,7 @@ components:
           description: Stable `ob-N` id, the same id the reviewer sees for this obligation.
         source:
           type: string
-          description: The routed channel the instruction arrived on (`concern` | `operator_concern` | `reason`).
+          description: The routed channel the instruction arrived on (`concern` | `operator_concern`).
         text_excerpt:
           type: string
           description: Bounded excerpt of the routed instruction.

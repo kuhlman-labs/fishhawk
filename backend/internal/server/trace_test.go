@@ -8911,10 +8911,10 @@ func newUnattemptedReviewServer(t *testing.T, reviewer PlanReviewer, scopeFiles 
 }
 
 // seedFixupTriggerConcerns seeds a stage_fixup_triggered entry routing the given
-// concerns, with `reason` as the operator's shared routed text. withIDs controls
-// whether the payload carries a concern_ids array: false reproduces the
-// DEPRECATED positional routing path, where a finding is identifiable only by
-// its 1-based routing position.
+// concerns, with `reason` as the audit-only note, never read as routed text
+// (#5561). withIDs controls whether the payload carries a concern_ids array:
+// false reproduces the DEPRECATED positional routing path, where a finding is
+// identifiable only by its 1-based routing position.
 func seedFixupTriggerConcerns(t *testing.T, au *auditFake, runID, stageID uuid.UUID,
 	concerns []planreview.Concern, reason string, withIDs bool) []string {
 	t.Helper()
