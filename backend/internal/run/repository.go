@@ -595,6 +595,35 @@ type ConsolidatedPROpenLocker interface {
 	WithConsolidatedPROpenLock(ctx context.Context, parentRunID uuid.UUID, fn func(context.Context) error) error
 }
 
+// DivergenceAnswerLocker is an OPTIONAL capability on the concrete postgres
+// repo: the cross-process per-question mutual exclusion for
+// POST /v0/runs/{run_id}/divergence/{sequence}/answer (#3891). The server runs
+// the answer verb's already-answered re-read, the doctrine_change filing and
+// the precedent_divergence_answered append inside it, so two concurrent
+// submissions for one question cannot both pass the check and both file.
+//
+// Kept OFF the Repository interface for the same reason as
+// ConsolidatedPROpenLocker (widening Repository would break every
+// manually-written full-interface test fake) and probed with a type assertion
+// by its consumer. A repo without it (the in-memory fakes) runs the section
+// unserialized.
+type DivergenceAnswerLocker interface {
+	// WithDivergenceAnswerLock runs fn while holding a cross-process mutual
+	// exclusion keyed on (runID, sequence). A concurrent call for the SAME
+	// (run, sequence) waits (a try-lock poll holding no connection between
+	// tries) until the holder's fn returns; a different sequence or run never
+	// contends for the same lock, though every call may wait, bounded by ctx,
+	// for a slot on the pool-wide pglock holder budget every pglock helper
+	// shares (#4591). When the lock cannot be acquired (a database error, or
+	// ctx cancelled while waiting) fn is NOT run and the error is returned;
+	// fn's own error is returned unchanged. fn's ctx carries the lock's fn
+	// deadline and is marked as inside a pglock lock, so fn must not take
+	// another pglock lock (pglock.ErrNestedLock). When fn returned nil but the
+	// unlock failed or found no lock, the call returns an error wrapping
+	// pglock.ErrLockLapsed (the exclusion may have lapsed).
+	WithDivergenceAnswerLock(ctx context.Context, runID uuid.UUID, sequence int64, fn func(context.Context) error) error
+}
+
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / E44.5) that
 // returns just a run's account_id ("" for an untenanted NULL row, the account
 // UUID string otherwise) without materializing the whole run.

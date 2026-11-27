@@ -20,7 +20,14 @@ import (
 // This file composes the two at the ONE point where a clone exists: inside
 // runVerifyCommittedTreeEnv, after materializeGateCheckoutFn and before
 // phases.startVerify(), so the load is neither charged to nor clipped by the
-// #4023 gate budget (its bound is sliceReachLoadTimeout).
+// #4023 gate budget (its bound is sliceReachLoadTimeout on a host path and
+// sliceReachContainerTimeout on the container exec).
+//
+// Isolation (ADR-063, ADR-090 A3.7 as amended on #5524): the load runs on the
+// host only on a host path (clone / clone-sandbox) under a non-hosted
+// profile; on the container path under a non-hosted profile it runs INSIDE
+// the gate image (slicereachcontainer.go). A hosted profile on any path, a
+// refused selection and any other value widen with gate_isolation_not_host.
 //
 // The hook rides a CALL-LOCAL ctx value (withSliceGateReach). Only the
 // deciding verify in runVerifyFixLoop's eligible arm and the single-shot
@@ -34,7 +41,8 @@ import (
 
 const (
 	// sliceGateReasonIsolationNotHost widens a gate whose isolation selection
-	// is not a host path (ADR-063): the host reach load never runs there.
+	// admits neither reach loader (ADR-063): a hosted profile, a refused
+	// selection or an unknown path.
 	sliceGateReasonIsolationNotHost = "gate_isolation_not_host"
 	// sliceGateIsolationTokenMax bounds the selection token in that reason.
 	sliceGateIsolationTokenMax = 64
@@ -45,9 +53,17 @@ const (
 	sliceGateScopedDetail = "slice gate: the deciding verify ran SCOPED to the slice's reverse-import reach; patch coverage and the full test loop run in the parent's fan-in merge-candidate pass"
 )
 
-// sliceGateLoadFn is the reach loader seam. Production is sliceReachLoad; a
-// test wraps it to count loads or stubs a graph.
+// sliceGateLoader is a reach loader: sliceReachLoad's signature.
+type sliceGateLoader func(ctx context.Context, wt string) (map[string][]string, map[string]bool, string)
+
+// sliceGateLoadFn is the HOST reach loader seam. Production is sliceReachLoad;
+// a test wraps it to count loads or stubs a graph.
 var sliceGateLoadFn = sliceReachLoad
+
+// sliceGateContainerLoadFn is the IN-IMAGE reach loader seam for the
+// container path (#5524). Production is sliceReachLoadContainer; a test
+// stubs it.
+var sliceGateContainerLoadFn = sliceReachLoadContainer
 
 // sliceGateSelectionFn reads the gate-isolation selection the same memoized
 // way runBoundedGateArgvDisposed does (gateIsolation.selection). It is the
@@ -57,20 +73,23 @@ var sliceGateSelectionFn = func(ctx context.Context) gateiso.Selection {
 	return gateIsolation.selection(ctx)
 }
 
-// sliceGateIsolationRefusal returns "" when the reach load may run on sel: a
-// host path (gateiso.PathClone, which includes the nil-state
-// hostExecSelection, or gateiso.PathCloneSandbox) under a non-hosted profile.
-// Anything else widens with gate_isolation_not_host:<selection>: a hosted
-// profile first whatever the path, then the path (container, refused or any
-// other value, bounded, `unknown` when empty). An allowlist, so a new
-// non-host path fails closed.
-func sliceGateIsolationRefusal(sel gateiso.Selection) string {
+// sliceGateLoaderFor returns the reach loader sel admits and "", or nil and
+// a gate_isolation_not_host:<selection> refusal. A hosted profile refuses
+// first whatever the path; then a host path (gateiso.PathClone, which
+// includes the nil-state hostExecSelection, or gateiso.PathCloneSandbox) gets
+// the host loader and the container path the in-image loader. Anything else
+// (refused or any other value, bounded, `unknown` when empty) refuses: an
+// allowlist, so a new path fails closed. The loader is read from its package
+// var at call time so a test stub applies.
+func sliceGateLoaderFor(sel gateiso.Selection) (sliceGateLoader, string) {
 	if sel.Profile == gateiso.ProfileHosted {
-		return sliceGateReasonIsolationNotHost + ":" + string(gateiso.ProfileHosted)
+		return nil, sliceGateReasonIsolationNotHost + ":" + string(gateiso.ProfileHosted)
 	}
 	switch sel.Path {
 	case gateiso.PathClone, gateiso.PathCloneSandbox:
-		return ""
+		return sliceGateLoadFn, ""
+	case gateiso.PathContainer:
+		return sliceGateContainerLoadFn, ""
 	}
 	tok := string(sel.Path)
 	if tok == "" {
@@ -79,7 +98,7 @@ func sliceGateIsolationRefusal(sel gateiso.Selection) string {
 	if len(tok) > sliceGateIsolationTokenMax {
 		tok = tok[:sliceGateIsolationTokenMax]
 	}
-	return sliceGateReasonIsolationNotHost + ":" + tok
+	return nil, sliceGateReasonIsolationNotHost + ":" + tok
 }
 
 // sliceGateReach is one gate's reach state: the scope it maps, the served
@@ -101,7 +120,7 @@ type sliceGateReach struct {
 
 	last    sliceGateDecision
 	decided bool // a decision was recorded since the last take()
-	loads   int  // sliceGateLoadFn calls
+	loads   int  // reach loads, either route
 }
 
 // newSliceGateReach builds the reach state for one gate.
@@ -175,14 +194,16 @@ func sliceGateScopeDigest(scope []string) string {
 
 // resolve decides the deciding verify's package set on the materialized clone
 // wt of committed tree treeSHA. It returns the scoped reach dirs, or nil (the
-// FULL form) on any refusal. Order: the isolation check (no load off a host
-// path), then the per-tree cache, then ONE load plus the mapping. An empty
-// treeSHA never caches.
+// FULL form) on any refusal. Order: the isolation check (the selection,
+// read once, picks the host or the in-image loader or refuses), then the
+// per-tree cache, then ONE load plus the mapping. An empty treeSHA never
+// caches.
 func (sg *sliceGateReach) resolve(ctx context.Context, wt, treeSHA string) []string {
 	sg.mu.Lock()
 	defer sg.mu.Unlock()
 
-	if refusal := sliceGateIsolationRefusal(sliceGateSelectionFn(ctx)); refusal != "" {
+	load, refusal := sliceGateLoaderFor(sliceGateSelectionFn(ctx))
+	if refusal != "" {
 		sg.record(sliceGateFull(refusal))
 		return nil
 	}
@@ -195,7 +216,7 @@ func (sg *sliceGateReach) resolve(ctx context.Context, wt, treeSHA string) []str
 		return sg.decideLocked(sg.cachePkgs, sg.cacheReason)
 	}
 
-	imports, emittable, reason := sliceGateLoadFn(ctx, wt)
+	imports, emittable, reason := load(ctx, wt)
 	sg.loads++
 	var pkgs []string
 	if reason == "" {

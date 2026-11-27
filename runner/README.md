@@ -284,9 +284,14 @@ The hook context is call-local to the one deciding verify call, so no other call
 
 Anything else is eligible.
 
-**Isolation (ADR-063).** The hook resolves the gate-isolation selection through the same memoized `gateIsolation.selection` the gate exec reads, before any load. The host reach load runs only on a host path: `clone` (which includes the unconfigured host exec) or `clone-sandbox`, and only under a non-hosted profile. A hosted profile, a container path, a refused selection or any other value widens to `gate_isolation_not_host:<hosted|container|refused|path|unknown>`, and no host `go list` runs.
+**Isolation (ADR-063; ADR-090 A3.7, amended on [#5524](https://github.com/kuhlman-labs/fishhawk/issues/5524)).** The hook reads the gate-isolation selection once, through the same memoized `gateIsolation.selection` the gate exec reads, before any load (`sliceGateLoaderFor`). A hosted profile widens first, whatever the path. Under a non-hosted profile there are two routes:
 
-**Reach load (`slicereach.go`).** The loader starts its `sliceReachLoadTimeout` bound (2 minutes) before it touches the clone. The bound covers every metadata read, the walk and the `go list`. It is not charged to the #4023 gate budget and is not clipped by it: the load runs after materialization and before the verify phase starts. The steps are:
+- a host path, `clone` (which includes the unconfigured host exec) or `clone-sandbox`, gets the host reach load below;
+- the `container` path gets the container reach load, which runs inside the gate image.
+
+A hosted profile, a refused selection or any other value widens to `gate_isolation_not_host:<hosted|refused|path|unknown>`, and neither load runs. The routes are an allowlist, so a new path fails closed.
+
+**Host reach load (`slicereach.go`).** The loader starts its `sliceReachLoadTimeout` bound (2 minutes) before it touches the clone. The bound covers every metadata read, the walk and the `go list`. It is not charged to the #4023 gate budget and is not clipped by it: the load runs after materialization and before the verify phase starts. The steps are:
 
 - Before any metadata read, the loader refuses a symlinked or non-regular `go.work`, `go.work.sum`, `go.mod` or `go.sum` at the root, at each `use` directory and at each filesystem `replace` target. It uses the predicate the container module seed uses (`gateiso.RequireRegularModuleMetadata`). Each read is size-capped and ctx-bounded.
 - It refuses a `use` or `replace` that resolves outside the clone.
@@ -295,13 +300,21 @@ Anything else is eligible.
 
 The edges are the union of the `go list` and walk imports, tests included.
 
+**Container reach load (`slicereachcontainer.go`, #5524).** On the container path the same load runs inside the gate image, and the host runs no `go list` and no parse over agent-authored files:
+
+- **Helper.** `cmd/fishhawk-runner/slicereachhelper/main.go` is a stdlib-only port of `slicereach.go`, so it compiles offline in any Go image. It re-implements the Lstat predicate and keeps the containment checks, walk, imports-only parse, `go list` argv, env pins and its own 2-minute bound. It reads `go.work` and `go.mod` through `go work edit -json` and `go mod edit -json`. The runner embeds it and passes it base64-encoded (no newlines) in `FISHHAWK_SLICE_REACH_HELPER_B64`, with a fresh nonce in `FISHHAWK_SLICE_REACH_NONCE`.
+- **Exec.** The fixed argv is `sh -c` over `set -eu; d=$(mktemp -d); printf "%s" "$FISHHAWK_SLICE_REACH_HELPER_B64" | base64 -d > "$d/main.go"; cd "$d"; exec env GOWORK=off GOFLAGS= CGO_ENABLED=0 GOENV=off GOCACHE="$d/gocache" go run ./main.go /work`. The helper builds in its own fresh `GOCACHE`, never the gate's shared cache volume, so a build-cache entry an earlier gate exec planted cannot stand in for it; the cost is a cold helper compile per exec, about 2 seconds in the gate image. It enters `runGateInContainer` directly, never the host exec switch, and calls no `markSeamReached`, because it is not a gate verdict. It has the verify's mounts, `--network=none`, sanitized env and launch marker, and provisions no gate service (`withoutGateServices`).
+- **One seed per tree.** The reach exec runs ADR-063's container module seed. Once that seed succeeds, the exec hands the seeded caches to the next container exec on the same clone, the deciding verify, which runs no seed of its own (`withSeedHandoff`). It hands them on whatever the exec's outcome, a launch failure or a timeout included. Only a seed that fails or refuses hands nothing on, and the verify then seeds as before. That seed is the only host-side module-metadata step. A declared `gate_container` also runs its existing host-side image resolution on the reach exec, as on every container exec (the committed-Dockerfile reads and screen, and a build on a cold tag). That resolution is not handed on: the verify repeats the reads and the screen and finds the built tag.
+- **Result.** The helper's last write is one `FISHHAWK_SLICE_REACH_RESULT <nonce> <json>` line, and it exits 0 for a graph and for a refusal. The host requires exactly one line carrying this exec's nonce, with at most 32 MiB of JSON, no unknown field and no trailing data. A reason passes only from the fixed vocabulary (`reach_unsupported_workspace[:…]`, `reach_load_failed:…`, `reach_dir_outside_clone:…`), with no control character and no graph. A graph must be non-empty. Every key, edge and emittable dir must be a node and either `.` or a clean, relative slash path with no `..` segment and no control character.
+- **Bound.** `sliceReachContainerTimeout` (4 minutes) is the reach exec's own timeout and nothing else's. The credential probe, image resolution, pull or build, the passwd read, the cache-volume prepare and the seed keep their own existing bounds. None of them is charged to the #4023 gate budget.
+
 **Phase 2 (`sliceGateResolveReach`).** This step maps the scope onto that graph:
 
 - A `.go` path seeds its own package dir.
 - Any other path seeds every ancestor dir that is a package. With none, a path matching `inert_paths` contributes nothing. This is a deliberate departure from ADR-124 D3, which says an inert entry never removes a path from graph reach. The slice gate also has no ADR-098 D2 data-read edges and no shared-artifact rule.
 - The reach is the reverse-import fixed point of the seeds, restricted to the dirs `go list` reported.
 
-**Reuse.** The hook caches one result per (tree SHA, scope digest). In-place re-runs (temp-fail, lock contention, infra flake, skipped gate, the #4036 flake re-run) reuse it without reloading. After the #3316 auto-format absorb, `carry()` reuses the result once for the reformatted tree. With the cache, the worst-case added wall time is one load bound per distinct committed tree.
+**Reuse.** The hook caches one result per (tree SHA, scope digest). In-place re-runs (temp-fail, lock contention, infra flake, skipped gate, the #4036 flake re-run) reuse it without reloading. After the #3316 auto-format absorb, `carry()` reuses the result once for the reformatted tree. The cache serves both routes. With it, the worst-case added wall time is one load per distinct committed tree: the host bound, or the container exec bound plus that exec's pre-exec steps.
 
 **Closed reason vocabulary.** Every widening is the full form, with one of these fixed tokens and never file bytes, parser text or go-command output:
 
@@ -309,6 +322,7 @@ The edges are the union of the `go list` and walk imports, tests included.
 |---|---|
 | phase 1 | `slice_gate_not_offered`, the served `unavailable_reason`, `empty_scope`, `undecodable_path`, `non_concrete_scope_entry:<entry>`, `go_module_file:<path>`, `global_surface:<path>` |
 | isolation | `gate_isolation_not_host:<selection>` |
+| container | `reach_container_unavailable:` + a non-executed disposition (`refused`, `unavailable`, `checkout_refused`, `launch_failed` for a runtime exit 125/126/127 before the script starts), `not_container_path` (the loader's own selection re-check) or `lint_cache_dir`; `reach_container_exit:<code>` (a non-zero exit, logged as `slice_reach_container_failed` with the output tail, which never enters the reason; a parent ctx cancelled mid-exec reports `-1`); `reach_container_output_unparseable`; an exec timeout is `reach_load_failed:load_timeout` |
 | workspace | `reach_unsupported_workspace`, `reach_unsupported_workspace:metadata_not_regular:<root\|use\|replace>`, `reach_dir_outside_clone:<importpath>` |
 | load | `reach_load_failed:` + one of `load_timeout`, `metadata_too_large:<path>`, `gomod_unreadable:<path>`, `unparsable_go_file:<path>`, `walk_failed:<path>`, `import_not_package:<importpath>`, `go_list_exit`, `go_list_malformed_json`, `go_list_stdout_cap`, `package_error:<importpath>`, `no_module:<importpath>`, `no_packages`, `unwalked_package_dir:<importpath>` |
 | mapping | `unmapped_go_path:<path>`, `unclassified_path:<path>`, `no_reach_packages`, `reach_is_everything`, `reach_too_large` (joined value over 64 KiB), `undecodable_path` (a package dir with a comma, tab, newline or CR) |
@@ -321,11 +335,11 @@ Every reason is bounded to 256 bytes.
 
 - Tests that read other packages' source as data are invisible to the import graph. Examples are the wire-contract parity scans and the audit-category emission scan.
 - Declared-inert docs that Go tests read as data contribute no reach. A repository that wants them to force full declares them in `global_surface` or `doc_check_inputs` instead.
-- A host-excluded dir (for example one whose only file has a build tag the host never sets) is traversed but not emitted. The walk closes the import-graph half of the GOOS/tag gap, not the execution half.
+- On a host path, a host-excluded dir (for example one whose only file has a build tag the host never sets) is traversed but not emitted. The walk closes the import-graph half of the GOOS/tag gap, not the execution half. On the container path the helper's `go list` runs in the verify's own image, so the gap does not arise.
 - Patch coverage is skipped in the scoped form and enforced only at fan-in.
-- Only the load timeout bounds two file classes the Lstat checks miss. The first is `vendor/` and nested-module metadata that the predicate does not cover. The second is the non-`.go` source files (`.c`, `.s`, `.h` and similar) that the host `go list` opens in each listed package dir to read build-constraint headers. The walk Lstats only `.go` files, so a FIFO or symlink with one of those extensions reaches the go subprocess. The worst case is a `reach_load_failed:load_timeout` that widens to full once per tree.
+- Only the load timeout bounds two file classes the Lstat checks miss. The first is `vendor/` and nested-module metadata that the predicate does not cover. The second is the non-`.go` source files (`.c`, `.s`, `.h` and similar) that `go list` opens in each listed package dir to read build-constraint headers. The walk Lstats only `.go` files, so a FIFO or symlink with one of those extensions reaches the go subprocess. The worst case is a `reach_load_failed:load_timeout` that widens to full once per tree.
 
-**When the saving holds.** The saving depends on a warm module cache and a host gate path. A cold cache widens through `package_error`, and a container or hosted selection widens through `gate_isolation_not_host`. In the post-merge split of `slice_scoped` from `full` by reason, a high share of either is the signal that the slice gate is not paying for itself.
+**When the saving holds.** On a host path the saving depends on a warm host module cache; a cold one widens through `package_error`. A hosted selection widens through `gate_isolation_not_host`. On the container path each distinct tree pays one extra container exec before its verify. A tree that cannot yield a reach pays image resolution and a container start before it widens: one with no root `go.mod` or `go.work`, or an image without `go`, `sh`, `mktemp` or `base64`. A cheap pre-check for those trees is a possible follow-up; none is added. In the post-merge split of `slice_scoped` from `full` by reason, a high share of `package_error`, `gate_isolation_not_host` or `reach_container_*` is the signal that the slice gate is not paying for itself.
 
 The verify-fix loop arm (the skipped full re-verify, the nonce rule and the outside-relation outcomes) is documented in `cmd/fishhawk-runner/README.md` § "Committed-tree verify-fix loop (#651)".
 

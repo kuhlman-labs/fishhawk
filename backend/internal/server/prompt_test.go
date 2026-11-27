@@ -13483,8 +13483,8 @@ func TestScopeProvenanceForReview_SourceChildBaselineUnchangedByMove(t *testing.
 }
 
 // makeFixupEntryWithReporting builds a stage_fixup_triggered entry carrying the
-// three operator-authored channels #2737's classifier reads: routed concern
-// notes, the free-text operator_concern, and the operator's reason.
+// two channels #2737's classifier reads (routed concern notes and the free-text
+// operator_concern) plus the audit-only `reason`, which it never reads (#5561).
 func makeFixupEntryWithReporting(runID, stageID uuid.UUID, concerns []planreview.Concern, operatorConcern, reason string) *audit.Entry {
 	return makeFixupEntryWithReportingSeq(runID, stageID, 1, concerns, operatorConcern, reason)
 }
@@ -13515,9 +13515,6 @@ func makeFixupEntryWithTargetsSeq(runID, stageID uuid.UUID, seq int64, concerns 
 	if pt.OperatorConcern != "" {
 		fields["operator_concern_target"] = pt.OperatorConcern
 	}
-	if pt.Reason != "" {
-		fields["reason_target"] = pt.Reason
-	}
 	payload, _ := json.Marshal(fields)
 	rid := runID
 	sid := stageID
@@ -13525,8 +13522,8 @@ func makeFixupEntryWithTargetsSeq(runID, stageID uuid.UUID, seq int64, concerns 
 }
 
 // TestResolveFixupReportObligations_Channels covers the #2737 audit-payload
-// reader directly across the three routed channels plus the dedupe and the
-// no-obligation default.
+// reader directly across the two routed channels plus the dedupe, the
+// no-obligation default, and the audit-only `reason` it must ignore (#5561).
 func TestResolveFixupReportObligations_Channels(t *testing.T) {
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -13573,15 +13570,37 @@ func TestResolveFixupReportObligations_Channels(t *testing.T) {
 		}
 	})
 
-	t.Run("reason carrying a reporting obligation is declared", func(t *testing.T) {
+	t.Run("reason carrying reporting wording is never declared (#5561)", func(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
 			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
 				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
 				"", "Record the observed RED output in the PR body's ## Notes.")}},
 		}})
+		if got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0); got != nil {
+			t.Errorf("got %+v, want nil: reason is an audit note, never an obligation source", got)
+		}
+	})
+
+	t.Run("legacy payload with reason_target still re-derives the concern", func(t *testing.T) {
+		const note = "Record the per-deletion counterfactual results in the run log."
+		payload, err := json.Marshal(map[string]any{
+			"concerns":      []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "process", Note: note}},
+			"reason":        "Report the observed RED output in the PR body.",
+			"reason_target": "pr_body",
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		rid, sid := runID, stageID
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {{
+				ID: uuid.New(), Sequence: 1, Category: CategoryStageFixupTriggered,
+				RunID: &rid, StageID: &sid, Payload: payload,
+			}}},
+		}})
 		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
-		if len(got) != 1 || got[0].Source != fixupobligation.SourceReason {
-			t.Fatalf("got %+v, want one reason-sourced obligation", got)
+		if len(got) != 1 || got[0].ID != "ob-1" || got[0].Source != fixupobligation.SourceConcern || got[0].Text != note || got[0].PRBody {
+			t.Errorf("got %+v, want only the ob-1 concern obligation, PRBody false", got)
 		}
 	})
 }
@@ -13684,16 +13703,16 @@ func TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted(t *te
 		t.Fatalf("the arms differ in more than the provenance flag (%+v vs %+v)", acceptance, operator)
 	}
 
-	// The operator's own channels are trusted by construction: the fix-up
+	// The operator's own channel is trusted by construction: the fix-up
 	// trigger records exactly what the operator typed.
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
 		byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
 			[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
-			"", "Record the observed RED output in the PR body's ## Notes.")}},
+			"Record the observed RED output in the PR body's ## Notes.", "")}},
 	}})
 	got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
-	if len(got) != 1 || got[0].Source != fixupobligation.SourceReason || got[0].Untrusted {
-		t.Errorf("got %+v, want one trusted reason-sourced obligation", got)
+	if len(got) != 1 || got[0].Source != fixupobligation.SourceOperatorConcern || got[0].Untrusted {
+		t.Errorf("got %+v, want one trusted operator_concern-sourced obligation", got)
 	}
 }
 

@@ -14,3 +14,8 @@ retired:
       run_id: 59af8515-5848-4b52-9fa3-e72d9d421e6d
       pr: 5482
       retired_at: "2026-11-20T11:35:22Z"
+    - id: scenario:issue-5212/operator-evidence-schema-names-close-out-verbs
+      reason: '#5561 deliberately moves the re-route guidance from `reason` (audit-only, never delivered to the agent) to operator_concern, so this scenario''s statement ''with the diff in reason'' is now intentionally false. The close-out-verb part of the scenario is re-pinned by this run''s TestFixupGuidance_ReasonIsAuditOnly and the existing operator_evidence description tests.'
+      run_id: 64c8b41c-6233-40dc-935c-1c84c910496b
+      pr: 5583
+      retired_at: "2026-11-25T18:57:09Z"

@@ -73,7 +73,8 @@ type postgresRepo struct {
 	pool *pgxpool.Pool
 
 	// locks is the pool-wide pglock holder budget WithConsolidatedPROpenLock
-	// shares with every other pglock helper on the pool (#4591).
+	// and WithDivergenceAnswerLock share with every other pglock helper on
+	// the pool (#4591).
 	locks *pglock.Budget
 
 	// stageTerminalObserver / runTerminalObserver are the post-commit
@@ -1740,6 +1741,53 @@ const consolidatedPROpenFnTimeout = 5 * time.Minute
 func (r *postgresRepo) WithConsolidatedPROpenLock(ctx context.Context, parentRunID uuid.UUID, fn func(context.Context) error) error {
 	return pglock.WithSessionLock(ctx, r.pool, r.locks, consolidatedPROpenLockKey(parentRunID),
 		pglock.Options{Name: "consolidated PR open lock", FnTimeout: consolidatedPROpenFnTimeout}, fn)
+}
+
+// Compile-time assertion that the concrete postgres repo carries the
+// DivergenceAnswerLocker capability (#3891). serve.go wires
+// run.NewPostgresRepository bare and the divergence answer handler probes the
+// capability by type assertion, so removing or renaming
+// WithDivergenceAnswerLock must fail the BUILD rather than silently dropping
+// the per-question serialization that stops a concurrent duplicate answer
+// from filing a second doctrine_change work item.
+var _ DivergenceAnswerLocker = (*postgresRepo)(nil)
+
+// divergenceAnswerLockDomain domain-separates the divergence-answer
+// advisory-lock key space from every other advisory key in the backend
+// (consolidated-PR open, refinement filing, captain, audit chain,
+// concurrency).
+const divergenceAnswerLockDomain = "fishhawk:divergence-answer:"
+
+// divergenceAnswerLockKey derives the advisory-lock key serializing one
+// divergence question's answer: the first 8 bytes, big-endian, of a sha256
+// over divergenceAnswerLockDomain, the run UUID bytes and the big-endian
+// sequence (the consolidatedPROpenLockKey shape). A residual 1-in-2^64
+// collision only serializes two unrelated answers.
+func divergenceAnswerLockKey(runID uuid.UUID, sequence int64) int64 {
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], uint64(sequence)) //nolint:gosec // deliberate reinterpretation: the sequence is hashed, never compared
+	h := sha256.New()
+	h.Write([]byte(divergenceAnswerLockDomain))
+	h.Write(runID[:])
+	h.Write(seqBytes[:])
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
+}
+
+// divergenceAnswerFnTimeout bounds WithDivergenceAnswerLock's fn: the
+// conventions load, the installation resolve, the forge filing and the audit
+// append (mirrors consolidatedPROpenFnTimeout).
+const divergenceAnswerFnTimeout = 5 * time.Minute
+
+// WithDivergenceAnswerLock implements DivergenceAnswerLocker (#3891): a
+// SESSION-level advisory lock keyed on divergenceAnswerLockKey, run through
+// pglock.WithSessionLock on the pool-wide pglock holder budget (#4591) the
+// consolidated-PR-open lock also uses. Session-level so fn's audit append
+// commits independently on another pool connection while the lock is held.
+// The acquisition, fn deadline, unlock and lapse contract is pglock's.
+func (r *postgresRepo) WithDivergenceAnswerLock(ctx context.Context, runID uuid.UUID, sequence int64, fn func(context.Context) error) error {
+	return pglock.WithSessionLock(ctx, r.pool, r.locks, divergenceAnswerLockKey(runID, sequence),
+		pglock.Options{Name: "divergence answer lock", FnTimeout: divergenceAnswerFnTimeout}, fn)
 }
 
 // Compile-time check that postgresRepo implements Repository.

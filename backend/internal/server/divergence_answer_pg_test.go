@@ -7,13 +7,20 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // divergence_answer_pg_test.go is the E75.5 / #3733 ask/answer half's
@@ -120,5 +127,122 @@ func TestDivergenceAnswerPG_EndToEndDoctrineChange(t *testing.T) {
 	}
 	if _, has := get(s.handleGetRunGateView, runPath+"/gate-view")["divergence"]; has {
 		t.Fatal("the answered question still surfaces on the gate view")
+	}
+}
+
+// daPGPostAnswer POSTs a doctrine_change answer for (runID, seq) to s.
+func daPGPostAnswer(t *testing.T, s *Server, runID uuid.UUID, seq int64) *httptest.ResponseRecorder {
+	t.Helper()
+	body := `{"answer":"doctrine_change","parent_epic":"#389","n":"5"}`
+	path := "/v0/runs/" + runID.String() + "/divergence/" + strconv.FormatInt(seq, 10) + "/answer"
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.SetPathValue("run_id", runID.String())
+	req.SetPathValue("sequence", strconv.FormatInt(seq, 10))
+	w := httptest.NewRecorder()
+	s.handleAnswerDivergence(w, withAuth(req))
+	return w
+}
+
+// TestDivergenceAnswerPG_ConcurrentDoctrineChangeFilesOnce (#3891): two
+// SERVERS (two replicas, each with its own connection pool and the REAL
+// run.NewPostgresRepository, so each probes the production
+// DivergenceAnswerLocker) answer ONE real divergence question with
+// doctrine_change concurrently. Exactly one work item is filed, exactly one
+// precedent_divergence_answered entry lands on the REAL chain, and the
+// duplicate gets 409 divergence_already_answered.
+//
+// The overlap is FORCED and PROVEN, never timed (the
+// TestFileRefinementSession_ConcurrentFilesOnce tracer pattern): the winner's
+// answer is pinned inside its first File, holding the answer lock; the loser's
+// answer is then launched, and the barrier waits until the loser's pool has
+// COMPLETED at least two pg_try_advisory_lock queries. pglock re-tries only a
+// refused lock, so a second try proves the loser reached the lock, was refused
+// while the winner held it, and is polling. Only then is the winner released.
+// The barrier's bound FAILS the test; it never releases the winner. With the
+// server's lock call removed the loser completes no try and files a second
+// item inside the winner's section, RED.
+func TestDivergenceAnswerPG_ConcurrentDoctrineChangeFilesOnce(t *testing.T) {
+	bp := newDABlockingProvider()
+	gh, _ := newDAForge(t)
+
+	dbURL := pgtest.NewURL(t)
+	pool := newFilingTestPool(t, dbURL, nil)
+	loserTries := &filingTryLockTracer{}
+	loserPool := newFilingTestPool(t, dbURL, loserTries)
+	f := &gpPG{pool: pool, audit: audit.NewPostgresRepository(pool)}
+	dvPGSeedApproves(t, f, 4)
+	runID, planStage := dvPGGateRun(t, f, "sha-gp")
+	winner := New(Config{Addr: "127.0.0.1:0",
+		RunRepo:          run.NewPostgresRepository(pool),
+		ConcernRepo:      concern.NewPostgresRepository(pool),
+		ApprovalRepo:     approval.NewPostgresRepository(pool),
+		AuditRepo:        f.audit,
+		PrecedentIndex:   decisionindex.NewStore(pool),
+		IdentityProvider: &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true},
+		GitHub:           gh,
+		DivergenceConfig: dvPGConfig(),
+	})
+	loser := New(Config{Addr: "127.0.0.1:0",
+		RunRepo:          run.NewPostgresRepository(loserPool),
+		AuditRepo:        audit.NewPostgresRepository(loserPool),
+		GitHub:           gh,
+		DivergenceConfig: dvPGConfig(),
+	})
+
+	dvPGReject(t, winner, planStage)
+	entries, err := f.audit.ListForRunByCategory(context.Background(), runID, CategoryPrecedentDivergence)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("precedent_divergence entries = %d (%v), want 1", len(entries), err)
+	}
+	seq := entries[0].Sequence
+
+	// Registered after the pools, so it runs BEFORE they close: release the
+	// pinned winner and wait for both requests to return their connections.
+	var inflight sync.WaitGroup
+	t.Cleanup(func() {
+		bp.releaseFirst()
+		inflight.Wait()
+	})
+	results := make(chan *httptest.ResponseRecorder, 2)
+	post := func(s *Server) {
+		inflight.Add(1)
+		go func() {
+			defer inflight.Done()
+			results <- daPGPostAnswer(t, s, runID, seq)
+		}()
+	}
+
+	post(winner)
+	select {
+	case <-bp.entered:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("the winner never reached File under the divergence answer lock")
+	}
+
+	post(loser)
+	deadline := time.After(timescale.D(10 * time.Second))
+	poll := time.NewTicker(5 * time.Millisecond)
+	defer poll.Stop()
+barrier:
+	for loserTries.tries.Load() < 2 {
+		select {
+		case n := <-bp.entered:
+			t.Errorf("File call %d began while the winner held the divergence answer lock: the loser filed inside the critical section", n)
+			break barrier
+		case <-poll.C:
+		case <-deadline:
+			t.Fatalf("the loser completed %d pg_try_advisory_lock queries and filed nothing within the bound: it never contended on the divergence answer lock", loserTries.tries.Load())
+		}
+	}
+	if got := loserTries.tries.Load(); got < 2 {
+		t.Errorf("loser completed %d pg_try_advisory_lock queries while the winner held the lock, want >= 2 (refused, then polling): the loser never contended", got)
+	}
+	bp.releaseFirst()
+
+	codes, recs := daAwaitResponses(t, results, 2)
+	daAssertOneFilingOneAnswer(t, codes, recs, bp.count())
+	answered, err := f.audit.ListForRunByCategory(context.Background(), runID, CategoryPrecedentDivergenceAnswered)
+	if err != nil || len(answered) != 1 {
+		t.Fatalf("precedent_divergence_answered entries on the real chain = %d (%v), want exactly 1", len(answered), err)
 	}
 }
