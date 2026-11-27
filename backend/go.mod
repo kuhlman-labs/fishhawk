@@ -15,7 +15,7 @@ require (
 	github.com/google/jsonschema-go v0.4.3
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.13.0
-	github.com/jackc/puddle/v2 v2.2.3
+	github.com/jackc/puddle/v2 v2.2.4
 	github.com/kuhlman-labs/fishhawk/credstore v0.0.0
 	github.com/kuhlman-labs/fishhawk/directory v0.0.0
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20261116012739-a1acfdb4c7b4
@@ -25,6 +25,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
 	go.yaml.in/yaml/v3 v3.0.6
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -65,6 +66,7 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/klauspost/compress v1.20.4 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20261101121723-be84dd9509a0 // indirect
 	github.com/magiconair/properties v1.18.13 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
