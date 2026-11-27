@@ -4126,7 +4126,7 @@ func TestCampaignHotfixTool_RoundTrip(t *testing.T) {
 		!out.DispatchHold.ExpiresAt.Equal(time.Date(2026, 10, 21, 2, 0, 0, 0, time.UTC)) {
 		t.Errorf("dispatch_hold = %+v", out.DispatchHold)
 	}
-	for _, part := range []string{"fishhawk_start_campaign_item_run", "issue:77", "workflow_id feature_change", "HELD", "2026-10-21T02:00:00Z"} {
+	for _, part := range []string{"fishhawk_start_campaign_item_run", "issue:77", "workflow_id feature_change", "auto_dispatch: true", "HELD", "2026-10-21T02:00:00Z"} {
 		if !strings.Contains(out.NextStep, part) {
 			t.Errorf("next_step %q missing %q", out.NextStep, part)
 		}
@@ -4151,6 +4151,33 @@ func TestCampaignHotfixTool_OptionalsOmittedSoBackendDefaults(t *testing.T) {
 	}
 	if !strings.Contains(out.NextStep, "workflow_id hotfix_change") {
 		t.Errorf("next_step %q does not name the recorded workflow", out.NextStep)
+	}
+	// #5562: the unheld next_step names the host-dispatcher mark too.
+	for _, part := range []string{"fishhawk_start_campaign_item_run", "auto_dispatch: true", "fishhawk_dispatch_stage"} {
+		if !strings.Contains(out.NextStep, part) {
+			t.Errorf("next_step %q missing %q", out.NextStep, part)
+		}
+	}
+}
+
+// TestCampaignHotfix_ToolTextNamesAutoDispatch pins the #5562 guidance on the
+// wire: the fishhawk_campaign_hotfix description tells the operator to start
+// the expedited item marked, and the fishhawk_start_campaign_item_run
+// description and auto_dispatch property say why. Whitespace is normalised so
+// a re-wrap does not redden it.
+func TestCampaignHotfix_ToolTextNamesAutoDispatch(t *testing.T) {
+	norm := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	descs := listToolDescriptions(t)
+	const hotfixSentence = "Start the expedited item with auto_dispatch: true so the host dispatcher drives it."
+	if got := norm(descs["fishhawk_campaign_hotfix"]); !strings.Contains(got, hotfixSentence) {
+		t.Errorf("fishhawk_campaign_hotfix description %q missing %q", got, hotfixSentence)
+	}
+	const itemSentence = "For an expedited (hotfix) item, pass true; an unmarked item run waits on a hand dispatch for every stage, including a fix-up the campaign driver routes."
+	if got := norm(descs["fishhawk_start_campaign_item_run"]); !strings.Contains(got, itemSentence) {
+		t.Errorf("fishhawk_start_campaign_item_run description %q missing %q", got, itemSentence)
+	}
+	if got := norm(toolInputPropertyDescription(t, "fishhawk_start_campaign_item_run", "auto_dispatch")); !strings.Contains(got, itemSentence) {
+		t.Errorf("auto_dispatch property %q missing %q", got, itemSentence)
 	}
 }
 

@@ -49,6 +49,11 @@ import (
 //     after the orchestrator advance left the stage parked on a run that is
 //     not host-dispatched. Resolved by a later acceptance_dispatched or
 //     acceptance_outcome_recorded (pageEventResolved).
+//   - a campaign-driver act left a stage parked at awaiting_host_dispatch on a
+//     run no dispatcher will spawn (#5562): the server wrote
+//     campaign_driver_act_awaiting_operator for the stage the act itself parked.
+//     Resolved once that stage leaves the park episode the row names
+//     (pageEventResolved).
 //
 // Dedup is per source audit event: each ping records the originating
 // entry's audit Sequence on CategoryAnchorPingPosted, so a re-render of
@@ -70,9 +75,10 @@ type pageEvent struct {
 	// firePings appends).
 	message string
 	// stageID and episodeKey are set only for the two stall-watch kinds
-	// (#5497): the stage the row names and the condition episode it was
-	// written for. pageEventResolved compares episodeKey with the named
-	// stage's CURRENT episode, so a row from an ended episode never posts.
+	// (#5497) and the #5562 driver-act page: the stage the row names and the
+	// condition episode it was written for. pageEventResolved compares
+	// episodeKey with the named stage's CURRENT episode, so a row from an
+	// ended episode never posts.
 	stageID    uuid.UUID
 	episodeKey string
 	// nextAction is the stall row's next_action when it is in the closed
@@ -90,6 +96,11 @@ const (
 	pageKindFailedStageStalled   = "failed_stage_stalled"
 	pageKindChildDispatchStalled = "child_dispatch_stalled"
 )
+
+// pageKindDriverActAwaitingOperator is the #5562 page kind projected from
+// server.CategoryCampaignDriverActAwaitingOperator. The token differs from the
+// category so each case label in this file stays unique.
+const pageKindDriverActAwaitingOperator = "driver_act_awaiting_operator_dispatch"
 
 // stallNextActions is the closed next-action set a stall row may name. A
 // payload next_action outside it renders the generic remedy line instead, so
@@ -126,6 +137,26 @@ func FailedStageStallEpisode(st *run.Stage) (string, bool) {
 // without a retry bump is still a new episode.
 func ChildDispatchStallEpisode(st *run.Stage) (string, bool) {
 	if st == nil || (st.State != run.StageStatePending && st.State != run.StageStateAwaitingHostDispatch) {
+		return "", false
+	}
+	dispatched := "never"
+	if st.DispatchedAt != nil {
+		dispatched = st.DispatchedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("%s/%d/%s", st.ID, st.SelfRetryCount, dispatched), true
+}
+
+// HostDispatchParkEpisode derives the park-episode key of a stage parked at
+// awaiting_host_dispatch (#5562). ok is true only in that state. The key is
+// "<stage_id>/<self_retry_count>/<dispatched_at RFC3339Nano UTC, or never>":
+// the next park of the same stage follows either a dispatch (migration 0072's
+// trigger re-stamps dispatched_at on every entry into dispatched) or a retry
+// re-open (which bumps self_retry_count), so each park episode has its own key.
+// It is the ONE derivation the server's campaign-driver page writer (dedup)
+// and this package's resolution share. No stage-transition audit row exists to
+// key on, so the stage row's own per-transition stamps identify the episode.
+func HostDispatchParkEpisode(st *run.Stage) (string, bool) {
+	if st == nil || st.State != run.StageStateAwaitingHostDispatch {
 		return "", false
 	}
 	dispatched := "never"
@@ -276,6 +307,15 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				kind:     "acceptance_awaiting_operator_dispatch",
 				message:  "🔁 A fix-up push re-opened the acceptance stage and no dispatcher will run it — dispatch acceptance against the new head.",
 			})
+		case "campaign_driver_act_awaiting_operator":
+			// #5562 (server.CategoryCampaignDriverActAwaitingOperator): a
+			// campaign-driver act (route_fixup, approve or retry) parked a stage
+			// at awaiting_host_dispatch on a run no dispatcher will spawn. The
+			// server writes the row only for the stage the act itself parked, once
+			// per park episode. Pings-only, like acceptance_reopen_awaiting_operator.
+			if ev, ok := driverActPageEvent(e, stages); ok {
+				out = append(out, ev)
+			}
 		case "stage_failed_awaiting_operator":
 			// #5497 (server.CategoryStageFailedAwaitingOperator): the stall
 			// watch found a failed stage with no operator or driver act past its
@@ -436,6 +476,51 @@ func stallPageEvent(e *audit.Entry, kind string, stages []*run.Stage) (pageEvent
 	}, true
 }
 
+// driverActPageEvent builds the #5562 driver-act page. It emits an event only
+// when the payload decodes to a stage_id that parses as a UUID and a non-empty
+// episode_key, the stallPageEvent posture. The message is built ONLY from
+// server-owned text: a fixed lead, the stage TYPE read from the matching live
+// stage (never from the payload) and the fixed fishhawk_dispatch_stage remedy.
+// The payload's reason, action and every other string never reach the body.
+func driverActPageEvent(e *audit.Entry, stages []*run.Stage) (pageEvent, bool) {
+	if len(e.Payload) == 0 {
+		return pageEvent{}, false
+	}
+	var p struct {
+		StageID    string `json:"stage_id"`
+		EpisodeKey string `json:"episode_key"`
+	}
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		return pageEvent{}, false
+	}
+	stageID, err := uuid.Parse(p.StageID)
+	if err != nil || p.EpisodeKey == "" {
+		return pageEvent{}, false
+	}
+	label := stallStageTypeLabel(stages, stageID)
+	if label == "" {
+		label = "next"
+	}
+	return pageEvent{
+		sequence:   e.Sequence,
+		kind:       pageKindDriverActAwaitingOperator,
+		message:    "🔁 The campaign driver advanced this run, and no dispatcher will run its " + label + " stage — dispatch it with `fishhawk_dispatch_stage`.",
+		stageID:    stageID,
+		episodeKey: p.EpisodeKey,
+	}, true
+}
+
+// driverActPageResolved reports whether a #5562 driver-act page is resolved:
+// the named stage is absent, has left awaiting_host_dispatch, or is parked in
+// a LATER episode than the one the row names, or the run is terminal.
+func driverActPageResolved(ev pageEvent, stages []*run.Stage, r *run.Run) bool {
+	if r != nil && r.State.IsTerminal() {
+		return true
+	}
+	key, ok := HostDispatchParkEpisode(stageByID(stages, ev.stageID))
+	return !ok || key != ev.episodeKey
+}
+
 // stallStageTypeLabel returns the closed-set type of the live stage with id,
 // or "" when it is absent or not a known type.
 func stallStageTypeLabel(stages []*run.Stage, id uuid.UUID) string {
@@ -539,7 +624,8 @@ func (m *stallParentMemo) get(ctx context.Context, ev pageEvent) (*run.Run, erro
 }
 
 // pageEventResolved reports whether a resolvable page event (a reviewer
-// reject, the #5308 acceptance dispatch page, or a #5497 stall page) has
+// reject, the #5308 acceptance dispatch page, a #5497 stall page or the #5562
+// driver-act page) has
 // already been resolved by a LATER audit entry or, for a stall page, by the
 // end of its episode, in which case firePings
 // records the dedup row but SKIPS the actual comment: the page would arrive
@@ -549,8 +635,8 @@ func (m *stallParentMemo) get(ctx context.Context, ev pageEvent) (*run.Run, erro
 // resolved it, whereas an immediate ping could still fire moments before
 // the resolving entry lands on a later re-render.
 //
-// Only the reviewer-reject kinds, the #5308 acceptance dispatch page and the
-// two #5497 stall kinds are resolvable; every other page class (a must_page_human park, a CI failure, an
+// Only the reviewer-reject kinds, the #5308 acceptance dispatch page, the
+// two #5497 stall kinds and the #5562 driver-act page are resolvable; every other page class (a must_page_human park, a CI failure, an
 // acceptance triage page, either crew escalation kind) always pages and returns
 // false.
 //
@@ -567,12 +653,16 @@ func (m *stallParentMemo) get(ctx context.Context, ev pageEvent) (*run.Run, erro
 //     stallPageResolved over the CURRENT stages, run row and parent row: the
 //     episode the row names has ended, or the run can no longer take the
 //     named remedy.
+//   - driver_act_awaiting_operator_dispatch (#5562) — resolved by
+//     driverActPageResolved over the CURRENT stages and run row: the named
+//     stage left awaiting_host_dispatch (it was dispatched or is absent), is
+//     parked in a later episode, or the run is terminal.
 //
 // stages and r are the caller's already-loaded stage list and run row (both
 // firePings and PushChannel.firePushes have them); parent is the
 // decomposition parent from stallParentMemo, nil when not read. Only the
-// stall arm reads them; a nil r skips its run-state check and a nil parent
-// its parent check.
+// stall and driver-act arms read them; a nil r skips their run-state checks
+// and a nil parent the stall parent check.
 func pageEventResolved(ev pageEvent, entries []*audit.Entry, stages []*run.Stage, r, parent *run.Run) bool {
 	switch ev.kind {
 	case pageKindFailedStageStalled, pageKindChildDispatchStalled:
@@ -585,6 +675,8 @@ func pageEventResolved(ev pageEvent, entries []*audit.Entry, stages []*run.Stage
 	case "acceptance_awaiting_operator_dispatch":
 		return hasLaterCategory(entries, ev.sequence, "acceptance_dispatched") ||
 			hasLaterCategory(entries, ev.sequence, "acceptance_outcome_recorded")
+	case pageKindDriverActAwaitingOperator:
+		return driverActPageResolved(ev, stages, r)
 	default:
 		return false
 	}

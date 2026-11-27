@@ -1,0 +1,14 @@
+id: scenario:issue-5562/page-category-registered
+statement: GET /v0/runs/{run_id}/audit?category=campaign_driver_act_awaiting_operator on any existing run returns 200 with an item list, not the 400 'category is not a known audit category' refusal, so operator list/await surfaces accept the new page category.
+verify_hint: 'HTTP surface: call GET /v0/runs/{run_id}/audit?category=campaign_driver_act_awaiting_operator against any run on the localhost preview (a dev fixture run or a freshly created one); expect 200, and compare with an unregistered category name, which returns 400.'
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"} -> run 59ad96ac-cec1-4c4b-a327-18d7e5d8507d. GET /v0/runs/59ad96ac-.../audit?category=campaign_driver_act_awaiting_operator. Control: GET the same route with category=campaign_driver_act_awaiting_operatorx.'
+assertions:
+    expected: 200 with an item list, not the 400 unknown-category refusal
+    observed_at_record: 200 {"items":[],"next_cursor":""}. The control answered 400 validation_failed 'category is not a known audit category', and its suggestions list campaign_driver_act_awaiting_operator.
+    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run_id>/audit?category=campaign_driver_act_awaiting_operator'
+origin:
+    issue: 5562
+    pr: 5585
+    run_id: 25ba3c40-84be-4ac6-8b66-b668a105f01d
+    head_sha: d4bb864fd97b2411cb587837f77fed27f7a0cd49
+    recorded_at: 2026-11-27T22:24:58Z
