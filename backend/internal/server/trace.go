@@ -9298,7 +9298,10 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 			Outcome:       vr.Outcome,
 			OutputTail:    vr.OutputTail,
 			TailTruncated: vr.TailTruncated,
-			Superseded:    vr.Superseded,
+			// The non-passed run's failure-signal lines from the WHOLE output
+			// (#5529); the render envelopes them as untrusted verify output.
+			Failures:   vr.Failures,
+			Superseded: vr.Superseded,
 		})
 	}
 	if ev.VerifySummary != nil {

@@ -2102,8 +2102,9 @@ banner, which stays last. In order:
 | a live dispatcher already in the pid file | `host dispatcher already running (pid N)`, no second spawn (a second one would be refused `state_dir_locked` anyway) |
 | `FISHHAWK_DEV_HOST_DISPATCH_TOKEN` unset | one line naming the variable and the `token issue` command; the operator token is NEVER substituted |
 | `bin/fishhawk-mcp` not executable | one line saying to run `scripts/dev reload` |
+| an invalid `FISHHAWK_HOST_DISPATCH_*` sizing value (below) | one line naming the variable, the flag and the remedy; nothing is started and the state dir is untouched. On a reload the dispatcher already stopped stays stopped until the value is fixed and a reload runs again |
 | the process exits during the readiness window | one line plus the last 15 lines of `logs/host-dispatch.log`; the pid file is removed |
-| alive, `status.json` names the spawned pid | `host dispatcher started (pid N) — logs: …; status: bin/fishhawk-mcp host-dispatch --status --state-dir …` |
+| alive, `status.json` names the spawned pid | `host dispatcher started (pid N) — logs: …; status: bin/fishhawk-mcp host-dispatch --status --state-dir …` (`with <flags>` follows the pid when sizing flags were passed) |
 | alive, no matching `status.json` after 10 s (50 polls of 0.2 s) | a warning naming the `--status` command; the pid file is kept |
 
 Every failure is **degrade-not-abort**, like the webhook relay: `up` prints
@@ -2117,9 +2118,29 @@ What it runs:
 - **Command.** `bin/fishhawk-mcp host-dispatch --allowed-roots <roots>
   --state-dir <checkout>/.fishhawk/cache/host-dispatch`. `<roots>` is
   `FISHHAWK_MCP_ALLOWED_ROOTS` when set, else the checkout root (the
-  `working_dir` local runs bind). The other flags keep their defaults
-  (`--interval` 30s, `--max-in-flight` 2, `--per-tick-cap` 4). There is no
-  daily cap by default (ADR-104 A1).
+  `working_dir` local runs bind). `--interval` keeps its 30s default. The
+  three sizing flags are passed only when their variable is set (#5530):
+
+  | Variable | Flag | Unset |
+  |---|---|---|
+  | `FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT` | `--max-in-flight` | `2` |
+  | `FISHHAWK_HOST_DISPATCH_PER_TICK_CAP` | `--per-tick-cap` | `4` |
+  | `FISHHAWK_HOST_DISPATCH_DAILY_CAP` | `--daily-cap` | no daily cap (ADR-104 A1) |
+
+  Set them in the shell or `.env`. `.env` is sourced after the shell, so its
+  value wins. An empty value means unset. A set value must be a whole number
+  from 1 to 999999 with no sign, whitespace or leading zero. The upper bound is
+  a deliberate limit. Leading zeros are refused because Go's flag parser reads
+  base prefixes (`010` would mean 8). `0` is refused too: unset
+  `FISHHAWK_HOST_DISPATCH_DAILY_CAP` for no daily cap. A change takes effect at
+  the next reload; a running dispatcher keeps its argv. `scripts/dev` consumes
+  these variables and does not pass them into the dispatcher's environment.
+
+  `FISHHAWK_HOST_CAPACITY` (1 to 64, default 3) is the related limit. Every
+  dispatched stage holds a `host:<host>:capacity` slot, so keep
+  `FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT` at or below it. A higher in-flight
+  limit only queues stages (`concurrency_slot_queued`). Raising the capacity
+  without raising the in-flight limit leaves the dispatcher the bottleneck.
 - **Scrubbed environment (approval condition G3).** It is spawned with an
   explicit allowlist and nothing else: `_host_dispatch_exec_scrubbed`, in a
   subshell, un-exports every exported variable, exports the allowlist and
@@ -2145,6 +2166,10 @@ What it runs:
     `CLAUDE_CONFIG_DIR`, `CODEX_HOME`. The acceptance synthetic HOME needs an
     env-carried model credential (`runner/README.md`), so without these the
     credential isolation would degrade on this path only;
+  - `FISHHAWK_HOST_CAPACITY`: the dispatcher's markers send it as `capacity`
+    (ADR-094 D4, #4241); without it the server uses 3. No runner reads it. An
+    invalid value makes the dispatcher exit at start (the exit-at-start row
+    above). An empty value is not carried, like every allowlisted name;
   - the other documented runner variables: `FISHHAWK_HOST_LABEL`,
     `FISHHAWK_RUNNER_BIN`, `FISHHAWK_AGENT_BIN`, `FISHHAWK_CODEX_BIN`,
     `FISHHAWK_DEPLOYMENT_PROFILE`, the `FISHHAWK_ACCEPTANCE_PREVIEW_*` and
@@ -2333,7 +2358,10 @@ The next `scripts/dev up` or reload also clears it.
   the scan, the pause before the `--when-quiet` wait, post-merge's quiesce
   before its scan and `git checkout main`, `down`'s quiesce before `_tls_down`,
   and both guard refusals restoring. HD-u7 pins the start after `_await_healthz`
-  and before the banner.
+  and before the banner. HD-c0 (library mode) and HD-c1 are the
+  `_host_dispatch_cap_args` table: unset and empty pass nothing, valid values
+  pass their flags, each invalid class is refused per variable with no partial
+  args, and a refused value is printed quoted.
 - **Stub-backed rows.** A compiled Go stub is built into
   `<tmp>/bin/fishhawk-mcp`, so the real argv rule matches it (approval
   condition G2: a shebang script would not). The reload rows scan with real
@@ -2346,7 +2374,10 @@ The next `scripts/dev up` or reload also clears it.
     and a `FISHHAWK_AGENT_ENV_*` variable do; an `env` shim proves the bearer
     is on no argv),
     HD-u2 (opt-out), HD-u3 (token required), HD-u3b (missing binary), HD-u4
-    (exit at start), HD-u5 (alive without status), HD-u6 (re-entrancy).
+    (exit at start), HD-u5 (alive without status), HD-u6 (re-entrancy). Sizing
+    (#5530): HD-u1 is also the unset-passes-no-flag row, HD-c2 (set values
+    become flags), HD-c3 (invalid refuses, the pause kept), HD-c4 (a value only
+    in `.env`) and HD-e2 (`FISHHAWK_HOST_CAPACITY` passthrough).
   - Stop: HD-s1, HD-s2 and HD-s3 (no pid file, dead pid, and a reused pid
     never signalled), HD-s3b (`ps` fails: degraded, still stopped), HD-s3d (G5:
     no unconfirmed SIGKILL), HD-s4 (drain timeout in each context), HD-s4e and

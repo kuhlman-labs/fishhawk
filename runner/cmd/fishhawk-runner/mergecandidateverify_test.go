@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1057,4 +1058,101 @@ func TestMergeCandidateVerify_FanInStaysFullForChildCfg(t *testing.T) {
 	if !strings.Contains(ship.MergeCandidateOutputTail, "pkgs=[unset]") {
 		t.Errorf("verify env carried a package set, want the full form: %q", ship.MergeCandidateOutputTail)
 	}
+}
+
+// --- #5529: a harness's column-0 `FAIL: ` row ---
+
+// mcvHarnessFailOutput is the run c43ba881 shape: a shell harness prints its
+// failing case EARLY, then more than a 4 KiB tail of passing rows, then its
+// Results line. It carries NO go-test signal, so only the harness arm of
+// isMergeCandidateSignalLine can find the failing row.
+func mcvHarnessFailOutput() string {
+	var b strings.Builder
+	b.WriteString(">>> scripts/test-dev\n")
+	b.WriteString("FAIL: case alpha should hold\n")
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&b, "PASS: case %03d holds\n", i)
+	}
+	b.WriteString("\nResults: 400 passed, 1 failed\n")
+	return b.String()
+}
+
+// TestMergeCandidateVerify_FailuresNameHarnessFailRowUnderLongPassRun is the
+// #5529 done-means: the 4 KiB tail holds only passing rows and the Results
+// line, and the SINGLE shipped report still names the failing harness row in
+// MergeCandidateFailures.
+func TestMergeCandidateVerify_FailuresNameHarnessFailRowUnderLongPassRun(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	withMCVVerifyOutput(t, mcvHarnessFailOutput(), "failed")
+	_, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd),
+		mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"})
+	if ship.MergeCandidateResult != mergeCandidateFailed {
+		t.Fatalf("result = %q (%s), want failed", ship.MergeCandidateResult, ship.MergeCandidateReason)
+	}
+	// Precondition: the fixture reproduces the incident — the tail lost the row.
+	if strings.Contains(ship.MergeCandidateOutputTail, "FAIL: case alpha") ||
+		!strings.HasSuffix(ship.MergeCandidateOutputTail, "Results: 400 passed, 1 failed\n") {
+		t.Fatalf("precondition: the 4 KiB tail must exclude the FAIL row and end with the Results line:\n%s", ship.MergeCandidateOutputTail)
+	}
+	if !strings.Contains(ship.MergeCandidateFailures, "FAIL: case alpha should hold") {
+		t.Errorf("MergeCandidateFailures missing the harness row:\n%s", ship.MergeCandidateFailures)
+	}
+	if n := len(ship.MergeCandidateFailures); n > upload.MaxMergeCandidateFailuresBytes {
+		t.Errorf("MergeCandidateFailures = %d bytes, over %d", n, upload.MaxMergeCandidateFailuresBytes)
+	}
+	if ship.MergeCandidateFailureSummary != nil {
+		t.Errorf("summary = %+v, want nil (a harness row names no go-test failure)", ship.MergeCandidateFailureSummary)
+	}
+}
+
+// TestRunMergeCandidateVerifyStage_LogsFailureSignalLines (#5529): a non-passed
+// pass writes the redacted excerpt to the runner log as a
+// merge_candidate_verify_failure_signal line BEFORE the report ships, so it
+// survives a report that fails to deliver; a passed pass logs none.
+func TestRunMergeCandidateVerifyStage_LogsFailureSignalLines(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	req := mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}
+	issued := &upload.IssuedKey{PrivateKey: make([]byte, 64)}
+	run := func(t *testing.T, client *crFakeUpload) string {
+		t.Helper()
+		installGateState(t, nil)
+		var log bytes.Buffer
+		runMergeCandidateVerifyStage(context.Background(), mcvCfg(dispatch, mcvVerifyCmd), req, client, issued, &log)
+		return log.String()
+	}
+
+	t.Run("failed pass logs the failing row", func(t *testing.T) {
+		withMCVVerifyOutput(t, mcvHarnessFailOutput(), "failed")
+		lines := logLines(run(t, &crFakeUpload{}), "merge_candidate_verify_failure_signal")
+		if len(lines) != 1 {
+			t.Fatalf("merge_candidate_verify_failure_signal lines = %d, want 1", len(lines))
+		}
+		var rec struct {
+			HeadSHA  string `json:"head_sha"`
+			Failures string `json:"failures"`
+		}
+		if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+			t.Fatalf("log line is not JSON: %v: %s", err, lines[0])
+		}
+		if !strings.Contains(rec.Failures, "FAIL: case alpha should hold") || rec.HeadSHA != tipA {
+			t.Errorf("log line = %+v, want the FAIL row and head %s", rec, tipA)
+		}
+	})
+	t.Run("failed pass still logs when the report fails to deliver", func(t *testing.T) {
+		withMCVVerifyOutput(t, mcvHarnessFailOutput(), "failed")
+		log := run(t, &crFakeUpload{err: errors.New("backend unreachable")})
+		if len(logLines(log, "merge_candidate_verify_report_failed")) != 1 {
+			t.Fatalf("precondition: the report must have failed to deliver:\n%s", log)
+		}
+		if lines := logLines(log, "merge_candidate_verify_failure_signal"); len(lines) != 1 ||
+			!strings.Contains(lines[0], "FAIL: case alpha should hold") {
+			t.Errorf("the failing row did not reach the log before the failed report: %v", lines)
+		}
+	})
+	t.Run("passed pass logs none", func(t *testing.T) {
+		withMCVVerifyOutput(t, "FAIL: case alpha (an expected-failure fixture row)\nok\n", "passed")
+		if lines := logLines(run(t, &crFakeUpload{}), "merge_candidate_verify_failure_signal"); len(lines) != 0 {
+			t.Errorf("a passed pass logged a failure-signal line: %v", lines)
+		}
+	})
 }

@@ -321,6 +321,17 @@ func SeedManifest() Manifest {
 				Mode:     ModeExact,
 			},
 			{
+				// One digested verify_run attempt in gate_evidence (#5529): the
+				// non-passed run's failure-signal excerpt (`failures`) rides
+				// beside the tail. ModeExact: both sides are flat leaves with
+				// identical tag sets. The marshaled bytes are ALSO pinned by the
+				// shared golden testdata/wire/gate_verify_run_failures.json.
+				Name: "verify_run_evidence", Anchor: "#5529",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "verifyRunEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "VerifyRunEvidence"},
+				Mode:     ModeExact,
+			},
+			{
 				// The approved plan's runner-executed counterfactuals (E85.3 /
 				// #4143), flattened onto the implement prompt response.
 				// ModeExact: a flat leaf the runner decodes field-for-field;

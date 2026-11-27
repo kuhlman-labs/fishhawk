@@ -55,6 +55,9 @@ HD_LOG_FILE="${hd_global_dir}/host-dispatch.log"
 HD_STATE_DIR="${hd_global_dir}/state"
 HD_BIN="${hd_global_dir}/bin/fishhawk-mcp"
 export FISHHAWK_DEV_HOST_DISPATCH=0
+# A developer shell's dispatcher sizing (#5530) must not change any row's argv
+# or env assertions.
+unset FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT FISHHAWK_HOST_DISPATCH_PER_TICK_CAP FISHHAWK_HOST_DISPATCH_DAILY_CAP FISHHAWK_HOST_CAPACITY
 
 # A high port with no LISTEN socket, for the port-preflight fixtures (#965,
 # E69.6 / #2917). Prints nothing when it cannot find one in five tries, so
@@ -10197,6 +10200,118 @@ else
   fail "HD-s5 _host_dispatch_drain_timeout table (rows above)"
 fi
 
+# HD-c0 (#5530) library mode, a fresh process: unset or empty sizing variables
+# add no flag; one valid value adds exactly its pair.
+cat > "${hd_global_dir}/cap-lib.zsh" <<'CAP'
+DEV_LIB_ONLY=1 source "$1/scripts/dev"
+set +e
+vars=(FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT FISHHAWK_HOST_DISPATCH_PER_TICK_CAP FISHHAWK_HOST_DISPATCH_DAILY_CAP)
+unset $vars
+_HD_CAP_ARGS=(stale); _host_dispatch_cap_args; print -r -- "unset rc=$? n=${#_HD_CAP_ARGS}"
+for v in $vars; do export "${v}="; done
+_HD_CAP_ARGS=(stale); _host_dispatch_cap_args; print -r -- "empty rc=$? n=${#_HD_CAP_ARGS}"
+FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=7
+_host_dispatch_cap_args; print -r -- "valid rc=$? n=${#_HD_CAP_ARGS} args=${(j:|:)_HD_CAP_ARGS}"
+CAP
+hd_got="$(zsh "${hd_global_dir}/cap-lib.zsh" "$orig_repo_root" 2>&1)"
+if [[ "$hd_got" == $'unset rc=0 n=0\nempty rc=0 n=0\nvalid rc=0 n=2 args=--max-in-flight|7' ]]; then
+  pass "HD-c0 library mode: unset and empty sizing variables add no flag; a valid value adds exactly --max-in-flight 7"
+else
+  fail "HD-c0 library-mode cap args (got=${hd_got})"
+fi
+rm -f "${hd_global_dir}/cap-lib.zsh"
+
+# HD-c1 (#5530) the _host_dispatch_cap_args table. Each row runs in its own
+# subshell: <MAX_IN_FLIGHT> <PER_TICK_CAP> <DAILY_CAP> ("-" = unset), printing
+# rc, the args and the stderr line.
+_hd_cap() {
+  (
+    unset FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT FISHHAWK_HOST_DISPATCH_PER_TICK_CAP FISHHAWK_HOST_DISPATCH_DAILY_CAP
+    [[ "$1" == - ]] || FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT="$1"
+    [[ "$2" == - ]] || FISHHAWK_HOST_DISPATCH_PER_TICK_CAP="$2"
+    [[ "$3" == - ]] || FISHHAWK_HOST_DISPATCH_DAILY_CAP="$3"
+    _HD_CAP_ARGS=(stale)
+    _host_dispatch_cap_args 2>"${hd_global_dir}/cap.err"
+    print -r -- "$? [${_HD_CAP_ARGS[*]}]"
+  )
+}
+hd_tbl_ok=1
+_hd_cap_want() {
+  local want="$1"; shift
+  local got="$(_hd_cap "$@")"
+  if [[ "$got" != "$want" || -s "${hd_global_dir}/cap.err" ]]; then
+    hd_tbl_ok=0; print -r -- "  HD-c1 [$*] got ${got} want ${want} err=$(cat "${hd_global_dir}/cap.err")"
+  fi
+}
+_hd_cap_want '0 []' - - -
+_hd_cap_want '0 []' '' '' ''
+for hd_in in 4 6 40 999999; do
+  _hd_cap_want "0 [--max-in-flight ${hd_in}]" "$hd_in" - -
+  _hd_cap_want "0 [--per-tick-cap ${hd_in}]" - "$hd_in" -
+  _hd_cap_want "0 [--daily-cap ${hd_in}]" - - "$hd_in"
+done
+_hd_cap_want '0 [--max-in-flight 4 --per-tick-cap 6 --daily-cap 40]' 4 6 40
+if (( hd_tbl_ok )); then
+  pass "HD-c1 valid: unset/empty pass nothing; each of 4, 6, 40, 999999 passes its flag; all three pass in order"
+else
+  fail "HD-c1 valid-value table (rows above)"
+fi
+# Refusals: <kind> picks the wording; every line names the variable, the flag
+# and `unset`.
+hd_tbl_ok=1
+for hd_row in "1|FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT|--max-in-flight|FISHHAWK_HOST_CAPACITY" \
+    "2|FISHHAWK_HOST_DISPATCH_PER_TICK_CAP|--per-tick-cap|unset it to keep the default 4" \
+    "3|FISHHAWK_HOST_DISPATCH_DAILY_CAP|--daily-cap|unset it for no daily cap"; do
+  hd_f=("${(@s:|:)hd_row}")
+  for hd_case_in in "bad|0" "bad|-1" "bad|+4" "bad|010" "bad|0x4" "bad|abc" "bad|4x" "bad| 4" "bad|4 " $'bad|4\n' \
+      "range|1000000" "range|99999999999999999999" "range|01000000"; do
+    hd_kind="${hd_case_in%%|*}"; hd_in="${hd_case_in#*|}"
+    hd_args=(- - -); hd_args[${hd_f[1]}]="$hd_in"
+    hd_got="$(_hd_cap "${hd_args[@]}")"
+    hd_err="$(cat "${hd_global_dir}/cap.err")"
+    if [[ "$hd_kind" == range ]]; then
+      hd_want_msg="is out of range (it sets ${hd_f[3]}; allowed 1 to 999999)"
+    else
+      hd_want_msg="is not a positive integer (it sets ${hd_f[3]})"
+    fi
+    if [[ "$hd_got" != '1 []' || "$hd_err" != "host dispatcher not started: ${hd_f[2]}=${(qq)hd_in} ${hd_want_msg}"* \
+          || "$hd_err" != *'unset '* || "$hd_err" != *"${hd_f[4]}"* ]]; then
+      hd_tbl_ok=0; print -r -- "  HD-c1 [${hd_f[2]}=${(qqqq)hd_in}] got ${hd_got} err=${(qqqq)hd_err}"
+    fi
+  done
+done
+if (( hd_tbl_ok )); then
+  pass "HD-c1 refusals: each variable refuses zero, signs, leading zero, hex, non-numeric, junk, whitespace and over-bound, naming itself, its flag and the unset remedy"
+else
+  fail "HD-c1 refusal table (rows above)"
+fi
+# A later invalid value leaves no partial args behind.
+hd_got="$(_hd_cap 4 abc -)"
+if [[ "$hd_got" == '1 []' ]]; then
+  pass "HD-c1 a valid MAX_IN_FLIGHT before an invalid PER_TICK_CAP leaves _HD_CAP_ARGS empty"
+else
+  fail "HD-c1 partial args after a refusal (got ${hd_got})"
+fi
+# A control character is refused, and the value is printed in its quoted form.
+hd_in=$'1\e[31m'
+hd_got="$(_hd_cap "$hd_in" - -)"
+hd_err="$(cat "${hd_global_dir}/cap.err")"
+if [[ "$hd_got" == '1 []' && "$hd_err" == *"FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=${(qq)hd_in} is not a positive integer"* ]]; then
+  pass "HD-c1 a value holding a control character is refused and printed quoted"
+else
+  fail "HD-c1 control-character value (got ${hd_got} err=${(qqqq)hd_err})"
+fi
+# A literal backslash sequence is printed as typed, never interpreted.
+hd_in='1\e[31m\n'
+hd_got="$(_hd_cap "$hd_in" - -)"
+hd_err="$(cat "${hd_global_dir}/cap.err")"
+if [[ "$hd_got" == '1 []' && "$hd_err" == *"FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=${(qq)hd_in} is not a positive integer"* ]]; then
+  pass "HD-c1 literal backslash sequences in a value are printed as typed"
+else
+  fail "HD-c1 backslash value (got ${hd_got} err=${(qqqq)hd_err})"
+fi
+rm -f "${hd_global_dir}/cap.err"
+
 # HD-o ordering pins over the function bodies (line numbers, as LR-k/RB-m do).
 _hd_at() { print -r -- "$1" | grep -n -- "$2" | head -n 1 | cut -d: -f1 }
 hd_rl_body="$(typeset -f cmd_reload)"
@@ -10491,6 +10606,7 @@ mkdir -p "$HD_STATE_DIR"
 print -r -- '{"pid": 1}' > "${HD_STATE_DIR}/status.json"
 hd_up_out="$(
   unset FISHHAWK_DEV_HOST_DISPATCH
+  unset FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT FISHHAWK_HOST_DISPATCH_PER_TICK_CAP FISHHAWK_HOST_DISPATCH_DAILY_CAP
   export FISHHAWK_API_TOKEN=op-token FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-token FISHHAWKD_ADDR=":18123"
   REPO_ROOT="$hd_dir"
   _host_dispatch_up 2>&1
@@ -10499,8 +10615,8 @@ hd_pid="$(cat "$HD_PID_FILE" 2>/dev/null)"
 if (( hd_up_rc == 0 )) && grep_q -Fx "argv host-dispatch --allowed-roots ${hd_dir} --state-dir ${HD_STATE_DIR}" < "$hd_rec" \
    && grep_q -Fx "token hd-token" < "$hd_rec" && grep_q -Fx "url http://localhost:18123" < "$hd_rec" \
    && grep_q -F "start pid=${hd_pid} pause_at_start=absent status_at_start=absent" < "$hd_rec" \
-   && print -r -- "$hd_up_out" | grep_q "host dispatcher started (pid ${hd_pid})" && _hd_alive "$hd_pid"; then
-  pass "HD-u1 _host_dispatch_up spawns host-dispatch with the dedicated token, the backend URL and the state dir, after clearing pause + status.json"
+   && print -r -- "$hd_up_out" | grep_q "host dispatcher started (pid ${hd_pid}) — logs:" && _hd_alive "$hd_pid"; then
+  pass "HD-u1 _host_dispatch_up spawns host-dispatch with the dedicated token, the backend URL and the state dir, after clearing pause + status.json; unset sizing passes no flag"
 else
   fail "HD-u1 spawn (rc=${hd_up_rc} pid=${hd_pid} out=${hd_up_out} rec=$(cat "$hd_rec" 2>/dev/null))"
 fi
@@ -10542,6 +10658,81 @@ if (( hd_up_rc == 0 )) && [[ -n "$hd_env" ]] && ! print -r -- "$hd_env" | grep_q
   pass "HD-e1 the dispatcher runs under a scrubbed env: no .env/AWS/ssh-agent sentinel and no operator token reach it; the runner policy knob, model credential, docker endpoint and allowlisted runner vars do; the bearer is on no argv"
 else
   fail "HD-e1 env custody (rc=${hd_up_rc} argv=$(cat "${hd_dir}/env.argv" 2>/dev/null) env=$(print -r -- "$hd_env" | tr '\n' ' '))"
+fi
+_hd_cleanup
+
+# HD-c2 (#5530) set sizing variables reach the dispatcher as flags, not env.
+_hd_case
+hd_up_out="$(
+  unset FISHHAWK_DEV_HOST_DISPATCH
+  export FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-token
+  export FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=4 FISHHAWK_HOST_DISPATCH_PER_TICK_CAP=6 FISHHAWK_HOST_DISPATCH_DAILY_CAP=40
+  REPO_ROOT="$hd_dir"
+  _host_dispatch_up 2>&1
+)"; hd_up_rc=$?
+hd_pid="$(cat "$HD_PID_FILE" 2>/dev/null)"
+if (( hd_up_rc == 0 )) \
+   && grep_q -Fx "argv host-dispatch --allowed-roots ${hd_dir} --state-dir ${HD_STATE_DIR} --max-in-flight 4 --per-tick-cap 6 --daily-cap 40" < "$hd_rec" \
+   && print -r -- "$hd_up_out" | grep_q -F "host dispatcher started (pid ${hd_pid}) with --max-in-flight 4 --per-tick-cap 6 --daily-cap 40 — logs:" \
+   && _hd_alive "$hd_pid" && grep_q '^PATH=' < "${hd_dir}/bin/hd-stub.env" \
+   && ! grep_q '^FISHHAWK_HOST_DISPATCH_' < "${hd_dir}/bin/hd-stub.env"; then
+  pass "HD-c2 the three sizing variables reach host-dispatch as flags, the start line names them, and none reaches its environment"
+else
+  fail "HD-c2 sizing flags (rc=${hd_up_rc} pid=${hd_pid} out=${hd_up_out} rec=$(cat "$hd_rec" 2>/dev/null))"
+fi
+_hd_cleanup
+
+# HD-c3 (#5530) an invalid value refuses the start before any state-dir change.
+_hd_case
+mkdir -p "$HD_STATE_DIR"
+: > "${HD_STATE_DIR}/pause"
+hd_up_out="$(
+  unset FISHHAWK_DEV_HOST_DISPATCH
+  export FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-token FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=abc
+  REPO_ROOT="$hd_dir"
+  _host_dispatch_up 2>&1
+)"; hd_up_rc=$?
+if (( hd_up_rc == 1 )) \
+   && print -r -- "$hd_up_out" | grep_q -F "host dispatcher not started: FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT='abc' is not a positive integer (it sets --max-in-flight)" \
+   && print -r -- "$hd_up_out" | grep_q -F 'unset it to keep the default 2' \
+   && [[ ! -f "$hd_rec" && ! -f "$HD_PID_FILE" && -f "${HD_STATE_DIR}/pause" ]]; then
+  pass "HD-c3 an invalid sizing value: rc 1, the reason names the variable, flag and remedy, nothing spawned, the operator's pause kept"
+else
+  fail "HD-c3 invalid sizing (rc=${hd_up_rc} out=${hd_up_out} rec=$(cat "$hd_rec" 2>/dev/null) pause=$([[ -f ${HD_STATE_DIR}/pause ]] && print present))"
+fi
+_hd_cleanup
+
+# HD-c4 (#5530) a sizing value set only in .env applies through the path that
+# sources it (the restore; cmd_up sources .env the same way).
+_hd_case
+print -rl -- 'FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-env-token' 'FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=4' > "${hd_dir}/.env"
+hd_up_out="$(
+  unset FISHHAWK_DEV_HOST_DISPATCH FISHHAWK_DEV_HOST_DISPATCH_TOKEN
+  unset FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT FISHHAWK_HOST_DISPATCH_PER_TICK_CAP FISHHAWK_HOST_DISPATCH_DAILY_CAP
+  _HD_RESTORE=1
+  _host_dispatch_restore 2>&1
+)"
+hd_pid="$(cat "$HD_PID_FILE" 2>/dev/null)"
+if grep_q -Fx "argv host-dispatch --allowed-roots ${hd_dir} --state-dir ${HD_STATE_DIR} --max-in-flight 4" < "$hd_rec" \
+   && grep_q -Fx 'token hd-env-token' < "$hd_rec" && _hd_alive "$hd_pid"; then
+  pass "HD-c4 FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT=4 set only in .env starts the dispatcher with --max-in-flight 4"
+else
+  fail "HD-c4 .env sizing (pid=${hd_pid} out=${hd_up_out} rec=$(cat "$hd_rec" 2>/dev/null))"
+fi
+_hd_cleanup
+
+# HD-e2 (#5530) FISHHAWK_HOST_CAPACITY survives the scrub.
+_hd_case
+hd_up_out="$(
+  unset FISHHAWK_DEV_HOST_DISPATCH
+  export FISHHAWK_DEV_HOST_DISPATCH_TOKEN=hd-token FISHHAWK_HOST_CAPACITY=4
+  REPO_ROOT="$hd_dir"
+  _host_dispatch_up 2>&1
+)"; hd_up_rc=$?
+if (( hd_up_rc == 0 )) && grep_q '^start ' < "$hd_rec" && grep_q -x 'FISHHAWK_HOST_CAPACITY=4' < "${hd_dir}/bin/hd-stub.env"; then
+  pass "HD-e2 FISHHAWK_HOST_CAPACITY reaches the dispatcher's scrubbed environment"
+else
+  fail "HD-e2 capacity passthrough (rc=${hd_up_rc} out=${hd_up_out} env=$(tr '\n' ' ' < "${hd_dir}/bin/hd-stub.env" 2>/dev/null))"
 fi
 _hd_cleanup
 

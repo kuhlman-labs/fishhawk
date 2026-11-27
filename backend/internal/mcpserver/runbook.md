@@ -1278,6 +1278,22 @@ tree the PR no longer carries. A head with no verify pass (no declared verify
 command, or a verdict transferred across a clean base advance) starts no pass
 and so no round; if none appears, start one with `fishhawk_rerun_review`.
 
+**A red verify pass: read the failing row before calling it a flake.** The
+`merge_candidate_verified` audit row (`fishhawk_list_audit`) holds `output_tail`,
+which is only the LAST 4 KiB of the output, and a long run of passing rows can
+push the failing one out of it. For a non-passed result the same row carries
+`failures`: every failure-signal line from the WHOLE output (go-test
+FAIL/panic/race lines, compiler diagnostics and a shell or Python test harness's
+column-0 `FAIL: ` row), with a little context, plus `failure_summary`'s parsed
+names. The local runner log carries the same lines as the
+`merge_candidate_verify_failure_signal` event, written before the report ships.
+For a red verify on an implement stage, the review prompt's gate evidence carries
+the same per-run failure-signal lines in each non-passed run's `failures` field.
+Read the failing row, re-run that named check at the SAME head, and if it passes
+treat the red as a flake: re-run only the verify (`fishhawk_rebase_run_branch`
+with `rerun_failed_verify` and a `reason`) and file the flake, naming that row.
+Never infer a flake from a pass count alone.
+
 **Never probe `fishhawk_merge_run`.** Every call is a real merge attempt; with a
 placeholder verdict it records the verdict and queues the merge as soon as the
 gates pass. To check readiness without recording a verdict, read

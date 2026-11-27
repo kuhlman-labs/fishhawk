@@ -340,6 +340,13 @@ type gateIsolationState struct {
 	uid  int
 	gid  int
 
+	// seedHandoff is the ONE module-cache seed a reach exec
+	// (withSeedHandoff, #5524) hands to the next container exec on the SAME
+	// checkout dir — the deciding verify — so a tree pays one host-side seed,
+	// not two. Guarded by seedHandoffMu; cleanup removes a leftover entry.
+	seedHandoffMu sync.Mutex
+	seedHandoff   *gateSeedHandoff
+
 	// seamReached is set by markSeamReached at the gate-exec seam
 	// (runBoundedGateArgvDisposed) — NOT inside selection()'s once.Do,
 	// because selection() has a non-exec caller too (runVerifyCommittedTree
@@ -355,6 +362,52 @@ type mintedCacheVolume struct {
 	vol    gateiso.CacheVolume
 	rt     gateiso.Runtime
 	cliEnv []string
+}
+
+// gateSeedHandoff is one handed-off seed: the checkout dir it was seeded
+// from and the visible caches (seeded module cache included) the reach exec
+// ran with.
+type gateSeedHandoff struct {
+	dir string
+	vc  *gateiso.VisibleCaches
+}
+
+// stashSeedHandoff keeps vc for the next container exec on dir, replacing
+// (and removing) any older entry. It reports whether vc was kept; a nil state
+// keeps nothing.
+func (s *gateIsolationState) stashSeedHandoff(dir string, vc *gateiso.VisibleCaches) bool {
+	if s == nil {
+		return false
+	}
+	s.seedHandoffMu.Lock()
+	old := s.seedHandoff
+	s.seedHandoff = &gateSeedHandoff{dir: dir, vc: vc}
+	s.seedHandoffMu.Unlock()
+	if old != nil {
+		_ = old.vc.Remove()
+	}
+	return true
+}
+
+// takeSeedHandoff returns, and clears, the handed-off caches seeded from dir.
+// An entry for any other dir is stale (its exec's verify never ran): it is
+// removed and nil is returned, so the caller seeds fresh. Nil-safe.
+func (s *gateIsolationState) takeSeedHandoff(dir string) *gateiso.VisibleCaches {
+	if s == nil {
+		return nil
+	}
+	s.seedHandoffMu.Lock()
+	h := s.seedHandoff
+	s.seedHandoff = nil
+	s.seedHandoffMu.Unlock()
+	if h == nil {
+		return nil
+	}
+	if h.dir != dir {
+		_ = h.vc.Remove()
+		return nil
+	}
+	return h.vc
 }
 
 // gateIsolation is the live state run() installs and clears (cleanup).
@@ -733,6 +786,47 @@ func wantsLaunchMarker(ctx context.Context) bool {
 	return v
 }
 
+// noGateServicesKey marks a container exec that provisions NO gate service
+// even when FISHHAWK_GATE_SERVICES configures one (#5524). Only the slice
+// gate's reach exec (sliceReachLoadContainer) sets it: the in-image reach
+// load needs no database, so it neither probes the service image's
+// credentials nor creates a volume or a service container. Every other exec
+// is unmarked and byte-unchanged.
+type noGateServicesKey struct{}
+
+// withoutGateServices returns a CALL-LOCAL ctx marking the exec as one that
+// provisions no gate service; never store it.
+func withoutGateServices(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noGateServicesKey{}, true)
+}
+
+// skipsGateServices reports whether ctx was marked by withoutGateServices.
+func skipsGateServices(ctx context.Context) bool {
+	v, _ := ctx.Value(noGateServicesKey{}).(bool)
+	return v
+}
+
+// seedHandoffKey marks a container exec whose host-side module-cache seed is
+// handed to the NEXT container exec on the same checkout dir (#5524, ADR-090
+// A3.7): the slice gate's reach exec, whose next exec on that clone is the
+// deciding verify. That verify then runs no seed of its own, so the reach
+// load adds no host-side module-metadata work beyond ADR-063's verify seed.
+// The handed-on module cache was touched only by the reach container, and
+// no host process ever re-seeds it (the ErrDestinationNotEmpty invariant).
+type seedHandoffKey struct{}
+
+// withSeedHandoff returns a CALL-LOCAL ctx marking the exec as one that hands
+// its seed on; never store it.
+func withSeedHandoff(ctx context.Context) context.Context {
+	return context.WithValue(ctx, seedHandoffKey{}, true)
+}
+
+// handsOffSeed reports whether ctx was marked by withSeedHandoff.
+func handsOffSeed(ctx context.Context) bool {
+	v, _ := ctx.Value(seedHandoffKey{}).(bool)
+	return v
+}
+
 // containerLaunchFailedOutput renders a gateLaunchFailed exec's output: a
 // runner-authored lead naming the launch failure, then the runtime's own text.
 func containerLaunchFailedOutput(code int, out string) string {
@@ -989,6 +1083,9 @@ func (s *gateIsolationState) removeDockerConfig() {
 // process (the test binary) starts unconfigured. Nil-safe.
 func (s *gateIsolationState) cleanup() {
 	if s != nil {
+		if vc := s.takeSeedHandoff(""); vc != nil {
+			_ = vc.Remove()
+		}
 		s.removeCacheVolumes()
 		s.removeDockerConfig()
 	}
@@ -1098,16 +1195,35 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // teardown failure is logged (gate_service_cleanup_failed) and never changes
 // the gate's verdict. Every exec that reaches the seam logs one
 // gate_container_timing line splitting cache / seed / service / exec time.
+// Two call-local markers serve only the slice gate's reach exec (#5524):
+// withoutGateServices provisions no gate service (wantService), and
+// withSeedHandoff stashes the exec's seeded caches, once its seed succeeded
+// and whatever the exec's outcome, for the NEXT exec on the same dir — the
+// deciding verify — which then skips its own seed, so a tree pays one
+// host-side seed. Every other caller is unmarked and byte-unchanged.
 // Deliberate residual: a legitimate tree whose `replace`
 // target sits outside the checkout draws ErrSeedCheckout too and reaches the
 // fix agent with the refusing message rather than parking category C.
 func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int, gateDisposition) {
 	st := gateIsolation
-	vc, err := gateiso.NewVisibleCaches()
-	if err != nil {
-		return "gate container: " + err.Error(), -1, gateUnavailable
+	// A reach exec's handed-off seed for THIS dir (#5524): reuse its caches
+	// and skip the seed below, so the tree pays one seed. Anything else
+	// starts from fresh, empty caches exactly as before.
+	vc := st.takeSeedHandoff(dir)
+	seeded := vc != nil
+	if vc == nil {
+		var err error
+		if vc, err = gateiso.NewVisibleCaches(); err != nil {
+			return "gate container: " + err.Error(), -1, gateUnavailable
+		}
 	}
-	defer func() { _ = vc.Remove() }()
+	keepCaches := false
+	defer func() {
+		if !keepCaches {
+			_ = vc.Remove()
+		}
+	}()
+	wantService := st.postgresServiceWanted() && !skipsGateServices(ctx)
 	if err := os.MkdirAll(lintCacheDir, 0o700); err != nil {
 		return "gate container: create lint cache dir: " + err.Error(), -1, gateUnavailable
 	}
@@ -1135,7 +1251,7 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if sel.Image != "" {
 		pulled = append(pulled, sel.Image)
 	}
-	if st.postgresServiceWanted() {
+	if wantService {
 		pulled = append(pulled, st.postgresImage)
 	}
 	if reason := st.probeGateCredentials(ctx, dockerCfg, pulled, cliEnv, "gate"); reason != "" {
@@ -1181,7 +1297,7 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	}
 	var svc *gateiso.PostgresService
 	var svcArgv gateServiceArgv
-	if st.postgresServiceWanted() {
+	if wantService {
 		s := gateiso.NewPostgresService(st.postgresImage)
 		if svcArgv, err = buildGateServiceArgv(s, sel.Runtime); err != nil {
 			return "gate container: provision postgres service: argv: " + err.Error(), -1, gateUnavailable
@@ -1238,16 +1354,21 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	}
 	// Seed only AFTER the mount guard accepted every source: the seed is the
 	// one host-side process the container path runs against the checkout.
+	// A handed-off seed (seeded) already ran on this very dir before the
+	// reach exec: no second host-side seed.
 	seedStart := time.Now()
-	_, err = seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout)
+	var seedErr error
+	if !seeded {
+		_, seedErr = seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout)
+	}
 	seedElapsed := time.Since(seedStart)
-	if err != nil {
+	if seedErr != nil {
 		disp := gateUnavailable
-		if errors.Is(err, gateiso.ErrSeedCheckout) {
+		if errors.Is(seedErr, gateiso.ErrSeedCheckout) {
 			// The checkout's OWN metadata was refused: tree-attributable.
 			disp = gateCheckoutRefused
 		}
-		return "gate container: seed module cache: " + err.Error(), -1, disp
+		return "gate container: seed module cache: " + seedErr.Error(), -1, disp
 	}
 	var serviceElapsed time.Duration
 	if svc != nil {
@@ -1276,6 +1397,14 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
 		defer cancel()
 		_, _, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
+	}
+	// A reach exec whose seed succeeded hands that seed to the verify on this
+	// dir (#5524) WHATEVER the exec's outcome — run to completion, launch
+	// failure or timeout (its container is already gone) — so a reach that
+	// widens never costs the tree a second seed. Its caches outlive this call
+	// only through the stash.
+	if handsOffSeed(ctx) {
+		keepCaches = st.stashSeedHandoff(dir, vc)
 	}
 	if nonce != "" {
 		var launched bool

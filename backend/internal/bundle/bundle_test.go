@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1325,6 +1326,71 @@ func TestExtractGateEvidence_OlderBundleWithoutFixupSelfReportDivergence(t *test
 	}
 	if got.FixupSelfReportDivergence != nil {
 		t.Errorf("FixupSelfReportDivergence = %+v, want nil for an older/non-fix-up bundle", got.FixupSelfReportDivergence)
+	}
+}
+
+// sharedVerifyRunFailuresGolden reads the SHARED golden
+// testdata/wire/gate_verify_run_failures.json the runner marshals byte-equal
+// (#5529): one verify run carrying the non-passed run's failure-signal lines.
+func sharedVerifyRunFailuresGolden(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_verify_run_failures.json"))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	return bytes.TrimSpace(b)
+}
+
+// TestExtractGateEvidence_DecodesVerifyRunFailures is the BACKEND half of the
+// #5529 wire seam: the runner's verify run, carrying `failures`, decodes with
+// the failing harness row in Failures — a row its OutputTail lost — and
+// re-encodes to the SAME members (a renamed or dropped tag would lose them).
+func TestExtractGateEvidence_DecodesVerifyRunFailures(t *testing.T) {
+	golden := sharedVerifyRunFailuresGolden(t)
+	got, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[`+string(golden)+`]}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if len(got.VerifyRuns) != 1 {
+		t.Fatalf("verify_runs = %d, want 1", len(got.VerifyRuns))
+	}
+	vr := got.VerifyRuns[0]
+	if !strings.Contains(vr.Failures, "FAIL: case alpha should hold") {
+		t.Errorf("Failures = %q, want the harness FAIL row", vr.Failures)
+	}
+	if strings.Contains(vr.OutputTail, "FAIL: case alpha") || !vr.TailTruncated {
+		t.Errorf("fixture lost its shape: tail=%q truncated=%v", vr.OutputTail, vr.TailTruncated)
+	}
+	re, err := json.Marshal(vr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Member ORDER differs between the runner's and the backend's struct, so
+	// the round trip is compared as decoded objects: a dropped or renamed tag
+	// still loses a key.
+	var gotObj, wantObj map[string]any
+	if err := json.Unmarshal(re, &gotObj); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(golden, &wantObj); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotObj, wantObj) {
+		t.Errorf("round trip drifted from the shared golden:\n got %s\nwant %s", re, golden)
+	}
+}
+
+// TestExtractGateEvidence_OlderBundleWithoutVerifyRunFailures: a verify run
+// from an older runner (no `failures` key) decodes Failures "" — the field is
+// additive/omitempty.
+func TestExtractGateEvidence_OlderBundleWithoutVerifyRunFailures(t *testing.T) {
+	got, err := ExtractGateEvidence(gateEvidenceBundle(t,
+		`{"verify_runs":[{"command":"scripts/test verify","exit_code":1,"outcome":"failed","output_tail":"tail"}]}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if len(got.VerifyRuns) != 1 || got.VerifyRuns[0].Failures != "" || got.VerifyRuns[0].OutputTail != "tail" {
+		t.Errorf("VerifyRuns = %+v, want one run with Failures empty", got.VerifyRuns)
 	}
 }
 
