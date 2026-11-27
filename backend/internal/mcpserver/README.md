@@ -4139,7 +4139,11 @@ per-tool contract). Internals not covered there:
     `server.Handler()` (the body crosses the strict decoder and reaches the fail-closed workflow-registration gate).
   - **Output.** `{campaign, item (CampaignItem + position), dispatch_hold?, next_step}`. `next_step` names
     `fishhawk_start_campaign_item_run` with the RECORDED `workflow_id` (another one is refused
-    `campaign_item_workflow_mismatch`) and, when held, the hold's `expires_at`.
+    `campaign_item_workflow_mismatch`) and `auto_dispatch: true`, and, when held, the hold's `expires_at`. Why the
+    mark ([#5562](https://github.com/kuhlman-labs/fishhawk/issues/5562)): the host dispatcher has no workflow filter
+    and spawns only a marked run, so an unmarked hotfix run waits on `fishhawk_dispatch_stage` for every stage,
+    including a fix-up the campaign driver routes. The tool description and `fishhawk_start_campaign_item_run`'s
+    `auto_dispatch` text say the same; the mark stays an explicit operator flag (ADR-104 Q3).
   - **Refusals** (`campaignHotfixRemedy`): `workflow_not_registered` renders `details.registered` plus the reason rule
     and the `.fishhawk/workflows.yaml` registration step; `campaign_hold_active` says retry without `hold_dispatch`;
     `campaign_item_duplicate`, `campaign_not_appendable`, `campaign_item_ref_invalid`, `campaign_not_found`,

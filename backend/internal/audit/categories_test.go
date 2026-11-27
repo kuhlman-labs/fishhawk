@@ -184,6 +184,16 @@ func TestKnownCategories_AcceptanceReopenAwaitingOperator(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_CampaignDriverActAwaitingOperator pins the #5562 page
+// category: server/campaign_gate_outcome.go appends it when a campaign-driver
+// act parks a stage no dispatcher will spawn, and an unregistered category
+// would redden TestKnownCategoriesCoversEmittedCategories and be un-awaitable.
+func TestKnownCategories_CampaignDriverActAwaitingOperator(t *testing.T) {
+	if !IsKnownCategory("campaign_driver_act_awaiting_operator") {
+		t.Fatal("campaign_driver_act_awaiting_operator is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_StallWatchPages pins the two #5497 stall-watch page
 // categories: server/stall_watch.go and server/stall_watch_children.go append
 // them, and an unregistered category would redden
