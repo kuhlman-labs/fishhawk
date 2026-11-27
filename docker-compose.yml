@@ -77,7 +77,7 @@ services:
     # list means an EXISTING bucket exits 0 with no create attempted, an
     # absent bucket is created (exit 0), and a create that genuinely fails
     # exits NON-ZERO — the trailing echo never masks a failed create.
-    image: amazon/aws-cli:2.40.3
+    image: amazon/aws-cli:2.42.3
     profiles: ["init"]
     depends_on:
       rustfs:
