@@ -10957,20 +10957,35 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// whole PR review body into its message. The PR title/body still come from
 	// the (run/stage-keyed, #1777) PR-description handoff unchanged. Overridden
 	// below on the isFixup path.
-	commitMessage := implementCommitMessage(cfg, title, body, logSink)
+	commitMessage, cmSource := implementCommitMessageParts(cfg, title, body, logSink)
 	// #3012. ORDERING IS LOAD-BEARING: the marker is applied AFTER
-	// implementCommitMessage, which on the no-sidecar path composes the commit
-	// message from title + body. Marking first would stamp the marker into
+	// implementCommitMessageParts, which on the no-sidecar path composes the
+	// commit message from title + body. Marking first would stamp the marker into
 	// main's squash commit message; TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged
-	// pins that it does not.
+	// pins that it does not. The #5410 rebuild below runs after it for the same
+	// reason, so it can never reach the commit message either.
 	//
 	// The condition is `reason != none`, NOT `!agentAuthoredPR` (binding
 	// condition 1): a TITLE-ONLY handoff is agent-authored yet ships a
 	// footer-only body with no `Closes #N` — the exact silent shape of #3012 —
 	// so it gets the marker too.
+	//
+	// #5410: when the agent skipped (or botched) the PR handoff but DID write its
+	// commit-message sidecar, the body is rebuilt from that commit message — the
+	// summary the run branch actually carries — instead of the bare placeholder.
+	// The marker stays (composition did fail and `Closes #N` is still missing), so
+	// pr_body_not_composed is emitted on BOTH branches. agentPRTitle/agentPRBody
+	// are deliberately NOT updated: the park/checkpoint/child-push carry only
+	// agent-authored text, so a rebuilt body is never served back as "recovered".
 	prHandoffPath := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
 	if prBodyFallbackReason != prBodyReasonNone {
-		body = prBodyNotComposedMarker(cfg, prBodyFallbackReason, prHandoffPath) + body
+		if rTitle, rBody, rebuilt := rebuildPRTextFromCommitMessage(cfg, branch, title, agentAuthoredPR, prBodyFallbackReason, prHandoffPath, cmSource); rebuilt {
+			titleRebuilt := rTitle != title
+			title, body = rTitle, rBody
+			emitPRBodyRebuilt(logSink, cfg, prBodyFallbackReason, titleRebuilt)
+		} else {
+			body = prBodyNotComposedMarker(cfg, prBodyFallbackReason, prHandoffPath) + body
+		}
 		emitPRBodyNotComposed(logSink, cfg, prBodyFallbackReason, prHandoffPath)
 	}
 	// #2884 fix-up landing snapshot. Captured on the isFixup path BEFORE
@@ -14150,6 +14165,26 @@ func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body st
 // sees no behavior change. title/body are the PR title/body sourced unchanged
 // from the run/stage-keyed PR-description handoff (#1777).
 func implementCommitMessage(cfg config, title, body string, logSink io.Writer) string {
+	msg, _ := implementCommitMessageParts(cfg, title, body, logSink)
+	return msg
+}
+
+// commitMessageSource records WHERE implementCommitMessageParts got the initial-
+// implement commit message (#5410). fromSidecar is true ONLY when the agent's
+// commit-message sidecar (fresh, or the #2840 replay) supplied it; subject/body
+// are then the parsed sidecar halves. On the title + body fallback fromSidecar is
+// false and subject/body are empty, so nothing downstream can mistake the
+// placeholder for agent text.
+type commitMessageSource struct {
+	subject, body string
+	fromSidecar   bool
+}
+
+// implementCommitMessageParts is implementCommitMessage that also reports the
+// message's source (#5410), so the ordinary call site can rebuild a
+// non-composed PR body from the commit message the run branch actually carries.
+// The resolved message is byte-identical to implementCommitMessage's.
+func implementCommitMessageParts(cfg config, title, body string, logSink io.Writer) (string, commitMessageSource) {
 	if subject, sidecarBody, ok := cfg.handoff.commitMessage(cfg, logSink); ok {
 		// Warn-only conventional-commit header check on the sidecar subject,
 		// matching the PR-title warn — advisory, never a rewrite or hard failure.
@@ -14158,12 +14193,13 @@ func implementCommitMessage(cfg config, title, body string, logSink io.Writer) s
 				`{"event":"implement_commitmsg_warning","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
 				cfg.runID, cfg.stageID, "sidecar subject is not a conventional-commit header")
 		}
+		src := commitMessageSource{subject: subject, body: sidecarBody, fromSidecar: true}
 		if sidecarBody == "" {
-			return subject
+			return subject, src
 		}
-		return subject + "\n\n" + sidecarBody
+		return subject + "\n\n" + sidecarBody, src
 	}
-	return title + "\n\n" + body
+	return title + "\n\n" + body, commitMessageSource{}
 }
 
 // terminalVerifyOutcome returns the committed-tree verify verdict already on the
@@ -14474,7 +14510,8 @@ func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, b
 	if kind == prSourceAgent {
 		// A title-only handoff is still agent-authored — the agent's title is
 		// honoured — but its body is EMPTY, so the opened PR is footer-only with
-		// no summary, no test plan and no `Closes #N`. loadAgentAuthoredPR
+		// no summary, no test plan and no `Closes #N` (unless the ordinary call
+		// site rebuilds it from the commit-message sidecar, #5410). loadAgentAuthoredPR
 		// already returns prBodyReasonBodyAbsent for it, so the reason passes
 		// through unchanged and the call site marks it exactly as it marks a
 		// full fallback (#3012 binding condition 1: reason != none implies the
@@ -14583,7 +14620,9 @@ var prBodyReasons = []prBodyReason{
 // receives the trigger issue number (no issueNumber field exists anywhere in
 // this package), so it structurally cannot synthesize the missing `Closes #N`,
 // and there is no retro-edit path to add one later (#2782). Saying outright that
-// the merge will not auto-close is the honest substitute.
+// the merge will not auto-close is the honest substitute. A body the ordinary
+// path rebuilt from the commit message (#5410) carries prBodyRebuiltMarker
+// instead, whose cost line is conditional on the copied text.
 func prBodyNotComposedMarker(cfg config, reason prBodyReason, checkedPath string) string {
 	return fmt.Sprintf(
 		"> **This pull-request body was not composed by the implement agent.**\n"+
