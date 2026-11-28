@@ -27,9 +27,11 @@ import (
 )
 
 // maxPatchBytes caps the unified-diff hunk text captured by RunPatch
-// into the git_diff event's patch field. 256 KiB stays well under
-// bundle.ReadEvents' 4 MiB per-line scanner buffer (so a capped patch
-// can never trip the line-length limit) and the 64 MiB MaxBundleBytes.
+// into the git_diff event's patch field. 256 KiB stays well under the
+// bundle readers' 16 MiB per-line bound (bundle.MaxLineBytes, mirrored by
+// the backend's bundle.ReadEvents, which also bounds the decompressed
+// total at 256 MiB), so a capped patch can never make bundle.Pack refuse
+// the load-bearing git_diff line, and under the 64 MiB MaxBundleBytes.
 // The patch is content for the implement-review prompt only; it is NOT
 // read by the policy engine, so truncation never affects enforcement.
 const maxPatchBytes = 256 * 1024

@@ -84,9 +84,9 @@ type Invoker struct {
 
 	// TraceLineMaxBytes is the retained-content cap handed to the trace-line
 	// reader (#3020). Zero — the production value — selects
-	// agent.MaxTraceLineBytes (4 MiB). A TEST seam, a peer of Cmd/Now: an
+	// agent.MaxTraceLineBytes (16 MiB). A TEST seam, a peer of Cmd/Now: an
 	// adapter test sets it small and emits modest lines rather than genuine
-	// >4 MiB ones. It substitutes the LIMIT; TraceStream substitutes the SOURCE.
+	// >16 MiB ones. It substitutes the LIMIT; TraceStream substitutes the SOURCE.
 	TraceLineMaxBytes int
 
 	// TraceStream, when non-nil, wraps the child's stdout before the trace-line

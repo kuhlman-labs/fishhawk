@@ -1,0 +1,11 @@
+{
+  "bundle_schema": "v1",
+  "run_id": "11111111-2222-3333-4444-555555555555",
+  "stage_id": "22222222-3333-4444-5555-666666666666",
+  "agent": "claude-code",
+  "model": "claude-opus-4-7",
+  "generated_at": "2026-11-27T12:00:00Z",
+  "runner_kind": "local",
+  "push_and_open_pr": true,
+  "verify_pin_head_sha": "0123456789abcdef0123456789abcdef01234567"
+}

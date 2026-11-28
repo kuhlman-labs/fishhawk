@@ -6,12 +6,17 @@ import (
 )
 
 // MaxTraceLineBytes is the default retained-content cap for a single trace
-// line (4 MiB, ~4x the prior bufio.Scanner limit). A physical line whose
-// CONTENT exceeds this is truncated to the first MaxTraceLineBytes bytes and
-// the rest discarded, rather than aborting the whole read the way
-// bufio.Scanner's ErrTooLong did (#3020). Truncation is bounded: the retained
-// buffer never exceeds this, whatever the physical line length.
-const MaxTraceLineBytes = 4 << 20
+// line (16 MiB). A physical line whose CONTENT exceeds this is truncated to
+// the first MaxTraceLineBytes bytes and the rest discarded, rather than
+// aborting the whole read the way bufio.Scanner's ErrTooLong did (#3020).
+// Truncation is bounded: the retained buffer never exceeds this, whatever
+// the physical line length.
+//
+// KEEP IN SYNC with runner/internal/bundle.MaxLineBytes, which mirrors the
+// backend's bundle reader bound (#5535); this package cannot import bundle.
+// A retained line whose bundle envelope (JSON escaping of a raw line) pushes
+// it over that bound is elided by bundle.Pack, not refused by the backend.
+const MaxTraceLineBytes = 16 << 20
 
 // defaultWorkBufBytes is the working buffer the exported constructor hands to
 // bufio.Reader. It bounds the ReadSlice fragment size, NOT the retained line:

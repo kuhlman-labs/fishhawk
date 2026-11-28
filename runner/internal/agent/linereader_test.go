@@ -260,3 +260,35 @@ func TestTraceLineReader_RetainedMemoryBounded(t *testing.T) {
 		t.Fatalf("Err after EOF = %v, want nil", err)
 	}
 }
+
+// TestTraceLineReader_DefaultCapKeepsFiveMiBLine pins the default cap at
+// 16 MiB (#5535): a 5 MiB line, over the old 4 MiB cap, is returned whole,
+// and a line one byte over 16 MiB is truncated to exactly 16 MiB.
+func TestTraceLineReader_DefaultCapKeepsFiveMiBLine(t *testing.T) {
+	five := strings.Repeat("a", 5<<20)
+	r := NewTraceLineReader(strings.NewReader(five+"\nnext\n"), 0)
+	if !r.Scan() {
+		t.Fatalf("Scan = false, err = %v", r.Err())
+	}
+	if r.Truncated() {
+		t.Fatalf("5 MiB line truncated at the default cap (retained %d of %d)", r.RetainedBytes(), r.OriginalBytes())
+	}
+	if len(r.Bytes()) != len(five) {
+		t.Fatalf("retained %d bytes, want %d", len(r.Bytes()), len(five))
+	}
+	if !r.Scan() || string(r.Bytes()) != "next" {
+		t.Fatalf("next line = %q, want next", r.Bytes())
+	}
+
+	over := strings.Repeat("b", MaxTraceLineBytes+1)
+	r = NewTraceLineReader(strings.NewReader(over+"\n"), 0)
+	if !r.Scan() {
+		t.Fatalf("Scan = false, err = %v", r.Err())
+	}
+	if !r.Truncated() {
+		t.Fatal("line over 16 MiB not truncated at the default cap")
+	}
+	if r.RetainedBytes() != 16<<20 || r.OriginalBytes() != MaxTraceLineBytes+1 {
+		t.Fatalf("retained/original = %d/%d, want %d/%d", r.RetainedBytes(), r.OriginalBytes(), 16<<20, MaxTraceLineBytes+1)
+	}
+}
