@@ -697,7 +697,11 @@ deadline): `backend/internal/mergequeue/README.md`.
   `dispatch_failed`) and surfaces the error, except a head-PINNED dispatch
   the forge refused for a head mismatch, which settles the claim by its
   refusal basis (released on precheck / rest_sha, `dispatch_failed` on
-  graphql_reread, #4749) and is observe-only (#4641). The note follows the
+  graphql_reread, #4749, a basis no longer produced since #4676) and is
+  observe-only (#4641), and a pinned not-merge-ready refusal (pre-claim from
+  the readiness pre-read, or a released leaf refusal), which is observe-only
+  with the `merge_not_ready` object (#4676, § "ADR-112 forge-approval
+  fold"). The head-moved note follows the
   SETTLE outcome (`autoDriveHeadMovedNote`, #4683): `autoDriveNoteHeadMoved`
   (released), `autoDriveNoteHeadMovedBasisHeld` (`dispatch_failed`, the basis
   does not prove nothing applied), `autoDriveNoteHeadMovedReleaseFailed`
@@ -726,10 +730,13 @@ deadline): `backend/internal/mergequeue/README.md`.
   requirements): `mergeTailMergeCallTimeout` 30s on the merge dispatch
   (`dispatchMergeBounded`); `mergeTailForgeReadTimeout` 10s on one observe
   forge read (`observeForgeMergeBounded`: the inline tier-(b) read and the
-  delegated landed read); `mergeTailRepublishTimeout` 10s on the pre-dispatch
-  audit-check recompute and publish (`republishAuditCheckBeforeMergeAtHead`,
-  which the queue's pre-lock republish shares). Worst-case in-lock sums:
-  inline 75s, delegated 65s (derivation on the vars in `merge_run.go`). A
+  delegated landed read); `mergePinnedPreReadTimeout` 5s on the pinned
+  readiness pre-read (#4676; its GET and review snapshot share it);
+  `mergeTailRepublishTimeout` 10s on the pre-dispatch audit-check recompute
+  and publish (`republishAuditCheckBeforeMergeAtHead`, which the queue's
+  pre-lock republish shares). Worst-case in-lock forge sums: inline 80s
+  (10s of non-forge headroom), delegated 70s (20s), derivation on the vars in
+  `merge_run.go`. A
   hung DISPATCH fails the merge (inline 502 `merge_dispatch_failed`,
   delegated "merge dispatch failed"; a deadline is uncertain, so the claim is
   `dispatch_failed`); a hung observe READ falls through (`obsForgeUnavailable`)
@@ -739,7 +746,9 @@ deadline): `backend/internal/mergequeue/README.md`.
 - **Dispatch-path settles.** Inline: a `merge_checks_pending`
   refusal releases the claim, so the re-invoke once the checks pass claims
   again; so does a pinned head-mismatch refusal, `409 merge_head_moved`
-  (#4641). Inline and delegated dispatches are PINNED to the gate's admitted
+  (#4641), and a pinned leaf not-merge-ready refusal
+  (`forge.ErrPullRequestNotMergeReady`, no PUT sent, #4676). A readiness
+  pre-read refusal takes no claim at all. Inline and delegated dispatches are PINNED to the gate's admitted
   head when it is non-empty (§ "ADR-112 forge-approval fold", head-pinned
   bullets), as merge-on-pass is to its verified head. Every ledger write
   after the forge call runs on `context.WithoutCancel` with a bounded
@@ -784,8 +793,10 @@ deadline): `backend/internal/mergequeue/README.md`.
   and `dispatch_claim` on the merge-queue read names why.
 - **Residuals.** GitHub pins only the head: a base push between the locked
   re-probe and the merge call lands the merge on a base the pass did not
-  see. An `inline_merge_dispatched` hold waits on the inline auto-merge; if
-  it never fires the entry holds the line until slice 3's bounded hold. In a
+  see. An `inline_merge_dispatched` hold waits on the inline dispatch to
+  settle (a queued auto-merge on an unpinned dispatch; the pull_request
+  webhook after a synchronous head-pinned GitHub merge, #4676); if it never
+  settles the entry holds the line until slice 3's bounded hold. In a
   dismiss-stale repository requiring an approving review (this one) every
   advance dismisses the approval, so a behind PR's fold answers dismissed:
   the entry WAITS at the head for the approval window, then yields
@@ -919,9 +930,12 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   `approval_dismissed` check never read a veto. So no veto enforcement is
   lost on a gate-less run. What IS lost there is the #4086 inline
   `approval_dismissed` refusal: a branch-protected PR whose approval was
-  dismissed now queues an auto-merge that does not fire until re-approved
-  (the gate view still shows the advisory; on merge-on-pass the typed
-  refusal yields `forge_review_required`).
+  dismissed now answers `409 merge_checks_pending` reason `not_merge_ready`
+  on a head-pinned GitHub dispatch (GitHub reports it blocked; `blocked_by`
+  `review_required` when its reviewDecision says so), and on an unpinned
+  dispatch queues an auto-merge that does not fire until re-approved (the
+  gate view still shows the advisory; on merge-on-pass the typed refusal
+  yields `forge_review_required`).
 - **Fake fidelity.** The mcq fake's GraphQL route IGNORES `writersOnly`
   (real GitHub pre-filters), so the tests exercise the write floor and the
   permission filter; whether GitHub includes DISMISSED in
@@ -938,21 +952,55 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   settled claim's `head_sha` and the pin the forge receives are one value
   (`merge_head_pin_e2e_test.go`). A push landing after the in-lock snapshot
   is refused by the forge instead of merged without a qualifying approval.
-- **Both GitHub arms are pinned.** `ForgeMerger` threads the head to the
-  github leaf (`serve.go::githubAutoMerger` → `githubclient.QueueMerge`). The
-  auto-merge enable carries GraphQL `expectedHeadOid` ("The expected head OID
-  of the pull request",
-  <https://docs.github.com/en/graphql/reference/input-objects#enablepullrequestautomergeinput>).
-  The clean-status REST fallback carries `sha` ("SHA that pull request head
-  must match to allow merge"; 409 when it does not,
-  <https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request>). Ladder
-  contract: `backend/internal/githubclient/README.md` § "Head-pinned
-  auto-merge ladder".
+- **A pinned GitHub dispatch is synchronous and never arms an auto-merge
+  ([#4676](https://github.com/kuhlman-labs/fishhawk/issues/4676)).**
+  `ForgeMerger` threads the head to the github leaf
+  (`serve.go::githubAutoMerger` → `githubclient.QueueMerge`), whose pinned
+  arm (`mergeAtHeadWhenReady`) re-reads the PR and sends ONE REST PUT
+  carrying `sha` ("SHA that pull request head must match to allow merge";
+  409 when it does not,
+  <https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request>) only
+  when GitHub reports the head unchanged and `mergeable_state` `clean` or
+  `has_hooks`. It sends no `enablePullRequestAutoMerge` mutation, so no
+  auto-merge can stay armed across a later write-access push. Leaf contract:
+  `backend/internal/githubclient/README.md` § "Head-pinned synchronous
+  merge".
+- **The server readiness pre-read (#4676).** Inside the merge-intent lock,
+  AFTER the durable verdict (inline) or the delegated forge-approval read,
+  and BEFORE the republish and the claim, `pinnedMergeReadiness` reads the
+  PR: (1) an existing D1 claim in any state skips it, so
+  `merge_already_dispatched` (or `already_merged`) still answers; (2) one
+  `mergePinnedPreReadTimeout` (5s) context bounds its GET and its review
+  snapshot, and a deadline or any read error falls through; (3) a merged or
+  closed PR, a head other than the gate head, or an empty gate head (the
+  unpinned path) falls through; (4) a conflict (`forge.PullRequestConflicting`)
+  refuses as a post-guard conflict; (5) `clean`, `has_hooks`, an empty or
+  unrecognised state falls through; (6) `unstable` keeps today's
+  `checks_pending` identity; (7) `blocked` reads GitHub's reviewDecision:
+  `REVIEW_REQUIRED` / `CHANGES_REQUESTED` are non-resumable
+  (`blocked_by`), `APPROVED`, null or an unreadable snapshot stay
+  resumable; (8) `unknown` is resumable, `behind` and `draft` are not. A
+  fall-through continues to the claim, and the leaf re-checks as the TOCTOU
+  backstop. A non-resumable refusal runs no republish; a resumable one runs
+  today's forced republish (not deduped, Z5) so a stranded
+  `fishhawk_audit_complete` check heals. Neither takes a claim nor writes a
+  settle row.
+- **Precedence (Z1).** The #3109 conflict guard refuses a conflicting PR
+  (`dirty`, or `mergeable` false) with `409 merge_conflicting` BEFORE the
+  verdict and the gate, unchanged. A conflict first seen by the pre-read or
+  the leaf means the PR turned conflicting after the guard: inline answers
+  `409 merge_conflicting` with `verdict_recorded: true`, the delegated arm an
+  observe-only conflict note, never not-merge-ready. Every other
+  not-merge-ready refusal answers `409 merge_checks_pending` reason
+  `not_merge_ready` (`mergeable_state`, `resumable`, `blocked_by`); the
+  delegated arm is observe-only with the `merge_not_ready` object. An
+  unattributed pinned REST 405 keeps the `502 merge_dispatch_failed`.
 - **Typed refusal; the basis decides the claim (#4749).** A head mismatch is
   `forge.ErrMergeConflict` carrying a `*githubclient.HeadMismatchError` that
   names its basis. `classifyMergeDispatchOutcome` releases the claim
   (`merge_dispatch_settled` outcome `released`) ONLY on `precheck` or
-  `rest_sha`; `graphql_reread`, or an empty or unrecognised basis, is
+  `rest_sha`; `graphql_reread` (no longer produced since #4676, retained for
+  rows recorded before it), or an empty or unrecognised basis, is
   uncertain (`mergeDispatchHeadMismatchUncertain`): the claim is
   `dispatch_failed` and a re-invoke answers `merge_already_dispatched` until
   reconciliation or the operator re-arm. The settled row carries
@@ -981,7 +1029,7 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   status, not a proven mismatch) are refusals where nothing applied, and only
   these say "Nothing merged". An EMPTY pre-check head is not the expected
   head, so it is refused as a `precheck` mismatch (fail closed, released: no
-  mutation was sent), while an empty re-read head stays uncertain (#4683). `graphql_reread` is INFERRED: the pinned enable
+  mutation was sent), while an empty re-read head stayed uncertain (#4683). `graphql_reread` (pre-#4676 rows only) is INFERRED: the pinned enable
   answered a GraphQL error and a fresh GET then showed a different head.
   GitHub documents no wording for an `expectedHeadOid` mismatch, so if that
   mutation had in fact applied, auto-merge may be armed at the pinned head.
@@ -1018,17 +1066,113 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   transient hold and re-claim at step 8 on every pump. Left uncertain, the
   claim strands once, loudly
   (`TestClassifyMergeDispatchOutcome_HeadPinRefusalStaysUncertain`).
-- **Residuals.** (Auto-merge persistence) The pre-dispatch window is closed
-  (pre-check plus forge pin), but GitHub does not document whether a QUEUED
-  auto-merge re-checks `expectedHeadOid` when it later fires. Its docs say
-  auto-merge is disabled when someone WITHOUT write permission pushes
-  (<https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request>),
-  so a write-access push after a successful pinned enable may leave
-  auto-merge armed at a head the fold never judged. Tracked as
-  [#4676](https://github.com/kuhlman-labs/fishhawk/issues/4676).
-  Merge-on-pass is synchronous (`MergePullRequestAtHead`), so it has no
-  such window. A late approval (for example dismiss-stale after a queue
-  advance) clears the yield on the next re-probe (no re-invoke needed).
+- **Residuals (auto-merge persistence, #4676).**
+  - *Closed for dispatches after deploy.* A head-pinned GitHub dispatch,
+    inline or delegated, gate-less runs included, is one synchronous REST
+    merge pinned by `sha` and never arms an auto-merge, so a write-access
+    push after the dispatch cannot fire a merge at a head the fold never
+    judged. GitHub disables auto-merge only on a push by someone WITHOUT
+    write permission
+    (<https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request>),
+    which is why an armed pinned enable was not safe. Merge-on-pass was
+    already synchronous (`MergePullRequestAtHead`).
+  - *Not closed by construction (accepted residuals).* (1) An UNPINNED
+    dispatch (a GitLab-family run, or an ungated GitHub admit) still queues
+    an auto-merge. (2) The orchestrator's check-gated `auto_merge` stage
+    (`orchestrator.go` `dispatchAutoMergeStage` → `enableAutoMerge`) still
+    arms an unpinned auto-merge. (3) The campaign driver keeps ticking
+    observe-only on a NON-resumable delegated not-merge-ready state
+    (`behind`, `draft`, `review_required`, `changes_requested`) and raises no
+    decision or page: it reads only Acted, Paged, DecisionRequired and Note
+    (an operator follow-up).
+  - *Auto-merges ARMED BEFORE DEPLOY (X7, revised for Z3).* They are not
+    disarmed, and their runs hold a `dispatched` D1 claim. A dispatched claim
+    is never re-armed (`../../mergequeue/README.md` § "Merge-dispatch
+    ledger") and #4676 adds no claim-deletion path, so Fishhawk cannot
+    re-dispatch these runs: a re-invoke answers `merge_already_dispatched`.
+    The procedure that works:
+    1. List open Fishhawk pull requests with auto-merge armed:
+       `gh pr list --state open --limit 1000 --json number,headRefOid,autoMergeRequest`.
+       The list must be complete: `gh pr list` returns 30 by default, so
+       raise `--limit` above the repository's open-PR count and confirm
+       the returned count is below it, or an older armed PR is missed.
+    2. Compare each PR head (`headRefOid`) with the claim head
+       (`fishhawk_get_merge_queue` `dispatch_claim`, or
+       `fishhawk_get_run_status`).
+    3. Disable auto-merge: `gh pr merge <n> --disable-auto`.
+    4. If the PR head EQUALS the claim head and the run should land, verify
+       the head yourself, then merge by hand under your own identity, pinned:
+       `gh pr merge <n> --match-head-commit <head>`. If the PR head DIFFERS
+       from the claim head, treat it as UNJUDGED (CC9): merge it by hand only
+       after a fresh qualifying approval at the current head, green required
+       checks including `fishhawk_audit_complete`, no open blocking concern
+       and a current acceptance verdict; otherwise leave auto-merge disabled
+       and do not merge.
+    5. When the webhook does not settle the run, use
+       `fishhawk_record_merge_observation`, then `fishhawk_reconcile_merge`,
+       as `run_status` `completion_blocked.recovery` names. A dispatched claim
+       whose PR reads merged is the normal settled state.
+  - *ADR-109 A1 point 4 is unchanged.* Inline and delegated claims stay
+    outside orphan release. Its rationale (a dispatched row is normal while
+    GitHub auto-merge is armed) no longer applies to a pinned GitHub
+    dispatch, but the decision holds: a synchronous pinned 200 leaves a
+    `dispatched` claim until the pull_request webhook settles the run. No
+    amendment.
+  - *Unsupported.* A branch whose protection or ruleset requires GitHub's
+    native merge queue
+    (<https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue>)
+    is UNSUPPORTED for a pinned dispatch. This is known but unverified.
+  - *Ruleset bypass (Z9).* The GitHub App must NOT be on a ruleset bypass
+    list. GitHub computes `mergeable_state` in a background job
+    (<https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request>), and a
+    bypass actor can merge through requirements
+    (<https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets>),
+    so a bypass-capable App's PUT could land past a pending required check
+    while the read still says clean. The readiness reads narrow that window
+    but cannot close it for a bypass actor.
+  - A late approval (for example dismiss-stale after a queue advance) clears
+    the yield on the next re-probe (no re-invoke needed).
+- **The not-ready wait (#4676, Z5/Z6).** `fishhawk_merge_run` returns at once
+  on a non-resumable `not_merge_ready` and re-POSTs a resumable one every
+  30s (`mergeNotReadyPollInterval`) within its `timeout_seconds` budget;
+  GitHub's `unstable` (`reason` `checks_pending`) keeps the 3s cadence. One
+  resumable POST costs about 6-7 forge requests on a gate-less run (the
+  conflict-guard GET, the gate's GET and compare, the tier-(b) observe GET on
+  a re-POST, the pre-read GET, the review snapshot on `blocked`, and the
+  forced republish's check-run create); a declared gate adds the fold's
+  snapshot plus one permission read per counted approver (typically 9,
+  worst case 18) and one `merge_queue_authorized` row per POST. The default
+  360s wait makes at most 13 POSTs (about 90 / 117 / 234 requests, 13 check
+  runs); the 600s maximum at most 21. `fishhawk_drive_run` keeps polling a
+  resumable delegated state within `max_minutes` at its default poll
+  interval (at most 30s), calling the gate on alternate ticks (CC10), and
+  stops with `decision_required:merge_not_ready` on a non-resumable one; the
+  campaign driver ticks at `campaigndriver.DefaultInterval` (60s) with the
+  same per-tick cost until the state clears. Against the 5,000 requests per
+  hour GitHub App installation limit
+  (<https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#primary-rate-limit-for-github-app-installations>)
+  one waiting run uses well under 10%. The forced republish is NOT deduped:
+  it runs on every resumable refusal and every fall-through, exactly as it
+  runs before every dispatch, so a stale-green required check stays
+  unreachable; its cost is bounded by the cadence, not a cache.
+- **Operator walk (#4676, live validation).** Pass rule: both parts pass.
+  - *(a) No pinned dispatch arms an auto-merge.* On a disposable PR, first
+    reproduce the pre-#4676 product path by hand (the product no longer
+    sends it): resolve the node id (`gh pr view <n> --json id,headRefOid`),
+    then run
+    `gh api graphql -f query='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod, expectedHeadOid: $expectedHeadOid}) { pullRequest { number autoMergeRequest { enabledAt } } } }' -f pullRequestId=<node id> -f mergeMethod=SQUASH -f expectedHeadOid=<head sha>`,
+    push a commit with write access, and record whether
+    `autoMergeRequest` is still set (`gh pr view <n> --json autoMergeRequest`);
+    then disable it (`gh pr merge <n> --disable-auto`). Then drive a pinned
+    run's `fishhawk_merge_run` before the PR is merge-ready: it must answer
+    `checks_pending` reason `not_merge_ready`, and the PR timeline must show
+    no auto-merge-enabled event.
+  - *(b) The wait converges.* After that refusal, once the PR is approved and
+    its required checks pass, the merge must land within N = 2 re-invokes of
+    `fishhawk_merge_run` at the default `timeout_seconds` after the first
+    invocation (at most three invocations, about 18 minutes). Record the
+    measured `mergeable_state` recompute latency. Anything slower FAILS the
+    walk and is filed as a follow-up to retune the cadence or the timeout.
 - **Tests.** `forge_approval_test.go` (the fold;
   `TestFoldSnapshot_VetoUndeterminedNamesDismissReview` over three read
   error classes; `TestReviewGateApprovalSequence_ReadErrorRefuses` and
@@ -1039,8 +1183,14 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   `TestForgeApprovalE2E_InlineStageReadErrorRefuses`), `merge_queue_merge_test.go` (the wait/yield table, evidence
   order, failure modes, post-refusal rows 4/5),
   `merge_queue_eligibility_test.go` (variant restriction),
-  `merge_head_pin_e2e_test.go` (the #4641 pin: precheck, GraphQL and REST
-  arms on the inline and delegated paths, plus a gate-less pinned merge).
+  `merge_head_pin_e2e_test.go` (the #4641 pin: precheck and REST arms on the
+  inline and delegated paths, plus a gate-less pinned merge; the #4676 pin:
+  `TestMergeHeadPinE2E_PinnedNeverArmsAutoMerge` with inline, delegated,
+  control and inline_pre_read subtests, and
+  `TestMergeHeadPinE2E_PinnedMergeStates`, one row per `mergeable_state`
+  class plus the 405 and the dirty-precedence rows), and
+  `merge_not_ready_test.go` (the server pre-read and the inline and delegated
+  answers).
 
 ### ADR-112 R3 yield and R5 visibility ([#4632](https://github.com/kuhlman-labs/fishhawk/issues/4632))
 

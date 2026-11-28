@@ -591,6 +591,12 @@ func TestClassifyMergeDispatchOutcome(t *testing.T) {
 		{"cancel", fmt.Errorf("x: %w", context.Canceled), mergeDispatchUncertain},
 		{"cancel wrapping a 409", fmt.Errorf("%w: %w", context.Canceled, forge.ErrMergeConflict), mergeDispatchUncertain},
 		{"nil", nil, mergeDispatchUncertain},
+		// #4676: a pinned leaf's not-merge-ready refusal sent no PUT, so the
+		// claim releases, conflicting or not, bare or wrapped.
+		{"not merge-ready sentinel", forge.ErrPullRequestNotMergeReady, mergeDispatchRelease},
+		{"not merge-ready typed", &forge.NotMergeReadyError{MergeableState: "blocked", ExpectedHeadSHA: "h1"}, mergeDispatchRelease},
+		{"not merge-ready conflicting", &forge.NotMergeReadyError{MergeableState: "dirty", ExpectedHeadSHA: "h1", Conflicting: true}, mergeDispatchRelease},
+		{"not merge-ready wrapped", fmt.Errorf("dispatch: %w", &forge.NotMergeReadyError{ExpectedHeadSHA: "h1"}), mergeDispatchRelease},
 	} {
 		if got := classifyMergeDispatchOutcome(tc.err); got != tc.want {
 			t.Errorf("%s: classify = %s, want %s", tc.name, got, tc.want)

@@ -6385,3 +6385,133 @@ func driveHasAction(actions []SuggestedAction, name string) bool {
 	}
 	return false
 }
+
+// --- #4676 (Z4): delegated merge_not_ready ----------------------------------
+
+// driveNotReadyOutcome is an observe-only gate answer carrying the
+// merge_not_ready object.
+func driveNotReadyOutcome(state string, resumable, conflicting bool, note string) AutoDriveOutcome {
+	return AutoDriveOutcome{Note: note, MergeNotReady: &autoDriveMergeNotReady{
+		MergeableState: state, Resumable: resumable, Conflicting: conflicting, ClaimOutcome: "pre_claim",
+	}}
+}
+
+// TestDriveRun_MergeNotReadyResumableKeepsPolling (Z4, C23/CC2): five
+// identical resumable merge_not_ready answers never stall the driver (the
+// stall guard would stop at three); it keeps polling until the run settles,
+// recording ONE observe step for the repeated note, and calls the gate on
+// alternate ticks only (CC10).
+func TestDriveRun_MergeNotReadyResumableKeepsPolling(t *testing.T) {
+	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
+	ticks := 0
+	f.setOnStages(func(f *driveFakeBackend) {
+		ticks++
+		if f.gateCalls >= 5 {
+			f.runState = "succeeded"
+		}
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+		return driveNotReadyOutcome("blocked", true, false, "not merge-ready: blocked; the next tick re-gates")
+	})
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q after %d gate calls, want merged (a resumable merge_not_ready never stalls)", out.StoppedReason, f.gateCalls)
+	}
+	if f.gateCalls < 5 {
+		t.Fatalf("gate calls = %d, want >= 5", f.gateCalls)
+	}
+	observe := 0
+	for _, st := range out.StepsTaken {
+		if st.Kind == "gate" && st.Action == "observe" {
+			observe++
+		}
+	}
+	if observe != 1 {
+		t.Errorf("observe steps = %d, want 1 for the repeated identical note: %+v", observe, out.StepsTaken)
+	}
+	// CC10: the gate is skipped on alternate ticks, so the stage reads (one
+	// per tick) outnumber the gate calls.
+	if ticks < 2*f.gateCalls-1 {
+		t.Errorf("ticks = %d for %d gate calls, want the gate called on alternate ticks only", ticks, f.gateCalls)
+	}
+}
+
+// TestDriveRun_MergeNotReadyResumableTimesOut: an always-resumable state ends
+// at the max_minutes deadline, never stalled.
+func TestDriveRun_MergeNotReadyResumableTimesOut(t *testing.T) {
+	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+		return driveNotReadyOutcome("unknown", true, false, "not merge-ready: unknown")
+	})
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	defer srv.Close()
+	r.driveMaxWallclock = 80 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q after %d gate calls, want timeout (never stalled)", out.StoppedReason, f.gateCalls)
+	}
+}
+
+// TestDriveRun_MergeNotReadyNonResumableStops (Z4, C24): a non-resumable
+// state stops decision_required:merge_not_ready after ONE gate call, with the
+// note in the steps and warnings; behind offers fishhawk_rebase_run_branch
+// first, and a conflict is non-resumable too.
+func TestDriveRun_MergeNotReadyNonResumableStops(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		state       string
+		conflicting bool
+		first       string
+	}{
+		{name: "draft", state: "draft", first: "fishhawk_get_gate_view"},
+		{name: "behind", state: "behind", first: "fishhawk_rebase_run_branch"},
+		{name: "conflicting", state: "dirty", conflicting: true, first: "fishhawk_get_gate_view"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			note := "not merge-ready: " + tc.state + "; gh pr ready; waiting will not clear it"
+			f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+				return driveNotReadyOutcome(tc.state, false, tc.conflicting, note)
+			})
+			r, srv := newDriveResolver(t, f, &spawnRecorder{})
+			defer srv.Close()
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if out.StoppedReason != "decision_required:"+driveMergeNotReadyState {
+				t.Fatalf("stopped_reason = %q, want decision_required:merge_not_ready", out.StoppedReason)
+			}
+			if f.gateCalls != 1 {
+				t.Errorf("gate calls = %d, want 1", f.gateCalls)
+			}
+			if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Note != note {
+				t.Errorf("steps = %+v, want the note on the last step", out.StepsTaken)
+			}
+			if !strings.Contains(strings.Join(out.Warnings, "\n"), note) {
+				t.Errorf("warnings = %v, want the note", out.Warnings)
+			}
+			if out.NextActions == nil || len(out.NextActions.Actions) == 0 || out.NextActions.Actions[0].Action != tc.first {
+				t.Fatalf("next_actions = %+v, want %s first", out.NextActions, tc.first)
+			}
+			names := ""
+			for _, a := range out.NextActions.Actions {
+				names += a.Action + " "
+			}
+			if !strings.Contains(names, "fishhawk_get_gate_view") || !strings.Contains(names, "fishhawk_merge_run") {
+				t.Errorf("next_actions = %s, want fishhawk_get_gate_view and fishhawk_merge_run", names)
+			}
+		})
+	}
+}

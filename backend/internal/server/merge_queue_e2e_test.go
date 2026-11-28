@@ -1254,43 +1254,34 @@ func TestMergeQueueE2E_InlineHoldsLockMergeOnPassWaits(t *testing.T) {
 	}
 }
 
-// TestMergeQueueE2E_InlineGenericGraphQLErrorLeavesDispatchFailed (ruling R1
-// tightening): the production githubclient auto-merge mutation answering an
-// HTTP-200 GraphQL INTERNAL error envelope is an UNCERTAIN outcome, so the
-// inline claim is dispatch_failed (never released) on the real ledger.
-func TestMergeQueueE2E_InlineGenericGraphQLErrorLeavesDispatchFailed(t *testing.T) {
+// TestMergeQueueE2E_InlinePinnedUncertainPutLeavesDispatchFailed (ruling R1
+// tightening, reworked for #4676): a head-pinned dispatch is ONE synchronous
+// REST PUT carrying sha. With the PR clean at the gate head the production
+// githubclient leaf sends it, and the PUT answering 502 Bad Gateway is an
+// UNCERTAIN outcome (GitHub may have applied the merge), so the inline claim
+// is dispatch_failed (never released) on the real ledger.
+func TestMergeQueueE2E_InlinePinnedUncertainPutLeavesDispatchFailed(t *testing.T) {
 	w, _ := newMQEWorld(t)
-	r := w.verified("gql", "h1")
-	orig := w.srv.cfg.GitHub
-	target, err := url.Parse(orig.BaseURL)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	rp := httputil.NewSingleHostReverseProxy(target)
-	gql := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/graphql" {
-			rw.Header().Set("Content-Type", "application/json")
-			_, _ = rw.Write([]byte(`{"data":null,"errors":[{"type":"INTERNAL","message":"Something went wrong while executing your query."}]}`))
-			return
-		}
-		rp.ServeHTTP(rw, req)
-	}))
-	t.Cleanup(gql.Close)
-	c := *orig
-	c.BaseURL = gql.URL
-	w.srv.cfg.GateMerger = mqeAutoMerger{gh: &c}
+	r := w.verified("uput", "h1")
+	w.mergeable(r, "clean")
+	w.gh.set(func() { w.gh.putStatus[r.pr] = http.StatusBadGateway })
+	w.srv.cfg.GateMerger = mqeAutoMerger{gh: w.srv.cfg.GitHub}
 
 	resp := w.mergeRun(r)
 	if resp.Code != http.StatusBadGateway || mqeCode(t, resp.Body.Bytes()) != "merge_dispatch_failed" {
 		t.Fatalf("merge = %d %s, want 502 merge_dispatch_failed", resp.Code, resp.Body.String())
 	}
+	if puts := w.gh.putCalls(); len(puts) != 1 || puts[0].SHA != "h1" {
+		t.Fatalf("PUTs = %+v, want one pinned to h1", puts)
+	}
 	if st, path := w.claim(r); st != string(mergequeue.DispatchFailed) || path != mergequeue.DispatchPathInline {
-		t.Fatalf("claim = %q/%q, want dispatch_failed/inline (a generic GraphQL error is uncertain)", st, path)
+		t.Fatalf("claim = %q/%q, want dispatch_failed/inline (an uncertain PUT outcome)", st, path)
 	}
 }
 
 // mqeAutoMerger is the inline GateMerger over the production githubclient
-// auto-merge ladder (QueueMerge, #4641), pinned to the head it is handed.
+// merge dispatch (QueueMerge, #4641): pinned to the head it is handed, which
+// is one synchronous REST merge carrying sha and never an auto-merge (#4676).
 type mqeAutoMerger struct{ gh *githubclient.Client }
 
 func (m mqeAutoMerger) MergePullRequest(ctx context.Context, runRow *run.Run, head string) error {

@@ -46,6 +46,12 @@ commit (409 `merge_candidate_unverified` or
 closed (502 `merge_candidate_check_failed`). Each refusal names the verb that
 clears it; the error-code table in the companion document has the details.
 
+On GitHub, a merge pinned to the verified head is one synchronous merge at
+that head and never queues an auto-merge, so a later push cannot land a head
+nobody approved. A call made before GitHub reports the pull request
+merge-ready merges nothing and answers 409 `merge_checks_pending` with reason
+`not_merge_ready`, naming the state and whether waiting can clear it.
+
 Before that check, the merge verb refuses while another run in the same
 repository has an implement stage dispatched or running whose planned files
 include a path this pull request changes (409
@@ -300,7 +306,7 @@ The v0 REST API exposes **190 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/rebase-branch` | Advance a run branch onto its declared base (operator-gated) |
 | `POST` | `/v0/runs/{run_id}/vouch-commit` | Vouch a foreign commit as run-authored lineage |
 | `POST` | `/v0/runs/{run_id}/retrigger-ci` | Re-run a run PR's failed CI at the current head |
-| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the forge merge with the repository's declared merge method, default squash (skipped when already merged) |
+| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and dispatch the forge merge (on GitHub a head-pinned merge is synchronous, never an auto-merge) with the repository's declared merge method, default squash (skipped when already merged) |
 | `POST` | `/v0/runs/{run_id}/grooming-dispositions` | Record per-entry grooming dispositions (operator-only) |
 | `GET` | `/v0/runs/{run_id}/grooming-dispositions` | Read back the recorded grooming dispositions for a run |
 | `POST` | `/v0/runs/{run_id}/upkeep-dispositions` | Record per-finding upkeep dispositions (captain-only) |

@@ -56,6 +56,12 @@ type runResolver struct {
 	// the poll loop runs without wall-clock sleeps.
 	reviewPollInterval time.Duration
 
+	// notReadyPollInterval is the re-POST cadence fishhawk_merge_run uses
+	// while the backend answers a RESUMABLE not_merge_ready (#4676, Z6).
+	// Zero falls back to mergeNotReadyPollInterval (30s); tests inject a
+	// short value.
+	notReadyPollInterval time.Duration
+
 	// acceptanceVerdictWindow, when non-zero, OVERRIDES
 	// acceptanceVerdictInFlightWindow for fishhawk_await_stage's acceptance
 	// verdict hold (E72.56 / #4072). Tests inject a tiny or a huge value to

@@ -1,0 +1,14 @@
+id: scenario:issue-4676/merge-run-text-states-pinned-merge-never-queues
+statement: The fishhawk_merge_run tool served over MCP states that a head-pinned GitHub merge never queues an auto-merge, so a call before the pull request is merge-ready answers checks_pending (reason not_merge_ready). This covers its description and its output note schema. No served merge text claims that queueing the merge before approval is safe. The server instructions describe the merge as dispatched, not queued, for a head-pinned GitHub merge.
+verify_hint: 'MCP surface on the localhost preview: POST /mcp tools/list (read the fishhawk_merge_run description and the output schema''s note property) and the initialize response''s instructions. The text ''never queues an auto-merge'' is present, and ''before approval is safe'' / ''before approval is also safe'' are absent.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. POST /mcp tools/list (2026-07-28 _meta); read the fishhawk_merge_run description and outputSchema.properties.note.description; searched all served tool JSON for 'before approval is safe' / 'before approval is also safe'. POST /mcp initialize answered -32601 method not found (the 2026-07-28 protocol has no initialize), so I read the server instructions from POST /mcp server/discover.
+assertions:
+    expected: '''never queues an auto-merge'' present in the description and note schema; the ''before approval is safe'' phrasings absent; the instructions describe a pinned merge as dispatched, not queued'
+    observed_at_record: 'Description: ''Approve BEFORE merging: on GitHub a head-pinned merge never queues an auto-merge (#4676), so a call before GitHub reports the pull request merge-ready answers checks_pending (reason not_merge_ready) and merges nothing.'' The note schema carries the same ''never queues an auto-merge ... checks_pending (reason not_merge_ready)''. Neither ''before approval is safe'' nor ''before approval is also safe'' appears in any served tool. Instructions: ''fishhawk_merge_run — ... dispatches the forge merge (... a head-pinned GitHub merge is one synchronous merge at the verified head, never a queued auto-merge)''. Per CC7, queued wording survives only scoped to unpinned dispatches (''On an unpinned dispatch only: If the merge stays queued ...'').'
+    repro_handle: 'POST http://localhost:8090/mcp {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}} with Authorization: Bearer <fhm_ from /v0/runs/{run}/mcp-token>; and the same with method server/discover'
+origin:
+    issue: 4676
+    pr: 5632
+    run_id: 546104a3-59db-4958-9109-b74c04c57347
+    head_sha: d6ebb93ba19c1158e1b5bd67c6bf0973c9344b3a
+    recorded_at: 2026-11-28T15:01:15Z

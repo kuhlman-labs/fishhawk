@@ -5120,8 +5120,10 @@ func campaignOperatorIdentity() server.Identity {
 
 // githubAutoMerger is the GITHUB-FAMILY LEAF of server.ForgeMerger (E45.47 /
 // #3464): may_merge dispatches a github-family run's pull request through
-// GitHub's auto-merge (EnableAutoMerge, with the run's resolved merge method,
-// server.ResolveRunMergeMethod — absent = squash, E93.2 / #4658), and the existing webhook /
+// githubclient.QueueMerge (a head-pinned dispatch is one synchronous REST merge
+// carrying sha, never an auto-merge, #4676; an unpinned one queues GitHub's
+// auto-merge), with the run's resolved merge method
+// (server.ResolveRunMergeMethod — absent = squash, E93.2 / #4658), and the existing webhook /
 // resolveReviewStageOnMerge path settles the review stage. Fails before any
 // HTTP call when the run lacks the installation id or PR url the merge needs.
 // server.ForgeMerger delegates github-family runs here byte-for-byte and routes
@@ -5231,7 +5233,7 @@ func (githubAutoMerger) mergeTarget(runRow *runpkg.Run) (forge.CredentialScope, 
 // (E93.2 / #4658) whose body carries sha, so
 // GitHub refuses (409 -> forge.ErrMergeConflict) a head that moved after the
 // queue verified it. It NEVER calls EnableAutoMerge and never takes the
-// clean-status ladder MergePullRequest uses: a queued auto-merge waits on
+// readiness check or the unpinned ladder MergePullRequest uses: a queued auto-merge waits on
 // checks while the base may move, which would merge a tree the queue never
 // verified against the current base.
 func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
@@ -5247,16 +5249,23 @@ func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *ru
 }
 
 // MergePullRequest is the github-family GitHubMerger leaf (inline merge_run
-// and the delegated may_merge arm). The auto-merge ladder — queue auto-merge,
-// fall back to a synchronous REST merge ONLY on the clean-status class, never
-// on the UNSTABLE-status class (#2717) — lives in githubclient.QueueMerge
-// (#4641), so it is one tested production function. headSHA is the head the
-// merge-candidate gate admitted: non-empty PINS both arms (expectedHeadOid on
-// the auto-merge enable, sha on the REST fallback) and a head mismatch surfaces
-// as forge.ErrMergeConflict; empty keeps the unpinned ladder. Both arms carry
-// the run's resolved merge method (server.ResolveRunMergeMethod, E93.2 /
-// #4658). The webhook / resolveReviewStageOnMerge path settles the review
-// stage on the merge.
+// and the delegated may_merge arm). The dispatch lives in
+// githubclient.QueueMerge (#4641), so it is one tested production function.
+// headSHA is the head the merge-candidate gate admitted:
+//
+//   - non-empty is a HEAD-PINNED dispatch and NEVER arms an auto-merge
+//     (#4676): a readiness GET (the head must still be headSHA and
+//     mergeable_state clean or has_hooks), then ONE synchronous REST merge
+//     carrying sha. A moved head surfaces as forge.ErrMergeConflict, a
+//     not-ready PR as forge.ErrPullRequestNotMergeReady (nothing sent), and
+//     unstable as forge.ErrPullRequestUnstableStatus;
+//   - empty keeps the unpinned ladder: queue auto-merge, fall back to a
+//     synchronous REST merge ONLY on the clean-status class, never on the
+//     UNSTABLE-status class (#2717).
+//
+// Both arms carry the run's resolved merge method (server.ResolveRunMergeMethod,
+// E93.2 / #4658). The webhook / resolveReviewStageOnMerge path settles the
+// review stage on the merge.
 func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
 	mm, err := server.ResolveRunMergeMethod(runRow)
 	if err != nil {
@@ -5549,7 +5558,8 @@ func parseCampaignPRURL(prURL string) (forge.RepoRef, int, error) {
 // campaignGateActor adapts *server.Server to campaigndriver.GateActor: it drives
 // a run gate via Server.DriveCampaignRunGate (which wraps AutoDriveRunGate)
 // under the campaign operator identity, dispatching may_merge through the
-// GitHub auto-merge client. The outcome translation lives in
+// GitHub merge client (githubAutoMerger: head-pinned = one synchronous merge,
+// never an auto-merge, #4676). The outcome translation lives in
 // DriveCampaignRunGate (E88.4 / #4528), so this adapter only delegates.
 type campaignGateActor struct {
 	srv    *server.Server
@@ -5573,7 +5583,7 @@ func (a campaignGateActor) DriveRunGateWithCampaign(ctx context.Context, runRow 
 // newCampaignGateActor builds the campaigndriver.GateActor that auto-acts on
 // each run gate under the campaign operator identity (E25.6 / ADR-047), or
 // returns nil — the driver then runs OBSERVE-ONLY — when the GitHub client is
-// unconfigured. The merge knob needs a GitHub client to enable auto-merge; with
+// unconfigured. The merge knob needs a GitHub client to dispatch the merge; with
 // no client the actor could not honour a delegated may_merge, so rather than
 // auto-act on the other knobs while silently dropping merges we fail the whole
 // actor closed and leave every gate parked for the human operator-agent.

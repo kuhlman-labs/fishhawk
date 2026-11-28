@@ -124,7 +124,59 @@ var (
 	// merge method, so a REBASE request is refused before any HTTP call. Wrapped
 	// with ErrUnsupported by its producer.
 	ErrMergeMethodUnsupported = errors.New("forge: merge method not supported by this forge")
+	// ErrPullRequestNotMergeReady means a head-pinned merge dispatch refused
+	// BEFORE sending any merge request, because the forge does not report the
+	// pull request merge-ready at the pinned head (#4676): GitHub's
+	// mergeable_state is not clean / has_hooks (blocked, behind, draft,
+	// unknown, empty, an unrecognised value, or a merge conflict). A pinned
+	// dispatch never arms a queued auto-merge, so nothing was merged or armed
+	// and the merge-dispatch claim is released. Carried by *NotMergeReadyError.
+	// Deliberately NOT wrapped with ErrValidation or ErrPullRequestNotMergeable,
+	// so the merge-method attribution never pays a settings read for it.
+	ErrPullRequestNotMergeReady = errors.New("forge: pull request not merge-ready at the pinned head")
 )
+
+// NotMergeReadyError is the typed refusal a head-pinned merge dispatch
+// returns when the forge does not report the pull request merge-ready at
+// ExpectedHeadSHA (#4676). No merge request was sent. Unwrap returns
+// ErrPullRequestNotMergeReady. Conflicting marks a merge conflict
+// (PullRequestConflicting held), which callers answer with the conflict
+// wording and remedy rather than as "not merge-ready".
+type NotMergeReadyError struct {
+	// MergeableState is GitHub's mergeable_state at the read ("" when the
+	// forge had not computed it yet).
+	MergeableState string
+	// ExpectedHeadSHA is the pinned head the dispatch was for.
+	ExpectedHeadSHA string
+	// Conflicting is true when the pull request has a merge conflict.
+	Conflicting bool
+}
+
+// Error names the state ("unknown" when empty), the pinned head and, when
+// Conflicting, the merge conflict.
+func (e *NotMergeReadyError) Error() string {
+	state := e.MergeableState
+	if state == "" {
+		state = "unknown"
+	}
+	msg := fmt.Sprintf("forge: pull request not merge-ready at pinned head %s (mergeable_state %s)", e.ExpectedHeadSHA, state)
+	if e.Conflicting {
+		msg += ": merge conflict"
+	}
+	return msg
+}
+
+// Unwrap returns ErrPullRequestNotMergeReady.
+func (*NotMergeReadyError) Unwrap() error { return ErrPullRequestNotMergeReady }
+
+// PullRequestConflicting is the ONE merge-conflict predicate (#3109, #4676):
+// GitHub's mergeable_state "dirty", or a non-nil Mergeable that is false. A
+// nil Mergeable (still computing, or a forge without the field) is never a
+// conflict. The server's pre-verdict conflict guard, the pinned readiness
+// pre-read and the GitHub leaf all call it, so the three cannot drift.
+func PullRequestConflicting(mergeableState string, mergeable *bool) bool {
+	return mergeableState == "dirty" || (mergeable != nil && !*mergeable)
+}
 
 // RepoRef identifies a repository by owner + name.
 type RepoRef struct {

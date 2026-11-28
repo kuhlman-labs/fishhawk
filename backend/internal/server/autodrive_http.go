@@ -74,9 +74,9 @@ var autoDriveDispatchStages = map[string]struct{}{
 
 // autoDriveResponse is the POST /v0/runs/{run_id}/auto-drive body: the
 // AutoDriveRunGate outcome, flattened for the drive verb to switch on. The
-// handler serializes it via the direct conversion autoDriveResponse(out), so
-// its fields MUST stay in the SAME order as AutoDriveOutcome (tags are ignored
-// by the conversion; a field-order mismatch fails to compile).
+// handler maps it field by field in newAutoDriveResponse (#4676: the nested
+// merge_not_ready object has its own wire type, so the former direct struct
+// conversion no longer applies).
 //
 // decision_required / decision_state carry the #2091 decision-required outcome
 // (an exhausted fix-up budget / ceiling on the delegated route_fixup arm): the
@@ -101,6 +101,33 @@ type autoDriveResponse struct {
 	ConcernIDs       []string `json:"concern_ids,omitempty"`
 	Reported         bool     `json:"reported"`
 	Note             string   `json:"note"`
+	// MergeNotReady (#4676, Z4) is present only on a delegated pinned
+	// not-merge-ready or conflict observe-only outcome; fishhawk_drive_run
+	// keeps polling a resumable state and stops on a non-resumable one.
+	MergeNotReady *autoDriveMergeNotReadyWire `json:"merge_not_ready,omitempty"`
+}
+
+// autoDriveMergeNotReadyWire is AutoDriveMergeNotReady on the auto-drive wire.
+type autoDriveMergeNotReadyWire struct {
+	MergeableState string `json:"mergeable_state"`
+	Resumable      bool   `json:"resumable"`
+	Conflicting    bool   `json:"conflicting"`
+	BlockedBy      string `json:"blocked_by,omitempty"`
+	ClaimOutcome   string `json:"claim_outcome"`
+}
+
+// newAutoDriveResponse maps an AutoDriveOutcome to the 200 wire body.
+func newAutoDriveResponse(out AutoDriveOutcome) autoDriveResponse {
+	resp := autoDriveResponse{
+		Acted: out.Acted, Action: out.Action, Paged: out.Paged, PageEvent: out.PageEvent,
+		DecisionRequired: out.DecisionRequired, DecisionState: out.DecisionState,
+		ConcernIDs: out.ConcernIDs, Reported: out.Reported, Note: out.Note,
+	}
+	if m := out.MergeNotReady; m != nil {
+		resp.MergeNotReady = &autoDriveMergeNotReadyWire{MergeableState: m.MergeableState, Resumable: m.Resumable,
+			Conflicting: m.Conflicting, BlockedBy: m.BlockedBy, ClaimOutcome: m.ClaimOutcome}
+	}
+	return resp
 }
 
 // handleAutoDrive implements POST /v0/runs/{run_id}/auto-drive (#1700): it
@@ -174,7 +201,7 @@ func (s *Server) handleAutoDrive(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.writeJSON(w, r, http.StatusOK, autoDriveResponse(out))
+	s.writeJSON(w, r, http.StatusOK, newAutoDriveResponse(out))
 }
 
 // recordAutoDriveActRequest is the POST /v0/runs/{run_id}/auto-drive/acts

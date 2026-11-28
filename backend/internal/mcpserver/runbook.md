@@ -91,15 +91,24 @@ One issue → one run → one PR.
    operator verdict (`gh pr review --approve`, under your own GitHub identity —
    App-identity approval is deferred to E39) before every merge — no
    exceptions. Then call **`fishhawk_merge_run`**: one verb records your merge
-   verdict as a chained audit entry, queues the forge merge (the repository's
-   declared merge method, default squash) through the same
+   verdict as a chained audit entry, dispatches the forge merge (the
+   repository's declared merge method, default squash; head-pinned on GitHub:
+   one synchronous merge at the verified head, never an auto-merge, #4676)
+   through the same
    seam `drive_run`'s `may_merge` arm uses, awaits the terminal run state, and
    surfaces your post-merge dev-host step (`scripts/dev post-merge`, surfaced
    for you to run — ADR-038 keeps host mutation out of the MCP surface). The
-   endpoint is idempotent: a timed-out re-invoke or a 502 retry re-queues the
-   merge with no duplicate verdict row, so it is safe to re-call. Queueing the
-   merge before the approval settles is also safe — GitHub fires it once branch
-   protection is satisfied. Before you approve, and for what to do when a wait
+   endpoint is idempotent: a timed-out re-invoke or a 502 retry re-dispatches
+   the merge with no duplicate verdict row, so it is safe to re-call. Approve
+   first: a head-pinned GitHub merge never queues an auto-merge, so a call
+   before GitHub reports the pull request merge-ready answers `checks_pending`
+   with `checks_pending_reason: not_merge_ready` and merges nothing (an
+   unpinned dispatch, such as a GitLab-family run, still queues the forge
+   merge). The pinned readiness read narrows, but cannot close, the window in
+   which GitHub's asynchronous `mergeable_state` still reads clean while a
+   required check is pending, so the GitHub App must NOT be on a ruleset
+   bypass list: a bypass-capable App's merge could land past that check.
+   Before you approve, and for what to do when a wait
    or a refusal stalls, read "Merge and acceptance: approve, wait and recover"
    in the edge-case playbook.
 
@@ -1256,11 +1265,17 @@ re-read, not the one you reviewed.
 
 **Bound every CI wait.** Give each wait a timeout and read the check status
 between calls (`fishhawk_merge_run` `timeout_seconds`, then
-`fishhawk_get_run_status`); never watch checks unbounded. A merge that stays
-queued while the pull request is BLOCKED is answered by the
-`fishhawk_audit_complete` check output on the pull request, whose summary names
-the missing item (where branch protection makes that check gate the merge), or
-by `merge_readiness`.
+`fishhawk_get_run_status`); never watch checks unbounded. On an unpinned
+dispatch, a merge that stays queued while the pull request is BLOCKED is
+answered by the `fishhawk_audit_complete` check output on the pull request,
+whose summary names the missing item (where branch protection makes that check
+gate the merge), or by `merge_readiness`. A head-pinned GitHub merge never
+queues: while GitHub does not report the pull request merge-ready the verb
+answers `checks_pending` with `checks_pending_reason: not_merge_ready`, naming
+`mergeable_state`, `blocked_by` and the remedy. A `resumable: false` answer
+(behind, draft, a required review missing or changes requested) returns at
+once, because waiting will not clear it; a resumable one is re-POSTed every 30
+seconds within `timeout_seconds`.
 
 **Expect all-skip for observables the preview cannot drive.** A plan whose every
 acceptance criterion is `skip_expected` with a basis settles `not_validated`
@@ -1295,8 +1310,8 @@ with `rerun_failed_verify` and a `reason`) and file the flake, naming that row.
 Never infer a flake from a pass count alone.
 
 **Never probe `fishhawk_merge_run`.** Every call is a real merge attempt; with a
-placeholder verdict it records the verdict and queues the merge as soon as the
-gates pass. To check readiness without recording a verdict, read
+placeholder verdict it records the verdict and dispatches the merge as soon as
+the gates pass. To check readiness without recording a verdict, read
 `merge_readiness` on the gate view; it covers the acceptance and review-coverage
 checks (plus an advisory approval check) and not every refusal, so an empty
 `blockers[]` does not predict a clean merge.

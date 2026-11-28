@@ -321,8 +321,12 @@ type approvalDismissedResult struct {
 // dismissed CHANGES_REQUESTED is indistinguishable from a dismissed approval;
 // the refusal therefore says "no approval is live and a prior review was
 // dismissed", and re-approving is the remedy either way. A never-reviewed PR
-// has no DISMISSED review and still queues: the "queueing before approval is
-// safe" contract is unchanged.
+// has no DISMISSED review, so this check stays silent on it. The check is
+// ADVISORY ONLY (the gate view's display; the merge endpoint does not run it,
+// #4619). On a head-pinned dispatch a blocked PR, never-reviewed or not, now
+// answers 409 merge_checks_pending reason not_merge_ready from the readiness
+// pre-read (blocked_by review_required when GitHub reports REVIEW_REQUIRED),
+// because a pinned merge never queues an auto-merge (#4676).
 func (s *Server) approvalDismissedCheck(ctx context.Context, runRow *run.Run) approvalDismissedResult {
 	undetermined := func(why string) approvalDismissedResult {
 		return approvalDismissedResult{Undetermined: why}

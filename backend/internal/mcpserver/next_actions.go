@@ -3187,7 +3187,8 @@ func cancelledPRClosedNextActions(run *Run) *NextActions {
 // mergeRitualActions is the ordered operator merge ritual for a run whose
 // PR is open and safe to act on (E48.7 / #1954): approve the PR under your
 // own GitHub identity (an unchanged gh step), then fishhawk_merge_run — the
-// one verb that records the operator merge verdict, queues the forge merge,
+// one verb that records the operator merge verdict, dispatches the forge merge
+// (queued only on an unpinned dispatch, #4676),
 // awaits the terminal run state, and surfaces the post-merge dev-host step.
 // This replaces the bare merge_pr + post_merge ritual steps; the post-merge
 // walk is folded into fishhawk_merge_run's own surfaced next_action.
@@ -3244,9 +3245,9 @@ func mergeRunAction(run *Run) SuggestedAction {
 	return SuggestedAction{
 		Action:       "fishhawk_merge_run",
 		Params:       map[string]string{"run_id": run.ID, "verdict": "<operator merge verdict>"},
-		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the published fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied). Fishhawk publishes that check but does not make it required: whether it gates the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports. Every call is a real merge attempt: use fishhawk_get_gate_view merge_readiness to check acceptance and review-coverage readiness without recording a verdict",
+		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the published fishhawk_audit_complete check is green — approve first: a head-pinned merge never queues an auto-merge, so an early call answers checks_pending (not_merge_ready). Fishhawk publishes that check but does not make it required: whether it gates the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports. Every call is a real merge attempt: use fishhawk_get_gate_view merge_readiness to check acceptance and review-coverage readiness without recording a verdict",
 		Consumes:     consumesNone,
-		Reason:       "records your operator merge verdict as a chained audit entry, queues the forge merge (the repository's declared merge method, default squash) through the same seam drive_run's may_merge arm uses, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
+		Reason:       "records your operator merge verdict as a chained audit entry, dispatches the forge merge (the declared merge method, default squash; queued only when unpinned) through drive_run's may_merge seam, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
 	}
 }
 

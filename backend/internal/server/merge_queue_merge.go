@@ -250,9 +250,13 @@ func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 	case errors.Is(err, forge.ErrPullRequestUnstableStatus),
 		errors.Is(err, forge.ErrPullRequestNotMergeable),
 		errors.Is(err, forge.ErrMergeConflict),
-		errors.Is(err, forge.ErrMergeUnprocessable):
+		errors.Is(err, forge.ErrMergeUnprocessable),
+		errors.Is(err, forge.ErrPullRequestNotMergeReady):
 		// Typed refusals only: a bare forge.ErrValidation also carries a
 		// generic GraphQL error envelope (HTTP 200), which is uncertain.
+		// ErrPullRequestNotMergeReady (#4676), Conflicting or not: the
+		// pinned leaf refused before sending any PUT, so the forge applied
+		// nothing.
 		return mergeDispatchRelease
 	}
 	return mergeDispatchUncertain
