@@ -81,14 +81,27 @@ stays open (this is a partial delivery; the first-officer seat half is
 remaining scope).
 
 - **Seam.** `Config.HostAdmissionHold` is the package-local interface
-  `HostAdmissionHold { Held(now) (bool, reason string) }`; nil (the default)
-  leaves the marker byte-identical. fishhawkd wires it only under
+  `HostAdmissionHold { Held(now) (bool, reason string); Host() string }`; nil
+  (the default) leaves the marker unchanged. fishhawkd wires it only under
   `--enable-ops-monitor --ops-monitor-dispatch-hold` on a `local` deployment,
   with the SAME `*opsmonitor.AdmissionHold` the ops monitor ticker updates
   (`backend/cmd/fishhawkd/README.md` § "Interim dispatch hold"). That hold is
   held while the memory probe reads CRITICAL pressure and reads not-held once
   the ticker has not updated it for 3 × its effective interval, so a dead
   ticker cannot pin admissions shut (`backend/internal/opsmonitor/README.md`).
+- **Keyed to the measured host** ([#5619](https://github.com/kuhlman-labs/fishhawk/issues/5619)).
+  `Host()` is the label of the host whose memory the hold measured, in the
+  marker's `{"host"}` vocabulary (`""` reads as `unknown`). A held hold
+  refuses a marker (`hostAdmissionHoldApplies`) when the request's label is
+  the measured one, or is `unknown` (a bodyless or pre-#4212 client cannot
+  show that it spawns elsewhere), and refuses EVERY marker when the measured
+  label is itself unresolved. Both are fail-closed. Any other label is
+  admitted, and the marker logs a WARN carrying `stage_id`, `run_id`,
+  `measured_host`, `request_host` and `reason`. The label is client-supplied:
+  this is a resource guard, not an authorization control.
+- **Body.** With the hold wired the optional marker body is parsed even with
+  no slot store, so the 400 `validation_failed` body refusals
+  (`parseHostDispatchBody`) apply whenever the hold is wired, held or not.
 - **Where it fires.** After every eligibility and dependency guard (dev mode,
   auth, runner_kind/executor, terminal run, wave order, post-deploy hold,
   decomposed-parent acceptance), the state switch, the operator per-run
@@ -97,10 +110,12 @@ remaining scope).
   merge-candidate pass refusal (#4811, below), and BEFORE the bare CAS
   or the concurrency slot admission. Only the two admissible arms reach it —
   `pending` (a first plan-stage spawn) and `awaiting_host_dispatch` — so it
-  refuses EVERY new admission, and it commits nothing: no transition, no
+  refuses only new admissions, and it commits nothing: no transition, no
   queue row, no slot.
 - **Refusal.** `409 host_memory_pressure`, details `{stage_id, state, reason,
-  retry: "re-dispatch once the ops monitor clears the condition"}`. A plain
+  retry: "re-dispatch once the ops monitor clears the condition", host,
+  request_host}`; `host` is the measured label (also named in the message) and
+  `request_host` the marker's. A plain
   409, not the queued `concurrency_slot_queued`: an MCP slot waiter stops on
   it and the operator re-dispatches once the condition clears; the stage stays
   where it was.
@@ -115,6 +130,11 @@ remaining scope).
   `…_NilIsDefault`, `…_AlreadyDispatchedUntouched` (the hold is not even
   consulted) and `…_PrecedesSlotAdmission` (a grouped implement stage: a held
   hold never calls `concurrency.Store.Admit`; the not-held control does).
+  Host keying (#5619): `…_MeasuredHostHeld`, `…_OtherHostAdmitted` (200,
+  committed `dispatched`, the WARN), `…_UnlabelledMarkerHeld`,
+  `…_UnresolvedMeasuredHostHoldsEvery`, `…_InvalidBodyRefused` (400 with no
+  slot store, state unchanged) and `…_OpsMonitorTickerEndToEnd` (a real
+  `opsmonitor.NewAdmissionHold` turned held by a real ticker tick).
 
 ## Operator per-run dispatch hold (`run_dispatch_hold.go`, E110.50 / [#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486))
 
@@ -687,8 +707,8 @@ A verify failure after a SUCCESSFUL implement agent pass used to discard the age
 
 - **Recording (`pullrequest.go`).** A `/pull-request` failure report with `resume_kind: "reverify"` records `{branch, head_sha, base_sha}` (+ the optional agent PR text) under its OWN audit category, `verify_resume_checkpoint` (`CategoryVerifyResumeCheckpoint`), appended AFTER `pull_request_failed` so it wins newest-wins — and ONLY when the report newly fails the stage category C (`newlyFailedC`: the handler-loaded state is not `failed` and `FailStage` succeeded). A stage the trace upload already failed (a category-B policy violation or gating-review reject, or a trace-time category C: `no_diff_captured` or the #5264 `verify_infra_tempfail` exit-75 reclassification), a category-B report, or a `FailStage` error records nothing, so a later override retry is never served a rejected tree. A trace-time `verify_infra_tempfail` stage therefore retries as a full agent re-run with the full review path, never a reverify resume. It cannot loop: each failure is one infra-park episode, and once `run.InfraFailureParkRetryBudget` parks are spent the next exit-75 failure fails the run with a `stage_infra_park_budget_exhausted` row (`TestShipTrace_VerifyInfraTempFail_ParkBudgetExhaustsToTerminal`). The loaded state decides because `FailStage` on an already-failed stage is a same-state no-op that returns nil. `recordPushResumeCheckpoint` is generalized over `(category, kind)`; the push call's payload is byte-identical. A reverify checkpoint records NO `verified_tree_sha`, even when the report sends one: the held tree is the one that FAILED verify, and a recorded tree would be named as "verified" by any later `verified_tree_discarded` row. The empty-kind allow-list on the `pull_request_failed` payload is unchanged, so `reverify` can never be laundered into a `pr_open` `push_checkpoint`.
 - **Rollback property.** Same as `push_resume_checkpoint`: a backend that predates the category never queries it, so a reverted resolver sees only a checkpoint-less `pull_request_failed` and the retry is a full agent re-run. An OLD backend receiving `resume_kind: reverify` records nothing (the allow-list skips it and the post-append switch has no default).
-- **Resolution (`prompt.go`).** `newestPushCheckpoint` walks the category as a carrier AND an invalidator (`pushCheckpointCategories`) and derives `resumeKindReverify` from the category alone. `resolvePushCheckpointResume` serves it as `held_commit_resume_kind: reverify` with the held coordinates and PR text and NO `held_commit_verified_tree_sha`. TOTAL DECLINES (no held-commit fields; the retry is an ordinary agent re-run): no `reverify-resume` token in `X-Fishhawk-Runner-Capabilities` → `runner_capability_absent`; a decomposition child → `child_resume_kind_unsupported` (the runner never arms reverify for a child, and its consume arm ends in the standalone PR-open tail); a fix-up dispatch → refused by the existing `fixup` guard. With no recorded tree, a decline writes no `verified_tree_discarded` row.
-- **Retry.** `retryStageAs`' keep-concerns decision reads `newestPushCheckpoint`, so a resumable reverify checkpoint keeps the prior round's implement-review concerns exactly like a push one (the optimistic #3621 rule: if the dispatch later falls back to an agent pass, the concerns are stale and get waived). Ahead of it, the #4816 gate (`retryReplaysLiveMergeCandidatePass`): a retry (ordinary or override) of an implement stage whose newest merge-candidate verify trigger is still live and populated replays that verify-only pass (the prompt resolves the trigger first and exclusively, ADR-090 D3), so it keeps the concerns, writes no `verified_tree_discarded` row, and records `replay_kept_reviewed_tree: true` on its `stage_retried` / `stage_override_retried` receipt (the key is present only when true). An unreadable, malformed or consumed trigger falls back fail-safe to today's supersede.
+- **Resolution (`prompt.go`).** `newestPushCheckpoint` walks the category as a carrier AND an invalidator (`pushCheckpointCategories`) and derives `resumeKindReverify` from the category alone. `resolvePushCheckpointResume` serves it as `held_commit_resume_kind: reverify` with the held coordinates and PR text and NO `held_commit_verified_tree_sha`. TOTAL DECLINES (no held-commit fields; the retry is an ordinary agent re-run): no `reverify-resume` token in `X-Fishhawk-Runner-Capabilities` → `runner_capability_absent`; a decomposition child → `child_resume_kind_unsupported` (the runner never arms reverify for a child, and its consume arm ends in the standalone PR-open tail); a fix-up dispatch → declined by the fix-up arm after the newest-wins read (reason `fixup_dispatch`, #3641). With no recorded tree, a decline writes no `verified_tree_discarded` row.
+- **Retry.** `retryStageAs`' keep-concerns decision reads `newestPushCheckpoint`, so a resumable reverify checkpoint keeps the prior round's implement-review concerns exactly like a push one (the optimistic #3621 rule: if the dispatch later falls back to an agent pass, the concerns are stale and get waived — for example, an OLD runner claims the dispatch and the prompt gate declines it, recording `verified_tree_discarded`; and when `maybeRecoverFixupFailure` returns false the stage stays failed, a retry keeps the concerns, and the re-dispatch is a fix-up that now declines with `fixup_dispatch`). Ahead of it, the #4816 gate (`retryReplaysLiveMergeCandidatePass`): a retry (ordinary or override) of an implement stage whose newest merge-candidate verify trigger is still live and populated replays that verify-only pass (the prompt resolves the trigger first and exclusively, ADR-090 D3), so it keeps the concerns, writes no `verified_tree_discarded` row, and records `replay_kept_reviewed_tree: true` on its `stage_retried` / `stage_override_retried` receipt (the key is present only when true). An unreadable, malformed or consumed trigger falls back fail-safe to today's supersede.
 - **Not an activity category.** `verify_resume_checkpoint` is registered in `backend/internal/audit/categories.go` and deliberately NOT in `issuecomment`'s `activityCategories`, like `push_resume_checkpoint`.
 - **Wire.** `resumeKindReverify = "reverify"`, `capabilityReverifyResume = "reverify-resume"` and the category are pinned by `TestResumeKindWireValues` against the same literals the runner's twin test pins; the full capability header a current runner sends is `push-resume,merge-candidate-verify,child-push-resume,reverify-resume,review-obligation-resume`. The shared golden `testdata/wire/reverify_failure_report.json` is the runner-marshalled failure body: the backend posts it through the real handler (`TestShipPullRequest_FailedReverifyRecordsVerifyResumeCheckpoint`, and the handler → audit → resolver crossing `TestReverifyCheckpoint_FailureReportThenPromptServes`), the runner asserts its marshalled body equals it. No struct field is added on either side, so `wirecontract` gains no row.
 

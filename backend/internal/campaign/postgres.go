@@ -227,9 +227,11 @@ func (r *postgresRepo) CreateCampaignItem(ctx context.Context, p CreateCampaignI
 		IssueRef:   p.IssueRef,
 		DependsOn:  dependsOn,
 		State:      string(ItemStatePending),
-		// Autonomy tier (#1551 / E32.4). Empty is the unknown/default tier; the
-		// column CHECK rejects any out-of-set value.
-		Autonomy: p.Autonomy,
+		// Autonomy tier (#1551 / E32.4), normalized so no write path persists
+		// "": an empty or out-of-set tier lands as the built-in medium
+		// (ADR-069 decision 4, #5316). The column CHECK still admits '' only for
+		// legacy rows.
+		Autonomy: normalizeAutonomy(p.Autonomy),
 		// Queue position (migration 0074): the item's explicit place in the
 		// campaign queue. Written rather than inferred from insertion sequence,
 		// which is not an ordering — every item of one campaign shares one
@@ -308,10 +310,10 @@ func (r *postgresRepo) SetCampaignItemRun(ctx context.Context, itemID uuid.UUID,
 
 // SetCampaignItemAutonomy overwrites the item's autonomy tier (#2355). It is a
 // single UPDATE, NOT a state transition — autonomy is routing metadata, not
-// lifecycle state — so it takes no FOR UPDATE lock. The input is normalized to
-// the CHECK-permitted set FIRST via normalizeAutonomy, so an out-of-set tier
-// persists as "" (the unknown/default tier) instead of violating the
-// migration-0049 column CHECK. pgx.ErrNoRows -> ErrNotFound for a missing item;
+// lifecycle state — so it takes no FOR UPDATE lock. The input is normalized
+// FIRST via normalizeAutonomy, so "" or an out-of-set tier persists as the
+// built-in medium (ADR-069 decision 4, #5316) — never "" and never a
+// migration-0049 column CHECK violation. pgx.ErrNoRows -> ErrNotFound for a missing item;
 // any other error is wrapped. Modelled on SetCampaignItemRun.
 func (r *postgresRepo) SetCampaignItemAutonomy(ctx context.Context, id uuid.UUID, autonomy string) (*Item, error) {
 	q := campaigndb.New(r.pool)

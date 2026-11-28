@@ -167,8 +167,10 @@ type AssembledItem struct {
 	DependsOn []string // sibling issue refs this item waits on
 	Wave      int      // 0-based topological wave index
 	// Autonomy is the item's autonomy tier (low|medium|high), copied from the
-	// source EpicChild.Autonomy. Empty when the child carried no autonomy label.
-	// Persist threads it onto CreateCampaignItemParams so it reaches the
+	// source EpicChild.Autonomy and normalized: a child with no autonomy label
+	// already carries the repository conventions' default from the provider
+	// (ADR-069 decision 4, #5316), and a "" or out-of-set tier from any other
+	// source degrades to the built-in medium. Never "". Persist threads it onto CreateCampaignItemParams so it reaches the
 	// campaign_items.autonomy column (#1551 / E32.4).
 	Autonomy string
 	// Position is the item's 0-based place in the campaign queue, stamped by
@@ -291,12 +293,14 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 			DependsOn: deps,
 			Wave:      waveOf[i],
 			// Carry the source child's autonomy tier through so Persist can
-			// stamp campaign_items.autonomy (#1551 / E32.4). Normalize as a
-			// campaign-layer backstop to the fail-closed 0049 CHECK: the parse
-			// boundary already maps an unrecognized `autonomy:<tier>` label to ""
-			// (non-human-led default), but a raw out-of-set tier reaching Assemble
-			// from any other source degrades to "" here rather than aborting the
-			// entire epic campaign with a CHECK violation at Persist.
+			// stamp campaign_items.autonomy (#1551 / E32.4). The provider
+			// boundary already resolved an absent or unrecognized
+			// `autonomy:<tier>` label to the repository conventions' default
+			// (ADR-069 decision 4, #5316); normalizing here is only the
+			// campaign-layer backstop: a "" or raw out-of-set tier reaching
+			// Assemble from any other source degrades to the built-in medium —
+			// never "", and never a CHECK violation that would abort the entire
+			// epic campaign at Persist.
 			Autonomy: normalizeAutonomy(c.Autonomy),
 			// Dense 0-based queue position from the assembled order (migration
 			// 0074). i is the index into res.Children, so this records exactly the
@@ -317,18 +321,15 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 	}, nil
 }
 
-// normalizeAutonomy maps an autonomy tier to the set the campaign_items.autonomy
-// CHECK (migration 0049) permits: "", "low", "medium", "high". Any other value
-// (an out-of-set tier that slipped past the label parse boundary) normalizes to
-// "" — the unknown/default tier the engine treats as non-human-led — so a single
+// normalizeAutonomy is the campaign-layer backstop for an autonomy tier: an
+// in-set tier (low, medium, high) passes through, and "" or any out-of-set value
+// maps to the built-in default `medium` (workmgmt.BuiltinDefaultAutonomyTier,
+// ADR-069 decision 4 / #5316). Resolution against the repository conventions'
+// default happens at the provider boundary; this only guarantees no campaign
+// write path persists "" or trips the migration-0049 column CHECK, so a single
 // mislabeled child can never abort persistence of the whole epic campaign.
 func normalizeAutonomy(tier string) string {
-	switch tier {
-	case "low", "medium", "high":
-		return tier
-	default:
-		return ""
-	}
+	return workmgmt.NormalizeAutonomyTier(tier)
 }
 
 // Persist materializes an Assembly into durable rows via the Repository: it

@@ -87,7 +87,11 @@ parent. A child pages only when all of these hold:
   admit it. These are the SAME calls `host_dispatch.go` makes, and both are
   read-only (pinned by `TestScanUndispatchedChildStalls_GuardsStayReadOnly`);
 - the host memory hold (`Config.HostAdmissionHold`) is not held. While it is,
-  the marker refuses every new admission, so no child pages at all;
+  no child pages at all. The marker itself is keyed to the measured host
+  ([#5619](https://github.com/kuhlman-labs/fishhawk/issues/5619)) and refuses
+  only that host's and unlabelled admissions, but the scan cannot know which
+  host will dispatch an undispatched child, so it stays conservative and may
+  skip a page for a child another host could have dispatched;
 - it is not held behind a live fan-out's cap (below).
 
 The child predicate mirrors those marker checks only, not every marker

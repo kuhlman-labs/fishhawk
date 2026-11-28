@@ -266,6 +266,15 @@ var fetchConflictBranchTip = gitops.FetchBaseTip
 // failure branch.
 var conflictTreeTempDir = ""
 
+// conflictTreeGit builds the git admin runner the throwaway tree's
+// `worktree add` and its targeted deregistrations (deregisterWorktree) run
+// through against dispatchDir (#4281). The default routes through gitOutRaw, so
+// the HardeningArgs choke point still applies. var (not func) so tests can
+// record the add-failure branch's deregistration.
+var conflictTreeGit = func(dispatchDir string) gitAdminRunner {
+	return func(c context.Context, a ...string) ([]byte, error) { return gitOutRaw(c, dispatchDir, a...) }
+}
+
 // gitOut runs git in repoDir and returns trimmed stdout.
 func gitOut(ctx context.Context, repoDir string, args ...string) (string, error) {
 	out, err := gitOutRaw(ctx, repoDir, args...)
@@ -1564,10 +1573,24 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 		}
 	}
 	tree := filepath.Join(parent, "tree")
-	if _, err := gitOutRaw(ctx, dispatchDir, "worktree", "add", "--detach", tree, tip); err != nil {
-		// Leave no half-registered worktree or leftover dir behind.
+	// The add and every targeted deregistration run through the conflictTreeGit
+	// seam, whose default keeps the gitOutRaw HardeningArgs choke point.
+	git := conflictTreeGit(dispatchDir)
+	if _, err := git(ctx, "worktree", "add", "--detach", tree, tip); err != nil {
+		// Leave no half-registered worktree or leftover dir behind. Deregister
+		// THIS tree before its parent is removed, on a detached, bounded context
+		// so a cancelled pass cannot skip it. Never a repo-wide prune: it would
+		// deregister any worktree the runner cannot see (#4281). A failed
+		// deregistration is logged, never discarded: it may strand a
+		// half-registered entry.
+		dctx, dcancel := detachedTeardownContext(ctx)
+		if derr := deregisterWorktree(dctx, git, tree); derr != nil {
+			logEvent(logSink, "conflict_resolution_teardown_failed", map[string]string{
+				"path": tree, "add_error": err.Error(), "deregister_error": derr.Error(),
+			})
+		}
+		dcancel()
 		_ = os.RemoveAll(parent)
-		_ = gitRun(ctx, dispatchDir, "worktree", "prune")
 		return "", "", noop, &conflictTreeRefusal{
 			Reason:   reasonTreeProvisionFailed,
 			Detail:   "git worktree add: " + err.Error(),
@@ -1585,25 +1608,28 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 		tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), conflictRecoveryTimeout)
 		defer tcancel()
 		removeErr := gitRun(tctx, dispatchDir, "worktree", "remove", "--force", tree)
+		var deregErr error
 		if removeErr != nil {
-			// A locked worktree refuses `remove --force` and is skipped by a plain
-			// `prune`, so unlock first, then RemoveAll, then prune the now-missing
-			// registration (the provisionAcceptanceTree ladder).
-			_ = gitRun(tctx, dispatchDir, "worktree", "unlock", tree)
+			// A locked worktree refuses a single `remove --force`, so RemoveAll the
+			// tree, then deregister exactly this entry (deregisterWorktree: double
+			// force covers a locked entry and an already-missing tree). Never a
+			// repo-wide prune: it would deregister any worktree the runner cannot
+			// see (#4281). The provisionAcceptanceTree ladder.
 			_ = os.RemoveAll(tree)
-			_ = gitRun(tctx, dispatchDir, "worktree", "prune")
+			deregErr = deregisterWorktree(tctx, git, tree)
 		}
 		_ = os.RemoveAll(parent)
 		if removeErr != nil {
 			// The primary remove failed and the fallback ladder ran. Name it
 			// DISTINCTLY rather than emitting the success event: the plan's step-3
 			// distinction (conflict_resolution_tree_removed OR _teardown_failed)
-			// exists precisely so a genuinely stranded tree — the fallback ladder
-			// discards each step's error — is not misreported as cleanly removed
-			// (#3340).
-			logEvent(logSink, "conflict_resolution_teardown_failed", map[string]string{
-				"path": tree, "remove_error": removeErr.Error(),
-			})
+			// exists precisely so a genuinely stranded tree is not misreported as
+			// cleanly removed (#3340).
+			fields := map[string]string{"path": tree, "remove_error": removeErr.Error()}
+			if deregErr != nil {
+				fields["deregister_error"] = deregErr.Error()
+			}
+			logEvent(logSink, "conflict_resolution_teardown_failed", fields)
 			return
 		}
 		logEvent(logSink, "conflict_resolution_tree_removed", map[string]string{"path": tree})

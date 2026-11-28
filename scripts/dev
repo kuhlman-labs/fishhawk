@@ -2258,13 +2258,16 @@ _warn_stale_worktrees() {
 #       cleanliness is POSITIVELY established. Fail-closed on a data-deleting
 #       path (#1917 review): a run worktree is removed ONLY when `git status`
 #       succeeds AND is empty; a status FAILURE (broken gitdir link after an
-#       out-of-band `git worktree prune`, transient git/fs error) or a non-empty
-#       status leaves the dir in place — never rm -rf'd — protecting a dirty or
-#       plausibly-live run. Removal is `git worktree remove` WITHOUT --force, so
-#       git re-checks cleanliness atomically at removal time and REFUSES a run
-#       that turned dirty in the check->remove window (closing the TOCTOU); a
-#       refusal leaves the dir for the next sweep. One `git worktree prune` at
-#       the end reaps the admin entries; plus aged run-*.runid files.
+#       repo-wide `git worktree prune` run from a context that could not see the
+#       tree, transient git/fs error) or a non-empty status leaves the dir in
+#       place — never rm -rf'd — protecting a dirty or plausibly-live run.
+#       Removal is `git worktree remove` WITHOUT --force, so git re-checks
+#       cleanliness atomically at removal time and REFUSES a run that turned
+#       dirty in the check->remove window (closing the TOCTOU); a refusal leaves
+#       the dir for the next sweep. Each `git worktree remove` also deregisters
+#       its own admin entry, so no repo-wide `git worktree prune` runs here: a
+#       prune deletes the admin dir of ANY worktree whose .git this process
+#       cannot see (#4281). Plus aged run-*.runid files.
 #   (2) <tmp_dir> keyed sidecars older than <days> — plain files only (the
 #       fishhawk-acceptance-evidence DIRECTORY is never matched), each glob
 #       requiring a dash after the prefix so the legacy fixed-slot transports
@@ -2315,9 +2318,6 @@ _prune_aged_artifacts() {
         rm -f "$rf" && print "removed runid file: $rf"
       fi
     done
-    if (( ! dry_run )); then
-      git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
-    fi
   fi
 
   # (2) aged keyed /tmp sidecars — plain-file qualifier (.), dash-keyed globs.
@@ -5368,24 +5368,28 @@ _preview_kill_tracked() {
   rm -f "$pid_file"
 }
 
-# Remove the preview worktree at <dir>. `git worktree remove --force` handles
-# the registered case; an unregistered leftover directory (or a repo state git
-# refuses to touch) degrades to rm -rf — the path is our own fixed
-# .fishhawk/preview-worktree, never operator data. Prune afterwards so a stale
-# registration can't block the next `git worktree add`. Idempotent.
+# Remove the preview worktree at <dir>. `git worktree remove --force --force`
+# handles the registered case (double force also covers a locked entry); an
+# unregistered leftover directory (or a repo state git refuses to touch)
+# degrades to rm -rf — the path is our own fixed .fishhawk/preview-worktree,
+# never operator data — followed by the same targeted remove, so a stale
+# registration of <dir> can't block the next `git worktree add`. A registered
+# but missing <dir> gets the targeted remove alone. Never a repo-wide
+# `git worktree prune`: it deletes the admin dir of ANY worktree whose .git this
+# process cannot see (#4281). Idempotent.
 _preview_remove_worktree() {
   local dir="$1"
   if [[ ! -d "$dir" ]]; then
-    git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
+    git -C "${REPO_ROOT}" worktree remove --force --force "$dir" 2>/dev/null || true
     return 0
   fi
-  if git -C "${REPO_ROOT}" worktree remove --force "$dir" 2>/dev/null; then
+  if git -C "${REPO_ROOT}" worktree remove --force --force "$dir" 2>/dev/null; then
     print "preview worktree removed"
   else
     rm -rf "$dir"
+    git -C "${REPO_ROOT}" worktree remove --force --force "$dir" 2>/dev/null || true
     print "preview worktree removed (rm -rf fallback)"
   fi
-  git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
 }
 
 # Credential-stripped exec prefix (E31.18 / #1569 security fixup, ADR-029
@@ -6513,7 +6517,12 @@ cmd_gocache() {
 # lists candidates and exits 0 WITHOUT removing anything — never a hung prompt in
 # a non-interactive session. Branch deletion is delegated to scripts/cleanup-merged
 # AFTER worktree removal (git refuses to delete a branch checked out in any
-# worktree — exactly why cleanup-merged alone never cleans these).
+# worktree — exactly why cleanup-merged alone never cleans these). No path in
+# scripts/dev runs a repo-wide `git worktree prune`: each removal is a targeted
+# `git worktree remove`, which deregisters its own entry, because a prune
+# deletes the admin dir of ANY worktree whose .git this process cannot see
+# (#4281). Registrations of vanished non-Fishhawk worktrees are left for an
+# operator-run prune.
 cmd_sweep() {
   local days=7 assume_yes=0 dry_run=0
   while [[ $# -gt 0 ]]; do
@@ -6621,7 +6630,6 @@ cmd_sweep() {
       print -u2 "warning: could not remove operator worktree (skipped): $c"
     fi
   done
-  git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
 
   # Prune aged run/tmp litter for real.
   _prune_aged_artifacts "$days" 0 || true

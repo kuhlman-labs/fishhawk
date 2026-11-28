@@ -3417,7 +3417,7 @@ func TestGroomingApply_DelegationTierRefusalLeavesBaselineUnaffected(t *testing.
 
 // TestLabelsSetDelegationTier tables the exported predicate itself, including
 // the two boundaries the prose claims: a MALFORMED tier (`autonomy:critical`,
-// which ParseAutonomyLabel normalizes to "" = non-human-led) is still a tier
+// which ParseAutonomyLabel resolves to the conventions default tier) is still a tier
 // PROPOSAL and refused, and a namespace merely CONTAINING the word (`area:autonomy`)
 // is not.
 func TestLabelsSetDelegationTier(t *testing.T) {

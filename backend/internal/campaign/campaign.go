@@ -296,8 +296,11 @@ type Item struct {
 	DependsOn  []string // sibling issue refs this item waits on (the campaign DAG edges)
 	// Autonomy is the item's autonomy tier (low|medium|high), threaded from the
 	// child issue's `autonomy:<tier>` label through EpicChild → AssembledItem →
-	// the campaign_items.autonomy column. Empty means unknown/default (the child
-	// carried no autonomy label), treated by the engine as non-human-led. A
+	// the campaign_items.autonomy column. A child with no autonomy label, or an
+	// unrecognised one, resolves to the repository conventions' default tier
+	// (ADR-069 decision 4, #5316), so new rows always carry low, medium or high.
+	// Empty survives only on legacy pre-#5316 rows; the engine treats it like
+	// medium (non-human-led) until the next reconcile-on-read re-resolves it. A
 	// deps-satisfied autonomy:low item is diverted out of the auto-dispatch
 	// Eligible slice into HumanLed (#1551 / E32.4).
 	Autonomy string

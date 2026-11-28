@@ -592,8 +592,9 @@ func GroomingActionClassFor(reportClass string) string {
 // evadable, and the direction an evasion fails in is a delegation tier written
 // on a real issue with no human in the loop.
 //
-// It is deliberately BROADER than ParseAutonomyLabel, which normalizes an
-// unrecognized tier (`autonomy:critical`) to "" = non-human-led. That breadth is
+// It is deliberately BROADER than ParseAutonomyLabel, which resolves an
+// unrecognized tier (`autonomy:critical`) to the repository conventions'
+// default tier (ADR-069 decision 4, #5316). That breadth is
 // the safe direction here: a malformed tier PROPOSAL is refused and audited
 // rather than parsed away and applied.
 //

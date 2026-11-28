@@ -298,12 +298,12 @@ func unionGroupRequests(base, add []concurrency.GroupRequest) []concurrency.Grou
 // withHostCapacity adds the host capacity group host:<host>:capacity at limit
 // to set (ADR-094 D4): every stage that reaches the marker's admission arm
 // holds one capacity slot. The capacity group is exempt from the store's FIFO
-// rule (b) and admits on ADR-087's reservation formula alone: holders plus
-// earlier live waiters below the limit, so each earlier waiter reserves one
-// slot even while it is blocked only on another group. At capacity 3, two
-// holding implements and one implement queued on local-implement:<host> fill
-// capacity, and a later plan, acceptance or verify pass queues; at capacity 4
-// one slot stays free (concurrency README § "Host capacity group").
+// rule (b) and admits on condition (a) alone, where an earlier live waiter
+// reserves a slot only while it is capacity-bound: every other group of its
+// set would admit it now (ADR-094 A4). A stage queued only on another group
+// reserves nothing, so at capacity 3 two holding implements and any number of
+// implements queued on local-implement:<host> leave one slot for a plan,
+// acceptance or verify pass (concurrency README § "Host capacity group").
 func withHostCapacity(set []concurrency.GroupRequest, host string, limit int) []concurrency.GroupRequest {
 	return unionGroupRequests(set, []concurrency.GroupRequest{{Key: concurrency.CapacityGroupKey(host), Limit: limit}})
 }

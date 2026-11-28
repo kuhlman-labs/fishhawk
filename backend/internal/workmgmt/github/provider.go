@@ -849,7 +849,7 @@ func (p *Provider) epicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 		children = append(children, workmgmt.EpicChild{
 			Number:   s.Number,
 			Title:    s.Title,
-			Autonomy: parseAutonomyLabel(s.Labels),
+			Autonomy: parseAutonomyLabel(s.Labels, req.DefaultAutonomy),
 			// Complete = closed-AND-completed (GitHub IssueState CLOSED with
 			// IssueStateReason COMPLETED, uppercase GraphQL enums). A
 			// not_planned / duplicate close is NOT complete — its work did not
@@ -1276,7 +1276,7 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 		children = append(children, workmgmt.EpicChild{
 			Number:   issue.Number,
 			Title:    issue.Title,
-			Autonomy: parseAutonomyLabel(issue.Labels),
+			Autonomy: parseAutonomyLabel(issue.Labels, req.DefaultAutonomy),
 			// Complete = closed-AND-completed. GetIssue is the REST issue payload,
 			// whose state/state_reason are LOWERCASE ("closed"/"completed") — unlike
 			// ListSubIssues' uppercase GraphQL enums — so match case-insensitively.
@@ -1961,11 +1961,12 @@ func parseDependsOnMarker(body string) []dependsOnRef {
 // parseAutonomyLabel delegates to workmgmt.ParseAutonomyLabel — the single
 // source of truth for the `autonomy:` tier parse (#2355), shared with the
 // reconcile-on-read autonomy refresh path. It is retained as a thin local name
-// so the provider's assembly call sites (EpicChildren / ResolveDependencies) and
-// the existing provider_test table read unchanged, proving the extraction is
-// behavior-preserving.
-func parseAutonomyLabel(labels []string) string {
-	return workmgmt.ParseAutonomyLabel(labels)
+// so the provider's assembly call sites (EpicChildren / ResolveDependencies)
+// read through one helper. defaultTier is the request's DefaultAutonomy — the
+// repository conventions' default an unlabelled or mislabelled child resolves
+// to (ADR-069 decision 4, #5316); the result is never "".
+func parseAutonomyLabel(labels []string, defaultTier string) string {
+	return workmgmt.ParseAutonomyLabel(labels, defaultTier)
 }
 
 // parseRunnableLabel delegates to workmgmt.ParseRunnableLabel — the single

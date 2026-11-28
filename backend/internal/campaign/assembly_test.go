@@ -49,12 +49,13 @@ func TestAssemble_MultiWaveDAG(t *testing.T) {
 
 	// Position is the DENSE 0-based queue position (migration 0074), stamped from
 	// each item's index in res.Children — distinct from Wave, which is the
-	// topological depth. Two items can share a wave and never a position.
+	// topological depth. Two items can share a wave and never a position. The
+	// children carry no tier, so each normalizes to the built-in medium (#5316).
 	wantItems := []campaign.AssembledItem{
-		{IssueRef: "issue:41", DependsOn: nil, Wave: 0, Position: 0},
-		{IssueRef: "issue:42", DependsOn: nil, Wave: 0, Position: 1},
-		{IssueRef: "issue:43", DependsOn: []string{"issue:41"}, Wave: 1, Position: 2},
-		{IssueRef: "issue:44", DependsOn: []string{"issue:42", "issue:43"}, Wave: 2, Position: 3},
+		{IssueRef: "issue:41", DependsOn: nil, Wave: 0, Autonomy: "medium", Position: 0},
+		{IssueRef: "issue:42", DependsOn: nil, Wave: 0, Autonomy: "medium", Position: 1},
+		{IssueRef: "issue:43", DependsOn: []string{"issue:41"}, Wave: 1, Autonomy: "medium", Position: 2},
+		{IssueRef: "issue:44", DependsOn: []string{"issue:42", "issue:43"}, Wave: 2, Autonomy: "medium", Position: 3},
 	}
 	if !reflect.DeepEqual(a.Items, wantItems) {
 		t.Errorf("items = %+v, want %+v", a.Items, wantItems)
@@ -304,7 +305,7 @@ func TestPersist_AssembleThenReadBack(t *testing.T) {
 // against a real pgtest pool, then reads the campaign_items row back — both
 // through the Repository (asserting Item.Autonomy) AND via a raw column SELECT
 // (asserting the campaign_items.autonomy column itself holds "low"). A sibling
-// child carrying no autonomy label reads back the empty (unknown/default) tier.
+// child carrying no tier reads back the built-in medium — never "" (#5316).
 func TestPersist_ThreadsAutonomy_SeamReadBack(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := campaign.NewPostgresRepository(pool)
@@ -313,7 +314,7 @@ func TestPersist_ThreadsAutonomy_SeamReadBack(t *testing.T) {
 	res := &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
 			{Number: 41, Autonomy: "low"}, // human-led
-			{Number: 42},                  // no autonomy label → "" default
+			{Number: 42},                  // no tier → built-in medium (#5316)
 		},
 	}
 	a, err := campaign.Assemble("issue:40", res)
@@ -325,8 +326,8 @@ func TestPersist_ThreadsAutonomy_SeamReadBack(t *testing.T) {
 	if a.Items[0].Autonomy != "low" {
 		t.Errorf("assembled item[0] autonomy = %q, want low", a.Items[0].Autonomy)
 	}
-	if a.Items[1].Autonomy != "" {
-		t.Errorf("assembled item[1] autonomy = %q, want empty", a.Items[1].Autonomy)
+	if a.Items[1].Autonomy != "medium" {
+		t.Errorf("assembled item[1] autonomy = %q, want medium", a.Items[1].Autonomy)
 	}
 
 	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", a)
@@ -345,8 +346,8 @@ func TestPersist_ThreadsAutonomy_SeamReadBack(t *testing.T) {
 	if items[0].IssueRef != "issue:41" || items[0].Autonomy != "low" {
 		t.Errorf("item issue:41 autonomy = %q, want low", items[0].Autonomy)
 	}
-	if items[1].IssueRef != "issue:42" || items[1].Autonomy != "" {
-		t.Errorf("item issue:42 autonomy = %q, want empty", items[1].Autonomy)
+	if items[1].IssueRef != "issue:42" || items[1].Autonomy != "medium" {
+		t.Errorf("item issue:42 autonomy = %q, want medium", items[1].Autonomy)
 	}
 
 	// Read the raw column too: prove campaign_items.autonomy itself holds the
@@ -359,6 +360,30 @@ func TestPersist_ThreadsAutonomy_SeamReadBack(t *testing.T) {
 	}
 	if col != "low" {
 		t.Errorf("campaign_items.autonomy column = %q, want low", col)
+	}
+}
+
+// TestAssemble_UnlabelledChildResolvesToDefaultTier pins the campaign-layer
+// backstop (ADR-069 decision 4, #5316): a child reaching Assemble with no tier
+// at all (a provider that left EpicChild.Autonomy empty) is assembled as the
+// built-in medium, never "", while a declared tier passes through.
+func TestAssemble_UnlabelledChildResolvesToDefaultTier(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 51, Autonomy: ""},
+			{Number: 52, Autonomy: "low"},
+			{Number: 53, Autonomy: "high"},
+		},
+	}
+	a, err := campaign.Assemble("issue:50", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	want := map[string]string{"issue:51": "medium", "issue:52": "low", "issue:53": "high"}
+	for _, it := range a.Items {
+		if it.Autonomy != want[it.IssueRef] {
+			t.Errorf("%s autonomy = %q, want %q", it.IssueRef, it.Autonomy, want[it.IssueRef])
+		}
 	}
 }
 

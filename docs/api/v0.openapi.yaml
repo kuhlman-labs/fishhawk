@@ -6277,7 +6277,7 @@ components:
         One resolved item in a `CampaignPreview` (#3647): the legible half of a
         `CampaignItem`, minus everything that only exists once a campaign row
         does (`id`, `run_id`, `state`, `pause_reason`).
-      required: [issue_ref, depends_on, position]
+      required: [issue_ref, depends_on, autonomy, position]
       properties:
         issue_ref:
           type: string
@@ -6299,7 +6299,11 @@ components:
         autonomy:
           type: string
           enum: [low, medium, high]
-          description: The item's autonomy tier; absent when the issue carries no `autonomy:*` label.
+          description: |
+            The item's autonomy tier. ALWAYS present on both the valid and the
+            invalid path: the declared `autonomy:*` tier, or the repository
+            conventions' default when the label is absent or unrecognised
+            (ADR-069 decision 4, #5316). Never empty.
         position:
           type: integer
           description: The item's 0-based place in the queue the campaign would be created with.
@@ -8158,7 +8162,9 @@ components:
     HostDispatchRequest:
       description: |
         Optional body of `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`
-        (#3964). `host` is the caller's host label; it keys the host groups:
+        (#3964). `host` is the caller's host label; it also keys the interim
+        host memory hold (#5619: a held hold refuses the measured host's
+        label and an absent one), and it keys the host groups:
         the host capacity group `host:<host>:capacity` every admitted stage
         holds (ADR-094 D4, #4241), the default implement group
         `local-implement:<host>`, and the `local-verify:<host>` group (limit
@@ -20382,12 +20388,15 @@ paths:
         declared limit. The stage is admitted into every group of its set at
         once or queued in all of them (no partial hold), FIFO per group
         except that the capacity group is exempt from the multi-group FIFO
-        rule: it admits on holders plus earlier live waiters below the limit
-        alone. A queued stage reserves one capacity slot; later stages queue
-        only when holders plus earlier reservations fill capacity. At
-        capacity 3, two holding implements and one implement queued on
-        `local-implement:<host>` fill capacity, and a later plan, acceptance
-        or verify pass queues; at capacity 4 one slot stays free. The 200 block, the 409 details and both audit
+        rule: it admits on holders plus earlier capacity-bound waiters below
+        the limit alone. An earlier queued stage reserves a capacity slot only
+        while it is capacity-bound: every other group of its set would admit
+        it now (ADR-094 A4). A stage queued only on another group reserves
+        nothing, so later stages queue only when holders plus earlier
+        capacity-bound reservations reach the limit. At capacity 3 with
+        implement limit 2, two holding implements and any number of
+        implements queued on `local-implement:<host>` leave one capacity slot
+        for a plan, acceptance or verify pass. The 200 block, the 409 details and both audit
         rows list the set as `groups`; their top-level group fields describe
         the binding group (a non-capacity group whenever the set has one). On the `pending|awaiting_host_dispatch` arm a
         grouped stage is either ADMITTED (the same CAS to `dispatched`, plus a
@@ -20405,8 +20414,9 @@ paths:
         admitted on (settled, parked, reaped), or by the liveness backstop
         (no heartbeat for 45 minutes while `running`, 15 minutes while
         `dispatched`). The idempotent already-`dispatched` arm and a daemon
-        with no slot store are unchanged (with no slot store the body is not
-        parsed). Audit:
+        with no slot store admit unchanged (the body is not parsed when
+        neither a slot store nor the interim host memory hold below is
+        wired). Audit:
         `stage_concurrency_queued` (once per queue episode) and
         `stage_concurrency_admitted` (every grouped admission).
 
@@ -20442,9 +20452,16 @@ paths:
         off; INTERIM, absorbed later by ADR-100's adaptive concurrency
         controller. With `fishhawkd serve --enable-ops-monitor
         --ops-monitor-dispatch-hold` on a local deployment, while the ops
-        monitor's memory probe reads CRITICAL pressure, every NEW admission —
-        a `pending` or `awaiting_host_dispatch` stage — answers 409
-        `host_memory_pressure`. It is checked after every guard above and
+        monitor's memory probe reads CRITICAL pressure, a NEW admission —
+        a `pending` or `awaiting_host_dispatch` stage — for the MEASURED host
+        answers 409 `host_memory_pressure` (#5619). The measured host label is
+        `--ops-monitor-host-label`, else fishhawkd's own host label (the
+        `HostDispatchRequest.host` ladder). A marker whose `host` is the
+        measured label, or that names no host (`unknown`), is refused
+        (fail-closed); any other `host` is admitted. When no measured label
+        resolves, every marker is refused. With the hold wired the body is
+        parsed even without a slot store, so a malformed body answers 400
+        `validation_failed`. The hold is checked after every guard above and
         BEFORE the CAS and the slot admission, so it commits no transition
         and no queue row. The idempotent already-`dispatched` arm is never
         refused and nothing in flight is touched. A hold the ops monitor has
@@ -20496,7 +20513,8 @@ paths:
         '400':
           description: |
             `validation_failed` — a malformed `run_id` or `stage_id` path
-            value, or (when a slot store is wired) a malformed request body:
+            value, or (when a slot store or the interim host memory hold is
+            wired) a malformed request body:
             not a JSON object, an unknown key, a body over 4 KiB, or a `host`
             longer than 253 characters or outside `[A-Za-z0-9._-]`. A body
             refusal reads no stage and commits nothing.
@@ -20655,11 +20673,17 @@ paths:
               to cover every child (`fishhawk_await_children` names a stuck
               child and its recovery), then re-dispatch.
             - `host_memory_pressure` — the interim host memory hold (E85.11 /
-              #4330, default off): the ops monitor reads CRITICAL host memory
-              pressure, so a `pending` or `awaiting_host_dispatch` stage is
-              not admitted. `details` carries `stage_id`, `state`, `reason`
-              (the probe's observed numbers) and `retry` (`re-dispatch once
-              the ops monitor clears the condition`). Fires BEFORE the CAS and
+              #4330, default off): the ops monitor reads CRITICAL memory
+              pressure on the measured host, so a `pending` or
+              `awaiting_host_dispatch` stage dispatched there is not admitted.
+              Refused when the request's `host` is the measured label or
+              absent (`unknown`), or when no measured label resolved; any
+              other `host` is admitted (#5619). `details` carries `stage_id`,
+              `state`, `reason` (the probe's observed numbers), `retry`
+              (`re-dispatch once the ops monitor clears the condition`),
+              `host` (the measured host label, `unknown` when unresolved) and
+              `request_host` (the request's label, `unknown` when it named
+              none). The message names the measured host. Fires BEFORE the CAS and
               the slot admission, so the stage keeps its state and no queue
               row is written; unlike `concurrency_slot_queued` it carries no
               `Retry-After`, so a slot waiter stops and the operator
@@ -27703,6 +27727,24 @@ paths:
                       `runner_capability_absent`), NEVER to a decomposition
                       child (declined, reason `child_resume_kind_unsupported`),
                       and never to a fix-up dispatch.
+
+                      FIX-UP DISPATCH (#2630, audited since #3641). A fix-up
+                      dispatch is never served any held-commit kind: it must
+                      re-invoke the agent. When the stage's newest checkpoint
+                      is resumable and recorded a verified tree, the decline
+                      appends a `verified_tree_discarded` row with reason
+                      `fixup_dispatch`; the preview render (`/prompt-render`)
+                      writes none, and a `reverify` checkpoint records no tree,
+                      so it writes none either. For a `pr_open` checkpoint the
+                      row records a forgone no-agent resume, and the tree
+                      remains published on the run branch. The rule is one row
+                      per DECLINED FIX-UP DISPATCH while the checkpoint stays
+                      the stage's newest outcome, not one row per discarded
+                      tree: a runner-crash re-dispatch, a fix-up pass that ends
+                      with no changes (`fixup_no_changes`) and a pass that
+                      fails with no `/pull-request` report all leave it newest,
+                      so the next fix-up dispatch records another row for the
+                      same tree. No dedupe is applied.
                   held_commit_verified_tree_sha:
                     type: string
                     description: |
