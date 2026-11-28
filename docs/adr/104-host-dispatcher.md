@@ -139,3 +139,53 @@ Ratification: Captain, 2026-11-24, at the #5489 plan gate ("ratified, proceed").
 - **Residuals.** An untenanted run cannot see a tenanted dispatcher's heartbeat, so it reads `host_dispatcher_absent`; this is a conservative false alarm. Until the dispatcher binary is rebuilt, every item reads absent. `budget_blocked` and `held` are covered by unit rows, not the end-to-end test.
 - **Rollback.** Revert #5572. Migration 0121 has a down migration, and a reverted dispatcher simply stops publishing.
 - **Unchanged.** Q1–Q6, the rest of Q4 and Q7, and Amendment A1 stand unchanged.
+
+## Amendment A3: the dispatcher's caps once the server sizes the host, and stale text
+
+Ratification: Captain, 2026-11-27 (issue #5610), ratifying the text exactly as converged in the operator's ADR review (docs/adr/README.md § "Drafting and review"; round 3: Fable claude-fable-5-2 and Astra gpt-6-astra both APPROVE, at repo commit d991330ad). Recorded by the operator. It changes no front-matter field.
+
+**Context.** Q6 gave the dispatcher its own caps because "until #4241 lands, `FISHHAWK_HOST_CAPACITY` is read by no code". A1 item 1 kept max in-flight (default 2) and the per-tick cap "until #4241 replaces them with host-declared capacity". #4241 has landed. ADR-094 (#4239) Amendment A5 makes this dispatcher's heartbeat the host's one capacity declaration. Three things remain:
+- what the dispatcher's caps now mean;
+- the coupling between the tick and the server's queue TTL. Today the interval cap is a separate 45 s constant (`backend/internal/mcpserver/host_dispatcher_loop.go:52`; `backend/cmd/fishhawk-mcp/host_dispatch.go:32`), and queued re-POSTs spend the per-tick budget (`host_dispatcher_loop.go:1076-1092`);
+- two stale lines in this record.
+
+**Decision.**
+1. **`--max-in-flight` becomes an optional dispatcher share.**
+   - **Unset, the new default.** The share is the governing host capacity, with no separate bound: every stage the dispatcher spawns holds one slot of `host:<label>:capacity` (ADR-094 A2 item 2), so the governing capacity of ADR-094 Amendment A5 bounds it. An operator who wants headroom for interactive sessions sets the share explicitly.
+   - **Set.** It bounds the stages in this dispatcher's own ledger, dispatched or running (`host_dispatcher_loop.go:1326-1333`). It is still checked before the marker POST (`:1311-1314`). At its share the dispatcher POSTs no marker, so it creates no queue row and no capacity reservation, and its queued stages lapse after `QueueTTL`. A share at or above governing capacity adds no tighter bound when the ledger matches live slot holders and capacity is stable; retained ledger entries can still make it bind.
+   - **What this replaces.** It replaces Q6's "max in-flight spawns (default 2)" and, for max in-flight, A1 item 1's "remain until #4241 replaces them". The flag, `FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT` and the `cap_reached:in_flight` refusal keep their syntax.
+2. **The heartbeat carries the host declaration.**
+   - The dispatcher sends `FISHHAWK_HOST_CAPACITY` as the heartbeat's `host_capacity`. It sends a new optional `FISHHAWK_HOST_IMPLEMENT_LIMIT` as `host_implement_limit`. Both follow ADR-094 A2 item 7's parse rules, and an invalid value refuses dispatcher start-up.
+   - An unset variable omits its field, which declares nothing for that limit; the other field still governs (ADR-094 Amendment A5 item 1).
+   - At ingest, a value outside 1..64 drops the declaration, never the heartbeat (ADR-094 Amendment A5 item 1). The rest is stored, so liveness and status still publish, and the response's `dropped_declaration` names the field. The dispatcher logs it once per distinct value, as A2 item 5 logs `dropped_refusals`, and the doctor rung reports it. No earlier declaration is carried forward.
+   - Before its first marker POST after process start, a dispatcher with either declaration field configured needs one successful heartbeat acknowledgement that retained its declaration. Until then it keeps publishing status and retries each tick, but spawns nothing. Later heartbeat failures follow ADR-094 Amendment A5's freshness and fallback rules. The dispatcher publishes this first heartbeat before its first candidate pass and waits for the acknowledgement within the heartbeat timeout, so a restart does not add an interval to the refresh gap. This narrows A2 item 1 at startup.
+   - `scripts/dev` passes `FISHHAWK_HOST_IMPLEMENT_LIMIT` through beside `FISHHAWK_HOST_CAPACITY` (`scripts/dev:3036-3047`).
+   - The dispatcher's markers keep sending `capacity`, which ADR-094 Amendment A5 ignores for admission.
+   - A2 item 7 ("no gate reads it") is narrowed: admission reads these two fields under ADR-094 Amendment A5. The rest of the heartbeat stays advisory, and no dispatch, approval or merge authority changes.
+   - Q6's "Its env carries `FISHHAWK_HOST_CAPACITY` once the marker reads it" now means this declaration.
+3. **Queued refreshes are exempt from the per-tick cap.** On each successful candidate pass, eligible queued stages are offered a refresh without spending that cap. FIFO position is retained only when consecutive successful marker refreshes are less than `QueueTTL` apart (`host_dispatcher_loop.go:38-45`; `backend/internal/concurrency/concurrency.go:61-64`). Pause, share, daily-cap, authorization and eligibility checks still apply; failures and long ticks can let rows lapse. The interval and the cap follow from that rule:
+   - **Interval.** The interval bound is `QueueTTL / 2`, derived from `concurrency.QueueTTL` or from a copy pinned to it by a parity test. That is 30 s today. The default equals the bound, so today's 30 s default is unchanged. A value above the bound is refused as today. The 45 s constant is retired: it is three-quarters of `QueueTTL`, not half. The half-TTL interval provides scheduling margin; it does not bound tick duration or guarantee refresh before expiry.
+   - **Per-tick cap.** A re-POST that refreshes a stage the dispatcher already holds queued (rank 0, `:1276-1285`) does not spend the per-tick cap. The cap (default 4) bounds only new candidates, those this dispatcher process has not recorded as queued; after a restart every candidate is new for one tick. A refresh creates no new reservation, and skipping one forfeits the stage's FIFO position after `QueueTTL`, so a refresh never depends on the cap's value. An admitted refresh spawns without spending the per-tick cap. Governing capacity bounds simultaneous live holders, and an explicit share bounds this dispatcher's ledger occupancy; capacity does not bound the total number of spawns during a tick. The per-tick cap stays with this meaning; this replaces A1 item 1's "remain until #4241 replaces them" for the per-tick cap.
+   - **By design, not violations.** Any refusal before the marker POSTs nothing: pause (Q5(b)), the share (item 1), the daily cap, and campaign, budget or hold refusals. A tick that fails before the candidate pass also re-POSTs nothing, as today.
+4. **`--daily-cap` is unchanged.** It stays an opt-in spawn-count guard (A1 item 2). It is not a spend guard: A1's Context says it counts spawns and weighs no stage's cost. A spend backstop remains the separate decision A1's Consequences name.
+5. **Clarifying lines.**
+   - **Shared preview (Consequences).** "serialized by `local-acceptance` limit 1" now reads: serialized by the built-in `host:<label>:preview-target` group at limit 1. A spec adds that group to acceptance's default `{capacity}` set (ADR-094 D5 as amended by A2 items 1 and 7). This repository declares it at `.fishhawk/workflows.yaml:828-831`. Without that declaration, acceptance holds only capacity (`backend/internal/concurrency/README.md:302`).
+   - **Campaign `max_in_flight` (Q6).** "It honours a campaign's `max_in_flight`" names a field that does not exist: the campaign model carries no such cap (`backend/internal/campaigndriver/driver.go:81-87`). A campaign's work in progress is bounded by the campaign driver's `DefaultMaxParallel` (4 running items per campaign; `driver.go:87`, `:1183`). The dispatcher honours campaign state through Q3 (running campaigns only). This amendment adds no field.
+
+**Consequences.**
+- **Upgrade order.** Upgrade fishhawkd first. An older fishhawkd refuses a heartbeat that carries the new fields (`backend/internal/server/host_dispatcher_heartbeat.go:60`), and campaign status then reads `host_dispatcher_absent`. A dispatcher with a declaration configured also spawns nothing until fishhawkd is upgraded (item 2).
+- **Rollback.** Revert the dispatcher binary. The old default of 2, the 45 s bound and the per-tick charging return.
+- **Behaviour change.** A host whose `.env` sets no share now lets unattended work take the whole governing capacity, and later interactive dispatches queue behind it in FIFO order.
+- **Docs updated in the implementing change:**
+  - `.env.example:102-112`;
+  - the `scripts/dev` hint (`:3129`);
+  - `backend/cmd/fishhawk-mcp/README.md:146-148`;
+  - `scripts/README.md` § "Host dispatcher";
+  - `docs/api/v0.openapi.yaml` for the heartbeat fields.
+- **Unchanged.** Q1–Q5, Q7 and A1 items 2–3 stand unchanged. A2 items 1–6 otherwise stand, subject to item 2's startup publication prerequisite.
+
+**Risks and residuals.**
+- **Tick duration.** Uncharged refreshes make a tick grow with the dispatcher's queued stages, bounded by eligible candidates and the campaign driver's cap; a long tick can let a row lapse.
+- **Startup prerequisite.** An unreachable heartbeat endpoint at start stops a configured dispatcher from spawning. This fails closed and is visible in `status.json` and the doctor. A restart that outlasts `QueueTTL` between refreshes still forfeits the queued stages' positions.
+- **A share is per dispatcher.** It does not see session-spawned stages. When ledger reads fail, it keeps entries and stays closed (`host_dispatcher_loop.go:1213-1215`).
+- **Not decided here.** The work-in-progress caps are not decided here: the ADR-041 decomposition fallback, the `fishhawk_run_children` clamp and a campaign `max_parallel` field. Neither are mirrored constants beyond the interval bound, or the racing-spawners residual.
