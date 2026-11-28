@@ -57,7 +57,7 @@ func shFrame(label, capacity string) string {
 }
 
 func fakeOpts(shell string, timeout time.Duration) dotenvOpts {
-	return dotenvOpts{shell: shell, timeout: timeout, owner: statOwner}
+	return dotenvOpts{shell: shell, timeout: timeout, waitDelay: dotenvWaitDelay, owner: statOwner}
 }
 
 // assertRefused pins the fail-closed contract: a nil map, exactly one warning
@@ -246,6 +246,58 @@ func TestStatOwner_ReportsCurrentUser(t *testing.T) {
 	}
 }
 
+// sysFileInfo is an fs.FileInfo whose Sys() is whatever the test gives it.
+type sysFileInfo struct {
+	fs.FileInfo
+	sys any
+}
+
+func (i sysFileInfo) Sys() any { return i.sys }
+
+// TestStatOwner_FallsClosedOnForeignSys pins the fallbacks a non-unix GOOS
+// would reach: a Sys() with no readable unsigned Uid reports false, so the
+// file is refused as not owned by the current user.
+func TestStatOwner_FallsClosedOnForeignSys(t *testing.T) {
+	type noUid struct{ Gid uint32 }
+	type stringUid struct{ Uid string }
+	cases := []struct {
+		name string
+		sys  any
+	}{
+		{"nil", nil},
+		{"nil pointer", (*syscall.Stat_t)(nil)},
+		{"non-struct", uint32(os.Getuid())},
+		{"pointer to non-struct", new(int)},
+		{"struct without Uid", noUid{Gid: 1}},
+		{"pointer to struct without Uid", &noUid{Gid: 1}},
+		{"non-unsigned Uid", stringUid{Uid: strconv.Itoa(os.Getuid())}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if uid, ok := statOwner(sysFileInfo{sys: tc.sys}); ok {
+				t.Fatalf("statOwner(Sys() = %#v) = (%d, true), want false", tc.sys, uid)
+			}
+		})
+	}
+	// The happy shape through the same fake: a struct with an unsigned Uid.
+	if uid, ok := statOwner(sysFileInfo{sys: &syscall.Stat_t{Uid: 4242}}); !ok || uid != 4242 {
+		t.Fatalf("statOwner(&Stat_t{Uid: 4242}) = (%d, %v), want (4242, true)", uid, ok)
+	}
+}
+
+// TestReadDotenv_NilOwnerUsesStatOwner pins the nil-seam default: a zero
+// dotenvOpts.owner falls back to statOwner, so an operator's own file is
+// sourced rather than refused.
+func TestReadDotenv_NilOwnerUsesStatOwner(t *testing.T) {
+	path := writeDotenv(t, t.TempDir(), "# fake\n")
+	shell := writeFakeShell(t, shFrame("nil-owner", "4"))
+	var warn bytes.Buffer
+	got := readDotenv(path, dotenvOpts{shell: shell, timeout: 5 * time.Second, waitDelay: dotenvWaitDelay}, &warn)
+	if want := map[string]string{hostLabelKey: "nil-owner", hostCapacityKey: "4"}; !mapsEqual(got, want) || warn.Len() != 0 {
+		t.Fatalf("readDotenv with a nil owner = %v (warn %q), want %v", got, warn.String(), want)
+	}
+}
+
 func TestReadDotenv_MissingShellWarnsAndSourcesNothing(t *testing.T) {
 	path := writeDotenv(t, t.TempDir(), "FISHHAWK_HOST_LABEL=no-zsh-label\n")
 	t.Setenv("PATH", t.TempDir())
@@ -301,16 +353,20 @@ func readPidFile(t *testing.T, path string) int {
 // TestReadDotenv_TimeoutSourcesNothing pins the timeout and the group kill: the
 // fake shell would print a valid frame after its sleep grandchild finishes, so
 // only the timeout keeps it from being sourced, and the grandchild must be
-// dead once readDotenv returns. A direct-process kill would leave the sleep
-// alive holding stdout (WaitDelay would still bound the return).
+// dead once readDotenv returns. WaitDelay is lengthened past the sleep, so a
+// direct-process kill would leave the sleep holding stdout and Run would not
+// return for 8s; only the timeout's group kill keeps the return near 1s (the
+// reap after Run would still kill the sleep, so the elapsed bound carries it).
 func TestReadDotenv_TimeoutSourcesNothing(t *testing.T) {
 	path := writeDotenv(t, t.TempDir(), "FISHHAWK_HOST_LABEL=after-sleep\n")
 	pidFile := filepath.Join(t.TempDir(), "sleep.pid")
 	shell := writeFakeShell(t, "sleep 8 &\necho $! > '"+pidFile+"'\nwait\n"+shFrame("after-sleep", "4"))
 	const timeout = time.Second
+	o := fakeOpts(shell, timeout)
+	o.waitDelay = 30 * time.Second
 	var warn bytes.Buffer
 	start := time.Now()
-	got := readDotenv(path, fakeOpts(shell, timeout), &warn)
+	got := readDotenv(path, o, &warn)
 	elapsed := time.Since(start)
 	assertRefused(t, got, warn.String(), path, "timed out after 1s", "after-sleep")
 	if elapsed > 3*timeout {
@@ -325,7 +381,8 @@ func TestReadDotenv_TimeoutSourcesNothing(t *testing.T) {
 // TestReadDotenv_WaitDelayBoundsHeldPipe pins WaitDelay: the fake shell prints
 // a valid frame and exits 0, but leaves a sleep holding stdout. Without
 // WaitDelay, Wait would block until the sleep ends and the frame would be
-// sourced.
+// sourced. The sleep must also be dead once readDotenv returns: the group is
+// reaped on this refusal too, not only on the timeout.
 func TestReadDotenv_WaitDelayBoundsHeldPipe(t *testing.T) {
 	path := writeDotenv(t, t.TempDir(), "FISHHAWK_HOST_LABEL=held-pipe\n")
 	pidFile := filepath.Join(t.TempDir(), "sleep.pid")
@@ -334,10 +391,46 @@ func TestReadDotenv_WaitDelayBoundsHeldPipe(t *testing.T) {
 	start := time.Now()
 	got := readDotenv(path, fakeOpts(shell, 30*time.Second), &warn)
 	elapsed := time.Since(start)
-	readPidFile(t, pidFile)
+	pid := readPidFile(t, pidFile)
 	assertRefused(t, got, warn.String(), path, "left a process holding its output open", "held-pipe")
 	if bound := 3 * (dotenvWaitDelay + time.Second/3); elapsed > bound {
 		t.Errorf("readDotenv took %s, want < %s (WaitDelay must bound a held pipe)", elapsed, bound)
+	}
+	if !processGone(pid, 2*time.Second) {
+		t.Errorf("sleep grandchild %d is still alive after readDotenv returned: the group must be reaped on every exit path", pid)
+	}
+}
+
+// TestReadDotenv_ReapsGroupOnEveryExit pins the reap on the paths that hold
+// no pipe: a sleep with its stdout on the null device outlives the fake shell
+// unless readDotenv kills the group after Run returns, on a refused non-zero
+// exit and on a clean, sourced exit alike.
+func TestReadDotenv_ReapsGroupOnEveryExit(t *testing.T) {
+	cases := []struct {
+		name, tail string
+		want       map[string]string
+		reason     string
+	}{
+		{"non-zero exit", "exit 3", nil, "exited unsuccessfully (exit status 3)"},
+		{"clean exit", "exit 0", map[string]string{hostLabelKey: "reaped", hostCapacityKey: "4"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeDotenv(t, t.TempDir(), "FISHHAWK_HOST_LABEL=reaped\n")
+			pidFile := filepath.Join(t.TempDir(), "sleep.pid")
+			shell := writeFakeShell(t, "sleep 10 >/dev/null 2>&1 &\necho $! > '"+pidFile+"'\n"+shFrame("reaped", "4")+"\n"+tc.tail)
+			var warn bytes.Buffer
+			got := readDotenv(path, fakeOpts(shell, 30*time.Second), &warn)
+			pid := readPidFile(t, pidFile)
+			if tc.want == nil {
+				assertRefused(t, got, warn.String(), path, tc.reason, "reaped")
+			} else if !mapsEqual(got, tc.want) || warn.Len() != 0 {
+				t.Fatalf("readDotenv = %v (warn %q), want %v", got, warn.String(), tc.want)
+			}
+			if !processGone(pid, 2*time.Second) {
+				t.Errorf("sleep grandchild %d is still alive after readDotenv returned: the group must be reaped on every exit path", pid)
+			}
+		})
 	}
 }
 
@@ -349,6 +442,25 @@ func TestReadDotenv_NonZeroExitSourcesNothing(t *testing.T) {
 	var warn bytes.Buffer
 	assertRefused(t, readDotenv(path, fakeOpts(shell, 5*time.Second), &warn), warn.String(), path,
 		"exited unsuccessfully (exit status 3)", "faked")
+}
+
+// TestReadDotenv_ShellFailsToStartSourcesNothing: the shell resolves through
+// LookPath (an executable regular file) but exec fails on its missing
+// interpreter, so Run returns neither a timeout, ErrWaitDelay nor an
+// *exec.ExitError. The generic refusal is the only guard; with it gone the
+// empty output would be refused as a malformed frame instead.
+func TestReadDotenv_ShellFailsToStartSourcesNothing(t *testing.T) {
+	path := writeDotenv(t, t.TempDir(), "FISHHAWK_HOST_LABEL=never-started\n")
+	shell := filepath.Join(t.TempDir(), "bad-interpreter-zsh")
+	if err := os.WriteFile(shell, []byte("#!/nonexistent/fishhawk-no-such-interpreter\n"), 0o755); err != nil { //nolint:gosec // test fixture script
+		t.Fatalf("write fake shell: %v", err)
+	}
+	if _, err := exec.LookPath(shell); err != nil {
+		t.Fatalf("fixture: LookPath must find the fake shell: %v", err)
+	}
+	var warn bytes.Buffer
+	assertRefused(t, readDotenv(path, fakeOpts(shell, 5*time.Second), &warn), warn.String(), path,
+		"exited unsuccessfully; sourcing nothing", "never-started", "exit status")
 }
 
 // TestReadDotenv_ShellSeesMinimalEnv pins that the evaluator gets PATH and
@@ -542,7 +654,9 @@ func TestMergeDotenv_SkipsEmptyAndInvalidCapacity(t *testing.T) {
 			if !strings.Contains(w, hostCapacityKey+" is not an integer in 1..64") {
 				t.Fatalf("warning %q does not name the key and the range", w)
 			}
-			if strings.Contains(w, "="+bad) || strings.Contains(w, "\""+bad+"\"") || strings.Contains(w, " "+bad+";") {
+			// Neither the fixed text nor /c/.env contains abc, 0 or 65, so
+			// any occurrence of the value is a leak, in whatever framing.
+			if strings.Contains(w, bad) {
 				t.Fatalf("warning %q leaks the value %q", w, bad)
 			}
 		})

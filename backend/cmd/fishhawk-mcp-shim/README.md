@@ -163,8 +163,9 @@ spawns.
    operator's own user: `zsh -f -c 'set -a; source "$1" …'` with an
    environment of only `PATH` and `HOME`, stdin and stdout of the `source`
    on the null device, and stderr discarded. It runs at EVERY child spawn,
-   so any side effect in the file runs then too. A `.env` that reads an
-   ambient variable (say `${USER}`) sees it unset here. `zsh -f` skips
+   so any side effect in the file runs then too; a process the file
+   backgrounds is killed when the evaluation ends (item 5). A `.env` that
+   reads an ambient variable (say `${USER}`) sees it unset here. `zsh -f` skips
    `~/.zshenv` and the other startup files, but zsh always reads
    `/etc/zshenv`; a key exported there is what a `scripts/dev` child sees
    too.
@@ -191,10 +192,12 @@ spawns.
    line naming the file and the reason, never a value or any text of the
    file, and sources nothing: a stat error, a FIFO or other non-regular file
    (never opened, so it cannot block a spawn), a file another uid owns, a
-   group- or world-writable file, zsh missing from `PATH`, the 5 s timeout
-   (the whole process group is killed), a non-zero exit, a process left
-   holding the output open, more than 4 KiB of output, and a malformed frame
-   (the file called `exit`, printed from a trap, or put a NUL in a value).
+   group- or world-writable file, zsh missing from `PATH`, the 5 s timeout,
+   a non-zero exit, a process left holding the output open, more than 4 KiB
+   of output, and a malformed frame (the file called `exit`, printed from a
+   trap, or put a NUL in a value). The evaluator's whole process group is
+   SIGKILLed on every path once it returns, the timeout, a refusal and a
+   clean exit alike, so nothing the file backgrounds outlives the evaluation.
 6. **Invalid capacity.** A sourced `FISHHAWK_HOST_CAPACITY` that is not an
    integer in 1..64 (the rule `fishhawk-mcp` applies) is skipped with a line
    naming the key and the range, not the value, so it can never stop the

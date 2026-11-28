@@ -63,14 +63,16 @@ var dotenvKeys = [...]string{hostLabelKey, hostCapacityKey}
 
 // dotenvOpts is how readDotenv evaluates a file. shell is resolved through
 // PATH (tests point it at a fake /bin/sh script); owner reports a file's
-// owning uid (tests substitute a foreign owner).
+// owning uid (tests substitute a foreign owner); waitDelay is cmd.WaitDelay
+// (a test lengthens it so only the timeout's group kill bounds the return).
 type dotenvOpts struct {
-	shell   string
-	timeout time.Duration
-	owner   func(fs.FileInfo) (int, bool)
+	shell     string
+	timeout   time.Duration
+	waitDelay time.Duration
+	owner     func(fs.FileInfo) (int, bool)
 }
 
-var defaultDotenvOpts = dotenvOpts{shell: "zsh", timeout: dotenvTimeout, owner: statOwner}
+var defaultDotenvOpts = dotenvOpts{shell: "zsh", timeout: dotenvTimeout, waitDelay: dotenvWaitDelay, owner: statOwner}
 
 // statOwner reads the owning uid from info.Sys(). The *syscall.Stat_t type
 // exists only on unix GOOS and this file carries no build tag, so the Uid
@@ -143,9 +145,13 @@ func readDotenv(path string, o dotenvOpts, warn io.Writer) map[string]string {
 	// Kill the whole group on timeout, so a sleeping grandchild dies too.
 	cmd.Cancel = func() error { signalKillGroup(cmd); return nil }
 	// Bound Wait when something outside the group still holds stdout.
-	cmd.WaitDelay = dotenvWaitDelay
+	cmd.WaitDelay = o.waitDelay
 
 	runErr := cmd.Run()
+	// Reap the group on every path, not only the timeout: anything the file
+	// backgrounded would otherwise outlive this evaluation, once per spawn.
+	// The leader is already waited, so a group with no member left is ESRCH.
+	signalKillGroup(cmd)
 	if runErr != nil {
 		if ctx.Err() != nil {
 			return refuse(fmt.Sprintf("timed out after %s", o.timeout))

@@ -848,10 +848,12 @@ func TestShimMainProcess(t *testing.T) {
 // execCopiedShim lays out <root>/bin/fishhawk-mcp-shim (a COPY of this test
 // binary: os.Executable may resolve a symlink) beside an echo_env
 // <root>/bin/fishhawk-mcp and a fixture <root>/.env, then execs the copy with
-// no --env-file and no --child under a minimal environment.
-func execCopiedShim(t *testing.T, root string) (*shimConn, *syncBuf) {
+// no --env-file and no --child under a minimal environment whose PATH is
+// pathEnv. It needs no zsh itself: the fake child is a #!/bin/sh script that
+// execs this test binary by absolute path, so a caller that sources a .env
+// calls requireZsh and one that must not can pass a zsh-free PATH.
+func execCopiedShim(t *testing.T, root, pathEnv string) (*shimConn, *syncBuf) {
 	t.Helper()
-	requireZsh(t)
 	bin := filepath.Join(root, "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
@@ -873,7 +875,7 @@ func execCopiedShim(t *testing.T, root string) (*shimConn, *syncBuf) {
 
 	cmd := exec.Command(shim, "-test.run=^TestShimMainProcess$")
 	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
+		"PATH=" + pathEnv,
 		"HOME=" + t.TempDir(),
 		"TMPDIR=" + os.TempDir(),
 		"GO_SHIM_MAIN=1",
@@ -919,6 +921,7 @@ func execCopiedShim(t *testing.T, root string) (*shimConn, *syncBuf) {
 // fishhawk checkout (.git and a regular scripts/dev beside bin/), the shim
 // sources <root>/.env with no flags at all.
 func TestShimDefaultEnvFileBesideBinDir(t *testing.T) {
+	requireZsh(t)
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0o700); err != nil {
 		t.Fatal(err)
@@ -929,7 +932,7 @@ func TestShimDefaultEnvFileBesideBinDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "scripts", "dev"), []byte("#!/bin/zsh\n"), 0o700); err != nil { //nolint:gosec // fixture
 		t.Fatal(err)
 	}
-	c, logs := execCopiedShim(t, root)
+	c, logs := execCopiedShim(t, root, os.Getenv("PATH"))
 	_, env := c.callEnv(2, "probe")
 	assertHostEnv(t, env, "default-label", "4")
 	c.assertNoDotenvLeak(logs.String())
@@ -937,22 +940,37 @@ func TestShimDefaultEnvFileBesideBinDir(t *testing.T) {
 
 // TestShimDefaultEnvFileReleaseLayoutSourcesNothing pins S0-1 end to end: a
 // release-style layout (no .git or scripts/dev beside bin/) sources nothing
-// from the default, and says so once with the --env-file remedy.
+// from the default, and says so once with the --env-file remedy. It needs no
+// zsh, so it runs on CI's zsh-less legs. The "zsh-free PATH" arm runs on every
+// host: there, a shim that skipped the gate would reach the evaluator and say
+// "zsh not found on PATH" instead of the skip line.
 func TestShimDefaultEnvFileReleaseLayoutSourcesNothing(t *testing.T) {
-	root := t.TempDir()
-	c, logs := execCopiedShim(t, root)
-	_, env := c.callEnv(2, "probe")
-	for _, k := range []string{hostLabelKey, hostCapacityKey} {
-		if got := env[k]; got.Set {
-			t.Errorf("child %s = %+v, want unset outside a checkout", k, got)
-		}
+	for _, tc := range []struct {
+		name, path string
+	}{
+		{"host PATH", os.Getenv("PATH")},
+		{"zsh-free PATH", t.TempDir()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			c, logs := execCopiedShim(t, root, tc.path)
+			_, env := c.callEnv(2, "probe")
+			for _, k := range []string{hostLabelKey, hostCapacityKey} {
+				if got := env[k]; got.Set {
+					t.Errorf("child %s = %+v, want unset outside a checkout", k, got)
+				}
+			}
+			if got := env["FISHHAWK_API_TOKEN"]; got.Value != fixtureShimToken {
+				t.Errorf("child FISHHAWK_API_TOKEN = %+v, want the shim's own", got)
+			}
+			l := logs.String()
+			if strings.Count(l, "skipping the default env file") != 1 || !strings.Contains(l, filepath.Join(root, ".env")) || !strings.Contains(l, "--env-file") {
+				t.Errorf("stderr must carry one skip line naming %s and --env-file:\n%s", filepath.Join(root, ".env"), l)
+			}
+			if strings.Contains(l, "sourcing nothing from this file") || !strings.Contains(l, "env_file=(none)") {
+				t.Errorf("the gate must stop the default before the evaluator runs:\n%s", l)
+			}
+			c.assertNoDotenvLeak(l)
+		})
 	}
-	if got := env["FISHHAWK_API_TOKEN"]; got.Value != fixtureShimToken {
-		t.Errorf("child FISHHAWK_API_TOKEN = %+v, want the shim's own", got)
-	}
-	l := logs.String()
-	if strings.Count(l, "skipping the default env file") != 1 || !strings.Contains(l, filepath.Join(root, ".env")) || !strings.Contains(l, "--env-file") {
-		t.Errorf("stderr must carry one skip line naming %s and --env-file:\n%s", filepath.Join(root, ".env"), l)
-	}
-	c.assertNoDotenvLeak(l)
 }
