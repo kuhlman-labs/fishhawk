@@ -1,0 +1,14 @@
+id: scenario:issue-5613/dispatch-stage-description-states-capacity-bound
+statement: 'The fishhawk_dispatch_stage tool description served by fishhawkd''s POST /mcp tools/list states that an earlier queued stage reserves a host capacity slot only while it is capacity-bound (every other group of its set would admit it), with the corrected example: at capacity 3 with implement limit 2, two holding implements and any number of queued implements leave one slot for a plan, acceptance or verify pass. It no longer says ''at capacity 4 one slot stays free'' or ''two holding implements plus one queued implement fill capacity''.'
+verify_hint: On the localhost preview, POST /mcp initialize then tools/list (HTTP JSON-RPC with the preview bearer) and read the fishhawk_dispatch_stage description. TestDispatchStage_Description_HostCapacity decides the same text in-repo.
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature to get an fhm_ bearer. POST /mcp JSON-RPC tools/list with Authorization Bearer, Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list and params._meta io.modelcontextprotocol/protocolVersion|clientInfo|clientCapabilities. Read the fishhawk_dispatch_stage description and grepped it for 'capacity 4', 'fill capacity' and 'plus one queued'.
+assertions:
+    expected: The capacity-bound reservation rule with the corrected capacity-3 example, and no 'at capacity 4 one slot stays free' or 'two holding implements plus one queued implement fill capacity' text
+    observed_at_record: 'The description reads: ''On capacity an earlier queued stage reserves a slot only while it is capacity-bound (every other group of its set would admit it now) and is never a FIFO barrier there, so capacity blocks only when holders plus earlier capacity-bound reservations reach the limit ... A stage queued only on another group reserves no capacity slot (ADR-094 A4). Example: at capacity 3 with implement limit 2, two holding implements and any number of queued implements leave one capacity slot for a plan, acceptance or verify pass.'' The grep found no ''capacity 4'', ''fill capacity'' or ''plus one queued'' text. The served version is dev+e7894ed2e'
+    repro_handle: POST http://localhost:8090/mcp {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{...}}} with an fhm_ bearer
+origin:
+    issue: 5613
+    pr: 5628
+    run_id: 6b7476bf-5ffe-48ee-86f6-5ebfdfd8a7a6
+    head_sha: e7894ed2e3c5b2938371a3d83c1c323d6c12bd00
+    recorded_at: 2026-11-28T07:41:32Z
