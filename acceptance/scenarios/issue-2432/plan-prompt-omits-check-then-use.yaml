@@ -1,0 +1,14 @@
+id: scenario:issue-2432/plan-prompt-omits-check-then-use
+statement: The rendered plan-stage prompt does not carry the implement-scoped check-then-use section.
+verify_hint: 'GET /v0/stages/{stage_id}/prompt-render for a plan stage returns 200, and the prompt body does not contain ''### Check-then-use: use exactly what you validated''.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"}; read stages.plan. GET /v0/stages/{plan_stage_id}/prompt-render.
+assertions:
+    expected: 200 and no check-then-use section
+    observed_at_record: '200, stage_type plan, a 51270-char prompt. ''### Check-then-use: use exactly what you validated'' and ''REVALIDATE on EVERY HOP'' each appear 0 times.'
+    repro_handle: GET /v0/stages/{plan}/prompt-render
+origin:
+    issue: 2432
+    pr: 5603
+    run_id: f295d8b5-25da-4e6e-9fab-f8e33a8a8a91
+    head_sha: b865cb6f04cbcaf6d30355f30b3c6b55c25408ea
+    recorded_at: 2026-11-28T00:18:17Z

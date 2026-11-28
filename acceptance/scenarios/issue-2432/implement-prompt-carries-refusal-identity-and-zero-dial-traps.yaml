@@ -1,0 +1,14 @@
+id: scenario:issue-2432/implement-prompt-carries-refusal-identity-and-zero-dial-traps
+statement: 'The rendered implement-stage prompt''s ''### Counterfactual attainability — confirm in your PR Notes'' section names three new traps: the shared-error-code trap (assert the refusal''s IDENTITY), the egress trap (assert the offending target was NEVER DIALED), and the cap-asserted-by-eventual-failure trap. The existing traps (a)–(f) are still present.'
+verify_hint: GET /v0/stages/{stage_id}/prompt-render for an implement stage returns 200, and the prompt body contains '(g) asserting a SHARED error code', 'NEVER DIALED', '(i) a bound or cap asserted by eventual failure' and '(d) a deletion the FIXTURE masks'.
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"}; read stages.implement. GET /v0/stages/{implement_stage_id}/prompt-render; read the '### Counterfactual attainability — confirm in your PR Notes' section of the prompt.
+assertions:
+    expected: '''(g) asserting a SHARED error code'', ''NEVER DIALED'', ''(i) a bound or cap asserted by eventual failure'', ''(d) a deletion the FIXTURE masks'''
+    observed_at_record: '200. Traps (a)–(f) are present, including ''(d) a deletion the FIXTURE masks''. The new traps: ''(g) asserting a SHARED error code ... assert the refusal''s IDENTITY'', ''(h) an EGRESS control asserted only by its error ... assert the offending target was NEVER DIALED'', and ''(i) a bound or cap asserted by eventual failure ... assert the cap''s own refusal and the exact number of hops served''.'
+    repro_handle: GET /v0/stages/{implement}/prompt-render
+origin:
+    issue: 2432
+    pr: 5603
+    run_id: f295d8b5-25da-4e6e-9fab-f8e33a8a8a91
+    head_sha: b865cb6f04cbcaf6d30355f30b3c6b55c25408ea
+    recorded_at: 2026-11-28T00:18:17Z
