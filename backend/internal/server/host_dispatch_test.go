@@ -2750,35 +2750,42 @@ func (c *countingAdmitStore) count() int {
 // TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission: for a GROUPED stage
 // (an implement stage with a slot store wired) a held hold refuses BEFORE the
 // slot admission, so no queue row or slot can be committed — Admit is never
-// called. The not-held control proves the fixture reaches Admit.
+// called. The not-held control proves the fixture reaches Admit, and a hold
+// held for ANOTHER host reaches it too, from both admissible arms.
 func TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission(t *testing.T) {
+	const waiting, pending = run.StageStateAwaitingHostDispatch, run.StageStatePending
 	for _, tc := range []struct {
 		name       string
+		state      run.StageState
 		held       bool
+		measured   string
+		body       string
 		wantCode   int
 		wantAdmits int
 	}{
-		{"held", true, http.StatusConflict, 0},
-		{"not held", false, http.StatusInternalServerError, 1},
+		{"held", waiting, true, "", "", http.StatusConflict, 0},
+		{"not held", waiting, false, "", "", http.StatusInternalServerError, 1},
+		{"held for another host", waiting, true, "host-a", `{"host":"host-b"}`, http.StatusInternalServerError, 1},
+		{"held for another host, pending", pending, true, "host-a", `{"host":"host-b"}`, http.StatusInternalServerError, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := newOrchestratorRepo()
 			runRow := rr.seedRun()
-			stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+			stage := rr.seedStage(runRow.ID, 0, tc.state)
 			stage.Type = run.StageTypeImplement
 			store := &countingAdmitStore{}
 			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, Concurrency: store,
-				HostAdmissionHold: &fakeAdmissionHold{held: tc.held, reason: "critical"}})
+				HostAdmissionHold: &fakeAdmissionHold{held: tc.held, reason: "critical", host: tc.measured}})
 
-			w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+			w := postHostDispatchBody(t, s, runRow.ID, stage.ID, tc.body, withHostDispatchOperator)
 			if w.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
 			}
 			if got := store.count(); got != tc.wantAdmits {
 				t.Errorf("slot Admit calls = %d, want %d", got, tc.wantAdmits)
 			}
-			if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateAwaitingHostDispatch {
-				t.Errorf("committed state = %q, want awaiting_host_dispatch", cur.State)
+			if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != tc.state {
+				t.Errorf("committed state = %q, want %q", cur.State, tc.state)
 			}
 		})
 	}

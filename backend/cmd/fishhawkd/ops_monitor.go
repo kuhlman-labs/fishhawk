@@ -190,7 +190,9 @@ func registerOpsMonitorDispatchHoldFlag(fs *flag.FlagSet, f *opsMonitorFlags) {
 		"the host label whose memory the probe measures (#5619): the dispatch hold refuses only host-dispatch "+
 			"markers naming it, or naming no host. Empty derives fishhawkd's own label (FISHHAWK_HOST_LABEL > "+
 			"persisted host-id > hostname, the ladder fishhawk-mcp uses); with none resolved the hold refuses "+
-			"every marker. 1..253 characters from [A-Za-z0-9._-]")
+			"every marker. An explicit value must equal the label co-located MCP processes (fishhawkd's /mcp route "+
+			"included) send: set FISHHAWK_HOST_LABEL to the same value, or the hold admits their markers. "+
+			"1..253 characters from [A-Za-z0-9._-]")
 }
 
 // opsMonitorConfig is the validated ops-monitor configuration.

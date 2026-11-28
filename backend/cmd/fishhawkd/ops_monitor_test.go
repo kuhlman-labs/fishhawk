@@ -703,11 +703,12 @@ func TestOpsAdmissionHold(t *testing.T) {
 		wantHost     string
 		wantResolved int
 		wantWarn     bool
+		wantSource   string
 	}{
-		{"explicit flag wins", "flag-host", derived, "flag-host", 0, false},
-		{"derived", "", derived, "derived-host", 1, false},
-		{"nothing resolved", "", resolver("", "none"), "unknown", 1, true},
-		{"nil resolver", "", nil, "unknown", 0, true},
+		{"explicit flag wins", "flag-host", derived, "flag-host", 0, false, "flag"},
+		{"derived", "", derived, "derived-host", 1, false, "persisted"},
+		{"nothing resolved", "", resolver("", "none"), "unknown", 1, true, "none"},
+		{"nil resolver", "", nil, "unknown", 0, true, "none"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resolved = 0
@@ -726,6 +727,21 @@ func TestOpsAdmissionHold(t *testing.T) {
 			}
 			if got := rec.has(slog.LevelWarn, "set --ops-monitor-host-label"); got != tc.wantWarn {
 				t.Errorf("unresolved-label WARN = %v, want %v", got, tc.wantWarn)
+			}
+			var keyed []map[string]string
+			for _, r := range rec.snapshot() {
+				if r.Level != slog.LevelInfo || r.Message != "ops monitor dispatch hold keyed to host" {
+					continue
+				}
+				attrs := map[string]string{}
+				r.Attrs(func(a slog.Attr) bool {
+					attrs[a.Key] = a.Value.String()
+					return true
+				})
+				keyed = append(keyed, attrs)
+			}
+			if len(keyed) != 1 || keyed[0]["host"] != tc.wantHost || keyed[0]["source"] != tc.wantSource {
+				t.Errorf("keyed-to-host INFO attrs = %v, want one with host %q source %q", keyed, tc.wantHost, tc.wantSource)
 			}
 		})
 	}
@@ -1240,12 +1256,13 @@ func TestServe_OpsMonitorDispatchHoldWiring(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
-		name string
-		args []string
+		name    string
+		args    []string
+		started bool // the 'ops monitor started' line is expected
 	}{
-		{"flag off", []string{"--enable-ops-monitor", "--ops-monitor-deployment", "local"}},
-		{"flag on, remote", []string{"--enable-ops-monitor", "--ops-monitor-dispatch-hold", "--ops-monitor-deployment", "remote"}},
-		{"monitor off", []string{"--ops-monitor-dispatch-hold", "--ops-monitor-deployment", "local"}},
+		{"flag off", []string{"--enable-ops-monitor", "--ops-monitor-deployment", "local"}, true},
+		{"flag on, remote", []string{"--enable-ops-monitor", "--ops-monitor-dispatch-hold", "--ops-monitor-deployment", "remote"}, true},
+		{"monitor off", []string{"--ops-monitor-dispatch-hold", "--ops-monitor-deployment", "local"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			code, log, hold := serveCapturingHold(t, func(server.HostAdmissionHold) bool { return true },
@@ -1255,6 +1272,13 @@ func TestServe_OpsMonitorDispatchHoldWiring(t *testing.T) {
 			}
 			if hold != nil {
 				t.Errorf("cfg.HostAdmissionHold = %#v, want nil", hold)
+			}
+			// The presence check keeps the absence check below non-vacuous.
+			if tc.started && !strings.Contains(log, `"dispatch_hold":false`) {
+				t.Errorf("'ops monitor started' does not report dispatch_hold:false:\n%s", log)
+			}
+			if strings.Contains(log, `"dispatch_hold_host"`) {
+				t.Errorf("log carries dispatch_hold_host with no hold wired:\n%s", log)
 			}
 		})
 	}
