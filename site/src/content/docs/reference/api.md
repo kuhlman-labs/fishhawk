@@ -51,7 +51,10 @@ repository has an implement stage dispatched or running whose planned files
 include a path this pull request changes (409
 `overlapping_implement_in_flight`): merging would move the base under that
 agent. Runs that are only planned or parked do not block, and neither does the
-run's own decomposition lineage. When a live implement exists elsewhere and the
+run's own decomposition lineage. An overlap made only of documentation (paths
+under `docs/` or ending in `.md`) does not block either: the other run meets it
+as a rebase conflict instead. One shared code path still blocks, and the
+refusal then lists every shared path. When a live implement exists elsewhere and the
 overlap cannot be decided (a truncated forge compare, a run whose scope does
 not resolve, a GitLab run whose changed paths cannot be read), the verb refuses
 409 `overlap_undetermined`; a read failure is 502 `overlap_check_failed`.

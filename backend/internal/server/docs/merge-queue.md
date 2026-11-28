@@ -565,7 +565,9 @@ deadline): `backend/internal/mergequeue/README.md`.
   (`undeterminable: concerns: …`). Each answer records, claims and merges
   nothing; a merged PR has already settled `pr_merged` at the PR re-read and
   is never refused; the merge overlap guard (#4119) → a 409 holds
-  and appends a deduped, counts-only `merge_queue_overlap_refused`, a 502
+  and appends a `merge_queue_overlap_refused` naming the `blocking[]` /
+  `undetermined[]` runs and their shared paths (#5604), deduped per decision
+  including the blocker set and withheld from run-bound reads, a 502
   holds, no override; the base re-probe (`CompareCommits(head, base)`
   behind > 0 → readvance; an entry with an established approval wait runs
   the fold first, writing nothing, so an expired wait yields with the
@@ -762,8 +764,14 @@ deadline): `backend/internal/mergequeue/README.md`.
   head_sha, verdict_sequence, verdict_head_sha, intent_sequence,
   approval_basis (the fold's live | transferred | not_required),
   authorization_sequence and qualifying_reviewer {login, actor_id,
-  permission} when a gate is declared}; `merge_queue_overlap_refused` {head, code, reason,
-  counts}. **`merge_verdict_recorded.head_sha` is the FIRST merge-on-pass
+  permission} when a gate is declared}; `merge_queue_overlap_refused` {run_id,
+  pr_url, head_sha, refused_code, refused_reason, blocking_count,
+  undetermined_count, blocking[], undetermined[]} (#5604: the two lists use the
+  guard's `mergeOverlapBlocker` shape, `[]` when empty; the row is deduped
+  against the run's LATEST one on code, reason, head, counts AND each listed
+  run's run_id, stage_id and paths, so a changed blocker or shared-path set
+  appends a new row; a legacy counts-only row reads as empty lists; withheld
+  from run-bound audit reads by `withholdScopeOverlapFromRunBound`). **`merge_verdict_recorded.head_sha` is the FIRST merge-on-pass
   attempt's head** (the 0062 once-index keeps one verdict row per run);
   `merge_queue_merged.head_sha` is authoritative for the merged head, and its
   `verdict_head_sha` shows any mismatch.
@@ -2038,8 +2046,9 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
 ## Merge overlap guard (`merge_overlap_guard.go`, E83.61 / [#4119](https://github.com/kuhlman-labs/fishhawk/issues/4119))
 
 `POST /v0/runs/{run_id}/merge` refuses while ANOTHER live run's implement
-stage is writing files this pull request changes: merging moves the base
-under that agent and lands its run in the category-B dead-end class. Unlike
+stage is writing files this pull request changes (unless every shared path
+is documentation, #5604, § Decision): merging moves the base under that
+agent and lands its run in the category-B dead-end class. Unlike
 the advisory #4118 surfaces it FAILS CLOSED.
 
 - **Placement (`handleMergeRun`).** AFTER the #3109 conflict guard (a
@@ -2108,8 +2117,24 @@ the advisory #4118 surfaces it FAILS CLOSED.
   not "simplify" this to `len(Files) >= 300` without exporting the cap.
 - **Decision.** Each live candidate's effective scope via
   `resolveOverlapScope`: unresolved → undetermined; a non-empty
-  intersection with the changed set → blocker (sorted by `issue_ref` then
-  `run_id`). Blockers → 409 `overlapping_implement_in_flight` (wins;
+  intersection with the changed set that holds at least one
+  non-documentation path → blocker (sorted by `issue_ref` then `run_id`;
+  its `paths` keep the FULL sorted intersection, documentation included).
+  **Docs-only exemption (#5604):** an intersection whose every path is
+  documentation (`mergeOverlapPathsDocsOnly`) is NOT a blocker.
+  `isMergeOverlapDocumentationPath` cleans the path (`path.Clean` over slash
+  form), rejects an absolute path, `.`, `..` and a `../` escape, then accepts
+  exactly `docs/**` or `*.md`, both case-sensitive, so
+  `docs/api/v0.openapi.yaml`, `docs/spec` and `docs/adr` qualify while
+  `Docs/x.go`, `NOTES.MD` and `.mdx` / `.markdown` / `.rst` / `.adoc` outside
+  `docs/` still block. It is deliberately NOT `isDocumentationPath` (the
+  conflict-resolution review-skip rule and the campaign preview's
+  `docs_only` class, #5221, both unchanged). On an INCOMPLETE changed set a
+  docs-only candidate is still undetermined (fail closed, below). This is a
+  partial relaxation of ADR-115 D4 for documentation-only overlaps: such an
+  overlap now surfaces at the other run's rebase as a mechanical union
+  conflict instead of holding this merge. Inline merge, merge-on-pass and the
+  delegated `may_merge` arm call this one guard, so all three exempt alike. Blockers → 409 `overlapping_implement_in_flight` (wins;
   `undetermined` is still carried). Else, with an incomplete changed set,
   every non-blocking live candidate is undetermined → 409
   `overlap_undetermined` reason `changed_files_capped` /
