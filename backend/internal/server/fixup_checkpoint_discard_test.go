@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -131,6 +132,67 @@ func TestResolvePushCheckpointResume_FixupDeclineAuditsDiscard(t *testing.T) {
 			} else if len(rows) != 0 {
 				t.Errorf("fix-up: want NO discard row, got %v", rows)
 			}
+		})
+	}
+
+	// PRECEDENCE: the fix-up arm runs BEFORE the kind switch, so a fix-up that
+	// coincides with a capability, child or kind decline still records
+	// fixup_dispatch. Each row is paired with a NON-fix-up control on the
+	// IDENTICAL state and flags that records the competing reason — so the
+	// competing decline is live on the fixture, and only the arm's position
+	// decides which reason the single row carries.
+	unknownKindCarrier := func(seq int64) *audit.Entry {
+		return scopeDecisionEntryPayload(uuid.Nil, CategoryReviewObligationCheckpoint, seq, `{
+		"resume_kind":"not_a_kind",
+		"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+			`","base_sha":"`+checkpointBaseSHA+`","verified_tree_sha":"`+checkpointVerifiedTree+`"}}`)
+	}
+	pushEntries := func() []*audit.Entry { return []*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)} }
+	for _, tc := range []struct {
+		name                            string
+		entries                         func() []*audit.Entry
+		child                           bool
+		pushCap, childPushCap, reverify bool
+		// competing is the reason the NON-fix-up control records.
+		competing string
+	}{
+		{"push_runner_capability_absent", pushEntries, false, false, true, true, "runner_capability_absent"},
+		{"push_child_runner_capability_absent", pushEntries, true, false, true, true, "runner_capability_absent"},
+		{"push_child_capability_absent", pushEntries, true, true, false, true, "runner_child_capability_absent"},
+		{"pr_open_child", func() []*audit.Entry { return []*audit.Entry{checkpointFailedEntry(7)} }, true, true, true, true, "child_resume_kind_unsupported"},
+		{"reverify_with_tree_capability_absent", func() []*audit.Entry {
+			return []*audit.Entry{prePushFailedEntry(7), reverifyCheckpointEntry(8, true)}
+		}, false, true, true, false, "runner_capability_absent"},
+		{"reverify_with_tree_child", func() []*audit.Entry {
+			return []*audit.Entry{prePushFailedEntry(7), reverifyCheckpointEntry(8, true)}
+		}, true, true, true, true, "child_resume_kind_unsupported"},
+		{"unknown_resume_kind", func() []*audit.Entry { return []*audit.Entry{unknownKindCarrier(7)} }, false, true, true, true, "unknown_resume_kind"},
+	} {
+		t.Run("precedence/"+tc.name, func(t *testing.T) {
+			fixture := func() (*Server, *run.Run, *run.Stage) {
+				s, runRow, stage := checkpointGateFixture(t, tc.entries())
+				if tc.child {
+					parent := uuid.New()
+					runRow.DecomposedFrom = &parent
+				}
+				return s, runRow, stage
+			}
+
+			s, runRow, stage := fixture()
+			if held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, tc.pushCap, tc.childPushCap, tc.reverify, true); ok {
+				t.Fatalf("control: served %+v, want the competing %s decline on the identical state", held, tc.competing)
+			}
+			rows := discardRows(s.cfg.AuditRepo.(*exemptAuditFake).appended, stage.ID)
+			if len(rows) != 1 || rows[0]["reason"] != tc.competing {
+				t.Fatalf("control: discard rows = %v, want exactly one with reason %s", rows, tc.competing)
+			}
+
+			s, runRow, stage = fixture()
+			if held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true, tc.pushCap, tc.childPushCap, tc.reverify, true); ok {
+				t.Fatalf("fix-up: served %+v, want declined", held)
+			}
+			rows = discardRows(s.cfg.AuditRepo.(*exemptAuditFake).appended, stage.ID)
+			assertOneFixupDiscard(t, rows, checkpointVerifiedTree, checkpointHeadSHA, checkpointBranch)
 		})
 	}
 }
@@ -342,9 +404,23 @@ func TestFixupRecoveredThenSecondFixup_AuditsVerifiedTreeDiscard(t *testing.T) {
 	}
 
 	// (2) R1 cross-check: retry is NOT the path — the recovered stage is not
-	// failed, so the real retry handler refuses it.
-	if w := postRetry(t, s, impl.ID); w.Code >= 200 && w.Code < 300 {
-		t.Fatalf("retry status = %d, want a refusal on a recovered (non-failed) stage:\n%s", w.Code, w.Body.String())
+	// failed, so the real retry handler refuses it. Pin the EXACT refusal:
+	// run.RetryStage's not-failed guard maps to 422 retry_not_applicable, and
+	// its message names the state — so an auth, wiring or lookup refusal
+	// (401/403/404/500/501/503) cannot stand in for it.
+	if w := postRetry(t, s, impl.ID); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("retry status = %d, want 422 retry_not_applicable on a recovered (non-failed) stage:\n%s", w.Code, w.Body.String())
+	} else {
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode retry error envelope: %v\n%s", err, w.Body.String())
+		}
+		if env.Error.Code != "retry_not_applicable" {
+			t.Fatalf("retry error code = %q, want %q", env.Error.Code, "retry_not_applicable")
+		}
+		if want := `stage is in state "succeeded" (only failed stages can be retried)`; !strings.Contains(env.Error.Message, want) {
+			t.Fatalf("retry error message = %q, want it to contain %q (the not-failed guard)", env.Error.Message, want)
+		}
 	}
 	if gotImpl, err = rr.GetStage(t.Context(), impl.ID); err != nil || gotImpl.State != run.StageStateSucceeded {
 		t.Fatalf("after refused retry: implement state = %v (err %v), want still succeeded", gotImpl, err)
