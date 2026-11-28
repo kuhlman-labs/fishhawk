@@ -3661,6 +3661,13 @@ func TestBuild_Implement_CounterfactualDiscipline_Rendered(t *testing.T) {
 		implementMechanismSetupTrap,
 		"(e) a mutation that stops COMPILATION is not a counterfactual",
 		"(f) a MASKING downstream",
+		// #2432 widened trap (c) and traps (g)-(i).
+		"or an unresolvable name",
+		"(g) asserting a SHARED error code",
+		"assert the refusal's IDENTITY",
+		"(h) an EGRESS control asserted only by its error",
+		"NEVER DIALED",
+		"(i) a bound or cap asserted by eventual failure",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -3699,6 +3706,9 @@ func TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup(t *testing.T) 
 		implementMechanismSetupTrap,
 		"(e) a mutation that stops COMPILATION is not a counterfactual",
 		"(f) a MASKING downstream",
+		"(g) asserting a SHARED error code",
+		"(h) an EGRESS control asserted only by its error",
+		"(i) a bound or cap asserted by eventual failure",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("fix-up prompt missing counterfactual trap %q\n---\n%s", want, got)
@@ -3890,6 +3900,137 @@ func TestBuild_Implement_BehaviorClaimSweep_AbsentFromPlanPrompt(t *testing.T) {
 	if !strings.Contains(implementPrompt, behaviorClaimSweepHeading) {
 		t.Errorf("implement prompt must carry the behavior-claim-sweep heading (proves the absence half is not vacuous):\n%s", implementPrompt)
 	}
+}
+
+// checkThenUseHeading is the single heading constant shared by the #2432
+// presence, absence and placement assertions. It is a test-file literal, never
+// shared with prompt.go, so mutating the production text cannot mutate it too.
+const checkThenUseHeading = "### Check-then-use: use exactly what you validated — confirm in your PR Notes"
+
+// TestBuild_Implement_CheckThenUse_Rendered pins the #2432 block on the FULL
+// implement path. Deleting the writeCheckThenUse call in buildImplement reddens
+// this.
+func TestBuild_Implement_CheckThenUse_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil: the block is unconditional.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		checkThenUseHeading,
+		"Whatever you validated must be the exact thing you use",
+		"PIN the validated artifact",
+		"the address the listener ACTUALLY bound",
+		"REVALIDATE on EVERY HOP",
+		"make the re-derived value DIFFER from the validated one",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement prompt missing check-then-use string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Implement_CheckThenUse_RenderedOnFixup pins the second call site, in
+// buildImplementFixup.
+func TestBuild_Implement_CheckThenUse_RenderedOnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{checkThenUseHeading, "REVALIDATE on EVERY HOP"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up prompt missing check-then-use string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Implement_CheckThenUse_AbsentFromPlanAndReview is self-paired over
+// one heading constant: the presence half on implement stops the absence halves
+// passing on a typo.
+func TestBuild_Implement_CheckThenUse_AbsentFromPlanAndReview(t *testing.T) {
+	implement := Trigger{Repo: "o/r", IssueNumber: 42, ApprovedPlan: fixturePlan()}
+	for _, tc := range []struct {
+		stage   string
+		trigger Trigger
+		want    bool
+	}{
+		{"plan", Trigger{IssueNumber: 7, IssueTitle: "Plan it", Repo: "x/y"}, false},
+		{"implement_review", implement, false},
+		{"implement", implement, true},
+	} {
+		got, err := Build(tc.stage, tc.trigger)
+		if err != nil {
+			t.Fatalf("Build(%s): %v", tc.stage, err)
+		}
+		if has := strings.Contains(got, checkThenUseHeading); has != tc.want {
+			t.Errorf("%s prompt contains check-then-use heading = %v, want %v\n---\n%s", tc.stage, has, tc.want, got)
+		}
+	}
+}
+
+// TestBuild_Implement_CheckThenUse_Placement pins the tail order on both paths:
+// the sidecar sub-block stays attached to the counterfactual block, and the
+// git-ops prohibition stays last on the fix-up path.
+func TestBuild_Implement_CheckThenUse_Placement(t *testing.T) {
+	const counterfactual = "### Counterfactual attainability — confirm in your PR Notes"
+	assertOrder := func(path, got string, markers ...string) {
+		t.Helper()
+		prev := -1
+		for i, m := range markers {
+			at := strings.Index(got, m)
+			if at < 0 {
+				t.Errorf("%s prompt missing marker %q\n---\n%s", path, m, got)
+				return
+			}
+			if at <= prev {
+				t.Errorf("%s prompt: marker %q must come after %q", path, m, markers[i-1])
+			}
+			prev = at
+		}
+	}
+
+	full, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		IssueNumber:      42,
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   "run-2432",
+		ImplementStageID: "stage-2432",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	assertOrder("implement", full,
+		counterfactual,
+		"#### Also record each counterfactual in the machine-readable sidecar",
+		checkThenUseHeading,
+		behaviorClaimSweepHeading,
+	)
+
+	fixup, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	assertOrder("fix-up", fixup,
+		counterfactual,
+		checkThenUseHeading,
+		behaviorClaimSweepHeading,
+		"Do not run `git checkout`",
+	)
 }
 
 func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {

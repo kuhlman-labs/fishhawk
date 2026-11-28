@@ -12,7 +12,7 @@ This directory is linked, not imported wholesale into every prompt.
 | Docs/site/generated sources | [documentation](documentation.md) |
 | Schema/API/auth/audit/module/review-prompt scope | [change checklists](change-checklists.md) |
 | Gate invocation and interpretation | [verification](verification.md), verify-gate skill |
-| Fixtures, concurrency, wire parity | [testing](testing.md) |
+| Fixtures, concurrency, security-control tests, wire parity | [testing](testing.md) |
 | Deploy/restart/cache/host failures | [operations](operations.md), relevant operational skill |
 
 Root AGENTS.md contains universal decisions and short routing, not incident
