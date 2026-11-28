@@ -1564,10 +1564,18 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 		}
 	}
 	tree := filepath.Join(parent, "tree")
+	// Every worktree admin command below runs through gitOutRaw, keeping the
+	// HardeningArgs choke point.
+	git := func(c context.Context, a ...string) ([]byte, error) { return gitOutRaw(c, dispatchDir, a...) }
 	if _, err := gitOutRaw(ctx, dispatchDir, "worktree", "add", "--detach", tree, tip); err != nil {
-		// Leave no half-registered worktree or leftover dir behind.
+		// Leave no half-registered worktree or leftover dir behind. Deregister
+		// THIS tree before its parent is removed, on a detached, bounded context
+		// so a cancelled pass cannot skip it. Never a repo-wide prune: it would
+		// deregister any worktree the runner cannot see (#4281).
+		dctx, dcancel := detachedTeardownContext(ctx)
+		_ = deregisterWorktree(dctx, git, tree)
+		dcancel()
 		_ = os.RemoveAll(parent)
-		_ = gitRun(ctx, dispatchDir, "worktree", "prune")
 		return "", "", noop, &conflictTreeRefusal{
 			Reason:   reasonTreeProvisionFailed,
 			Detail:   "git worktree add: " + err.Error(),
@@ -1585,25 +1593,28 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 		tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), conflictRecoveryTimeout)
 		defer tcancel()
 		removeErr := gitRun(tctx, dispatchDir, "worktree", "remove", "--force", tree)
+		var deregErr error
 		if removeErr != nil {
-			// A locked worktree refuses `remove --force` and is skipped by a plain
-			// `prune`, so unlock first, then RemoveAll, then prune the now-missing
-			// registration (the provisionAcceptanceTree ladder).
-			_ = gitRun(tctx, dispatchDir, "worktree", "unlock", tree)
+			// A locked worktree refuses a single `remove --force`, so RemoveAll the
+			// tree, then deregister exactly this entry (deregisterWorktree: double
+			// force covers a locked entry and an already-missing tree). Never a
+			// repo-wide prune: it would deregister any worktree the runner cannot
+			// see (#4281). The provisionAcceptanceTree ladder.
 			_ = os.RemoveAll(tree)
-			_ = gitRun(tctx, dispatchDir, "worktree", "prune")
+			deregErr = deregisterWorktree(tctx, git, tree)
 		}
 		_ = os.RemoveAll(parent)
 		if removeErr != nil {
 			// The primary remove failed and the fallback ladder ran. Name it
 			// DISTINCTLY rather than emitting the success event: the plan's step-3
 			// distinction (conflict_resolution_tree_removed OR _teardown_failed)
-			// exists precisely so a genuinely stranded tree — the fallback ladder
-			// discards each step's error — is not misreported as cleanly removed
-			// (#3340).
-			logEvent(logSink, "conflict_resolution_teardown_failed", map[string]string{
-				"path": tree, "remove_error": removeErr.Error(),
-			})
+			// exists precisely so a genuinely stranded tree is not misreported as
+			// cleanly removed (#3340).
+			fields := map[string]string{"path": tree, "remove_error": removeErr.Error()}
+			if deregErr != nil {
+				fields["deregister_error"] = deregErr.Error()
+			}
+			logEvent(logSink, "conflict_resolution_teardown_failed", fields)
 			return
 		}
 		logEvent(logSink, "conflict_resolution_tree_removed", map[string]string{"path": tree})

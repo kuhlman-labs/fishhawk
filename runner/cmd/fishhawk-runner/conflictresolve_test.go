@@ -2518,7 +2518,7 @@ func TestConflictResolutionStage_TeardownOnRefusal(t *testing.T) {
 // TestConflictResolutionTeardown_FallbackOnLockedWorktree drives the teardown's
 // FAILURE arm: a LOCKED worktree makes the primary `git worktree remove --force`
 // refuse (a single --force will not remove a locked worktree), so the fallback
-// ladder (unlock, RemoveAll, prune) runs. It asserts the ladder actually removes
+// ladder (RemoveAll, then the targeted deregisterWorktree) runs. It asserts the ladder actually removes
 // both the directory AND the git registration, and that the teardown names the
 // fallback DISTINCTLY (conflict_resolution_teardown_failed) rather than emitting
 // the success event over a possibly-stranded tree.
@@ -2563,6 +2563,94 @@ func TestConflictResolutionTeardown_FallbackOnLockedWorktree(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
 		t.Errorf("temp parent not empty after fallback teardown: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionTeardown_FallbackSparesHiddenForeignWorktree (#4281):
+// the lock-forced teardown fallback removes and deregisters the throwaway tree
+// while a foreign worktree of the dispatch repo, invisible during the teardown,
+// keeps its registration. A repo-wide prune in the ladder would delete it.
+func TestConflictResolutionTeardown_FallbackSparesHiddenForeignWorktree(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+	ext, hide, restore := hiddenForeignWorktree(t, dispatch)
+
+	var sink strings.Builder
+	treeDir, _, teardown, refusal := establishConflictResolutionTree(
+		context.Background(), crStageCfg(dispatch), &crFakeUpload{},
+		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+	if refusal != nil {
+		t.Fatalf("establish refused: %+v", refusal)
+	}
+	crGit(t, dispatch, "worktree", "lock", treeDir)
+
+	hide()
+	teardown()
+	restore()
+
+	if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") {
+		t.Errorf("teardown did not name the fallback distinctly:\n%s", sink.String())
+	}
+	if strings.Contains(sink.String(), "deregister_error") {
+		t.Errorf("the targeted deregistration must succeed on a locked tree:\n%s", sink.String())
+	}
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("tree directory still present after fallback teardown: err=%v", err)
+	}
+	if worktreeRegistered(t, dispatch, treeDir) {
+		t.Error("fallback must deregister the locked throwaway tree")
+	}
+	assertForeignWorktreeSurvives(t, dispatch, ext)
+}
+
+// TestConflictResolutionTeardown_DeregisterFailureReported: when the admin
+// area refuses the deregistration (here read-only .git/worktrees admin dirs, so
+// neither remove can delete the entry), the teardown names the stranded registration
+// with deregister_error on conflict_resolution_teardown_failed.
+func TestConflictResolutionTeardown_DeregisterFailureReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+
+	var sink strings.Builder
+	treeDir, _, teardown, refusal := establishConflictResolutionTree(
+		context.Background(), crStageCfg(dispatch), &crFakeUpload{},
+		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+	if refusal != nil {
+		t.Fatalf("establish refused: %+v", refusal)
+	}
+	// Read-only admin dirs: neither the entry's files nor the entry itself can
+	// be deleted, so every remove fails and the listing still names the tree.
+	admin := filepath.Join(dispatch, ".git", "worktrees")
+	ents, err := os.ReadDir(admin)
+	if err != nil || len(ents) != 1 {
+		t.Fatalf("admin entries = %v (err %v), want exactly the throwaway tree", ents, err)
+	}
+	for _, d := range []string{filepath.Join(admin, ents[0].Name()), admin} {
+		if err := os.Chmod(d, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(d, 0o755) })
+	}
+
+	teardown()
+
+	if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") {
+		t.Errorf("teardown did not report the failure:\n%s", sink.String())
+	}
+	if !strings.Contains(sink.String(), "deregister_error") {
+		t.Errorf("a stranded registration must carry deregister_error:\n%s", sink.String())
+	}
+	if !worktreeRegistered(t, dispatch, treeDir) {
+		t.Fatal("fixture: the read-only admin dir should have kept the registration")
 	}
 }
 

@@ -1081,6 +1081,56 @@ func TestCheckVerifyCommand_CleanupRemovesWorktree(t *testing.T) {
 	}
 }
 
+// TestProvisionDoctorWorktree_SparesHiddenForeignWorktree (#4281): a full
+// checkVerifyCommand pass runs the pre-add reclaim, the add and the cleanup
+// while a FOREIGN worktree of the repo is moved aside (how a partial
+// filesystem view looks to git). Every deregistration is targeted at the
+// doctor's own worktree, so the foreign registration survives; a repo-wide
+// `git worktree prune` would delete its admin dir and git would then fail
+// inside it after the restore.
+func TestProvisionDoctorWorktree_SparesHiddenForeignWorktree(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+	worktree := doctorVerifyWorktreeFor(t, repo)
+	ext := filepath.Join(t.TempDir(), "ext")
+	gitIn(t, repo, "worktree", "add", "--detach", ext, "HEAD")
+	hidden := ext + ".hidden"
+	restore := func() {
+		if _, err := os.Stat(hidden); err == nil {
+			_ = os.Rename(hidden, ext)
+		}
+	}
+	t.Cleanup(restore)
+	if err := os.Rename(ext, hidden); err != nil {
+		t.Fatalf("hide foreign worktree: %v", err)
+	}
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	restore()
+
+	if r.status != "ok" {
+		t.Fatalf("status = %q, want ok; detail: %s", r.status, r.detail)
+	}
+	if out, err := exec.Command("git", "-C", ext, "rev-parse", "--git-dir").CombinedOutput(); err != nil {
+		t.Errorf("foreign worktree lost its admin dir (a repo-wide prune ran): %v\n%s", err, out)
+	}
+	want, err := filepath.EvalSymlinks(ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := false
+	for _, line := range strings.Split(gitIn(t, repo, "worktree", "list", "--porcelain"), "\n") {
+		if p, ok := strings.CutPrefix(line, "worktree "); ok {
+			if got, err := filepath.EvalSymlinks(strings.TrimSpace(p)); err == nil && got == want {
+				listed = true
+			}
+		}
+	}
+	if !listed {
+		t.Errorf("foreign worktree %s is no longer registered", ext)
+	}
+	assertWorktreeGone(t, repo, worktree)
+}
+
 // TestCheckVerifyCommand_CleanupRemovesWorktreeAfterTimeout (binding
 // condition 3) asserts the same on the TIMEOUT path, which is the one most
 // likely to leak because the group kill runs first.

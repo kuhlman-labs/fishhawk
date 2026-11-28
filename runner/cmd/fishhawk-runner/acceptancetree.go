@@ -57,6 +57,15 @@ import (
 // acceptanceVerdictDir.
 var acceptanceTreeDir = "/tmp"
 
+// acceptanceTreeGit builds the git admin runner provisionAcceptanceTree uses
+// against repoDir for the teardown remove and every targeted deregistration
+// (#4281). var (not func) so tests can stub the git side of a teardown failure.
+var acceptanceTreeGit = func(repoDir string) gitAdminRunner {
+	return func(ctx context.Context, args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, "git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+	}
+}
+
 // acceptanceTreePath is the run/stage-keyed path of the disposable
 // merge-candidate checkout. Keyed by the FULL run id + stage id (#1881), the
 // same keying AcceptanceVerdictPath uses. The acceptance prompt NAMES this exact
@@ -118,14 +127,17 @@ func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stage
 	}
 
 	target := acceptanceTreePath(runID, stageID)
+	git := acceptanceTreeGit(repoDir)
 
 	// (ii) Sweep any stale leftover at the keyed path from a SIGKILL'd prior run
 	// (mirroring sweepStaleAcceptanceVerdict): a leftover directory would make
 	// `git worktree add` refuse. os.RemoveAll clears the tree; a best-effort
-	// `git worktree prune` clears any dangling admin registration.
+	// targeted deregistration (deregisterWorktree) clears a dangling admin
+	// registration of THIS keyed path only. Never a repo-wide prune: it would
+	// deregister any worktree the runner cannot see (#4281).
 	if _, statErr := os.Stat(target); statErr == nil {
 		_ = os.RemoveAll(target)
-		_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "prune").Run()
+		_ = deregisterWorktree(ctx, git, target)
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"acceptance_tree_stale_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 			runID, stageID, target)
@@ -179,37 +191,33 @@ func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stage
 		`{"event":"acceptance_tree_provisioned","run_id":%q,"stage_id":%q,"path":%q,"head_sha":%q}`+"\n",
 		runID, stageID, target, headSHA)
 
-	// Teardown: `git worktree remove --force <path>`, with an unlock + os.RemoveAll
-	// + `git worktree prune` fallback. The fallback is path-canonicalization-proof:
-	// on macOS /tmp is a symlink to /private/tmp, so the path git REGISTERED for
-	// the worktree can differ from the path passed to `worktree remove`, making
-	// the remove miss — os.RemoveAll deletes the tree regardless and prune clears
-	// the registration by scanning for a missing tree.
-	//
-	// A single `worktree remove --force` REFUSES a locked worktree, and a plain
-	// `worktree prune` ALSO skips locked entries (git-worktree(1)) — so without the
-	// explicit `worktree unlock` the fallback would remove the directory yet leave
-	// the registration + lock stranded in the dispatch repo's admin area, making
-	// the acceptance_tree_removed event overclaim. The unlock (best-effort; a
-	// no-op/harmless error when the worktree is unlocked or the path mismatches, as
-	// in the /tmp-symlink case) runs BEFORE the RemoveAll so git can still resolve
-	// the registered path, letting the subsequent prune actually unregister the
-	// now-missing tree. Best-effort throughout; never changes the stage outcome.
+	// Teardown: `git worktree remove --force <path>`, with an os.RemoveAll +
+	// targeted deregistration fallback (deregisterWorktree: `git worktree remove
+	// --force --force <path>`). A single `--force` REFUSES a locked worktree, and
+	// on macOS /tmp is a symlink to /private/tmp, so the registered path can
+	// differ from target and make the primary remove miss. The fallback removes
+	// the tree regardless and deregisters exactly this entry: double force covers
+	// a locked entry and an already-missing tree, and deregisterWorktree matches
+	// the registration through the symlink-resolved parent. It never runs a
+	// repo-wide prune, which would deregister any worktree whose .git the runner
+	// cannot see (#4281). A deregistration failure emits
+	// acceptance_tree_teardown_failed rather than an overclaiming
+	// acceptance_tree_removed. The teardown runs on a detached, bounded context so
+	// a cancelled stage cannot strand the registration or mask the failure.
+	// Best-effort throughout; never changes the stage outcome.
 	return func() {
-		if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-			"worktree", "remove", "--force", target).CombinedOutput(); err != nil {
-			_ = exec.CommandContext(ctx, "git", "-C", repoDir,
-				"worktree", "unlock", target).Run()
+		tctx, tcancel := detachedTeardownContext(ctx)
+		defer tcancel()
+		if out, err := git(tctx, "worktree", "remove", "--force", target); err != nil {
 			_ = os.RemoveAll(target)
-			if pout, perr := exec.CommandContext(ctx, "git", "-C", repoDir,
-				"worktree", "prune").CombinedOutput(); perr != nil {
+			if derr := deregisterWorktree(tctx, git, target); derr != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"acceptance_tree_teardown_failed","run_id":%q,"stage_id":%q,"path":%q,"detail":%q}`+"\n",
-					runID, stageID, target, strings.TrimSpace(string(out))+"; prune: "+strings.TrimSpace(string(pout)))
+					runID, stageID, target, strings.TrimSpace(string(out))+"; deregister: "+derr.Error())
 				return
 			}
 			_, _ = fmt.Fprintf(logSink,
-				`{"event":"acceptance_tree_removed","run_id":%q,"stage_id":%q,"path":%q,"fallback":"rm_prune"}`+"\n",
+				`{"event":"acceptance_tree_removed","run_id":%q,"stage_id":%q,"path":%q,"fallback":"rm_deregister"}`+"\n",
 				runID, stageID, target)
 			return
 		}
