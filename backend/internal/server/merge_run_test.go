@@ -1688,6 +1688,75 @@ func TestHandleMergeRun_ChecksPending409NamesAuditCompleteMissing(t *testing.T) 
 	}
 }
 
+// TestHandleMergeRun_NotMergeReady409NamesAuditCompleteMissing (#4676, X3,
+// C7) pins the audit-complete enrichment on the not_merge_ready branch: a
+// leaf refusal (GitHub does not report the pull request merge-ready, state
+// blocked) answers 409 merge_checks_pending reason not_merge_ready, and when
+// the pre-merge recompute is PENDING the body carries audit_complete_state
+// and audit_complete_missing and names the cause inline. When the recompute
+// passes, neither key is added. Counterfactual: deleting the
+// appendAuditCompletePending call in the not_merge_ready branch of
+// writeInlineMergeDispatchFailure makes the pending row RED.
+func TestHandleMergeRun_NotMergeReady409NamesAuditCompleteMissing(t *testing.T) {
+	notReady := func() *fakeMerger {
+		return &fakeMerger{err: &forge.NotMergeReadyError{MergeableState: "blocked"}}
+	}
+	decode := func(t *testing.T, w *httptest.ResponseRecorder) (string, map[string]any) {
+		t.Helper()
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		env := decodeMergeErr(t, w)
+		if env.Error.Code != "merge_checks_pending" || env.Error.Details["reason"] != "not_merge_ready" {
+			t.Fatalf("code = %q reason = %v, want merge_checks_pending / not_merge_ready", env.Error.Code, env.Error.Details["reason"])
+		}
+		return env.Error.Message, env.Error.Details
+	}
+	t.Run("pending", func(t *testing.T) {
+		merger := notReady()
+		s, rr, au, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
+		s.reopenAcceptanceOnFixupPush(context.Background(), r.ID, fixupHeadSHA)
+		assertStaleStrandRefused(t, s, r.ID, acc.ID, merger, gh)
+		shipAcceptanceReRunInFlight(t, rr, au, r.ID, acc.ID)
+
+		msg, d := decode(t, postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "go"}, withMergeOperator))
+		if d["audit_complete_state"] != "pending" {
+			t.Errorf("details.audit_complete_state = %v, want pending", d["audit_complete_state"])
+		}
+		items, ok := d["audit_complete_missing"].([]any)
+		if !ok || len(items) != 1 {
+			t.Fatalf("details.audit_complete_missing = %v, want one item", d["audit_complete_missing"])
+		}
+		item, _ := items[0].(map[string]any)
+		if item["kind"] != "stage_not_terminal" {
+			t.Errorf("missing[0].kind = %v, want stage_not_terminal", item["kind"])
+		}
+		detail, _ := item["detail"].(string)
+		if !strings.Contains(detail, shortStageID(acc.ID)) {
+			t.Errorf("missing[0].detail = %q, want it to name stage %s", detail, shortStageID(acc.ID))
+		}
+		if !strings.Contains(msg, "fishhawk_audit_complete is pending because: "+detail) {
+			t.Errorf("message must state the cause inline: %q", msg)
+		}
+		if d["mergeable_state"] != "blocked" || d["resumable"] != true {
+			t.Errorf("details = %v, want mergeable_state blocked resumable true", d)
+		}
+	})
+	t.Run("not_pending", func(t *testing.T) {
+		s, _, _, _, r, _ := reopenedAcceptanceStrandFixture(t, "", notReady())
+		// NO reopen: every non-review stage is terminal, so the recompute passes.
+		msg, d := decode(t, postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "go"}, withMergeOperator))
+		for _, k := range []string{"audit_complete_state", "audit_complete_missing"} {
+			if _, present := d[k]; present {
+				t.Errorf("a non-pending audit-complete must add NO %s key: %v", k, d)
+			}
+		}
+		if strings.Contains(msg, "fishhawk_audit_complete is pending because") {
+			t.Errorf("a non-pending audit-complete must keep the generic wording: %q", msg)
+		}
+	})
+}
+
 // TestHandleMergeRun_ChecksPending409UnchangedWhenAuditCompleteNotPending is the
 // FALLBACK branch: the very same fixture with NO fix-up reopen recomputes to a
 // PASS, so the blocking required check is something else entirely — a CI job, a

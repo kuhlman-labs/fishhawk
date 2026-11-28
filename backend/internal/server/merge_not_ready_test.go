@@ -536,3 +536,84 @@ func TestAutoDriveMergeNotReadyNote_FollowsClaimOutcome(t *testing.T) {
 		t.Errorf("unrecognised state note = %q", note)
 	}
 }
+
+// nmrWirePublisher wires a recording fishhawk_audit_complete publisher onto
+// w's server (the publisher fake from auditcheckpublish_test.go) and an
+// artifact repository, so the pre-merge recompute runs and every check run it
+// publishes reaches the fake.
+func (w *mqmWorld) nmrWirePublisher() *publisherFakeGitHub {
+	w.t.Helper()
+	arts := newFakeArtifactRepo()
+	w.srv.cfg.ArtifactRepo = arts
+	gh := newPublisherFakeGitHub()
+	wireEpisodePublisher(w.srv, gh, w.repo, arts)
+	return gh
+}
+
+// TestMergeRunNotMergeReady_NonResumableSkipsRepublish (Z6, C6) pins the
+// republish gating around the pinned pre-read on both arms: a non-resumable
+// refusal (draft) posts ZERO fishhawk_audit_complete check runs (the Z6 cost
+// bound), and a resumable one (blocked) posts exactly ONE at the gate head
+// before answering, because a stranded required check itself reads as
+// blocked (#3159, #4397). Neither arm dispatches or claims.
+//
+// Counterfactuals: narrowing the condition to `ready.Refusal == nil` makes
+// the blocked rows RED (0 check runs); widening it to always republish makes
+// the draft rows RED (1 check run).
+func TestMergeRunNotMergeReady_NonResumableSkipsRepublish(t *testing.T) {
+	for _, tc := range []struct {
+		state     string
+		resumable bool
+		want      int
+	}{
+		{state: "draft", resumable: false, want: 0},
+		{state: "blocked", resumable: true, want: 1},
+	} {
+		t.Run("inline_"+tc.state, func(t *testing.T) {
+			w, m := newMQEWorld(t)
+			r := w.faeInline("nmr-rp", mmrSpec(""))
+			gh := w.nmrWirePublisher()
+			w.mergeable(r, tc.state)
+			resp := w.mergeRun(r)
+			_, d := nmrErr(t, resp.Body.Bytes(), "merge_checks_pending")
+			if d["reason"] != "not_merge_ready" || d["resumable"] != tc.resumable {
+				t.Fatalf("details = %v, want not_merge_ready resumable=%v", d, tc.resumable)
+			}
+			assertNMRCheckRuns(t, gh, tc.want)
+			if m.inlineCalls() != 0 || w.claims(r) != 0 {
+				t.Fatalf("dispatches=%d claims=%d, want 0/0", m.inlineCalls(), w.claims(r))
+			}
+		})
+		t.Run("delegated_"+tc.state, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r := w.admqReady("nmr-rpd", "h1")
+			gh := w.nmrWirePublisher()
+			w.mergeable(r, tc.state)
+			m := &admqMerger{}
+			out := w.admqDrive(r, m)
+			nr := out.MergeNotReady
+			if out.Acted || nr == nil || nr.ClaimOutcome != autoDriveClaimOutcomePreClaim || nr.Resumable != tc.resumable {
+				t.Fatalf("out = %+v (merge_not_ready %+v), want observe-only pre_claim resumable=%v", out, nr, tc.resumable)
+			}
+			assertNMRCheckRuns(t, gh, tc.want)
+			if m.calls() != 0 || w.claims(r) != 0 {
+				t.Fatalf("merger=%d claims=%d, want 0/0", m.calls(), w.claims(r))
+			}
+		})
+	}
+}
+
+// assertNMRCheckRuns requires exactly want fishhawk_audit_complete check runs
+// on gh, each at the gate head h1.
+func assertNMRCheckRuns(t *testing.T, gh *publisherFakeGitHub, want int) {
+	t.Helper()
+	calls := gh.calls()
+	if len(calls) != want {
+		t.Fatalf("check runs posted = %d, want %d: %+v", len(calls), want, calls)
+	}
+	for _, c := range calls {
+		if c.params.HeadSHA != "h1" {
+			t.Fatalf("check run head = %q, want h1 (the gate head)", c.params.HeadSHA)
+		}
+	}
+}

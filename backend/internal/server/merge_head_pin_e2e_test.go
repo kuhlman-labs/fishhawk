@@ -423,6 +423,11 @@ func TestMergeHeadPinE2E_PinnedNeverArmsAutoMerge(t *testing.T) {
 		if d["head_sha"] != "h1" {
 			t.Fatalf("details = %v, want head_sha h1", d)
 		}
+		// GitHub has not computed mergeability: mergeable_state is sent
+		// PRESENT and empty, so the MCP tool reads "still computing".
+		if st, present := d["mergeable_state"]; !present || st != "" || d["resumable"] != true {
+			t.Fatalf("details = %v, want mergeable_state present and empty, resumable true", d)
+		}
 		if puts := w.gh.putCalls(); len(puts) != 0 {
 			t.Fatalf("PUTs = %+v, want none", puts)
 		}

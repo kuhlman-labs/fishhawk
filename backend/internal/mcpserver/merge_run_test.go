@@ -3035,7 +3035,12 @@ func TestChecksPendingOutput_NotMergeReadyNamesStateAndRemedy(t *testing.T) {
 			want: []string{"mergeable_state draft", "gh pr ready", "Waiting will not clear it"}},
 		{name: "unknown", extra: `,"mergeable_state":"unknown","resumable":true`, state: "unknown", resumable: boolPtr(true),
 			want: []string{"mergeable_state unknown", "still computing mergeability"}},
-		{name: "no_state", extra: `,"resumable":true`, resumable: boolPtr(true),
+		// The server always sends mergeable_state with reason not_merge_ready,
+		// empty while GitHub is still computing mergeability (#4676).
+		{name: "no_state", extra: `,"mergeable_state":"","resumable":true`, resumable: boolPtr(true),
+			want: []string{"mergeable_state not yet computed", "GitHub is still computing mergeability", "Bound the wait"}},
+		// Defensive: a body with NO mergeable_state key reads as undetermined.
+		{name: "absent_state", extra: `,"resumable":true`, resumable: boolPtr(true),
 			want: []string{"no mergeable_state named", "inspect the pull request"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

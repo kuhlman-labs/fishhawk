@@ -17577,21 +17577,25 @@ paths:
       description: |
         The one-verb operator merge path (E48.7 / #1954). Records the
         operator's merge verdict as a chained `merge_verdict_recorded` audit
-        entry (modeled on `vouch-commit`) and queues the forge merge — with
+        entry (modeled on `vouch-commit`) and dispatches the forge merge — with
         the merge method the run's cached admission spec declares
         (workflow-v2 `merge_method`; absent = squash, E93.2 / #4658) — through
         the SAME merge seam the delegated `may_merge` arm of the auto-driver
         uses — so the human merge and the delegated merge converge on one path.
         The seam is forge-resolved by the run's `installation_ref` family
-        (E45.47 / #3464): a GitHub run enables GitHub auto-merge, a GitLab run
+        (E45.47 / #3464): a head-pinned GitHub run gets one synchronous REST
+        merge at the verified head and never an auto-merge (#4676), an
+        unpinned GitHub run enables GitHub auto-merge, and a GitLab run
         queues `merge_when_pipeline_succeeds` (squash for squash, an explicit squash=false for merge) on the merge request.
         The PR-approval review itself stays a `gh pr review --approve` step
         under the operator's own GitHub identity (App-identity approval is
         deferred to E39).
 
-        The endpoint does NOT wait for the merge to land: it only
-        ENABLES/queues GitHub's merge (a PR already merge-ready falls back to a
-        synchronous REST merge with the resolved method), and the `pr_merged` / run-completion
+        The endpoint does NOT wait for the run to settle: a head-pinned GitHub
+        dispatch is one synchronous merge at the verified head, while an
+        unpinned one only ENABLES/queues GitHub's merge (a PR already
+        merge-ready falls back to a synchronous REST merge with the resolved
+        method), and the `pr_merged` / run-completion
         settle is left to the `pull_request`-closed webhook. The
         `fishhawk_merge_run` MCP tool awaits the terminal run state client-side.
 
@@ -17999,8 +18003,9 @@ paths:
             `merge_checks_pending` also answers a head-pinned GitHub dispatch
             GitHub does not report merge-ready at the pinned head (#4676), with
             `details.reason` `not_merge_ready`: `{run_id, verdict_sequence,
-            pr_url, reason, head_sha (the pin), mergeable_state (omitted when
-            empty), resumable, blocked_by (omitted when empty)}`. Nothing was
+            pr_url, reason, head_sha (the pin), mergeable_state (always
+            present; empty while GitHub is still computing mergeability),
+            resumable, blocked_by (omitted when empty)}`. Nothing was
             merged or armed: a pinned merge is synchronous and never queues an
             auto-merge. It comes from the readiness pre-read (no dispatch claim
             taken, no settle row) or from the GitHub leaf after the claim (the
@@ -19199,10 +19204,12 @@ paths:
         genuine gate-dispatch failure is surfaced as `500
         auto_drive_dispatch_failed`, never swallowed as observe-only.
 
-        **Merge is queued, not landed.** A delegated `may_merge` ENABLES
-        GitHub auto-merge via the configured seam; the real merge lands when
-        branch protection clears, observed via the `pull_request`-closed
-        webhook. A nil merge seam keeps `may_merge` fail-closed to
+        **Merge is dispatched, not settled.** A delegated `may_merge` on an
+        unpinned dispatch ENABLES GitHub auto-merge via the configured seam
+        and the real merge lands when branch protection clears; a head-pinned
+        GitHub dispatch is one synchronous merge at the verified head and
+        never an auto-merge (#4676). Either way the run settles via the
+        `pull_request`-closed webhook. A nil merge seam keeps `may_merge` fail-closed to
         observe-only. Inside the run's merge-intent lock the `may_merge` arm
         evaluates the merge endpoint's blocking-concern leg (#5045, the
         child-slice reconcile included): an open high-severity or

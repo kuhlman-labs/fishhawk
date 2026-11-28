@@ -2724,11 +2724,12 @@ func (s *Server) writeInlineMergeDispatchFailure(w http.ResponseWriter, r *http.
 	// not report the PR merge-ready at the pinned head. Nothing was sent.
 	if isNotMergeReadyRefusal(merr) {
 		nmr, resumable, blockedBy, _ := notMergeReadyOf(merr)
+		// mergeable_state is ALWAYS present, empty when GitHub has not
+		// computed mergeability: the MCP tool reads a present empty state as
+		// "still computing" and an absent one as undetermined.
 		details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL,
-			"reason": "not_merge_ready", "head_sha": gate.HeadSHA, "resumable": resumable}
-		if nmr.MergeableState != "" {
-			details["mergeable_state"] = nmr.MergeableState
-		}
+			"reason": "not_merge_ready", "head_sha": gate.HeadSHA, "resumable": resumable,
+			"mergeable_state": nmr.MergeableState}
 		if blockedBy != "" {
 			details["blocked_by"] = blockedBy
 		}

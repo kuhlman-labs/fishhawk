@@ -1092,7 +1092,10 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
     re-dispatch these runs: a re-invoke answers `merge_already_dispatched`.
     The procedure that works:
     1. List open Fishhawk pull requests with auto-merge armed:
-       `gh pr list --json number,headRefOid,autoMergeRequest`.
+       `gh pr list --state open --limit 1000 --json number,headRefOid,autoMergeRequest`.
+       The list must be complete: `gh pr list` returns 30 by default, so
+       raise `--limit` above the repository's open-PR count and confirm
+       the returned count is below it, or an older armed PR is missed.
     2. Compare each PR head (`headRefOid`) with the claim head
        (`fishhawk_get_merge_queue` `dispatch_claim`, or
        `fishhawk_get_run_status`).
