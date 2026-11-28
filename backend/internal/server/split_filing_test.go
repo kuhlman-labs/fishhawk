@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,11 +50,53 @@ type splitFileProvider struct {
 	// forge-state adoption tests (#2064) can assert an adopted child's recorded
 	// url is byte-identical to the url the CREATION pass produced.
 	creations []workmgmt.CreatedItem
+
+	// #3925 detached-filing seams. attempts counts EVERY File entry (outside
+	// mu, so a parked call never blocks a reader). parkOnCall (1-based) parks
+	// that call until park is closed, after closing parked. onFile runs after
+	// a successful call, outside mu. ctxHonouring fails a call whose ctx is
+	// already done, as a real forge client does. panicOnCall panics.
+	attempts     atomic.Int64
+	parkOnCall   int
+	park         chan struct{}
+	parked       chan struct{}
+	onFile       func(call int)
+	ctxHonouring bool
+	panicOnCall  int
 }
 
 func (p *splitFileProvider) Name() string { return p.name }
 
-func (p *splitFileProvider) File(_ context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+// releasePark unparks a parkOnCall call.
+func (p *splitFileProvider) releasePark() { close(p.park) }
+
+func (p *splitFileProvider) File(ctx context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	n := int(p.attempts.Add(1))
+	if p.ctxHonouring && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if p.panicOnCall != 0 && n == p.panicOnCall {
+		panic("split provider: injected File panic")
+	}
+	if p.parkOnCall != 0 && n == p.parkOnCall {
+		close(p.parked)
+		<-p.park
+	}
+	created, err := p.file(req)
+	if err == nil && p.onFile != nil {
+		p.onFile(n)
+	}
+	return created, err
+}
+
+// requestCount is the number of successful File requests recorded.
+func (p *splitFileProvider) requestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.reqs)
+}
+
+func (p *splitFileProvider) file(req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
@@ -312,7 +356,35 @@ type splitFilingConfig struct {
 	// the fail-CLOSED abort branch.
 	epicChildren    []workmgmt.EpicChild
 	epicChildrenErr error
+
+	// #3925 options. approvalGate gives the plan stage RequiresApproval and
+	// wires a fake ApprovalRepo; the stage starts at awaiting_approval, or —
+	// with approvedAlready — at succeeded with EndedAt and one approve row
+	// seeded BY CONSTRUCTION. The promptRunRepo does not stamp ended_at the
+	// way postgres does, so the harness stamps it on every terminal transition.
+	approvalGate    bool
+	approvedAlready bool
+	// parkOnCall / onFile / ctxHonouring / panicOnCall configure the provider.
+	parkOnCall   int
+	onFile       func(call int)
+	ctxHonouring bool
+	panicOnCall  int
+	// planLoadErr makes the artifact repo's ListForStage fail.
+	planLoadErr error
+	// parentRun: the run's own plan stage carries NO artifact and ParentRunID
+	// names a parent run whose plan stage carries the split artifact.
+	parentRun bool
+	// runState seeds run.Run.State.
+	runState run.State
+	// artifactAt / endedAt seed the plan artifact's CreatedAt and the plan
+	// stage's EndedAt BY CONSTRUCTION. Zero values default to a fixed base and
+	// base+1m, so the artifact predates the gate's close.
+	artifactAt time.Time
+	endedAt    time.Time
 }
+
+// splitFixtureBase is the fixed clock the harness assigns timestamps from.
+var splitFixtureBase = time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 
 // splitFilingHarness bundles the wired Server plus the seeded run coordinates.
 type splitFilingHarness struct {
@@ -323,6 +395,14 @@ type splitFilingHarness struct {
 	querier   *splitQueryProvider // nil unless cfg.withQuerier
 	runID     uuid.UUID
 	planStage *run.Stage
+	// #3925: art is the artifact repo, ar the approval repo (approvalGate),
+	// planArtifact the seeded split artifact, parentRunID the parentRun
+	// option's parent, logs the WARN/ERROR capture.
+	art          *fakeArtifactRepo
+	ar           *fakeApprovalRepo
+	planArtifact *artifact.Artifact
+	parentRunID  uuid.UUID
+	logs         *syncBuffer
 }
 
 const splitParentIssue = 2100
@@ -437,7 +517,11 @@ func seedReachability(au *auditFake, runID uuid.UUID, contractDerived int) {
 
 func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarness {
 	t.Helper()
-	provider := &splitFileProvider{name: workmgmt.Default().Provider, failOnCall: cfg.providerFailOnCall}
+	provider := &splitFileProvider{
+		name: workmgmt.Default().Provider, failOnCall: cfg.providerFailOnCall,
+		parkOnCall: cfg.parkOnCall, onFile: cfg.onFile, ctxHonouring: cfg.ctxHonouring, panicOnCall: cfg.panicOnCall,
+		park: make(chan struct{}), parked: make(chan struct{}),
+	}
 	var querier *splitQueryProvider
 	if cfg.withQuerier {
 		querier = &splitQueryProvider{splitFileProvider: provider, children: cfg.epicChildren, err: cfg.epicChildrenErr}
@@ -449,6 +533,7 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	au := newAuditFake()
 	rr := newPromptRunRepo()
 	art := newFakeArtifactRepo()
+	art.listErr = cfg.planLoadErr
 
 	runID := uuid.New()
 	planStageID := uuid.New()
@@ -460,12 +545,43 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 		TriggerRef:      &trigger,
 		InstallationID:  cfg.installID,
 		InstallationRef: cfg.installationRef,
+		State:           cfg.runState,
 	}
 	if cfg.withSpec {
 		runRow.WorkflowSpec = specImplementPathConstraints
 	}
 	rr.getRuns[runID] = runRow
-	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded}
+	artifactAt := cfg.artifactAt
+	if artifactAt.IsZero() {
+		artifactAt = splitFixtureBase
+	}
+	endedAt := cfg.endedAt
+	if endedAt.IsZero() {
+		endedAt = splitFixtureBase.Add(time.Minute)
+	}
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded, EndedAt: &endedAt}
+	var ar *fakeApprovalRepo
+	if cfg.approvalGate {
+		ar = newFakeApprovalRepo()
+		planStage.RequiresApproval = true
+		if !cfg.approvedAlready {
+			planStage.State = run.StageStateAwaitingApproval
+			planStage.EndedAt = nil
+		} else {
+			ar.all = append(ar.all, &approval.Approval{
+				ID: uuid.New(), StageID: planStageID, ApproverSubject: "seed-approver",
+				Decision: approval.DecisionApprove, SubmittedAt: endedAt,
+			})
+		}
+		// promptRunRepo does not stamp ended_at; postgres does on every
+		// terminal entry (and not on a same-state short-circuit).
+		rr.onTransitionStage = func(id uuid.UUID, to run.StageState) {
+			if st, ok := rr.getStages[id]; ok && to.IsTerminal() && st.State != to {
+				at := endedAt
+				st.EndedAt = &at
+			}
+		}
+	}
 	rr.getStages[planStageID] = planStage
 	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
 
@@ -474,24 +590,50 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	if planContent == nil {
 		planContent = splitPlanBytes(t, cfg.withSplitProposal)
 	}
-	if _, err := art.Create(context.Background(), artifact.CreateParams{
-		StageID:       planStageID,
+	artifactStage := planStageID
+	var parentRunID uuid.UUID
+	if cfg.parentRun {
+		parentRunID = uuid.New()
+		parentStageID := uuid.New()
+		runRow.ParentRunID = &parentRunID
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r", WorkflowID: "feature_change", TriggerRef: &trigger}
+		parentStage := &run.Stage{ID: parentStageID, RunID: parentRunID, Type: run.StageTypePlan, State: run.StageStateSucceeded, EndedAt: &endedAt}
+		rr.getStages[parentStageID] = parentStage
+		rr.stagesByRunID[parentRunID] = []*run.Stage{parentStage}
+		artifactStage = parentStageID
+	}
+	planArtifact, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       artifactStage,
 		Kind:          artifact.KindPlan,
 		SchemaVersion: &sv,
 		Content:       planContent,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed plan artifact: %v", err)
 	}
+	planArtifact.CreatedAt = artifactAt
 
 	if cfg.reachabilityDerived != 0 {
 		seedReachability(au, runID, cfg.reachabilityDerived)
 	}
 
-	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr, ArtifactRepo: art})
+	logs := &syncBuffer{}
+	scfg := Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	if ar != nil {
+		scfg.ApprovalRepo = ar
+	}
+	s := New(scfg)
+	// V5: no detached filer may outlive its test and file against the NEXT
+	// test's provider through the process-global workmgmt registry.
+	t.Cleanup(s.waitSplitFiling)
 	if cfg.github != nil {
 		s.cfg.GitHub = cfg.github
 	}
-	return &splitFilingHarness{s: s, au: au, rr: rr, provider: provider, querier: querier, runID: runID, planStage: planStage}
+	return &splitFilingHarness{
+		s: s, au: au, rr: rr, provider: provider, querier: querier, runID: runID, planStage: planStage,
+		art: art, ar: ar, planArtifact: planArtifact, parentRunID: parentRunID, logs: logs,
+	}
 }
 
 // completionEntry returns the decoded split_children_filed completion payload
@@ -998,8 +1140,10 @@ func TestFileSplitProposalChildren_EndToEnd(t *testing.T) {
 		t.Fatalf("seed plan artifact: %v", err)
 	}
 	seedReachability(au, runID, 12) // governed-exception through the real path
+	stampEndedAtOnTerminal(rr, art)
 
 	s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au, ArtifactRepo: art})
+	t.Cleanup(s.waitSplitFiling)
 
 	res, err := s.approveStageAs(context.Background(), campaignOperatorIdentity(), approveActionParams{
 		Stage:    planStage,
@@ -1011,6 +1155,8 @@ func TestFileSplitProposalChildren_EndToEnd(t *testing.T) {
 	if res.Stage == nil || res.Stage.State != run.StageStateSucceeded {
 		t.Fatalf("approve did not advance the plan stage: %+v", res.Stage)
 	}
+	// S6: the filing is detached (#3925); sync before reading what it wrote.
+	s.waitSplitFiling()
 
 	// The real hook persisted the completion marker; decode it the way
 	// loadSplitFiling will.
@@ -1261,16 +1407,50 @@ func TestFileSplitProposalChildren_AllPhasesInCapUnchanged(t *testing.T) {
 // isolation: the top-of-hook split_children_filed dedup list still succeeds (so
 // the hook reaches the refusal), and only the refusal's own split_filing_refused
 // dedup list fails.
+//
+// #3925 extends it in place: failOnCall > 0 fails ONLY the Nth read of
+// failCategory (the counter is mutex-guarded because the detached filer reads
+// from a goroutine), and err overrides the injected error (e.g. a
+// dberr-unavailable one).
 type categoryListErrAuditRepo struct {
 	*auditFake
 	failCategory string
+	failOnCall   int
+	err          error
+
+	callMu sync.Mutex
+	calls  int
 }
 
 func (r *categoryListErrAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	if category == r.failCategory {
-		return nil, errors.New("audit: injected ListForRunByCategory error for " + category)
+		r.callMu.Lock()
+		r.calls++
+		n := r.calls
+		r.callMu.Unlock()
+		if r.failOnCall == 0 || n == r.failOnCall {
+			if r.err != nil {
+				return nil, r.err
+			}
+			return nil, errors.New("audit: injected ListForRunByCategory error for " + category)
+		}
 	}
 	return r.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// stampEndedAtOnTerminal makes a promptRunRepo stamp ended_at on a terminal
+// transition the way postgres does (and not on a same-state short-circuit), and
+// backdates every seeded artifact so it predates that stamp BY CONSTRUCTION.
+func stampEndedAtOnTerminal(rr *promptRunRepo, art *fakeArtifactRepo) {
+	for _, a := range art.all {
+		a.CreatedAt = splitFixtureBase
+	}
+	rr.onTransitionStage = func(id uuid.UUID, to run.StageState) {
+		if st, ok := rr.getStages[id]; ok && to.IsTerminal() && st.State != to {
+			at := splitFixtureBase.Add(time.Minute)
+			st.EndedAt = &at
+		}
+	}
 }
 
 // TestFileSplitProposalChildren_RefusalDedupListError_SilentReturn pins the
@@ -1378,7 +1558,9 @@ func TestSplitFilingRefused_EndToEndThroughGetPlan(t *testing.T) {
 		RunID: &distractRun, Category: splitFilingRefusedCategory, Payload: distractPayload,
 	})
 
+	stampEndedAtOnTerminal(rr, art)
 	s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au, ArtifactRepo: art})
+	t.Cleanup(s.waitSplitFiling)
 
 	// Drive the REAL approval hook. Approval succeeds (the top-level scope is in
 	// cap); the best-effort hook then REFUSES to file the over-cap split.
@@ -1392,6 +1574,8 @@ func TestSplitFilingRefused_EndToEndThroughGetPlan(t *testing.T) {
 	if res.Stage == nil || res.Stage.State != run.StageStateSucceeded {
 		t.Fatalf("approve did not advance the plan stage: %+v", res.Stage)
 	}
+	// S6: the filing is detached (#3925); sync before reading what it wrote.
+	s.waitSplitFiling()
 
 	// Serve the live backend and read the refusal back through the REAL
 	// fishhawk_get_plan tool over the SDK's in-memory transport.
@@ -2166,4 +2350,63 @@ func TestFileSplitProposalChildren_ChildBodiesCarryParentApproach(t *testing.T) 
 			}
 		}
 	})
+}
+
+// TestFileSplitProposalChildren_FiledMarkerReadError_AbortsBeforeFiling (V1,
+// #3925): a phase-0 work_item_filed marker is recorded, and the work_item_filed
+// read fails. The hook must file NOTHING and write no completion marker — an
+// unreadable resume record is never treated as an empty one. No querier is
+// registered, so forge adoption cannot mask a re-file.
+func TestFileSplitProposalChildren_FiledMarkerReadError_AbortsBeforeFiling(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
+	idx := 0
+	marker, _ := json.Marshal(splitChildFiledMarker{SplitPhaseIndex: &idx, CreatedNumber: 4001, CreatedURL: "https://github.com/o/r/issues/4001"})
+	rid := h.runID
+	h.au.seeded = append(h.au.seeded, &audit.Entry{RunID: &rid, Category: categoryWorkItemFiled, Payload: marker})
+	h.s.cfg.AuditRepo = &categoryListErrAuditRepo{auditFake: h.au, failCategory: categoryWorkItemFiled}
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if got := h.provider.requestCount(); got != 0 {
+		t.Errorf("File requests = %d, want 0 (a failed work_item_filed read must abort before any filing)", got)
+	}
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Errorf("split_children_filed entries = %d, want 0", n)
+	}
+	if !strings.Contains(h.logs.String(), "list work_item_filed failed") {
+		t.Errorf("no 'list work_item_filed failed' WARN; logs:\n%s", h.logs.String())
+	}
+}
+
+// TestFileSplitProposalChildren_IgnoresParentRunSplitPlan (V2a, #3925): the
+// run's own plan stage carries NO artifact and ParentRunID names a parent whose
+// plan stage carries a 3-phase split. The hook files only from the approved
+// stage's OWN artifact, so it files nothing.
+func TestFileSplitProposalChildren_IgnoresParentRunSplitPlan(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true, parentRun: true})
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if got := h.provider.requestCount(); got != 0 {
+		t.Errorf("File requests = %d, want 0 (a parent run's split plan is never filed from a child run)", got)
+	}
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Errorf("split_children_filed entries = %d, want 0", n)
+	}
+}
+
+// TestFileSplitProposalChildren_UndecodableOwnArtifact_FilesNothing (#3925):
+// the stage's own newest artifact is not plan JSON; the hook files nothing and
+// the WARN names the artifact.
+func TestFileSplitProposalChildren_UndecodableOwnArtifact_FilesNothing(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{planOverride: []byte("not json")})
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if got := h.provider.requestCount(); got != 0 {
+		t.Errorf("File requests = %d, want 0", got)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "plan artifact undecodable") || !strings.Contains(logs, h.planArtifact.ID.String()) {
+		t.Errorf("undecodable WARN missing or does not name the artifact; logs:\n%s", logs)
+	}
 }

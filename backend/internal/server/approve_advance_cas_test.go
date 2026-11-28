@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -72,8 +73,12 @@ type casRunRepo struct {
 	mu          sync.Mutex
 	states      map[uuid.UUID]run.StageState
 	completions map[uuid.UUID]*run.StageCompletion
-	fromCalls   []casTransitionCall
-	plainCalls  []casTransitionCall
+	// endedAt mirrors postgres's ended_at stamp on a terminal entry (and not on
+	// a same-state short-circuit): the split-filing approval binding (#3925,
+	// AA1) reads it.
+	endedAt    map[uuid.UUID]time.Time
+	fromCalls  []casTransitionCall
+	plainCalls []casTransitionCall
 	// getRunCalls counts run-row reads. Both the quorum gate evaluation
 	// (fetchApprovalsForStage, quorum.go) and both post-approval hooks read
 	// the run row, so it is the countable "did the gate machinery run again"
@@ -95,6 +100,7 @@ func newCASRunRepo(inner *promptRunRepo) *casRunRepo {
 		promptRunRepo: inner,
 		states:        map[uuid.UUID]run.StageState{},
 		completions:   map[uuid.UUID]*run.StageCompletion{},
+		endedAt:       map[uuid.UUID]time.Time{},
 	}
 	for id, st := range inner.getStages {
 		r.states[id] = st.State
@@ -117,6 +123,9 @@ func (r *casRunRepo) stageCopyLocked(id uuid.UUID) (*run.Stage, bool) {
 		cp.FailureCategory = c.FailureCategory
 		cp.FailureReason = c.FailureReason
 	}
+	if at, ok := r.endedAt[id]; ok {
+		cp.EndedAt = &at
+	}
 	return &cp, true
 }
 
@@ -129,6 +138,9 @@ func (r *casRunRepo) applyLocked(id uuid.UUID, to run.StageState, c *run.StageCo
 	}
 	if cur != to && !run.ValidStageTransition(cur, to) {
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(cur), To: string(to)}
+	}
+	if cur != to && to.IsTerminal() {
+		r.endedAt[id] = splitFixtureBase.Add(time.Minute)
 	}
 	r.states[id] = to
 	if c != nil {
@@ -352,6 +364,7 @@ type approveCASHarness struct {
 	// per-category read counter and the optional hook-window rendezvous.
 	gaud      *casGatedAudit
 	ar        *fakeApprovalRepo
+	art       *fakeArtifactRepo
 	provider  *splitFileProvider
 	runID     uuid.UUID
 	stageID   uuid.UUID
@@ -413,19 +426,27 @@ func newApproveCASHarness(t *testing.T) *approveCASHarness {
 	inner.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
 
 	sv := "standard_v1"
-	if _, err := art.Create(context.Background(), artifact.CreateParams{
+	a, err := art.Create(context.Background(), artifact.CreateParams{
 		StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: approveCASPlanBytes(t),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed plan artifact: %v", err)
 	}
+	// BY CONSTRUCTION the artifact predates the gate's close (the EndedAt the
+	// CAS repo stamps), so the #3925 approval binding admits the filing.
+	a.CreatedAt = splitFixtureBase
 	seedReachability(au, runID, 12)
 
 	rr := newCASRunRepo(inner)
 	gaud := newCASGatedAudit(au)
 	s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: gaud, ArtifactRepo: art})
+	// V5 (#3925): the split filing is detached; no filer may outlive its test
+	// and file against the NEXT test's provider through workmgmt's
+	// process-global registry.
+	t.Cleanup(s.waitSplitFiling)
 
 	return &approveCASHarness{
-		s: s, rr: rr, au: au, gaud: gaud, ar: ar, provider: provider,
+		s: s, rr: rr, au: au, gaud: gaud, ar: ar, art: art, provider: provider,
 		runID: runID, stageID: planStageID, planStage: planStage,
 	}
 }
@@ -549,18 +570,25 @@ func TestApproveAdvanceCAS_ConcurrentApprovals_HooksRunExactlyOncePerFilingPath(
 		wg.Add(1)
 		go func(i int, subj string) {
 			defer wg.Done()
-			// depart() before the goroutine ends so a REFUSED approval that
-			// never reaches the hook guard still releases the winner parked in
-			// it — the CAS-present world's release condition.
-			defer gate.depart()
 			_, err := h.s.approveStageAs(context.Background(), approverIdentity(subj), approveActionParams{
 				Stage:    h.observedStage(),
 				Decision: approval.DecisionApprove,
 			})
 			errs[i] = err
+			// depart() ONLY for a REFUSED approval (#3925): the filing is now
+			// detached, so an ADMITTED approval returns before its filer reaches
+			// the guard, and counting its return as a departure would let the
+			// first filer through without waiting for the second — making the
+			// deleted-CAS counterfactual interleaving-dependent again. A refused
+			// loser launches nothing, so its departure is what releases the
+			// winner's filer in the CAS-present world.
+			if err != nil {
+				gate.depart()
+			}
 		}(i, subj)
 	}
 	wg.Wait()
+	h.s.waitSplitFiling()
 
 	// The per-filing-path counts come FIRST: they are the behavioral assertion
 	// the counterfactual has to redden, so they must be reported even when the
@@ -637,6 +665,7 @@ func TestApproveAdvanceCAS_LoserRefusedOnStaleObservation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("first approve: %v", err)
 	}
+	h.s.waitSplitFiling()
 	h.assertHooksRanExactlyOncePerPath(t)
 	splitBefore, walkBefore := h.filings()
 
@@ -644,6 +673,12 @@ func TestApproveAdvanceCAS_LoserRefusedOnStaleObservation(t *testing.T) {
 		Stage:    h.observedStage(), // the stale premise: still awaiting_approval
 		Decision: approval.DecisionApprove,
 	})
+	h.s.waitSplitFiling()
+	// The refused advance released its pre-CAS split-filing claim (#3925): a
+	// leaked hold would refuse every later resume and re-approval of the run.
+	if got := h.s.splitFiling.holdersFor(h.runID); got != 0 {
+		t.Errorf("split-filing registry holders after the refused approve = %d, want 0", got)
+	}
 	if err == nil {
 		t.Fatal("second approve on a stale observation returned nil error, want refusal")
 	}
@@ -702,6 +737,7 @@ func TestApproveAdvanceCAS_SequentialFreshLoadReapprove_MarkerDedupFilesNothing(
 	}); err != nil {
 		t.Fatalf("first approve: %v", err)
 	}
+	h.s.waitSplitFiling()
 	h.assertHooksRanExactlyOncePerPath(t)
 	splitBefore, walkBefore := h.filings()
 	guardReadsBefore := h.gaud.readCount(splitChildrenFiledCategory)
@@ -722,6 +758,7 @@ func TestApproveAdvanceCAS_SequentialFreshLoadReapprove_MarkerDedupFilesNothing(
 	}); err != nil {
 		t.Fatalf("sequential fresh-load re-approve returned %v; it must still be admitted (no 200→409 narrowing)", err)
 	}
+	h.s.waitSplitFiling()
 
 	// It really did re-enter the hook tail — this is the assertion that makes
 	// the zero-additional-filings claim below about DEDUP rather than about the
@@ -771,6 +808,7 @@ func TestApproveAdvanceCAS_HTTPRacedApproveReturns409(t *testing.T) {
 	}
 
 	w := submitApproval(t, h.s, h.stageID, `{"decision":"approve"}`)
+	h.s.waitSplitFiling()
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
 	}
@@ -826,6 +864,8 @@ func TestApproveAdvanceCAS_NonCASRepoStillAdvances(t *testing.T) {
 		t.Fatal("promptRunRepo unexpectedly implements StageCASTransitioner; it is this test's no-capability vehicle")
 	}
 	h.s.cfg.RunRepo = plain
+	// The bare promptRunRepo does not stamp ended_at; postgres does.
+	stampEndedAtOnTerminal(plain, h.art)
 
 	res, err := h.s.approveStageAs(context.Background(), approverIdentity("approver-one"), approveActionParams{
 		Stage:    h.observedStage(),
@@ -834,6 +874,10 @@ func TestApproveAdvanceCAS_NonCASRepoStillAdvances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("approve against a non-CAS RunRepo: %v", err)
 	}
+	// The RunRepo swap and TransitionStage's writes precede the detached
+	// filer's start, and the filer only READS promptRunRepo; every read below
+	// still waits for it (#3925).
+	h.s.waitSplitFiling()
 	if res.Stage == nil || res.Stage.State != run.StageStateSucceeded {
 		t.Fatalf("stage did not advance: %+v", res.Stage)
 	}
@@ -866,6 +910,7 @@ func TestApproveAdvanceCAS_DuplicateSubmissionUnchanged(t *testing.T) {
 	if w := submitApproval(t, h.s, h.stageID, `{"decision":"approve"}`); w.Code != http.StatusOK {
 		t.Fatalf("first approve status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
+	h.s.waitSplitFiling()
 	h.assertHooksRanExactlyOncePerPath(t)
 	splitBefore, walkBefore := h.filings()
 	approvalsBefore := len(h.ar.all)
@@ -878,6 +923,7 @@ func TestApproveAdvanceCAS_DuplicateSubmissionUnchanged(t *testing.T) {
 	}
 
 	w := submitApproval(t, h.s, h.stageID, `{"decision":"approve"}`) // same subject
+	h.s.waitSplitFiling()
 	if w.Code != http.StatusOK {
 		t.Fatalf("duplicate approve status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -1098,6 +1144,7 @@ func TestApproveAdvanceCAS_RejectLegUnchanged(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed approve: %v", err)
 	}
+	h2.s.waitSplitFiling()
 	succeeded, err := h2.rr.GetStage(context.Background(), h2.stageID)
 	if err != nil {
 		t.Fatalf("reload stage: %v", err)
