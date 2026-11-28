@@ -81,14 +81,27 @@ stays open (this is a partial delivery; the first-officer seat half is
 remaining scope).
 
 - **Seam.** `Config.HostAdmissionHold` is the package-local interface
-  `HostAdmissionHold { Held(now) (bool, reason string) }`; nil (the default)
-  leaves the marker byte-identical. fishhawkd wires it only under
+  `HostAdmissionHold { Held(now) (bool, reason string); Host() string }`; nil
+  (the default) leaves the marker unchanged. fishhawkd wires it only under
   `--enable-ops-monitor --ops-monitor-dispatch-hold` on a `local` deployment,
   with the SAME `*opsmonitor.AdmissionHold` the ops monitor ticker updates
   (`backend/cmd/fishhawkd/README.md` § "Interim dispatch hold"). That hold is
   held while the memory probe reads CRITICAL pressure and reads not-held once
   the ticker has not updated it for 3 × its effective interval, so a dead
   ticker cannot pin admissions shut (`backend/internal/opsmonitor/README.md`).
+- **Keyed to the measured host** ([#5619](https://github.com/kuhlman-labs/fishhawk/issues/5619)).
+  `Host()` is the label of the host whose memory the hold measured, in the
+  marker's `{"host"}` vocabulary (`""` reads as `unknown`). A held hold
+  refuses a marker (`hostAdmissionHoldApplies`) when the request's label is
+  the measured one, or is `unknown` (a bodyless or pre-#4212 client cannot
+  show that it spawns elsewhere), and refuses EVERY marker when the measured
+  label is itself unresolved. Both are fail-closed. Any other label is
+  admitted, and the marker logs a WARN carrying `stage_id`, `run_id`,
+  `measured_host`, `request_host` and `reason`. The label is client-supplied:
+  this is a resource guard, not an authorization control.
+- **Body.** With the hold wired the optional marker body is parsed even with
+  no slot store, so the 400 `validation_failed` body refusals
+  (`parseHostDispatchBody`) apply whenever the hold is wired, held or not.
 - **Where it fires.** After every eligibility and dependency guard (dev mode,
   auth, runner_kind/executor, terminal run, wave order, post-deploy hold,
   decomposed-parent acceptance), the state switch, the operator per-run
@@ -97,10 +110,12 @@ remaining scope).
   merge-candidate pass refusal (#4811, below), and BEFORE the bare CAS
   or the concurrency slot admission. Only the two admissible arms reach it —
   `pending` (a first plan-stage spawn) and `awaiting_host_dispatch` — so it
-  refuses EVERY new admission, and it commits nothing: no transition, no
+  refuses only new admissions, and it commits nothing: no transition, no
   queue row, no slot.
 - **Refusal.** `409 host_memory_pressure`, details `{stage_id, state, reason,
-  retry: "re-dispatch once the ops monitor clears the condition"}`. A plain
+  retry: "re-dispatch once the ops monitor clears the condition", host,
+  request_host}`; `host` is the measured label (also named in the message) and
+  `request_host` the marker's. A plain
   409, not the queued `concurrency_slot_queued`: an MCP slot waiter stops on
   it and the operator re-dispatches once the condition clears; the stage stays
   where it was.
@@ -115,6 +130,11 @@ remaining scope).
   `…_NilIsDefault`, `…_AlreadyDispatchedUntouched` (the hold is not even
   consulted) and `…_PrecedesSlotAdmission` (a grouped implement stage: a held
   hold never calls `concurrency.Store.Admit`; the not-held control does).
+  Host keying (#5619): `…_MeasuredHostHeld`, `…_OtherHostAdmitted` (200,
+  committed `dispatched`, the WARN), `…_UnlabelledMarkerHeld`,
+  `…_UnresolvedMeasuredHostHoldsEvery`, `…_InvalidBodyRefused` (400 with no
+  slot store, state unchanged) and `…_OpsMonitorTickerEndToEnd` (a real
+  `opsmonitor.NewAdmissionHold` turned held by a real ticker tick).
 
 ## Operator per-run dispatch hold (`run_dispatch_hold.go`, E110.50 / [#5486](https://github.com/kuhlman-labs/fishhawk/issues/5486))
 
