@@ -142,10 +142,11 @@ type CreateCampaignItemParams struct {
 	IssueRef   string
 	DependsOn  []string
 	// Autonomy is the item's autonomy tier (low|medium|high), persisted to the
-	// campaign_items.autonomy column. Empty is the unknown/default tier (the
-	// child carried no autonomy label). The column CHECK admits only the empty
-	// tier plus the three known tiers, so an out-of-set value fails closed at
-	// write time.
+	// campaign_items.autonomy column. CreateCampaignItem normalizes it, so ""
+	// or an out-of-set value persists as the built-in medium (ADR-069 decision
+	// 4, #5316); an unlabelled child normally arrives already carrying the
+	// repository conventions' default. The column CHECK still admits '' only
+	// for legacy rows.
 	Autonomy string
 	// Position is the item's 0-based place in the campaign queue, persisted to
 	// campaign_items.queue_position (migration 0074). The caller assigns dense
@@ -465,9 +466,9 @@ type Repository interface {
 	// metadata re-read from the issue's autonomy:* label on the reconcile-on-read
 	// refresh (#2355), so relabelling a child unblocks a campaign parked on
 	// attend_human_led instead of the tier staying frozen at assembly time. It
-	// NORMALIZES the input to the CHECK-permitted set ("", low, medium, high) —
-	// an out-of-set tier persists as "" (the unknown/default tier) rather than
-	// tripping the migration-0049 column CHECK. Idempotent when the tier is
+	// NORMALIZES the input to low, medium or high — "" or an out-of-set tier
+	// persists as the built-in medium (ADR-069 decision 4, #5316), never "" and
+	// never a migration-0049 column CHECK violation. Idempotent when the tier is
 	// unchanged (the caller only writes on a real difference, but a same-value
 	// write is harmless). Returns ErrNotFound for a missing item. Deliberately
 	// NOT a lifecycle transition (autonomy is routing metadata, not state), so —

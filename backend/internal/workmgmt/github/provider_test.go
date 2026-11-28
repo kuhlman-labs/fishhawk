@@ -706,8 +706,9 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	}
 	// Autonomy is parsed off each child's `autonomy:<tier>` label: #41 low,
 	// #42 medium (its non-autonomy type:feature label is ignored), #43 unlabeled
-	// -> "" (#1551).
-	wantAutonomy := map[int]string{41: "low", 42: "medium", 43: ""}
+	// -> the request default, which is zero here and so degrades to the built-in
+	// medium (ADR-069 decision 4, #5316; #1551).
+	wantAutonomy := map[int]string{41: "low", 42: "medium", 43: "medium"}
 	for _, c := range res.Children {
 		if c.Autonomy != wantAutonomy[c.Number] {
 			t.Errorf("child #%d Autonomy = %q, want %q", c.Number, c.Autonomy, wantAutonomy[c.Number])
@@ -863,32 +864,90 @@ func TestProvider_EpicChildren_CrossPageDependencyIsEdgeNotDropped(t *testing.T)
 }
 
 // TestParseAutonomyLabel covers the tier extraction: the first autonomy:<tier>
-// label's suffix wins, a non-autonomy label is ignored, no autonomy label
-// yields "" (unknown/default), and an out-of-set tier normalizes to "" so a
-// mislabeled child degrades to the non-human-led default (matching the
-// fail-closed campaign_items.autonomy CHECK) rather than reaching Persist as a
-// value the CHECK rejects.
+// label's suffix wins, a non-autonomy label is ignored, and no autonomy label or
+// an out-of-set tier resolves to the supplied default (the repository
+// conventions' default, ADR-069 decision 4 / #5316). An empty default degrades
+// to medium, so the result is never "" and always inside the fail-closed
+// campaign_items.autonomy CHECK set.
 func TestParseAutonomyLabel(t *testing.T) {
 	cases := []struct {
-		name   string
-		labels []string
-		want   string
+		name        string
+		labels      []string
+		defaultTier string
+		want        string
 	}{
-		{"low", []string{"type:feature", "autonomy:low"}, "low"},
-		{"medium", []string{"autonomy:medium"}, "medium"},
-		{"high", []string{"autonomy:high", "area:backend"}, "high"},
-		{"unlabeled", []string{"type:bug", "area:server"}, ""},
-		{"nil labels", nil, ""},
-		{"first autonomy wins", []string{"autonomy:high", "autonomy:low"}, "high"},
-		{"known tier passes through", []string{"autonomy:low"}, "low"},
-		{"out-of-set tier normalizes to empty", []string{"autonomy:bogus"}, ""},
+		{"low", []string{"type:feature", "autonomy:low"}, "high", "low"},
+		{"medium", []string{"autonomy:medium"}, "low", "medium"},
+		{"high", []string{"autonomy:high", "area:backend"}, "low", "high"},
+		{"unlabeled resolves to default", []string{"type:bug", "area:server"}, "low", "low"},
+		{"unlabeled with empty default degrades to medium", []string{"type:bug"}, "", "medium"},
+		{"nil labels resolve to default", nil, "low", "low"},
+		{"first autonomy wins", []string{"autonomy:high", "autonomy:low"}, "low", "high"},
+		{"known tier passes through", []string{"autonomy:low"}, "medium", "low"},
+		{"out-of-set tier resolves to default", []string{"autonomy:bogus"}, "low", "low"},
+		{"out-of-set tier with empty default degrades to medium", []string{"autonomy:bogus"}, "", "medium"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := parseAutonomyLabel(tc.labels); got != tc.want {
-				t.Errorf("parseAutonomyLabel(%v) = %q, want %q", tc.labels, got, tc.want)
+			if got := parseAutonomyLabel(tc.labels, tc.defaultTier); got != tc.want {
+				t.Errorf("parseAutonomyLabel(%v, %q) = %q, want %q", tc.labels, tc.defaultTier, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestEpicChildren_UnlabelledChildResolvesToRequestDefault pins the provider
+// threading (#5316): EpicChildren resolves an unlabelled child to the request's
+// DefaultAutonomy, while a declared tier still wins over it.
+func TestEpicChildren_UnlabelledChildResolvesToRequestDefault(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 51, NodeID: "N51", Title: "unlabelled", Body: "no deps", State: "OPEN"},
+			{Number: 52, NodeID: "N52", Title: "declared high", Body: "no deps", Labels: []string{"autonomy:high"}, State: "OPEN"},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target:          workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:            "#1005",
+		DefaultAutonomy: "low",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	want := map[int]string{51: "low", 52: "high"}
+	if len(res.Children) != len(want) {
+		t.Fatalf("children = %+v, want #51 and #52", res.Children)
+	}
+	for _, c := range res.Children {
+		if c.Autonomy != want[c.Number] {
+			t.Errorf("child #%d Autonomy = %q, want %q (request DefaultAutonomy low)", c.Number, c.Autonomy, want[c.Number])
+		}
+	}
+}
+
+// TestResolveDependencies_UnlabelledItemResolvesToRequestDefault is the
+// issue-set counterpart: ResolveDependencies resolves an unlabelled named issue
+// to the request's DefaultAutonomy, while a declared tier still wins (#5316).
+func TestResolveDependencies_UnlabelledItemResolvesToRequestDefault(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		200: {Number: 200, Title: "unlabelled", Body: "no deps", State: "open"},
+		201: {Number: 201, Title: "declared high", Body: "no deps", State: "open", Labels: []string{"autonomy:high"}},
+	}}
+	req := resolveReq("200", "201")
+	req.DefaultAutonomy = "low"
+	res, err := New(api).ResolveDependencies(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	want := map[int]string{200: "low", 201: "high"}
+	if len(res.Children) != len(want) {
+		t.Fatalf("children = %+v, want #200 and #201", res.Children)
+	}
+	for _, c := range res.Children {
+		if c.Autonomy != want[c.Number] {
+			t.Errorf("#%d Autonomy = %q, want %q (request DefaultAutonomy low)", c.Number, c.Autonomy, want[c.Number])
+		}
 	}
 }
 
@@ -3393,16 +3452,18 @@ func jitterGolden() *workmgmt.EpicChildrenResult {
 			// #101 is closed+completed, so State normalizes to "CLOSED" (#3323); the
 			// rest carry no state in the fixture, so State is "". Each child carries
 			// its fetched Body verbatim (#3649: the REST site now populates Body).
-			{Number: 101, Title: "one-one", Complete: true, State: "CLOSED"},
-			{Number: 102, Title: "one-two"},
-			{Number: 103, Title: "one-three"},
-			{Number: 104, Title: "one-four", Body: "Depends on: #103\n"},
-			{Number: 105, Title: "one-five", Body: "Depends on: #903\n"},
-			{Number: 106, Title: "one-six", Body: "Depends on: #902\n"},
-			{Number: 107, Title: "one-seven", Body: "Depends on: other/repo#5\n"},
-			{Number: 108, Title: "one-eight", Body: "Depends on: #901\n"},
-			{Number: 109, Title: "one-nine", Body: "Depends on: #900\n"},
-			{Number: 110, Title: "one-ten", Body: "Depends on: #101\n"},
+			// Every child is unlabelled, so Autonomy is the zero request default
+			// degraded to the built-in medium (#5316).
+			{Number: 101, Title: "one-one", Autonomy: "medium", Complete: true, State: "CLOSED"},
+			{Number: 102, Title: "one-two", Autonomy: "medium"},
+			{Number: 103, Title: "one-three", Autonomy: "medium"},
+			{Number: 104, Title: "one-four", Autonomy: "medium", Body: "Depends on: #103\n"},
+			{Number: 105, Title: "one-five", Autonomy: "medium", Body: "Depends on: #903\n"},
+			{Number: 106, Title: "one-six", Autonomy: "medium", Body: "Depends on: #902\n"},
+			{Number: 107, Title: "one-seven", Autonomy: "medium", Body: "Depends on: other/repo#5\n"},
+			{Number: 108, Title: "one-eight", Autonomy: "medium", Body: "Depends on: #901\n"},
+			{Number: 109, Title: "one-nine", Autonomy: "medium", Body: "Depends on: #900\n"},
+			{Number: 110, Title: "one-ten", Autonomy: "medium", Body: "Depends on: #101\n"},
 		},
 		Edges: []workmgmt.DependsEdge{{From: 104, To: 103, Source: srcNative}, {From: 110, To: 101, Source: srcLegacy}},
 		DroppedEdges: []workmgmt.DependsEdge{
@@ -3471,9 +3532,9 @@ func TestResolveDependenciesByteIdenticalUnderJitter(t *testing.T) {
 func epicJitterGolden() *workmgmt.EpicChildrenResult {
 	return &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
-			{Number: 10, Title: "ten", Body: "Depends on: #901\n"},
-			{Number: 11, Title: "eleven", Body: "Depends on: #900\n"},
-			{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
+			{Number: 10, Title: "ten", Autonomy: "medium", Body: "Depends on: #901\n"},
+			{Number: 11, Title: "eleven", Autonomy: "medium", Body: "Depends on: #900\n"},
+			{Number: 12, Title: "twelve", Autonomy: "medium", Body: "Depends on: #11\n"},
 		},
 		Edges: []workmgmt.DependsEdge{{From: 12, To: 11, Source: srcLegacy}},
 		DroppedEdges: []workmgmt.DependsEdge{
@@ -4883,10 +4944,10 @@ func TestCampaignEpicChildrenByteIdenticalUnderJitter(t *testing.T) {
 	canon := dependsOnTokenCanonical("other/repo#3")
 	golden := &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
-			{Number: 10, Title: "ten"},
-			{Number: 11, Title: "eleven"},
-			{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
-			{Number: 13, Title: "thirteen"},
+			{Number: 10, Title: "ten", Autonomy: "medium"},
+			{Number: 11, Title: "eleven", Autonomy: "medium"},
+			{Number: 12, Title: "twelve", Autonomy: "medium", Body: "Depends on: #11\n"},
+			{Number: 13, Title: "thirteen", Autonomy: "medium"},
 		},
 		Edges: []workmgmt.DependsEdge{{From: 12, To: 11, Source: srcNative}, {From: 13, To: 12, Source: srcNative}},
 		DroppedEdges: []workmgmt.DependsEdge{{From: 10, To: 0, Reason: workmgmt.DropTargetStateUnreadable,

@@ -125,6 +125,12 @@ type CampaignEpicChildrenQuerier interface {
 type EpicChildrenRequest struct {
 	Target Target
 	Epic   string
+	// DefaultAutonomy is the tier a child with no `autonomy:*` label, or an
+	// unrecognised one, resolves to (ADR-069 decision 4, #5316) — normally
+	// Conventions.DefaultAutonomyTier(). A zero value degrades to
+	// BuiltinDefaultAutonomyTier through ParseAutonomyLabel, so a caller that
+	// never reads EpicChild.Autonomy need not set it.
+	DefaultAutonomy string
 }
 
 // EpicLinker is the optional link-an-existing-issue-to-its-epic capability
@@ -203,6 +209,11 @@ type IssueSetDependencyResolver interface {
 type IssueSetRequest struct {
 	Target Target
 	Items  []string
+	// DefaultAutonomy is the tier a named issue with no `autonomy:*` label, or
+	// an unrecognised one, resolves to (ADR-069 decision 4, #5316) — normally
+	// Conventions.DefaultAutonomyTier(). A zero value degrades to
+	// BuiltinDefaultAutonomyTier through ParseAutonomyLabel.
+	DefaultAutonomy string
 }
 
 // ErrInvalidItemRef is PART OF THE RESOLVER CONTRACT: a named item ref is not a
@@ -467,8 +478,9 @@ type SatisfiedEdge struct {
 
 // EpicChild is one child issue of an epic: its number, title, autonomy tier,
 // and completion state. Autonomy is the tier parsed from the child's
-// `autonomy:<tier>` label (low|medium|high), empty when the child carries no
-// autonomy label (unknown/default). It is the producer end of the campaign
+// `autonomy:<tier>` label (low|medium|high); a child with no autonomy label, or
+// an unrecognised one, carries the request's DefaultAutonomy (the repository
+// conventions' default, ADR-069 decision 4 / #5316) — never "". It is the producer end of the campaign
 // autonomy-aware eligibility path (#1551): the campaign engine diverts a
 // deps-satisfied autonomy:low child out of the auto-dispatch Eligible slice.
 //

@@ -79,10 +79,13 @@ func worktreeRegistered(t *testing.T, repoDir, target string) bool {
 	if err != nil {
 		t.Fatalf("worktree list: %v", err)
 	}
-	ct := canonPath(target)
+	// canonWorktreePath resolves a missing leaf through its parent, so an
+	// already-removed target under a symlinked temp dir (macOS /var ->
+	// /private/var) still matches the realpath git registered.
+	ct := canonWorktreePath(target)
 	for _, line := range strings.Split(string(out), "\n") {
 		if p, ok := strings.CutPrefix(line, "worktree "); ok {
-			if canonPath(strings.TrimSpace(p)) == ct {
+			if canonWorktreePath(strings.TrimSpace(p)) == ct {
 				return true
 			}
 		}
@@ -251,12 +254,45 @@ func TestProvisionAcceptanceTree_StaleLeftoverSwept(t *testing.T) {
 	}
 }
 
+// TestProvisionAcceptanceTree_RegisteredMissingLeftoverReclaimed: the leftover
+// is a REGISTERED worktree of the dispatch repo whose directory is gone (the
+// runner was killed, then /tmp was cleaned). No directory exists for the
+// os.Stat sweep to see, so only the unconditional targeted deregistration
+// clears the registration; without it `git worktree add` refuses "missing but
+// already registered worktree" and the agent runs unprovisioned.
+func TestProvisionAcceptanceTree_RegisteredMissingLeftoverReclaimed(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	redirectAcceptanceTreeDir(t)
+	var log strings.Builder
+
+	target := acceptanceTreePath("run1", "stage1")
+	if out, err := exec.Command("git", "-C", dispatch, "worktree", "add", "--detach", target, mcSHA).CombinedOutput(); err != nil {
+		t.Fatalf("seed leftover worktree: %v\n%s", err, out)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	if !worktreeRegistered(t, dispatch, target) {
+		t.Fatal("fixture: the leftover must still be registered with its directory gone")
+	}
+
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
+	defer teardown()
+	if !strings.Contains(log.String(), `"event":"acceptance_tree_provisioned"`) {
+		t.Fatalf("a registered-but-missing leftover must be reclaimed before the add:\n%s", log.String())
+	}
+	if _, err := os.Stat(filepath.Join(target, "keep.txt")); err != nil {
+		t.Errorf("provisioned checkout content missing: %v", err)
+	}
+}
+
 // TestProvisionAcceptanceTree_TeardownRemoveFallback: when `git worktree remove`
 // fails (here forced by locking the worktree so a single --force is refused),
-// teardown falls back to unlock + os.RemoveAll + `git worktree prune` — the
-// directory is removed AND the locked registration is unregistered (the unlock
-// clears the lock a plain prune would otherwise skip), the fallback variant is
-// logged, and the stage outcome is never affected.
+// teardown falls back to os.RemoveAll + the targeted deregisterWorktree
+// (`git worktree remove --force --force <target>`) — the directory is removed
+// AND the locked registration is unregistered (double force clears a locked
+// entry), the rm_deregister variant is logged, and the stage outcome is never
+// affected.
 func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 	dispatch, mcSHA := acceptanceTreeRepo(t)
 	redirectAcceptanceTreeDir(t)
@@ -268,7 +304,7 @@ func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 		t.Fatalf("provision failed: %v\n%s", err, log.String())
 	}
 	// Lock the worktree so `git worktree remove --force` (single --force) is
-	// refused, forcing the rm+prune fallback.
+	// refused, forcing the rm+deregister fallback.
 	if out, err := exec.Command("git", "-C", dispatch, "worktree", "lock", target).CombinedOutput(); err != nil {
 		t.Fatalf("git worktree lock: %v\n%s", err, out)
 	}
@@ -277,15 +313,179 @@ func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Errorf("fallback must remove the checkout dir despite the lock (err=%v)", err)
 	}
-	if !strings.Contains(log.String(), `"fallback":"rm_prune"`) {
-		t.Errorf("teardown remove failure must take the rm_prune fallback:\n%s", log.String())
+	if !strings.Contains(log.String(), `"fallback":"rm_deregister"`) {
+		t.Errorf("teardown remove failure must take the rm_deregister fallback:\n%s", log.String())
 	}
-	// The unlock+prune fallback must ALSO unregister the locked worktree — a plain
-	// prune skips locked entries, so without the unlock the registration would
-	// persist in the dispatch repo's admin area and acceptance_tree_removed would
-	// overclaim.
+	// The fallback must ALSO unregister the locked worktree — otherwise the
+	// registration would persist in the dispatch repo's admin area and
+	// acceptance_tree_removed would overclaim.
 	if worktreeRegistered(t, dispatch, target) {
 		t.Error("fallback must unregister the locked worktree, not leave a stranded registration")
+	}
+}
+
+// TestProvisionAcceptanceTree_StaleSweepSparesHiddenForeignWorktree (#4281): the
+// stale-leftover sweep deregisters only the keyed path, so a foreign worktree of
+// the dispatch repo that is invisible while the sweep runs keeps its
+// registration.
+func TestProvisionAcceptanceTree_StaleSweepSparesHiddenForeignWorktree(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	redirectAcceptanceTreeDir(t)
+	ext, hide, restore := hiddenForeignWorktree(t, dispatch)
+	var log strings.Builder
+
+	target := acceptanceTreePath("run1", "stage1")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "stale.txt"), []byte("crash residue\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hide()
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
+	restore()
+	defer teardown()
+
+	if !strings.Contains(log.String(), `"event":"acceptance_tree_stale_swept"`) {
+		t.Fatalf("the sweep branch must run:\n%s", log.String())
+	}
+	assertForeignWorktreeSurvives(t, dispatch, ext)
+}
+
+// TestProvisionAcceptanceTree_TeardownFallbackSparesHiddenForeignWorktree
+// (#4281): the lock-forced teardown fallback removes and deregisters the
+// acceptance tree while a hidden foreign worktree keeps its registration.
+func TestProvisionAcceptanceTree_TeardownFallbackSparesHiddenForeignWorktree(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	redirectAcceptanceTreeDir(t)
+	ext, hide, restore := hiddenForeignWorktree(t, dispatch)
+	var log strings.Builder
+
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
+	target := acceptanceTreePath("run1", "stage1")
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("provision failed: %v\n%s", err, log.String())
+	}
+	if out, err := exec.Command("git", "-C", dispatch, "worktree", "lock", target).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree lock: %v\n%s", err, out)
+	}
+
+	hide()
+	teardown()
+	restore()
+
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("fallback must remove the checkout dir (err=%v)", err)
+	}
+	if worktreeRegistered(t, dispatch, target) {
+		t.Error("fallback must deregister the locked acceptance tree")
+	}
+	if !strings.Contains(log.String(), `"fallback":"rm_deregister"`) {
+		t.Errorf("teardown must log the rm_deregister fallback:\n%s", log.String())
+	}
+	assertForeignWorktreeSurvives(t, dispatch, ext)
+}
+
+// stubAcceptanceTreeGitRemoveFails makes every `git worktree remove` the
+// acceptance tree issues fail, passing every other command through to real git,
+// so the teardown's deregistration sees the tree still registered.
+func stubAcceptanceTreeGitRemoveFails(t *testing.T) {
+	t.Helper()
+	orig := acceptanceTreeGit
+	acceptanceTreeGit = func(repoDir string) gitAdminRunner {
+		passthrough := orig(repoDir)
+		return func(ctx context.Context, args ...string) ([]byte, error) {
+			if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+				return []byte("fatal: stub refuses remove"), exec.ErrNotFound
+			}
+			return passthrough(ctx, args...)
+		}
+	}
+	t.Cleanup(func() { acceptanceTreeGit = orig })
+}
+
+// assertTeardownDeregisterFailed checks the teardown reported the stranded
+// registration instead of overclaiming acceptance_tree_removed.
+func assertTeardownDeregisterFailed(t *testing.T, log string) {
+	t.Helper()
+	if !strings.Contains(log, `"event":"acceptance_tree_teardown_failed"`) {
+		t.Errorf("a failed deregistration must emit acceptance_tree_teardown_failed:\n%s", log)
+	}
+	if !strings.Contains(log, "; deregister: ") {
+		t.Errorf("teardown_failed detail must carry the deregister error:\n%s", log)
+	}
+	if strings.Contains(log, `"event":"acceptance_tree_removed"`) {
+		t.Errorf("teardown must not claim acceptance_tree_removed over a stranded registration:\n%s", log)
+	}
+}
+
+// TestProvisionAcceptanceTree_TeardownDeregisterFailureReported (DD1c): when
+// both removes fail and the listing still names the tree, the teardown emits
+// acceptance_tree_teardown_failed with the "; deregister:" detail.
+func TestProvisionAcceptanceTree_TeardownDeregisterFailureReported(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	resolved, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := acceptanceTreeDir
+	acceptanceTreeDir = resolved
+	t.Cleanup(func() { acceptanceTreeDir = orig })
+	stubAcceptanceTreeGitRemoveFails(t)
+	var log strings.Builder
+
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
+	if !strings.Contains(log.String(), `"event":"acceptance_tree_provisioned"`) {
+		t.Fatalf("provision failed:\n%s", log.String())
+	}
+	teardown()
+	assertTeardownDeregisterFailed(t, log.String())
+}
+
+// TestProvisionAcceptanceTree_TeardownDeregisterFailureReportedAliasPath
+// (DD1b/c): the same stranded registration, with the tree named through a
+// symlink alias whose leaf is gone after the RemoveAll. git registered the
+// resolved path, so only parent-resolving canonicalization sees the match.
+func TestProvisionAcceptanceTree_TeardownDeregisterFailureReportedAliasPath(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	_, alias := symlinkAlias(t)
+	orig := acceptanceTreeDir
+	acceptanceTreeDir = alias
+	t.Cleanup(func() { acceptanceTreeDir = orig })
+	stubAcceptanceTreeGitRemoveFails(t)
+	var log strings.Builder
+
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
+	if !strings.Contains(log.String(), `"event":"acceptance_tree_provisioned"`) {
+		t.Fatalf("provision failed:\n%s", log.String())
+	}
+	teardown()
+	assertTeardownDeregisterFailed(t, log.String())
+}
+
+// TestProvisionAcceptanceTree_TeardownSurvivesCancelledContext (DD2): the
+// teardown runs on a detached context, so a stage context cancelled before the
+// teardown still removes and deregisters the tree.
+func TestProvisionAcceptanceTree_TeardownSurvivesCancelledContext(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	redirectAcceptanceTreeDir(t)
+	var log strings.Builder
+	ctx, cancel := context.WithCancel(context.Background())
+
+	teardown := provisionAcceptanceTree(ctx, dispatch, mcSHA, "run1", "stage1", nil, &log)
+	target := acceptanceTreePath("run1", "stage1")
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("provision failed: %v\n%s", err, log.String())
+	}
+	cancel()
+	teardown()
+
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("teardown on a cancelled stage must still remove the tree (err=%v)\n%s", err, log.String())
+	}
+	if worktreeRegistered(t, dispatch, target) {
+		t.Errorf("teardown on a cancelled stage must still deregister the tree:\n%s", log.String())
 	}
 }
 

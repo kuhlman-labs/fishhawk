@@ -326,6 +326,66 @@ func TestShipTrace_HappyPath(t *testing.T) {
 	}
 }
 
+// TestShipTrace_DecodesTraceUploadResponseGolden is the runner end of the
+// #5535 trace 202 seam: the backend's TestTraceUploadResponse_MatchesWireGolden
+// marshals traceUploadResponse to testdata/wire/trace_upload_response.json,
+// and ShipTrace must surface its stage_state and stage_failure_kind on
+// ShipResult when the backend answers with those exact bytes.
+func TestShipTrace_DecodesTraceUploadResponseGolden(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "trace_upload_response.json"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	fb, srv := newFakeBackend(t)
+	fb.shipBody = string(golden)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+	res, err := c.ShipTrace(context.Background(), ShipArgs{
+		RunID:      "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+		StageID:    "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+		Variant:    "raw",
+		Bundle:     []byte("gzip-bytes-pretend"),
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipTrace: %v", err)
+	}
+	if res.StageState != "failed" || res.StageFailureKind != "trace_rejected" {
+		t.Errorf("StageState/StageFailureKind = %q/%q, want failed/trace_rejected (golden %s)", res.StageState, res.StageFailureKind, golden)
+	}
+	// The whole golden round-trips through ShipResult: no field is dropped.
+	var want, got map[string]any
+	if err := json.Unmarshal(golden, &want); err != nil {
+		t.Fatalf("golden is not JSON: %v", err)
+	}
+	b, _ := json.Marshal(res)
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ShipResult round-trip = %s, want the golden %s", b, golden)
+	}
+}
+
+// TestShipTrace_OlderBackendOmitsStageState pins the compatibility arm: a
+// 202 without the #5535 fields decodes to empty StageState and
+// StageFailureKind, which keep the runner's existing behaviour.
+func TestShipTrace_OlderBackendOmitsStageState(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+	res, err := c.ShipTrace(context.Background(), ShipArgs{
+		RunID: "11111111-2222-3333-4444-555555555555", StageID: "22222222-3333-4444-5555-666666666666",
+		Variant: "raw", Bundle: []byte("gzip-bytes-pretend"), PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipTrace: %v", err)
+	}
+	if res.StageState != "" || res.StageFailureKind != "" {
+		t.Errorf("StageState/StageFailureKind = %q/%q, want both empty from an older backend", res.StageState, res.StageFailureKind)
+	}
+}
+
 func TestShipTrace_RetriesOn500(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	priv, _ := makeKey(t, fb)

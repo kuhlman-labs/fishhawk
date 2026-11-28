@@ -1050,7 +1050,8 @@
         "ADR-096"
       ],
       "amended_by": [
-        "ADR-142"
+        "ADR-142",
+        "ADR-150"
       ],
       "applies_to": []
     },
@@ -1079,7 +1080,8 @@
         "ADR-093"
       ],
       "amended_by": [
-        "ADR-115"
+        "ADR-115",
+        "ADR-150"
       ],
       "applies_to": []
     },
@@ -1096,7 +1098,8 @@
       "amended_by": [
         "ADR-109",
         "ADR-112",
-        "ADR-115"
+        "ADR-115",
+        "ADR-150"
       ],
       "applies_to": []
     },
@@ -1312,6 +1315,9 @@
       "amends": [
         "ADR-093"
       ],
+      "amended_by": [
+        "ADR-150"
+      ],
       "applies_to": []
     },
     {
@@ -1344,7 +1350,8 @@
       ],
       "amended_by": [
         "ADR-115",
-        "ADR-121"
+        "ADR-121",
+        "ADR-150"
       ],
       "applies_to": []
     },
@@ -1391,7 +1398,8 @@
       ],
       "amended_by": [
         "ADR-116",
-        "ADR-149"
+        "ADR-149",
+        "ADR-150"
       ],
       "applies_to": []
     },
@@ -1787,6 +1795,9 @@
       "amends": [
         "ADR-090"
       ],
+      "amended_by": [
+        "ADR-150"
+      ],
       "applies_to": []
     },
     {
@@ -1893,6 +1904,24 @@
         "ADR-115",
         "ADR-119",
         "ADR-122"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-150",
+      "title": "Speculative merge queue: each entry verifies on the base plus every entry ahead of it",
+      "path": "docs/adr/150-speculative-merge-queue.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-090",
+        "ADR-092",
+        "ADR-093",
+        "ADR-109",
+        "ADR-112",
+        "ADR-115",
+        "ADR-142"
       ],
       "applies_to": []
     }

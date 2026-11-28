@@ -974,10 +974,14 @@ type Config struct {
 
 	// HostAdmissionHold is the optional, default-off INTERIM dispatch hold
 	// (E85.11 / #4330): while it reads held, the host-dispatch marker
-	// refuses every NEW admission — a stage at pending OR
+	// refuses a NEW admission — a stage at pending OR
 	// awaiting_host_dispatch — with 409 host_memory_pressure and commits no
 	// transition; the already-dispatched idempotent arm and every in-flight
-	// stage are untouched. Wired from serve.go only under
+	// stage are untouched. The hold is keyed to the host whose memory was
+	// measured (Host, #5619): only a marker naming that host, or no host, is
+	// refused (every marker when the measured host is unresolved), and the
+	// marker parses its body whenever this is wired. Wired from serve.go only
+	// under
 	// --enable-ops-monitor --ops-monitor-dispatch-hold on a local deployment
 	// (the same *opsmonitor.AdmissionHold the ops monitor ticker updates);
 	// nil keeps the marker byte-identical. ADR-100's adaptive concurrency

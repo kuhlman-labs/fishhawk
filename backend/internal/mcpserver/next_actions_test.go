@@ -9536,6 +9536,68 @@ func TestImplementFailureReasonClauses_WireFixture(t *testing.T) {
 	}
 }
 
+// TestTraceTimeFailureReasons_WireGolden_OfferVerifyRef is the mcpserver end
+// of the #5535 trace-time failure seam: backend/internal/server's
+// TestShipTrace_TraceTimeFailure_ReasonsMatchWireGolden renders every reason
+// in testdata/wire/trace_time_failure_reasons.json through the real trace
+// handler, and each FULL reason, fed through implementFailedNextActions on a
+// failed implement stage of its category (a terminal run and a non-terminal
+// park alike), must offer inspect_checkpoint_ref with params.ref equal to the
+// stage's -verify ref.
+func TestTraceTimeFailureReasons_WireGolden_OfferVerifyRef(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(wd, "..", "..", "..", "testdata", "wire", "trace_time_failure_reasons.json")) //nolint:gosec // fixed workspace-relative path
+	if err != nil {
+		t.Fatalf("reading the shared fixture: %v", err)
+	}
+	var fx struct {
+		ExampleSHA string `json:"example_sha"`
+		RunID      string `json:"run_id"`
+		StageID    string `json:"stage_id"`
+		VerifyRef  string `json:"verify_ref"`
+		Reasons    []struct {
+			Arm             string `json:"arm"`
+			FailureCategory string `json:"failure_category"`
+			ReasonTemplate  string `json:"reason_template"`
+		} `json:"reasons"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("fixture is not JSON: %v", err)
+	}
+	if len(fx.Reasons) == 0 || !strings.HasSuffix(fx.VerifyRef, "-verify") {
+		t.Fatalf("fixture carries %d reasons and verify_ref %q; want reasons and a -verify ref", len(fx.Reasons), fx.VerifyRef)
+	}
+	sawUnreadable := false
+	for _, r := range fx.Reasons {
+		sawUnreadable = sawUnreadable || r.Arm == "bundle_unreadable"
+		reason := strings.ReplaceAll(r.ReasonTemplate, "<sha>", fx.ExampleSHA)
+		for _, runState := range []string{"failed", "running"} {
+			t.Run(r.Arm+"/"+runState, func(t *testing.T) {
+				run := &Run{ID: fx.RunID, Repo: "x/y", WorkflowID: "feature_change", State: runState}
+				impl := naFailedImplement(r.FailureCategory, reason)
+				impl.ID = fx.StageID
+				plan := naStage("plan", "succeeded")
+				na := implementFailedNextActions(run, &plan, nil, &impl)
+				var got []string
+				for _, a := range na.Actions {
+					if a.Action == "inspect_checkpoint_ref" {
+						got = append(got, a.Params["ref"])
+					}
+				}
+				if len(got) != 1 || got[0] != fx.VerifyRef {
+					t.Errorf("inspect_checkpoint_ref refs = %q, want exactly [%q] for the full reason %q", got, fx.VerifyRef, reason)
+				}
+			})
+		}
+	}
+	if !sawUnreadable {
+		t.Error("fixture has no bundle_unreadable reason")
+	}
+}
+
 // --- binding-assertion recovery (R1, Q2) ---
 
 func baEntry(seq int64, category, stageID string, payload any) AuditEntry {

@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 
+	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // The verify-head pin (#4190).
@@ -177,4 +181,133 @@ func verifyHeadFailureSuffix(headSHA, ref string) string {
 // log-only, exactly like releaseCheckpointRefs (which also releases this ref).
 func releaseVerifyHeadRef(ctx context.Context, repoDir, runID, stageID string, logSink io.Writer) {
 	releaseRefs(ctx, repoDir, runID, stageID, []string{checkpointVerifyRef(runID, stageID)}, logSink)
+}
+
+// The pre-trace verify pin (#5535).
+//
+// A push-gated implement stage whose committed verify PASSED used to hold its
+// verified tree only in the working checkout until the push: when the backend
+// then failed the stage at trace time (bundle_unreadable, no_diff_captured,
+// verify_infra_tempfail, policy violations on re-evaluation), nothing named
+// the verified commit. The helpers below pin it BEFORE the trace upload, at the
+// same -verify ref the #4190 failure pin uses, and declare its SHA in the
+// signed manifest (verify_pin_head_sha) so the backend's trace-time failure
+// reason can name it. The pin is inspection-only: it never arms a reverify
+// checkpoint. A successful push releases it (releaseVerifyHeadRef). The
+// #4190 committed-gate failure pin and this one are disjoint: the first runs
+// only when the gate failed, this one only when it passed.
+
+// Trace 202 stage_state / stage_failure_kind values the runner acts on
+// (upload.ShipResult). Both are positive lists: any other value, or an absent
+// one from an older backend, keeps the pre-#5535 behaviour.
+const (
+	traceStageStateFailed  = "failed"
+	traceStageStateRunning = "running"
+	// traceFailureKindRejected is the backend refusing the stage at trace
+	// time. implement_review_rejected (the #877 gating reject) is deliberately
+	// NOT acted on: that stage still pushes, and the backend closes the PR.
+	traceFailureKindRejected = "trace_rejected"
+)
+
+// errImplementNoChangesHeld is a standalone implement stage that produced no
+// changes after the backend held it `running` for its push report (W4). The
+// stage cannot advance without a /pull-request report, so run()'s push-failure
+// arm reports it failed C (pushFailureCategory's default), keeps the pin, and
+// exits non-zero. An unheld stage (an older backend) keeps the bare return.
+var errImplementNoChangesHeld = errors.New("implement produced no changes after the backend held the stage for its push report")
+
+// checkpointRefNamespace is the prefix every checkpoint pin shares. A reason
+// that already names one gets no second clause.
+const checkpointRefNamespace = "refs/fishhawk/checkpoints/"
+
+// pinPassingVerifyHead is the pre-trace pin: it pins the last verify_run head
+// of a stage whose committed verify passed. Silent when no verify_run carries
+// a head (no committed verify ran), and FAIL-OPEN otherwise exactly like
+// pinVerifyHead: a failure logs verify_head_pin_failed and the push proceeds.
+func pinPassingVerifyHead(ctx context.Context, cfg config, events []agent.Event, logSink io.Writer) (verifyHeadPin, bool) {
+	if head, _ := lastVerifyRunHead(events); head == "" {
+		return verifyHeadPin{}, false
+	}
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	return pinVerifyHead(ctx, cfg, repoDir, events, logSink)
+}
+
+// preTracePinClause is the clause a post-trace failure report appends for the
+// pre-trace pin: empty when nothing was pinned, when the report arms a
+// checkpoint (its coordinates already name the work), or when the reason
+// already names a checkpoint ref.
+func preTracePinClause(reason string, pin verifyHeadPin, pinned, armsCheckpoint bool) string {
+	if !pinned || armsCheckpoint || strings.Contains(reason, checkpointRefNamespace) {
+		return ""
+	}
+	return verifyHeadFailureSuffix(pin.headSHA, pin.ref)
+}
+
+// heldReportReason is the reason a NEW post-trace failure report carries (Y4):
+// acceptance-bound values are scrubbed and secrets redacted over the FULL
+// text, then the result is bounded, then the (secret-free) pin clause is
+// appended, so neither a cut nor redaction can drop or split the clause.
+func heldReportReason(reason string, known *redaction.KnownValues, clause string) string {
+	s, _ := scrubKnownString(reason, known)
+	s, _ = redactString(s)
+	return upload.TruncateReason(s, upload.MaxFailureReportReasonBytes-len(clause)) + clause
+}
+
+// manifestInfraFlakeMarker is appended to a bounded manifest failure reason
+// whose FULL text carried an infra-flake signature (Y1). It leads with the
+// literal verify_infra_flake_retry token, which
+// backend/internal/delegation.hasInfraFlakeSignature (and the MCP next-actions
+// classifier) accept on their own, so the classification survives the
+// head+tail cut even when the signature sat in the elided middle.
+const manifestInfraFlakeMarker = "; verify_infra_flake_retry: infra-flake signature in the elided verify output"
+
+// backendInfraFlakeSignature mirrors the signature set
+// backend/internal/delegation.hasInfraFlakeSignature recognizes: the literal
+// marker, the testcontainers start and port-not-found signatures, the
+// daemon-unreachable markers and a vanished Go build-cache entry. KEEP IN
+// SYNC with that function; the golangci-lint lock signature
+// isVerifyInfraFailure also matches is deliberately absent, because the
+// backend classifier does not read it.
+func backendInfraFlakeSignature(s string) bool {
+	return strings.Contains(s, "verify_infra_flake_retry") ||
+		isTestcontainersStartFlake(s) ||
+		isTestcontainersPortFlake(s) ||
+		isDockerDaemonUnavailable(s) ||
+		isGoBuildCacheEntryVanished(s)
+}
+
+// manifestFailureReasons bounds the manifest's agent_failure_reason (#5535,
+// the incident fix). scrubbed is the FULL reason with acceptance-bound values
+// already removed. When it is over the bound and carries an infra-flake
+// signature, the marker is inserted before any trailing #4190 pin clause, so
+// the clause stays last. The redacted variant is redacted over the FULL text
+// before its own cut (W6), so no secret straddling a cut leaves a fragment.
+// Hits are counted on the full text.
+func manifestFailureReasons(scrubbed string) (raw, redacted string, hits []redaction.Hit) {
+	max := upload.MaxFailureReportReasonBytes
+	if len(scrubbed) > max && backendInfraFlakeSignature(scrubbed) {
+		head, clause := scrubbed, ""
+		if i := strings.LastIndex(scrubbed, "; verified head "); i >= 0 &&
+			strings.Contains(scrubbed[i:], " pinned at "+checkpointRefNamespace) && !strings.ContainsAny(scrubbed[i:], "\n") {
+			head, clause = scrubbed[:i], scrubbed[i:]
+		}
+		scrubbed = head + manifestInfraFlakeMarker + clause
+	}
+	redactedFull, hits := redactString(scrubbed)
+	return upload.TruncateReason(scrubbed, max), upload.TruncateReason(redactedFull, max), hits
+}
+
+// reportPackRefusal self-reports a bundle pack refusal (W10) through the
+// reap-failure endpoint, constructing the upload client first when the trace
+// was to be uploaded and none exists yet. Returns the client so the caller
+// keeps it. The detail is scrubbed, redacted and bounded (Y4).
+func reportPackRefusal(ctx context.Context, cfg config, client uploadClient, mcpToken, stageAttempt string, logSink io.Writer, known *redaction.KnownValues, reason string, err error) uploadClient {
+	if cfg.uploadTrace && client == nil {
+		client = newUploadClient(cfg.backendURL)
+	}
+	reportTerminalRunnerFailure(ctx, cfg, client, mcpToken, stageAttempt, logSink, reason, heldReportReason(err.Error(), known, ""), 1)
+	return client
 }

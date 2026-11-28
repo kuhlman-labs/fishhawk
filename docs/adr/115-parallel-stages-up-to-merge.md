@@ -7,7 +7,7 @@ issue: https://github.com/kuhlman-labs/fishhawk/issues/4646
 supersedes: []
 superseded_by: []
 amends: ["ADR-063", "ADR-092", "ADR-093", "ADR-094", "ADR-112"]
-amended_by: ["ADR-116", "ADR-149"]
+amended_by: ["ADR-116", "ADR-149", "ADR-150"]
 applies_to: []
 ---
 

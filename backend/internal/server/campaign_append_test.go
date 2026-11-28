@@ -347,6 +347,13 @@ func TestAppendCampaignItems_Created201VisibleInStatus(t *testing.T) {
 			t.Errorf("appended row missing %q: %v", k, first)
 		}
 	}
+	// issue:20 is unlabelled (the resolver leaves its tier empty), so it is
+	// persisted and audited as the built-in medium — never "" (#5316); issue:21
+	// keeps its declared low.
+	second, _ := rows[1].(map[string]any)
+	if first["autonomy"] != "medium" || second["autonomy"] != "low" {
+		t.Errorf("appended autonomy = %v / %v, want medium (unlabelled) / low", first["autonomy"], second["autonomy"])
+	}
 	// The unchanged status handler shows both: issue:20 eligible, issue:21 human-led.
 	st := getCampaignStatusBody(t, h.s, c.ID)
 	if !containsRef(st.Rollup.Eligible, "issue:20") || !containsRef(st.Rollup.HumanLed, "issue:21") {

@@ -3080,7 +3080,9 @@ Notes:
   into `GET /v0/campaigns/{id}/status`) and the operator start verb's targeted
   refresh (`refreshOneItemAutonomy`, in `handleStartCampaignItemRun`). When an
   item's stored autonomy tier DIFFERS from the tier re-read off its GitHub
-  issue's `autonomy:*` label, the item is overwritten via
+  issue's `autonomy:*` label (an absent or unrecognised label resolving to the
+  repository conventions' default, ADR-069 decision 4 / #5316, so a legacy
+  empty `from` re-resolves once), the item is overwritten via
   `campaign.Repository.SetCampaignItemAutonomy` and this marker is emitted with
   payload `{campaign_id, issue_ref, from, to}` — so relabelling a child
   (`autonomy:low` → `autonomy:medium`) unblocks a campaign parked on

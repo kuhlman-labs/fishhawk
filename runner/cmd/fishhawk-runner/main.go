@@ -3020,6 +3020,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// reverify on the red head would re-verify a known-red commit and drop
 	// the fix re-invoke's work. The retry re-runs the agent instead.
 	committedGateFailed := okBeforeCommittedGates && !res.OK && stageType == "implement" && !cfg.noPR
+	// committedVerifyPassed is the complement the pre-trace pin (#5535) reads:
+	// the committed gates judged the agent pass's tree and passed it. Captured
+	// HERE, before the diff-coverage measurement below can demote res.OK, so a
+	// post-gate demotion after a passing verify still pins (Y3). The two pins
+	// are disjoint: #4190's runs only when the gate failed.
+	committedVerifyPassed := okBeforeCommittedGates && res.OK && stageType == "implement" && !cfg.noPR
 	var verifyPin verifyHeadPin
 	verifyPinned := false
 	if committedGateFailed {
@@ -3061,7 +3067,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			repoDir = "."
 		}
 		baseRef := resolveDiffCoverageBaseRef(cfg, diffCoverage)
-		ev, fatal := runDiffCoverageGate(ctx, cfg, diffCoverage, repoDir, baseRef)
+		ev, fatal := diffCoverageGate(ctx, cfg, diffCoverage, repoDir, baseRef)
 		res.Events = append(res.Events, ev)
 		if fatal != nil {
 			// NOT a coverage verdict — the gate's throwaway commit could not
@@ -3305,6 +3311,27 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// a decomposed child (decomposedFromRunID == "").
 	willPushFixup := stageType == "implement" && cfg.fixup
 
+	// pushGated is the forward-gated set: the backend holds the stage
+	// `running` at trace time until the runner's /pull-request report.
+	pushGated := willOpenPR || willPushChild || willPushFixup
+
+	// PRE-TRACE VERIFY PIN (#5535). A push-gated stage whose committed verify
+	// passed pins that verified head BEFORE the trace upload and declares it in
+	// the signed manifest, so a trace-time failure (which now stops the push,
+	// below) names a commit that still exists. Inspection-only: it arms no
+	// reverify checkpoint, and a successful push releases it. FAIL-OPEN.
+	var preTracePin verifyHeadPin
+	preTracePinned := false
+	if committedVerifyPassed && pushGated && (cfg.bundleOut != "" || cfg.uploadTrace) {
+		preTracePin, preTracePinned = pinPassingVerifyHead(ctx, cfg, res.Events, logSink)
+	}
+	// heldForPush is set once the trace 202 reports the stage held `running`
+	// for its push report; pushReportSent records that this process already
+	// sent a /pull-request failure report, so the final backstop never sends a
+	// second one.
+	heldForPush := false
+	pushReportSent := false
+
 	var rawBundle, redactedBundle []byte
 	if cfg.bundleOut != "" || cfg.uploadTrace {
 		agentFailed := res.FailureCategory == "A"
@@ -3313,8 +3340,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			agentFailureReason = res.FailureReason
 		}
 		// Acceptance-bound values leave the failure reason before the
-		// manifest is built, so neither variant carries them (#3793).
-		agentFailureReason, knownReasonHits := scrubKnownString(agentFailureReason, acceptanceKnown)
+		// manifest is built, so neither variant carries them (#3793). The
+		// scrub, and the redaction below, run over the FULL reason; only then
+		// is each variant bounded (W6, the #5535 incident fix: an unbounded
+		// verify output made a 4.9 MB manifest line the backend could not read).
+		scrubbedReason, knownReasonHits := scrubKnownString(agentFailureReason, acceptanceKnown)
+		agentFailureReason, redactedReason, reasonHits := manifestFailureReasons(scrubbedReason)
 
 		manifestRaw := bundle.PackInputs{
 			RunID:   cfg.runID,
@@ -3344,6 +3375,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			PushAndOpenPR:      willOpenPR,
 			PushToSharedBranch: willPushChild,
 			PushFixup:          willPushFixup,
+			// The pre-trace pin's SHA (#5535); manifestRedacted copies it.
+			VerifyPinHeadSHA: preTracePin.headSHA,
+			// Elision / trim log lines go to this run's log sink, tagged with
+			// the variant so the raw and redacted lines (whose sha256 values
+			// differ) are told apart (Y5).
+			Log:        logSink,
+			LogVariant: "raw",
 		}
 		// Gate evidence (#963): fold the stage's verify / scope /
 		// constraint gate results into one bounded, pre-redacted
@@ -3385,6 +3423,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"bundle_pack","detail":%q}`+"\n", err.Error())
+			// A pack refusal leaves no bundle to settle the stage: self-report
+			// it (W10) so the stage does not sit `running` behind a dead
+			// process.
+			client = reportPackRefusal(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, acceptanceKnown, "bundle_pack", err)
 			logCompletion(logSink, res, invokeErr)
 			return exitFailure
 		}
@@ -3395,7 +3437,6 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// produces the trailer from whatever bytes it sees, so any
 		// post-pack rewrite would invalidate it.
 		redactedEvents, eventHits := redactEvents(packEvents)
-		redactedReason, reasonHits := redactString(agentFailureReason)
 		hits := mergeHits(mergeHits(eventHits, reasonHits), mergeHits(knownEventHits, knownReasonHits))
 		if len(hits) > 0 {
 			hitsJSON, _ := json.Marshal(hits)
@@ -3405,10 +3446,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		manifestRedacted := manifestRaw
 		manifestRedacted.AgentFailureReason = redactedReason
+		manifestRedacted.LogVariant = "redacted"
 		redBytes, _, err := bundle.PackBytes(manifestRedacted, redactedEvents)
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"bundle_pack_redacted","detail":%q}`+"\n", err.Error())
+			client = reportPackRefusal(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, acceptanceKnown, "bundle_pack_redacted", err)
 			logCompletion(logSink, res, invokeErr)
 			return exitFailure
 		}
@@ -3474,11 +3517,27 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// raw row is the source of truth for compliance, and
 		// downstream consumers that want the redacted variant can
 		// follow the second audit entry.
+		// traceStageState / traceFailureKind are what the trace 202 reported
+		// about the stage (#5535): from the first variant that reports failed,
+		// otherwise from the last variant that reports a state. An absent
+		// stage_state (an older backend, or writeTraceAccepted's best-effort
+		// GetStage miss) reports nothing, so it never clears an earlier answer.
+		var traceStageState, traceFailureKind string
 		for _, v := range []traceVariant{
 			{name: "raw", bytes: rawBundle},
 			{name: "redacted", bytes: redactedBundle},
 		} {
-			if err := uploadTrace(ctx, cfg, v.name, v.bytes, logSink, client, issuedKey); err != nil {
+			shipRes, err := uploadTrace(ctx, cfg, v.name, v.bytes, logSink, client, issuedKey)
+			if err == nil && shipRes != nil && shipRes.StageState != "" && traceStageState != traceStageStateFailed {
+				traceStageState, traceFailureKind = shipRes.StageState, shipRes.StageFailureKind
+			}
+			if err != nil {
+				// The pass's own failure, before the upload's C is stamped over
+				// an OK result: the held report below keeps it.
+				priorFailed, priorCategory, priorReason := !res.OK, res.FailureCategory, res.FailureReason
+				if priorReason == "" && invokeErr != nil {
+					priorReason = invokeErr.Error()
+				}
 				// Upload failures are MVP_SPEC §6 category-C (infra).
 				// We DON'T overwrite an earlier A/B failure category;
 				// only stamp C when the agent itself succeeded.
@@ -3495,11 +3554,64 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				if planPath, ok := retainPlanArtifact(cfg, logSink); ok {
 					detail += "; plan artifact retained at " + planPath
 				}
+				// Name the pre-trace pin in the self-report too (#5535).
+				detail += preTracePinClause(detail, preTracePin, preTracePinned, false)
+				// Y6: an EARLIER variant (raw) already answered that the stage is
+				// held `running` for its push report, so the reap-failure
+				// self-report alone is not the stage's settling report: send the
+				// held /pull-request failure report first. A pass that had
+				// already failed keeps its own reason, and B stays B, as in the
+				// final held backstop.
+				if pushGated && traceStageState == traceStageStateRunning {
+					category := "C"
+					reason := fmt.Sprintf("trace upload (%s) failed after the stage was held for its push report: %s", v.name, err.Error())
+					if priorFailed {
+						if priorCategory == "B" {
+							category = "B"
+						}
+						if priorReason != "" {
+							reason = priorReason + "; " + reason
+						}
+					}
+					clause := preTracePinClause(reason, preTracePin, preTracePinned, false)
+					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, category,
+						heldReportReason(reason, acceptanceKnown, clause), nil)
+				}
 				reportTerminalRunnerFailure(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, "trace_upload", detail, 1)
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
 		}
+
+		// TRACE-TIME FAILURE SHORT-CIRCUIT (#5535, W1/W2). The backend refused a
+		// push-gated stage at trace time (trace_rejected): pushing now would
+		// publish work the backend already failed, and the success path would
+		// release the verify pin that is the only thing naming it. Stop without
+		// pushing, keep the pin, and exit non-zero; the detached reaper's re-POST
+		// is a no-op on a stage that is no longer running. A positive list, and
+		// only for an OK pass: implement_review_rejected still pushes (#877's
+		// close needs the PR), an absent kind keeps today's push, and a failed
+		// committed gate (res.OK false) keeps its #4190 report below.
+		if res.OK && pushGated && traceStageState == traceStageStateFailed && traceFailureKind == traceFailureKindRejected {
+			pinRef := ""
+			if preTracePinned {
+				pinRef = preTracePin.ref
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"trace_time_stage_failed","run_id":%q,"stage_id":%q,"stage_failure_kind":%q,"verify_pin_ref":%q}`+"\n",
+				cfg.runID, cfg.stageID, traceFailureKind, pinRef)
+			res.OK = false
+			res.FailureCategory = "C"
+			res.FailureReason = "backend failed the stage at trace time (" + traceFailureKind + "); not pushing" +
+				preTracePinClause("", preTracePin, preTracePinned, false)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"trace_time_stage_failed","detail":%q}`+"\n", res.FailureReason)
+			logCompletion(logSink, res, invokeErr)
+			return exitFailure
+		}
+		// A held stage (`running`) is settled only by this process's
+		// /pull-request report: every exit below that does not push sends one.
+		heldForPush = pushGated && traceStageState == traceStageStateRunning
 
 		// Plan upload follows trace upload so they share the signing
 		// key and the audit log carries the trace event before the
@@ -3728,6 +3840,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// Best-effort: this path already exits non-zero, so the detached
 			// reaper backstop still engages if the report itself fails.
 			_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, res.FailureReason, cp)
+			pushReportSent = true
 		}
 
 		// Implement-stage post-processing: commit + push + open PR
@@ -3748,6 +3861,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// the pre-push arming site can gate on it without a new function
 			// parameter on openPRAndShipArtifact's ~40 call sites.
 			prCheckpoint.backendSupportsPushResume = supportsPushResume
+			// #5535 W4: the trace 202's held state rides in the same way, so the
+			// standalone no-changes arm can report a held stage instead of
+			// returning nil over it.
+			prCheckpoint.traceHeldForPush = heldForPush
 			// Arm the per-stage agent-handoff memo (#2840) immediately before
 			// the FIRST openPRAndShipArtifact call. Arming here — rather than
 			// capturing eagerly above the retry — is what keeps the first pass
@@ -3861,6 +3978,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					// review's gate_evidence can NOT be re-fed: it is dispatched at
 					// trace-upload time, strictly before this re-invoke (#1153).
 					supplemental := diffExemptions(reinvokeExemptions, sealedExemptions)
+					// Re-assert the caller-set held flag: no arm assignment preserves it.
+					prCheckpoint.traceHeldForPush = heldForPush
 					// The re-invoke ship reuses the SAME checkpoint out-parameter: the
 					// first attempt failed before the push (a base-rebase conflict is a
 					// commit-time failure), so nothing was armed, and the re-invoke's
@@ -3961,7 +4080,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					if prCheckpoint.armed {
 						cp = &prCheckpoint
 					}
-					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error(), cp)
+					// A report that arms no checkpoint names the pre-trace pin
+					// (#5535), e.g. a pre-push failure or the held no-changes
+					// sentinel (W4).
+					reason := err.Error() + preTracePinClause(err.Error(), preTracePin, preTracePinned, cp != nil)
+					// This arm returns below, so the final held backstop never runs
+					// after it: no pushReportSent bookkeeping is needed.
+					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, reason, cp)
 				}
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
@@ -3979,6 +4104,25 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 	if rawBundle == nil {
 		emitEvents(os.Stdout, res.Events)
+	}
+
+	// HELD-STAGE BACKSTOP (#5535, W4). The backend held this stage `running`
+	// for its push report, and the pass failed without one being sent (an
+	// agent B/C failure, the post-gate diff-coverage demotion, any later exit):
+	// send it, so the stage fails now instead of when the SLA watchdog reaps
+	// it. B stays B; everything else is C. The reason is scrubbed, redacted and
+	// bounded (Y4) and names the pre-trace pin when one was taken.
+	if !res.OK && heldForPush && !pushReportSent {
+		category := "C"
+		if res.FailureCategory == "B" {
+			category = "B"
+		}
+		reason := res.FailureReason
+		if reason == "" && invokeErr != nil {
+			reason = invokeErr.Error()
+		}
+		clause := preTracePinClause(reason, preTracePin, preTracePinned, false)
+		_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, category, heldReportReason(reason, acceptanceKnown, clause), nil)
 	}
 
 	logCompletion(logSink, res, invokeErr)
@@ -4007,9 +4151,11 @@ func bundleStageID(cfg config) string {
 // the prompt-fetch path when --fetch-prompt is set, since the
 // signing-key endpoint is one-shot per run.
 //
-// Returns nil on accepted, non-nil on any failure (key issuance,
-// signing, network, signature rejection). The caller translates
-// the error into the right category-C audit narrative.
+// Returns the backend's 202 result on accepted, whose StageState and
+// StageFailureKind (#5535) tell run() whether the stage is held for its push
+// report or was refused at trace time, and a non-nil error on any failure (key
+// issuance, signing, network, signature rejection). The caller translates the
+// error into the right category-C audit narrative.
 // traceVariant pairs a variant name with the bundle bytes produced
 // for that variant. Used to drive the per-variant ShipTrace loop.
 type traceVariant struct {
@@ -4017,9 +4163,9 @@ type traceVariant struct {
 	bytes []byte
 }
 
-func uploadTrace(ctx context.Context, cfg config, variant string, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) error {
+func uploadTrace(ctx context.Context, cfg config, variant string, bundleBytes []byte, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) (*upload.ShipResult, error) {
 	if cfg.stageID == "" {
-		return errors.New("upload: --stage-id required with --upload-trace")
+		return nil, errors.New("upload: --stage-id required with --upload-trace")
 	}
 	if client == nil {
 		client = newUploadClient(cfg.backendURL)
@@ -4028,7 +4174,7 @@ func uploadTrace(ctx context.Context, cfg config, variant string, bundleBytes []
 	if issued == nil {
 		key, err := issueSigningKey(ctx, client, cfg, logSink)
 		if err != nil {
-			return fmt.Errorf("issue key: %w", err)
+			return nil, fmt.Errorf("issue key: %w", err)
 		}
 		issued = key
 	}
@@ -4041,13 +4187,13 @@ func uploadTrace(ctx context.Context, cfg config, variant string, bundleBytes []
 		PrivateKey: issued.PrivateKey,
 	})
 	if err != nil {
-		return fmt.Errorf("ship trace (%s): %w", variant, err)
+		return nil, fmt.Errorf("ship trace (%s): %w", variant, err)
 	}
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"trace_uploaded","run_id":%q,"stage_id":%q,"variant":%q,"content_hash":%q}`+"\n",
-		res.RunID, res.StageID, res.Variant, res.ContentHash,
+		`{"event":"trace_uploaded","run_id":%q,"stage_id":%q,"variant":%q,"content_hash":%q,"stage_state":%q,"stage_failure_kind":%q}`+"\n",
+		res.RunID, res.StageID, res.Variant, res.ContentHash, res.StageState, res.StageFailureKind,
 	)
-	return nil
+	return res, nil
 }
 
 // uploadPlan ships the validated plan-out file to /v0/runs/{run_id}/plan.
@@ -8230,6 +8376,12 @@ const diffCoverageCleanupTimeout = 30 * time.Second
 // baseRef is resolved by the CALLER (resolveDiffCoverageBaseRef) so this
 // function's empty-ref path is the fail-closed backstop, not the resolution
 // itself.
+// diffCoverageGate is run()'s seam over runDiffCoverageGate. A run()-level
+// test cannot provoke the gate's fatal undo (the push path runs in a detached
+// lineage worktree), so the #5535 pre-trace-pin test substitutes the fatal
+// result to reach the post-gate category-B demotion after a passing verify.
+var diffCoverageGate = runDiffCoverageGate
+
 func runDiffCoverageGate(ctx context.Context, cfg config, dc *upload.DiffCoverageConfig, repoDir, baseRef string) (agent.Event, error) {
 	ev := diffCoverageEvidence{
 		Outcome:    "failed",
@@ -10532,6 +10684,12 @@ type pushCheckpoint struct {
 	// retry is an ordinary agent re-run, exactly as today.
 	backendSupportsPushResume bool
 
+	// traceHeldForPush is another caller-set INPUT (#5535 W4), not recorded
+	// state: the trace 202 reported the stage held `running` for its push
+	// report. openPRAndShipArtifact captures it on entry, so a whole-struct arm
+	// assignment that drops it changes nothing.
+	traceHeldForPush bool
+
 	// prTitle and prBody are the agent-authored pull-request text this pass
 	// resolved (#2570), carried so the failure report persists it and the RESUME
 	// opens a real pull request instead of the
@@ -10767,6 +10925,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// function parameter is threaded through the ~40 existing call sites.
 	// Captured here because the post-push arm below assigns the whole struct.
 	supportsPushResume := checkpoint != nil && checkpoint.backendSupportsPushResume
+	traceHeldForPush := checkpoint != nil && checkpoint.traceHeldForPush
 
 	// Local-runner mode (E22.8 / #406): --no-pr skips the entire
 	// push + PR-open + artifact-ship chain. The trace has already
@@ -11928,11 +12087,19 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			return reportPullRequestFailure(ctx, cfg, logSink, client, issued, "C",
 				childNoChangesReason(runSliceIndex), nil)
 		}
-		// Non-fix-up no-changes (first implement pass, no forward gate): no PR to
-		// open; no artifact to ship. The stage still counts as succeeded — the
-		// agent decided no edits were needed. Reviewer will see the empty trace +
-		// this log. That path's stage was never left in running by a forward
-		// gate, so `return nil` remains correct.
+		// Held no-changes (#5535, W4): the trace 202 reported this standalone
+		// stage held `running` for its push report, so a bare return would
+		// leave it running. Return the sentinel instead: run()'s push-failure
+		// arm sends the single failed C report, keeps the verify pin and exits
+		// non-zero.
+		if traceHeldForPush {
+			return fmt.Errorf("%w (base %s)", errImplementNoChangesHeld, cap.BaseSHA)
+		}
+		// Non-fix-up no-changes against a backend that did not report the stage
+		// held (an older backend, or one that advanced the no-diff stage at
+		// trace time): no PR to open; no artifact to ship. The stage still
+		// counts as succeeded — the agent decided no edits were needed.
+		// Reviewer will see the empty trace + this log.
 		return nil
 	}
 

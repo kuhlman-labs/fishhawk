@@ -867,6 +867,42 @@ func TestShipTrace_ImplementReview_GatingReject_StageFailedB(t *testing.T) {
 	}
 }
 
+// TestShipTrace_ImplementReview_GatingReject_ReportsReviewRejectedKind pins
+// the W1 split of the #5535 trace 202 (stage_failure_kind): a gating
+// implement-review reject fails the stage during the raw-trace upload, and
+// the 202 reports it as implement_review_rejected, NOT trace_rejected, so
+// the runner still pushes and the /pull-request handler's #877 dangling-PR
+// close (keyed on implementReviewGatingRejectPrefix, the prefix asserted
+// here) runs. The harness carries no PR-close recorder; the close itself is
+// pinned by TestShipPullRequest_ClosesDanglingPROnGatingReject.
+func TestShipTrace_ImplementReview_GatingReject_ReportsReviewRejectedKind(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if implStage.State != run.StageStateFailed || implStage.FailureReason == nil ||
+		!strings.HasPrefix(*implStage.FailureReason, implementReviewGatingRejectPrefix) {
+		t.Fatalf("stage = %q / %v, want failed with the %q prefix the #877 close keys on",
+			implStage.State, implStage.FailureReason, implementReviewGatingRejectPrefix)
+	}
+	var resp traceUploadResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode 202: %v", err)
+	}
+	if resp.StageState != string(run.StageStateFailed) || resp.StageFailureKind != traceFailureKindImplementReviewRejected {
+		t.Errorf("202 stage_state/stage_failure_kind = %q/%q, want failed/implement_review_rejected", resp.StageState, resp.StageFailureKind)
+	}
+}
+
 // TestShipTrace_ImplementReview_ReviewerError_EmitsImplementReviewFailed is
 // the #664 symmetric producer-contract test for the implement stage: a
 // reviewer that errors (modelling a timeout) writes exactly one terminal

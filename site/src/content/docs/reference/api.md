@@ -211,10 +211,14 @@ The same marker can also hold new dispatches while the host is short of
 memory, which the table does not spell out either. The hold is off by
 default and interim (the planned adaptive concurrency controller replaces
 it): `fishhawkd serve --enable-ops-monitor --ops-monitor-dispatch-hold` on a
-local deployment turns it on. While the ops monitor reads critical memory
-pressure, a `pending` or `awaiting_host_dispatch` stage is refused with 409
-`host_memory_pressure`, `details.reason` and `details.retry`, and the stage
-keeps its state. A stage that is already `dispatched` keeps its idempotent
+local deployment turns it on. The hold is keyed to the host whose memory was
+measured: `--ops-monitor-host-label`, or the server's own host label when the
+flag is unset. While the ops monitor reads critical memory pressure, a
+`pending` or `awaiting_host_dispatch` stage is refused if the marker's `host`
+is that label or is absent. A marker for another host is admitted, and if no
+measured label can be resolved every marker is refused. The refusal is 409
+`host_memory_pressure` with `details.reason`, `details.retry`, `details.host`
+and `details.request_host`, and the stage keeps its state. A stage that is already `dispatched` keeps its idempotent
 200, and nothing in flight is stopped. Re-dispatch once the condition
 clears.
 
@@ -227,11 +231,13 @@ agent review and any other agent-run stage. An implement also holds
 capacity limit applies to one request: the optional body field `capacity`
 (1 to 64), which the MCP server sends from `FISHHAWK_HOST_CAPACITY`, and 3
 when it is absent. Nothing is stored, so set the variable to the same value
-in every process that dispatches for the host. A queued stage reserves one
-capacity slot; later stages queue only when holders plus earlier
-reservations fill capacity. At capacity 3, two
-running implements and one queued implement fill it, and a later plan,
-acceptance or verify pass queues; at capacity 4 one slot stays free. A
+in every process that dispatches for the host. An earlier queued stage
+reserves a capacity slot only while every other group of its set would
+admit it now (ADR-094 A4); a stage queued only on another group reserves
+nothing. Later stages queue only when holders plus those reservations reach
+the limit. At capacity 3 with implement limit 2, two running implements and
+any number of queued implements leave one capacity slot for a plan,
+acceptance or verify pass. A
 queued stage gets 409 `concurrency_slot_queued` and keeps its state. A
 `capacity` outside 1 to 64, or one that is not an integer, gets 400
 `validation_failed` with `details.field` `capacity`. A workflow stage's

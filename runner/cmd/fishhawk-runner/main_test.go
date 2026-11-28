@@ -529,6 +529,16 @@ func withFakeInvoker(t *testing.T, fake *fakeInvoker) {
 // assertions can confirm the runner wired the right
 // run/stage/variant/bundle.
 type fakeUploader struct {
+	// traceStageState / traceFailureKind are the trace 202's stage_state and
+	// stage_failure_kind (#5535) every ShipTrace answers with; empty is an
+	// older backend. traceStateByVariant overrides both for the named variant
+	// (a zero traceAnswer is a 202 omitting the fields). shipErrByVariant
+	// fails only the named variant's upload.
+	traceStageState     string
+	traceFailureKind    string
+	traceStateByVariant map[string]traceAnswer
+	shipErrByVariant    map[string]error
+
 	issueErr error
 	// issueErrAfterN fails IssueKey only AFTER the Nth successful call
 	// (0 = disabled): the first N issuances succeed and the (N+1)th onward
@@ -783,13 +793,25 @@ func (f *fakeUploader) ShipTrace(_ context.Context, args upload.ShipArgs) (*uplo
 	if f.shipErr != nil {
 		return nil, f.shipErr
 	}
+	if err := f.shipErrByVariant[args.Variant]; err != nil {
+		return nil, err
+	}
+	state, kind := f.traceStageState, f.traceFailureKind
+	if a, ok := f.traceStateByVariant[args.Variant]; ok {
+		state, kind = a.state, a.kind
+	}
 	return &upload.ShipResult{
-		RunID:       args.RunID,
-		StageID:     args.StageID,
-		Variant:     args.Variant,
-		ContentHash: "deadbeef",
+		RunID:            args.RunID,
+		StageID:          args.StageID,
+		Variant:          args.Variant,
+		ContentHash:      "deadbeef",
+		StageState:       state,
+		StageFailureKind: kind,
 	}, nil
 }
+
+// traceAnswer is one variant's trace 202 stage_state / stage_failure_kind.
+type traceAnswer struct{ state, kind string }
 
 func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error) {
 	a := args

@@ -2990,16 +2990,31 @@ else
 fi
 
 # 15e. _preview_remove_worktree: an unregistered leftover directory is removed
-# via the rm -rf fallback; a missing directory is a clean no-op.
+# via the rm -rf fallback; a missing directory is a clean no-op. Hermetic: every
+# call runs with REPO_ROOT at a throwaway repo, so test-dev never runs a
+# worktree admin command against the real checkout's shared .git (#4281).
+pv_repo="$(mktemp -d -t test-dev-pvrepo.XXXXXX)"
+( cd "$pv_repo" && git init -q -b main && git config user.email t@e.com \
+  && git config user.name t && git config commit.gpgsign false \
+  && git commit -q --allow-empty -m base ) 2>/dev/null
 mkdir -p "$pv_dir/wt"
 touch "$pv_dir/wt/marker"
+REPO_ROOT="$pv_repo"
 _preview_remove_worktree "$pv_dir/wt" >/dev/null 2>&1
+REPO_ROOT="$orig_repo_root"
 if [[ ! -d "$pv_dir/wt" ]]; then
   pass "_preview_remove_worktree removes an unregistered leftover directory"
 else
   fail "_preview_remove_worktree should remove the directory (fallback rm -rf)"
 fi
+REPO_ROOT="$pv_repo"
 if _preview_remove_worktree "$pv_dir/wt" >/dev/null 2>&1; then
+  pv_absent_rc=0
+else
+  pv_absent_rc=1
+fi
+REPO_ROOT="$orig_repo_root"
+if (( pv_absent_rc == 0 )); then
   pass "_preview_remove_worktree is a clean no-op when the directory is absent"
 else
   fail "_preview_remove_worktree should return 0 for a missing directory"
@@ -3010,7 +3025,70 @@ if print -r -- "$rw_body" | grep_q 'worktree remove --force'; then
 else
   fail "_preview_remove_worktree should call git worktree remove --force"
 fi
-rm -rf "$pv_dir"
+
+# _wt_listed <repo> <path>: 0 when <path> is a registered worktree of <repo>.
+# Both sides are symlink-resolved (:A), so the macOS /var -> /private/var alias
+# of a mktemp path still matches what git recorded.
+_wt_listed() {
+  local want="${2:A}" line p
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    p="${line#worktree }"
+    [[ "${p:A}" == "$want" ]] && return 0
+  done < <(git -C "$1" worktree list --porcelain 2>/dev/null)
+  return 1
+}
+
+# 15e2. Targeted preview removal spares a hidden foreign worktree (#4281). A
+# FOREIGN worktree of pv_repo lives under its own mktemp dir and is moved aside
+# while _preview_remove_worktree runs on all three branches: registered and
+# present, an unregistered leftover dir, and registered but already missing.
+# A repo-wide `git worktree prune` in any branch would delete the hidden
+# worktree's admin dir, and git would then fail inside it after the restore.
+pv_ext_parent="$(mktemp -d -t test-dev-pvext.XXXXXX)"
+pv_ext="$pv_ext_parent/ext"
+git -C "$pv_repo" worktree add -q --detach "$pv_ext" HEAD 2>/dev/null
+git -C "$pv_repo" worktree add -q --detach "$pv_dir/present" HEAD 2>/dev/null
+mkdir -p "$pv_dir/leftover"; : > "$pv_dir/leftover/marker"
+git -C "$pv_repo" worktree add -q --detach "$pv_dir/missing" HEAD 2>/dev/null
+rm -rf "$pv_dir/missing"
+if [[ -d "$pv_ext" && -d "$pv_dir/present" ]] && _wt_listed "$pv_repo" "$pv_dir/missing"; then
+  mv "$pv_ext" "$pv_ext.hidden"
+  REPO_ROOT="$pv_repo"
+  _preview_remove_worktree "$pv_dir/present" >/dev/null 2>&1
+  _preview_remove_worktree "$pv_dir/leftover" >/dev/null 2>&1
+  _preview_remove_worktree "$pv_dir/missing" >/dev/null 2>&1
+  REPO_ROOT="$orig_repo_root"
+  mv "$pv_ext.hidden" "$pv_ext"
+  if git -C "$pv_ext" rev-parse --git-dir >/dev/null 2>&1 && _wt_listed "$pv_repo" "$pv_ext"; then
+    pass "_preview_remove_worktree spares a hidden foreign worktree (no repo-wide prune, #4281)"
+  else
+    fail "_preview_remove_worktree deregistered a foreign worktree it could not see (repo-wide prune?)"
+  fi
+  if [[ ! -d "$pv_dir/present" ]] && ! _wt_listed "$pv_repo" "$pv_dir/present"; then
+    pass "_preview_remove_worktree removes and deregisters a present preview worktree"
+  else
+    fail "_preview_remove_worktree should remove and deregister the present preview worktree"
+  fi
+  if [[ ! -d "$pv_dir/leftover" ]]; then
+    pass "_preview_remove_worktree removes an unregistered leftover beside a foreign worktree"
+  else
+    fail "_preview_remove_worktree should rm -rf the unregistered leftover"
+  fi
+  if ! _wt_listed "$pv_repo" "$pv_dir/missing"; then
+    pass "_preview_remove_worktree clears a registered-but-missing preview entry"
+  else
+    fail "_preview_remove_worktree should deregister the registered-but-missing preview entry"
+  fi
+  if git -C "$pv_repo" worktree add -q --detach "$pv_dir/missing" HEAD >/dev/null 2>&1; then
+    pass "_preview_remove_worktree: the next worktree add at the cleared path succeeds"
+  else
+    fail "_preview_remove_worktree left a stale registration that blocks the next worktree add"
+  fi
+else
+  fail "15e2 fixture setup failed (foreign/present/missing worktrees not registered)"
+fi
+rm -rf "$pv_dir" "$pv_ext_parent" "$pv_repo"
 
 # 15f. cmd_preview wiring body-greps (section-13b style): detached worktree,
 # GitSHA-stamped build, DB reset, git_sha-gated readiness, fail-loud contract.
@@ -4621,7 +4699,7 @@ else
 fi
 
 # 18. _prune_aged_artifacts: age boundary, legacy fixed-slot protection, dry-run.
-# Uses a throwaway git repo as REPO_ROOT so the git worktree remove/prune calls
+# Uses a throwaway git repo as REPO_ROOT so the git worktree remove calls
 # are hermetic, and drives the two litter roots against tempdir fixtures.
 prune_repo="$(mktemp -d -t test-dev-prunerepo.XXXXXX)"
 # A HEAD commit is required so `git worktree add --detach HEAD` can register the
@@ -4675,9 +4753,23 @@ make_prune_fixture() {
 
 prune_run="$(mktemp -d -t test-dev-prunerun.XXXXXX)"
 make_prune_fixture "$prune_run"
+# A FOREIGN worktree of prune_repo outside $prune_run, moved aside for the call:
+# a repo-wide `git worktree prune` would delete its admin dir (#4281).
+prune_ext_parent="$(mktemp -d -t test-dev-pruneext.XXXXXX)"
+prune_ext="$prune_ext_parent/ext"
+git -C "$prune_repo" worktree add -q --detach "$prune_ext" HEAD 2>/dev/null
+[[ -d "$prune_ext" ]] && mv "$prune_ext" "$prune_ext.hidden"
 REPO_ROOT="$prune_repo"
 _prune_aged_artifacts 7 0 "$prune_run/wt" "$prune_run/tmp" >/dev/null 2>&1
 REPO_ROOT="$orig_repo_root"
+[[ -d "$prune_ext.hidden" ]] && mv "$prune_ext.hidden" "$prune_ext"
+if [[ -d "$prune_ext" ]] && git -C "$prune_ext" rev-parse --git-dir >/dev/null 2>&1 \
+   && _wt_listed "$prune_repo" "$prune_ext"; then
+  pass "_prune: spares a hidden foreign worktree (no repo-wide prune, #4281)"
+else
+  fail "_prune deregistered a foreign worktree it could not see (repo-wide prune?)"
+fi
+rm -rf "$prune_ext_parent"
 if [[ ! -d "$prune_run/wt/run-old" ]]; then pass "_prune: removes aged CLEAN run worktree dir"; else fail "_prune should remove the aged clean run-old worktree"; fi
 if [[ ! -f "$prune_run/wt/run-old.runid" ]]; then pass "_prune: removes aged runid file"; else fail "_prune should remove aged run-old.runid"; fi
 # Protective branch: an aged-but-DIRTY registered run worktree survives (#1917).
@@ -4914,6 +5006,16 @@ if print -r -- "$sweep_body" | grep_q '_prune_aged_artifacts'; then
 else
   fail "cmd_sweep should call _prune_aged_artifacts"
 fi
+# No repo-wide prune in any worktree-removing path (#4281): a prune deletes the
+# admin dir of ANY worktree whose .git the calling process cannot see. Secondary
+# fence; the behavioural checks are 15e2, 18 and 21.
+for nf in _preview_remove_worktree _prune_aged_artifacts cmd_sweep; do
+  if print -r -- "$(typeset -f "$nf")" | grep_q 'worktree prune'; then
+    fail "$nf must not run a repo-wide git worktree prune (#4281)"
+  else
+    pass "$nf runs no repo-wide git worktree prune"
+  fi
+done
 if grep -qE '^[[:space:]]*sweep\)[[:space:]]*cmd_sweep' "${orig_repo_root}/scripts/dev"; then
   pass "sweep wired into the dispatch table"
 else
@@ -5011,12 +5113,25 @@ if command -v git >/dev/null 2>&1; then
     git branch merged-clean
     git worktree add -q .claude/worktrees/wt-merged merged-clean
   )
-  if [[ -d "$cfix/main/.claude/worktrees/wt-merged" ]]; then
+  # A FOREIGN worktree of $cfix/main under its own mktemp dir, moved aside for
+  # the confirmed sweep: a repo-wide `git worktree prune` would delete its admin
+  # dir and git would fail inside it after the restore (#4281).
+  sw_ext_parent="$(mktemp -d -t test-dev-sweepext.XXXXXX)"
+  sw_ext="$sw_ext_parent/ext"
+  git -C "$cfix/main" worktree add -q --detach "$sw_ext" HEAD 2>/dev/null
+  if [[ -d "$cfix/main/.claude/worktrees/wt-merged" && -d "$sw_ext" ]]; then
+    mv "$sw_ext" "$sw_ext.hidden"
     REPO_ROOT="$cfix/main"
     cd "$cfix/main"
     cmd_sweep --yes --days 99999 >/dev/null 2>&1
     cd "$orig_pwd"
     REPO_ROOT="$orig_repo_root"
+    mv "$sw_ext.hidden" "$sw_ext"
+    if git -C "$sw_ext" rev-parse --git-dir >/dev/null 2>&1 && _wt_listed "$cfix/main" "$sw_ext"; then
+      pass "cmd_sweep --yes spares a hidden foreign worktree (no repo-wide prune, #4281)"
+    else
+      fail "cmd_sweep --yes deregistered a foreign worktree it could not see (repo-wide prune?)"
+    fi
     if [[ ! -d "$cfix/main/.claude/worktrees/wt-merged" ]]; then
       pass "cmd_sweep --yes removes the merged-clean operator worktree"
     else
@@ -5028,9 +5143,9 @@ if command -v git >/dev/null 2>&1; then
       fail "cmd_sweep --yes should delete the merged branch (cleanup-merged composition)"
     fi
   else
-    fail "confirmed-sweep fixture setup failed (no wt-merged)"
+    fail "confirmed-sweep fixture setup failed (no wt-merged or foreign worktree)"
   fi
-  rm -rf "$cfix"
+  rm -rf "$cfix" "$sw_ext_parent"
 else
   print "skip: git not found — skipping confirmed-sweep fixture"
 fi

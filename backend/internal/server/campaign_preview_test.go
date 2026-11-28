@@ -1184,3 +1184,80 @@ func TestPreviewCampaign_AdmissionScreen_ScreensOnlyDriverWorkflow(t *testing.T)
 		})
 	}
 }
+
+// --- #5316: the conventions autonomy default reaches the provider and the wire ---
+
+// TestPreviewCampaign_ThreadsConventionsAutonomyDefault pins the server threading
+// (ADR-069 decision 4, #5316): resolveCampaignSource derives the repository
+// conventions' default tier and hands it to the provider as DefaultAutonomy on
+// BOTH campaign sources — the epic sweep and the explicit issue set.
+func TestPreviewCampaign_ThreadsConventionsAutonomyDefault(t *testing.T) {
+	stubConventionsProvider(t, lowDefaultConventions(t))
+	t.Run("epic path", func(t *testing.T) {
+		fp := &fakeEpicProvider{result: smallDAG()}
+		registerEpicProvider(t, fp)
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		_ = decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+		if !fp.called {
+			t.Fatal("epic provider was not dispatched")
+		}
+		if fp.captured.DefaultAutonomy != "low" {
+			t.Errorf("EpicChildrenRequest.DefaultAutonomy = %q, want low (the conventions default)", fp.captured.DefaultAutonomy)
+		}
+	})
+	t.Run("issue-set path", func(t *testing.T) {
+		fp := &fakeIssueSetProvider{result: noEpicDAG()}
+		registerIssueSetProvider(t, fp)
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		_ = decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`))
+		if !fp.resolveCalled {
+			t.Fatal("issue-set resolver was not dispatched")
+		}
+		if fp.captured.DefaultAutonomy != "low" {
+			t.Errorf("IssueSetRequest.DefaultAutonomy = %q, want low (the conventions default)", fp.captured.DefaultAutonomy)
+		}
+	})
+}
+
+// TestPreviewCampaign_InvalidSetItemsCarryDefaultTier: on an INVALID set the
+// preview items come straight from the provider children, so a child the
+// provider left with no tier must still preview a tier — the built-in medium —
+// and the wire key is always present (#5316).
+func TestPreviewCampaign_InvalidSetItemsCarryDefaultTier(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 101, Title: "a", Autonomy: "low"},
+			{Number: 102, Title: "b"}, // provider left the tier empty
+		},
+		DroppedEdges: []workmgmt.DependsEdge{{From: 101, To: 999, Reason: workmgmt.DropNotChild}},
+	}}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`)
+	rep := decodePreview(t, w)
+	if rep.Valid {
+		t.Fatalf("valid = true on a dangling set: %+v", rep)
+	}
+	byRef := map[string]campaignPreviewItem{}
+	for _, it := range rep.Items {
+		byRef[it.IssueRef] = it
+	}
+	if got := byRef["issue:102"].Autonomy; got != "medium" {
+		t.Errorf("issue:102 autonomy = %q, want medium (invalid-path item normalized)", got)
+	}
+	if got := byRef["issue:101"].Autonomy; got != "low" {
+		t.Errorf("issue:101 autonomy = %q, want low (declared tier passes through)", got)
+	}
+	var raw struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw preview: %v", err)
+	}
+	for _, it := range raw.Items {
+		if _, ok := it["autonomy"]; !ok {
+			t.Errorf("preview item %v has no autonomy key, want it always present", it["issue_ref"])
+		}
+	}
+}
