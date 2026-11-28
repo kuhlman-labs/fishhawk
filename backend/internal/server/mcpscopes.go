@@ -329,6 +329,12 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_record_upkeep_dispositions":   {anyOf: []string{"write:approvals"}}, // upkeep_dispositions.go handleRecordUpkeepDispositions
 	"fishhawk_record_comms_dispositions":    {anyOf: []string{"write:approvals"}}, // comms_dispositions.go handleRecordCommsDispositions (#4016)
 
+	// split_filing_resume.go handleResumeSplitFiling (#3925, E50.25): the
+	// scope plan approval needs (AA2). The handler refuses ANY run-bound
+	// subject 403 run_token_forbidden (isRunBoundSubject prefix check) before
+	// its scope check, so no runBoundSubjectOK.
+	"fishhawk_resume_split_filing": {anyOf: []string{"write:approvals"}},
+
 	// --- write:deploy. approvals.go handleSubmitApproval takes the
 	// write:deploy branch for a deploy-gate approval (approvals.go:791).
 	"fishhawk_approve_deploy": {anyOf: []string{"write:deploy"}},

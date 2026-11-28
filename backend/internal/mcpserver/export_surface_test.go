@@ -458,6 +458,12 @@ var exportBaseline = []string{
 	"ResumeCampaignOutput",
 	"ResumeRunInput",
 	"ResumeRunOutput",
+	// E50.25 / #3925: fishhawk_resume_split_filing's I/O, exported for the
+	// SDK's jsonschema reflection like every DTO, plus the apiClient mirror of
+	// the resume route's 200/202 body.
+	"ResumeSplitFilingInput",
+	"ResumeSplitFilingOutput",
+	"ResumeSplitFilingResult",
 	"RetryStageInput",
 	"RetryStageOutput",
 	"ReviewActionHint",
