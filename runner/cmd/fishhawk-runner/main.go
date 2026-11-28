@@ -3377,6 +3377,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			PushFixup:          willPushFixup,
 			// The pre-trace pin's SHA (#5535); manifestRedacted copies it.
 			VerifyPinHeadSHA: preTracePin.headSHA,
+			// Elision / trim log lines go to this run's log sink, tagged with
+			// the variant so the raw and redacted lines (whose sha256 values
+			// differ) are told apart (Y5).
+			Log:        logSink,
+			LogVariant: "raw",
 		}
 		// Gate evidence (#963): fold the stage's verify / scope /
 		// constraint gate results into one bounded, pre-redacted
@@ -3441,6 +3446,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		manifestRedacted := manifestRaw
 		manifestRedacted.AgentFailureReason = redactedReason
+		manifestRedacted.LogVariant = "redacted"
 		redBytes, _, err := bundle.PackBytes(manifestRedacted, redactedEvents)
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
@@ -3513,17 +3519,25 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// follow the second audit entry.
 		// traceStageState / traceFailureKind are what the trace 202 reported
 		// about the stage (#5535): from the first variant that reports failed,
-		// otherwise from the last variant. Empty from an older backend.
+		// otherwise from the last variant that reports a state. An absent
+		// stage_state (an older backend, or writeTraceAccepted's best-effort
+		// GetStage miss) reports nothing, so it never clears an earlier answer.
 		var traceStageState, traceFailureKind string
 		for _, v := range []traceVariant{
 			{name: "raw", bytes: rawBundle},
 			{name: "redacted", bytes: redactedBundle},
 		} {
 			shipRes, err := uploadTrace(ctx, cfg, v.name, v.bytes, logSink, client, issuedKey)
-			if err == nil && shipRes != nil && traceStageState != traceStageStateFailed {
+			if err == nil && shipRes != nil && shipRes.StageState != "" && traceStageState != traceStageStateFailed {
 				traceStageState, traceFailureKind = shipRes.StageState, shipRes.StageFailureKind
 			}
 			if err != nil {
+				// The pass's own failure, before the upload's C is stamped over
+				// an OK result: the held report below keeps it.
+				priorFailed, priorCategory, priorReason := !res.OK, res.FailureCategory, res.FailureReason
+				if priorReason == "" && invokeErr != nil {
+					priorReason = invokeErr.Error()
+				}
 				// Upload failures are MVP_SPEC §6 category-C (infra).
 				// We DON'T overwrite an earlier A/B failure category;
 				// only stamp C when the agent itself succeeded.
@@ -3545,11 +3559,23 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// Y6: an EARLIER variant (raw) already answered that the stage is
 				// held `running` for its push report, so the reap-failure
 				// self-report alone is not the stage's settling report: send the
-				// held /pull-request failure report first.
+				// held /pull-request failure report first. A pass that had
+				// already failed keeps its own reason, and B stays B, as in the
+				// final held backstop.
 				if pushGated && traceStageState == traceStageStateRunning {
-					clause := preTracePinClause(err.Error(), preTracePin, preTracePinned, false)
-					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, "C",
-						heldReportReason(fmt.Sprintf("trace upload (%s) failed after the stage was held for its push report: %s", v.name, err.Error()), acceptanceKnown, clause), nil)
+					category := "C"
+					reason := fmt.Sprintf("trace upload (%s) failed after the stage was held for its push report: %s", v.name, err.Error())
+					if priorFailed {
+						if priorCategory == "B" {
+							category = "B"
+						}
+						if priorReason != "" {
+							reason = priorReason + "; " + reason
+						}
+					}
+					clause := preTracePinClause(reason, preTracePin, preTracePinned, false)
+					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, category,
+						heldReportReason(reason, acceptanceKnown, clause), nil)
 				}
 				reportTerminalRunnerFailure(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, "trace_upload", detail, 1)
 				logCompletion(logSink, res, invokeErr)

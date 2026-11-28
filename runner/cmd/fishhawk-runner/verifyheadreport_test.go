@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
@@ -1015,6 +1016,137 @@ func TestRun_PackRefusal_SelfReports(t *testing.T) {
 	rf := fu.runnerFailures()
 	if len(rf) != 1 || rf[0].Reason != "bundle_pack" || !strings.Contains(rf[0].Detail, "MaxLineBytes") {
 		t.Fatalf("self-reports = %+v, want one bundle_pack:\n%.2000s", rf, log)
+	}
+}
+
+// TestRun_RedactedPackRefusal_SelfReports (W10): the raw pack fits but the
+// redacted pack refuses: redaction grows a load-bearing policy_event line
+// (each 20-byte AWS key id becomes a 28-byte marker) past MaxLineBytes. The
+// runner self-reports bundle_pack_redacted and ships neither variant.
+func TestRun_RedactedPackRefusal_SelfReports(t *testing.T) {
+	repo := gateFailRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	ts := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	const keys = "AKIAABCDEFGHIJKLMNOP AKIAQRSTUVWXYZ234567 "
+	mk := func(pad int) json.RawMessage {
+		b, _ := json.Marshal(map[string]string{"blob": keys + strings.Repeat("p", pad)})
+		return b
+	}
+	// Size the raw line (seq 2) to MaxLineBytes-6: a later seq adds at most a
+	// few digits, and the two redactions add 16 bytes.
+	probe, _ := json.Marshal(bundle.Line{Seq: 2, Timestamp: ts, Kind: "policy_event", Data: mk(0)})
+	payload := mk(bundle.MaxLineBytes - 6 - len(probe))
+	withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "policy_event", Timestamp: ts, Payload: payload}}}})
+	cmd, _ := formVerifyCmd(t, noopPassOut, 0, noopPassOut, 0)
+	fu := newFakeUploader(t)
+	fu.promptResp = gateFailPrompt(cmd, 2)
+	fu.promptResp.StageAttempt = selfReportAttemptToken
+
+	code, log := runGateWith(t, repo, fu, &fakePusher{}, &fakePROpener{}, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%.2000s", code, log)
+	}
+	if strings.Contains(log, `"reason":"bundle_pack",`) {
+		t.Fatalf("fixture: the RAW pack refused; only the redacted pack must:\n%.2000s", log)
+	}
+	if len(fu.gotShipCalls) != 0 {
+		t.Errorf("shipped %d trace(s) after a redacted pack refusal", len(fu.gotShipCalls))
+	}
+	rf := fu.runnerFailures()
+	if len(rf) != 1 || rf[0].Reason != "bundle_pack_redacted" || !strings.Contains(rf[0].Detail, "MaxLineBytes") {
+		t.Fatalf("self-reports = %+v, want one bundle_pack_redacted:\n%.2000s", rf, log)
+	}
+}
+
+// TestRun_TraceVariantStates_FirstFailedWins: the raw 202 says failed +
+// trace_rejected; a different redacted answer (an omitted stage_state after a
+// GetStage miss, or running) does not override it: no push, no /pull-request,
+// the pin is kept and the short-circuit is taken.
+func TestRun_TraceVariantStates_FirstFailedWins(t *testing.T) {
+	for name, redacted := range map[string]traceAnswer{
+		"redacted omits state": {},
+		"redacted running":     {state: "running"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := gateFailRepo(t)
+			fu := passingGate(t, repo)
+			fu.traceStateByVariant = map[string]traceAnswer{
+				"raw":      {state: "failed", kind: "trace_rejected"},
+				"redacted": redacted,
+			}
+			fp, fpr := &fakePusher{}, &fakePROpener{}
+
+			code, log := runGateWith(t, repo, fu, fp, fpr, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+			if code != exitFailure {
+				t.Fatalf("run = %d, want exitFailure:\n%s", code, log)
+			}
+			if len(fu.gotShipCalls) != 2 {
+				t.Fatalf("fixture: %d trace uploads, want raw + redacted", len(fu.gotShipCalls))
+			}
+			if fp.calls != 0 || fpr.gotArgs != nil || len(fu.gotPRCalls) != 0 {
+				t.Fatalf("push=%d openPR=%v /pull-request=%d, want none:\n%s", fp.calls, fpr.gotArgs != nil, len(fu.gotPRCalls), log)
+			}
+			if _, ok := refTarget(repo, checkpointVerifyRef(verifyFixRunID, verifyFixStageID)); !ok {
+				t.Errorf("pre-trace pin released:\n%s", log)
+			}
+			if !strings.Contains(log, `"event":"trace_time_stage_failed"`) {
+				t.Errorf("log lacks trace_time_stage_failed:\n%s", log)
+			}
+		})
+	}
+}
+
+// TestRun_TraceVariantStates_EmptyLaterAnswerKeepsHeld: the raw 202 says
+// running and the redacted 202 omits stage_state (writeTraceAccepted's
+// best-effort GetStage miss). The stage stays held, so a no-changes push
+// still sends its failed C report and keeps the pin.
+func TestRun_TraceVariantStates_EmptyLaterAnswerKeepsHeld(t *testing.T) {
+	repo := gateFailRepo(t)
+	fu := passingGate(t, repo)
+	fu.traceStateByVariant = map[string]traceAnswer{"raw": {state: "running"}, "redacted": {}}
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base-sha-def"}}
+
+	code, log := runGateWith(t, repo, fu, fp, &fakePROpener{}, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (the stage is still held):\n%s", code, log)
+	}
+	ref := checkpointVerifyRef(verifyFixRunID, verifyFixStageID)
+	pinned, ok := refTarget(repo, ref)
+	if !ok {
+		t.Fatalf("pre-trace pin released:\n%s", log)
+	}
+	reports := failedReports(fu)
+	if len(reports) != 1 || reports[0].Category != "C" || !strings.Contains(reports[0].Reason, errImplementNoChangesHeld.Error()) ||
+		!strings.HasSuffix(reports[0].Reason, verifyHeadFailureSuffix(pinned, ref)) {
+		t.Fatalf("failed reports = %+v, want one held no-changes C report ending with the pin clause:\n%s", reports, log)
+	}
+}
+
+// TestRun_HeldRedactedUploadFailure_KeepsAgentB: a held stage whose agent
+// pass failed B, then whose redacted upload failed, reports B with the
+// agent's reason ahead of the upload error, as the final backstop would.
+func TestRun_HeldRedactedUploadFailure_KeepsAgentB(t *testing.T) {
+	repo := gateFailRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: false, FailureCategory: "B", FailureReason: "agent output invalid"}})
+	cmd, _ := formVerifyCmd(t, noopPassOut, 0, noopPassOut, 0)
+	fu := newFakeUploader(t)
+	fu.promptResp = gateFailPrompt(cmd, 2)
+	fu.promptResp.StageAttempt = selfReportAttemptToken
+	fu.traceStageState = "running"
+	fu.shipErrByVariant = map[string]error{"redacted": errors.New("backend 503 on redacted trace")}
+
+	code, log := runGateWith(t, repo, fu, &fakePusher{}, &fakePROpener{}, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", code, log)
+	}
+	reports := failedReports(fu)
+	if len(reports) != 1 || reports[0].Category != "B" ||
+		!strings.Contains(reports[0].Reason, "agent output invalid") || !strings.Contains(reports[0].Reason, "503 on redacted trace") {
+		t.Fatalf("failed reports = %+v, want one B report naming the agent reason and the upload error:\n%s", reports, log)
+	}
+	if rf := fu.runnerFailures(); len(rf) != 1 || rf[0].Reason != "trace_upload" {
+		t.Errorf("runner failure self-reports = %+v, want one trace_upload", rf)
 	}
 }
 

@@ -334,6 +334,11 @@ type PackInputs struct {
 	// the runner's log stream.
 	Log io.Writer
 
+	// LogVariant tags each Log line with the bundle variant being packed
+	// ("raw" / "redacted"), so the two packs' lines, whose sha256 values
+	// differ, are told apart. Empty omits the field. Not written to the bundle.
+	LogVariant string
+
 	// Now returns the manifest's GeneratedAt timestamp. Default
 	// time.Now; overridable for deterministic tests.
 	Now func() time.Time
@@ -701,8 +706,16 @@ func elide(pl *packedLine, lim packLimits, bound string, in PackInputs, logw io.
 func logElision(logw io.Writer, in PackInputs, kind string, seq int, original []byte, bound string) {
 	sum := sha256.Sum256(original)
 	_, _ = fmt.Fprintf(logw,
-		`{"event":"bundle_event_elided","run_id":%q,"stage_id":%q,"kind":%q,"seq":%d,"original_bytes":%d,"sha256":%q,"bound":%q}`+"\n",
-		in.RunID, in.StageID, kind, seq, len(original), hex.EncodeToString(sum[:]), bound)
+		`{"event":"bundle_event_elided","run_id":%q,"stage_id":%q%s,"kind":%q,"seq":%d,"original_bytes":%d,"sha256":%q,"bound":%q}`+"\n",
+		in.RunID, in.StageID, logVariantField(in), kind, seq, len(original), hex.EncodeToString(sum[:]), bound)
+}
+
+// logVariantField is the `,"variant":"..."` member of a Log line, or "".
+func logVariantField(in PackInputs) string {
+	if in.LogVariant == "" {
+		return ""
+	}
+	return fmt.Sprintf(`,"variant":%q`, in.LogVariant)
 }
 
 var errNoOutputToTrim = errors.New("bundle: verify_run has no string output to trim")
@@ -750,8 +763,8 @@ func trimVerifyRun(pl *packedLine, lim packLimits, bound string, in PackInputs, 
 	}
 	sum := sha256.Sum256(pl.body)
 	_, _ = fmt.Fprintf(logw,
-		`{"event":"bundle_verify_output_trimmed","run_id":%q,"stage_id":%q,"kind":%q,"seq":%d,"original_bytes":%d,"output_elided_bytes":%d,"sha256":%q,"bound":%q}`+"\n",
-		in.RunID, in.StageID, pl.kind, pl.seq, len(pl.body), elided, hex.EncodeToString(sum[:]), bound)
+		`{"event":"bundle_verify_output_trimmed","run_id":%q,"stage_id":%q%s,"kind":%q,"seq":%d,"original_bytes":%d,"output_elided_bytes":%d,"sha256":%q,"bound":%q}`+"\n",
+		in.RunID, in.StageID, logVariantField(in), pl.kind, pl.seq, len(pl.body), elided, hex.EncodeToString(sum[:]), bound)
 	np.trimmed = true
 	*pl = *np
 	return nil
