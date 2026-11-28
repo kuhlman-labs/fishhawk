@@ -6517,7 +6517,12 @@ components:
             overlap guard's conservative rule (a `.md`, `.mdx`, `.markdown`,
             `.rst` or `.adoc` file outside `docs/review`, `docs/spec`,
             `docs/adr`, `docs/compliance` and instruction files); otherwise
-            `code`. `docs/api/v0.openapi.yaml` is `code`.
+            `code`. `docs/api/v0.openapi.yaml` is `code`. The class is the
+            preview's own rule, unchanged by #5604: the merge overlap guard
+            exempts a different set (`docs/**` or `*.md`), so a pair sharing
+            only such paths is not held at merge even when its class is
+            `code`, and a `docs_only` pair sharing a `.mdx`, `.markdown`,
+            `.rst` or `.adoc` path outside `docs/` is still held.
         remedy:
           type: string
           description: |
@@ -6525,7 +6530,9 @@ components:
             so the later item plans after the earlier one's PR opens, or
             confirm they touch unrelated parts of the file, then re-preview.
             `docs_only`: parallel plans are fine; the merges serialize through
-            the merge overlap guard.
+            the merge overlap guard. Since #5604 that last clause no longer
+            holds for `docs/**` and `*.md` paths, which the guard does not
+            hold (see `class`).
 
     CampaignItem:
       type: object
@@ -17804,7 +17811,17 @@ paths:
         merge-candidate verify pass) `dispatched` or `running` whose effective
         scope shares a path with what THIS pull request changes at its head
         (the forge's three-dot compare `base_ref...head_sha`, rename sources
-        included). A run that is only planned or parked (`pending`,
+        included). **Docs-only exemption (#5604, a partial relaxation of
+        ADR-115 D4):** an overlap whose every shared path is documentation —
+        `docs/**` or `*.md`, matched case-sensitively after `path.Clean`
+        (an absolute, `.`, `..` or `../` path never qualifies, and `.mdx`,
+        `.markdown`, `.rst` or `.adoc` outside `docs/` still block) — does
+        not refuse; the merge proceeds and the overlap surfaces at the other
+        run's rebase as a mechanical union conflict. One shared code path
+        refuses, and the blocker's `paths` then list every shared path,
+        documentation included. On an incomplete changed set a docs-only
+        candidate is still undetermined (fail closed). A run that is only
+        planned or parked (`pending`,
         `awaiting_host_dispatch`, `awaiting_approval`,
         `awaiting_scope_decision`) or terminal does not block. It FAILS
         CLOSED once a live implement exists elsewhere: `409
@@ -17834,7 +17851,13 @@ paths:
         arm of the auto-driver runs the SAME guard (#4582, see `POST
         /v0/runs/{run_id}/auto-drive`) with no override, and ADR-093 slice
         2's merge-on-pass (#4296) runs it under the run's merge-intent lock,
-        also with no override. Residual: the guard reads the state at POST
+        also with no override; a refusal there holds the queue entry and
+        appends a `merge_queue_overlap_refused` row that, since #5604, names
+        the blocking and undetermined runs and their shared paths
+        (`blocking[]`, `undetermined[]`, the entry shape of the `409`
+        details) beside the counts, code, reason and head. It is deduped per
+        decision, blocker set included, and withheld from run-bound
+        subjects. Residual: the guard reads the state at POST
         time (a push or dispatch between the read and the forge merge is not
         caught).
       tags: [runs]
@@ -18142,7 +18165,9 @@ paths:
             (4) and before case (7a), with NO new verdict row, nothing
             dispatched or enqueued. `overlapping_implement_in_flight`:
             another live run's implement-type stage scopes a path this pull
-            request changes. `overlap_undetermined`: the guard could not rule
+            request changes, at least one of them not documentation (an
+            overlap of only `docs/**` or `*.md` paths does not refuse,
+            #5604). `overlap_undetermined`: the guard could not rule
             that out and fails closed; `details.reason` is
             `changed_files_capped` (the forge's compare was truncated — the
             300-file cap or an omitted patch body), `rename_source_unknown`
@@ -20888,10 +20913,11 @@ paths:
         export stay complete. This is not access control: any caller holding
         `read:audit` may request the category explicitly.
 
-        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #4694).** For
-        a run-bound `mcp:run:<uuid>` caller, entries of category
-        `plan_scope_overlap` and `merge_overlap_overridden` (which name OTHER
-        runs) and `escape_recorded` (ADR-117 A1.6: the escape record the run's
+        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #5604, #4694).**
+        For a run-bound `mcp:run:<uuid>` caller, entries of category
+        `plan_scope_overlap`, `merge_overlap_overridden` and
+        `merge_queue_overlap_refused` (which name OTHER runs) and
+        `escape_recorded` (ADR-117 A1.6: the escape record the run's
         reviews are measured against) are omitted from every non-chain read,
         a read that names the category included, BEFORE pagination; such a caller's
         `chain=true` read is refused `403 run_token_forbidden`. Operators are
@@ -21484,10 +21510,11 @@ paths:
         recent-activity read) still returns up to N visible entries. This is
         not access control.
 
-        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #4694).** For
-        a run-bound `mcp:run:<uuid>` caller, entries of category
-        `plan_scope_overlap` and `merge_overlap_overridden` (which name OTHER
-        runs) and `escape_recorded` (ADR-117 A1.6) are omitted even when the
+        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #5604, #4694).**
+        For a run-bound `mcp:run:<uuid>` caller, entries of category
+        `plan_scope_overlap`, `merge_overlap_overridden` and
+        `merge_queue_overlap_refused` (which name OTHER runs) and
+        `escape_recorded` (ADR-117 A1.6) are omitted even when the
         request names the category, BEFORE pagination. This one IS access
         control by subject;
         operators are unchanged.

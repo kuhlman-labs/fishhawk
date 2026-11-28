@@ -1600,17 +1600,58 @@ func (s *Server) mergeOnPassMerged(ctx context.Context, e mergequeue.Entry, head
 }
 
 // recordMergeQueueOverlapRefusal appends merge_queue_overlap_refused for a
-// merge-on-pass the overlap guard held, at the delegated_merge_overlap_refused
-// detail level (counts, code, reason and head; never another run's id or
-// path), unless the run's LATEST such row records the same decision: the pump
-// re-decides a held entry every tick, so one row per distinct decision.
+// merge-on-pass the overlap guard held. The row NAMES the other runs (#5604):
+// blocking[] and undetermined[] carry the mergeOverlapBlocker shape the inline
+// 409 and merge_overlap_overridden carry (run_id, issue_ref, decomposed_from,
+// stage_id, stage_type, stage_state, paths), beside the counts, code, reason
+// and head. Because it names other runs' ids, issue refs and paths, it is
+// WITHHELD from run-bound audit reads (withholdScopeOverlapFromRunBound in
+// server/reads.go), the same posture as merge_overlap_overridden. The pump
+// re-decides a held entry every tick, so one row per distinct decision: the
+// run's LATEST such row suppresses the append only when its code, reason,
+// head, counts AND blocker set (each blocking and undetermined run's run_id,
+// stage_id and paths, in order) all match. A changed blocker or shared-path
+// set is a new decision and appends a row; a legacy counts-only row decodes
+// with empty lists, so the first decision after #5604 that has a blocker
+// appends one naming row.
 func (s *Server) recordMergeQueueOverlapRefusal(ctx context.Context, runRow *run.Run, o mergeOverlapResult) error {
-	decision := delegatedOverlapDecision{
-		HeadSHA:           o.HeadSHA,
-		RefusedCode:       o.Code,
-		RefusedReason:     o.Reason,
-		BlockingCount:     len(o.Blockers),
-		UndeterminedCount: len(o.Undetermined),
+	type queueOverlapDecision struct {
+		delegatedOverlapDecision
+		Blocking     []mergeOverlapBlocker `json:"blocking"`
+		Undetermined []mergeOverlapBlocker `json:"undetermined"`
+	}
+	nonNil := func(bs []mergeOverlapBlocker) []mergeOverlapBlocker {
+		if bs == nil {
+			return []mergeOverlapBlocker{}
+		}
+		return bs
+	}
+	sameBlockers := func(a, b []mergeOverlapBlocker) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i].RunID != b[i].RunID || a[i].StageID != b[i].StageID || len(a[i].Paths) != len(b[i].Paths) {
+				return false
+			}
+			for j := range a[i].Paths {
+				if a[i].Paths[j] != b[i].Paths[j] {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	decision := queueOverlapDecision{
+		delegatedOverlapDecision: delegatedOverlapDecision{
+			HeadSHA:           o.HeadSHA,
+			RefusedCode:       o.Code,
+			RefusedReason:     o.Reason,
+			BlockingCount:     len(o.Blockers),
+			UndeterminedCount: len(o.Undetermined),
+		},
+		Blocking:     nonNil(o.Blockers),
+		Undetermined: nonNil(o.Undetermined),
 	}
 	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryMergeQueueOverlapRefused)
 	if err != nil {
@@ -1623,8 +1664,9 @@ func (s *Server) recordMergeQueueOverlapRefusal(ctx context.Context, runRow *run
 		}
 	}
 	if latest != nil {
-		var prior delegatedOverlapDecision
-		if json.Unmarshal(latest.Payload, &prior) == nil && prior == decision {
+		var prior queueOverlapDecision
+		if json.Unmarshal(latest.Payload, &prior) == nil && prior.delegatedOverlapDecision == decision.delegatedOverlapDecision &&
+			sameBlockers(prior.Blocking, decision.Blocking) && sameBlockers(prior.Undetermined, decision.Undetermined) {
 			return nil
 		}
 	}
@@ -1636,6 +1678,8 @@ func (s *Server) recordMergeQueueOverlapRefusal(ctx context.Context, runRow *run
 		"refused_reason":     decision.RefusedReason,
 		"blocking_count":     decision.BlockingCount,
 		"undetermined_count": decision.UndeterminedCount,
+		"blocking":           decision.Blocking,
+		"undetermined":       decision.Undetermined,
 	})
 	if err != nil {
 		return err

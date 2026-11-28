@@ -2654,6 +2654,79 @@ func TestListGlobalAudit_RunBoundWithholdsMergeOverlapOverride(t *testing.T) {
 	}
 }
 
+// TestListRunAudit_RunBoundWithholdsMergeQueueOverlapRefused pins the
+// run-bound withhold of merge_queue_overlap_refused on GET
+// /v0/runs/{run_id}/audit (#5604): since the row names the blocking and
+// undetermined runs and their shared paths, a run-bound subject never
+// receives it — unfiltered, category-named or paginated — while an operator's
+// category-named read answers 200 WITHOUT allow_unknown and carries the row.
+// Counterfactual: deleting `|| e.Category == CategoryMergeQueueOverlapRefused`
+// from the withhold predicate exposes the row → RED.
+func TestListRunAudit_RunBoundWithholdsMergeQueueOverlapRefused(t *testing.T) {
+	f := newRunBoundWithholdFixture(t, CategoryMergeQueueOverlapRefused)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		id := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+		t.Run(subject, func(t *testing.T) {
+			w := f.listRunAudit("", id)
+			items := readAuditItems(t, w)
+			if n := countAuditItemsInCategory(items, CategoryMergeQueueOverlapRefused); n != 0 {
+				t.Fatalf("unfiltered read: %d merge_queue_overlap_refused rows, want 0", n)
+			}
+			if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+				t.Fatalf("unfiltered read leaks the refusal payload:\n%s", w.Body.String())
+			}
+			w = f.listRunAudit("?category="+CategoryMergeQueueOverlapRefused, id)
+			if items := readAuditItems(t, w); len(items) != 0 {
+				t.Fatalf("category-named read: %d items, want 0:\n%s", len(items), w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+				t.Fatalf("category-named read leaks the refusal payload:\n%s", w.Body.String())
+			}
+			items = readAuditItems(t, f.listRunAudit("?limit=1", id))
+			if len(items) != 1 || items[0].Category != "plan_generated" {
+				t.Fatalf("limit=1 read = %+v, want the ordinary row (withhold before pagination)", items)
+			}
+		})
+	}
+	t.Run("operator category read is 200 without allow_unknown", func(t *testing.T) {
+		op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+		w := f.listRunAudit("?category="+CategoryMergeQueueOverlapRefused, op)
+		if w.Code != http.StatusOK {
+			t.Fatalf("operator category read status = %d, want 200 (registered category, no allow_unknown):\n%s", w.Code, w.Body.String())
+		}
+		if n := countAuditItemsInCategory(readAuditItems(t, w), CategoryMergeQueueOverlapRefused); n != 1 {
+			t.Fatalf("operator category read: %d merge_queue_overlap_refused rows, want 1", n)
+		}
+	})
+}
+
+// TestListGlobalAudit_RunBoundWithholdsMergeQueueOverlapRefused is the GET
+// /v0/audit twin: a run-bound subject never sees the row or its payload, an
+// operator does.
+func TestListGlobalAudit_RunBoundWithholdsMergeQueueOverlapRefused(t *testing.T) {
+	f := newRunBoundWithholdFixture(t, CategoryMergeQueueOverlapRefused)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		id := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+		t.Run(subject, func(t *testing.T) {
+			w := f.listGlobalAudit("", id)
+			if n := countAuditItemsInCategory(readAuditItems(t, w), CategoryMergeQueueOverlapRefused); n != 0 {
+				t.Fatalf("unfiltered read: %d merge_queue_overlap_refused rows, want 0", n)
+			}
+			if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+				t.Fatalf("unfiltered read leaks the refusal payload:\n%s", w.Body.String())
+			}
+			w = f.listGlobalAudit("&category="+CategoryMergeQueueOverlapRefused, id)
+			if items := readAuditItems(t, w); len(items) != 0 {
+				t.Fatalf("category-named read: %d items, want 0:\n%s", len(items), w.Body.String())
+			}
+		})
+	}
+	op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+	if n := countAuditItemsInCategory(readAuditItems(t, f.listGlobalAudit("&category="+CategoryMergeQueueOverlapRefused, op)), CategoryMergeQueueOverlapRefused); n != 1 {
+		t.Fatalf("operator category read: %d merge_queue_overlap_refused rows, want 1", n)
+	}
+}
+
 // escapeWithholdMarker is a unique token planted in a seeded escape_recorded
 // payload, so any read that leaks the row's body is caught by a substring
 // check independent of the category name.

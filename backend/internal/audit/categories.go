@@ -372,7 +372,12 @@ import "sort"
 // merge_queue_merged and merge_queue_overlap_refused, the ADR-093 D3
 // merge-on-pass rows (server/merge_queue_merge.go, merge_candidate_queue.go),
 // plus merge_dispatch_settled, the D1 dispatch-ledger outcome row —
-// INTERNAL, not issue-comment surfaces.
+// INTERNAL, not issue-comment surfaces. Since #5604 merge_queue_overlap_refused
+// names the blocking/undetermined runs and shared paths, so it is WITHHELD
+// from run-bound audit reads by an interim deny-list entry in
+// server/reads.go's withholdScopeOverlapFromRunBound — the same deliberate
+// interim deviation from ADR-106, owned by E89 #4537, that MUST migrate to
+// ADR-106's per-category registry flag when that lands.
 // E87.6 / #4297 (ADR-093 D4) added merge_queue_ejected, the ONE ejection
 // record per ejected merge-queue entry naming its reason and a closed
 // next_step (server/merge_queue_eject.go), and FORWARD-registered
@@ -701,7 +706,7 @@ var KnownCategories = map[string]struct{}{
 	"merge_queue_ejected":                     {}, // E87.6 / #4297 (ADR-093 D4): ONE row per ejected merge-queue entry, written only by the settling call, naming reason (verify_failed, advance_conflict, forge_merge_refused, pass_not_startable), next_step from the closed vocabulary, fixup_routed (verify_failed), forge_reason and sanitised forge_detail (server/merge_queue_eject.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_intent_withdrawn":            {}, // E87.17 / #4685 (ADR-112 R3): the operator withdrew a YIELDED merge-queue entry's merge intent, settling it dropped intent_withdrawn, appended INSIDE the withdrawal transaction (server/merge_queue_withdraw.go); payload carries only this run's ids and no yield_detail, so it is run-bound-readable under ADR-106 — INTERNAL, not an issue-comment surface
 	"merge_queue_merged":                      {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass merged the head of line through the forge pinned to the verified head, naming verdict_head_sha and approval basis (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
-	"merge_queue_overlap_refused":             {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass was held by the merge overlap guard; counts only, no other run's ids or paths, one row per distinct decision (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_overlap_refused":             {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass was held by the merge overlap guard; #5604: names the blocking/undetermined runs and shared paths; withheld from run-bound reads (server/reads.go); one row per distinct decision including the blocker set (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_promoted":                    {}, // E87.6 / #4297 (ADR-093 D7): FORWARD registration — the operator promote verb moved an unmarked held entry to the head of its base's line, appended INSIDE the promotion transaction (server/merge_queue_promote.go, a later slice) — INTERNAL, not an issue-comment surface
 	"merge_queue_resumed":                     {}, // E87.7 / #4298 (ADR-093 D8): the restart resume's record for a live head-of-line entry, naming step, action (reclaim, apply_verdict, eject, record_unverified, redispatch_pass, settle_merged, settle_pr_merged, drop_pr_closed, redecide, hold), reason, head and admission epoch; appended BEFORE the action it records and fail-closed; only this run's own ids (server/merge_queue_resume_verifying.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_verified":                    {}, // E87.5 / #4296 (ADR-093 D3): a merge-intent queue entry's head read passed (pass, transfer, already_passed or not_required) (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface

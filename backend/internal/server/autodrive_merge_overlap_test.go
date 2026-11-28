@@ -207,6 +207,51 @@ func TestAutoDriveRunGate_MergeOverlap_NoOverlapMerges(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_MergeOverlap_DocsOnlyAdmitsCodeRefuses (#5604, JJ2):
+// the delegated may_merge arm runs the same guard, so an overlap whose shared
+// paths are all documentation admits and the delegated merge runs, while the
+// SAME fixture plus one shared code path still parks decision_required
+// overlapping_implement_in_flight with the merger never called.
+// Counterfactual (d): the exemption line as `if len(paths) > 0 {` parks
+// docs_only → RED; (g) mergeOverlapPathsDocsOnly as `return true` merges
+// docs_plus_code → RED.
+func TestAutoDriveRunGate_MergeOverlap_DocsOnlyAdmitsCodeRefuses(t *testing.T) {
+	t.Run("docs_only", func(t *testing.T) {
+		f := newDelegatedOverlapFixture(t)
+		f.gh.setFiles("docs/api/v0.md", "docs/api/v0.openapi.yaml", "a.go")
+		f.seedOther(t, run.StageStateRunning, "docs/api/v0.md", "docs/api/v0.openapi.yaml", "b.go")
+		out := f.driveGate(t, overlapAuditReaderIdentity())
+		if !out.Acted || out.Action != delegation.ActionMerge || out.DecisionRequired {
+			t.Fatalf("outcome = %+v, want acted merge (a docs-only overlap is not a blocker)", out)
+		}
+		if f.merger.called != 1 {
+			t.Fatalf("merger called %d times, want 1", f.merger.called)
+		}
+		if n := len(overlapRows(f.au, CategoryDelegatedMergeOverlapRefused)); n != 0 {
+			t.Fatalf("delegated_merge_overlap_refused rows = %d, want 0 (the guard admitted)", n)
+		}
+		if n := f.gh.prCompareCalls(); n < 1 {
+			t.Fatalf("main...head compares = %d, want >= 1 (the guard read the changed paths)", n)
+		}
+	})
+	t.Run("docs_plus_code", func(t *testing.T) {
+		f := newDelegatedOverlapFixture(t)
+		f.gh.setFiles("docs/api/v0.md", "shared.go", "a.go")
+		b, st := f.seedOther(t, run.StageStateRunning, "docs/api/v0.md", "shared.go", "b.go")
+		out := f.driveGate(t, campaignOperatorIdentity())
+		if !out.DecisionRequired || out.DecisionState != mergeCodeOverlappingImplement || out.Action != delegation.ActionMerge || out.Acted {
+			t.Fatalf("outcome = %+v, want decision_required %s", out, mergeCodeOverlappingImplement)
+		}
+		f.assertNoMergeRows(t)
+		raw, fields := f.delegatedRefusalRow(t)
+		if fields["refused_code"] != mergeCodeOverlappingImplement || fields["blocking_count"] != float64(1) {
+			t.Fatalf("delegated refusal row = %v", fields)
+		}
+		assertNamesNoOtherRun(t, "delegated_merge_overlap_refused payload", raw, b, st)
+		assertNamesNoOtherRun(t, "server log", f.log.String(), b, st)
+	})
+}
+
 // TestAutoDriveRunGate_MergeOverlap_NoteWithheldWithoutReadAudit (approval
 // condition C4): the campaign operator identity holds no read:audit, so the
 // note carries counts, never B's run id, stage id or issue ref.

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -23,7 +25,9 @@ import (
 // one behavioral test per refusal and fail-closed mode, the override and its
 // record-before-commit contract, and the guard's placement ahead of the
 // ADR-093 enqueue arm. Every refusal test reads COMMITTED state (no verdict
-// row, no override row, no dispatch), not only the error code.
+// row, no override row, no dispatch), not only the error code. The #5604
+// docs-only exemption is pinned inline (fake fixture) and on merge-on-pass
+// (Postgres queue world), with its classifier table below.
 
 const overlapHead = "h0000000000000000000000000000000000000001"
 
@@ -773,6 +777,170 @@ func TestMergeOverlapGuard_ZeroValueAdmits(t *testing.T) {
 	}
 }
 
+// --- #5604: the docs-only exemption (inline merge_run, fake fixture) ---
+
+// seedSharedOverlap makes A change shared plus a.go and B's running implement
+// scope shared plus b.go, so A and B share EXACTLY the shared paths and each
+// side also holds a disjoint code file.
+func (f *mergeOverlapFixture) seedSharedOverlap(t *testing.T, shared ...string) (*run.Run, *run.Stage) {
+	t.Helper()
+	f.gh.setFiles(append(append([]string{}, shared...), "a.go")...)
+	return f.seedOther(t, run.StageStateRunning, append(append([]string{}, shared...), "b.go")...)
+}
+
+// TestMergeRun_OverlapDocsOnlyAdmits (#5604, JJ1): an overlap whose shared
+// paths are ALL documentation admits — 200, one verdict, one merge, no
+// override row. One subtest per classifier arm: docs_prefix shares only
+// docs/api/v0.openapi.yaml (matched by the docs/ arm alone, not .md);
+// md_suffix shares only AGENTS.md (outside docs/, matched by the .md arm
+// alone); nested_readme is the original incident; docs_md_pair is the
+// recurrence; docs_adr is a governance doc under docs/ (JJ1: does not block).
+// Counterfactuals: (d) the exemption line as `if len(paths) > 0 {` refuses
+// every subtest 409; (e) deleting the docs/ arm refuses docs_prefix; (f)
+// deleting the .md arm refuses md_suffix and nested_readme.
+func TestMergeRun_OverlapDocsOnlyAdmits(t *testing.T) {
+	for name, shared := range map[string][]string{
+		"docs_prefix":   {"docs/api/v0.openapi.yaml"},
+		"md_suffix":     {"AGENTS.md"},
+		"nested_readme": {"runner/cmd/fishhawk-runner/README.md"},
+		"docs_md_pair":  {"docs/api/v0.md", "docs/api/v0.openapi.yaml"},
+		"docs_adr":      {"docs/adr/0115-merge-overlap.md"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMergeOverlapFixture(t)
+			f.seedSharedOverlap(t, shared...)
+			f.assertAdmitted(t, f.post(t, mergeRunRequest{}))
+			if n := len(overlapRows(f.au, CategoryMergeOverlapOverridden)); n != 0 {
+				t.Fatalf("merge_overlap_overridden rows = %d, want 0 (nothing was overridden)", n)
+			}
+			if n := f.gh.prCompareCalls(); n != 1 {
+				t.Fatalf("main...head compares = %d, want 1 (the guard read the changed paths)", n)
+			}
+		})
+	}
+}
+
+// TestMergeRun_OverlapNonDocsPathStillRefuses (#5604, JJ1): the SAME fixture
+// with any non-documentation shared path still refuses 409
+// overlapping_implement_in_flight naming B, its stage and the FULL sorted
+// intersection (docs paths included). mixed_docs_code is the non-vacuity
+// partner of the docs-only admits; mdx_outside_docs, uppercase_md and
+// rst_outside_docs pin that the exemption is NOT isDocumentationPath and is
+// case-sensitive. Counterfactual (g): mergeOverlapPathsDocsOnly's body as
+// `return true` admits every subtest 200.
+func TestMergeRun_OverlapNonDocsPathStillRefuses(t *testing.T) {
+	for name, tc := range map[string]struct {
+		shared    []string
+		wantPaths string
+	}{
+		"mixed_docs_code":  {[]string{"docs/api/v0.md", "shared.go"}, "[docs/api/v0.md shared.go]"},
+		"mdx_outside_docs": {[]string{"site/src/content/docs/guides/intro.mdx"}, "[site/src/content/docs/guides/intro.mdx]"},
+		"uppercase_md":     {[]string{"NOTES.MD"}, "[NOTES.MD]"},
+		"rst_outside_docs": {[]string{"README.rst"}, "[README.rst]"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMergeOverlapFixture(t)
+			b, st := f.seedSharedOverlap(t, tc.shared...)
+			env := f.assertRefused(t, f.post(t, mergeRunRequest{}), http.StatusConflict, mergeCodeOverlappingImplement)
+			d := env.Error.Details
+			if d["blocking_run_id"] != b.ID.String() || d["stage_id"] != st.ID.String() {
+				t.Fatalf("details = %v, want blocking_run_id %s stage_id %s", d, b.ID, st.ID)
+			}
+			blocking, _ := d["blocking"].([]any)
+			if len(blocking) != 1 {
+				t.Fatalf("blocking = %v, want one entry", d["blocking"])
+			}
+			first := blocking[0].(map[string]any)
+			if first["run_id"] != b.ID.String() || first["stage_id"] != st.ID.String() || fmt.Sprint(first["paths"]) != tc.wantPaths {
+				t.Fatalf("blocking[0] = %v, want run %s stage %s paths %s", first, b.ID, st.ID, tc.wantPaths)
+			}
+		})
+	}
+}
+
+// TestMergeRun_OverlapDocsOnlyIncompleteStaysUndetermined (#5604): a docs-only
+// intersection on an INCOMPLETE changed set (a patch omitted, so the compare is
+// truncated) is undetermined, not admitted: the unlisted paths may be code.
+// Counterfactual (i): writing the exemption as a `continue` ahead of the
+// incomplete branch admits 200.
+func TestMergeRun_OverlapDocsOnlyIncompleteStaysUndetermined(t *testing.T) {
+	f := newMergeOverlapFixture(t)
+	b, _ := f.seedOther(t, run.StageStateRunning, "docs/api/v0.md", "b.go")
+	f.gh.mu.Lock()
+	f.gh.files = []map[string]any{
+		{"filename": "docs/api/v0.md", "status": "modified", "changes": 1, "patch": "@@ -1 +1 @@"},
+		{"filename": "other.go", "status": "modified", "changes": 5000},
+	}
+	f.gh.mu.Unlock()
+	env := f.assertRefused(t, f.post(t, mergeRunRequest{}), http.StatusConflict, mergeCodeOverlapUndetermined)
+	assertUndeterminedReason(t, env, overlapReasonChangedFilesCapped)
+	und, _ := env.Error.Details["undetermined"].([]any)
+	if len(und) != 1 {
+		t.Fatalf("undetermined = %v, want B", env.Error.Details["undetermined"])
+	}
+	first := und[0].(map[string]any)
+	if first["run_id"] != b.ID.String() || fmt.Sprint(first["paths"]) != "[]" {
+		t.Fatalf("undetermined[0] = %v, want run %s with no paths", first, b.ID)
+	}
+}
+
+// TestIsMergeOverlapDocumentationPath pins the exemption's classifier (#5604,
+// JJ1): docs/** or *.md, case-sensitive, after path.Clean over slash form,
+// never an absolute path or an escape. Counterfactuals: (e) and (f) delete an
+// arm; (h) dropping the path.Clean classifies docs/../backend/x.go as docs and
+// ./docs/x.go as code; deleting the absolute or "../" rejection classifies
+// /docs/x.md or ../docs/x.md as docs.
+func TestIsMergeOverlapDocumentationPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"docs/api/v0.openapi.yaml":             true,
+		"docs/spec/workflow-v2.schema.json":    true,
+		"docs/adr/x.md":                        true,
+		"docs/api/v0.md":                       true,
+		"AGENTS.md":                            true,
+		"runner/cmd/fishhawk-runner/README.md": true,
+		"./docs/x.go":                          true,
+		`docs\guides\x.go`:                     true,
+		"backend/x.go":                         false,
+		"docs.go":                              false,
+		"docs":                                 false,
+		"Docs/x.go":                            false,
+		"mydocs/x.go":                          false,
+		"README.MD":                            false,
+		"README.rst":                           false,
+		"site/src/content/docs/guides/x.mdx":   false,
+		"guide.markdown":                       false,
+		"docs/../backend/x.go":                 false,
+		"../docs/x.md":                         false,
+		"/docs/x.md":                           false,
+		"..":                                   false,
+		".":                                    false,
+		"":                                     false,
+	} {
+		if got := isMergeOverlapDocumentationPath(p); got != want {
+			t.Errorf("isMergeOverlapDocumentationPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}
+
+func TestMergeOverlapPathsDocsOnly(t *testing.T) {
+	for name, tc := range map[string]struct {
+		paths []string
+		want  bool
+	}{
+		"nil":       {nil, false},
+		"empty":     {[]string{}, false},
+		"all_docs":  {[]string{"docs/api/v0.md", "docs/api/v0.openapi.yaml", "AGENTS.md"}, true},
+		"mixed":     {[]string{"docs/api/v0.md", "shared.go"}, false},
+		"code_only": {[]string{"shared.go"}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := mergeOverlapPathsDocsOnly(tc.paths); got != tc.want {
+				t.Fatalf("mergeOverlapPathsDocsOnly(%v) = %v, want %v", tc.paths, got, tc.want)
+			}
+		})
+	}
+}
+
 // --- ADR-093 enqueue arm (real Postgres): the guard precedes the enqueue ---
 
 // seedOverlapLiveRun adds a second run in the mcq fixture's repo whose
@@ -868,5 +1036,128 @@ func TestMergeRun_OverlapOverrideUnrecordedNeverEnqueues(t *testing.T) {
 	}
 	if got := f.intentAt(r); len(got) != 0 {
 		t.Fatalf("queue entries = %v, want none", got)
+	}
+}
+
+// --- #5604: the docs-only exemption on merge-on-pass (real Postgres) ---
+
+// mqmOverlapWorld is a merge-on-pass world whose queued run r changes changed
+// at h1 and whose second run other has its implement stage running on a plan
+// scoping otherScope. The plan artifact lives in a fake artifact repository
+// wired into the server, so the guard resolves other's scope; an in-test proxy
+// answers the guard's compare main...h1 with the changed files and forwards
+// every other request to the world's GitHub stub.
+type mqmOverlapWorld struct {
+	*mqmWorld
+	r, other *mcqRun
+	req      mergeOnPassRequest
+	compares *int
+}
+
+func newMQMOverlapWorld(t *testing.T, changed, otherScope []string) *mqmOverlapWorld {
+	t.Helper()
+	ctx := context.Background()
+	w := newMQMWorld(t)
+	art := newFakeArtifactRepo()
+	w.srv.cfg.ArtifactRepo = art
+	r, req := w.ready("ov", "h1", mcvUndelegatedSpecYAML)
+	other := w.seed("other", "o1", []byte(mcvUndelegatedSpecYAML))
+	w.setStage(other.impl.ID, run.StageStateRunning)
+	stages, err := w.repo.ListStagesForRun(ctx, other.id)
+	if err != nil {
+		t.Fatalf("list other's stages: %v", err)
+	}
+	var planID uuid.UUID
+	for _, st := range stages {
+		if st.Type == run.StageTypePlan {
+			planID = st.ID
+		}
+	}
+	if planID == uuid.Nil {
+		t.Fatal("other has no plan stage")
+	}
+	seedBudgetPlanArtifact(t, art, planID, overlapPlan(otherScope...))
+
+	orig := w.srv.cfg.GitHub
+	target, err := url.Parse(orig.BaseURL)
+	if err != nil {
+		t.Fatalf("parse github url: %v", err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	files := make([]map[string]any, 0, len(changed))
+	for _, p := range changed {
+		files = append(files, map[string]any{"filename": p, "status": "modified", "changes": 1, "patch": "@@ -1 +1 @@"})
+	}
+	body, _ := json.Marshal(map[string]any{"commits": []map[string]string{{"sha": "h1"}}, "files": files})
+	var (
+		mu       sync.Mutex
+		compares int
+	)
+	ps := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet && req.URL.Path == "/repos/x/y/compare/"+mcqBase+"...h1" {
+			mu.Lock()
+			compares++
+			mu.Unlock()
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write(body)
+			return
+		}
+		forward.ServeHTTP(rw, req)
+	}))
+	t.Cleanup(ps.Close)
+	gh := *orig
+	gh.BaseURL = ps.URL
+	w.srv.cfg.GitHub = &gh
+	return &mqmOverlapWorld{mqmWorld: w, r: r, other: other, req: req, compares: &compares}
+}
+
+// TestMergeQueueMergeOnPass_OverlapDocsOnlyMerges (#5604): across every layer
+// — the forge compare over httptest, the Postgres run repository and the
+// plan-artifact scope, the guard, merge-on-pass under the queue lock — a
+// queued run whose only overlap with a live implement is documentation merges,
+// with no merge_queue_overlap_refused row. Counterfactual (d): the exemption
+// line as `if len(paths) > 0 {` holds it overlap_refused with zero merges.
+func TestMergeQueueMergeOnPass_OverlapDocsOnlyMerges(t *testing.T) {
+	w := newMQMOverlapWorld(t,
+		[]string{"docs/api/v0.md", "docs/api/v0.openapi.yaml", "a.go"},
+		[]string{"docs/api/v0.md", "docs/api/v0.openapi.yaml", "o.go"})
+	requireOutcome(t, w.decide(w.req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	w.requireMerges(1)
+	if n := len(w.rows(w.r, CategoryMergeQueueOverlapRefused)); n != 0 {
+		t.Fatalf("merge_queue_overlap_refused rows = %d, want 0 (the guard admitted)", n)
+	}
+	if *w.compares < 1 {
+		t.Fatalf("guard compares = %d, want >= 1 (the guard read the changed paths)", *w.compares)
+	}
+}
+
+// TestMergeQueueMergeOnPass_OverlapCodeHeldNamesBlocker (#5604): the SAME
+// fixture plus one shared code path is held overlap_refused with zero merges,
+// and the persisted merge_queue_overlap_refused row names the other run and
+// the FULL shared-path set, docs included. It is the non-vacuity partner of
+// the docs-only merge: the guard is live on this fixture. Counterfactual (g):
+// mergeOverlapPathsDocsOnly as `return true` merges.
+func TestMergeQueueMergeOnPass_OverlapCodeHeldNamesBlocker(t *testing.T) {
+	w := newMQMOverlapWorld(t,
+		[]string{"docs/api/v0.md", "shared.go", "a.go"},
+		[]string{"docs/api/v0.md", "shared.go", "o.go"})
+	requireOutcome(t, w.decide(w.req), mergeOnPassHeld, mergeOnPassReasonOverlapRefused)
+	w.requireMerges(0)
+	rows := w.rows(w.r, CategoryMergeQueueOverlapRefused)
+	if len(rows) != 1 {
+		t.Fatalf("merge_queue_overlap_refused rows = %d, want 1", len(rows))
+	}
+	var row struct {
+		RefusedCode string                `json:"refused_code"`
+		Blocking    []mergeOverlapBlocker `json:"blocking"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &row); err != nil {
+		t.Fatalf("decode overlap row: %v", err)
+	}
+	if row.RefusedCode != mergeCodeOverlappingImplement || len(row.Blocking) != 1 ||
+		row.Blocking[0].RunID != w.other.id.String() || row.Blocking[0].StageID != w.other.impl.ID.String() ||
+		strings.Join(row.Blocking[0].Paths, " ") != "docs/api/v0.md shared.go" {
+		t.Fatalf("overlap row = %s, want %s blocking [{run_id %s stage_id %s paths [docs/api/v0.md shared.go]}]",
+			rows[0].Payload, mergeCodeOverlappingImplement, w.other.id, w.other.impl.ID)
 	}
 }
