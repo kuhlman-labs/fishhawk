@@ -71,21 +71,21 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-057": {[]string{"ADR-061"}, nil, nil, []string{"ADR-105", "ADR-147"}},
 	"ADR-061": {[]string{"ADR-058"}, []string{"ADR-057"}, nil, []string{"ADR-105"}},
 	"ADR-085": {nil, nil, nil, []string{"ADR-101", "ADR-122"}},
-	"ADR-093": {[]string{"ADR-090", "ADR-092"}, nil, nil, []string{"ADR-109", "ADR-112", "ADR-115"}},
+	"ADR-093": {[]string{"ADR-090", "ADR-092"}, nil, nil, []string{"ADR-109", "ADR-112", "ADR-115", "ADR-150"}},
 	"ADR-103": {nil, nil, []string{"ADR-050"}, []string{"ADR-126"}},
 	"ADR-104": {nil, nil, []string{"ADR-022", "ADR-024"}, nil},
 	"ADR-105": {nil, nil, []string{"ADR-057", "ADR-061"}, nil},
 	"ADR-107": {nil, nil, []string{"ADR-025"}, nil},
-	"ADR-109": {nil, nil, []string{"ADR-093"}, nil},
+	"ADR-109": {nil, nil, []string{"ADR-093"}, []string{"ADR-150"}},
 	"ADR-041": {nil, nil, []string{"ADR-032"}, []string{"ADR-116"}},
 	"ADR-055": {nil, nil, nil, []string{"ADR-113", "ADR-132"}},
 	"ADR-063": {nil, nil, nil, []string{"ADR-115", "ADR-149"}},
 	"ADR-068": {nil, nil, nil, []string{"ADR-118"}},
 	"ADR-084": {nil, nil, nil, []string{"ADR-118", "ADR-120", "ADR-139", "ADR-143", "ADR-147"}},
-	"ADR-092": {[]string{"ADR-090"}, []string{"ADR-093"}, nil, []string{"ADR-115"}},
-	"ADR-112": {nil, nil, []string{"ADR-093"}, []string{"ADR-115", "ADR-121"}},
+	"ADR-092": {[]string{"ADR-090"}, []string{"ADR-093"}, nil, []string{"ADR-115", "ADR-150"}},
+	"ADR-112": {nil, nil, []string{"ADR-093"}, []string{"ADR-115", "ADR-121", "ADR-150"}},
 	"ADR-113": {nil, nil, []string{"ADR-055"}, []string{"ADR-120", "ADR-123", "ADR-139", "ADR-148"}},
-	"ADR-115": {nil, nil, []string{"ADR-063", "ADR-092", "ADR-093", "ADR-094", "ADR-112"}, []string{"ADR-116", "ADR-149"}},
+	"ADR-115": {nil, nil, []string{"ADR-063", "ADR-092", "ADR-093", "ADR-094", "ADR-112"}, []string{"ADR-116", "ADR-149", "ADR-150"}},
 	"ADR-116": {nil, nil, []string{"ADR-041", "ADR-115"}, nil},
 	"ADR-117": {nil, nil, nil, []string{"ADR-118", "ADR-126"}},
 	"ADR-118": {nil, nil, []string{"ADR-068", "ADR-084", "ADR-117"}, []string{"ADR-121", "ADR-122", "ADR-129"}},
@@ -117,13 +117,13 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-141": {nil, nil, []string{"ADR-035"}, nil},
 	"ADR-035": {nil, nil, nil, []string{"ADR-141"}},
 	// ADR-142, ratified 2026-11-06 (relations from its record-metadata line, ADR-113 D3).
-	"ADR-142": {nil, nil, []string{"ADR-090"}, nil},
+	"ADR-142": {nil, nil, []string{"ADR-090"}, []string{"ADR-150"}},
 	// ADR-143, ratified 2026-11-12 (relations from its record-metadata line, ADR-113 D3).
 	"ADR-143": {nil, nil, []string{"ADR-084"}, []string{"ADR-148"}},
 	// ADR-145, ratified 2026-11-13 (relations from its record-metadata line, ADR-113 D3).
 	"ADR-145": {nil, nil, []string{"ADR-144"}, nil},
 	"ADR-144": {nil, nil, nil, []string{"ADR-145"}},
-	"ADR-090": {[]string{"ADR-043"}, []string{"ADR-092", "ADR-093", "ADR-096"}, nil, []string{"ADR-142"}},
+	"ADR-090": {[]string{"ADR-043"}, []string{"ADR-092", "ADR-093", "ADR-096"}, nil, []string{"ADR-142", "ADR-150"}},
 	// The Captain's 2026-11-14 #5271 rulings: the D13 clarification lines and ADR-123 A1 (docs/adr/README.md
 	// "Amendment relation").
 	"ADR-009": {nil, nil, nil, []string{"ADR-073", "ADR-138"}},
@@ -139,6 +139,8 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	// ADR-148 and ADR-149, ratified 2026-11-14 (relations from their record-metadata lines, ADR-113 D3).
 	"ADR-148": {nil, nil, []string{"ADR-019", "ADR-083", "ADR-089", "ADR-097", "ADR-101", "ADR-113", "ADR-121", "ADR-123", "ADR-126", "ADR-132", "ADR-143"}, nil},
 	"ADR-149": {nil, nil, []string{"ADR-028", "ADR-029", "ADR-063", "ADR-101", "ADR-115", "ADR-119", "ADR-122"}, nil},
+	// ADR-150, ratified 2026-11-28 (relations from its record-metadata line, ADR-113 D3).
+	"ADR-150": {nil, nil, []string{"ADR-090", "ADR-092", "ADR-093", "ADR-109", "ADR-112", "ADR-115", "ADR-142"}, nil},
 	// The Captain's 2026-10-23 status rulings (ADR-041 amends ADR-032).
 	"ADR-032": {nil, nil, nil, []string{"ADR-041"}},
 }
