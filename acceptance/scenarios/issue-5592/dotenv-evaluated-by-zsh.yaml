@@ -2,13 +2,14 @@ id: scenario:issue-5592/dotenv-evaluated-by-zsh
 statement: zsh evaluates the .env. One .env sets FISHHAWK_HOST_LABEL=acc-if-label inside an `if true; then` / `fi` block, then sets FISHHAWK_HOST_CAPACITY=5, then sets a multi-line double-quoted NOTE value with an inner line reading FISHHAWK_HOST_CAPACITY=9. Through the shim, fishhawk_doctor reports host_label.label acc-if-label with source override, and host_capacity.capacity 5. A second launch uses a .env that sets the label as an array, FISHHAWK_HOST_LABEL=(acc-array-label x), and reports a host_label.source other than override and a label other than acc-array-label, because zsh never exports an array.
 verify_hint: MCP tool result. Use the dotenv-host-settings-reach-doctor launch (stdio, preview backend, fixture-minted fhm_ run token, zsh on PATH) twice, once with each .env. Read structuredContent.host_label.label, host_label.source and host_capacity.capacity from each fishhawk_doctor result.
 steps: 'Built fishhawk-mcp-shim and fishhawk-mcp from the sanctioned checkout (cd backend && go build -o /tmp/fhacc5592/bin/ ./cmd/fishhawk-mcp-shim ./cmd/fishhawk-mcp). Minted an fhm_ run token: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign body ''{}'' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token body ''{}'' with X-Fishhawk-Signature. Launched /tmp/fhacc5592/bin/fishhawk-mcp-shim --env-file <tmp>/.env --state-dir <tmp>/state from an empty temp cwd with an exact environment of only PATH=/usr/bin:/bin:/usr/sbin:/sbin, HOME, XDG_STATE_HOME, TMPDIR (each an empty temp dir), FISHHAWK_BACKEND_URL=http://localhost:8090 and FISHHAWK_API_TOKEN=<fhm_>. .env mode 0600 owned by the current user. Sent initialize, notifications/initialized, tools/call fishhawk_doctor {repo: kuhlman-labs/fishhawk}, twice. Launch A .env: ''if true; then\n  FISHHAWK_HOST_LABEL=acc-if-label\nfi\nFISHHAWK_HOST_CAPACITY=5\nNOTE="first line\nFISHHAWK_HOST_CAPACITY=9\nlast line"''. Launch B .env: ''FISHHAWK_HOST_LABEL=(acc-array-label x)''.'
+steps_carried_from: head 0fdfe4535e1785e2d1dbea45850f4cf4efce28da recorded_at 2026-11-28T08:50:58Z
 assertions:
     expected: 'A: acc-if-label/override, capacity 5. B: source != override, label != acc-array-label'
-    observed_at_record: 'A: host_label acc-if-label source override; host_capacity 5 source env. B: host_label source persisted, label Bretts-MacBook-Pro.local (from the fresh XDG host-id file), not acc-array-label; shim reported nothing sourced.'
-    repro_handle: python3 -I /tmp/fhacc5592/scripts/case.py /tmp/fhacc5592/c4a.json ; python3 -I /tmp/fhacc5592/scripts/case.py /tmp/fhacc5592/c4b.json
+    observed_at_record: 'A: label acc-if-label, source override, capacity 5. B: label Bretts-MacBook-Pro.local, source persisted (from the fresh XDG host-id), capacity 3 default'
+    repro_handle: python3 -I /tmp/fhacc5592v/scripts/run5592.py
 origin:
     issue: 5592
     pr: 5630
     run_id: f04df6e1-e8a7-4a8b-9658-762af802ff53
-    head_sha: 0fdfe4535e1785e2d1dbea45850f4cf4efce28da
-    recorded_at: 2026-11-28T08:50:58Z
+    head_sha: bdc235c3ee7eb782834acc4a13656289f225bff6
+    recorded_at: 2026-11-28T14:12:56Z
