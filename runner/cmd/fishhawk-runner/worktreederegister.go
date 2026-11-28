@@ -42,13 +42,18 @@ func detachedTeardownContext(ctx context.Context) (context.Context, context.Canc
 // tree").
 //
 // (d) It ALSO deletes the tree if it is still present, so callers pass only a
-// path they own.
+// path they own. A path that is not absolute is refused before any git call:
+// git-worktree(1) resolves a relative argument by unique trailing path
+// components, so it could match, and delete, a foreign worktree.
 //
 // When the remove fails, the registration is checked through the same runner.
 // A path that is not registered returns nil: nothing is left to deregister. A
 // failed listing, or one with no worktree records, returns an error (fail
 // closed): empty or failed output never reads as "not registered".
 func deregisterWorktree(ctx context.Context, git gitAdminRunner, path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("deregister worktree %q: path is not absolute", path)
+	}
 	var last error
 	for _, p := range []string{path} {
 		args := []string{"worktree", "remove", "--force", "--force", p}

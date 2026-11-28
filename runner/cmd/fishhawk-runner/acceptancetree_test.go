@@ -254,6 +254,38 @@ func TestProvisionAcceptanceTree_StaleLeftoverSwept(t *testing.T) {
 	}
 }
 
+// TestProvisionAcceptanceTree_RegisteredMissingLeftoverReclaimed: the leftover
+// is a REGISTERED worktree of the dispatch repo whose directory is gone (the
+// runner was killed, then /tmp was cleaned). No directory exists for the
+// os.Stat sweep to see, so only the unconditional targeted deregistration
+// clears the registration; without it `git worktree add` refuses "missing but
+// already registered worktree" and the agent runs unprovisioned.
+func TestProvisionAcceptanceTree_RegisteredMissingLeftoverReclaimed(t *testing.T) {
+	dispatch, mcSHA := acceptanceTreeRepo(t)
+	redirectAcceptanceTreeDir(t)
+	var log strings.Builder
+
+	target := acceptanceTreePath("run1", "stage1")
+	if out, err := exec.Command("git", "-C", dispatch, "worktree", "add", "--detach", target, mcSHA).CombinedOutput(); err != nil {
+		t.Fatalf("seed leftover worktree: %v\n%s", err, out)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	if !worktreeRegistered(t, dispatch, target) {
+		t.Fatal("fixture: the leftover must still be registered with its directory gone")
+	}
+
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
+	defer teardown()
+	if !strings.Contains(log.String(), `"event":"acceptance_tree_provisioned"`) {
+		t.Fatalf("a registered-but-missing leftover must be reclaimed before the add:\n%s", log.String())
+	}
+	if _, err := os.Stat(filepath.Join(target, "keep.txt")); err != nil {
+		t.Errorf("provisioned checkout content missing: %v", err)
+	}
+}
+
 // TestProvisionAcceptanceTree_TeardownRemoveFallback: when `git worktree remove`
 // fails (here forced by locking the worktree so a single --force is refused),
 // teardown falls back to os.RemoveAll + the targeted deregisterWorktree

@@ -131,17 +131,20 @@ func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stage
 
 	// (ii) Sweep any stale leftover at the keyed path from a SIGKILL'd prior run
 	// (mirroring sweepStaleAcceptanceVerdict): a leftover directory would make
-	// `git worktree add` refuse. os.RemoveAll clears the tree; a best-effort
-	// targeted deregistration (deregisterWorktree) clears a dangling admin
-	// registration of THIS keyed path only. Never a repo-wide prune: it would
-	// deregister any worktree the runner cannot see (#4281).
+	// `git worktree add` refuse. os.RemoveAll clears the tree. A best-effort
+	// targeted deregistration (deregisterWorktree) of THIS keyed path then runs
+	// UNCONDITIONALLY, whether or not the directory exists: a registration whose
+	// directory is already gone (runner killed, then /tmp cleaned) also makes
+	// `worktree add` refuse ("missing but already registered worktree"). Never a
+	// repo-wide prune: it would deregister any worktree the runner cannot see
+	// (#4281).
 	if _, statErr := os.Stat(target); statErr == nil {
 		_ = os.RemoveAll(target)
-		_ = deregisterWorktree(ctx, git, target)
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"acceptance_tree_stale_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 			runID, stageID, target)
 	}
+	_ = deregisterWorktree(ctx, git, target)
 
 	// (iii) Ensure the merge-candidate object is present. On the local dogfood
 	// loop the SHA is normally already in the dispatch checkout's object store

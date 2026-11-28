@@ -2446,6 +2446,112 @@ func TestConflictResolutionStage_TreeProvisionFailureIsCategoryC(t *testing.T) {
 	})
 }
 
+// conflictTreeRemoveCall records one `git worktree remove`: its path, whether
+// the tree's parent dir still existed, and the context's error at that moment.
+type conflictTreeRemoveCall struct {
+	path         string
+	parentExists bool
+	ctxErr       error
+}
+
+// stubConflictTreeAddFails routes the conflict pass's worktree admin commands
+// through a recording seam. `worktree add` fails (calling onAdd first), each
+// `worktree remove` is recorded (and refused when removeFails), `worktree list`
+// answers listFn(tree) when listFn is set, and everything else runs real git.
+func stubConflictTreeAddFails(t *testing.T, onAdd func(), removeFails bool, listFn func(tree string) string) (*[]conflictTreeRemoveCall, *string) {
+	t.Helper()
+	var removes []conflictTreeRemoveCall
+	var tree string
+	orig := conflictTreeGit
+	conflictTreeGit = func(dispatchDir string) gitAdminRunner {
+		real := orig(dispatchDir)
+		return func(c context.Context, args ...string) ([]byte, error) {
+			switch {
+			case len(args) >= 4 && args[0] == "worktree" && args[1] == "add":
+				tree = args[3]
+				if onAdd != nil {
+					onAdd()
+				}
+				return []byte("fatal: stub refuses add"), errors.New("exit status 128")
+			case len(args) >= 2 && args[0] == "worktree" && args[1] == "remove":
+				p := args[len(args)-1]
+				_, statErr := os.Stat(filepath.Dir(p))
+				removes = append(removes, conflictTreeRemoveCall{path: p, parentExists: statErr == nil, ctxErr: c.Err()})
+				if removeFails {
+					return []byte("fatal: stub refuses remove"), errors.New("exit status 128")
+				}
+			case len(args) >= 2 && args[0] == "worktree" && args[1] == "list" && listFn != nil:
+				return []byte(listFn(tree)), nil
+			}
+			return real(c, args...)
+		}
+	}
+	t.Cleanup(func() { conflictTreeGit = orig })
+	return &removes, &tree
+}
+
+// TestConflictResolutionTree_AddFailureDeregisters (DD2, #4281) pins the
+// add-failure branch's targeted deregistration through the conflictTreeGit seam.
+func TestConflictResolutionTree_AddFailureDeregisters(t *testing.T) {
+	// The pass is cancelled as the add fails, so the deregistration must run on
+	// the detached context, and it must run while the tree's parent still exists.
+	t.Run("before_parent_removal_on_detached_context", func(t *testing.T) {
+		dispatch, _, featureTip, _ := crDispatchRepo(t)
+		tmp := t.TempDir()
+		origTmp := conflictTreeTempDir
+		conflictTreeTempDir = tmp
+		t.Cleanup(func() { conflictTreeTempDir = origTmp })
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		removes, tree := stubConflictTreeAddFails(t, cancel, false, nil)
+
+		_, _, _, refusal := establishConflictResolutionTree(ctx, crStageCfg(dispatch), &crFakeUpload{},
+			&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), io.Discard)
+		if refusal == nil || refusal.Reason != reasonTreeProvisionFailed {
+			t.Fatalf("refusal = %+v, want %q", refusal, reasonTreeProvisionFailed)
+		}
+		if len(*removes) == 0 {
+			t.Fatal("the add-failure branch issued no `git worktree remove` for the tree")
+		}
+		got := (*removes)[0]
+		if got.path != *tree {
+			t.Errorf("remove targeted %q, want the tree %q", got.path, *tree)
+		}
+		if !got.parentExists {
+			t.Error("the tree's parent was removed before the deregistration ran")
+		}
+		if got.ctxErr != nil {
+			t.Errorf("the deregistration ran on a cancelled context (%v), want the detached one", got.ctxErr)
+		}
+		if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+			t.Errorf("temp parent not cleaned up on worktree-add failure: %d entries", len(ents))
+		}
+	})
+
+	// A failed deregistration (remove refused, listing still names the tree) is
+	// logged, never discarded.
+	t.Run("failure_logged", func(t *testing.T) {
+		dispatch, _, featureTip, _ := crDispatchRepo(t)
+		origTmp := conflictTreeTempDir
+		conflictTreeTempDir = t.TempDir()
+		t.Cleanup(func() { conflictTreeTempDir = origTmp })
+		stubConflictTreeAddFails(t, nil, true, func(tree string) string {
+			return "worktree " + dispatch + "\nHEAD abc\n\nworktree " + tree + "\nHEAD abc\ndetached\n"
+		})
+
+		var sink strings.Builder
+		_, _, _, refusal := establishConflictResolutionTree(context.Background(), crStageCfg(dispatch), &crFakeUpload{},
+			&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+		if refusal == nil || refusal.Reason != reasonTreeProvisionFailed {
+			t.Fatalf("refusal = %+v, want %q", refusal, reasonTreeProvisionFailed)
+		}
+		if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") ||
+			!strings.Contains(sink.String(), "deregister_error") {
+			t.Errorf("a failed add-branch deregistration must be logged with deregister_error:\n%s", sink.String())
+		}
+	})
+}
+
 // TestConflictResolutionStage_AgentRunsInEstablishedTree: the agent must spawn in
 // the throwaway tree (detached HEAD at the anchor), NOT the dispatch checkout,
 // and its resolution must reach the pushed merge commit. Counterfactual: drop the

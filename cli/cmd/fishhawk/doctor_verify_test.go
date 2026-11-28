@@ -1131,6 +1131,51 @@ func TestProvisionDoctorWorktree_SparesHiddenForeignWorktree(t *testing.T) {
 	assertWorktreeGone(t, repo, worktree)
 }
 
+// TestProvisionDoctorWorktree_CleanupDeregistersAfterFailedRemove (#4281): with
+// the tree's .git file gone, the cleanup's first `worktree remove --force
+// --force` fails validation ("'.git' does not exist") and leaves the
+// registration. Only the second deregistration, run after os.RemoveAll (when
+// git sees the tree as missing), clears it.
+func TestProvisionDoctorWorktree_CleanupDeregistersAfterFailedRemove(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+	target, cleanup, err := provisionDoctorWorktree(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("provisionDoctorWorktree: %v", err)
+	}
+	if err := os.Remove(filepath.Join(target, ".git")); err != nil {
+		t.Fatalf("break the tree's .git file: %v", err)
+	}
+	cleanup()
+	assertWorktreeGone(t, repo, target)
+}
+
+// TestProvisionDoctorWorktree_AddFailureDeregisters (#4281): an add that
+// registers the tree and THEN reports failure (the seam runs the real add and
+// returns an error) must not strand the registration. Only the add-failure
+// deregistration clears it, because no cleanup is returned.
+func TestProvisionDoctorWorktree_AddFailureDeregisters(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+	var added string
+	withFakeDoctorVerifyGitRun(t, func(orig func(context.Context, string, bool, ...string) ([]byte, error),
+		ctx context.Context, dir string, combineOutput bool, args ...string) ([]byte, error) {
+		out, err := orig(ctx, dir, combineOutput, args...)
+		if len(args) >= 4 && args[0] == "worktree" && args[1] == "add" && err == nil {
+			added = args[3]
+			return []byte("fatal: stub reports add failure"), errors.New("exit status 128")
+		}
+		return out, err
+	})
+
+	_, cleanup, err := provisionDoctorWorktree(context.Background(), repo)
+	if err == nil || cleanup != nil {
+		t.Fatalf("err = %v, cleanup nil = %v; want the stubbed add failure and no cleanup", err, cleanup == nil)
+	}
+	if added == "" {
+		t.Fatal("fixture: the real `worktree add` never ran")
+	}
+	assertWorktreeGone(t, repo, added)
+}
+
 // TestCheckVerifyCommand_CleanupRemovesWorktreeAfterTimeout (binding
 // condition 3) asserts the same on the TIMEOUT path, which is the one most
 // likely to leak because the group kill runs first.

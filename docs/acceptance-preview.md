@@ -113,7 +113,7 @@ The runner logs these JSON events (one per line) to its log sink:
 | `acceptance_preview_teardown_missing` | **advisory**: a provision command is configured but no teardown command is — the provisioned instance will not be torn down |
 | `acceptance_tree_provisioned` | the merge-candidate checkout was created; carries `path` + `head_sha` (see below) |
 | `acceptance_tree_skipped` | merge-candidate checkout skipped — empty expectation, no dispatch dir, or a non-git dispatch dir (warn-and-proceed) |
-| `acceptance_tree_stale_swept` | a leftover checkout dir from a crashed prior run was removed before provisioning |
+| `acceptance_tree_stale_swept` | a leftover checkout dir from a crashed prior run was removed before provisioning (the keyed path is then deregistered before every add, whether or not a dir was there, so a registration whose dir is gone cannot block the add) |
 | `acceptance_tree_fetch_failed` | the head SHA was absent locally and the bare-SHA fetch failed (may still `worktree add` from a reachable object) |
 | `acceptance_tree_failed` | `git worktree add` failed (unfetchable/invalid SHA); the agent spawns unprovisioned (warn-and-proceed) |
 | `acceptance_tree_removed` | teardown removed the checkout (a `"fallback":"rm_deregister"` field marks the `os.RemoveAll` + targeted-deregister path) |

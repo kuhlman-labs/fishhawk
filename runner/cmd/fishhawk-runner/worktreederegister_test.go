@@ -243,10 +243,32 @@ func TestDeregisterWorktree_EmptyListReturnsError(t *testing.T) {
 	}
 }
 
+// TestDeregisterWorktree_RelativePathRefused: a relative path is refused
+// before any git call. git-worktree(1) resolves a relative argument by unique
+// trailing path components, so `remove --force --force` could otherwise match
+// and delete a foreign worktree. The stub ACCEPTS every command, so only the
+// guard can produce the error and the zero call count.
+func TestDeregisterWorktree_RelativePathRefused(t *testing.T) {
+	var calls []string
+	git := func(_ context.Context, args ...string) ([]byte, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return nil, nil
+	}
+	err := deregisterWorktree(context.Background(), git, filepath.Join("worktrees", "tree"))
+	if err == nil || !strings.Contains(err.Error(), "not absolute") {
+		t.Fatalf("err = %v, want the relative path refused", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("git ran %q for a relative path, want no git call", calls)
+	}
+}
+
 // TestNoRepoWideWorktreePrune fences every runner call site, including the
-// conflict-resolution add-failure branch that no in-package fixture can drive
-// with a foreign worktree registered: no non-test source in this package may
-// pass a `"worktree", "prune"` literal to git (#4281).
+// conflict-resolution add-failure branch, whose targeted deregistration
+// TestConflictResolutionTree_AddFailureDeregisters pins through a stub seam but
+// that no in-package fixture drives with a foreign worktree registered: no
+// non-test source in this package may pass a `"worktree", "prune"` literal to
+// git (#4281).
 func TestNoRepoWideWorktreePrune(t *testing.T) {
 	re := regexp.MustCompile(`"worktree",\s*"prune"`)
 	files, err := filepath.Glob(filepath.Join(pkgSrcDir, "*.go"))
