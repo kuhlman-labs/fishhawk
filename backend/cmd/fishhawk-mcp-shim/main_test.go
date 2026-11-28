@@ -77,6 +77,9 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if f.staleGrace != 60*time.Second {
 		t.Errorf("stale-grace default = %s, want 60s", f.staleGrace)
 	}
+	if want := defaultEnvFile(os.Executable); f.envFile != want || f.envFileExplicit {
+		t.Errorf("env-file default = (%q, explicit=%v), want (%q, false)", f.envFile, f.envFileExplicit, want)
+	}
 }
 
 // TestDefaultStateDirMatchesShellConvention pins that Go and zsh agree on the
@@ -228,6 +231,24 @@ func TestParseFlagsExplicit(t *testing.T) {
 	}
 	if f.quiesceTimeout != 10*time.Second {
 		t.Errorf("quiesce-timeout = %s", f.quiesceTimeout)
+	}
+
+	// --env-file names a file, and --env-file= disables sourcing; both are
+	// explicit, so neither is gated on a verified checkout (#5592).
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--env-file", "/x/.env"}, "/x/.env"},
+		{[]string{"--env-file="}, ""},
+	} {
+		f, err := parseFlags(append([]string{"fishhawk-mcp-shim"}, tc.args...), os.Stderr)
+		if err != nil {
+			t.Fatalf("parseFlags(%q): %v", tc.args, err)
+		}
+		if f.envFile != tc.want || !f.envFileExplicit {
+			t.Errorf("parseFlags(%q): env-file = (%q, explicit=%v), want (%q, true)", tc.args, f.envFile, f.envFileExplicit, tc.want)
+		}
 	}
 }
 
