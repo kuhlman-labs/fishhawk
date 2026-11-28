@@ -254,6 +254,8 @@ func TestMergeRunMergeMethod_InlineGraphQLRefusalNamesRearm(t *testing.T) {
 // 502 merge_dispatch_failed, whose message names the method actually
 // dispatched and where it came from — declared merge, or the squash default.
 // Counterfactual (22): rendering the literal squash reddens the declared arm.
+// It is also the #4676 pin (X1 option B) that an UNATTRIBUTED pinned 405
+// keeps the 502 and never answers not_merge_ready.
 func TestMergeRunMergeMethod_502NamesResolvedMethod(t *testing.T) {
 	for _, tc := range []struct{ name, method, want string }{
 		{"declared merge", "merge", "merge method merge: .fishhawk/workflows.yaml merge_method"},
@@ -270,6 +272,9 @@ func TestMergeRunMergeMethod_502NamesResolvedMethod(t *testing.T) {
 			mmrErrorDetails(t, resp.Body.Bytes(), "merge_dispatch_failed")
 			if !strings.Contains(resp.Body.String(), tc.want) {
 				t.Fatalf("502 message does not name %q: %s", tc.want, resp.Body.String())
+			}
+			if strings.Contains(resp.Body.String(), "not_merge_ready") {
+				t.Fatalf("an unattributed pinned 405 answered not_merge_ready: %s", resp.Body.String())
 			}
 		})
 	}

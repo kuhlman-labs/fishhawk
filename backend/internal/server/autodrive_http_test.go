@@ -822,3 +822,26 @@ func TestAutoDrive_Merge_RepublishesAuditCheckBeforeDispatch(t *testing.T) {
 	}
 	assertPublishPrecedesMerge(t, log)
 }
+
+// TestHandleAutoDrive_MergeNotReadyOnWire (#4676, Z4) pins the 200 body's
+// merge_not_ready object: present with every field on a not-ready outcome,
+// absent (never null) on every other outcome.
+func TestHandleAutoDrive_MergeNotReadyOnWire(t *testing.T) {
+	out := observeOnly("not ready")
+	out.MergeNotReady = &AutoDriveMergeNotReady{MergeableState: "blocked", Resumable: false, BlockedBy: "review_required", ClaimOutcome: "pre_claim"}
+	raw, err := json.Marshal(newAutoDriveResponse(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	nr, ok := body["merge_not_ready"].(map[string]any)
+	if !ok || nr["mergeable_state"] != "blocked" || nr["resumable"] != false || nr["conflicting"] != false ||
+		nr["blocked_by"] != "review_required" || nr["claim_outcome"] != "pre_claim" {
+		t.Fatalf("merge_not_ready = %v (body %s)", body["merge_not_ready"], raw)
+	}
+	raw, _ = json.Marshal(newAutoDriveResponse(observeOnly("other")))
+	if strings.Contains(string(raw), "merge_not_ready") {
+		t.Fatalf("merge_not_ready present on an unrelated outcome: %s", raw)
+	}
+}
