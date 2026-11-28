@@ -2740,6 +2740,10 @@ func buildImplement(t Trigger) string {
 		writeCounterfactualSidecar(&b, t)
 	}
 
+	// Check-then-use (#2432): after the sidecar sub-block, so that stays attached
+	// to its parent. ALSO on the fix-up path (see buildImplementFixup).
+	writeCheckThenUse(&b)
+
 	// Behavior-change claim sweep (#3013): the no-assertion-at-all sibling of the
 	// counterfactual block. Rendered on the full implement path here and — like
 	// writeCounterfactualDiscipline — ALSO on the fix-up path (see buildImplementFixup).
@@ -3502,6 +3506,11 @@ func writeFailureModeTestChecklist(b *strings.Builder) {
 // (e.g. #2453's certificate/key correspondence check, which landed correct and
 // completely unpinned) would otherwise escape the plan-stage rule entirely
 // (#2453/#2444). It is not nil-gated on anything.
+//
+// Traps (g)-(i) (#2432) are about what a REFUSAL test asserts rather than how
+// its fixture is set up: the refusal's identity instead of a code a transport
+// failure shares, the absence of any request to the refused target instead of
+// merely an error, and a bound's own refusal instead of an eventual failure.
 func writeCounterfactualDiscipline(b *strings.Builder) {
 	b.WriteString("\n### Counterfactual attainability — confirm in your PR Notes\n\n")
 	b.WriteString("For every control you add or change in this pass — any guard, validation, check, or refusal, in ANY language and whether or not it looks " +
@@ -3509,18 +3518,59 @@ func writeCounterfactualDiscipline(b *strings.Builder) {
 		"would fail — run it. Record the observed RED output for each cycle in your PR `## Notes`. Three traps that leave a test green with the control deleted: " +
 		"(a) asserting error IDENTITY when the control's effect is COMMITTED STATE — a control that fires and is then rolled back returns a byte-identical error, " +
 		"so read the state after the call returns instead; (b) pairing a malformed input with a DIFFERENT clean value, where a byte-exact comparison refuses it " +
-		"whether or not the guard exists — pair the malformed input with ITSELF; (c) pointing a hop/target URL at an unreachable address, where the connection " +
-		"error maps to the same code the control returns — point it at a reachable in-test server. Three more, all SETUP defects rather than assertion defects: " +
+		"whether or not the guard exists — pair the malformed input with ITSELF; (c) pointing a hop/target URL at an unreachable address " +
+		"or an unresolvable name, where the connection or DNS error maps to the same code the control returns (and an unresolvable name attempts real DNS " +
+		"from a package that may claim zero egress) — point it at a reachable in-test server. Three more, all SETUP defects rather than assertion defects: " +
 		"(d) a deletion the FIXTURE masks — before you delete, state what the test would produce with the control absent; if that is the same as what it produces " +
 		"now, the arm is not a control, so change the FIXTURE to isolate the control rather than relaxing the assertion; (e) a mutation that stops COMPILATION is " +
 		"not a counterfactual — deleting a function, type, or declaration the test references proves only that the test names it, so mutate the BODY (return nil, " +
 		"the zero value, or the permissive branch) or delete only the CALL SITES from the production path and run the behavioural test; (f) a MASKING downstream " +
 		"guard — when a later guard makes the deletion unobservable because the deleted check is redundant on the fixture you chose, construct a case that " +
 		"ISOLATES the control (a fixture on which the deleted check is the only thing in the path) or report the control as unverifiable, having run it. " +
+		"Three more, about WHAT a refusal test asserts: " +
+		"(g) asserting a SHARED error code — when a transport failure (connection refused, DNS failure, timeout) maps to the same code the control returns, " +
+		"deleting the control leaves the test green, so assert the refusal's IDENTITY: the control's own sentinel error or a message no transport error can " +
+		"produce; " +
+		"(h) an EGRESS control asserted only by its error — for a control that stops a request, the property is NO EGRESS, not that an error came back, so " +
+		"add a seam (a hit-counting in-test server or a dial hook) and assert the offending target was NEVER DIALED; " +
+		"(i) a bound or cap asserted by eventual failure — with a hop cap or retry limit deleted the loop just runs until a timeout and the test still sees " +
+		"a failure, so assert the cap's own refusal and the exact number of hops served. " +
 		"Seed bad state BY CONSTRUCTION rather than by calling the " +
 		"control inside the test's own setup guard, so the RED lands on the behavioral assertion and not on a fixture-setup failure. If a test genuinely cannot " +
 		"serve as a counterfactual vehicle, prove that by running it under the deletion and say so — do not assert it. A control you invent in THIS pass gets the " +
 		"same treatment as one the plan named (#2444).\n")
+}
+
+// writeCheckThenUse renders the tail check-then-use block (#2432): whatever a
+// change validated must be the exact thing it uses (TOCTOU).
+//
+// Two call sites, buildImplement and buildImplementFixup, for the same reason
+// writeCounterfactualDiscipline has two: a fix-up designs controls too. It is
+// deliberately UNCONDITIONAL rather than gated on a security-relevant surface,
+// because the shape appears in non-security code and the text is cheap to carry.
+// It is not rendered on the plan or review paths.
+//
+// The four rules come from the four E66 (#2388) instances: the #2390 self URL
+// and the #2390 listener, and the #2427 client-metadata DNS rebinding and
+// redirect-hop downgrade.
+func writeCheckThenUse(b *strings.Builder) {
+	b.WriteString("\n### Check-then-use: use exactly what you validated — confirm in your PR Notes\n\n")
+	b.WriteString("Whatever you validated must be the exact thing you use. When this pass checks a value — a hostname, address, URL, path, identifier, or any input — " +
+		"and something later USES it, nothing may re-resolve, re-parse, or re-derive it between the check and the use; if anything does, the check guarded a " +
+		"different value from the one used (check-then-use, TOCTOU). Four rules: " +
+		"(a) PIN the validated artifact rather than the name it came from — resolve once, validate the resolved address, and dial exactly that literal (or " +
+		"guard at CONNECT time on the address actually being dialed, e.g. a `net.Dialer.Control` hook), never a pre-flight lookup followed by a client that " +
+		"resolves the name again (DNS rebinding); " +
+		"(b) verify what the system ACTUALLY did, not what you asked for — classify the address the listener ACTUALLY bound (`Listener.Addr()`), not the " +
+		"configured string the OS resolved independently at bind; " +
+		"(c) carry the CANONICAL form you checked forward to the use site, not the raw input re-parsed later (and for files, check the opened handle, not a " +
+		"path you inspected before opening it); " +
+		"(d) REVALIDATE on EVERY HOP of a multi-step operation — each redirect, retry target, or followed link gets the same scheme/host/userinfo checks as " +
+		"the first, because an HTTPS URL that redirects to plain HTTP is a downgrade the initial check never saw. " +
+		"Test it with the counterfactual discipline above: the fixture must make the re-derived value DIFFER from the validated one (a resolver that answers " +
+		"differently on its second lookup, a reachable in-test server that redirects to a disallowed scheme), so that deleting the pin or the per-hop check " +
+		"turns the test RED. In your PR `## Notes`, name each check-then-use pair this pass added or changed and the artifact you pinned, or state that it " +
+		"has none (#2432).\n")
 }
 
 // writeCounterfactualSidecar renders the machine-readable carrier sub-block for
@@ -4576,6 +4626,10 @@ func buildImplementFixup(t Trigger) string {
 	// condition, so a control a fix-up introduces (e.g. #2453's cert/key
 	// correspondence check) needs the same execute-and-record discipline.
 	writeCounterfactualDiscipline(&b)
+
+	// Check-then-use (#2432): on the fix-up path too, since a fix-up designs
+	// checks downstream of every plan-gate condition.
+	writeCheckThenUse(&b)
 
 	// Behavior-change claim sweep (#3013): DELIBERATELY rendered on the fix-up
 	// path too, for the same reason as writeCounterfactualDiscipline above — a

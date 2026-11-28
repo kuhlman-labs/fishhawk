@@ -1,0 +1,14 @@
+id: scenario:issue-2432/implement-prompt-carries-check-then-use
+statement: 'The rendered implement-stage prompt carries a ''### Check-then-use: use exactly what you validated — confirm in your PR Notes'' section. It instructs the agent to pin the validated artifact (resolved address, bound address, canonical form) rather than re-derive it, and to revalidate on every hop of a multi-step operation.'
+verify_hint: GET /v0/stages/{stage_id}/prompt-render for an implement stage returns 200, and the prompt body contains the heading plus the phrases 'PIN the validated artifact' and 'REVALIDATE on EVERY HOP'.
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"}; read stages.implement from the 201. GET /v0/stages/{implement_stage_id}/prompt-render. Searched the prompt field.
+assertions:
+    expected: The heading plus 'PIN the validated artifact' and 'REVALIDATE on EVERY HOP'
+    observed_at_record: '200, stage_type implement. The prompt has exactly one ''### Check-then-use: use exactly what you validated — confirm in your PR Notes'', after the Counterfactual attainability section. Its four rules: (a) PIN the validated artifact rather than the name it came from (resolve once, dial that literal or guard at connect time); (b) classify the address the listener ACTUALLY bound (Listener.Addr()); (c) carry the CANONICAL form forward; (d) REVALIDATE on EVERY HOP of a multi-step operation (each redirect or retry target). It ends with a PR Notes instruction (#2432).'
+    repro_handle: POST /v0/dev/fixtures {"scenario":"implement-running"}; GET /v0/stages/{implement}/prompt-render
+origin:
+    issue: 2432
+    pr: 5603
+    run_id: f295d8b5-25da-4e6e-9fab-f8e33a8a8a91
+    head_sha: b865cb6f04cbcaf6d30355f30b3c6b55c25408ea
+    recorded_at: 2026-11-28T00:18:17Z
