@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
@@ -78,6 +79,9 @@ type opsMonitorFlags struct {
 	// DispatchHold is the serve-only --ops-monitor-dispatch-hold (the
 	// interim admission hold); ops-probe never registers it.
 	DispatchHold bool
+	// HostLabel is the serve-only --ops-monitor-host-label (#5619): whose
+	// memory the probe measures; ops-probe never registers it.
+	HostLabel string
 }
 
 // defaultOpsMonitorDiskPath is the operator's home directory: the volume the
@@ -171,15 +175,22 @@ func registerOpsMonitorFlags(fs *flag.FlagSet) *opsMonitorFlags {
 }
 
 // registerOpsMonitorDispatchHoldFlag registers the serve-only
-// --ops-monitor-dispatch-hold onto f (ops-probe writes and holds nothing,
-// so it never registers it).
+// --ops-monitor-dispatch-hold and --ops-monitor-host-label onto f (ops-probe
+// writes and holds nothing, so it never registers them).
 func registerOpsMonitorDispatchHoldFlag(fs *flag.FlagSet, f *opsMonitorFlags) {
 	fs.BoolVar(&f.DispatchHold, "ops-monitor-dispatch-hold",
 		envOrBool("FISHHAWKD_OPS_MONITOR_DISPATCH_HOLD", false),
 		"INTERIM dispatch hold (E85.11 / #4330; ADR-100's adaptive concurrency controller absorbs it): while the "+
-			"memory probe reads CRITICAL pressure, refuse NEW host-dispatch admissions with 409 host_memory_pressure. "+
+			"memory probe reads CRITICAL pressure, refuse NEW host-dispatch admissions for the measured host "+
+			"(--ops-monitor-host-label) with 409 host_memory_pressure. "+
 			"In-flight and already-dispatched stages are never touched. Needs --enable-ops-monitor and a local "+
 			"deployment; ignored (with a WARN) otherwise. Off by default")
+	fs.StringVar(&f.HostLabel, "ops-monitor-host-label",
+		envOr("FISHHAWKD_OPS_MONITOR_HOST_LABEL", ""),
+		"the host label whose memory the probe measures (#5619): the dispatch hold refuses only host-dispatch "+
+			"markers naming it, or naming no host. Empty derives fishhawkd's own label (FISHHAWK_HOST_LABEL > "+
+			"persisted host-id > hostname, the ladder fishhawk-mcp uses); with none resolved the hold refuses "+
+			"every marker. 1..253 characters from [A-Za-z0-9._-]")
 }
 
 // opsMonitorConfig is the validated ops-monitor configuration.
@@ -205,6 +216,9 @@ type opsMonitorConfig struct {
 	// DispatchHold requests the interim admission hold (opsAdmissionHold
 	// decides whether it is built).
 	DispatchHold bool
+	// HostLabel is the validated explicit measured-host label; empty means
+	// opsAdmissionHold derives one.
+	HostLabel string
 }
 
 // hostThresholdOverrides are the operator's host-health threshold
@@ -356,6 +370,10 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 	if err != nil {
 		return nil, err
 	}
+	if f.HostLabel != "" && !validOpsHostLabel(f.HostLabel) {
+		return nil, fmt.Errorf("--ops-monitor-host-label must be 1..%d characters from [A-Za-z0-9._-], got %q",
+			opsHostLabelMax, f.HostLabel)
+	}
 	conf := &opsMonitorConfig{
 		Deployment:       deployment,
 		Interval:         f.Interval,
@@ -372,6 +390,7 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 
 		HostThresholds: hostThresholds,
 		DispatchHold:   f.DispatchHold,
+		HostLabel:      f.HostLabel,
 	}
 	if f.NotifyIssue != "" {
 		repo, issue, err := opsmonitor.ParseIssueRef(f.NotifyIssue)
@@ -381,6 +400,27 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 		conf.NotifyRepo, conf.NotifyIssue = repo, issue
 	}
 	return conf, nil
+}
+
+// opsHostLabelMax mirrors server.hostLabelMax.
+const opsHostLabelMax = 253
+
+// validOpsHostLabel mirrors server.validHostLabel
+// (backend/internal/server/stage_concurrency.go), which validates the
+// marker's {"host"}: a label the marker would refuse could never match one.
+// TestValidOpsHostLabel_MatchesMarker pins the parity.
+func validOpsHostLabel(h string) bool {
+	if len(h) == 0 || len(h) > opsHostLabelMax {
+		return false
+	}
+	for _, c := range h {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // gibToBytes converts a positive, finite GiB flag value to bytes, refusing a
@@ -410,6 +450,9 @@ type opsMonitorSeams struct {
 	// load-attribution reads go through (E85.11); the zero Reader reads the
 	// running host.
 	Host hosthealth.Reader
+	// HostLabel resolves fishhawkd's own host label for the dispatch hold
+	// (#5619); nil selects mcpserver.ProcessHostLabel.
+	HostLabel func() (label, source string)
 }
 
 // opsMonitorDeps are the ops monitor's runtime dependencies. Every field is
@@ -459,11 +502,17 @@ func newOpsProbes(conf opsMonitorConfig, deps opsMonitorDeps) []opsmonitor.Probe
 // opsAdmissionHold builds the interim dispatch hold (E85.11 / #4330) when
 // the monitor is enabled, --ops-monitor-dispatch-hold is set AND the
 // resolved deployment is local: only there does the memory probe observe
-// the host the runners spawn on. Otherwise it returns nil (a requested hold
+// a host runners spawn on. Otherwise it returns nil (a requested hold
 // under a non-local deployment WARNs). serve builds it BEFORE newServer and
 // hands the same pointer to the ticker. INTERIM: ADR-100's adaptive
 // concurrency controller absorbs it.
-func opsAdmissionHold(conf *opsMonitorConfig, logger *slog.Logger) *opsmonitor.AdmissionHold {
+//
+// The hold is keyed to the measured host (#5619): conf.HostLabel (source
+// flag), else resolveLabel(), else concurrency.UnknownHost (source none), under
+// which the marker refuses every host and a WARN says so. resolveLabel is
+// called only when a hold is built and no explicit label is set, because
+// resolving may create the persisted host-id file.
+func opsAdmissionHold(conf *opsMonitorConfig, resolveLabel func() (label, source string), logger *slog.Logger) *opsmonitor.AdmissionHold {
 	if conf == nil || !conf.DispatchHold {
 		return nil
 	}
@@ -472,7 +521,23 @@ func opsAdmissionHold(conf *opsMonitorConfig, logger *slog.Logger) *opsmonitor.A
 			slog.String("deployment", string(conf.Deployment)))
 		return nil
 	}
-	return &opsmonitor.AdmissionHold{}
+	label, source := conf.HostLabel, "flag"
+	if label == "" {
+		label, source = "", "none"
+		if resolveLabel != nil {
+			label, source = resolveLabel()
+		}
+	}
+	if label == "" {
+		label = concurrency.UnknownHost
+	}
+	if label == concurrency.UnknownHost {
+		logger.Warn("ops monitor dispatch hold has no measured host label, so while held it refuses EVERY host; set --ops-monitor-host-label",
+			slog.String("host", label), slog.String("source", source))
+	}
+	logger.Info("ops monitor dispatch hold keyed to host",
+		slog.String("host", label), slog.String("source", source))
+	return opsmonitor.NewAdmissionHold(label)
 }
 
 // opsAmendmentReader adapts a pool to the amendment probes' reader. A nil

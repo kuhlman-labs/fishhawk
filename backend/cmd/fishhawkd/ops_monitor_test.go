@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,9 +25,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/opsmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -63,6 +67,7 @@ var opsMonitorEnvVars = []string{
 	"FISHHAWKD_OPS_MONITOR_CONTAINERS_MAX",
 	"FISHHAWKD_OPS_MONITOR_CONTAINERS_MEM_PCT",
 	"FISHHAWKD_OPS_MONITOR_DISPATCH_HOLD",
+	"FISHHAWKD_OPS_MONITOR_HOST_LABEL",
 	"FISHHAWKD_DATABASE_URL",
 }
 
@@ -360,6 +365,9 @@ func TestRegisterOpsMonitorFlags_DefaultsAndEnv(t *testing.T) {
 	if fs.Lookup("ops-monitor-dispatch-hold") != nil {
 		t.Error("the shared registration registered --ops-monitor-dispatch-hold; it is serve-only")
 	}
+	if fs.Lookup("ops-monitor-host-label") != nil {
+		t.Error("the shared registration registered --ops-monitor-host-label; it is serve-only")
+	}
 	if f.SwapEnterPct != 0 || f.SwapExitPct != 0 || f.MemAvailableMinPct != 0 || f.CriticalSwapPct != 0 ||
 		f.HolderMinPct != 0 || f.ContainersMax != 0 || f.ContainersMemPct != 0 || f.DispatchHold {
 		t.Errorf("host-health flag defaults = %+v, want all zero (keep hosthealth.DefaultThresholds)", *f)
@@ -391,6 +399,7 @@ func TestRegisterOpsMonitorFlags_DefaultsAndEnv(t *testing.T) {
 	t.Setenv("FISHHAWKD_OPS_MONITOR_CONTAINERS_MAX", "5")
 	t.Setenv("FISHHAWKD_OPS_MONITOR_CONTAINERS_MEM_PCT", "45")
 	t.Setenv("FISHHAWKD_OPS_MONITOR_DISPATCH_HOLD", "true")
+	t.Setenv("FISHHAWKD_OPS_MONITOR_HOST_LABEL", "env-host")
 	envFS := flag.NewFlagSet("env", flag.ContinueOnError)
 	g := registerOpsMonitorFlags(envFS)
 	registerOpsMonitorDispatchHoldFlag(envFS, g)
@@ -399,10 +408,18 @@ func TestRegisterOpsMonitorFlags_DefaultsAndEnv(t *testing.T) {
 		DiskMinFreeGB: 11, GoCacheDir: "/env/cache", GoCacheMaxGB: 12, LoadFactor: 3, NotifyIssue: "acme/ops#7",
 		AmendmentWindow: 30 * time.Minute, AmendmentWarnLead: 0, AmendmentLookback: 24 * time.Hour,
 		SwapEnterPct: 85, SwapExitPct: 65, MemAvailableMinPct: 4, CriticalSwapPct: 96, HolderMinPct: 30,
-		ContainersMax: 5, ContainersMemPct: 45, DispatchHold: true,
+		ContainersMax: 5, ContainersMemPct: 45, DispatchHold: true, HostLabel: "env-host",
 	}
 	if *g != want {
 		t.Errorf("env fallbacks = %+v, want %+v", *g, want)
+	}
+	g.Deployment = "local"
+	conf, err := resolveOpsMonitorConfig(true, g, os.Getenv)
+	if err != nil {
+		t.Fatalf("resolveOpsMonitorConfig: %v", err)
+	}
+	if conf.HostLabel != "env-host" {
+		t.Errorf("conf.HostLabel = %q, want env-host", conf.HostLabel)
 	}
 }
 
@@ -642,31 +659,191 @@ func TestHostThresholdOverrides_Thresholds(t *testing.T) {
 
 // TestOpsAdmissionHold (E85.11): the interim hold is built only with the
 // monitor enabled, --ops-monitor-dispatch-hold set AND a local deployment;
-// a requested hold under a non-local deployment WARNs and is nil.
+// a requested hold under a non-local deployment WARNs and is nil. The built
+// hold is keyed to the explicit label, else the resolved one, else unknown
+// with a WARN (#5619); a hold that is not built never resolves a label.
 func TestOpsAdmissionHold(t *testing.T) {
 	rec := &opsLogRecorder{}
 	logger := slog.New(rec)
-	if h := opsAdmissionHold(nil, logger); h != nil {
+	var resolved int
+	resolver := func(label, source string) func() (string, string) {
+		return func() (string, string) {
+			resolved++
+			return label, source
+		}
+	}
+	derived := resolver("derived-host", "persisted")
+
+	if h := opsAdmissionHold(nil, derived, logger); h != nil {
 		t.Errorf("monitor off: hold = %p, want nil", h)
 	}
 	conf := validOpsConf()
-	if h := opsAdmissionHold(&conf, logger); h != nil {
+	if h := opsAdmissionHold(&conf, derived, logger); h != nil {
 		t.Errorf("flag off: hold = %p, want nil", h)
 	}
 	conf.DispatchHold = true
-	if h := opsAdmissionHold(&conf, logger); h == nil {
-		t.Error("flag on + local: hold = nil, want an AdmissionHold")
-	}
 	for _, dep := range []opsmonitor.Deployment{opsmonitor.DeploymentKubernetes, opsmonitor.DeploymentRemote} {
 		c := conf
 		c.Deployment = dep
-		if h := opsAdmissionHold(&c, logger); h != nil {
+		if h := opsAdmissionHold(&c, derived, logger); h != nil {
 			t.Errorf("flag on + %s: hold = %p, want nil", dep, h)
 		}
 	}
 	if !rec.has(slog.LevelWarn, "--ops-monitor-dispatch-hold ignored") {
 		t.Errorf("no WARN for a hold requested under a non-local deployment; records: %v", rec.atOrAbove(slog.LevelDebug))
 	}
+	if resolved != 0 {
+		t.Errorf("label resolved %d times with no hold built, want 0", resolved)
+	}
+
+	for _, tc := range []struct {
+		name         string
+		flag         string
+		resolve      func() (string, string)
+		wantHost     string
+		wantResolved int
+		wantWarn     bool
+	}{
+		{"explicit flag wins", "flag-host", derived, "flag-host", 0, false},
+		{"derived", "", derived, "derived-host", 1, false},
+		{"nothing resolved", "", resolver("", "none"), "unknown", 1, true},
+		{"nil resolver", "", nil, "unknown", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved = 0
+			rec := &opsLogRecorder{}
+			c := conf
+			c.HostLabel = tc.flag
+			h := opsAdmissionHold(&c, tc.resolve, slog.New(rec))
+			if h == nil {
+				t.Fatal("flag on + local: hold = nil, want an AdmissionHold")
+			}
+			if h.Host() != tc.wantHost {
+				t.Errorf("Host() = %q, want %q", h.Host(), tc.wantHost)
+			}
+			if resolved != tc.wantResolved {
+				t.Errorf("resolver calls = %d, want %d", resolved, tc.wantResolved)
+			}
+			if got := rec.has(slog.LevelWarn, "set --ops-monitor-host-label"); got != tc.wantWarn {
+				t.Errorf("unresolved-label WARN = %v, want %v", got, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// TestResolveOpsMonitorConfig_HostLabel: an explicit label outside the
+// marker's accepted class fails startup naming the flag.
+func TestResolveOpsMonitorConfig_HostLabel(t *testing.T) {
+	clearOpsMonitorEnv(t)
+	resolve := func(label string) (*opsMonitorConfig, error) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		f := registerOpsMonitorFlags(fs)
+		registerOpsMonitorDispatchHoldFlag(fs, f)
+		f.Deployment = "local"
+		f.HostLabel = label
+		return resolveOpsMonitorConfig(true, f, os.Getenv)
+	}
+	for _, bad := range []string{"a:b", "has space", strings.Repeat("a", 254), "\u00e9"} {
+		if _, err := resolve(bad); err == nil || !strings.Contains(err.Error(), "--ops-monitor-host-label") {
+			t.Errorf("label %q: err = %v, want one naming --ops-monitor-host-label", bad, err)
+		}
+	}
+	for _, good := range []string{"", "Mac.local-1"} {
+		conf, err := resolve(good)
+		if err != nil {
+			t.Errorf("label %q: %v", good, err)
+		} else if conf.HostLabel != good {
+			t.Errorf("conf.HostLabel = %q, want %q", conf.HostLabel, good)
+		}
+	}
+}
+
+// TestValidOpsHostLabel_MatchesMarker pins validOpsHostLabel to the marker's
+// own validation (server.validHostLabel) over shared samples: each is posted
+// as the marker's {"host"} to a real server, whose 400 field=host is the
+// refusal. The empty string is the one deliberate difference at this
+// boundary: the marker reads it as "no host", and neither function accepts it
+// as a label.
+func TestValidOpsHostLabel_MatchesMarker(t *testing.T) {
+	for _, tc := range []struct {
+		label string
+		valid bool
+	}{
+		{"a", true},
+		{"Mac.local_1-x", true},
+		{".", true},
+		{"_", true},
+		{"-", true},
+		{strings.Repeat("a", 64), true},
+		{strings.Repeat("a", 65), true},
+		{strings.Repeat("a", 253), true},
+		{strings.Repeat("a", 254), false},
+		{"a:b", false},
+		{"has space", false},
+		{"a/b", false},
+		{"a\x01b", false},
+		{"a\n", false},
+		{"\u00e9", false},
+	} {
+		if got := validOpsHostLabel(tc.label); got != tc.valid {
+			t.Errorf("validOpsHostLabel(%q) = %v, want %v", tc.label, got, tc.valid)
+		}
+		if got := markerAcceptsHost(t, tc.label); got != tc.valid {
+			t.Errorf("the marker accepts %q = %v, want %v", tc.label, got, tc.valid)
+		}
+	}
+	if validOpsHostLabel("") {
+		t.Error(`validOpsHostLabel("") = true, want false`)
+	}
+	if !markerAcceptsHost(t, "") {
+		t.Error(`the marker refused {"host":""}, want it read as no host`)
+	}
+}
+
+// markerTokens authenticates any bearer as a write:runs operator token.
+type markerTokens struct{ apitoken.Repository }
+
+func (markerTokens) Authenticate(context.Context, string) (*apitoken.Token, error) {
+	return &apitoken.Token{ID: uuid.New(), Subject: "op", Scopes: []string{"write:runs"}}, nil
+}
+
+// markerRuns answers every stage lookup not found, so a marker whose body
+// passed validation answers 404.
+type markerRuns struct{ runpkg.Repository }
+
+func (markerRuns) GetStage(context.Context, uuid.UUID) (*runpkg.Stage, error) {
+	return nil, runpkg.ErrNotFound
+}
+
+func (markerRuns) GetRun(context.Context, uuid.UUID) (*runpkg.Run, error) {
+	return nil, runpkg.ErrNotFound
+}
+
+func (markerRuns) GetRunAccountID(context.Context, uuid.UUID) (string, error) { return "", nil }
+
+// markerAcceptsHost posts {"host": label} to a real server's host-dispatch
+// marker: 400 field=host is a refused label, 404 an accepted one.
+func markerAcceptsHost(t *testing.T, label string) bool {
+	t.Helper()
+	srv := server.New(server.Config{Addr: "127.0.0.1:0", RunRepo: markerRuns{}, APITokenRepo: markerTokens{},
+		HostAdmissionHold: opsmonitor.NewAdmissionHold("measured")})
+	body, err := json.Marshal(map[string]string{"host": label})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+uuid.NewString()+"/stages/"+uuid.NewString()+"/host-dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer fhk_test")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	switch {
+	case w.Code == http.StatusNotFound:
+		return true
+	case w.Code == http.StatusBadRequest && strings.Contains(w.Body.String(), `"field":"host"`):
+		return false
+	}
+	t.Fatalf("marker with host %q answered %d: %s", label, w.Code, w.Body.String())
+	return false
 }
 
 // failingOpsSeams returns seams that all error, plus a counter of disk probe
@@ -687,6 +864,8 @@ func failingOpsSeams() (opsMonitorSeams, *atomic.Int32) {
 		DockerExec:  func(context.Context, string, ...string) ([]byte, error) { return nil, boom },
 		ListRunners: func(context.Context) ([]stalesweep.RunnerProcess, error) { return nil, boom },
 		Ping:        func(context.Context) error { return boom },
+		// Fixed, so no serve test resolves the real HOME's host-id.
+		HostLabel: func() (string, string) { return "seam-host", "persisted" },
 	}, &sweeps
 }
 
@@ -1014,6 +1193,49 @@ func TestServe_OpsMonitorDispatchHoldWiring(t *testing.T) {
 		}
 		if !strings.Contains(log, `"dispatch_hold":true`) {
 			t.Errorf("'ops monitor started' does not report dispatch_hold:true:\n%s", log)
+		}
+		if got := hold.Host(); got != "seam-host" {
+			t.Errorf("hold Host() = %q, want the resolved seam-host", got)
+		}
+		if !strings.Contains(log, `"dispatch_hold_host":"seam-host"`) {
+			t.Errorf("'ops monitor started' does not report dispatch_hold_host:\n%s", log)
+		}
+	})
+
+	t.Run("explicit host label", func(t *testing.T) {
+		code, log, hold := serveCapturingHold(t, func(h server.HostAdmissionHold) bool { return h != nil },
+			"--enable-ops-monitor", "--ops-monitor-dispatch-hold", "--ops-monitor-host-label", "pinned-a",
+			"--ops-monitor-interval", "10ms", "--ops-monitor-deployment", "local", "--ops-monitor-disk-path", t.TempDir())
+		if code != exitOK || hold == nil {
+			t.Fatalf("runServe exit = %d, hold = %v; log:\n%s", code, hold, log)
+		}
+		if got := hold.Host(); got != "pinned-a" {
+			t.Errorf("hold Host() = %q, want pinned-a", got)
+		}
+	})
+
+	// The production arm: no seam, so the label comes from the process ladder.
+	// FISHHAWK_HOST_LABEL is set before the first resolution and wins every
+	// other rung, so the real HOME is never touched.
+	t.Run("nil seam uses mcpserver.ProcessHostLabel", func(t *testing.T) {
+		t.Setenv("FISHHAWK_HOST_LABEL", "ladder-host")
+		prod := seams
+		prod.HostLabel = nil
+		serveOpsMonitorSeams = prod
+		defer func() { serveOpsMonitorSeams = seams }()
+
+		code, log, hold := serveCapturingHold(t, func(h server.HostAdmissionHold) bool { return h != nil },
+			"--enable-ops-monitor", "--ops-monitor-dispatch-hold",
+			"--ops-monitor-interval", "10ms", "--ops-monitor-deployment", "local", "--ops-monitor-disk-path", t.TempDir())
+		if code != exitOK || hold == nil {
+			t.Fatalf("runServe exit = %d, hold = %v; log:\n%s", code, hold, log)
+		}
+		want, source := mcpserver.ProcessHostLabel()
+		if want != "ladder-host" || source != "override" {
+			t.Fatalf("ProcessHostLabel() = (%q, %q), want the env override; another test resolved it first", want, source)
+		}
+		if got := hold.Host(); got != want {
+			t.Errorf("hold Host() = %q, want %q", got, want)
 		}
 	})
 

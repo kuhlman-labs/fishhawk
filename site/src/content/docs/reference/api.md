@@ -211,10 +211,14 @@ The same marker can also hold new dispatches while the host is short of
 memory, which the table does not spell out either. The hold is off by
 default and interim (the planned adaptive concurrency controller replaces
 it): `fishhawkd serve --enable-ops-monitor --ops-monitor-dispatch-hold` on a
-local deployment turns it on. While the ops monitor reads critical memory
-pressure, a `pending` or `awaiting_host_dispatch` stage is refused with 409
-`host_memory_pressure`, `details.reason` and `details.retry`, and the stage
-keeps its state. A stage that is already `dispatched` keeps its idempotent
+local deployment turns it on. The hold is keyed to the host whose memory was
+measured: `--ops-monitor-host-label`, or the server's own host label when the
+flag is unset. While the ops monitor reads critical memory pressure, a
+`pending` or `awaiting_host_dispatch` stage is refused if the marker's `host`
+is that label or is absent. A marker for another host is admitted, and if no
+measured label can be resolved every marker is refused. The refusal is 409
+`host_memory_pressure` with `details.reason`, `details.retry`, `details.host`
+and `details.request_host`, and the stage keeps its state. A stage that is already `dispatched` keeps its idempotent
 200, and nothing in flight is stopped. Re-dispatch once the condition
 clears.
 
