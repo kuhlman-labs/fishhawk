@@ -391,8 +391,8 @@ func TestRunPatch_TruncatesWithMarker(t *testing.T) {
 	}
 	// The captured body is capped at maxPatchBytes; total length is
 	// the cap plus the (small) marker, never the full raw output. This
-	// keeps the emitted JSONL line well under bundle.ReadEvents' 4 MiB
-	// per-line scanner buffer.
+	// keeps the emitted JSONL line well under the bundle readers' 16 MiB
+	// per-line bound (and their 256 MiB decompressed total).
 	if len(patch) > maxPatchBytes+256 {
 		t.Errorf("patch len %d exceeds cap+marker budget", len(patch))
 	}
