@@ -96,6 +96,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// Escape record + close (E94.3 / #4694, ADR-117 D3 + A1). The outer
 	// wrapper answers an anonymous caller 401 BEFORE the ownership check.
 	mux.HandleFunc("POST /v0/runs/{run_id}/escapes", s.escapeRequireAuthenticated(s.requireRunAccount(memberWrite, s.handleRecordEscape)))
+	// #3925: the operator resume verb for a stopped split-proposal filing; the
+	// authentication-first wrapper answers an anonymous caller 401 before
+	// requireRunAccount could answer 403.
+	mux.HandleFunc("POST /v0/runs/{run_id}/split-filing/resume", s.splitFilingResumeRequireAuthenticated(s.requireRunAccount(memberWrite, s.handleResumeSplitFiling)))
 	// Per-entry grooming disposition capture + read-back (E54.30 / #2843).
 	// CAPTURE is operator-only (the handler refuses a run-bound agent token AND
 	// a delegated operator-agent token); the READ-BACK needs read access only.

@@ -153,9 +153,11 @@ const liveValidationWalkArea = "area:backend"
 // production double-filing. Since E50.15 / #2656 the approve advance is a CAS
 // anchored on the observed state (advanceStage → casTransitionFromObserved), so
 // a raced second approval is refused at the advance and NEVER reaches this hook.
-// Both hooks are invoked from exactly one production call site each, in
-// finishApprovalAdvance (approvals.go — fileSplitProposalChildren, then
-// fileOrLinkLiveValidationWalk), and the production RunRepo is the postgres one,
+// This walk is invoked from exactly one production call site, in
+// finishApprovalAdvance (approvals.go). The split hook now has TWO production
+// entries (#3925): the approval path's detached launch and the operator resume
+// verb (POST /v0/runs/{run_id}/split-filing/resume). The production RunRepo is
+// the postgres one,
 // which implements run.StageCASTransitioner; the non-CAS degradation in
 // casTransitionFromObserved is reachable only by in-memory test fakes. So the
 // CAS covers every path a deployed daemon can take, and this mutex is load-
@@ -164,16 +166,20 @@ const liveValidationWalkArea = "area:backend"
 // the acquisition below still reddens that test (measured: 19 of 20 -race
 // iterations, provider File called 2 times, want 1).
 //
-// Its sibling fileSplitProposalChildren (split_filing.go) deliberately holds NO
-// equivalent lock, and that asymmetry is NOT a principled difference between the
-// two hooks — at this layer there is none. It is retained here only because
-// removing a working guard buys nothing, and not added there only because it
-// would defend a path that cannot occur outside tests.
+// Its sibling split hook (split_filing.go) holds no mutex around its
+// list-then-append, but since #3925 it is no longer unguarded underneath: every
+// split launch claims the process-local splitFilingRegistry
+// (split_filing_detach.go), where same-state re-approvals and the resume verb
+// claim EXCLUSIVELY, while same-stage FIRST approvals deliberately co-hold and
+// stay serialized by the CAS alone. This mutex is retained here because
+// removing a working guard buys nothing.
 //
 // THE RESIDUAL, stated plainly for whoever changes this next: if the CAS is ever
 // removed, or the run.StageCASTransitioner capability assert in
-// casTransitionFromObserved is dropped, BOTH hooks lose their protection — and
-// the split hook loses it FIRST and SILENTLY, because it has nothing underneath.
+// casTransitionFromObserved is dropped, two same-stage first approvals
+// double-launch the split filing (the registry admits them together by design),
+// while this walk keeps its mutex. Both the mutex and the registry are
+// PROCESS-LOCAL.
 // The #2656 evidence is the measurement: with the CAS deleted, split-child
 // filings went 3 → 6 (two split_children_filed markers) while the walk count
 // stayed at 1, held up by this mutex alone.
