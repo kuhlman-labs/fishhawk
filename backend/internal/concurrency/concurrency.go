@@ -6,7 +6,9 @@
 // group's live holders. Group keys are scoped identities (ScopedGroupKey,
 // ParseGroupKey; ADR-094 Amendment A1 keeps the legacy strings canonical).
 // The host capacity group (CapacityGroupKey, ADR-094 D4) is exempt from the
-// multi-group FIFO rule and keeps only ADR-087's reservation formula.
+// multi-group FIFO rule, and its reservation formula counts only
+// capacity-bound earlier waiters: those every other group of whose set would
+// admit them now (ADR-094 A4).
 // Admission is FIFO except for a waiter an operator
 // PROMOTED (#4191), which is ordered just ahead of every other fresh waiter for
 // the rest of its queue episode. Holding is derived from stage state, so a
