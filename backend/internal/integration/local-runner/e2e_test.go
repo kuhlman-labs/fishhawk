@@ -18,17 +18,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -44,6 +48,8 @@ type localRunnerFixture struct {
 	pool         *pgxpool.Pool
 	runRepo      runpkg.Repository
 	artifactRepo artifact.Repository
+	auditRepo    audit.Repository
+	traceStore   *tracestore.MemStorage
 	runnerBinary string // path to built fishhawk-runner
 	fakeAgentDir string // dir containing the fake claude shim
 }
@@ -134,13 +140,14 @@ func newLocalRunnerFixtureWithTokenProvider(t *testing.T, withTokenProvider bool
 	signingRepo := signing.NewPostgresRepository(pool)
 	auditRepo := audit.NewPostgresRepository(pool)
 	artifactRepo := artifact.NewPostgresRepository(pool)
+	traceStore := tracestore.NewMem()
 	srvCfg := server.Config{
 		Addr:         "127.0.0.1:0",
 		RunRepo:      runRepo,
 		SigningRepo:  signingRepo,
 		AuditRepo:    auditRepo,
 		ArtifactRepo: artifactRepo,
-		TraceStore:   tracestore.NewMem(),
+		TraceStore:   traceStore,
 		// A no-op client (nil TokenProvider) satisfies the prompt
 		// handler's non-nil GitHub guard. GetIssue is never reached for
 		// CLI-triggered runs with no issue ref, so the nil tokens never
@@ -196,6 +203,8 @@ func newLocalRunnerFixtureWithTokenProvider(t *testing.T, withTokenProvider bool
 		pool:         pool,
 		runRepo:      runRepo,
 		artifactRepo: artifactRepo,
+		auditRepo:    auditRepo,
+		traceStore:   traceStore,
 		runnerBinary: binary,
 		fakeAgentDir: fakeDir,
 	}
@@ -1246,6 +1255,425 @@ func TestE2E_LocalRunner_DecomposedChildNoChanges_TerminalizesFailedC(t *testing
 	}
 	if !strings.Contains(out.String(), `"event":"implement_child_no_changes"`) {
 		t.Errorf("missing implement_child_no_changes log line:\n%s", out.String())
+	}
+}
+
+// oversizedLineSpecYAML is a feature_change workflow with no constraints, so
+// the trace handler's backend re-evaluation runs (a cached spec is present)
+// and records policy_evaluated passed:true over the diff, instead of
+// policy_skipped spec_unavailable.
+const oversizedLineSpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// traceTimeForbiddenSpecYAML declares an implement-stage forbidden_paths glob
+// matching added.txt. It lives ONLY on the run row's cached spec: the runner
+// enforces constraints only from --constraints-file, which the test does not
+// pass, so only the backend's trace-time re-evaluation sees it (#5535).
+const traceTimeForbiddenSpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - forbidden_paths:
+              - "added.txt"
+        produces:
+          - artifact: pull_request
+`
+
+// oversizedTextBytes is the size of the text block the oversized-line shim
+// writes: over the pre-#5535 4 MiB trace-line cap and under the 16 MiB one.
+const oversizedTextBytes = 5 * 1024 * 1024
+
+// seedScopedImplementRun creates a CLI-triggered local run carrying spec as
+// its cached WorkflowSpec, a plan stage with an approved plan scoped to
+// added.txt, and a gated (RequiresApproval) implement stage. It returns the
+// run and the implement stage.
+func seedScopedImplementRun(ctx context.Context, t *testing.T, fx *localRunnerFixture, workflowSHA, spec string) (*runpkg.Run, *runpkg.Stage) {
+	t.Helper()
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   workflowSHA,
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+		WorkflowSpec:  []byte(spec),
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       scopedPlanJSON(t, "added.txt"),
+		ContentHash:   workflowSHA,
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+	return r, implStage
+}
+
+// runImplementRunner runs the real runner binary for an implement stage with
+// the claude shim in fakeDir first on PATH and the gh-CLI push fallback (#713)
+// denied (empty GH_CONFIG_DIR and token env), so no push can authenticate.
+// extraArgs are appended to the common flags. It returns the combined output
+// and the exit error.
+func runImplementRunner(ctx context.Context, t *testing.T, fx *localRunnerFixture, r *runpkg.Run, stage *runpkg.Stage, workDir, fakeDir string, extraArgs ...string) (string, error) {
+	t.Helper()
+	args := []string{
+		"--run-id", r.ID.String(),
+		"--backend-url", fx.url,
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		"--stage-id", stage.ID.String(),
+		"--fetch-prompt",
+		"--upload-trace",
+		"--working-dir", workDir,
+		"--check-base-ref", "main",
+		"--github-repo", "kuhlman-labs/fishhawk",
+		"--base-branch", "main",
+	}
+	cmd := exec.CommandContext(ctx, fx.runnerBinary, append(args, extraArgs...)...)
+	ghConfigDir := t.TempDir()
+	runnerEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		switch {
+		case strings.HasPrefix(e, "PATH="):
+			e = "PATH=" + fakeDir + ":" + strings.TrimPrefix(e, "PATH=")
+		case strings.HasPrefix(e, "GH_TOKEN="), strings.HasPrefix(e, "GITHUB_TOKEN="), strings.HasPrefix(e, "GH_CONFIG_DIR="):
+			continue
+		}
+		runnerEnv = append(runnerEnv, e)
+	}
+	runnerEnv = append(runnerEnv, "GH_TOKEN=", "GITHUB_TOKEN=", "GH_CONFIG_DIR="+ghConfigDir)
+	cmd.Env = runnerEnv
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// writeClaudeShim writes an executable `claude` shim with the given sh body
+// into a fresh directory and returns that directory.
+func writeClaudeShim(t *testing.T, body string) string {
+	t.Helper()
+	fakeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeDir, "claude"), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	return fakeDir
+}
+
+// runnerLogLines returns the runner's JSONL log lines, each cut to 512 bytes
+// so a failure message never dumps a multi-MiB trace line.
+func runnerLogLines(out string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) > 512 {
+			line = line[:512] + fmt.Sprintf("…(%d bytes)", len(line))
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// stageAudit returns the run's audit entries of category for stageID.
+func stageAudit(ctx context.Context, t *testing.T, fx *localRunnerFixture, runID, stageID uuid.UUID, category string) []*audit.Entry {
+	t.Helper()
+	entries, err := fx.auditRepo.ListForRunByCategory(ctx, runID, category)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(%s): %v", category, err)
+	}
+	var out []*audit.Entry
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestE2E_LocalRunner_ImplementOversizedEventLine_ReachesPushGate is the
+// real-runner cross-boundary test for #5535's line bound. The fake claude
+// shim prints one ~5 MiB stream-json assistant line, writes the scoped file
+// added.txt and prints a result line. Before #5535 the runner's 4 MiB trace
+// line cap and the backend's 4 MiB bundle reader each dropped or refused such
+// a line. It asserts, across the real runner line reader and Pack, the real
+// trace handler's bounded reader and policy arm, and real Postgres:
+//
+//   - the stored RAW bundle decodes with the backend's bounded
+//     bundle.ReadEvents and still carries a line over 4 MiB;
+//   - policy_evaluated records passed:true over the one-file diff;
+//   - the trace 202 held the stage `running` for its push report (it was not
+//     advanced as a no-changes pass);
+//   - the hermetic PR-open failure (no App installation, denied gh fallback)
+//     then fails the stage category C through the runner's /pull-request
+//     report.
+func TestE2E_LocalRunner_ImplementOversizedEventLine_ReachesPushGate(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; skipping oversized-line E2E")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("sh claude shim; skipping on windows")
+	}
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	r, implStage := seedScopedImplementRun(ctx, t, fx, "deadbeef-oversized", oversizedLineSpecYAML)
+	workDir := t.TempDir()
+	gitRepoInit(t, workDir)
+
+	fakeDir := writeClaudeShim(t, fmt.Sprintf(
+		"printf '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"'\n"+
+			"head -c %d /dev/zero | tr '\\000' 'a'\n"+
+			"printf '\"}]}}\\n'\n"+
+			"echo 'package main' > added.txt\n"+
+			"printf '{\"type\":\"result\"}\\n'\n", oversizedTextBytes))
+
+	out, runErr := runImplementRunner(ctx, t, fx, r, implStage, workDir, fakeDir)
+	logs := runnerLogLines(out)
+	if runErr == nil {
+		t.Fatalf("runner exited 0; expected failure on the hermetic PR-open step\noutput:\n%s", logs)
+	}
+
+	// The stored raw bundle: located by its trace_uploaded audit row, read
+	// from the trace store, and decoded with the backend's bounded reader.
+	var rawHash string
+	for _, e := range stageAudit(ctx, t, fx, r.ID, implStage.ID, "trace_uploaded") {
+		var p struct {
+			Variant     string `json:"variant"`
+			ContentHash string `json:"content_hash"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err == nil && p.Variant == string(tracestore.VariantRaw) {
+			rawHash = p.ContentHash
+		}
+	}
+	if rawHash == "" {
+		t.Fatalf("no raw trace_uploaded audit row for the stage\noutput:\n%s", logs)
+	}
+	rc, err := fx.traceStore.Get(ctx, tracestore.BundleRef{RunID: r.ID, Variant: tracestore.VariantRaw, ContentHash: rawHash})
+	if err != nil {
+		t.Fatalf("get raw bundle: %v", err)
+	}
+	rawBundle, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("read raw bundle: %v", err)
+	}
+	lines, err := bundle.ReadEvents(rawBundle)
+	if err != nil {
+		t.Fatalf("backend bundle.ReadEvents refused the stored raw bundle: %v", err)
+	}
+	largest := 0
+	for _, l := range lines {
+		if len(l.Data) > largest {
+			largest = len(l.Data)
+		}
+	}
+	if largest <= 4*1024*1024 {
+		t.Fatalf("largest stored raw bundle line data = %d bytes, want > 4 MiB (the shim's %d-byte text was dropped or elided)\noutput:\n%s",
+			largest, oversizedTextBytes, logs)
+	}
+
+	// Policy evaluated the diff (not skipped, not undeterminable) and passed.
+	evals := stageAudit(ctx, t, fx, r.ID, implStage.ID, policy.CategoryPolicyEvaluated)
+	if len(evals) == 0 {
+		t.Fatalf("no policy_evaluated audit row for the stage\noutput:\n%s", logs)
+	}
+	var eval policy.EvaluationPayload
+	if err := json.Unmarshal(evals[0].Payload, &eval); err != nil {
+		t.Fatalf("decode policy_evaluated: %v", err)
+	}
+	if !eval.Passed || eval.SkipReason != "" {
+		t.Errorf("policy_evaluated passed=%t skip_reason=%q, want passed with no skip\npayload: %s", eval.Passed, eval.SkipReason, evals[0].Payload)
+	}
+	if len(eval.Diff) != 1 || eval.Diff[0].Path != "added.txt" {
+		t.Errorf("policy_evaluated diff = %+v, want exactly added.txt", eval.Diff)
+	}
+
+	// Held at trace time: the raw upload's 202 answered stage_state running.
+	if !regexpTraceUploadedRunning.MatchString(out) {
+		t.Errorf("no trace_uploaded line with stage_state running; the stage was not held for its push report\noutput:\n%s", logs)
+	}
+
+	got, err := fx.runRepo.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != runpkg.StageStateFailed {
+		t.Fatalf("implement stage State = %q, want failed\noutput:\n%s", got.State, logs)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != runpkg.FailureC {
+		t.Errorf("FailureCategory = %v, want C\noutput:\n%s", got.FailureCategory, logs)
+	}
+	if got.FailureReason != nil && strings.HasPrefix(*got.FailureReason, "bundle_unreadable:") {
+		t.Errorf("FailureReason = %q, want the runner's PR-open failure, not a trace-time bundle_unreadable", *got.FailureReason)
+	}
+	// The failure came from the runner's /pull-request report.
+	if prFails := stageAudit(ctx, t, fx, r.ID, implStage.ID, "pull_request_failed"); len(prFails) == 0 {
+		t.Errorf("no pull_request_failed audit row; the stage was not failed by the runner's PR-open report\noutput:\n%s", logs)
+	}
+	gotRun, err := fx.runRepo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL != nil {
+		t.Errorf("run.PullRequestURL = %q, want nil after a PR-open failure", *gotRun.PullRequestURL)
+	}
+}
+
+// regexpTraceUploadedRunning matches the runner's raw trace_uploaded log line
+// when the 202 reported the stage held `running`.
+var regexpTraceUploadedRunning = regexp.MustCompile(`"event":"trace_uploaded"[^\n]*"variant":"raw"[^\n]*"stage_state":"running"`)
+
+// TestE2E_LocalRunner_ImplementTraceTimeFailure_KeepsVerifyPin is the
+// real-runner cross-boundary test for #5535's trace-time failure path (W10).
+// The run row's cached spec forbids added.txt on the implement stage, and the
+// runner gets no --constraints-file, so the runner's own pass and its
+// committed-tree verify (--verify-cmd true) succeed while the backend's
+// trace-time re-evaluation fails the stage category B. It asserts that:
+//
+//   - the runner pinned the verified head BEFORE the trace upload, and stopped
+//     on the trace_rejected 202 (trace_time_stage_failed) without pushing;
+//   - refs/fishhawk/checkpoints/<run>/<stage>-verify still exists in the
+//     working checkout;
+//   - the stage failure_reason is the policy reason ending with the verify-pin
+//     clause, whose SHA equals that ref;
+//   - no /pull-request report was sent and no PR URL was recorded.
+//
+// If the seeded constraint reached the runner, its own policy check would fail
+// the pass before the pin and the short-circuit, so the verify_head_pinned and
+// trace_time_stage_failed assertions fail loudly rather than passing vacuously.
+func TestE2E_LocalRunner_ImplementTraceTimeFailure_KeepsVerifyPin(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; skipping trace-time-failure E2E")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("sh claude shim; skipping on windows")
+	}
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	r, implStage := seedScopedImplementRun(ctx, t, fx, "deadbeef-tracetimefail", traceTimeForbiddenSpecYAML)
+	workDir := t.TempDir()
+	gitRepoInit(t, workDir)
+	fakeDir := writeClaudeShim(t, "printf '{\"type\":\"result\"}\\n'\necho 'package main' > added.txt\n")
+
+	out, runErr := runImplementRunner(ctx, t, fx, r, implStage, workDir, fakeDir, "--verify-cmd", "true")
+	logs := runnerLogLines(out)
+	if runErr == nil {
+		t.Fatalf("runner exited 0; expected exitFailure on the trace-time failure\noutput:\n%s", logs)
+	}
+
+	// Ordering: pin before the trace upload, then the short-circuit.
+	pinAt := strings.Index(out, `"event":"verify_head_pinned"`)
+	traceAt := strings.Index(out, `"event":"trace_uploaded"`)
+	stopAt := strings.Index(out, `"event":"trace_time_stage_failed"`)
+	// Non-fatal: the state assertions below must also observe a missing pin or
+	// a missing short-circuit, not only these log lines.
+	if pinAt < 0 || traceAt < 0 || stopAt < 0 {
+		t.Errorf("runner log missing verify_head_pinned (%d), trace_uploaded (%d) or trace_time_stage_failed (%d); "+
+			"if the constraint reached the runner this test no longer isolates the backend-only check\noutput:\n%s",
+			pinAt, traceAt, stopAt, logs)
+	} else if pinAt >= traceAt || traceAt >= stopAt {
+		t.Errorf("runner log order verify_head_pinned=%d trace_uploaded=%d trace_time_stage_failed=%d, want pin < trace < stop\noutput:\n%s",
+			pinAt, traceAt, stopAt, logs)
+	}
+	if !strings.Contains(out, `"stage_failure_kind":"trace_rejected"`) {
+		t.Errorf("runner log carries no stage_failure_kind trace_rejected\noutput:\n%s", logs)
+	}
+	for _, pushSign := range []string{`"reason":"pull_request_upload"`, `"event":"pull_request_uploaded"`, `"event":"push_token_refreshed"`, `"event":"push_token_refresh_failed"`} {
+		if strings.Contains(out, pushSign) {
+			t.Errorf("runner log carries %s; the runner reached the push path after a trace-time failure\noutput:\n%s", pushSign, logs)
+		}
+	}
+
+	// The pin survives in the working checkout.
+	ref := "refs/fishhawk/checkpoints/" + r.ID.String() + "/" + implStage.ID.String() + "-verify"
+	revParse := exec.Command("git", "-C", workDir, "rev-parse", "--verify", ref)
+	shaOut, err := revParse.Output()
+	if err != nil {
+		t.Fatalf("git rev-parse %s: %v (the verify pin was released or never taken)\noutput:\n%s", ref, err, logs)
+	}
+	pinnedSHA := strings.TrimSpace(string(shaOut))
+
+	got, err := fx.runRepo.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != runpkg.StageStateFailed {
+		t.Fatalf("implement stage State = %q, want failed\noutput:\n%s", got.State, logs)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != runpkg.FailureB {
+		t.Errorf("FailureCategory = %v, want B (policy violations on backend re-evaluation)", got.FailureCategory)
+	}
+	if got.FailureReason == nil {
+		t.Fatalf("FailureReason is nil, want the policy reason with the verify-pin clause")
+	}
+	reason := *got.FailureReason
+	if !strings.HasPrefix(reason, "policy violations on backend re-evaluation") {
+		t.Errorf("FailureReason = %q, want prefix %q", reason, "policy violations on backend re-evaluation")
+	}
+	wantClause := "; verified head " + pinnedSHA + " pinned at " + ref
+	if !strings.HasSuffix(reason, wantClause) {
+		t.Errorf("FailureReason = %q, want suffix %q (the clause naming the kept pin)", reason, wantClause)
+	}
+
+	if prFails := stageAudit(ctx, t, fx, r.ID, implStage.ID, "pull_request_failed"); len(prFails) != 0 {
+		t.Errorf("pull_request_failed audit rows = %d, want 0 (the runner must not push or report after trace_rejected)", len(prFails))
+	}
+	gotRun, err := fx.runRepo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.PullRequestURL != nil {
+		t.Errorf("run.PullRequestURL = %q, want nil", *gotRun.PullRequestURL)
 	}
 }
 

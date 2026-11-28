@@ -90,6 +90,11 @@ const (
 	// stageProgressGo holds the backend's decoder for the runner's
 	// stage-progress heartbeat (#2541, phase fields #4023).
 	stageProgressGo = "backend/internal/server/stage_progress.go"
+	// traceGo holds the trace upload's 202 body (traceUploadResponse, #5535)
+	// and runnerBundleGo the runner's signed bundle manifest (ManifestData,
+	// #5535 verify_pin_head_sha).
+	traceGo        = "backend/internal/server/trace.go"
+	runnerBundleGo = "runner/internal/bundle/bundle.go"
 )
 
 // SeedManifest is the repo's cross-module wire contract manifest. Verified
@@ -452,6 +457,29 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: stageProgressGo, Type: "stageProgressReport"},
 				Mode:     ModeExact,
 			},
+			{
+				// The trace upload's 202 body (#5535): the runner reads
+				// stage_state and stage_failure_kind to decide whether to push.
+				// ModeExact: a flat leaf, and the two additive fields must stay
+				// omitempty on both sides so an older peer interoperates. The
+				// bytes are ALSO pinned by the shared golden
+				// testdata/wire/trace_upload_response.json.
+				Name: "trace_upload_response", Anchor: "#5535",
+				Emitter:  Endpoint{File: traceGo, Type: "traceUploadResponse"},
+				Consumer: Endpoint{File: uploadFile, Type: "ShipResult"},
+				Mode:     ModeExact,
+			},
+			{
+				// The signed bundle manifest (line 1 of every trace bundle). The
+				// backend decodes every field the runner writes (the package
+				// rule is lockstep), so ModeExact, options included. The
+				// verify_pin_head_sha bytes (#5535) are ALSO pinned by the
+				// shared golden testdata/wire/bundle_manifest_verify_pin.json.
+				Name: "bundle_manifest", Anchor: "#5535",
+				Emitter:  Endpoint{File: runnerBundleGo, Type: "ManifestData"},
+				Consumer: Endpoint{File: bundleGo, Type: "Manifest"},
+				Mode:     ModeExact,
+			},
 		},
 		CoveredFiles: []string{
 			"backend/internal/server/reads.go",
@@ -471,6 +499,8 @@ func SeedManifest() Manifest {
 			specialistJobGo,
 			specialistJobPkgGo,
 			stageProgressGo,
+			traceGo,
+			runnerBundleGo,
 		},
 		UnpairedExemptions: []Endpoint{
 			// ShipPlanArgs carries the marker on its Reachability field, but the

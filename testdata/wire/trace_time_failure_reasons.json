@@ -1,0 +1,29 @@
+{
+  "_comment": "Shared wire fixture (#5535): the FULL stage failure reasons the trace handler stamps at trace time when the signed manifest declares a verify pin (verify_pin_head_sha). backend/internal/server TestShipTrace_TraceTimeFailure_ReasonsMatchWireGolden renders each through the real handler for run_id/stage_id and the bundle's example_sha; backend/internal/mcpserver TestTraceTimeFailureReasons_WireGolden_OfferVerifyRef feeds each through implementFailedNextActions and expects inspect_checkpoint_ref with params.ref = verify_ref. <sha> is the pinned 40-hex commit; both sides substitute example_sha.",
+  "example_sha": "0123456789abcdef0123456789abcdef01234567",
+  "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+  "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+  "verify_ref": "refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify",
+  "reasons": [
+    {
+      "arm": "bundle_unreadable",
+      "failure_category": "C",
+      "reason_template": "bundle_unreadable: the implement trace bundle could not be read (bundle: parse line: invalid JSON), so its diff, the implement review and the policy verdict are undeterminable; the stage was failed rather than advanced as a no-changes pass. A current runner does not push after this failure: it keeps its verify pin, named at the end of this reason when the manifest declared one; otherwise the verified tree survives only as the runner checkout's `fishhawk verify wip` commit, and an ephemeral runner's local refs may not outlive its job. Inspect it before retrying the stage in place (retryable; see #5535); verified head <sha> pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify"
+    },
+    {
+      "arm": "no_diff_captured",
+      "failure_category": "C",
+      "reason_template": "no_diff_captured: implement stage produced an empty diff; nothing was staged or captured (retryable; see #691/#692); verified head <sha> pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify"
+    },
+    {
+      "arm": "verify_infra_tempfail",
+      "failure_category": "C",
+      "reason_template": "verify_infra_tempfail: the committed-tree verify's only failing command exited 75 (EX_TEMPFAIL, an infrastructure / temporary failure) and backend policy re-evaluation found no other violation; the change was NOT judged. Retry the stage in place (#5264, #4022); verified head <sha> pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify"
+    },
+    {
+      "arm": "policy_violations",
+      "failure_category": "B",
+      "reason_template": "policy violations on backend re-evaluation; verified head <sha> pinned at refs/fishhawk/checkpoints/8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904/c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203-verify"
+    }
+  ]
+}

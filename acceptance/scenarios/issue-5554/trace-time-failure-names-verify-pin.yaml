@@ -1,0 +1,15 @@
+id: scenario:issue-5554/trace-time-failure-names-verify-pin
+statement: 'A signed trace upload for a running implement stage whose bundle manifest declares verify_pin_head_sha as a 40-hex SHA, and whose second line is malformed, returns 202 with stage_state failed and stage_failure_kind trace_rejected. The stage reads back failed category C with a failure_reason that starts with bundle_unreadable: and ends with ''; verified head <sha> pinned at refs/fishhawk/checkpoints/<run_id>/<stage_id>-verify''.'
+verify_hint: Seed the implement-running dev fixture, then POST /v0/runs/{run_id}/signing-key. Sign a hand-built gzip bundle (valid manifest line with verify_pin_head_sha, malformed line 2) via POST /v0/dev/sign and POST it to /v0/runs/{run_id}/trace?stage_id=…&variant=raw. Read the 202 body's stage_state and stage_failure_kind, then GET /v0/runs/{run_id}/stages for state, failure_category and failure_reason.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"}; read run_id and stages.implement from the 201. 2) POST /v0/runs/{run_id}/signing-key {} and read private_key. 3) Built a gzip JSONL bundle. Line 1: {"seq":0,"ts":"2026-11-28T00:00:00Z","kind":"manifest","data":{"bundle_schema":"v1","run_id":<run>,"stage_id":<implement>,"agent":"claude-code","push_and_open_pr":true,"verify_pin_head_sha":"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"}}. Line 2, malformed: ''{"seq":1,"ts":"2026-11-28T00:00:01Z","kind":"git_diff","data":{THIS IS NOT JSON''. 4) POST /v0/dev/sign with the bundle bytes as the body and header X-Fishhawk-Dev-Private-Key; read signature. 5) POST /v0/runs/{run_id}/trace?stage_id={implement}&variant=raw with X-Fishhawk-Signature and the bundle bytes. 6) GET /v0/runs/{run_id}/stages and read the implement item.'
+steps_carried_from: head fdfdc4c777b6f5aea0558fa6441313fedfb687ab recorded_at 2026-11-28T11:38:55Z
+assertions:
+    expected: '202 failed/trace_rejected; stage failed C; the reason has the bundle_unreadable: prefix and ends with the verify-pin clause naming <run_id>/<stage_id>-verify'
+    observed_at_record: '202 {stage_state: failed, stage_failure_kind: trace_rejected}. The stage reads back state failed, failure_category C. Its failure_reason starts ''bundle_unreadable: the implement trace bundle could not be read (bundle: parse line: invalid JSON)...'' and ends exactly ''; verified head a1b2c3d4e5f60718293a4b5c6d7e8f9012345678 pinned at refs/fishhawk/checkpoints/dff3c8ca-a857-4bfd-a1b3-ce044c367cff/9f90e4d0-f2c3-40cf-bdfd-15dc36d2249b-verify'' (both checked programmatically).'
+    repro_handle: python3 -I /tmp/fhacc5554/drive.py
+origin:
+    issue: 5554
+    pr: 5633
+    run_id: d8f12702-b8b0-4599-b276-b9578660305a
+    head_sha: 4e97879d1dfed565e32643b273e6a03b08cd6058
+    recorded_at: 2026-11-28T12:46:32Z

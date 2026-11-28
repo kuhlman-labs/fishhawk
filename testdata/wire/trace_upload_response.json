@@ -1,0 +1,8 @@
+{
+  "run_id": "8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904",
+  "stage_id": "c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203",
+  "variant": "raw",
+  "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "stage_state": "failed",
+  "stage_failure_kind": "trace_rejected"
+}
