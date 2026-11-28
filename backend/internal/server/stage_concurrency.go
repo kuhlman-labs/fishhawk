@@ -74,12 +74,12 @@ type hostDispatchBody struct {
 	// its admission response can tell its own admission from another
 	// session's (concurrency README § "Admission nonce").
 	AdmissionNonce string `json:"admission_nonce"`
-	// Capacity is the host capacity the client declares for THIS request
-	// (ADR-094 D4 as amended by A2, #4241): the limit of
-	// host:<host>:capacity for this one Admit call, 1..concurrency.MaxLimit.
-	// Absent or JSON null declares none, and the admission uses
-	// concurrency.DefaultHostCapacity. Nothing is stored: the next request
-	// sizes its own admission.
+	// Capacity is the host capacity the client sends (ADR-094 D4 as amended
+	// by A2, #4241). Under ADR-094 A5 it is still VALIDATED
+	// (1..concurrency.MaxLimit, else 400 field=capacity) but no longer sizes
+	// admission: host:<host>:capacity takes the host's governing capacity
+	// (resolveHostLimits). A value that differs from the governing one is
+	// reported back as capacity_warning. Absent or JSON null sends none.
 	Capacity *int `json:"capacity"`
 }
 
@@ -87,18 +87,10 @@ type hostDispatchBody struct {
 type hostDispatchRequest struct {
 	host  string
 	nonce string
-	// capacity is the declared host capacity, nil when the body declared
-	// none.
+	// capacity is the body's validated capacity, nil when the body sent
+	// none. It never sizes admission (ADR-094 A5); it only decides whether
+	// the response carries a capacity_warning.
 	capacity *int
-}
-
-// capacityLimit is the host capacity group's limit for this request: the
-// declared capacity, else concurrency.DefaultHostCapacity.
-func (q hostDispatchRequest) capacityLimit() int {
-	if q.capacity != nil {
-		return *q.capacity
-	}
-	return concurrency.DefaultHostCapacity
 }
 
 // hostDispatchBodyShape names the body's keys in the decode-error message.
@@ -175,7 +167,7 @@ func (s *Server) parseHostDispatchBody(w http.ResponseWriter, r *http.Request) (
 // hostCapacityRangeMessage is the 400 message for a capacity outside the
 // accepted range or of the wrong JSON type.
 func hostCapacityRangeMessage() string {
-	return fmt.Sprintf("capacity must be an integer in 1..%d (the host capacity for this request; omit it for the default %d)",
+	return fmt.Sprintf("capacity must be an integer in 1..%d or omitted (it is validated but does not size admission: the host's dispatcher declaration, else fishhawkd's --default-host-capacity, else %d governs host:<host>:capacity)",
 		concurrency.MaxLimit, concurrency.DefaultHostCapacity)
 }
 
@@ -212,9 +204,10 @@ func validHostLabel(h string) bool {
 // admission arm is grouped: the set is the stage type's DEFAULT set, plus
 // every declared group (add-only, deduplicated by key; a declared entry's
 // limit wins on a shared key), plus one slot of the host capacity group
-// host:<host>:capacity at capacityLimit (the request's declared capacity,
-// else concurrency.DefaultHostCapacity; nothing is stored, so the limit sizes
-// THIS admission only). Default sets, before the capacity group:
+// host:<host>:capacity at capacityLimit: the host's GOVERNING capacity, which
+// the marker resolves once per request through resolveHostLimits (ADR-094
+// A5), never the request body's capacity. Default sets, before the capacity
+// group:
 //
 //   - implement: local-implement:<host> at DefaultLimit.
 //   - a merge-candidate verify pass: local-verify:<host> at
@@ -296,7 +289,8 @@ func unionGroupRequests(base, add []concurrency.GroupRequest) []concurrency.Grou
 }
 
 // withHostCapacity adds the host capacity group host:<host>:capacity at limit
-// to set (ADR-094 D4): every stage that reaches the marker's admission arm
+// (the host's governing capacity from resolveHostLimits, ADR-094 A5) to set
+// (ADR-094 D4): every stage that reaches the marker's admission arm
 // holds one capacity slot. The capacity group is exempt from the store's FIFO
 // rule (b) and admits on condition (a) alone, where an earlier live waiter
 // reserves a slot only while it is capacity-bound: every other group of its
@@ -308,11 +302,123 @@ func withHostCapacity(set []concurrency.GroupRequest, host string, limit int) []
 	return unionGroupRequests(set, []concurrency.GroupRequest{{Key: concurrency.CapacityGroupKey(host), Limit: limit}})
 }
 
+// Governing host capacity sources (ADR-094 A5 item 2), the capacity_warning
+// `source` values.
+const (
+	hostCapacitySourceDeclaration      = "declaration"
+	hostCapacitySourceFishhawkdDefault = "fishhawkd_default"
+	hostCapacitySourceDefault          = "default"
+)
+
+// hostLimits is one marker request's governing host admission limits.
+// capacity sizes host:<host>:capacity and source names the rung it came
+// from; implementLimit is a fresh declared host_implement_limit, the ceiling
+// on local-implement:<host>, or 0 for none.
+type hostLimits struct {
+	capacity       int
+	source         string
+	implementLimit int
+}
+
+// resolveHostLimits resolves the host's governing admission limits ONCE per
+// marker request, before Admit (ADR-094 Amendment A5 item 2). Capacity is the
+// first of:
+//
+//	(a) a valid host_capacity in the FRESH heartbeat row whose account
+//	    EXACTLY equals the run's account and whose label equals host
+//	    (dispatcherheartbeat Repository.Get; an untenanted declaration never
+//	    governs a tenanted run, A5 item 7). Fresh is
+//	    hostDispatcherRecordFresh: received within StaleAfter(interval) and
+//	    not beyond FutureSkew (ADR-104 A2 item 6);
+//	(b) Config.DefaultHostCapacity when it is in 1..concurrency.MaxLimit;
+//	(c) concurrency.DefaultHostCapacity.
+//
+// implementLimit is the same fresh row's valid host_implement_limit, taken
+// independently of host_capacity (an implement-only declaration leaves
+// capacity on rung (b) or (c)); 0 means none. A nil heartbeat repository
+// skips rung (a). A read error WARN-logs and is read as no fresh row: it
+// falls through to (b), and it ALSO drops a fresh declared
+// host_implement_limit, so local-implement:<host> returns to its spec value
+// while the read fails. Holders admitted earlier keep holding whatever the
+// value becomes (the store is unchanged).
+func (s *Server) resolveHostLimits(ctx context.Context, runRow *run.Run, host string) hostLimits {
+	var out hostLimits
+	if repo := s.cfg.HostDispatcherHeartbeatRepo; repo != nil {
+		rec, found, err := repo.Get(ctx, runRow.AccountID, host)
+		switch {
+		case err != nil:
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"host dispatch: heartbeat declaration read failed; host limits fall back to the fishhawkd default",
+				slog.String("run_id", runRow.ID.String()), slog.String("host", host), slog.String("error", err.Error()))
+		case found && hostDispatcherRecordFresh(rec, s.nowFunc()):
+			if v := rec.Heartbeat.HostImplementLimit; validHostLimit(v) {
+				out.implementLimit = *v
+			}
+			if v := rec.Heartbeat.HostCapacity; validHostLimit(v) {
+				out.capacity, out.source = *v, hostCapacitySourceDeclaration
+				return out
+			}
+		}
+	}
+	if d := s.cfg.DefaultHostCapacity; d >= 1 && d <= concurrency.MaxLimit {
+		out.capacity, out.source = d, hostCapacitySourceFishhawkdDefault
+		return out
+	}
+	out.capacity, out.source = concurrency.DefaultHostCapacity, hostCapacitySourceDefault
+	return out
+}
+
+// validHostLimit reports whether a declared limit is present and within the
+// slot store's range. Ingest already drops an out-of-range declaration; this
+// keeps a row written around ingest from sizing a group.
+func validHostLimit(v *int) bool {
+	return v != nil && *v >= 1 && *v <= concurrency.MaxLimit
+}
+
+// applyHostImplementCeiling caps the local-implement:<host> entry of groups
+// at min(its limit, limit) when limit > 0 (a fresh declared
+// host_implement_limit, ADR-094 A5). The entry may come from the implement
+// default, the {limit: N} shorthand on any stage type, or a {implement, host}
+// groups entry. The ceiling never raises a limit, and the spec grammar and
+// its validators are untouched. groups is modified in place and returned.
+func applyHostImplementCeiling(groups []concurrency.GroupRequest, host string, limit int) []concurrency.GroupRequest {
+	if limit < 1 {
+		return groups
+	}
+	key := concurrency.DefaultGroupKey(host)
+	for i := range groups {
+		if groups[i].Key == key {
+			groups[i].Limit = min(groups[i].Limit, limit)
+		}
+	}
+	return groups
+}
+
+// hostCapacityWarning is the additive capacity_warning on the marker's 200
+// and on its 409 concurrency_slot_queued details (ADR-094 A5): the request's
+// capacity differs from the governing one, which sized the admission.
+type hostCapacityWarning struct {
+	RequestCapacity   int    `json:"request_capacity"`
+	GoverningCapacity int    `json:"governing_capacity"`
+	Source            string `json:"source"`
+}
+
+// capacityWarning returns the warning for a request that sent capacity when
+// it differs from limits.capacity, else nil (no capacity sent, or equal).
+func capacityWarning(capacity *int, limits hostLimits) *hostCapacityWarning {
+	if capacity == nil || *capacity == limits.capacity {
+		return nil
+	}
+	return &hostCapacityWarning{RequestCapacity: *capacity, GoverningCapacity: limits.capacity, Source: limits.source}
+}
+
 // hostScopedGroupLimit is the slot count of a NON-legacy, non-capacity
 // host-scoped group (e.g. the built-in host:<h>:preview-target). A
 // host-scoped group is shared by every repository on the host, so no
 // repository's spec may size it (approval condition H1); the host operator
-// sizes only the capacity group, through FISHHAWK_HOST_CAPACITY.
+// sizes only the capacity group (its dispatcher's heartbeat declaration, else
+// fishhawkd's --default-host-capacity, ADR-094 A5) and caps
+// local-implement:<host> through the declared host_implement_limit.
 const hostScopedGroupLimit = 1
 
 // declaredGroupRequests maps a declared `groups` list onto the store's group
@@ -332,8 +438,8 @@ const hostScopedGroupLimit = 1
 // Two host groups are reserved, and an entry for either answers an error and
 // no set. An entry whose CANONICAL identity, its scope and name trimmed and
 // lowercased, is the host capacity group concurrency.CapacityGroupKey(host):
-// the server adds that group to every set at the request's capacity, so no
-// spec may declare or size it (ADR-094 A2). The fold is defence in depth for
+// the server adds that group to every set at the host's governing capacity,
+// so no spec may declare or size it (ADR-094 A2, A5). The fold is defence in depth for
 // a declaration built in Go: the schema pattern already refuses a case or
 // whitespace variant at parse time. And an entry canonicalising to
 // concurrency.VerifyGroupKey(host): local-verify:<host> is reserved for
@@ -665,10 +771,14 @@ func (s *Server) stageConcurrencyBlocks(ctx context.Context, stageIDs []uuid.UUI
 // writeConcurrencySlotQueued answers 409 concurrency_slot_queued with a
 // Retry-After of the waiter poll interval. Queued is a 409, not a 2xx, so a
 // pre-change client (which treats any 2xx as "proceed and spawn") fails
-// closed.
-func (s *Server) writeConcurrencySlotQueued(w http.ResponseWriter, r *http.Request, stageID uuid.UUID, req []concurrency.GroupRequest, adm concurrency.Admission) {
+// closed. A non-nil warning (the request's capacity differs from the
+// governing one, ADR-094 A5) is added as details.capacity_warning.
+func (s *Server) writeConcurrencySlotQueued(w http.ResponseWriter, r *http.Request, stageID uuid.UUID, req []concurrency.GroupRequest, adm concurrency.Admission, warning *hostCapacityWarning) {
 	w.Header().Set("Retry-After", strconv.Itoa(int(concurrency.WaiterPollInterval/time.Second)))
 	b, details := concurrencyQueuedDetails(stageID, req, adm)
+	if warning != nil {
+		details["capacity_warning"] = warning
+	}
 	adm.Position, adm.Holders = b.Position, b.Holders
 	s.writeError(w, r, http.StatusConflict, "concurrency_slot_queued",
 		concurrencyQueuedMessage(b.Key, b.Limit, adm), details)
@@ -800,8 +910,9 @@ func (s *Server) emitStageConcurrency(ctx context.Context, stage *run.Stage, cat
 // to when that item is expedited (#4234), else nil. A QUEUED stage of an
 // expedited item is auto-promoted to the head of its group
 // (autoPromoteExpeditedWaiter, fail-open), and the 409 reports the
-// post-promote position.
-func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, groups []concurrency.GroupRequest, host, nonce string, expedited *campaign.Item) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
+// post-promote position. warning is the request's capacity_warning (nil for
+// none), carried on the queued 409's details.
+func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, groups []concurrency.GroupRequest, host, nonce string, expedited *campaign.Item, warning *hostCapacityWarning) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
 	adm, err := s.cfg.Concurrency.Admit(r.Context(), concurrency.Request{
 		StageID:        stage.ID,
 		RunID:          stage.RunID,
@@ -820,7 +931,7 @@ func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage
 		if expedited != nil {
 			adm = s.autoPromoteExpeditedWaiter(r.Context(), stage, expedited, adm)
 		}
-		s.writeConcurrencySlotQueued(w, r, stage.ID, groups, adm)
+		s.writeConcurrencySlotQueued(w, r, stage.ID, groups, adm, warning)
 		return nil, nil, true, nil
 	}
 	s.emitStageConcurrencyAdmitted(r.Context(), stage, groups, adm)

@@ -1513,14 +1513,17 @@ func queuedOnCapacity(t *testing.T, err error, capKey string, limit int) {
 	t.Errorf("details.groups = %v, want an entry for %s at limit %d", details["groups"], capKey, limit)
 }
 
-// TestConcurrencySlot_E2E_HostCapacityTwo crosses every boundary of the
-// capacity declaration: FISHHAWK_HOST_CAPACITY=2 in the MCP process env (a
-// fake lookupEnv through the real resolver), the client wire, the real
-// server handler, the Postgres slot store and its rows. An implement and an
-// acceptance stage are admitted at limit 2; a plan stage, whose only group is
-// the capacity group, then queues naming host:<label>:capacity at limit 2.
-// With the declared capacity ignored (always 3) the plan would be admitted.
-func TestConcurrencySlot_E2E_HostCapacityTwo(t *testing.T) {
+// TestConcurrencySlot_E2E_RequestCapacityIgnored crosses every boundary of
+// the request capacity under ADR-094 A5: FISHHAWK_HOST_CAPACITY=2 in the MCP
+// process env (a fake lookupEnv through the real resolver) still reaches the
+// wire, but the real server sizes host:<label>:capacity from its governing
+// value — here the server default 3 (no dispatcher declaration, no fishhawkd
+// default) — through the Postgres slot store and its rows. Three plan stages
+// are admitted at limit 3; the fourth queues naming host:<label>:capacity at
+// limit 3, its 409 details carrying capacity_warning {2, 3, default}, which
+// proves the client sent 2 and the client decodes the additive fields.
+// Honouring the request value would queue the third at 2.
+func TestConcurrencySlot_E2E_RequestCapacityIgnored(t *testing.T) {
 	f := newE2ESlotFixture(t)
 	const label = "e2e-cap-two"
 	capKey := concurrency.CapacityGroupKey(label)
@@ -1530,21 +1533,31 @@ func TestConcurrencySlot_E2E_HostCapacityTwo(t *testing.T) {
 		}
 		return "", false
 	})
-	for _, typ := range []runpkg.StageType{runpkg.StageTypeImplement, runpkg.StageTypeAcceptance} {
-		st := f.parkType(t, nil, typ)
+	for i := range concurrency.DefaultHostCapacity {
+		st := f.parkType(t, nil, runpkg.StageTypePlan)
 		res, err := api.HostDispatchStage(f.ctx, st.RunID, st.ID)
 		if err != nil || res == nil || !res.Transitioned {
-			t.Fatalf("%s: HostDispatchStage = %+v, %v; want an admission", typ, res, err)
+			t.Fatalf("plan %d: HostDispatchStage = %+v, %v; want an admission", i+1, res, err)
+		}
+		if res.Concurrency == nil || res.Concurrency.Group != capKey || res.Concurrency.Limit != concurrency.DefaultHostCapacity {
+			t.Errorf("plan %d admission block = %+v, want %s at %d", i+1, res.Concurrency, capKey, concurrency.DefaultHostCapacity)
 		}
 	}
-	plan := f.parkType(t, nil, runpkg.StageTypePlan)
-	_, err := api.HostDispatchStage(f.ctx, plan.RunID, plan.ID)
-	queuedOnCapacity(t, err, capKey, 2)
-	if got := f.stageState(t, plan); got != string(runpkg.StageStateAwaitingHostDispatch) {
+	fourth := f.parkType(t, nil, runpkg.StageTypePlan)
+	_, err := api.HostDispatchStage(f.ctx, fourth.RunID, fourth.ID)
+	queuedOnCapacity(t, err, capKey, concurrency.DefaultHostCapacity)
+	var ae *apiError
+	if errors.As(err, &ae) {
+		w, _ := ae.Details["capacity_warning"].(map[string]any)
+		if w["request_capacity"] != float64(2) || w["governing_capacity"] != float64(concurrency.DefaultHostCapacity) || w["source"] != "default" {
+			t.Errorf("details.capacity_warning = %v, want {request_capacity 2, governing_capacity %d, source default}", ae.Details["capacity_warning"], concurrency.DefaultHostCapacity)
+		}
+	}
+	if got := f.stageState(t, fourth); got != string(runpkg.StageStateAwaitingHostDispatch) {
 		t.Errorf("queued plan state = %s, want awaiting_host_dispatch", got)
 	}
-	if held, queued := f.slotRows(t, capKey, "held"), f.slotRows(t, capKey, "queued"); held != 2 || queued != 1 {
-		t.Errorf("%s rows: %d held, %d queued; want 2 held, 1 queued", capKey, held, queued)
+	if held, queued := f.slotRows(t, capKey, "held"), f.slotRows(t, capKey, "queued"); held != 3 || queued != 1 {
+		t.Errorf("%s rows: %d held, %d queued; want 3 held, 1 queued", capKey, held, queued)
 	}
 }
 
