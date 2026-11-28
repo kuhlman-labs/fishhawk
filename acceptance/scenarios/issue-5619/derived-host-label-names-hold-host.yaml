@@ -1,0 +1,13 @@
+id: scenario:issue-5619/derived-host-label-names-hold-host
+statement: With --enable-ops-monitor --ops-monitor-dispatch-hold set, no --ops-monitor-host-label flag, and FISHHAWK_HOST_LABEL=acc-derived-label in fishhawkd's environment, the 'ops monitor started' startup record reports dispatch_hold_host acc-derived-label.
+steps: Built fishhawkd from the sanctioned checkout. Ran env -i PATH=$PATH HOME=/tmp/fhacc5619/home FISHHAWK_HOST_LABEL=acc-derived-label fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold (no --ops-monitor-host-label) in the background; after 5s read 'ops monitor started'; SIGTERM.
+assertions:
+    expected: dispatch_hold_host acc-derived-label
+    observed_at_record: '''ops monitor started'' deployment local, dispatch_hold:true, dispatch_hold_host:"acc-derived-label"'
+    repro_handle: FISHHAWK_HOST_LABEL=acc-derived-label fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold
+origin:
+    issue: 5619
+    pr: 5629
+    run_id: aceea4db-113a-4949-a73d-c70867037e8b
+    head_sha: 038dbb16697e1f290d7d6fb7cb3cf17dbe3cd303
+    recorded_at: 2026-11-28T07:48:19Z
