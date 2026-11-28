@@ -140,6 +140,20 @@ type Manifest struct {
 	// and decode to false. Keep in lockstep with
 	// runner/internal/bundle.ManifestData.
 	PushFixup bool `json:"push_fixup,omitempty"`
+	// VerifyPinHeadSHA is the commit the runner pinned at
+	// refs/fishhawk/checkpoints/<run>/<stage>-verify before the trace upload,
+	// after a passing committed verify on a push-gated implement stage
+	// (#5535). The trace handler's trace-time failure arms name it in the
+	// stage's failure reason (verifyPinClause), read through PeekManifest so a
+	// bundle whose later line is unreadable still names it. Older bundles and
+	// unpinned stages omit it and decode to "", which renders no clause.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to
+	// runner/internal/bundle.ManifestData.VerifyPinHeadSHA. Pinned by the
+	// shared golden testdata/wire/bundle_manifest_verify_pin.json, which the
+	// runner bundle test writes and this package's test decodes, and by the
+	// wirecontract bundle_manifest pair.
+	VerifyPinHeadSHA string `json:"verify_pin_head_sha,omitempty"`
 }
 
 // Errors callers may want to switch on.
@@ -897,6 +911,52 @@ func ExtractManifest(bundleBytes []byte) (Manifest, error) {
 	}
 	var m Manifest
 	if err := json.Unmarshal(lines[0].Data, &m); err != nil {
+		return Manifest{}, fmt.Errorf("bundle: parse manifest: %w", err)
+	}
+	return m, nil
+}
+
+// PeekManifest returns the manifest from line 1 of bundleBytes WITHOUT
+// reading the rest of the bundle (#5535). The trace handler uses it to name
+// a declared verify pin (Manifest.VerifyPinHeadSHA) in a trace-time failure
+// reason even when a LATER line makes ReadEvents, and so ExtractManifest,
+// fail: the bundle_unreadable arm is exactly that case. The body it reads has
+// already passed the handler's Ed25519 signature check, so line 1 is the
+// runner's signed manifest; the trailer hash is not re-checked here.
+//
+// Line 1 is bounded by MaxLineBytes (ErrLineTooLong). Returns ErrBadGzip on a
+// corrupt frame and ErrNoManifest when the bundle is empty or line 1 is not a
+// manifest record.
+func PeekManifest(bundleBytes []byte) (Manifest, error) {
+	return peekManifest(bundleBytes, MaxLineBytes)
+}
+
+// peekManifest is PeekManifest with an injectable line bound for the tests.
+func peekManifest(bundleBytes []byte, maxLine int) (Manifest, error) {
+	zr, err := gzip.NewReader(byteReader(bundleBytes))
+	if err != nil {
+		return Manifest{}, fmt.Errorf("%w: %v", ErrBadGzip, err)
+	}
+	defer func() { _ = zr.Close() }()
+	// Reading at most maxLine+2 bytes is enough for readBundleLine to tell a
+	// line within the bound from one over it; the rest is never inflated.
+	br := bufio.NewReaderSize(&io.LimitedReader{R: zr, N: int64(maxLine) + 2}, readBufferBytes)
+	raw, err := readBundleLine(br, maxLine)
+	if err == io.EOF {
+		return Manifest{}, ErrNoManifest
+	}
+	if err != nil {
+		return Manifest{}, fmt.Errorf("bundle: read: %w", err)
+	}
+	var line Line
+	if err := json.Unmarshal(raw, &line); err != nil {
+		return Manifest{}, fmt.Errorf("bundle: parse line: %w", err)
+	}
+	if line.Kind != EventKindManifest {
+		return Manifest{}, ErrNoManifest
+	}
+	var m Manifest
+	if err := json.Unmarshal(line.Data, &m); err != nil {
 		return Manifest{}, fmt.Errorf("bundle: parse manifest: %w", err)
 	}
 	return m, nil

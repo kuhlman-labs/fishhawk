@@ -37,6 +37,16 @@ the module absorbs the contracts — a legible migration signal.
   (`pullRequestScopeParkBody`, `pullRequestFailureBody`,
   `pullRequestChildPushBody`).
 
+Two #5535 pairs ride the trace upload, each also pinned by a shared golden:
+`trace_upload_response` (`traceUploadResponse` in `server/trace.go` →
+`upload.ShipResult`, ModeExact; the additive `stage_state` and
+`stage_failure_kind` stay omitempty on both sides;
+`testdata/wire/trace_upload_response.json`) and `bundle_manifest`
+(`runner/internal/bundle.ManifestData` → `bundle.Manifest`, ModeExact because
+the manifest is kept in lockstep, so a field either side adds alone fails;
+`testdata/wire/bundle_manifest_verify_pin.json` pins `verify_pin_head_sha`).
+Both files are in `CoveredFiles`.
+
 A consumer name the emitter never emits is ALWAYS a violation in both modes —
 that is the #2558 failure shape (a backend rename leaving the runner decoding a
 key nobody sends).

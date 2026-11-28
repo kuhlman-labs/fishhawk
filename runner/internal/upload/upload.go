@@ -547,11 +547,28 @@ type ShipArgs struct {
 
 // ShipResult is the (run, stage, variant, content_hash) tuple the
 // backend echoes on 202.
+//
+// StageState and StageFailureKind (#5535) report what the upload did to the
+// stage: StageState is the stage's state after the upload (`running` means
+// held for the runner's /pull-request report), and StageFailureKind, set
+// only on a failed stage, is the closed value `trace_rejected` (the backend
+// refused the stage at trace time) or `implement_review_rejected` (the #877
+// gating implement-review reject; the runner still pushes and the backend
+// closes the PR). Both are empty from an older backend, or when the backend
+// could not read the stage, and an empty value keeps the runner's existing
+// behaviour.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+// backend/internal/server.traceUploadResponse. Pinned by the shared golden
+// testdata/wire/trace_upload_response.json, which the backend marshals and
+// upload_test decodes, and by the wirecontract trace_upload_response pair.
 type ShipResult struct {
-	RunID       string `json:"run_id"`
-	StageID     string `json:"stage_id"`
-	Variant     string `json:"variant"`
-	ContentHash string `json:"content_hash"`
+	RunID            string `json:"run_id"`
+	StageID          string `json:"stage_id"`
+	Variant          string `json:"variant"`
+	ContentHash      string `json:"content_hash"`
+	StageState       string `json:"stage_state,omitempty"`
+	StageFailureKind string `json:"stage_failure_kind,omitempty"`
 }
 
 // ShipTrace signs the bundle's content hash and POSTs it to

@@ -33232,6 +33232,38 @@ paths:
                   content_hash:
                     type: string
                     description: Hex sha256 of the uploaded bundle bytes.
+                  stage_state:
+                    type: string
+                    enum:
+                      [pending, awaiting_host_dispatch, dispatched, running,
+                       awaiting_approval, awaiting_children, awaiting_input,
+                       awaiting_scope_decision, awaiting_deploy_approval,
+                       awaiting_deployment, succeeded, failed, cancelled, superseded]
+                    description: |
+                      The stage's state after this upload (#5535), re-read from
+                      the stage row. `running` means the stage is held for the
+                      runner's `/pull-request` report (a push-gated implement
+                      stage). `failed` carries `stage_failure_kind` when the
+                      failure is classified. Absent when the stage cannot be
+                      read or does not belong to `run_id` (see #5587).
+                  stage_failure_kind:
+                    type: string
+                    enum: [trace_rejected, implement_review_rejected]
+                    description: |
+                      Present only with `stage_state: failed` (#5535).
+                      `trace_rejected`: the backend failed the stage at trace
+                      time (an unreadable bundle, an empty captured diff, an
+                      exit-75-only verify, or a policy violation on backend
+                      re-evaluation); a current runner keeps its verify pin and
+                      does not push, and the stage's `failure_reason` ends with
+                      `; verified head <sha> pinned at
+                      refs/fishhawk/checkpoints/<run>/<stage>-verify` when the
+                      signed manifest declared `verify_pin_head_sha`.
+                      `implement_review_rejected`: a gating implement review
+                      rejected the stage (#877); the runner still pushes and
+                      opens the PR, and the `/pull-request` handler closes it.
+                      Absent for any other failure, and whenever `stage_state`
+                      is absent.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401':
           description: Signature invalid or no signing key for this run.
