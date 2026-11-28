@@ -31,8 +31,11 @@ import (
 const hdTestBearer = "fhm_test_dispatcher_bearer_value"
 
 type hdRun struct {
-	ID             string
-	State          string
+	ID    string
+	State string
+	// WorkflowID is served as the run's workflow_id; empty serves
+	// feature_change, so every fixture that predates it is byte-identical.
+	WorkflowID     string
 	RunnerKind     string
 	WorkingDir     string
 	AutoDispatch   bool
@@ -135,8 +138,12 @@ func apiErrBody(code, msg string) string {
 }
 
 func (b *hdBackend) runJSON(r *hdRun, include string) string {
+	workflowID := r.WorkflowID
+	if workflowID == "" {
+		workflowID = "feature_change"
+	}
 	m := map[string]any{
-		"id": r.ID, "repo": "acme/widgets", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"id": r.ID, "repo": "acme/widgets", "workflow_id": workflowID, "workflow_sha": "abc",
 		"trigger_source": "api", "state": r.State, "runner_kind": r.RunnerKind,
 		"forge": "github", "default_branch": "main", "retry_attempt": 0, "max_retries_snapshot": 0,
 	}
@@ -641,6 +648,63 @@ func TestHostDispatcher_UnmarkedVerifyReopenNotSpawned(t *testing.T) {
 	if o := h.eval(t, marked); !o.Spawned || o.StageType != "implement" {
 		t.Fatalf("marked verify re-open = %+v; want implement spawned", o)
 	}
+}
+
+// TestHostDispatcher_HotfixChangeDispatchedLikeFeatureChange pins #5562's
+// premise correction: the host dispatcher has no workflow filter. A marked
+// local hotfix_change run's parked plan and re-opened implement (the fix-up /
+// verify-only re-open shape) spawn exactly as feature_change's do, and an
+// UNMARKED hotfix_change run is refused not_eligible with no marker POST.
+func TestHostDispatcher_HotfixChangeDispatchedLikeFeatureChange(t *testing.T) {
+	shapes := []struct {
+		name      string
+		stages    func(runID string) []Stage
+		wantStage string
+	}{
+		{"plan parked", func(runID string) []Stage {
+			return []Stage{
+				{ID: uuid.NewString(), RunID: runID, Sequence: 1, Type: "plan", State: "awaiting_host_dispatch", UpdatedAt: time.Now()},
+				{ID: uuid.NewString(), RunID: runID, Sequence: 2, Type: "implement", State: "pending", UpdatedAt: time.Now()},
+			}
+		}, "plan"},
+		{"implement re-opened", func(runID string) []Stage {
+			return []Stage{
+				{ID: uuid.NewString(), RunID: runID, Sequence: 1, Type: "plan", State: "succeeded"},
+				{ID: uuid.NewString(), RunID: runID, Sequence: 2, Type: "implement", State: "awaiting_host_dispatch", UpdatedAt: time.Now()},
+			}
+		}, "implement"},
+	}
+	for _, shape := range shapes {
+		outcomes := map[string]hostDispatchOutcome{}
+		for _, workflowID := range []string{"feature_change", "hotfix_change"} {
+			t.Run(workflowID+"/"+shape.name, func(t *testing.T) {
+				h := newHDHarness(t)
+				r := h.addRun(func(r *hdRun) { r.WorkflowID = workflowID; r.Stages = shape.stages(r.ID) })
+				o := h.eval(t, r)
+				if !o.Spawned || o.StageType != shape.wantStage {
+					t.Fatalf("%s %s = %+v; want %s spawned", workflowID, shape.name, o, shape.wantStage)
+				}
+				if len(h.b.acts) != 1 || h.b.acts[0].Source != "host_dispatcher" || h.b.acts[0].Action != "dispatch_stage" || h.b.acts[0].Stage != shape.wantStage {
+					t.Fatalf("acts = %+v; want one dispatch_stage/%s act tagged host_dispatcher", h.b.acts, shape.wantStage)
+				}
+				outcomes[workflowID] = hostDispatchOutcome{Spawned: o.Spawned, StageType: o.StageType}
+			})
+		}
+		if outcomes["feature_change"] != outcomes["hotfix_change"] {
+			t.Errorf("%s: hotfix_change outcome %+v != feature_change %+v; want identical dispatch", shape.name, outcomes["hotfix_change"], outcomes["feature_change"])
+		}
+	}
+
+	t.Run("hotfix_change/unmarked", func(t *testing.T) {
+		h := newHDHarness(t)
+		r := h.addRun(func(r *hdRun) { r.WorkflowID = "hotfix_change"; r.AutoDispatch = false })
+		if o := h.eval(t, r); o.Spawned || o.Refusal != hdRefuseNotEligible {
+			t.Fatalf("unmarked hotfix_change run = %+v; want not_eligible", o)
+		}
+		if n := h.b.count(isMarkerReq); n != 0 || h.spawner.n() != 0 {
+			t.Fatalf("unmarked hotfix_change run drew %d marker POSTs and %d spawns; want 0, 0", n, h.spawner.n())
+		}
+	})
 }
 
 func TestHostDispatcher_ChildEligibility(t *testing.T) {

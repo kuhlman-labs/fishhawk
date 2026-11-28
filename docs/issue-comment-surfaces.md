@@ -482,8 +482,8 @@ Notes:
       than left implicit; a run-less-anchor page surface is not in E77.6.
     - Neither kind is RESOLVABLE: `pageEventResolved` returns false for both, so
       a later approval or fix-up never records-and-skips a crew-escalation page.
-      Only a reviewer-reject page, the #5308 acceptance dispatch page and the
-      two #5497 stall-watch pages are resolvable.
+      Only a reviewer-reject page, the #5308 acceptance dispatch page, the
+      two #5497 stall-watch pages and the #5562 driver-act page are resolvable.
   - **Acceptance scenario-corpus reports (E72.4, #3328)** — two kinds written
     by `server/pullrequest.go` on the acceptance runner's post-verdict report,
     each followed by an anchor rebuild (no new comment surface, no page-class
@@ -1831,6 +1831,32 @@ Notes:
   acceptance-dispatch lead plus the status refresh remain. An auto_dispatch local
   run whose dispatcher refuses or is not running is NOT covered here; the #5500
   awaiting-block overlay owns it.
+- The campaign-driver act operator page — `campaign_driver_act_awaiting_operator`
+  (#5562) — is a **system-actor (`system:campaign-driver`), stage-scoped audit
+  kind that is PINGS-ONLY: no dedicated Notifier method, no
+  `activityCategories` entry and no anchor timeline render**. WRITER:
+  `server/campaign_gate_outcome.go::pageDriverActAwaitingOperator`, called by
+  `DriveCampaignRunGate` after an `Acted` outcome (`route_fixup`, `approve` or
+  `retry`; a `merge` parks nothing). It writes one row per stage the act itself
+  parked at `awaiting_host_dispatch` on a LOCAL run the host dispatcher does not
+  spawn (`hostDispatchKind` is not `host_dispatcher`): a stage parked before the
+  act (read by `snapshotHostDispatchParks`) is skipped, and each `(stage, park
+  episode)` pages once (`issuecomment.HostDispatchParkEpisode`, the dedup key
+  read back from the prior rows). PAYLOAD `{stage_id, stage_type, stage_state,
+  episode_key, action, runner_kind, auto_dispatch, next_action, reason}`, with
+  `next_action` always `fishhawk_dispatch_stage`. PROJECTION:
+  `ping.go::pageClassEvents` turns it into the page-class kind
+  `driver_act_awaiting_operator_dispatch` ("🔁 The campaign driver advanced
+  this run, and no dispatcher will run its <stage type> stage — dispatch it with
+  `fishhawk_dispatch_stage`."); the stage type comes from the live stage, never
+  the payload, and a row without a UUID `stage_id` or an `episode_key` projects
+  nothing. It fires immediately through the pings-only `notifyPageClass`, once
+  after the appends. RESOLUTION: `pageEventResolved` treats it as resolved once
+  the named stage is absent, has left `awaiting_host_dispatch`, is parked in a
+  later episode, or the run is terminal. Best-effort: a failed read or append
+  loses the page permanently; the campaign status awaiting block
+  (`human`/`operator_dispatch`) remains. An unmarked run's first plan park and a
+  post-rebase verify-only re-open are not driver acts and do not page here.
 - The stall-watch operator pages — `stage_failed_awaiting_operator` and
   `child_dispatch_awaiting_operator` (#5497) — are **system-actor
   (`system:stall-watch`), stage-scoped audit kinds that are PINGS-ONLY: no

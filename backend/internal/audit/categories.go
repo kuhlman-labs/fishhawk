@@ -461,6 +461,16 @@ import "sort"
 // kind, auto_dispatch flag and a server-written reason, so
 // withholdScopeOverlapFromRunBound needs no entry for it. It takes the
 // mandatory run-bound flag when #4599 / E89 #4537 lands.
+// #5562 added campaign_driver_act_awaiting_operator, a stage-scoped system row
+// server/campaign_gate_outcome.go appends when a campaign-driver act leaves a
+// stage parked at awaiting_host_dispatch on a run no dispatcher will spawn. It
+// is a pings-only PAGE-CLASS marker projected by issuecomment.pageClassEvents
+// (no activityCategories entry, no Notifier method). It is INTENDED run-bound
+// READABLE because its payload names only this run's own stage id, type and
+// state, the park episode key, the driver's delegation verb, runner kind, the
+// auto_dispatch flag, a closed next_action and a server-written reason. It is
+// an interim ADR-106 registration that takes the mandatory run-bound flag with
+// #4599 / E89 #4537.
 // E110.50 / #5486 added run_dispatch_hold_set and run_dispatch_hold_cleared,
 // the operator per-run dispatch hold verb's pair (POST
 // /v0/runs/{run_id}/dispatch-hold, server/run_dispatch_hold.go). The latest
@@ -548,6 +558,7 @@ var KnownCategories = map[string]struct{}{
 	"campaign_auto_start_refused":             {},
 	"campaign_cancelled":                      {},
 	"campaign_dependencies_refreshed":         {}, // E86.47 / #4358: the monotone tracker-edge refresh added held depends_on edges (server/campaign_dependency_refresh.go) — INTERNAL
+	"campaign_driver_act_awaiting_operator":   {},
 	"campaign_gate_acted":                     {},
 	"campaign_gate_decision_cleared":          {},
 	"campaign_gate_decision_required":         {},
