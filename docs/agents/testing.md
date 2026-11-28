@@ -83,6 +83,18 @@ Use `frontend-check`. jsdom must use the configured HTTPS localhost URL for
 worktree exception: stock Vite denies every file in those run checkouts and
 misreports missing modules. [frontend/README.md](../../frontend/README.md), #3030.
 
+## Security controls
+
+- **Counterfactual-vacuous refusal tests.** State what the test does with the
+  control deleted. Assert the refusal's identity, not a shared error code; for
+  an egress control prove the target was never dialed; point targets at
+  reachable in-test servers; pair a malformed input with itself on byte-exact
+  comparisons; assert a cap's own refusal. See
+  `backend/internal/prompt/README.md` (#2432).
+- **Check-then-use.** Use exactly what you validated: pin the resolved, bound or
+  canonical artifact, and revalidate on every hop. See
+  `backend/internal/prompt/README.md` (#2432).
+
 ## Cross-module wire types
 
 A duplicated marshaled/decoded struct pair must carry `CROSS-MODULE WIRE CONTRACT`
