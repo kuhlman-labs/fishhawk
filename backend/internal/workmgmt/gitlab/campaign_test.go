@@ -81,8 +81,10 @@ func TestResolveDependencies_ThreeIssueDAG(t *testing.T) {
 	}
 	want := &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
-			{Number: 1, Title: "issue 1", Complete: true, State: "CLOSED", Body: "one", URL: "https://gitlab.example/acme/widgets/-/issues/1", NotRunnable: true},
-			{Number: 2, Title: "issue 2", State: "OPEN", Body: "two", URL: "https://gitlab.example/acme/widgets/-/issues/2"},
+			// Unlabelled children resolve to the request default; it is zero here,
+			// so they degrade to the built-in medium (ADR-069 decision 4, #5316).
+			{Number: 1, Title: "issue 1", Autonomy: "medium", Complete: true, State: "CLOSED", Body: "one", URL: "https://gitlab.example/acme/widgets/-/issues/1", NotRunnable: true},
+			{Number: 2, Title: "issue 2", Autonomy: "medium", State: "OPEN", Body: "two", URL: "https://gitlab.example/acme/widgets/-/issues/2"},
 			{Number: 3, Title: "issue 3", Autonomy: "high", State: "OPEN", Body: "three", URL: "https://gitlab.example/acme/widgets/-/issues/3"},
 		},
 		Edges: []workmgmt.DependsEdge{{From: 3, To: 1, Source: workmgmt.DependencySourceNative}},
@@ -355,6 +357,45 @@ func epicFixture() *fakeAPI {
 func epicChildren(t *testing.T, api *fakeAPI, epic string) (*workmgmt.EpicChildrenResult, error) {
 	t.Helper()
 	return New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{Target: glTarget(), Epic: epic})
+}
+
+// TestResolveDependencies_UnlabelledItemResolvesToRequestDefault pins the
+// gitlab provider threading (#5316) on BOTH campaign sources: an unlabelled
+// issue resolves to the request's DefaultAutonomy, a declared tier still wins.
+func TestResolveDependencies_UnlabelledItemResolvesToRequestDefault(t *testing.T) {
+	t.Run("issue set", func(t *testing.T) {
+		api := &fakeAPI{}
+		api.issue(1, "opened", "one", nil).
+			issue(2, "opened", "two", []string{"autonomy:high"})
+		res, err := New(api).ResolveDependencies(context.Background(), workmgmt.IssueSetRequest{Target: glTarget(), Items: []string{"1", "2"}, DefaultAutonomy: "low"})
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		want := map[int]string{1: "low", 2: "high"}
+		if len(res.Children) != len(want) {
+			t.Fatalf("children = %+v, want #1 and #2", res.Children)
+		}
+		for _, c := range res.Children {
+			if c.Autonomy != want[c.Number] {
+				t.Errorf("#%d Autonomy = %q, want %q (request DefaultAutonomy low)", c.Number, c.Autonomy, want[c.Number])
+			}
+		}
+	})
+	t.Run("epic children", func(t *testing.T) {
+		api := epicFixture()
+		res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{Target: glTarget(), Epic: "issue:100", DefaultAutonomy: "low"})
+		if err != nil {
+			t.Fatalf("EpicChildren: %v", err)
+		}
+		if len(res.Children) == 0 {
+			t.Fatal("no children resolved")
+		}
+		for _, c := range res.Children {
+			if c.Autonomy != "low" {
+				t.Errorf("#%d Autonomy = %q, want low (unlabelled child, request DefaultAutonomy low)", c.Number, c.Autonomy)
+			}
+		}
+	})
 }
 
 func TestEpicChildren_RelatesToWithParentMarker(t *testing.T) {

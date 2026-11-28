@@ -60,8 +60,10 @@ type campaignPreviewItem struct {
 	// valid and the invalid path.
 	DependsOn []string `json:"depends_on"`
 	Wave      *int     `json:"wave,omitempty"`
-	Autonomy  string   `json:"autonomy,omitempty"`
-	Position  int      `json:"position"`
+	// Autonomy is always present (#5316): the declared tier, or the
+	// repository conventions' default for an absent or unrecognised label.
+	Autonomy string `json:"autonomy"`
+	Position int    `json:"position"`
 }
 
 // campaignPreviewDangling is one depends_on edge that blocks assembly, reported
@@ -368,8 +370,10 @@ func partialPreviewReport(repo, epicRef string, source *campaignSourceResolution
 		items = append(items, campaignPreviewItem{
 			IssueRef:  "issue:" + strconv.Itoa(c.Number),
 			DependsOn: nonNilRefs(depsOf[c.Number]),
-			Autonomy:  c.Autonomy,
-			Position:  i,
+			// Normalized so an invalid-set preview item always carries a tier,
+			// even when a provider leaves the field empty (#5316).
+			Autonomy: workmgmt.NormalizeAutonomyTier(c.Autonomy),
+			Position: i,
 		})
 	}
 	return campaignPreviewResponse{
