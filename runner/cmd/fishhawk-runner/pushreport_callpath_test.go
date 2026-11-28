@@ -223,7 +223,7 @@ func TestPersistAndReport_PushReportFailedThenUploadTrace(t *testing.T) {
 			}
 
 			time.Sleep(600 * time.Millisecond)
-			if err := uploadTrace(context.Background(), cfg, "raw", []byte("bundle"), io.Discard, c, issued); err != nil {
+			if _, err := uploadTrace(context.Background(), cfg, "raw", []byte("bundle"), io.Discard, c, issued); err != nil {
 				t.Errorf("assert: uploadTrace after a failed push report: %v", err)
 			}
 			if got := b.count(routeTraceRaw); got != 1 {
