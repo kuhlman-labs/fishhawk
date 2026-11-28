@@ -31288,15 +31288,19 @@ paths:
         at a gate with a recorded approve decision, and only from the stage's
         own newest plan artifact when that artifact was created no later than
         the stage's `ended_at` — the transition that succeeded the plan
-        stage — and no later than the stage's earliest approve row.
-        `ended_at` is stamped from the daemon's clock and `created_at` by the
-        database, so the approve-row check (both database clock; the closing
-        approve is recorded before the transition) keeps a clock skew from
-        admitting a late upload. A same-state re-approval moves neither
-        bound, so an artifact uploaded after the gate closed is refused
+        stage. A same-state re-approval does not move `ended_at`, and
+        approve rows never move the binding: a vote recorded before a
+        revise_plan on the same stage does not block the revised plan. An
+        artifact created after `ended_at` is refused
         `409 plan_changed_since_approval`: start a new run, because the
-        artifact changed after the plan gate closed. An approve row recorded
-        before the final artifact refuses too (fail closed).
+        artifact changed after the plan gate closed. A succeeded stage with
+        no `ended_at` is refused with the same code and a remedy that names
+        the missing `ended_at`. Accepted residual: `created_at` is the
+        database's clock and `ended_at` the daemon's, so a skew of d errs
+        both ways. A daemon clock behind refuses a plan uploaded less than d
+        before approval. A daemon clock ahead admits one uploaded less than d
+        after the gate closed; that needs a plan upload onto a succeeded
+        stage, which #5601 closes.
 
         **Progress.** A detached filing that aborts writes no terminal
         marker, so a missing `split_children_filed` is not proof of progress.
@@ -31323,9 +31327,8 @@ paths:
         `no_approve_decision`); `409 no_split_proposal` (`details.reason`
         `no_plan_artifact`, `plan_artifact_undecodable` or
         `no_split_proposal`); `409 plan_changed_since_approval`
-        (`details.artifact_id`, `artifact_created_at`, `stage_ended_at`,
-        `first_approve_submitted_at`); `409
-        split_filing_repo_malformed`; `409 split_filing_no_parent_issue`;
+        (`details.artifact_id`, `artifact_created_at`, `stage_ended_at`
+        when recorded); `409 split_filing_repo_malformed`; `409 split_filing_no_parent_issue`;
         `409 split_filing_in_progress` (`details.budget_seconds`); `409
         split_filing_refused` (a prior over-cap refusal marker); `500
         split_filing_resume_failed` (the plan load or the attribution append

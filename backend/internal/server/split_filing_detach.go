@@ -185,8 +185,7 @@ const (
 	// splitFilingNotConfigured: AuditRepo, RunRepo or ArtifactRepo is nil.
 	splitFilingNotConfigured
 	// splitFilingPlanChanged: the stage's newest plan artifact postdates the
-	// transition that succeeded the plan stage (AA1) — its EndedAt, or on the
-	// database's clock its earliest approve row; nothing was spawned.
+	// transition that succeeded the plan stage (AA1); nothing was spawned.
 	splitFilingPlanChanged
 )
 

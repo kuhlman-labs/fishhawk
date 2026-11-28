@@ -290,10 +290,11 @@ func TestResumeSplitFiling_RealServerDecodes202(t *testing.T) {
 	}
 	// The artifact is created BEFORE the approve row and the stage success. Its
 	// created_at is the DATABASE's now() while EndedAt is stamped from this
-	// process's clock, so the AA1 EndedAt check compares two clocks: wait until
-	// this process's clock has passed the artifact's created_at before the
-	// stage succeeds, so a database clock running ahead of the test process
-	// cannot refuse the resume. The approve-row check is database-clock only.
+	// process's clock, so the AA1 EndedAt check compares two clocks (the
+	// accepted residual on loadSplitPlanForStage): wait until this process's
+	// clock has passed the artifact's created_at before the stage succeeds, so
+	// a database clock running ahead of the test process cannot refuse the
+	// resume.
 	sv := "standard_v1"
 	art, err := artRepo.Create(ctx, artifact.CreateParams{
 		StageID: st.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: resumeSplitPlanJSON(t),

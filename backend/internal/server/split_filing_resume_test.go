@@ -300,30 +300,6 @@ func TestResumeSplitFiling_UndecodableOwnArtifact409(t *testing.T) {
 	}
 }
 
-// TestResumeSplitFiling_ArtifactAfterFirstApproveOnDBClock409: the artifact
-// predates EndedAt on the daemon clock but postdates the earliest approve row
-// on the database clock (the clock artifacts.created_at uses). A later
-// re-approval row (base+2m) cannot widen the bound: the EARLIEST row decides.
-// Refused naming the approve-row time; nothing filed.
-func TestResumeSplitFiling_ArtifactAfterFirstApproveOnDBClock409(t *testing.T) {
-	h := newResumeHarness(t, func(c *splitFilingConfig) {
-		c.artifactAt = splitFixtureBase.Add(30 * time.Second)
-		c.endedAt = splitFixtureBase.Add(time.Minute)
-		c.approvedAt = splitFixtureBase.Add(10 * time.Second)
-	})
-	h.ar.all = append(h.ar.all, &approval.Approval{
-		ID: uuid.New(), StageID: h.planStage.ID, ApproverSubject: "late-reapprover",
-		Decision: approval.DecisionApprove, SubmittedAt: splitFixtureBase.Add(2 * time.Minute),
-	})
-	eb := wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodePlanChanged)
-	if eb.Details["first_approve_submitted_at"] != "2026-11-01T12:00:10Z" {
-		t.Errorf("details.first_approve_submitted_at = %v, want 2026-11-01T12:00:10Z", eb.Details["first_approve_submitted_at"])
-	}
-	if eb.Details["artifact_id"] != h.planArtifact.ID.String() {
-		t.Errorf("details.artifact_id = %v, want %s", eb.Details["artifact_id"], h.planArtifact.ID)
-	}
-}
-
 // TestResumeSplitFiling_StoreReadErrors (77a8e926 a-c): each read before the
 // claim surfaces its error as 500 internal_error with nothing recorded,
 // launched or held.
@@ -427,6 +403,25 @@ func TestResumeSplitFiling_PlanChangedSinceApproval409(t *testing.T) {
 	}
 	if !strings.Contains(eb.Message, "start a new run, because the artifact changed after the plan gate closed") {
 		t.Errorf("remedy = %q, want the start-a-new-run text", eb.Message)
+	}
+}
+
+// TestResumeSplitFiling_NoEndedAt409: a succeeded stage that records no
+// EndedAt is refused, but the EndedAt comparison never ran, so the remedy must
+// not claim the artifact changed after the gate closed, and details carry no
+// stage_ended_at.
+func TestResumeSplitFiling_NoEndedAt409(t *testing.T) {
+	h := newResumeHarness(t, nil)
+	h.planStage.EndedAt = nil
+	eb := wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodePlanChanged)
+	if strings.Contains(eb.Message, "changed after the plan gate closed") {
+		t.Errorf("remedy = %q claims the artifact changed after the gate closed, but no EndedAt comparison ran", eb.Message)
+	}
+	if !strings.Contains(eb.Message, "records no ended_at") || !strings.Contains(eb.Message, "start a new run") {
+		t.Errorf("remedy = %q, want the no-ended_at text naming a new run", eb.Message)
+	}
+	if _, ok := eb.Details["stage_ended_at"]; ok {
+		t.Errorf("details.stage_ended_at = %v, want absent", eb.Details["stage_ended_at"])
 	}
 }
 

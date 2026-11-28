@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
@@ -288,7 +290,8 @@ func TestApproveAdvance_ArtifactAfterSuccess_ReapprovalLaunchesNothing(t *testin
 
 // TestLoadSplitPlanForStage_NoEndedAtRefuses: a stage with no recorded
 // gate-close time cannot prove any artifact predates it, so the hook files
-// nothing (fail closed).
+// nothing (fail closed). The EndedAt comparison never ran, so the WARN must
+// not claim the artifact changed after the gate closed.
 func TestLoadSplitPlanForStage_NoEndedAtRefuses(t *testing.T) {
 	h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
 	h.planStage.EndedAt = nil
@@ -296,8 +299,12 @@ func TestLoadSplitPlanForStage_NoEndedAtRefuses(t *testing.T) {
 	if got := h.provider.requestCount(); got != 0 {
 		t.Errorf("File requests = %d, want 0", got)
 	}
-	if !strings.Contains(h.logs.String(), "changed after the plan gate closed") {
-		t.Errorf("no plan-changed WARN; logs:\n%s", h.logs.String())
+	logs := h.logs.String()
+	if !strings.Contains(logs, "split filing: skipped; the plan stage records no ended_at") {
+		t.Errorf("no no-ended_at WARN; logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "changed after the plan gate closed") {
+		t.Errorf("WARN claims the artifact changed after the gate closed, but no EndedAt comparison ran; logs:\n%s", logs)
 	}
 }
 
@@ -479,68 +486,110 @@ func TestStartSplitFilingDetached_PrelaunchBudgetBoundsLoad(t *testing.T) {
 	}
 }
 
-// TestApproveAdvance_ArtifactAfterFirstApproveOnDBClock_LaunchesNothing: the
-// artifact predates EndedAt on the daemon clock (base+30s < base+1m) but was
-// created after the earliest approve row on the database clock (base+10s), the
-// shape a daemon clock leading the database's produces for an upload just
-// after the gate closed. The re-approval launches nothing and the WARN names
-// the approve-row time; only the database-clock check is in the path.
-func TestApproveAdvance_ArtifactAfterFirstApproveOnDBClock_LaunchesNothing(t *testing.T) {
-	h := newSplitFilingHarness(t, splitFilingConfig{
-		withSplitProposal: true, approvalGate: true, approvedAlready: true,
-		artifactAt: splitFixtureBase.Add(30 * time.Second), endedAt: splitFixtureBase.Add(time.Minute),
-		approvedAt: splitFixtureBase.Add(10 * time.Second),
-	})
-	h.approveAs(t, context.Background(), "approver-two", *h.planStage)
-	h.s.waitSplitFiling()
-
-	if got := h.launches(); got != 0 {
-		t.Errorf("launches = %d, want 0", got)
-	}
-	if got := h.provider.requestCount(); got != 0 {
-		t.Errorf("File requests = %d, want 0", got)
-	}
-	logs := h.logs.String()
-	if !strings.Contains(logs, "changed after the plan gate closed") || !strings.Contains(logs, "first_approve_submitted_at=2026-11-01T12:00:10") {
-		t.Errorf("plan-changed WARN missing or does not name the approve-row time; logs:\n%s", logs)
-	}
+// quorumPlanSpec is a feature_change spec whose plan gate declares an
+// approvals block of the given count, so approveStageAs takes the quorum path
+// (a sub-quorum or delegated approve row is recorded without advancing).
+func quorumPlanSpec(count int) []byte {
+	return []byte(fmt.Sprintf(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: %d
+`, count))
 }
 
-// TestLoadSplitPlanForStage_ApproveRowWitness pins the database-clock witness:
-// no approve row refuses; only APPROVE rows count (an earlier reject row is
-// ignored); no ApprovalRepo refuses as a load error.
-func TestLoadSplitPlanForStage_ApproveRowWitness(t *testing.T) {
-	t.Run("no_approve_row_refuses", func(t *testing.T) {
-		h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
-		h.ar.all = nil
-		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
-		if got := h.provider.requestCount(); got != 0 {
-			t.Errorf("File requests = %d, want 0", got)
-		}
-		if !strings.Contains(h.logs.String(), "changed after the plan gate closed") {
-			t.Errorf("no plan-changed WARN; logs:\n%s", h.logs.String())
-		}
-	})
-	t.Run("earlier_reject_row_ignored", func(t *testing.T) {
-		h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
-		h.ar.all = append(h.ar.all, &approval.Approval{
-			ID: uuid.New(), StageID: h.planStage.ID, ApproverSubject: "early-rejecter",
-			Decision: approval.DecisionReject, SubmittedAt: splitFixtureBase.Add(-time.Hour),
+// TestApproveAdvance_VoteThenReviseThenClosingApprove_FilesEveryPhase (fix-up
+// 813ef1c0 / d2c957f6 / 3d74d06e): an approve row recorded while the plan
+// stage still awaits approval is NOT the gate's close. The row is a quorum's
+// first vote or an uncounted delegated vote; a revise_plan then re-plans in
+// place on the SAME stage (a new plan artifact, approval rows untouched);
+// the closing approve succeeds the stage. Every phase of the revised plan is
+// filed on approval, and the resume is a no-op 200 completed. The early row
+// is seeded BEFORE the revised artifact BY CONSTRUCTION (base+10s < base+30s
+// < EndedAt base+1m), so a binding that an approve row could move refuses
+// here.
+func TestApproveAdvance_VoteThenReviseThenClosingApprove_FilesEveryPhase(t *testing.T) {
+	for name, tc := range map[string]struct {
+		count     int
+		firstVote Identity
+		rule      string
+	}{
+		"quorum_first_vote":       {count: 2, firstVote: approverIdentity("github:first-voter")},
+		"uncounted_delegated_row": {count: 1, firstVote: approverIdentity("github:op"), rule: "clean_dual_approval"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true, approvalGate: true, runState: run.StateRunning})
+			specBytes := quorumPlanSpec(tc.count)
+			if _, err := spec.ParseBytes(specBytes); err != nil {
+				t.Fatalf("fixture spec does not parse: %v", err)
+			}
+			h.rr.getRuns[h.runID].WorkflowSpec = specBytes
+			ctx := context.Background()
+
+			// (1) The early approve row: recorded, below quorum or uncounted.
+			observed := *h.planStage
+			if _, err := h.s.approveStageAs(ctx, tc.firstVote, approveActionParams{
+				Stage: &observed, Decision: approval.DecisionApprove, DelegatedRule: tc.rule,
+			}); err != nil {
+				t.Fatalf("first vote: %v", err)
+			}
+			if got := h.planStage.State; got != run.StageStateAwaitingApproval {
+				t.Fatalf("stage state after the first vote = %q, want awaiting_approval (the vote must not close the gate)", got)
+			}
+			if len(h.ar.all) != 1 {
+				t.Fatalf("approval rows after the first vote = %d, want 1", len(h.ar.all))
+			}
+			h.ar.all[0].SubmittedAt = splitFixtureBase.Add(10 * time.Second)
+
+			// (2)+(3) revise_plan in place: a new artifact on the SAME stage,
+			// after the early row. Approval rows are untouched.
+			sv := "standard_v1"
+			revised, err := h.art.Create(ctx, artifact.CreateParams{
+				StageID: h.planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: splitPlanBytes(t, true),
+			})
+			if err != nil {
+				t.Fatalf("seed revised artifact: %v", err)
+			}
+			revised.CreatedAt = splitFixtureBase.Add(30 * time.Second)
+
+			// (4) The closing approve succeeds the stage at EndedAt base+1m.
+			h.approveAs(t, ctx, "github:closer", *h.planStage)
+			h.s.waitSplitFiling()
+			if got := h.planStage.State; got != run.StageStateSucceeded {
+				t.Fatalf("stage state after the closing approve = %q, want succeeded", got)
+			}
+			if got := h.launches(); got != 1 {
+				t.Errorf("launches = %d, want 1", got)
+			}
+			if got := h.provider.requestCount(); got != 3 {
+				t.Errorf("File requests = %d, want 3 (every phase of the revised plan)", got)
+			}
+			if _, n := h.completionEntry(t); n != 1 {
+				t.Errorf("split_children_filed entries = %d, want 1", n)
+			}
+			if logs := h.logs.String(); strings.Contains(logs, "split filing: skipped") {
+				t.Errorf("unexpected skipped-filing WARN; logs:\n%s", logs)
+			}
+
+			// The resume is a no-op: 200 completed, nothing filed again.
+			resp := decodeResumeResponse(t, h.resume(t, resumeOperatorID()), http.StatusOK)
+			if resp.State != splitFilingResumeStateCompleted {
+				t.Errorf("resume state = %q, want completed", resp.State)
+			}
+			h.s.waitSplitFiling()
+			if got := h.provider.requestCount(); got != 3 {
+				t.Errorf("File requests after the resume = %d, want 3", got)
+			}
 		})
-		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
-		if got := h.provider.requestCount(); got != 3 {
-			t.Errorf("File requests = %d, want 3 (a reject row is not a gate-close witness)", got)
-		}
-	})
-	t.Run("no_approval_repo_load_error", func(t *testing.T) {
-		h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
-		h.s.cfg.ApprovalRepo = nil
-		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
-		if got := h.provider.requestCount(); got != 0 {
-			t.Errorf("File requests = %d, want 0", got)
-		}
-		if !strings.Contains(h.logs.String(), "approval repository not configured") {
-			t.Errorf("no load-error WARN naming the missing repo; logs:\n%s", h.logs.String())
-		}
-	})
+	}
 }

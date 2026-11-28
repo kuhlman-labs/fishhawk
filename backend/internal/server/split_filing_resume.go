@@ -26,10 +26,9 @@ import (
 // plan stage, only when that stage was approved at a gate with a recorded
 // approve decision, and only from that stage's own newest plan artifact when
 // the artifact was created no later than the stage's EndedAt — the transition
-// that actually succeeded the plan stage (AA1) — and no later than the stage's
-// earliest approve row, the same check on the database's clock
-// (loadSplitPlanForStage). Every refusal precedes any write and names its
-// remedy.
+// that actually succeeded the plan stage (AA1). Approve rows never move that
+// binding; its two-clock residual is documented on loadSplitPlanForStage.
+// Every refusal precedes any write and names its remedy.
 //
 // A detached filing that aborts writes no terminal marker, so a missing
 // split_children_filed entry is NOT proof of progress. The longest a caller
@@ -184,15 +183,15 @@ func (s *Server) handleResumeSplitFiling(w http.ResponseWriter, r *http.Request)
 			"run_id": runID.String(), "stage_id": planStage.ID.String(),
 			"artifact_id": src.artifactID.String(), "artifact_created_at": src.createdAt.UTC().Format(time.RFC3339Nano),
 		}
-		if !src.boundAt.IsZero() {
+		msg := "the plan stage's newest plan artifact was created after the plan gate closed, so nothing is filed from it; start a new run, because the artifact changed after the plan gate closed"
+		if src.boundAt.IsZero() {
+			// No EndedAt: the comparison never ran, so the text must not claim
+			// the artifact changed after the gate closed.
+			msg = "the plan stage records no ended_at, so its newest plan artifact cannot be shown to predate the plan gate's close and nothing is filed from it; start a new run"
+		} else {
 			details["stage_ended_at"] = src.boundAt.UTC().Format(time.RFC3339Nano)
 		}
-		if !src.approvedAt.IsZero() {
-			details["first_approve_submitted_at"] = src.approvedAt.UTC().Format(time.RFC3339Nano)
-		}
-		s.writeError(w, r, http.StatusConflict, splitFilingResumeCodePlanChanged,
-			"the plan stage's newest plan artifact was created after the plan gate closed, so nothing is filed from it; start a new run, because the artifact changed after the plan gate closed",
-			details)
+		s.writeError(w, r, http.StatusConflict, splitFilingResumeCodePlanChanged, msg, details)
 		return
 	case splitPlanUndecodable:
 		s.splitFilingResumeNoSplit(w, r, runID, planStage, "plan_artifact_undecodable")

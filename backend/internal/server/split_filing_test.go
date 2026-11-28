@@ -368,8 +368,8 @@ type splitFilingConfig struct {
 	epicChildren    []workmgmt.EpicChild
 	epicChildrenErr error
 
-	// #3925 options. approvalGate gives the plan stage RequiresApproval (every
-	// harness wires a fake ApprovalRepo); the stage starts at awaiting_approval, or —
+	// #3925 options. approvalGate gives the plan stage RequiresApproval and
+	// wires a fake ApprovalRepo; the stage starts at awaiting_approval, or —
 	// with approvedAlready — at succeeded with EndedAt and one approve row
 	// seeded BY CONSTRUCTION. The promptRunRepo does not stamp ended_at the
 	// way postgres does, so the harness stamps it on every terminal transition.
@@ -394,9 +394,6 @@ type splitFilingConfig struct {
 	// base+1m, so the artifact predates the gate's close.
 	artifactAt time.Time
 	endedAt    time.Time
-	// approvedAt seeds the seeded approve row's SubmittedAt (the database
-	// clock) BY CONSTRUCTION; zero defaults to endedAt.
-	approvedAt time.Time
 }
 
 // splitFixtureBase is the fixed clock the harness assigns timestamps from.
@@ -411,7 +408,7 @@ type splitFilingHarness struct {
 	querier   *splitQueryProvider // nil unless cfg.withQuerier
 	runID     uuid.UUID
 	planStage *run.Stage
-	// #3925: art is the artifact repo, ar the approval repo (always wired),
+	// #3925: art is the artifact repo, ar the approval repo (approvalGate),
 	// planArtifact the seeded split artifact, parentRunID the parentRun
 	// option's parent, logs the WARN/ERROR capture.
 	art          *fakeArtifactRepo
@@ -577,31 +574,18 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 		endedAt = splitFixtureBase.Add(time.Minute)
 	}
 	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded, EndedAt: &endedAt}
-	// Every harness wires an approval repo: the split loader reads the earliest
-	// approve row as the database-clock witness of the gate's close, and fails
-	// closed without one. A stage that starts succeeded carries one approve row
-	// submitted at approvedAt (default endedAt) BY CONSTRUCTION.
-	ar := newFakeApprovalRepo()
-	approvedAt := cfg.approvedAt
-	if approvedAt.IsZero() {
-		approvedAt = endedAt
-	}
-	seedApprove := func() {
-		ar.all = append(ar.all, &approval.Approval{
-			ID: uuid.New(), StageID: planStageID, ApproverSubject: "seed-approver",
-			Decision: approval.DecisionApprove, SubmittedAt: approvedAt,
-		})
-	}
-	if !cfg.approvalGate {
-		seedApprove()
-	}
+	var ar *fakeApprovalRepo
 	if cfg.approvalGate {
+		ar = newFakeApprovalRepo()
 		planStage.RequiresApproval = true
 		if !cfg.approvedAlready {
 			planStage.State = run.StageStateAwaitingApproval
 			planStage.EndedAt = nil
 		} else {
-			seedApprove()
+			ar.all = append(ar.all, &approval.Approval{
+				ID: uuid.New(), StageID: planStageID, ApproverSubject: "seed-approver",
+				Decision: approval.DecisionApprove, SubmittedAt: endedAt,
+			})
 		}
 		// promptRunRepo does not stamp ended_at; postgres does on every
 		// terminal entry (and not on a same-state short-circuit).
@@ -650,7 +634,9 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	logs := &syncBuffer{}
 	scfg := Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
-	scfg.ApprovalRepo = ar
+	if ar != nil {
+		scfg.ApprovalRepo = ar
+	}
 	s := New(scfg)
 	// V5: no detached filer may outlive its test and file against the NEXT
 	// test's provider through the process-global workmgmt registry.
