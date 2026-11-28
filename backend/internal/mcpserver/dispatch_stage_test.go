@@ -3116,12 +3116,13 @@ func TestDispatchStage_UnresolvedDefaultBranch_RefusesBeforeMarker(t *testing.T)
 	}
 }
 
-// TestDispatchStage_Description_HostCapacity pins the #4241 (ADR-094 D4/A2)
+// TestDispatchStage_Description_HostCapacity pins the #4241 (ADR-094 D4/A2/A4)
 // concurrency sentences, which supersede #5214 rule 11: every host-dispatched
-// stage holds a host capacity slot, review stages included, a queued stage
-// reserves one slot, the concrete reservation example, and that every
-// host-spawn verb queues (#3969). It also pins that the old "only implement is
-// grouped" sentences and the #3969 interim are gone.
+// stage holds a host capacity slot, review stages included, an earlier queued
+// stage reserves a capacity slot only while it is capacity-bound (A4), the
+// capacity-3 example, and that every host-spawn verb queues (#3969). It also
+// pins that the old "only implement is grouped" sentences, the #3969 interim
+// and A2's withdrawn reservation reading are gone.
 func TestDispatchStage_Description_HostCapacity(t *testing.T) {
 	desc := strings.Join(strings.Fields(listToolDescriptions(t)["fishhawk_dispatch_stage"]), " ")
 	for _, want := range []string{
@@ -3132,13 +3133,13 @@ func TestDispatchStage_Description_HostCapacity(t *testing.T) {
 		"An implement also holds local-implement:<host>",
 		"holds local-verify:<host>",
 		"ADDS groups to these defaults",
-		"each earlier queued stage reserves one slot",
-		"capacity blocks only when holders plus earlier reservations fill capacity",
-		"at capacity 3 with implement limit 2, two holding implements plus one queued implement fill capacity",
-		"at capacity 4 one slot stays free",
+		"an earlier queued stage reserves a slot only while it is capacity-bound (every other group of its set would admit it now) and is never a FIFO barrier there",
+		"capacity blocks only when holders plus earlier capacity-bound reservations reach the limit",
+		"A stage queued only on another group reserves no capacity slot (ADR-094 A4)",
+		"at capacity 3 with implement limit 2, two holding implements and any number of queued implements leave one capacity slot for a plan, acceptance or verify pass",
 		"Every host-spawn verb queues the same way (#3969): fishhawk_run_stage returns outcome awaiting_concurrency_slot, fishhawk_drive_run stops awaiting_concurrency_slot, and fishhawk_run_children marks the child queued",
 		"this session's slot waiter spawns the runner on admission",
-		"For plan and acceptance stages a queue happens only when holders plus earlier reservations fill capacity",
+		"For plan and acceptance stages a queue happens only when holders plus earlier capacity-bound reservations reach the limit",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_dispatch_stage description missing %q:\n%s", want, desc)
@@ -3151,6 +3152,12 @@ func TestDispatchStage_Description_HostCapacity(t *testing.T) {
 		"only when host capacity is actually full",
 		"Until #3969",
 		"fail closed on a queued dispatch",
+		// Withdrawn by ADR-094 A4: a waiter blocked on another group
+		// reserves no capacity slot.
+		"at capacity 4 one slot stays free",
+		"two holding implements plus one queued implement fill capacity",
+		"each earlier queued stage reserves one slot",
+		"holders plus earlier reservations fill capacity",
 	} {
 		if strings.Contains(desc, gone) {
 			t.Errorf("fishhawk_dispatch_stage description still says %q", gone)

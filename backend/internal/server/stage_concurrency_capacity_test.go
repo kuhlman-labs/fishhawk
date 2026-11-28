@@ -209,7 +209,8 @@ func TestHostDispatch_CapacityDeclarationIsPerRequest(t *testing.T) {
 
 // capacityExemptFixture (C1): capacity 6 on h4 with implement {limit: 2}.
 // I1 and I2 are admitted and I3 is QUEUED on local-implement:h4 — an earlier
-// fresh multi-group waiter on host:h4:capacity.
+// fresh multi-group waiter on host:h4:capacity that is not capacity-bound
+// (local-implement:h4 is full), so it reserves no capacity slot (ADR-094 A4).
 func capacityExemptFixture(t *testing.T) (f *scPG, doc string, i3 *run.Stage) {
 	t.Helper()
 	f = newSCPG(t, pgStore)
@@ -225,8 +226,8 @@ func capacityExemptFixture(t *testing.T) (f *scPG, doc string, i3 *run.Stage) {
 }
 
 // admitLaterStages admits a plan, an acceptance and a merge-candidate verify
-// pass on h4 at capacity 6: holders 2, 3 and 4, each + I3's one reservation,
-// stay below 6.
+// pass on h4 at capacity 6: holders 2, 3 and 4, each + 0 reservations (I3 is
+// not capacity-bound), stay below 6.
 func admitLaterStages(f *scPG, doc string) {
 	f.t.Helper()
 	body := capacityBody("h4", 6)
@@ -245,8 +246,8 @@ func admitLaterStages(f *scPG, doc string) {
 // vehicle): a queued implement never FIFO-blocks a later stage of another
 // type on the capacity group. With rule (b) re-applied to capacity, I3's
 // earlier fresh queued row on host:h4:capacity queues the plan; condition (a)
-// passes (2 holders + 1 reservation < 6), so rule (b) is the only thing in
-// the path. I3 stays queued throughout.
+// passes (2 holders + 0 reservations < 6: I3 is not capacity-bound), so rule
+// (b) is the only thing in the path. I3 stays queued throughout.
 func TestHostDispatch_CapacityExemptFromFIFOAcrossTypes(t *testing.T) {
 	f, doc, i3 := capacityExemptFixture(t)
 	admitLaterStages(f, doc)
@@ -260,19 +261,28 @@ func TestHostDispatch_CapacityExemptFromFIFOAcrossTypes(t *testing.T) {
 	}
 }
 
-// TestHostDispatch_CapacityFullQueuesLaterStages (C1, reservation reading):
-// after the later stages are admitted, 5 holders + I3's reservation = 6 fill
-// capacity, so a second plan is QUEUED on host:h4:capacity at limit 6 though
-// only 5 slots are held.
+// TestHostDispatch_CapacityFullQueuesLaterStages (ADR-094 A4 through the
+// real marker handler): after the later stages are admitted (5 holders), I3
+// is queued on local-implement:h4 at limit 2 and is not capacity-bound, so it
+// reserves no capacity slot and a second plan is ADMITTED (5 + 0 < 6). With 6
+// host:h4:capacity rows held, a third plan is QUEUED on host:h4:capacity at
+// limit 6 behind 6 holders.
 func TestHostDispatch_CapacityFullQueuesLaterStages(t *testing.T) {
-	f, doc, _ := capacityExemptFixture(t)
+	f, doc, i3 := capacityExemptFixture(t)
 	admitLaterStages(f, doc)
-	d, _, _ := f.queued(f.specStageOf("org/one", run.StageTypePlan, doc), capacityBody("h4", 6))
-	if d.Group != "host:h4:capacity" || d.Limit != 6 || len(d.Holders) != 5 {
-		t.Fatalf("second plan details = %+v, want queued in host:h4:capacity at limit 6 behind 5 holders", d)
+	body := capacityBody("h4", 6)
+	f.admitted(f.specStageOf("org/one", run.StageTypePlan, doc), body)
+	if n := f.heldRows("host:h4:capacity"); n != 6 {
+		t.Errorf("held host:h4:capacity rows = %d, want 6", n)
 	}
-	if n := f.heldRows("host:h4:capacity"); n != 5 {
-		t.Errorf("held host:h4:capacity rows = %d, want 5", n)
+	d, _, _ := f.queued(f.specStageOf("org/one", run.StageTypePlan, doc), body)
+	if d.Group != "host:h4:capacity" || d.Limit != 6 || len(d.Holders) != 6 {
+		t.Fatalf("third plan details = %+v, want queued in host:h4:capacity at limit 6 behind 6 holders", d)
+	}
+	for _, r := range f.slotRows(i3.ID) {
+		if r.state != "queued" {
+			t.Fatalf("I3 slot rows = %+v, want every row still queued", f.slotRows(i3.ID))
+		}
 	}
 }
 

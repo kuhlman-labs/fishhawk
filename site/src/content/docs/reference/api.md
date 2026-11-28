@@ -227,11 +227,13 @@ agent review and any other agent-run stage. An implement also holds
 capacity limit applies to one request: the optional body field `capacity`
 (1 to 64), which the MCP server sends from `FISHHAWK_HOST_CAPACITY`, and 3
 when it is absent. Nothing is stored, so set the variable to the same value
-in every process that dispatches for the host. A queued stage reserves one
-capacity slot; later stages queue only when holders plus earlier
-reservations fill capacity. At capacity 3, two
-running implements and one queued implement fill it, and a later plan,
-acceptance or verify pass queues; at capacity 4 one slot stays free. A
+in every process that dispatches for the host. An earlier queued stage
+reserves a capacity slot only while every other group of its set would
+admit it now (ADR-094 A4); a stage queued only on another group reserves
+nothing. Later stages queue only when holders plus those reservations reach
+the limit. At capacity 3 with implement limit 2, two running implements and
+any number of queued implements leave one capacity slot for a plan,
+acceptance or verify pass. A
 queued stage gets 409 `concurrency_slot_queued` and keeps its state. A
 `capacity` outside 1 to 64, or one that is not an integer, gets 400
 `validation_failed` with `details.field` `capacity`. A workflow stage's

@@ -114,7 +114,9 @@ The SQL is hand-written pgx, with no sqlc (same precedent as
 7. **Lock hit**: decide fully before any write. Admit only when EVERY group
    G satisfies (a) `holders + job holders + round_ahead < Limit` AND (b)
    `multi_round_ahead == 0` (§ "Group sets and scoped keys"). (b) is not
-   checked on the host capacity group (§ "Host capacity group"). For a
+   checked on the host capacity group, and there (a) counts only the
+   CAPACITY-BOUND `round_ahead` waiters (ADR-094 A4, § "Host capacity
+   group"). For a
    single-group queue (b) is vacuous and (a) is ADR-087's rule. `round_ahead`
    counts only fresh queued rows enqueued at or before the round start
    (approval condition 2). A contended loser's row is inserted after it
@@ -202,15 +204,21 @@ Racing overlapping sets never leave a partial hold or over-admit a group
 set:
 
 - (a) `holders(G) + job holders(G) + round_ahead(G) < limit(G)`: ADR-087's
-  reservation formula, which reserves one slot per earlier fresh waiter; and
+  reservation formula, which reserves one slot per earlier fresh waiter; on
+  `host:<label>:capacity` only the earlier fresh waiters that are
+  capacity-bound reserve (ADR-094 A4, § "Host capacity group"); and
 - (b) `multi_round_ahead(G) == 0`: no earlier fresh waiter on G belongs to a
   set of more than one group (D2's strict per-group FIFO). (b) applies to
   every group EXCEPT `host:<label>:capacity`, which keeps only (a) (§ "Host
   capacity group").
 
+`groupAdmits` (`store.go`) is this rule for one group; the capacity
+classification applies the same function to each earlier capacity waiter.
+
 Read the other way: a later waiter on G is refused when (i) an earlier fresh
 waiter on G has a multi-group set, or (ii) no slot of G remains after
-reserving one per earlier fresh waiter. "Earlier" and "fresh" are the
+reserving one per earlier fresh waiter (on capacity, one per earlier
+capacity-bound waiter). "Earlier" and "fresh" are the
 `round_ahead` window of § "Admit, step by step" step 7, so (b) never counts a
 same-round entrant that (a) ignores. A dead multi-group waiter stops
 counting once it is stale past `QueueTTL`, so (b) cannot wedge a group.
@@ -293,7 +301,8 @@ one slot of the host capacity group, `CapacityGroupKey(host)` =
 many agent sessions one host runs at once, across stage types. The server
 builds every set (`backend/internal/server/stage_concurrency.go`,
 `resolveStageConcurrency`); the store sees ordinary keys and limits, and
-differs for capacity only in rule (b) and the binding preference.
+differs for capacity only in rule (b), the capacity-bound reservation count
+(ADR-094 A4) and the binding preference.
 
 | Stage | Default set (ADR-094 D5 as amended by A2) |
 |---|---|
@@ -329,39 +338,73 @@ Nearly every capacity waiter has a multi-group set (an implement also waits
 on `local-implement:<host>`), so strict per-group FIFO on capacity would
 queue every later plan, acceptance and verify pass behind an implement that
 is waiting for a DIFFERENT group. On `host:<label>:capacity`, `Admit`
-therefore checks only condition (a), ADR-087's reservation formula:
-`holders + job holders + round_ahead < limit` (job holders are 0 there:
-specialist jobs admit through `local-verify:<host>` only). Every other group
-of the set still checks (a) and (b). `TestAdmitSet_CapacityExemptFromFIFO`
-pins it: at capacity 6 and implement limit 2, with I1 and I2 holding and I3
-queued on `local-implement:<host>`, a later plan, acceptance and verify pass
-are each admitted (2 + 1, 3 + 1 and 4 + 1 are all below 6), and I3 stays
-queued. With (b) re-applied to capacity the plan queues.
+therefore checks only condition (a), with the reservation count narrowed
+below: `holders + job holders + capacity-bound round_ahead < limit` (job
+holders are 0 there: specialist jobs admit through `local-verify:<host>`
+only). Every other group of the set still checks (a) and (b).
+`TestAdmitSet_CapacityExemptFromFIFO` pins it: at capacity 6 and implement
+limit 2, with I1 and I2 holding and I3 queued on `local-implement:<host>`, a
+later plan, acceptance and verify pass are each admitted (I3 reserves
+nothing, and even counting it, 2 + 1, 3 + 1 and 4 + 1 are all below 6), and
+I3 stays queued. With (b) re-applied to capacity the plan queues.
 
-**A queued waiter still reserves a capacity slot.** (a) counts every earlier
-live waiter, including one queued only because ANOTHER group of its set is
-full. So "full" on capacity means holders + job holders + earlier live
-waiters >= limit: a later stage blocks only when holders plus earlier
-reservations fill capacity. Example: at capacity 3 with implement limit 2,
-two holding implements plus one queued implement fill capacity (2 + 1), so a
-later plan, acceptance or verify pass queues
-(`TestAdmitSet_CapacityReservationCountsAsFull`; once I2 settles, I3 and
-then the plan are admitted, and held capacity rows never exceed 3). At
-capacity 4 one slot stays free, so a host running implement limit 2 wants
-`FISHHAWK_HOST_CAPACITY=4`; each further queued implement reserves one more
-slot. A queued capacity reservation lasts until its waiter is admitted, and
-only while that waiter refreshes its row within `QueueTTL`: condition (a)
-counts only fresh queued rows, so a row stale past `QueueTTL` reserves
-nothing. `TestAdmitSet_StaleCapacityReservationEnds` pins it: at capacity
-3 with implement limit 2, I1 and I2 hold and I3 queues on
-`{capacity, implement}`; once only I3's row ages past `QueueTTL`, a new
-capacity-only stage is admitted at once. Since #3969 every host-spawn verb
+**Only a capacity-bound waiter reserves a capacity slot (ADR-094 A4).** On
+capacity, (a) counts an earlier fresh `round_ahead` waiter W only when W is
+CAPACITY-BOUND: every group of W's set other than capacity would admit W
+now, judged exactly as W's own `Admit` would judge it (`groupAdmits`), with
+the limit W's row for that group records, W's effective key, and that
+group's live holders, job holders and fresh waiters ahead of W. A waiter
+blocked on any other group (an implement behind `local-implement:<host>`, a
+verify pass behind `local-verify:<host>` or a running job there, a stage
+behind an earlier multi-group waiter by rule (b)) holds nothing and reserves
+no capacity; its reservations and FIFO barriers on its other groups are
+unchanged. A `{capacity}`-only waiter is always capacity-bound, so ADR-087's
+reservation is unchanged for it. The test never asks whether capacity itself
+would admit W, so nothing recurses. So "full" on capacity means holders +
+job holders + earlier capacity-bound waiters >= limit. Example: at capacity
+3 with implement limit 2, two holding implements and any number of queued
+implements leave one capacity slot for a plan, acceptance or verify pass
+(`TestAdmitSet_BlockedWaiterReservesNoCapacity`, which inverts A2's
+`TestAdmitSet_CapacityReservationCountsAsFull`). Size capacity to the host,
+not to the implement limit plus a margin. `TestAdmitSet_SecondInLineWaiterReservesNoCapacity`
+pins the rule-(b) arm, `TestAdmitSet_JobHeldGroupReservesNoCapacity` the
+job-holder arm, `TestAdmitSet_OtherGroupEarlierWaiterUnbindsCapacity` the
+earlier-waiter arm (counted from W's own key, so a waiter behind W never
+counts), `TestAdmitSet_CapacityBoundClassificationAccountScoped` the account
+scoping, and `TestAdmitSet_CapacityOnlyWaiterReserves` the `{capacity}`-only
+case.
+
+A waiter keeps its FIFO position on capacity: its fresh rows keep their
+`enqueued_at`, so the moment its other groups would admit it, it counts as
+capacity-bound at its original position for every later admitter, before it
+polls again. `TestAdmitSet_CapacityBoundWaiterKeepsPosition` is A4 item 3's
+fixture: at capacity 3 with implement limit 2, I1 and I2 hold, I3 queues on
+`{capacity, implement}`, plan P1 is admitted (three capacity holders) and
+plan P2 queues on capacity. When I2 settles, P2's re-ask is refused with two
+capacity holders (2 + I3's reservation = 3), and I3 is admitted on its next
+poll. A waiter that becomes capacity-bound after a later stage took the slot
+waits for one more capacity release.
+
+A capacity reservation lasts until its waiter is admitted, and only while
+that waiter refreshes its row within `QueueTTL`: the classification reads
+only fresh queued rows, so a row stale past `QueueTTL` reserves nothing.
+`TestAdmitSet_StaleCapacityReservationEnds` pins it on a capacity-bound
+waiter: at capacity 2, H1 and H2 hold and W `{capacity}` queues; H2 settles,
+and once only W's row ages past `QueueTTL`, a new capacity-only stage is
+admitted at once. Since #3969 every host-spawn verb
 (`fishhawk_dispatch_stage`, `fishhawk_run_stage`, `fishhawk_drive_run`,
 `fishhawk_run_children`) leaves a live waiter behind a queued set, so a
 waiterless set arises only when a waiter's process dies (an MCP restart, a
 shim hot-swap, `/mcp`) or its cap expires, and it stops reserving within
-`QueueTTL`. `TestAdmitSet_HostCapacityBoundsMixedTypes` pins the full-host
-case: two implements and one acceptance fill capacity 3, and a fourth plan,
+`QueueTTL`.
+
+Read surfaces are unchanged: a queued stage's capacity `position` (the
+`Admission`, `StatusForStages` and `Promote`) still counts every earlier
+live waiter, so it can overstate the wait.
+
+`TestAdmitSet_HostCapacityBoundsMixedTypes` pins the full-host
+case: two implements and one acceptance hold all three slots of capacity 3,
+and a fourth plan,
 verify pass or other-repository acceptance queues on capacity alone, with
 exactly 3 capacity rows held. `TestAdmitSet_RacingCapacityAcrossTypes` races
 the four set shapes on one host and reads the committed rows back after
@@ -773,6 +816,14 @@ effective key (§ "Ordering and `order_key`") sorts before the caller's.
 - **A promote holds one connection while it waits.** The wait is for
   in-flight admission transactions (milliseconds each, one group at a time)
   and is bounded by the request context.
+- **The capacity classification takes no other lock (ADR-094 A4 item 4).**
+  Classifying an earlier capacity waiter reads its other groups' slot, stage
+  and `specialist_jobs` rows inside the admission transaction without taking
+  those groups' locks. A concurrent change there can misclassify one waiter
+  for one decision, which affects only who is admitted first. The capacity
+  occupancy bound is unaffected: capacity holders are counted under the
+  capacity lock, which every capacity admitter takes
+  (`TestAdmitSet_RacingCapacityAcrossTypes`).
 - **The CAS must stay inside the admission transaction.** A CAS on another
   connection blocks on locks the admission transaction holds. The
   counterfactual that routes it through the pool hangs.
@@ -815,6 +866,13 @@ under-count holders.
 - A job runner that stalls past `JobHeartbeatTTL` and then heartbeats again
   under its own nonce refreshes its row without re-deciding, so it can
   briefly run beside a verify pass admitted while it was stale.
+- The capacity classification (ADR-094 A4) costs up to queue depth x
+  `MaxGroups` extra reads inside the admission transaction, which lengthens
+  the capacity lock hold. It runs only when the capacity verdict depends on
+  it (holders + job holders < limit <= holders + job holders +
+  `round_ahead`) and stops once the bound waiters reach the limit; an
+  admitter that misses the lock meanwhile queues and decides on its next
+  poll.
 - Stages already dispatched before deploy hold no row and are not counted.
 - A bypass dispatch is not counted, by design. One example is the prompt-fetch
   liveness flip on a direct `bin/fishhawk-runner` run.
