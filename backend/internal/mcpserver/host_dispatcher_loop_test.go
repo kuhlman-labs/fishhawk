@@ -2059,3 +2059,83 @@ func TestHostDispatchLoop_HeartbeatBoundsRunRefusals(t *testing.T) {
 		t.Fatalf("bounded heartbeat fails Validate: %v", err)
 	}
 }
+
+// TestHostDispatchLoop_WarnsOnTokenLabelMismatch (#5614, ADR-094 A5 label
+// match): the server echoes the label it stored the heartbeat under (the
+// token subject's). When it differs from this process's resolved label, two
+// heartbeats log exactly ONE warning naming both labels and the re-mint
+// remedy. A matching echo, and an absent echo (an older server), log nothing.
+// An empty resolved label reads as `unknown` and the remedy is
+// FISHHAWK_HOST_LABEL, never a re-mint of an empty host-dispatcher/ subject
+// (condition C6). Counterfactuals run by hand: removing the mismatch logf
+// logged nothing, RED; removing the dedupe logged two warnings, RED.
+func TestHostDispatchLoop_WarnsOnTokenLabelMismatch(t *testing.T) {
+	const warn = "ADR-094 A5 matches a declaration's label exactly"
+	for _, c := range []struct {
+		name, resolved, echo string
+		want                 int
+		contains, absent     []string
+	}{
+		{
+			name: "mismatch", resolved: "Mac", echo: "Bretts-MacBook-Pro", want: 1,
+			contains: []string{
+				"host-dispatcher/Bretts-MacBook-Pro", `markers send host label "Mac"`, "host:Mac:*",
+				"fishhawkd token issue --subject host-dispatcher/Mac", "FISHHAWK_HOST_LABEL=Bretts-MacBook-Pro",
+			},
+		},
+		{name: "match", resolved: "Mac", echo: "Mac", want: 0},
+		{name: "older server omits host_label", resolved: "Mac", echo: "", want: 0},
+		{
+			name: "empty resolved label reads unknown", resolved: "", echo: "Mac", want: 1,
+			contains: []string{"host-dispatcher/Mac", `file under host "unknown"`, "host:unknown:*", "Set FISHHAWK_HOST_LABEL=Mac"},
+			absent:   []string{"token issue", "--subject host-dispatcher/ ", "host-dispatcher/)"},
+		},
+		{name: "empty resolved label and unknown token match", resolved: "", echo: "unknown", want: 0},
+		{
+			name: "control runes in the echo are stripped", resolved: "Mac", echo: "Ev\x07il\nX", want: 1,
+			contains: []string{"host-dispatcher/EvilX"}, absent: []string{"\x07", "Evil\n"},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lh := newHDLoopHarness(t)
+			if c.resolved != "" {
+				lh.d.r.api.hostLabel = fixedHostLabel(c.resolved)
+			}
+			log := &hdLockedLog{}
+			l := lh.loop(func(cfg *HostDispatcherConfig) { cfg.Log = log })
+			if l.hostLabel != c.resolved || l.status.Host != c.resolved {
+				t.Fatalf("loop host label = %q / status %q; want %q", l.hostLabel, l.status.Host, c.resolved)
+			}
+			body := `{"dropped_refusals":0}`
+			if c.echo != "" {
+				echo, _ := json.Marshal(c.echo)
+				body = fmt.Sprintf(`{"dropped_refusals":0,"host_label":%s}`, echo)
+			}
+			lh.mu.Lock()
+			lh.heartbeat = func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, body) }
+			lh.mu.Unlock()
+			got, _, _ := hdStartPublisher(t, l)
+			for i := 1; i <= 2; i++ {
+				lh.clock = lh.clock.Add(30 * time.Second)
+				lh.tick(l)
+				if d := hdAwaitDelivery(t, got, fmt.Sprintf("tick %d", i)); d.err != nil {
+					t.Fatalf("tick %d publish err = %v; want nil (a mismatch is a warning, not a failure)", i, d.err)
+				}
+			}
+			out := log.b.String()
+			if n := log.count(warn); n != c.want {
+				t.Fatalf("%d label-mismatch warnings across two heartbeats; want %d\n%s", n, c.want, out)
+			}
+			for _, sub := range c.contains {
+				if !strings.Contains(out, sub) {
+					t.Errorf("warning lacks %q:\n%s", sub, out)
+				}
+			}
+			for _, sub := range c.absent {
+				if strings.Contains(out, sub) {
+					t.Errorf("warning carries %q:\n%s", sub, out)
+				}
+			}
+		})
+	}
+}

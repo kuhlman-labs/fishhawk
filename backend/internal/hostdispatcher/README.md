@@ -135,8 +135,10 @@ construction: token rows record a token id or a SHA-256 of the token, and
 `diff_secrets_detected` records locations, pattern classes and truncated
 fingerprints, never matched bytes. Agent and operator free text (reasons,
 review summaries) is credential-scanned best effort only, the same posture as
-every other `read:audit` reader. It cannot approve, merge, mint, recover,
-cancel or decide a gate.
+every other `read:audit` reader. Through the heartbeat it can also declare its
+own host's admission limits (ADR-094 A5; § Server heartbeat), sizing that
+host's `host:<label>:capacity` up to 64. It cannot approve, merge, mint,
+recover, cancel or decide a gate.
 
 ## Server heartbeat (#5489, ADR-104 Amendment A2)
 
@@ -151,13 +153,21 @@ The body carries no host and no account: the host comes from the
 
 The route needs `write:runs` (in the profile) and a valid dispatcher subject.
 It is the dispatcher's only server write that is not run-scoped: it rewrites
-the dispatcher's own heartbeat row and adds no dispatch reach. It writes no
-audit row, because a heartbeat is state, not an event.
+the dispatcher's own heartbeat row. Since ADR-094 Amendment A5 (#5614) that
+row also DECLARES the host's admission limits (`host_capacity` up to 64, and
+the `host_implement_limit` ceiling) for the token's own label and account, so
+the route carries admission reach for that one host: a stolen dispatcher token
+can size its own host's `host:<label>:capacity` up to 64 while its heartbeat
+stays fresh. It cannot start, approve or dispatch a stage, and it reaches no
+other host's or account's limits. It writes no audit row, because a heartbeat
+is state, not an event.
 
 Fields: `interval_seconds`, `started_at`, `last_tick_at`,
 `last_complete_tick_at` (omitted when unknown), `paused`, `tick_failure_code`,
-`daily_cap`, `spawns_today`, `spawns_day` (UTC `YYYY-MM-DD`), `in_flight` and
-`run_refusals`. Each refusal carries `run_id`, `stage_id`, `code`, `detail`,
+`daily_cap`, `spawns_today`, `spawns_day` (UTC `YYYY-MM-DD`), `in_flight`,
+`run_refusals`, and the optional declaration `host_capacity` and
+`host_implement_limit` (ADR-094 A5; omitted when not declared, JSON `null`
+reads absent). Each refusal carries `run_id`, `stage_id`, `code`, `detail`,
 `disposition`, `budget_source`, `first_at` and `last_at`.
 
 - `disposition` is the dispatcher's reading of the refusal, a closed set:
@@ -169,11 +179,15 @@ Fields: `interval_seconds`, `started_at`, `last_tick_at`,
 Ingest rules, applied in this order:
 
 1. **Structural errors are a 400** (`Validate`): malformed JSON, an unknown
-   key, a missing or non-positive `interval_seconds`, a missing `started_at` or
-   `last_tick_at`, a negative count, an unparseable `spawns_day`, more than
-   `MaxRunRefusals` (256) entries, a `run_id` or non-empty `stage_id` that is
-   not a lowercase 8-4-4-4-12 UUID, or a duplicate `run_id`. A body over
-   256 KiB is a 400 with field `body`.
+   key (a client-sent `dropped_declaration` included), a missing or
+   non-positive `interval_seconds`, a missing `started_at` or `last_tick_at`,
+   a negative count, an unparseable `spawns_day`, more than `MaxRunRefusals`
+   (256) entries, a `run_id` or non-empty `stage_id` that is not a lowercase
+   8-4-4-4-12 UUID, or a duplicate `run_id`. A body over 256 KiB is a 400 with
+   field `body`. A `host_capacity` or `host_implement_limit` that is not an
+   integer literal (a string, `4.5`, `4.0`, `4e0`, a boolean, an object or an
+   array) is a 400 naming that field: a type error is structural (ADR-104 A2
+   item 5).
 2. **One bad entry never blanks a dispatcher** (`DropInvalidRefusals`): an
    entry whose `code` is not 1–64 bytes of `[a-z0-9_:.-]`, whose
    `disposition` is outside its set, or whose `budget_source` is outside its
@@ -188,6 +202,35 @@ Ingest rules, applied in this order:
    grammar after that is stored as `invalid_tick_failure_code`
    (`TickFailureCodeInvalid`): the field reaches every item the record decides,
    so it carries a code, never free text.
+4. **An out-of-range declaration drops, the heartbeat stays**
+   (`DropInvalidDeclaration`, ADR-094 A5 item 1): when either declared value
+   is outside 1–64 (`MinDeclaredLimit`, `MaxDeclaredLimit`), an integer
+   literal that overflows `int` included, BOTH fields are cleared. The 200
+   reports `"dropped_declaration": "<field>"` (host_capacity checked first) and
+   the row records the same field name. The rest of the heartbeat is stored.
+
+Each upsert replaces the whole payload, so a heartbeat that omits a
+declaration field removes that field's earlier declaration, and an
+out-of-range heartbeat carries no earlier declaration forward. The row's
+payload holds the server-only `dropped_declaration` beside the heartbeat
+fields (`dispatcherheartbeat.storedPayload`); the wire type never gains that
+key.
+
+The 200 also echoes `host_label`: the label the server stored the row under,
+which is the token subject's `host-dispatcher/<host>`, never a body value. A
+declaration governs only the markers whose host label equals it EXACTLY, in
+the same account (ADR-094 A5 items 2(a) and 7;
+`dispatcherheartbeat.Repository.Get` reads the exact (account, label) row,
+with no untenanted fallback). So the dispatcher's token subject must be
+`host-dispatcher/<resolved host label>`. When the echo differs from the label
+this process's markers send, `fishhawk-mcp host-dispatch` logs one warning per
+(token label, resolved label) pair, at the first heartbeat acknowledgement,
+naming the remedy: re-mint with
+`fishhawkd token issue --subject host-dispatcher/<resolved>`, or set
+`FISHHAWK_HOST_LABEL` to the token's label. An empty resolved label reads as
+`unknown` (the host label-less markers file under) and the remedy is then
+`FISHHAWK_HOST_LABEL`. It is a warning, not a refusal; an older server that
+omits `host_label` is silent.
 
 Readers judge freshness on the server-stamped `received_at`, never on
 `last_tick_at`. A heartbeat is fresh for `StaleAfter(interval_seconds)`, which

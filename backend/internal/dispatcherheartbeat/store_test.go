@@ -180,3 +180,141 @@ func TestMemoryRepository_Semantics(t *testing.T) {
 		t.Errorf("Upsert with UpsertErr = %v, want boom", err)
 	}
 }
+
+// getExactCases is the shared Get table: an untenanted and an acctX row share
+// label "a" (seeded by the caller with host capacity 1 and 2 respectively).
+var getExactCases = []struct {
+	name, account, label string
+	wantFound            bool
+	wantCap              int
+}{
+	{"untenanted caller gets the untenanted row only", "", "a", true, 1},
+	{"tenanted caller gets its own row only", acctX, "a", true, 2},
+	{"other account finds nothing (no untenanted fallback)", acctY, "a", false, 0},
+	{"label must match exactly", acctX, "A", false, 0},
+	{"unknown label finds nothing", "", "b", false, 0},
+}
+
+func declaring(capacity int) hostdispatcher.Heartbeat {
+	h := hb(false)
+	h.HostCapacity = &capacity
+	return h
+}
+
+func checkGet(t *testing.T, repo Repository) {
+	t.Helper()
+	ctx := context.Background()
+	for _, c := range getExactCases {
+		rec, found, err := repo.Get(ctx, c.account, c.label)
+		if err != nil {
+			t.Fatalf("%s: Get(%q, %q): %v", c.name, c.account, c.label, err)
+		}
+		gotCap := 0
+		if found && rec.Heartbeat.HostCapacity != nil {
+			gotCap = *rec.Heartbeat.HostCapacity
+		}
+		if found != c.wantFound || gotCap != c.wantCap || (found && (rec.AccountID != c.account || rec.HostLabel != c.label)) {
+			t.Errorf("%s: Get(%q, %q) = found %v, %s/%s host_capacity %d; want found %v host_capacity %d",
+				c.name, c.account, c.label, found, rec.AccountID, rec.HostLabel, gotCap, c.wantFound, c.wantCap)
+		}
+	}
+	if _, _, err := repo.Get(ctx, "not-a-uuid", "a"); err == nil {
+		t.Error("Get(non-UUID account) = nil error, want a refusal before the store")
+	}
+}
+
+// TestPostgres_GetExactAccount (pgtest) pins Get's EXACT account match (ADR-094
+// A5 item 7): an untenanted and a tenanted row share one label, and each
+// caller sees only the row in its own partition; with only the untenanted row
+// present a tenanted caller finds nothing. Counterfactual run by hand:
+// replacing getSQL's predicate with listSQL's `(account_id IS NULL OR
+// account_id = $1)` went RED (acctY found the untenanted row).
+func TestPostgres_GetExactAccount(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	ctx := context.Background()
+	if err := repo.Upsert(ctx, Record{HostLabel: "a", Heartbeat: declaring(1), ReceivedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := repo.Get(ctx, acctX, "a"); err != nil || found {
+		t.Fatalf("only the untenanted row present: Get(acctX) found=%v (%v), want nothing", found, err)
+	}
+	if err := repo.Upsert(ctx, Record{AccountID: acctX, HostLabel: "a", TokenID: "tok-x", Heartbeat: declaring(2), ReceivedAt: t0.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	checkGet(t, repo)
+	rec, _, err := repo.Get(ctx, acctX, "a")
+	if err != nil || rec.TokenID != "tok-x" || !rec.ReceivedAt.Equal(t0.Add(time.Second)) || len(rec.Heartbeat.RunRefusals) != 1 {
+		t.Errorf("Get(acctX, a) = %+v (%v), want the full stored record", rec, err)
+	}
+}
+
+// TestPostgres_DroppedDeclarationRoundTrip (pgtest): the server-only
+// dropped_declaration persists in the payload and reads back through both Get
+// and List, while a row without one reads back empty. Counterfactual run by
+// hand: dropping storedPayload's DroppedDeclaration field went RED.
+func TestPostgres_DroppedDeclarationRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	ctx := context.Background()
+	dropped := Record{HostLabel: "a", Heartbeat: hb(false), DroppedDeclaration: hostdispatcher.DeclarationFieldHostImplementLimit, ReceivedAt: t0}
+	if err := repo.Upsert(ctx, dropped); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Upsert(ctx, Record{HostLabel: "b", Heartbeat: declaring(4), ReceivedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	rec, found, err := repo.Get(ctx, "", "a")
+	if err != nil || !found || rec.DroppedDeclaration != hostdispatcher.DeclarationFieldHostImplementLimit {
+		t.Fatalf("Get(a).DroppedDeclaration = %q (found %v, %v), want %q", rec.DroppedDeclaration, found, err, hostdispatcher.DeclarationFieldHostImplementLimit)
+	}
+	if rec.Heartbeat.HostCapacity != nil || rec.Heartbeat.HostImplementLimit != nil {
+		t.Errorf("Get(a) declaration = %v/%v, want both absent", rec.Heartbeat.HostCapacity, rec.Heartbeat.HostImplementLimit)
+	}
+	var raw string
+	if err := pool.QueryRow(ctx, `SELECT payload->>'dropped_declaration' FROM host_dispatcher_heartbeats WHERE host_label = 'a'`).Scan(&raw); err != nil ||
+		raw != hostdispatcher.DeclarationFieldHostImplementLimit {
+		t.Errorf("payload dropped_declaration column = %q (%v), want it stored at the payload's top level", raw, err)
+	}
+	all, err := repo.List(ctx, "", 10)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("List = %d rows (%v), want 2", len(all), err)
+	}
+	for _, r := range all {
+		want := ""
+		if r.HostLabel == "a" {
+			want = hostdispatcher.DeclarationFieldHostImplementLimit
+		}
+		if r.DroppedDeclaration != want {
+			t.Errorf("List %s DroppedDeclaration = %q, want %q", r.HostLabel, r.DroppedDeclaration, want)
+		}
+		if r.HostLabel == "b" && (r.Heartbeat.HostCapacity == nil || *r.Heartbeat.HostCapacity != 4) {
+			t.Errorf("List b host_capacity = %v, want 4 (the declaration round-trips)", r.Heartbeat.HostCapacity)
+		}
+	}
+}
+
+// TestMemory_Get pins the test double's Get to the Postgres table above, plus
+// GetErr injection.
+func TestMemory_Get(t *testing.T) {
+	m := NewMemoryRepository()
+	ctx := context.Background()
+	if err := m.Upsert(ctx, Record{HostLabel: "a", Heartbeat: declaring(1), ReceivedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := m.Get(ctx, acctX, "a"); err != nil || found {
+		t.Fatalf("only the untenanted row present: Get(acctX) found=%v (%v), want nothing", found, err)
+	}
+	if err := m.Upsert(ctx, Record{AccountID: acctX, HostLabel: "a", Heartbeat: declaring(2), DroppedDeclaration: "x", ReceivedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	checkGet(t, m)
+	if rec, _, _ := m.Get(ctx, acctX, "a"); rec.DroppedDeclaration != "x" {
+		t.Errorf("Get DroppedDeclaration = %q, want x", rec.DroppedDeclaration)
+	}
+	boom := errors.New("boom")
+	m.GetErr = boom
+	if _, found, err := m.Get(ctx, "", "a"); !errors.Is(err, boom) || found {
+		t.Errorf("Get with GetErr = found %v, %v; want boom", found, err)
+	}
+}

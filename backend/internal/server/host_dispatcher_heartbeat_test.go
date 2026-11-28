@@ -360,3 +360,248 @@ func TestHostDispatcherHeartbeat_StoreErrors(t *testing.T) {
 		t.Errorf("500 body leaks the store cause: %s", w.Body.String())
 	}
 }
+
+// Declaration ingest tests (#5614, ADR-094 Amendment A5).
+
+// hbWithRaw appends raw `"key":value` members to a valid heartbeat body.
+func hbWithRaw(t *testing.T, members string) string {
+	t.Helper()
+	b := hbBody(t, nil)
+	return b[:len(b)-1] + "," + members + "}"
+}
+
+type hbDeclResp struct {
+	DroppedRefusals    *int    `json:"dropped_refusals"`
+	DroppedDeclaration *string `json:"dropped_declaration"`
+	HostLabel          *string `json:"host_label"`
+}
+
+func hbDecl(t *testing.T, w *httptest.ResponseRecorder) hbDeclResp {
+	t.Helper()
+	var resp hbDeclResp
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response %q: %v", w.Body.String(), err)
+	}
+	return resp
+}
+
+func hbLimit(v *int) string {
+	if v == nil {
+		return "nil"
+	}
+	return fmt.Sprint(*v)
+}
+
+func hbOnlyRecord(t *testing.T, mem *dispatcherheartbeat.MemoryRepository) dispatcherheartbeat.Record {
+	t.Helper()
+	recs := mem.Records()
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	return recs[0]
+}
+
+// TestHostDispatcherHeartbeat_StoresDeclaration: in-range declarations are
+// stored (each field alone, both, and the 1/64 bounds) and the 200 carries no
+// dropped_declaration.
+func TestHostDispatcherHeartbeat_StoresDeclaration(t *testing.T) {
+	for _, c := range []struct {
+		name, members   string
+		wantCap, wantIm string
+	}{
+		{"both", `"host_capacity":4,"host_implement_limit":2`, "4", "2"},
+		{"capacity only", `"host_capacity":4`, "4", "nil"},
+		{"implement only", `"host_implement_limit":1`, "nil", "1"},
+		{"bounds", `"host_capacity":64,"host_implement_limit":1`, "64", "1"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f, mem := newHBFixture(t)
+			tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+			w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, c.members))
+			if w.Code != http.StatusOK {
+				t.Fatalf("POST = %d %s", w.Code, w.Body.String())
+			}
+			if resp := hbDecl(t, w); resp.DroppedDeclaration != nil {
+				t.Errorf("dropped_declaration = %q, want the key omitted", *resp.DroppedDeclaration)
+			}
+			rec := hbOnlyRecord(t, mem)
+			if hbLimit(rec.Heartbeat.HostCapacity) != c.wantCap || hbLimit(rec.Heartbeat.HostImplementLimit) != c.wantIm || rec.DroppedDeclaration != "" {
+				t.Errorf("stored host_capacity=%s host_implement_limit=%s dropped=%q, want %s/%s/\"\"",
+					hbLimit(rec.Heartbeat.HostCapacity), hbLimit(rec.Heartbeat.HostImplementLimit), rec.DroppedDeclaration, c.wantCap, c.wantIm)
+			}
+		})
+	}
+}
+
+// TestHostDispatcherHeartbeat_OutOfRangeDropsDeclarationKeepsHeartbeat (A5
+// item 1, condition C3): per field, an out-of-range value (0, 65, -1, and an
+// integer literal that overflows int in either direction) answers 200 with
+// dropped_declaration naming the field; the stored row has BOTH declaration
+// fields nil and records the dropped field; the liveness fields are stored.
+// Counterfactuals run by hand: DropInvalidDeclaration returning "" without
+// clearing stored 65 and omitted dropped_declaration, RED; clearing only the
+// offending field kept the valid sibling, RED.
+func TestHostDispatcherHeartbeat_OutOfRangeDropsDeclarationKeepsHeartbeat(t *testing.T) {
+	const overflow = "99999999999999999999"
+	for _, c := range []struct{ name, members, field string }{
+		{"capacity 0", `"host_capacity":0,"host_implement_limit":2`, "host_capacity"},
+		{"capacity 65", `"host_capacity":65,"host_implement_limit":2`, "host_capacity"},
+		{"capacity -1", `"host_capacity":-1`, "host_capacity"},
+		{"capacity overflows int", `"host_capacity":` + overflow + `,"host_implement_limit":2`, "host_capacity"},
+		{"capacity overflows negative", `"host_capacity":-` + overflow, "host_capacity"},
+		{"implement 0", `"host_capacity":4,"host_implement_limit":0`, "host_implement_limit"},
+		{"implement 65", `"host_capacity":4,"host_implement_limit":65`, "host_implement_limit"},
+		{"implement overflows int", `"host_capacity":4,"host_implement_limit":` + overflow, "host_implement_limit"},
+		{"both out of range names host_capacity", `"host_capacity":65,"host_implement_limit":0`, "host_capacity"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f, mem := newHBFixture(t)
+			tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+			w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, c.members))
+			if w.Code != http.StatusOK {
+				t.Fatalf("POST = %d %s; want 200 (an out-of-range declaration keeps the heartbeat)", w.Code, w.Body.String())
+			}
+			if resp := hbDecl(t, w); resp.DroppedDeclaration == nil || *resp.DroppedDeclaration != c.field {
+				t.Errorf("dropped_declaration = %v, want %q (%s)", resp.DroppedDeclaration, c.field, w.Body.String())
+			}
+			rec := hbOnlyRecord(t, mem)
+			if rec.Heartbeat.HostCapacity != nil || rec.Heartbeat.HostImplementLimit != nil {
+				t.Errorf("stored declaration = %s/%s, want both nil (the whole declaration drops)",
+					hbLimit(rec.Heartbeat.HostCapacity), hbLimit(rec.Heartbeat.HostImplementLimit))
+			}
+			if rec.DroppedDeclaration != c.field {
+				t.Errorf("stored DroppedDeclaration = %q, want %q", rec.DroppedDeclaration, c.field)
+			}
+			if !rec.Heartbeat.Paused || rec.Heartbeat.IntervalSeconds != 30 || len(rec.Heartbeat.RunRefusals) != 1 || !rec.ReceivedAt.Equal(hbNow) {
+				t.Errorf("liveness fields not stored: %+v", rec)
+			}
+		})
+	}
+}
+
+// TestHostDispatcherHeartbeat_NonIntegerDeclarationIs400 (ADR-104 A2 item 5,
+// condition C3): a string, fraction, integral fraction, exponent, boolean,
+// object or array per field answers 400 validation_failed with details.field
+// naming the field, and nothing is stored. Counterfactual run by hand:
+// removing the nonIntegerDeclaration branch let the value through as 0, which
+// DropInvalidDeclaration dropped: 200, RED.
+func TestHostDispatcherHeartbeat_NonIntegerDeclarationIs400(t *testing.T) {
+	f, mem := newHBFixture(t)
+	tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+	for _, field := range []string{"host_capacity", "host_implement_limit"} {
+		for _, v := range []string{`"4"`, `4.5`, `4.0`, `4e0`, `true`, `false`, `{}`, `[4]`} {
+			w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"`+field+`":`+v))
+			if w.Code != http.StatusBadRequest || hdErrCode(t, w) != "validation_failed" || hbErrField(t, w) != field {
+				t.Errorf("%s=%s: %d %s; want 400 validation_failed field %q", field, v, w.Code, w.Body.String(), field)
+			}
+		}
+	}
+	// A valid sibling does not rescue the other field.
+	w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":4,"host_implement_limit":"1"`))
+	if w.Code != http.StatusBadRequest || hbErrField(t, w) != "host_implement_limit" {
+		t.Errorf("valid capacity + string implement: %d %s; want 400 field host_implement_limit", w.Code, w.Body.String())
+	}
+	if n := len(mem.Records()); n != 0 {
+		t.Fatalf("records = %d, want 0 (a structural 400 stores nothing)", n)
+	}
+}
+
+// TestHostDispatcherHeartbeat_NullDeclarationIsAbsent: JSON null is absent,
+// not a type error and not a declaration.
+func TestHostDispatcherHeartbeat_NullDeclarationIsAbsent(t *testing.T) {
+	f, mem := newHBFixture(t)
+	tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+	w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":null,"host_implement_limit":null`))
+	if w.Code != http.StatusOK || hbDecl(t, w).DroppedDeclaration != nil {
+		t.Fatalf("POST = %d %s; want 200 without dropped_declaration", w.Code, w.Body.String())
+	}
+	rec := hbOnlyRecord(t, mem)
+	if rec.Heartbeat.HostCapacity != nil || rec.Heartbeat.HostImplementLimit != nil || rec.DroppedDeclaration != "" {
+		t.Errorf("stored %s/%s dropped %q, want absent", hbLimit(rec.Heartbeat.HostCapacity), hbLimit(rec.Heartbeat.HostImplementLimit), rec.DroppedDeclaration)
+	}
+}
+
+// TestHostDispatcherHeartbeat_OmittedFieldRemovesDeclaration (condition C7):
+// the upsert replaces the whole payload, so a heartbeat that omits a field
+// removes that field's earlier declaration while a still-sent field stays.
+func TestHostDispatcherHeartbeat_OmittedFieldRemovesDeclaration(t *testing.T) {
+	f, mem := newHBFixture(t)
+	tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+	if w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":4,"host_implement_limit":2`)); w.Code != http.StatusOK {
+		t.Fatalf("first POST = %d %s", w.Code, w.Body.String())
+	}
+	if w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":4`)); w.Code != http.StatusOK {
+		t.Fatalf("second POST = %d %s", w.Code, w.Body.String())
+	}
+	if rec := hbOnlyRecord(t, mem); hbLimit(rec.Heartbeat.HostCapacity) != "4" || rec.Heartbeat.HostImplementLimit != nil {
+		t.Errorf("after omitting host_implement_limit: %s/%s, want 4/nil", hbLimit(rec.Heartbeat.HostCapacity), hbLimit(rec.Heartbeat.HostImplementLimit))
+	}
+	if w := f.do(http.MethodPost, hbPath, tok, hbBody(t, nil)); w.Code != http.StatusOK {
+		t.Fatalf("third POST = %d %s", w.Code, w.Body.String())
+	}
+	if rec := hbOnlyRecord(t, mem); rec.Heartbeat.HostCapacity != nil || rec.Heartbeat.HostImplementLimit != nil {
+		t.Errorf("after omitting both: %s/%s, want nil/nil", hbLimit(rec.Heartbeat.HostCapacity), hbLimit(rec.Heartbeat.HostImplementLimit))
+	}
+}
+
+// TestHostDispatcherHeartbeat_OutOfRangeNotCarriedForward (condition C7): a
+// valid declaration followed by an out-of-range one leaves NO declaration
+// stored (the earlier 4 is not carried forward), and a later valid heartbeat
+// clears the dropped marker.
+func TestHostDispatcherHeartbeat_OutOfRangeNotCarriedForward(t *testing.T) {
+	f, mem := newHBFixture(t)
+	tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+	if w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":4,"host_implement_limit":2`)); w.Code != http.StatusOK {
+		t.Fatalf("first POST = %d %s", w.Code, w.Body.String())
+	}
+	if w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":65`)); w.Code != http.StatusOK {
+		t.Fatalf("second POST = %d %s", w.Code, w.Body.String())
+	}
+	rec := hbOnlyRecord(t, mem)
+	if rec.Heartbeat.HostCapacity != nil || rec.Heartbeat.HostImplementLimit != nil || rec.DroppedDeclaration != "host_capacity" {
+		t.Errorf("after an out-of-range POST: %s/%s dropped %q; want nil/nil dropped host_capacity",
+			hbLimit(rec.Heartbeat.HostCapacity), hbLimit(rec.Heartbeat.HostImplementLimit), rec.DroppedDeclaration)
+	}
+	if w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":3`)); w.Code != http.StatusOK {
+		t.Fatalf("third POST = %d %s", w.Code, w.Body.String())
+	}
+	if rec := hbOnlyRecord(t, mem); hbLimit(rec.Heartbeat.HostCapacity) != "3" || rec.DroppedDeclaration != "" {
+		t.Errorf("after a valid POST: %s dropped %q; want 3 and no dropped marker", hbLimit(rec.Heartbeat.HostCapacity), rec.DroppedDeclaration)
+	}
+}
+
+// TestHostDispatcherHeartbeat_ClientDroppedDeclarationKeyRefused: the
+// server-only dropped_declaration key stays an unknown key on the wire.
+func TestHostDispatcherHeartbeat_ClientDroppedDeclarationKeyRefused(t *testing.T) {
+	f, mem := newHBFixture(t)
+	tok := f.mint(hbE2EHost, hostdispatcher.Scopes()...)
+	w := f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"dropped_declaration":"host_capacity"`))
+	if w.Code != http.StatusBadRequest || hdErrCode(t, w) != "validation_failed" || hbErrField(t, w) != "body" {
+		t.Errorf("POST = %d %s; want 400 validation_failed field body", w.Code, w.Body.String())
+	}
+	// An unknown key after an overflowing declaration is still caught: the
+	// overflow is not a decode error that would stop the decoder early.
+	w = f.do(http.MethodPost, hbPath, tok, hbWithRaw(t, `"host_capacity":99999999999999999999,"host":"x"`))
+	if w.Code != http.StatusBadRequest || hbErrField(t, w) != "body" {
+		t.Errorf("overflow + unknown key: %d %s; want 400 field body", w.Code, w.Body.String())
+	}
+	if n := len(mem.Records()); n != 0 {
+		t.Fatalf("records = %d, want 0", n)
+	}
+}
+
+// TestHostDispatcherHeartbeat_EchoesHostLabel: the 200 echoes the subject's
+// host label (never a body value), so the dispatcher can see which label its
+// declaration governs. Counterfactual run by hand: responding HostLabel ""
+// went RED.
+func TestHostDispatcherHeartbeat_EchoesHostLabel(t *testing.T) {
+	f, _ := newHBFixture(t)
+	tok := f.mint("host-dispatcher/Bretts-MacBook-Pro", hostdispatcher.Scopes()...)
+	w := f.do(http.MethodPost, hbPath, tok, hbBody(t, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST = %d %s", w.Code, w.Body.String())
+	}
+	if resp := hbDecl(t, w); resp.HostLabel == nil || *resp.HostLabel != "Bretts-MacBook-Pro" {
+		t.Errorf("host_label = %v, want Bretts-MacBook-Pro (%s)", resp.HostLabel, w.Body.String())
+	}
+}

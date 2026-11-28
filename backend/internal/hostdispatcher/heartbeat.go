@@ -15,7 +15,10 @@ import (
 // label, so the campaign awaiting block and the Web UI can see dispatcher
 // state. The wire type lives here so the dispatcher and the server share one
 // definition. The body carries no host and no account: the server takes both
-// from the bearer token. Long-form contract: README.md § Server heartbeat.
+// from the bearer token. Since ADR-094 Amendment A5 (#5614) the heartbeat also
+// DECLARES the host's admission limits (host_capacity, host_implement_limit)
+// for the token's own label and account. Long-form contract: README.md §
+// Server heartbeat.
 
 // HeartbeatRoute is the heartbeat write path (POST).
 const HeartbeatRoute = "/v0/host-dispatchers/heartbeat"
@@ -25,9 +28,37 @@ const HeartbeatRoute = "/v0/host-dispatchers/heartbeat"
 // (#5489 condition H3). The rest of the heartbeat was stored. The dispatcher
 // logs a non-zero count, because a dropped entry's run reads live on the
 // server while the dispatcher refuses it.
+//
+// DroppedDeclaration names the declaration field (DeclarationFieldHostCapacity
+// or DeclarationFieldHostImplementLimit) whose out-of-range value dropped the
+// whole declaration (DropInvalidDeclaration); it is omitted when none dropped.
+// HostLabel is the label the server stored the row under: the token subject's
+// host-dispatcher/<host>, never a body value. A declaration governs only
+// markers whose host label equals it exactly (ADR-094 A5), so the dispatcher
+// warns when it differs from its own resolved label. An older server omits it.
 type HeartbeatResponse struct {
-	DroppedRefusals int `json:"dropped_refusals"`
+	DroppedRefusals    int    `json:"dropped_refusals"`
+	DroppedDeclaration string `json:"dropped_declaration,omitempty"`
+	HostLabel          string `json:"host_label,omitempty"`
 }
+
+// Declared admission-limit bounds (ADR-094 A5 item 1): a declared
+// host_capacity or host_implement_limit is an integer in
+// [MinDeclaredLimit, MaxDeclaredLimit], the slot store's own limit range
+// (1..concurrency.MaxLimit). MaxDeclaredLimit copies concurrency.MaxLimit so
+// this wire package, which the MCP binary imports, gains no import edge onto
+// the server's slot store; TestDeclaredLimitParity pins the copy.
+const (
+	MinDeclaredLimit = 1
+	MaxDeclaredLimit = 64
+)
+
+// The declaration field names, as they appear on the wire and in
+// HeartbeatResponse.DroppedDeclaration.
+const (
+	DeclarationFieldHostCapacity       = "host_capacity"
+	DeclarationFieldHostImplementLimit = "host_implement_limit"
+)
 
 // TickFailureCodeInvalid replaces an off-grammar tick_failure_code at ingest
 // (BoundFields): the tick still reads as failing, but no dispatcher-authored
@@ -118,6 +149,16 @@ type Heartbeat struct {
 	SpawnsDay   string       `json:"spawns_day,omitempty"`
 	InFlight    int          `json:"in_flight"`
 	RunRefusals []RunRefusal `json:"run_refusals"`
+	// HostCapacity and HostImplementLimit are the host's declared admission
+	// limits (ADR-094 A5): host_capacity sizes host:<label>:capacity and
+	// host_implement_limit caps local-implement:<label>. Each is optional
+	// (absent = no declaration of that field; JSON null reads absent) and
+	// independent of the other. A value outside
+	// [MinDeclaredLimit, MaxDeclaredLimit] is not a structural error:
+	// DropInvalidDeclaration drops the whole declaration and keeps the
+	// heartbeat. A non-integer value is a structural 400 at ingest.
+	HostCapacity       *int `json:"host_capacity,omitempty"`
+	HostImplementLimit *int `json:"host_implement_limit,omitempty"`
 }
 
 // RunRefusal is one candidate run's latest refusal.
@@ -196,6 +237,34 @@ func (h Heartbeat) Validate() error {
 		}
 	}
 	return nil
+}
+
+// DropInvalidDeclaration applies ADR-094 A5 item 1: when either supplied
+// declaration value lies outside [MinDeclaredLimit, MaxDeclaredLimit] it
+// clears BOTH fields (the whole declaration drops, the rest of the heartbeat
+// stays) and returns the first offending field name, host_capacity checked
+// first. It returns "" and changes nothing when every supplied value is in
+// range or none is supplied. Validate does not range-check these fields: an
+// out-of-range declaration is dropped, never a 400.
+func (h *Heartbeat) DropInvalidDeclaration() string {
+	field := ""
+	switch {
+	case !declaredLimitInRange(h.HostCapacity):
+		field = DeclarationFieldHostCapacity
+	case !declaredLimitInRange(h.HostImplementLimit):
+		field = DeclarationFieldHostImplementLimit
+	default:
+		return ""
+	}
+	h.HostCapacity = nil
+	h.HostImplementLimit = nil
+	return field
+}
+
+// declaredLimitInRange reports whether v is absent or within
+// [MinDeclaredLimit, MaxDeclaredLimit].
+func declaredLimitInRange(v *int) bool {
+	return v == nil || (*v >= MinDeclaredLimit && *v <= MaxDeclaredLimit)
 }
 
 // RefusalValid reports whether ref's code, disposition and budget_source are
