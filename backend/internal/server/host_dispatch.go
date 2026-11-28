@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -42,14 +43,42 @@ const hostDispatchReasonEarlierStageFailed = "earlier_stage_failed"
 const hostDispatchReasonFanInVerifyPending = "fan_in_verify_pending"
 
 // HostAdmissionHold is the interim host-dispatch admission hold (E85.11 /
-// #4330; Config.HostAdmissionHold). Held reports whether NEW admissions are
-// held at now and a human-readable reason. Production is
-// *opsmonitor.AdmissionHold, whose Held also reads false once the ops
+// #4330; Config.HostAdmissionHold). Held reports whether the measured host's
+// memory pressure holds NEW admissions at now and a human-readable reason.
+// Host is the label of the host whose pressure the hold measured (#5619), in
+// the marker's {"host"} vocabulary; "" reads as concurrency.UnknownHost.
+// Which markers a held hold refuses is hostAdmissionHoldApplies. Production
+// is *opsmonitor.AdmissionHold, whose Held also reads false once the ops
 // monitor has not updated it for 3 x its effective interval, so a dead
 // ticker cannot pin it. INTERIM: ADR-100's adaptive concurrency controller
 // absorbs it.
 type HostAdmissionHold interface {
 	Held(now time.Time) (held bool, reason string)
+	Host() string
+}
+
+// measuredAdmissionHost is the hold's measured-host label, with "" read as
+// concurrency.UnknownHost.
+func measuredAdmissionHost(measured string) string {
+	if measured == "" {
+		return concurrency.UnknownHost
+	}
+	return measured
+}
+
+// hostAdmissionHoldApplies reports whether a held HostAdmissionHold refuses a
+// marker (#5619). A marker naming the measured host is held. A marker naming
+// NO host (concurrency.UnknownHost: a bodyless or pre-#4212 client) is held
+// too, fail-closed, because it cannot show that it spawns elsewhere. Any
+// other label is NOT held: that host's memory was not measured. An
+// UNRESOLVED measured host ("" or concurrency.UnknownHost) has nothing to
+// compare with, so it holds EVERY marker, also fail-closed.
+func hostAdmissionHoldApplies(measured, requested string) bool {
+	measured = measuredAdmissionHost(measured)
+	if measured == concurrency.UnknownHost {
+		return true
+	}
+	return requested == measured || requested == concurrency.UnknownHost
 }
 
 // hostDispatchHoldRetry is the `retry` detail on the 409
@@ -199,12 +228,18 @@ type hostDispatchResponse struct {
 // Host memory hold (E85.11 / #4330, INTERIM until ADR-100's adaptive
 // concurrency controller): with Config.HostAdmissionHold wired and held, a
 // stage in either admissible arm — `pending` or `awaiting_host_dispatch` —
-// returns 409 host_memory_pressure (details reason + retry) AFTER every
-// eligibility and dependency guard and BEFORE the CAS / slot admission, so
-// it commits no transition and no queue row. The idempotent `dispatched`
-// arm is deliberately NOT checked (a spawn attempt already exists), and
-// nothing in flight is refused or killed. A plain 409, not the queued one:
-// an MCP slot waiter stops on it and the operator re-dispatches.
+// returns 409 host_memory_pressure (details reason, retry, host,
+// request_host) AFTER every eligibility and dependency guard and BEFORE the
+// CAS / slot admission, so it commits no transition and no queue row. The
+// hold is keyed to the host whose memory was measured (#5619): it refuses a
+// marker naming that host or no host, and every marker when the measured host
+// is unresolved; any other host's marker is admitted with a WARN (see
+// hostAdmissionHoldApplies). The body is therefore parsed, and a malformed one
+// answers 400 validation_failed, whenever the hold or a slot store is wired.
+// The idempotent `dispatched` arm is deliberately NOT checked (a spawn attempt
+// already exists), and nothing in flight is refused or killed. A plain 409,
+// not the queued one: an MCP slot waiter stops on it and the operator
+// re-dispatches.
 //
 // Decomposed-parent acceptance (#4080): an ACCEPTANCE stage of a run that has
 // decomposed children returns 409 acceptance_integration_incomplete — on every
@@ -272,12 +307,13 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// Optional {"host", "admission_nonce", "capacity"} body (#3964, #4241):
 	// the client's host label keys the host groups, a slot waiter's nonce is
 	// recorded on the slot it is admitted to, and the declared capacity sizes
-	// this request's host capacity group. Parsed only when a slot store is
-	// wired (a nil store keeps today's body-ignoring marker byte-identical),
+	// this request's host capacity group. The host label also keys the host
+	// memory hold (#5619). Parsed only when a slot store or the memory hold
+	// is wired (with both nil the marker keeps ignoring the body),
 	// after the dev-mode refusal, the auth ladder and the id parse, and
 	// before any stage read — a 400 leaves the stage untouched.
 	body := hostDispatchRequest{host: concurrency.UnknownHost}
-	if s.cfg.Concurrency != nil {
+	if s.cfg.Concurrency != nil || s.cfg.HostAdmissionHold != nil {
 		if body, ok = s.parseHostDispatchBody(w, r); !ok {
 			return
 		}
@@ -596,15 +632,26 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 
 	// Host memory hold (E85.11 / #4330, INTERIM): only the two admissible
 	// arms reach here (the idempotent dispatched arm returned above), so the
-	// hold refuses every NEW admission and nothing already spawned. Before
-	// the CAS / slot admission, so a refusal commits no state.
+	// hold refuses NEW admissions and nothing already spawned. Keyed to the
+	// measured host (#5619, hostAdmissionHoldApplies): a marker for another
+	// host is admitted and WARN-logged. Before the CAS / slot admission, so a
+	// refusal commits no state.
 	if s.cfg.HostAdmissionHold != nil {
 		if held, reason := s.cfg.HostAdmissionHold.Held(time.Now()); held {
-			s.writeError(w, r, http.StatusConflict, "host_memory_pressure",
-				"new host-dispatch admissions are held while host memory pressure is critical",
-				map[string]any{"stage_id": stageID.String(), "state": string(stage.State),
-					"reason": reason, "retry": hostDispatchHoldRetry})
-			return
+			measured := measuredAdmissionHost(s.cfg.HostAdmissionHold.Host())
+			if hostAdmissionHoldApplies(measured, host) {
+				s.writeError(w, r, http.StatusConflict, "host_memory_pressure",
+					fmt.Sprintf("new host-dispatch admissions for host %q are held while its memory pressure is critical", measured),
+					map[string]any{"stage_id": stageID.String(), "state": string(stage.State),
+						"reason": reason, "retry": hostDispatchHoldRetry,
+						"host": measured, "request_host": host})
+				return
+			}
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"host dispatch: memory hold is held for another host; this marker is not held by it",
+				slog.String("stage_id", stageID.String()), slog.String("run_id", runID.String()),
+				slog.String("measured_host", measured), slog.String("request_host", host),
+				slog.String("reason", reason))
 		}
 	}
 

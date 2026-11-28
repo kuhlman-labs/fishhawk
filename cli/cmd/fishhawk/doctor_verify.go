@@ -288,30 +288,38 @@ func provisionDoctorWorktree(ctx context.Context, workingDir string) (string, fu
 	}
 	target := filepath.Join(parent, doctorVerifyWorktreeName())
 
-	// Best-effort reclaim of a leftover from a SIGKILLed earlier doctor on
-	// the same pid. Deliberately NOT an os.RemoveAll: an unregistered
-	// directory here is not ours to delete, and `worktree add` failing on
-	// it is an honest warn.
 	gitCleanup := func(args ...string) {
 		cctx, ccancel := context.WithTimeout(context.Background(), verifyCleanupTimeout)
 		defer ccancel()
 		_ = exec.CommandContext(cctx, "git", append([]string{"-C", dir}, args...)...).Run() //nolint:gosec
 	}
-	gitCleanup("worktree", "remove", "--force", target)
-	gitCleanup("worktree", "prune")
+	// deregister clears the registration of THIS doctor worktree only. Double
+	// --force also removes a locked entry and one whose tree is already gone
+	// (git-worktree(1)). Never a repo-wide `git worktree prune`: it deletes the
+	// admin dir of ANY worktree whose .git this process cannot see, breaking
+	// live worktrees outside the repo (#4281).
+	deregister := func() { gitCleanup("worktree", "remove", "--force", "--force", target) }
+
+	// Best-effort reclaim of a leftover from a SIGKILLed earlier doctor on
+	// the same pid. Deliberately NOT an os.RemoveAll: an unregistered
+	// directory here is not ours to delete, and `worktree add` failing on
+	// it is an honest warn.
+	deregister()
 
 	if addOut, addErr := doctorVerifyGitRun(ctx, dir, true,
 		"worktree", "add", "--detach", target, headSHA); addErr != nil {
-		gitCleanup("worktree", "prune")
+		deregister()
 		return "", nil, fmt.Errorf("git worktree add: %v: %s", addErr, strings.TrimSpace(string(addOut)))
 	}
 
 	cleanup := func() {
-		gitCleanup("worktree", "remove", "--force", target)
-		// `worktree remove` refuses a tree it considers dirty; the
-		// throwaway is ours by construction, so remove what remains.
+		deregister()
+		// `worktree remove` can fail on a tree git refuses to touch; the
+		// throwaway is ours by construction, so remove what remains, then
+		// deregister again so a registration whose first removal failed is
+		// cleared once the tree is gone.
 		_ = os.RemoveAll(target)
-		gitCleanup("worktree", "prune")
+		deregister()
 	}
 	return target, cleanup, nil
 }

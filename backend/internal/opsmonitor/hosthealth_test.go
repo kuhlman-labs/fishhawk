@@ -698,6 +698,32 @@ func TestAdmissionHold_Staleness(t *testing.T) {
 	}
 }
 
+// TestAdmissionHold_Host: the measured-host label is set at construction,
+// empty for the zero value and a nil hold, and a tick that turns the hold held
+// leaves it unchanged.
+func TestAdmissionHold_Host(t *testing.T) {
+	var nilHold *AdmissionHold
+	if got := nilHold.Host(); got != "" {
+		t.Errorf("nil hold Host() = %q, want empty", got)
+	}
+	if got := (&AdmissionHold{}).Host(); got != "" {
+		t.Errorf("zero value Host() = %q, want empty", got)
+	}
+	clk := newClock()
+	tk := hhTicker(&fakeAudit{}, clk, &captureHandler{}, &MemoryProbe{Reader: darwinDoneMeans().reader("darwin")})
+	tk.Hold = NewAdmissionHold("host-a")
+	if got := tk.Hold.Host(); got != "host-a" {
+		t.Errorf("Host() = %q, want host-a", got)
+	}
+	tk.Tick(context.Background())
+	if held, _ := tk.Hold.Held(clk.Now()); !held {
+		t.Fatal("hold not held after a critical tick")
+	}
+	if got := tk.Hold.Host(); got != "host-a" {
+		t.Errorf("Host() after the tick = %q, want host-a", got)
+	}
+}
+
 // TestHostHealth_AlertAppendFailureWarnsAndHoldStillUpdates (approval
 // condition 7): a failing or panicking ops_monitor_alert append is a WARN,
 // the tick still returns its results, and the hold is updated regardless.

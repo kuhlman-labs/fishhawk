@@ -5446,8 +5446,10 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 // short-circuit, which discards the fix-up prompt it just fetched and re-opens
 // the PR from the stale held commit, running none of the fix the operator
 // requested (the #2630 sticky re-entry that stranded a stage in `running`). The
-// sibling resolvePushCheckpointResume already refuses a fix-up for the same
-// reason; this gate mirrors it exactly so both held-commit emission paths agree.
+// sibling resolvePushCheckpointResume refuses a fix-up too, so both gates serve
+// a fix-up no held-commit fields; since #3641 the checkpoint sibling also records
+// a verified_tree_discarded row (reason fixup_dispatch) when its resumable
+// checkpoint recorded a tree, while this exempt gate's refusal writes no row.
 //
 // DECOMPOSITION-CHILD REFUSAL (E55.16 / #3916). A child run (DecomposedFrom
 // set) never takes the exempt resume: it opens a PR from the held commit, and
@@ -5496,8 +5498,11 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 	}
 	// FIX-UP REFUSAL (#2630): a fix-up dispatch carries a fix-up prompt the
 	// runner MUST run; emitting the held-commit fields would send it to the
-	// pre-agent openHeldCommitPR short-circuit and discard that prompt. Mirror
-	// the sibling resolvePushCheckpointResume's refusal exactly.
+	// pre-agent openHeldCommitPR short-circuit and discard that prompt. Both
+	// gates refuse a fix-up and serve it no held-commit fields; since #3641 the
+	// sibling resolvePushCheckpointResume also records a verified_tree_discarded
+	// row (reason fixup_dispatch) when its resumable checkpoint recorded a tree,
+	// while this exempt gate's refusal writes no row.
 	if fixup {
 		return heldCommitResume{}, false
 	}
@@ -5967,6 +5972,12 @@ const (
 	checkpointIncomplete = "incomplete_checkpoint"
 )
 
+// declineReasonFixupDispatch is the verified_tree_discarded `reason` a FIX-UP
+// dispatch records when it declines a RESUMABLE checkpoint (#3641): the fix-up
+// re-runs the agent, so the recorded verified tree is thrown away and the row
+// names it. A wire token asserted by identity, not prose.
+const declineReasonFixupDispatch = "fixup_dispatch"
+
 // pushCheckpointPayload is the decoded checkpoint plus the kind that carried
 // it. VerifiedTreeSHA is populated for the pr_open and push kinds (the #2169
 // payload has carried it since it existed) — it is what the
@@ -6170,25 +6181,32 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 // (runner_capability_absent), and a decomposition child is declined
 // unconditionally (child_resume_kind_unsupported) — the runner arms reverify
 // only for a standalone open-PR stage, and its consume arm ends in the
-// standalone PR-open tail. A fix-up is already refused by the `fixup` guard
-// below. A served reverify carries NO verified tree, even when the recorded
-// payload has one: the held tree is the one that FAILED verify.
+// standalone PR-open tail. A fix-up is declined by the fix-up arm below, which
+// runs after the newest-wins read. A served reverify carries NO verified tree,
+// even when the recorded payload has one: the held tree is the one that FAILED
+// verify.
+//
+// FIX-UP DISPATCH (#2630, audited since #3641), a TOTAL DECLINE for every kind:
+// a fix-up MUST re-invoke the agent, so it is never served a held-commit field.
+// The refusal runs AFTER the newest-wins read so that, like the capability
+// declines, it audits a resumable checkpoint's recorded tree on the dispatch
+// path (reason fixup_dispatch). The real path is a fix-up whose push failed:
+// the backend recovers it to its review gate (maybeRecoverFixupFailure) before
+// recording the checkpoint, so the NEXT fix-up's dispatch is what meets it.
 //
 // recordDrop selects the DISPATCH path (handleGetStagePrompt, true) over the
 // preview render (handleGetStagePromptRender, false): only a real dispatch may
 // write the decline audit row, so previewing a stage never mutates the chain.
 //
 // FAIL-CLOSED on every uncertain branch: a nil stage, a non-implement stage, a
-// FIXUP dispatch (a fix-up MUST re-invoke the agent), any undecidable audit
-// state, an incomplete checkpoint, a push kind with no verified tree, or an
+// FIXUP dispatch (a fix-up MUST re-invoke the agent; a TOTAL decline that, like
+// the capability declines, audits a recorded tree on the dispatch path), any
+// undecidable audit state, an incomplete checkpoint, a push kind with no verified tree, or an
 // unrecognized kind. The cost of a wrong emission is a PR opened from an
 // unintended head; the cost of a wrong omission is today's agent re-run. Those
 // are not symmetric.
 func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool, runnerAdvertisesPushResume, runnerAdvertisesChildPushResume, runnerAdvertisesReverifyResume, recordDrop bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement {
-		return heldCommitResume{}, false
-	}
-	if fixup {
 		return heldCommitResume{}, false
 	}
 	cp, verdict := s.newestPushCheckpoint(ctx, runRow.ID, stage.ID)
@@ -6205,6 +6223,12 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 			s.appendVerifiedTreeDiscarded(ctx, runRow.ID, stage.ID, cp, reason)
 		}
 		return heldCommitResume{}, false
+	}
+	// FIX-UP ARM (#2630 refusal, audited by #3641): a fix-up is served no
+	// held-commit field for any kind, and the decline records the resumable
+	// checkpoint's verified tree (none for reverify) on the dispatch path.
+	if fixup {
+		return decline(declineReasonFixupDispatch)
 	}
 	isChild := runRow != nil && runRow.DecomposedFrom != nil
 	switch cp.ResumeKind {
