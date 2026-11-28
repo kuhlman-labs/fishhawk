@@ -854,6 +854,17 @@ func withholdDelegationShadow(entries []*audit.Entry, requestedCategory string) 
 // the revert outlive it, so reverting it would expose their spend figures to
 // run-bound reads. A revert that drops it must re-add it by hand.
 //
+// `merge_queue_overlap_refused` entries (#5604) are withheld because the row
+// names the blocking and undetermined runs that held a merge-on-pass: their
+// run ids, issue refs, stage ids and shared paths, the same cross-run detail
+// merge_overlap_overridden carries. This entry is INTERIM under ADR-106 (it
+// MUST migrate into the per-category registry flag with escape_recorded,
+// owned by E89 #4537) and is guarded by
+// TestListRunAudit_RunBoundWithholdsMergeQueueOverlapRefused and
+// TestListGlobalAudit_RunBoundWithholdsMergeQueueOverlapRefused. A rollback
+// of #5604 KEEPS this entry: rows written while it was live name other runs
+// and outlive the revert. A revert that drops it must re-add it by hand.
+//
 // It returns a NEW slice and never filters in place: the input may be a
 // repository's shared backing array.
 func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []*audit.Entry {
@@ -863,7 +874,7 @@ func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []
 	out := make([]*audit.Entry, 0, len(entries))
 	for _, e := range entries {
 		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden || e.Category == CategoryEscapeRecorded ||
-			e.Category == CategoryScopeAmendmentRefused || e.Category == CategoryRunBudgetOverrideBound) {
+			e.Category == CategoryScopeAmendmentRefused || e.Category == CategoryRunBudgetOverrideBound || e.Category == CategoryMergeQueueOverlapRefused) {
 			continue
 		}
 		out = append(out, e)
