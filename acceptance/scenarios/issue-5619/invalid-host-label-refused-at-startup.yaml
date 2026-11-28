@@ -1,0 +1,14 @@
+id: scenario:issue-5619/invalid-host-label-refused-at-startup
+statement: fishhawkd serve --enable-ops-monitor --ops-monitor-dispatch-hold --ops-monitor-deployment local --ops-monitor-host-label 'bad:label' exits non-zero before serving, and its stderr log names --ops-monitor-host-label.
+verify_hint: 'CLI exit code and stderr: run the built fishhawkd binary with those flags plus --addr 127.0.0.1:0. Expect exit 1 and an `invalid ops monitor configuration` log line whose error names --ops-monitor-host-label.'
+steps: 'Posture B: built fishhawkd from the sanctioned checkout (HEAD 3d519e629, equal to the target''s git_sha) with cd backend && go build -o /tmp/fhacc5619b/fishhawkd ./cmd/fishhawkd. Ran env -i PATH=$PATH HOME=/tmp/fhacc5619b/home fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold --ops-monitor-deployment local --ops-monitor-host-label ''bad:label'' with no DB.'
+assertions:
+    expected: exit 1 and an 'invalid ops monitor configuration' line naming --ops-monitor-host-label
+    observed_at_record: exit=1; ERROR 'invalid ops monitor configuration' error '--ops-monitor-host-label must be 1..253 characters from [A-Za-z0-9._-], got "bad:label"' (stderr sha256:3f84a9a4…)
+    repro_handle: fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold --ops-monitor-deployment local --ops-monitor-host-label 'bad:label'; echo $?
+origin:
+    issue: 5619
+    pr: 5629
+    run_id: aceea4db-113a-4949-a73d-c70867037e8b
+    head_sha: 3d519e629768c0893a20e515e4d207e3233dc796
+    recorded_at: 2026-11-28T09:51:05Z

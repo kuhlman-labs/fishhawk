@@ -88,7 +88,7 @@ After the per-result emit, `Tick` collects the tick's failing crossings and writ
 
 ### `AdmissionHold` (INTERIM)
 
-Default off; fishhawkd constructs one only with the hold flag on a local deployment and shares it with the server's host-dispatch admission. `Ticker.Hold` is updated every tick: held iff a failing `host_memory_pressure` result is `Critical`; ok, unknown, not_applicable or no memory result clear it. `Held(now)` reads false once the last update is older than 3 × the Ticker's EFFECTIVE interval (`Interval` 0 resolves to `DefaultInterval`, as `Run` does), so a dead ticker cannot pin it; a nil hold is never held. ADR-100's adaptive concurrency controller absorbs it.
+Default off; fishhawkd constructs one only with the hold flag on a local deployment and shares it with the server's host-dispatch admission. `Ticker.Hold` is updated every tick: held iff a failing `host_memory_pressure` result is `Critical`; ok, unknown, not_applicable or no memory result clear it. `Held(now)` reads false once the last update is older than 3 × the Ticker's EFFECTIVE interval (`Interval` 0 resolves to `DefaultInterval`, as `Run` does), so a dead ticker cannot pin it; a nil hold is never held. `NewAdmissionHold(host)` gives the hold its immutable measured-host label, read back by `Host()` (empty for the zero value or a nil hold; [#5619](https://github.com/kuhlman-labs/fishhawk/issues/5619)): `Held` says only whether pressure is critical, `Host` says whose memory was measured, and the server decides which markers that holds. ADR-100's adaptive concurrency controller absorbs it.
 
 ### Residuals
 
