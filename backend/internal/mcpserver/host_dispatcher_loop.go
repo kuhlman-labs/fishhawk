@@ -693,13 +693,18 @@ type hostDispatchLoop struct {
 	// hook run after each publish attempt (nil in production).
 	// heartbeatLastErr is the dedupe key (heartbeatErrKey) of the last logged
 	// publish error and heartbeatLastDropped the last logged dropped_refusals
-	// count, both owned by the publisher goroutine.
+	// count, both owned by the publisher goroutine. hostLabel is the resolved
+	// label this process's markers send (fixed at construction), and
+	// heartbeatLabelWarned the (token label, resolved label) pairs already
+	// warned about (ADR-094 A5 label match), also publisher-owned.
 	heartbeats           chan hostdispatcher.Heartbeat
-	publishHeartbeat     func(ctx context.Context, hb hostdispatcher.Heartbeat) (dropped int, err error)
+	publishHeartbeat     func(ctx context.Context, hb hostdispatcher.Heartbeat) (hostdispatcher.HeartbeatResponse, error)
 	heartbeatTimeout     time.Duration
 	heartbeatDelivered   func(hb hostdispatcher.Heartbeat, err error)
 	heartbeatLastErr     string
 	heartbeatLastDropped int
+	hostLabel            string
+	heartbeatLabelWarned map[string]bool
 	// logMu serialises logf: the tick and the heartbeat publisher both log.
 	logMu sync.Mutex
 }
@@ -728,9 +733,11 @@ func newHostDispatchLoop(cfg HostDispatcherConfig, r *runResolver, binary string
 	l.core = newHostDispatcher(r, binary, l, l)
 	l.core.staleAfter = cfg.StaleAfter
 	l.core.now = func() time.Time { return l.now() }
+	l.hostLabel = r.api.hostLabelResolution().Label
+	l.heartbeatLabelWarned = map[string]bool{}
 	l.status = HostDispatcherStatus{
 		PID:             os.Getpid(),
-		Host:            r.api.hostLabelResolution().Label,
+		Host:            l.hostLabel,
 		IntervalSeconds: cfg.Interval.Seconds(),
 		DailyCap:        cfg.DailyCap,
 	}
@@ -959,11 +966,14 @@ func (l *hostDispatchLoop) startHeartbeatPublisher(ctx context.Context) <-chan s
 // older server, a 5xx) never fails a tick: it is logged once per distinct
 // heartbeatErrKey, and a success resets the dedupe. A success whose
 // dropped_refusals is non-zero is logged once per distinct count: a dropped
-// entry's run reads live on the server while this dispatcher refuses it.
+// entry's run reads live on the server while this dispatcher refuses it. A
+// success whose host_label differs from this process's resolved label is
+// warned about once per pair (warnTokenLabelMismatch).
 func (l *hostDispatchLoop) publishOnce(ctx context.Context, hb hostdispatcher.Heartbeat) {
 	pctx, cancel := context.WithTimeout(ctx, l.heartbeatTimeout)
-	dropped, err := l.publishHeartbeat(pctx, hb)
+	resp, err := l.publishHeartbeat(pctx, hb)
 	cancel()
+	dropped := resp.DroppedRefusals
 	if err != nil {
 		if key := heartbeatErrKey(err); key != l.heartbeatLastErr {
 			l.heartbeatLastErr = key
@@ -977,6 +987,7 @@ func (l *hostDispatchLoop) publishOnce(ctx context.Context, hb hostdispatcher.He
 				l.logf("heartbeat stored with %d run_refusals entries dropped as off-grammar; the server reads those runs as live (check that the dispatcher and server versions match; logged once per distinct count)", dropped)
 			}
 		}
+		l.warnTokenLabelMismatch(resp.HostLabel)
 	}
 	if l.heartbeatDelivered != nil {
 		l.heartbeatDelivered(hb, err)
@@ -994,18 +1005,58 @@ func heartbeatErrKey(err error) string {
 	return err.Error()
 }
 
+// warnTokenLabelMismatch compares the server-echoed host_label (the label
+// the server stored this dispatcher's heartbeat under: its token subject's
+// host-dispatcher/<host>) with the label this process's markers send. ADR-094
+// A5 matches a declaration's label EXACTLY, so on a mismatch the dispatcher's
+// declaration never governs this host's host:<label>:* groups. It is a
+// warning, not a refusal, logged once per (token label, resolved label) pair.
+// An empty echo (an older server) is silent. An empty resolved label reads as
+// `unknown`, the host the server files label-less markers under, and the
+// remedy is then FISHHAWK_HOST_LABEL: minting host-dispatcher/ with an empty
+// label is impossible. Only the server echo is interpolated, never anything
+// derived from the bearer.
+func (l *hostDispatchLoop) warnTokenLabelMismatch(tokenLabel string) {
+	if tokenLabel == "" {
+		return
+	}
+	resolved := l.hostLabel
+	if resolved == "" {
+		resolved = unknownHostLabel
+	}
+	if tokenLabel == resolved {
+		return
+	}
+	tokenLabel = hostdispatcher.BoundText(tokenLabel)
+	key := tokenLabel + "\x00" + resolved
+	if l.heartbeatLabelWarned[key] {
+		return
+	}
+	if l.heartbeatLabelWarned == nil {
+		l.heartbeatLabelWarned = map[string]bool{}
+	}
+	l.heartbeatLabelWarned[key] = true
+	if l.hostLabel == "" {
+		l.logf("warning: this dispatcher's token subject is host-dispatcher/%s, but its host label did not resolve, so its markers file under host %q; ADR-094 A5 matches a declaration's label exactly, so this dispatcher's declaration never governs the host:%s:* groups. Set %s=%s so the markers carry the token's label (logged once)",
+			tokenLabel, unknownHostLabel, unknownHostLabel, hostLabelEnv, tokenLabel)
+		return
+	}
+	l.logf("warning: this dispatcher's token subject is host-dispatcher/%s, but its markers send host label %q; ADR-094 A5 matches a declaration's label exactly, so this dispatcher's declaration never governs the host:%s:* groups. Re-mint the token with `fishhawkd token issue --subject host-dispatcher/%s`, or set %s=%s (logged once)",
+		tokenLabel, resolved, resolved, resolved, hostLabelEnv, tokenLabel)
+}
+
 // postHeartbeat is the default publish seam: POST hostdispatcher.HeartbeatRoute
-// under the dispatcher's own token, returning the response's dropped_refusals.
-func (l *hostDispatchLoop) postHeartbeat(ctx context.Context, hb hostdispatcher.Heartbeat) (int, error) {
+// under the dispatcher's own token, returning the decoded 200 body.
+func (l *hostDispatchLoop) postHeartbeat(ctx context.Context, hb hostdispatcher.Heartbeat) (hostdispatcher.HeartbeatResponse, error) {
 	body, err := json.Marshal(hb)
 	if err != nil {
-		return 0, err
+		return hostdispatcher.HeartbeatResponse{}, err
 	}
 	var resp hostdispatcher.HeartbeatResponse
 	if err := l.api.do(ctx, http.MethodPost, hostdispatcher.HeartbeatRoute, body, &resp); err != nil {
-		return 0, err
+		return hostdispatcher.HeartbeatResponse{}, err
 	}
-	return resp.DroppedRefusals, nil
+	return resp, nil
 }
 
 // tick is one dispatcher round. A tick error is logged and never spawns; only

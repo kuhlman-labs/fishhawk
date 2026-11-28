@@ -2,15 +2,23 @@
 // heartbeat (#5489, ADR-104 Amendment A2) in host_dispatcher_heartbeats
 // (migration 0121): one row per (account, host label), written by
 // POST /v0/host-dispatchers/heartbeat and read by the campaign status awaiting
-// block. The wire type is hostdispatcher.Heartbeat.
+// block and, through Get, by the marker's host-capacity resolution (ADR-094
+// Amendment A5). The wire type is hostdispatcher.Heartbeat.
 //
 // ACCOUNT PARTITION: a write lands in the token's account partition (empty =
-// the untenanted partition). A read for account X sees the untenanted rows and
-// X's rows, never another account's; a read for the untenanted caller sees the
-// untenanted rows only. Both methods run inside postgres.WithTenant, AND List
-// carries an explicit account WHERE: the runtime superuser bypasses RLS
+// the untenanted partition). A List read for account X sees the untenanted
+// rows and X's rows, never another account's; a List read for the untenanted
+// caller sees the untenanted rows only. Get is EXACT instead: it returns only
+// the row whose account equals the caller's (two empties match), so an
+// untenanted declaration never governs a tenanted run (A5 item 7). Every
+// method runs inside postgres.WithTenant AND carries an explicit account
+// WHERE: the runtime superuser bypasses RLS
 // (backend/internal/postgres/tenant.go), so the WHERE is the operative
 // control and the 0121 policy is defense in depth.
+//
+// The payload column holds the heartbeat plus the server-only
+// dropped_declaration (storedPayload), so the strict wire type gains no key a
+// client could send.
 //
 // Hand-written pgx, not sqlc: a local `sqlc generate` regenerates every
 // package in backend/sqlc.yaml (the userreport / digest precedent).
@@ -45,8 +53,22 @@ type Record struct {
 	// TokenID is the authenticating token's id (empty when unknown).
 	TokenID   string
 	Heartbeat hostdispatcher.Heartbeat
+	// DroppedDeclaration names the declaration field whose out-of-range value
+	// dropped the whole declaration at ingest (hostdispatcher
+	// DeclarationField*); empty when none dropped. Heartbeat's declaration
+	// fields are then both nil, so no earlier declaration carries forward.
+	DroppedDeclaration string
 	// ReceivedAt is fishhawkd's clock at ingest, never the dispatcher's.
 	ReceivedAt time.Time
+}
+
+// storedPayload is the payload column's shape: the wire heartbeat's fields
+// promoted to the top level (an embedded struct), plus the server-only
+// dropped_declaration. Keeping that key off hostdispatcher.Heartbeat keeps it
+// an unknown-key 400 when a client sends it.
+type storedPayload struct {
+	hostdispatcher.Heartbeat
+	DroppedDeclaration string `json:"dropped_declaration,omitempty"`
 }
 
 // Repository is the heartbeat store seam.
@@ -56,6 +78,11 @@ type Repository interface {
 	// List returns the rows visible to accountID (see the package doc), newest
 	// received_at first, ties broken by the lower host label.
 	List(ctx context.Context, accountID string, limit int) ([]Record, error)
+	// Get returns the row whose account EXACTLY equals accountID (empty
+	// matches only the untenanted row) and whose label equals hostLabel, and
+	// whether one exists. Unlike List it never falls back to an untenanted
+	// row for a tenanted caller.
+	Get(ctx context.Context, accountID, hostLabel string) (Record, bool, error)
 }
 
 // PostgresRepository is the pgx-backed Repository.
@@ -99,7 +126,7 @@ func (p *PostgresRepository) Upsert(ctx context.Context, rec Record) error {
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(rec.Heartbeat)
+	payload, err := json.Marshal(storedPayload{Heartbeat: rec.Heartbeat, DroppedDeclaration: rec.DroppedDeclaration})
 	if err != nil {
 		return fmt.Errorf("dispatcherheartbeat: encode payload: %w", err)
 	}
@@ -136,17 +163,10 @@ func (p *PostgresRepository) List(ctx context.Context, accountID string, limit i
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var (
-				rec     Record
-				payload []byte
-			)
-			if err := rows.Scan(&rec.AccountID, &rec.HostLabel, &rec.TokenID, &payload, &rec.ReceivedAt); err != nil {
+			rec, err := scanRecord(rows)
+			if err != nil {
 				return err
 			}
-			if err := json.Unmarshal(payload, &rec.Heartbeat); err != nil {
-				return fmt.Errorf("decode payload for host %q: %w", rec.HostLabel, err)
-			}
-			rec.ReceivedAt = rec.ReceivedAt.UTC()
 			out = append(out, rec)
 		}
 		return rows.Err()
@@ -157,16 +177,75 @@ func (p *PostgresRepository) List(ctx context.Context, accountID string, limit i
 	return out, nil
 }
 
+// getSQL is Get's EXACT (account, label) read. The COALESCE pair is the 0121
+// unique expression index's key, so two NULL accounts match and the read is an
+// index point lookup. It deliberately does NOT use listSQL's visibility rule:
+// an untenanted row is invisible to a tenanted caller here.
+const getSQL = `SELECT COALESCE(account_id::text, ''), host_label, COALESCE(token_id, ''), payload, received_at
+	FROM host_dispatcher_heartbeats
+	WHERE host_label = $2
+	  AND COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid) = COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)`
+
+// Get implements Repository.
+func (p *PostgresRepository) Get(ctx context.Context, accountID, hostLabel string) (Record, bool, error) {
+	acct, err := accountParam(accountID)
+	if err != nil {
+		return Record{}, false, err
+	}
+	var (
+		rec   Record
+		found bool
+	)
+	err = postgres.WithTenant(ctx, p.pool, accountID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, getSQL, acct, hostLabel)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if rows.Next() {
+			if rec, err = scanRecord(rows); err != nil {
+				return err
+			}
+			found = true
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return Record{}, false, fmt.Errorf("dispatcherheartbeat: get: %w", err)
+	}
+	return rec, found, nil
+}
+
+// scanRecord reads one row of listSQL's / getSQL's column list.
+func scanRecord(rows pgx.Rows) (Record, error) {
+	var (
+		rec     Record
+		payload []byte
+	)
+	if err := rows.Scan(&rec.AccountID, &rec.HostLabel, &rec.TokenID, &payload, &rec.ReceivedAt); err != nil {
+		return Record{}, err
+	}
+	var sp storedPayload
+	if err := json.Unmarshal(payload, &sp); err != nil {
+		return Record{}, fmt.Errorf("decode payload for host %q: %w", rec.HostLabel, err)
+	}
+	rec.Heartbeat = sp.Heartbeat
+	rec.DroppedDeclaration = sp.DroppedDeclaration
+	rec.ReceivedAt = rec.ReceivedAt.UTC()
+	return rec, nil
+}
+
 // MemoryRepository is an in-memory Repository with the same account
 // semantics, for tests. It has no host-label CHECK, so a caller that skips
-// label validation is observable through Records(). Set UpsertErr or ListErr
-// to inject a failure.
+// label validation is observable through Records(). Set UpsertErr, ListErr or
+// GetErr to inject a failure.
 type MemoryRepository struct {
 	mu        sync.Mutex
 	rows      map[memoryKey]Record
 	listCalls int
 	UpsertErr error
 	ListErr   error
+	GetErr    error
 }
 
 type memoryKey struct{ account, label string }
@@ -219,6 +298,26 @@ func (m *MemoryRepository) List(_ context.Context, accountID string, limit int) 
 		out = out[:n]
 	}
 	return out, nil
+}
+
+// Get implements Repository with the Postgres repository's EXACT account
+// match: the key is (accountID, hostLabel), so an untenanted row never answers
+// a tenanted caller.
+func (m *MemoryRepository) Get(_ context.Context, accountID, hostLabel string) (Record, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.GetErr != nil {
+		return Record{}, false, m.GetErr
+	}
+	if _, err := accountParam(accountID); err != nil {
+		return Record{}, false, err
+	}
+	rec, ok := m.rows[memoryKey{accountID, hostLabel}]
+	if !ok {
+		return Record{}, false, nil
+	}
+	rec.Heartbeat.RunRefusals = append([]hostdispatcher.RunRefusal(nil), rec.Heartbeat.RunRefusals...)
+	return rec, true, nil
 }
 
 // ListCalls reports how many times List was called.

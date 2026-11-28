@@ -182,3 +182,78 @@ func TestHostDispatcherHeartbeatE2E_AwaitingNamesDispatcherState(t *testing.T) {
 		t.Fatal("harness dispatcher subject or allowlist drifted")
 	}
 }
+
+// TestHostDispatcherHeartbeatE2E_EchoesHostLabelAndStoresDeclaration (#5614,
+// ADR-094 A5) is cross-boundary: the REAL publish seam (postHeartbeat) under
+// the harness's real host-dispatcher/e2e-host token POSTs over real HTTP to
+// the real server and Postgres. (a) The 200 echoes host_label e2e-host and an
+// in-range declaration lands in the row. (b) An out-of-range declaration
+// answers dropped_declaration and the row keeps no declaration but records the
+// dropped field. (c) Through the real publisher, a loop whose resolved label
+// matches the token logs no label warning; (d) one whose resolved label
+// differs logs exactly one, naming the server-echoed token label.
+func TestHostDispatcherHeartbeatE2E_EchoesHostLabelAndStoresDeclaration(t *testing.T) {
+	var repo *dispatcherheartbeat.PostgresRepository
+	h := newAdE2EHarnessWith(t, adE2EPlanSpecYAML, func(cfg *server.Config, pool *pgxpool.Pool) {
+		repo = dispatcherheartbeat.NewPostgresRepository(pool)
+		cfg.HostDispatcherHeartbeatRepo = repo
+	})
+	now := time.Now().UTC()
+	hb := func(capacity, implement int) hostdispatcher.Heartbeat {
+		return hostdispatcher.Heartbeat{
+			IntervalSeconds: 30, StartedAt: now.Add(-time.Minute), LastTickAt: now,
+			HostCapacity: &capacity, HostImplementLimit: &implement,
+		}
+	}
+	row := func(step string) dispatcherheartbeat.Record {
+		t.Helper()
+		rec, found, err := repo.Get(context.Background(), "", adE2EHeartbeatHost)
+		if err != nil || !found {
+			t.Fatalf("%s: Get(untenanted, %s) found=%v err=%v; want the dispatcher's row", step, adE2EHeartbeatHost, found, err)
+		}
+		return rec
+	}
+
+	// (a) in range.
+	resp, err := h.loop.postHeartbeat(h.ctx, hb(4, 2))
+	if err != nil {
+		t.Fatalf("(a) postHeartbeat: %v", err)
+	}
+	if resp.HostLabel != adE2EHeartbeatHost || resp.DroppedDeclaration != "" {
+		t.Fatalf("(a) response = %+v; want host_label %s and no dropped_declaration", resp, adE2EHeartbeatHost)
+	}
+	if rec := row("(a)"); rec.Heartbeat.HostCapacity == nil || *rec.Heartbeat.HostCapacity != 4 ||
+		rec.Heartbeat.HostImplementLimit == nil || *rec.Heartbeat.HostImplementLimit != 2 || rec.DroppedDeclaration != "" {
+		t.Fatalf("(a) stored = %+v dropped %q; want host_capacity 4, host_implement_limit 2", rec.Heartbeat, rec.DroppedDeclaration)
+	}
+
+	// (b) out of range: the whole declaration drops, the heartbeat stays.
+	resp, err = h.loop.postHeartbeat(h.ctx, hb(4, 65))
+	if err != nil {
+		t.Fatalf("(b) postHeartbeat: %v", err)
+	}
+	if resp.DroppedDeclaration != hostdispatcher.DeclarationFieldHostImplementLimit || resp.HostLabel != adE2EHeartbeatHost {
+		t.Fatalf("(b) response = %+v; want dropped_declaration host_implement_limit", resp)
+	}
+	if rec := row("(b)"); rec.Heartbeat.HostCapacity != nil || rec.Heartbeat.HostImplementLimit != nil ||
+		rec.DroppedDeclaration != hostdispatcher.DeclarationFieldHostImplementLimit {
+		t.Fatalf("(b) stored = %+v dropped %q; want no declaration carried forward and the dropped field recorded", rec.Heartbeat, rec.DroppedDeclaration)
+	}
+
+	// (c) and (d): the real publisher's label check against the real echo.
+	const warn = "ADR-094 A5 matches a declaration's label exactly"
+	log := &hdLockedLog{}
+	h.loop.cfg.Log = log
+	h.loop.hostLabel = adE2EHeartbeatHost
+	got, _, _ := hdStartPublisher(t, h.loop)
+	h.heartbeatTick(got)
+	if n := log.count(warn); n != 0 {
+		t.Fatalf("(c) matching labels logged %d warnings; want 0\n%s", n, log.b.String())
+	}
+	h.loop.hostLabel = "Mac"
+	h.heartbeatTick(got)
+	h.heartbeatTick(got)
+	if n := log.count(warn); n != 1 || !strings.Contains(log.b.String(), "host-dispatcher/"+adE2EHeartbeatHost) {
+		t.Fatalf("(d) mismatched labels logged %d warnings; want 1 naming host-dispatcher/%s\n%s", n, adE2EHeartbeatHost, log.b.String())
+	}
+}

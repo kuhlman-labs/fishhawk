@@ -158,7 +158,14 @@ func OutsideProfile(requested []string) []string {
 // POST /v0/host-dispatchers/heartbeat (#5489, ADR-104 Amendment A2) is the
 // dispatcher's per-tick state snapshot (HeartbeatRoute). It is the
 // dispatcher's only server write that is not run-scoped; it upserts the
-// dispatcher's own (account, host) heartbeat row and adds no dispatch reach.
+// dispatcher's own (account, host) heartbeat row. Since ADR-094 Amendment A5
+// (#5614) that row also DECLARES the host's admission limits: host_capacity
+// (up to MaxDeclaredLimit, 64) sizes host:<label>:capacity and
+// host_implement_limit caps local-implement:<label>, for the token's own
+// label and account only (the server takes both from the token, never the
+// body). So the route now carries admission reach for its own host: a stolen
+// dispatcher token can raise that host's capacity to 64 while its heartbeat
+// stays fresh. It still cannot start, approve or dispatch a stage.
 var routes = []string{
 	"GET /v0/runs",
 	"GET /v0/runs/{run_id}",

@@ -1,12 +1,15 @@
 package hostdispatcher
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 )
 
 const (
@@ -209,5 +212,99 @@ func TestHeartbeatStaleAfter(t *testing.T) {
 	}
 	if FutureSkew != 60*time.Second {
 		t.Errorf("FutureSkew = %v, want 60s (the status.json reader's hostDispatchStatusFutureSkew)", FutureSkew)
+	}
+}
+
+func intp(v int) *int { return &v }
+
+func derefLimit(v *int) string {
+	if v == nil {
+		return "nil"
+	}
+	return fmt.Sprint(*v)
+}
+
+// TestHeartbeat_DropInvalidDeclaration pins ADR-094 A5 item 1: an out-of-range
+// value drops the WHOLE declaration (both fields) and names the first
+// offending field, host_capacity checked first; in-range values, either one
+// alone, and an absent declaration are kept untouched. Counterfactuals run by
+// hand: returning "" without clearing went RED on every out-of-range row;
+// clearing only the offending field went RED on the valid-cap/invalid-impl
+// row.
+func TestHeartbeat_DropInvalidDeclaration(t *testing.T) {
+	for _, c := range []struct {
+		name              string
+		capacity, impl    *int
+		wantField         string
+		wantCap, wantImpl *int
+	}{
+		{name: "none", wantField: ""},
+		{name: "both valid", capacity: intp(4), impl: intp(2), wantCap: intp(4), wantImpl: intp(2)},
+		{name: "bounds valid", capacity: intp(MinDeclaredLimit), impl: intp(MaxDeclaredLimit), wantCap: intp(1), wantImpl: intp(64)},
+		{name: "cap only", capacity: intp(4), wantCap: intp(4)},
+		{name: "impl only", impl: intp(1), wantImpl: intp(1)},
+		{name: "cap 0", capacity: intp(0), wantField: DeclarationFieldHostCapacity},
+		{name: "cap 65", capacity: intp(65), wantField: DeclarationFieldHostCapacity},
+		{name: "cap -1", capacity: intp(-1), wantField: DeclarationFieldHostCapacity},
+		{name: "impl 0", impl: intp(0), wantField: DeclarationFieldHostImplementLimit},
+		{name: "impl 65", impl: intp(65), wantField: DeclarationFieldHostImplementLimit},
+		{name: "valid cap invalid impl clears both", capacity: intp(4), impl: intp(65), wantField: DeclarationFieldHostImplementLimit},
+		{name: "invalid cap valid impl clears both", capacity: intp(65), impl: intp(2), wantField: DeclarationFieldHostCapacity},
+		{name: "both invalid names host_capacity", capacity: intp(0), impl: intp(65), wantField: DeclarationFieldHostCapacity},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := validHeartbeat()
+			h.HostCapacity, h.HostImplementLimit = c.capacity, c.impl
+			if got := h.DropInvalidDeclaration(); got != c.wantField {
+				t.Errorf("DropInvalidDeclaration() = %q, want %q", got, c.wantField)
+			}
+			if derefLimit(h.HostCapacity) != derefLimit(c.wantCap) || derefLimit(h.HostImplementLimit) != derefLimit(c.wantImpl) {
+				t.Errorf("after drop: host_capacity=%s host_implement_limit=%s, want %s / %s",
+					derefLimit(h.HostCapacity), derefLimit(h.HostImplementLimit), derefLimit(c.wantCap), derefLimit(c.wantImpl))
+			}
+			if h.IntervalSeconds != 30 || len(h.RunRefusals) != len(validHeartbeat().RunRefusals) {
+				t.Errorf("the rest of the heartbeat changed: %+v", h)
+			}
+			if err := h.Validate(); err != nil {
+				t.Errorf("Validate() after drop = %v, want nil (range is not structural)", err)
+			}
+		})
+	}
+}
+
+// TestHeartbeat_DeclarationWireShape: the declaration fields are omitted when
+// absent (an older server sees the A2 body byte-for-byte), carried when set,
+// and JSON null decodes as absent.
+func TestHeartbeat_DeclarationWireShape(t *testing.T) {
+	b, err := json.Marshal(validHeartbeat())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "host_capacity") || strings.Contains(string(b), "host_implement_limit") {
+		t.Errorf("absent declaration marshalled its keys: %s", b)
+	}
+	h := validHeartbeat()
+	h.HostCapacity, h.HostImplementLimit = intp(4), intp(1)
+	b, _ = json.Marshal(h)
+	if !strings.Contains(string(b), `"host_capacity":4`) || !strings.Contains(string(b), `"host_implement_limit":1`) {
+		t.Errorf("set declaration = %s, want both keys", b)
+	}
+	var back Heartbeat
+	if err := json.Unmarshal([]byte(`{"host_capacity":null,"host_implement_limit":null}`), &back); err != nil ||
+		back.HostCapacity != nil || back.HostImplementLimit != nil {
+		t.Errorf("null declaration = %s/%s (%v), want absent", derefLimit(back.HostCapacity), derefLimit(back.HostImplementLimit), err)
+	}
+	var resp HeartbeatResponse
+	if b, _ := json.Marshal(resp); string(b) != `{"dropped_refusals":0}` {
+		t.Errorf("zero HeartbeatResponse = %s, want only dropped_refusals (older-dispatcher shape)", b)
+	}
+}
+
+// TestDeclaredLimitParity pins the wire package's copy of the slot store's
+// limit range: a declaration the heartbeat accepts must be one the slot store
+// can hold.
+func TestDeclaredLimitParity(t *testing.T) {
+	if MinDeclaredLimit != 1 || MaxDeclaredLimit != concurrency.MaxLimit {
+		t.Errorf("declared limit range = [%d, %d], want [1, concurrency.MaxLimit=%d]", MinDeclaredLimit, MaxDeclaredLimit, concurrency.MaxLimit)
 	}
 }
