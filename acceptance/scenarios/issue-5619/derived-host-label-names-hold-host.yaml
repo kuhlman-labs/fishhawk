@@ -1,13 +1,13 @@
 id: scenario:issue-5619/derived-host-label-names-hold-host
 statement: With --enable-ops-monitor --ops-monitor-dispatch-hold set, no --ops-monitor-host-label flag, and FISHHAWK_HOST_LABEL=acc-derived-label in fishhawkd's environment, the 'ops monitor started' startup record reports dispatch_hold_host acc-derived-label.
-steps: Built fishhawkd from the sanctioned checkout. Ran env -i PATH=$PATH HOME=/tmp/fhacc5619/home FISHHAWK_HOST_LABEL=acc-derived-label fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold (no --ops-monitor-host-label) in the background; after 5s read 'ops monitor started'; SIGTERM.
+steps: 'Posture B: using the fishhawkd built from the sanctioned checkout, ran env -i PATH=$PATH HOME=/tmp/fhacc5619b/home FISHHAWK_HOST_LABEL=acc-derived-label fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold with no --ops-monitor-host-label. After 5s I read ''ops monitor started'', then sent SIGTERM.'
 assertions:
     expected: dispatch_hold_host acc-derived-label
-    observed_at_record: '''ops monitor started'' deployment local, dispatch_hold:true, dispatch_hold_host:"acc-derived-label"'
+    observed_at_record: dispatch_hold:true, dispatch_hold_host:"acc-derived-label" (stderr sha256:4160f3b7…)
     repro_handle: FISHHAWK_HOST_LABEL=acc-derived-label fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold
 origin:
     issue: 5619
     pr: 5629
     run_id: aceea4db-113a-4949-a73d-c70867037e8b
-    head_sha: 038dbb16697e1f290d7d6fb7cb3cf17dbe3cd303
-    recorded_at: 2026-11-28T07:48:19Z
+    head_sha: 3d519e629768c0893a20e515e4d207e3233dc796
+    recorded_at: 2026-11-28T09:51:05Z
