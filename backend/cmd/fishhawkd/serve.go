@@ -3699,9 +3699,15 @@ func runServe(args []string, logSink io.Writer) int {
 	// cfg, and the SAME pointer goes to the ops monitor ticker below, which
 	// updates it every tick. nil (monitor off, --ops-monitor-dispatch-hold
 	// off, or a non-local deployment) leaves cfg.HostAdmissionHold nil and
-	// the host-dispatch marker unchanged. INTERIM: ADR-100's adaptive
+	// the host-dispatch marker unchanged. The hold is keyed to the measured
+	// host (#5619): --ops-monitor-host-label, else this daemon's own host
+	// label from the ladder fishhawk-mcp uses. INTERIM: ADR-100's adaptive
 	// concurrency controller absorbs it.
-	opsHold := opsAdmissionHold(opsMonitorConf, logger)
+	hostLabel := serveOpsMonitorSeams.HostLabel
+	if hostLabel == nil {
+		hostLabel = mcpserver.ProcessHostLabel
+	}
+	opsHold := opsAdmissionHold(opsMonitorConf, hostLabel, logger)
 	if opsHold != nil {
 		cfg.HostAdmissionHold = opsHold
 	}
@@ -4139,12 +4145,17 @@ func runServe(args []string, logSink io.Writer) int {
 			Hold:       opsHold,
 		}
 		startOpsMonitor(ctx, newOpsMonitorTicker(*opsMonitorConf, deps), logger)
-		logger.Info("ops monitor started",
+		started := []any{
 			slog.String("deployment", string(opsMonitorConf.Deployment)),
 			slog.Duration("interval", opsMonitorConf.Interval),
 			slog.Duration("quiet_window", opsMonitorConf.QuietWindow),
 			slog.Bool("notify_issue", opsMonitorConf.NotifyIssue > 0 && cfg.GitHub != nil),
-			slog.Bool("dispatch_hold", opsHold != nil))
+			slog.Bool("dispatch_hold", opsHold != nil),
+		}
+		if opsHold != nil {
+			started = append(started, slog.String("dispatch_hold_host", opsHold.Host()))
+		}
+		logger.Info("ops monitor started", started...)
 	}
 
 	// Child-completion sweeper (#455 / ADR-025 D4). Resolves parent

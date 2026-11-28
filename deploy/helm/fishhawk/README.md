@@ -78,9 +78,8 @@ older fishhawkd refuses the unknown `capacity` key with 400
 the daemon is upgraded; a client with the variable unset sends a
 byte-identical body and works against either. On the upgraded daemon every
 host-dispatched stage also holds one `host:<host>:capacity` slot (default 3):
-a host running implement limit 2 should set `FISHHAWK_HOST_CAPACITY=4`,
-because a queued implement reserves one capacity slot and at 3 it would queue
-later plan, acceptance and verify stages. **The upgrade also re-queues every
+size capacity to the host; a stage queued only on another group reserves no
+capacity slot (ADR-094 A4). **The upgrade also re-queues every
 live waiter.** On its first poll after the upgrade each queued stage asks for
 a larger set: it gains `host:<host>:capacity`, and an implement whose
 declaration did not name the host implement group (the named

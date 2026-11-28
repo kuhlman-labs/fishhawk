@@ -2566,6 +2566,17 @@ classification precedence, git-tempdir scan/warn fixtures, the
 age-boundary/legacy-protection prune fixtures, and the
 non-tty/self-protection/confirmed-sweep `cmd_sweep` paths.
 
+No `scripts/dev` path runs a repo-wide `git worktree prune` (#4281): each
+removal is a targeted `git worktree remove`, which deregisters only its own
+entry, because a prune deletes the `.git/worktrees/<id>` admin dir of ANY
+worktree whose `.git` the calling process cannot see. So `sweep` no longer
+reaps the registrations of vanished non-Fishhawk worktrees; clear those with a
+manual `git worktree prune`, run only from a context that can see every live
+worktree. Run from a sandbox, container or other partial filesystem view, a
+prune silently breaks live worktrees outside the repo. `scripts/test-dev` pins
+this by hiding a foreign worktree around the preview removal,
+`_prune_aged_artifacts` and the confirmed sweep.
+
 ### MCP banner selection (ADR-060 / #1922)
 
 Because `--all` always rebuilds `fishhawk-mcp`, the closing MCP banner is

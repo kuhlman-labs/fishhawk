@@ -48,8 +48,12 @@ import (
 // max_parallel override; a child behind one can still page
 // (backend/internal/stallwatch/README.md § Residuals).
 //
-// While Config.HostAdmissionHold reports held, the marker refuses every new
-// admission, so the scan pages no child at all (M2).
+// While Config.HostAdmissionHold reports held, the scan pages no child at all
+// (M2). The marker itself is keyed to the measured host (#5619): it refuses
+// only that host's and unlabelled admissions. The scan cannot know which host
+// will dispatch an undispatched child, so it stays conservative and suppresses
+// every child page, and may skip a page for a child another host could have
+// dispatched.
 //
 // The quiet clock's base is the latest of the stage's UpdatedAt, the child's
 // CreatedAt, the parent's newest slices_integrated row and the newest
@@ -70,7 +74,7 @@ func (s *Server) ScanUndispatchedChildStalls(ctx context.Context, p StallScanPar
 	if s.cfg.HostAdmissionHold != nil {
 		if held, reason := s.cfg.HostAdmissionHold.Held(p.Now); held {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-				"stall watch: host admission hold is held, so the marker refuses every child; no child page this tick",
+				"stall watch: host admission hold is held (the marker refuses admissions for the measured host or no host) and a child's dispatch host is unknown; no child page this tick",
 				slog.String("reason", reason))
 			return rep, nil
 		}

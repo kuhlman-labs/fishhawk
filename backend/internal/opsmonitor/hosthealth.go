@@ -411,7 +411,10 @@ func containersRemedy(cs []Contributor) string {
 // held while the memory probe reads CRITICAL pressure, so the server can
 // refuse NEW host-dispatch admissions (409 host_memory_pressure) without
 // touching in-flight stages. It is INTERIM: ADR-100's adaptive concurrency
-// controller absorbs it. The Ticker updates it every tick (held iff a
+// controller absorbs it. Held says only WHETHER pressure is critical; Host
+// says WHOSE memory was measured: the immutable label NewAdmissionHold was
+// given, so the server can hold only that host's admissions (#5619). The
+// Ticker updates it every tick (held iff a
 // failing host_memory_pressure result is Critical; ok, unknown,
 // not_applicable or a missing memory result clear it). Held reads false
 // once the last update is older than 3 x the Ticker's EFFECTIVE interval
@@ -419,11 +422,27 @@ func containersRemedy(cs []Contributor) string {
 // never pin it. Safe for concurrent use; the zero value and a nil pointer
 // are not held.
 type AdmissionHold struct {
+	host       string // set once by NewAdmissionHold, so read without mu
 	mu         sync.Mutex
 	held       bool
 	reason     string
 	updated    time.Time
 	staleAfter time.Duration
+}
+
+// NewAdmissionHold returns a not-held hold whose measured-host label is host
+// (the host-dispatch marker's {"host"} vocabulary).
+func NewAdmissionHold(host string) *AdmissionHold {
+	return &AdmissionHold{host: host}
+}
+
+// Host is the label of the host whose memory pressure the hold measures; ""
+// for the zero value or a nil hold.
+func (h *AdmissionHold) Host() string {
+	if h == nil {
+		return ""
+	}
+	return h.host
 }
 
 // Held reports whether new host-dispatch admissions are held at now, and

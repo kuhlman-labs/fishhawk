@@ -188,12 +188,15 @@ merge-candidate VERIFY-ONLY pass (ADR-090/ADR-092 D3: a live
 stage_merge_candidate_verify_triggered row, no agent) holds local-verify:<host>
 (limit 1), never behind a queued full implement on that group; fix-ups and
 conflict-resolution re-opens stay in local-implement. A declared concurrency
-block ADDS groups to these defaults. On capacity each earlier queued stage
-reserves one slot but is not a FIFO barrier, so capacity blocks only when
-holders plus earlier reservations fill capacity, and a plan, acceptance or
-verify pass queues only then. Example: at capacity 3 with implement limit 2,
-two holding implements plus one queued implement fill capacity, so a later
-plan, acceptance or verify pass queues; at capacity 4 one slot stays free.
+block ADDS groups to these defaults. On capacity an earlier queued stage
+reserves a slot only while it is capacity-bound (every other group of its
+set would admit it now) and is never a FIFO barrier there, so capacity
+blocks only when holders plus earlier capacity-bound reservations reach the
+limit, and a plan, acceptance or verify pass queues only then. A stage
+queued only on another group reserves no capacity slot (ADR-094 A4).
+Example: at capacity 3 with implement limit 2, two holding implements and
+any number of queued implements leave one capacity slot for a plan,
+acceptance or verify pass.
 Acceptance also serializes on its shared preview slot. When a group is full,
 the dispatch is QUEUED, not refused: NO runner is spawned, the stage
 stays awaiting_host_dispatch, and the result carries concurrency_slot (status
@@ -209,7 +212,7 @@ fishhawk_run_stage returns outcome awaiting_concurrency_slot,
 fishhawk_drive_run stops awaiting_concurrency_slot, and fishhawk_run_children
 marks the child queued; in each case this session's slot waiter spawns the
 runner on admission. For plan and acceptance stages a queue happens only when
-holders plus earlier reservations fill capacity. An invalid FISHHAWK_HOST_CAPACITY fails every
+holders plus earlier capacity-bound reservations reach the limit. An invalid FISHHAWK_HOST_CAPACITY fails every
 dispatch closed before the marker (no spawn); fishhawk_doctor's host_capacity
 rung names it.
 

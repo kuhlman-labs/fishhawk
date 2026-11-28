@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/opsmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -99,8 +103,19 @@ func withHostDispatchOperator(req *http.Request) *http.Request {
 func postHostDispatch(t *testing.T, s *Server, runID, stageID uuid.UUID,
 	withID func(*http.Request) *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	return postHostDispatchBody(t, s, runID, stageID, "", withID)
+}
+
+// postHostDispatchBody is postHostDispatch with a marker body; "" sends none.
+func postHostDispatchBody(t *testing.T, s *Server, runID, stageID uuid.UUID, body string,
+	withID func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	var rd io.Reader
+	if body != "" {
+		rd = strings.NewReader(body)
+	}
 	req := httptest.NewRequest(http.MethodPost,
-		"/v0/runs/"+runID.String()+"/stages/"+stageID.String()+"/host-dispatch", nil)
+		"/v0/runs/"+runID.String()+"/stages/"+stageID.String()+"/host-dispatch", rd)
 	req.SetPathValue("run_id", runID.String())
 	req.SetPathValue("stage_id", stageID.String())
 	w := httptest.NewRecorder()
@@ -2395,14 +2410,17 @@ func TestHostDispatch_DecomposedParentAcceptance_NoIntegrationAuthority_Admits(t
 
 // --- interim host memory hold (E85.11 / #4330) -------------------------------
 
-// fakeAdmissionHold is a HostAdmissionHold that answers a fixed verdict and
-// counts how often the marker consulted it.
+// fakeAdmissionHold is a HostAdmissionHold that answers a fixed verdict for a
+// fixed measured host and counts how often the marker consulted it.
 type fakeAdmissionHold struct {
 	mu     sync.Mutex
 	held   bool
 	reason string
+	host   string
 	calls  int
 }
+
+func (h *fakeAdmissionHold) Host() string { return h.host }
 
 func (h *fakeAdmissionHold) Held(time.Time) (bool, string) {
 	h.mu.Lock()
@@ -2527,6 +2545,187 @@ func TestHostDispatch_HostMemoryHold_AlreadyDispatchedUntouched(t *testing.T) {
 	}
 }
 
+// wantHeldForHost asserts a 409 host_memory_pressure naming measured and
+// request, and that nothing was committed.
+func wantHeldForHost(t *testing.T, w *httptest.ResponseRecorder, rr *orchestratorRepo, stageID uuid.UUID, measured, request, reason string) {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if body.Error.Code != "host_memory_pressure" {
+		t.Errorf("error code = %q, want host_memory_pressure:\n%s", body.Error.Code, w.Body.String())
+	}
+	d := body.Error.Details
+	if d["host"] != measured || d["request_host"] != request || d["reason"] != reason ||
+		d["retry"] != hostDispatchHoldRetry || d["state"] != string(run.StageStateAwaitingHostDispatch) {
+		t.Errorf("details = %v, want host %q, request_host %q, reason %q, retry and state", d, measured, request, reason)
+	}
+	if !strings.Contains(body.Error.Message, strconv.Quote(measured)) {
+		t.Errorf("message = %q, want it to name the measured host %q", body.Error.Message, measured)
+	}
+	wantStageState(t, rr, stageID, run.StageStateAwaitingHostDispatch)
+}
+
+// wantStageState re-reads the committed stage state.
+func wantStageState(t *testing.T, rr *orchestratorRepo, stageID uuid.UUID, want run.StageState) {
+	t.Helper()
+	cur, err := rr.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("re-read stage: %v", err)
+	}
+	if cur.State != want {
+		t.Errorf("committed state = %q, want %q", cur.State, want)
+	}
+}
+
+// wantMarkerAdmitted asserts a transitioned 200 and the committed state.
+func wantMarkerAdmitted(t *testing.T, w *httptest.ResponseRecorder, rr *orchestratorRepo, stageID uuid.UUID) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	} else if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	wantStageState(t, rr, stageID, run.StageStateDispatched)
+}
+
+// The held fixtures below wire NO slot store, so the marker reads the body
+// only because the hold is wired (#5619).
+
+func TestHostDispatch_HostMemoryHold_MeasuredHostHeld(t *testing.T) {
+	hold := &fakeAdmissionHold{held: true, reason: "critical", host: "host-a"}
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+
+	w := postHostDispatchBody(t, s, runID, stageID, `{"host":"host-a"}`, withHostDispatchOperator)
+	wantHeldForHost(t, w, rr, stageID, "host-a", "host-a", "critical")
+}
+
+// TestHostDispatch_HostMemoryHold_OtherHostAdmitted: a marker for a host
+// whose memory was not measured is admitted, and the admission under a held
+// hold is WARN-logged.
+func TestHostDispatch_HostMemoryHold_OtherHostAdmitted(t *testing.T) {
+	hold := &fakeAdmissionHold{held: true, reason: "critical", host: "host-a"}
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	w := postHostDispatchBody(t, s, runID, stageID, `{"host":"host-b"}`, withHostDispatchOperator)
+	wantMarkerAdmitted(t, w, rr, stageID)
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec["level"] != "WARN" || !strings.Contains(fmt.Sprint(rec["msg"]), "memory hold is held for another host") {
+			continue
+		}
+		found = true
+		for k, want := range map[string]string{
+			"stage_id": stageID.String(), "run_id": runID.String(),
+			"measured_host": "host-a", "request_host": "host-b", "reason": "critical",
+		} {
+			if rec[k] != want {
+				t.Errorf("WARN %s = %v, want %q", k, rec[k], want)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no WARN for a held hold admitting another host; log:\n%s", logBuf.String())
+	}
+}
+
+// TestHostDispatch_HostMemoryHold_UnlabelledMarkerHeld: a marker naming no
+// host cannot show it spawns elsewhere, so it is held (fail-closed).
+func TestHostDispatch_HostMemoryHold_UnlabelledMarkerHeld(t *testing.T) {
+	hold := &fakeAdmissionHold{held: true, reason: "critical", host: "host-a"}
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	wantHeldForHost(t, w, rr, stageID, "host-a", concurrency.UnknownHost, "critical")
+}
+
+// TestHostDispatch_HostMemoryHold_UnresolvedMeasuredHostHoldsEvery: with no
+// resolved measured host there is nothing to compare a label with, so a held
+// hold refuses every marker (fail-closed).
+func TestHostDispatch_HostMemoryHold_UnresolvedMeasuredHostHoldsEvery(t *testing.T) {
+	for _, measured := range []string{"", concurrency.UnknownHost} {
+		for _, tc := range []struct{ body, request string }{
+			{`{"host":"host-b"}`, "host-b"},
+			{"", concurrency.UnknownHost},
+		} {
+			t.Run(fmt.Sprintf("measured=%q request=%s", measured, tc.request), func(t *testing.T) {
+				hold := &fakeAdmissionHold{held: true, reason: "critical", host: measured}
+				s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+
+				w := postHostDispatchBody(t, s, runID, stageID, tc.body, withHostDispatchOperator)
+				wantHeldForHost(t, w, rr, stageID, concurrency.UnknownHost, tc.request, "critical")
+			})
+		}
+	}
+}
+
+// TestHostDispatch_HostMemoryHold_InvalidBodyRefused: the wired hold alone
+// (no slot store) parses the body, so an invalid one answers 400 and leaves
+// the stage untouched, held or not.
+func TestHostDispatch_HostMemoryHold_InvalidBodyRefused(t *testing.T) {
+	for _, body := range []string{`{"host":"a:b"}`, `{"nope":1}`} {
+		t.Run(body, func(t *testing.T) {
+			hold := &fakeAdmissionHold{host: "host-a"}
+			s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+
+			w := postHostDispatchBody(t, s, runID, stageID, body, withHostDispatchOperator)
+			if w.Code != http.StatusBadRequest || decodeError(t, w) != "validation_failed" {
+				t.Errorf("status = %d, want 400 validation_failed:\n%s", w.Code, w.Body.String())
+			}
+			wantStageState(t, rr, stageID, run.StageStateAwaitingHostDispatch)
+		})
+	}
+}
+
+// pressureProbe is an opsmonitor.Probe reporting one CRITICAL memory result.
+type pressureProbe struct{}
+
+func (pressureProbe) Name() string    { return "memory" }
+func (pressureProbe) HostLocal() bool { return true }
+func (pressureProbe) Check(context.Context) []opsmonitor.Result {
+	return []opsmonitor.Result{{Probe: "memory", Status: opsmonitor.StatusFailing,
+		Condition: opsmonitor.ConditionHostMemoryPressure, Subject: "host", Observed: "swap 98.0%", Critical: true}}
+}
+
+// TestHostDispatch_HostMemoryHold_OpsMonitorTickerEndToEnd crosses the
+// boundary: a real opsmonitor hold turned held by a real ticker tick, read by
+// the marker.
+func TestHostDispatch_HostMemoryHold_OpsMonitorTickerEndToEnd(t *testing.T) {
+	hold := opsmonitor.NewAdmissionHold("host-a")
+	tk := &opsmonitor.Ticker{Probes: []opsmonitor.Probe{pressureProbe{}},
+		Deployment: opsmonitor.DeploymentLocal, Hold: hold, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	tk.Tick(context.Background())
+	held, reason := hold.Held(time.Now())
+	if !held {
+		t.Fatal("the ticker did not turn the hold held")
+	}
+
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+	w := postHostDispatchBody(t, s, runID, stageID, `{"host":"host-a"}`, withHostDispatchOperator)
+	wantHeldForHost(t, w, rr, stageID, "host-a", "host-a", reason)
+
+	s2, rr2, runID2, stageID2 := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+	w2 := postHostDispatchBody(t, s2, runID2, stageID2, `{"host":"host-b"}`, withHostDispatchOperator)
+	wantMarkerAdmitted(t, w2, rr2, stageID2)
+}
+
 // countingAdmitStore is a concurrency.Store that counts Admit calls and
 // fails each one (so an admission that is reached answers 500).
 type countingAdmitStore struct {
@@ -2551,35 +2750,42 @@ func (c *countingAdmitStore) count() int {
 // TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission: for a GROUPED stage
 // (an implement stage with a slot store wired) a held hold refuses BEFORE the
 // slot admission, so no queue row or slot can be committed — Admit is never
-// called. The not-held control proves the fixture reaches Admit.
+// called. The not-held control proves the fixture reaches Admit, and a hold
+// held for ANOTHER host reaches it too, from both admissible arms.
 func TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission(t *testing.T) {
+	const waiting, pending = run.StageStateAwaitingHostDispatch, run.StageStatePending
 	for _, tc := range []struct {
 		name       string
+		state      run.StageState
 		held       bool
+		measured   string
+		body       string
 		wantCode   int
 		wantAdmits int
 	}{
-		{"held", true, http.StatusConflict, 0},
-		{"not held", false, http.StatusInternalServerError, 1},
+		{"held", waiting, true, "", "", http.StatusConflict, 0},
+		{"not held", waiting, false, "", "", http.StatusInternalServerError, 1},
+		{"held for another host", waiting, true, "host-a", `{"host":"host-b"}`, http.StatusInternalServerError, 1},
+		{"held for another host, pending", pending, true, "host-a", `{"host":"host-b"}`, http.StatusInternalServerError, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := newOrchestratorRepo()
 			runRow := rr.seedRun()
-			stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+			stage := rr.seedStage(runRow.ID, 0, tc.state)
 			stage.Type = run.StageTypeImplement
 			store := &countingAdmitStore{}
 			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, Concurrency: store,
-				HostAdmissionHold: &fakeAdmissionHold{held: tc.held, reason: "critical"}})
+				HostAdmissionHold: &fakeAdmissionHold{held: tc.held, reason: "critical", host: tc.measured}})
 
-			w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+			w := postHostDispatchBody(t, s, runRow.ID, stage.ID, tc.body, withHostDispatchOperator)
 			if w.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
 			}
 			if got := store.count(); got != tc.wantAdmits {
 				t.Errorf("slot Admit calls = %d, want %d", got, tc.wantAdmits)
 			}
-			if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateAwaitingHostDispatch {
-				t.Errorf("committed state = %q, want awaiting_host_dispatch", cur.State)
+			if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != tc.state {
+				t.Errorf("committed state = %q, want %q", cur.State, tc.state)
 			}
 		})
 	}
