@@ -1,0 +1,14 @@
+id: scenario:issue-5592/invalid-dotenv-capacity-is-skipped
+statement: A .env setting FISHHAWK_HOST_CAPACITY=abc does not stop the session MCP. The shim's child starts, and fishhawk_doctor answers with host_capacity source default (capacity 3). The shim's stderr carries a line naming FISHHAWK_HOST_CAPACITY as not sourced, and that line does not contain the value abc.
+verify_hint: MCP tool result plus CLI stderr. Use the dotenv-host-settings-reach-doctor launch (stdio, preview backend, fixture-minted fhm_ run token, zsh on PATH), with FISHHAWK_HOST_CAPACITY=abc in the .env. Read host_capacity.source and host_capacity.capacity from the fishhawk_doctor result. Grep the shim's stderr for FISHHAWK_HOST_CAPACITY and confirm that the matching line does not contain abc.
+steps: 'Built fishhawk-mcp-shim and fishhawk-mcp from the sanctioned checkout (cd backend && go build -o /tmp/fhacc5592/bin/ ./cmd/fishhawk-mcp-shim ./cmd/fishhawk-mcp). Minted an fhm_ run token: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign body ''{}'' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token body ''{}'' with X-Fishhawk-Signature. Launched /tmp/fhacc5592/bin/fishhawk-mcp-shim --env-file <tmp>/.env --state-dir <tmp>/state from an empty temp cwd with an exact environment of only PATH=/usr/bin:/bin:/usr/sbin:/sbin, HOME, XDG_STATE_HOME, TMPDIR (each an empty temp dir), FISHHAWK_BACKEND_URL=http://localhost:8090 and FISHHAWK_API_TOKEN=<fhm_>. .env mode 0600 owned by the current user. Sent initialize, notifications/initialized, tools/call fishhawk_doctor {repo: kuhlman-labs/fishhawk}. .env: FISHHAWK_HOST_LABEL=acc-dotenv-label / FISHHAWK_HOST_CAPACITY=abc. Grepped shim stderr.'
+assertions:
+    expected: source default, capacity 3; stderr names the key without the value
+    observed_at_record: 'Child started and answered; host_capacity {capacity 3, source default}. Stderr line: ''fishhawk-mcp-shim: <tmp>/.env: FISHHAWK_HOST_CAPACITY is not an integer in 1..64; not sourcing it'' — ''abc'' appears nowhere in stderr.'
+    repro_handle: python3 -I /tmp/fhacc5592/scripts/case.py /tmp/fhacc5592/c3.json
+origin:
+    issue: 5592
+    pr: 5630
+    run_id: f04df6e1-e8a7-4a8b-9658-762af802ff53
+    head_sha: 0fdfe4535e1785e2d1dbea45850f4cf4efce28da
+    recorded_at: 2026-11-28T08:50:58Z

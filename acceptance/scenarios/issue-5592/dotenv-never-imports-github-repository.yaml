@@ -1,0 +1,13 @@
+id: scenario:issue-5592/dotenv-never-imports-github-repository
+statement: Launched as in dotenv-host-settings-reach-doctor (fixture-minted fhm_ run token, shim under env -i with GITHUB_REPOSITORY and CI_PROJECT_PATH absent from its environment), with a .env that also sets GITHUB_REPOSITORY=kuhlman-labs/fishhawk. A fishhawk_doctor call with the repo argument omitted returns the 'repo is required' tool error, which proves the non-allowlisted GITHUB_REPOSITORY key was not imported into the child.
+steps: 'Built fishhawk-mcp-shim and fishhawk-mcp from the sanctioned checkout (cd backend && go build -o /tmp/fhacc5592/bin/ ./cmd/fishhawk-mcp-shim ./cmd/fishhawk-mcp). Minted an fhm_ run token: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign body ''{}'' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token body ''{}'' with X-Fishhawk-Signature. Launched /tmp/fhacc5592/bin/fishhawk-mcp-shim --env-file <tmp>/.env --state-dir <tmp>/state from an empty temp cwd with an exact environment of only PATH=/usr/bin:/bin:/usr/sbin:/sbin, HOME, XDG_STATE_HOME, TMPDIR (each an empty temp dir), FISHHAWK_BACKEND_URL=http://localhost:8090 and FISHHAWK_API_TOKEN=<fhm_>. .env mode 0600 owned by the current user. Sent initialize, notifications/initialized, tools/call fishhawk_doctor with arguments {} (repo omitted). .env: FISHHAWK_HOST_LABEL=acc-dotenv-label / FISHHAWK_HOST_CAPACITY=4 / GITHUB_REPOSITORY=kuhlman-labs/fishhawk; GITHUB_REPOSITORY and CI_PROJECT_PATH absent from the shim env. Control launch: same .env without GITHUB_REPOSITORY, GITHUB_REPOSITORY=kuhlman-labs/fishhawk in the shim''s own env.'
+assertions:
+    expected: '''repo is required'' tool error'
+    observed_at_record: 'isError true: ''repo is required: pass repo ... or set GITHUB_REPOSITORY / CI_PROJECT_PATH in the environment''. Shim stderr: sourced only FISHHAWK_HOST_CAPACITY, FISHHAWK_HOST_LABEL. Control: doctor answered normally (repo resolved from env), proving the probe discriminates.'
+    repro_handle: python3 -I /tmp/fhacc5592/scripts/case.py /tmp/fhacc5592/c9.json ; python3 -I /tmp/fhacc5592/scripts/case.py /tmp/fhacc5592/c9ctl.json
+origin:
+    issue: 5592
+    pr: 5630
+    run_id: f04df6e1-e8a7-4a8b-9658-762af802ff53
+    head_sha: 0fdfe4535e1785e2d1dbea45850f4cf4efce28da
+    recorded_at: 2026-11-28T08:50:58Z

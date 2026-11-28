@@ -1,0 +1,14 @@
+id: scenario:issue-5592/doctor-dispatcher-check-not-applicable-for-run-token
+statement: fishhawk-mcp runs over stdio with FISHHAWK_BACKEND_URL at the preview, a fixture-minted run token, FISHHAWK_HOST_LABEL=acc-session-a, and FISHHAWK_HOST_DISPATCH_STATE_DIR at a 0700 dir holding a fresh status.json whose host is acc-dispatcher-b. Its fishhawk_doctor result reports host_label.label acc-session-a and host_label.dispatcher_check not_applicable, with no dispatcher_label, no dispatcher_status_path and no warning.
+verify_hint: MCP tool result. Mint the fhm_ run token as in dotenv-host-settings-reach-doctor. Write <tmp>/hd/status.json (mode 0600, dir 0700) as {"pid":1,"host":"acc-dispatcher-b","started_at":<now>,"last_tick_at":<now>,"interval_seconds":30,"paused":false,"spawns_today":0,"spawns_day":<today>,"in_flight":0}. Launch bin/fishhawk-mcp over stdio with FISHHAWK_BACKEND_URL at the preview, FISHHAWK_API_TOKEN=<fhm_ token>, FISHHAWK_HOST_LABEL=acc-session-a and FISHHAWK_HOST_DISPATCH_STATE_DIR=<tmp>/hd. Call fishhawk_doctor and read structuredContent.host_label.
+steps: 'Minted an fhm_ run token: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"}; POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign ''{}''; POST /v0/runs/{run}/mcp-token. Wrote <tmp>/hd/status.json (0600, dir 0700) {pid 1, host acc-dispatcher-b, started_at/last_tick_at now, interval_seconds 30, paused false, spawns_today 0, spawns_day today, in_flight 0}. Launched /tmp/fhacc5592/bin/fishhawk-mcp (built from the sanctioned checkout) over stdio with only PATH, HOME, XDG_STATE_HOME, TMPDIR, FISHHAWK_BACKEND_URL=http://localhost:8090, FISHHAWK_API_TOKEN=<fhm_>, FISHHAWK_HOST_LABEL=acc-session-a, FISHHAWK_HOST_DISPATCH_STATE_DIR=<tmp>/hd. initialize, notifications/initialized, tools/call fishhawk_doctor {repo: kuhlman-labs/fishhawk}.'
+assertions:
+    expected: label acc-session-a, dispatcher_check not_applicable, no dispatcher fields/warning
+    observed_at_record: host_label {label acc-session-a, source override, dispatcher_check not_applicable}; no dispatcher_label, dispatcher_status_path or warning keys
+    repro_handle: python3 -I /tmp/fhacc5592/scripts/case.py /tmp/fhacc5592/c8.json
+origin:
+    issue: 5592
+    pr: 5630
+    run_id: f04df6e1-e8a7-4a8b-9658-762af802ff53
+    head_sha: 0fdfe4535e1785e2d1dbea45850f4cf4efce28da
+    recorded_at: 2026-11-28T08:50:58Z
