@@ -143,7 +143,7 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	if err := phaseOneError(ctx, projectID, numbers, inSet, fetches); err != nil {
 		return nil, err
 	}
-	return p.buildResult(ctx, projectID, numbers, inSet, fetches)
+	return p.buildResult(ctx, projectID, numbers, inSet, fetches, req.DefaultAutonomy)
 }
 
 // EpicChildren implements workmgmt.EpicChildrenQuerier over the Free tier: the
@@ -222,7 +222,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 		childFetches = append(childFetches, f)
 	}
 
-	res, err := p.buildResult(ctx, projectID, numbers, inSet, childFetches)
+	res, err := p.buildResult(ctx, projectID, numbers, inSet, childFetches, req.DefaultAutonomy)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/gitlab: epic #%d children: %w", epic, err)
 	}
@@ -276,7 +276,10 @@ func phaseOneError(ctx context.Context, projectID int, numbers []int, inSet map[
 }
 
 // buildResult runs phases 2 and 3 over phase-1 fetches that all succeeded.
-func (p *Provider) buildResult(ctx context.Context, projectID int, numbers []int, inSet map[int]bool, fetches []issueFetch) (*workmgmt.EpicChildrenResult, error) {
+// defaultAutonomy is the request's DefaultAutonomy: the tier an unlabelled or
+// mislabelled issue resolves to (the repository conventions' default, ADR-069
+// decision 4 / #5316).
+func (p *Provider) buildResult(ctx context.Context, projectID int, numbers []int, inSet map[int]bool, fetches []issueFetch, defaultAutonomy string) (*workmgmt.EpicChildrenResult, error) {
 	// PHASE 2 — distinct out-of-set LOCAL targets, first-encounter order,
 	// bounded; the cache is built in the parent after the pool drains.
 	targets := outOfSetTargets(projectID, inSet, fetches)
@@ -301,7 +304,7 @@ func (p *Provider) buildResult(ctx context.Context, projectID int, numbers []int
 		children = append(children, workmgmt.EpicChild{
 			Number:   f.number,
 			Title:    issue.Title,
-			Autonomy: workmgmt.ParseAutonomyLabel(issue.Labels),
+			Autonomy: workmgmt.ParseAutonomyLabel(issue.Labels, defaultAutonomy),
 			// GitLab issues carry NO state_reason (the REST payload exposes only
 			// state: opened|closed), so closed IS complete here — there is no
 			// not_planned close to distinguish. A GitLab-shape fact, not an

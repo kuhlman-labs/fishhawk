@@ -6277,7 +6277,7 @@ components:
         One resolved item in a `CampaignPreview` (#3647): the legible half of a
         `CampaignItem`, minus everything that only exists once a campaign row
         does (`id`, `run_id`, `state`, `pause_reason`).
-      required: [issue_ref, depends_on, position]
+      required: [issue_ref, depends_on, autonomy, position]
       properties:
         issue_ref:
           type: string
@@ -6299,7 +6299,11 @@ components:
         autonomy:
           type: string
           enum: [low, medium, high]
-          description: The item's autonomy tier; absent when the issue carries no `autonomy:*` label.
+          description: |
+            The item's autonomy tier. ALWAYS present on both the valid and the
+            invalid path: the declared `autonomy:*` tier, or the repository
+            conventions' default when the label is absent or unrecognised
+            (ADR-069 decision 4, #5316). Never empty.
         position:
           type: integer
           description: The item's 0-based place in the queue the campaign would be created with.

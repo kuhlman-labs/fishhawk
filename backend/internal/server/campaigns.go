@@ -1560,6 +1560,9 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 		result, err = query(ctx, workmgmt.EpicChildrenRequest{
 			Target: target,
 			Epic:   req.EpicRef,
+			// An unlabelled or mislabelled child resolves to the repository
+			// conventions' default tier (ADR-069 decision 4, #5316).
+			DefaultAutonomy: conv.DefaultAutonomyTier(),
 		})
 		if err != nil {
 			if refusal := nativeDependencyReadRefusal(err); refusal != nil {
@@ -1647,6 +1650,9 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 			// grooming order's rank-ordered refs for the #2238 variant — one
 			// resolution path, two ways of naming the set.
 			Items: itemRefs,
+			// An unlabelled or mislabelled issue resolves to the repository
+			// conventions' default tier (ADR-069 decision 4, #5316).
+			DefaultAutonomy: conv.DefaultAutonomyTier(),
 		})
 		cancelResolve()
 		if err != nil {
@@ -3729,40 +3735,79 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 	return settledAny || refreshedAny
 }
 
+// campaignAutonomyDefault resolves the repository conventions' autonomy
+// default for c's repo (ADR-069 decision 4, #5316) — the tier an issue with no
+// autonomy:* label, or an unrecognised one, resolves to. A conventions load
+// error logs a Warn and reports ok=false: the caller then leaves undeclared
+// items on their stored tier rather than writing a guessed default (a transient
+// built-in medium could flip a low-default repo's items to the more permissive
+// direction). A declared in-set label never needs this read.
+func (s *Server) campaignAutonomyDefault(ctx context.Context, c *campaign.Campaign) (string, bool) {
+	conv, err := conventionsLoader(ctx, c.Repo)
+	if err != nil {
+		s.cfg.Logger.Warn("autonomy refresh: load conventions failed; unlabelled items keep their stored tier",
+			"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
+		return "", false
+	}
+	return conv.DefaultAutonomyTier(), true
+}
+
 // refreshItemAutonomyFromIssues folds the live autonomy:* tier of each fetched
 // issue back onto its campaign item (#2355), so relabelling a child unblocks a
 // campaign parked on attend_human_led without a rebuild. For every item present
 // in `fetched` (the autonomy-relevant items settleIssueClosedItems' Phase 1 read
-// exactly once), it parses workmgmt.ParseAutonomyLabel(issue.Labels) and — ONLY
-// when the parsed tier DIFFERS from the stored tier — calls
-// SetCampaignItemAutonomy, emits a campaign_item_autonomy_refreshed audit, and
-// reports changed. An unchanged tier performs NO write (the no-op-write
-// guarantee). It is BEST-EFFORT and NEVER fails the read: a SetCampaignItemAutonomy
-// error logs and leaves the tier stale. Returns whether it refreshed anything.
+// exactly once), it resolves the issue's tier — a declared in-set autonomy:*
+// label as-is, otherwise the repository conventions' default (ADR-069
+// decision 4, #5316) — and ONLY when that tier DIFFERS from the stored tier
+// calls SetCampaignItemAutonomy, emits a campaign_item_autonomy_refreshed
+// audit, and reports changed. An unchanged tier performs NO write (the
+// no-op-write guarantee). The conventions default is loaded at most once per
+// pass and only when some fetched issue declares no in-set tier; when that load
+// fails, those undeclared items are left unchanged (no write) while declared
+// tiers still apply. It is BEST-EFFORT and NEVER fails the read: a
+// SetCampaignItemAutonomy error logs and leaves the tier stale. Returns whether
+// it refreshed anything.
 func (s *Server) refreshItemAutonomyFromIssues(ctx context.Context, c *campaign.Campaign, items []*campaign.Item, fetched map[uuid.UUID]*githubclient.Issue) bool {
 	refreshedAny := false
+	defaultTier, defaultLoaded, defaultOK := "", false, false
 	for _, it := range items {
 		issue, ok := fetched[it.ID]
 		if !ok {
 			continue // not fetched (non-autonomy-relevant state, non issue:N ref, or a GetIssue error).
 		}
-		want := workmgmt.ParseAutonomyLabel(issue.Labels)
-		// No-op-write guarantee: only a genuine tier change is persisted. Both
-		// sides are already in the normalized set {"", low, medium, high}, so the
-		// comparison is exact.
+		want, declared := workmgmt.DeclaredAutonomyTier(issue.Labels)
+		if !declared {
+			// Only DEFAULTING an absent or unrecognised label needs the
+			// conventions read; resolve it once per pass.
+			if !defaultLoaded {
+				defaultTier, defaultOK = s.campaignAutonomyDefault(ctx, c)
+				defaultLoaded = true
+			}
+			if !defaultOK {
+				continue // conventions unavailable: leave the stored tier, no write.
+			}
+			want = workmgmt.ParseAutonomyLabel(issue.Labels, defaultTier)
+		}
+		// No-op-write guarantee: only a genuine tier change is persisted. want is
+		// always in {low, medium, high}; the stored side is too, except a legacy
+		// pre-#5316 '' row, which differs from every resolved tier and is
+		// therefore re-resolved exactly once.
 		if want == it.Autonomy {
 			continue
 		}
+		// Capture the prior tier BEFORE the write: a repository that aliases the
+		// item (the in-memory fake) would otherwise report from == to.
+		from := it.Autonomy
 		if _, err := s.cfg.CampaignRepo.SetCampaignItemAutonomy(ctx, it.ID, want); err != nil {
 			s.cfg.Logger.Warn("reconcile-on-read: refresh item autonomy failed; tier left stale (read still succeeds)",
 				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef,
-				"from", it.Autonomy, "to", want, "error", err.Error())
+				"from", from, "to", want, "error", err.Error())
 			continue
 		}
 		s.emitCampaignAudit(ctx, categoryCampaignItemAutonomyRefreshed, map[string]any{
 			"campaign_id": c.ID.String(),
 			"issue_ref":   it.IssueRef,
-			"from":        it.Autonomy,
+			"from":        from,
 			"to":          want,
 		})
 		refreshedAny = true
@@ -3774,11 +3819,14 @@ func (s *Server) refreshItemAutonomyFromIssues(ctx context.Context, c *campaign.
 // its GitHub issue and persists the fresh tier when it differs (#2355) — the
 // targeted refresh the operator start verb runs so a relabel-then-start works
 // without an intervening status poll. It returns the (possibly-updated) item and
-// whether it changed the stored tier. BEST-EFFORT and FAIL-OPEN on every guard —
-// GitHub unwired, a repo not in owner/name form, an installation-resolve error, a
-// non issue:N ref, a GetIssue error, or a SetCampaignItemAutonomy error each
-// leaves the item on its stored tier and reports changed=false, so the DAG gate
-// runs exactly as it would today.
+// whether it changed the stored tier. A declared in-set autonomy:* label is
+// applied as-is; an absent or unrecognised one resolves to the repository
+// conventions' default (ADR-069 decision 4, #5316), loaded only in that case.
+// BEST-EFFORT and FAIL-OPEN on every guard — GitHub unwired, a repo not in
+// owner/name form, an installation-resolve error, a non issue:N ref, a GetIssue
+// error, a conventions load error on an undeclared label, or a
+// SetCampaignItemAutonomy error each leaves the item on its stored tier and
+// reports changed=false, so the DAG gate runs exactly as it would today.
 func (s *Server) refreshOneItemAutonomy(ctx context.Context, c *campaign.Campaign, item *campaign.Item) (*campaign.Item, bool) {
 	if s.cfg.GitHub == nil {
 		return item, false
@@ -3804,20 +3852,28 @@ func (s *Server) refreshOneItemAutonomy(ctx context.Context, c *campaign.Campaig
 			"campaign_id", c.ID.String(), "item_id", item.ID.String(), "issue_ref", item.IssueRef, "error", err.Error())
 		return item, false
 	}
-	want := workmgmt.ParseAutonomyLabel(issue.Labels)
+	want, declared := workmgmt.DeclaredAutonomyTier(issue.Labels)
+	if !declared {
+		defaultTier, ok := s.campaignAutonomyDefault(ctx, c)
+		if !ok {
+			return item, false // conventions unavailable: keep the stored tier.
+		}
+		want = workmgmt.ParseAutonomyLabel(issue.Labels, defaultTier)
+	}
 	if want == item.Autonomy {
 		return item, false
 	}
+	from := item.Autonomy // captured before the write (see refreshItemAutonomyFromIssues)
 	updated, err := s.cfg.CampaignRepo.SetCampaignItemAutonomy(ctx, item.ID, want)
 	if err != nil {
 		s.cfg.Logger.Warn("start-verb autonomy refresh: persist tier failed; item keeps stored tier",
-			"campaign_id", c.ID.String(), "item_id", item.ID.String(), "from", item.Autonomy, "to", want, "error", err.Error())
+			"campaign_id", c.ID.String(), "item_id", item.ID.String(), "from", from, "to", want, "error", err.Error())
 		return item, false
 	}
 	s.emitCampaignAudit(ctx, categoryCampaignItemAutonomyRefreshed, map[string]any{
 		"campaign_id": c.ID.String(),
 		"issue_ref":   item.IssueRef,
-		"from":        item.Autonomy,
+		"from":        from,
 		"to":          want,
 	})
 	return updated, true

@@ -422,9 +422,11 @@ func TestPostgres_CampaignItem_RoundTripAndDependsOn(t *testing.T) {
 // TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed covers both the
 // happy path and the fail-closed CHECK for the campaign_items.autonomy column
 // (#1551 / E32.4). A known tier ("low") round-trips onto Item.Autonomy; an item
-// created with no autonomy reads back the empty (unknown/default) tier; and an
-// out-of-set value ("bogus") is REJECTED by campaign_items_autonomy_check rather
-// than silently persisting a tier the engine cannot interpret.
+// created with no autonomy, and one created with an out-of-set value ("bogus"),
+// are both NORMALIZED on write to the built-in medium — never "" and never an
+// invalid value (ADR-069 decision 4, #5316). The column CHECK itself still
+// fails closed: a direct-SQL write of an invalid value is REJECTED by
+// campaign_items_autonomy_check, and the legacy empty tier it still admits is readable.
 func TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := campaign.NewPostgresRepository(pool)
@@ -452,7 +454,7 @@ func TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed(t *testing.T) {
 		t.Errorf("read-back autonomy = %q, want low", got.Autonomy)
 	}
 
-	// No autonomy → empty (unknown/default) tier, never NULL.
+	// No autonomy → normalized to the built-in medium on write, never "" or NULL.
 	bare, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
 		CampaignID: c.ID,
 		IssueRef:   "issue:1533",
@@ -460,17 +462,58 @@ func TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create bare item: %v", err)
 	}
-	if bare.Autonomy != "" {
-		t.Errorf("bare item autonomy = %q, want empty", bare.Autonomy)
+	if bare.Autonomy != "medium" {
+		t.Errorf("bare item autonomy = %q, want medium (normalized on write)", bare.Autonomy)
 	}
+	assertAutonomyColumn(t, pool, bare.ID, "medium")
 
-	// Fail closed: an out-of-set tier is rejected by the CHECK constraint.
-	if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+	// An out-of-set tier is normalized to medium on write — it neither trips the
+	// CHECK nor persists as "" or the invalid value.
+	bogus, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
 		CampaignID: c.ID,
 		IssueRef:   "issue:1534",
 		Autonomy:   "bogus",
-	}); err == nil {
-		t.Error("create item with autonomy='bogus' succeeded, want CHECK-constraint rejection")
+	})
+	if err != nil {
+		t.Fatalf("create item with autonomy='bogus' errored (normalize missing?): %v", err)
+	}
+	if bogus.Autonomy != "medium" {
+		t.Errorf("out-of-set item autonomy = %q, want medium (normalized on write)", bogus.Autonomy)
+	}
+	assertAutonomyColumn(t, pool, bogus.ID, "medium")
+
+	// The column CHECK still fails closed: a direct-SQL write that bypasses the
+	// repository's normalization is REJECTED for an invalid value...
+	if _, err := pool.Exec(ctx, `UPDATE campaign_items SET autonomy = 'bogus' WHERE id = $1`, bogus.ID); err == nil {
+		t.Error("direct-SQL autonomy='bogus' write succeeded, want campaign_items_autonomy_check rejection")
+	}
+	assertAutonomyColumn(t, pool, bogus.ID, "medium")
+	// ...while the legacy '' it still admits stays writable, so a pre-#5316 row
+	// remains readable until reconcile-on-read re-resolves it (no migration).
+	if _, err := pool.Exec(ctx, `UPDATE campaign_items SET autonomy = '' WHERE id = $1`, bare.ID); err != nil {
+		t.Fatalf("direct-SQL legacy autonomy='' write: %v", err)
+	}
+	legacy, err := repo.GetCampaignItem(ctx, bare.ID)
+	if err != nil {
+		t.Fatalf("get legacy item: %v", err)
+	}
+	if legacy.Autonomy != "" {
+		t.Errorf("legacy item autonomy = %q, want the stored legacy empty tier", legacy.Autonomy)
+	}
+}
+
+// assertAutonomyColumn reads the raw campaign_items.autonomy column for id, so
+// the assertion covers the stored value rather than only the row mapper.
+func assertAutonomyColumn(t *testing.T, pool *pgxpool.Pool, id uuid.UUID, want string) {
+	t.Helper()
+	var col string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT autonomy FROM campaign_items WHERE id = $1`, id,
+	).Scan(&col); err != nil {
+		t.Fatalf("read autonomy column: %v", err)
+	}
+	if col != want {
+		t.Errorf("campaign_items.autonomy column = %q, want %q", col, want)
 	}
 }
 
@@ -513,8 +556,8 @@ func TestSetCampaignItemAutonomy_RoundTrip(t *testing.T) {
 // outside {low,medium,high} would otherwise trip the migration-0049 column CHECK
 // (SQLSTATE 23514). The item is seeded BY CONSTRUCTION with a valid "low" tier;
 // the bad tier is passed only to the control under test, so the RED lands on the
-// behavioral assertion (the write succeeds and persists "") rather than a
-// fixture-setup failure. Delete the normalizeAutonomy call and this test goes
+// behavioral assertion (the write succeeds and persists the built-in medium,
+// #5316) rather than a fixture-setup failure. Delete the normalizeAutonomy call and this test goes
 // RED with a CHECK violation.
 func TestSetCampaignItemAutonomy_NormalizesOutOfSetTier(t *testing.T) {
 	pool := pgtest.NewPool(t)
@@ -535,8 +578,8 @@ func TestSetCampaignItemAutonomy_NormalizesOutOfSetTier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetCampaignItemAutonomy with out-of-set tier errored (normalize missing?): %v", err)
 	}
-	if updated.Autonomy != "" {
-		t.Errorf("out-of-set tier persisted as %q, want empty (normalized)", updated.Autonomy)
+	if updated.Autonomy != "medium" {
+		t.Errorf("out-of-set tier persisted as %q, want medium (normalized, never \"\")", updated.Autonomy)
 	}
 }
 
@@ -581,8 +624,9 @@ func TestSetCampaignItemAutonomy_NotFound(t *testing.T) {
 // untested-path seam test (#1551 / E32.4 fix-up): it drives the FULL
 // Assemble→Persist path from an EpicChild carrying an OUT-OF-SET autonomy tier
 // (a typo'd label such as `autonomy:critical`) and asserts persistence
-// SUCCEEDS with the campaign_items.autonomy column stored as "" — the mislabeled
-// child degrades to the non-human-led default instead of aborting the entire
+// SUCCEEDS with the campaign_items.autonomy column stored as the built-in
+// medium (#5316) — the mislabeled child degrades to the named default, never "",
+// instead of aborting the entire
 // epic campaign with an SQLSTATE 23514 CHECK violation. This pins the campaign
 // package's half of the fix; the parse boundary's normalization of the label
 // itself is pinned by TestParseAutonomyLabel in the github provider package.
@@ -593,7 +637,7 @@ func TestPostgres_Assemble_OutOfSetAutonomy_DegradesNotAborts(t *testing.T) {
 
 	res := &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
-			{Number: 41, Autonomy: "critical"}, // out-of-set typo → must degrade to ""
+			{Number: 41, Autonomy: "critical"}, // out-of-set typo → must degrade to medium
 			{Number: 42, Autonomy: "low"},      // valid tier passes through
 		},
 	}
@@ -601,9 +645,9 @@ func TestPostgres_Assemble_OutOfSetAutonomy_DegradesNotAborts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
 	}
-	// Assemble normalizes the out-of-set tier to "" before it can reach the DB.
-	if a.Items[0].Autonomy != "" {
-		t.Errorf("assembled item[0] autonomy = %q, want empty (normalized)", a.Items[0].Autonomy)
+	// Assemble normalizes the out-of-set tier to medium before it can reach the DB.
+	if a.Items[0].Autonomy != "medium" {
+		t.Errorf("assembled item[0] autonomy = %q, want medium (normalized)", a.Items[0].Autonomy)
 	}
 	if a.Items[1].Autonomy != "low" {
 		t.Errorf("assembled item[1] autonomy = %q, want low (passthrough)", a.Items[1].Autonomy)
@@ -622,24 +666,16 @@ func TestPostgres_Assemble_OutOfSetAutonomy_DegradesNotAborts(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("persisted %d items, want 2", len(items))
 	}
-	if items[0].IssueRef != "issue:41" || items[0].Autonomy != "" {
-		t.Errorf("item issue:41 autonomy = %q, want empty", items[0].Autonomy)
+	if items[0].IssueRef != "issue:41" || items[0].Autonomy != "medium" {
+		t.Errorf("item issue:41 autonomy = %q, want medium", items[0].Autonomy)
 	}
 	if items[1].IssueRef != "issue:42" || items[1].Autonomy != "low" {
 		t.Errorf("item issue:42 autonomy = %q, want low", items[1].Autonomy)
 	}
 
-	// Read the raw column too: prove campaign_items.autonomy itself holds "",
+	// Read the raw column too: prove campaign_items.autonomy itself holds medium,
 	// satisfying the fail-closed 0049 CHECK rather than the rejected "critical".
-	var col string
-	if err := pool.QueryRow(ctx,
-		`SELECT autonomy FROM campaign_items WHERE id = $1`, items[0].ID,
-	).Scan(&col); err != nil {
-		t.Fatalf("read autonomy column: %v", err)
-	}
-	if col != "" {
-		t.Errorf("campaign_items.autonomy column = %q, want empty", col)
-	}
+	assertAutonomyColumn(t, pool, items[0].ID, "medium")
 }
 
 // TestPostgres_CampaignItem_MalformedDependsOn_Tolerated asserts the

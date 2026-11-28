@@ -604,9 +604,10 @@ func (f *fakeCampaignRepo) SettleCampaignItemForClosedIssue(_ context.Context, i
 // SetCampaignItemAutonomy overwrites an item's autonomy tier (found by id across
 // all campaigns), mirroring the Postgres adapter's normalize-then-write contract
 // (#2355) so the reconcile-on-read + start-verb autonomy refresh is exercised.
-// It normalizes an out-of-set tier to "" like normalizeAutonomy does, counts
-// invocations for the no-op-write assertion, and honors setAutonomyErr so the
-// fail-open branch is reachable.
+// It normalizes "" and an out-of-set tier to medium exactly as
+// workmgmt.NormalizeAutonomyTier does (#5316), counts invocations for the
+// no-op-write assertion, and honors setAutonomyErr so the fail-open branch is
+// reachable.
 func (f *fakeCampaignRepo) SetCampaignItemAutonomy(_ context.Context, itemID uuid.UUID, autonomy string) (*campaign.Item, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -614,12 +615,7 @@ func (f *fakeCampaignRepo) SetCampaignItemAutonomy(_ context.Context, itemID uui
 	if f.setAutonomyErr != nil {
 		return nil, f.setAutonomyErr
 	}
-	switch autonomy {
-	case "low", "medium", "high":
-		// permitted tiers pass through
-	default:
-		autonomy = "" // normalize an out-of-set tier to the unknown/default
-	}
+	autonomy = workmgmt.NormalizeAutonomyTier(autonomy)
 	for _, items := range f.itemsByCmp {
 		for _, it := range items {
 			if it.ID != itemID {
@@ -8590,6 +8586,302 @@ func autonomyStartGitHub(t *testing.T, labels []string) *githubclient.Client {
 		Tokens:  &ghTokensStub{tok: "ghs_test"},
 		HTTP:    &http.Client{Timeout: 5 * time.Second},
 		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+}
+
+// --- #5316: unlabelled / unrecognised autonomy resolves to the conventions default ---
+
+// lowDefaultConventions returns the built-in conventions with every item type's
+// label_defaults.autonomy rewritten to autonomy:low, so the repository's derived
+// default tier is low. The Types map is deep-copied: Default() shares its maps.
+func lowDefaultConventions(t *testing.T) workmgmt.Conventions {
+	t.Helper()
+	conv := workmgmt.Default()
+	types := make(map[string]workmgmt.ItemType, len(conv.Types))
+	for name, it := range conv.Types {
+		ld := make(map[string]string, len(it.LabelDefaults))
+		for k, v := range it.LabelDefaults {
+			ld[k] = v
+		}
+		if _, ok := ld["autonomy"]; ok {
+			ld["autonomy"] = "autonomy:low"
+		}
+		it.LabelDefaults = ld
+		types[name] = it
+	}
+	conv.Types = types
+	if got := conv.DefaultAutonomyTier(); got != "low" {
+		t.Fatalf("lowDefaultConventions DefaultAutonomyTier = %q, want low (fixture broken)", got)
+	}
+	return conv
+}
+
+// stubFailingConventionsLoader makes every conventions load fail and returns a
+// pointer to the call count, so a test can assert a declared tier needed no read.
+func stubFailingConventionsLoader(t *testing.T) *int {
+	t.Helper()
+	calls := 0
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		calls++
+		return workmgmt.Conventions{}, errInjected
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+	return &calls
+}
+
+// autonomyRefreshedPayloads decodes every campaign_item_autonomy_refreshed audit
+// payload the recorder captured.
+func autonomyRefreshedPayloads(t *testing.T, aud *campaignAuditRecorder) []map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	var out []map[string]any
+	for _, e := range aud.entries {
+		if e.Category != categoryCampaignItemAutonomyRefreshed {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode autonomy-refreshed payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// campaignItemTier reads an item's stored tier from the fake by issue ref.
+func campaignItemTier(t *testing.T, crepo *fakeCampaignRepo, campaignID uuid.UUID, ref string) string {
+	t.Helper()
+	crepo.mu.Lock()
+	defer crepo.mu.Unlock()
+	for _, it := range crepo.itemsByCmp[campaignID] {
+		if it.IssueRef == ref {
+			return it.Autonomy
+		}
+	}
+	t.Fatalf("item %s not found in campaign %s", ref, campaignID)
+	return ""
+}
+
+// TestGetCampaignStatus_UnlabelledIssueResolvesToRepoDefaultTier is the
+// cross-boundary done-means for #5316 (ADR-069 decision 4): conventions whose
+// types declare autonomy:low → the REAL githubclient parse of an UNLABELLED
+// GitHub issue → the reconcile-on-read refresh write → the engine partition →
+// the wire rollup → the audit row. A pending, deps-satisfied item stored with
+// the legacy empty tier
+// becomes low and human_led, never eligible "by omission".
+func TestGetCampaignStatus_UnlabelledIssueResolvesToRepoDefaultTier(t *testing.T) {
+	stubConventionsProvider(t, lowDefaultConventions(t))
+	crepo := newFakeCampaignRepo()
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: ""}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open"}}} // no labels
+	s, aud := newAutonomyRefreshServer(t, crepo, ghState)
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "low" {
+		t.Errorf("persisted autonomy = %q, want low (the repo conventions' default)", got)
+	}
+	if !containsRefTest(st.Rollup.HumanLed, "issue:100") {
+		t.Errorf("rollup.HumanLed = %v, want issue:100 (unlabelled → conventions default low)", st.Rollup.HumanLed)
+	}
+	if containsRefTest(st.Rollup.Eligible, "issue:100") {
+		t.Errorf("rollup.Eligible = %v, must not contain issue:100 (never non-human-led by omission)", st.Rollup.Eligible)
+	}
+	rows := autonomyRefreshedPayloads(t, aud)
+	if len(rows) != 1 {
+		t.Fatalf("campaign_item_autonomy_refreshed rows = %d, want 1: %v", len(rows), rows)
+	}
+	if rows[0]["from"] != "" || rows[0]["to"] != "low" || rows[0]["issue_ref"] != "issue:100" {
+		t.Errorf("audit payload = %v, want issue:100 from '' to low", rows[0])
+	}
+}
+
+// TestGetCampaignStatus_LegacyEmptyTierReResolvedToDefault: under the built-in
+// conventions a legacy empty-tier row (pre-#5316) is re-resolved to medium on its next
+// reconcile-on-read — one write, one audit row — stays eligible, and a second
+// poll performs ZERO further writes (the no-op-write guarantee holds once the
+// stored tier is in-set).
+func TestGetCampaignStatus_LegacyEmptyTierReResolvedToDefault(t *testing.T) {
+	stubConventionsProvider(t, workmgmt.Default())
+	crepo := newFakeCampaignRepo()
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: ""}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open"}}}
+	s, aud := newAutonomyRefreshServer(t, crepo, ghState)
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "medium" {
+		t.Errorf("persisted autonomy = %q, want medium (legacy '' re-resolved)", got)
+	}
+	if !containsRefTest(st.Rollup.Eligible, "issue:100") {
+		t.Errorf("rollup.Eligible = %v, want issue:100 (medium is non-human-led)", st.Rollup.Eligible)
+	}
+	if rows := autonomyRefreshedPayloads(t, aud); len(rows) != 1 || rows[0]["from"] != "" || rows[0]["to"] != "medium" {
+		t.Errorf("audit rows = %v, want exactly one from '' to medium", rows)
+	}
+	if crepo.setAutonomyCalls != 1 {
+		t.Fatalf("setAutonomyCalls after first poll = %d, want 1", crepo.setAutonomyCalls)
+	}
+	_ = getCampaignStatusBody(t, s, c.ID)
+	if crepo.setAutonomyCalls != 1 {
+		t.Errorf("setAutonomyCalls after second poll = %d, want still 1 (no further writes)", crepo.setAutonomyCalls)
+	}
+	if rows := autonomyRefreshedPayloads(t, aud); len(rows) != 1 {
+		t.Errorf("audit rows after second poll = %d, want still 1", len(rows))
+	}
+}
+
+// TestGetCampaignStatus_UnrecognisedTierResolvesToDefault: an issue labelled
+// with an unrecognised tier (autonomy:critical) resolves to the conventions
+// default (medium here), so a stored low item is refreshed to medium.
+func TestGetCampaignStatus_UnrecognisedTierResolvesToDefault(t *testing.T) {
+	stubConventionsProvider(t, workmgmt.Default())
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:critical"}}}}
+	s, aud := newAutonomyRefreshServer(t, crepo, ghState)
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "medium" {
+		t.Errorf("persisted autonomy = %q, want medium (unrecognised tier → conventions default)", got)
+	}
+	if !containsRefTest(st.Rollup.Eligible, "issue:100") {
+		t.Errorf("rollup.Eligible = %v, want issue:100", st.Rollup.Eligible)
+	}
+	if rows := autonomyRefreshedPayloads(t, aud); len(rows) != 1 || rows[0]["from"] != "low" || rows[0]["to"] != "medium" {
+		t.Errorf("audit rows = %v, want exactly one from low to medium", rows)
+	}
+}
+
+// TestGetCampaignStatus_ConventionsLoadErrorSkipsDefaultingOnly pins approval
+// condition FF1 (#5316): a conventions load error must NOT suppress an
+// explicit in-set label. Under a failing loader, issue:100 (stored medium,
+// relabelled autonomy:low) is still persisted low, while issue:101 (stored low,
+// unlabelled) is left untouched — no guessed default is written. The read
+// still returns 200, and the loader is consulted once for the pass.
+//
+// COUNTERFACTUAL: deleting the `!defaultOK` skip in refreshItemAutonomyFromIssues
+// lets issue:101 resolve against an empty default → medium → a second write.
+func TestGetCampaignStatus_ConventionsLoadErrorSkipsDefaultingOnly(t *testing.T) {
+	loads := stubFailingConventionsLoader(t)
+	crepo := newFakeCampaignRepo()
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "medium"},
+		{IssueRef: "issue:101", State: campaign.ItemStatePending, Autonomy: "low"},
+	})
+	c.State = campaign.StateRunning
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "open", labels: []string{"autonomy:low"}},
+		101: {state: "open"}, // unlabelled: needs the (failing) conventions default
+	}}
+	s, aud := newAutonomyRefreshServer(t, crepo, ghState)
+
+	st := getCampaignStatusBody(t, s, c.ID) // fails the test on a non-200
+	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "low" {
+		t.Errorf("issue:100 autonomy = %q, want low (declared tier applies without conventions)", got)
+	}
+	if got := campaignItemTier(t, crepo, c.ID, "issue:101"); got != "low" {
+		t.Errorf("issue:101 autonomy = %q, want low (unlabelled item left untouched on load error)", got)
+	}
+	if crepo.setAutonomyCalls != 1 {
+		t.Errorf("setAutonomyCalls = %d, want 1 (only the declared relabel is written)", crepo.setAutonomyCalls)
+	}
+	if !containsRefTest(st.Rollup.HumanLed, "issue:100") || !containsRefTest(st.Rollup.HumanLed, "issue:101") {
+		t.Errorf("rollup.HumanLed = %v, want issue:100 and issue:101", st.Rollup.HumanLed)
+	}
+	if rows := autonomyRefreshedPayloads(t, aud); len(rows) != 1 || rows[0]["issue_ref"] != "issue:100" {
+		t.Errorf("audit rows = %v, want exactly one, for issue:100", rows)
+	}
+	if *loads != 1 {
+		t.Errorf("conventions loads = %d, want 1 (resolved once per pass)", *loads)
+	}
+}
+
+// TestGetCampaignStatus_DeclaredTierNeedsNoConventionsRead pins FF1's other
+// half: when every fetched issue declares an in-set tier, the refresh applies it
+// without touching the conventions loader at all.
+func TestGetCampaignStatus_DeclaredTierNeedsNoConventionsRead(t *testing.T) {
+	loads := stubFailingConventionsLoader(t)
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:medium"}}}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "medium" {
+		t.Errorf("persisted autonomy = %q, want medium (declared tier)", got)
+	}
+	if !containsRefTest(st.Rollup.Eligible, "issue:100") {
+		t.Errorf("rollup.Eligible = %v, want issue:100", st.Rollup.Eligible)
+	}
+	if *loads != 0 {
+		t.Errorf("conventions loads = %d, want 0 (a declared tier needs no conventions read)", *loads)
+	}
+}
+
+// TestStartCampaignItemRun_UnlabelledIssueResolvesToRepoDefaultBeforeGate is the
+// start verb's targeted refresh (#5316): under low-default conventions a ”
+// item whose issue is unlabelled is refreshed to low by refreshOneItemAutonomy
+// before the DAG gate, so the verb refuses 409 item_human_led instead of
+// starting it as non-human-led by omission.
+func TestStartCampaignItemRun_UnlabelledIssueResolvesToRepoDefaultBeforeGate(t *testing.T) {
+	stubConventionsProvider(t, lowDefaultConventions(t))
+	crepo := newFakeCampaignRepo()
+	gh := autonomyStartGitHub(t, nil)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: ""}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict || decodeCampaignError(t, w) != "item_human_led" {
+		t.Fatalf("status/code = %d/%s, want 409 item_human_led (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "low" {
+		t.Errorf("item autonomy = %q, want low (refreshed to the conventions default before the gate)", got)
+	}
+}
+
+// TestStartCampaignItemRun_ConventionsLoadErrorAppliesOnlyDeclaredTier pins FF1
+// on the start verb: under a failing loader an item relabelled autonomy:low is
+// still refreshed to low (refused item_human_led), and an unlabelled item stored
+// low keeps its stored tier with no write (also refused) — the failure never
+// degrades it to a guessed, more permissive default.
+func TestStartCampaignItemRun_ConventionsLoadErrorAppliesOnlyDeclaredTier(t *testing.T) {
+	cases := []struct {
+		name       string
+		labels     []string
+		stored     string
+		wantWrites int
+	}{
+		{"declared low applied", []string{"autonomy:low"}, "medium", 1},
+		{"unlabelled left untouched", nil, "low", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubFailingConventionsLoader(t)
+			crepo := newFakeCampaignRepo()
+			gh := autonomyStartGitHub(t, tc.labels)
+			s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+			item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: tc.stored}
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+			c.State = campaign.StatePending
+
+			w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+			if w.Code != http.StatusConflict || decodeCampaignError(t, w) != "item_human_led" {
+				t.Fatalf("status/code = %d/%s, want 409 item_human_led (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+			}
+			if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "low" {
+				t.Errorf("item autonomy = %q, want low", got)
+			}
+			if crepo.setAutonomyCalls != tc.wantWrites {
+				t.Errorf("setAutonomyCalls = %d, want %d", crepo.setAutonomyCalls, tc.wantWrites)
+			}
+		})
 	}
 }
 

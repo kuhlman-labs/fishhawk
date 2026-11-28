@@ -312,7 +312,9 @@ Structural blockers, and nothing else:
 - the human is the experimental subject (operator drills)
 - it is not code at all (partner agreements, commercial terms)
 
-A campaign refuses `autonomy:low` items as `item_human_led`.
+A campaign refuses `autonomy:low` items as `item_human_led`. An issue with no `autonomy:*`
+label, or an unrecognised one, is treated as the conventions default (`autonomy:medium`
+here), never more permissively (ADR-069 decision 4, #5316).
 
 Current: **34 open `autonomy:low`**, of which 14 are epics (parents, never campaign
 items), leaving 20 genuine human-led work items. 36 issues were re-tiered to

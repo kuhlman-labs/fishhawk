@@ -211,7 +211,9 @@ func TestPlanAppend_Classification(t *testing.T) {
 	}
 	want := []CreateCampaignItemParams{
 		{IssueRef: "issue:20", DependsOn: []string{"issue:10"}, Autonomy: "low"},
-		{IssueRef: "issue:21", DependsOn: []string{"issue:20", "issue:999", "issue:10"}, Autonomy: ""},
+		// The out-of-set "bogus" tier degrades to the built-in medium, never ""
+		// (ADR-069 decision 4, #5316).
+		{IssueRef: "issue:21", DependsOn: []string{"issue:20", "issue:999", "issue:10"}, Autonomy: "medium"},
 	}
 	if !reflect.DeepEqual(plan.Items, want) {
 		t.Errorf("items = %+v\nwant %+v", plan.Items, want)

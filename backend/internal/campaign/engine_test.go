@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // item is a small constructor for an *Item in the engine tests.
@@ -204,14 +205,22 @@ func TestNextEligible_PausedBucketed(t *testing.T) {
 // HumanLed (never Eligible) while an autonomous sibling lands in Eligible, and
 // a deps-UNsatisfied autonomy:low item stays Blocked (not HumanLed).
 func TestNextEligible_HumanLedDiverted(t *testing.T) {
+	// An unlabelled item resolves to the repository conventions' default tier
+	// (ADR-069 decision 4, #5316) — medium under the built-in conventions —
+	// rather than an empty "unknown" tier.
+	unlabelled := workmgmt.ParseAutonomyLabel(nil, workmgmt.Default().DefaultAutonomyTier())
+	if unlabelled != "medium" {
+		t.Fatalf("unlabelled tier = %q, want medium (the built-in conventions default)", unlabelled)
+	}
 	items := []*campaign.Item{
 		item("issue:1", campaign.ItemStateSucceeded, nil), // done — satisfies deps below
 		// deps satisfied, autonomy:low → human-led (diverted out of Eligible).
 		{IssueRef: "issue:2", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: "low"},
 		// deps satisfied, autonomy:high → eligible (autonomous sibling).
 		{IssueRef: "issue:3", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: "high"},
-		// deps satisfied, autonomy unset → eligible (unknown defaults to non-human-led).
-		{IssueRef: "issue:4", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}},
+		// deps satisfied, unlabelled → resolves to the conventions default
+		// (medium here) → eligible.
+		{IssueRef: "issue:4", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: unlabelled},
 		// deps UNsatisfied, autonomy:low → stays Blocked, NOT HumanLed.
 		{IssueRef: "issue:5", State: campaign.ItemStatePending, DependsOn: []string{"issue:999"}, Autonomy: "low"},
 	}
@@ -225,6 +234,79 @@ func TestNextEligible_HumanLedDiverted(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
 	}
+}
+
+// TestNextEligible_UnlabelledNeverMorePermissiveThanMedium pins ADR-069
+// decision 4 (#5316) at the engine: an unlabelled child assembled through
+// campaign.Assemble carries medium, and lands in exactly the eligibility
+// buckets a medium-labelled twin does, across every autonomy-sensitive state.
+// The value assertion is the one that bites if Assemble stops normalizing: the
+// engine keys only on == "low", so "" and medium would still share buckets.
+func TestNextEligible_UnlabelledNeverMorePermissiveThanMedium(t *testing.T) {
+	cases := []struct {
+		name  string
+		state campaign.ItemState
+		deps  []string
+	}{
+		{"pending deps satisfied", campaign.ItemStatePending, []string{"issue:1"}},
+		{"pending deps unsatisfied", campaign.ItemStatePending, []string{"issue:999"}},
+		{"failed", campaign.ItemStateFailed, []string{"issue:1"}},
+		{"cancelled", campaign.ItemStateCancelled, []string{"issue:1"}},
+		{"replanning", campaign.ItemStateReplanning, []string{"issue:1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := campaign.Assemble("issue:100", &workmgmt.EpicChildrenResult{
+				Children: []workmgmt.EpicChild{
+					{Number: 10, Autonomy: ""},       // unlabelled
+					{Number: 11, Autonomy: "medium"}, // medium twin
+				},
+			})
+			if err != nil {
+				t.Fatalf("Assemble: %v", err)
+			}
+			tier := map[string]string{}
+			for _, ai := range a.Items {
+				tier[ai.IssueRef] = ai.Autonomy
+			}
+			if tier["issue:10"] != "medium" {
+				t.Fatalf("unlabelled twin assembled Autonomy = %q, want medium", tier["issue:10"])
+			}
+			items := []*campaign.Item{
+				item("issue:1", campaign.ItemStateSucceeded, nil),
+				{IssueRef: "issue:10", State: tc.state, DependsOn: tc.deps, Autonomy: tier["issue:10"]},
+				{IssueRef: "issue:11", State: tc.state, DependsOn: tc.deps, Autonomy: tier["issue:11"]},
+			}
+			e := campaign.NextEligible(items)
+			unlabelled, medium := eligibilityBuckets(e, "issue:10"), eligibilityBuckets(e, "issue:11")
+			if len(medium) == 0 {
+				t.Fatalf("medium twin landed in no bucket: %+v", e)
+			}
+			if !reflect.DeepEqual(unlabelled, medium) {
+				t.Errorf("unlabelled twin buckets = %v, medium twin buckets = %v; want identical", unlabelled, medium)
+			}
+		})
+	}
+}
+
+// eligibilityBuckets names every Eligibility slice that holds ref, by reflecting
+// over all []string fields so a future bucket is covered without an edit.
+func eligibilityBuckets(e campaign.Eligibility, ref string) []string {
+	var out []string
+	v := reflect.ValueOf(e)
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		refs, ok := f.Interface().([]string)
+		if !ok {
+			continue
+		}
+		for _, r := range refs {
+			if r == ref {
+				out = append(out, v.Type().Field(i).Name)
+			}
+		}
+	}
+	return out
 }
 
 // TestDeriveState exercises one assertion per derived branch: pending,
