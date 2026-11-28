@@ -189,3 +189,38 @@ Ratification: Captain, 2026-11-27 (issue #5610), ratifying the text exactly as c
 - **Startup prerequisite.** An unreachable heartbeat endpoint at start stops a configured dispatcher from spawning. This fails closed and is visible in `status.json` and the doctor. A restart that outlasts `QueueTTL` between refreshes still forfeits the queued stages' positions.
 - **A share is per dispatcher.** It does not see session-spawned stages. When ledger reads fail, it keeps entries and stays closed (`host_dispatcher_loop.go:1213-1215`).
 - **Not decided here.** The work-in-progress caps are not decided here: the ADR-041 decomposition fallback, the `fishhawk_run_children` clamp and a campaign `max_parallel` field. Neither are mirrored constants beyond the interval bound, or the racing-spawners residual.
+
+## Amendment A4: the dispatcher declares host group limits
+
+Ratification: Captain, 2026-11-28 (issue #5659), ratifying the text exactly as converged in the operator's ADR review (docs/adr/README.md § "Drafting and review"; round 3: Fable claude-fable-5-2 and Astra gpt-6-astra both APPROVE, at repo commit bf8cf6403). Recorded by the operator. It changes no front-matter field.
+
+**Context.** A3 item 2 makes this dispatcher's heartbeat carry the host's capacity and implement-limit declaration (ADR-094 (#4239) Amendment A5). ADR-094 (#4239) Amendment A6 adds a third, optional part, `host_group_limits`, which sizes every other host-scoped group, the host verify group and the shared preview target among them. This amendment gives the dispatcher its input and states how it sends it. A3 item 2's rules for parsing, start-up refusal, the ingest drop and the startup acknowledgement apply to the new field unchanged.
+
+**Decision.**
+1. **Input.** The dispatcher reads an optional `FISHHAWK_HOST_GROUP_LIMITS`, a comma-separated list of `<name>=<n>` entries. For example, `verify=2` gives the host verify group two slots. Whitespace around entries is ignored.
+   - Each name follows ADR-094 A6 item 1's key rules, and each value follows ADR-094 A2 item 7's integer rules (1..64).
+   - A duplicate name, a reserved name (`capacity`, `implement`), an invalid group name, an invalid value or more than 16 entries refuses dispatcher start-up and names the entry, as an invalid `FISHHAWK_HOST_CAPACITY` does under A3 item 2.
+   - If the variable is unset, the field is omitted, which declares nothing for any host group. A set but empty value refuses dispatcher start-up, as ADR-094 A2 item 7 states for `FISHHAWK_HOST_CAPACITY`. `scripts/dev` passes no empty variable through (`scripts/dev:3058-3063`).
+2. **Sending.** The dispatcher sends the parsed list as the heartbeat's `host_group_limits` object, beside `host_capacity` and `host_implement_limit`.
+   - A3 item 2's startup prerequisite counts this field: a dispatcher with any of the three configured waits for one successful acknowledgement that retained its declaration before its first marker POST.
+   - A dropped declaration at ingest is logged once per distinct value and reported by the doctor rung, as A3 item 2 states.
+3. **Passthrough.** `scripts/dev` passes `FISHHAWK_HOST_GROUP_LIMITS` through to the dispatcher beside `FISHHAWK_HOST_CAPACITY` (`scripts/dev:3036-3047`). It also sets fishhawkd's `FISHHAWKD_DEFAULT_HOST_GROUP_LIMITS` from the same `.env` value (ADR-094 A6 item 2 (b)).
+4. **Shared preview.** A3 item 5's "serialized by the built-in `host:<label>:preview-target` group at limit 1" now reads: serialized by that group at its governing limit under ADR-094 A6 item 2, with a built-in fallback of 1. A host with one shared preview target keeps 1. A higher value needs the operator to provide enough independent preview targets for the stages it admits.
+5. **Unchanged.** These stand:
+   - the dispatcher's share (A3 item 1);
+   - the per-tick cap and the queued-refresh exemption (A3 item 3);
+   - the daily cap (A3 item 4).
+
+   The dispatcher does not count its own spawns against any host group limit; the server's admission does.
+
+**Consequences.**
+- **Upgrade order and rollback** are A3's: upgrade fishhawkd first, and revert the dispatcher first. An older fishhawkd refuses a heartbeat that carries `host_group_limits` (`backend/internal/server/host_dispatcher_heartbeat.go:60`), so the dispatcher sends the field only when the variable is set.
+- **Docs updated in the implementing change:**
+  - `.env.example`;
+  - the `scripts/dev` passthrough comment;
+  - `backend/cmd/fishhawk-mcp/README.md`;
+  - `scripts/README.md` § "Host dispatcher".
+
+**Risks and residuals.**
+- **Session-spawned stages.** Stages spawned outside the dispatcher are admitted under the same server-resolved limits, but they do not declare them.
+- **No fresh declaration.** When a group has no fresh declaration entry, admission uses the fishhawkd default or the built-in fallback (ADR-094 A6 item 2). A stopped dispatcher's last declaration keeps governing until it goes stale, which can take up to 15 minutes (ADR-094 A5's freshness ceiling).

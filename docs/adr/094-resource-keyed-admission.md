@@ -340,3 +340,67 @@ A2 item 6 leaves a host-declared implement limit as future work. ADR-104 Amendme
 - **Tenancy mismatch.** Tenanted runs with an untenanted dispatcher token get the fishhawkd default, and the doctor rung shows it.
 - **A2 item 6's gap.** Under `min()` a host implement limit only lowers, so the named shorthand still cannot run N implements.
 - **Out of scope.** Cross-account budgets for one physical host (accounting is per account), and counting fishhawkd review sessions or specialist jobs against capacity.
+
+## Amendment A6: every host-scoped group limit has a declared value
+
+Ratification: Captain, 2026-11-28 (issue #5658), ratifying the text exactly as converged in the operator's ADR review (docs/adr/README.md § "Drafting and review"; round 3: Fable claude-fable-5-2 APPROVE_WITH_NITS, its one optional low not applied, and Astra gpt-6-astra APPROVE, at repo commit bf8cf6403). Factual errata for ADR-150 were applied after ratification, Captain-approved and reviewer-confirmed (round 4). Recorded by the operator. It changes no front-matter field.
+
+**Context.** Amendment A5 gives two host limits a declarer: `host_capacity` and `host_implement_limit`, sent on the host dispatcher's heartbeat (A5 item 1). Every other host-scoped group is still sized by a compile-time constant that no operator can change:
+- `local-verify:<host>`, which merge-candidate verify-only passes hold, is `DefaultVerifyLimit` 1 (`backend/internal/concurrency/concurrency.go:47-48`, applied at `backend/internal/server/stage_concurrency.go:252`). Specialist jobs admit against the same constant (`backend/internal/specialistjob/store.go:568`).
+- Every other host-scoped group, including the built-in `host:<label>:preview-target`, is `hostScopedGroupLimit` 1 (`stage_concurrency.go:316`, applied at `:373`).
+
+A1 item 6 forbids a repository spec from sizing these groups, because a host group is shared by every repository on the host, and it leaves host-level limits to the host operator. A5 built that operator surface for capacity and implement only. The fixed host verify limit therefore prevents otherwise eligible merge-candidate passes from different repositories or bases from running concurrently, even when the host could fit their gates.
+
+The merge queue already admits one live pass per (repository, base) (ADR-092 D1, ADR-115 D7), or one per candidate within a speculative train (ADR-150 D3). That is a correctness serialization, and this amendment does not change it. The host group additionally serializes passes of different repositories or bases, a train's candidate passes, and passes against specialist jobs. On a host whose gates take the container path, it is the only thing that does:
+- each gate execution gets a private container;
+- with `FISHHAWK_GATE_SERVICES=postgres`, it also gets a private Postgres service (`runner/internal/gateiso/README.md:1042-1062`);
+- the runner does not hand it the primary repository's verify lock (`runner/cmd/fishhawk-runner/main.go:7928-7933`).
+
+**Decision.**
+1. **A host group-limit declaration.** The A5 heartbeat gains an optional `host_group_limits` object. Each key names a host-scoped group, and each value is an integer in 1..64. It follows A5 item 1's rules: the declarer, the account and label binding, storage in the heartbeat row, latest write wins, and omitting a key or the whole object removes that part of an earlier declaration. A JSON `null` or an empty object is the same as an absent field.
+   - **Keys.** A key is a host-scoped group NAME, as a spec's `concurrency.groups` entry spells one (`{group: <name>, scope: host}`). The key `verify` is the host verify group, which canonicalises to `local-verify:<host>` (A1 decision 1). The key `preview-target` is `host:<label>:preview-target`, and any other name `<n>` is `host:<label>:<n>`.
+   - **Reserved and invalid keys.** `capacity` and `implement` are refused as keys, because A5's `host_capacity` and `host_implement_limit` declare those two groups. A key must also match the workflow-v2 group-name pattern `^[a-z0-9][a-z0-9._-]{0,62}$` (`docs/spec/workflow-v2.schema.json:478`), compared exactly, with no case or whitespace folding. Any other key is invalid. The object holds at most 16 entries.
+   - **Invalid entries.** A reserved or invalid key, a value outside 1..64, or more than 16 entries drops the whole `host_group_limits` object, never the heartbeat. It drops A5's `host_capacity` and `host_implement_limit` too, so a half-applied declaration never governs. The reverse also holds: an invalid `host_capacity` or `host_implement_limit` drops `host_group_limits` with it. From this amendment, A5 item 1's "the whole declaration" and A5 item 5's "clears both fields" mean all three parts. The response's `dropped_declaration` names the field (`host_group_limits.<key>` for an entry), and the row records it, as A5 item 1 states. A value of the wrong JSON type is a structural 400.
+2. **The governing limit of a host-scoped group.** For a marker admission, take the run's account and the marker's host label. Each host-scoped group in the stage's set, other than capacity and implement, is sized from the first of these that applies:
+   - (a) that group's entry in the fresh declaration, matched exactly as A5 item 2 (a) matches;
+   - (b) fishhawkd's `--default-host-group-limit <name>=<n>` (repeatable; env `FISHHAWKD_DEFAULT_HOST_GROUP_LIMITS`, a comma-separated `<name>=<n>` list), 1..64, applied to every label. The list follows ADR-104 (#4524) Amendment A4 item 1's entry rules: whitespace around entries is ignored, and a duplicate, reserved or invalid name, an invalid value or more than 16 entries refuses fishhawkd start-up. The flag and the environment variable are one list, and a name given in both is a duplicate. An unset or empty environment variable sets no default. On the local stack, `scripts/dev` sets it from the same `.env` `FISHHAWK_HOST_GROUP_LIMITS` that the dispatcher declares (ADR-104 (#4524) Amendment A4), so the declaration and the fallback agree;
+   - (c) the built-in value: `DefaultVerifyLimit` 1 for `local-verify:<host>`, and `hostScopedGroupLimit` 1 for every other host-scoped group.
+
+   The server resolves this once per marker request, before `Admit`, the same way A5 item 2 resolves capacity, and passes the result as that request's limit for that group. The store, its single transaction, and ADR-087's rule that the admitting stage's limit governs are unchanged. A row admitted under an earlier value keeps holding, and a lower value never evicts a holder. A changed limit does not re-queue a waiter: its rows keep their position and take the new limit on its next poll (`backend/internal/concurrency/store.go:550-554`, `:568`).
+3. **Specialist jobs share the resolved verify limit.** `AdmitJob` admits a job when live stage holders plus live job holders are below the governing `local-verify:<host>` limit for the job's account and host label, resolved under item 2, instead of below `DefaultVerifyLimit`. Its other conditions are unchanged: no fresh verify-stage waiter, and no older fresh queued job (`backend/internal/specialistjob/store.go:479-500`).
+4. **What the verify limit bounds.** It bounds merge-candidate verify-only passes and specialist jobs only (A2 item 5). Implement-stage gate verifies run inside the implement stage's own slots and are not counted in it. Every pass still holds one slot of `host:<label>:capacity`, so the governing capacity bounds passes together with every other stage type (D4, A4). A specialist job holds no capacity slot (`backend/internal/concurrency/README.md:342-343`). At a verify limit of N, up to N jobs can therefore run beside a full capacity group, and the declarer sizes for that.
+5. **The declarer sizes for its own gate path.** The server cannot see which gate path a runner will take at admission, because the runner selects it after spawn (`runner/internal/gateiso/select.go`). A declared or default verify limit above 1 is therefore the host operator's statement that that many verify gates fit on the host.
+   - On the clone paths, a repository's own verify serialization still applies inside the gate. This repository's verify lock is one example: a runner that meets a live runner holder waits up to 600 s and then exits 73, "not judged" (`scripts/README.md` § "The verify lock").
+   - A5 item 3's doctor rung reports the governing value and its source for `verify`, for `preview-target`, and for each other name in the fresh declaration or the fishhawkd default (`declaration`, `fishhawkd_default` or `default`). It warns when the verify limit is above 1 and this process's environment configures no gate image (`FISHHAWK_GATE_IMAGE` unset).
+   - The warning is advisory. The doctor runs in the backend module, which has no import edge to the runner (`backend/internal/mcpserver/onboard.go:343-346`), so it cannot see a repository's declared `gate_container` or whether the runtime is available.
+6. **Unchanged.**
+   - A1 item 6 stands: a repository spec still cannot size a host-scoped group, and a host `concurrency.groups` entry still carries no `limit`. Both validators and every captured spec are unchanged.
+   - The reservation of `local-verify:<host>` for merge-candidate passes and specialist jobs stands, as do A2 item 5's host keying of verify passes and A4's capacity-bound reservation rule.
+   - A5 items 2 to 5 stand for capacity and the implement group.
+   - ADR-100 is unchanged: these limits stay integers in every mode (ADR-100 D2, A5 item 6).
+7. **What this replaces.**
+   - A1 item 6's "any other declarable host-scoped group is resolved at limit 1" now reads "is resolved at its governing limit (A6 item 2)".
+   - A2 item 7's "`preview-target` … held at limit 1. There is no host knob for its limit yet" is replaced by item 2's resolution order, with a built-in fallback of 1.
+   - ADR-092 D3's "default limit 1" for `local-verify:<host>` becomes the built-in fallback of item 2 (c).
+
+**Consequences.**
+- **No migration.** The declaration rides A5's heartbeat row payload (migration 0121).
+- **Behaviour on upgrade.** A group governed by item 2 that has neither a declaration entry nor a fishhawkd default keeps its built-in limit of 1. Capacity and implement continue to follow A5, including capacity's built-in 3 and implement's spec value with its optional host ceiling.
+- **Upgrade order and rollback.** These are A5's, applied to the new field.
+  - Upgrade fishhawkd first, because an older fishhawkd refuses a heartbeat carrying an unknown field.
+  - To roll back: unset `FISHHAWK_HOST_GROUP_LIMITS`, revert the dispatcher, remove `--default-host-group-limit` / `FISHHAWKD_DEFAULT_HOST_GROUP_LIMITS`, then revert fishhawkd.
+- **Surfaces updated in the implementing change:**
+  - the heartbeat schema and the doctor read in `docs/api/v0.openapi.yaml`;
+  - `backend/internal/concurrency/README.md` § "Constants";
+  - `backend/internal/specialistjob/README.md` § "Admission";
+  - `.env.example`;
+  - `scripts/dev`;
+  - the fishhawkd flag reference.
+
+**Risks and residuals.**
+- **Mid-stage fallback.** A runner can fall back from container to clone after admission. Under a verify limit above 1, it can then meet a repository verify lock that another pass holds, wait, and possibly exit 73. That is a retryable "not judged", not a red tree. ADR-115 D2's re-queue on fallback (#4655) removes it, and this amendment does not decide that re-queue.
+- **Sizing is the operator's.** Gate containers carry no CPU or memory bound today. A verify limit above 1 without per-gate resource bounds can oversubscribe the container runtime. Specialist jobs hold no capacity slot, so at a verify limit of N up to N jobs run beside a full capacity group. Bounding gate resources is outside this decision.
+- **Single repository and base.** On a host serving one repository and one base without a speculative train, the per-base bound (ADR-092 D1) admits one pass at a time whatever the verify limit, and a larger limit lets only a specialist job run beside it. With a train (ADR-150, effective depth above 1), the verify limit, together with host capacity (item 4), bounds how many of its candidate passes run at once.
+- **Preview target above 1.** The `preview-target` limit serializes one shared preview target, which is a correctness bound, not a resource bound. A declared value above 1 is the operator's statement that the host has that many independent targets (ADR-104 (#4524) Amendment A4 item 4). The doctor does not check it.
+- **Label drift and fallback flips** are A5's residuals, unchanged.
+- **Out of scope.** Non-host limits: campaign running items, decomposition children, the merge-queue batch size and train depth (ADR-150 D1), and in-process semaphores.
