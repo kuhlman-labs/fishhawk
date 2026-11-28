@@ -70,9 +70,10 @@ const (
 // routes land and never lowered silently — a drop means a route vanished or
 // the enumeration broke, and the per-route loop would otherwise pass
 // vacuously. E94.3 / #4694 raised runs 56 -> 61: the 60 run-family
-// patterns registered by then plus POST /v0/runs/{run_id}/escapes.
+// patterns registered by then plus POST /v0/runs/{run_id}/escapes. #3925
+// raised runs 61 -> 62 for POST /v0/runs/{run_id}/split-filing/resume.
 var sweepFamilyFloors = map[string]int{
-	sweepFamilyRuns:     61,
+	sweepFamilyRuns:     62,
 	sweepFamilyStages:   12,
 	sweepFamilyConcerns: 2,
 }
