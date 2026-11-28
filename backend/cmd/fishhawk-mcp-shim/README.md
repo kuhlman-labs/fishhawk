@@ -112,6 +112,7 @@ Because that prune DELETES files in an operator-supplied directory, the reader o
 | `--version` | off | print the SHIM's own build identity, `<Version> (<GitSHA>)` (bare `<Version>` when unstamped), and exit — like `--status` it spawns no child, reads no stdin and writes no state file (#4117). The CHILD's identity is the `serverInfo.version` it advertises on `initialize` |
 | `--state-dir` | `${TMPDIR:-/tmp}/fishhawk-mcp-shim` | where per-shim snapshots live (env: `FISHHAWK_MCP_SHIM_STATE_DIR`) |
 | `--stale-grace` | `60s` | how long a pending swap must have been outstanding before it counts as stale |
+| `--env-file` | `../.env` beside the shim's `bin/` dir, sourced only inside a fishhawk checkout | the `.env` each child spawn sources `FISHHAWK_HOST_LABEL` and `FISHHAWK_HOST_CAPACITY` from when the shim's own env lacks them; `--env-file=` disables sourcing. See [Host settings from the checkout .env](#host-settings-from-the-checkout-env-5592) |
 
 ## Registration
 
@@ -125,7 +126,7 @@ claude mcp add fishhawk -- /path/to/bin/fishhawk-mcp-shim
 
 The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — the binary path given positionally after the `--` separator — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed. Run `/mcp` once after re-registering so the session picks up the shim; from then on child rebuilds hot-swap with no further `/mcp`.
 
-The shim passes env through unchanged: it adds no auth of its own and forwards `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight to the child. With a **stored credential** (`fishhawk token login`) there is no `--env FISHHAWK_API_TOKEN` to pass — the child resolves the bearer from the shared [`credstore`](../../../credstore/README.md) at startup. If you would rather keep the token in the environment, wire it with `-e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN` on the `claude mcp add` line above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`); an explicit env token wins over the store.
+The shim passes its env through to the child, adding at most the two host settings below ([Host settings from the checkout .env](#host-settings-from-the-checkout-env-5592)): it adds no auth of its own and forwards `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight to the child. With a **stored credential** (`fishhawk token login`) there is no `--env FISHHAWK_API_TOKEN` to pass — the child resolves the bearer from the shared [`credstore`](../../../credstore/README.md) at startup. If you would rather keep the token in the environment, wire it with `-e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN` on the `claude mcp add` line above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`); an explicit env token wins over the store.
 
 ### `scripts/dev` integration
 
@@ -145,6 +146,72 @@ The shim is wired into the dev loop ([#1922](https://github.com/kuhlman-labs/fis
 **State-dir coupling.** The advisory forwards `FISHHAWK_MCP_SHIM_STATE_DIR` to the probe as `--state-dir` only when that variable is set in `scripts/dev`'s OWN environment. A shim registered with a custom state dir that `scripts/dev` cannot see (for example `claude mcp add ... -e FISHHAWK_MCP_SHIM_STATE_DIR=...`) writes its snapshots elsewhere, the probe reads the default dir, finds nothing, and stays silent — a false negative. Treat the override as test-only unless you also export it where `scripts/dev` runs.
 
 Registration is detected via the `FISHHAWK_MCP_SHIM_REGISTERED` env override (sourced from `.env`; `1`/`true` or `0`/`false`) winning over a bounded `claude mcp get fishhawk` probe. **Not registered** is an answer: the `claude` CLI is absent, or it ran and exited 1-123, or it exited 0 without naming the shim; that keeps the manual banner (the fail-safe direction). **Undetermined** is no answer: the probe expired, could not start or launch (exit 124-127), was killed (exit >= 128), or exited 0 with no output. `reload` runs the probe before its guards and teardown, so a hung CLI can never leave the backend down; see "Bounded registration probe" in [`scripts/README.md`](../../../scripts/README.md).
+
+## Host settings from the checkout .env (#5592)
+
+A session's stdio `fishhawk-mcp` and the host dispatcher `scripts/dev` starts
+must agree on `FISHHAWK_HOST_LABEL` (the `local-implement:<label>` and
+`host:<label>:capacity` groups) and, until ADR-094 Amendment A5
+([#5609](https://github.com/kuhlman-labs/fishhawk/issues/5609)) ships, on
+`FISHHAWK_HOST_CAPACITY`. `scripts/dev` reads both from the checkout `.env`;
+the harness's MCP registration does not. So when the shim's own environment
+lacks either key, the shim sources it from that `.env` into every child it
+spawns.
+
+1. **Trust model.** `.env` is operator-owned code that `scripts/dev` already
+   sources at every `up` and reload. The shim runs it the same way, as the
+   operator's own user: `zsh -f -c 'set -a; source "$1" …'` with an
+   environment of only `PATH` and `HOME`, stdin and stdout of the `source`
+   on the null device, and stderr discarded. It runs at EVERY child spawn,
+   so any side effect in the file runs then too; a process the file
+   backgrounds is killed when the evaluation ends (item 5). A `.env` that
+   reads an ambient variable (say `${USER}`) sees it unset here. `zsh -f` skips
+   `~/.zshenv` and the other startup files, but zsh always reads
+   `/etc/zshenv`; a key exported there is what a `scripts/dev` child sees
+   too.
+2. **Only two keys, only as exported scalars.** Only `FISHHAWK_HOST_LABEL`
+   and `FISHHAWK_HOST_CAPACITY` are ever read back, and only when zsh types
+   them as an exported scalar, integer or float: exactly what a child of
+   `set -a; source .env` sees. An array (zsh never exports one) or a
+   `typeset +x` key is not sourced. No other key in the file (the token,
+   `FISHHAWK_HOST_DISPATCH_STATE_DIR`, anything) can reach the child.
+3. **Explicit env wins.** A key present in the shim's environment, even
+   set-but-empty (`FISHHAWK_HOST_LABEL=` in the registration), is never
+   overridden. An empty sourced value is skipped.
+4. **Which file.** The default is `../.env` beside the shim's `bin/` dir,
+   sourced ONLY when that directory is a fishhawk checkout: `../.git` exists
+   and `../scripts/dev` is a regular file. In a release install (the shim in
+   some `bin/` with no checkout around it) the default sources nothing and
+   the shim says so once on stderr, naming the skipped path and
+   `--env-file` as the remedy. `--env-file <path>` names a file anywhere;
+   `--env-file=` disables sourcing (a host without zsh, or an operator who
+   prefers none). For the default and an explicit file alike, the file must
+   be a regular file owned by the current uid and not group- or
+   world-writable.
+5. **Fail closed.** A missing file is silent. Each of these gives one stderr
+   line naming the file and the reason, never a value or any text of the
+   file, and sources nothing: a stat error, a FIFO or other non-regular file
+   (never opened, so it cannot block a spawn), a file another uid owns, a
+   group- or world-writable file, zsh missing from `PATH`, the 5 s timeout,
+   a non-zero exit, a process left holding the output open, more than 4 KiB
+   of output, and a malformed frame (the file called `exit`, printed from a
+   trap, or put a NUL in a value). The evaluator's whole process group is
+   SIGKILLed on every path once it returns, the timeout, a refusal and a
+   clean exit alike, so nothing the file backgrounds outlives the evaluation.
+6. **Invalid capacity.** A sourced `FISHHAWK_HOST_CAPACITY` that is not an
+   integer in 1..64 (the rule `fishhawk-mcp` applies) is skipped with a line
+   naming the key and the range, not the value, so it can never stop the
+   child from starting. The label is still sourced.
+7. **CRLF.** The shim does no CR or whitespace normalisation: whatever zsh
+   yields is passed as is, for example a trailing `\r` from a CRLF file, and
+   `fishhawk-mcp` trims the label and the capacity.
+8. **When it applies.** The file is re-read at every spawn: startup, a
+   hot-swap and a crash-respawn, so an edited `.env` moves the session's
+   label or capacity at the next spawn, as `scripts/dev reload` moves the
+   dispatcher's. One `/mcp` is needed after the shim binary itself changes.
+   A value hand-set in the MCP registration's env keeps winning; remove it
+   to let the `.env` govern. Each spawn logs one line naming the sourced
+   keys and the file, never their values.
 
 ## Layout
 
@@ -173,4 +240,7 @@ A separate binary built from the **backend module**, sibling to `fishhawk-mcp` p
 - **A state-file write failure degrades the diagnostic, not the proxy.** A read-only or full `TMPDIR` logs once and the shim keeps serving frames.
 - **Session classification comes from the client's own `_meta`.** A client that stamps no protocol version into its requests is treated as legacy — the fail-safe direction: that path still refuses a swap loudly (`deferred_no_initialize_recorded`) rather than swapping blind onto an uninitialised child.
 - **Claude Code's client is not the go-sdk client.** How it handles an unsolicited or subscription-tagged `tools/list_changed` under 2026-07-28 cannot be observed from this repository, so the operator-visible confirmation of a swap stays what it was: a version-returning tool call reflecting the new GitSHA, **re-reading the tool description** rather than relying on a cached one (a cached description is exactly what a missed notification leaves behind).
+- **The default `.env` is the shim binary's checkout, not the session's** (#5592). A session registered against one checkout's `bin/fishhawk-mcp-shim` reads that checkout's `.env`, whichever directory it works in. `--env-file` points elsewhere.
+- **The `.env` checks are a stat before zsh opens the path** (#5592). A file swapped between the two is not caught; the file and its directory are the operator's own.
+- **Sourcing needs zsh** (#5592). A host without it gets one warning per spawn and no sourcing; register with `--env-file=` to silence it.
 - **Shim-binary changes still need one manual `/mcp`.** The shim swaps the *child*; a rebuild of the shim itself is still owned by the harness, so a change to `fishhawk-mcp-shim` needs a one-time `/mcp` reconnect like any MCP server change.

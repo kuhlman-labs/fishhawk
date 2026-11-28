@@ -329,7 +329,12 @@ request carries: the marker body's optional `capacity` (the MCP process's
 stored beyond each row's `slot_limit`. As for every group, the admitting
 stage's limit governs its own decision (ADR-087), so two processes on one
 host label with different values each admit against their own limit; set
-the variable identically in every process that dispatches for a host. Like
+the variable identically in every process that dispatches for a host. On the
+local stack the checkout `.env` is that one place: `scripts/dev` passes it to
+the host dispatcher, and `fishhawk-mcp-shim` sources it into a session's
+stdio `fishhawk-mcp` when the registration's env lacks it (#5592,
+`backend/cmd/fishhawk-mcp-shim/README.md`). ADR-094 Amendment A5 (#5609)
+replaces this per-request limit with the dispatcher's declaration. Like
 the host label, the value is client-supplied (ADR-094 Q1): it is advisory
 against a hostile `write:runs` caller, not a security boundary.
 

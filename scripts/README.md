@@ -2141,6 +2141,13 @@ What it runs:
   `FISHHAWK_HOST_DISPATCH_MAX_IN_FLIGHT` at or below it. A higher in-flight
   limit only queues stages (`concurrency_slot_queued`). Raising the capacity
   without raising the in-flight limit leaves the dispatcher the bottleneck.
+  A session's stdio `fishhawk-mcp` must admit at the same capacity and label.
+  Under `fishhawk-mcp-shim`, it does with no hand-set registration value: the
+  shim sources `FISHHAWK_HOST_CAPACITY` and `FISHHAWK_HOST_LABEL` from this
+  checkout's `.env` at each child spawn when its own env lacks them (#5592;
+  `backend/cmd/fishhawk-mcp-shim/README.md` § "Host settings from the checkout
+  .env"). An edit reaches the dispatcher at the next `up` or reload and the
+  session at its next child spawn.
 - **Scrubbed environment (approval condition G3).** It is spawned with an
   explicit allowlist and nothing else: `_host_dispatch_exec_scrubbed`, in a
   subshell, un-exports every exported variable, exports the allowlist and

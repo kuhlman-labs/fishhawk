@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -91,23 +92,57 @@ type hostDispatchBudgetRefusal struct {
 	Detail       string `json:"detail,omitempty" jsonschema:"the dispatcher's bounded refusal detail: the budget, its period, its spend and its remedies"`
 }
 
-// hostDispatchBudgetRung renders the host_dispatch_budget rung. In a posture
-// the host-local rungs do not run in it returns not_applicable before any
-// file is read.
-func (r *runResolver) hostDispatchBudgetRung() *hostDispatchBudgetRung {
-	if reason := r.hostRungNotApplicableReason(); reason != "" {
-		return &hostDispatchBudgetRung{Status: hostDispatchBudgetNotApplicable, Reason: reason,
-			Note: notApplicableNote(reason, "no host dispatcher status file is read")}
+// doctorHostDispatch is ONE read of the host dispatcher's state-dir ladder,
+// shared by every doctor rung that reports on the dispatcher (#5592 C7):
+// host_dispatch_budget and host_label's dispatcher check render the same
+// status.json read, so the two can never disagree about which file, or which
+// version of it, they saw.
+type doctorHostDispatch struct {
+	// notApplicable is the host-local posture refusal (not_local_stdio_process
+	// or run_bound_token); when set, nothing was read.
+	notApplicable string
+	now           time.Time
+	found         hostDispatchProbe
+}
+
+// doctorHostDispatchProbe walks the doctor's state-dir ladder ONCE: the call
+// rungs (FISHHAWK_HOST_DISPATCH_STATE_DIR, else the cwd checkout's state dir),
+// then TMPDIR's default rung when the env var is unset. It reads no run, so a
+// run's working_dir rung is never consulted. In a posture the host-local rungs
+// do not run in it returns before any file is read.
+func (r *runResolver) doctorHostDispatchProbe() doctorHostDispatch {
+	var hd doctorHostDispatch
+	if hd.notApplicable = r.hostRungNotApplicableReason(); hd.notApplicable != "" {
+		return hd
 	}
-	now := r.hostDispatchClock()
-	lad := r.newHostDispatchLadder(now)
+	hd.now = r.hostDispatchClock()
+	lad := r.newHostDispatchLadder(hd.now)
 	for _, dir := range r.hostDispatchCallRungs() {
 		lad.probe(dir)
 	}
 	if r.hostDispatchEnv(hostDispatchStateDirEnv) == "" {
 		lad.probe(hostDispatchDefaultRung())
 	}
-	found := lad.result()
+	hd.found = lad.result()
+	return hd
+}
+
+// hostDispatchBudgetRung renders the host_dispatch_budget rung from its own
+// ladder walk. The doctor handler shares one walk across rungs through
+// hostDispatchBudgetRungFrom instead.
+func (r *runResolver) hostDispatchBudgetRung() *hostDispatchBudgetRung {
+	return hostDispatchBudgetRungFrom(r.doctorHostDispatchProbe())
+}
+
+// hostDispatchBudgetRungFrom renders the host_dispatch_budget rung from one
+// ladder read. In a posture the host-local rungs do not run in it returns
+// not_applicable, and the probe read no file.
+func hostDispatchBudgetRungFrom(hd doctorHostDispatch) *hostDispatchBudgetRung {
+	if hd.notApplicable != "" {
+		return &hostDispatchBudgetRung{Status: hostDispatchBudgetNotApplicable, Reason: hd.notApplicable,
+			Note: notApplicableNote(hd.notApplicable, "no host dispatcher status file is read")}
+	}
+	found, now := hd.found, hd.now
 	rung := &hostDispatchBudgetRung{PathsTried: hostDispatchBoundedPaths(found.tried)}
 	if !found.found {
 		rung.Status = hostDispatchBudgetAbsent
@@ -276,6 +311,61 @@ type hostLabelRung struct {
 	Variable     string `json:"variable" jsonschema:"the override env var: FISHHAWK_HOST_LABEL"`
 	Note         string `json:"note" jsonschema:"the human sentence on how the label was resolved, naming the cause on a fallback"`
 	Remediation  string `json:"remediation,omitempty" jsonschema:"on source hostname or none: the operator next step, naming FISHHAWK_HOST_LABEL and the host-id path"`
+	// The dispatcher check (#5592 C1): this process's label against the host
+	// field of the host dispatcher status.json the doctor's ladder reads.
+	DispatcherCheck      string `json:"dispatcher_check,omitempty" jsonschema:"this label compared with the host label of the host dispatcher whose status.json this process reads: match (this process and that dispatcher file host-dispatched stages under the same local-implement and host capacity groups), mismatch (they never share a group; warning names both), absent (no status file on the ladder), unreadable (the status file could not be read), stale (the status file is stale: no live dispatcher to compare with), or not_applicable (not the operator's stdio fishhawk-mcp process, or a run-bound token: no status file is read)"`
+	DispatcherLabel      string `json:"dispatcher_label,omitempty" jsonschema:"on match or mismatch: the host label in the dispatcher's status.json, bounded (control runes dropped, at most 300 bytes)"`
+	DispatcherStatusPath string `json:"dispatcher_status_path,omitempty" jsonschema:"the dispatcher status.json the check read; absent on absent and not_applicable"`
+	Warning              string `json:"warning,omitempty" jsonschema:"on mismatch: both default groups, the account caveat (status.json carries no backend or account identity, so first confirm the dispatcher serves the same backend and account) and the remedies"`
+}
+
+// host_label dispatcher_check values (#5592 C1).
+const (
+	hostLabelDispatcherMatch         = "match"
+	hostLabelDispatcherMismatch      = "mismatch"
+	hostLabelDispatcherAbsent        = "absent"
+	hostLabelDispatcherUnreadable    = "unreadable"
+	hostLabelDispatcherStale         = "stale"
+	hostLabelDispatcherNotApplicable = "not_applicable"
+)
+
+// checkHostLabelAgainstDispatcher fills the rung's dispatcher check from one
+// ladder read (#5592 C1). The status file carries no backend or account
+// identity, so the comparison is against the host dispatcher whose status file
+// this process reads, and the warning says to confirm the account first. Only
+// the BOUNDED status host reaches output (D3: every string from status.json is
+// bounded, as on hostDispatchBudgetRung); the comparison reads the raw host,
+// so a difference that bounding would hide still reads mismatch.
+func (*runResolver) checkHostLabelAgainstDispatcher(rung *hostLabelRung, res hostLabelResolution, hd doctorHostDispatch) {
+	if reason := hd.notApplicable; reason != "" {
+		rung.DispatcherCheck = hostLabelDispatcherNotApplicable
+		return
+	}
+	if !hd.found.found {
+		rung.DispatcherCheck = hostLabelDispatcherAbsent
+		return
+	}
+	rung.DispatcherStatusPath = boundHostDispatchText(filepath.Join(hd.found.dir, hostDispatchStatusFile))
+	if hd.found.readErr != "" {
+		rung.DispatcherCheck = hostLabelDispatcherUnreadable
+		return
+	}
+	if hd.found.st.State(hd.now) == hostDispatchStateStale {
+		rung.DispatcherCheck = hostLabelDispatcherStale
+		return
+	}
+	dispatcherLabel := boundHostDispatchText(hd.found.st.Host)
+	rung.DispatcherLabel = dispatcherLabel
+	if defaultGroupKeyFor(hd.found.st.Host) != defaultGroupKeyFor(res.Label) {
+		rung.DispatcherCheck = hostLabelDispatcherMismatch
+		rung.Warning = fmt.Sprintf("host_label differs from the label of the host dispatcher whose status file this process reads (%s): this process admits host-dispatched stages in %s and %s, that dispatcher in %s and %s, so they never share a concurrency group. The status file carries no backend or account identity: first confirm that dispatcher serves the same backend and account as this process. If it does, set %s in the checkout .env (the stdio shim sources it at its next child spawn; scripts/dev passes it to the dispatcher at the next up or reload), or remove a stale %s from the MCP registration's env, then reconnect (/mcp).",
+			rung.DispatcherStatusPath,
+			defaultGroupKeyFor(res.Label), capacityGroupKeyFor(res.Label),
+			defaultGroupKeyFor(dispatcherLabel), capacityGroupKeyFor(dispatcherLabel),
+			hostLabelEnv, hostLabelEnv)
+		return
+	}
+	rung.DispatcherCheck = hostLabelDispatcherMatch
 }
 
 // newHostLabelRung renders a resolution as the doctor rung. The volatile rungs
@@ -744,7 +834,18 @@ MCP server about its own process and NOT served by fishhawkd:
               carry the label; since #4241 it is held in addition to
               default_group on an implement stage, never instead of it.
               Resolved once per process, on the first doctor or host-dispatch
-              call.
+              call. dispatcher_check compares this label with the host field
+              of the host dispatcher status.json that host_dispatch_budget
+              reads (one shared read): match | mismatch (the two file stages
+              under different local-implement and host capacity groups, so
+              they never share one; warning names both groups and the
+              remedies) | absent (no status file) | unreadable | stale (no
+              live dispatcher to compare with) | not_applicable (the same
+              host-local posture as credential). dispatcher_label and
+              dispatcher_status_path name what was read, bounded. The status
+              file carries no backend or account identity, so on a mismatch
+              first confirm that dispatcher serves the same backend and
+              account as this process.
   - host_capacity — the capacity of the host capacity group capacity_group
               (host:<label>:capacity), which every host-dispatched agent stage
               (plan, implement, acceptance, review, a verify pass) holds one
@@ -755,9 +856,13 @@ MCP server about its own process and NOT served by fishhawkd:
               from this process fails closed before any request, and
               remediation names FISHHAWK_HOST_CAPACITY and the range). The
               capacity is per request, so set the same value in every process
-              that dispatches for one host label. The stdio fishhawk-mcp
-              refuses to start on an invalid value; fishhawkd's /mcp route
-              reads it lazily, so there it surfaces here and at marker time.
+              that dispatches for one host label. Under the stdio shim
+              (fishhawk-mcp-shim), a FISHHAWK_HOST_CAPACITY (or
+              FISHHAWK_HOST_LABEL) absent from the shim's own environment is
+              sourced from the checkout .env at each child spawn. The stdio
+              fishhawk-mcp refuses to start on an invalid value; fishhawkd's
+              /mcp route reads it lazily, so there it surfaces here and at
+              marker time.
   - credential — where this server's bearer came from: source is
               env:FISHHAWK_API_TOKEN (variable names it) | stored_login |
               stored_login_refreshed (the stored ` + "`fishhawk token login`" + `
@@ -944,6 +1049,7 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 		return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w", err)
 	}
 	out := DoctorOutput{Report: *report}
+	hostDispatch := r.doctorHostDispatchProbe()
 	// The first LOCALLY-computed rung (E45.82 / #3617): keyed on the family the
 	// backend reported, answered from this process's own environment. It is
 	// attached AFTER the report is copied verbatim, so `report` stays the
@@ -953,6 +1059,10 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 	// resolved lazily (the first doctor or host-dispatch call resolves it).
 	hostLabel := r.api.hostLabelResolution()
 	out.HostLabel = newHostLabelRung(hostLabel)
+	// One read of the host dispatcher's state-dir ladder, shared by the
+	// host_label dispatcher check and host_dispatch_budget (#5592 C7).
+	// Host-local, with no run read.
+	r.checkHostLabelAgainstDispatcher(out.HostLabel, hostLabel, hostDispatch)
 	// The fifth LOCALLY-computed rung (#4241): this process's host capacity,
 	// resolved lazily like the label, keyed on the same label.
 	capRes, capErr := r.api.hostCapacityResolution()
@@ -965,7 +1075,7 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 	// The sixth LOCALLY-computed rung (#5473): the runs a blocking periodic
 	// budget holds, from the host dispatcher's status.json. Host-local, with
 	// no run read.
-	out.HostDispatchBudget = r.hostDispatchBudgetRung()
+	out.HostDispatchBudget = hostDispatchBudgetRungFrom(hostDispatch)
 	return nil, out, nil
 }
 

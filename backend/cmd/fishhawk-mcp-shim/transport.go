@@ -49,6 +49,10 @@ type childTransport interface {
 type stdioChild struct {
 	path   string
 	stderr io.Writer
+	// env, when non-nil, supplies the child's whole environment at each Start
+	// (#5592: the shim's own env plus host settings sourced from the checkout
+	// .env). A nil provider inherits the shim's environment.
+	env func() []string
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -62,11 +66,13 @@ type stdioChild struct {
 
 // newStdioChild builds an unstarted stdio child for the binary at path. Child
 // stderr is wired straight through to the shim's stderr so the child's own
-// diagnostics stay visible.
-func newStdioChild(path string, stderr io.Writer) *stdioChild {
+// diagnostics stay visible. env is called once per Start; nil inherits the
+// shim's environment.
+func newStdioChild(path string, stderr io.Writer, env func() []string) *stdioChild {
 	return &stdioChild{
 		path:   path,
 		stderr: stderr,
+		env:    env,
 		frames: make(chan []byte, 256),
 		exited: make(chan error, 1),
 	}
@@ -81,6 +87,9 @@ func (c *stdioChild) Start(ctx context.Context) error {
 
 	cmd := exec.CommandContext(ctx, c.path)
 	cmd.Stderr = c.stderr
+	if c.env != nil {
+		cmd.Env = c.env()
+	}
 	setPgid(cmd)
 
 	stdin, err := cmd.StdinPipe()

@@ -55,7 +55,11 @@ func TestFakeChildProcess(t *testing.T) {
 						_ = gc.Start()
 						os.Exit(0)
 					}
-					fmt.Printf(`{"jsonrpc":"2.0","id":%s,"result":{"marker":"%s"}}`+"\n", idRaw, marker)
+					if mode == "echo_env" || mode == "echo_env_crash_once" {
+						fakeEchoEnv(line, idRaw, marker, mode)
+					} else {
+						fmt.Printf(`{"jsonrpc":"2.0","id":%s,"result":{"marker":"%s"}}`+"\n", idRaw, marker)
+					}
 				}
 			}
 		}
@@ -73,13 +77,74 @@ func TestFakeChildProcess(t *testing.T) {
 	}
 }
 
+// echoedEnvKeys are the variables an echo_env child reports (#5592): the two
+// sourced host keys, the shim's own token, and two keys a fixture .env sets
+// that must never reach the child.
+var echoedEnvKeys = []string{
+	hostLabelKey, hostCapacityKey, "FISHHAWK_API_TOKEN",
+	"FISHHAWK_HOST_DISPATCH_STATE_DIR", "FISHHAWK_DOTENV_ONLY_PROBE", "FAKE_MARKER",
+}
+
+// envProbe is one echoed variable.
+type envProbe struct {
+	Set   bool   `json:"set"`
+	Value string `json:"value"`
+}
+
+// fakeEchoEnv answers a tools/call with what the child's environment holds
+// for echoedEnvKeys. FISHHAWK_API_TOKEN's value is echoed only for a test
+// fixture token, so a real operator token never reaches a frame (C6). In
+// echo_env_crash_once mode a call named "crash" exits 1 the first time, after
+// creating FAKE_CRASH_SENTINEL.
+func fakeEchoEnv(line []byte, idRaw, marker, mode string) {
+	var call struct {
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	_ = json.Unmarshal(line, &call)
+	if mode == "echo_env_crash_once" && call.Params.Name == "crash" {
+		sentinel := os.Getenv("FAKE_CRASH_SENTINEL")
+		if _, err := os.Stat(sentinel); err != nil {
+			_ = os.WriteFile(sentinel, nil, 0o600)
+			os.Exit(1)
+		}
+	}
+	env := map[string]envProbe{}
+	for _, k := range echoedEnvKeys {
+		v, ok := os.LookupEnv(k)
+		if k == "FISHHAWK_API_TOKEN" && ok && !strings.HasPrefix(v, "fhk_test_") && !strings.HasPrefix(v, "fhk_dotenv_") {
+			v = "<withheld>"
+		}
+		env[k] = envProbe{Set: ok, Value: v}
+	}
+	b, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      json.RawMessage(idRaw),
+		"result":  map[string]any{"marker": marker, "env": env},
+	})
+	fmt.Printf("%s\n", b)
+}
+
 // writeChildScript writes (atomically, via rename) a shell script at path that
 // execs the test binary as a fake child carrying the given marker/mode. Atomic
 // rename means the swap flips content in one step, so the watcher's settle
 // debounce sees a stable hash rather than a half-written file.
 func writeChildScript(t *testing.T, path, marker, mode string) {
 	t.Helper()
-	script := "#!/bin/sh\nGO_FAKE_CHILD=1 FAKE_MARKER=" + marker + " FAKE_MODE=" + mode +
+	writeChildScriptWith(t, path, marker, mode)
+}
+
+// writeChildScriptWith is writeChildScript with extra KEY=value assignments
+// for the fake child, single-quoted.
+func writeChildScriptWith(t *testing.T, path, marker, mode string, extraEnv ...string) {
+	t.Helper()
+	extra := ""
+	for _, kv := range extraEnv {
+		k, v, _ := strings.Cut(kv, "=")
+		extra += " " + k + "='" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+	}
+	script := "#!/bin/sh\nGO_FAKE_CHILD=1 FAKE_MARKER=" + marker + " FAKE_MODE=" + mode + extra +
 		" exec " + strconv.Quote(os.Args[0]) + " -test.run=TestFakeChildProcess\n"
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(script), 0o755); err != nil {
@@ -104,8 +169,8 @@ func newE2ERig(t *testing.T, childPath string, poll time.Duration, sleep func(ti
 	go frameReader(inR, clientIn)
 	out := &frameSink{ch: make(chan []byte, 64)}
 
-	child := newStdioChild(childPath, io.Discard)
-	newChild := func() childTransport { return newStdioChild(childPath, io.Discard) }
+	child := newStdioChild(childPath, io.Discard, nil)
+	newChild := func() childTransport { return newStdioChild(childPath, io.Discard, nil) }
 	w := newWatcher(childPath)
 	sup := newSupervisor(child, newChild, w, clientIn, out, io.Discard, 5*time.Second, 2*time.Second)
 	if sleep != nil {
@@ -180,7 +245,7 @@ func TestTerminateEscalatesToSIGKILL(t *testing.T) {
 	childPath := filepath.Join(dir, "child.sh")
 	writeChildScript(t, childPath, "A", "ignore_sigterm")
 
-	c := newStdioChild(childPath, io.Discard)
+	c := newStdioChild(childPath, io.Discard, nil)
 	if err := c.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -216,7 +281,7 @@ func TestExitFiresDespiteGrandchildHoldingStdout(t *testing.T) {
 	childPath := filepath.Join(dir, "child.sh")
 	writeChildScript(t, childPath, "A", "leak_grandchild")
 
-	c := newStdioChild(childPath, io.Discard)
+	c := newStdioChild(childPath, io.Discard, nil)
 	if err := c.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -272,7 +337,7 @@ func TestPidZeroBeforeStartLivePidAfter(t *testing.T) {
 	childPath := filepath.Join(dir, "child.sh")
 	writeChildScript(t, childPath, "P", "")
 
-	c := newStdioChild(childPath, io.Discard)
+	c := newStdioChild(childPath, io.Discard, nil)
 	if got := c.Pid(); got != 0 {
 		t.Fatalf("Pid before Start = %d, want 0", got)
 	}
@@ -314,6 +379,7 @@ func TestRunPublishesStateFileAndCleansUpOnExit(t *testing.T) {
 			"--child", childPath,
 			"--state-dir", stateDir,
 			"--poll-interval", "20ms",
+			"--env-file=",
 		}, inR, outW, io.Discard)
 		_ = outW.Close()
 		done <- rc
@@ -410,6 +476,7 @@ func TestRunDegradesWhenStateDirUnusable(t *testing.T) {
 			"--child", childPath,
 			"--state-dir", blocked,
 			"--poll-interval", "5ms",
+			"--env-file=",
 		}, inR, outW, logs)
 		_ = outW.Close()
 		done <- rc
@@ -460,5 +527,450 @@ func TestRunDegradesWhenStateDirUnusable(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run did not return after upstream EOF")
+	}
+}
+
+// --- Host settings from the checkout .env (#5592) ---
+
+const (
+	fixtureShimToken   = "fhk_test_fixture_token"
+	fixtureDotenvToken = "fhk_dotenv_sentinel"
+	fixtureDotenvProbe = "from-dotenv"
+)
+
+// isolateHostEnv gives the shim a known token and NO host keys, so whatever
+// the child reports for them can only have come from the .env (C6). t.Setenv
+// registers the restore; the unset follows it, so these tests are not parallel.
+func isolateHostEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("FISHHAWK_API_TOKEN", fixtureShimToken)
+	for _, k := range []string{hostLabelKey, hostCapacityKey, "FISHHAWK_HOST_DISPATCH_STATE_DIR", "FISHHAWK_DOTENV_ONLY_PROBE"} {
+		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
+	}
+}
+
+// writeFixtureDotenv writes a checkout .env with the two host keys plus a
+// token and a probe key that must never reach the child.
+func writeFixtureDotenv(t *testing.T, dir, label string, extra ...string) string {
+	t.Helper()
+	content := "FISHHAWK_HOST_LABEL=" + label + "\n" +
+		"FISHHAWK_HOST_CAPACITY=4\n" +
+		"FISHHAWK_API_TOKEN=" + fixtureDotenvToken + "\n" +
+		"FISHHAWK_DOTENV_ONLY_PROBE=" + fixtureDotenvProbe + "\n"
+	for _, line := range extra {
+		content += line + "\n"
+	}
+	return writeDotenv(t, dir, content)
+}
+
+// shimConn is a client talking ndjson to a shim, in process (run()) or exec'd.
+type shimConn struct {
+	t      *testing.T
+	in     io.WriteCloser
+	outC   chan []byte
+	frames []string
+}
+
+func (c *shimConn) send(frame string) {
+	c.t.Helper()
+	if _, err := io.WriteString(c.in, frame+"\n"); err != nil {
+		c.t.Fatalf("send: %v", err)
+	}
+}
+
+// next reads frames until one contains substr.
+func (c *shimConn) next(substr string, timeout time.Duration) string {
+	c.t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case f, ok := <-c.outC:
+			if !ok {
+				c.t.Fatalf("shim closed stdout while waiting for %q", substr)
+			}
+			c.frames = append(c.frames, string(f))
+			if strings.Contains(string(f), substr) {
+				return string(f)
+			}
+		case <-deadline:
+			c.t.Fatalf("timed out waiting for a frame containing %q", substr)
+			return ""
+		}
+	}
+}
+
+// callEnv sends a tools/call named name under id and returns the env the
+// echo_env child reported.
+func (c *shimConn) callEnv(id int, name string) (string, map[string]envProbe) {
+	c.t.Helper()
+	c.send(fmt.Sprintf(`{"jsonrpc":"2.0","method":"tools/call","id":%d,"params":{"name":%q}}`, id, name))
+	f := c.next(fmt.Sprintf(`"id":%d,`, id), 10*time.Second)
+	var resp struct {
+		Result struct {
+			Marker string              `json:"marker"`
+			Env    map[string]envProbe `json:"env"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(f), &resp); err != nil || resp.Result.Env == nil {
+		c.t.Fatalf("call %d: not an echo_env reply: %q (%v)", id, f, err)
+	}
+	return resp.Result.Marker, resp.Result.Env
+}
+
+// assertNoDotenvLeak pins that no frame and no log line carries the fixture
+// .env's token or probe value.
+func (c *shimConn) assertNoDotenvLeak(logs string) {
+	c.t.Helper()
+	for _, f := range append(c.frames, logs) {
+		for _, bad := range []string{fixtureDotenvToken, fixtureDotenvProbe} {
+			if strings.Contains(f, bad) {
+				c.t.Errorf("%q leaked into %q", bad, f)
+			}
+		}
+	}
+}
+
+// startShimRun drives the REAL run() wiring (flags, provider closure, stdioChild
+// env field, real zsh, real exec'd child) over io.Pipe.
+func startShimRun(t *testing.T, args ...string) (*shimConn, *syncBuf) {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	outC := make(chan []byte, 64)
+	go frameReader(outR, outC)
+	logs := &syncBuf{}
+	done := make(chan int, 1)
+	go func() {
+		rc := run(append([]string{"fishhawk-mcp-shim"}, args...), inR, outW, logs)
+		_ = outW.Close()
+		done <- rc
+	}()
+	t.Cleanup(func() {
+		_ = inW.Close()
+		select {
+		case rc := <-done:
+			if rc != exitOK {
+				t.Errorf("run = %d, want %d (stderr: %s)", rc, exitOK, logs.String())
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("run did not return after upstream EOF")
+		}
+	})
+	c := &shimConn{t: t, in: inW, outC: outC}
+	c.send(initReq1)
+	c.next(`"id":1`, 10*time.Second)
+	return c, logs
+}
+
+// assertHostEnv pins what the child saw: the host keys as given, the shim's
+// own fixture token, and neither .env-only key.
+func assertHostEnv(t *testing.T, env map[string]envProbe, label, capacity string) {
+	t.Helper()
+	if got := env[hostLabelKey]; !got.Set || got.Value != label {
+		t.Errorf("child %s = %+v, want %q", hostLabelKey, got, label)
+	}
+	if got := env[hostCapacityKey]; !got.Set || got.Value != capacity {
+		t.Errorf("child %s = %+v, want %q", hostCapacityKey, got, capacity)
+	}
+	if got := env["FISHHAWK_API_TOKEN"]; !got.Set || got.Value != fixtureShimToken {
+		t.Errorf("child FISHHAWK_API_TOKEN = %+v, want the shim's own %q", got, fixtureShimToken)
+	}
+	for _, k := range []string{"FISHHAWK_DOTENV_ONLY_PROBE", "FISHHAWK_HOST_DISPATCH_STATE_DIR"} {
+		if got := env[k]; got.Set {
+			t.Errorf("child %s = %+v, want unset: only the two host keys are ever sourced", k, got)
+		}
+	}
+}
+
+// TestStdioChildPassesProvidedEnv is the zsh-free vehicle for the sourcing
+// hop (S0-2): a LITERAL env provider reaches a real exec'd child as its whole
+// environment. The test process has no host keys and a fixture token, so an
+// inherited environment would show neither label nor capacity and would show
+// the token.
+func TestStdioChildPassesProvidedEnv(t *testing.T) {
+	isolateHostEnv(t)
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "L", "echo_env")
+	provided := []string{"PATH=" + os.Getenv("PATH"), hostLabelKey + "=literal-label", hostCapacityKey + "=7"}
+	c := newStdioChild(childPath, io.Discard, func() []string { return provided })
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Terminate(time.Second)
+	recv := func() string {
+		t.Helper()
+		select {
+		case f := <-c.Frames():
+			return string(f)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no frame from child")
+			return ""
+		}
+	}
+	if err := c.Send([]byte(initReq1 + "\n")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	recv()
+	if err := c.Send([]byte(`{"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"probe"}}` + "\n")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	var resp struct {
+		Result struct {
+			Env map[string]envProbe `json:"env"`
+		} `json:"result"`
+	}
+	if f := recv(); json.Unmarshal([]byte(f), &resp) != nil || resp.Result.Env == nil {
+		t.Fatalf("not an echo_env reply: %q", f)
+	}
+	env := resp.Result.Env
+	if got := env[hostLabelKey]; !got.Set || got.Value != "literal-label" {
+		t.Errorf("child %s = %+v, want literal-label from the provider", hostLabelKey, got)
+	}
+	if got := env[hostCapacityKey]; !got.Set || got.Value != "7" {
+		t.Errorf("child %s = %+v, want 7 from the provider", hostCapacityKey, got)
+	}
+	if got := env["FISHHAWK_API_TOKEN"]; got.Set {
+		t.Errorf("child FISHHAWK_API_TOKEN = %+v, want unset: the provider's env is the child's whole env", got)
+	}
+}
+
+func TestShimSourcesHostSettingsFromDotenv(t *testing.T) {
+	requireZsh(t)
+	isolateHostEnv(t)
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "A", "echo_env")
+	envFile := writeFixtureDotenv(t, dir, "dotenv-label")
+
+	c, logs := startShimRun(t, "--child", childPath, "--env-file", envFile, "--state-dir", filepath.Join(dir, "state"), "--poll-interval", "1h")
+	_, env := c.callEnv(2, "probe")
+	assertHostEnv(t, env, "dotenv-label", "4")
+	c.assertNoDotenvLeak(logs.String())
+	if !strings.Contains(logs.String(), "env_file="+envFile) {
+		t.Errorf("startup line does not name the env file: %s", logs.String())
+	}
+}
+
+func TestShimExplicitEnvWinsOverDotenv(t *testing.T) {
+	requireZsh(t)
+	isolateHostEnv(t)
+	t.Setenv(hostLabelKey, "explicit-label")
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "A", "echo_env")
+	envFile := writeFixtureDotenv(t, dir, "dotenv-label")
+
+	c, logs := startShimRun(t, "--child", childPath, "--env-file", envFile, "--state-dir", filepath.Join(dir, "state"), "--poll-interval", "1h")
+	_, env := c.callEnv(2, "probe")
+	assertHostEnv(t, env, "explicit-label", "4")
+	c.assertNoDotenvLeak(logs.String())
+}
+
+// TestShimNeverPassesNonAllowlistedDotenvKeys is the hermetic D2(b) decider: a
+// .env that sets other FISHHAWK_* keys reaches the child with only the two
+// host keys, and the child keeps the shim's own token.
+func TestShimNeverPassesNonAllowlistedDotenvKeys(t *testing.T) {
+	requireZsh(t)
+	isolateHostEnv(t)
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "A", "echo_env")
+	envFile := writeFixtureDotenv(t, dir, "dotenv-label", "FISHHAWK_HOST_DISPATCH_STATE_DIR="+filepath.Join(dir, "hd"))
+
+	c, logs := startShimRun(t, "--child", childPath, "--env-file", envFile, "--state-dir", filepath.Join(dir, "state"), "--poll-interval", "1h")
+	_, env := c.callEnv(2, "probe")
+	assertHostEnv(t, env, "dotenv-label", "4")
+	c.assertNoDotenvLeak(logs.String())
+	if strings.Contains(strings.Join(c.frames, ""), filepath.Join(dir, "hd")) {
+		t.Errorf("the .env's FISHHAWK_HOST_DISPATCH_STATE_DIR reached a frame")
+	}
+}
+
+// TestShimRereadsDotenvOnSwap pins D1f for a hot-swap: the swapped-in child is
+// spawned with the .env as it reads NOW.
+func TestShimRereadsDotenvOnSwap(t *testing.T) {
+	requireZsh(t)
+	isolateHostEnv(t)
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "A", "echo_env")
+	envFile := writeFixtureDotenv(t, dir, "dotenv-label")
+
+	c, logs := startShimRun(t, "--child", childPath, "--env-file", envFile, "--state-dir", filepath.Join(dir, "state"), "--poll-interval", "20ms")
+	_, env := c.callEnv(2, "probe")
+	assertHostEnv(t, env, "dotenv-label", "4")
+
+	writeFixtureDotenv(t, dir, "dotenv-label-2")
+	writeChildScript(t, childPath, "B", "echo_env")
+	c.next("notifications/tools/list_changed", 10*time.Second)
+	marker, env := c.callEnv(3, "probe")
+	if marker != "B" {
+		t.Fatalf("post-swap call answered by marker %q, want B", marker)
+	}
+	assertHostEnv(t, env, "dotenv-label-2", "4")
+	c.assertNoDotenvLeak(logs.String())
+}
+
+// TestShimRereadsDotenvOnCrashRespawn pins D1f for a crash-respawn (C9).
+func TestShimRereadsDotenvOnCrashRespawn(t *testing.T) {
+	requireZsh(t)
+	isolateHostEnv(t)
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScriptWith(t, childPath, "A", "echo_env_crash_once", "FAKE_CRASH_SENTINEL="+filepath.Join(dir, "crashed"))
+	envFile := writeFixtureDotenv(t, dir, "dotenv-label")
+
+	c, logs := startShimRun(t, "--child", childPath, "--env-file", envFile, "--state-dir", filepath.Join(dir, "state"), "--poll-interval", "1h")
+	_, env := c.callEnv(2, "probe")
+	assertHostEnv(t, env, "dotenv-label", "4")
+
+	writeFixtureDotenv(t, dir, "dotenv-label-3")
+	c.send(`{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"crash"}}`)
+	c.next("-32603", 10*time.Second)
+	c.next("notifications/tools/list_changed", 10*time.Second)
+	_, env = c.callEnv(4, "probe")
+	assertHostEnv(t, env, "dotenv-label-3", "4")
+	c.assertNoDotenvLeak(logs.String())
+}
+
+// TestShimMainProcess is the re-exec helper for the default-env-file tests:
+// with GO_SHIM_MAIN=1 the (copied) test binary runs the shim's main path with
+// NO flags, so the default --child and --env-file resolve from its own path.
+func TestShimMainProcess(t *testing.T) {
+	if os.Getenv("GO_SHIM_MAIN") != "1" {
+		return
+	}
+	os.Exit(run([]string{"fishhawk-mcp-shim"}, os.Stdin, os.Stdout, os.Stderr))
+}
+
+// execCopiedShim lays out <root>/bin/fishhawk-mcp-shim (a COPY of this test
+// binary: os.Executable may resolve a symlink) beside an echo_env
+// <root>/bin/fishhawk-mcp and a fixture <root>/.env, then execs the copy with
+// no --env-file and no --child under a minimal environment whose PATH is
+// pathEnv. It needs no zsh itself: the fake child is a #!/bin/sh script that
+// execs this test binary by absolute path, so a caller that sources a .env
+// calls requireZsh and one that must not can pass a zsh-free PATH.
+func execCopiedShim(t *testing.T, root, pathEnv string) (*shimConn, *syncBuf) {
+	t.Helper()
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Skipf("os.Executable unavailable: %v", err)
+	}
+	b, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatalf("read test binary: %v", err)
+	}
+	shim := filepath.Join(bin, "fishhawk-mcp-shim")
+	if err := os.WriteFile(shim, b, 0o755); err != nil { //nolint:gosec // copied test binary
+		t.Fatalf("copy test binary: %v", err)
+	}
+	writeChildScript(t, filepath.Join(bin, "fishhawk-mcp"), "M", "echo_env")
+	writeFixtureDotenv(t, root, "default-label")
+
+	cmd := exec.Command(shim, "-test.run=^TestShimMainProcess$")
+	cmd.Env = []string{
+		"PATH=" + pathEnv,
+		"HOME=" + t.TempDir(),
+		"TMPDIR=" + os.TempDir(),
+		"GO_SHIM_MAIN=1",
+		stateDirEnv + "=" + filepath.Join(root, "state"),
+		"FISHHAWK_API_TOKEN=" + fixtureShimToken,
+	}
+	logs := &syncBuf{}
+	cmd.Stderr = logs
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("exec copied shim: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = in.Close()
+		waited := make(chan error, 1)
+		go func() { waited <- cmd.Wait() }()
+		select {
+		case err := <-waited:
+			if err != nil {
+				t.Errorf("copied shim exited %v (stderr: %s)", err, logs.String())
+			}
+		case <-time.After(10 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Error("copied shim did not exit after upstream EOF")
+		}
+	})
+	outC := make(chan []byte, 64)
+	go frameReader(out, outC)
+	c := &shimConn{t: t, in: in, outC: outC}
+	c.send(initReq1)
+	c.next(`"id":1`, 10*time.Second)
+	return c, logs
+}
+
+// TestShimDefaultEnvFileBesideBinDir pins the default (C9, S0-1): inside a
+// fishhawk checkout (.git and a regular scripts/dev beside bin/), the shim
+// sources <root>/.env with no flags at all.
+func TestShimDefaultEnvFileBesideBinDir(t *testing.T) {
+	requireZsh(t)
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts", "dev"), []byte("#!/bin/zsh\n"), 0o700); err != nil { //nolint:gosec // fixture
+		t.Fatal(err)
+	}
+	c, logs := execCopiedShim(t, root, os.Getenv("PATH"))
+	_, env := c.callEnv(2, "probe")
+	assertHostEnv(t, env, "default-label", "4")
+	c.assertNoDotenvLeak(logs.String())
+}
+
+// TestShimDefaultEnvFileReleaseLayoutSourcesNothing pins S0-1 end to end: a
+// release-style layout (no .git or scripts/dev beside bin/) sources nothing
+// from the default, and says so once with the --env-file remedy. It needs no
+// zsh, so it runs on CI's zsh-less legs. The "zsh-free PATH" arm runs on every
+// host: there, a shim that skipped the gate would reach the evaluator and say
+// "zsh not found on PATH" instead of the skip line.
+func TestShimDefaultEnvFileReleaseLayoutSourcesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+	}{
+		{"host PATH", os.Getenv("PATH")},
+		{"zsh-free PATH", t.TempDir()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			c, logs := execCopiedShim(t, root, tc.path)
+			_, env := c.callEnv(2, "probe")
+			for _, k := range []string{hostLabelKey, hostCapacityKey} {
+				if got := env[k]; got.Set {
+					t.Errorf("child %s = %+v, want unset outside a checkout", k, got)
+				}
+			}
+			if got := env["FISHHAWK_API_TOKEN"]; got.Value != fixtureShimToken {
+				t.Errorf("child FISHHAWK_API_TOKEN = %+v, want the shim's own", got)
+			}
+			l := logs.String()
+			if strings.Count(l, "skipping the default env file") != 1 || !strings.Contains(l, filepath.Join(root, ".env")) || !strings.Contains(l, "--env-file") {
+				t.Errorf("stderr must carry one skip line naming %s and --env-file:\n%s", filepath.Join(root, ".env"), l)
+			}
+			if strings.Contains(l, "sourcing nothing from this file") || !strings.Contains(l, "env_file=(none)") {
+				t.Errorf("the gate must stop the default before the evaluator runs:\n%s", l)
+			}
+			c.assertNoDotenvLeak(l)
+		})
 	}
 }

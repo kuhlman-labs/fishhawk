@@ -21,6 +21,11 @@
 // The child connection sits behind a childTransport seam so a later phase can
 // substitute a streamable-HTTP upstream (the #655 gateway phase-0 constraint).
 //
+// Each child spawn (startup, hot-swap and crash-respawn) gets the shim's own
+// environment plus FISHHAWK_HOST_LABEL and FISHHAWK_HOST_CAPACITY sourced from
+// the checkout .env when the shim's environment lacks them (#5592; see
+// envfile.go). --env-file names the file; --env-file= disables sourcing.
+//
 // scripts/dev integration, banner retirement, and operator re-registration are
 // the sibling issue #1922; this binary is not yet wired into the dev loop.
 package main
@@ -68,6 +73,12 @@ type shimFlags struct {
 	// version prints version.String() and exits (#4117), spawning no child
 	// and reading no stdin.
 	version bool
+
+	// envFile is the .env each child spawn sources host settings from
+	// (#5592); "" disables sourcing. envFileExplicit records that --env-file
+	// was given: only the default is gated on a verified checkout.
+	envFile         string
+	envFileExplicit bool
 }
 
 // parseFlags parses the shim flags from args[1:]. An empty --child resolves to
@@ -85,9 +96,15 @@ func parseFlags(args []string, stderr io.Writer) (shimFlags, error) {
 	fs.StringVar(&f.stateDir, "state-dir", resolveStateDir(), "directory holding per-shim swap-state snapshots (env: "+stateDirEnv+")")
 	fs.DurationVar(&f.staleGrace, "stale-grace", 60*time.Second, "how long a pending swap must have been outstanding before it counts as stale")
 	fs.BoolVar(&f.version, "version", false, "print the shim's build version and git SHA, \"<Version> (<GitSHA>)\", and exit, without spawning a child or reading stdin")
+	fs.StringVar(&f.envFile, "env-file", defaultEnvFile(os.Executable), "checkout .env to source FISHHAWK_HOST_LABEL and FISHHAWK_HOST_CAPACITY from at each child spawn when the shim's env lacks them; empty disables (default: ../.env beside the shim's bin/ dir, sourced only inside a fishhawk checkout)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return shimFlags{}, err
 	}
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "env-file" {
+			f.envFileExplicit = true
+		}
+	})
 	if f.child == "" {
 		f.child = defaultChildPath()
 	}
@@ -128,16 +145,27 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	statePath := stateFilePath(f.stateDir, os.Getpid())
-	_, _ = fmt.Fprintf(stderr, "fishhawk-mcp-shim: starting (git_sha=%s child=%s poll=%s quiesce=%s state=%s)\n",
-		version.GitSHA, f.child, f.pollInterval, f.quiesceTimeout, statePath)
+	envFile := f.envFile
+	if !f.envFileExplicit {
+		envFile = checkoutEnvFile(envFile, stderr)
+	}
+	shownEnvFile := envFile
+	if shownEnvFile == "" {
+		shownEnvFile = "(none)"
+	}
+	_, _ = fmt.Fprintf(stderr, "fishhawk-mcp-shim: starting (git_sha=%s child=%s poll=%s quiesce=%s state=%s env_file=%s)\n",
+		version.GitSHA, f.child, f.pollInterval, f.quiesceTimeout, statePath, shownEnvFile)
 
 	ctx := context.Background()
 
 	clientIn := make(chan []byte)
 	go frameReader(stdin, clientIn)
 
-	child := newStdioChild(f.child, stderr)
-	newChild := func() childTransport { return newStdioChild(f.child, stderr) }
+	// ONE provider for the initial child and every later spawn (hot-swap and
+	// crash-respawn), so .env is re-read by zsh at each spawn.
+	spawnEnv := func() []string { return childEnv(os.Environ(), envFile, defaultDotenvOpts, stderr) }
+	child := newStdioChild(f.child, stderr, spawnEnv)
+	newChild := func() childTransport { return newStdioChild(f.child, stderr, spawnEnv) }
 	w := newWatcher(f.child)
 
 	sup := newSupervisor(child, newChild, w, clientIn, stdout, stderr, f.quiesceTimeout, terminateGrace)
