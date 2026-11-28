@@ -1561,6 +1561,31 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 		s.writeStageModelResolutions(ctx, p.Stage, res.Approval, *p.ResolvedModel, p.PlanModel, p.ReviewModel)
 	}
 
+	// Split-filing single-flight claim (#3925), plan-stage approve only, taken
+	// BEFORE the advance so a concurrent resume sees it no later than the stage
+	// commit. A caller that OBSERVED the stage already succeeded is a same-state
+	// re-approval and claims exclusively; every other caller is a first approval.
+	// E50.16 coexistence: same-stage first approvals may co-hold and are
+	// serialized only by the approve CAS below (its loser never reaches the
+	// launch); re-approvals and the resume verb are refused by the registry. A
+	// refused claim leaves hold nil and never fails or refuses the approval. The
+	// defer releases the hold on every path the launch does not take it over
+	// (the advance-error return, the CAS loser, a non-launch outcome).
+	var splitHold *splitFilingHold
+	if p.Decision == approval.DecisionApprove && p.Stage.Type == run.StageTypePlan && s.splitFiling != nil {
+		kind := splitHoldFirstApproval
+		if p.Stage.State == run.StageStateSucceeded {
+			kind = splitHoldReapproval
+		}
+		splitHold = s.splitFiling.claim(kind, p.Stage.RunID, p.Stage.ID)
+	}
+	splitHoldOwned := false
+	defer func() {
+		if !splitHoldOwned {
+			splitHold.release()
+		}
+	}()
+
 	advanced, err := s.advanceForDecision(ctx, p.Stage, p.Decision)
 	if err != nil {
 		return nil, &approveActionError{failedAt: gateActionAdvance, err: err}
@@ -1604,19 +1629,31 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 	// attempted.
 	if p.Decision == approval.DecisionApprove && advanced.Type == run.StageTypePlan {
 		s.recordDrivePlanApproved(ctx, advanced)
-		// On-approval split-proposal child filing (#2057, E50.5): when the
-		// approved plan carries a split_proposal, file the phased children,
-		// classify the contract phase, and emit the split_children_filed
-		// completion marker. Best-effort like recordDrivePlanApproved above — a
-		// failure logs and never unwinds the approval the gate already recorded;
-		// a plan without a split_proposal no-ops.
-		s.fileSplitProposalChildren(ctx, advanced)
+		// On-approval split-proposal child filing (#2057, E50.5), DETACHED
+		// (#3925): when the approved stage's own plan artifact carries a
+		// split_proposal, file the phased children on a bounded goroutine that
+		// survives the request (split_filing_detach.go). Best-effort like
+		// recordDrivePlanApproved above — no outcome here ever fails or unwinds
+		// the approval the gate already recorded; a plan without a
+		// split_proposal no-ops silently.
+		if s.splitFilingPreLaunch != nil {
+			s.splitFilingPreLaunch(advanced)
+		}
+		splitHoldOwned = true // startSplitFilingDetached releases or hands it off
+		switch s.startSplitFilingDetached(ctx, advanced, splitHold) {
+		case splitFilingBusy:
+			s.logSplitFilingWarn(ctx, advanced.RunID,
+				"skipped; another split filing for this run holds the single-flight registry",
+				"once the in-flight filing settles (at most its budget_seconds), if fishhawk_get_plan shows no split_filing, "+
+					"call POST /v0/runs/"+advanced.RunID.String()+"/split-filing/resume; a missing split_children_filed is not "+
+					"proof of progress, and that call answers 409 split_filing_in_progress while a filing still runs")
+		}
 		// On-approval live-validation walk filing (#2045, E48.35): when the
 		// approved plan carries any requires_live_validation acceptance
 		// criterion, auto-file (or, on a re-approval, idempotently no-op on) a
 		// chore-type operator-validation walk and record a durable marker so the
 		// pending live check is surfaced rather than shipped silently
-		// unvalidated. Best-effort like fileSplitProposalChildren above — a
+		// unvalidated. Best-effort like the split filing above — a
 		// failure logs and never unwinds the approval; a plan with no marked
 		// criterion no-ops.
 		s.fileOrLinkLiveValidationWalk(ctx, advanced)

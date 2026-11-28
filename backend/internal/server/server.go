@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -1337,6 +1338,25 @@ type Server struct {
 	// bgBranchSweeps, bounded by the shutdown context.
 	bgRefinementFiling sync.WaitGroup
 
+	// bgSplitFiling tracks the DETACHED split-proposal child filing (#3925):
+	// a plan-stage approval (and the split-filing resume verb) runs
+	// fileSplitProposalChildrenFrom on a goroutine in this group under a
+	// phase-count-scaled budget (splitFilingBudgetFor), so a client timeout
+	// can no longer truncate it. Shutdown drains it alongside
+	// bgRefinementFiling, bounded by the shutdown context.
+	bgSplitFiling sync.WaitGroup
+	// splitFiling is the process-local per-run single-flight registry every
+	// split-filing launch claims (#3925, split_filing_detach.go). Built in New.
+	splitFiling *splitFilingRegistry
+	// splitFilingLaunches counts detached split-filing launches, so a test can
+	// assert a refused or skipped claim launched nothing.
+	splitFilingLaunches atomic.Int64
+	// splitFilingPreLaunch is a TEST-ONLY seam, nil in production: when set,
+	// finishApprovalAdvance calls it with the advanced plan stage after the
+	// stage commit and before the split-filing launch (the commit-to-launch
+	// window a concurrent resume must observe as in progress).
+	splitFilingPreLaunch func(*run.Stage)
+
 	// bgTransferShadows tracks the DETACHED shadow verdict-transfer decisions
 	// (E87.2 / #4293); tests wait on it. Shutdown deliberately does not: a
 	// lost shadow row is a measurement gap, never a skipped pass.
@@ -1727,6 +1747,7 @@ func New(cfg Config) *Server {
 	if s.mcpRoute.mode == mcpRouteEnabled {
 		s.mcpHandler = newMCPHandler(s.mcpRoute, cfg.MCPServerFactory, cfg.Logger)
 	}
+	s.splitFiling = newSplitFilingRegistry()
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildHandler(),
@@ -1787,7 +1808,8 @@ func (s *Server) Start() error {
 // drains, it also waits for any detached advisory review goroutines
 // (#584), any detached grooming apply (E54.77 / #3232), any detached
 // proposal-report apply (bgReportApply: the upkeep apply, #3924), any
-// detached refinement filing (bgRefinementFiling, #4153) and the periodic
+// detached refinement filing (bgRefinementFiling, #4153), any detached
+// split-proposal child filing (bgSplitFiling, #3925) and the periodic
 // merge-candidate queue pump with any admission it is running
 // (bgMergeQueuePump, #4303) to finish, bounded by the same shutdown context
 // so a hung reviewer or a wedged forge can't block shutdown past the
@@ -1826,6 +1848,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.bgBranchSweeps.Wait()
 		s.bgCampaignBoardSweeps.Wait()
 		s.bgRefinementFiling.Wait()
+		s.bgSplitFiling.Wait()
 		s.bgMergeQueuePump.Wait()
 		close(done)
 	}()
@@ -1892,6 +1915,12 @@ func (s *Server) waitCampaignBoardSweeps() { s.bgCampaignBoardSweeps.Wait() }
 // Production code never calls it (Shutdown drains the same group, bounded by
 // its context).
 func (s *Server) waitRefinementFiling() { s.bgRefinementFiling.Wait() }
+
+// waitSplitFiling blocks until every detached split filing (#3925) has
+// finished — the deterministic sync point tests use before asserting on the
+// File requests and audit markers a detached filing writes. Production code
+// never calls it (Shutdown drains the same group, bounded by its context).
+func (s *Server) waitSplitFiling() { s.bgSplitFiling.Wait() }
 
 // resolveRepoScope resolves the GitHub App installation for owner/name into a
 // forge.CredentialScope (ADR-058 / #1855), the input the scope-taking

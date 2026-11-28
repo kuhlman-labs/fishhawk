@@ -988,7 +988,9 @@ Notes:
   Nothing in `issuecomment` posts it. It is emitted ONCE per run, only when EVERY
   phased child of an approved `split_proposal` is durably filed (a partial run
   leaves per-phase `work_item_filed` resume markers and NO completion marker, so
-  a re-approval resumes at the first un-filed ordinal), with a `system` actor and
+  the operator resume verb `POST /v0/runs/{run_id}/split-filing/resume` files
+  only the un-filed ordinals; a missing completion marker is not proof that a
+  filing is still running, #3925), with a `system` actor and
   payload `{contract_classification (delete-only|governed-exception), children:
   [{phase_index, title, number, url, is_contract}], contract_child_number,
   deferral_issue (#2062), cap_exception?: {spec_diff, pr_body}}`. The
@@ -2131,6 +2133,17 @@ Notes:
   (`{action, reason, actor}`, same-run payload only); the latest of the pair
   decides whether the host-dispatch marker refuses the run and its
   descendants. Read them through `GET /v0/runs/{id}/audit`.
+
+- The split-filing resume attribution kind `split_filing_resume_requested`
+  (#3925, `server/split_filing_resume.go`) is an **INTERNAL,
+  deliberately-not-a-surface** row: no Notifier method, NOT in
+  `activityCategories`, nothing in `issuecomment` renders or posts it. It is
+  written once per ADMITTED operator resume of a split-proposal child filing,
+  before any launch (`{stage_id, artifact_id, outcome, phase_count,
+  already_filed, actor}`, same-run payload only); refusals write nothing. The
+  resumed filing's own acceptance-carrier comment is the existing surface
+  above. Children filed by hand carry no idempotency marker, so a resume files
+  those phases again. Read it through `GET /v0/runs/{id}/audit`.
 
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier

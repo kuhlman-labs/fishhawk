@@ -6998,6 +6998,28 @@ components:
           maxLength: 1000
           description: Why the run's dispatches are held or released; 1..1000 bytes after trimming.
 
+    SplitFilingResumeResponse:
+      type: object
+      description: The split-filing resume result (`POST /v0/runs/{run_id}/split-filing/resume`, #3925).
+      required: [run_id, stage_id, state, phase_count, already_filed]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id:
+          $ref: '#/components/schemas/UUID'
+          description: The run's own plan stage the filing is bound to.
+        state:
+          type: string
+          enum: [resuming, completed]
+          description: '`resuming` (202, a filer was launched) or `completed` (200, the filing already completed).'
+        phase_count:
+          type: integer
+          description: The approved split_proposal's phase count.
+        already_filed:
+          type: integer
+          description: Phases with a durable work_item_filed marker before this call; the filer skips them.
+        budget_seconds:
+          type: integer
+          description: 202 only. The longest the launched filing can run. A missing split_children_filed is not proof of progress; after this, call the resume again (409 split_filing_in_progress means it is still running).
     RunDispatchHoldResponse:
       type: object
       required: [run_id, action, changed]
@@ -31288,6 +31310,135 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/split-filing/resume:
+    post:
+      operationId: resumeSplitFiling
+      summary: Resume a stopped split-proposal child filing
+      description: |
+        The operator resume verb for a split-proposal child filing (#3925,
+        E50.25). Approving a plan that carries a `split_proposal` launches the
+        child filing DETACHED from the approval request, under a
+        phase-count-scaled budget. A filing that stopped part-way (budget
+        expiry, a provider or audit error, a process exit) leaves durable
+        per-phase `work_item_filed` markers and no `split_children_filed`
+        completion marker; this call re-enters the same hook, which files
+        only the phases with no durable marker. It is idempotent. MCP:
+        `fishhawk_resume_split_filing`.
+
+        **Binding.** It files only from the run's OWN plan stage (a parent
+        run's plan is never filed from here), only when that stage succeeded
+        at a gate with a recorded approve decision, and only from the stage's
+        own newest plan artifact when that artifact was created no later than
+        the stage's `ended_at` — the transition that succeeded the plan
+        stage. A same-state re-approval does not move `ended_at`, and
+        approve rows never move the binding: a vote recorded before a
+        revise_plan on the same stage does not block the revised plan. An
+        artifact created after `ended_at` is refused
+        `409 plan_changed_since_approval`: start a new run, because the
+        artifact changed after the plan gate closed. A succeeded stage with
+        no `ended_at` is refused with the same code and a remedy that names
+        the missing `ended_at`. Accepted residual: `created_at` is the
+        database's clock and `ended_at` the daemon's, so a skew of d errs
+        both ways. A daemon clock behind refuses a plan uploaded less than d
+        before approval. A daemon clock ahead admits one uploaded less than d
+        after the gate closed; that needs a plan upload onto a succeeded
+        stage, which #5601 closes.
+
+        **Progress.** A detached filing that aborts writes no terminal
+        marker, so a missing `split_children_filed` is not proof of progress.
+        `budget_seconds` on the 202 is the longest the launched filing can
+        run; the probe is this call itself: `409 split_filing_in_progress`
+        means a filing for the run is still running. Observe completion with
+        `split_filing` on `fishhawk_get_plan` or a `split_children_filed`
+        audit entry.
+
+        **Children filed by hand** carry no `SplitChildKey` idempotency
+        marker and no `work_item_filed` record, so a resume files those
+        phases again.
+
+        **Refusals, each decided before anything is written.**
+        `401 authentication_required` (anonymous, answered before the
+        account check); `403 run_token_forbidden` (any `mcp:run:` subject);
+        `403 insufficient_scope` (no `write:approvals`); `403
+        account_forbidden`; `400 validation_failed` (a non-UUID `run_id`);
+        `503 split_filing_resume_unconfigured` (no run, audit, artifact or
+        approval repository); `404 run_not_found`; `409 run_terminal` (a
+        failed or cancelled run; a succeeded run is admitted);
+        `409 plan_not_approved` (`details.reason` `no_plan_stage`,
+        `plan_stage_not_succeeded`, `gateless_plan_stage` or
+        `no_approve_decision`); `409 no_split_proposal` (`details.reason`
+        `no_plan_artifact`, `plan_artifact_undecodable` or
+        `no_split_proposal`); `409 plan_changed_since_approval`
+        (`details.artifact_id`, `artifact_created_at`, `stage_ended_at`
+        when recorded); `409 split_filing_repo_malformed`; `409 split_filing_no_parent_issue`;
+        `409 split_filing_in_progress` (`details.budget_seconds`); `409
+        split_filing_refused` (a prior over-cap refusal marker); `500
+        split_filing_resume_failed` (the plan load or the attribution append
+        failed; nothing launched); `500 internal_error` / `503
+        service_unavailable` (a store read failed; nothing written).
+
+        **Audit.** Every ADMITTED call (200 or 202) appends one chained
+        `split_filing_resume_requested` entry `{stage_id, artifact_id,
+        outcome, phase_count, already_filed, actor}` BEFORE any launch; an
+        append failure launches nothing. It is an internal category, not an
+        issue-comment surface. Refusals write nothing.
+
+        **Authorization.** An authenticated identity with `write:approvals`
+        (the scope plan approval needs) at the member tier of the run's
+        workspace account. A delegated operator-agent token holding
+        `write:approvals` is admitted: no approver-eligibility gate applies,
+        and the call files only what a recorded approval authorized. A
+        cookie session passes the scope check and is bounded by the member
+        tier. A host-dispatcher token is refused by its route allowlist.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: '`state: completed` — the filing already completed (`split_children_filed` present); nothing launched; the call was attributed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SplitFilingResumeResponse' }
+        '202':
+          description: '`state: resuming` — a detached filer was launched for the phases with no durable marker; `budget_seconds` is its longest run.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SplitFilingResumeResponse' }
+        '400':
+          description: '`validation_failed` — `run_id` is not a UUID.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: '`authentication_required` — an authenticated operator token carrying `write:approvals` is required.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`run_token_forbidden` (a run-bound `mcp:run:` token), `insufficient_scope` (no `write:approvals`), or `account_forbidden` (the run belongs to another workspace account).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`plan_not_approved`, `no_split_proposal`, `plan_changed_since_approval`, `run_terminal`, `split_filing_repo_malformed`, `split_filing_no_parent_issue`, `split_filing_in_progress` or `split_filing_refused`; each names its remedy. Nothing was written.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`split_filing_resume_failed` (the plan load or the attribution append failed) or `internal_error` (a store read failed). Nothing launched.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`split_filing_resume_unconfigured` (a required repository is not wired) or `service_unavailable` (the database is unreachable).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v0/stages/{stage_id}/concurrency/promote:
     post:
       operationId: promoteQueuedStage

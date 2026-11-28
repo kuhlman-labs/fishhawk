@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -29,7 +30,9 @@ import (
 // sole surface fishhawk_get_plan's loadSplitFiling reads (a sibling slice), so
 // it is written ONCE, only on FULL completion (all N children durably filed),
 // never per child; per-child durable progress rides work_item_filed markers so
-// a partial run stays resumable (operator binding condition 1).
+// a partial run stays resumable (operator binding condition 1). A detached
+// filing that aborts writes no terminal marker, so its ABSENCE is not proof of
+// progress (#3925): see split_filing_detach.go for the budget and the probe.
 const splitChildrenFiledCategory = "split_children_filed"
 
 // splitFilingRefusedCategory is the audit-log category for the ONE refusal
@@ -145,7 +148,7 @@ type SplitCapExceptionDraft = splitCapExceptionDraft
 // splitChildFiledMarker is the per-phase durable resume marker
 // fileSplitProposalChildren records — via the existing work_item_filed category
 // so it needs no new registry entry — immediately after each child is filed. On
-// a re-approval after a partial failure, loadFiledSplitChildren reads these back
+// a resume after a partial failure, loadFiledSplitChildren reads these back
 // to skip the already-filed ordinals (never a duplicate) and to resolve
 // depends_on edges to sibling #N. The split_phase_index discriminator is what
 // distinguishes a split-filing marker from any other work_item_filed entry on
@@ -162,55 +165,66 @@ type filedChild struct {
 	url    string
 }
 
-// fileSplitProposalChildren is the best-effort on-approval hook (#2057, E50.5):
-// when an operator approves a plan carrying a split_proposal at the plan gate,
-// it files N conventions-complete phased child issues with depends_on edges and
-// symbol-set scopes, classifies the contract phase delete-only vs
-// governed-exception, drafts the in-memory cap exception for the latter, posts
-// the parent acceptance-carrier comment, and emits the split_children_filed
-// completion marker. It is invoked from finishApprovalAdvance with the same
-// best-effort posture as recordDrivePlanApproved — every forge / work-item /
-// audit error logs and returns, NEVER unwinding the approval the gate already
-// recorded.
+// fileSplitProposalChildren is the best-effort split-proposal filing hook
+// (#2057, E50.5): when an operator approves a plan carrying a split_proposal at
+// the plan gate, it files N conventions-complete phased child issues with
+// depends_on edges and symbol-set scopes, classifies the contract phase
+// delete-only vs governed-exception, drafts the in-memory cap exception for the
+// latter, posts the parent acceptance-carrier comment, and emits the
+// split_children_filed completion marker. Every forge / work-item / audit error
+// logs and returns, NEVER unwinding the approval the gate already recorded.
+//
+// It is a thin wrapper: it loads the approved stage's OWN newest plan artifact
+// (loadSplitPlanForStage — never a parent run's plan, and never an artifact
+// that postdates the transition that succeeded the stage) and hands the pinned
+// plan to fileSplitProposalChildrenFrom. The production approval path does not
+// call this wrapper: finishApprovalAdvance launches the filing DETACHED through
+// startSplitFilingDetached (split_filing_detach.go, #3925), which loads once
+// and passes the same pinned plan to fileSplitProposalChildrenFrom on a
+// goroutine, so a client timeout can no longer truncate the filing.
 //
 // Idempotency (operator binding condition 1): a prior split_children_filed
 // completion marker means every child is already filed → no-op. A partial run
-// (some children filed, then an error) writes NO completion marker, so a
-// re-approval re-enters here, reads the per-phase work_item_filed resume markers
-// — the durable per-ordinal filing record — skips the already-recorded ordinals,
-// and fills only the un-recorded ones. The per-ordinal marker append is a HARD
-// prerequisite, not a best-effort side effect: if it fails the run aborts (no
-// completion marker, no parent comment) rather than proceeding on a durable
-// state it can no longer resume from — mirroring refinement.ExecuteFiling's
-// abort-on-record-failure discipline. The one irreducible residual — a child
-// whose provider File succeeded but whose marker never persisted re-files once
-// on a re-approval — is the same at-least-once seam ExecuteFiling documents
-// (GitHub's issue-create API offers no idempotency key to close it).
+// (some children filed, then an error) writes NO completion marker, so a later
+// entry — the operator resume verb (POST /v0/runs/{run_id}/split-filing/resume)
+// or a later approval whose registry claim is admitted — re-enters here, reads
+// the per-phase work_item_filed resume markers — the durable per-ordinal filing
+// record — skips the already-recorded ordinals, and fills only the
+// un-recorded ones. A failure to READ those markers aborts before any filing
+// (fail closed): an unreadable record is never treated as an empty one. The
+// per-ordinal marker append is a HARD prerequisite, not a best-effort side
+// effect: if it fails the run aborts (no completion marker, no parent comment)
+// rather than proceeding on a durable state it can no longer resume from —
+// mirroring refinement.ExecuteFiling's abort-on-record-failure discipline. The
+// one irreducible residual — a child whose provider File succeeded but whose
+// marker never persisted re-files once on a resume — is the same at-least-once
+// seam ExecuteFiling documents (GitHub's issue-create API offers no idempotency
+// key to close it). Children filed BY HAND carry neither the SplitChildKey
+// marker nor a work_item_filed record, so a resume files those phases again.
 //
-// NO IN-PROCESS LOCK, AND THAT IS A RECORDED DECISION (E50.16 / #2657 — the
-// OPERATOR's, not an oversight and not a re-derivation). The completion-marker
+// SELF-PROTECTION (E50.16 / #2657, amended by #3925). The completion-marker
 // dedup below is an unlocked list-then-append, and this hook holds no mutex
 // around it, while its sibling fileOrLinkLiveValidationWalk
-// (live_validation_filing.go) holds a per-run one. That is NOT a principled
-// difference between the two hooks — at this layer there is none. The concurrent
-// double-file this hook exhibited before E50.15 / #2656 is closed UPSTREAM by
-// the approve compare-and-swap (advanceStage → casTransitionFromObserved): a
-// raced second approval is refused at the advance and never reaches
-// finishApprovalAdvance's hook tail, which is this hook's only production call
-// site (approvals.go). The production RunRepo is the postgres one, which
-// implements run.StageCASTransitioner, so casTransitionFromObserved's non-CAS
-// degradation is reachable only by in-memory test fakes. The CAS therefore
-// covers every path a deployed daemon can take, and a second in-process mutex
-// here would defend only a path that cannot occur outside tests — while implying
-// a cross-process guarantee an in-process map cannot make.
+// (live_validation_filing.go) holds a per-run one. Two guards sit upstream:
 //
-// THE RESIDUAL, stated plainly for whoever changes this next: if the CAS is ever
-// removed, or the run.StageCASTransitioner capability assert is dropped, BOTH
-// hooks lose their protection — and THIS one loses it FIRST and SILENTLY,
-// because it has nothing underneath. That is measured, not asserted: with the
-// CAS deleted, split-child filings went 3 → 6 (two split_children_filed markers)
-// while the walk's count stayed at 1, held up by its retained mutex alone
-// (approve_advance_cas_test.go's concurrent case).
+//   - FIRST approvals of one stage are serialized by the approve
+//     compare-and-swap (advanceStage → casTransitionFromObserved): a raced
+//     second approval is refused at the advance and never reaches the launch.
+//     Two same-stage first approvals may deliberately CO-HOLD the split-filing
+//     registry, so the CAS stays the only thing between them — which is what
+//     keeps its measured counterfactual observable: with the CAS deleted,
+//     split-child filings go 3 → 6 (two split_children_filed markers) while
+//     the walk's count stays at 1, held up by its retained mutex alone
+//     (approve_advance_cas_test.go's concurrent case).
+//   - Same-state RE-approvals and the resume verb are guarded by the
+//     process-local splitFilingRegistry: each claims EXCLUSIVELY, so neither
+//     can launch a second filer while one is in flight for the run.
+//
+// THE RESIDUAL, stated plainly for whoever changes this next: the registry is
+// PROCESS-LOCAL (a second replica sees neither another replica's claim nor its
+// in-flight filing), and if the CAS is ever removed, or the
+// run.StageCASTransitioner capability assert is dropped, two same-stage first
+// approvals double-launch exactly as E50.16 measured.
 //
 // MARKER ORDERING vs the sibling hook: this hook writes each per-phase
 // work_item_filed marker AFTER the child is filed, which preserves per-ordinal
@@ -220,16 +234,149 @@ type filedChild struct {
 // stranded-intent residual. The difference follows from resume semantics, not
 // from a difference in self-protection.
 func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage) {
+	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil {
+		return
+	}
+	src, status, err := s.loadSplitPlanForStage(ctx, stage)
+	if err != nil {
+		s.logSplitFilingWarn(ctx, stage.RunID, "load approved plan failed", err.Error())
+		return
+	}
+	switch status {
+	case splitPlanOK:
+		s.fileSplitProposalChildrenFrom(ctx, stage, src.plan)
+	case splitPlanChangedSinceApproval:
+		s.logSplitFilingPlanChanged(ctx, stage, src)
+	}
+}
+
+// splitPlanStatus is what loadSplitPlanForStage found on the stage.
+type splitPlanStatus int
+
+const (
+	// splitPlanOK: src carries the decoded own artifact.
+	splitPlanOK splitPlanStatus = iota + 1
+	// splitPlanNoArtifact: the stage carries no standard_v1 plan artifact.
+	splitPlanNoArtifact
+	// splitPlanUndecodable: the newest own artifact is not valid plan JSON.
+	splitPlanUndecodable
+	// splitPlanChangedSinceApproval: the newest own artifact was created after
+	// the stage's EndedAt — the transition that actually succeeded the plan
+	// stage — or the stage records no EndedAt at all, so no artifact can be
+	// shown to predate the gate's close (AA1). src.boundAt is zero in the
+	// second case.
+	splitPlanChangedSinceApproval
+)
+
+// splitPlanSource is the PINNED plan a split filing files from: the plan
+// stage's own newest plan artifact, with the id and creation time a caller can
+// name, and the stage EndedAt it was bound against (zero when the stage
+// records none).
+type splitPlanSource struct {
+	artifactID uuid.UUID
+	createdAt  time.Time
+	boundAt    time.Time
+	plan       *plan.Plan
+}
+
+// loadSplitPlanForStage loads ONLY the given plan stage's own newest
+// standard_v1 plan artifact (the same pick tryLoadPlanForRun makes) — no
+// ParentRunID walk, so a child run's artifact-less plan stage can never file a
+// parent run's split. loadApprovedPlanForRun is deliberately not used and is
+// unchanged for its other callers.
+//
+// The approval binding (AA1) lives HERE, so every split launch — the approval
+// path and the resume verb — gets it: the artifact must have been created no
+// later than the stage's EndedAt, the time the transition that succeeded the
+// plan stage committed. A same-state re-approval does not move EndedAt, so a
+// plan uploaded after the gate closed can never be filed by re-approving it.
+// Approval rows record no artifact id or hash, which is why the binding is
+// temporal.
+//
+// Approve rows never move this binding, counted or uncounted, early or late.
+// A vote recorded while the stage still awaits approval (a quorum's first
+// vote, a delegated or agent row) is not the gate's close: a revise_plan on
+// the same stage can follow it, and the revised artifact is what the closing
+// approve authorizes.
+//
+// ACCEPTED RESIDUAL: two clocks. artifacts.created_at is the database's now(),
+// while EndedAt is stamped from the daemon's clock (run.transitionStageTx), so
+// this comparison is exact only when the two agree. Skew of d errs in both
+// directions. A daemon clock BEHIND the database's refuses a plan uploaded
+// less than d before the approving transition: fail closed, nothing is filed,
+// the resume refuses the same way, and the remedy is a new run. A daemon
+// clock AHEAD of the database's admits an artifact uploaded less than d after
+// the gate closed. That second direction needs a writer that can upload a
+// plan onto an already-succeeded plan stage; #5601 (refuse a plan upload onto
+// a succeeded stage) is the control that closes it.
+//
+// An IO error returns err; every other non-OK case returns a status.
+func (s *Server) loadSplitPlanForStage(ctx context.Context, stage *run.Stage) (splitPlanSource, splitPlanStatus, error) {
+	arts, err := s.cfg.ArtifactRepo.ListForStage(ctx, stage.ID)
+	if err != nil {
+		return splitPlanSource{}, 0, fmt.Errorf("list plan stage artifacts: %w", err)
+	}
+	var picked *artifact.Artifact
+	for _, a := range arts {
+		if a.Kind != artifact.KindPlan || a.SchemaVersion == nil || *a.SchemaVersion != "standard_v1" {
+			continue
+		}
+		if picked == nil || a.CreatedAt.After(picked.CreatedAt) {
+			picked = a
+		}
+	}
+	if picked == nil {
+		return splitPlanSource{}, splitPlanNoArtifact, nil
+	}
+	src := splitPlanSource{artifactID: picked.ID, createdAt: picked.CreatedAt}
+	if stage.EndedAt == nil || picked.CreatedAt.After(*stage.EndedAt) {
+		if stage.EndedAt != nil {
+			src.boundAt = *stage.EndedAt
+		}
+		return src, splitPlanChangedSinceApproval, nil
+	}
+	src.boundAt = *stage.EndedAt
+	var p plan.Plan
+	if err := json.Unmarshal(picked.Content, &p); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "split filing: plan artifact undecodable; filing nothing",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("artifact_id", picked.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return src, splitPlanUndecodable, nil
+	}
+	src.plan = &p
+	return src, splitPlanOK, nil
+}
+
+// logSplitFilingPlanChanged is the WARN for a launch skipped because the plan
+// stage's newest artifact postdates the gate's close (AA1). The approval itself
+// is never failed for it.
+func (s *Server) logSplitFilingPlanChanged(ctx context.Context, stage *run.Stage, src splitPlanSource) {
+	msg := "split filing: skipped; the plan artifact changed after the plan gate closed, so nothing is filed from it. Start a new run"
+	if src.boundAt.IsZero() {
+		// No EndedAt: the comparison never ran, so the text must not claim
+		// the artifact changed after the gate closed.
+		msg = "split filing: skipped; the plan stage records no ended_at, so the plan artifact cannot be shown to predate the plan gate's close and nothing is filed from it. Start a new run"
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, msg,
+		slog.String("run_id", stage.RunID.String()),
+		slog.String("stage_id", stage.ID.String()),
+		slog.String("artifact_id", src.artifactID.String()),
+		slog.Time("artifact_created_at", src.createdAt),
+		slog.Time("stage_ended_at", src.boundAt),
+	)
+}
+
+// fileSplitProposalChildrenFrom files approvedPlan's split_proposal children
+// for stage's run. approvedPlan is the PINNED plan the caller loaded (see
+// fileSplitProposalChildren and spawnSplitFiling); it is never re-read here.
+func (s *Server) fileSplitProposalChildrenFrom(ctx context.Context, stage *run.Stage, approvedPlan *plan.Plan) {
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil {
 		return
 	}
 	runID := stage.RunID
 
-	approvedPlan, err := s.loadApprovedPlanForRun(ctx, runID)
-	if err != nil {
-		s.logSplitFilingWarn(ctx, runID, "load approved plan failed", err.Error())
-		return
-	}
 	if approvedPlan == nil || approvedPlan.SplitProposal == nil || len(approvedPlan.SplitProposal.Phases) == 0 {
 		return // no split_proposal → nothing to file
 	}
@@ -323,8 +470,16 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 		}
 	}
 
-	// Resume: the durable per-phase markers already filed on a prior pass.
-	filed := s.loadFiledSplitChildren(ctx, runID)
+	// Resume: the durable per-phase markers already filed on a prior pass. A
+	// read error ABORTS before any filing, exactly like the split_children_filed
+	// read above: an unreadable record is never treated as an empty one, which
+	// would re-file every recorded phase (gitlab and jira have no forge-adoption
+	// backstop).
+	filed, err := s.loadFiledSplitChildren(ctx, runID)
+	if err != nil {
+		s.logSplitFilingWarn(ctx, runID, "list work_item_filed failed", err.Error())
+		return
+	}
 	parentEpicRef := "#" + strconv.Itoa(parentIssue)
 
 	// FORGE-STATE dedup (#2064, E50.7): query the parent's children ONCE, before
@@ -413,7 +568,7 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 			// comment) rather than filing more children on top of a durable
 			// state we can no longer resume from — the same abort-on-record-
 			// failure discipline refinement.ExecuteFiling uses. The just-filed
-			// ordinal re-files once on a re-approval (its record never
+			// ordinal re-files once on a resume (its record never
 			// persisted): the documented at-least-once residual, not a widening
 			// of it.
 			break
@@ -422,7 +577,7 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 
 	// Completion only when EVERY phase is durably filed (operator binding
 	// condition 1): a partial run writes no completion marker and posts no
-	// parent comment, so a re-approval resumes.
+	// parent comment, so a resume (the resume verb) re-enters.
 	if len(filed) != len(specs) {
 		return
 	}
@@ -444,10 +599,10 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	}
 
 	// Persist the completion marker (the durable dedup record) BEFORE posting the
-	// best-effort parent comment: once the marker is durable a re-approval no-ops
+	// best-effort parent comment: once the marker is durable a later entry no-ops
 	// at the priorCompletion gate above and never re-enters, so the acceptance-
 	// carrier comment is posted at most once for a completed filing. (If the
-	// completion append itself fails, a re-approval re-enters and may re-post — a
+	// completion append itself fails, a resume re-enters and may re-post — a
 	// narrow best-effort residual on that one interleaving, not a guarantee.)
 	s.writeSplitChildrenFiledAudit(ctx, runRow, classification, children, contractChildNumber, capDraft, runRow.Repo, parentIssue)
 	s.postSplitParentComment(ctx, runRow, owner, name, parentIssue, contractChildNumber)
@@ -646,18 +801,17 @@ func (s *Server) loadReachabilityEvidence(ctx context.Context, runID uuid.UUID) 
 // These markers ARE the durable per-ordinal filing record the hook consults on
 // resume — appended immediately after each child files and treated as a hard
 // prerequisite (writeSplitChildFiledMarker's failure aborts filing), so a
-// re-approval skips every durably-recorded ordinal and re-files none of them.
+// resume skips every durably-recorded ordinal and re-files none of them.
 // applyAndFileWorkItem itself provides NO durable idempotency (it calls
-// provider.File unconditionally), so the marker is the sole resume record: a
-// read error here fails open to an empty map and a resume then re-files (the
-// same at-least-once residual refinement.ExecuteFiling documents), and the
-// completion-marker dedup at the top of the hook prevents re-entry once the full
-// set is recorded.
-func (s *Server) loadFiledSplitChildren(ctx context.Context, runID uuid.UUID) map[int]filedChild {
+// provider.File unconditionally), so the marker is the sole resume record, and
+// its read FAILS CLOSED: the list error is returned and the hook files nothing
+// (#3925). The completion-marker dedup at the top of the hook prevents re-entry
+// once the full set is recorded.
+func (s *Server) loadFiledSplitChildren(ctx context.Context, runID uuid.UUID) (map[int]filedChild, error) {
 	filed := map[int]filedChild{}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryWorkItemFiled)
 	if err != nil {
-		return filed
+		return nil, err
 	}
 	for _, e := range entries {
 		var m splitChildFiledMarker
@@ -666,11 +820,11 @@ func (s *Server) loadFiledSplitChildren(ctx context.Context, runID uuid.UUID) ma
 		}
 		filed[*m.SplitPhaseIndex] = filedChild{number: m.CreatedNumber, url: m.CreatedURL}
 	}
-	return filed
+	return filed, nil
 }
 
 // writeSplitChildFiledMarker records the durable per-phase resume marker
-// immediately after a child is filed, so a partial-failure re-approval skips it.
+// immediately after a child is filed, so a partial-failure resume skips it.
 // It returns the append error (also WARN-logged): because this marker is the
 // hook's sole durable per-ordinal record, its append is a HARD prerequisite —
 // the caller aborts the run (no completion marker) on failure rather than filing
