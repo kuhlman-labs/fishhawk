@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,6 +35,14 @@ import (
 // #4582: the delegated may_merge arm of AutoDriveRunGate runs the SAME guard
 // (mergeOverlapAutoDriveHold) with no override, and a 409 refusal names other
 // runs only to a caller that may read cross-run overlap (overlapDetailsVisible).
+//
+// #5604: an overlap whose shared paths are ALL documentation
+// (mergeOverlapPathsDocsOnly: docs/** or *.md) is not a blocker, a partial
+// relaxation of ADR-115 D4. Such an overlap surfaces at the other run's rebase
+// as a mechanical union conflict instead of holding this merge. Any shared
+// code path still blocks, and a docs-only overlap on an INCOMPLETE changed set
+// is still undetermined (fail closed). Inline merge_run, merge-on-pass and the
+// delegated may_merge arm all call this one guard, so all three exempt alike.
 
 // CategoryDelegatedMergeOverlapRefused is the chained audit row the delegated
 // may_merge arm appends when the merge overlap guard refuses it (#4582,
@@ -86,6 +96,41 @@ const mergeOverlapReasonMaxBytes = 2000
 // terminal state do not — a planned or parked run is not writing files.
 func overlapBlockingStageState(st run.StageState) bool {
 	return st == run.StageStateDispatched || st == run.StageStateRunning
+}
+
+// isMergeOverlapDocumentationPath reports whether p is documentation for the
+// merge overlap guard's docs-only exemption (#5604): under docs/ (which covers
+// docs/api/v0.openapi.yaml, docs/spec and docs/adr) or ending in .md. Both
+// matches are case-SENSITIVE, because an inclusion that admits a merge must
+// not widen under case folding: docs/x.go qualifies, Docs/x.go and NOTES.MD do
+// not. The path is canonicalised first (path.Clean over slash form), so
+// docs/../backend/x.go classifies as backend/x.go; an absolute path, ".",
+// ".." and a "../" escape are never documentation. Deliberately NOT
+// isDocumentationPath: that rule is the conflict-resolution review-skip rule
+// and the campaign preview's docs_only class (#5221), and it would admit
+// .mdx / .markdown / .rst / .adoc outside docs/, which still block here.
+func isMergeOverlapDocumentationPath(p string) bool {
+	p = path.Clean(toSlashPath(p))
+	if p == "." || p == ".." || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "../") {
+		return false
+	}
+	return strings.HasPrefix(p, "docs/") || strings.HasSuffix(p, ".md")
+}
+
+// mergeOverlapPathsDocsOnly reports whether a NON-EMPTY shared-path list is
+// entirely documentation (isMergeOverlapDocumentationPath). An empty list is
+// not docs-only: it is no overlap at all, and the guard never reads it as an
+// exemption.
+func mergeOverlapPathsDocsOnly(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, p := range paths {
+		if !isMergeOverlapDocumentationPath(p) {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeOverlapBlocker is one other run in a refusal: a confirmed blocker
@@ -255,7 +300,11 @@ func overlapUndetermined(reason, headSHA string, undetermined []mergeOverlapBloc
 //	    rename PreviousPath; a truncated comparison or a rename with no
 //	    source leaves the set INCOMPLETE;
 //	(e) each live candidate's effective scope (resolveOverlapScope):
-//	    unresolved → undetermined; a non-empty intersection → blocker;
+//	    unresolved → undetermined; a non-empty intersection with at least
+//	    one non-documentation path → blocker (its Paths keep the FULL
+//	    intersection, docs included); an all-documentation intersection
+//	    (mergeOverlapPathsDocsOnly, #5604) or an empty one → not a blocker,
+//	    but undetermined on an incomplete changed set (fail closed);
 //	(f) blockers → 409 overlapping_implement_in_flight (wins; undetermined is
 //	    still carried); else an incomplete changed set (every non-blocking
 //	    live candidate undetermined) → 409 changed_files_capped /
@@ -368,8 +417,8 @@ func (s *Server) mergeOverlapGuard(ctx context.Context, runRow *run.Run) mergeOv
 				paths = append(paths, p)
 			}
 		}
-		if len(paths) > 0 {
-			sort.Strings(paths)
+		sort.Strings(paths)
+		if len(paths) > 0 && !mergeOverlapPathsDocsOnly(paths) {
 			out.Blockers = append(out.Blockers, c.blocker(paths))
 		} else if incomplete != "" {
 			out.Undetermined = append(out.Undetermined, c.blocker(nil))
