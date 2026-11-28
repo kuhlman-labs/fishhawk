@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,67 +10,49 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 )
 
-// #4641 (ADR-112 residual H3): the cross-boundary head-pin suite. HTTP
-// endpoint (inline merge_run) or the delegated may_merge arm → the
-// merge-candidate gate → the ADR-112 fold → the D1 ledger in Postgres → the
-// PRODUCTION server.ForgeMerger → the PRODUCTION githubclient.QueueMerge (via
+// #4641 (ADR-112 residual H3) and #4676: the cross-boundary head-pin suite.
+// HTTP endpoint (inline merge_run) or the delegated may_merge arm → the #3109
+// conflict guard → the merge-candidate gate → the ADR-112 fold → the server
+// readiness pre-read → the D1 ledger in Postgres → the PRODUCTION
+// server.ForgeMerger → the PRODUCTION githubclient.QueueMerge (via
 // mqeAutoMerger, which mirrors serve.go's githubAutoMerger.mergeTarget: the
-// serve.go leaf lives in package main) → the GraphQL / REST wire → the mcq
+// serve.go leaf lives in package main) → the REST / GraphQL wire → the mcq
 // fake → the audit chain. A per-test proxy answers ONLY the
 // enablePullRequestAutoMerge mutation locally and forwards everything else,
-// so the shared mcq fake is untouched. Every row approves ONLY at h1 and
-// moves the PR head h1 -> h2 at one point in the dispatch, then reads
-// committed state: the outcome, the PR, the enable calls, the PUTs, the claim
-// and the queue/ledger/audit rows.
-
-// Enable-mutation modes of the head-pin proxy.
-const (
-	// mhpRefuseOnMismatch answers a pinned enable whose expectedHeadOid is not
-	// the PR's current head with a GraphQL error envelope (GitHub does not
-	// document the wording, so neither does this fake), and APPLIES any other
-	// enable — an unpinned one included — at the current head.
-	mhpRefuseOnMismatch = "refuse_on_mismatch"
-	// mhpCleanStatus answers every enable with GitHub's clean-status refusal,
-	// so the ladder takes the REST fallback.
-	mhpCleanStatus = "clean_status"
-	// mhpApplyThenError (#4749) refuses a mismatched pin like
-	// mhpRefuseOnMismatch, but the FIRST enable whose pin equals the current
-	// head is APPLIED (recorded Applied), the head then moves to h2, and the
-	// answer is a GraphQL error envelope: the client's re-read sees h2 and
-	// reports graphql_reread although the enable took effect. Later enables
-	// apply cleanly.
-	mhpApplyThenError = "apply_then_error"
-)
-
-// mhpBound is the GraphQL argument binding for expectedHeadOid: the pin is
-// resolved THROUGH the declared variable, never by assuming its name (C1).
-var mhpBound = regexp.MustCompile(`expectedHeadOid:\s*\$(\w+)`)
+// so the shared mcq fake is untouched. A head-pinned dispatch must never send
+// that mutation (#4676); the proxy APPLIES any enable it receives and keeps it
+// ARMED across a later head move, and fireArmed then merges the PR at its
+// then-current head, as GitHub's auto-merge would. Every row reads committed
+// state: the outcome, the PR, the enable calls, the PUTs, the claim and the
+// queue/ledger/audit rows.
 
 // mhpEnable is one enablePullRequestAutoMerge call the proxy received.
 type mhpEnable struct {
-	// Pin is the value bound to the expectedHeadOid argument ("" unpinned).
-	Pin string
-	// Applied is true when the proxy answered success: auto-merge ENABLED at
-	// AppliedHead.
+	// Applied is true when the proxy answered success: auto-merge ARMED at
+	// AppliedHead. mhpArmedSurvivesPush keeps it armed across moveHead.
 	Applied     bool
 	AppliedHead string
 }
 
+// mhpArmedSurvivesPush is the proxy's only enable mode (#4676): every enable
+// is applied and stays armed after the head moves, the residual the issue
+// names (a write-access push does not disarm it).
+const mhpArmedSurvivesPush = "armed_survives_push"
+
 // mhpProxy sits in front of the mqm/mqe chain.
 type mhpProxy struct {
-	w    *mqmWorld
-	r    *mcqRun
-	rp   *httputil.ReverseProxy
-	mode string
+	w  *mqmWorld
+	r  *mcqRun
+	rp *httputil.ReverseProxy
 
 	mu sync.Mutex
 	// afterSnapshot is the hook an arm plants to fire right after the fold's
@@ -82,12 +65,7 @@ type mhpProxy struct {
 	// request yet and always finds it set: the head move lands before that
 	// request is served, deterministic by construction.
 	beforeNext func()
-	// onEnable runs once, on receipt of the enable mutation, before it is
-	// judged.
-	onEnable func()
-	enables  []mhpEnable
-	// appliedErr: the mhpApplyThenError one-shot has fired.
-	appliedErr bool
+	enables    []mhpEnable
 }
 
 func (p *mhpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -107,7 +85,12 @@ func (p *mhpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	body, _ := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 	if bytes.Contains(body, []byte("enablePullRequestAutoMerge")) {
-		p.serveEnable(rw, body)
+		head := p.head()
+		p.mu.Lock()
+		p.enables = append(p.enables, mhpEnable{Applied: true, AppliedHead: head})
+		p.mu.Unlock()
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":1,"url":"u","state":"OPEN"}}}}`))
 		return
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -118,54 +101,6 @@ func (p *mhpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		p.mu.Unlock()
 	}
 	p.rp.ServeHTTP(rw, req)
-}
-
-func (p *mhpProxy) serveEnable(rw http.ResponseWriter, body []byte) {
-	var gq struct {
-		Query     string         `json:"query"`
-		Variables map[string]any `json:"variables"`
-	}
-	_ = json.Unmarshal(body, &gq)
-	pin := ""
-	if m := mhpBound.FindStringSubmatch(gq.Query); m != nil {
-		pin, _ = gq.Variables[m[1]].(string)
-	}
-	p.mu.Lock()
-	hook := p.onEnable
-	p.onEnable = nil
-	p.mu.Unlock()
-	if hook != nil {
-		hook()
-	}
-	head := p.head()
-	rw.Header().Set("Content-Type", "application/json")
-	call := mhpEnable{Pin: pin}
-	switch {
-	case p.mode == mhpCleanStatus:
-		_, _ = rw.Write([]byte(`{"data":null,"errors":[{"type":"UNPROCESSABLE","message":"Pull request is in clean status"}]}`))
-	case pin != "" && pin != head:
-		_, _ = rw.Write([]byte(`{"data":null,"errors":[{"type":"UNPROCESSABLE","message":"Expected head OID does not match the pull request head"}]}`))
-	case p.mode == mhpApplyThenError && !p.firedApplyErr():
-		call.Applied, call.AppliedHead = true, head
-		p.moveHead()
-		_, _ = rw.Write([]byte(`{"data":null,"errors":[{"type":"INTERNAL","message":"Something went wrong while executing your query"}]}`))
-	default:
-		call.Applied, call.AppliedHead = true, head
-		_, _ = rw.Write([]byte(`{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":1,"url":"u","state":"OPEN"}}}}`))
-	}
-	p.mu.Lock()
-	p.enables = append(p.enables, call)
-	p.mu.Unlock()
-}
-
-// firedApplyErr reports whether the mhpApplyThenError one-shot already fired,
-// marking it fired.
-func (p *mhpProxy) firedApplyErr() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	fired := p.appliedErr
-	p.appliedErr = true
-	return fired
 }
 
 func (p *mhpProxy) head() string {
@@ -180,22 +115,45 @@ func (p *mhpProxy) calls() []mhpEnable {
 	return append([]mhpEnable(nil), p.enables...)
 }
 
-// moveHead moves r's PR head to h2 on the mcq fake.
+// moveHead moves r's PR head to h2 on the mcq fake (a write-access push).
 func (p *mhpProxy) moveHead() {
 	p.w.gh.set(func() { p.w.gh.prs[p.r.pr].head = "h2" })
+}
+
+// fireArmed is GitHub's auto-merge firing: when any enable was applied (and,
+// mhpArmedSurvivesPush, survived a head move) the PR merges at its CURRENT
+// head, which it returns ("" when nothing was armed or the PR already merged).
+func (p *mhpProxy) fireArmed() string {
+	if len(p.calls()) == 0 {
+		return ""
+	}
+	var head string
+	p.w.gh.set(func() {
+		pr := p.w.gh.prs[p.r.pr]
+		if pr.merged {
+			return
+		}
+		pr.merged, pr.state, head = true, "closed", pr.head
+	})
+	return head
+}
+
+// setState serves mergeable_state on r's PR (the mqm world's GET override).
+func (p *mhpProxy) setState(state string) {
+	p.w.mergeable(p.r, state)
 }
 
 // newMHPProxy routes the server's GitHub client AND the head-pin merge leaf
 // through a head-pin proxy for r, and returns the proxy plus the PRODUCTION
 // ForgeMerger whose github leaf calls the production QueueMerge.
-func newMHPProxy(t *testing.T, w *mqmWorld, r *mcqRun, mode string) (*mhpProxy, ForgeMerger) {
+func newMHPProxy(t *testing.T, w *mqmWorld, r *mcqRun) (*mhpProxy, ForgeMerger) {
 	t.Helper()
 	orig := w.srv.cfg.GitHub
 	target, err := url.Parse(orig.BaseURL)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	p := &mhpProxy{w: w, r: r, rp: httputil.NewSingleHostReverseProxy(target), mode: mode}
+	p := &mhpProxy{w: w, r: r, rp: httputil.NewSingleHostReverseProxy(target)}
 	ps := httptest.NewServer(p)
 	t.Cleanup(ps.Close)
 	c := *orig
@@ -204,14 +162,15 @@ func newMHPProxy(t *testing.T, w *mqmWorld, r *mcqRun, mode string) (*mhpProxy, 
 	return p, ForgeMerger{GitHub: mqeAutoMerger{gh: &c}}
 }
 
-// mhpArm is one head-moving dispatch arm: where the head moves, which proxy
-// mode answers the enable, the refusal basis the forge reports, and the claim
-// outcome the D1 ledger must be left in (#4749). claim and note are
-// HARD-CODED per arm, never derived from the production predicate: note is the
-// delegated arm's observe-only note for a claim left in arm.claim (#4683).
+// mhpArm is one head-moving dispatch arm: where the head moves, the refusal
+// basis the forge reports, and the claim outcome the D1 ledger must be left
+// in (#4749). claim and note are HARD-CODED per arm, never derived from the
+// production predicate: note is the delegated arm's observe-only note for a
+// claim left in arm.claim (#4683). Both arms serve mergeable_state clean, so
+// the server pre-read falls through and the leaf alone answers. The
+// graphql_reread arm is gone with the pinned enable (#4676).
 type mhpArm struct {
 	name  string
-	mode  string
 	basis string
 	claim mergeDispatchLedgerOutcome
 	note  string
@@ -220,31 +179,26 @@ type mhpArm struct {
 
 var mhpArms = []mhpArm{
 	// The head moves at the top of the first request after the fold's
-	// snapshot request: the client pre-check sees h2 and sends no mutation.
-	{"precheck", mhpRefuseOnMismatch, githubclient.HeadMismatchPrecheck, mergeDispatchRelease, autoDriveNoteHeadMoved, func(p *mhpProxy) {
+	// snapshot request: the pre-read sees h2 and falls through, and the leaf's
+	// pre-check sees h2 and sends nothing.
+	{"precheck", githubclient.HeadMismatchPrecheck, mergeDispatchRelease, autoDriveNoteHeadMoved, func(p *mhpProxy) {
+		p.setState("clean")
 		p.afterSnapshot = p.moveHead
 	}},
-	// The head moves on receipt of the pinned enable: the forge refuses it
-	// (expectedHeadOid h1 vs head h2) and the client's re-read sees h2. The
-	// basis is inferred, so the claim is held dispatch_failed (#4749).
-	{"graphql", mhpRefuseOnMismatch, githubclient.HeadMismatchGraphQLReread, mergeDispatchUncertain, autoDriveNoteHeadMovedBasisHeld, func(p *mhpProxy) {
-		p.onEnable = p.moveHead
-	}},
-	// The enable answers clean status, so the ladder takes the pinned REST
-	// fallback; the head moves before the PUT is judged, so its sha h1 is
-	// refused 409.
-	{"rest", mhpCleanStatus, githubclient.HeadMismatchRESTSha, mergeDispatchRelease, autoDriveNoteHeadMoved, func(p *mhpProxy) {
+	// The readiness GET reads h1 clean, so the leaf sends the pinned PUT; the
+	// head moves before the PUT is judged, so its sha h1 is refused 409.
+	{"rest", githubclient.HeadMismatchRESTSha, mergeDispatchRelease, autoDriveNoteHeadMoved, func(p *mhpProxy) {
+		p.setState("clean")
 		p.w.gh.set(func() { p.w.gh.onPut = func(int) { p.moveHead() } })
 	}},
 }
 
 // requireHeadPinRefused asserts the committed state every head-moved row
-// shares: the PR unmerged, no successful enable, the claim left in arm.claim
-// (released: no claim row; dispatch_failed: the row held), one
+// shares: the PR unmerged, NO auto-merge enable at all (#4676), the claim left
+// in arm.claim (released: no claim row; dispatch_failed: the row held), one
 // merge_dispatch_settled row with outcome arm.claim at h1 carrying the arm's
 // refusal_basis (and observed_head_sha h2 where the forge reported it), and
-// merge_queue_authorized.head_sha == settled head_sha == every pin the forge
-// received == h1.
+// merge_queue_authorized.head_sha == settled head_sha == every PUT sha == h1.
 func requireHeadPinRefused(t *testing.T, w *mqmWorld, r *mcqRun, p *mhpProxy, arm mhpArm, path string) {
 	t.Helper()
 	var merged bool
@@ -252,28 +206,18 @@ func requireHeadPinRefused(t *testing.T, w *mqmWorld, r *mcqRun, p *mhpProxy, ar
 	if merged {
 		t.Fatal("the PR merged; want it unmerged (the moved head was never judged)")
 	}
-	enables := p.calls()
-	for _, e := range enables {
-		if e.Applied {
-			t.Fatalf("auto-merge was ENABLED at %s; want no successful enable", e.AppliedHead)
-		}
-		if e.Pin != "h1" {
-			t.Fatalf("expectedHeadOid received = %q, want h1", e.Pin)
-		}
+	if enables := p.calls(); len(enables) != 0 {
+		t.Fatalf("auto-merge enables = %+v; want none (a head-pinned dispatch never arms auto-merge)", enables)
 	}
 	puts := w.gh.putCalls()
 	switch arm.basis {
 	case githubclient.HeadMismatchPrecheck:
-		if len(enables) != 0 || len(puts) != 0 {
-			t.Fatalf("forge calls: %d enables, %d PUTs; want none (the pre-check sends nothing)", len(enables), len(puts))
-		}
-	case githubclient.HeadMismatchGraphQLReread:
-		if len(enables) != 1 || len(puts) != 0 {
-			t.Fatalf("forge calls: %d enables, %d PUTs; want 1 refused enable and no PUT", len(enables), len(puts))
+		if len(puts) != 0 {
+			t.Fatalf("PUTs = %+v; want none (the pre-check sends nothing)", puts)
 		}
 	case githubclient.HeadMismatchRESTSha:
-		if len(enables) != 1 || len(puts) != 1 || puts[0].SHA != "h1" {
-			t.Fatalf("forge calls: %d enables, PUTs %+v; want 1 enable and 1 PUT with sha h1", len(enables), puts)
+		if len(puts) != 1 || puts[0].SHA != "h1" {
+			t.Fatalf("PUTs = %+v; want 1 PUT with sha h1", puts)
 		}
 	}
 	st, claimPath := w.claim(r)
@@ -308,20 +252,19 @@ func requireHeadPinRefused(t *testing.T, w *mqmWorld, r *mcqRun, p *mhpProxy, ar
 }
 
 // TestMergeHeadPinE2E_Inline: each arm answers 409 merge_head_moved naming h1
-// and the arm's refusal_basis, with nothing merged and the claim in the arm's
-// outcome (released on precheck / rest_sha, dispatch_failed on graphql). The
-// REST row then re-invokes: the gate and the fold re-run at h2, where no
-// approval qualifies, so 409 forge_approval_required — the moved head is
-// never merged unapproved. Counterfactual: gate.HeadSHA -> "" at the
-// merge_run.go dispatch sends no pin, so the precheck and graphql arms ENABLE
-// auto-merge at h2 and the REST arm merges h2: 200, RED.
+// and the arm's refusal_basis, with nothing merged, nothing armed and the
+// claim released. The REST row then re-invokes: the gate and the fold re-run
+// at h2, where no approval qualifies, so 409 forge_approval_required — the
+// moved head is never merged unapproved. Counterfactual: gate.HeadSHA -> ""
+// at the merge_run.go dispatch sends no pin, so the unpinned ladder arms
+// auto-merge (an enable is recorded): RED.
 func TestMergeHeadPinE2E_Inline(t *testing.T) {
 	for _, arm := range mhpArms {
 		t.Run(arm.name, func(t *testing.T) {
 			w, _ := newMQEWorld(t)
 			r := w.faeInline("pin"+arm.name, faeGateSpecYAML)
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
-			p, merger := newMHPProxy(t, w, r, arm.mode)
+			p, merger := newMHPProxy(t, w, r)
 			w.srv.cfg.GateMerger = merger
 			arm.plant(p)
 			resp := w.mergeRun(r)
@@ -333,16 +276,16 @@ func TestMergeHeadPinE2E_Inline(t *testing.T) {
 				t.Fatalf("details = %v, want head_sha h1 refusal_basis %s", d, arm.basis)
 			}
 			// A declared gate folded, so the message names the evaluated
-			// approval (C2); only the forge-guaranteed bases say nothing merged
+			// approval (C2); both forge-guaranteed bases say nothing merged
 			// (C3).
 			if !strings.Contains(msg, "the approval was evaluated at") {
 				t.Fatalf("message = %q, want the evaluated-approval clause (declared gate)", msg)
 			}
-			if got, want := strings.Contains(msg, "Nothing merged"), mergeHeadMovedNothingApplied(arm.basis); got != want {
+			if got, want := strings.Contains(msg, "Nothing merged"), mergeHeadMovedNothingApplied(arm.basis); got != want || !want {
 				t.Fatalf("message nothing-merged claim = %v, want %v: %q", got, want, msg)
 			}
-			if got, want := strings.Contains(msg, "does not prove the forge applied nothing"), arm.claim == mergeDispatchUncertain; got != want {
-				t.Fatalf("message held-claim clause = %v, want %v: %q", got, want, msg)
+			if strings.Contains(msg, "does not prove the forge applied nothing") {
+				t.Fatalf("message = %q, want no held-claim clause (the basis is forge-guaranteed)", msg)
 			}
 			requireHeadPinRefused(t, w, r, p, arm, mergequeue.DispatchPathInline)
 			if arm.basis != githubclient.HeadMismatchRESTSha {
@@ -363,20 +306,21 @@ func TestMergeHeadPinE2E_Inline(t *testing.T) {
 	}
 }
 
-// TestMergeHeadPinE2E_InlineGateLessHappyPathPinned: a gate-less run (no
-// declared approval gate) whose merge-candidate gate admitted h1 is now pinned
-// too (the behaviour change): the enable carries expectedHeadOid h1, the
-// clean-status fallback PUT carries sha h1, and the PR merges.
+// TestMergeHeadPinE2E_InlineGateLessHappyPathPinned (X8): a gate-less run (no
+// declared approval gate) whose merge-candidate gate admitted h1 is pinned
+// too: no auto-merge enable, ONE synchronous PUT carrying sha h1, and the PR
+// merges.
 func TestMergeHeadPinE2E_InlineGateLessHappyPathPinned(t *testing.T) {
 	w, _ := newMQEWorld(t)
 	r := w.verified("gl", "h1")
-	p, merger := newMHPProxy(t, w, r, mhpCleanStatus)
+	p, merger := newMHPProxy(t, w, r)
+	p.setState("clean")
 	w.srv.cfg.GateMerger = merger
 	if resp := w.mergeRun(r); resp.Code != http.StatusOK {
 		t.Fatalf("merge = %d %s, want 200", resp.Code, resp.Body.String())
 	}
-	if e := p.calls(); len(e) != 1 || e[0].Pin != "h1" {
-		t.Fatalf("enables = %+v, want one pinned to h1", e)
+	if e := p.calls(); len(e) != 0 {
+		t.Fatalf("enables = %+v, want none (a head-pinned dispatch never arms auto-merge)", e)
 	}
 	if puts := w.gh.putCalls(); len(puts) != 1 || puts[0].SHA != "h1" {
 		t.Fatalf("PUTs = %+v, want one with sha h1", puts)
@@ -388,17 +332,15 @@ func TestMergeHeadPinE2E_InlineGateLessHappyPathPinned(t *testing.T) {
 	}
 }
 
-// TestMergeHeadPinE2E_Delegated: the same three arms on the delegated
-// may_merge arm are observe-only with nothing merged and the claim in the
-// arm's outcome (released: autoDriveNoteHeadMoved, the next tick re-gates at
-// the new head; dispatch_failed on graphql: autoDriveNoteHeadMovedBasisHeld,
-// held until reconciliation or the operator re-arm), and the head-moved log's
-// claim_outcome names that SETTLE outcome (approval condition C1). The mcq
-// fake reads the PR unmerged, so #4617's observe-before-settle falls through
-// to the head-moved arm. The run declares an approval gate, so the log's
-// pinned_to also names the evaluated approval (#4683). Counterfactual: liveHead -> "" in
-// dispatchAcceptanceGatedMerge flips the outcome to Acted (auto-merge enabled
-// at h2, or h2 merged), RED.
+// TestMergeHeadPinE2E_Delegated: the same arms on the delegated may_merge arm
+// are observe-only with nothing merged, nothing armed and the claim released
+// (autoDriveNoteHeadMoved, the next tick re-gates at the new head), and the
+// head-moved log's claim_outcome names that SETTLE outcome (approval condition
+// C1). The mcq fake reads the PR unmerged, so #4617's observe-before-settle
+// falls through to the head-moved arm. The run declares an approval gate, so
+// the log's pinned_to also names the evaluated approval (#4683).
+// Counterfactual: liveHead -> "" in dispatchAcceptanceGatedMerge flips the
+// outcome to Acted (auto-merge armed), RED.
 func TestMergeHeadPinE2E_Delegated(t *testing.T) {
 	for _, arm := range mhpArms {
 		t.Run(arm.name, func(t *testing.T) {
@@ -406,7 +348,7 @@ func TestMergeHeadPinE2E_Delegated(t *testing.T) {
 			logs := mhpCaptureLogs(w)
 			r := w.faeDelegated("dpin" + arm.name)
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
-			p, merger := newMHPProxy(t, w, r, arm.mode)
+			p, merger := newMHPProxy(t, w, r)
 			arm.plant(p)
 			requireObserveOnly(t, w.admqDrive(r, merger), arm.note)
 			requireHeadPinRefused(t, w, r, p, arm, mergequeue.DispatchPathDelegated)
@@ -416,6 +358,244 @@ func TestMergeHeadPinE2E_Delegated(t *testing.T) {
 			}
 			if got, _ := rec["pinned_to"].(string); !strings.Contains(got, "the approval was evaluated at") {
 				t.Fatalf("head-moved log pinned_to = %q, want the evaluated-approval clause (declared gate)", got)
+			}
+		})
+	}
+}
+
+// requireNeverArmed asserts the #4676 property after a write-access push: no
+// auto-merge was armed, so firing "armed" merges nothing and the PR stays
+// unmerged at its moved head.
+func requireNeverArmed(t *testing.T, w *mqmWorld, r *mcqRun, p *mhpProxy) {
+	t.Helper()
+	p.moveHead()
+	if head := p.fireArmed(); head != "" {
+		t.Fatalf("an armed auto-merge fired at %s after the push; want nothing armed (enables %+v)", head, p.calls())
+	}
+	var merged bool
+	w.gh.set(func() { merged = w.gh.prs[r.pr].merged })
+	if merged {
+		t.Fatal("PR merged; want it unmerged (the pushed head was never judged)")
+	}
+	if e := p.calls(); len(e) != 0 {
+		t.Fatalf("enables = %+v, want none", e)
+	}
+}
+
+// requireNotMergeReady409 asserts a 409 merge_checks_pending reason
+// not_merge_ready and returns its details.
+func requireNotMergeReady409(t *testing.T, resp *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	code, _, d := mqeErrorDetails(t, resp.Body.Bytes())
+	if resp.Code != http.StatusConflict || code != "merge_checks_pending" || d["reason"] != "not_merge_ready" {
+		t.Fatalf("merge = %d %s, want 409 merge_checks_pending reason not_merge_ready", resp.Code, resp.Body.String())
+	}
+	return d
+}
+
+// TestMergeHeadPinE2E_PinnedNeverArmsAutoMerge is the #4676 cross-boundary
+// pin: a head-pinned dispatch, inline and delegated, never arms a GitHub
+// auto-merge, so a write-access push after the dispatch can never fire a merge
+// at a head the forge-approval fold never judged.
+//
+//   - inline / delegated serve an EMPTY mergeable_state at h1, so the server
+//     pre-read FALLS THROUGH and the leaf is the only control on the path (the
+//     pre-read cannot mask C27): the leaf refuses not-merge-ready with nothing
+//     sent and the claim is released (one released settle row, no claim row:
+//     C31 reads that committed state). The head then moves to h2 and the proxy
+//     fires anything armed: nothing is, so the PR stays unmerged.
+//   - control proves the fixture: an unpinned enable through the same proxy IS
+//     armed, survives the push and merges h2.
+//   - inline_pre_read serves blocked at h1: the server pre-read refuses
+//     before the claim, so ZERO claim rows and ZERO settle rows.
+//
+// Counterfactual C27: routing QueueMerge's pinned arm to EnableAutoMerge arms
+// auto-merge at h1, the inline merge answers 200, and the fire after the push
+// merges h2: RED.
+func TestMergeHeadPinE2E_PinnedNeverArmsAutoMerge(t *testing.T) {
+	t.Run("inline", func(t *testing.T) {
+		w, _ := newMQEWorld(t)
+		r := w.faeInline("never", faeGateSpecYAML)
+		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+		p, merger := newMHPProxy(t, w, r)
+		w.srv.cfg.GateMerger = merger
+		d := requireNotMergeReady409(t, w.mergeRun(r))
+		if d["head_sha"] != "h1" {
+			t.Fatalf("details = %v, want head_sha h1", d)
+		}
+		if puts := w.gh.putCalls(); len(puts) != 0 {
+			t.Fatalf("PUTs = %+v, want none", puts)
+		}
+		if st, _ := w.claim(r); st != "" {
+			t.Fatalf("claim = %q, want released (no row): the leaf refused before any PUT", st)
+		}
+		settled := w.rows(r, categoryMergeDispatchSettled)
+		if len(settled) != 1 || w.payload(settled[0])["outcome"] != string(mergeDispatchRelease) {
+			t.Fatalf("merge_dispatch_settled rows = %d, want one released", len(settled))
+		}
+		requireNeverArmed(t, w, r, p)
+		// The re-invoke at the pushed head re-runs the gate and the fold at
+		// h2, where no approval qualifies.
+		again := w.mergeRun(r)
+		if again.Code != http.StatusConflict {
+			t.Fatalf("re-invoke at h2 = %d %s, want 409 %s", again.Code, again.Body.String(), mergeCodeForgeApprovalRequired)
+		}
+		faeRefusal(t, again.Body.Bytes())
+	})
+	t.Run("delegated", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r := w.faeDelegated("dnever")
+		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+		p, merger := newMHPProxy(t, w, r)
+		out := w.admqDrive(r, merger)
+		if out.Acted || out.MergeNotReady == nil || out.MergeNotReady.ClaimOutcome != autoDriveClaimOutcomeReleased {
+			t.Fatalf("outcome = %+v (merge_not_ready %+v), want observe-only not-merge-ready, claim released", out, out.MergeNotReady)
+		}
+		if st, _ := w.claim(r); st != "" {
+			t.Fatalf("claim = %q, want released (no row)", st)
+		}
+		if puts := w.gh.putCalls(); len(puts) != 0 {
+			t.Fatalf("PUTs = %+v, want none", puts)
+		}
+		requireNeverArmed(t, w, r, p)
+	})
+	t.Run("control", func(t *testing.T) {
+		w, _ := newMQEWorld(t)
+		r := w.faeInline("ctl", faeGateSpecYAML)
+		p, _ := newMHPProxy(t, w, r)
+		// The unpinned enable is the pre-#4676 pinned path's effect (an
+		// auto-merge armed on the PR); the mcq fake routes any owner/repo.
+		if err := w.srv.cfg.GitHub.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(1),
+			githubclient.RepoRef{Owner: "x", Name: "y"}, r.pr, forge.MergeMethodSquash); err != nil {
+			t.Fatalf("EnableAutoMerge: %v", err)
+		}
+		p.moveHead()
+		if head := p.fireArmed(); head != "h2" {
+			t.Fatalf("fireArmed = %q, want h2 (the fixture must merge the pushed head when anything is armed)", head)
+		}
+	})
+	t.Run("inline_pre_read", func(t *testing.T) {
+		w, _ := newMQEWorld(t)
+		r := w.faeInline("preread", faeGateSpecYAML)
+		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+		p, merger := newMHPProxy(t, w, r)
+		p.setState("blocked")
+		w.srv.cfg.GateMerger = merger
+		d := requireNotMergeReady409(t, w.mergeRun(r))
+		if d["mergeable_state"] != "blocked" || d["resumable"] != true {
+			t.Fatalf("details = %v, want mergeable_state blocked resumable true", d)
+		}
+		if st, _ := w.claim(r); st != "" {
+			t.Fatalf("claim = %q, want none (the pre-read refuses before the claim)", st)
+		}
+		if n := len(w.rows(r, categoryMergeDispatchSettled)); n != 0 {
+			t.Fatalf("merge_dispatch_settled rows = %d, want 0", n)
+		}
+		if puts := w.gh.putCalls(); len(puts) != 0 {
+			t.Fatalf("PUTs = %+v, want none", puts)
+		}
+		requireNeverArmed(t, w, r, p)
+	})
+}
+
+// TestMergeHeadPinE2E_PinnedMergeStates walks each mergeable_state class end
+// to end on a gate-less pinned inline run (#4676): only clean and has_hooks
+// send the PUT; unstable keeps checks_pending (CC5); the other states answer
+// not_merge_ready from the server pre-read with no claim (resumable per
+// state); an empty state falls through the pre-read and the LEAF refuses,
+// releasing its claim; a 405 on the PUT keeps the 502 (X1) and releases; and
+// dirty is refused by the #3109 conflict guard BEFORE the verdict (Z1).
+// No row ever records an auto-merge enable.
+func TestMergeHeadPinE2E_PinnedMergeStates(t *testing.T) {
+	cases := []struct {
+		name      string
+		state     string
+		putStatus int
+		status    int
+		code      string
+		reason    string
+		resumable any // nil = not asserted
+		puts      int
+		settled   int // released settle rows
+		verdicts  int
+		merged    bool
+	}{
+		{name: "clean", state: "clean", status: http.StatusOK, puts: 1, verdicts: 1, merged: true},
+		{name: "has_hooks", state: "has_hooks", status: http.StatusOK, puts: 1, verdicts: 1, merged: true},
+		{name: "unstable", state: "unstable", status: http.StatusConflict, code: "merge_checks_pending", reason: "checks_pending", verdicts: 1},
+		{name: "blocked", state: "blocked", status: http.StatusConflict, code: "merge_checks_pending", reason: "not_merge_ready", resumable: true, verdicts: 1},
+		{name: "unknown", state: "unknown", status: http.StatusConflict, code: "merge_checks_pending", reason: "not_merge_ready", resumable: true, verdicts: 1},
+		{name: "behind", state: "behind", status: http.StatusConflict, code: "merge_checks_pending", reason: "not_merge_ready", resumable: false, verdicts: 1},
+		{name: "draft", state: "draft", status: http.StatusConflict, code: "merge_checks_pending", reason: "not_merge_ready", resumable: false, verdicts: 1},
+		{name: "empty_leaf", state: "", status: http.StatusConflict, code: "merge_checks_pending", reason: "not_merge_ready", settled: 1, verdicts: 1},
+		{name: "put_405", state: "clean", putStatus: http.StatusMethodNotAllowed, status: http.StatusBadGateway, code: "merge_dispatch_failed", puts: 1, settled: 1, verdicts: 1},
+		{name: "dirty_guard_first", state: "dirty", status: http.StatusConflict, code: "merge_conflicting"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, _ := newMQEWorld(t)
+			r := w.verified("st"+tc.name, "h1")
+			p, merger := newMHPProxy(t, w, r)
+			p.setState(tc.state)
+			if tc.putStatus != 0 {
+				w.gh.set(func() { w.gh.putStatus[r.pr] = tc.putStatus })
+			}
+			w.srv.cfg.GateMerger = merger
+			resp := w.mergeRun(r)
+			if resp.Code != tc.status {
+				t.Fatalf("merge = %d %s, want %d", resp.Code, resp.Body.String(), tc.status)
+			}
+			if tc.code != "" {
+				code, msg, d := mqeErrorDetails(t, resp.Body.Bytes())
+				if code != tc.code {
+					t.Fatalf("code = %q (%s), want %q", code, resp.Body.String(), tc.code)
+				}
+				if tc.reason != "" && d["reason"] != tc.reason {
+					t.Fatalf("details.reason = %v, want %s", d["reason"], tc.reason)
+				}
+				if tc.resumable != nil && d["resumable"] != tc.resumable {
+					t.Fatalf("details.resumable = %v, want %v", d["resumable"], tc.resumable)
+				}
+				if tc.code == "merge_dispatch_failed" && (!strings.Contains(msg, "merge method squash") || strings.Contains(resp.Body.String(), "not_merge_ready")) {
+					t.Fatalf("502 message = %q, want the resolved method named and no not_merge_ready", msg)
+				}
+			}
+			puts := w.gh.putCalls()
+			if len(puts) != tc.puts {
+				t.Fatalf("PUTs = %+v, want %d", puts, tc.puts)
+			}
+			for _, put := range puts {
+				if put.SHA != "h1" {
+					t.Fatalf("PUT sha = %q, want h1", put.SHA)
+				}
+			}
+			if e := p.calls(); len(e) != 0 {
+				t.Fatalf("enables = %+v, want none", e)
+			}
+			st, _ := w.claim(r)
+			if tc.merged {
+				if st != string(mergequeue.DispatchDispatched) {
+					t.Fatalf("claim = %q, want dispatched (merged)", st)
+				}
+			} else if st != "" {
+				t.Fatalf("claim = %q, want none (refused before the claim, or released)", st)
+			}
+			settled := w.rows(r, categoryMergeDispatchSettled)
+			if len(settled) != tc.settled {
+				t.Fatalf("merge_dispatch_settled rows = %d, want %d", len(settled), tc.settled)
+			}
+			for _, e := range settled {
+				if w.payload(e)["outcome"] != string(mergeDispatchRelease) {
+					t.Fatalf("settled payload = %v, want released", w.payload(e))
+				}
+			}
+			if n := len(w.rows(r, CategoryMergeVerdictRecorded)); n != tc.verdicts {
+				t.Fatalf("merge_verdict_recorded rows = %d, want %d", n, tc.verdicts)
+			}
+			var merged bool
+			w.gh.set(func() { merged = w.gh.prs[r.pr].merged })
+			if merged != tc.merged {
+				t.Fatalf("PR merged = %v, want %v", merged, tc.merged)
 			}
 		})
 	}
@@ -439,7 +619,7 @@ func TestMergeHeadPinE2E_ReleaseFailureReportsSettledClaim(t *testing.T) {
 		w.srv.cfg.MergeQueue = mqeReleaseFailQueue{Store: w.store}
 		r := w.faeInline("relfail", faeGateSpecYAML)
 		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
-		p, merger := newMHPProxy(t, w, r, arm.mode)
+		p, merger := newMHPProxy(t, w, r)
 		w.srv.cfg.GateMerger = merger
 		arm.plant(p)
 		resp := w.mergeRun(r)
@@ -466,73 +646,13 @@ func TestMergeHeadPinE2E_ReleaseFailureReportsSettledClaim(t *testing.T) {
 		logs := mhpCaptureLogs(w)
 		r := w.faeDelegated("drelfail")
 		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
-		p, merger := newMHPProxy(t, w, r, arm.mode)
+		p, merger := newMHPProxy(t, w, r)
 		arm.plant(p)
 		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMovedReleaseFailed)
 		requireHeadPinRefused(t, w, r, p, arm, mergequeue.DispatchPathDelegated)
 		if got := mhpHeadMovedClaimOutcome(t, logs); got != string(mergeDispatchUncertain) {
 			t.Fatalf("head-moved log claim_outcome = %q, want dispatch_failed (the settle outcome)", got)
 		}
-	})
-}
-
-// TestMergeHeadPinE2E_AppliedEnableErrorKeepsClaim is the issue-mandated
-// applied-then-error fake (#4749): the pinned enable at h1 is APPLIED, the
-// head then moves to h2, and the forge answers a GraphQL error, so the client
-// reports graphql_reread. The claim must be HELD dispatch_failed: an approval
-// is then planted at h2 so the fold approves the new head (it cannot mask the
-// claim), and the re-invoke (inline: 409 merge_already_dispatched) / next tick
-// (delegated: observe-only already claimed) never sends a second enable.
-// Counterfactual: mergeDispatchHeadMismatchUncertain returning false releases
-// the claim, so the re-invoke re-claims and enables again at h2, RED.
-func TestMergeHeadPinE2E_AppliedEnableErrorKeepsClaim(t *testing.T) {
-	requireApplied := func(t *testing.T, w *mqmWorld, r *mcqRun, p *mhpProxy, path string) {
-		t.Helper()
-		enables := p.calls()
-		if len(enables) != 1 || !enables[0].Applied || enables[0].Pin != "h1" || enables[0].AppliedHead != "h1" {
-			t.Fatalf("enables = %+v, want exactly one, pinned and applied at h1", enables)
-		}
-		var merged bool
-		w.gh.set(func() { merged = w.gh.prs[r.pr].merged })
-		if merged {
-			t.Fatal("the PR merged; want it unmerged")
-		}
-		if st, cp := w.claim(r); st != string(mergequeue.DispatchFailed) || cp != path {
-			t.Fatalf("claim = %q/%q, want dispatch_failed/%s", st, cp, path)
-		}
-	}
-	t.Run("inline", func(t *testing.T) {
-		w, _ := newMQEWorld(t)
-		r := w.faeInline("applerr", faeGateSpecYAML)
-		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
-		p, merger := newMHPProxy(t, w, r, mhpApplyThenError)
-		w.srv.cfg.GateMerger = merger
-		resp := w.mergeRun(r)
-		code, msg, d := mqeErrorDetails(t, resp.Body.Bytes())
-		if resp.Code != http.StatusConflict || code != mergeCodeHeadMoved || d["refusal_basis"] != githubclient.HeadMismatchGraphQLReread {
-			t.Fatalf("merge = %d %s, want 409 %s refusal_basis graphql_reread", resp.Code, resp.Body.String(), mergeCodeHeadMoved)
-		}
-		if !strings.Contains(msg, "does not prove the forge applied nothing") {
-			t.Fatalf("message = %q, want the held claim named", msg)
-		}
-		requireApplied(t, w, r, p, mergequeue.DispatchPathInline)
-		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "carol", "APPROVED", "h2"))
-		again := w.mergeRun(r)
-		if again.Code != http.StatusConflict || mqeCode(t, again.Body.Bytes()) != "merge_already_dispatched" {
-			t.Fatalf("re-invoke at h2 = %d %s, want 409 merge_already_dispatched", again.Code, again.Body.String())
-		}
-		requireApplied(t, w, r, p, mergequeue.DispatchPathInline)
-	})
-	t.Run("delegated", func(t *testing.T) {
-		w := newMQMWorld(t)
-		r := w.faeDelegated("dapplerr")
-		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
-		p, merger := newMHPProxy(t, w, r, mhpApplyThenError)
-		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMovedBasisHeld)
-		requireApplied(t, w, r, p, mergequeue.DispatchPathDelegated)
-		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "carol", "APPROVED", "h2"))
-		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteAlreadyClaimed)
-		requireApplied(t, w, r, p, mergequeue.DispatchPathDelegated)
 	})
 }
 
