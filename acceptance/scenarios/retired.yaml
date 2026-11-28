@@ -19,3 +19,8 @@ retired:
       run_id: 64c8b41c-6233-40dc-935c-1c84c910496b
       pr: 5583
       retired_at: "2026-11-25T18:57:09Z"
+    - id: scenario:issue-4241/dispatch-description-states-capacity
+      reason: 'Superseded by ADR-094 Amendment A4 (#5608, ratified 2026-11-27): only a capacity-bound queued waiter reserves a capacity slot, and the capacity 3 vs 4 example is withdrawn. This run''s dispatch-stage-description-states-capacity-bound criterion replaces it.'
+      run_id: 6b7476bf-5ffe-48ee-86f6-5ebfdfd8a7a6
+      pr: 5628
+      retired_at: "2026-11-28T03:47:09Z"
