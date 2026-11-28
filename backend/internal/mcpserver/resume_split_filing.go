@@ -73,7 +73,9 @@ What it refuses (each is a tool error carrying the backend code verbatim):
     artifact changed after the plan gate closed.
   - plan_not_approved (409, details.reason) — the run's own plan stage is not
     succeeded, has no approval gate, or carries no approve decision.
-  - no_split_proposal (409) — the run's own plan artifact carries no split.
+  - no_split_proposal (409, details.reason) — the run's own plan artifact is
+    absent (no_plan_artifact), not valid plan JSON (plan_artifact_undecodable)
+    or carries no split (no_split_proposal).
   - split_filing_in_progress (409) — a filing for this run is still running.
   - split_filing_refused (409) — the filing was refused (an over-cap phase).
   - split_filing_no_parent_issue / split_filing_repo_malformed (409).

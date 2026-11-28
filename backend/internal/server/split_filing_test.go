@@ -56,13 +56,16 @@ type splitFileProvider struct {
 	// that call until park is closed, after closing parked. onFile runs after
 	// a successful call, outside mu. ctxHonouring fails a call whose ctx is
 	// already done, as a real forge client does. panicOnCall panics.
-	attempts     atomic.Int64
-	parkOnCall   int
-	park         chan struct{}
-	parked       chan struct{}
-	onFile       func(call int)
-	ctxHonouring bool
-	panicOnCall  int
+	// parkHonoursCtx makes the parked call also return ctx.Err() when its ctx
+	// ends first, so a budget expiry (not only releasePark) can end it.
+	attempts       atomic.Int64
+	parkOnCall     int
+	park           chan struct{}
+	parked         chan struct{}
+	onFile         func(call int)
+	ctxHonouring   bool
+	panicOnCall    int
+	parkHonoursCtx bool
 }
 
 func (p *splitFileProvider) Name() string { return p.name }
@@ -80,7 +83,15 @@ func (p *splitFileProvider) File(ctx context.Context, req workmgmt.ProviderReque
 	}
 	if p.parkOnCall != 0 && n == p.parkOnCall {
 		close(p.parked)
-		<-p.park
+		if p.parkHonoursCtx {
+			select {
+			case <-p.park:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		} else {
+			<-p.park
+		}
 	}
 	created, err := p.file(req)
 	if err == nil && p.onFile != nil {
@@ -357,18 +368,20 @@ type splitFilingConfig struct {
 	epicChildren    []workmgmt.EpicChild
 	epicChildrenErr error
 
-	// #3925 options. approvalGate gives the plan stage RequiresApproval and
-	// wires a fake ApprovalRepo; the stage starts at awaiting_approval, or —
+	// #3925 options. approvalGate gives the plan stage RequiresApproval (every
+	// harness wires a fake ApprovalRepo); the stage starts at awaiting_approval, or —
 	// with approvedAlready — at succeeded with EndedAt and one approve row
 	// seeded BY CONSTRUCTION. The promptRunRepo does not stamp ended_at the
 	// way postgres does, so the harness stamps it on every terminal transition.
 	approvalGate    bool
 	approvedAlready bool
-	// parkOnCall / onFile / ctxHonouring / panicOnCall configure the provider.
-	parkOnCall   int
-	onFile       func(call int)
-	ctxHonouring bool
-	panicOnCall  int
+	// parkOnCall / onFile / ctxHonouring / panicOnCall / parkHonoursCtx
+	// configure the provider.
+	parkOnCall     int
+	onFile         func(call int)
+	ctxHonouring   bool
+	panicOnCall    int
+	parkHonoursCtx bool
 	// planLoadErr makes the artifact repo's ListForStage fail.
 	planLoadErr error
 	// parentRun: the run's own plan stage carries NO artifact and ParentRunID
@@ -381,6 +394,9 @@ type splitFilingConfig struct {
 	// base+1m, so the artifact predates the gate's close.
 	artifactAt time.Time
 	endedAt    time.Time
+	// approvedAt seeds the seeded approve row's SubmittedAt (the database
+	// clock) BY CONSTRUCTION; zero defaults to endedAt.
+	approvedAt time.Time
 }
 
 // splitFixtureBase is the fixed clock the harness assigns timestamps from.
@@ -395,7 +411,7 @@ type splitFilingHarness struct {
 	querier   *splitQueryProvider // nil unless cfg.withQuerier
 	runID     uuid.UUID
 	planStage *run.Stage
-	// #3925: art is the artifact repo, ar the approval repo (approvalGate),
+	// #3925: art is the artifact repo, ar the approval repo (always wired),
 	// planArtifact the seeded split artifact, parentRunID the parentRun
 	// option's parent, logs the WARN/ERROR capture.
 	art          *fakeArtifactRepo
@@ -520,7 +536,8 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	provider := &splitFileProvider{
 		name: workmgmt.Default().Provider, failOnCall: cfg.providerFailOnCall,
 		parkOnCall: cfg.parkOnCall, onFile: cfg.onFile, ctxHonouring: cfg.ctxHonouring, panicOnCall: cfg.panicOnCall,
-		park: make(chan struct{}), parked: make(chan struct{}),
+		parkHonoursCtx: cfg.parkHonoursCtx,
+		park:           make(chan struct{}), parked: make(chan struct{}),
 	}
 	var querier *splitQueryProvider
 	if cfg.withQuerier {
@@ -560,18 +577,31 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 		endedAt = splitFixtureBase.Add(time.Minute)
 	}
 	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded, EndedAt: &endedAt}
-	var ar *fakeApprovalRepo
+	// Every harness wires an approval repo: the split loader reads the earliest
+	// approve row as the database-clock witness of the gate's close, and fails
+	// closed without one. A stage that starts succeeded carries one approve row
+	// submitted at approvedAt (default endedAt) BY CONSTRUCTION.
+	ar := newFakeApprovalRepo()
+	approvedAt := cfg.approvedAt
+	if approvedAt.IsZero() {
+		approvedAt = endedAt
+	}
+	seedApprove := func() {
+		ar.all = append(ar.all, &approval.Approval{
+			ID: uuid.New(), StageID: planStageID, ApproverSubject: "seed-approver",
+			Decision: approval.DecisionApprove, SubmittedAt: approvedAt,
+		})
+	}
+	if !cfg.approvalGate {
+		seedApprove()
+	}
 	if cfg.approvalGate {
-		ar = newFakeApprovalRepo()
 		planStage.RequiresApproval = true
 		if !cfg.approvedAlready {
 			planStage.State = run.StageStateAwaitingApproval
 			planStage.EndedAt = nil
 		} else {
-			ar.all = append(ar.all, &approval.Approval{
-				ID: uuid.New(), StageID: planStageID, ApproverSubject: "seed-approver",
-				Decision: approval.DecisionApprove, SubmittedAt: endedAt,
-			})
+			seedApprove()
 		}
 		// promptRunRepo does not stamp ended_at; postgres does on every
 		// terminal entry (and not on a same-state short-circuit).
@@ -620,9 +650,7 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	logs := &syncBuffer{}
 	scfg := Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
-	if ar != nil {
-		scfg.ApprovalRepo = ar
-	}
+	scfg.ApprovalRepo = ar
 	s := New(scfg)
 	// V5: no detached filer may outlive its test and file against the NEXT
 	// test's provider through the process-global workmgmt registry.

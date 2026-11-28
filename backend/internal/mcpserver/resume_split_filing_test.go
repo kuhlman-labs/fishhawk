@@ -288,8 +288,12 @@ func TestResumeSplitFiling_RealServerDecodes202(t *testing.T) {
 			t.Fatalf("plan stage → %s: %v", to, err)
 		}
 	}
-	// The artifact is created BEFORE the stage succeeds, so its created_at
-	// precedes the stage's EndedAt (the AA1 binding).
+	// The artifact is created BEFORE the approve row and the stage success. Its
+	// created_at is the DATABASE's now() while EndedAt is stamped from this
+	// process's clock, so the AA1 EndedAt check compares two clocks: wait until
+	// this process's clock has passed the artifact's created_at before the
+	// stage succeeds, so a database clock running ahead of the test process
+	// cannot refuse the resume. The approve-row check is database-clock only.
 	sv := "standard_v1"
 	art, err := artRepo.Create(ctx, artifact.CreateParams{
 		StageID: st.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: resumeSplitPlanJSON(t),
@@ -297,6 +301,7 @@ func TestResumeSplitFiling_RealServerDecodes202(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create plan artifact: %v", err)
 	}
+	waitClockPast(t, art.CreatedAt, 10*time.Second)
 	if _, err := apprRepo.Submit(ctx, approval.SubmitParams{
 		StageID: st.ID, ApproverSubject: "github:op", Decision: approval.DecisionApprove, Surface: approval.SurfaceAPI,
 	}); err != nil {
@@ -326,6 +331,19 @@ func TestResumeSplitFiling_RealServerDecodes202(t *testing.T) {
 	}
 	if art.ID == uuid.Nil {
 		t.Error("seeded plan artifact has no id")
+	}
+}
+
+// waitClockPast blocks until this process's clock is strictly after at, a
+// database-assigned timestamp, failing when the skew exceeds bound.
+func waitClockPast(t *testing.T, at time.Time, bound time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for !time.Now().After(at) {
+		if time.Now().After(deadline) {
+			t.Fatalf("database clock leads this process by more than %v (created_at %v); the fixture cannot order the two clocks", bound, at)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

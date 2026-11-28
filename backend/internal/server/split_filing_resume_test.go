@@ -290,9 +290,125 @@ func TestResumeSplitFiling_ParentSplitPlanOnly409(t *testing.T) {
 }
 
 // TestResumeSplitFiling_UndecodableOwnArtifact409 is a response-mode check.
+// It pins the reason too: an own artifact that exists but is not plan JSON is
+// plan_artifact_undecodable, never conflated with no_plan_artifact.
 func TestResumeSplitFiling_UndecodableOwnArtifact409(t *testing.T) {
 	h := newResumeHarness(t, func(c *splitFilingConfig) { c.planOverride = []byte("not json") })
-	wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodeNoSplit)
+	eb := wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodeNoSplit)
+	if eb.Details["reason"] != "plan_artifact_undecodable" {
+		t.Errorf("details.reason = %v, want plan_artifact_undecodable", eb.Details["reason"])
+	}
+}
+
+// TestResumeSplitFiling_ArtifactAfterFirstApproveOnDBClock409: the artifact
+// predates EndedAt on the daemon clock but postdates the earliest approve row
+// on the database clock (the clock artifacts.created_at uses). A later
+// re-approval row (base+2m) cannot widen the bound: the EARLIEST row decides.
+// Refused naming the approve-row time; nothing filed.
+func TestResumeSplitFiling_ArtifactAfterFirstApproveOnDBClock409(t *testing.T) {
+	h := newResumeHarness(t, func(c *splitFilingConfig) {
+		c.artifactAt = splitFixtureBase.Add(30 * time.Second)
+		c.endedAt = splitFixtureBase.Add(time.Minute)
+		c.approvedAt = splitFixtureBase.Add(10 * time.Second)
+	})
+	h.ar.all = append(h.ar.all, &approval.Approval{
+		ID: uuid.New(), StageID: h.planStage.ID, ApproverSubject: "late-reapprover",
+		Decision: approval.DecisionApprove, SubmittedAt: splitFixtureBase.Add(2 * time.Minute),
+	})
+	eb := wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodePlanChanged)
+	if eb.Details["first_approve_submitted_at"] != "2026-11-01T12:00:10Z" {
+		t.Errorf("details.first_approve_submitted_at = %v, want 2026-11-01T12:00:10Z", eb.Details["first_approve_submitted_at"])
+	}
+	if eb.Details["artifact_id"] != h.planArtifact.ID.String() {
+		t.Errorf("details.artifact_id = %v, want %s", eb.Details["artifact_id"], h.planArtifact.ID)
+	}
+}
+
+// TestResumeSplitFiling_StoreReadErrors (77a8e926 a-c): each read before the
+// claim surfaces its error as 500 internal_error with nothing recorded,
+// launched or held.
+func TestResumeSplitFiling_StoreReadErrors(t *testing.T) {
+	t.Run("get_run", func(t *testing.T) {
+		h := newResumeHarness(t, nil)
+		h.rr.runErr = errors.New("run store down")
+		wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusInternalServerError, "internal_error")
+	})
+	t.Run("list_stages", func(t *testing.T) {
+		h := newResumeHarness(t, nil)
+		h.rr.stagesByRunID = nil // promptRunRepo answers ListStagesForRun with an error
+		wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusInternalServerError, "internal_error")
+	})
+	t.Run("list_approvals", func(t *testing.T) {
+		h := newResumeHarness(t, nil)
+		h.s.cfg.ApprovalRepo = &listErrApprovalRepo{fakeApprovalRepo: h.ar, err: errors.New("approval store down")}
+		wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusInternalServerError, "internal_error")
+	})
+}
+
+// listErrApprovalRepo fails ListForStage; every other method is the fake's.
+type listErrApprovalRepo struct {
+	*fakeApprovalRepo
+	err error
+}
+
+func (l *listErrApprovalRepo) ListForStage(context.Context, uuid.UUID) ([]*approval.Approval, error) {
+	return nil, l.err
+}
+
+// TestResumeSplitFiling_PlanStageSelection (af3bb039, 77a8e926 d): the run's
+// NEWEST plan stage decides. An older succeeded, approved stage carries the
+// split artifact; a newer plan stage (listed second, so a first-match pick
+// would take the older one) is still awaiting approval. Refused with nothing
+// filed. A run with no plan stage at all is refused no_plan_stage.
+func TestResumeSplitFiling_PlanStageSelection(t *testing.T) {
+	t.Run("newest_not_succeeded", func(t *testing.T) {
+		h := newResumeHarness(t, nil)
+		h.planStage.CreatedAt = splitFixtureBase
+		newer := &run.Stage{
+			ID: uuid.New(), RunID: h.runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval,
+			RequiresApproval: true, CreatedAt: splitFixtureBase.Add(time.Hour),
+		}
+		h.rr.getStages[newer.ID] = newer
+		h.rr.stagesByRunID[h.runID] = []*run.Stage{h.planStage, newer}
+		eb := wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodeNotApproved)
+		if eb.Details["reason"] != "plan_stage_not_succeeded" || eb.Details["stage_id"] != newer.ID.String() {
+			t.Errorf("details = %v, want reason plan_stage_not_succeeded on the newer stage %s", eb.Details, newer.ID)
+		}
+	})
+	t.Run("no_plan_stage", func(t *testing.T) {
+		h := newResumeHarness(t, nil)
+		h.rr.stagesByRunID[h.runID] = []*run.Stage{{ID: uuid.New(), RunID: h.runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}}
+		eb := wantResumeRefused(t, h, h.resume(t, resumeOperatorID()), http.StatusConflict, splitFilingResumeCodeNotApproved)
+		if eb.Details["reason"] != "no_plan_stage" {
+			t.Errorf("details.reason = %v, want no_plan_stage", eb.Details["reason"])
+		}
+	})
+}
+
+// TestResumeSplitFiling_AdmittedPrincipals (77a8e926 e, c3d3633f): pins who
+// the verb ADMITS beyond a plain operator token. A cookie session (no
+// TokenID) passes the scope rung without write:approvals, bounded only by the
+// memberWrite account tier; a delegated operator-agent token holding
+// write:approvals is admitted — the verb applies no approver-eligibility gate
+// and files only what a recorded approval authorized.
+func TestResumeSplitFiling_AdmittedPrincipals(t *testing.T) {
+	for name, id := range map[string]Identity{
+		"cookie_session":           {Subject: "github:op", UserID: "user-op", SessionID: "sess-op", AccountID: "acct-op"},
+		"delegated_operator_agent": {Subject: "operator-agent/operator-role-v0", TokenID: "tok-agent", Scopes: []string{"write:approvals"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newResumeHarness(t, nil)
+			resp := decodeResumeResponse(t, h.resume(t, id), http.StatusAccepted)
+			if resp.State != splitFilingResumeStateResuming {
+				t.Errorf("state = %q, want resuming", resp.State)
+			}
+			h.s.waitSplitFiling()
+			entries, _ := h.resumeEntries(t)
+			if len(entries) != 1 || entries[0].Actor != id.Subject {
+				t.Errorf("attribution entries = %+v, want one by %s", entries, id.Subject)
+			}
+		})
+	}
 }
 
 // TestResumeSplitFiling_PlanChangedSinceApproval409 (AA1): the stage succeeded

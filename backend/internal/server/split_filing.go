@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -262,18 +264,21 @@ const (
 	splitPlanUndecodable
 	// splitPlanChangedSinceApproval: the newest own artifact was created after
 	// the stage's EndedAt — the transition that actually succeeded the plan
-	// stage — or the stage records no EndedAt at all, so no artifact can be
-	// shown to predate the gate's close (AA1).
+	// stage — or after the stage's earliest approve row, or the stage records
+	// no EndedAt or no approve row at all, so no artifact can be shown to
+	// predate the gate's close (AA1).
 	splitPlanChangedSinceApproval
 )
 
 // splitPlanSource is the PINNED plan a split filing files from: the plan
 // stage's own newest plan artifact, with the id and creation time a caller can
-// name, and the stage EndedAt it was bound against.
+// name, the stage EndedAt it was bound against, and the earliest approve row's
+// submitted_at (the database-clock witness of the gate's close).
 type splitPlanSource struct {
 	artifactID uuid.UUID
 	createdAt  time.Time
 	boundAt    time.Time
+	approvedAt time.Time
 	plan       *plan.Plan
 }
 
@@ -290,6 +295,20 @@ type splitPlanSource struct {
 // plan uploaded after the gate closed can never be filed by re-approving it.
 // Approval rows record no artifact id or hash, which is why the binding is
 // temporal.
+//
+// EndedAt is stamped from the daemon's clock (run.transitionStageTx) while
+// artifacts.created_at is the database's now(), so the EndedAt comparison alone
+// mixes two clocks: a daemon clock that leads the database's would admit an
+// artifact uploaded just after the gate closed. The binding is therefore also
+// checked on the database clock alone: the artifact must be no later than the
+// stage's EARLIEST approve row (approvals.submitted_at, also the database's
+// now()). The approve that closes a plan gate is recorded before the stage
+// transition, so the earliest approve row never postdates the close, and a
+// later row (a same-state re-approval, an uncounted delegated or agent row)
+// can only be later than it, so it never moves this bound. An earlier row (a
+// quorum's first vote, a vote cast before a plan revise) makes the check
+// stricter: fail closed, never open. No approve row at all, or no
+// ApprovalRepo, refuses the same way.
 //
 // An IO error returns err; every other non-OK case returns a status.
 func (s *Server) loadSplitPlanForStage(ctx context.Context, stage *run.Stage) (splitPlanSource, splitPlanStatus, error) {
@@ -310,13 +329,33 @@ func (s *Server) loadSplitPlanForStage(ctx context.Context, stage *run.Stage) (s
 		return splitPlanSource{}, splitPlanNoArtifact, nil
 	}
 	src := splitPlanSource{artifactID: picked.ID, createdAt: picked.CreatedAt}
-	if stage.EndedAt == nil || picked.CreatedAt.After(*stage.EndedAt) {
-		if stage.EndedAt != nil {
-			src.boundAt = *stage.EndedAt
+	if stage.EndedAt != nil {
+		src.boundAt = *stage.EndedAt
+	}
+	if s.cfg.ApprovalRepo == nil {
+		return src, 0, errors.New("approval repository not configured; the gate-close witness cannot be read")
+	}
+	rows, err := s.cfg.ApprovalRepo.ListForStage(ctx, stage.ID)
+	if err != nil {
+		return src, 0, fmt.Errorf("list plan stage approvals: %w", err)
+	}
+	var firstApprove *time.Time
+	for _, a := range rows {
+		if a.Decision != approval.DecisionApprove {
+			continue
 		}
+		if firstApprove == nil || a.SubmittedAt.Before(*firstApprove) {
+			at := a.SubmittedAt
+			firstApprove = &at
+		}
+	}
+	if firstApprove != nil {
+		src.approvedAt = *firstApprove
+	}
+	if stage.EndedAt == nil || picked.CreatedAt.After(*stage.EndedAt) ||
+		firstApprove == nil || picked.CreatedAt.After(*firstApprove) {
 		return src, splitPlanChangedSinceApproval, nil
 	}
-	src.boundAt = *stage.EndedAt
 	var p plan.Plan
 	if err := json.Unmarshal(picked.Content, &p); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "split filing: plan artifact undecodable; filing nothing",
@@ -341,6 +380,7 @@ func (s *Server) logSplitFilingPlanChanged(ctx context.Context, stage *run.Stage
 		slog.String("artifact_id", src.artifactID.String()),
 		slog.Time("artifact_created_at", src.createdAt),
 		slog.Time("stage_ended_at", src.boundAt),
+		slog.Time("first_approve_submitted_at", src.approvedAt),
 	)
 }
 

@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,8 +216,11 @@ func TestStartSplitFilingDetached_LoadErrorLogsNotBusy(t *testing.T) {
 	h.s.waitSplitFiling()
 
 	logs := h.logs.String()
-	if !strings.Contains(logs, "load approved plan failed") {
-		t.Errorf("no load-failure WARN; logs:\n%s", logs)
+	// The SPLIT-filing WARN, not the live-validation hook's same-worded one
+	// ("live-validation filing: load approved plan failed"), which the same
+	// seeded listErr also triggers.
+	if !strings.Contains(logs, `msg="split filing: load approved plan failed"`) || !strings.Contains(logs, "artifact store down") {
+		t.Errorf("no split-filing load-failure WARN naming the cause; logs:\n%s", logs)
 	}
 	if strings.Contains(logs, "single-flight registry") {
 		t.Errorf("a load error was reported as busy; logs:\n%s", logs)
@@ -351,4 +357,190 @@ func TestSplitFiling_PanickingProviderReleasesRegistryAndDrains(t *testing.T) {
 	case <-time.After(timescale.D(5 * time.Second)):
 		t.Fatal("Shutdown did not drain after a panicking filer")
 	}
+}
+
+// shrinkSplitFilingBudgets sets the detached-filing budget vars for one test
+// and restores them on cleanup. Tests calling it must not run in parallel.
+func shrinkSplitFilingBudgets(t *testing.T, floor, perChild, prelaunch time.Duration) {
+	t.Helper()
+	oldFloor, oldPer, oldPre := splitFilingBudget, splitFilingPerChildBudget, splitFilingPrelaunchBudget
+	splitFilingBudget, splitFilingPerChildBudget, splitFilingPrelaunchBudget = floor, perChild, prelaunch
+	t.Cleanup(func() {
+		splitFilingBudget, splitFilingPerChildBudget, splitFilingPrelaunchBudget = oldFloor, oldPer, oldPre
+	})
+}
+
+// waitOrFail runs wait on a goroutine and fails the test when it has not
+// returned within bound; onTimeout unblocks whatever wait is stuck on, so the
+// harness drain cannot deadlock after the failure.
+func waitOrFail(t *testing.T, bound time.Duration, what string, wait func(), onTimeout func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(bound):
+		onTimeout()
+		<-done
+		t.Fatalf("%s did not return within %v; the budget deadline did not end it", what, bound)
+	}
+}
+
+// TestSplitFiling_FilerBudgetExpiryReleasesRegistry (AA5): a provider parked
+// inside File that only its ctx can end. With the filing budget shrunk to
+// 100ms the detached filer's deadline ends the park, so the filer returns, the
+// registry is free again and a resume is admitted rather than answered 409
+// split_filing_in_progress. No completion marker is written: a missing
+// split_children_filed is not proof of progress.
+func TestSplitFiling_FilerBudgetExpiryReleasesRegistry(t *testing.T) {
+	shrinkSplitFilingBudgets(t, timescale.D(100*time.Millisecond), time.Millisecond, splitFilingPrelaunchBudget)
+	h := newResumeHarness(t, func(c *splitFilingConfig) { c.parkOnCall = 1; c.parkHonoursCtx = true; c.ctxHonouring = true })
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(h.provider.releasePark) }
+	t.Cleanup(release)
+
+	decodeResumeResponse(t, h.resume(t, resumeOperatorID()), http.StatusAccepted)
+	<-h.provider.parked
+	waitOrFail(t, timescale.D(10*time.Second), "the parked detached filer", h.s.waitSplitFiling, release)
+
+	if got := h.provider.requestCount(); got != 0 {
+		t.Errorf("File requests = %d, want 0 (the deadline ended the parked phase-0 call)", got)
+	}
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Errorf("split_children_filed entries = %d, want 0 after a budget expiry", n)
+	}
+	if n := h.s.splitFiling.holdersFor(h.runID); n != 0 {
+		t.Fatalf("holders after the budget expiry = %d, want 0", n)
+	}
+	// The documented probe: after at most budget_seconds a resume is admitted.
+	resp := decodeResumeResponse(t, h.resume(t, resumeOperatorID()), http.StatusAccepted)
+	if resp.State != splitFilingResumeStateResuming {
+		t.Errorf("second resume state = %q, want resuming", resp.State)
+	}
+	h.s.waitSplitFiling()
+	if got := h.provider.requestCount(); got != 3 {
+		t.Errorf("File requests after the second resume = %d, want 3", got)
+	}
+}
+
+// blockingListArtifactRepo blocks the first ListForStage after arm() until
+// its ctx ends (or unblock is closed), then returns the ctx error; every other
+// call passes through to the fake.
+type blockingListArtifactRepo struct {
+	*fakeArtifactRepo
+	armed   atomic.Bool
+	unblock chan struct{}
+}
+
+func (b *blockingListArtifactRepo) ListForStage(ctx context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	if b.armed.CompareAndSwap(true, false) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-b.unblock:
+			return nil, errors.New("blocking list released by the test")
+		}
+	}
+	return b.fakeArtifactRepo.ListForStage(ctx, stageID)
+}
+
+// TestStartSplitFilingDetached_PrelaunchBudgetBoundsLoad: the launcher's own
+// plan load runs on a ctx detached from the request; splitFilingPrelaunchBudget
+// is its only bound. The armed load blocks until that ctx ends, so with the
+// budget shrunk to 100ms the approval returns, the split WARN names the
+// deadline, nothing launches and the hold is released.
+func TestStartSplitFilingDetached_PrelaunchBudgetBoundsLoad(t *testing.T) {
+	shrinkSplitFilingBudgets(t, splitFilingBudget, splitFilingPerChildBudget, timescale.D(100*time.Millisecond))
+	h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true, approvalGate: true})
+	blocking := &blockingListArtifactRepo{fakeArtifactRepo: h.art, unblock: make(chan struct{})}
+	h.s.cfg.ArtifactRepo = blocking
+	h.s.splitFilingPreLaunch = func(*run.Stage) { blocking.armed.Store(true) }
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(blocking.unblock) }) }
+	t.Cleanup(unblock)
+
+	waitOrFail(t, timescale.D(10*time.Second), "the approval's split pre-launch load", func() {
+		h.approveAs(t, context.Background(), "approver-one", *h.planStage)
+	}, unblock)
+	h.s.waitSplitFiling()
+
+	logs := h.logs.String()
+	if !strings.Contains(logs, `msg="split filing: load approved plan failed"`) || !strings.Contains(logs, "context deadline exceeded") {
+		t.Errorf("no split-filing load WARN naming the deadline; logs:\n%s", logs)
+	}
+	if got := h.launches(); got != 0 {
+		t.Errorf("launches = %d, want 0", got)
+	}
+	if n := h.s.splitFiling.holdersFor(h.runID); n != 0 {
+		t.Errorf("holders = %d, want 0", n)
+	}
+	if got := h.planStage.State; got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded (a load failure never fails the approval)", got)
+	}
+}
+
+// TestApproveAdvance_ArtifactAfterFirstApproveOnDBClock_LaunchesNothing: the
+// artifact predates EndedAt on the daemon clock (base+30s < base+1m) but was
+// created after the earliest approve row on the database clock (base+10s), the
+// shape a daemon clock leading the database's produces for an upload just
+// after the gate closed. The re-approval launches nothing and the WARN names
+// the approve-row time; only the database-clock check is in the path.
+func TestApproveAdvance_ArtifactAfterFirstApproveOnDBClock_LaunchesNothing(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, approvalGate: true, approvedAlready: true,
+		artifactAt: splitFixtureBase.Add(30 * time.Second), endedAt: splitFixtureBase.Add(time.Minute),
+		approvedAt: splitFixtureBase.Add(10 * time.Second),
+	})
+	h.approveAs(t, context.Background(), "approver-two", *h.planStage)
+	h.s.waitSplitFiling()
+
+	if got := h.launches(); got != 0 {
+		t.Errorf("launches = %d, want 0", got)
+	}
+	if got := h.provider.requestCount(); got != 0 {
+		t.Errorf("File requests = %d, want 0", got)
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "changed after the plan gate closed") || !strings.Contains(logs, "first_approve_submitted_at=2026-11-01T12:00:10") {
+		t.Errorf("plan-changed WARN missing or does not name the approve-row time; logs:\n%s", logs)
+	}
+}
+
+// TestLoadSplitPlanForStage_ApproveRowWitness pins the database-clock witness:
+// no approve row refuses; only APPROVE rows count (an earlier reject row is
+// ignored); no ApprovalRepo refuses as a load error.
+func TestLoadSplitPlanForStage_ApproveRowWitness(t *testing.T) {
+	t.Run("no_approve_row_refuses", func(t *testing.T) {
+		h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
+		h.ar.all = nil
+		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+		if got := h.provider.requestCount(); got != 0 {
+			t.Errorf("File requests = %d, want 0", got)
+		}
+		if !strings.Contains(h.logs.String(), "changed after the plan gate closed") {
+			t.Errorf("no plan-changed WARN; logs:\n%s", h.logs.String())
+		}
+	})
+	t.Run("earlier_reject_row_ignored", func(t *testing.T) {
+		h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
+		h.ar.all = append(h.ar.all, &approval.Approval{
+			ID: uuid.New(), StageID: h.planStage.ID, ApproverSubject: "early-rejecter",
+			Decision: approval.DecisionReject, SubmittedAt: splitFixtureBase.Add(-time.Hour),
+		})
+		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+		if got := h.provider.requestCount(); got != 3 {
+			t.Errorf("File requests = %d, want 3 (a reject row is not a gate-close witness)", got)
+		}
+	})
+	t.Run("no_approval_repo_load_error", func(t *testing.T) {
+		h := newSplitFilingHarness(t, splitFilingConfig{withSplitProposal: true})
+		h.s.cfg.ApprovalRepo = nil
+		h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+		if got := h.provider.requestCount(); got != 0 {
+			t.Errorf("File requests = %d, want 0", got)
+		}
+		if !strings.Contains(h.logs.String(), "approval repository not configured") {
+			t.Errorf("no load-error WARN naming the missing repo; logs:\n%s", h.logs.String())
+		}
+	})
 }

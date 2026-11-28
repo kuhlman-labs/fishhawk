@@ -31288,10 +31288,15 @@ paths:
         at a gate with a recorded approve decision, and only from the stage's
         own newest plan artifact when that artifact was created no later than
         the stage's `ended_at` — the transition that succeeded the plan
-        stage. A same-state re-approval does not move `ended_at`, so an
-        artifact uploaded after the gate closed is refused
+        stage — and no later than the stage's earliest approve row.
+        `ended_at` is stamped from the daemon's clock and `created_at` by the
+        database, so the approve-row check (both database clock; the closing
+        approve is recorded before the transition) keeps a clock skew from
+        admitting a late upload. A same-state re-approval moves neither
+        bound, so an artifact uploaded after the gate closed is refused
         `409 plan_changed_since_approval`: start a new run, because the
-        artifact changed after the plan gate closed.
+        artifact changed after the plan gate closed. An approve row recorded
+        before the final artifact refuses too (fail closed).
 
         **Progress.** A detached filing that aborts writes no terminal
         marker, so a missing `split_children_filed` is not proof of progress.
@@ -31316,9 +31321,10 @@ paths:
         `409 plan_not_approved` (`details.reason` `no_plan_stage`,
         `plan_stage_not_succeeded`, `gateless_plan_stage` or
         `no_approve_decision`); `409 no_split_proposal` (`details.reason`
-        `no_plan_artifact` or `no_split_proposal`); `409
-        plan_changed_since_approval` (`details.artifact_id`,
-        `artifact_created_at`, `stage_ended_at`); `409
+        `no_plan_artifact`, `plan_artifact_undecodable` or
+        `no_split_proposal`); `409 plan_changed_since_approval`
+        (`details.artifact_id`, `artifact_created_at`, `stage_ended_at`,
+        `first_approve_submitted_at`); `409
         split_filing_repo_malformed`; `409 split_filing_no_parent_issue`;
         `409 split_filing_in_progress` (`details.budget_seconds`); `409
         split_filing_refused` (a prior over-cap refusal marker); `500
@@ -31334,8 +31340,11 @@ paths:
 
         **Authorization.** An authenticated identity with `write:approvals`
         (the scope plan approval needs) at the member tier of the run's
-        workspace account. A host-dispatcher token is refused by its route
-        allowlist.
+        workspace account. A delegated operator-agent token holding
+        `write:approvals` is admitted: no approver-eligibility gate applies,
+        and the call files only what a recorded approval authorized. A
+        cookie session passes the scope check and is bounded by the member
+        tier. A host-dispatcher token is refused by its route allowlist.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
