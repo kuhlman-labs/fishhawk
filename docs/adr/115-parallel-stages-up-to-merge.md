@@ -250,3 +250,41 @@ Fishhawk runs plan, implement, fix-up, review, acceptance and verify-only stages
   - ADR-112 R1 (D5 CLEAN variant) and R3 (`stage_live` yield).
 - **Record metadata.** amends: ["ADR-063", "ADR-092", "ADR-093", "ADR-094", "ADR-112"]; supersedes: []; applies_to: []
 - **Related:** ADR-027, ADR-031, ADR-087, ADR-088, ADR-090, ADR-091, ADR-100, ADR-109, ADR-096, ADR-098, ADR-110, ADR-111, ADR-113, #2897, #3086, #3202, #3901, #3969, #3973, #4019, #4077, #4083, #4119, #4240–#4243, #4582.
+
+## Amendment A1: verify passes keep the host verify group, and per-type defaults become declarable
+
+Ratification: Captain, 2026-11-28 (issue #5660), ratifying the text exactly as converged in the operator's ADR review (docs/adr/README.md § "Drafting and review"; round 3: Fable claude-fable-5-2 and Astra gpt-6-astra both APPROVE, at repo commit bf8cf6403). Factual errata for ADR-150 were applied after ratification, Captain-approved and reviewer-confirmed (round 4). Recorded by the operator. It changes no front-matter field.
+
+**Context.** Two ratified records disagree on how merge-candidate verify passes are keyed (#5621):
+- D3 "Verify grouping" re-keys passes to `repository:<repo>:verify:<base>`, "replacing ADR-092 D3's per-host `local-verify` limit of 1". D3 "Per-type defaults" removes "the shipped per-type default limits of 1".
+- ADR-094 (#4239) Amendment A2 item 5 keeps the host group `local-verify:<host>` and does not cite this record.
+
+The code follows ADR-094 (`backend/internal/server/stage_concurrency.go:252`). D3's re-keying and default removal are unshipped (#4647, #4655). ADR-094 (#4239) Amendment A6 now gives a host-declared value to every host-scoped group limit except capacity and implement, which ADR-094 A5 covers.
+
+**Decision.**
+1. **Verify passes keep the host verify group.** D3's "Verify grouping" bullet is withdrawn.
+   - A host-dispatched merge-candidate verify-only pass holds `{host:<label>:capacity, local-verify:<host>}`. Capacity is sized under ADR-094 A5, and verify under A6. This amendment leaves non-host runner paths unchanged, `github_actions` included (`backend/internal/server/host_dispatch.go:402-407`).
+   - Per-(repository, base) serialization of queue passes is D7's and ADR-092 D1's, as ADR-150 D3 and D7 amend them: one live pass per (repository, base), or one per candidate within a speculative train. A repository-and-base verify group of 1 would repeat that bound at effective depth 1, and at a greater depth would serialize a train's candidate passes.
+   - The host group bounds what passes actually share: the host's container runtime.
+2. **Per-type defaults become declarable fallbacks, not removed.** D3's "Per-type defaults" bullet now reads:
+   - The shipped per-type limits of 1 remain fallbacks. Implement follows ADR-094 A5 item 5, and capacity follows A5 item 2. Verify, and every other host-scoped group except those two, follow A6 item 2.
+   - Removing the fallbacks, so that capacity is the only bound, is deferred to ADR-100's `enforce` staging. D3's "Who governs in `enforce`" already places the controller there. This amendment does not decide that removal.
+3. **The verify concurrency declaration stands, keyed as D2 states.** D2's `executor.verify.concurrency: shared | exclusive` and its rules are unchanged. That includes `exclusive`'s repository-scoped verify group of 1, held for the whole stage, and the clone path forcing `exclusive`. It is a repository's statement about its own verify, a correctness bound.
+   - Item 1 withdraws only D3's re-keying of merge-candidate passes away from the host group, which is a resource bound. The two compose.
+   - Today a pass holds exactly the two groups of item 1, resolved before any declared lookup (`stage_concurrency.go:251-253`). When #4655 ships D2, a pass of an `exclusive` stage adds D2's repository verify group to those two. That change widens ADR-094 A2 item 5's set, and #4655 states it there.
+4. **The queue-pass reserve stands.** D3's "Queue passes" bullet, at least one host capacity unit reserved for merge-queue verify passes, is unchanged and stays with #4655.
+5. **What this replaces.**
+   - D3's "Verify grouping" bullet is withdrawn (item 1). D3's "Per-type defaults" bullet is restated (item 2).
+   - Consequences: "Costs" and "Implementation order" step 3 drop "the verify re-keying". "Amended clauses" keeps "ADR-092 D3: per-host verify limit", now read as: the limit of 1 is a fallback that the host declares over (ADR-094 A6 item 7).
+   - D1's "Concurrency is bounded only by declared CAPACITY (D3)" and D3's heading now describe the deferred direction. Until a further decision removes the fallbacks, declared capacity and the retained group limits both govern.
+   - D1's "Queues for different repositories or bases are independent" stands for queue order, not for host admission.
+   - The Gains line "merge queues for different repositories no longer serialize each other" becomes: "merge queues keep independent ordering, while their host-dispatched passes share host admission limits".
+
+**Consequences.**
+- **No code change.** The shipped code already keys passes per host.
+- **#4655 is narrowed.** It loses the per-type default removal. It keeps the schema field, the gate-path report on the dispatch marker, the queue-pass reserve and the fallback re-queue. #4647's step 3 loses the verify re-keying.
+- **Unchanged by this amendment.** D1 (apart from the readings in item 5), D2, D3's other bullets, D4 to D7, the measurement gate and Direction T. ADR-150 separately amends D7 and Direction T.
+
+**Risks and residuals.**
+- **Laptop parallelism.** D3's estimate stands: about 1–2 verify-bearing stages fit on a laptop. A host that declares a verify limit above that oversubscribes its container runtime, the residual ADR-094 A6 names.
+- **Cross-repository fairness.** Within one account and host label, repositories share `local-verify:<host>` under the existing FIFO rules. Raising its limit allows more concurrent holders. It creates neither repository isolation nor a per-repository reservation.
