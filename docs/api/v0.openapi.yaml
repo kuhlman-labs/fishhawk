@@ -17573,7 +17573,7 @@ paths:
   /v0/runs/{run_id}/merge:
     post:
       operationId: mergeRun
-      summary: Record an operator merge verdict and queue the forge merge with the repository's declared merge method, default squash (skipped when already merged)
+      summary: Record an operator merge verdict and dispatch the forge merge (on GitHub a head-pinned merge is synchronous, never an auto-merge) with the repository's declared merge method, default squash (skipped when already merged)
       description: |
         The one-verb operator merge path (E48.7 / #1954). Records the
         operator's merge verdict as a chained `merge_verdict_recorded` audit
@@ -17665,8 +17665,11 @@ paths:
 
         **Conflict precondition (E64.14 / #3109).** Before recording the
         verdict, the endpoint checks the PR's mergeability and refuses a
-        conflicting PR with `409 merge_conflicting` — GitHub can never fire the
-        auto-merge on a conflicting PR, so queuing it would only time out. The
+        conflicting PR with `409 merge_conflicting` — a conflicting PR cannot
+        merge, so dispatching it would only be refused or time out. A conflict
+        first seen AFTER this guard (by the pinned readiness pre-read or the
+        GitHub leaf, #4676) answers `409 merge_conflicting` with the verdict
+        recorded (below); it never answers `not_merge_ready`. The
         check is BEST-EFFORT and FAIL-OPEN: it refuses ONLY on an explicit
         GitHub signal (`mergeable_state == "dirty"` or a documented
         `mergeable == false`) and proceeds on every uncertainty (GitHub
@@ -17770,8 +17773,9 @@ paths:
         `409 merge_already_dispatched` (or `200 already_merged` when the pull
         request landed) and the forge is never called. A dispatch that fails
         after the claim is classified once: a refusal that applied nothing
-        (`merge_checks_pending`, a REST merge PUT 405/409/422; never a
-        generic GraphQL error envelope, which is uncertain) releases the
+        (`merge_checks_pending`, a pinned leaf not-merge-ready refusal sent
+        before any PUT, a REST merge PUT 405/409/422; never a generic GraphQL
+        error envelope, which is uncertain) releases the
         claim, so the re-invoke claims again; an uncertain outcome (5xx, timeout,
         cancel, 403) leaves it `dispatch_failed` until the pull request reads
         merged or the operator re-arms it
@@ -17781,13 +17785,25 @@ paths:
         dispatch, like the delegated `may_merge` one, is PINNED to the head
         the merge-candidate gate admitted: the head the dispatch claim
         records and, on a declared approval gate, the head the
-        forge-approval fold judged. On GitHub the auto-merge
-        enable carries GraphQL `expectedHeadOid` and the clean-status REST
-        fallback carries `sha`. This is a behaviour change: gate-less GitHub
-        runs are pinned too. A forge refusal for a head mismatch answers
-        `409 merge_head_moved`; it releases the claim on refusal_basis
-        `precheck` / `rest_sha` and leaves it `dispatch_failed` on
-        `graphql_reread` (#4749), needing the operator re-arm. An empty gate head (an
+        forge-approval fold judged. On GitHub a pinned dispatch NEVER arms an
+        auto-merge (#4676): inside the merge-intent lock, after the durable
+        verdict and before the republish and the claim, a readiness pre-read
+        reads the pull request, and the GitHub leaf then sends ONE synchronous
+        REST merge carrying `sha`, only when GitHub reports the head unchanged
+        and `mergeable_state` `clean` or `has_hooks`. The pre-read is skipped
+        when the run already holds a dispatch claim in any state (so
+        `merge_already_dispatched` answers), is bounded (5s; a deadline or read
+        error falls through to the claim and the leaf), and falls through on a
+        merged or closed PR, a moved head, and a `clean`, `has_hooks`, empty or
+        unrecognised state. A not-ready state answers `409
+        merge_checks_pending` reason `not_merge_ready` with no claim taken
+        (case 3). This is a behaviour change: gate-less GitHub runs are pinned
+        too, and a merge invoked before GitHub reports the pull request
+        merge-ready no longer queues. A forge refusal for a head mismatch
+        answers `409 merge_head_moved`; it releases the claim on refusal_basis
+        `precheck` / `rest_sha`. `graphql_reread` is no longer produced and is
+        retained for rows recorded before #4676 (it left the claim
+        `dispatch_failed`, #4749). An empty gate head (an
         ungated ADR-090 D7 admit, including every GitLab-family run, or a
         merged-PR admit) keeps the unpinned ladder, and an unpinned forge
         conflict stays `502 merge_dispatch_failed`.
@@ -17980,10 +17996,31 @@ paths:
             merge clears by re-dispatching that acceptance stage — or, when the
             item reports the re-run as already in flight, by waiting for it to
             settle.
+            `merge_checks_pending` also answers a head-pinned GitHub dispatch
+            GitHub does not report merge-ready at the pinned head (#4676), with
+            `details.reason` `not_merge_ready`: `{run_id, verdict_sequence,
+            pr_url, reason, head_sha (the pin), mergeable_state (omitted when
+            empty), resumable, blocked_by (omitted when empty)}`. Nothing was
+            merged or armed: a pinned merge is synchronous and never queues an
+            auto-merge. It comes from the readiness pre-read (no dispatch claim
+            taken, no settle row) or from the GitHub leaf after the claim (the
+            claim released). `resumable` false (`behind`, `draft`, or
+            `blocked` with `blocked_by` `review_required` /
+            `changes_requested`, GitHub's reviewDecision) means waiting will
+            not clear it; `blocked` otherwise and `unknown` are resumable. An
+            existing claim takes precedence: the pre-read is skipped and
+            `merge_already_dispatched` answers. GitHub's `unstable` keeps
+            `reason` `checks_pending`. A non-resumable pre-read refusal ran no
+            republish, so it carries no `audit_complete_*` keys; otherwise the
+            #3190 keys above apply.
             (4) The pull request has a merge conflict against its base
             (`merge_conflicting`, E64.14 / #3109). NO verdict row is recorded
             (the guard runs before the append) and `details` carry
-            `{run_id, pr_url, mergeable_state}`. Waiting cannot resolve it:
+            `{run_id, pr_url, mergeable_state}`. A POST-VERDICT variant
+            (#4676) answers a pull request that turned conflicting AFTER this
+            guard read it, seen by the pinned readiness pre-read or the GitHub
+            leaf: the verdict IS recorded and `details` additionally carry
+            `verdict_recorded: true` and `verdict_sequence`. Waiting cannot resolve it:
             resolve the conflict on the run branch, vouch the resulting commit
             with `vouch-commit` so the `fishhawk_audit_complete` check re-posts,
             re-approve the pull request, and re-invoke the merge.
@@ -18178,30 +18215,31 @@ paths:
             D1), so the forge was not called again; `details` carry
             `{run_id, pr_url, verdict_sequence, claim_state, claim_path,
             claim_head_sha, claimed_at, failure_cause}`; a `dispatch_failed`
-            claim (an uncertain forge outcome, a `graphql_reread`
+            claim (an uncertain forge outcome, a pre-#4676 `graphql_reread`
             head-moved refusal included, #4749) needs the operator re-arm
             before a re-invoke. (15) `merge_head_moved` (#4641, ADR-112
             residual H3): the dispatch was PINNED to the head the
-            merge-candidate gate admitted (GitHub auto-merge
-            `expectedHeadOid`; clean-status REST fallback `sha`) and the forge
-            refused it because the pull request head moved after it. The
+            merge-candidate gate admitted (the synchronous REST merge's `sha`,
+            #4676) and the forge refused it because the pull request head
+            moved after it. The
             verdict row is recorded and durable, and the dispatch claim, when
             one was held, is released on refusal_basis `precheck` /
             `rest_sha` (a release that does not land is recorded
             `dispatch_failed` and the message names the re-arm) and left
-            `dispatch_failed` on `graphql_reread` or an unrecognised basis
-            (#4749): a re-invoke then answers `merge_already_dispatched` until
+            `dispatch_failed` on a pre-#4676 `graphql_reread` or an
+            unrecognised basis (#4749): a re-invoke then answers `merge_already_dispatched` until
             the operator re-arm.
             `details` carry `{run_id, pr_url, verdict_sequence,
             head_sha, refusal_basis, next_step: "fishhawk_merge_run"}`, where
             `head_sha` is the pinned head. `refusal_basis` `precheck` (the
-            client read a different head and sent no mutation) and `rest_sha`
+            client read a different head and sent nothing) and `rest_sha`
             (any 409 on the pinned PUT, which GitHub documents as a `sha`
             mismatch, so the label names the status, not a proven mismatch)
-            are refusals where nothing merged; `graphql_reread` (the auto-merge enable answered a GraphQL
-            error and a fresh read showed a different head) and `unknown` are
-            INFERRED, so if that enable had in fact applied, auto-merge may be
-            armed at the pinned head: inspect the pull request. The message
+            are refusals where nothing merged; `graphql_reread` (no longer
+            produced since #4676, retained for rows recorded before it: the
+            pinned auto-merge enable answered a GraphQL error and a fresh read
+            showed a different head) and `unknown` are INFERRED: inspect the
+            pull request. The message
             names the head the merge-candidate gate admitted, and the head the
             approval was evaluated at only when the review stage declares an
             approval gate. Re-invoke once the head settles (and is
@@ -18287,10 +18325,12 @@ paths:
             true}` where `reason` is `forge_read` or `audit_read`; the raw
             cause stays in the operator log.
 
-            `merge_dispatch_failed`: the verdict row is recorded and durable, but queuing the forge
+            `merge_dispatch_failed`: the verdict row is recorded and durable, but dispatching the forge
             merge failed for a reason OTHER than the checks-pending precondition
             above (`merge_dispatch_failed`); the merge is retryable — a re-POST
-            re-queues without duplicating the verdict. A checks-not-all-passed
+            re-dispatches without duplicating the verdict. An unattributed
+            REST 405 on a head-pinned GitHub merge stays here (#4676), naming
+            the merge method; it is never `not_merge_ready`. A checks-not-all-passed
             refusal is reported distinctly as `409 merge_checks_pending`, not
             here, so this 502 is never a remedy-that-cannot-work. A
             head-pinned dispatch refused for a head mismatch is likewise the
@@ -19241,7 +19281,12 @@ paths:
             proposal without acting, #2222); observe-only has all four
             false. A driver that switches only on the first three keeps
             polling through a `reported` outcome, which is the intent — a
-            report is a proposal, not a hand-off.
+            report is a proposal, not a hand-off. A delegated head-pinned
+            GitHub merge GitHub does not report merge-ready, or that turned
+            conflicting, is observe-only and additionally carries
+            `merge_not_ready` (#4676): `fishhawk_drive_run` keeps polling a
+            resumable state and stops on a non-resumable one. GitHub's
+            `unstable` keeps its existing error answer.
           content:
             application/json:
               schema:
@@ -19260,6 +19305,16 @@ paths:
                     description: 'The open concern ids the last no-change fix-up pass routed, which the route_fixup arm declined to re-route. Present only on decision_state fixup_no_changes_unaddressed (#5390); absent on every other outcome.'
                   reported: { type: boolean, description: 'True when a workflow-v2 `mode: report` class surfaced a proposal at a live gate (#2222): a run_auto_driven act:report row was appended (at most once per gate occurrence), `action` names the verb the class governs, and nothing was dispatched or paged. The driver keeps polling.' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
+                  merge_not_ready:
+                    type: object
+                    description: 'Present ONLY on a delegated may_merge observe-only outcome whose head-pinned GitHub dispatch was refused as not merge-ready or as a post-guard merge conflict (#4676); absent on every other outcome. The note names the state, the claim outcome and, on a non-resumable state, the remedy.'
+                    required: [mergeable_state, resumable, conflicting, claim_outcome]
+                    properties:
+                      mergeable_state: { type: string, description: 'GitHub''s mergeable_state at the read (blocked, behind, draft, unknown, dirty, or empty while GitHub is still computing).' }
+                      resumable: { type: boolean, description: 'False when waiting will not clear it (behind, draft, a conflict, or blocked with blocked_by set); fishhawk_drive_run then stops with decision_required:merge_not_ready.' }
+                      conflicting: { type: boolean, description: 'True when the refusal is a merge conflict (mergeable_state dirty, or mergeable false); never resumable.' }
+                      blocked_by: { type: string, enum: [review_required, changes_requested], description: 'GitHub''s reviewDecision on a blocked pull request when it names a review requirement; omitted otherwise.' }
+                      claim_outcome: { type: string, enum: [pre_claim, released, dispatch_failed, unclaimed], description: 'What became of the merge-dispatch claim: pre_claim (the readiness pre-read refused before any claim), released (the GitHub leaf refused before any PUT and the claim was released), dispatch_failed (the release did not land; later ticks are observe-only until reconciliation or the operator re-arm), unclaimed (no ledger wired).' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: 'The identity lacks `write:approvals` (`insufficient_scope`).'

@@ -24,7 +24,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1587,16 +1586,19 @@ func TestGithubAutoMerger_FailsClosed(t *testing.T) {
 
 // mergeFallbackGitHub is a minimal GitHub stand-in for the githubAutoMerger
 // clean-status REST fallback test (E48.7 / #1954). It answers the three calls
-// the merge seam makes — GET pull (node id), POST /graphql (auto-merge enable),
-// PUT pull merge (REST squash) — and records whether the REST merge fired so a
-// test can assert the fallback is taken exactly on the clean-status class.
+// the merge seam makes — GET pull (node id, head and mergeable_state), POST
+// /graphql (auto-merge enable), PUT pull merge (REST squash) — and records
+// whether the REST merge fired so a test can assert the fallback is taken
+// exactly on the clean-status class. The GET serves mergeableState (empty →
+// clean) for the head-pinned readiness check (#4676).
 type mergeFallbackGitHub struct {
-	graphqlBody string // the enable-auto-merge graphql response body
-	mergeStatus int    // status for the REST merge PUT (0 → 200)
-	mergeHits   int    // number of REST merge PUTs served
-	graphqlHits int    // number of POST /graphql (auto-merge enable) served
-	mergeBody   []byte // the last REST merge PUT body
-	graphqlReq  []byte // the last POST /graphql request body
+	mergeableState string // the GET's mergeable_state ("" → clean)
+	graphqlBody    string // the enable-auto-merge graphql response body
+	mergeStatus    int    // status for the REST merge PUT (0 → 200)
+	mergeHits      int    // number of REST merge PUTs served
+	graphqlHits    int    // number of POST /graphql (auto-merge enable) served
+	mergeBody      []byte // the last REST merge PUT body
+	graphqlReq     []byte // the last POST /graphql request body
 }
 
 func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient.Client {
@@ -1604,8 +1606,12 @@ func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}",
 		func(w http.ResponseWriter, _ *http.Request) {
+			state := fg.mergeableState
+			if state == "" {
+				state = "clean"
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_node","state":"open","head":{"sha":"abc"}}`)
+			_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_node","state":"open","mergeable_state":"`+state+`","head":{"sha":"abc"}}`)
 		})
 	mux.HandleFunc("POST /graphql",
 		func(w http.ResponseWriter, r *http.Request) {
@@ -1659,44 +1665,58 @@ func TestGithubAutoMerger_CleanStatus_RESTFallback(t *testing.T) {
 	}
 }
 
-// TestGithubAutoMerger_PinnedHead_ThreadsToForge pins (#4641) that the serve.go
-// github leaf threads the evaluated head to BOTH forge arms: the auto-merge
-// enable's expectedHeadOid argument resolves (through its declared GraphQL
-// variable) to the head, and the clean-status REST fallback PUT carries it as
-// sha. The fixture's GET answers head "abc", so the client pre-check passes.
-// Counterfactual: passing "" to QueueMerge sends neither pin.
+// TestGithubAutoMerger_PinnedHead_ThreadsToForge pins (#4641, #4676) that the
+// serve.go github leaf threads the evaluated head to the forge as a
+// SYNCHRONOUS pinned merge: zero /graphql requests (no auto-merge armed, even
+// though the fixture would accept the enable) and exactly one REST PUT whose
+// sha is the head. The fixture's GET answers head "abc" with mergeable_state
+// clean, so the readiness check passes. Counterfactual: passing "" to
+// QueueMerge sends the unpinned enable instead (one /graphql, zero PUTs).
 func TestGithubAutoMerger_PinnedHead_ThreadsToForge(t *testing.T) {
 	fg := &mergeFallbackGitHub{
-		graphqlBody: `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`,
+		graphqlBody: `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`,
 	}
 	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
 	const head = "abc"
 	if err := m.MergePullRequest(context.Background(), mergeFallbackRun(), head); err != nil {
 		t.Fatalf("MergePullRequest(pinned): %v", err)
 	}
-	var req struct {
-		Query     string         `json:"query"`
-		Variables map[string]any `json:"variables"`
-	}
-	if err := json.Unmarshal(fg.graphqlReq, &req); err != nil {
-		t.Fatalf("decode graphql request %q: %v", fg.graphqlReq, err)
-	}
-	bound := regexp.MustCompile(`expectedHeadOid:\s*\$(\w+)`).FindStringSubmatch(req.Query)
-	if bound == nil {
-		t.Fatalf("auto-merge mutation binds no expectedHeadOid argument: %q", req.Query)
-	}
-	if got := req.Variables[bound[1]]; got != head {
-		t.Errorf("variables[%q] (bound to expectedHeadOid) = %v, want %q", bound[1], got, head)
+	if fg.graphqlHits != 0 {
+		t.Errorf("/graphql requests = %d, want 0 (a head-pinned dispatch never arms auto-merge): %s", fg.graphqlHits, fg.graphqlReq)
 	}
 	if fg.mergeHits != 1 {
-		t.Fatalf("REST merge PUTs = %d, want 1 (clean-status fallback)", fg.mergeHits)
+		t.Fatalf("REST merge PUTs = %d, want 1 (one synchronous pinned merge)", fg.mergeHits)
 	}
 	var body map[string]string
 	if err := json.Unmarshal(fg.mergeBody, &body); err != nil {
 		t.Fatalf("decode merge body %q: %v", fg.mergeBody, err)
 	}
 	if body["sha"] != head {
-		t.Errorf("REST fallback sha = %q, want %q (pinned)", body["sha"], head)
+		t.Errorf("REST merge sha = %q, want %q (pinned)", body["sha"], head)
+	}
+}
+
+// TestGithubAutoMerger_PinnedHead_BlockedSendsNothing (#4676): a head-pinned
+// dispatch on a PR GitHub reports blocked sends NOTHING — no auto-merge enable
+// and no PUT — and surfaces forge.ErrPullRequestNotMergeReady naming the state.
+// The fixture's PUT would answer 200, so only the leaf's readiness check keeps
+// the PR from merging.
+func TestGithubAutoMerger_PinnedHead_BlockedSendsNothing(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		mergeableState: "blocked",
+		graphqlBody:    `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	err := m.MergePullRequest(context.Background(), mergeFallbackRun(), "abc")
+	if !errors.Is(err, forge.ErrPullRequestNotMergeReady) {
+		t.Fatalf("err = %v, want forge.ErrPullRequestNotMergeReady", err)
+	}
+	var nmr *forge.NotMergeReadyError
+	if !errors.As(err, &nmr) || nmr.MergeableState != "blocked" || nmr.ExpectedHeadSHA != "abc" {
+		t.Errorf("NotMergeReadyError = %+v, want state blocked head abc", nmr)
+	}
+	if fg.graphqlHits != 0 || fg.mergeHits != 0 {
+		t.Errorf("requests = %d graphql / %d PUT, want 0 / 0 (nothing sent)", fg.graphqlHits, fg.mergeHits)
 	}
 }
 

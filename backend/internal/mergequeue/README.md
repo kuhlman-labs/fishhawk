@@ -486,7 +486,11 @@ change nothing (ADR-093 slice 2, rejection item 1):
     (`forge.ErrPullRequestUnstableStatus`) and the REST merge PUT's 405 (not
     mergeable, `forge.ErrPullRequestNotMergeable`), 409 (head-SHA mismatch,
     `forge.ErrMergeConflict`) or 422 (`forge.ErrMergeUnprocessable`, wrapped
-    alongside `forge.ErrValidation`). A bare `forge.ErrValidation` is NOT a
+    alongside `forge.ErrValidation`), and a head-pinned GitHub dispatch's
+    not-merge-ready refusal (`forge.ErrPullRequestNotMergeReady`, Conflicting
+    or not, [#4676](https://github.com/kuhlman-labs/fishhawk/issues/4676)):
+    the leaf refused before sending any merge PUT, so no PUT was sent and the
+    forge applied nothing. A bare `forge.ErrValidation` is NOT a
     release: it also carries a generic HTTP-200 GraphQL error envelope,
     whose outcome is uncertain. A head-PINNED inline or delegated dispatch
     the forge refuses for a head mismatch
@@ -498,8 +502,10 @@ change nothing (ADR-093 slice 2, rejection item 1):
     409 (`rest_sha`: any 409 on that PUT, which GitHub documents as a `sha`
     mismatch, so the label names the status, not a proven mismatch) are
     refusals where nothing applied and release. The
-    pinned auto-merge enable's `graphql_reread` basis (a GraphQL error, then
-    a fresh read showing a different head) is INFERRED: a GraphQL execution
+    pinned auto-merge enable's `graphql_reread` basis is NO LONGER PRODUCED
+    (#4676: a pinned dispatch sends no enable) and is retained for rows and
+    claims recorded before it. It named a GraphQL error, then a fresh read
+    showing a different head, and is INFERRED: a GraphQL execution
     error can accompany an applied mutation, so that enable may in fact have
     armed auto-merge at the pinned head. It is UNCERTAIN: the claim moves to
     `dispatch_failed` and only reconciliation or the operator re-arm clears
@@ -509,9 +515,10 @@ change nothing (ADR-093 slice 2, rejection item 1):
     The settle's `merge_dispatch_settled` row records `refusal_basis`,
     `expected_head_sha` and `observed_head_sha` as separate keys
     (`backend/internal/server/docs/merge-queue.md` § "ADR-112 forge-approval
-    fold", head-pinned bullets). A pinned GraphQL
-    error whose re-read shows the SAME head, or whose re-read fails, stays a
-    bare `forge.ErrValidation`: uncertain. A pre-forge head-pin refusal
+    fold", head-pinned bullets). Before #4676 a pinned GraphQL
+    error whose re-read showed the SAME head, or whose re-read failed, stayed
+    a bare `forge.ErrValidation`: uncertain; an unpinned enable's GraphQL
+    error still is. A pre-forge head-pin refusal
     (`ErrHeadPinnedMergeUnsupported`) is deliberately uncertain too: it is a
     deterministic capability refusal, and a release would re-dispatch into it
     (#4683, ADR-093 D4). **`ReleaseMergeDispatch(claim)`**
@@ -566,7 +573,12 @@ change nothing (ADR-093 slice 2, rejection item 1):
   re-decides from scratch (the ADR-112 forge-approval fold and veto run
   in-lock) and merges at most once. A `dispatched` claim is never re-armed
   by the operator: its merge was handed to the forge (a crash-left queue
-  one is released by ADR-109 Amendment A1, below).
+  one is released by ADR-109 Amendment A1, below). That includes an inline
+  or delegated claim whose head-pinned auto-merge was ARMED BEFORE the #4676
+  deploy: Fishhawk cannot re-dispatch it (a re-invoke answers
+  `merge_already_dispatched`), so the operator disables that auto-merge and
+  merges by hand (`backend/internal/server/docs/merge-queue.md` §
+  "ADR-112 forge-approval fold", Residuals).
 - **Crash-left claims (ADR-093 D8, #4298; ADR-109 Amendment A1, #4711).** A
   process that dies between `ClaimMergeDispatch` and classifying the forge
   outcome leaves a `dispatched` claim no live process owns. The server's
@@ -578,7 +590,9 @@ change nothing (ADR-093 slice 2, rejection item 1):
   release as the backstop):
   - Only a `queue`-path claim is ever reconciled or released. An `inline` or
     `delegated` claim stays `dispatched` while the forge's auto-merge is
-    armed, which is normal, as is a GitLab claim: neither the resume nor
+    armed (an unpinned dispatch) or, after a synchronous head-pinned GitHub
+    merge (#4676), until the pull_request webhook settles the run, which is
+    normal, as is a GitLab claim: neither the resume nor
     merge-on-pass ever transitions, releases or rewrites one, and any arm
     meeting one holds with no ledger write.
   - A queue claim is crash-left only when it is observed while HOLDING the

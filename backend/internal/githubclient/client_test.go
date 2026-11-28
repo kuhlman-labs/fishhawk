@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -2568,17 +2567,24 @@ func TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal(t *testing.T) {
 	}
 }
 
-// pinFake is a recording GitHub fake for the head-pinned auto-merge ladder
-// (#4641). Unlike newFakeGitHub (which keeps only the LAST request) it records
-// EVERY GraphQL and PUT body and serves the PR GET a SEQUENCE of heads (the
-// last one repeats), so a test can move the head between the pre-check GET
-// and the post-error re-read.
+// pinFake is a recording GitHub fake for the merge dispatch (#4641, #4676).
+// Unlike newFakeGitHub (which keeps only the LAST request) it records EVERY
+// GraphQL and PUT body and serves the PR GET a SEQUENCE of heads (the last one
+// repeats). It serves a configurable mergeable_state (default clean),
+// mergeable (default absent, JSON null) and state (default open), and its PUT
+// answers 200 by default, modelling a bypass-capable App whose PUT GitHub
+// would accept whatever the readiness: only the leaf's own readiness check
+// can then keep a not-ready PR from merging.
 type pinFake struct {
 	mu sync.Mutex
 
-	heads     []string // head.sha served on the Nth GET (last repeats)
-	getFailAt int      // 1-based GET hit answered 404 (0 = never)
-	getHits   int
+	heads          []string // head.sha served on the Nth GET (last repeats)
+	getFailAt      int      // 1-based GET hit answered 404 (0 = never)
+	getHits        int
+	mergeableState string
+	mergeable      *bool
+	prState        string
+	merged         bool
 
 	graphqlBody   string
 	graphqlBodies [][]byte
@@ -2596,10 +2602,12 @@ const (
 func newPinFake(t *testing.T, heads ...string) (*pinFake, *Client) {
 	t.Helper()
 	pf := &pinFake{
-		heads:       heads,
-		graphqlBody: `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
-		putStatus:   http.StatusOK,
-		putBody:     `{"sha":"deadbeef","merged":true}`,
+		heads:          heads,
+		mergeableState: "clean",
+		prState:        "open",
+		graphqlBody:    `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
+		putStatus:      http.StatusOK,
+		putBody:        `{"sha":"deadbeef","merged":true}`,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/x/y/pulls/42", func(w http.ResponseWriter, _ *http.Request) {
@@ -2611,6 +2619,12 @@ func newPinFake(t *testing.T, heads ...string) (*pinFake, *Client) {
 			head = pf.heads[min(hit, n)-1]
 		}
 		fail := pf.getFailAt == hit
+		mergeable := "null"
+		if pf.mergeable != nil {
+			mergeable = strconv.FormatBool(*pf.mergeable)
+		}
+		body := fmt.Sprintf(`{"number":42,"node_id":"PR_pin","state":%q,"merged":%t,"mergeable":%s,"mergeable_state":%q,"head":{"sha":%q}}`,
+			pf.prState, pf.merged, mergeable, pf.mergeableState, head)
 		pf.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if fail {
@@ -2618,7 +2632,7 @@ func newPinFake(t *testing.T, heads ...string) (*pinFake, *Client) {
 			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
 			return
 		}
-		_, _ = io.WriteString(w, `{"number":42,"node_id":"PR_pin","state":"open","merged":false,"head":{"sha":"`+head+`"}}`)
+		_, _ = io.WriteString(w, body)
 	})
 	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -2670,164 +2684,6 @@ func decodeGraphQL(t *testing.T, raw []byte) (string, map[string]any) {
 	return req.Query, req.Variables
 }
 
-// resolveExpectedHeadOid resolves the value the mutation's expectedHeadOid
-// argument is BOUND to, through the variable declared for it (approval C1): it
-// finds `expectedHeadOid: $<name>` in the mutation text, requires `$<name>` to
-// be declared non-null `GitObjectID!`, and returns variables[<name>]. A
-// declaration/argument/key mismatch therefore reads as absent, never as a
-// coincidental hit on a "expectedHeadOid" map key.
-func resolveExpectedHeadOid(t *testing.T, query string, vars map[string]any) (string, bool) {
-	t.Helper()
-	m := regexp.MustCompile(`expectedHeadOid:\s*\$(\w+)`).FindStringSubmatch(query)
-	if m == nil {
-		return "", false
-	}
-	name := m[1]
-	if !regexp.MustCompile(`\$` + name + `:\s*GitObjectID!`).MatchString(query) {
-		t.Errorf("mutation binds expectedHeadOid to $%s but does not declare it GitObjectID!:\n%s", name, query)
-		return "", false
-	}
-	v, ok := vars[name].(string)
-	return v, ok
-}
-
-// TestEnableAutoMergeAtHead_SendsExpectedHeadOid pins the head pin on the
-// GraphQL wire (#4641, approval C1): the value bound to the expectedHeadOid
-// argument, resolved through its declared variable, is the expected head.
-func TestEnableAutoMergeAtHead_SendsExpectedHeadOid(t *testing.T) {
-	pf, c := newPinFake(t, pinH1)
-	if err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1); err != nil {
-		t.Fatalf("EnableAutoMergeAtHead: %v", err)
-	}
-	if _, n, _ := pf.counts(); n != 1 {
-		t.Fatalf("graphql requests = %d, want 1", n)
-	}
-	query, vars := decodeGraphQL(t, pf.graphqlBodies[0])
-	got, ok := resolveExpectedHeadOid(t, query, vars)
-	if !ok || got != pinH1 {
-		t.Errorf("expectedHeadOid resolves to (%q, %v), want %q; query:\n%s\nvariables: %v", got, ok, pinH1, query, vars)
-	}
-	if vars["id"] != "PR_pin" || vars["method"] != "SQUASH" {
-		t.Errorf("variables = %v, want id PR_pin and method SQUASH", vars)
-	}
-}
-
-// TestEnableAutoMergeAtHead_EmptyShaRefusedBeforeHTTP: an empty or whitespace
-// expected head is refused with ZERO requests, so the pinned seam never
-// degrades into an unpinned enable.
-func TestEnableAutoMergeAtHead_EmptyShaRefusedBeforeHTTP(t *testing.T) {
-	pf, c := newPinFake(t, pinH1)
-	for _, sha := range []string{"", "   "} {
-		err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, sha)
-		if err == nil || !strings.Contains(err.Error(), "expected head sha required") {
-			t.Errorf("sha %q: err = %v, want expected-head-sha refusal", sha, err)
-		}
-	}
-	if g, q, p := pf.counts(); g+q+p != 0 {
-		t.Errorf("requests = %d GET / %d graphql / %d PUT, want none", g, q, p)
-	}
-}
-
-// TestEnableAutoMergeAtHead_HeadMovedBeforeMutation: the pre-check GET serves
-// h2 for an expected h1. The fake would answer the mutation with SUCCESS, so
-// without the pre-check this returns nil after one mutation; with it, the
-// call is a typed head mismatch (basis precheck) and NO mutation is sent.
-func TestEnableAutoMergeAtHead_HeadMovedBeforeMutation(t *testing.T) {
-	pf, c := newPinFake(t, pinH2)
-	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	if !errors.Is(err, ErrMergeConflict) {
-		t.Fatalf("err = %v, want ErrMergeConflict", err)
-	}
-	var hm *HeadMismatchError
-	if !errors.As(err, &hm) || hm.Basis != HeadMismatchPrecheck || hm.ExpectedHeadSHA != pinH1 || hm.ObservedHeadSHA != pinH2 {
-		t.Errorf("HeadMismatchError = %+v, want basis precheck expected h1 observed h2", hm)
-	}
-	if _, n, _ := pf.counts(); n != 0 {
-		t.Errorf("graphql requests = %d, want 0 (no mutation sent after a failed pre-check)", n)
-	}
-}
-
-// TestEnableAutoMergeAtHead_GraphQLRefusalWithMovedHeadIsHeadMismatch: the
-// pre-check sees h1, the pinned mutation answers a GraphQL error, and the
-// re-read sees h2 — a typed head mismatch (ErrValidation AND ErrMergeConflict,
-// basis graphql_reread) regardless of the error's wording.
-func TestEnableAutoMergeAtHead_GraphQLRefusalWithMovedHeadIsHeadMismatch(t *testing.T) {
-	pf, c := newPinFake(t, pinH1, pinH2)
-	pf.graphqlBody = pinGenericGraphQLError
-	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	if !errors.Is(err, ErrMergeConflict) || !errors.Is(err, ErrValidation) {
-		t.Fatalf("err = %v, want ErrMergeConflict AND ErrValidation", err)
-	}
-	var hm *HeadMismatchError
-	if !errors.As(err, &hm) || hm.Basis != HeadMismatchGraphQLReread || hm.ObservedHeadSHA != pinH2 {
-		t.Errorf("HeadMismatchError = %+v, want basis graphql_reread observed h2", hm)
-	}
-	if g, q, _ := pf.counts(); g != 2 || q != 1 {
-		t.Errorf("requests = %d GET / %d graphql, want 2 / 1", g, q)
-	}
-}
-
-// TestEnableAutoMergeAtHead_GraphQLErrorUnmovedHeadStaysGeneric: the re-read
-// still names the expected head, so the error stays the generic ErrValidation
-// (uncertain) — the classifier cannot over-release a claim.
-func TestEnableAutoMergeAtHead_GraphQLErrorUnmovedHeadStaysGeneric(t *testing.T) {
-	pf, c := newPinFake(t, pinH1, pinH1)
-	pf.graphqlBody = pinGenericGraphQLError
-	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	assertGenericPinnedGraphQLError(t, err)
-	if g, _, _ := pf.counts(); g != 2 {
-		t.Errorf("GET requests = %d, want 2 (the re-read ran)", g)
-	}
-}
-
-// TestEnableAutoMergeAtHead_ReReadFailureStaysGeneric: a failed re-read is
-// not evidence of a moved head; the error stays the generic ErrValidation and
-// does not leak the re-read's own sentinel (ErrNotFound).
-func TestEnableAutoMergeAtHead_ReReadFailureStaysGeneric(t *testing.T) {
-	pf, c := newPinFake(t, pinH1)
-	pf.getFailAt = 2
-	pf.graphqlBody = pinGenericGraphQLError
-	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	assertGenericPinnedGraphQLError(t, err)
-	if errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v must not wrap the re-read's ErrNotFound", err)
-	}
-	if err == nil || !strings.Contains(err.Error(), "head re-read failed") {
-		t.Errorf("err = %v, want it to name the failed re-read", err)
-	}
-}
-
-// TestEnableAutoMergeAtHead_ReReadEmptyHeadStaysGeneric: a re-read that
-// reports NO head is not evidence the head moved either.
-func TestEnableAutoMergeAtHead_ReReadEmptyHeadStaysGeneric(t *testing.T) {
-	pf, c := newPinFake(t, pinH1, "")
-	pf.graphqlBody = pinGenericGraphQLError
-	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	assertGenericPinnedGraphQLError(t, err)
-}
-
-// TestEnableAutoMergeAtHead_PreCheckEmptyHeadFailsClosed: a pre-check GET that
-// reports NO head is not the expected head, so it is refused as a precheck
-// mismatch with an empty observed head and NO mutation is sent (#4683). The
-// fake answers the mutation with SUCCESS, so without the fail-closed pre-check
-// this returns nil after one mutation. The re-read arm's empty head stays
-// uncertain (TestEnableAutoMergeAtHead_ReReadEmptyHeadStaysGeneric) because
-// the mutation was sent by then.
-func TestEnableAutoMergeAtHead_PreCheckEmptyHeadFailsClosed(t *testing.T) {
-	pf, c := newPinFake(t, "")
-	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	if !errors.Is(err, ErrMergeConflict) {
-		t.Fatalf("err = %v, want ErrMergeConflict", err)
-	}
-	var hm *HeadMismatchError
-	if !errors.As(err, &hm) || hm.Basis != HeadMismatchPrecheck || hm.ExpectedHeadSHA != pinH1 || hm.ObservedHeadSHA != "" {
-		t.Errorf("HeadMismatchError = %+v, want basis precheck expected h1 observed empty", hm)
-	}
-	if _, graphqls, puts := pf.counts(); graphqls != 0 || puts != 0 {
-		t.Errorf("graphql requests = %d, PUTs = %d, want 0 and 0 (no mutation after a failed pre-check)", graphqls, puts)
-	}
-}
-
 func assertGenericPinnedGraphQLError(t *testing.T, err error) {
 	t.Helper()
 	if !errors.Is(err, ErrValidation) {
@@ -2839,36 +2695,6 @@ func assertGenericPinnedGraphQLError(t *testing.T, err error) {
 	var hm *HeadMismatchError
 	if errors.As(err, &hm) {
 		t.Errorf("err carries HeadMismatchError %+v, want none", hm)
-	}
-}
-
-// TestEnableAutoMergeAtHead_PreconditionClassesKeepPriority: on a pinned call
-// the clean-status and unstable-status envelopes keep their sentinels and take
-// no re-read, even when the head would read as moved.
-func TestEnableAutoMergeAtHead_PreconditionClassesKeepPriority(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-		want error
-	}{
-		{"clean", `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`, ErrPullRequestCleanStatus},
-		{"unstable", `{"errors":[{"message":"Pull request Pull request is in unstable status","type":"UNPROCESSABLE"}]}`, ErrPullRequestUnstableStatus},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			pf, c := newPinFake(t, pinH1, pinH2)
-			pf.graphqlBody = tc.body
-			err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-			if !errors.Is(err, tc.want) || !errors.Is(err, ErrValidation) {
-				t.Errorf("err = %v, want %v AND ErrValidation", err, tc.want)
-			}
-			if errors.Is(err, ErrMergeConflict) {
-				t.Errorf("err = %v must not be a head mismatch", err)
-			}
-			if g, _, _ := pf.counts(); g != 1 {
-				t.Errorf("GET requests = %d, want 1 (no re-read on a precondition class)", g)
-			}
-		})
 	}
 }
 
@@ -2914,45 +2740,6 @@ func decodePut(t *testing.T, raw []byte) map[string]string {
 
 const pinCleanStatus = `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`
 
-// TestQueueMerge_PinnedCleanStatusFallbackSendsSha: a pinned ladder whose
-// enable is refused for clean status falls back to the PINNED REST merge — the
-// PUT carries sha == the expected head, and the enable carried expectedHeadOid.
-func TestQueueMerge_PinnedCleanStatusFallbackSendsSha(t *testing.T) {
-	pf, c := newPinFake(t, pinH1)
-	pf.graphqlBody = pinCleanStatus
-	if err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1); err != nil {
-		t.Fatalf("QueueMerge: %v", err)
-	}
-	if _, q, p := pf.counts(); q != 1 || p != 1 {
-		t.Fatalf("requests = %d graphql / %d PUT, want 1 / 1", q, p)
-	}
-	query, vars := decodeGraphQL(t, pf.graphqlBodies[0])
-	if got, ok := resolveExpectedHeadOid(t, query, vars); !ok || got != pinH1 {
-		t.Errorf("enable expectedHeadOid = (%q, %v), want %q", got, ok, pinH1)
-	}
-	if body := decodePut(t, pf.putBodies[0]); body["sha"] != pinH1 || body["merge_method"] != "squash" {
-		t.Errorf("PUT body = %v, want sha %q merge_method squash", body, pinH1)
-	}
-}
-
-// TestQueueMerge_PinnedFallbackShaMismatchIsHeadMismatch: the pinned REST
-// fallback's 409 ("sha was provided and pull request head did not match") is a
-// typed head mismatch with basis rest_sha.
-func TestQueueMerge_PinnedFallbackShaMismatchIsHeadMismatch(t *testing.T) {
-	pf, c := newPinFake(t, pinH1)
-	pf.graphqlBody = pinCleanStatus
-	pf.putStatus = http.StatusConflict
-	pf.putBody = `{"message":"Head branch was modified. Review and try the merge again."}`
-	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	if !errors.Is(err, ErrMergeConflict) {
-		t.Fatalf("err = %v, want ErrMergeConflict", err)
-	}
-	var hm *HeadMismatchError
-	if !errors.As(err, &hm) || hm.Basis != HeadMismatchRESTSha || hm.ExpectedHeadSHA != pinH1 {
-		t.Errorf("HeadMismatchError = %+v, want basis rest_sha expected h1", hm)
-	}
-}
-
 // TestQueueMerge_UnpinnedCleanStatusFallbackOmitsSha: an empty expected head
 // keeps the unpinned ladder — the enable carries no expectedHeadOid and the
 // REST fallback no sha.
@@ -2975,44 +2762,234 @@ func TestQueueMerge_UnpinnedCleanStatusFallbackOmitsSha(t *testing.T) {
 	}
 }
 
-// TestQueueMerge_UnstableStatusNoFallback: the UNSTABLE-status class never
-// takes the REST fallback (#2717), pinned or unpinned — zero PUTs.
+// TestQueueMerge_UnstableStatusNoFallback: the unpinned UNSTABLE-status class
+// never takes the REST fallback (#2717) — zero PUTs. The pinned arm's unstable
+// refusal is TestQueueMerge_PinnedUnstableSendsNoPut.
 func TestQueueMerge_UnstableStatusNoFallback(t *testing.T) {
-	for _, head := range []string{pinH1, ""} {
-		pf, c := newPinFake(t, pinH1)
-		pf.graphqlBody = `{"errors":[{"message":"Pull request Pull request is in unstable status","type":"UNPROCESSABLE"}]}`
-		err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, head)
-		if !errors.Is(err, ErrPullRequestUnstableStatus) {
-			t.Errorf("head %q: err = %v, want ErrPullRequestUnstableStatus", head, err)
-		}
-		if _, _, p := pf.counts(); p != 0 {
-			t.Errorf("head %q: PUT requests = %d, want 0", head, p)
-		}
+	pf, c := newPinFake(t, pinH1)
+	pf.graphqlBody = `{"errors":[{"message":"Pull request Pull request is in unstable status","type":"UNPROCESSABLE"}]}`
+	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, "")
+	if !errors.Is(err, ErrPullRequestUnstableStatus) {
+		t.Errorf("err = %v, want ErrPullRequestUnstableStatus", err)
+	}
+	if _, _, p := pf.counts(); p != 0 {
+		t.Errorf("PUT requests = %d, want 0", p)
 	}
 }
 
-// TestQueueMerge_EnableSuccessNoFallback: a successful enable ends the ladder,
-// pinned or unpinned — zero PUTs. A pinned pre-check head mismatch also ends it
-// (zero mutations, zero PUTs).
+// TestQueueMerge_EnableSuccessNoFallback: a successful unpinned enable ends
+// the ladder — zero PUTs.
 func TestQueueMerge_EnableSuccessNoFallback(t *testing.T) {
-	for _, head := range []string{pinH1, ""} {
-		pf, c := newPinFake(t, pinH1)
-		if err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, head); err != nil {
-			t.Errorf("head %q: QueueMerge: %v", head, err)
-		}
-		if _, q, p := pf.counts(); q != 1 || p != 0 {
-			t.Errorf("head %q: requests = %d graphql / %d PUT, want 1 / 0", head, q, p)
-		}
+	pf, c := newPinFake(t, pinH1)
+	if err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, ""); err != nil {
+		t.Errorf("QueueMerge: %v", err)
 	}
-	pf, c := newPinFake(t, pinH2)
-	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
-	var hm *HeadMismatchError
-	if !errors.Is(err, ErrMergeConflict) || !errors.As(err, &hm) || hm.Basis != HeadMismatchPrecheck {
-		t.Errorf("moved head: err = %v, want a precheck head mismatch", err)
+	if _, q, p := pf.counts(); q != 1 || p != 0 {
+		t.Errorf("requests = %d graphql / %d PUT, want 1 / 0", q, p)
 	}
+}
+
+// assertPinnedPut asserts exactly one PUT carrying sha == pinH1 and the squash
+// method, and zero GraphQL requests (no auto-merge armed).
+func assertPinnedPut(t *testing.T, pf *pinFake) {
+	t.Helper()
+	_, q, p := pf.counts()
+	if q != 0 || p != 1 {
+		t.Fatalf("requests = %d graphql / %d PUT, want 0 / 1 (a pinned dispatch never arms auto-merge)", q, p)
+	}
+	if body := decodePut(t, pf.putBodies[0]); body["sha"] != pinH1 || body["merge_method"] != "squash" {
+		t.Errorf("PUT body = %v, want sha %q merge_method squash", body, pinH1)
+	}
+}
+
+// assertNothingSent asserts zero GraphQL requests and zero PUTs.
+func assertNothingSent(t *testing.T, pf *pinFake) {
+	t.Helper()
 	if _, q, p := pf.counts(); q != 0 || p != 0 {
-		t.Errorf("moved head: requests = %d graphql / %d PUT, want 0 / 0", q, p)
+		t.Errorf("requests = %d graphql / %d PUT, want 0 / 0 (nothing sent)", q, p)
 	}
+}
+
+// TestQueueMerge_PinnedNeverArmsAutoMerge (#4676): a head-pinned dispatch on
+// a clean PR is ONE synchronous REST merge carrying sha == the pinned head and
+// sends NO enablePullRequestAutoMerge mutation. The fake would accept that
+// mutation, so routing the pinned arm back to EnableAutoMerge reads as one
+// GraphQL request and zero PUTs (C27).
+func TestQueueMerge_PinnedNeverArmsAutoMerge(t *testing.T) {
+	pf, c := newPinFake(t, pinH1)
+	if err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1); err != nil {
+		t.Fatalf("QueueMerge: %v", err)
+	}
+	assertPinnedPut(t, pf)
+}
+
+// TestQueueMerge_PinnedHasHooksMerges: has_hooks is merge-ready (GitHub's
+// HAS_HOOKS: mergeable with passing status and pre-receive hooks).
+func TestQueueMerge_PinnedHasHooksMerges(t *testing.T) {
+	pf, c := newPinFake(t, pinH1)
+	pf.mergeableState = "has_hooks"
+	if err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1); err != nil {
+		t.Fatalf("QueueMerge: %v", err)
+	}
+	assertPinnedPut(t, pf)
+}
+
+// TestQueueMerge_PinnedNotReadyStatesSendNoPut (#4676): every mergeable_state
+// other than clean / has_hooks (and unstable, its own row) refuses with a
+// *forge.NotMergeReadyError and sends NOTHING. The PUT would answer 200 (a
+// bypass-capable App), so the leaf's readiness guard is the only control
+// (C28). A conflict — dirty, or mergeable=false whatever the state — carries
+// Conflicting (C32); the mergeable=false/clean row would otherwise PUT.
+func TestQueueMerge_PinnedNotReadyStatesSendNoPut(t *testing.T) {
+	falseV := false
+	cases := []struct {
+		name        string
+		state       string
+		mergeable   *bool
+		conflicting bool
+	}{
+		{"blocked", "blocked", nil, false},
+		{"unknown", "unknown", nil, false},
+		{"behind", "behind", nil, false},
+		{"draft", "draft", nil, false},
+		{"empty", "", nil, false},
+		{"unrecognised", "some_future_state", nil, false},
+		{"dirty", "dirty", nil, true},
+		{"mergeable_false_clean", "clean", &falseV, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newPinFake(t, pinH1)
+			pf.mergeableState = tc.state
+			pf.mergeable = tc.mergeable
+			err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+			if !errors.Is(err, forge.ErrPullRequestNotMergeReady) {
+				t.Fatalf("err = %v, want forge.ErrPullRequestNotMergeReady", err)
+			}
+			var nmr *forge.NotMergeReadyError
+			if !errors.As(err, &nmr) {
+				t.Fatalf("err = %v, want a *forge.NotMergeReadyError", err)
+			}
+			if nmr.MergeableState != tc.state || nmr.ExpectedHeadSHA != pinH1 || nmr.Conflicting != tc.conflicting {
+				t.Errorf("NotMergeReadyError = %+v, want state %q head h1 conflicting %v", nmr, tc.state, tc.conflicting)
+			}
+			if errors.Is(err, ErrPullRequestUnstableStatus) || errors.Is(err, ErrPullRequestNotMergeable) || errors.Is(err, ErrValidation) {
+				t.Errorf("err = %v must not wrap unstable / not-mergeable / validation", err)
+			}
+			assertNothingSent(t, pf)
+		})
+	}
+}
+
+// TestQueueMerge_PinnedUnstableSendsNoPut: unstable keeps its pre-#4676
+// identity (ErrValidation AND ErrPullRequestUnstableStatus, the server's
+// checks_pending, CC5) and sends nothing. Without the unstable branch it
+// would read as a NotMergeReadyError (C29).
+func TestQueueMerge_PinnedUnstableSendsNoPut(t *testing.T) {
+	pf, c := newPinFake(t, pinH1)
+	pf.mergeableState = "unstable"
+	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+	if !errors.Is(err, ErrPullRequestUnstableStatus) || !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want ErrPullRequestUnstableStatus AND ErrValidation", err)
+	}
+	if errors.Is(err, forge.ErrPullRequestNotMergeReady) {
+		t.Errorf("err = %v must not be NotMergeReady", err)
+	}
+	assertNothingSent(t, pf)
+}
+
+// TestQueueMerge_PinnedPrecheckHeadMoved: the pre-check GET serves h2 (clean)
+// for an expected h1, or an EMPTY head. The PUT would succeed, so without the
+// pre-check one PUT is sent (C30); with it the call is a typed head mismatch
+// (basis precheck) and nothing is sent.
+func TestQueueMerge_PinnedPrecheckHeadMoved(t *testing.T) {
+	for _, served := range []string{pinH2, ""} {
+		t.Run("served_"+map[bool]string{true: "empty", false: "h2"}[served == ""], func(t *testing.T) {
+			pf, c := newPinFake(t, served)
+			err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+			if !errors.Is(err, ErrMergeConflict) {
+				t.Fatalf("err = %v, want ErrMergeConflict", err)
+			}
+			var hm *HeadMismatchError
+			if !errors.As(err, &hm) || hm.Basis != HeadMismatchPrecheck || hm.ExpectedHeadSHA != pinH1 || hm.ObservedHeadSHA != served {
+				t.Errorf("HeadMismatchError = %+v, want basis precheck expected h1 observed %q", hm, served)
+			}
+			assertNothingSent(t, pf)
+		})
+	}
+}
+
+// TestQueueMerge_PinnedShaMismatchIsHeadMismatch: the pinned PUT's 409 ("sha
+// was provided and pull request head did not match") is a typed head mismatch
+// with basis rest_sha.
+func TestQueueMerge_PinnedShaMismatchIsHeadMismatch(t *testing.T) {
+	pf, c := newPinFake(t, pinH1)
+	pf.putStatus = http.StatusConflict
+	pf.putBody = `{"message":"Head branch was modified. Review and try the merge again."}`
+	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+	if !errors.Is(err, ErrMergeConflict) {
+		t.Fatalf("err = %v, want ErrMergeConflict", err)
+	}
+	var hm *HeadMismatchError
+	if !errors.As(err, &hm) || hm.Basis != HeadMismatchRESTSha || hm.ExpectedHeadSHA != pinH1 {
+		t.Errorf("HeadMismatchError = %+v, want basis rest_sha expected h1", hm)
+	}
+	assertPinnedPut(t, pf)
+}
+
+// TestQueueMerge_Pinned405IsNotMergeable (X1): the pinned PUT's 405 stays the
+// unattributed ErrPullRequestNotMergeable — never a NotMergeReadyError, so the
+// server keeps its 502 merge_dispatch_failed.
+func TestQueueMerge_Pinned405IsNotMergeable(t *testing.T) {
+	pf, c := newPinFake(t, pinH1)
+	pf.putStatus = http.StatusMethodNotAllowed
+	pf.putBody = `{"message":"Pull Request is not mergeable"}`
+	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+	if !errors.Is(err, ErrPullRequestNotMergeable) {
+		t.Fatalf("err = %v, want ErrPullRequestNotMergeable", err)
+	}
+	if errors.Is(err, forge.ErrPullRequestNotMergeReady) {
+		t.Errorf("err = %v must not be NotMergeReady", err)
+	}
+	assertPinnedPut(t, pf)
+}
+
+// TestQueueMerge_PinnedClosedPRFallsToFailure (CC6): a closed, unmerged PR at
+// the pinned head is never a resumable not-merge-ready state. It is refused as
+// ErrPullRequestNotMergeable (the existing failure answer: the server's 502
+// merge_dispatch_failed) with nothing sent, even though the fake serves clean.
+// A merged PR is refused the same way.
+func TestQueueMerge_PinnedClosedPRFallsToFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		merged bool
+	}{{"closed_unmerged", false}, {"merged", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newPinFake(t, pinH1)
+			pf.prState = "closed"
+			pf.merged = tc.merged
+			err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+			if !errors.Is(err, ErrPullRequestNotMergeable) {
+				t.Fatalf("err = %v, want ErrPullRequestNotMergeable", err)
+			}
+			if errors.Is(err, forge.ErrPullRequestNotMergeReady) {
+				t.Errorf("err = %v must never be a (resumable) NotMergeReady", err)
+			}
+			assertNothingSent(t, pf)
+		})
+	}
+}
+
+// TestQueueMerge_PinnedGetFailureSendsNothing: a failed readiness GET returns
+// its error and sends no merge request.
+func TestQueueMerge_PinnedGetFailureSendsNothing(t *testing.T) {
+	pf, c := newPinFake(t, pinH1)
+	pf.getFailAt = 1
+	err := c.QueueMerge(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	assertNothingSent(t, pf)
 }
 
 // TestQueueMerge_WhitespaceHeadRefused: a whitespace-only head is NOT treated
