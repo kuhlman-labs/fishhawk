@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -851,14 +852,158 @@ func TestMergeQueueMergeOnPass_OverlapRefusalHoldsUnmerged(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("merge_queue_overlap_refused rows = %d, want 1", len(rows))
 	}
-	p := w.payload(rows[0])
-	if strings.Contains(string(rows[0].Payload), other.id.String()) || p["refused_code"] == "" {
-		t.Fatalf("overlap row = %s", rows[0].Payload)
+	// The persisted row NAMES the undetermined run (#5604): undetermined[0] is
+	// the other run's live implement stage with no shared paths, blocking is
+	// empty, and the code is overlap_undetermined.
+	var row struct {
+		RefusedCode  string                `json:"refused_code"`
+		Blocking     []mergeOverlapBlocker `json:"blocking"`
+		Undetermined []mergeOverlapBlocker `json:"undetermined"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &row); err != nil {
+		t.Fatalf("decode overlap row: %v", err)
+	}
+	if row.RefusedCode != mergeCodeOverlapUndetermined || row.Blocking == nil || len(row.Blocking) != 0 ||
+		len(row.Undetermined) != 1 || row.Undetermined[0].RunID != other.id.String() ||
+		row.Undetermined[0].StageID != other.impl.ID.String() ||
+		row.Undetermined[0].Paths == nil || len(row.Undetermined[0].Paths) != 0 {
+		t.Fatalf("overlap row = %s, want refused_code %s, blocking [] and undetermined [{run_id %s stage_id %s paths []}]",
+			rows[0].Payload, mergeCodeOverlapUndetermined, other.id, other.impl.ID)
 	}
 	// A repeat decision appends no second row.
 	requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonOverlapRefused)
 	if n := len(w.rows(r, CategoryMergeQueueOverlapRefused)); n != 1 {
 		t.Fatalf("overlap rows after repeat = %d, want 1", n)
+	}
+}
+
+// TestRecordMergeQueueOverlapRefusal_NamesBlockersAndDedupes pins the
+// merge_queue_overlap_refused payload and its dedupe key (#5604): the row
+// names each blocking run with its stage, issue ref and shared paths, and the
+// pump's per-tick re-decision appends a row only when the decision changes,
+// INCLUDING its blocker set. Counterfactuals: dropping the blocking key from
+// the payload fails (a); restoring the counts-only `prior == decision` dedupe
+// fails (c), whose result keeps every count and swaps only the blocker run.
+func TestRecordMergeQueueOverlapRefusal_NamesBlockersAndDedupes(t *testing.T) {
+	au := newAuditFake()
+	au.stampSequence = true
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	prURL := "https://github.com/acme/widget/pull/7"
+	runRow := &run.Run{ID: uuid.New(), PullRequestURL: &prURL}
+	blocker := func(issue string, paths ...string) mergeOverlapBlocker {
+		return mergeOverlapBlocker{
+			RunID: uuid.NewString(), IssueRef: issue, StageID: uuid.NewString(),
+			StageType: string(run.StageTypeImplement), StageState: string(run.StageStateRunning), Paths: paths,
+		}
+	}
+	refusal := func(b mergeOverlapBlocker) mergeOverlapResult {
+		return mergeOverlapResult{
+			Status: http.StatusConflict, Code: mergeCodeOverlappingImplement, HeadSHA: "h1",
+			Blockers: []mergeOverlapBlocker{b},
+		}
+	}
+	type row struct {
+		RunID             string                `json:"run_id"`
+		PRURL             string                `json:"pr_url"`
+		HeadSHA           string                `json:"head_sha"`
+		RefusedCode       string                `json:"refused_code"`
+		BlockingCount     int                   `json:"blocking_count"`
+		UndeterminedCount int                   `json:"undetermined_count"`
+		Blocking          []mergeOverlapBlocker `json:"blocking"`
+		Undetermined      []mergeOverlapBlocker `json:"undetermined"`
+	}
+	rowsNow := func() []row {
+		t.Helper()
+		entries, err := au.ListForRunByCategory(context.Background(), runRow.ID, CategoryMergeQueueOverlapRefused)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		out := make([]row, 0, len(entries))
+		for _, e := range entries {
+			var r row
+			if err := json.Unmarshal(e.Payload, &r); err != nil {
+				t.Fatalf("decode %s: %v", e.Payload, err)
+			}
+			out = append(out, r)
+		}
+		return out
+	}
+	record := func(o mergeOverlapResult) {
+		t.Helper()
+		if err := s.recordMergeQueueOverlapRefusal(context.Background(), runRow, o); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+	requireNames := func(r row, b mergeOverlapBlocker) {
+		t.Helper()
+		if len(r.Blocking) != 1 {
+			t.Fatalf("blocking = %+v, want exactly %+v", r.Blocking, b)
+		}
+		got := r.Blocking[0]
+		if got.RunID != b.RunID || got.StageID != b.StageID || got.IssueRef != b.IssueRef ||
+			got.StageType != b.StageType || got.StageState != b.StageState || !slices.Equal(got.Paths, b.Paths) {
+			t.Fatalf("blocking[0] = %+v, want %+v", got, b)
+		}
+		if r.Undetermined == nil || len(r.Undetermined) != 0 {
+			t.Fatalf("undetermined = %#v, want []", r.Undetermined)
+		}
+	}
+
+	runB := blocker("acme/widget#11", "docs/api/v0.md", "shared.go")
+	// (a) The row names run B, its stage, issue ref and shared paths beside
+	// the existing keys.
+	record(refusal(runB))
+	got := rowsNow()
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	if r := got[0]; r.RunID != runRow.ID.String() || r.PRURL != prURL || r.HeadSHA != "h1" ||
+		r.RefusedCode != mergeCodeOverlappingImplement || r.BlockingCount != 1 || r.UndeterminedCount != 0 {
+		t.Fatalf("row = %+v, want this run's id, pr_url, head h1, %s, counts 1/0", r, mergeCodeOverlappingImplement)
+	}
+	requireNames(got[0], runB)
+
+	// (b) An identical decision appends nothing.
+	record(refusal(runB))
+	if n := len(rowsNow()); n != 1 {
+		t.Fatalf("rows after an identical decision = %d, want 1", n)
+	}
+
+	// (c) Same code, reason, head and counts, but blocker run C: a new
+	// decision, so a second row naming C.
+	runC := blocker("acme/widget#12", "docs/api/v0.md", "shared.go")
+	record(refusal(runC))
+	got = rowsNow()
+	if len(got) != 2 {
+		t.Fatalf("rows after the blocker changed B→C = %d, want 2 (the dedupe must key on the blocker set, not only the counts)", len(got))
+	}
+	requireNames(got[1], runC)
+
+	// (d) The same blocker C with a changed shared-path set: a third row.
+	runCWider := runC
+	runCWider.Paths = []string{"docs/api/v0.md", "other.go", "shared.go"}
+	record(refusal(runCWider))
+	got = rowsNow()
+	if len(got) != 3 {
+		t.Fatalf("rows after C's shared paths changed = %d, want 3", len(got))
+	}
+	requireNames(got[2], runCWider)
+
+	// A legacy counts-only row (written before #5604) is a different decision
+	// from a naming one with the same counts: the next decision appends.
+	legacy := newAuditFake()
+	legacy.stampSequence = true
+	legacyRun := uuid.New()
+	legacy.seeded = []*audit.Entry{{
+		ID: uuid.New(), RunID: &legacyRun, Sequence: 1, Category: CategoryMergeQueueOverlapRefused,
+		Payload: json.RawMessage(`{"head_sha":"h1","refused_code":"` + mergeCodeOverlappingImplement + `","refused_reason":"","blocking_count":1,"undetermined_count":0}`),
+	}}
+	ls := New(Config{Addr: "127.0.0.1:0", AuditRepo: legacy})
+	if err := ls.recordMergeQueueOverlapRefusal(context.Background(), &run.Run{ID: legacyRun}, refusal(runB)); err != nil {
+		t.Fatalf("record over legacy: %v", err)
+	}
+	if n := len(legacy.appended); n != 1 {
+		t.Fatalf("appends over a legacy counts-only row = %d, want 1 naming row", n)
 	}
 }
 
