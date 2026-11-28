@@ -2612,3 +2612,110 @@ func TestReadEvents_TruncatedGzipIsReadError(t *testing.T) {
 		t.Errorf("err = %v, want a `bundle: read:` error", err)
 	}
 }
+
+// --- PeekManifest (#5535) ---
+
+// peekPinnedManifestLine is a manifest line declaring a verify pin.
+const peekPinnedManifestLine = `{"seq":1,"kind":"manifest","data":{"bundle_schema":"v1","run_id":"r","stage_id":"s","agent":"claude-code","generated_at":"2026-11-27T12:00:00Z","verify_pin_head_sha":"0123456789abcdef0123456789abcdef01234567"}}`
+
+// TestPeekManifest_ReadsLineOnePastMalformedLaterLine pins the reason
+// PeekManifest exists: a malformed line 2 makes ReadEvents (and so
+// ExtractManifest) fail, but PeekManifest still returns the line-1 manifest
+// and its declared verify pin.
+func TestPeekManifest_ReadsLineOnePastMalformedLaterLine(t *testing.T) {
+	b := gzipRaw(t, []byte(peekPinnedManifestLine+"\n{not json\n"))
+	if _, err := ExtractManifest(b); err == nil {
+		t.Fatal("fixture: ExtractManifest must fail on the malformed line 2, or this test isolates nothing")
+	}
+	m, err := PeekManifest(b)
+	if err != nil {
+		t.Fatalf("PeekManifest: %v", err)
+	}
+	if m.VerifyPinHeadSHA != "0123456789abcdef0123456789abcdef01234567" || m.Agent != "claude-code" {
+		t.Errorf("PeekManifest = %+v, want the line-1 manifest with its verify pin", m)
+	}
+}
+
+// TestPeekManifest_DoesNotReadPastLineOne pins that the later lines are not
+// read: at a line bound equal to line 1, line 2 is over the bound and fails
+// readEvents with ErrLineTooLong, yet the peek succeeds.
+func TestPeekManifest_DoesNotReadPastLineOne(t *testing.T) {
+	bound := len(peekPinnedManifestLine)
+	raw := []byte(peekPinnedManifestLine + "\n" + strings.Repeat("y", bound+1) + "\n")
+	b := gzipRaw(t, raw)
+	if _, err := readEvents(b, bound, MaxDecompressedBytes); !errors.Is(err, ErrLineTooLong) {
+		t.Fatalf("fixture: readEvents err = %v, want ErrLineTooLong on line 2", err)
+	}
+	m, err := peekManifest(b, bound)
+	if err != nil || m.VerifyPinHeadSHA == "" {
+		t.Fatalf("peekManifest at a line bound equal to line 1 = %+v, %v; want the manifest", m, err)
+	}
+}
+
+func TestPeekManifest_Errors(t *testing.T) {
+	t.Run("corrupt gzip header", func(t *testing.T) {
+		_, err := PeekManifest([]byte("not gzip"))
+		if !errors.Is(err, ErrBadGzip) {
+			t.Fatalf("err = %v, want ErrBadGzip", err)
+		}
+	})
+	t.Run("non-manifest line 1", func(t *testing.T) {
+		_, err := PeekManifest(gzipRaw(t, []byte(`{"seq":1,"kind":"raw","data":{}}`+"\n"+peekPinnedManifestLine+"\n")))
+		if !errors.Is(err, ErrNoManifest) {
+			t.Fatalf("err = %v, want ErrNoManifest", err)
+		}
+	})
+	t.Run("empty bundle", func(t *testing.T) {
+		_, err := PeekManifest(gzipRaw(t, nil))
+		if !errors.Is(err, ErrNoManifest) {
+			t.Fatalf("err = %v, want ErrNoManifest", err)
+		}
+	})
+	t.Run("line 1 over the bound", func(t *testing.T) {
+		_, err := peekManifest(gzipRaw(t, []byte(peekPinnedManifestLine+"\n")), len(peekPinnedManifestLine)-1)
+		if !errors.Is(err, ErrLineTooLong) {
+			t.Fatalf("err = %v, want ErrLineTooLong", err)
+		}
+	})
+	t.Run("malformed manifest payload", func(t *testing.T) {
+		_, err := PeekManifest(gzipRaw(t, []byte(`{"seq":1,"kind":"manifest","data":{"verify_pin_head_sha":7}}`+"\n")))
+		if err == nil || errors.Is(err, ErrNoManifest) || !strings.Contains(err.Error(), "bundle: parse manifest") {
+			t.Fatalf("err = %v, want a `bundle: parse manifest` error", err)
+		}
+	})
+}
+
+// TestManifest_DecodesVerifyPinGolden is the backend end of the shared
+// manifest golden (#5535): runner/internal/bundle's test packs a fixed
+// PackInputs and asserts its manifest data equals
+// testdata/wire/bundle_manifest_verify_pin.json; this decodes the same
+// bytes into Manifest and reads verify_pin_head_sha, through PeekManifest
+// and ExtractManifest alike.
+func TestManifest_DecodesVerifyPinGolden(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "bundle_manifest_verify_pin.json"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	var m Manifest
+	if err := json.Unmarshal(golden, &m); err != nil {
+		t.Fatalf("decode golden into Manifest: %v", err)
+	}
+	const want = "0123456789abcdef0123456789abcdef01234567"
+	if m.VerifyPinHeadSHA != want {
+		t.Fatalf("Manifest.VerifyPinHeadSHA = %q, want %q: the json tag drifted from the runner's", m.VerifyPinHeadSHA, want)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, golden); err != nil {
+		t.Fatal(err)
+	}
+	b := packLines(t, []Line{
+		{Seq: 1, Kind: EventKindManifest, Data: compact.Bytes()},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	})
+	for name, read := range map[string]func([]byte) (Manifest, error){"PeekManifest": PeekManifest, "ExtractManifest": ExtractManifest} {
+		got, err := read(b)
+		if err != nil || got.VerifyPinHeadSHA != want || !got.PushAndOpenPR {
+			t.Errorf("%s = %+v, %v; want the golden's verify pin and push_and_open_pr", name, got, err)
+		}
+	}
+}

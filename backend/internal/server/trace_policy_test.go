@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -2850,5 +2851,434 @@ func TestShipTrace_NoDiffEvent_StillSkipPass(t *testing.T) {
 	rows := policyPayloads(t, au)
 	if len(rows) != 1 || !rows[0].Passed || rows[0].SkipReason != policy.SkipNoDiffInBundle {
 		t.Fatalf("policy rows = %+v, want one passed:true no_diff_in_bundle", rows)
+	}
+}
+
+// --- #5535 slice 1: verify-pin clause, stage_state and stage_failure_kind ---
+
+// traceTimeFailureGolden is testdata/wire/trace_time_failure_reasons.json.
+type traceTimeFailureGolden struct {
+	ExampleSHA string `json:"example_sha"`
+	RunID      string `json:"run_id"`
+	StageID    string `json:"stage_id"`
+	VerifyRef  string `json:"verify_ref"`
+	Reasons    []struct {
+		Arm             string `json:"arm"`
+		FailureCategory string `json:"failure_category"`
+		ReasonTemplate  string `json:"reason_template"`
+	} `json:"reasons"`
+}
+
+func readTraceTimeFailureGolden(t *testing.T) traceTimeFailureGolden {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "trace_time_failure_reasons.json"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	var g traceTimeFailureGolden
+	if err := json.Unmarshal(b, &g); err != nil {
+		t.Fatalf("golden is not JSON: %v", err)
+	}
+	return g
+}
+
+// reason returns arm's rendered reason (with the clause) and its category.
+func (g traceTimeFailureGolden) reason(t *testing.T, arm string) (string, string) {
+	t.Helper()
+	for _, r := range g.Reasons {
+		if r.Arm == arm {
+			return strings.ReplaceAll(r.ReasonTemplate, "<sha>", g.ExampleSHA), r.FailureCategory
+		}
+	}
+	t.Fatalf("golden has no %q reason", arm)
+	return "", ""
+}
+
+// clause is the verify-pin clause the golden's reasons end with.
+func (g traceTimeFailureGolden) clause() string {
+	return "; verified head " + g.ExampleSHA + " pinned at " + g.VerifyRef
+}
+
+// withVerifyPin rewrites line 1 (the manifest) of a gzipped bundle to
+// declare verify_pin_head_sha = sha and, when pushFixup, push_fixup:true,
+// leaving every later line byte-identical (a malformed later line stays
+// malformed).
+func withVerifyPin(t *testing.T, b []byte, sha string, pushFixup bool) []byte {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, rest, _ := bytes.Cut(raw, []byte("\n"))
+	var line map[string]json.RawMessage
+	if err := json.Unmarshal(first, &line); err != nil {
+		t.Fatalf("line 1 is not JSON: %v", err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(line["data"], &data); err != nil {
+		t.Fatalf("manifest data: %v", err)
+	}
+	data["verify_pin_head_sha"] = sha
+	if pushFixup {
+		data["push_fixup"] = true
+	}
+	line["data"], _ = json.Marshal(data)
+	newFirst, _ := json.Marshal(line)
+	return gzipJSONL(t, string(newFirst)+"\n"+string(rest))
+}
+
+// decodeTraceAccepted decodes a 202 trace body into the response struct and
+// the raw key set, so a test can tell an omitted field from an empty one.
+func decodeTraceAccepted(t *testing.T, body []byte) (traceUploadResponse, map[string]json.RawMessage) {
+	t.Helper()
+	var resp traceUploadResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode 202: %v\n%s", err, body)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keys); err != nil {
+		t.Fatal(err)
+	}
+	return resp, keys
+}
+
+// setTraceIDs re-keys the policy fixture's run and stage to fixed ids, so
+// the rendered reason can be compared with the golden byte for byte.
+func setTraceIDs(t *testing.T, repo *policyRunRepo, runID, stageID string) {
+	t.Helper()
+	repo.runRow.ID = uuid.MustParse(runID)
+	repo.stage.RunID = repo.runRow.ID
+	repo.stage.ID = uuid.MustParse(stageID)
+}
+
+// traceTimeArmFixture builds one of the four trace-time failure arms of
+// handleShipTrace over the fixed golden ids, returning the server and the
+// bundle (with no verify pin declared) that drives that arm.
+func traceTimeArmFixture(t *testing.T, arm string, g traceTimeFailureGolden) (*Server, *signingFake, *policyRunRepo, []byte) {
+	t.Helper()
+	var (
+		s    *Server
+		sf   *signingFake
+		repo *policyRunRepo
+		b    []byte
+	)
+	switch arm {
+	case "bundle_unreadable":
+		var au *auditFake
+		s, sf, repo, au = newPolicyTraceServer(t, nil)
+		repo.runRow.State = run.StateRunning
+		s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: repo, Audit: au}
+		b = unreadableBundleMalformedLine(t)
+	case "no_diff_captured":
+		s, sf, repo, _ = newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = []byte(testWorkflowSpecRequireTests)
+		b = makeTestBundle(t, []map[string]string{})
+	case "verify_infra_tempfail":
+		changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+		s, sf, repo, _ = newVerifyTempFailTraceServer(t, testWorkflowSpecRequireVerification, changed)
+		b = makeTestBundleWithGateEvidence(t, changed, verifyTempFailEvidence())
+	case "policy_violations":
+		violating := []map[string]string{{"path": "infra/terraform.tf", "status": "M"}}
+		s, sf, repo, _ = newPolicyTraceServer(t, violating)
+		b = makeTestBundle(t, violating)
+	default:
+		t.Fatalf("unknown arm %q", arm)
+	}
+	setTraceIDs(t, repo, g.RunID, g.StageID)
+	return s, sf, repo, b
+}
+
+// TestShipTrace_TraceTimeFailure_ReasonsMatchWireGolden pins every trace-time
+// failure arm (#5535): with a verify pin declared in the signed manifest the
+// stored reason equals the golden (base reason plus the clause), with no pin
+// or a fix-up manifest (Y7) it is the base reason byte for byte, and the 202
+// reports stage_state failed with stage_failure_kind trace_rejected in every
+// case. The bundle_unreadable fixture's line 2 is malformed, so the clause is
+// rendered only because verifyPinClause reads line 1 alone (PeekManifest).
+func TestShipTrace_TraceTimeFailure_ReasonsMatchWireGolden(t *testing.T) {
+	g := readTraceTimeFailureGolden(t)
+	for _, arm := range []string{"bundle_unreadable", "no_diff_captured", "verify_infra_tempfail", "policy_violations"} {
+		want, wantCat := g.reason(t, arm)
+		if !strings.HasSuffix(want, g.clause()) {
+			t.Fatalf("%s: golden reason does not end with the clause %q", arm, g.clause())
+		}
+		base := strings.TrimSuffix(want, g.clause())
+		for _, tc := range []struct {
+			name       string
+			pin        bool
+			pushFixup  bool
+			wantReason string
+		}{
+			{"pin declared", true, false, want},
+			{"no pin", false, false, base},
+			{"fix-up manifest omits the clause", true, true, base},
+		} {
+			t.Run(arm+"/"+tc.name, func(t *testing.T) {
+				s, sf, repo, b := traceTimeArmFixture(t, arm, g)
+				if tc.pin {
+					b = withVerifyPin(t, b, g.ExampleSHA, tc.pushFixup)
+				}
+				priv, _ := sf.issue(t, repo.runRow.ID)
+				w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+				if w.Code != http.StatusAccepted {
+					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+				}
+				if repo.stage.State != run.StageStateFailed {
+					t.Fatalf("stage state = %q (reason %v), want failed", repo.stage.State, repo.stage.FailureReason)
+				}
+				if repo.stage.FailureCategory == nil || string(*repo.stage.FailureCategory) != wantCat {
+					t.Errorf("FailureCategory = %v, want %s", repo.stage.FailureCategory, wantCat)
+				}
+				if repo.stage.FailureReason == nil || *repo.stage.FailureReason != tc.wantReason {
+					t.Errorf("FailureReason =\n  %v\nwant\n  %q", derefReason(repo.stage.FailureReason), tc.wantReason)
+				}
+				resp, _ := decodeTraceAccepted(t, w.Body.Bytes())
+				if resp.StageState != string(run.StageStateFailed) || resp.StageFailureKind != traceFailureKindTraceRejected {
+					t.Errorf("202 stage_state/stage_failure_kind = %q/%q, want failed/trace_rejected", resp.StageState, resp.StageFailureKind)
+				}
+			})
+		}
+	}
+}
+
+func derefReason(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
+}
+
+// TestVerifyPinClause_MatchesSharedClauseFixture pins the clause text to the
+// `verify` entry of testdata/wire/implement_failure_reason_clauses.json, the
+// fixture the mcpserver checkpoint-ref extractor and the runner's own -verify
+// clause producer are pinned against.
+func TestVerifyPinClause_MatchesSharedClauseFixture(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "implement_failure_reason_clauses.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fx struct {
+		ExampleSHA        string `json:"example_sha"`
+		CheckpointClauses []struct {
+			Kind           string `json:"kind"`
+			RunID          string `json:"run_id"`
+			StageID        string `json:"stage_id"`
+			ClauseTemplate string `json:"clause_template"`
+		} `json:"checkpoint_clauses"`
+	}
+	if err := json.Unmarshal(b, &fx); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range fx.CheckpointClauses {
+		if c.Kind != "verify" {
+			continue
+		}
+		bundle := withVerifyPin(t, makeTestBundle(t, nil), fx.ExampleSHA, false)
+		got := verifyPinClause(bundle, uuid.MustParse(c.RunID), uuid.MustParse(c.StageID))
+		if want := strings.ReplaceAll(c.ClauseTemplate, "<sha>", fx.ExampleSHA); got != want {
+			t.Fatalf("verifyPinClause = %q, want the shared fixture's verify clause %q", got, want)
+		}
+		return
+	}
+	t.Fatal("implement_failure_reason_clauses.json has no verify clause")
+}
+
+// TestVerifyPinClause_Shapes pins the fail-open naming rules: only a 40- or
+// 64-character lowercase hex claim renders, a fix-up manifest renders nothing
+// (Y7), and an unreadable line 1 renders nothing.
+func TestVerifyPinClause_Shapes(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	ref := "refs/fishhawk/checkpoints/" + runID.String() + "/" + stageID.String() + "-verify"
+	sha40 := strings.Repeat("ab", 20)
+	sha64 := strings.Repeat("cd", 32)
+	for _, tc := range []struct {
+		name string
+		b    []byte
+		want string
+	}{
+		{"sha1", withVerifyPin(t, makeTestBundle(t, nil), sha40, false), "; verified head " + sha40 + " pinned at " + ref},
+		{"sha256", withVerifyPin(t, makeTestBundle(t, nil), sha64, false), "; verified head " + sha64 + " pinned at " + ref},
+		{"malformed line 2 still names it", withVerifyPin(t, unreadableBundleMalformedLine(t), sha40, false), "; verified head " + sha40 + " pinned at " + ref},
+		{"39 characters", withVerifyPin(t, makeTestBundle(t, nil), sha40[:39], false), ""},
+		{"41 characters", withVerifyPin(t, makeTestBundle(t, nil), sha40+"a", false), ""},
+		{"non-hex", withVerifyPin(t, makeTestBundle(t, nil), strings.Repeat("g", 40), false), ""},
+		{"uppercase hex", withVerifyPin(t, makeTestBundle(t, nil), strings.ToUpper(sha40), false), ""},
+		{"injection tail", withVerifyPin(t, makeTestBundle(t, nil), sha40+"; rm -rf /", false), ""},
+		{"empty claim", makeTestBundle(t, nil), ""},
+		{"push_fixup", withVerifyPin(t, makeTestBundle(t, nil), sha40, true), ""},
+		{"corrupt gzip", []byte("not gzip"), ""},
+		{"non-manifest line 1", gzipJSONL(t, `{"seq":1,"kind":"raw","data":{"verify_pin_head_sha":"`+sha40+`"}}`+"\n"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := verifyPinClause(tc.b, runID, stageID); got != tc.want {
+				t.Errorf("verifyPinClause = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTraceStageFailureKind pins the W1 classification table: the four
+// trace-time arms are trace_rejected, the #877 gating reject is
+// implement_review_rejected, and anything else (an agent category-A reason, a
+// runner /pull-request reason, a non-failed stage, a nil reason) is "".
+func TestTraceStageFailureKind(t *testing.T) {
+	failed := func(reason string) *run.Stage {
+		return &run.Stage{State: run.StageStateFailed, FailureReason: &reason}
+	}
+	running := policyViolationsTraceReason
+	for _, tc := range []struct {
+		name  string
+		stage *run.Stage
+		want  string
+	}{
+		{"bundle_unreadable", failed(bundleUnreadableTraceReason(errors.New("bundle: x"))), traceFailureKindTraceRejected},
+		{"no_diff_captured", failed(noDiffCapturedTraceReason), traceFailureKindTraceRejected},
+		{"verify_infra_tempfail", failed(verifyInfraTempFailTraceReason), traceFailureKindTraceRejected},
+		{"policy violations with clause", failed(policyViolationsTraceReason + "; verified head " + strings.Repeat("a", 40) + " pinned at x"), traceFailureKindTraceRejected},
+		{"gating reject", failed(implementReviewGatingRejectReason), traceFailureKindImplementReviewRejected},
+		{"agent category A", failed(`verify command "scripts/verify-change" still failing after 2 iteration(s): boom`), ""},
+		{"runner pull-request report", failed("commit+push: push rejected"), ""},
+		{"nil reason", &run.Stage{State: run.StageStateFailed}, ""},
+		{"running stage", &run.Stage{State: run.StageStateRunning, FailureReason: &running}, ""},
+		{"nil stage", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := traceStageFailureKind(tc.stage); got != tc.want {
+				t.Errorf("traceStageFailureKind = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShipTrace_HeldOversizedLineStage_ReportsRunning: a push_and_open_pr
+// stage whose bundle carries a ~5 MiB event line (the #5535 incident shape)
+// is held for its PR, and the 202 says so with stage_state running and no
+// stage_failure_kind.
+func TestShipTrace_HeldOversizedLineStage_ReportsRunning(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = []byte(testWorkflowSpec)
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	big, err := json.Marshal(map[string]any{"seq": 5, "kind": "agent_output", "data": map[string]string{"text": strings.Repeat("x", 5*1024*1024)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(big) <= 4*1024*1024 {
+		t.Fatalf("fixture line = %d bytes, want over the old 4 MiB cap", len(big))
+	}
+	files := `[{"path":"file0.go","status":"modified"}]`
+	b := gateBundle(t, bundlepkg.Manifest{BundleSchema: "v1", PushAndOpenPR: true, VerifyPinHeadSHA: strings.Repeat("a", 40)},
+		string(big)+"\n"+`{"seq":6,"kind":"git_diff","data":{"files":`+files+`,"num_files":1}}`+"\n")
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, b, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	resp, keys := decodeTraceAccepted(t, w.Body.Bytes())
+	if resp.StageState != string(run.StageStateRunning) {
+		t.Fatalf("202 stage_state = %q, want running (held for the PR)", resp.StageState)
+	}
+	if _, ok := keys["stage_failure_kind"]; ok {
+		t.Errorf("202 carries stage_failure_kind on a held stage: %s", w.Body.String())
+	}
+}
+
+// TestShipTrace_StageStateOmittedForOtherRunOrLookupError pins W7 (see
+// #5587): the 202 reports stage_state and stage_failure_kind only for a stage
+// that belongs to the URL's run. A stage seeded FAILED with a trace-time
+// reason under ANOTHER run id gets neither field, and so does an upload whose
+// stage lookup fails.
+func TestShipTrace_StageStateOmittedForOtherRunOrLookupError(t *testing.T) {
+	assertOmitted := func(t *testing.T, w []byte) {
+		t.Helper()
+		_, keys := decodeTraceAccepted(t, w)
+		for _, k := range []string{"stage_state", "stage_failure_kind"} {
+			if _, ok := keys[k]; ok {
+				t.Errorf("202 carries %s: %s", k, w)
+			}
+		}
+	}
+	t.Run("stage of another run", func(t *testing.T) {
+		clean := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+		s, sf, repo, _ := newPolicyTraceServer(t, clean)
+		reason := policyViolationsTraceReason
+		cat := run.FailureB
+		repo.stage.RunID = uuid.New()
+		repo.stage.State = run.StageStateFailed
+		repo.stage.FailureReason = &reason
+		repo.stage.FailureCategory = &cat
+		priv, _ := sf.issue(t, repo.runRow.ID)
+		w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, makeTestBundle(t, clean), "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		// The fake repo does not refuse the transition (that handler gap is
+		// #5587); whatever state the stage reached, it is readable, so only
+		// the RunID guard keeps it out of the 202.
+		if got, err := repo.GetStage(t.Context(), repo.stage.ID); err != nil || got.State == "" {
+			t.Fatalf("fixture: stage lookup = %v, %v; want a readable stage so only the RunID guard omits the fields", got, err)
+		}
+		assertOmitted(t, w.Body.Bytes())
+	})
+	t.Run("stage lookup error", func(t *testing.T) {
+		clean := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+		s, sf, repo, _ := newPolicyTraceServer(t, clean)
+		priv, _ := sf.issue(t, repo.runRow.ID)
+		w := shipRequest(t, s, repo.runRow.ID, uuid.New(), "raw", priv, makeTestBundle(t, clean), "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		assertOmitted(t, w.Body.Bytes())
+	})
+}
+
+// TestTraceUploadResponse_MatchesWireGolden is the backend end of the trace
+// 202 seam: traceUploadResponse marshals to exactly
+// testdata/wire/trace_upload_response.json, which runner/internal/upload's
+// TestShipTrace_DecodesTraceUploadResponseGolden decodes into ShipResult.
+func TestTraceUploadResponse_MatchesWireGolden(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "trace_upload_response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(golden, &want); err != nil {
+		t.Fatal(err)
+	}
+	resp := traceUploadResponse{
+		RunID:            uuid.MustParse("8d3f6c2a-41b7-4e59-9a0c-7f15e2b3d904"),
+		StageID:          uuid.MustParse("c5e1a9b7-2f48-4d63-8b0e-19a7d4c6f203"),
+		Variant:          "raw",
+		ContentHash:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		StageState:       string(run.StageStateFailed),
+		StageFailureKind: traceFailureKindTraceRejected,
+	}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("traceUploadResponse marshals to %s, want the golden %s", b, golden)
 	}
 }

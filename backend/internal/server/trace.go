@@ -75,11 +75,92 @@ const implementReviewGatingRejectPrefix = "implement_review_rejected"
 // variant, content_hash) tuple so the runner can confirm the
 // backend stored the same bytes it sent and stash the hash for
 // later cross-reference.
+//
+// StageState and StageFailureKind (#5535) tell the runner what this upload
+// did to its stage: `running` means the stage is held for the runner's
+// /pull-request report; `failed` with StageFailureKind trace_rejected means
+// the backend refused the stage at trace time (the runner keeps its verify
+// pin and does not push); `failed` with implement_review_rejected is the
+// gating implement-review reject (the runner still pushes and the PR is
+// closed, #877). Both are omitted when the stage cannot be read or does not
+// belong to the URL's run (writeTraceAccepted).
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+// runner/internal/upload.ShipResult. Pinned by the shared golden
+// testdata/wire/trace_upload_response.json and the wirecontract
+// trace_upload_response pair.
 type traceUploadResponse struct {
-	RunID       uuid.UUID `json:"run_id"`
-	StageID     uuid.UUID `json:"stage_id"`
-	Variant     string    `json:"variant"`
-	ContentHash string    `json:"content_hash"`
+	RunID            uuid.UUID `json:"run_id"`
+	StageID          uuid.UUID `json:"stage_id"`
+	Variant          string    `json:"variant"`
+	ContentHash      string    `json:"content_hash"`
+	StageState       string    `json:"stage_state,omitempty"`
+	StageFailureKind string    `json:"stage_failure_kind,omitempty"`
+}
+
+// Closed stage_failure_kind values in the trace 202 body (#5535).
+const (
+	// traceFailureKindTraceRejected: the trace handler itself failed the
+	// stage (bundle_unreadable, no_diff_captured, verify_infra_tempfail or a
+	// backend policy re-evaluation violation).
+	traceFailureKindTraceRejected = "trace_rejected"
+	// traceFailureKindImplementReviewRejected: a gating agent implement
+	// review rejected the stage during the raw-trace upload (#877).
+	traceFailureKindImplementReviewRejected = "implement_review_rejected"
+)
+
+// traceRejectedReasonPrefixes are the stored-reason prefixes of the four
+// trace-time failure arms of handleShipTrace. traceStageFailureKind maps a
+// failed stage whose reason starts with one of them to trace_rejected.
+var traceRejectedReasonPrefixes = []string{
+	bundleUnreadableReasonPrefix,
+	noDiffCapturedTraceReasonPrefix,
+	verifyInfraTempFailTraceReason,
+	policyViolationsTraceReason,
+}
+
+// traceStageFailureKind classifies a FAILED stage's stored failure reason
+// by prefix for the trace 202's stage_failure_kind (#5535 W1): one of the
+// trace handler's four trace-time arms is trace_rejected, the #877 gating
+// implement-review reject (implementReviewGatingRejectPrefix, the same key
+// handleShipPullRequest's PR close matches) is implement_review_rejected,
+// and anything else, a non-failed stage or a nil reason is "". The kind is
+// a positive list, so an unclassified failure keeps the runner's existing
+// push behaviour.
+func traceStageFailureKind(stage *run.Stage) string {
+	if stage == nil || stage.State != run.StageStateFailed || stage.FailureReason == nil {
+		return ""
+	}
+	reason := *stage.FailureReason
+	if strings.HasPrefix(reason, implementReviewGatingRejectPrefix) {
+		return traceFailureKindImplementReviewRejected
+	}
+	for _, p := range traceRejectedReasonPrefixes {
+		if strings.HasPrefix(reason, p) {
+			return traceFailureKindTraceRejected
+		}
+	}
+	return ""
+}
+
+// writeTraceAccepted writes the trace upload's 202 body. It re-reads the
+// stage best-effort and reports stage_state and stage_failure_kind only
+// when the lookup succeeds AND the stage belongs to the URL's run; a lookup
+// error, a stage of another run or a nil RunRepo omits both (see #5587).
+func (s *Server) writeTraceAccepted(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, variant tracestore.Variant, contentHash string) {
+	resp := traceUploadResponse{
+		RunID:       runID,
+		StageID:     stageID,
+		Variant:     string(variant),
+		ContentHash: contentHash,
+	}
+	if s.cfg.RunRepo != nil {
+		if stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID); err == nil && stage != nil && stage.RunID == runID {
+			resp.StageState = string(stage.State)
+			resp.StageFailureKind = traceStageFailureKind(stage)
+		}
+	}
+	s.writeJSON(w, r, http.StatusAccepted, resp)
 }
 
 // handleShipTrace implements POST /v0/runs/{run_id}/trace.
@@ -300,12 +381,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		// short-circuit here so the stage-advancement block below never runs
 		// — no further stage is dispatched for a run the system has stopped.
 		if s.checkRunBudget(r.Context(), runID, stageID) {
-			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
-				RunID:       runID,
-				StageID:     stageID,
-				Variant:     string(variant),
-				ContentHash: contentHash,
-			})
+			s.writeTraceAccepted(w, r, runID, stageID, variant, contentHash)
 			return
 		}
 
@@ -318,12 +394,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		// stage is dispatched; an ADVISORY breach audits and returns false, so
 		// the stage advances normally.
 		if s.checkStageBudget(r.Context(), runID, stageID) {
-			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
-				RunID:       runID,
-				StageID:     stageID,
-				Variant:     string(variant),
-				ContentHash: contentHash,
-			})
+			s.writeTraceAccepted(w, r, runID, stageID, variant, contentHash)
 			return
 		}
 	}
@@ -379,12 +450,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 					slog.String("run_id", runID.String()),
 					slog.String("stage_id", stageID.String()),
 					slog.String("error", err.Error()))
-				s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
-					RunID:       runID,
-					StageID:     stageID,
-					Variant:     string(variant),
-					ContentHash: contentHash,
-				})
+				s.writeTraceAccepted(w, r, runID, stageID, variant, contentHash)
 				return
 			}
 			// Advance so the orchestrator walks the run to its
@@ -397,12 +463,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			// stages that failed agent-side. Errors logged at WARN
 			// and do not unwind the upload.
 			s.emitRuntimeObserved(r.Context(), runID, stageID, body, "failed")
-			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
-				RunID:       runID,
-				StageID:     stageID,
-				Variant:     string(variant),
-				ContentHash: contentHash,
-			})
+			s.writeTraceAccepted(w, r, runID, stageID, variant, contentHash)
 			return
 		}
 	}
@@ -448,9 +509,7 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			// category-C so the existing failed → pending retry path
 			// gives operators an escape hatch rather than dooming the
 			// stage (and any fan-out parent) on an un-redrivable B.
-			s.failStageCategoryC(r, runID, stageID,
-				"no_diff_captured: implement stage produced an empty diff; nothing was staged or captured (retryable; see #691/#692)",
-				body)
+			s.failStageCategoryC(r, runID, stageID, noDiffCapturedTraceReason, body)
 		case s.verifyInfraTempFailOnly(r.Context(), stageID, body, violations):
 			// #5264: the committed-tree verify's only failing commands
 			// exited 75 (EX_TEMPFAIL, ADR-102 / #4022), so the change
@@ -460,16 +519,11 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			// retry-eligible instead of failing it on a B.
 			s.failStageCategoryC(r, runID, stageID, verifyInfraTempFailTraceReason, body)
 		default:
-			s.failStageCategoryB(r, runID, stageID, "policy violations on backend re-evaluation", body)
+			s.failStageCategoryB(r, runID, stageID, policyViolationsTraceReason, body)
 		}
 	}
 
-	s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
-		RunID:       runID,
-		StageID:     stageID,
-		Variant:     string(variant),
-		ContentHash: contentHash,
-	})
+	s.writeTraceAccepted(w, r, runID, stageID, variant, contentHash)
 }
 
 // advanceStageAfterTrace walks the stage out of `dispatched`. The
@@ -1562,7 +1616,11 @@ func isEmptyConstraints(c policy.Constraints) bool {
 // run stays in pending forever once any stage fails.
 //
 // bundleBytes is used for runtime calibration emit (best-effort).
+//
+// The reason gains verifyPinClause's `; verified head <sha> pinned at <ref>`
+// suffix when the signed manifest declares a verify pin (#5535).
 func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
+	reason += verifyPinClause(bundleBytes, runID, stageID)
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, reason); err != nil {
 		// #968: FailStage rejecting the transition means this report is a
 		// duplicate against an already-resolved stage (e.g. fix-up recovery
@@ -1590,8 +1648,11 @@ func (s *Server) failStageCategoryB(r *http.Request, runID, stageID uuid.UUID, r
 // and the #5264 exit-75 verify signature (verifyInfraTempFailOnly), so
 // operators get an escape hatch instead of an un-redrivable B. Same
 // best-effort posture as the B helper:
-// failures log at WARN and never unwind the already-stored upload.
+// failures log at WARN and never unwind the already-stored upload. Its
+// callers are the no_diff_captured, verify_infra_tempfail and
+// bundle_unreadable arms; like the B helper it appends verifyPinClause.
 func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, reason string, bundleBytes []byte) {
+	reason += verifyPinClause(bundleBytes, runID, stageID)
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureC, reason); err != nil {
 		// #968: same duplicate-report discipline as the B helper — the
 		// 68e13183 incident was a duplicate cat-C report arriving after
@@ -1609,6 +1670,45 @@ func (s *Server) failStageCategoryC(r *http.Request, runID, stageID uuid.UUID, r
 	// Best-effort: emit runtime calibration for implement stages that
 	// failed with an empty captured diff or an exit-75 verify.
 	s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
+}
+
+// noDiffCapturedTraceReasonPrefix starts the no_diff_captured trace-time
+// failure reason (#691/#692); traceStageFailureKind keys on it.
+const noDiffCapturedTraceReasonPrefix = "no_diff_captured:"
+
+// noDiffCapturedTraceReason is the category-C reason for an implement
+// stage whose bundle carries a present-but-empty diff (#691/#692).
+const noDiffCapturedTraceReason = noDiffCapturedTraceReasonPrefix + " implement stage produced an empty diff; nothing was staged or captured (retryable; see #691/#692)"
+
+// policyViolationsTraceReason is the category-B reason for an implement or
+// other stage whose backend policy re-evaluation found violations.
+// traceStageFailureKind keys on it.
+const policyViolationsTraceReason = "policy violations on backend re-evaluation"
+
+// verifyPinRefPattern is the shape a declared verify pin SHA must have to be
+// named in a reason: a full SHA-1 (40) or SHA-256 (64) lowercase hex object
+// id. Anything else renders no clause.
+var verifyPinRefPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
+
+// verifyPinClause returns the `; verified head <sha> pinned at
+// refs/fishhawk/checkpoints/<run>/<stage>-verify` suffix the trace-time
+// failure arms append when the signed manifest declares the verify pin the
+// runner took before the trace upload (#5535). It reads ONLY line 1
+// (bundle.PeekManifest), so a bundle a later line makes unreadable still
+// names its pin. The SHA must match verifyPinRefPattern and the ref is built
+// from the URL's run and stage ids, so no other runner-chosen bytes reach
+// the reason. It returns "" when the manifest cannot be read, declares no
+// pin or an invalid one, or is a fix-up (PushFixup): an in-request fix-up
+// recovery pushes and releases the ref, so naming it would point at a ref
+// that no longer exists. The clause text is pinned by the `verify` entry of
+// testdata/wire/implement_failure_reason_clauses.json.
+func verifyPinClause(bundleBytes []byte, runID, stageID uuid.UUID) string {
+	m, err := bundle.PeekManifest(bundleBytes)
+	if err != nil || m.PushFixup || !verifyPinRefPattern.MatchString(m.VerifyPinHeadSHA) {
+		return ""
+	}
+	return "; verified head " + m.VerifyPinHeadSHA + " pinned at refs/fishhawk/checkpoints/" +
+		runID.String() + "/" + stageID.String() + "-verify"
 }
 
 // bundleDiffUnreadable reports whether an ExtractDiff (or ExtractManifest)
@@ -1716,8 +1816,9 @@ func bundleUnreadableTraceReason(err error) string {
 		"the implement trace bundle could not be read (" + bundleErrDetail(err) + "), " +
 		"so its diff, the implement review and the policy verdict are undeterminable; " +
 		"the stage was failed rather than advanced as a no-changes pass. " +
-		"A run branch the runner pushed after the trace carries the agent's verified work; " +
-		"otherwise the verified tree survives only as the runner checkout's `fishhawk verify wip` commit. " +
+		"A current runner does not push after this failure: it keeps its verify pin, named at the end of this reason when the manifest declared one; " +
+		"otherwise the verified tree survives only as the runner checkout's `fishhawk verify wip` commit, " +
+		"and an ephemeral runner's local refs may not outlive its job. " +
 		"Inspect it before retrying the stage in place (retryable; see #5535)"
 }
 
