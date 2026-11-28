@@ -6,18 +6,17 @@ import (
 	"unicode/utf8"
 )
 
-// TestDetect_PositiveAcrossAllThreeSources: an obligation-bearing text on each
+// TestDetect_PositiveAcrossBothSources: an obligation-bearing text on each
 // routed channel is classified, tagged with its source, and given an id.
-func TestDetect_PositiveAcrossAllThreeSources(t *testing.T) {
+func TestDetect_PositiveAcrossBothSources(t *testing.T) {
 	got := Detect([]Source{
 		{Kind: SourceConcern, Text: "Record the per-deletion counterfactual results in the PR body's ## Notes."},
 		{Kind: SourceOperatorConcern, Text: "Also document the failure-mode mapping in the pull request description."},
-		{Kind: SourceReason, Text: "Report the observed RED output in the run log."},
 	})
-	if len(got) != 3 {
-		t.Fatalf("Detect returned %d obligations, want 3: %+v", len(got), got)
+	if len(got) != 2 {
+		t.Fatalf("Detect returned %d obligations, want 2: %+v", len(got), got)
 	}
-	wantSources := []SourceKind{SourceConcern, SourceOperatorConcern, SourceReason}
+	wantSources := []SourceKind{SourceConcern, SourceOperatorConcern}
 	for i, ob := range got {
 		if ob.Source != wantSources[i] {
 			t.Errorf("obligation %d source = %q, want %q", i, ob.Source, wantSources[i])
@@ -67,7 +66,7 @@ func TestDetect_SurfaceNounWithoutVerbIsNotAnObligation(t *testing.T) {
 func TestDetect_RoutineConcernIsNotAnObligation(t *testing.T) {
 	got := Detect([]Source{
 		{Kind: SourceConcern, Text: "[high/correctness] Guard the nil pool in the retry path."},
-		{Kind: SourceReason, Text: "route the two correctness concerns"},
+		{Kind: SourceOperatorConcern, Text: "route the two correctness concerns"},
 	})
 	if len(got) != 0 {
 		t.Fatalf("Detect classified a routine fix-up as obligations: %+v", got)
@@ -75,25 +74,23 @@ func TestDetect_RoutineConcernIsNotAnObligation(t *testing.T) {
 }
 
 // TestDetect_IDsAreDeterministicAndKindOrdered: ids are ob-1..ob-N in the fixed
-// concern → operator_concern → reason order REGARDLESS of the caller's
+// concern → operator_concern order REGARDLESS of the caller's
 // interleaving. Determinism is load-bearing: the prompt renderer and the
 // review-time re-derivation must mint the same id for the same instruction.
 func TestDetect_IDsAreDeterministicAndKindOrdered(t *testing.T) {
 	const (
-		reasonText   = "Report the deletion table in the PR body."
 		operatorText = "Document each dropped branch in the pull request description."
 		concernA     = "Record counterfactual A in the PR body's ## Notes."
 		concernB     = "Record counterfactual B in the PR body's ## Notes."
 	)
 	// Deliberately shuffled input order.
 	got := Detect([]Source{
-		{Kind: SourceReason, Text: reasonText},
-		{Kind: SourceConcern, Text: concernA},
 		{Kind: SourceOperatorConcern, Text: operatorText},
+		{Kind: SourceConcern, Text: concernA},
 		{Kind: SourceConcern, Text: concernB},
 	})
-	if len(got) != 4 {
-		t.Fatalf("Detect returned %d, want 4: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("Detect returned %d, want 3: %+v", len(got), got)
 	}
 	// Every text here names a PR-body surface in prose, but no source declares
 	// a target, so each obligation is a code-target obligation with PRBody
@@ -103,7 +100,6 @@ func TestDetect_IDsAreDeterministicAndKindOrdered(t *testing.T) {
 		{ID: "ob-1", Source: SourceConcern, Text: concernA, Target: TargetCode},
 		{ID: "ob-2", Source: SourceConcern, Text: concernB, Target: TargetCode},
 		{ID: "ob-3", Source: SourceOperatorConcern, Text: operatorText, Target: TargetCode},
-		{ID: "ob-4", Source: SourceReason, Text: reasonText, Target: TargetCode},
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -129,12 +125,12 @@ func TestDetect_OperatorConcernDedupedAgainstIdenticalConcernNote(t *testing.T) 
 	}
 }
 
-// TestDetect_EmptyAndWhitespaceSourcesSkipped: an absent operator_concern /
-// reason arrives as "" and must not be classified or draw an id.
+// TestDetect_EmptyAndWhitespaceSourcesSkipped: an absent operator_concern or an
+// empty note arrives as "" and must not be classified or draw an id.
 func TestDetect_EmptyAndWhitespaceSourcesSkipped(t *testing.T) {
 	got := Detect([]Source{
 		{Kind: SourceOperatorConcern, Text: ""},
-		{Kind: SourceReason, Text: "   \n\t "},
+		{Kind: SourceConcern, Text: "   \n\t "},
 		{Kind: SourceConcern, Text: "Record the deletion table in the PR body."},
 	})
 	if len(got) != 1 || got[0].ID != "ob-1" {
@@ -177,7 +173,7 @@ func TestDetect_BoundsTheStoredExcerpt(t *testing.T) {
 func declaredPair() []Obligation {
 	return []Obligation{
 		{ID: "ob-1", Source: SourceConcern, Text: "Record counterfactual A in the PR body."},
-		{ID: "ob-2", Source: SourceReason, Text: "Record counterfactual B in the PR body."},
+		{ID: "ob-2", Source: SourceOperatorConcern, Text: "Record counterfactual B in the PR body."},
 	}
 }
 
@@ -366,7 +362,7 @@ func TestDetect_TargetDecidesSatisfiability(t *testing.T) {
 // disjunct widens the set only for a router-declared pr_body target.
 func TestDetect_NoTargetNonReportingInstructionStaysUndeclared(t *testing.T) {
 	for _, target := range []Target{"", TargetCode, TargetDocs} {
-		if got := Detect([]Source{{Kind: SourceReason, Text: "Tighten the summary to mention the retry bound.", Target: target}}); got != nil {
+		if got := Detect([]Source{{Kind: SourceOperatorConcern, Text: "Tighten the summary to mention the retry bound.", Target: target}}); got != nil {
 			t.Errorf("Detect(target %q) = %+v, want nil", target, got)
 		}
 	}
@@ -433,11 +429,11 @@ func TestUndelivered_TargetDecidesUnsatisfiable(t *testing.T) {
 	const text = "Record the counterfactual table in the PR body's ## Notes."
 	met := []Report{{ID: "ob-1", Status: StatusMet}}
 
-	code := Detect([]Source{{Kind: SourceReason, Text: text, Target: TargetCode}})
+	code := Detect([]Source{{Kind: SourceOperatorConcern, Text: text, Target: TargetCode}})
 	if got := Undelivered(code, met); got != nil {
 		t.Errorf("code target + met: Undelivered = %+v, want nil", got)
 	}
-	prBody := Detect([]Source{{Kind: SourceReason, Text: text, Target: TargetPRBody}})
+	prBody := Detect([]Source{{Kind: SourceOperatorConcern, Text: text, Target: TargetPRBody}})
 	got := Undelivered(prBody, met)
 	if len(got) != 1 || got[0].Status != StatusUnsatisfiable {
 		t.Errorf("pr_body target + met: Undelivered = %+v, want one %q finding", got, StatusUnsatisfiable)

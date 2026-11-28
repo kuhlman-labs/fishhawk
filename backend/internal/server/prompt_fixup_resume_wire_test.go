@@ -93,6 +93,17 @@ func fixupConcernsSection(prompt string) string {
 // apart from the entry identity the chain would stamp.
 func routeFixupWireTrigger(t *testing.T) *audit.Entry {
 	t.Helper()
+	return routeFixupWireTriggerWith(t, func(ids []string) fixupRequest {
+		return fixupRequest{ConcernIDs: ids, Reason: "address both review concerns"}
+	})
+}
+
+// routeFixupWireTriggerWith is routeFixupWireTrigger with the request built by
+// the caller from the two seeded concern ids. The routed trigger must carry
+// exactly those ids, plus one minted id when the request sets operator_concern
+// (mintOperatorConcern).
+func routeFixupWireTriggerWith(t *testing.T, request func(ids []string) fixupRequest) *audit.Entry {
+	t.Helper()
 	s, repo, au, cr := fixupServerWithConcerns(t)
 	repo.seedRun(&run.Run{ID: fixupWireRunID, State: run.StateRunning})
 	repo.mu.Lock()
@@ -116,7 +127,8 @@ func routeFixupWireTrigger(t *testing.T) *audit.Entry {
 		ids = append(ids, c.id.String())
 	}
 
-	w := postFixup(t, s, fixupWireImplStageID, fixupRequest{ConcernIDs: ids, Reason: "address both review concerns"})
+	req := request(ids)
+	w := postFixup(t, s, fixupWireImplStageID, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("fix-up route status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -142,8 +154,13 @@ func routeFixupWireTrigger(t *testing.T) *audit.Entry {
 	if err := json.Unmarshal(trigger.Payload, &payload); err != nil {
 		t.Fatalf("decode trigger payload: %v", err)
 	}
-	if strings.Join(payload.ConcernIDs, ",") != strings.Join(ids, ",") {
-		t.Fatalf("trigger concern_ids = %v, want the routed %v", payload.ConcernIDs, ids)
+	minted := 0
+	if req.OperatorConcern != "" {
+		minted = 1
+	}
+	if len(payload.ConcernIDs) != len(ids)+minted ||
+		strings.Join(payload.ConcernIDs[:len(ids)], ",") != strings.Join(ids, ",") {
+		t.Fatalf("trigger concern_ids = %v, want the routed %v plus %d minted id(s)", payload.ConcernIDs, ids, minted)
 	}
 	return trigger
 }

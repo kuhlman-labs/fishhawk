@@ -83,6 +83,10 @@ import (
 //	    merge (merge_run.go) and the delegated may_merge arm (autodrive.go)
 //	    do not evaluate this predicate, but each evaluates leg (d) through
 //	    openBlockingConcernIDs under the run's merge-intent lock (#5045).
+//	    Merge-on-pass evaluates this predicate pre-lock (its step 4) AND
+//	    re-judges leg (d) inside the merge-intent lock, through
+//	    mergeQueueConcernLeg at mergeOnPassLocked step 4b (#5261). The
+//	    enqueue arm and re-entry evaluate it pre-lock only.
 //
 // Leg (a)'s FORGE sub-legs differ by variant (ADR-112, #4619 / #4632):
 //
@@ -671,15 +675,19 @@ func (s *Server) mergeQueueConcernLeg(ctx context.Context, runRow *run.Run) (str
 // and the delegated arm to observe-only, so the merge is held, never waved
 // through. A refusal's "nothing written" therefore means no verdict, intent
 // or queue row, not no concern row. An unwired concern repository is an
-// error too (the inline and delegated callers skip the leg before calling).
+// error too (the inline and delegated callers skip the leg before calling;
+// merge-on-pass's step 4b holds on it, as its pre-lock predicate does).
 //
 // Locking: the inline merge endpoint and the delegated may_merge arm call it
-// INSIDE the run's merge-intent lock (mergequeue.Store.WithMergeIntentLock);
-// the predicate's own callers (the enqueue arm, re-entry, merge-on-pass)
-// evaluate before they take that lock. ImportRolledUp takes the child-source
-// row locks (FOR NO KEY UPDATE) inside that lock, so the order is always the
-// merge-intent lock first, then the concern store's child-source row locks;
-// no path takes those row locks and then waits on the merge-intent lock. The
+// INSIDE the run's merge-intent lock (mergequeue.Store.WithMergeIntentLock),
+// and so does merge-on-pass, through mergeQueueConcernLeg at
+// mergeOnPassLocked step 4b (#5261), while still evaluating the predicate
+// before the lock at its step 4; the predicate's other callers (the enqueue
+// arm, re-entry) evaluate only before they take that lock. ImportRolledUp
+// takes the child-source row locks (FOR NO KEY UPDATE) inside that lock, so
+// the order is always the merge-intent lock first, then the concern store's
+// child-source row locks; no path takes those row locks and then waits on the
+// merge-intent lock. The
 // added cost is one indexed child listing per evaluation, plus, for a
 // decomposed parent with succeeded children, one parent stage list, one
 // open-concern read per succeeded child and one import transaction, all

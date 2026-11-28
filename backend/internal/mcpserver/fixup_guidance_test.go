@@ -200,6 +200,97 @@ func TestFixupStage_OperatorEvidenceSchema_NamesCloseOutAndDroppedItem(t *testin
 	}
 }
 
+// fixupGuidanceInputProperty returns the flattened description of one property
+// of name's SERVED input schema.
+func fixupGuidanceInputProperty(t *testing.T, tools map[string]*mcp.Tool, name, property string) string {
+	t.Helper()
+	tool, ok := tools[name]
+	if !ok {
+		t.Fatalf("%s not registered over ListTools", name)
+	}
+	raw, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal %s input schema: %v", name, err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode %s input schema: %v", name, err)
+	}
+	prop, ok := schema.Properties[property]
+	if !ok {
+		t.Fatalf("%s input schema has no %q property: %s", name, property, raw)
+	}
+	return fixupGuidanceFlatten(prop.Description)
+}
+
+// TestFixupGuidance_ReasonIsAuditOnly pins the SERVED fishhawk_fixup_stage text
+// to the #5561 contract: `reason` is an audit note the fix-up agent never sees,
+// so no surface offers it as an instruction channel or an instruction_targets
+// key. It also carries the close-out-verbs half of the retired scenario
+// issue-5212/operator-evidence-schema-names-close-out-verbs.
+func TestFixupGuidance_ReasonIsAuditOnly(t *testing.T) {
+	const tool = "fishhawk_fixup_stage"
+	tools := fixupGuidanceTools(t)
+	desc := fixupGuidanceDescription(t, tools, tool)
+	require := func(surface, text string, anchors ...string) {
+		t.Helper()
+		for _, a := range anchors {
+			if !strings.Contains(text, a) {
+				t.Errorf("%s lacks %q:\n%s", surface, a, text)
+			}
+		}
+	}
+	forbid := func(surface, text string, anchors ...string) {
+		t.Helper()
+		for _, a := range anchors {
+			if strings.Contains(text, a) {
+				t.Errorf("%s still says %q:\n%s", surface, a, text)
+			}
+		}
+	}
+
+	require("reason schema", fixupGuidanceInputProperty(t, tools, tool, "reason"),
+		"audit note", "never sees it", "operator_concern", "warnings")
+
+	targets := fixupGuidanceInputProperty(t, tools, tool, "instruction_targets")
+	require("instruction_targets schema", targets, "never reaches the agent")
+	forbid("instruction_targets schema keys", fixupGuidanceSlice(t, targets, "keys are", ";"), "reason")
+
+	bullet := fixupGuidanceSlice(t, desc, "- instruction_targets :", "- implement_model :")
+	require("instruction_targets bullet", bullet, "never reaches the agent")
+	forbid("instruction_targets bullet keys", fixupGuidanceSlice(t, bullet, "keys:", "values:"), "reason")
+
+	forbid("PR-body routed-instruction list",
+		fixupGuidanceSlice(t, desc, "when you declare a routed instruction", "with the"), "reason")
+
+	require("reason bullet", fixupGuidanceSlice(t, desc, "- reason :", "- allow_create :"),
+		"audit note", "never sees it", "operator_concern")
+
+	sizing := fixupGuidanceSlice(t, desc, "sizing, cost and follow-through", "returns the re-opened stage row")
+	require("sizing re-route guidance", sizing,
+		"describe the unaddressed item in operator_concern in your own words",
+		"do not paste raw diff hunks",
+		"binding instruction",
+		"untrusted",
+		"behind operator_evidence's declaration",
+		"do not use reason for this: the agent never sees it")
+	forbid("sizing re-route guidance", sizing, "in reason")
+
+	evidence := fixupGuidanceInputProperty(t, tools, tool, "operator_evidence")
+	forbid("operator_evidence schema", evidence, "reason/operator_concern", "in reason")
+	require("operator_evidence schema", evidence,
+		"in operator_concern",
+		"stays open until you close it",
+		"fishhawk_resolve_concerns", "fishhawk_waive_concern", "fishhawk_defer_concern")
+
+	require("warnings output schema", fixupGuidanceOutputPropertyDescription(t, tools, tool, "warnings"),
+		"reason advisory", "without operator_concern")
+}
+
 // TestFixupGuidance_GateViewAndAwaitReviewStateConfirmedIsNotAReproduction
 // pins R12 and R1 on the served gate-view and await-review descriptions.
 func TestFixupGuidance_GateViewAndAwaitReviewStateConfirmedIsNotAReproduction(t *testing.T) {

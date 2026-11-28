@@ -978,7 +978,7 @@ type StartCampaignItemRunInput struct {
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"OPTIONAL absolute path to the checkout this campaign item's run executes in, OVERRIDING the campaign's own working_dir binding. Needed only when the campaign carries NO binding (bind it once at fishhawk_start_campaign instead of repeating it here): omit it and the item run inherits the campaign's. A local item run whose campaign has no binding and that passes none is refused working_dir_required. A value that differs from the campaign binding is accepted as a deliberate override — use it when this one item genuinely executes in a different checkout. A non-absolute value is refused for any runner_kind. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 	// AutoDispatch is the operator's explicit host-dispatcher opt-in (#5266,
 	// ADR-104 Q3), threaded to the request body only when true.
-	AutoDispatch bool `json:"auto_dispatch,omitempty" jsonschema:"OPTIONAL, default false. true stamps the ADR-104 host-dispatcher mark on the minted run, so fishhawk-mcp host-dispatch spawns the item run's parked local stages; omit it to leave the run for an operator to dispatch. An operator opt-in: a run-bound agent token is refused run_token_forbidden"`
+	AutoDispatch bool `json:"auto_dispatch,omitempty" jsonschema:"OPTIONAL, default false. true stamps the ADR-104 host-dispatcher mark on the minted run, so fishhawk-mcp host-dispatch spawns the item run's parked local stages; omit it to leave the run for an operator to dispatch. For an expedited (hotfix) item, pass true; an unmarked item run waits on a hand dispatch for every stage, including a fix-up the campaign driver routes. An operator opt-in: a run-bound agent token is refused run_token_forbidden"`
 }
 
 // StartCampaignItemRunOutput carries the minted run plus the linked campaign
@@ -1067,7 +1067,9 @@ NOT — this verb reopens it).
 
 auto_dispatch is OPTIONAL (default false): pass true when this host's
 fishhawk-mcp host-dispatch should spawn the item run's parked local stages;
-omitted, the run waits for an operator dispatch. On a deployment that runs the
+omitted, the run waits for an operator dispatch. For an expedited (hotfix)
+item, pass true; an unmarked item run waits on a hand dispatch for every stage,
+including a fix-up the campaign driver routes. On a deployment that runs the
 campaign driver, an eligible item needs no hand start: the driver starts it on
 its next tick, so wait one interval and poll fishhawk_get_campaign_status.
 Start by hand only beyond the driver's cap or on a driver-off deployment. A
@@ -1485,6 +1487,7 @@ other items are refused campaign_dispatch_held until the hotfix item or its run
 is terminal, or 2 h pass (running stages continue; one hold per campaign).
 Recorded on the audit chain before it commits. Operator-only: needs
 write:campaigns, and run-bound and delegated operator-agent tokens are refused.
+Start the expedited item with auto_dispatch: true so the host dispatcher drives it.
 `),
 	}, resolver.campaignHotfix)
 }
@@ -1513,7 +1516,7 @@ func (r *runResolver) campaignHotfix(ctx context.Context, _ *mcp.CallToolRequest
 		}
 		return nil, campaignHotfixOutput{}, fmt.Errorf("campaign hotfix: %w", err)
 	}
-	next := fmt.Sprintf("start it with fishhawk_start_campaign_item_run (issue_ref %s, workflow_id %s — the recorded workflow; any other is refused campaign_item_workflow_mismatch); it heads the queue, so fishhawk_get_campaign_status offers it first",
+	next := fmt.Sprintf("start it with fishhawk_start_campaign_item_run (issue_ref %s, workflow_id %s — the recorded workflow; any other is refused campaign_item_workflow_mismatch — and auto_dispatch: true, so the host dispatcher spawns every stage (plan, implement, a driver-routed fix-up, the merge-candidate verify-only pass) as for a driver-started item; without it each stage waits on fishhawk_dispatch_stage); it heads the queue, so fishhawk_get_campaign_status offers it first, and on a deployment running the campaign driver the driver starts it, already marked, on its next tick when the campaign is under its max_parallel cap",
 		res.Item.IssueRef, res.Item.Workflow)
 	if res.DispatchHold != nil {
 		next += fmt.Sprintf(". The campaign is HELD until the hotfix is terminal or %s: other items' implement dispatches answer campaign_dispatch_held",

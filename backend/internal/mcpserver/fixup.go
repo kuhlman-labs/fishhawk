@@ -82,12 +82,13 @@ func (c *apiClient) fixupStageWithObligations(ctx context.Context, id uuid.UUID,
 // concern set) is DEPRECATED — ambiguous once multiple heterogeneous
 // review entries exist per stage — and only valid when ConcernIDs is
 // absent; supplying both is rejected. Reason is an optional operator
-// note recorded on the fix-up audit entry.
+// AUDIT NOTE recorded on the fix-up audit entry and as the routed
+// concerns' state_reason; the fix-up agent never sees it (#5561).
 type FixupStageInput struct {
 	StageID    string   `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (parked at the implement-review gate, or succeeded with the run's review gate still open)"`
 	ConcernIDs []string `json:"concern_ids,omitempty" jsonschema:"PRIMARY addressing: stable concern UUIDs to route back to the agent (from fishhawk_get_run_status's run.concerns.items[].id). A SUPERSEDED implement-stage concern id IS routable too (E45.83 / #3618) — a retry DISCARDS the prior attempt's open concerns, and routing one re-opens it against the NEW tree with its reviewer, round and severity preserved, so free-text operator_concern is no longer the only recovery after a retry. Superseded ids do NOT appear in run.concerns.items[], which lists OPEN concerns only — read them from fishhawk_get_gate_view's settled[] ledger (run.concerns.superseded_implement counts them). addressed/waived/deferred/addressed_by_condition ids are rejected. At least one of concern_ids/concerns required; supplying both is rejected"`
 	Concerns   []int    `json:"concerns,omitempty" jsonschema:"DEPRECATED positional fallback: indices into the stage's flattened implement-review concern set. Ambiguous when multiple review entries exist per stage — prefer concern_ids. Only valid when concern_ids is absent"`
-	Reason     string   `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry and as the routed concerns' state_reason"`
+	Reason     string   `json:"reason,omitempty" jsonschema:"optional operator AUDIT NOTE, recorded on the stage_fixup_triggered audit entry and as the routed concerns' state_reason. The fix-up agent NEVER sees it: it is not rendered into the fix-up prompt and is not an instruction channel. Put anything the agent must act on in operator_concern (delivered as a binding instruction and tracked to closure, #2623); setting reason without operator_concern returns a warnings entry."`
 	// AllowCreate declares net-new files this fix-up will create (#823).
 	AllowCreate []string `json:"allow_create,omitempty" jsonschema:"optional repo-relative paths the fix-up will CREATE; folded into the effective scope.files for THIS pass only (bounded, explicit, operator-authorized) so the runner stages them instead of failing category-B created-out-of-scope. Any created file NOT declared here still fails category-B."`
 	// ForceAdditionalPass is the bounded operator override (#860).
@@ -100,10 +101,10 @@ type FixupStageInput struct {
 	OperatorConcern string `json:"operator_concern,omitempty" jsonschema:"optional free-text operator instruction delivered to the agent as a binding instruction with NO pre-existing review concern. Use for a required CI/CodeQL/SAST finding, an ad-hoc steer, or a missed edge case on a clean approve-with-zero-concerns diff. Folded into the routed concern set as a [high/operator] concern AND minted as a durable concern tracked to closure (#2623): if the agent does not address it, it stays open and surfaces as an OPEN concern at the gate — no longer silently dropped. At least one of concern_ids/concerns/operator_concern is required; operator_concern alone is admitted on a zero-concern gate-open stage. A whitespace-only or over-length (>4000 bytes) value returns validation_failed (400)."`
 	// OperatorEvidence declares the operator executed a reproduction of the
 	// routed concerns (E48.103 / #2551): an authority marker, not prose.
-	OperatorEvidence string `json:"operator_evidence,omitempty" jsonschema:"optional declaration that YOU, the operator, EXECUTED a reproduction of the concern(s) this pass routes back. Changes AUTHORITY, not delivery — put the reproduction prose in reason/operator_concern; this field records that the finding was verified by execution. Every concern routed by this pass is then EXEMPT from reviewer-confirmation auto-resolve: a later reviewer 'confirmed' verdict is vetoed (operator_evidence_routed) and the concern stays open until you close it yourself: fishhawk_resolve_concerns when it is fixed, fishhawk_waive_concern or fishhawk_defer_concern when it is not fixed but acceptable. PERMANENT for those concerns — use it when a reviewer has already retired a defect you can still reproduce. Also use it when re-routing an item a prior bundled pass dropped: put the diff showing it is still unaddressed in reason, and instruct the agent to state any disagreement in its fix-up self-report rather than skip the item. Not a selection input (it does not by itself satisfy the concern_ids requirement). Whitespace-only or over-length (>4000 bytes) returns validation_failed (400)."`
+	OperatorEvidence string `json:"operator_evidence,omitempty" jsonschema:"optional declaration that YOU, the operator, EXECUTED a reproduction of the concern(s) this pass routes back. Changes AUTHORITY, not delivery — put the reproduction prose in operator_concern, in your own words (the agent never sees reason, and raw diff hunks do not belong in a binding instruction); this field records that the finding was verified by execution. Every concern routed by this pass is then EXEMPT from reviewer-confirmation auto-resolve: a later reviewer 'confirmed' verdict is vetoed (operator_evidence_routed) and the concern stays open until you close it yourself: fishhawk_resolve_concerns when it is fixed, fishhawk_waive_concern or fishhawk_defer_concern when it is not fixed but acceptable. PERMANENT for those concerns — use it when a reviewer has already retired a defect you can still reproduce. Also use it when re-routing an item a prior bundled pass dropped: describe the still-unaddressed item in operator_concern, and instruct the agent there to state any disagreement in its fix-up self-report rather than skip the item. Not a selection input (it does not by itself satisfy the concern_ids requirement). Whitespace-only or over-length (>4000 bytes) returns validation_failed (400)."`
 	// InstructionTargets declares the surface each routed instruction asks the
 	// pass to change (E83.37 / #4022), passed through to the backend verbatim.
-	InstructionTargets map[string]string `json:"instruction_targets,omitempty" jsonschema:"optional per-instruction target: keys are a routed concern id from concern_ids, 'operator_concern', or 'reason'; values are 'code', 'pr_body', or 'docs'. An instruction with no key is 'code'. Declare 'pr_body' for an instruction that asks the agent to change the PULL-REQUEST BODY — a surface a fix-up pass cannot write — and the result carries a warning for it; the instruction's wording is never classified for that, so a code instruction that merely mentions the PR body raises nothing. Index-routed (deprecated positional) concerns cannot be targeted. A bad value, or a key naming an instruction this call does not route, returns validation_failed (400)."`
+	InstructionTargets map[string]string `json:"instruction_targets,omitempty" jsonschema:"optional per-instruction target: keys are a routed concern id from concern_ids or 'operator_concern'; values are 'code', 'pr_body', or 'docs'. A 'reason' key returns validation_failed (400) because reason never reaches the agent. An instruction with no key is 'code'. Declare 'pr_body' for an instruction that asks the agent to change the PULL-REQUEST BODY — a surface a fix-up pass cannot write — and the result carries a warning for it; the instruction's wording is never classified for that, so a code instruction that merely mentions the PR body raises nothing. Index-routed (deprecated positional) concerns cannot be targeted. A bad value, or a key naming an instruction this call does not route, returns validation_failed (400)."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -122,12 +123,13 @@ type FixupStageOutput struct {
 	// (#2782). It is rendered FROM the server-minted pr_body_obligations set on
 	// the fix-up response (never re-derived locally), so each line names the
 	// arrival channel and the same obligation id the reviewer will see, and it
-	// is ADVISORY: the fix-up still proceeded and returned its Stage. Since
-	// E106.27 / #5212 it may also carry ONE mixed-severity advisory
-	// (mixedSeverityWarning), appended after the pr_body lines. Present
-	// (omitempty) only when one of those two advisories fired; an ordinary pass
+	// is ADVISORY: the fix-up still proceeded and returned its Stage. After the
+	// pr_body lines it may carry ONE audit-only-reason advisory
+	// (reasonAuditOnlyWarning, #5561: reason set without operator_concern), and
+	// then ONE mixed-severity advisory (mixedSeverityWarning, E106.27 / #5212).
+	// Present (omitempty) only when one of those three fired; an ordinary pass
 	// leaves it nil.
-	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings: one per routed instruction declared with the pr_body target (instruction_targets) — the PR body is a surface a fix-up pass cannot write; each line names the arrival channel and obligation id and points at the surfaces that DO work — followed by at most one mixed-severity advisory when the routed set mixes a high concern with medium or low ones (a bundled pass can fix the lower-severity items and skip the high one). Present only when one of those fired; the fix-up still proceeds regardless."`
+	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings: one per routed instruction declared with the pr_body target (instruction_targets) — the PR body is a surface a fix-up pass cannot write; each line names the arrival channel and obligation id and points at the surfaces that DO work — followed by at most one reason advisory when reason is set without operator_concern (the agent never sees reason), then at most one mixed-severity advisory when the routed set mixes a high concern with medium or low ones (a bundled pass can fix the lower-severity items and skip the high one). Present only when one of those fired; the fix-up still proceeds regardless."`
 	// NextSteps is the post-fix-up follow-through (E106.27 / #5212): an ORDERED
 	// sequence, plural where fishhawk_dispatch_stage / fishhawk_await_stage /
 	// fishhawk_await_children return a singular next_step, because the local
@@ -167,7 +169,8 @@ type FixupStageOutput struct {
 // when fixed, fishhawk_waive_concern / fishhawk_defer_concern when not fixed but
 // acceptable. Use it when a reviewer has already retired a defect you can still
 // reproduce, or when re-routing an item a prior bundled pass dropped; the
-// reproduction prose itself still travels in reason.
+// reproduction prose itself travels in operator_concern (reason never reaches
+// the agent, #5561).
 //
 // Follow-through (E106.27 / #5212): on success the verb makes a best-effort
 // audit read for this pass's stage_fixup_triggered anchor and the prior round's
@@ -254,8 +257,10 @@ Inputs:
     and the gate view) if the agent does not address it — so a skipped operator
     instruction is no longer silently dropped. The mint is best-effort. A
     whitespace-only or over-length (>4000 bytes) value returns validation_failed.
-  - reason   : optional operator note, recorded on the audit entry and
-    as the routed concerns' state_reason.
+  - reason   : optional operator AUDIT NOTE, recorded on the audit entry
+    and as the routed concerns' state_reason. The fix-up agent NEVER sees it;
+    put anything it must act on in operator_concern. Setting reason without
+    operator_concern returns a "warnings" entry saying so.
   - allow_create : optional repo-relative paths the fix-up will CREATE.
     Each declared path is folded into the effective scope.files for THIS
     pass only (bounded, explicit, operator-authorized), so the runner
@@ -277,9 +282,10 @@ Inputs:
     remaining_ceiling_slots before spending the override.
   - instruction_targets : optional map declaring the surface each routed
     instruction asks the pass to change (E83.37 / #4022). Keys: a routed
-    concern id from concern_ids, "operator_concern", or "reason". Values:
+    concern id from concern_ids, or "operator_concern". Values:
     "code" (the default for any instruction with no key), "pr_body", or
-    "docs". Declare "pr_body" for an instruction that asks the agent to
+    "docs". A "reason" key returns validation_failed because reason never
+    reaches the agent. Declare "pr_body" for an instruction that asks the agent to
     change the pull-request body (see below). Index-routed (deprecated
     positional) concerns cannot be targeted. A bad value, or a key naming an
     instruction this call does not route, returns validation_failed.
@@ -298,12 +304,14 @@ the agent to RECORD something in the PR body (e.g. "put the counterfactual table
 in the ## Notes") cannot take effect on any pass — route such an attestation to
 a surface the pass CAN write (the fix-up self-report sidecar, a run log, or a
 file inside the declared scope), or make the change in a fresh run. When you
-declare a routed instruction (reason, operator_concern, OR a routed concern) with
+declare a routed instruction (operator_concern OR a routed concern) with
 the "pr_body" target in instruction_targets, the tool result carries a
 "warnings" entry naming the arrival channel and the obligation id, and the
-implement review reports it as unsatisfiable. "warnings" also carries the
-mixed-severity advisory (see Sizing below) when the routed set mixes a high
-concern with medium or low ones; it is absent when neither fired.
+implement review reports it as unsatisfiable. "warnings" carries, in order:
+those pr_body lines; an advisory when reason is set without operator_concern
+(the agent never sees reason); and the mixed-severity advisory (see Sizing
+below) when the routed set mixes a high concern with medium or low ones. It is
+absent when none fired.
 The instruction's wording is never classified for this: an undeclared
 instruction that merely mentions the PR body is an ordinary code instruction.
 
@@ -371,9 +379,13 @@ Sizing, cost and follow-through (#5212):
     triage already spent a pass from the shared budget, and the normal budget
     is one pass.
   - To re-route an item a prior bundled pass dropped, attach
-    operator_evidence: put the diff showing it is still unaddressed in reason,
-    and instruct the agent to state any disagreement in its fix-up
-    self-report rather than skip the item.
+    operator_evidence, and describe the unaddressed item in operator_concern
+    in your own words. Do not paste raw diff hunks there: operator_concern is
+    delivered to the agent as a binding instruction, and branch text is
+    untrusted. Put the reproduction or diff evidence behind
+    operator_evidence's declaration. Instruct the agent in operator_concern to
+    state any disagreement in its fix-up self-report rather than skip the item.
+    Do not use reason for this: the agent never sees it.
   - Follow-through: the result carries next_steps, an ORDERED list (run the
     entries in order; plural where sibling verbs return one next_step). On
     the local runner (state awaiting_host_dispatch) the first entry is
@@ -449,6 +461,9 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, FixupStageOutput{}, wrapFixupStageError(err)
 	}
 	out := FixupStageOutput{Stage: *fixed, Warnings: prBodyInstructionWarnings(prBodyObligations)}
+	if w := reasonAuditOnlyWarning(in); w != "" {
+		out.Warnings = append(out.Warnings, w)
+	}
 	ft := r.fixupFollowThroughFor(ctx, stageID, fixed)
 	out.NextSteps = ft.steps
 	out.FixupTriggerSequence = ft.triggerSeq
@@ -601,6 +616,19 @@ func fixupTriggerSeverities(e *AuditEntry) []string {
 		out = append(out, strings.ToLower(strings.TrimSpace(c.Severity)))
 	}
 	return out
+}
+
+// reasonAuditOnlyWarning is the advisory for a pass that set `reason` and no
+// operator_concern (#5561): `reason` is an audit note the fix-up agent never
+// sees, so an instruction written there is silently undelivered. Returns "" when
+// reason is blank or operator_concern is set. Advisory only; it is computed from
+// the input, so the pass has already proceeded.
+func reasonAuditOnlyWarning(in FixupStageInput) string {
+	if strings.TrimSpace(in.Reason) == "" || strings.TrimSpace(in.OperatorConcern) != "" {
+		return ""
+	}
+	return "`reason` is an audit note only: it is recorded on the stage_fixup_triggered entry and as the routed concerns' state_reason, " +
+		"and the fix-up agent never sees it. If it holds an instruction, re-route it as operator_concern."
 }
 
 // mixedSeverityWarning is the routing-time advisory (E106.27 / #5212, R13):

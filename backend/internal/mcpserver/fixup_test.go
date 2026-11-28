@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -612,7 +613,8 @@ func TestFixupStage_PRBodyInstruction_WarnsAtRouting(t *testing.T) {
 }
 
 // TestFixupStage_OrdinaryPass_NoWarnings: a response with no pr_body_obligations
-// (and no readable trigger, so no mixed-severity advisory) yields nil warnings.
+// (and no readable trigger, so no mixed-severity advisory) and no reason (so no
+// audit-only advisory) yields nil warnings.
 // The output is no longer byte-identical to the pre-#5212 shape: next_steps is
 // ALWAYS populated, here with the single review wait (the stage is pending, not
 // awaiting_host_dispatch) whose since_sequence is the field-path hint, because
@@ -624,7 +626,6 @@ func TestFixupStage_OrdinaryPass_NoWarnings(t *testing.T) {
 	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{
 		StageID:  stageID.String(),
 		Concerns: []int{0},
-		Reason:   "fix the nil deref",
 	})
 	if err != nil {
 		t.Fatalf("fixupStage: %v", err)
@@ -640,6 +641,62 @@ func TestFixupStage_OrdinaryPass_NoWarnings(t *testing.T) {
 	}
 	if out.FixupTriggerSequence != 0 || out.ExpectedReviewers != 0 {
 		t.Errorf("fixup_trigger_sequence = %d, expected_reviewers = %d, want both omitted (0) with no audit entries", out.FixupTriggerSequence, out.ExpectedReviewers)
+	}
+}
+
+// TestFixupStage_ReasonWithoutOperatorConcern_Warns (#5561): `reason` is an
+// audit note the agent never sees, so setting it without operator_concern draws
+// one advisory. The backend returns no obligations and no trigger, so no other
+// advisory can fire; each suppression branch of the guard has its own row, and
+// the pr_body row pins the order.
+//
+// Counterfactual: delete the reasonAuditOnlyWarning call in fixupStage and the
+// firing rows go RED.
+func TestFixupStage_ReasonWithoutOperatorConcern_Warns(t *testing.T) {
+	const note = "guard the nil pool"
+	prBody := []map[string]any{{"id": "ob-1", "source": "concern", "text_excerpt": "x"}}
+	for _, tc := range []struct {
+		name            string
+		reason          string
+		operatorConcern string
+		obligations     []map[string]any
+		want            [][]string // substrings of each warning, in order
+	}{
+		{"reason without operator_concern", note, "", nil, [][]string{{"never sees", "operator_concern", "stage_fixup_triggered", "state_reason"}}},
+		{"reason with operator_concern", note, note, nil, nil},
+		{"no reason", "", "", nil, nil},
+		{"whitespace-only reason", "  \n\t ", "", nil, nil},
+		{"after the pr_body line", note, "", prBody, [][]string{{"PULL-REQUEST BODY"}, {"never sees"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stageID, runID := uuid.New(), uuid.New()
+			r := fixupResolverReturning(t, stageID, runID, tc.obligations)
+			_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+				StageID:         stageID.String(),
+				ConcernIDs:      []string{uuid.NewString()},
+				Reason:          tc.reason,
+				OperatorConcern: tc.operatorConcern,
+			})
+			if err != nil {
+				t.Fatalf("fixupStage: %v", err)
+			}
+			if tc.want == nil {
+				if out.Warnings != nil {
+					t.Errorf("warnings = %+v, want nil", out.Warnings)
+				}
+				return
+			}
+			if len(out.Warnings) != len(tc.want) {
+				t.Fatalf("warnings = %+v, want %d", out.Warnings, len(tc.want))
+			}
+			for i, wants := range tc.want {
+				for _, want := range wants {
+					if !strings.Contains(out.Warnings[i], want) {
+						t.Errorf("warnings[%d] lacks %q:\n%s", i, want, out.Warnings[i])
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -903,22 +960,26 @@ func TestFixupStage_NextSteps_AuditReadFailsOpen(t *testing.T) {
 }
 
 // TestFixupStage_MixedSeverityWarning (R13): one advisory when the routed set
-// holds a high AND a medium/low concern; none otherwise; pr_body lines first.
+// holds a high AND a medium/low concern; none otherwise; pr_body lines first,
+// and the audit-only-reason advisory (#5561) before it.
 //
 // Counterfactuals: mixedSeverityWarning returning "" reddens the [high low]
-// rows; a predicate reduced to "has a high" reddens [high high] and [high].
+// rows; a predicate reduced to "has a high" reddens [high high] and [high];
+// appending the reason advisory after this one reddens [high low reason].
 func TestFixupStage_MixedSeverityWarning(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		severities []string
 		withPRBody bool
 		wantMixed  bool
+		reason     string
 	}{
-		{"high_low", []string{"high", "low"}, false, true},
-		{"high_high", []string{"high", "high"}, false, false},
-		{"low_medium", []string{"low", "medium"}, false, false},
-		{"single_high", []string{"high"}, false, false},
-		{"high_low_with_pr_body", []string{"high", "low"}, true, true},
+		{"high_low", []string{"high", "low"}, false, true, ""},
+		{"high_high", []string{"high", "high"}, false, false, ""},
+		{"low_medium", []string{"low", "medium"}, false, false, ""},
+		{"single_high", []string{"high"}, false, false, ""},
+		{"high_low_with_pr_body", []string{"high", "low"}, true, true, ""},
+		{"high_low_with_reason", []string{"high", "low"}, false, true, "guard the nil pool"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stageID, runID := uuid.New(), uuid.New()
@@ -940,16 +1001,23 @@ func TestFixupStage_MixedSeverityWarning(t *testing.T) {
 				}
 				body := map[string]any{"id": sid, "run_id": runID.String(), "type": "implement", "state": "pending"}
 				if tc.withPRBody {
-					body["pr_body_obligations"] = []map[string]any{{"id": "ob-1", "source": "reason", "text_excerpt": "x"}}
+					body["pr_body_obligations"] = []map[string]any{{"id": "ob-1", "source": "operator_concern", "text_excerpt": "x"}}
 				}
 				_ = json.NewEncoder(w).Encode(body)
 			}))
 			t.Cleanup(ts.Close)
 			r := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})}
 
-			_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: sid, ConcernIDs: []string{uuid.NewString()}})
+			_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{StageID: sid, ConcernIDs: []string{uuid.NewString()}, Reason: tc.reason})
 			if err != nil {
 				t.Fatalf("fixupStage: %v", err)
+			}
+			if tc.reason != "" {
+				reasonAt := slices.IndexFunc(out.Warnings, func(w string) bool { return strings.Contains(w, "never sees") })
+				mixedAt := slices.IndexFunc(out.Warnings, func(w string) bool { return strings.Contains(w, "mixed-severity") })
+				if reasonAt < 0 || mixedAt < 0 || reasonAt >= mixedAt {
+					t.Errorf("warnings = %+v, want the audit-only-reason advisory (at %d) before the mixed-severity advisory (at %d)", out.Warnings, reasonAt, mixedAt)
+				}
 			}
 			var mixed []string
 			for _, w := range out.Warnings {

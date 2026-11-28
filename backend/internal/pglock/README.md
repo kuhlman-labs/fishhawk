@@ -39,7 +39,12 @@ pool.
    further pool connection at a time (sequential queries, or one transaction
    at a time). A `fn` that holds a transaction open while it acquires a
    second connection reopens hold-and-wait. Not enforced at runtime; pinned
-   for the three production fns by the mixed-helper test.
+   for the merge-intent, consolidated-PR-open and refinement filing fns by
+   the mixed-helper test. The divergence-answer fn (sequential audit reads, a
+   forge filing that holds no DB connection, one `AppendChained`
+   transaction) shares the run repo's budget with the consolidated-PR-open
+   helper the mixed test already drives; it is exercised end to end by
+   `server.TestDivergenceAnswerPG_ConcurrentDoctrineChangeFilesOnce`.
 2. **No nesting — ENFORCED.** `fn` runs on a context marked by this package;
    `WithSessionLock` on a marked context (or any context derived from it)
    fails closed with `ErrNestedLock` before it takes a slot or a connection.
@@ -92,6 +97,7 @@ draft).
 | `mergequeue.(*PostgresStore).WithMergeIntentLock` | per-run intent key | `intentFnTimeout` 30s | `ErrIntentLockLapsed` wrapping `ErrLockLapsed` |
 | `run` postgres repo `WithConsolidatedPROpenLock` | sha256 `fishhawk:consolidated-pr-open:` + run | `consolidatedPROpenFnTimeout` 5m | `ErrLockLapsed` (was swallowed) |
 | `refinement` postgres repo `WithFilingLock` | draft UUID first 8 bytes | `filingLockFnTimeout` 30m | `ErrLockLapsed` (was discarded) |
+| `run` postgres repo `WithDivergenceAnswerLock` (#3891) | sha256 `fishhawk:divergence-answer:` + run + sequence | `divergenceAnswerFnTimeout` 5m | `ErrLockLapsed`, logged at WARN by the server's answer handler |
 
 Each store takes `BudgetFor(pool)` in its constructor. A new helper on the
 pool must go through `WithSessionLock` with the shared budget; a hand-rolled
@@ -121,7 +127,8 @@ normalizes these write errors before returning them and discards the socket
 cause; `TestCtxTimeoutErr` separately pins preservation of a raw timeout when
 one reaches the helper.
 
-`mixed_test.go` (the three production helpers over ONE 6-connection pool,
+`mixed_test.go` (the merge-intent, consolidated-PR-open and refinement
+filing helpers over ONE 6-connection pool,
 `HolderLimit` 2):
 
 - `TestSharedBudget_MixedHelpersUnderLoadProgress` — #4591's done-means: 12
@@ -140,4 +147,9 @@ one reaches the helper.
 Per-helper pins: `mergequeue/store_test.go` `TestWithMergeIntentLock_*`,
 `run/consolidated_pr_lock_test.go`, `refinement/postgres_test.go`
 `TestPostgres_WithFilingLock_*` (each: `_FnCarriesDeadline`,
-`_PanicReleasesLock`, `_LapsedSessionSurfaces`).
+`_PanicReleasesLock`, `_LapsedSessionSurfaces`). The divergence answer lock:
+`run/divergence_answer_lock_key_test.go` `TestDivergenceAnswerLockKey` and
+`run/divergence_answer_lock_test.go` `TestPostgres_WithDivergenceAnswerLock_*`
+(`_SerializesSameQuestion`, `_DistinctQuestionsDoNotBlock`,
+`_FnCarriesDeadline`); its panic, cancelled-wait and lapse paths are the
+shared `WithSessionLock` code those helpers' pins cover.

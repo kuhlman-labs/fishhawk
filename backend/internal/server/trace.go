@@ -3855,7 +3855,8 @@ type fixupConcernUnattemptedPayload struct {
 	UndeterminableCount int                             `json:"undeterminable_count"`
 	Concerns            []fixupConcernUnattemptedDetail `json:"concerns"`
 	// MentionedUntouchedFiles are candidate paths the routed instruction text as
-	// a WHOLE MENTIONED (the operator's fix-up reason / operator_concern) and
+	// a WHOLE MENTIONED (the operator's free-text operator_concern; never the
+	// audit-only fix-up reason, #5561) and
 	// the pass never touched. The field NAME is the contract: it claims a
 	// mention, not an obligation, and never that these paths are evidence of an
 	// unattempted concern. Two things are unknowable here and both are withheld
@@ -5227,10 +5228,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 				})
 			}
 			findings, undeterminable := fixupattempt.Unattempted(classified, committed)
-			// The routed instruction text as a WHOLE (the operator's reason and
-			// operator_concern) routinely names the files a concern's own prose
-			// only alludes to — in the #2896 incident NEITHER concern note named
-			// a path while the reason named both. Those paths cannot be
+			// The routed instruction text as a WHOLE (operator_concern; the fix-up
+			// reason is audit-only and never read, #5561) routinely names the
+			// files a concern's own prose only alludes to — in the #2896
+			// incident NEITHER concern note named a path while the operator's
+			// free text named both. Those paths cannot be
 			// attributed to one concern without guessing, so untouched ones are
 			// reported as paths the routed instructions MENTIONED and the pass
 			// never touched — no claim about which concern they belong to, and no
@@ -9007,7 +9009,9 @@ type routedFixupConcern struct {
 
 // resolveRoutedFixupConcerns returns the concerns routed back to the fix-up pass
 // that produced THE DELTA UNDER REVIEW, plus the SHARED routed instruction text
-// (the operator's fix-up `reason` and free-text `operator_concern`).
+// (the operator's free-text `operator_concern`). The fix-up `reason` is NOT part
+// of it: it is an audit note the fix-up agent never sees, so a path named only
+// there was never an instruction the pass could attempt (#5561).
 //
 // ENTRY SELECTION IS PINNED TO headSHA, not newest-wins (#2896 fix-up, item B).
 // A stage routinely carries SEVERAL stage_fixup_triggered entries — re-routing a
@@ -9093,7 +9097,6 @@ func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID 
 		var payload struct {
 			Concerns        []planreview.Concern `json:"concerns"`
 			ConcernIDs      []string             `json:"concern_ids"`
-			Reason          string               `json:"reason"`
 			OperatorConcern string               `json:"operator_concern"`
 		}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
@@ -9135,11 +9138,7 @@ func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID 
 			}
 			out = append(out, rc)
 		}
-		shared := payload.Reason
-		if payload.OperatorConcern != "" {
-			shared += "\n" + payload.OperatorConcern
-		}
-		return out, shared, true
+		return out, payload.OperatorConcern, true
 	}
 	return nil, "", false
 }

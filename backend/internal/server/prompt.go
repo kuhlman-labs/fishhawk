@@ -4636,11 +4636,13 @@ type fixupReportObligationsDeclaredPayload struct {
 //     the whole point: the review joins against the exact entry the agent saw,
 //     not against whatever is newest when the review happens to run.
 //
-// The selected entry's `concerns` notes, `operator_concern`, and `reason` —
-// with the router-declared targets recorded beside them (concern_targets /
-// operator_concern_target / reason_target, E83.37 / #4022; absent = code) — are
-// fed to fixupobligation.Detect, so the same entry always mints the same `ob-N`
-// ids and the same PR-body classification.
+// The selected entry's `concerns` notes and `operator_concern` — with the
+// router-declared targets recorded beside them (concern_targets /
+// operator_concern_target, E83.37 / #4022; absent = code) — are fed to
+// fixupobligation.Detect, so the same entry always mints the same `ob-N` ids and
+// the same PR-body classification. The entry's `reason` is an audit note and is
+// deliberately not decoded (#5561), so it never reaches the prompt; a legacy
+// entry's `reason_target` is ignored the same way.
 //
 // Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
 // trigger (the common, non-fix-up case), no routed instruction carries a
@@ -4677,7 +4679,6 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 		// pre-#4022 payload re-derives as all-code.
 		var payload struct {
 			Concerns        []planreview.Concern `json:"concerns"`
-			Reason          string               `json:"reason"`
 			OperatorConcern string               `json:"operator_concern"`
 			fixupInstructionTargets
 		}
@@ -4699,7 +4700,7 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 		// site (ADR-050 / E31.8 / #1613). The recorded targets ride the same
 		// helper, so PRBody here is the routing-time PRBody (E83.37 / #4022).
 		obligations := fixupobligation.Detect(
-			buildFixupObligationSources(payload.Concerns, payload.OperatorConcern, payload.Reason, payload.fixupInstructionTargets))
+			buildFixupObligationSources(payload.Concerns, payload.OperatorConcern, payload.fixupInstructionTargets))
 		if len(obligations) == 0 {
 			return nil, 0
 		}
