@@ -4591,8 +4591,10 @@ type MergeRunResult struct {
 	AlreadyQueued   bool   `json:"already_queued"`
 }
 
-// MergeRun records the operator merge verdict and queues the forge merge (the
-// repository's declared merge method, default squash)
+// MergeRun records the operator merge verdict and dispatches the forge merge
+// (the repository's declared merge method, default squash; on GitHub a
+// head-pinned merge is one synchronous merge at the verified head and never a
+// queued auto-merge, #4676, while an unpinned one is queued)
 // via `POST /v0/runs/{run_id}/merge` (E48.7 / #1954): the endpoint appends
 // a chained merge_verdict_recorded audit entry (no duplicate on a repeated
 // POST — already_recorded:true) and dispatches the shared merge helper the
@@ -4609,13 +4611,20 @@ type MergeRunResult struct {
 //     (E67.56 / #2717 — the PR's required checks have not all passed, so GitHub
 //     will not queue the merge; the verdict row is durable; details carry
 //     verdict_sequence + reason:"checks_pending"; fishhawk_merge_run WAITS on
-//     this one rather than surfacing it as an error), or merge_conflicting
-//     (E64.14 / #3109 — the PR has a merge conflict against its base, so GitHub
-//     can never queue the merge and NO verdict row is recorded; details carry
-//     pr_url + mergeable_state; fishhawk_merge_run returns status=conflicting
-//     IMMEDIATELY rather than waiting, since waiting cannot resolve a conflict).
-//   - 502 merge_dispatch_failed (the verdict row is durable; the queue step
-//     is retryable — re-POST re-queues with no duplicate row. Since E45.87 /
+//     this one rather than surfacing it as an error; #4676 adds
+//     reason:"not_merge_ready" — a head-pinned GitHub dispatch refused before
+//     any merge request because GitHub does not report the PR merge-ready at
+//     the pinned head; details add head_sha, mergeable_state, resumable and
+//     blocked_by, and the tool returns a non-resumable one at once), or
+//     merge_conflicting (E64.14 / #3109 — the PR has a merge conflict against
+//     its base, so GitHub can never queue the merge and NO verdict row is
+//     recorded; details carry pr_url + mergeable_state; fishhawk_merge_run
+//     returns status=conflicting IMMEDIATELY rather than waiting, since waiting
+//     cannot resolve a conflict; #4676's post-verdict variant, a PR that turned
+//     conflicting after the guard read it, carries verdict_recorded:true and
+//     verdict_sequence because the verdict IS recorded).
+//   - 502 merge_dispatch_failed (the verdict row is durable; the dispatch
+//     is retryable — re-POST re-dispatches with no duplicate row. Since E45.87 /
 //     #3622 the endpoint re-observes the forge once before writing this, so a
 //     merge that landed in the dispatch window resolves as 200
 //     already_merged:true instead; details carry forge_merge_state and the
@@ -4960,6 +4969,10 @@ func (c *apiClient) ArbitrateAcceptance(ctx context.Context, runID uuid.UUID, re
 // decision_state fixup_no_changes_unaddressed (#5390): the open concern ids
 // the last no-change fix-up pass routed, which drive_run carries onto its
 // fix-up, resolve and waive next_actions; it decodes nil otherwise.
+// MergeNotReady is present only on a delegated head-pinned not-merge-ready or
+// conflict observe-only outcome (#4676, Z4); drive_run keeps polling a
+// resumable one and stops decision_required:merge_not_ready on the rest. It
+// decodes nil otherwise.
 type AutoDriveOutcome struct {
 	Acted            bool     `json:"acted"`
 	Action           string   `json:"action,omitempty"`
@@ -4969,6 +4982,29 @@ type AutoDriveOutcome struct {
 	DecisionState    string   `json:"decision_state,omitempty"`
 	ConcernIDs       []string `json:"concern_ids,omitempty"`
 	Note             string   `json:"note"`
+	// MergeNotReady (#4676, Z4): see the type doc above.
+	MergeNotReady *autoDriveMergeNotReady `json:"merge_not_ready,omitempty"`
+}
+
+// autoDriveMergeNotReady is the auto-drive response's merge_not_ready object
+// (#4676, Z4): the delegated may_merge arm's head-pinned dispatch refused
+// before any merge request because GitHub does not report the pull request
+// merge-ready at the verified head. Repeated (not imported) per the thin
+// local-copy rule; client_test.go pins the wire decode.
+type autoDriveMergeNotReady struct {
+	// MergeableState is GitHub's mergeable_state at the read ("" when GitHub
+	// had not computed it yet).
+	MergeableState string `json:"mergeable_state"`
+	// Resumable is true when waiting can clear the state (a running required
+	// check, or GitHub still computing mergeability).
+	Resumable bool `json:"resumable"`
+	// Conflicting marks a merge conflict, never resumable by waiting.
+	Conflicting bool `json:"conflicting"`
+	// BlockedBy names a blocked state's review cause: review_required or
+	// changes_requested.
+	BlockedBy string `json:"blocked_by,omitempty"`
+	// ClaimOutcome is pre_claim, released, dispatch_failed or unclaimed.
+	ClaimOutcome string `json:"claim_outcome"`
 }
 
 // AutoDriveRunGate calls POST /v0/runs/{run_id}/auto-drive (#1700): it drives

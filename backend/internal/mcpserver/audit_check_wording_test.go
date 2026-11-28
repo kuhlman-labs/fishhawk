@@ -157,3 +157,40 @@ func TestAuditCheckWording_SweptSurfacesNameThePublishedCheck(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeWording_NoQueueBeforeApprovalSafetyClaim (#4676, X4, C20): a
+// head-pinned GitHub merge never queues an auto-merge, so "queueing before
+// approval is safe" became false. It sweeps every surface that carried it:
+// mergeRunNote, the Note jsonschema, the mergeRunAction Precondition, the wire
+// tool description, mergeTimeoutBlockedPRHint and the onboarding
+// instructions. The note, the Note jsonschema and the Precondition must say
+// "never queues an auto-merge".
+func TestMergeWording_NoQueueBeforeApprovalSafetyClaim(t *testing.T) {
+	noteField, ok := reflect.TypeOf(MergeRunOutput{}).FieldByName("Note")
+	if !ok {
+		t.Fatal("MergeRunOutput has no Note field")
+	}
+	norm := func(s string) string { return strings.Join(strings.Fields(strings.ToLower(s)), " ") }
+	desc := fixupGuidanceDescription(t, fixupGuidanceTools(t), "fishhawk_merge_run")
+	for _, s := range []struct {
+		name, text   string
+		mustNeverArm bool
+	}{
+		{"mergeRunNote", mergeRunNote, true},
+		{"MergeRunOutput.Note jsonschema", noteField.Tag.Get("jsonschema"), true},
+		{"mergeRunAction().Precondition", mergeRunAction(&Run{ID: "11111111-1111-1111-1111-111111111111"}).Precondition, true},
+		{"fishhawk_merge_run description", desc, false},
+		{"mergeTimeoutBlockedPRHint", mergeTimeoutBlockedPRHint, false},
+		{"onboardingInstructions", onboardingInstructions, false},
+	} {
+		got := norm(s.text)
+		for _, banned := range []string{"before approval is safe", "before approval is also safe", "before that approval is safe"} {
+			if strings.Contains(got, banned) {
+				t.Errorf("%s still claims %q (#4676: a head-pinned merge never queues an auto-merge)", s.name, banned)
+			}
+		}
+		if s.mustNeverArm && !strings.Contains(got, "never queues an auto-merge") {
+			t.Errorf("%s lacks %q", s.name, "never queues an auto-merge")
+		}
+	}
+}

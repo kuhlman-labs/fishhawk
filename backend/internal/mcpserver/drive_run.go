@@ -223,6 +223,13 @@ const (
 	// signature unchanged. It has its own driveDecisionActions arm, so the drive
 	// verb's "every decision_required:* names an operator judgment" contract holds.
 	driveDelegatedActNoProgress = "delegated_act_no_progress"
+	// driveMergeNotReadyState is the decision_required state a NON-resumable
+	// delegated merge_not_ready stops on (#4676, Z4): the head-pinned merge
+	// was refused before any merge request because GitHub does not report
+	// the pull request merge-ready at the verified head, and waiting will not
+	// clear it (behind, draft, review_required, changes_requested, a
+	// conflict). It has its own driveDecisionActions arm.
+	driveMergeNotReadyState = "merge_not_ready"
 	// stoppedAcceptanceNeedsTarget is the resumable stop when the acceptance
 	// target-identity gate (#1953) refuses to spawn: the admission endpoint
 	// reported the plan needs live validation against a declared target and the
@@ -627,10 +634,17 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 	haveActed := false
 	var lastActedSig, lastActedAction string
 
+	// mergeNotReadySkipGate (#4676, Z4, CC10): after a RESUMABLE delegated
+	// merge_not_ready the next gate call is skipped for one poll tick, so the
+	// gate (with its forge reads and forced republish) is called on alternate
+	// ticks while every tick keeps the pollInterval heartbeat and
+	// amendment-window checks.
+	mergeNotReadySkipGate := false
+
 	// QUEUED-MERGE MEMORY across invocations: a prior run_auto_driven act:gate
 	// merge row means a merge was already queued on an earlier invocation, so a
 	// resume during merge latency must poll for the webhook-settle instead of
-	// re-calling the gate (no duplicate gate:merge act, no auto-merge re-enable).
+	// re-calling the gate (no duplicate gate:merge act, no merge re-dispatch).
 	// FAIL-OPEN on a read error, unlike the dispatch-path fail-closed: this check
 	// opens NO code-execution surface — the worst case of a false negative is the
 	// pre-existing duplicate gate:merge attribution row, so fail-closed halting
@@ -715,13 +729,15 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			return nil, out, nil
 		}
 
-		// A delegated merge was queued on a prior iteration: GitHub auto-merge
-		// settles it via the pull_request webhook (merge is queued-not-landed).
-		// Poll the run state ONLY — never re-call the gate, which would
-		// re-enable auto-merge and append a duplicate run_auto_driven act:gate
-		// merge row every interval (and, if the seam rejects re-enabling on an
-		// already-enabled PR, exit gate_error) — until the run settles terminal
-		// (handled at the top of the loop) or the deadline elapses.
+		// A delegated merge was dispatched on a prior iteration. On a
+		// head-pinned GitHub run it was one synchronous REST merge at the
+		// verified head (#4676), which the pull_request webhook settles; an
+		// unpinned dispatch is settled by GitHub auto-merge via the same
+		// webhook. Poll the run state ONLY — never re-call the gate: the D1
+		// claim answers already-claimed and a re-call appends a duplicate
+		// run_auto_driven act:gate merge row every interval — until the run
+		// settles terminal (handled at the top of the loop) or the deadline
+		// elapses.
 		if mergeQueued {
 			driveSleep(ctx, pollInterval)
 			continue
@@ -1200,6 +1216,16 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			}
 		}
 
+		// (e-nmr) #4676 (CC10): the previous gate call answered a RESUMABLE
+		// merge_not_ready, so skip this tick's gate call and poll at the
+		// shared cadence: the gate is called on alternate ticks.
+		if mergeNotReadySkipGate {
+			mergeNotReadySkipGate = false
+			stall = 0
+			driveSleep(ctx, pollInterval)
+			continue
+		}
+
 		// (e) Parked at a gate — call the auto-drive endpoint.
 		gate, err := r.api.AutoDriveRunGate(ctx, runUUID)
 		if err != nil {
@@ -1244,10 +1270,11 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			out.StepsTaken = append(out.StepsTaken, DriveStep{
 				Kind: "gate", Action: gate.Action, Delegated: true, Note: gate.Note,
 			})
-			// A merge is queued-not-landed: remember it so subsequent iterations
-			// poll for the webhook-settle instead of re-calling the gate (which
-			// would duplicate the gate:merge attribution row and re-enable
-			// auto-merge every interval).
+			// A merge was dispatched but has not landed: remember it so
+			// subsequent iterations poll for the webhook-settle instead of
+			// re-calling the gate (which would duplicate the gate:merge
+			// attribution row every interval; the D1 claim already refuses a
+			// second dispatch).
 			if gate.Action == driveActionMerge {
 				mergeQueued = true
 			}
@@ -1281,6 +1308,28 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			out.NextActions = driveDecisionActions(gate.DecisionState, runUUID, in.WorkingDir)
 			return nil, out, nil
 		default:
+			// #4676 (Z4): a delegated head-pinned merge refused as not
+			// merge-ready. Checked BEFORE the parked-gate and stall logic. A
+			// resumable state keeps polling within max_minutes and never
+			// stalls; a non-resumable one (a conflict included) stops with the
+			// note, which names mergeable_state and the remedy.
+			if nr := gate.MergeNotReady; nr != nil {
+				if nr.Resumable && !nr.Conflicting {
+					stall = 0
+					if n := len(out.StepsTaken); n == 0 || out.StepsTaken[n-1].Kind != "gate" ||
+						out.StepsTaken[n-1].Action != "observe" || out.StepsTaken[n-1].Note != gate.Note {
+						out.StepsTaken = append(out.StepsTaken, DriveStep{Kind: "gate", Action: "observe", Note: gate.Note})
+					}
+					mergeNotReadySkipGate = true
+					driveSleep(ctx, pollInterval)
+					continue
+				}
+				out.StepsTaken = append(out.StepsTaken, DriveStep{Kind: "gate", Action: "observe", Note: gate.Note})
+				out.Warnings = append(out.Warnings, "delegated merge not merge-ready (waiting will not clear it): "+gate.Note)
+				out.StoppedReason = "decision_required:" + driveMergeNotReadyState
+				out.NextActions = driveMergeNotReadyActions(nr, gate.Note, runUUID)
+				return nil, out, nil
+			}
 			// Observe-only. If a real gate is parked (a stage awaiting
 			// approval the driver could not auto-act), it is a decision — EXCEPT a
 			// review stage parked at awaiting_approval under a derived
@@ -1881,6 +1930,45 @@ func driveSlotQueuedActions(runID uuid.UUID, stageID, stage, workingDir string) 
 	}}
 }
 
+// driveMergeNotReadyActions is the decision_required:merge_not_ready arm
+// (#4676, Z4): read the gate view's merge_readiness, apply the remedy the
+// note names, then re-invoke the merge. On mergeable_state behind,
+// fishhawk_rebase_run_branch comes first. nr and note may be empty (the
+// driveDecisionActions fallback).
+func driveMergeNotReadyActions(nr *autoDriveMergeNotReady, note string, runID uuid.UUID) *NextActions {
+	remedy := "apply the remedy the drive note names"
+	if strings.TrimSpace(note) != "" {
+		remedy = "apply the remedy the drive note names (" + note + ")"
+	}
+	pre := "the delegated head-pinned merge was refused before any merge request because GitHub does not report the pull request merge-ready at the verified head, and waiting will not clear it; nothing was merged or armed (#4676)"
+	var actions []SuggestedAction
+	if nr != nil && nr.MergeableState == "behind" {
+		actions = append(actions, SuggestedAction{
+			Action:       "fishhawk_rebase_run_branch",
+			Params:       map[string]string{"run_id": runID.String()},
+			Precondition: "GitHub reports the pull request behind its base (mergeable_state behind)",
+			Consumes:     consumesNone,
+			Reason:       "bring the run branch up to date, then re-invoke fishhawk_drive_run or fishhawk_merge_run",
+		})
+	}
+	actions = append(actions,
+		SuggestedAction{
+			Action:       "fishhawk_get_gate_view",
+			Params:       map[string]string{"run_id": runID.String()},
+			Precondition: pre,
+			Consumes:     consumesNone,
+			Reason:       "read merge_readiness to see what blocks the pull request at the verified head",
+		},
+		SuggestedAction{
+			Action:       "fishhawk_merge_run",
+			Params:       map[string]string{"run_id": runID.String()},
+			Precondition: pre,
+			Consumes:     consumesNone,
+			Reason:       remedy + ", then re-invoke the merge (or fishhawk_drive_run)",
+		})
+	return &NextActions{State: driveMergeNotReadyState, Actions: actions}
+}
+
 // driveDecisionActions builds the drive verb's own next-actions pointer for a
 // decision / paged / stalled stop. It is a focused pointer at the decision
 // tool; fishhawk_get_run_status carries the full lifecycle next_actions block.
@@ -1890,6 +1978,8 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 		params["working_dir"] = workingDir
 	}
 	switch {
+	case state == driveMergeNotReadyState:
+		return driveMergeNotReadyActions(nil, "", runID)
 	case state == "scope_amendment_requested":
 		return &NextActions{State: state, Actions: []SuggestedAction{{
 			Action:       "fishhawk_decide_scope_amendment",

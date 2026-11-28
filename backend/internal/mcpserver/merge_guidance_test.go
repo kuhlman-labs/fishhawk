@@ -94,6 +94,7 @@ func TestMergeRun_DescriptionStatesMergeGuidance(t *testing.T) {
 		{"13", "the merge queue re-runs this overlap guard at merge-on-pass"},
 		// R4: the new wording must not contradict the refusal's own text.
 		{"13", "nothing merged or queued"},
+		{"#4676", "never queues an auto-merge"},
 	})
 
 	// The gate view covers a SUBSET of the refusals and is not "the same
@@ -522,6 +523,7 @@ func TestMergeRitualActions_ApprovePRCarriesPreApprovalChecklist(t *testing.T) {
 				{"16", "use fishhawk_get_gate_view merge_readiness to check acceptance and review-coverage readiness without recording a verdict"},
 				{"R5c", "merge_gate"},
 				{"R5c", "fishhawk_audit_complete"},
+				{"#4676", "never queues an auto-merge"},
 			})
 		})
 	}
