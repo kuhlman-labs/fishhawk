@@ -2,13 +2,14 @@ id: scenario:issue-3925/resume-anonymous-caller-401
 statement: An unauthenticated POST /v0/runs/{run_id}/split-filing/resume for a well-formed run id answers HTTP 401 with error code authentication_required and a message naming the remedy (an operator token carrying write:runs), and does not answer 403, 404 or 5xx.
 verify_hint: On the localhost preview, send POST /v0/runs/00000000-0000-0000-0000-000000000000/split-filing/resume with no Authorization header and no session cookie. Expect HTTP 401, a JSON error body whose code is authentication_required, and a message that mentions write:runs.
 steps: 'curl -X POST http://localhost:8090/v0/runs/00000000-0000-0000-0000-000000000000/split-filing/resume with no Authorization header or cookie. Control 1: POST the same path with a trailing ''x'' (/resumex). Control 2: POST /v0/runs/not-a-uuid/split-filing/resume. Control 3: POST with header ''[REDACTED:authorization-bearer]''.'
+steps_carried_from: head 0ede9dda4bf19961b3935c8ff11bcb8ecd975f43 recorded_at 2026-11-28T09:07:14Z
 assertions:
-    expected: 401 authentication_required with a remedy naming the required operator scope; no 403/404/5xx
-    observed_at_record: HTTP 401 {"error":{"code":"authentication_required","message":"an authenticated operator token carrying write:approvals is required to resume a split filing"}}. The /resumex control returned 404 page not found, so the route is registered. The malformed-id and bogus-bearer requests also returned 401.
-    repro_handle: curl -s -w '%{http_code}' -X POST http://localhost:8090/v0/runs/00000000-0000-0000-0000-000000000000/split-filing/resume
+    expected: 401 authentication_required with a remedy naming the required operator scope
+    observed_at_record: HTTP 401 {"error":{"code":"authentication_required","message":"an authenticated operator token carrying write:approvals is required to resume a split filing"}}. No 403, 404 or 5xx on the real route.
+    repro_handle: curl -i -X POST http://localhost:8090/v0/runs/00000000-0000-0000-0000-000000000000/split-filing/resume
 origin:
     issue: 3925
     pr: 5626
     run_id: 1fb93c6d-4d3a-49e9-af05-fdcba900a590
-    head_sha: 0ede9dda4bf19961b3935c8ff11bcb8ecd975f43
-    recorded_at: 2026-11-28T09:07:14Z
+    head_sha: c7460d7272cda73bf3a0a9f4d2ec8f9edf0efd0d
+    recorded_at: 2026-11-28T15:05:30Z
