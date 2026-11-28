@@ -2,13 +2,14 @@ id: scenario:issue-5554/held-oversized-line-reports-running
 statement: A signed trace upload for a running implement stage, with a readable bundle whose manifest sets push_and_open_pr, one event line over 4 MiB and a non-empty git_diff, returns 202 with stage_state running and no stage_failure_kind. The stage stays running, held for its pull-request report, rather than advancing or failing.
 verify_hint: Use the same dev-fixture signing recipe as trace-time-failure-names-verify-pin, with a repetitive ~5 MiB event line that gzips small and stays under the sign route's cap. Check the 202 body and GET /v0/runs/{run_id}/stages.
 steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"}; read run_id and stages.implement. 2) POST /v0/runs/{run_id}/signing-key {}. 3) Built a gzip bundle (5,528 bytes compressed) with three lines. Line 1: a manifest {bundle_schema v1, run_id, stage_id, agent claude-code, push_and_open_pr:true}. Line 2: {"seq":1,"kind":"agent_output","data":{"text":"A"*5242880}}, 5,242,966 bytes. Line 3: a git_diff {files:[{path:README.md,status:M}], patch:<one-line README diff>}. 4) Signed it via POST /v0/dev/sign with X-Fishhawk-Dev-Private-Key. 5) POST /v0/runs/{run_id}/trace?stage_id={implement}&variant=raw with X-Fishhawk-Signature. 6) GET /v0/runs/{run_id}/stages.'
+steps_carried_from: head fdfdc4c777b6f5aea0558fa6441313fedfb687ab recorded_at 2026-11-28T11:38:55Z
 assertions:
     expected: 202 stage_state running, no stage_failure_kind; the stage stays running
-    observed_at_record: The trace answered 202 {"stage_state":"running"} with no stage_failure_kind key. GET stages shows plan succeeded, implement (sequence 2) running with null failure_category and reason, and the later stages pending.
-    repro_handle: python3 -I /tmp/fhacc5554/main.py
+    observed_at_record: '202 {stage_state: running} with no stage_failure_kind key. The stage reads back state running, with ended_at, failure_category and failure_reason all null.'
+    repro_handle: python3 -I /tmp/fhacc5554/drive.py
 origin:
     issue: 5554
     pr: 5633
     run_id: d8f12702-b8b0-4599-b276-b9578660305a
-    head_sha: fdfdc4c777b6f5aea0558fa6441313fedfb687ab
-    recorded_at: 2026-11-28T11:38:55Z
+    head_sha: 4e97879d1dfed565e32643b273e6a03b08cd6058
+    recorded_at: 2026-11-28T12:46:32Z
