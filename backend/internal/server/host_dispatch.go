@@ -105,11 +105,17 @@ const hostDispatchHoldRetry = "re-dispatch once the ops monitor clears the condi
 // queued first. With a slot store wired every stage on the admitting arm is
 // grouped (it holds a host capacity slot, ADR-094 D4 / #4241), so it is
 // omitted only on the nil-store and idempotent arms.
+//
+// CapacityWarning (ADR-094 A5) is present only on a grouped admission whose
+// request sent a capacity that differs from the host's governing capacity:
+// it names both values and the governing source. The request's capacity is
+// validated but never sizes admission.
 type hostDispatchResponse struct {
-	Transitioned bool                     `json:"transitioned"`
-	StageState   string                   `json:"stage_state"`
-	BaseBranch   string                   `json:"base_branch,omitempty"`
-	Concurrency  *hostDispatchConcurrency `json:"concurrency,omitempty"`
+	Transitioned    bool                     `json:"transitioned"`
+	StageState      string                   `json:"stage_state"`
+	BaseBranch      string                   `json:"base_branch,omitempty"`
+	Concurrency     *hostDispatchConcurrency `json:"concurrency,omitempty"`
+	CapacityWarning *hostCapacityWarning     `json:"capacity_warning,omitempty"`
 }
 
 // handleHostDispatchStage implements
@@ -130,8 +136,11 @@ type hostDispatchResponse struct {
 //
 // Concurrency groups (#3964 / ADR-087, ADR-094 D4/D5 / #4241): with
 // Config.Concurrency wired, EVERY stage on the admitting arm is grouped: it
-// holds one slot of host:<host>:capacity (the request's declared capacity,
-// default 3) plus its type's default groups (local-implement:<host> for an
+// holds one slot of host:<host>:capacity at the host's GOVERNING capacity
+// (ADR-094 A5: the fresh dispatcher declaration for the run's account and
+// this label, else fishhawkd's --default-host-capacity, else 3; the
+// request's capacity is validated and, when it differs, answered with a
+// capacity_warning) plus its type's default groups (local-implement:<host> for an
 // implement, local-verify:<host> for a merge-candidate verify pass) plus any
 // spec-declared groups. It takes that CAS only when every group of its set
 // has a free slot; otherwise it is QUEUED — 409 concurrency_slot_queued, the
@@ -306,8 +315,9 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 
 	// Optional {"host", "admission_nonce", "capacity"} body (#3964, #4241):
 	// the client's host label keys the host groups, a slot waiter's nonce is
-	// recorded on the slot it is admitted to, and the declared capacity sizes
-	// this request's host capacity group. The host label also keys the host
+	// recorded on the slot it is admitted to, and the capacity is validated
+	// but no longer sizes the host capacity group (ADR-094 A5: it only
+	// decides the capacity_warning). The host label also keys the host
 	// memory hold (#5619). Parsed only when a slot store or the memory hold
 	// is wired (with both nil the marker keeps ignoring the body),
 	// after the dev-mode refusal, the auth ladder and the id parse, and
@@ -691,14 +701,21 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	var slot *hostDispatchConcurrency
 	//
 	// Every stage that reaches this arm with a slot store wired is grouped
-	// (ADR-094 D4/D5, #4241): it holds one slot of host:<host>:capacity,
-	// sized by THIS request's declared capacity (else
-	// concurrency.DefaultHostCapacity) and used for this Admit call only.
+	// (ADR-094 D4/D5, #4241): it holds one slot of host:<host>:capacity at
+	// the host's governing capacity, resolved ONCE here before Admit
+	// (ADR-094 A5, resolveHostLimits). A fresh declared host_implement_limit
+	// caps local-implement:<host> (applyHostImplementCeiling), and a request
+	// capacity that differs from the governing one is answered with
+	// capacity_warning on the 200 and on the queued 409.
 	var groups []concurrency.GroupRequest
+	var capWarning *hostCapacityWarning
 	grouped := false
 	if s.cfg.Concurrency != nil {
+		limits := s.resolveHostLimits(r.Context(), runRow, host)
+		capWarning = capacityWarning(body.capacity, limits)
 		var rerr error
-		groups, rerr = s.resolveStageConcurrency(r.Context(), runRow, stage, host, body.capacityLimit())
+		groups, rerr = s.resolveStageConcurrency(r.Context(), runRow, stage, host, limits.capacity)
+		groups = applyHostImplementCeiling(groups, host, limits.implementLimit)
 		grouped = true
 		if rerr != nil {
 			// Unreachable for a validated spec (ADR-094 A1 keys admit no ':'
@@ -714,7 +731,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	switch cas, isCAS := s.cfg.RunRepo.(run.StageCASTransitioner); {
 	case grouped:
 		var queued bool
-		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, groups, host, nonce, expedited)
+		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, groups, host, nonce, expedited, capWarning)
 		if queued {
 			return
 		}
@@ -799,10 +816,11 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.writeJSON(w, r, http.StatusOK, hostDispatchResponse{
-		Transitioned: true,
-		StageState:   string(updated.State),
-		BaseBranch:   baseBranch,
-		Concurrency:  slot,
+		Transitioned:    true,
+		StageState:      string(updated.State),
+		BaseBranch:      baseBranch,
+		Concurrency:     slot,
+		CapacityWarning: capWarning,
 	})
 }
 

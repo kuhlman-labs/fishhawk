@@ -566,9 +566,11 @@ type Config struct {
 	// HostDispatcherHeartbeatRepo persists each host dispatcher's latest
 	// per-tick heartbeat, one row per (account, host) (#5489, ADR-104
 	// Amendment A2). POST /v0/host-dispatchers/heartbeat writes it; the
-	// campaign status awaiting block reads it. Nil leaves the endpoint
-	// answering 503 not_configured and the awaiting block on its legacy
-	// classification.
+	// campaign status awaiting block reads it, and the host-dispatch marker
+	// reads the (run account, marker label) row's declared host limits
+	// (ADR-094 A5, resolveHostLimits). Nil leaves the endpoint answering 503
+	// not_configured, the awaiting block on its legacy classification, and
+	// the marker on DefaultHostCapacity's fallback.
 	HostDispatcherHeartbeatRepo dispatcherheartbeat.Repository
 
 	// GateMerger is the forge-resolved merge seam the local auto-driver
@@ -970,6 +972,16 @@ type Config struct {
 	// bare CAS, no queue, no block). See stage_concurrency.go and
 	// backend/internal/concurrency/README.md.
 	Concurrency concurrency.Store
+
+	// DefaultHostCapacity is fishhawkd's --default-host-capacity /
+	// FISHHAWKD_DEFAULT_HOST_CAPACITY (ADR-094 Amendment A5 item 2(b)): the
+	// limit of host:<host>:capacity when no FRESH dispatcher heartbeat for the
+	// run's exact account and the marker's label declares a valid
+	// host_capacity. 0 means unset, and a value outside
+	// 1..concurrency.MaxLimit is treated as unset (fishhawkd refuses one at
+	// start-up; this is defence in depth), so the ladder falls to
+	// concurrency.DefaultHostCapacity. See resolveHostLimits.
+	DefaultHostCapacity int
 
 	// HostAdmissionHold is the optional, default-off INTERIM dispatch hold
 	// (E85.11 / #4330): while it reads held, the host-dispatch marker

@@ -43,14 +43,31 @@ type scPG struct {
 
 func newSCPG(t *testing.T, store func(*pgxpool.Pool) concurrency.Store) *scPG {
 	t.Helper()
+	return newSCPGWith(t, store, nil)
+}
+
+// newSCPGWith is newSCPG with the server Config passed through mut before
+// New (nil: unchanged), e.g. to set Config.DefaultHostCapacity or wire a
+// heartbeat repository over f.pool.
+func newSCPGWith(t *testing.T, store func(*pgxpool.Pool) concurrency.Store, mut func(cfg *Config, pool *pgxpool.Pool)) *scPG {
+	t.Helper()
 	pool := pgtest.NewPool(t)
 	f := &scPG{t: t, pool: pool, repo: run.NewPostgresRepository(pool), audit: audit.NewPostgresRepository(pool)}
 	cfg := Config{Addr: "127.0.0.1:0", RunRepo: f.repo, AuditRepo: f.audit}
 	if store != nil {
 		cfg.Concurrency = store(pool)
 	}
+	if mut != nil {
+		mut(&cfg, pool)
+	}
 	f.srv = New(cfg)
 	return f
+}
+
+// withDefaultHostCapacity sets fishhawkd's --default-host-capacity (ADR-094
+// A5 rung (b)) on a newSCPGWith fixture.
+func withDefaultHostCapacity(n int) func(*Config, *pgxpool.Pool) {
+	return func(cfg *Config, _ *pgxpool.Pool) { cfg.DefaultHostCapacity = n }
 }
 
 func pgStore(pool *pgxpool.Pool) concurrency.Store { return concurrency.NewPostgresStore(pool) }
@@ -1050,14 +1067,15 @@ func (f *scPG) slotGroup(id uuid.UUID) string {
 // position 4. The pass holds no implement slot: a later implement still sees
 // only the implement holder.
 //
-// The pass declares capacity 8 as headroom. Under ADR-094 A4 the three
-// queued implements are blocked on local-implement:h1 and reserve no slot of
-// host:h1:capacity, so the default capacity 3 would admit the pass too (1
-// holder + 0 < 3). 8 keeps capacity out of the path even if every queued
-// implement were counted (1 + 3 < 8), leaving the verify group the only group
-// in the path.
+// The host has capacity 8 as headroom, through fishhawkd's
+// --default-host-capacity (ADR-094 A5: a request's capacity no longer sizes
+// admission). Under ADR-094 A4 the three queued implements are blocked on
+// local-implement:h1 and reserve no slot of host:h1:capacity, so the default
+// capacity 3 would admit the pass too (1 holder + 0 < 3). 8 keeps capacity
+// out of the path even if every queued implement were counted (1 + 3 < 8),
+// leaving the verify group the only group in the path.
 func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T) {
-	f := newSCPG(t, pgStore)
+	f := newSCPGWith(t, pgStore, withDefaultHostCapacity(8))
 	holder := f.impl()
 	f.admitted(holder, hostBody("h1"))
 	for i := 1; i <= 3; i++ {
@@ -1068,7 +1086,7 @@ func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T)
 
 	pass := f.impl()
 	f.triggerPass(pass, "aaaa1111")
-	resp := f.admitted(pass, `{"host":"h1","capacity":8}`)
+	resp := f.admitted(pass, hostBody("h1"))
 	if resp.Concurrency == nil || resp.Concurrency.Group != "local-verify:h1" || resp.Concurrency.Limit != 1 || resp.Concurrency.QueuedBefore {
 		t.Fatalf("pass admission block = %+v, want {local-verify:h1, limit 1, queued_before:false}", resp.Concurrency)
 	}

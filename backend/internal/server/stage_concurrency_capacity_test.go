@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -13,13 +14,15 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
-// ADR-094 D4/D5 as amended by A2 (#4241), server half: every stage that
-// reaches the host-dispatch marker's admission arm holds one slot of
-// host:<host>:capacity, sized PER REQUEST by the marker body's optional
-// `capacity` (default 3); each stage type has a default set that every
-// declaration form adds to; and {capacity, host} is reserved. Every verdict
-// drives the REAL handler over the newSCPG pgtest harness and reads slot
-// rows back.
+// ADR-094 D4/D5 as amended by A2 (#4241) and A5, server half: every stage
+// that reaches the host-dispatch marker's admission arm holds one slot of
+// host:<host>:capacity at the host's GOVERNING capacity (a fresh dispatcher
+// declaration, else fishhawkd's --default-host-capacity, else 3; the marker
+// body's `capacity` is validated but never sizes admission); each stage type
+// has a default set that every declaration form adds to; and {capacity,
+// host} is reserved. Every verdict drives the REAL handler over the newSCPG
+// pgtest harness and reads slot rows back. The heartbeat-declaration rungs
+// are host_capacity_declaration_test.go.
 
 // specStage renders one workflow stage of typ (id == type) with an optional
 // concurrency block for specDoc.
@@ -142,19 +145,21 @@ func TestHostDispatch_HostCapacityQueuesFourthStage(t *testing.T) {
 	}
 }
 
-// TestHostDispatch_DeclaredCapacityTwoHonoured (done-means, CF2 vehicle): a
-// body declaring capacity 2 on a fresh label sizes the group at 2: two plan
-// stages are admitted and the third is queued at limit 2. Ignoring the
-// declaration (always the default 3) admits the third.
-func TestHostDispatch_DeclaredCapacityTwoHonoured(t *testing.T) {
-	f := newSCPG(t, pgStore)
+// TestHostDispatch_FishhawkdDefaultTwoHonoured (done-means, CF4 vehicle):
+// with no heartbeat declaration, fishhawkd's --default-host-capacity 2
+// (ADR-094 A5 rung (b)) sizes the group at 2: two plan stages are admitted
+// and the third is queued at limit 2. Ignoring the fishhawkd default (always
+// DefaultHostCapacity 3) admits the third.
+func TestHostDispatch_FishhawkdDefaultTwoHonoured(t *testing.T) {
+	f := newSCPGWith(t, pgStore, withDefaultHostCapacity(2))
 	for i := range 2 {
 		st := f.stage(fhRepo, run.StageTypePlan)
-		if resp := f.admitted(st, capacityBody("h2", 2)); resp.Concurrency.Group != "host:h2:capacity" || resp.Concurrency.Limit != 2 {
-			t.Fatalf("plan %d block = %+v, want host:h2:capacity at limit 2", i, resp.Concurrency)
+		resp := f.admitted(st, hostBody("h2"))
+		if resp.Concurrency.Group != "host:h2:capacity" || resp.Concurrency.Limit != 2 || resp.CapacityWarning != nil {
+			t.Fatalf("plan %d = %+v (warning %+v), want host:h2:capacity at limit 2 and no warning", i, resp.Concurrency, resp.CapacityWarning)
 		}
 	}
-	d, _, _ := f.queued(f.stage(fhRepo, run.StageTypePlan), capacityBody("h2", 2))
+	d, _, _ := f.queued(f.stage(fhRepo, run.StageTypePlan), hostBody("h2"))
 	if d.Group != "host:h2:capacity" || d.Limit != 2 || len(d.Holders) != 2 {
 		t.Fatalf("third plan details = %+v, want queued in host:h2:capacity at limit 2 behind two holders", d)
 	}
@@ -186,36 +191,56 @@ func TestHostDispatch_OldClientGetsDefaultCapacity(t *testing.T) {
 	}
 }
 
-// TestHostDispatch_CapacityDeclarationIsPerRequest (C3): a declared capacity
-// sizes ITS request's admission only. Stage 1 declares 64 and is admitted at
-// limit 64; stages 2 and 3 declare none and are admitted at 3; stage 4
-// declares none and is QUEUED at 3. A sticky per-host declaration would admit
-// stage 4 at 64. A regression guard against a reintroduced registry.
-func TestHostDispatch_CapacityDeclarationIsPerRequest(t *testing.T) {
+// TestHostDispatch_RequestCapacityIgnored (ADR-094 A5, CF1 vehicle; the
+// inverted A2 C3 guard): a request's capacity never sizes admission. Stage 1
+// sends 64 and is admitted at the governing default 3 with capacity_warning
+// {64, 3, default}; stages 2 and 3 send none and are admitted at 3 with no
+// warning; stage 4 sends 64 and is QUEUED at 3, its 409 details carrying the
+// same warning. Honouring the request value would admit stage 4 at 64.
+func TestHostDispatch_RequestCapacityIgnored(t *testing.T) {
 	f := newSCPG(t, pgStore)
-	if resp := f.admitted(f.stage(fhRepo, run.StageTypePlan), capacityBody("h3", 64)); resp.Concurrency.Limit != 64 {
-		t.Fatalf("stage 1 block = %+v, want limit 64", resp.Concurrency)
+	want := hostCapacityWarning{RequestCapacity: 64, GoverningCapacity: concurrency.DefaultHostCapacity, Source: hostCapacitySourceDefault}
+	resp := f.admitted(f.stage(fhRepo, run.StageTypePlan), capacityBody("h3", 64))
+	if resp.Concurrency.Limit != concurrency.DefaultHostCapacity || resp.CapacityWarning == nil || *resp.CapacityWarning != want {
+		t.Fatalf("stage 1 = %+v (warning %+v), want limit %d and warning %+v", resp.Concurrency, resp.CapacityWarning, concurrency.DefaultHostCapacity, want)
 	}
 	for i := 2; i <= 3; i++ {
-		if resp := f.admitted(f.stage(fhRepo, run.StageTypePlan), hostBody("h3")); resp.Concurrency.Limit != concurrency.DefaultHostCapacity {
-			t.Fatalf("stage %d block = %+v, want limit %d", i, resp.Concurrency, concurrency.DefaultHostCapacity)
+		if resp := f.admitted(f.stage(fhRepo, run.StageTypePlan), hostBody("h3")); resp.Concurrency.Limit != concurrency.DefaultHostCapacity || resp.CapacityWarning != nil {
+			t.Fatalf("stage %d = %+v (warning %+v), want limit %d and no warning", i, resp.Concurrency, resp.CapacityWarning, concurrency.DefaultHostCapacity)
 		}
 	}
-	d, _, _ := f.queued(f.stage(fhRepo, run.StageTypePlan), hostBody("h3"))
+	d, _, raw := f.queued(f.stage(fhRepo, run.StageTypePlan), capacityBody("h3", 64))
 	if d.Group != "host:h3:capacity" || d.Limit != concurrency.DefaultHostCapacity || len(d.Holders) != 3 {
 		t.Fatalf("stage 4 details = %+v, want queued in host:h3:capacity at limit %d behind 3 holders", d, concurrency.DefaultHostCapacity)
 	}
+	if got := queuedCapacityWarning(t, raw); got == nil || *got != want {
+		t.Fatalf("stage 4 details.capacity_warning = %+v, want %+v:\n%s", got, want, raw)
+	}
 }
 
-// capacityExemptFixture (C1): capacity 6 on h4 with implement {limit: 2}.
+// queuedCapacityWarning decodes details.capacity_warning from a queued 409's
+// raw details, nil when absent.
+func queuedCapacityWarning(t *testing.T, raw string) *hostCapacityWarning {
+	t.Helper()
+	var d struct {
+		CapacityWarning *hostCapacityWarning `json:"capacity_warning"`
+	}
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		t.Fatalf("decode details: %v", err)
+	}
+	return d.CapacityWarning
+}
+
+// capacityExemptFixture (C1): capacity 6 on h4 (fishhawkd's
+// --default-host-capacity, ADR-094 A5) with implement {limit: 2}.
 // I1 and I2 are admitted and I3 is QUEUED on local-implement:h4 — an earlier
 // fresh multi-group waiter on host:h4:capacity that is not capacity-bound
 // (local-implement:h4 is full), so it reserves no capacity slot (ADR-094 A4).
 func capacityExemptFixture(t *testing.T) (f *scPG, doc string, i3 *run.Stage) {
 	t.Helper()
-	f = newSCPG(t, pgStore)
+	f = newSCPGWith(t, pgStore, withDefaultHostCapacity(6))
 	doc = capacityFixtureSpec(t)
-	body := capacityBody("h4", 6)
+	body := hostBody("h4")
 	f.admitted(f.specStageOf("org/one", run.StageTypeImplement, doc), body)
 	f.admitted(f.specStageOf("org/one", run.StageTypeImplement, doc), body)
 	i3 = f.specStageOf("org/one", run.StageTypeImplement, doc)
@@ -230,7 +255,7 @@ func capacityExemptFixture(t *testing.T) (f *scPG, doc string, i3 *run.Stage) {
 // not capacity-bound), stay below 6.
 func admitLaterStages(f *scPG, doc string) {
 	f.t.Helper()
-	body := capacityBody("h4", 6)
+	body := hostBody("h4")
 	pass := f.specStageOf("org/one", run.StageTypeImplement, doc)
 	f.triggerPass(pass, "4241bbbb")
 	for _, st := range []*run.Stage{
@@ -270,7 +295,7 @@ func TestHostDispatch_CapacityExemptFromFIFOAcrossTypes(t *testing.T) {
 func TestHostDispatch_CapacityFullQueuesLaterStages(t *testing.T) {
 	f, doc, i3 := capacityExemptFixture(t)
 	admitLaterStages(f, doc)
-	body := capacityBody("h4", 6)
+	body := hostBody("h4")
 	f.admitted(f.specStageOf("org/one", run.StageTypePlan, doc), body)
 	if n := f.heldRows("host:h4:capacity"); n != 6 {
 		t.Errorf("held host:h4:capacity rows = %d, want 6", n)
@@ -287,11 +312,12 @@ func TestHostDispatch_CapacityFullQueuesLaterStages(t *testing.T) {
 }
 
 // TestHostDispatch_CapacityBodyRefusals (CF5 vehicle, one assertion per
-// failure mode): a capacity outside 1..64, or of a non-integer JSON type,
-// answers 400 validation_failed with details.field=capacity before any stage
-// read, so the stage is still awaiting_host_dispatch and no slot row exists.
-// Without the range check, 0 / -1 / 65 reach Admit, whose request validation
-// answers 500; without the type mapping, the type errors name field=body.
+// failure mode; ADR-094 A5 keeps the request capacity VALIDATED though it no
+// longer sizes admission): a capacity outside 1..64, or of a non-integer JSON
+// type, answers 400 validation_failed with details.field=capacity before any
+// stage read, so the stage is still awaiting_host_dispatch and no slot row
+// exists. Without the range check, 0 / -1 / 65 are admitted at the governing
+// capacity (200); without the type mapping, the type errors name field=body.
 // An absent capacity and a JSON null are both accepted at the default.
 func TestHostDispatch_CapacityBodyRefusals(t *testing.T) {
 	f := newSCPG(t, pgStore)
