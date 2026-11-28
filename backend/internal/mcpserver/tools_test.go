@@ -3700,7 +3700,15 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// operator. ELIGIBILITY: write:runs on a NON-run-bound credential
 	// (run_token_forbidden otherwise). The hold binds every spawner at the
 	// host-dispatch marker and its audited clear is the only override. 87 -> 88.
-	const wantToolCount = 88
+	//
+	// E50.25 / #3925 adds exactly ONE tool — fishhawk_resume_split_filing, the
+	// wrapper over POST /v0/runs/{run_id}/split-filing/resume. WHEN: a plan
+	// stage approved with a split_proposal has succeeded, fishhawk_get_plan
+	// shows no split_filing, and the detached on-approval filing has stopped.
+	// ELIGIBILITY: write:approvals on a NON-run-bound credential
+	// (run_token_forbidden otherwise). It files only phases with no durable
+	// marker, from the run's own approved plan artifact. 88 -> 89.
+	const wantToolCount = 89
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -4135,6 +4143,21 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawReconcileReviews {
 		t.Error("fishhawk_reconcile_reviews is not registered/visible over ListTools")
+	}
+
+	// fishhawk_resume_split_filing (#3925) must be wire-visible: it is the only
+	// recovery for a detached split filing that stopped part-way, and the
+	// 88 -> 89 bump alone would stay green if its registration were dropped
+	// and a DIFFERENT tool added in the same change.
+	var sawResumeSplitFiling bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_resume_split_filing" {
+			sawResumeSplitFiling = true
+			break
+		}
+	}
+	if !sawResumeSplitFiling {
+		t.Error("fishhawk_resume_split_filing is not registered/visible over ListTools")
 	}
 
 	// fishhawk_rerun_review (#4219) must likewise be wire-visible: it is the

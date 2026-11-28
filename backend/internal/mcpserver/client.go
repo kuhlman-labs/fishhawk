@@ -4361,6 +4361,43 @@ func (c *apiClient) ReconcileRunReviews(ctx context.Context, runID uuid.UUID) (*
 	return &res, nil
 }
 
+// ResumeSplitFilingResult mirrors the 200 (completed) / 202 (resuming) body of
+// POST /v0/runs/{run_id}/split-filing/resume
+// (backend/internal/server/split_filing_resume.go::splitFilingResumeResponse).
+//
+// HAND-MAINTAINED WIRE MIRROR of an UNEXPORTED backend struct (the #371
+// class): every json tag MUST byte-match or the field silently decodes to its
+// zero value. backend/internal/server/split_filing_resume_mcp_test.go decodes
+// the REAL handler's body through this mirror.
+type ResumeSplitFilingResult struct {
+	RunID         string `json:"run_id"`
+	StageID       string `json:"stage_id"`
+	State         string `json:"state"`
+	PhaseCount    int    `json:"phase_count"`
+	AlreadyFiled  int    `json:"already_filed"`
+	BudgetSeconds int    `json:"budget_seconds,omitempty"`
+}
+
+// ResumeSplitFiling resumes a stopped on-approval split-child filing (#3925).
+// It is idempotent: the backend files only phases with no durable marker.
+//
+// 2xx: 202 resuming (a filing was launched; budget_seconds set) or 200
+// completed (nothing launched). Every 4xx/5xx passes through as *apiError with
+// its code, message and details verbatim: 400 validation_failed, 401
+// authentication_required, 403 run_token_forbidden / insufficient_scope
+// (write:approvals), 404 run_not_found, 409 plan_not_approved /
+// no_split_proposal / plan_changed_since_approval / run_terminal /
+// split_filing_repo_malformed / split_filing_no_parent_issue /
+// split_filing_in_progress / split_filing_refused, 500
+// split_filing_resume_failed, 503 split_filing_resume_unconfigured.
+func (c *apiClient) ResumeSplitFiling(ctx context.Context, runID uuid.UUID) (*ResumeSplitFilingResult, error) {
+	var res ResumeSplitFilingResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/split-filing/resume", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // MergeObservationFact mirrors the `observation` object of
 // POST /v0/runs/{run_id}/record-merge-observation
 // (backend/internal/server/merge_observation.go::mergeObservation).
