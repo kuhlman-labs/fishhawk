@@ -1342,10 +1342,13 @@ func TestMergeRun_ConflictMergeableFalse(t *testing.T) {
 	}
 }
 
-// TestMergeRun_NullMergeableProceeds (m3) pins the fail-open on a
-// still-computing PR: mergeable==null + mergeable_state=="unknown" dispatches
-// the merge (GitHub's background mergeability job has not finished — treating
-// null as a conflict would refuse every freshly-opened PR).
+// TestMergeRun_NullMergeableProceeds (m3) pins the conflict guard's fail-open
+// on a still-computing PR: mergeable==null + mergeable_state=="unknown" is
+// never merge_conflicting (treating null as a conflict would refuse every
+// freshly-opened PR). The fixture is PINNED (the gate head is the PR head), so
+// since #4676 the readiness pre-read answers it 409 merge_checks_pending
+// reason not_merge_ready (resumable) after the durable verdict, and nothing is
+// dispatched or armed.
 func TestMergeRun_NullMergeableProceeds(t *testing.T) {
 	merger := &fakeMerger{}
 	s, repo, au := newAutoDriveMergeServer(t, merger)
@@ -1354,11 +1357,13 @@ func TestMergeRun_NullMergeableProceeds(t *testing.T) {
 	seedMergeConflictRun(t, s, repo, runID, gh)
 
 	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (null mergeable fails open):\n%s", w.Code, w.Body.String())
+	env := decodeMergeErr(t, w)
+	if w.Code != http.StatusConflict || env.Error.Code != "merge_checks_pending" || env.Error.Details["reason"] != "not_merge_ready" ||
+		env.Error.Details["resumable"] != true {
+		t.Fatalf("status = %d, want 409 merge_checks_pending not_merge_ready resumable (never merge_conflicting):\n%s", w.Code, w.Body.String())
 	}
-	if merger.called != 1 {
-		t.Errorf("merger called %d times, want 1 (null mergeable dispatches)", merger.called)
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (the pinned pre-read refuses before dispatch)", merger.called)
 	}
 	if rows := mergeVerdictRows(au); len(rows) != 1 {
 		t.Errorf("merge_verdict_recorded rows = %d, want 1", len(rows))
@@ -1367,8 +1372,9 @@ func TestMergeRun_NullMergeableProceeds(t *testing.T) {
 
 // TestMergeRun_BlockedStateProceeds pins the predicate's narrowness (binding
 // condition 2 / risk assumption): mergeable_state=="blocked" with
-// mergeable==true still returns 200 and dispatches — a blocked/unstable branch
-// is not a conflict, so the conflict guard lets it through. (A BEHIND branch is
+// mergeable==true is not a conflict, so the conflict guard lets it through.
+// The fixture is PINNED, so since #4676 the readiness pre-read then answers
+// 409 merge_checks_pending reason not_merge_ready and nothing is dispatched. (A BEHIND branch is
 // refused by the ADR-090 merge-candidate gate that follows; this fixture's
 // compare answers up to date, so only the conflict guard is exercised.)
 func TestMergeRun_BlockedStateProceeds(t *testing.T) {
@@ -1382,11 +1388,12 @@ func TestMergeRun_BlockedStateProceeds(t *testing.T) {
 	s.cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (blocked is not a conflict):\n%s", w.Code, w.Body.String())
+	env := decodeMergeErr(t, w)
+	if w.Code != http.StatusConflict || env.Error.Code != "merge_checks_pending" || env.Error.Details["mergeable_state"] != "blocked" {
+		t.Fatalf("status = %d, want 409 merge_checks_pending not_merge_ready blocked (blocked is not a conflict):\n%s", w.Code, w.Body.String())
 	}
-	if merger.called != 1 {
-		t.Errorf("merger called %d times, want 1 (blocked dispatches)", merger.called)
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (the pinned pre-read refuses blocked)", merger.called)
 	}
 	// ADR-112 (#4619): the merge endpoint no longer runs the #4086
 	// approval-dismissed check (the gate view keeps it advisory), so the
@@ -2855,31 +2862,89 @@ func TestMergeRun_MergeCandidate_ConflictGuardRunsFirst(t *testing.T) {
 
 // --- #4086: merge-readiness refusals -----------------------------------------
 
-// TestMergeRun_ApprovalDismissed_AfterVouchCommit pins ADR-112's REMOVAL of
-// the #4086 approval_dismissed refusal from the merge endpoint (#4619): under
-// a gate-less spec a blocked PR whose only review was DISMISSED by an operator
-// vouch commit is now ADMITTED (the forge-approval fold judges approvals only
-// when the review stage declares an approval gate; the gate-spec dismissed
-// row answers 409 forge_approval_required in forge_approval_e2e_test.go). The
-// gate view keeps approvalDismissedCheck as an advisory display.
+// TestMergeRun_ApprovalDismissed_AfterVouchCommit KEEPS the #4619 pin
+// (ADR-112's REMOVAL of the #4086 approval_dismissed refusal from the merge
+// endpoint) under #4676 (Z10), in two rows over a gate-less spec and a PR
+// whose only review was DISMISSED by an operator vouch commit: (a) blocked
+// answers 409 merge_checks_pending reason not_merge_ready from the pinned
+// readiness pre-read, NEVER approval_dismissed, and nothing is dispatched;
+// (b) the same review with mergeable_state clean is admitted. Re-wiring
+// approvalDismissedCheck into the endpoint reddens both rows. The gate view
+// keeps approvalDismissedCheck as an advisory display.
 func TestMergeRun_ApprovalDismissed_AfterVouchCommit(t *testing.T) {
 	const approved = "2222222222222222222222222222222222222222"
-	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
-	g.gh.mergeableState = "blocked"
-	g.gh.reviews = []map[string]any{
-		{"id": 11, "user": map[string]any{"login": "operator"}, "state": "DISMISSED", "commit_id": approved},
+	for _, state := range []string{"blocked", "clean"} {
+		t.Run(state, func(t *testing.T) {
+			g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+			g.gh.mergeableState = state
+			g.gh.reviews = []map[string]any{
+				{"id": 11, "user": map[string]any{"login": "operator"}, "state": "DISMISSED", "commit_id": approved},
+			}
+			seedReadinessEntry(g.au, g.runID, nil, CategoryOperatorCommitVouched, 40, map[string]any{lineageVouchedSHAField: mcvHead})
+			w := g.post(t)
+			if state == "clean" {
+				g.assertAdmitted(t, w)
+				return
+			}
+			env := decodeMergeErr(t, w)
+			if w.Code != http.StatusConflict || env.Error.Code != "merge_checks_pending" || env.Error.Details["reason"] != "not_merge_ready" {
+				t.Fatalf("status = %d, want 409 merge_checks_pending not_merge_ready:\n%s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "approval_dismissed") {
+				t.Fatalf("body names approval_dismissed (the #4619 removal regressed):\n%s", w.Body.String())
+			}
+			if g.merger.called != 0 {
+				t.Fatalf("merger called %d times, want 0", g.merger.called)
+			}
+		})
 	}
-	seedReadinessEntry(g.au, g.runID, nil, CategoryOperatorCommitVouched, 40, map[string]any{lineageVouchedSHAField: mcvHead})
-	g.assertAdmitted(t, g.post(t))
 }
 
-// TestMergeRun_ApprovalDismissed_NeverReviewedStillQueues pins the preserved
-// "queueing before approval is safe" contract: a blocked PR with NO review
-// has no DISMISSED review, so the merge queues as before.
-func TestMergeRun_ApprovalDismissed_NeverReviewedStillQueues(t *testing.T) {
+// TestMergeRun_ApprovalDismissed_NeverReviewedAnswersNotMergeReady replaces
+// the pre-#4676 "queueing before approval is safe" pin: a pinned dispatch
+// never arms an auto-merge, so a never-reviewed blocked PR answers 409
+// merge_checks_pending reason not_merge_ready (resumable: no reviewDecision is
+// readable here), the verdict is durable and nothing is dispatched.
+func TestMergeRun_ApprovalDismissed_NeverReviewedAnswersNotMergeReady(t *testing.T) {
 	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
 	g.gh.mergeableState = "blocked"
-	g.assertAdmitted(t, g.post(t))
+	w := g.post(t)
+	env := decodeMergeErr(t, w)
+	if w.Code != http.StatusConflict || env.Error.Code != "merge_checks_pending" || env.Error.Details["reason"] != "not_merge_ready" {
+		t.Fatalf("status = %d, want 409 merge_checks_pending not_merge_ready:\n%s", w.Code, w.Body.String())
+	}
+	if g.merger.called != 0 {
+		t.Errorf("merger called %d times, want 0", g.merger.called)
+	}
+	if rows := mergeVerdictRows(g.au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1 (durable)", len(rows))
+	}
+}
+
+// TestHandleMergeRun_NotMergeReady_ChecksPending (C1): with GitHub unwired the
+// pre-read falls through, so the merger's wrapped *forge.NotMergeReadyError is
+// the only source; it answers 409 merge_checks_pending reason not_merge_ready
+// (never the generic 502) after a durable verdict.
+func TestHandleMergeRun_NotMergeReady_ChecksPending(t *testing.T) {
+	merger := &fakeMerger{err: fmt.Errorf("pinned: %w", &forge.NotMergeReadyError{MergeableState: "blocked", ExpectedHeadSHA: "h1"})}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	env := decodeMergeErr(t, w)
+	if w.Code != http.StatusConflict || env.Error.Code != "merge_checks_pending" {
+		t.Fatalf("status = %d, want 409 merge_checks_pending:\n%s", w.Code, w.Body.String())
+	}
+	d := env.Error.Details
+	if d["reason"] != "not_merge_ready" || d["mergeable_state"] != "blocked" || d["resumable"] != true {
+		t.Fatalf("details = %v", d)
+	}
+	if !strings.Contains(env.Error.Message, "never queues an auto-merge") || strings.Contains(env.Error.Message, "retry the merge") {
+		t.Fatalf("message = %q", env.Error.Message)
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1", len(rows))
+	}
 }
 
 // seedStaleAcceptanceRun seeds a running run under the acceptance spec with a

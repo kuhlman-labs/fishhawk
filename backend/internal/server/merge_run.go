@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -492,8 +493,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Conflict precondition (E64.14 / #3109): a PR whose base has advanced into
-	// a merge conflict can never fire GitHub's auto-merge, so queuing it would
-	// only time out at 360s with a message that says nothing about conflicts.
+	// a merge conflict can never merge: an unpinned dispatch's queued auto-merge
+	// would only time out at 360s with a message that says nothing about
+	// conflicts, and a head-pinned dispatch's synchronous merge is refused
+	// (#4676).
 	// Refuse BEFORE the merge_verdict_recorded append (binding-ratified
 	// ordering): a durable verdict for a merge that structurally cannot queue is
 	// a false record. A re-POST after the operator resolves the conflict records
@@ -509,7 +512,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			slog.String("run_id", runID.String()),
 			slog.String("mergeable_state", mergeableState))
 		s.writeError(w, r, http.StatusConflict, "merge_conflicting",
-			"the pull request has a merge conflict against its base and GitHub can never queue the merge; resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit so the fishhawk_audit_complete check re-posts on the new head, re-approve the pull request, and re-invoke the merge",
+			"the pull request has a merge conflict against its base and GitHub can never queue the merge; "+mergeConflictRemedy,
 			map[string]any{"run_id": runID.String(), "pr_url": prURL, "mergeable_state": mergeableState})
 		return
 	}
@@ -804,7 +807,30 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// operator-vouched head and would re-post at a stale recorded head while
 		// the live head kept its missing or IN_PROGRESS required check. An empty
 		// gate.HeadSHA (ungated D7 admit, merged PR) keeps the findHeadSHA head.
-		auditRes, auditRecomputed := s.republishAuditCheckBeforeMergeAtHead(r.Context(), runID, gate.HeadSHA)
+		//
+		// #4676: on a head-pinned dispatch the readiness pre-read
+		// (pinnedMergeReadiness) runs FIRST, after the verdict and the observe
+		// and BEFORE this republish and the claim. A non-resumable refusal
+		// answers at once (no republish, no claim, no settle row). A resumable
+		// one runs the forced republish first, because a stranded
+		// fishhawk_audit_complete required check itself reads as blocked or
+		// unstable (#3159, #4397), then answers with no claim. A fall-through
+		// continues as before, and the leaf re-checks as the TOCTOU backstop.
+		var inlineLedger mergeDispatchClaimReader
+		if s.cfg.MergeQueue != nil {
+			inlineLedger = mergeQueueDispatchLedger{s.cfg.MergeQueue}
+		}
+		ready := s.pinnedMergeReadiness(r.Context(), runRow, gate.HeadSHA, inlineLedger)
+		var auditRes auditcomplete.Result
+		var auditRecomputed bool
+		if ready.Refusal == nil || ready.Resumable {
+			auditRes, auditRecomputed = s.republishAuditCheckBeforeMergeAtHead(r.Context(), runID, gate.HeadSHA)
+		}
+		if ready.Refusal != nil {
+			s.logNotMergeReady(r.Context(), runRow, gate.HeadSHA, ready.Refusal, "pre_claim")
+			s.writeInlineMergeDispatchFailure(w, r, runRow, prURL, verdictSequence, gate, ready.Refusal, false, "", "", mergeObserveResult{}, auditRes, auditRecomputed)
+			return nil
+		}
 
 		// Approval condition D1: claim the run's ONE merge dispatch on the
 		// ledger, under the merge-intent lock and BEFORE the forge call. An
@@ -821,13 +847,15 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// #4641 (ADR-112 residual H3): the dispatch is PINNED to gate.HeadSHA,
 		// the SAME head the merge-candidate gate admitted, inlineForgeApproval
 		// folded at and claimInlineMergeDispatch records, so the fold, the
-		// claim, merge_queue_authorized and the forge pin are one value. An
-		// empty gate head (ungated D7 admit, merged PR) keeps the unpinned
-		// ladder.
+		// claim, merge_queue_authorized and the forge pin are one value. On
+		// GitHub a pinned dispatch is the readiness pre-read above, then the
+		// leaf's own readiness check and ONE synchronous REST merge carrying
+		// sha; it never arms an auto-merge (#4676). An empty gate head
+		// (ungated D7 admit, merged PR) keeps the unpinned ladder.
 		// #4617: the dispatch is bounded by mergeTailMergeCallTimeout; the
 		// re-observe and the settle below keep the lock fn context.
 		if merr := dispatchMergeBounded(r.Context(), s.cfg.GateMerger, runRow, gate.HeadSHA); merr != nil {
-			checksPending := errors.Is(merr, forge.ErrPullRequestUnstableStatus)
+			checksPending := errors.Is(merr, forge.ErrPullRequestUnstableStatus) || isNotMergeReadyUnstable(merr)
 			// RE-OBSERVE ONCE (E45.87 / #3622), BEFORE the ledger is settled
 			// (matching merge-on-pass): a merge that landed in the
 			// observe-to-dispatch window, or one the dispatch itself rejected
@@ -848,84 +876,21 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			}
 			rearm := ""
 			settled := mergeDispatchLedgerOutcome("")
-			// Ruling R1: a checks_pending refusal or a forge 405/409/422
-			// RELEASES the claim (nothing was applied), so the re-invoke can
-			// claim again; any other outcome, a graphql_reread head mismatch
-			// included (#4749), is uncertain: dispatch_failed.
+			// Ruling R1: a checks_pending refusal, a not-merge-ready refusal
+			// (#4676) or a forge 405/409/422 RELEASES the claim (nothing was
+			// applied), so the re-invoke can claim again; any other outcome, a
+			// graphql_reread head mismatch included (#4749), is uncertain:
+			// dispatch_failed.
 			if claimed {
 				settled = s.settleMergeDispatchClaim(r.Context(), mergeQueueDispatchLedger{s.cfg.MergeQueue}, claim, merr)
 				if settled == mergeDispatchUncertain {
 					rearm = mergeDispatchRearmNote
 				}
 			}
-			// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
-			// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE
-			// status and refuses to queue auto-merge until its required checks pass.
-			// Classify it distinctly as 409 merge_checks_pending so the operator gets
-			// a remedy that can work (wait for the checks, or inspect the PR if a
-			// check has already failed) instead of the generic 502's "retry the
-			// merge", which reproduces the identical failure. The verdict row is
-			// already durable, so the tool re-POSTs across a bounded wait with no
-			// duplicate row. EVERY other error keeps the generic 502 so a real
-			// dispatch failure is never swallowed as "just waiting".
-			if checksPending {
-				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
-					slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
-				details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
-				msg := "the merge verdict is recorded and durable, but " + mergeMethodPhrase(runRow) + " cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting." + rearm
-				// E64.59 / #3190: when the blocking check is OUR OWN
-				// fishhawk_audit_complete sitting at pending, say WHY and WHAT TO
-				// DO. Purely additive — the existing keys are untouched, and a
-				// recompute that produced nothing, or a non-pending state, keeps
-				// the generic wording so a genuinely unrelated failing required
-				// check is never mislabelled.
-				if auditRecomputed && auditRes.State == stagecheck.StatePending && len(auditRes.Missing) > 0 {
-					items := make([]map[string]any, 0, len(auditRes.Missing))
-					for _, m := range auditRes.Missing {
-						items = append(items, map[string]any{"kind": string(m.Kind), "detail": m.Detail})
-					}
-					details["audit_complete_state"] = string(auditRes.State)
-					details["audit_complete_missing"] = items
-					msg += " fishhawk_audit_complete is pending because: " + auditRes.Missing[0].Detail
-				}
-				s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
-				return nil
+			if errors.Is(merr, forge.ErrPullRequestNotMergeReady) {
+				s.logNotMergeReady(r.Context(), runRow, gate.HeadSHA, merr, string(settled))
 			}
-			// #4641: a PINNED dispatch the forge refused for a head mismatch is
-			// 409 merge_head_moved, not the generic 502: the PR head moved after
-			// the merge-candidate gate admitted gate.HeadSHA, and a re-invoke
-			// re-runs the gate and the fold at the new head. An UNPINNED
-			// ErrMergeConflict (empty gate head) keeps the 502.
-			if gate.HeadSHA != "" && errors.Is(merr, forge.ErrMergeConflict) {
-				s.writeMergeHeadMoved(w, r, runRow, prURL, verdictSequence, gate.HeadSHA, merr, claimed, settled, rearm)
-				return nil
-			}
-			// E93.2 / #4658: a refusal ForgeMerger attributed to the run's
-			// merge method (the repository's settings disallow it, or the
-			// adapter cannot apply it) is a named 409, built from the refusal's
-			// closed-set fields only — never merr.Error() or its Cause.
-			var mref *MergeMethodRefusalError
-			if errors.As(merr, &mref) {
-				s.writeMergeMethodPostDispatchRefusal(w, r, runID, prURL, verdictSequence, mref, claimed, settled, rearm)
-				return nil
-			}
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
-				slog.String("run_id", runID.String()), slog.String("error", merr.Error()),
-				slog.String("forge_merge_state", obs.ForgeState))
-			// The observed state is named in the MESSAGE, not only in the details:
-			// a 5xx body's details are default-deny redacted (errors.go's
-			// redactableDetailKeys), so an un-allow-listed forge_merge_state key
-			// would never reach the caller. It is still passed as a detail because
-			// writeError logs the FULL pre-redaction map against the error_ref, so
-			// the operator's log record carries it alongside the raw cause.
-			s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
-				"the merge verdict is recorded and durable, but queuing "+mergeMethodPhrase(runRow)+" failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run."+rearm,
-				map[string]any{
-					"run_id":            runID.String(),
-					"error":             merr.Error(),
-					"verdict_sequence":  verdictSequence,
-					"forge_merge_state": obs.ForgeState,
-				})
+			s.writeInlineMergeDispatchFailure(w, r, runRow, prURL, verdictSequence, gate, merr, claimed, settled, rearm, obs, auditRes, auditRecomputed)
 			return nil
 		}
 
@@ -1095,7 +1060,8 @@ func (s *Server) inlineForgeApproval(w http.ResponseWriter, r *http.Request, run
 
 // prMergeConflicting reports whether the run's pull request has a merge
 // conflict against its base (E64.14 / #3109) — a state in which GitHub can
-// never fire the queued auto-merge. It is BEST-EFFORT and FAIL-OPEN: it reuses
+// never merge it (forge.PullRequestConflicting, the predicate the #4676
+// pinned pre-read and the GitHub leaf share). It is BEST-EFFORT and FAIL-OPEN: it reuses
 // the established lineage.go resolution idiom (nil GitHub client, nil/zero
 // installation id, unparseable repo, non-positive PR number, or a
 // GetPullRequest error all return (false, "") plus a warn log — i.e. behave
@@ -1145,10 +1111,238 @@ func (s *Server) prMergeConflicting(ctx context.Context, runRow *run.Run) (confl
 			slog.String("error", err.Error()))
 		return false, ""
 	}
-	if pr.MergeableState == "dirty" || (pr.Mergeable != nil && !*pr.Mergeable) {
+	if forge.PullRequestConflicting(pr.MergeableState, pr.Mergeable) {
 		return true, pr.MergeableState
 	}
 	return false, ""
+}
+
+// mergeConflictRemedy is the #3109 conflict guard's remedy, shared by the
+// post-verdict conflict answer (#4676, Z1) and the delegated conflict note.
+const mergeConflictRemedy = "resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit so the fishhawk_audit_complete check re-posts on the new head, re-approve the pull request, and re-invoke the merge"
+
+// Pinned-readiness blocked_by values (#4676, Z6): GitHub's reviewDecision on a
+// blocked pull request that names a review requirement waiting cannot clear.
+const (
+	notMergeReadyBlockedByReviewRequired   = "review_required"
+	notMergeReadyBlockedByChangesRequested = "changes_requested"
+)
+
+// mergePinnedPreReadTimeout bounds the pinned readiness pre-read (#4676, Z9,
+// approval condition CC4): ONE context covers its GetPullRequest and, on a
+// blocked state, its review snapshot. It is 5s, not mergeTailForgeReadTimeout's
+// 10s, so the inline in-lock forge worst case keeps real non-forge headroom
+// under the 90s lock-fn deadline (see the per-call budget comment). A deadline
+// is a read error: the pre-read falls through and the leaf decides. A var so a
+// test can shorten it.
+var mergePinnedPreReadTimeout = 5 * time.Second
+
+// mergeDispatchClaimReader is the DB-only D1 claim read the pinned pre-read
+// probes first (#4676, Z2).
+type mergeDispatchClaimReader interface {
+	MergeDispatch(ctx context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error)
+}
+
+// pinnedReadiness is the pinned readiness pre-read's answer (#4676). A nil
+// Refusal means FALL THROUGH to today's republish -> claim -> dispatch, where
+// the GitHub leaf's own fail-closed readiness check decides.
+type pinnedReadiness struct {
+	State     string
+	Refusal   error
+	Resumable bool
+	BlockedBy string
+}
+
+// pinnedReadinessRefusal carries the pre-read's resumable / blocked_by
+// classification on a *forge.NotMergeReadyError refusal, so the shared
+// inline mapping and the delegated note read them back with errors.As.
+type pinnedReadinessRefusal struct {
+	cause     error
+	resumable bool
+	blockedBy string
+}
+
+func (e *pinnedReadinessRefusal) Error() string { return e.cause.Error() }
+func (e *pinnedReadinessRefusal) Unwrap() error { return e.cause }
+
+// pinnedMergeReadiness is the head-pinned readiness pre-read (#4676), run by
+// the inline merge_run and the delegated may_merge arm inside the merge-intent
+// lock, AFTER the verdict/fold and BEFORE the republish and the D1 claim. In
+// order:
+//  1. Z2: an existing D1 claim (dispatched or dispatch_failed), or a claim
+//     read error, falls through, so the claim path answers
+//     merge_already_dispatched / already_claimed; not-merge-ready is never
+//     reported over a claim. No ledger wired means no claim can exist.
+//  2. Z9/CC4: ONE mergePinnedPreReadTimeout context bounds both forge reads;
+//     a deadline is a read error and falls through.
+//  3. Any unresolvable pull request (GitHub unwired, no installation, bad
+//     repo or PR number, a GET error) falls through. A merged PR, and a
+//     closed unmerged one (CC6: never a resumable not_merge_ready), fall
+//     through to the existing answers. A PR head that differs from gateHead
+//     falls through, so an unpinned dispatch (empty gateHead) is never
+//     refused here and the leaf precheck alone owns merge_head_moved.
+//  4. Z1: forge.PullRequestConflicting refuses Conflicting, non-resumable.
+//  5. unstable refuses with the leaf's own ErrValidation+UnstableStatus
+//     identity, resumable (CC5: today's checks_pending / delegated error).
+//  6. blocked reads the review snapshot (Z6): REVIEW_REQUIRED or
+//     CHANGES_REQUESTED is non-resumable with blocked_by; APPROVED, null, a
+//     read error or an unsupported forge is resumable.
+//  7. unknown is resumable; behind and draft are not.
+//  8. clean, has_hooks, empty (GitHub still computing) and any unrecognised
+//     value fall through.
+func (s *Server) pinnedMergeReadiness(ctx context.Context, runRow *run.Run, gateHead string, ledger mergeDispatchClaimReader) pinnedReadiness {
+	if ledger != nil {
+		if _, found, err := ledger.MergeDispatch(ctx, runRow.ID); err != nil || found {
+			return pinnedReadiness{}
+		}
+	}
+	if s.cfg.GitHub == nil || runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		return pinnedReadiness{}
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return pinnedReadiness{}
+	}
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		return pinnedReadiness{}
+	}
+	rctx, cancel := context.WithTimeout(ctx, mergePinnedPreReadTimeout)
+	defer cancel()
+	pr, err := s.cfg.GitHub.GetPullRequest(rctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber)
+	if err != nil || pr == nil {
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: pinned readiness pre-read failed; falling through to the leaf",
+				slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
+		}
+		return pinnedReadiness{}
+	}
+	if pr.Merged || pr.State == "closed" || pr.HeadSHA != gateHead {
+		return pinnedReadiness{}
+	}
+	state := pr.MergeableState
+	nmr := &forge.NotMergeReadyError{MergeableState: state, ExpectedHeadSHA: gateHead}
+	if forge.PullRequestConflicting(state, pr.Mergeable) {
+		nmr.Conflicting = true
+		return pinnedReadiness{State: state, Refusal: nmr}
+	}
+	switch state {
+	case "unstable":
+		return pinnedReadiness{State: state, Resumable: true,
+			Refusal: fmt.Errorf("%w: %w: GitHub reports the pull request in unstable status at pinned head %s", forge.ErrValidation, forge.ErrPullRequestUnstableStatus, gateHead)}
+	case "blocked":
+		blockedBy := s.pinnedBlockedBy(rctx, runRow)
+		resumable := blockedBy == ""
+		return pinnedReadiness{State: state, Resumable: resumable, BlockedBy: blockedBy,
+			Refusal: &pinnedReadinessRefusal{cause: nmr, resumable: resumable, blockedBy: blockedBy}}
+	case "unknown":
+		return pinnedReadiness{State: state, Resumable: true, Refusal: &pinnedReadinessRefusal{cause: nmr, resumable: true}}
+	case "behind", "draft":
+		return pinnedReadiness{State: state, Refusal: &pinnedReadinessRefusal{cause: nmr}}
+	}
+	return pinnedReadiness{}
+}
+
+// pinnedBlockedBy judges a blocked pull request's RETURNED reviewDecision
+// (#4676, Z6), not forgeReviewRequiredSnapshot's present flag, which also
+// fires on mergeStateStatus BLOCKED. Any uncertainty is "" (resumable).
+func (s *Server) pinnedBlockedBy(ctx context.Context, runRow *run.Run) string {
+	decision, _, _, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
+	if err != nil {
+		return ""
+	}
+	switch decision {
+	case "REVIEW_REQUIRED":
+		return notMergeReadyBlockedByReviewRequired
+	case "CHANGES_REQUESTED":
+		return notMergeReadyBlockedByChangesRequested
+	}
+	return ""
+}
+
+// notMergeReadyOf returns the *forge.NotMergeReadyError err carries, the
+// pre-read's resumable / blocked_by classification when it came from the
+// pre-read, and whether one was found. A leaf refusal carries no blocked_by;
+// its resumable comes from the state alone (notMergeReadyStateResumable).
+func notMergeReadyOf(err error) (nmr *forge.NotMergeReadyError, resumable bool, blockedBy string, ok bool) {
+	if !errors.As(err, &nmr) {
+		return nil, false, "", false
+	}
+	var pre *pinnedReadinessRefusal
+	if errors.As(err, &pre) {
+		return nmr, pre.resumable, pre.blockedBy, true
+	}
+	return nmr, !nmr.Conflicting && notMergeReadyStateResumable(nmr.MergeableState), "", true
+}
+
+// notMergeReadyStateResumable reports whether waiting can clear a
+// not-merge-ready state with no review classification: blocked (a required
+// check may still be running), unknown and empty (GitHub still computing).
+// behind, draft and any unrecognised value are not.
+func notMergeReadyStateResumable(state string) bool {
+	switch state {
+	case "blocked", "unknown", "":
+		return true
+	}
+	return false
+}
+
+// isNotMergeReadyRefusal is the not_merge_ready mapping predicate (#4676,
+// X1 option B): a forge.ErrPullRequestNotMergeReady that is not a conflict
+// (Z1, answered merge_conflicting) and not GitHub's unstable status (CC5,
+// which keeps today's checks_pending / delegated error). An unattributed
+// pinned 405 (ErrPullRequestNotMergeable) never matches: it keeps the 502.
+func isNotMergeReadyRefusal(err error) bool {
+	nmr, _, _, ok := notMergeReadyOf(err)
+	return ok && !nmr.Conflicting && nmr.MergeableState != "unstable"
+}
+
+// isNotMergeReadyConflict reports a pinned not-merge-ready refusal that is a
+// merge conflict seen AFTER the #3109 guard (#4676, Z1).
+func isNotMergeReadyConflict(err error) bool {
+	nmr, _, _, ok := notMergeReadyOf(err)
+	return ok && nmr.Conflicting
+}
+
+// isNotMergeReadyUnstable reports a NotMergeReadyError naming GitHub's
+// unstable status, which keeps today's checks_pending answer (CC5).
+func isNotMergeReadyUnstable(err error) bool {
+	nmr, _, _, ok := notMergeReadyOf(err)
+	return ok && !nmr.Conflicting && nmr.MergeableState == "unstable"
+}
+
+// notMergeReadyWaitingWillNotClear ends every non-resumable remedy.
+const notMergeReadyWaitingWillNotClear = "; waiting will not clear it"
+
+// notMergeReadyRemedy is the per-state remedy both arms name (#4676).
+func notMergeReadyRemedy(state, blockedBy string, conflicting bool) string {
+	switch {
+	case conflicting:
+		return mergeConflictRemedy + notMergeReadyWaitingWillNotClear
+	case blockedBy == notMergeReadyBlockedByReviewRequired:
+		return "obtain the required approving review under a qualifying identity (gh pr review --approve), then re-invoke the merge" + notMergeReadyWaitingWillNotClear
+	case blockedBy == notMergeReadyBlockedByChangesRequested:
+		return "address the requested changes, or have the reviewer re-review or dismiss the review, then re-invoke the merge" + notMergeReadyWaitingWillNotClear
+	case state == "behind":
+		return "bring the run branch up to date with fishhawk_rebase_run_branch, then re-invoke the merge" + notMergeReadyWaitingWillNotClear
+	case state == "draft":
+		return "mark the pull request ready for review under your own identity (gh pr ready), then re-invoke the merge" + notMergeReadyWaitingWillNotClear
+	case notMergeReadyStateResumable(state):
+		return "wait for the running required check, or for GitHub to finish computing mergeability, then re-invoke the merge"
+	}
+	return "inspect the pull request: GitHub reports a mergeable_state Fishhawk does not recognise" + notMergeReadyWaitingWillNotClear
+}
+
+// notMergeReadyStateLabel names a mergeable_state from the closed set; any
+// other value renders as "unrecognized", and empty as "unknown".
+func notMergeReadyStateLabel(state string) string {
+	switch state {
+	case "blocked", "behind", "draft", "unknown", "dirty", "clean", "has_hooks", "unstable":
+		return state
+	case "":
+		return "unknown"
+	}
+	return "unrecognized"
 }
 
 // Merge-candidate gate error codes (ADR-090 / E83.33 / #4018). The three
@@ -2222,10 +2416,14 @@ var mergeRunLockAcquireTimeout = 30 * time.Second
 // approval condition (f)): each call is abandoned at its own bound, well under
 // the 90s mergequeue.IntentFnTimeout the merge-intent lock fn runs under. Vars
 // so a slow-forge test can shorten them; the shipped defaults are the
-// merge-on-pass bounds. Worst-case in-lock sum: inline = fold 15s + tier-(b)
-// observe 10s + republish 10s + merge 30s + post-error re-observe 10s = 75s;
-// delegated = fold 15s + republish 10s + merge 30s + landed read 10s = 65s. The
-// post-dispatch ledger write runs on its own WithoutCancel
+// merge-on-pass bounds. Worst-case in-lock FORGE sum (#4676, approval
+// condition CC4): inline = fold 15s + tier-(b) observe 10s + pinned readiness
+// pre-read 5s (mergePinnedPreReadTimeout, its GET and review snapshot share
+// it) + republish 10s + merge 30s + post-error re-observe 10s = 80s, leaving
+// 10s of non-forge headroom (the DB reads and audit appends) under the 90s
+// lock-fn deadline; delegated = fold 15s + pre-read 5s + republish 10s +
+// merge 30s + landed read 10s = 70s, leaving 20s. A refusal path never
+// reaches the merge call. The post-dispatch ledger write runs on its own WithoutCancel
 // mergeDispatchRecordTimeout, and every child context still inherits the lock
 // fn's earlier deadline. A hung dispatch fails the merge (dispatch_failed); a
 // hung observe read falls through (Landed:false) and a hung republish is
@@ -2460,4 +2658,158 @@ func (s *Server) writeMergeMethodPostDispatchRefusal(w http.ResponseWriter, r *h
 	details := mergeMethodRefusalDetails(runID, prURL, ref, mergeMethodNextStepAllowOrMergeHand)
 	details["verdict_sequence"] = verdictSequence
 	s.writeError(w, r, http.StatusConflict, mergeCodeMergeMethodRefused, msg, details)
+}
+
+// writeInlineMergeDispatchFailure is the inline merge_run's ONE mapping of a
+// failed or refused dispatch (#4676): a pre-read refusal (claimed=false,
+// settled empty) and a post-claim leaf refusal take the same branches. In
+// order: checks_pending (GitHub's unstable status, CC5: today's answer); a
+// pinned head mismatch (merge_head_moved); a merge-method refusal; a merge
+// conflict seen after the #3109 guard (merge_conflicting, verdict recorded,
+// Z1); not_merge_ready (409 merge_checks_pending, X1 option B); and the
+// generic 502, which an unattributed pinned 405 keeps.
+func (s *Server) writeInlineMergeDispatchFailure(w http.ResponseWriter, r *http.Request, runRow *run.Run, prURL string,
+	verdictSequence int64, gate mergeCandidateGateResult, merr error, claimed bool, settled mergeDispatchLedgerOutcome, rearm string,
+	obs mergeObserveResult, auditRes auditcomplete.Result, auditRecomputed bool) {
+	runID := runRow.ID
+	// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
+	// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE
+	// status and refuses the merge until its required checks pass.
+	// Classify it distinctly as 409 merge_checks_pending so the operator gets
+	// a remedy that can work (wait for the checks, or inspect the PR if a
+	// check has already failed) instead of the generic 502's "retry the
+	// merge", which reproduces the identical failure. The verdict row is
+	// already durable, so the tool re-POSTs across a bounded wait with no
+	// duplicate row. EVERY other error keeps the generic 502 so a real
+	// dispatch failure is never swallowed as "just waiting".
+	if errors.Is(merr, forge.ErrPullRequestUnstableStatus) || isNotMergeReadyUnstable(merr) {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
+			slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
+		details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
+		msg := "the merge verdict is recorded and durable, but " + mergeMethodPhrase(runRow) + " cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting." + rearm
+		msg = appendAuditCompletePending(details, msg, auditRes, auditRecomputed)
+		s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
+		return
+	}
+	// #4641: a PINNED dispatch the forge refused for a head mismatch is
+	// 409 merge_head_moved, not the generic 502: the PR head moved after
+	// the merge-candidate gate admitted gate.HeadSHA, and a re-invoke
+	// re-runs the gate and the fold at the new head. An UNPINNED
+	// ErrMergeConflict (empty gate head) keeps the 502.
+	if gate.HeadSHA != "" && errors.Is(merr, forge.ErrMergeConflict) {
+		s.writeMergeHeadMoved(w, r, runRow, prURL, verdictSequence, gate.HeadSHA, merr, claimed, settled, rearm)
+		return
+	}
+	// E93.2 / #4658: a refusal ForgeMerger attributed to the run's
+	// merge method (the repository's settings disallow it, or the
+	// adapter cannot apply it) is a named 409, built from the refusal's
+	// closed-set fields only — never merr.Error() or its Cause.
+	var mref *MergeMethodRefusalError
+	if errors.As(merr, &mref) {
+		s.writeMergeMethodPostDispatchRefusal(w, r, runID, prURL, verdictSequence, mref, claimed, settled, rearm)
+		return
+	}
+	// #4676 (Z1): a conflict first seen AFTER the #3109 guard, by the
+	// pre-read or the leaf, answers merge_conflicting with the guard's
+	// remedy; unlike the guard, the verdict is already recorded.
+	if isNotMergeReadyConflict(merr) {
+		nmr, _, _, _ := notMergeReadyOf(merr)
+		s.writeError(w, r, http.StatusConflict, "merge_conflicting",
+			"the merge verdict is recorded and durable, but the pull request became conflicting after the conflict guard read it, so nothing was merged or armed; "+mergeConflictRemedy+rearm,
+			map[string]any{"run_id": runID.String(), "pr_url": prURL, "mergeable_state": nmr.MergeableState,
+				"verdict_recorded": true, "verdict_sequence": verdictSequence})
+		return
+	}
+	// #4676 (X1 option B): the pinned dispatch refused because GitHub does
+	// not report the PR merge-ready at the pinned head. Nothing was sent.
+	if isNotMergeReadyRefusal(merr) {
+		nmr, resumable, blockedBy, _ := notMergeReadyOf(merr)
+		details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL,
+			"reason": "not_merge_ready", "head_sha": gate.HeadSHA, "resumable": resumable}
+		if nmr.MergeableState != "" {
+			details["mergeable_state"] = nmr.MergeableState
+		}
+		if blockedBy != "" {
+			details["blocked_by"] = blockedBy
+		}
+		why := "mergeable_state " + notMergeReadyStateLabel(nmr.MergeableState)
+		if blockedBy != "" {
+			why += ", blocked_by " + blockedBy
+		}
+		msg := "the merge verdict is recorded and durable, but " + mergeMethodPhrase(runRow) +
+			" was not dispatched because GitHub does not report the pull request merge-ready at the pinned head (" + why + "). " +
+			"A head-pinned merge is synchronous and never queues an auto-merge, so nothing was merged or armed. Remedy: " +
+			notMergeReadyRemedy(nmr.MergeableState, blockedBy, false) + "."
+		if resumable {
+			msg += " A re-invoke once the pull request is merge-ready re-runs the merge-candidate gate (and, on a declared approval gate, the forge-approval fold) at the then-current head."
+		}
+		msg += rearm
+		msg = appendAuditCompletePending(details, msg, auditRes, auditRecomputed)
+		s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
+		return
+	}
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
+		slog.String("run_id", runID.String()), slog.String("error", merr.Error()),
+		slog.String("forge_merge_state", obs.ForgeState))
+	// The observed state is named in the MESSAGE, not only in the details:
+	// a 5xx body's details are default-deny redacted (errors.go's
+	// redactableDetailKeys), so an un-allow-listed forge_merge_state key
+	// would never reach the caller. It is still passed as a detail because
+	// writeError logs the FULL pre-redaction map against the error_ref, so
+	// the operator's log record carries it alongside the raw cause.
+	// CC7 (#4676): a pinned dispatch is one synchronous merge, so it never
+	// "queued" anything; an unpinned one still queues the forge merge.
+	verb := "queuing "
+	if gate.HeadSHA != "" {
+		verb = "the synchronous head-pinned dispatch of "
+	}
+	s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
+		"the merge verdict is recorded and durable, but "+verb+mergeMethodPhrase(runRow)+" failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run."+rearm,
+		map[string]any{
+			"run_id":            runID.String(),
+			"error":             merr.Error(),
+			"verdict_sequence":  verdictSequence,
+			"forge_merge_state": obs.ForgeState,
+		})
+}
+
+// appendAuditCompletePending is the E64.59 / #3190 block the checks_pending and
+// not_merge_ready answers share (#4676, X3): when the blocking check is OUR
+// OWN fishhawk_audit_complete sitting at pending, it says WHY. Purely
+// additive; a recompute that produced nothing, or a non-pending state, keeps
+// the generic wording so an unrelated failing required check is never
+// mislabelled.
+func appendAuditCompletePending(details map[string]any, msg string, res auditcomplete.Result, recomputed bool) string {
+	if !recomputed || res.State != stagecheck.StatePending || len(res.Missing) == 0 {
+		return msg
+	}
+	items := make([]map[string]any, 0, len(res.Missing))
+	for _, m := range res.Missing {
+		items = append(items, map[string]any{"kind": string(m.Kind), "detail": m.Detail})
+	}
+	details["audit_complete_state"] = string(res.State)
+	details["audit_complete_missing"] = items
+	return msg + " fishhawk_audit_complete is pending because: " + res.Missing[0].Detail
+}
+
+// logNotMergeReady logs a pinned not-merge-ready refusal (#4676, X5c): INFO
+// for a resumable state, WARN with the error for a non-resumable or
+// conflicting one, so a repeat is never silent.
+func (s *Server) logNotMergeReady(ctx context.Context, runRow *run.Run, head string, err error, claimOutcome string) {
+	nmr, resumable, blockedBy, ok := notMergeReadyOf(err)
+	if !ok {
+		return
+	}
+	if claimOutcome == "" {
+		claimOutcome = "unclaimed"
+	}
+	attrs := []slog.Attr{slog.String("run_id", runRow.ID.String()), slog.String("head_sha", head),
+		slog.String("mergeable_state", nmr.MergeableState), slog.String("blocked_by", blockedBy),
+		slog.String("claim_outcome", claimOutcome), slog.Bool("conflicting", nmr.Conflicting)}
+	if resumable && !nmr.Conflicting {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: pull request not merge-ready at the pinned head; nothing dispatched (resumable)", attrs...)
+		return
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge: pull request not merge-ready at the pinned head; nothing dispatched (waiting will not clear it)",
+		append(attrs, slog.String("error", err.Error()))...)
 }

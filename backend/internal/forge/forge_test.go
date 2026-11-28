@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -66,6 +67,7 @@ func TestMovedSentinelsAreDistinctFromEachOther(t *testing.T) {
 		forge.ErrMergeConflict,
 		forge.ErrPullRequestCleanStatus,
 		forge.ErrPullRequestNotMergeable,
+		forge.ErrPullRequestNotMergeReady,
 	}
 	for i := range all {
 		for j := range all {
@@ -288,5 +290,83 @@ func TestFamilyOfInstallationRef(t *testing.T) {
 		if got := forge.FamilyOfInstallationRef(tc.ref); got != tc.want {
 			t.Errorf("%s: FamilyOfInstallationRef = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestNotMergeReadyError_IdentityAndMessage pins the #4676 pinned-dispatch
+// refusal: the sentinel is distinct from every other forge sentinel (in
+// particular never ErrValidation / ErrPullRequestNotMergeable, so merge-method
+// attribution never fires on it), the typed error unwraps to it, is matchable
+// with errors.As through a wrap, and its message names the state, the head
+// and the conflict.
+func TestNotMergeReadyError_IdentityAndMessage(t *testing.T) {
+	if errors.Unwrap(forge.ErrPullRequestNotMergeReady) != nil {
+		t.Fatal("ErrPullRequestNotMergeReady must not wrap another error")
+	}
+	for _, other := range []error{
+		forge.ErrNotFound, forge.ErrForbidden, forge.ErrValidation, forge.ErrNotInstalled,
+		forge.ErrPullRequestExists, forge.ErrMergeConflict, forge.ErrPullRequestCleanStatus,
+		forge.ErrPullRequestUnstableStatus, forge.ErrPullRequestNotMergeable, forge.ErrUnsupported,
+		forge.ErrMergeMethodNotAllowed, forge.ErrMergeMethodUnsupported,
+	} {
+		if errors.Is(other, forge.ErrPullRequestNotMergeReady) {
+			t.Errorf("ErrPullRequestNotMergeReady collides with %v", other)
+		}
+	}
+	err := fmt.Errorf("dispatch: %w", &forge.NotMergeReadyError{MergeableState: "blocked", ExpectedHeadSHA: "h1"})
+	if !errors.Is(err, forge.ErrPullRequestNotMergeReady) {
+		t.Fatal("wrapped *NotMergeReadyError does not unwrap to ErrPullRequestNotMergeReady")
+	}
+	if errors.Is(err, forge.ErrValidation) || errors.Is(err, forge.ErrPullRequestNotMergeable) {
+		t.Fatal("*NotMergeReadyError must not wrap ErrValidation or ErrPullRequestNotMergeable")
+	}
+	var nmr *forge.NotMergeReadyError
+	if !errors.As(err, &nmr) || nmr.MergeableState != "blocked" || nmr.ExpectedHeadSHA != "h1" {
+		t.Fatalf("errors.As = %+v", nmr)
+	}
+	for _, tc := range []struct {
+		e        forge.NotMergeReadyError
+		contains []string
+		absent   string
+	}{
+		{forge.NotMergeReadyError{MergeableState: "draft", ExpectedHeadSHA: "abc"}, []string{"draft", "abc"}, "conflict"},
+		{forge.NotMergeReadyError{ExpectedHeadSHA: "abc"}, []string{"unknown", "abc"}, "conflict"},
+		{forge.NotMergeReadyError{MergeableState: "dirty", ExpectedHeadSHA: "abc", Conflicting: true}, []string{"dirty", "abc", "merge conflict"}, ""},
+	} {
+		msg := tc.e.Error()
+		for _, want := range tc.contains {
+			if !strings.Contains(msg, want) {
+				t.Errorf("Error() = %q, want it to contain %q", msg, want)
+			}
+		}
+		if tc.absent != "" && strings.Contains(msg, tc.absent) {
+			t.Errorf("Error() = %q, must not contain %q", msg, tc.absent)
+		}
+	}
+}
+
+// TestPullRequestConflicting pins the ONE shared conflict predicate (#3109,
+// #4676): dirty, or mergeable=false with any state; never a nil mergeable.
+func TestPullRequestConflicting(t *testing.T) {
+	f, tr := false, true
+	for _, tc := range []struct {
+		name      string
+		state     string
+		mergeable *bool
+		want      bool
+	}{
+		{"dirty", "dirty", nil, true},
+		{"dirty_mergeable_true", "dirty", &tr, true},
+		{"mergeable_false_other_state", "blocked", &f, true},
+		{"mergeable_false_clean", "clean", &f, true},
+		{"clean", "clean", &tr, false},
+		{"nil_mergeable_blocked", "blocked", nil, false},
+		{"empty", "", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := forge.PullRequestConflicting(tc.state, tc.mergeable); got != tc.want {
+				t.Errorf("PullRequestConflicting(%q, %v) = %v, want %v", tc.state, tc.mergeable, got, tc.want)
+			}
+		})
 	}
 }

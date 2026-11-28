@@ -57,9 +57,12 @@ const requirementConcernCategory = "requirement"
 //
 // expectedHeadSHA (#4641, ADR-112 residual H3) is the head the merge-candidate
 // gate admitted, which the ADR-112 fold judged and the D1 claim records. A
-// non-empty value PINS the merge: the auto-merge enable carries GitHub's
-// expectedHeadOid and the clean-status REST fallback carries `sha`, so a push
-// landing after the gate is refused by the forge rather than merged unapproved.
+// non-empty value PINS the merge: on GitHub it is a readiness check, then ONE
+// synchronous REST merge carrying `sha`, and NEVER an auto-merge (#4676), so a
+// push landing after the gate is refused by the forge rather than merged
+// unapproved, and nothing stays armed across a later push. A pull request
+// GitHub does not report merge-ready is refused with a
+// *forge.NotMergeReadyError before any PUT.
 // A head mismatch surfaces as forge.ErrMergeConflict (with a
 // *githubclient.HeadMismatchError naming its basis); the classifier releases
 // the claim. An EMPTY value means no head was evaluated (an ungated D7 admit,
@@ -121,6 +124,11 @@ type AutoDriveOutcome struct {
 	// Note is a short human-readable summary for the driver log /
 	// observe-only audit. Always set.
 	Note string
+	// MergeNotReady is the structured delegated not-merge-ready outcome
+	// (#4676, Z4), set ONLY on a pinned not-merge-ready or conflict
+	// observe-only outcome; nil on every other outcome. The campaign driver
+	// does not read it.
+	MergeNotReady *AutoDriveMergeNotReady
 }
 
 func observeOnly(note string) AutoDriveOutcome { return AutoDriveOutcome{Note: note} }
@@ -865,6 +873,24 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 			slog.String("claim_outcome", claimOutcome),
 			slog.String("error", derr.Error()))
 		return observeOnly(autoDriveHeadMovedNote(settled, derr)), nil
+	case mergeDispatchNotMergeReadyPreClaim, mergeDispatchNotMergeReady:
+		// #4676: observe-only, nil error; the note and the structured
+		// merge_not_ready object follow the claim outcome.
+		claimOutcome := autoDriveClaimOutcomePreClaim
+		if outcome == mergeDispatchNotMergeReady {
+			claimOutcome = autoDriveNotMergeReadyClaimOutcome(settled)
+		}
+		s.logNotMergeReady(ctx, runRow, gate.HeadSHA, derr, claimOutcome)
+		nmr, resumable, blockedBy, _ := notMergeReadyOf(derr)
+		state := ""
+		conflicting := false
+		if nmr != nil {
+			state, conflicting = nmr.MergeableState, nmr.Conflicting
+		}
+		out := observeOnly(autoDriveMergeNotReadyNote(claimOutcome, state, blockedBy, conflicting, resumable))
+		out.MergeNotReady = &AutoDriveMergeNotReady{MergeableState: state, Resumable: resumable && !conflicting,
+			Conflicting: conflicting, BlockedBy: blockedBy, ClaimOutcome: claimOutcome}
+		return out, nil
 	case mergeDispatchLandedOnReobserve:
 		// #4617: the dispatch errored but the merge landed; acted, no error.
 		return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: autoDriveNoteMergeLandedOnReobserve}, nil
@@ -890,14 +916,15 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 		}
 		return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
 	}
-	// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
-	// the PR has landed. The settle (pr_merged + run completion) is
-	// deliberately left to the existing pull_request-closed webhook /
+	// may_merge DISPATCHES the merge (a head-pinned GitHub dispatch is one
+	// synchronous REST merge at the verified head, #4676; an unpinned one
+	// enables/queues GitHub auto-merge); it does NOT prove the PR has
+	// landed. The settle (pr_merged + run completion) is deliberately left to the existing pull_request-closed webhook /
 	// resolveReviewStageOnMerge path that fires when GitHub actually
 	// merges — the actor must not record a merge GitHub may still
 	// block (failing checks) or defer (queued). Recording pr_merged
 	// here would complete the run before the merge is real.
-	return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: "enabled auto-merge; webhook settles on merge"}, nil
+	return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: "merge dispatched; webhook settles on merge"}, nil
 }
 
 // mergeDispatchOutcome classifies what dispatchAcceptanceGatedMerge decided at
@@ -951,6 +978,15 @@ const (
 	// merge_dispatch_settled row is written and the returned error is nil:
 	// the caller reports acted, never "merge dispatch failed".
 	mergeDispatchLandedOnReobserve
+	// mergeDispatchNotMergeReadyPreClaim (#4676): the pinned readiness
+	// pre-read refused (not merge-ready, or a conflict) BEFORE the claim:
+	// nothing was merged, armed or claimed. The returned error is the
+	// refusal; the caller is observe-only.
+	mergeDispatchNotMergeReadyPreClaim
+	// mergeDispatchNotMergeReady (#4676): the claimed pinned dispatch's leaf
+	// refused as not merge-ready (forge.ErrPullRequestNotMergeReady) and the
+	// claim was settled; the note follows the settle outcome.
+	mergeDispatchNotMergeReady
 )
 
 // logMergeMethodRefusal logs a merge-method refusal with its closed-set fields
@@ -1096,8 +1132,30 @@ func (s *Server) dispatchAcceptanceGatedMergeSettled(ctx context.Context, runRow
 	// E86.57 / #4397, #4440: the publish targets liveHead, the head the merge
 	// will land, because findHeadSHA cannot resolve a conflict-resolution,
 	// base-advance or operator-vouched head (mirror of handleMergeRun).
-	_, _ = s.republishAuditCheckBeforeMergeAtHead(ctx, runRow.ID, liveHead)
+	//
+	// #4676: the pinned readiness pre-read runs FIRST (pinnedMergeReadiness),
+	// after the fold and BEFORE this republish and the claim, with the same
+	// Z2 existing-claim probe: an existing claim falls through to the claim
+	// below, whose !claimed branch answers mergeDispatchAlreadyClaimed. A
+	// non-resumable refusal skips the republish; a resumable one republishes
+	// first. A NotMergeReadyError refusal is mergeDispatchNotMergeReadyPreClaim
+	// with nothing claimed; an unstable refusal keeps today's error (CC5),
+	// only no claim is taken.
 	ledger := s.mergeDispatchLedger()
+	var claimReader mergeDispatchClaimReader
+	if ledger != nil {
+		claimReader = ledger
+	}
+	ready := s.pinnedMergeReadiness(ctx, runRow, liveHead, claimReader)
+	if ready.Refusal == nil || ready.Resumable {
+		_, _ = s.republishAuditCheckBeforeMergeAtHead(ctx, runRow.ID, liveHead)
+	}
+	if ready.Refusal != nil {
+		if errors.Is(ready.Refusal, forge.ErrPullRequestNotMergeReady) {
+			return mergeDispatchNotMergeReadyPreClaim, gateState, "", ready.Refusal
+		}
+		return mergeDispatchMerged, gateState, "", ready.Refusal
+	}
 	claimed := false
 	var claim mergequeue.DispatchClaim
 	if ledger != nil {
@@ -1137,6 +1195,14 @@ func (s *Server) dispatchAcceptanceGatedMergeSettled(ctx context.Context, runRow
 	}
 	if liveHead != "" && errors.Is(merr, forge.ErrMergeConflict) {
 		return mergeDispatchHeadMoved, gateState, settled, merr
+	}
+	// #4676: the pinned leaf refused before any PUT because GitHub does not
+	// report the PR merge-ready (a conflict included); the claim was
+	// settled (released, or dispatch_failed when the release did not land).
+	// After the head-moved mapping; it never matches a merge-method refusal.
+	// An unstable NotMergeReadyError keeps today's error (CC5).
+	if errors.Is(merr, forge.ErrPullRequestNotMergeReady) && !isNotMergeReadyUnstable(merr) {
+		return mergeDispatchNotMergeReady, gateState, settled, merr
 	}
 	return mergeDispatchMerged, gateState, settled, merr
 }
@@ -2128,4 +2194,74 @@ func implementSpecStage(wf *spec.Workflow) *spec.Stage {
 		}
 	}
 	return nil
+}
+
+// AutoDriveMergeNotReady is the structured delegated not-merge-ready outcome
+// (#4676, Z4), set on AutoDriveOutcome.MergeNotReady ONLY for a pinned
+// not-merge-ready or conflict observe-only outcome (nil on every other).
+// fishhawk_drive_run reads it: a resumable state keeps polling, a
+// non-resumable one stops with decision_required:merge_not_ready.
+type AutoDriveMergeNotReady struct {
+	MergeableState string
+	Resumable      bool
+	Conflicting    bool
+	BlockedBy      string
+	// ClaimOutcome is pre_claim, released, dispatch_failed or unclaimed.
+	ClaimOutcome string
+}
+
+// Delegated not-merge-ready claim outcomes (#4676).
+const (
+	autoDriveClaimOutcomePreClaim       = "pre_claim"
+	autoDriveClaimOutcomeReleased       = "released"
+	autoDriveClaimOutcomeDispatchFailed = "dispatch_failed"
+	autoDriveClaimOutcomeUnclaimed      = "unclaimed"
+)
+
+// autoDriveNotMergeReadyClaimOutcome maps the settle outcome of a claimed
+// not-merge-ready leaf refusal: released, dispatch_failed (the release did
+// not land), or unclaimed (no ledger wired, settled empty).
+func autoDriveNotMergeReadyClaimOutcome(settled mergeDispatchLedgerOutcome) string {
+	switch settled {
+	case mergeDispatchRelease:
+		return autoDriveClaimOutcomeReleased
+	case mergeDispatchUncertain:
+		return autoDriveClaimOutcomeDispatchFailed
+	}
+	return autoDriveClaimOutcomeUnclaimed
+}
+
+// autoDriveMergeNotReadyNote is the delegated not-merge-ready observe-only
+// note (#4676, X6), mirroring autoDriveHeadMovedNote: it names the claim
+// outcome and the mergeable_state from the closed set ("unrecognized"
+// otherwise). A conflict uses the conflict wording and remedy, never "not
+// merge-ready" (Z1); a non-resumable state appends notMergeReadyRemedy.
+func autoDriveMergeNotReadyNote(claimOutcome, state, blockedBy string, conflicting, resumable bool) string {
+	label := notMergeReadyStateLabel(state)
+	var what string
+	if conflicting {
+		what = "the pull request has a merge conflict at the verified head (mergeable_state " + label + ")"
+	} else {
+		what = "GitHub does not report the pull request merge-ready at the verified head (mergeable_state " + label
+		if blockedBy != "" {
+			what += ", blocked_by " + blockedBy
+		}
+		what += "); the head-pinned merge never queues an auto-merge"
+	}
+	var claim string
+	switch claimOutcome {
+	case autoDriveClaimOutcomePreClaim:
+		claim = "nothing was merged, armed or claimed; the next tick re-gates"
+	case autoDriveClaimOutcomeReleased:
+		claim = "the forge refused the dispatch before any merge request, the merge-dispatch claim was released, and the next tick re-gates"
+	case autoDriveClaimOutcomeDispatchFailed:
+		claim = "the forge refused the dispatch before any merge request but the claim release did not land, so the claim is dispatch_failed and every later tick is observe-only (already claimed) until reconciliation or the operator re-arm (mergequeue README § \"Merge-dispatch ledger\")"
+	default:
+		claim = "nothing was merged or armed (no merge-dispatch ledger is wired); the next tick re-gates"
+	}
+	note := what + "; " + claim
+	if conflicting || !resumable {
+		note += "; remedy: " + notMergeReadyRemedy(state, blockedBy, conflicting)
+	}
+	return note + "; observe-only"
 }
