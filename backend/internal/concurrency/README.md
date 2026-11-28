@@ -372,7 +372,11 @@ job-holder arm, `TestAdmitSet_OtherGroupEarlierWaiterUnbindsCapacity` the
 earlier-waiter arm (counted from W's own key, so a waiter behind W never
 counts), `TestAdmitSet_CapacityBoundClassificationAccountScoped` the account
 scoping, and `TestAdmitSet_CapacityOnlyWaiterReserves` the `{capacity}`-only
-case.
+case. The classification lists only the `round_ahead` waiters:
+`TestAdmitSet_CapacityClassificationSkipsSameRoundWaiter` pins that a
+`{capacity}`-only loser committed during the caller's round is not listed,
+and `TestAdmitSet_CapacityClassificationSkipsWaiterBehindCaller` that a
+bound waiter behind the caller's key is not.
 
 A waiter keeps its FIFO position on capacity: its fresh rows keep their
 `enqueued_at`, so the moment its other groups would admit it, it counts as
@@ -386,12 +390,17 @@ poll. A waiter that becomes capacity-bound after a later stage took the slot
 waits for one more capacity release.
 
 A capacity reservation lasts until its waiter is admitted, and only while
-that waiter refreshes its row within `QueueTTL`: the classification reads
-only fresh queued rows, so a row stale past `QueueTTL` reserves nothing.
-`TestAdmitSet_StaleCapacityReservationEnds` pins it on a capacity-bound
-waiter: at capacity 2, H1 and H2 hold and W `{capacity}` queues; H2 settles,
-and once only W's row ages past `QueueTTL`, a new capacity-only stage is
-admitted at once. Since #3969 every host-spawn verb
+that waiter refreshes its row within `QueueTTL`: `round_ahead` and the
+classification both read only fresh queued rows, so a row stale past
+`QueueTTL` reserves nothing. `TestAdmitSet_StaleCapacityReservationEnds`
+pins it on a capacity-bound waiter: at capacity 2, H1 and H2 hold and W
+`{capacity}` queues; H2 settles, and once only W's row ages past `QueueTTL`,
+a new capacity-only stage is admitted at once. There the stale row leaves
+`round_ahead`, so the cheap path decides and the classification never runs.
+`TestAdmitSet_CapacityClassificationSkipsStaleWaiter` pins the
+classification's own freshness: a fresh unbound waiter keeps the
+classification running, and a stale `{capacity}`-only row ahead of the
+caller must not count. Since #3969 every host-spawn verb
 (`fishhawk_dispatch_stage`, `fishhawk_run_stage`, `fishhawk_drive_run`,
 `fishhawk_run_children`) leaves a live waiter behind a queued set, so a
 waiterless set arises only when a waiter's process dies (an MCP restart, a
