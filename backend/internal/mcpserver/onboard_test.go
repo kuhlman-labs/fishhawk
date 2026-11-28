@@ -2397,6 +2397,9 @@ func TestDoctorToolDescription_DescribesHostLabel(t *testing.T) {
 		"host_label", hostLabelEnv, "local-implement:<label>",
 		"override (", "persisted (", "hostname (", "none (",
 		"spec-named concurrency group is repo-scoped",
+		// #5592 C1: the dispatcher check, its values and the account caveat.
+		"dispatcher_check", "match |", "mismatch (", "absent (", "unreadable |", "stale (", "not_applicable (",
+		"same backend and account",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)
@@ -2790,5 +2793,290 @@ func TestDoctorToolDescription_DescribesHostDispatchBudget(t *testing.T) {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)
 		}
+	}
+}
+
+// --- host_label dispatcher check (#5592 C1, C5, C7, D3) ---
+
+// hlDispatcherOwner is a counting S4 owner seam that trusts every dir as
+// os.Getuid()'s, so a test can assert how many state dirs the ladder read.
+func hlDispatcherOwner() (func(os.FileInfo) (int, bool), *int) {
+	calls := 0
+	return func(os.FileInfo) (int, bool) {
+		calls++
+		return os.Getuid(), true
+	}, &calls
+}
+
+// hlDispatcherStatus is a fresh status at hdoNow naming host.
+func hlDispatcherStatus(host string) HostDispatcherStatus {
+	st := hdoStatus()
+	st.Host = host
+	return st
+}
+
+// TestHostLabelRung_DispatcherCheck drives doctorHostDispatchProbe plus
+// checkHostLabelAgainstDispatcher over every dispatcher_check value: match,
+// mismatch (with the C1 warning), an empty host against an empty label
+// (both unknown), absent, stale (no comparison even though the host
+// differs), unreadable, and not_applicable for a run-bound bearer and off the
+// stdio posture with ZERO state-dir reads. The two D3 cases pin that only the
+// BOUNDED status host reaches dispatcher_label and the warning.
+func TestHostLabelRung_DispatcherCheck(t *testing.T) {
+	stale := hlDispatcherStatus("dispatcher-b")
+	stale.LastTickAt, stale.LastCompleteTickAt = hdoNow.Add(-time.Hour), hdoNow.Add(-time.Hour)
+	oversized := strings.Repeat("x", 400)
+	controlHost := "dispatcher-b\x1b[2J\u0085"
+	sessionA := hostLabelResolution{Label: "session-a", Source: hostLabelSourceOverride}
+	const controlPathCase = "D3 control runes in the status path are dropped"
+	for _, tc := range []struct {
+		name      string
+		res       hostLabelResolution
+		write     any // nil: no file; []byte: raw
+		runBound  bool
+		offStdio  bool
+		want      string
+		wantReads int
+		check     func(t *testing.T, rung *hostLabelRung, statusPath string)
+	}{
+		{"match", hostLabelResolution{Label: "dispatcher-b", Source: hostLabelSourceOverride}, hlDispatcherStatus("dispatcher-b"), false, false, hostLabelDispatcherMatch, 1,
+			func(t *testing.T, rung *hostLabelRung, statusPath string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "dispatcher-b" || rung.DispatcherStatusPath != statusPath {
+					t.Errorf("rung = %+v; want no warning, dispatcher_label dispatcher-b and the status path", rung)
+				}
+			}},
+		{"mismatch", sessionA, hlDispatcherStatus("dispatcher-b"), false, false, hostLabelDispatcherMismatch, 1,
+			func(t *testing.T, rung *hostLabelRung, statusPath string) {
+				if rung.DispatcherLabel != "dispatcher-b" || rung.DispatcherStatusPath != statusPath {
+					t.Errorf("rung = %+v; want dispatcher_label dispatcher-b and the status path", rung)
+				}
+				hdoContainsAll(t, "warning", rung.Warning, "local-implement:session-a", "host:session-a:capacity",
+					"local-implement:dispatcher-b", "host:dispatcher-b:capacity", "whose status file this process reads",
+					statusPath, "same backend and account", hostLabelEnv, ".env", "(/mcp)")
+			}},
+		{"empty host vs empty label is a match", hostLabelResolution{Source: hostLabelSourceNone}, hlDispatcherStatus(""), false, false, hostLabelDispatcherMatch, 1,
+			func(t *testing.T, rung *hostLabelRung, _ string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "" {
+					t.Errorf("rung = %+v; want no warning and an empty dispatcher_label", rung)
+				}
+			}},
+		{"absent", sessionA, nil, false, false, hostLabelDispatcherAbsent, 0,
+			func(t *testing.T, rung *hostLabelRung, _ string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "" || rung.DispatcherStatusPath != "" {
+					t.Errorf("rung = %+v; want nothing but dispatcher_check", rung)
+				}
+			}},
+		{"stale mismatching status is stale with no comparison", sessionA, stale, false, false, hostLabelDispatcherStale, 1,
+			func(t *testing.T, rung *hostLabelRung, statusPath string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "" || rung.DispatcherStatusPath != statusPath {
+					t.Errorf("rung = %+v; want no warning, no dispatcher_label and the status path", rung)
+				}
+			}},
+		{"corrupt status is unreadable", sessionA, []byte("{not json"), false, false, hostLabelDispatcherUnreadable, 1,
+			func(t *testing.T, rung *hostLabelRung, statusPath string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "" || rung.DispatcherStatusPath != statusPath {
+					t.Errorf("rung = %+v; want no warning, no dispatcher_label and the status path", rung)
+				}
+			}},
+		{"run-bound bearer is not_applicable with no read", sessionA, hlDispatcherStatus("dispatcher-b"), true, false, hostLabelDispatcherNotApplicable, 0,
+			func(t *testing.T, rung *hostLabelRung, _ string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "" || rung.DispatcherStatusPath != "" {
+					t.Errorf("rung = %+v; want nothing read", rung)
+				}
+			}},
+		{"off the stdio posture is not_applicable with no read", sessionA, hlDispatcherStatus("dispatcher-b"), false, true, hostLabelDispatcherNotApplicable, 0,
+			func(t *testing.T, rung *hostLabelRung, _ string) {
+				if rung.Warning != "" || rung.DispatcherLabel != "" || rung.DispatcherStatusPath != "" {
+					t.Errorf("rung = %+v; want nothing read", rung)
+				}
+			}},
+		{"D3 oversized host is bounded", sessionA, hlDispatcherStatus(oversized), false, false, hostLabelDispatcherMismatch, 1,
+			func(t *testing.T, rung *hostLabelRung, _ string) {
+				if len(rung.DispatcherLabel) > hostDispatchTextMax || rung.DispatcherLabel != oversized[:hostDispatchTextMax] {
+					t.Errorf("dispatcher_label is %d bytes; want the %d-byte bound", len(rung.DispatcherLabel), hostDispatchTextMax)
+				}
+				if strings.Contains(rung.Warning, oversized) {
+					t.Errorf("warning carries the unbounded %d-byte host", len(oversized))
+				}
+				hdoContainsAll(t, "warning", rung.Warning, "local-implement:"+oversized[:hostDispatchTextMax])
+			}},
+		{"D3 control runes are dropped", sessionA, hlDispatcherStatus(controlHost), false, false, hostLabelDispatcherMismatch, 1,
+			func(t *testing.T, rung *hostLabelRung, _ string) {
+				if rung.DispatcherLabel != "dispatcher-b[2J" {
+					t.Errorf("dispatcher_label = %q; want %q", rung.DispatcherLabel, "dispatcher-b[2J")
+				}
+				if hdHasControlRune(rung.DispatcherLabel) || hdHasControlRune(rung.Warning) {
+					t.Errorf("a control rune reached output: dispatcher_label %q, warning %q", rung.DispatcherLabel, rung.Warning)
+				}
+				hdoContainsAll(t, "warning", rung.Warning, "local-implement:dispatcher-b[2J", "host:dispatcher-b[2J:capacity")
+			}},
+		{controlPathCase, sessionA, hlDispatcherStatus("dispatcher-b"), false, false, hostLabelDispatcherMismatch, 1,
+			func(t *testing.T, rung *hostLabelRung, statusPath string) {
+				want := boundHostDispatchText(statusPath)
+				if !strings.Contains(statusPath, "\x1b") || rung.DispatcherStatusPath != want {
+					t.Errorf("dispatcher_status_path = %q; want the bounded %q", rung.DispatcherStatusPath, want)
+				}
+				if hdHasControlRune(rung.DispatcherStatusPath) || hdHasControlRune(rung.Warning) {
+					t.Errorf("a control rune reached output: dispatcher_status_path %q, warning %q", rung.DispatcherStatusPath, rung.Warning)
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdoEmptyTMPDIR(t)
+			stateName := "state"
+			if tc.name == controlPathCase {
+				stateName = "state\x1b[2J"
+			}
+			dir := filepath.Join(t.TempDir(), stateName)
+			switch w := tc.write.(type) {
+			case nil:
+			case []byte:
+				hdoWriteRaw(t, dir, w)
+			default:
+				hdoWrite(t, dir, w)
+			}
+			r := hdoResolver(map[string]string{hostDispatchStateDirEnv: dir}, t.TempDir(), nil)
+			owner, reads := hlDispatcherOwner()
+			r.hostDispatchOwner = owner
+			r.runBoundToken = tc.runBound
+			r.localHostRungs = !tc.offStdio
+			rung := newHostLabelRung(tc.res)
+			r.checkHostLabelAgainstDispatcher(rung, tc.res, r.doctorHostDispatchProbe())
+			if rung.DispatcherCheck != tc.want {
+				t.Fatalf("dispatcher_check = %q (rung %+v); want %q", rung.DispatcherCheck, rung, tc.want)
+			}
+			if *reads != tc.wantReads {
+				t.Errorf("state-dir owner reads = %d; want %d", *reads, tc.wantReads)
+			}
+			// The resolution fields are untouched by the check.
+			if rung.Label != tc.res.Label || rung.Source != tc.res.Source || rung.DefaultGroup != defaultGroupKeyFor(tc.res.Label) {
+				t.Errorf("rung = %+v; want the resolution rendered unchanged", rung)
+			}
+			tc.check(t, rung, filepath.Join(dir, hostDispatchStatusFile))
+		})
+	}
+}
+
+// hlDispatcherDoctorResolver is a doctor resolver in the stdio-operator
+// posture reading the state dir from env, with label session-a and the model
+// CLI faked absent (nothing exec'd).
+func hlDispatcherDoctorResolver(t *testing.T, srv *httptest.Server, dir string) *runResolver {
+	t.Helper()
+	hdoEmptyTMPDIR(t)
+	withFakeClaude(t, errors.New("absent"), "", nil)
+	r := newResolver(srv, map[string]string{hostDispatchStateDirEnv: dir})
+	r.localHostRungs = true
+	r.hostDispatchNow = func() time.Time { return hdoNow }
+	emptyCwd := t.TempDir()
+	r.getwd = func() (string, error) { return emptyCwd, nil }
+	r.api.hostLabel = func() hostLabelResolution {
+		return hostLabelResolution{Label: "session-a", Source: hostLabelSourceOverride}
+	}
+	return r
+}
+
+// TestDoctor_HostLabelDispatcherMismatchThroughHandler (C5): the doctor
+// handler itself runs the dispatcher check, so a fresh dispatcher-b status
+// read against this process's session-a label reports mismatch.
+func TestDoctor_HostLabelDispatcherMismatchThroughHandler(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	hdoWrite(t, dir, hlDispatcherStatus("dispatcher-b"))
+	r := hlDispatcherDoctorResolver(t, srv, dir)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	hl := out.HostLabel
+	if hl == nil || hl.DispatcherCheck != hostLabelDispatcherMismatch {
+		t.Fatalf("host_label = %+v; want dispatcher_check mismatch", hl)
+	}
+	hdoContainsAll(t, "warning", hl.Warning, "local-implement:session-a", "local-implement:dispatcher-b")
+}
+
+// TestDoctor_HostLabelDispatcherFieldsSerialize (S1-1): the fishhawk_doctor
+// MCP structuredContent for a mismatching status.json carries the four
+// dispatcher fields under their wire keys, through a REAL NewServer.
+func TestDoctor_HostLabelDispatcherFieldsSerialize(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	hdoEmptyTMPDIR(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	st := hlDispatcherStatus("dispatcher-b")
+	now := time.Now()
+	st.LastTickAt, st.LastCompleteTickAt, st.SpawnsDay = now, now, now.UTC().Format(time.DateOnly)
+	hdoWrite(t, dir, st)
+	t.Setenv(hostDispatchStateDirEnv, dir)
+	withFakeClaude(t, errors.New("absent"), "", nil)
+	saved := processHostLabel
+	t.Cleanup(func() { processHostLabel = saved })
+	processHostLabel = func() hostLabelResolution {
+		return hostLabelResolution{Label: "session-a", Source: hostLabelSourceOverride}
+	}
+
+	res := callToolViaNewServer(t, Config{BackendURL: srv.URL, APIToken: doctorSentinelBearer,
+		CredentialSource: credentialSourceEnv, LocalHostRungs: true}, "fishhawk_doctor", map[string]any{"repo": "kuhlman-labs/fishhawk"})
+	if res.IsError {
+		t.Fatalf("fishhawk_doctor errored: %s", toolResultText(t, res))
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var wire struct {
+		HostLabel map[string]any `json:"host_label"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode structured content: %v", err)
+	}
+	hl := wire.HostLabel
+	for key, want := range map[string]string{
+		"dispatcher_check":       "mismatch",
+		"dispatcher_label":       "dispatcher-b",
+		"dispatcher_status_path": filepath.Join(dir, hostDispatchStatusFile),
+	} {
+		if got, _ := hl[key].(string); got != want {
+			t.Errorf("host_label.%s = %#v; want %q (host_label %s)", key, hl[key], want, raw)
+		}
+	}
+	warning, _ := hl["warning"].(string)
+	hdoContainsAll(t, "host_label.warning", warning, "local-implement:session-a", "local-implement:dispatcher-b",
+		"host:dispatcher-b:capacity", "same backend and account", hostLabelEnv)
+}
+
+// TestDoctor_HostDispatchRungsShareOneProbe (C7): host_label's dispatcher
+// check and host_dispatch_budget render ONE ladder read. The owner seam
+// rewrites status.json on every read k (host h<k>, a budget_blocked refusal
+// for run-h<k>), so a second walk would show as a second read and as a
+// budget rung naming run-h2 beside a host_label naming h1.
+func TestDoctor_HostDispatchRungsShareOneProbe(t *testing.T) {
+	_, srv := newDoctorFakeBackend(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	hdoWrite(t, dir, hlDispatcherStatus("h0"))
+	r := hlDispatcherDoctorResolver(t, srv, dir)
+	reads := 0
+	r.hostDispatchOwner = func(os.FileInfo) (int, bool) {
+		reads++
+		st := hlDispatcherStatus(fmt.Sprintf("h%d", reads))
+		runID := fmt.Sprintf("run-h%d", reads)
+		st.RunRefusals = map[string]hostDispatchRunRefusal{runID: {RunID: runID, StageID: "s-" + runID,
+			Code: hdRefuseBudgetBlocked, Detail: hdoBudgetDetail(dispatchBudgetSourceLive), FirstAt: hdoNow.Add(-time.Minute), LastAt: hdoNow}}
+		hdoWrite(t, dir, st)
+		return os.Getuid(), true
+	}
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if reads != 1 {
+		t.Errorf("state-dir reads = %d; want 1 shared read", reads)
+	}
+	if out.HostLabel == nil || out.HostLabel.DispatcherLabel != "h1" {
+		t.Errorf("host_label = %+v; want dispatcher_label h1", out.HostLabel)
+	}
+	b := out.HostDispatchBudget
+	if b == nil || b.Status != hostDispatchBudgetBlocked || len(b.Refusals) != 1 || b.Refusals[0].RunID != "run-h1" {
+		t.Fatalf("host_dispatch_budget = %+v; want blocked with refusals[0].run_id run-h1", b)
 	}
 }
