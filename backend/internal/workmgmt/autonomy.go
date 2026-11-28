@@ -1,6 +1,9 @@
 package workmgmt
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // AutonomyLabelPrefix is the label namespace the campaign autonomy tier is read
 // from. It mirrors the conventions' `autonomy:` namespace (LabelDefaults keys on
@@ -97,28 +100,49 @@ func DeclaredAutonomyTier(labels []string) (tier string, ok bool) {
 	return "", false
 }
 
+// IgnoredAutonomyDefault names one item type's `label_defaults.autonomy` value
+// that DefaultAutonomyTier skipped because it is not `autonomy:low`,
+// `autonomy:medium` or `autonomy:high` — a typo such as "autonomy:lows", an
+// unrecognised tier such as "autonomy:manual", or a value missing the
+// `autonomy:` namespace. Conventions validation admits such a value (it checks
+// only the namespace prefix), so this report is the signal the campaign
+// callers log a WARN on (#5316).
+type IgnoredAutonomyDefault struct {
+	ItemType string // the conventions item type that declared the value
+	Value    string // the declared label_defaults.autonomy value, verbatim
+}
+
 // DefaultAutonomyTier derives the repository's autonomy default from its
 // conventions: the LEAST permissive in-set tier any item type declares in
 // `label_defaults.autonomy` (low < medium < high), falling back to
 // BuiltinDefaultAutonomyTier when no type declares one. A malformed value (an
 // out-of-set tier such as "autonomy:critical", or one missing the `autonomy:`
-// namespace) is ignored.
+// namespace) is ignored, and reported in ignored (sorted by item type) so the
+// caller can log it: a mistyped human-led default ("autonomy:lows") resolves
+// to the remaining types' tier or medium, and the report is that residual's
+// only signal. A type declaring no autonomy default is not reported.
 //
 // Taking the least permissive default across types is the accepted,
 // fail-closed reading of ADR-069 decision 4's "conventions default" (#5316):
 // the campaign path does not infer an issue's item type from its `type:*`
 // label, so when types disagree an unlabelled issue resolves to the tier that
-// keeps the most human oversight. It never returns "".
-func (c Conventions) DefaultAutonomyTier() string {
+// keeps the most human oversight. tier is never "".
+func (c Conventions) DefaultAutonomyTier() (tier string, ignored []IgnoredAutonomyDefault) {
 	best := ""
-	for _, it := range c.Types {
-		tier, ok := strings.CutPrefix(it.LabelDefaults["autonomy"], AutonomyLabelPrefix)
-		if !ok || !isAutonomyTier(tier) {
+	for name, it := range c.Types {
+		v := it.LabelDefaults["autonomy"]
+		if v == "" {
+			continue // the type declares no autonomy default.
+		}
+		t, ok := strings.CutPrefix(v, AutonomyLabelPrefix)
+		if !ok || !isAutonomyTier(t) {
+			ignored = append(ignored, IgnoredAutonomyDefault{ItemType: name, Value: v})
 			continue
 		}
-		if best == "" || autonomyTierRank(tier) < autonomyTierRank(best) {
-			best = tier
+		if best == "" || autonomyTierRank(t) < autonomyTierRank(best) {
+			best = t
 		}
 	}
-	return NormalizeAutonomyTier(best)
+	sort.Slice(ignored, func(i, j int) bool { return ignored[i].ItemType < ignored[j].ItemType })
+	return NormalizeAutonomyTier(best), ignored
 }

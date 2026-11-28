@@ -1,6 +1,9 @@
 package workmgmt
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // TestParseAutonomyLabel covers the tier extraction (ADR-069 decision 4,
 // #5316): an absent label resolves to the supplied default, each valid tier
@@ -88,9 +91,10 @@ func TestNormalizeAutonomyTier(t *testing.T) {
 
 // TestConventionsDefaultAutonomyTier pins the repo-default derivation: the
 // least permissive in-set label_defaults.autonomy across item types, falling
-// back to medium, with malformed values ignored (#5316). The disagreeing-types
-// fixture declares high, low and medium, so the result is low regardless of map
-// iteration order.
+// back to medium, with malformed values ignored AND reported (#5316). The
+// disagreeing-types fixture declares high, low and medium, so the result is low
+// regardless of map iteration order. The ignored report is sorted by item type,
+// so its comparison is order-independent too.
 func TestConventionsDefaultAutonomyTier(t *testing.T) {
 	typ := func(autonomy string) ItemType {
 		if autonomy == "" {
@@ -99,49 +103,64 @@ func TestConventionsDefaultAutonomyTier(t *testing.T) {
 		return ItemType{LabelDefaults: map[string]string{"autonomy": autonomy}}
 	}
 	cases := []struct {
-		name  string
-		types map[string]ItemType
-		want  string
+		name        string
+		types       map[string]ItemType
+		want        string
+		wantIgnored []IgnoredAutonomyDefault
 	}{
-		{"single type declaring low", map[string]ItemType{"feature": typ("autonomy:low")}, "low"},
-		{"single type declaring high", map[string]ItemType{"feature": typ("autonomy:high")}, "high"},
+		{"single type declaring low", map[string]ItemType{"feature": typ("autonomy:low")}, "low", nil},
+		{"single type declaring high", map[string]ItemType{"feature": typ("autonomy:high")}, "high", nil},
 		{"least permissive across disagreeing types", map[string]ItemType{
 			"feature": typ("autonomy:high"),
 			"bug":     typ("autonomy:low"),
 			"chore":   typ("autonomy:medium"),
-		}, "low"},
+		}, "low", nil},
 		{"one specialty type declaring low among medium types", map[string]ItemType{
 			"feature":  typ("autonomy:medium"),
 			"bug":      typ("autonomy:medium"),
 			"security": typ("autonomy:low"),
 			"epic":     typ(""),
-		}, "low"},
-		{"no type declaring one", map[string]ItemType{"feature": typ(""), "epic": typ("")}, "medium"},
-		{"no types at all", nil, "medium"},
+		}, "low", nil},
+		{"no type declaring one", map[string]ItemType{"feature": typ(""), "epic": typ("")}, "medium", nil},
+		{"no types at all", nil, "medium", nil},
 		{"malformed tier ignored", map[string]ItemType{
 			"feature": typ("autonomy:critical"),
 			"bug":     typ("autonomy:high"),
-		}, "high"},
+		}, "high", []IgnoredAutonomyDefault{{ItemType: "feature", Value: "autonomy:critical"}}},
 		{"namespace-less value ignored", map[string]ItemType{
 			"feature": typ("low"),
 			"bug":     typ("autonomy:high"),
-		}, "high"},
+		}, "high", []IgnoredAutonomyDefault{{ItemType: "feature", Value: "low"}}},
 		{"only malformed values fall back to medium", map[string]ItemType{
 			"feature": typ("autonomy:critical"),
 			"bug":     typ("low"),
-		}, "medium"},
+		}, "medium", []IgnoredAutonomyDefault{{ItemType: "bug", Value: "low"}, {ItemType: "feature", Value: "autonomy:critical"}}},
+		// The accepted residual: a mistyped human-led default resolves to the
+		// remaining types' tier, and the ignored report is its only signal.
+		{"mistyped human-led default reported", map[string]ItemType{
+			"feature":  typ("autonomy:medium"),
+			"security": typ("autonomy:lows"),
+		}, "medium", []IgnoredAutonomyDefault{{ItemType: "security", Value: "autonomy:lows"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := Conventions{Types: tc.types}
-			if got := c.DefaultAutonomyTier(); got != tc.want {
-				t.Errorf("DefaultAutonomyTier() = %q, want %q", got, tc.want)
+			got, ignored := c.DefaultAutonomyTier()
+			if got != tc.want {
+				t.Errorf("DefaultAutonomyTier() tier = %q, want %q", got, tc.want)
+			}
+			if !reflect.DeepEqual(ignored, tc.wantIgnored) {
+				t.Errorf("DefaultAutonomyTier() ignored = %#v, want %#v", ignored, tc.wantIgnored)
 			}
 		})
 	}
 	t.Run("built-in Default conventions resolve to medium", func(t *testing.T) {
-		if got := Default().DefaultAutonomyTier(); got != "medium" {
+		got, ignored := Default().DefaultAutonomyTier()
+		if got != "medium" {
 			t.Errorf("Default().DefaultAutonomyTier() = %q, want medium", got)
+		}
+		if len(ignored) != 0 {
+			t.Errorf("Default().DefaultAutonomyTier() ignored = %#v, want none (the shipped conventions declare only in-set tiers)", ignored)
 		}
 	})
 }
@@ -150,7 +169,7 @@ func TestConventionsDefaultAutonomyTier(t *testing.T) {
 // the shipped built-in conventions' derived default must equal the constant
 // ADR-069 decision 4 names, so the two cannot drift silently.
 func TestDefaultConventionsAutonomyDefaultMatchesBuiltin(t *testing.T) {
-	if got := Default().DefaultAutonomyTier(); got != BuiltinDefaultAutonomyTier {
+	if got, _ := Default().DefaultAutonomyTier(); got != BuiltinDefaultAutonomyTier {
 		t.Errorf("Default().DefaultAutonomyTier() = %q, BuiltinDefaultAutonomyTier = %q; keep the shipped conventions' label_defaults.autonomy and the constant in lockstep", got, BuiltinDefaultAutonomyTier)
 	}
 }

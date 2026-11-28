@@ -208,7 +208,8 @@ func TestNextEligible_HumanLedDiverted(t *testing.T) {
 	// An unlabelled item resolves to the repository conventions' default tier
 	// (ADR-069 decision 4, #5316) — medium under the built-in conventions —
 	// rather than an empty "unknown" tier.
-	unlabelled := workmgmt.ParseAutonomyLabel(nil, workmgmt.Default().DefaultAutonomyTier())
+	defaultTier, _ := workmgmt.Default().DefaultAutonomyTier()
+	unlabelled := workmgmt.ParseAutonomyLabel(nil, defaultTier)
 	if unlabelled != "medium" {
 		t.Fatalf("unlabelled tier = %q, want medium (the built-in conventions default)", unlabelled)
 	}

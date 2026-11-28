@@ -8610,7 +8610,7 @@ func lowDefaultConventions(t *testing.T) workmgmt.Conventions {
 		types[name] = it
 	}
 	conv.Types = types
-	if got := conv.DefaultAutonomyTier(); got != "low" {
+	if got, _ := conv.DefaultAutonomyTier(); got != "low" {
 		t.Fatalf("lowDefaultConventions DefaultAutonomyTier = %q, want low (fixture broken)", got)
 	}
 	return conv
@@ -8760,45 +8760,192 @@ func TestGetCampaignStatus_UnrecognisedTierResolvesToDefault(t *testing.T) {
 // TestGetCampaignStatus_ConventionsLoadErrorSkipsDefaultingOnly pins approval
 // condition FF1 (#5316): a conventions load error must NOT suppress an
 // explicit in-set label. Under a failing loader, issue:100 (stored medium,
-// relabelled autonomy:low) is still persisted low, while issue:101 (stored low,
-// unlabelled) is left untouched — no guessed default is written. The read
-// still returns 200, and the loader is consulted once for the pass.
+// relabelled autonomy:low) is still persisted low, while issue:101 and
+// issue:102 (stored low, unlabelled) are left untouched — no guessed default is
+// written. The read still returns 200, and the loader is consulted once for the
+// pass.
 //
-// COUNTERFACTUAL: deleting the `!defaultOK` skip in refreshItemAutonomyFromIssues
-// lets issue:101 resolve against an empty default → medium → a second write.
+// The fixture order is load-bearing: the refresh walks items in listing order
+// (insertion order here), so an UNLABELLED item (issue:101) comes BEFORE the
+// declared one and a SECOND unlabelled item (issue:102) comes after it. That
+// isolates three controls in refreshItemAutonomyFromIssues:
+//
+// COUNTERFACTUAL: deleting the `!defaultOK` skip lets issue:101 and issue:102
+// resolve against an empty default → medium → extra writes.
+// COUNTERFACTUAL: turning that skip's `continue` into an early `return`
+// abandons the pass at issue:101, so the declared issue:100 is never written.
+// COUNTERFACTUAL: deleting the `defaultLoaded = true` memo reloads the
+// conventions for issue:102, so loads == 2.
 func TestGetCampaignStatus_ConventionsLoadErrorSkipsDefaultingOnly(t *testing.T) {
 	loads := stubFailingConventionsLoader(t)
 	crepo := newFakeCampaignRepo()
 	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
-		{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "medium"},
 		{IssueRef: "issue:101", State: campaign.ItemStatePending, Autonomy: "low"},
+		{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "medium"},
+		{IssueRef: "issue:102", State: campaign.ItemStatePending, Autonomy: "low"},
 	})
 	c.State = campaign.StateRunning
 	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
 		100: {state: "open", labels: []string{"autonomy:low"}},
 		101: {state: "open"}, // unlabelled: needs the (failing) conventions default
+		102: {state: "open"}, // a second unlabelled item: pins the once-per-pass memo
 	}}
 	s, aud := newAutonomyRefreshServer(t, crepo, ghState)
 
 	st := getCampaignStatusBody(t, s, c.ID) // fails the test on a non-200
 	if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "low" {
-		t.Errorf("issue:100 autonomy = %q, want low (declared tier applies without conventions)", got)
+		t.Errorf("issue:100 autonomy = %q, want low (declared tier applies without conventions, even after an unlabelled item hit the load error)", got)
 	}
-	if got := campaignItemTier(t, crepo, c.ID, "issue:101"); got != "low" {
-		t.Errorf("issue:101 autonomy = %q, want low (unlabelled item left untouched on load error)", got)
+	for _, ref := range []string{"issue:101", "issue:102"} {
+		if got := campaignItemTier(t, crepo, c.ID, ref); got != "low" {
+			t.Errorf("%s autonomy = %q, want low (unlabelled item left untouched on load error)", ref, got)
+		}
 	}
 	if crepo.setAutonomyCalls != 1 {
 		t.Errorf("setAutonomyCalls = %d, want 1 (only the declared relabel is written)", crepo.setAutonomyCalls)
 	}
-	if !containsRefTest(st.Rollup.HumanLed, "issue:100") || !containsRefTest(st.Rollup.HumanLed, "issue:101") {
-		t.Errorf("rollup.HumanLed = %v, want issue:100 and issue:101", st.Rollup.HumanLed)
+	for _, ref := range []string{"issue:100", "issue:101", "issue:102"} {
+		if !containsRefTest(st.Rollup.HumanLed, ref) {
+			t.Errorf("rollup.HumanLed = %v, want it to contain %s", st.Rollup.HumanLed, ref)
+		}
 	}
 	if rows := autonomyRefreshedPayloads(t, aud); len(rows) != 1 || rows[0]["issue_ref"] != "issue:100" {
 		t.Errorf("audit rows = %v, want exactly one, for issue:100", rows)
 	}
 	if *loads != 1 {
-		t.Errorf("conventions loads = %d, want 1 (resolved once per pass)", *loads)
+		t.Errorf("conventions loads = %d, want 1 (resolved once per pass across two unlabelled items)", *loads)
 	}
+}
+
+// mistypedAutonomyDefaultConventions returns the built-in conventions with the
+// bug type's label_defaults.autonomy mistyped as "autonomy:lows" — a value
+// conventions validation admits (it checks only the `autonomy:` prefix) but
+// DefaultAutonomyTier ignores. The other types keep autonomy:medium, so the
+// derived default is medium. The Types map is deep-copied: Default() shares
+// its maps.
+func mistypedAutonomyDefaultConventions(t *testing.T) workmgmt.Conventions {
+	t.Helper()
+	conv := workmgmt.Default()
+	types := make(map[string]workmgmt.ItemType, len(conv.Types))
+	for name, it := range conv.Types {
+		ld := make(map[string]string, len(it.LabelDefaults))
+		for k, v := range it.LabelDefaults {
+			ld[k] = v
+		}
+		if name == "bug" {
+			ld["autonomy"] = "autonomy:lows"
+		}
+		it.LabelDefaults = ld
+		types[name] = it
+	}
+	conv.Types = types
+	if got, ignored := conv.DefaultAutonomyTier(); got != "medium" || len(ignored) != 1 {
+		t.Fatalf("mistypedAutonomyDefaultConventions DefaultAutonomyTier = %q, %v; want medium with one ignored value (fixture broken)", got, ignored)
+	}
+	return conv
+}
+
+// ignoredAutonomyDefaultWarns decodes the JSON log lines in buf and returns the
+// WARN records conventionsAutonomyDefault emitted for an ignored value.
+func ignoredAutonomyDefaultWarns(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if rec["level"] == "WARN" && strings.HasPrefix(fmt.Sprint(rec["msg"]), "autonomy default: ignored") {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// assertIgnoredAutonomyDefaultWarn requires exactly ONE ignored-default WARN for
+// the resolution, naming the item type and the ignored value.
+func assertIgnoredAutonomyDefaultWarn(t *testing.T, buf *bytes.Buffer) {
+	t.Helper()
+	warns := ignoredAutonomyDefaultWarns(t, buf)
+	if len(warns) != 1 {
+		t.Fatalf("ignored-autonomy-default WARNs = %d, want exactly 1 per resolution (log=%s)", len(warns), buf.String())
+	}
+	ignored, _ := warns[0]["ignored"].([]any)
+	if len(ignored) != 1 || ignored[0] != "bug=autonomy:lows" {
+		t.Errorf("WARN ignored = %v, want [bug=autonomy:lows] (names the item type and the ignored value)", warns[0]["ignored"])
+	}
+	if warns[0]["resolved_default"] != "medium" || warns[0]["repo"] != "kuhlman-labs/fishhawk" {
+		t.Errorf("WARN resolved_default/repo = %v/%v, want medium/kuhlman-labs/fishhawk", warns[0]["resolved_default"], warns[0]["repo"])
+	}
+}
+
+// TestCampaignAutonomyDefault_WarnsOnIgnoredConventionsValue pins the signal
+// for the accepted residual (#5316): DefaultAutonomyTier ignores a mistyped
+// label_defaults.autonomy ("autonomy:lows"), so the tier resolves to medium,
+// and EVERY campaign resolution path logs ONE WARN naming the item type and the
+// ignored value — the reconcile-on-read refresh and both assembly sources.
+//
+// COUNTERFACTUAL: emptying the WARN branch in conventionsAutonomyDefault turns
+// every arm RED (zero WARNs), and routing a caller back to a bare
+// conv.DefaultAutonomyTier() turns that caller's arm RED.
+func TestCampaignAutonomyDefault_WarnsOnIgnoredConventionsValue(t *testing.T) {
+	stubConventionsProvider(t, mistypedAutonomyDefaultConventions(t))
+	newLogger := func() (*bytes.Buffer, *slog.Logger) {
+		var buf bytes.Buffer
+		return &buf, slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+	t.Run("reconcile-on-read refresh", func(t *testing.T) {
+		crepo := newFakeCampaignRepo()
+		c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+			{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"},
+		})
+		c.State = campaign.StateRunning
+		ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open"}}} // unlabelled
+		buf, logger := newLogger()
+		s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: newRunlessGitHubClient(t, ghState), Logger: logger})
+
+		_ = getCampaignStatusBody(t, s, c.ID)
+		if got := campaignItemTier(t, crepo, c.ID, "issue:100"); got != "medium" {
+			t.Errorf("issue:100 autonomy = %q, want medium (the mistyped low is ignored)", got)
+		}
+		assertIgnoredAutonomyDefaultWarn(t, buf)
+	})
+	t.Run("assembly epic source", func(t *testing.T) {
+		fp := &fakeEpicProvider{result: smallDAG()}
+		registerEpicProvider(t, fp)
+		buf, logger := newLogger()
+		s := New(Config{CampaignRepo: newFakeCampaignRepo(), Logger: logger})
+		_ = decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+		if fp.captured.DefaultAutonomy != "medium" {
+			t.Errorf("EpicChildrenRequest.DefaultAutonomy = %q, want medium", fp.captured.DefaultAutonomy)
+		}
+		assertIgnoredAutonomyDefaultWarn(t, buf)
+	})
+	t.Run("assembly issue-set source", func(t *testing.T) {
+		fp := &fakeIssueSetProvider{result: noEpicDAG()}
+		registerIssueSetProvider(t, fp)
+		buf, logger := newLogger()
+		s := New(Config{CampaignRepo: newFakeCampaignRepo(), Logger: logger})
+		_ = decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`))
+		if fp.captured.DefaultAutonomy != "medium" {
+			t.Errorf("IssueSetRequest.DefaultAutonomy = %q, want medium", fp.captured.DefaultAutonomy)
+		}
+		assertIgnoredAutonomyDefaultWarn(t, buf)
+	})
+	t.Run("in-set conventions log no WARN", func(t *testing.T) {
+		stubConventionsProvider(t, lowDefaultConventions(t))
+		fp := &fakeEpicProvider{result: smallDAG()}
+		registerEpicProvider(t, fp)
+		buf, logger := newLogger()
+		s := New(Config{CampaignRepo: newFakeCampaignRepo(), Logger: logger})
+		_ = decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+		if warns := ignoredAutonomyDefaultWarns(t, buf); len(warns) != 0 {
+			t.Errorf("ignored-autonomy-default WARNs = %d, want 0 for in-set conventions", len(warns))
+		}
+	})
 }
 
 // TestGetCampaignStatus_DeclaredTierNeedsNoConventionsRead pins FF1's other

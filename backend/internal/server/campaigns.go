@@ -1562,7 +1562,7 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 			Epic:   req.EpicRef,
 			// An unlabelled or mislabelled child resolves to the repository
 			// conventions' default tier (ADR-069 decision 4, #5316).
-			DefaultAutonomy: conv.DefaultAutonomyTier(),
+			DefaultAutonomy: s.conventionsAutonomyDefault(conv, req.Repo),
 		})
 		if err != nil {
 			if refusal := nativeDependencyReadRefusal(err); refusal != nil {
@@ -1652,7 +1652,7 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 			Items: itemRefs,
 			// An unlabelled or mislabelled issue resolves to the repository
 			// conventions' default tier (ADR-069 decision 4, #5316).
-			DefaultAutonomy: conv.DefaultAutonomyTier(),
+			DefaultAutonomy: s.conventionsAutonomyDefault(conv, req.Repo),
 		})
 		cancelResolve()
 		if err != nil {
@@ -3749,7 +3749,29 @@ func (s *Server) campaignAutonomyDefault(ctx context.Context, c *campaign.Campai
 			"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
 		return "", false
 	}
-	return conv.DefaultAutonomyTier(), true
+	return s.conventionsAutonomyDefault(conv, c.Repo), true
+}
+
+// conventionsAutonomyDefault resolves conv's autonomy default tier and logs ONE
+// WARN for the resolution when it ignored a `label_defaults.autonomy` value
+// outside autonomy:low|medium|high (#5316), naming each ignored item type and
+// value. Conventions validation admits such a value (it checks only the
+// `autonomy:` prefix), so a mistyped human-led default ("autonomy:lows")
+// would otherwise resolve to medium silently; this WARN is that accepted
+// residual's signal. Both campaign paths resolve through it: assembly
+// (resolveCampaignSource) and the reconcile-on-read refresh
+// (campaignAutonomyDefault).
+func (s *Server) conventionsAutonomyDefault(conv workmgmt.Conventions, repo string) string {
+	tier, ignored := conv.DefaultAutonomyTier()
+	if len(ignored) > 0 {
+		pairs := make([]string, 0, len(ignored))
+		for _, ig := range ignored {
+			pairs = append(pairs, ig.ItemType+"="+ig.Value)
+		}
+		s.cfg.Logger.Warn("autonomy default: ignored a conventions label_defaults.autonomy value outside autonomy:low|medium|high; unlabelled items resolve to the remaining default",
+			"repo", repo, "ignored", pairs, "resolved_default", tier)
+	}
+	return tier
 }
 
 // refreshItemAutonomyFromIssues folds the live autonomy:* tier of each fetched
