@@ -22,6 +22,8 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -2980,5 +2982,335 @@ func TestMergeWording_MethodNeutral(t *testing.T) {
 		if strings.Contains(strings.ToLower(text), "squash merge") {
 			t.Errorf("%s names a squash merge; the merge method is the repository's declaration:\n%s", name, text)
 		}
+	}
+}
+
+// --- #4676: not_merge_ready and the post-verdict conflict -----------------
+
+// mergeNotReadyBody is a real-shaped 409 merge_checks_pending not_merge_ready
+// body; extra is spliced into details verbatim.
+func mergeNotReadyBody(extra string) string {
+	return `{"error":{"code":"merge_checks_pending","message":"not merge-ready",` +
+		`"details":{"run_id":"` + uuid.NewString() + `","verdict_sequence":77,"pr_url":"https://github.com/x/y/pull/7",` +
+		`"reason":"not_merge_ready","head_sha":"h1"` + extra + `}}}`
+}
+
+// mergeRunOnce decodes body through the tool's real apiError path (the fake
+// backend answers 409 with body on every POST) and returns the output.
+func mergeRunOnce(t *testing.T, body string) (MergeRunOutput, *mergeRunFakeBackend) {
+	t.Helper()
+	fb := &mergeRunFakeBackend{prURL: "https://github.com/x/y/pull/7", stateBeforeMerge: "running", stateAfterMerge: "running",
+		mergeStickyStatus: http.StatusConflict, mergeErrBody: body}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	r.notReadyPollInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	return out, fb
+}
+
+// TestChecksPendingOutput_NotMergeReadyNamesStateAndRemedy (X2, C19): one row
+// per state and blocked_by, decoded from real 409 bodies; the legacy body with
+// no reason keeps today's message byte-identical.
+func TestChecksPendingOutput_NotMergeReadyNamesStateAndRemedy(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra, state, blockedBy string
+		resumable                     *bool
+		want                          []string
+		nextAction                    string
+	}{
+		{name: "blocked", extra: `,"mergeable_state":"blocked","resumable":true`, state: "blocked", resumable: boolPtr(true),
+			want: []string{"mergeable_state blocked", "A required check is still running", "fishhawk_get_gate_view merge_readiness", "Bound the wait"}},
+		{name: "blocked_review_required", extra: `,"mergeable_state":"blocked","resumable":false,"blocked_by":"review_required"`, state: "blocked", blockedBy: "review_required", resumable: boolPtr(false),
+			want: []string{"blocked_by review_required", "gh pr review --approve", "Waiting will not clear it"}},
+		{name: "blocked_changes_requested", extra: `,"mergeable_state":"blocked","resumable":false,"blocked_by":"changes_requested"`, state: "blocked", blockedBy: "changes_requested", resumable: boolPtr(false),
+			want: []string{"address the requested changes", "Waiting will not clear it"}},
+		{name: "behind", extra: `,"mergeable_state":"behind","resumable":false`, state: "behind", resumable: boolPtr(false),
+			want: []string{"mergeable_state behind", "fishhawk_rebase_run_branch", "Waiting will not clear it"}, nextAction: "fishhawk_rebase_run_branch"},
+		{name: "draft", extra: `,"mergeable_state":"draft","resumable":false`, state: "draft", resumable: boolPtr(false),
+			want: []string{"mergeable_state draft", "gh pr ready", "Waiting will not clear it"}},
+		{name: "unknown", extra: `,"mergeable_state":"unknown","resumable":true`, state: "unknown", resumable: boolPtr(true),
+			want: []string{"mergeable_state unknown", "still computing mergeability"}},
+		{name: "no_state", extra: `,"resumable":true`, resumable: boolPtr(true),
+			want: []string{"no mergeable_state named", "inspect the pull request"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _ := mergeRunOnce(t, mergeNotReadyBody(tc.extra))
+			if out.Status != "checks_pending" || out.ChecksPendingReason != "not_merge_ready" {
+				t.Fatalf("status=%q reason=%q, want checks_pending / not_merge_ready", out.Status, out.ChecksPendingReason)
+			}
+			if out.MergeableState != tc.state || out.BlockedBy != tc.blockedBy {
+				t.Errorf("state=%q blocked_by=%q, want %q / %q", out.MergeableState, out.BlockedBy, tc.state, tc.blockedBy)
+			}
+			if (out.Resumable == nil) != (tc.resumable == nil) || (out.Resumable != nil && *out.Resumable != *tc.resumable) {
+				t.Errorf("resumable = %v, want %v", out.Resumable, tc.resumable)
+			}
+			for _, w := range append(tc.want, "recorded and durable", "never queues an auto-merge", "nothing was merged or armed") {
+				if !strings.Contains(out.Message, w) {
+					t.Errorf("message lacks %q: %q", w, out.Message)
+				}
+			}
+			if strings.Contains(out.Message, "unstable status") {
+				t.Errorf("not_merge_ready message names the unstable status: %q", out.Message)
+			}
+			if out.MergeQueued || out.VerdictRecorded || out.VerdictSequence != 77 {
+				t.Errorf("flags queued=%v recorded=%v seq=%d, want false/false/77", out.MergeQueued, out.VerdictRecorded, out.VerdictSequence)
+			}
+			got := ""
+			if out.NextAction != nil {
+				got = out.NextAction.Action
+			}
+			if got != tc.nextAction {
+				t.Errorf("next_action = %q, want %q", got, tc.nextAction)
+			}
+		})
+	}
+	t.Run("legacy_no_reason_byte_identical", func(t *testing.T) {
+		start := time.Now()
+		details := map[string]any{"verdict_sequence": float64(5)}
+		got := checksPendingOutput(5, start, details)
+		want := "the merge verdict is recorded and durable, but GitHub will not queue the merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." + mergeChecksPendingBoundedWaitHint
+		if got.Message != want || got.ChecksPendingReason != "" || got.Resumable != nil || got.MergeableState != "" {
+			t.Fatalf("legacy output changed: %+v", got)
+		}
+	})
+}
+
+// TestConflictingOutput_PostVerdictRace (Z1, C25): details.verdict_recorded
+// true is the post-verdict variant (VerdictRecorded, durable, the sequence);
+// the pre-verdict guard body keeps today's output byte-identical.
+func TestConflictingOutput_PostVerdictRace(t *testing.T) {
+	start := time.Now()
+	pre := &apiError{Code: "merge_conflicting", Details: map[string]any{"pr_url": "u", "mergeable_state": "dirty"}}
+	got := conflictingOutput(pre, start)
+	want := "the pull request has a merge conflict against its base, so GitHub can never queue the merge. Waiting cannot resolve it. Resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit (so the fishhawk_audit_complete check re-posts on the new head), re-approve the pull request, and re-invoke fishhawk_merge_run. (GitHub reports mergeable_state=dirty.)"
+	if got.Message != want || got.VerdictRecorded || got.VerdictSequence != 0 {
+		t.Fatalf("pre-verdict output changed: %+v", got)
+	}
+	post := &apiError{Code: "merge_conflicting", Details: map[string]any{"pr_url": "u", "mergeable_state": "dirty",
+		"verdict_recorded": true, "verdict_sequence": float64(42)}}
+	got = conflictingOutput(post, start)
+	if got.Status != "conflicting" || !got.VerdictRecorded || got.VerdictSequence != 42 || !strings.Contains(got.Message, "durable") ||
+		!strings.Contains(got.Message, "after the conflict guard read it") {
+		t.Fatalf("post-verdict output = %+v", got)
+	}
+}
+
+// TestMergeRun_NotMergeReadyNonResumableReturnsImmediately (Z6, C18): a draft
+// 409 with resumable false is ONE POST, no wait tick.
+func TestMergeRun_NotMergeReadyNonResumableReturnsImmediately(t *testing.T) {
+	out, fb := mergeRunOnce(t, mergeNotReadyBody(`,"mergeable_state":"draft","resumable":false`))
+	if out.Status != "checks_pending" || fb.mergeCalls != 1 {
+		t.Fatalf("status=%q POSTs=%d, want checks_pending after exactly 1 POST", out.Status, fb.mergeCalls)
+	}
+}
+
+// TestMergeRun_NotMergeReadyResumableUsesSlowCadence (Z6, C21): a resumable
+// not_merge_ready re-POSTs on notReadyPollInterval, not the 1ms
+// reviewPollInterval: at 100ms over a 350ms window at most 6 POSTs (the 1ms
+// tick would make more than 50), then the merge lands.
+func TestMergeRun_NotMergeReadyResumableUsesSlowCadence(t *testing.T) {
+	fb := &mergeRunFakeBackend{prURL: "https://github.com/x/y/pull/7", stateBeforeMerge: "running", stateAfterMerge: "succeeded",
+		mergeStickyStatus: http.StatusConflict, mergeErrBody: mergeNotReadyBody(`,"mergeable_state":"blocked","resumable":true`),
+		mergeResp:    MergeRunResult{MergeQueued: true, VerdictSequence: 5, PRURL: "https://github.com/x/y/pull/7"},
+		auditEntries: []AuditEntry{{Category: "pr_merged", Sequence: 6}}}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv) // reviewPollInterval = 1ms
+	r.notReadyPollInterval = 100 * time.Millisecond
+	time.AfterFunc(350*time.Millisecond, func() {
+		fb.mu.Lock()
+		fb.mergeStickyStatus = 0
+		fb.mu.Unlock()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	fb.mu.Lock()
+	calls := fb.mergeCalls
+	fb.mu.Unlock()
+	if out.Status != "merged" || calls > 6 || calls < 2 {
+		t.Fatalf("status=%q POSTs=%d, want merged after 2..6 POSTs at the slow cadence", out.Status, calls)
+	}
+}
+
+// gateNotReadyMerger is a GateMerger refusing every dispatch as not
+// merge-ready at the pinned head (#4676), counting calls.
+type gateNotReadyMerger struct {
+	mu    sync.Mutex
+	calls int
+	state string
+}
+
+func (m *gateNotReadyMerger) MergePullRequest(context.Context, *runpkg.Run, string) error {
+	m.mu.Lock()
+	m.calls++
+	m.mu.Unlock()
+	return &forge.NotMergeReadyError{MergeableState: m.state, ExpectedHeadSHA: "h1"}
+}
+
+// TestMergeRun_CrossBoundary_RealServerNotMergeReady (Z7, C22) crosses the
+// MCP tool, the real API client, the REAL HTTP handler (server.New over
+// httptest) and the real Postgres audit repo, ending at a GateMerger that
+// refuses not merge-ready (draft): exactly one POST, checks_pending reason
+// not_merge_ready, resumable false, no tool error, one durable verdict row.
+func TestMergeRun_CrossBoundary_RealServerNotMergeReady(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE runs SET workflow_sha = '' WHERE id = $1`, row.ID); err != nil {
+		t.Fatalf("clear workflow_sha: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("transition running: %v", err)
+	}
+	if _, err := runRepo.SetRunPullRequestURL(ctx, row.ID, "https://github.com/x/y/pull/7"); err != nil {
+		t.Fatalf("set pr url: %v", err)
+	}
+	const bearer = "fhk_merge_not_ready_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:approvals"}, PlainText: bearer,
+	}}
+	merger := &gateNotReadyMerger{state: "draft"}
+	s := server.New(server.Config{RunRepo: runRepo, AuditRepo: auditRepo, APITokenRepo: tokRepo, GateMerger: merger})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	r := &runResolver{
+		api:                  newAPIClient(config{backendURL: ts.URL, apiToken: bearer}),
+		reviewPollInterval:   time.Millisecond,
+		notReadyPollInterval: time.Millisecond,
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	_, out, err := r.mergeRun(waitCtx, nil, MergeRunInput{RunID: row.ID.String(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun (cross-boundary): %v", err)
+	}
+	merger.mu.Lock()
+	calls := merger.calls
+	merger.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("GateMerger calls = %d, want exactly 1 (a non-resumable not_merge_ready returns at once)", calls)
+	}
+	if out.Status != "checks_pending" || out.ChecksPendingReason != "not_merge_ready" || out.MergeableState != "draft" ||
+		out.Resumable == nil || *out.Resumable {
+		t.Fatalf("out = %+v, want checks_pending / not_merge_ready / draft / resumable false", out)
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, row.ID, "merge_verdict_recorded")
+	if err != nil {
+		t.Fatalf("list merge verdicts: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1", len(entries))
+	}
+}
+
+// adRealNotReadySpec delegates may_merge (gates_resolved_ci_green), mirroring
+// the server's admq fixture spec.
+const adRealNotReadySpec = `version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      may_merge: gates_resolved_ci_green
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestDriveRun_CrossBoundary_RealServerMergeNotReady (CC3, #4676 Z4) decodes
+// a REAL handleAutoDrive response (server.New over httptest, the real
+// Postgres repos, the delegated may_merge arm, a GateMerger refusing
+// not-merge-ready) through the MCP client's AutoDriveRunGate, then drives
+// fishhawk_drive_run's merge_not_ready branch on that decoded outcome.
+func TestDriveRun_CrossBoundary_RealServerMergeNotReady(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec: []byte(adRealNotReadySpec),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("transition running: %v", err)
+	}
+	if _, err := runRepo.SetRunPullRequestURL(ctx, row.ID, "https://github.com/x/y/pull/7"); err != nil {
+		t.Fatalf("set pr url: %v", err)
+	}
+	for i, typ := range []runpkg.StageType{runpkg.StageTypePlan, runpkg.StageTypeImplement, runpkg.StageTypeReview} {
+		st, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{RunID: row.ID, Sequence: i + 1, Type: typ,
+			ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code"})
+		if err != nil {
+			t.Fatalf("create stage: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE stages SET state = 'succeeded' WHERE id = $1`, st.ID); err != nil {
+			t.Fatalf("settle stage: %v", err)
+		}
+	}
+	kind, subj := audit.ActorSystem, "test"
+	payload, _ := json.Marshal(map[string]any{"rule": string(drive.RuleChecksGreenAwaitingMerge)})
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{RunID: row.ID, Timestamp: time.Now().UTC(),
+		Category: drive.Category, ActorKind: &kind, ActorSubject: &subj, Payload: payload}); err != nil {
+		t.Fatalf("seed drive advance: %v", err)
+	}
+	const bearer = "fhk_drive_not_ready_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:approvals"}, PlainText: bearer,
+	}}
+	merger := &gateNotReadyMerger{state: "draft"}
+	s := server.New(server.Config{RunRepo: runRepo, AuditRepo: auditRepo, APITokenRepo: tokRepo, GateMerger: merger,
+		ConcernRepo: concern.NewPostgresRepository(pool)})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	real := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	gate, err := real.AutoDriveRunGate(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("real AutoDriveRunGate: %v", err)
+	}
+	if gate.MergeNotReady == nil || gate.MergeNotReady.MergeableState != "draft" || gate.MergeNotReady.Resumable {
+		t.Fatalf("real handleAutoDrive outcome = %+v (merge_not_ready %+v), want a non-resumable draft merge_not_ready", gate, gate.MergeNotReady)
+	}
+
+	// Relay the REAL decoded outcome into the drive loop's gate answer.
+	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
+	f.setOnGate(func(*driveFakeBackend) AutoDriveOutcome { return *gate })
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	defer srv.Close()
+	_, out, err := r.driveRun(ctx, nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+driveMergeNotReadyState || f.gateCalls != 1 {
+		t.Fatalf("stopped_reason = %q after %d gate calls, want decision_required:merge_not_ready after 1", out.StoppedReason, f.gateCalls)
+	}
+	if !strings.Contains(strings.Join(out.Warnings, "\n"), gate.Note) || gate.Note == "" {
+		t.Fatalf("warnings = %v, want the real note %q", out.Warnings, gate.Note)
 	}
 }

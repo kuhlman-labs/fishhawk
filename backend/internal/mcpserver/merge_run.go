@@ -72,13 +72,22 @@ const mergeOverlapReasonMaxBytes = 2000
 //     Resumable: re-invoke once the checks complete — but if a required check
 //     has already FAILED the merge will never queue, so inspect the PR instead
 //     of waiting. See the per-field notes below for what the flags mean here.
+//     #4676: ChecksPendingReason not_merge_ready is the head-pinned GitHub
+//     dispatch's refusal before any merge request, because GitHub does not
+//     report the PR merge-ready at the verified head (MergeableState,
+//     BlockedBy, Resumable). A pinned merge never queues an auto-merge, so
+//     nothing was merged or armed. Resumable false returns at once; a
+//     resumable one is re-POSTed every 30s (notReadyPollInterval).
 //   - "conflicting"   — the pull request has a merge conflict against its base
 //     (E64.14 / #3109), so GitHub can NEVER queue the merge. UNLIKE
 //     checks_pending this is NOT resumable by waiting: an immediate return, no
 //     verdict row recorded (merge_queued / verdict_recorded / already_recorded
 //     all false). The Message names the resolution path — resolve the conflict,
 //     vouch the resulting commit so the audit-complete check re-posts, re-approve,
-//     and re-merge.
+//     and re-merge. #4676 post-verdict variant: a PR that turned conflicting
+//     AFTER the conflict guard read it (seen by the pinned pre-read or the
+//     leaf) answers conflicting with the verdict ALREADY recorded
+//     (VerdictRecorded true, VerdictSequence set).
 //   - "behind_base", "merge_candidate_unverified", "merge_candidate_verify_failed"
 //     — the ADR-090 merge-candidate gate (E83.33 / #4018) refused the merge:
 //     the PR head does not contain the base tip (409 merge_base_behind), a
@@ -150,10 +159,12 @@ type MergeRunOutput struct {
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
 	// MergeQueued mirrors the endpoint's merge_queued: the merge was
-	// dispatched through the shared GitHubMerger seam. FALSE on checks_pending —
+	// dispatched through the shared GitHubMerger seam (a head-pinned GitHub
+	// merge synchronously, an unpinned one queued). FALSE on checks_pending —
 	// GitHub refused to queue the merge because the required checks have not all
-	// passed, so nothing is queued yet.
-	MergeQueued bool `json:"merge_queued" jsonschema:"true when the endpoint dispatched the forge merge (the repository's declared merge method, default squash) through the shared merger seam; false on checks_pending (GitHub would not queue it — the required checks have not all passed)"`
+	// passed, or (#4676, not_merge_ready) the pinned dispatch sent nothing —
+	// and on conflicting.
+	MergeQueued bool `json:"merge_queued" jsonschema:"true when the endpoint dispatched the forge merge (the repository's declared merge method, default squash) through the shared merger seam (on GitHub a head-pinned merge is one synchronous merge, an unpinned one is queued); false on checks_pending (the required checks have not all passed, or reason not_merge_ready: the pinned dispatch sent nothing) and on conflicting"`
 	// VerdictRecorded is true when THIS call appended the merge_verdict_recorded
 	// row; AlreadyRecorded is true when the endpoint found an existing row and
 	// skipped the duplicate append (still re-dispatching the merge). Exactly one
@@ -161,10 +172,19 @@ type MergeRunOutput struct {
 	// was never queued, and the response does not positively distinguish a
 	// pre-existing verdict row from one this invocation created (E67.56 / #2717
 	// binding condition 4), so provenance is not inferred — the Message carries
-	// the durability claim instead.
-	VerdictRecorded bool  `json:"verdict_recorded" jsonschema:"true when this call appended the chained merge_verdict_recorded audit entry; false on checks_pending (provenance is not inferred there)"`
-	AlreadyRecorded bool  `json:"already_recorded" jsonschema:"true when the endpoint found an existing merge_verdict_recorded row (idempotent resume) and re-dispatched the merge without a duplicate append; false on checks_pending"`
-	VerdictSequence int64 `json:"verdict_sequence,omitempty" jsonschema:"the merge_verdict_recorded row's audit sequence — the anchor the terminal await polls past; on checks_pending it is the durable verdict row's sequence when the server surfaced it"`
+	// the durability claim instead. That holds for both checks_pending reasons
+	// (checks_pending and #4676's not_merge_ready). On conflicting
+	// VerdictRecorded is true ONLY for #4676's post-verdict variant, where the
+	// server reports details.verdict_recorded.
+	VerdictRecorded bool  `json:"verdict_recorded" jsonschema:"true when this call appended the chained merge_verdict_recorded audit entry; false on checks_pending, either reason (provenance is not inferred there); on conflicting, true only for the post-verdict variant (the pull request turned conflicting after the conflict guard read it, so the verdict is recorded)"`
+	AlreadyRecorded bool  `json:"already_recorded" jsonschema:"true when the endpoint found an existing merge_verdict_recorded row (idempotent resume) and re-dispatched the merge without a duplicate append; false on checks_pending (either reason) and conflicting"`
+	VerdictSequence int64 `json:"verdict_sequence,omitempty" jsonschema:"the merge_verdict_recorded row's audit sequence — the anchor the terminal await polls past; on checks_pending (either reason) and on the post-verdict conflicting variant it is the durable verdict row's sequence when the server surfaced it"`
+	// ChecksPendingReason / MergeableState / BlockedBy / Resumable ride
+	// status checks_pending only (#4676), from the 409's details.
+	ChecksPendingReason string `json:"checks_pending_reason,omitempty" jsonschema:"on checks_pending only: checks_pending (GitHub reports the pull request in unstable status) or not_merge_ready (a head-pinned GitHub dispatch refused before any merge request because GitHub does not report the pull request merge-ready at the verified head; nothing was merged or armed). Absent from an older backend"`
+	MergeableState      string `json:"mergeable_state,omitempty" jsonschema:"on checks_pending reason not_merge_ready: GitHub's mergeable_state at the pinned head (blocked, behind, draft, unknown); absent when GitHub had not computed it"`
+	BlockedBy           string `json:"blocked_by,omitempty" jsonschema:"on checks_pending reason not_merge_ready with mergeable_state blocked: review_required or changes_requested when GitHub's reviewDecision names the review side; absent when a required check or an unnamed requirement blocks it"`
+	Resumable           *bool  `json:"resumable,omitempty" jsonschema:"on checks_pending reason not_merge_ready: false means waiting will not clear it (the tool returned at once; act on the message's remedy, then re-invoke); true means a re-invoke once the pull request is merge-ready can succeed. An absent value (an older backend) reads as resumable"`
 	// AlreadyMerged is the E45.87 / #3622 arm: the endpoint OBSERVED the pull
 	// request already merged and queued NO merge (MergeQueued is false). The
 	// tool returns status=merged WITHOUT awaiting — there is nothing left to
@@ -181,7 +201,7 @@ type MergeRunOutput struct {
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
 	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on forge_approval_required, details.next_step (approve_pr ritual, dismiss_review naming the CHANGES_REQUESTED reviewer, fishhawk_merge_run for retry_after, none for configure_identity_provider or a forge without approval binding); on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued and merge_queue_owns_merge, fishhawk_get_merge_queue (watch the base's line); on overlapping_implement_in_flight, fishhawk_await_stage on the blocking run's stage; on overlap_undetermined, fishhawk_merge_run with allow_overlap (an audited override)"`
-	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness / merge-overlap statuses"`
+	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending (including reason not_merge_ready, which names mergeable_state and the remedy) / conflicting (including the post-verdict variant) / merge-candidate / merge-readiness / merge-overlap statuses"`
 	// QueuePosition / AnchoredHeadSHA / LiveRunID ride status
 	// merge_candidate_held (ADR-092 / #4200), from the 409's details, and
 	// status queued (ADR-093 slice 1, E87.4 / #4295), from the 202 body.
@@ -203,14 +223,16 @@ type MergeRunOutput struct {
 	MergeQueueIneligible []string `json:"merge_queue_ineligible,omitempty" jsonschema:"on behind_base / merge_candidate_unverified / merge_candidate_held: why the run was NOT enqueued (not_approved, changes_requested, review_pending, review_coverage_incomplete, acceptance_not_eligible, acceptance_stale, checks_not_green, checks_red, blocking_concern_open, undeterminable); nothing was written. Clear each, then re-invoke"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
-	// approval deferred to E39). Queueing the merge before that approval is
-	// safe — GitHub fires the merge once branch protection is satisfied.
+	// approval deferred to E39). Approve BEFORE merging: on GitHub a head-pinned
+	// merge never queues an auto-merge (#4676), so a merge invoked before
+	// GitHub reports the PR merge-ready answers checks_pending (reason
+	// not_merge_ready) and merges nothing; an unpinned dispatch still queues.
 	//
 	// It also states the audit check honestly (E64.44 / #3161): Fishhawk
 	// PUBLISHES fishhawk_audit_complete; whether that check gates the merge is
 	// a property of the repository's branch protection, which fishhawk_doctor's
 	// merge_gate rung reports. Nothing here may assert it is required.
-	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; queueing the merge before approval is safe — GitHub fires it once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether it gates the merge depends on this repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge enforces"`
+	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; approve BEFORE merging. On GitHub a head-pinned merge (the merge-candidate gate verified the head) is one synchronous merge at that head and never queues an auto-merge (#4676), so a merge invoked before GitHub reports the pull request merge-ready answers checks_pending (reason not_merge_ready) and merges nothing; an unpinned dispatch (a GitLab-family run, or an ungated GitHub admit) still queues the forge merge, which fires once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether it gates the merge depends on this repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge enforces"`
 	// Overlap rides status overlapping_implement_in_flight / overlap_undetermined
 	// (E83.61 / #4119), decoded from the 409's details.
 	Overlap *mergeOverlapRefusal `json:"overlap,omitempty" jsonschema:"on overlapping_implement_in_flight / overlap_undetermined: the merge overlap guard's refusal — reason (overlap_undetermined: why the guard could not decide), head_sha, blocking_count / undetermined_count, and ONLY when the caller's token holds read:audit (#4582) blocking[] (runs whose live implement stage scopes a path this pull request changes, with the shared paths) and undetermined[] (live runs the guard could not judge). Without read:audit details_withheld is true, required_scope names read:audit and both lists are empty: the refusal carries counts plus next_step only"`
@@ -222,7 +244,7 @@ type MergeRunOutput struct {
 }
 
 // mergeRunNote is the split-identity reminder surfaced on every response.
-const mergeRunNote = "The PR-approval review (gh pr review --approve) stays a step under your own GitHub identity — App-identity approval is deferred to E39. Queueing the merge before approval is safe: GitHub fires the merge once this repository's branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether that check gates the merge depends on the repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge actually enforces (E64.44 / #3161)."
+const mergeRunNote = "The PR-approval review (gh pr review --approve) stays a step under your own GitHub identity — App-identity approval is deferred to E39. Approve BEFORE merging. On GitHub a head-pinned merge (the merge-candidate gate verified the head) is one synchronous merge at that head and never queues an auto-merge (#4676), so a merge invoked before GitHub reports the pull request merge-ready answers checks_pending (reason not_merge_ready) and merges nothing; an unpinned dispatch (a GitLab-family run, or an ungated GitHub admit) still queues the forge merge, which fires once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether that check gates the merge depends on the repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge actually enforces (E64.44 / #3161)."
 
 // registerMergeRun wires the fishhawk_merge_run tool (E48.7 / #1954): the
 // one operator verb that takes a gate-approved run from verdict to
@@ -236,15 +258,17 @@ func registerMergeRun(srv *mcp.Server, resolver *runResolver) {
 		Description: strings.TrimSpace(`
 Use this AFTER a run's PR gate is settled and you have approved the PR (gh
 pr review --approve under your own identity): fishhawk_merge_run records
-your operator merge verdict, queues the forge merge (the repository's
-declared merge method, default squash) through the same
+your operator merge verdict, dispatches the forge merge (the repository's
+declared merge method, default squash; on GitHub a head-pinned merge is one
+synchronous merge at the verified head and never queues an auto-merge, while
+an unpinned dispatch queues the forge merge) through the same
 GitHubMerger seam the delegated drive_run may_merge arm uses, awaits the
 webhook-settled terminal run state, and surfaces the operator post-merge
 dev-host step (E48.7 / #1954). It replaces the four-step hand ceremony
 (approve → merge → post-merge) with one verb.
 
 EVERY CALL IS A REAL MERGE ATTEMPT. When the gates pass this verb records your
-verdict and queues the merge; it is never a dry run, so do not call it with a
+verdict and dispatches the merge (queued only on an unpinned dispatch); it is never a dry run, so do not call it with a
 placeholder verdict to see which refusal comes back. To check readiness without
 recording a verdict, read fishhawk_get_gate_view merge_readiness: it runs the
 merge endpoint's acceptance and review-coverage checks (plus an advisory approval
@@ -280,9 +304,12 @@ separately:
     left non-terminal names POST /v0/runs/{run_id}/reconcile-merge.
 
 The PR-approval review itself STAYS a gh step under your own GitHub identity
-(App-identity approval is deferred to E39); queueing the merge before that
-approval is safe — GitHub fires the merge once this repository's branch
-protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check
+(App-identity approval is deferred to E39). Approve BEFORE merging: on GitHub
+a head-pinned merge never queues an auto-merge (#4676), so a call before
+GitHub reports the pull request merge-ready answers checks_pending (reason
+not_merge_ready) and merges nothing. An unpinned dispatch (a GitLab-family
+run, or an ungated GitHub admit) still queues the forge merge, which fires
+once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check
 but does not make it required: whether it gates the merge is a property of the
 repository's branch protection, and fishhawk_doctor's merge_gate rung reports
 what the forge actually enforces (E64.44 / #3161).
@@ -301,12 +328,16 @@ Statuses:
                      deliberately so consumers switching on it keep working.
   - "timeout"       — nothing settled within the window; resumable — re-invoke
                      to resume (no duplicate verdict row, and the re-dispatch
-                     is guarded by the endpoint's observe rung). If the merge
-                     stays queued while the pull request is BLOCKED, read the
+                     is guarded by the endpoint's observe rung). On an unpinned
+                     dispatch only: If the merge stays queued while the pull request is BLOCKED, read the
                      fishhawk_audit_complete check output on the pull request
                      (its summary names the missing item, where the repository's
                      branch protection makes that check gate the merge) or
-                     fishhawk_get_gate_view merge_readiness.
+                     fishhawk_get_gate_view merge_readiness. A head-pinned GitHub
+                     merge never queues: a timeout after it means the merged
+                     webhook has not settled the run; use
+                     fishhawk_record_merge_observation then
+                     fishhawk_reconcile_merge.
   - "run_terminal"  — the run reached failed/cancelled while waiting; the
                      merge will most likely never settle — check
                      fishhawk_get_run_status.
@@ -321,14 +352,27 @@ Statuses:
                      timeout budget rather than surfacing a remedy that would fail.
                      Bound the wait: set timeout_seconds, never watch the checks
                      unbounded, and read the check status between calls instead of
-                     polling indefinitely.
+                     polling indefinitely. checks_pending_reason not_merge_ready
+                     (#4676): a head-pinned GitHub merge was refused before any
+                     merge request because GitHub does not report the pull
+                     request merge-ready at the verified head; nothing was
+                     merged or armed. mergeable_state and blocked_by name why
+                     and the message names the remedy. resumable:false
+                     (behind, draft, blocked_by review_required or
+                     changes_requested) returns IMMEDIATELY — waiting will not
+                     clear it; a resumable state (a running required check,
+                     GitHub still computing) is re-POSTed every 30s within the
+                     timeout budget.
   - "conflicting"   — the pull request has a merge conflict against its base, so
                      GitHub can NEVER queue the merge. UNLIKE checks_pending this
                      is NOT resumable by waiting — the tool returns it IMMEDIATELY
                      (no poll, no re-POST) and records no verdict row. Resolve the
                      conflict on the run branch, vouch the resulting commit with
                      fishhawk_vouch_commit (so the fishhawk_audit_complete check
-                     re-posts on the new head), re-approve, and re-invoke.
+                     re-posts on the new head), re-approve, and re-invoke. A pull
+                     request that turned conflicting AFTER the conflict guard
+                     read it answers conflicting with the verdict already
+                     recorded (verdict_recorded:true, #4676).
   - "behind_base"   — the PR head does not contain the current base tip, so
                      Fishhawk refuses to merge an unverified merge candidate
                      (ADR-090 D1). Immediate, no verdict row. next_action names
@@ -543,7 +587,9 @@ Tool errors:
     message names the re-arm, also when a release did not land; #4749).
     details.refusal_basis precheck / rest_sha means
     the forge applied nothing; graphql_reread / unknown is inferred, so
-    auto-merge may be armed at the pinned head; inspect the pull request.
+    auto-merge may be armed at the pinned head; inspect the pull request
+    (graphql_reread is produced only by dispatches before #4676, when a
+    pinned dispatch could arm an auto-merge).
     Re-invoke once the head settles and, on a declared approval gate, is
     re-approved: the re-invoke re-gates at the new head),
     merge_dispatch_unclaimed (503 — the dispatch claim could not be written;
@@ -557,7 +603,9 @@ Tool errors:
 The backend's 409 merge_checks_pending is NOT surfaced as a tool error: it is
 the checks-not-all-passed precondition the tool WAITS on (re-POSTing on the poll
 tick within the shared timeout budget), returning status=checks_pending on
-budget exhaustion rather than an error whose remedy is guaranteed to fail.
+budget exhaustion rather than an error whose remedy is guaranteed to fail. Its
+reason not_merge_ready (#4676) re-POSTs every 30s when resumable and returns
+status=checks_pending at once when resumable is false.
 
 The backend's 409 merge_conflicting is likewise NOT a tool error: it is the
 merge-conflict precondition the tool returns IMMEDIATELY as status=conflicting
@@ -622,23 +670,36 @@ func isConflicting(err error) (*apiError, bool) {
 // resolution path: resolve the conflict, vouch the resulting commit so the
 // audit-complete check re-posts, re-approve, and re-merge. This is NOT
 // resumable by waiting, so the tool returns it at once rather than polling.
+//
+// #4676 (Z1) post-verdict variant: a pull request that turned conflicting
+// AFTER the guard read it carries details.verdict_recorded true and
+// verdict_sequence. Then VerdictRecorded is true and the message says the
+// verdict is durable; the pre-verdict guard's output is byte-identical.
 func conflictingOutput(ae *apiError, start time.Time) MergeRunOutput {
 	prURL, _ := ae.Details["pr_url"].(string)
 	mergeableState, _ := ae.Details["mergeable_state"].(string)
+	postVerdict, _ := ae.Details["verdict_recorded"].(bool)
 	msg := "the pull request has a merge conflict against its base, so GitHub can never queue the merge. Waiting cannot resolve it. Resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit (so the fishhawk_audit_complete check re-posts on the new head), re-approve the pull request, and re-invoke fishhawk_merge_run."
+	if postVerdict {
+		msg = "the merge verdict is recorded and durable, but the pull request became conflicting after the conflict guard read it, so nothing was merged or armed. " + msg
+	}
 	if mergeableState != "" {
 		msg += " (GitHub reports mergeable_state=" + mergeableState + ".)"
 	}
-	return MergeRunOutput{
+	out := MergeRunOutput{
 		Status:          "conflicting",
 		MergeQueued:     false,
-		VerdictRecorded: false,
+		VerdictRecorded: postVerdict,
 		AlreadyRecorded: false,
 		PRURL:           prURL,
 		WaitedSeconds:   time.Since(start).Seconds(),
 		Note:            mergeRunNote,
 		Message:         msg,
 	}
+	if postVerdict {
+		out.VerdictSequence = mergeVerdictSequenceFrom(ae.Details)
+	}
+	return out
 }
 
 // mergeCandidateStatuses maps the backend's ADR-090 merge-candidate 409 codes
@@ -1209,7 +1270,126 @@ const mergeChecksPendingBoundedWaitHint = " Bound the wait: re-invoke with a tim
 // fishhawk_audit_complete check but does not make it required, and it must not
 // contain the phrase the timeout control in merge_run_test.go forbids in the
 // no-advisory base message.
-const mergeTimeoutBlockedPRHint = " If the merge stays queued while the pull request is BLOCKED, read the fishhawk_audit_complete check output on the pull request (its summary names the missing item, where the repository's branch protection makes that check gate the merge) or fishhawk_get_gate_view merge_readiness."
+//
+// #4676: the BLOCKED read applies to an UNPINNED dispatch only. A head-pinned
+// GitHub merge never queues, so a timeout after it means the merged webhook
+// has not settled the run. The recorded issue-5213 phrase "If the merge stays
+// queued while the pull request is BLOCKED" stays a sentence-initial
+// substring.
+const mergeTimeoutBlockedPRHint = " On an unpinned dispatch only: If the merge stays queued while the pull request is BLOCKED, read the fishhawk_audit_complete check output on the pull request (its summary names the missing item, where the repository's branch protection makes that check gate the merge) or fishhawk_get_gate_view merge_readiness. A head-pinned GitHub merge never queues: a timeout after it means the merged webhook has not settled the run; use fishhawk_record_merge_observation then fishhawk_reconcile_merge."
+
+// mergeNotReadyPollInterval is the re-POST cadence for a RESUMABLE
+// not_merge_ready (#4676, Z6): each re-POST costs several forge requests and a
+// forced fishhawk_audit_complete republish, so it is far slower than the 3s
+// checks_pending tick. runResolver.notReadyPollInterval overrides it in tests.
+const mergeNotReadyPollInterval = 30 * time.Second
+
+// checksPendingReasonNotMergeReady is the server's details.reason for a
+// head-pinned GitHub dispatch refused before any merge request (#4676).
+const checksPendingReasonNotMergeReady = "not_merge_ready"
+
+// notMergeReadyDetails reads the #4676 not_merge_ready fields from a 409
+// merge_checks_pending detail map. DEFENSIVE: the map crossed an HTTP JSON
+// boundary, so a wrong-typed value reads as absent. ok is false unless
+// details.reason is not_merge_ready. resumable is nil when absent (an older
+// backend), which callers read as resumable.
+func notMergeReadyDetails(details map[string]any) (state, blockedBy string, resumable *bool, ok bool) {
+	if reason, _ := details["reason"].(string); reason != checksPendingReasonNotMergeReady {
+		return "", "", nil, false
+	}
+	state, _ = details["mergeable_state"].(string)
+	blockedBy, _ = details["blocked_by"].(string)
+	if b, isBool := details["resumable"].(bool); isBool {
+		resumable = &b
+	}
+	return state, blockedBy, resumable, true
+}
+
+// notMergeReadyNonResumable reports a not_merge_ready 409 whose details say
+// waiting will not clear it (resumable false, #4676 Z6): the tool returns the
+// checkpoint at once, with no wait tick and no re-POST.
+func notMergeReadyNonResumable(details map[string]any) bool {
+	_, _, resumable, ok := notMergeReadyDetails(details)
+	return ok && resumable != nil && !*resumable
+}
+
+// notMergeReadyRemedyText is the per-state remedy the not_merge_ready
+// checkpoint names (#4676, X2). There is no dirty arm: a conflict always
+// arrives as merge_conflicting (Z1).
+func notMergeReadyRemedyText(state, blockedBy string, stateKnown bool) string {
+	const noWait = " Waiting will not clear it."
+	switch {
+	case !stateKnown:
+		return "The cause is undetermined (the server named no mergeable_state): inspect the pull request, then re-invoke fishhawk_merge_run."
+	case state == "blocked" && blockedBy == "review_required":
+		return "GitHub requires an approving review: request it under a qualifying identity (gh pr review --approve), then re-invoke fishhawk_merge_run." + noWait
+	case state == "blocked" && blockedBy == "changes_requested":
+		return "A reviewer requested changes: address the requested changes (or have the reviewer re-review or dismiss the review), then re-invoke fishhawk_merge_run." + noWait
+	case state == "blocked":
+		return "A required check is still running, or a requirement GitHub does not name is outstanding: re-invoke fishhawk_merge_run once it completes. fishhawk_get_gate_view merge_readiness shows the review side."
+	case state == "behind":
+		return "The pull request is behind its base: run fishhawk_rebase_run_branch (set as next_action), then re-invoke fishhawk_merge_run." + noWait
+	case state == "draft":
+		return "The pull request is a draft: mark it ready for review under your own identity (gh pr ready), then re-invoke fishhawk_merge_run." + noWait
+	case state == "" || state == "unknown":
+		return "GitHub is still computing mergeability: re-invoke fishhawk_merge_run shortly."
+	default:
+		return "GitHub reports an unrecognised mergeable_state: inspect the pull request, then re-invoke fishhawk_merge_run."
+	}
+}
+
+// notMergeReadyOutput is checksPendingOutput's reason not_merge_ready arm
+// (#4676, X2): the verdict is durable, GitHub does not report the pull
+// request merge-ready at the verified head, and a head-pinned merge never
+// queues an auto-merge, so nothing was merged or armed.
+func notMergeReadyOutput(seq int64, start time.Time, details map[string]any) MergeRunOutput {
+	state, blockedBy, resumable, _ := notMergeReadyDetails(details)
+	_, stateKnown := details["mergeable_state"]
+	if stateKnown {
+		_, stateKnown = details["mergeable_state"].(string)
+	}
+	label := state
+	if label == "" {
+		label = "not yet computed"
+	}
+	why := "mergeable_state " + label
+	if !stateKnown {
+		why = "no mergeable_state named"
+	}
+	if blockedBy != "" {
+		why += ", blocked_by " + blockedBy
+	}
+	msg := "the merge verdict is recorded and durable, but GitHub does not report the pull request merge-ready at the head the merge-candidate gate verified (" + why + "). A head-pinned merge never queues an auto-merge, so nothing was merged or armed. " +
+		notMergeReadyRemedyText(state, blockedBy, stateKnown) + auditCompleteDetailSuffix(details)
+	if resumable == nil || *resumable {
+		msg += mergeChecksPendingBoundedWaitHint
+	}
+	out := MergeRunOutput{
+		Status:              "checks_pending",
+		VerdictSequence:     seq,
+		WaitedSeconds:       time.Since(start).Seconds(),
+		Note:                mergeRunNote,
+		Message:             msg,
+		ChecksPendingReason: checksPendingReasonNotMergeReady,
+		MergeableState:      state,
+		BlockedBy:           blockedBy,
+		Resumable:           resumable,
+	}
+	if state == "behind" {
+		params := map[string]string{}
+		if id, _ := details["run_id"].(string); id != "" {
+			params["run_id"] = id
+		}
+		out.NextAction = &SuggestedAction{
+			Action:       "fishhawk_rebase_run_branch",
+			Params:       params,
+			Precondition: "GitHub reports the pull request behind its base at the verified head (not_merge_ready, #4676)",
+			Consumes:     consumesNone,
+			Reason:       "a head-pinned merge needs an up-to-date branch; rebase, then re-invoke fishhawk_merge_run",
+		}
+	}
+	return out
+}
 
 // checksPendingOutput builds the resumable checks_pending checkpoint returned
 // when the shared deadline expires while GitHub still refuses to queue the merge
@@ -1225,15 +1405,25 @@ const mergeTimeoutBlockedPRHint = " If the merge stays queued while the pull req
 // audit_complete_missing list, the message NAMES the blocking audit-complete
 // item and its action, because fishhawk_merge_run is where an operator first
 // observes the strand — the last hop of the same serialization boundary.
+//
+// #4676 (X2): details.reason not_merge_ready branches to notMergeReadyOutput.
+// reason checks_pending, or an absent reason from an older backend, keeps the
+// unstable-status message byte-identical, with ChecksPendingReason set only
+// when the server named the reason.
 func checksPendingOutput(seq int64, start time.Time, details map[string]any) MergeRunOutput {
+	if _, _, _, ok := notMergeReadyDetails(details); ok {
+		return notMergeReadyOutput(seq, start, details)
+	}
+	reason, _ := details["reason"].(string)
 	return MergeRunOutput{
-		Status:          "checks_pending",
-		MergeQueued:     false,
-		VerdictRecorded: false,
-		AlreadyRecorded: false,
-		VerdictSequence: seq,
-		WaitedSeconds:   time.Since(start).Seconds(),
-		Note:            mergeRunNote,
+		ChecksPendingReason: reason,
+		Status:              "checks_pending",
+		MergeQueued:         false,
+		VerdictRecorded:     false,
+		AlreadyRecorded:     false,
+		VerdictSequence:     seq,
+		WaitedSeconds:       time.Since(start).Seconds(),
+		Note:                mergeRunNote,
 		Message: "the merge verdict is recorded and durable, but GitHub will not queue the merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." + mergeChecksPendingBoundedWaitHint +
 			auditCompleteDetailSuffix(details),
 	}
@@ -1490,6 +1680,10 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 	if interval <= 0 {
 		interval = defaultReviewPollInterval
 	}
+	notReadyInterval := r.notReadyPollInterval
+	if notReadyInterval <= 0 {
+		notReadyInterval = mergeNotReadyPollInterval
+	}
 
 	// Record the verdict + queue the merge. ALWAYS POST on resume (no
 	// client-side skip): the endpoint is idempotent (#1954 condition 1), so a
@@ -1573,12 +1767,24 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 		if seq := mergeVerdictSequenceFrom(ae.Details); seq != 0 {
 			checksSeq = seq
 		}
+		// #4676 (Z6): a not_merge_ready that waiting will not clear (behind,
+		// draft, review_required, changes_requested) returns at once: no wait
+		// tick, no re-POST.
+		if notMergeReadyNonResumable(ae.Details) {
+			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
+		}
 		// Wait one poll tick, bounded by the shared deadline and ctx. On
 		// exhaustion return the resumable checks_pending checkpoint.
 		if !time.Now().Before(deadline) {
 			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 		}
 		wait := interval
+		// A resumable not_merge_ready re-POSTs on the slow 30s cadence
+		// (Z6): each re-POST costs forge reads and a forced republish.
+		// reason checks_pending keeps the reviewPollInterval tick.
+		if _, _, _, nmr := notMergeReadyDetails(ae.Details); nmr {
+			wait = notReadyInterval
+		}
 		if d := time.Until(deadline); d < wait {
 			wait = d
 		}
@@ -1646,7 +1852,7 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 		out.NextAction = &step
 	case "timeout":
 		out.Message = appendAcceptanceAdvisory(
-			fmt.Sprintf("no pr_merged / post_merge_observed entry landed within %ds. The merge is queued; re-invoke fishhawk_merge_run to resume the wait (the endpoint is idempotent — the re-POST records no duplicate verdict row), or poll fishhawk_get_run_status."+mergeTimeoutBlockedPRHint, clampAwaitTimeout(in.TimeoutSeconds)),
+			fmt.Sprintf("no pr_merged / post_merge_observed entry landed within %ds. The merge was dispatched (a head-pinned GitHub merge is synchronous; an unpinned one is queued); re-invoke fishhawk_merge_run to resume the wait (the endpoint is idempotent — the re-POST records no duplicate verdict row), or poll fishhawk_get_run_status."+mergeTimeoutBlockedPRHint, clampAwaitTimeout(in.TimeoutSeconds)),
 			r.acceptanceBlockerAdvisoryFor(ctx, runID))
 	case "run_terminal":
 		out.Message = fmt.Sprintf("run %s reached terminal state %q while awaiting the merge and no pr_merged / post_merge_observed entry landed — the merge will most likely never settle. Check fishhawk_get_run_status before re-invoking.", runID, runState)

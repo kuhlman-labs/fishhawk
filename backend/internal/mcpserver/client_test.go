@@ -5805,3 +5805,24 @@ func TestRunDecode_BudgetOverrideBinding(t *testing.T) {
 		t.Errorf("plain read decoded binding %+v / budget %+v; want both nil", plain.BudgetOverrideBinding, plain.DispatchBudget)
 	}
 }
+
+// TestAutoDriveOutcome_DecodesMergeNotReady (#4676, C26) pins the
+// merge_not_ready wire decode: present → every field; absent → nil.
+func TestAutoDriveOutcome_DecodesMergeNotReady(t *testing.T) {
+	var out AutoDriveOutcome
+	body := `{"acted":false,"paged":false,"decision_required":false,"note":"n","merge_not_ready":{"mergeable_state":"blocked","resumable":false,"conflicting":false,"blocked_by":"review_required","claim_outcome":"pre_claim"}}`
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatal(err)
+	}
+	nr := out.MergeNotReady
+	if nr == nil || nr.MergeableState != "blocked" || nr.Resumable || nr.Conflicting || nr.BlockedBy != "review_required" || nr.ClaimOutcome != "pre_claim" {
+		t.Fatalf("merge_not_ready = %+v", nr)
+	}
+	out = AutoDriveOutcome{}
+	if err := json.Unmarshal([]byte(`{"acted":false,"note":"n"}`), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.MergeNotReady != nil {
+		t.Fatalf("merge_not_ready = %+v on a body without it, want nil", out.MergeNotReady)
+	}
+}

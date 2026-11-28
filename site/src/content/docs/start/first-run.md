@@ -447,8 +447,11 @@ curl -s -X POST -H "Authorization: Bearer $FISHHAWK_TOKEN" \
   "$FISHHAWK_BACKEND_URL/v0/runs/<run-id>/merge"
 ```
 
-That records a `merge_verdict_recorded` audit entry and queues the squash merge
-through the same seam the delegated path uses. Repeating the post never duplicates the verdict
+That records a `merge_verdict_recorded` audit entry and dispatches the merge
+(on GitHub, one synchronous merge pinned to the verified head) through the same
+seam the delegated path uses. If GitHub does not yet report the pull request
+merge-ready, it answers `409 merge_checks_pending` with reason
+`not_merge_ready` and merges nothing, so approve first. Repeating the post never duplicates the verdict
 entry, and it is safe to repeat: the endpoint reads the merge state first, so a
 pull request that has already merged comes back as `already_merged` with no
 second merge queued. It requires
@@ -478,11 +481,21 @@ stop a merge. A Check Run is a report until the repository's branch protection
 makes it a required status check, and Fishhawk cannot make it one for you — the
 App installation holds no `administration: write` permission.
 
-Until you add it, gate 5 has a real hole. `fishhawk_merge_run` queues a GitHub
-auto-merge, and an auto-merge on a branch that does not require the check will
-fire as soon as the other protections clear — including while the agent review
-verdict is still pending. The audit trail records what happened; nothing stopped
-it.
+Until you add it, gate 5 has a real hole. On a head-pinned run
+`fishhawk_merge_run` no longer queues a GitHub auto-merge: it merges once,
+synchronously, at the verified head, and only when GitHub reports the pull
+request merge-ready. That readiness check reads GitHub's view of the required
+checks, so a check the branch does not require cannot hold it. An unpinned
+dispatch still queues an auto-merge, which on a branch that does not require
+the check fires as soon as the other protections clear — including while the
+agent review verdict is still pending. The audit trail records what happened;
+nothing stopped it.
+
+The GitHub App must also NOT be on a ruleset bypass list. GitHub computes
+`mergeable_state` asynchronously, so for a moment it can read clean while a
+required check is still pending; a bypass-capable App's merge could land in
+that window. The readiness check narrows the window but cannot close it for a
+bypass actor.
 
 Add the check to a repository ruleset on your default branch:
 
