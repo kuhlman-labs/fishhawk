@@ -2446,6 +2446,112 @@ func TestConflictResolutionStage_TreeProvisionFailureIsCategoryC(t *testing.T) {
 	})
 }
 
+// conflictTreeRemoveCall records one `git worktree remove`: its path, whether
+// the tree's parent dir still existed, and the context's error at that moment.
+type conflictTreeRemoveCall struct {
+	path         string
+	parentExists bool
+	ctxErr       error
+}
+
+// stubConflictTreeAddFails routes the conflict pass's worktree admin commands
+// through a recording seam. `worktree add` fails (calling onAdd first), each
+// `worktree remove` is recorded (and refused when removeFails), `worktree list`
+// answers listFn(tree) when listFn is set, and everything else runs real git.
+func stubConflictTreeAddFails(t *testing.T, onAdd func(), removeFails bool, listFn func(tree string) string) (*[]conflictTreeRemoveCall, *string) {
+	t.Helper()
+	var removes []conflictTreeRemoveCall
+	var tree string
+	orig := conflictTreeGit
+	conflictTreeGit = func(dispatchDir string) gitAdminRunner {
+		real := orig(dispatchDir)
+		return func(c context.Context, args ...string) ([]byte, error) {
+			switch {
+			case len(args) >= 4 && args[0] == "worktree" && args[1] == "add":
+				tree = args[3]
+				if onAdd != nil {
+					onAdd()
+				}
+				return []byte("fatal: stub refuses add"), errors.New("exit status 128")
+			case len(args) >= 2 && args[0] == "worktree" && args[1] == "remove":
+				p := args[len(args)-1]
+				_, statErr := os.Stat(filepath.Dir(p))
+				removes = append(removes, conflictTreeRemoveCall{path: p, parentExists: statErr == nil, ctxErr: c.Err()})
+				if removeFails {
+					return []byte("fatal: stub refuses remove"), errors.New("exit status 128")
+				}
+			case len(args) >= 2 && args[0] == "worktree" && args[1] == "list" && listFn != nil:
+				return []byte(listFn(tree)), nil
+			}
+			return real(c, args...)
+		}
+	}
+	t.Cleanup(func() { conflictTreeGit = orig })
+	return &removes, &tree
+}
+
+// TestConflictResolutionTree_AddFailureDeregisters (DD2, #4281) pins the
+// add-failure branch's targeted deregistration through the conflictTreeGit seam.
+func TestConflictResolutionTree_AddFailureDeregisters(t *testing.T) {
+	// The pass is cancelled as the add fails, so the deregistration must run on
+	// the detached context, and it must run while the tree's parent still exists.
+	t.Run("before_parent_removal_on_detached_context", func(t *testing.T) {
+		dispatch, _, featureTip, _ := crDispatchRepo(t)
+		tmp := t.TempDir()
+		origTmp := conflictTreeTempDir
+		conflictTreeTempDir = tmp
+		t.Cleanup(func() { conflictTreeTempDir = origTmp })
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		removes, tree := stubConflictTreeAddFails(t, cancel, false, nil)
+
+		_, _, _, refusal := establishConflictResolutionTree(ctx, crStageCfg(dispatch), &crFakeUpload{},
+			&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), io.Discard)
+		if refusal == nil || refusal.Reason != reasonTreeProvisionFailed {
+			t.Fatalf("refusal = %+v, want %q", refusal, reasonTreeProvisionFailed)
+		}
+		if len(*removes) == 0 {
+			t.Fatal("the add-failure branch issued no `git worktree remove` for the tree")
+		}
+		got := (*removes)[0]
+		if got.path != *tree {
+			t.Errorf("remove targeted %q, want the tree %q", got.path, *tree)
+		}
+		if !got.parentExists {
+			t.Error("the tree's parent was removed before the deregistration ran")
+		}
+		if got.ctxErr != nil {
+			t.Errorf("the deregistration ran on a cancelled context (%v), want the detached one", got.ctxErr)
+		}
+		if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+			t.Errorf("temp parent not cleaned up on worktree-add failure: %d entries", len(ents))
+		}
+	})
+
+	// A failed deregistration (remove refused, listing still names the tree) is
+	// logged, never discarded.
+	t.Run("failure_logged", func(t *testing.T) {
+		dispatch, _, featureTip, _ := crDispatchRepo(t)
+		origTmp := conflictTreeTempDir
+		conflictTreeTempDir = t.TempDir()
+		t.Cleanup(func() { conflictTreeTempDir = origTmp })
+		stubConflictTreeAddFails(t, nil, true, func(tree string) string {
+			return "worktree " + dispatch + "\nHEAD abc\n\nworktree " + tree + "\nHEAD abc\ndetached\n"
+		})
+
+		var sink strings.Builder
+		_, _, _, refusal := establishConflictResolutionTree(context.Background(), crStageCfg(dispatch), &crFakeUpload{},
+			&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+		if refusal == nil || refusal.Reason != reasonTreeProvisionFailed {
+			t.Fatalf("refusal = %+v, want %q", refusal, reasonTreeProvisionFailed)
+		}
+		if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") ||
+			!strings.Contains(sink.String(), "deregister_error") {
+			t.Errorf("a failed add-branch deregistration must be logged with deregister_error:\n%s", sink.String())
+		}
+	})
+}
+
 // TestConflictResolutionStage_AgentRunsInEstablishedTree: the agent must spawn in
 // the throwaway tree (detached HEAD at the anchor), NOT the dispatch checkout,
 // and its resolution must reach the pushed merge commit. Counterfactual: drop the
@@ -2518,7 +2624,7 @@ func TestConflictResolutionStage_TeardownOnRefusal(t *testing.T) {
 // TestConflictResolutionTeardown_FallbackOnLockedWorktree drives the teardown's
 // FAILURE arm: a LOCKED worktree makes the primary `git worktree remove --force`
 // refuse (a single --force will not remove a locked worktree), so the fallback
-// ladder (unlock, RemoveAll, prune) runs. It asserts the ladder actually removes
+// ladder (RemoveAll, then the targeted deregisterWorktree) runs. It asserts the ladder actually removes
 // both the directory AND the git registration, and that the teardown names the
 // fallback DISTINCTLY (conflict_resolution_teardown_failed) rather than emitting
 // the success event over a possibly-stranded tree.
@@ -2563,6 +2669,94 @@ func TestConflictResolutionTeardown_FallbackOnLockedWorktree(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
 		t.Errorf("temp parent not empty after fallback teardown: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionTeardown_FallbackSparesHiddenForeignWorktree (#4281):
+// the lock-forced teardown fallback removes and deregisters the throwaway tree
+// while a foreign worktree of the dispatch repo, invisible during the teardown,
+// keeps its registration. A repo-wide prune in the ladder would delete it.
+func TestConflictResolutionTeardown_FallbackSparesHiddenForeignWorktree(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+	ext, hide, restore := hiddenForeignWorktree(t, dispatch)
+
+	var sink strings.Builder
+	treeDir, _, teardown, refusal := establishConflictResolutionTree(
+		context.Background(), crStageCfg(dispatch), &crFakeUpload{},
+		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+	if refusal != nil {
+		t.Fatalf("establish refused: %+v", refusal)
+	}
+	crGit(t, dispatch, "worktree", "lock", treeDir)
+
+	hide()
+	teardown()
+	restore()
+
+	if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") {
+		t.Errorf("teardown did not name the fallback distinctly:\n%s", sink.String())
+	}
+	if strings.Contains(sink.String(), "deregister_error") {
+		t.Errorf("the targeted deregistration must succeed on a locked tree:\n%s", sink.String())
+	}
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("tree directory still present after fallback teardown: err=%v", err)
+	}
+	if worktreeRegistered(t, dispatch, treeDir) {
+		t.Error("fallback must deregister the locked throwaway tree")
+	}
+	assertForeignWorktreeSurvives(t, dispatch, ext)
+}
+
+// TestConflictResolutionTeardown_DeregisterFailureReported: when the admin
+// area refuses the deregistration (here read-only .git/worktrees admin dirs, so
+// neither remove can delete the entry), the teardown names the stranded registration
+// with deregister_error on conflict_resolution_teardown_failed.
+func TestConflictResolutionTeardown_DeregisterFailureReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+
+	var sink strings.Builder
+	treeDir, _, teardown, refusal := establishConflictResolutionTree(
+		context.Background(), crStageCfg(dispatch), &crFakeUpload{},
+		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+	if refusal != nil {
+		t.Fatalf("establish refused: %+v", refusal)
+	}
+	// Read-only admin dirs: neither the entry's files nor the entry itself can
+	// be deleted, so every remove fails and the listing still names the tree.
+	admin := filepath.Join(dispatch, ".git", "worktrees")
+	ents, err := os.ReadDir(admin)
+	if err != nil || len(ents) != 1 {
+		t.Fatalf("admin entries = %v (err %v), want exactly the throwaway tree", ents, err)
+	}
+	for _, d := range []string{filepath.Join(admin, ents[0].Name()), admin} {
+		if err := os.Chmod(d, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(d, 0o755) })
+	}
+
+	teardown()
+
+	if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") {
+		t.Errorf("teardown did not report the failure:\n%s", sink.String())
+	}
+	if !strings.Contains(sink.String(), "deregister_error") {
+		t.Errorf("a stranded registration must carry deregister_error:\n%s", sink.String())
+	}
+	if !worktreeRegistered(t, dispatch, treeDir) {
+		t.Fatal("fixture: the read-only admin dir should have kept the registration")
 	}
 }
 

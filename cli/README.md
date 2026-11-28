@@ -396,8 +396,9 @@ documented above. Implementation notes:
   cwd would provision the worktree, and point `cmd.Dir`, at the wrong checkout entirely. It pins HEAD once and runs
   `git worktree add --detach <common>/fishhawk-worktrees/doctor-verify-<pid> <pinned sha>`. The returned cleanup runs
   on every exit path (pass, fail, timeout), never depends on the caller's possibly-cancelled context, and is safe to
-  call twice. A leftover from a SIGKILLed doctor is reclaimed best-effort by `worktree remove --force` + `prune`, never
-  by an `os.RemoveAll` of a directory the rung did not create. Provisioning runs under a DEADLINE (E48.73 / #2505):
+  call twice. A leftover from a SIGKILLed doctor is reclaimed best-effort by a targeted `worktree remove --force --force`
+  of its own path, never by an `os.RemoveAll` of a directory the rung did not create, and never by a repo-wide
+  `git worktree prune`, which would deregister any worktree invisible to the doctor process (#4281). Provisioning runs under a DEADLINE (E48.73 / #2505):
   `verifyProvisionTimeout(effective)` = the effective per-command cap (`--verify-timeout` min'd against the spec's
   `executor.verify.timeout`, resolved once by `effectiveVerifyTimeout` and shared with the child) plus a fixed
   `verifyProvisionHeadroom` (30s) of checkout allowance — derived from the operator's cap because that is where they
