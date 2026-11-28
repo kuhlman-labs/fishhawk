@@ -155,11 +155,43 @@ const multiGroupStageQ = `EXISTS (SELECT 1 FROM stage_concurrency_slots m
 // multi-group set: Admit's condition (b) (README.md § "Group sets and scoped
 // keys"). (b) skips the host capacity group: it applies to every group
 // except host:<label>:capacity (Captain ruling 2026-11-20, #4241; README.md
-// § "Host capacity group"). Status and Promote ignore it.
+// § "Host capacity group"). On the capacity group Admit's condition (a)
+// counts only the CAPACITY-BOUND subset of round_ahead (ADR-094 A4;
+// capacityBoundAhead). Status and Promote ignore multi_round_ahead, and their
+// positions still count every earlier live waiter.
 var aheadSQL = `SELECT
   count(*) FILTER (WHERE s.enqueued_at <= $5) AS round_ahead,
   count(*) AS all_ahead,
   count(*) FILTER (WHERE s.enqueued_at <= $5 AND ` + multiGroupStageQ + `) AS multi_round_ahead
+FROM stage_concurrency_slots s
+JOIN stages st ON st.id = s.stage_id
+JOIN runs r ON r.id = s.run_id
+WHERE ` + freshWaiterPredicateQ + `
+  AND (` + effectiveKeySQL + `, s.stage_id) < ($4, $2)`
+
+// capacityWaitersSQL lists the round_ahead waiters of one capacity group
+// (aheadSQL's window: $1 group, $2 caller stage, $3 account, $4 caller
+// effective key, $5 round start), each joined to every OTHER slot row of its
+// stage with the limit that row records (ADR-094 A4). A {capacity}-only
+// waiter yields one row with a NULL group. Rows come in waiter order, and a
+// waiter's rows are consecutive.
+var capacityWaitersSQL = `SELECT s.stage_id, ` + effectiveKeySQL + ` AS wkey, o.group_key, o.slot_limit
+FROM stage_concurrency_slots s
+JOIN stages st ON st.id = s.stage_id
+JOIN runs r ON r.id = s.run_id
+LEFT JOIN stage_concurrency_slots o ON o.stage_id = s.stage_id AND o.group_key <> s.group_key
+WHERE ` + freshWaiterPredicateQ + `
+  AND s.enqueued_at <= $5
+  AND (` + effectiveKeySQL + `, s.stage_id) < ($4, $2)
+ORDER BY wkey, s.stage_id, o.group_key`
+
+// waiterAheadSQL counts the fresh waiters ahead of waiter W on one of W's
+// other groups ($1 group, $2 W's stage, $3 account, $4 W's effective key),
+// and the multi-group subset: the inputs W's own Admit would read there
+// (ADR-094 A4 item 1). It has no round-start filter: A4 counts W's fresh
+// earlier waiters, and a row enqueued after the caller's round start is
+// behind W anyway.
+var waiterAheadSQL = `SELECT count(*), count(*) FILTER (WHERE ` + multiGroupStageQ + `)
 FROM stage_concurrency_slots s
 JOIN stages st ON st.id = s.stage_id
 JOIN runs r ON r.id = s.run_id
@@ -380,17 +412,21 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 	// (6) Decide under every group lock, fully before any write. Live
 	// specialist-job holders count against the same limit (ADR-097 D6): zero
 	// whenever no job is running in the group, so stage-only groups are
-	// unchanged. Per group G: (a) holders + job holders + earlier fresh
-	// waiters < limit (ADR-087's reservation formula), AND (b) no earlier
-	// fresh waiter on G has a multi-group set (ADR-094 D2 strict per-group
-	// FIFO). (b) is vacuous when every earlier waiter is single-group.
+	// unchanged. Per group G (groupAdmits): (a) holders + job holders +
+	// earlier fresh waiters < limit (ADR-087's reservation formula), AND (b)
+	// no earlier fresh waiter on G has a multi-group set (ADR-094 D2 strict
+	// per-group FIFO). (b) is vacuous when every earlier waiter is
+	// single-group.
 	//
 	// (b) applies to every group EXCEPT host:<label>:capacity (Captain ruling
 	// 2026-11-20, #4241): almost every capacity waiter is multi-group, so (b)
-	// would queue a plan behind an implement waiting on local-implement. The
-	// capacity group keeps (a), so each earlier live waiter still reserves
-	// one capacity slot: "full" there means holders + job holders + earlier
-	// live waiters >= limit (README.md § "Host capacity group").
+	// would queue a plan behind an implement waiting on local-implement. On
+	// the capacity group, (a) counts only the CAPACITY-BOUND earlier waiters
+	// (ADR-094 A4): a waiter every other group of whose set would admit it
+	// now. An implement queued only behind local-implement reserves nothing
+	// (README.md § "Host capacity group"). The bound count is a subset of
+	// round_ahead, so it is read only when it can change the verdict:
+	// holders + job holders < limit <= holders + job holders + round_ahead.
 	admit := true
 	for i, g := range groups {
 		jobs, err := countJobHolders(ctx, tx, g.Key, acct)
@@ -398,9 +434,15 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 			return Admission{}, err
 		}
 		v := views[i]
-		free := len(v.holders)+jobs+v.roundAhead < g.Limit // (a)
-		fifo := v.multi > 0 && !IsCapacityGroupKey(g.Key)  // (b)
-		if !free || fifo {
+		used := len(v.holders) + jobs
+		reserved := v.roundAhead
+		if IsCapacityGroupKey(g.Key) && used < g.Limit && g.Limit <= used+v.roundAhead {
+			reserved, err = capacityBoundAhead(ctx, tx, g.Key, req.StageID, acct, effectiveKey, roundStart, g.Limit-used)
+			if err != nil {
+				return Admission{}, err
+			}
+		}
+		if !groupAdmits(g.Key, g.Limit, len(v.holders), jobs, reserved, v.multi) {
 			admit = false
 		}
 	}
@@ -567,6 +609,108 @@ func countJobHolders(ctx context.Context, tx pgx.Tx, group string, acct pgtype.U
 		return 0, fmt.Errorf("concurrency: count job holders: %w", err)
 	}
 	return n, nil
+}
+
+// groupAdmits is Admit's per-group rule (step 6): (a) holders + job holders
+// + reserved < limit, and (b) no earlier multi-group waiter, except on the
+// host capacity group. The capacity classification judges each earlier
+// waiter with this same rule, so a waiter counts as capacity-bound exactly
+// when its own Admit would pass that group (ADR-094 A4 item 1).
+func groupAdmits(key string, limit, holders, jobs, reserved, multiAhead int) bool {
+	return holders+jobs+reserved < limit && (multiAhead == 0 || IsCapacityGroupKey(key))
+}
+
+// capacityWaiter is one earlier fresh waiter on a capacity group: its stage,
+// its effective key, and its NON-capacity rows at the limit each row records.
+type capacityWaiter struct {
+	stageID uuid.UUID
+	key     time.Time
+	others  []GroupRequest
+}
+
+// groupLoad is one group's live holders and job holders, read once per
+// admission decision.
+type groupLoad struct{ holders, jobs int }
+
+// capacityBoundAhead counts the round_ahead waiters on capacity group key
+// that are CAPACITY-BOUND (ADR-094 A4 item 1), stopping once the count
+// reaches stop: more bound waiters cannot change the verdict. It collects
+// every waiter row and closes them before classifying, because the
+// transaction cannot run the per-waiter queries while Rows is open. The
+// classification reads other groups' rows without their locks (A4 item 4).
+func capacityBoundAhead(ctx context.Context, tx pgx.Tx, key string, stageID uuid.UUID, acct pgtype.UUID, effectiveKey, roundStart time.Time, stop int) (int, error) {
+	rows, err := tx.Query(ctx, capacityWaitersSQL, key, stageID, acct, effectiveKey, roundStart)
+	if err != nil {
+		return 0, fmt.Errorf("concurrency: list capacity waiters: %w", err)
+	}
+	var waiters []capacityWaiter
+	for rows.Next() {
+		var id uuid.UUID
+		var wkey time.Time
+		var other *string
+		var limit *int32
+		if err := rows.Scan(&id, &wkey, &other, &limit); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("concurrency: scan capacity waiter: %w", err)
+		}
+		if n := len(waiters); n == 0 || waiters[n-1].stageID != id {
+			waiters = append(waiters, capacityWaiter{stageID: id, key: wkey})
+		}
+		if other != nil && limit != nil {
+			w := &waiters[len(waiters)-1]
+			w.others = append(w.others, GroupRequest{Key: *other, Limit: int(*limit)})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("concurrency: list capacity waiters: %w", err)
+	}
+	loads := map[string]groupLoad{}
+	bound := 0
+	for _, w := range waiters {
+		ok, err := waiterCapacityBound(ctx, tx, acct, w, loads)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			bound++
+			if bound >= stop {
+				break
+			}
+		}
+	}
+	return bound, nil
+}
+
+// waiterCapacityBound reports whether every non-capacity group of w's set
+// would admit w now, judged as w's own Admit would judge it: the limit w's
+// row records, that group's live holders and job holders, and the fresh
+// waiters ahead of w's effective key. A {capacity}-only waiter is always
+// bound, and the test never asks about capacity itself, so nothing recurses.
+func waiterCapacityBound(ctx context.Context, tx pgx.Tx, acct pgtype.UUID, w capacityWaiter, loads map[string]groupLoad) (bool, error) {
+	for _, h := range w.others {
+		load, ok := loads[h.Key]
+		if !ok {
+			holders, err := listHolders(ctx, tx, h.Key, acct)
+			if err != nil {
+				return false, err
+			}
+			jobs, err := countJobHolders(ctx, tx, h.Key, acct)
+			if err != nil {
+				return false, err
+			}
+			load = groupLoad{holders: len(holders), jobs: jobs}
+			loads[h.Key] = load
+		}
+		var ahead, multi int
+		if err := tx.QueryRow(ctx, waiterAheadSQL, h.Key, w.stageID, acct, w.key).Scan(&ahead, &multi); err != nil {
+			return false, fmt.Errorf("concurrency: count waiter queue ahead: %w", err)
+		}
+		if !groupAdmits(h.Key, h.Limit, load.holders, load.jobs, ahead, multi) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func pgAccount(acct *uuid.UUID) pgtype.UUID {

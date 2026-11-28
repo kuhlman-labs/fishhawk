@@ -857,8 +857,8 @@ func (f *fixture) raceAndDrain(trials []raceTrial, limits map[string]int, rounds
 
 // Host capacity group (ADR-094 D4, #4241): every host-dispatched agent stage
 // also holds one slot of host:<label>:capacity, which is exempt from rule (b)
-// and keeps rule (a) (Captain ruling 2026-11-20). README § "Host capacity
-// group".
+// (Captain ruling 2026-11-20) and whose rule (a) counts only capacity-bound
+// earlier waiters (ADR-094 A4). README § "Host capacity group".
 
 // liveHeld counts the held rows of group whose stage is still live
 // (dispatched or running): a released stage's rows stay 'held'.
@@ -971,13 +971,14 @@ func TestAdmitSet_CapacityExemptFromFIFO(t *testing.T) {
 	}
 }
 
-// TestAdmitSet_CapacityReservationCountsAsFull (C1 test 2): the exemption
-// drops rule (b) only; rule (a) still reserves one capacity slot per earlier
-// live waiter. At capacity 3, two holding implements plus a third QUEUED on
-// local-implement fill capacity (2 + 1), so a later plan queues. Once I2
-// settles, I3 and then the plan are admitted, and held capacity rows never
-// exceed 3.
-func TestAdmitSet_CapacityReservationCountsAsFull(t *testing.T) {
+// TestAdmitSet_BlockedWaiterReservesNoCapacity (ADR-094 A4, inverting A2's
+// TestAdmitSet_CapacityReservationCountsAsFull): on capacity, condition (a)
+// counts only CAPACITY-BOUND earlier waiters. At capacity 3 with implement
+// limit 2, I1 and I2 hold and I3 queues on {capacity, implement}; I3's only
+// blocker is local-implement (2 holders at limit 2), so it reserves no
+// capacity slot and a later plan is ADMITTED (2 holders + 0 < 3). I3 stays
+// queued, and a further capacity-only stage queues behind 3 holders.
+func TestAdmitSet_BlockedWaiterReservesNoCapacity(t *testing.T) {
 	f := newFixture(t)
 	capKey := CapacityGroupKey("h1")
 	capG, implG := gr(capKey, 3), gr(DefaultGroupKey("h1"), 2)
@@ -985,52 +986,465 @@ func TestAdmitSet_CapacityReservationCountsAsFull(t *testing.T) {
 	f.mustAdmitSet(i1, capG, implG)
 	f.mustAdmitSet(i2, capG, implG)
 	f.mustQueueSet(i3, 1, capG, implG)
-	q := f.mustQueueSet(p, 2, capG)
-	if c := groupByKey(t, q.Groups, capKey); c.Position != 2 || len(c.Holders) != 2 {
-		t.Fatalf("plan capacity group = %+v, want position 2 behind I3 with two holders (2 holders + 1 reservation = 3)", c)
+	if a := f.admitSet(p, capG); !a.Admitted {
+		t.Fatalf("plan = queued (groups %+v), want admitted: I3 is blocked on local-implement and reserves no capacity slot (2 holders + 0 < 3)", a.Groups)
 	}
-	f.assertAllQueued(p, 1)
-	check := func(phase string, want int) {
-		t.Helper()
-		if n := f.liveHeld(capKey); n != want {
-			t.Fatalf("%s: held %s rows = %d, want %d (never above 3)", phase, capKey, n, want)
-		}
+	if n := f.liveHeld(capKey); n != 3 {
+		t.Fatalf("held %s rows = %d, want 3 (I1, I2 and the plan)", capKey, n)
 	}
-	check("I3 and the plan queued", 2)
-	f.to(i2.ID, run.StageStateRunning, run.StageStateSucceeded)
-	f.mustAdmitSet(i3, capG, implG)
-	check("I3 admitted", 2)
-	f.mustAdmitSet(p, capG)
-	check("the plan admitted", 3)
-	if a := f.admitSet(f.stage(), capG); a.Admitted {
-		t.Fatal("a fifth stage at three live capacity holders was admitted, want queued")
+	f.assertAllQueued(i3, 2)
+	q := f.mustQueueSet(f.stage(), 2, capG)
+	if c := groupByKey(t, q.Groups, capKey); len(c.Holders) != 3 {
+		t.Fatalf("further stage capacity group = %+v, want three holders", c)
 	}
-	check("a fifth stage queued", 3)
 }
 
-// TestAdmitSet_StaleCapacityReservationEnds (#3969 carry-forward item 1): a
-// queued capacity reservation lasts only while its waiter refreshes the row
-// within QueueTTL. At capacity 3 with implement limit 2, I1 and I2 hold and I3
-// queues on {capacity, implement}, so I3 reserves the third capacity slot
-// while its row is fresh (TestAdmitSet_CapacityReservationCountsAsFull). Once
-// ONLY I3's row ages past QueueTTL (its waiter died), a NEW capacity-only
-// stage is admitted at once: nothing else is queued, so the staleness filter
-// is the only thing between it and a queue.
-func TestAdmitSet_StaleCapacityReservationEnds(t *testing.T) {
+// TestAdmitSet_CapacityBoundWaiterKeepsPosition is ADR-094 A4 item 3's
+// fixture: capacity 3, implement limit 2. I1 and I2 hold; I3 queues on
+// {capacity, implement}; plan P1 is admitted (three capacity holders) and
+// plan P2 queues on capacity. When I2 settles, I3's other group would admit
+// it, so I3 is capacity-bound at its original position before it polls: P2's
+// re-ask is REFUSED with only 2 capacity holders (2 + I3's reservation = 3),
+// and I3 is admitted on its next ask.
+func TestAdmitSet_CapacityBoundWaiterKeepsPosition(t *testing.T) {
 	f := newFixture(t)
 	capKey := CapacityGroupKey("h1")
 	capG, implG := gr(capKey, 3), gr(DefaultGroupKey("h1"), 2)
-	i1, i2, i3 := f.stage(), f.stage(), f.stage()
+	i1, i2, i3, p1, p2 := f.stage(), f.stage(), f.stage(), f.stage(), f.stage()
 	f.mustAdmitSet(i1, capG, implG)
 	f.mustAdmitSet(i2, capG, implG)
 	f.mustQueueSet(i3, 1, capG, implG)
-	f.staleQueued(i3.ID)
-	if a := f.admitSet(f.stage(), capG); !a.Admitted {
-		t.Fatalf("new capacity-only stage = queued (groups %+v), want admitted: I3's stale row (past QueueTTL) must not reserve a capacity slot", a.Groups)
+	if a := f.admitSet(p1, capG); !a.Admitted {
+		t.Fatalf("P1 = queued (groups %+v), want admitted: I3 is not capacity-bound while local-implement is full", a.Groups)
 	}
+	f.mustQueueSet(p2, 2, capG)
+	f.to(i2.ID, run.StageStateRunning, run.StageStateSucceeded)
+	a := f.admitSet(p2, capG)
+	if a.Admitted {
+		t.Fatal("P2 admitted after I2 settled, want refused: I3 is now capacity-bound and earlier (2 holders + 1 reservation = 3)")
+	}
+	if c := groupByKey(t, a.Groups, capKey); len(c.Holders) != 2 {
+		t.Fatalf("P2 capacity group = %+v, want exactly two holders: the queue comes from I3's reservation, not from holders", c)
+	}
+	f.mustAdmitSet(i3, capG, implG)
 	if n := f.liveHeld(capKey); n != 3 {
-		t.Fatalf("held %s rows = %d, want 3 (I1, I2 and the new stage)", capKey, n)
+		t.Fatalf("held %s rows = %d, want 3 (I1, P1 and I3)", capKey, n)
 	}
+	f.assertAllQueued(p2, 1)
+}
+
+// argFaultTracer cancels the context of the first statement whose SQL is
+// exactly sql and whose arguments include the string arg, so exactly that
+// statement fails before it is sent.
+type argFaultTracer struct {
+	mu    sync.Mutex
+	sql   string
+	arg   string
+	fired bool
+}
+
+func (ft *argFaultTracer) arm(sql, arg string) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.sql, ft.arg, ft.fired = sql, arg, false
+}
+
+// disarm stops injecting and reports whether a statement was failed.
+func (ft *argFaultTracer) disarm() bool {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	fired := ft.fired
+	ft.sql, ft.arg = "", ""
+	return fired
+}
+
+func (ft *argFaultTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	if ft.fired || ft.sql == "" || data.SQL != ft.sql {
+		return ctx
+	}
+	for _, a := range data.Args {
+		if s, ok := a.(string); ok && s == ft.arg {
+			ft.fired = true
+			failed, cancel := context.WithCancel(ctx)
+			cancel()
+			return failed
+		}
+	}
+	return ctx
+}
+
+func (*argFaultTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// TestAdmitSet_CapacityClassificationStatementFailure fails each statement
+// of the capacity-bound classification (ADR-094 A4) in turn, on
+// TestAdmitSet_CapacityBoundWaiterKeepsPosition's fixture after I2 settles:
+// P2 {capacity} must classify I3 {capacity, implement}. Every failure
+// surfaces as Admit's error and commits nothing, and the fixture still
+// decides as before once the faults stop.
+func TestAdmitSet_CapacityClassificationStatementFailure(t *testing.T) {
+	cfg, err := pgxpool.ParseConfig(pgtest.NewURL(t))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	ft := &argFaultTracer{}
+	cfg.ConnConfig.Tracer = ft
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	f := &fixture{t: t, pool: pool, repo: run.NewPostgresRepository(pool), store: NewPostgresStore(pool)}
+	capKey, implKey := CapacityGroupKey("h1"), DefaultGroupKey("h1")
+	capG, implG := gr(capKey, 3), gr(implKey, 2)
+	i1, i2, i3, p1, p2 := f.stage(), f.stage(), f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(i1, capG, implG)
+	f.mustAdmitSet(i2, capG, implG)
+	f.mustQueueSet(i3, 1, capG, implG)
+	f.mustAdmitSet(p1, capG)
+	f.mustQueueSet(p2, 2, capG)
+	f.to(i2.ID, run.StageStateRunning, run.StageStateSucceeded)
+
+	// P2's set is {capacity} alone, so implKey reaches a statement only
+	// through the classification of I3's other group.
+	for _, tc := range []struct{ name, sql, arg string }{
+		{"list capacity waiters", capacityWaitersSQL, capKey},
+		{"waiter group holders", holdersSQL, implKey},
+		{"waiter group job holders", jobHoldersSQL, implKey},
+		{"waiter queue ahead", waiterAheadSQL, implKey},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ft.arm(tc.sql, tc.arg)
+			_, err := f.store.Admit(context.Background(), setReq(p2, capG))
+			if !ft.disarm() {
+				t.Fatalf("fixture: no statement ran the %s SQL with %q", tc.name, tc.arg)
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Admit err = %v, want the failed statement's error", err)
+			}
+			if n := f.liveHeld(capKey); n != 2 {
+				t.Fatalf("held %s rows = %d, want 2 (I1 and P1): a failed classification committed a hold", capKey, n)
+			}
+			f.assertAllQueued(p2, 1)
+		})
+	}
+	if a := f.admitSet(p2, capG); a.Admitted {
+		t.Fatal("P2 admitted after the faults stopped, want refused: I3 is capacity-bound and earlier")
+	}
+	f.mustAdmitSet(i3, capG, implG)
+}
+
+// TestAdmitSet_CapacityOnlyWaiterReserves is ADR-094 A4 item 1's unchanged
+// case: a {capacity}-only waiter is always capacity-bound. At capacity 2, H1
+// and H2 hold and W {capacity} queues. Once H2 settles, a new capacity-only
+// stage queues with exactly ONE capacity holder (1 + W's reservation = 2),
+// and W is admitted on its next ask.
+func TestAdmitSet_CapacityOnlyWaiterReserves(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG := gr(capKey, 2)
+	h1, h2, w := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(h1, capG)
+	f.mustAdmitSet(h2, capG)
+	f.mustQueueSet(w, 1, capG)
+	f.to(h2.ID, run.StageStateRunning, run.StageStateSucceeded)
+	a := f.admitSet(f.stage(), capG)
+	if a.Admitted {
+		t.Fatal("new capacity-only stage admitted, want queued: W is {capacity}-only, so it is capacity-bound and reserves the free slot (1 holder + 1 reservation = 2)")
+	}
+	if c := groupByKey(t, a.Groups, capKey); len(c.Holders) != 1 {
+		t.Fatalf("new stage capacity group = %+v, want exactly one holder", c)
+	}
+	f.mustAdmitSet(w, capG)
+	if n := f.liveHeld(capKey); n != 2 {
+		t.Fatalf("held %s rows = %d, want 2 (H1 and W)", capKey, n)
+	}
+}
+
+// TestAdmitSet_StaleCapacityReservationEnds (#3969 carry-forward item 1,
+// re-based on a capacity-bound waiter by ADR-094 A4): a capacity reservation
+// lasts only while its waiter refreshes the row within QueueTTL. At capacity
+// 2, H1 and H2 hold and W {capacity} queues; W is {capacity}-only, so it is
+// capacity-bound (TestAdmitSet_CapacityOnlyWaiterReserves). H2 settles FIRST
+// and only then does ONLY W's row age past QueueTTL (its waiter died), so a
+// NEW capacity-only stage is admitted at once: the freshness filter is the
+// only thing between it and a queue.
+func TestAdmitSet_StaleCapacityReservationEnds(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG := gr(capKey, 2)
+	h1, h2, w := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(h1, capG)
+	f.mustAdmitSet(h2, capG)
+	f.mustQueueSet(w, 1, capG)
+	f.to(h2.ID, run.StageStateRunning, run.StageStateSucceeded)
+	f.staleQueued(w.ID)
+	if a := f.admitSet(f.stage(), capG); !a.Admitted {
+		t.Fatalf("new capacity-only stage = queued (groups %+v), want admitted: W's stale row (past QueueTTL) must not reserve a capacity slot", a.Groups)
+	}
+	if n := f.liveHeld(capKey); n != 2 {
+		t.Fatalf("held %s rows = %d, want 2 (H1 and the new stage)", capKey, n)
+	}
+}
+
+// TestAdmitSet_SecondInLineWaiterReservesNoCapacity pins the rule-(b) arm of
+// the capacity classification (ADR-094 A4 "Second-in-line waiters") and its
+// (a)-by-holders arm. At capacity 2, H0 {capacity} holds and Z holds
+// repository group Y (limit 1). X {capacity, G:5, Y:1} queues because Y is
+// full by holder. W {capacity, G:5} queues ONLY by rule (b) on G behind the
+// multi-group X: on G, 0 holders + 1 ahead < 5. A plan P {capacity} is
+// ADMITTED: X is not bound (Y full) and W is not bound (rule (b) on G), so
+// capacity sees 1 holder + 0 < 2.
+func TestAdmitSet_SecondInLineWaiterReservesNoCapacity(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG, gG, yG := gr(capKey, 2), gr(mg1, 5), gr(mg2, 1)
+	h0, z, x, w, p := f.stage(), f.stage(), f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(h0, capG)
+	f.mustAdmitSet(z, yG)
+	if a := f.admitSet(x, capG, gG, yG); a.Admitted {
+		t.Fatal("fixture: X admitted, want queued on Y")
+	} else if y := groupByKey(t, a.Groups, mg2); len(y.Holders) != 1 {
+		t.Fatalf("fixture: X's Y group = %+v, want full by Z", y)
+	}
+	if a := f.admitSet(w, capG, gG); a.Admitted {
+		t.Fatal("fixture: W admitted, want queued by rule (b) on G behind multi-group X")
+	} else if g := groupByKey(t, a.Groups, mg1); len(g.Holders) != 0 || g.Position != 2 {
+		t.Fatalf("fixture: W's G group = %+v, want no holder at position 2 (rule (b) alone)", g)
+	}
+	if a := f.admitSet(p, capG); !a.Admitted {
+		t.Fatalf("plan P = queued (groups %+v), want admitted: neither X (Y full) nor W (rule (b) on G) is capacity-bound", a.Groups)
+	}
+	f.assertAllQueued(x, 3)
+	f.assertAllQueued(w, 2)
+}
+
+// TestAdmitSet_JobHeldGroupReservesNoCapacity pins the job-holder term of
+// the classification's condition (a). At capacity 2, H0 {capacity} holds and
+// a running specialist job occupies local-verify:h1 (no stage holder, no
+// waiter), so a verify pass V {capacity, local-verify:1} queues on the job
+// alone. V is not capacity-bound, so a plan P {capacity} is ADMITTED.
+func TestAdmitSet_JobHeldGroupReservesNoCapacity(t *testing.T) {
+	f := newFixture(t)
+	capKey, verify := CapacityGroupKey("h1"), VerifyGroupKey("h1")
+	capG, verifyG := gr(capKey, 2), gr(verify, DefaultVerifyLimit)
+	h0, v, p := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(h0, capG)
+	f.seedRunningJob(verify)
+	if a := f.admitSet(v, capG, verifyG); a.Admitted {
+		t.Fatal("fixture: V admitted, want queued behind the running job")
+	} else if g := groupByKey(t, a.Groups, verify); len(g.Holders) != 0 {
+		t.Fatalf("fixture: V's verify group = %+v, want no stage holder (the job alone blocks)", g)
+	}
+	if a := f.admitSet(p, capG); !a.Admitted {
+		t.Fatalf("plan P = queued (groups %+v), want admitted: V is blocked by a job holder and reserves no capacity slot", a.Groups)
+	}
+	f.assertAllQueued(v, 2)
+}
+
+// TestAdmitSet_OtherGroupEarlierWaiterUnbindsCapacity pins the earlier-waiter
+// term of the classification's condition (a), counted from W's OWN effective
+// key. H is repository group G (limit 2) with one holder A, and every waiter
+// on it is single-group, so rule (b) never applies. At capacity 2, H0
+// {capacity} holds. E {G} is a fresh earlier waiter, and W {capacity, G}
+// queues on G (1 holder + E = 2). L {G} queues AFTER W but before the
+// callers.
+//
+// Phase 1: on G, 1 holder < 2 but 1 + E >= 2, so W is not capacity-bound by
+// that term alone and plan P1 is ADMITTED. Phase 2: P1 settles and E's row
+// ages past QueueTTL. W's only remaining waiter on G is L, which is behind W
+// and must not count: 1 holder + 0 < 2, so W is capacity-bound and plan P2
+// QUEUES with one capacity holder (1 + W's reservation = 2).
+func TestAdmitSet_OtherGroupEarlierWaiterUnbindsCapacity(t *testing.T) {
+	f := newFixture(t)
+	capKey := CapacityGroupKey("h1")
+	capG, hG := gr(capKey, 2), gr(mg1, 2)
+	h0, a, e, w, l, p1, p2 := f.stage(), f.stage(), f.stage(), f.stage(), f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(h0, capG)
+	f.mustAdmitSet(a, hG)
+	f.makeContendedWaiter(e, mg1, 2)
+	if q := f.admitSet(w, capG, hG); q.Admitted {
+		t.Fatal("fixture: W admitted, want queued on G behind holder A and earlier waiter E")
+	} else if g := groupByKey(t, q.Groups, mg1); len(g.Holders) != 1 || g.Position != 2 {
+		t.Fatalf("fixture: W's G group = %+v, want one holder at position 2", g)
+	}
+	f.makeContendedWaiter(l, mg1, 2)
+	if q := f.admitSet(p1, capG); !q.Admitted {
+		t.Fatalf("P1 = queued (groups %+v), want admitted: W is not capacity-bound (G: 1 holder + earlier waiter E = 2)", q.Groups)
+	}
+	f.to(p1.ID, run.StageStateRunning, run.StageStateSucceeded)
+	f.staleQueued(e.ID)
+	q := f.admitSet(p2, capG)
+	if q.Admitted {
+		t.Fatal("P2 admitted, want queued: W is capacity-bound (G: 1 holder + 0 earlier waiters < 2; L is behind W and must not count)")
+	}
+	if c := groupByKey(t, q.Groups, capKey); len(c.Holders) != 1 {
+		t.Fatalf("P2 capacity group = %+v, want exactly one holder (the queue is W's reservation)", c)
+	}
+	f.mustAdmitSet(w, capG, hG)
+}
+
+// TestAdmitSet_CapacityBoundClassificationAccountScoped (ADR-094 A4 item 7):
+// the classification of an earlier capacity waiter reads only the run's
+// account. W, the capacity holders and the plan run in account 1; the other
+// scope is the untenanted one. At capacity 2, H0 and H1 {capacity} hold and W
+// {capacity, G:1} queues on capacity; H1 then settles. Another scope's
+// holder, earlier waiter or running specialist job on G must leave W
+// capacity-bound, so the plan QUEUES with one capacity holder (1 + W's
+// reservation = 2), and W is admitted on its next ask.
+func TestAdmitSet_CapacityBoundClassificationAccountScoped(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		other func(f *fixture, st *run.Stage)
+		// before reports whether the other scope's occupant is installed
+		// before W queues (an earlier waiter must be ahead of W's key).
+		before bool
+	}{
+		{"holder", func(f *fixture, st *run.Stage) { f.mustAdmitSet(st, gr(mg1, 1)) }, false},
+		{"earlier waiter", func(f *fixture, st *run.Stage) { f.makeContendedWaiter(st, mg1, 1) }, true},
+		// A RUNNING specialist job in the other scope fills G there (limit
+		// 1), so a job-holder read without the account would unbind W.
+		{"running job", func(f *fixture, _ *run.Stage) { f.seedRunningJob(mg1) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := uuid.New()
+			f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "cc-"+acct.String())
+			capKey := CapacityGroupKey("h1")
+			capG, hG := gr(capKey, 2), gr(mg1, 1)
+			h0, h1, w, p, other := f.stage(), f.stage(), f.stage(), f.stage(), f.stage()
+			for _, st := range []*run.Stage{h0, h1, w, p} {
+				f.exec(`UPDATE runs SET account_id = $1 WHERE id = $2`, acct, st.RunID)
+			}
+			if tc.before {
+				tc.other(f, other)
+			}
+			f.mustAdmitSet(h0, capG)
+			f.mustAdmitSet(h1, capG)
+			if q := f.admitSet(w, capG, hG); q.Admitted {
+				t.Fatal("fixture: W admitted, want queued on capacity")
+			} else if g := groupByKey(t, q.Groups, mg1); len(g.Holders) != 0 || g.Position != 1 {
+				t.Fatalf("fixture: W's G group in account 1 = %+v, want free (no holder, position 1)", g)
+			}
+			if !tc.before {
+				tc.other(f, other)
+			}
+			f.to(h1.ID, run.StageStateRunning, run.StageStateSucceeded)
+			q := f.admitSet(p, capG)
+			if q.Admitted {
+				t.Fatalf("plan admitted, want queued: another account's %s on G must not unbind W", tc.name)
+			}
+			if c := groupByKey(t, q.Groups, capKey); len(c.Holders) != 1 {
+				t.Fatalf("plan capacity group = %+v, want exactly one holder (the queue is W's reservation)", c)
+			}
+			f.mustAdmitSet(w, capG, hG)
+		})
+	}
+}
+
+// openCapacityClassificationWindow builds the shared fixture of the
+// capacity-waiter window tests: at capacity 2, H0 {capacity} holds and Z
+// holds repository group Y (limit 1), so X {capacity, Y:1} queues on Y and is
+// a fresh earlier waiter on capacity that is NOT capacity-bound. A later
+// capacity admitter then sees used = 1 < 2 <= 1 + round_ahead, so the
+// classification runs (store.go step 6), and only a bound waiter it wrongly
+// lists can queue that admitter. It returns the capacity request and X.
+func (f *fixture) openCapacityClassificationWindow() (GroupRequest, *run.Stage) {
+	f.t.Helper()
+	capG, yG := gr(CapacityGroupKey("h1"), 2), gr(mg2, 1)
+	h0, z, x := f.stage(), f.stage(), f.stage()
+	f.mustAdmitSet(h0, capG)
+	f.mustAdmitSet(z, yG)
+	if a := f.admitSet(x, capG, yG); a.Admitted {
+		f.t.Fatal("fixture: X admitted, want queued on Y (full by Z)")
+	} else if y := groupByKey(f.t, a.Groups, mg2); len(y.Holders) != 1 {
+		f.t.Fatalf("fixture: X's Y group = %+v, want full by Z", y)
+	}
+	return capG, x
+}
+
+// TestAdmitSet_CapacityClassificationSkipsSameRoundWaiter pins
+// capacityWaitersSQL's round-start filter (enqueued_at <= the caller's round
+// start). In the open window, caller C {capacity} wins the capacity lock and
+// is parked (afterLock) while Y {capacity} misses it and commits a queued row.
+// Y is {capacity}-only, so it would count as capacity-bound, and C is fresh,
+// so Y's row is AHEAD of C's effective key: only the round-start filter keeps
+// Y out of the classification. C must be ADMITTED (1 holder + 0 bound < 2).
+func TestAdmitSet_CapacityClassificationSkipsSameRoundWaiter(t *testing.T) {
+	f := newFixture(t)
+	capG, x := f.openCapacityClassificationWindow()
+	c, y := f.stage(), f.stage()
+	parked, resume := make(chan struct{}), make(chan struct{})
+	cs := NewPostgresStore(f.pool)
+	cs.afterLock = func(_ context.Context, hit bool) {
+		if hit {
+			close(parked)
+			<-resume
+		}
+	}
+	var ca Admission
+	var cerr error
+	done := make(chan struct{})
+	go func() { defer close(done); ca, cerr = cs.Admit(context.Background(), setReq(c, capG)) }()
+	<-parked
+	ya, err := f.store.Admit(context.Background(), setReq(y, capG))
+	close(resume)
+	<-done
+	if err != nil || ya.Admitted || !ya.Contended {
+		t.Fatalf("fixture: Y while C holds the capacity lock = %+v, %v; want a contended queue", ya, err)
+	}
+	if cerr != nil {
+		t.Fatalf("C: %v", cerr)
+	}
+	if !ya.EnqueuedAt.Before(ca.EnqueuedAt) {
+		t.Fatalf("fixture: Y enqueued %v not before C %v: Y is not ahead of C's key, so the round-start case is not constructed", ya.EnqueuedAt, ca.EnqueuedAt)
+	}
+	if !ca.Admitted {
+		t.Fatalf("C = queued (groups %+v), want admitted: Y committed during C's round and must not count as a capacity-bound reservation", ca.Groups)
+	}
+	f.assertAllQueued(x, 2)
+	f.assertAllQueued(y, 1)
+}
+
+// TestAdmitSet_CapacityClassificationSkipsWaiterBehindCaller pins
+// capacityWaitersSQL's (effective key, stage_id) < caller bound. In the open
+// window, C {capacity} queues contended (without deciding) and then B
+// {capacity} queues behind it: B is {capacity}-only and capacity-bound, and
+// was enqueued before C's next round starts, so only the key bound keeps it
+// out of C's classification. C's re-ask must be ADMITTED (1 holder + 0 bound
+// ahead < 2).
+func TestAdmitSet_CapacityClassificationSkipsWaiterBehindCaller(t *testing.T) {
+	f := newFixture(t)
+	capG, x := f.openCapacityClassificationWindow()
+	c, b := f.stage(), f.stage()
+	f.makeContendedWaiter(c, capG.Key, capG.Limit)
+	// B classifies X (not bound) and C ({capacity}-only, bound): 1 + 1 = 2.
+	f.mustQueueSet(b, 3, capG)
+	if a := f.admitSet(c, capG); !a.Admitted {
+		t.Fatalf("C = queued (groups %+v), want admitted: B is behind C and must not count as a capacity-bound reservation", a.Groups)
+	}
+	f.assertAllQueued(x, 2)
+	f.assertAllQueued(b, 1)
+}
+
+// TestAdmitSet_CapacityClassificationSkipsStaleWaiter pins
+// capacityWaitersSQL's freshness predicate (QueueTTL). In the open window, S
+// {capacity} queues contended ahead of the caller and its row then ages past
+// QueueTTL. Fresh X keeps the window open (round_ahead counts only fresh
+// rows), so the classification runs, and S is {capacity}-only: only the
+// freshness predicate keeps it out. A new plan P must be ADMITTED (1 holder +
+// 0 bound < 2).
+func TestAdmitSet_CapacityClassificationSkipsStaleWaiter(t *testing.T) {
+	f := newFixture(t)
+	capG, x := f.openCapacityClassificationWindow()
+	s, p := f.stage(), f.stage()
+	f.makeContendedWaiter(s, capG.Key, capG.Limit)
+	f.staleQueued(s.ID)
+	if a := f.admitSet(p, capG); !a.Admitted {
+		t.Fatalf("plan P = queued (groups %+v), want admitted: S is stale past QueueTTL and must not count as a capacity-bound reservation", a.Groups)
+	}
+	f.assertAllQueued(x, 2)
 }
 
 // TestAdmitSet_RacingCapacityAcrossTypes races {capacity, implement},

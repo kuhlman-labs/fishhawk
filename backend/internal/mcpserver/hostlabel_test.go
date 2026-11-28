@@ -461,6 +461,17 @@ func TestNewServer_DoesNotResolveHostLabel(t *testing.T) {
 	}
 }
 
+// TestProcessHostLabel_ReturnsResolvedLabel: the exported accessor reads the
+// process resolver at call time.
+func TestProcessHostLabel_ReturnsResolvedLabel(t *testing.T) {
+	saved := processHostLabel
+	t.Cleanup(func() { processHostLabel = saved })
+	processHostLabel = fixedHostLabel("pin")
+	if label, source := ProcessHostLabel(); label != "pin" || source != hostLabelSourceOverride {
+		t.Errorf("ProcessHostLabel() = (%q, %q), want (pin, %s)", label, source, hostLabelSourceOverride)
+	}
+}
+
 // TestDefaultGroupKeyParity pins the mirrored default-group constants to
 // backend/internal/concurrency's.
 func TestDefaultGroupKeyParity(t *testing.T) {

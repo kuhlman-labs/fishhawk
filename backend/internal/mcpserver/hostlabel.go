@@ -238,13 +238,26 @@ func productionHostLabelDeps() hostLabelDeps {
 }
 
 // processHostLabel is this process's host label, resolved lazily and once, on
-// first use (the first host-dispatch marker or fishhawk_doctor call). Lazy on
-// purpose: fishhawkd's /mcp route builds a tool registry per request and many
-// tests call NewServer, so an eager resolution would touch the real HOME at
-// daemon boot and during the test run. Config.internal wires it.
+// first use (the first host-dispatch marker or fishhawk_doctor call, or
+// ProcessHostLabel, which fishhawkd calls at boot only when it builds the
+// interim dispatch hold with no explicit label). Lazy on purpose: fishhawkd's
+// /mcp route builds a tool registry per request and many tests call NewServer,
+// so an eager resolution would touch the real HOME at every daemon boot and
+// during the test run. Config.internal wires it.
 var processHostLabel = sync.OnceValue(func() hostLabelResolution {
 	return resolveHostLabel(productionHostLabelDeps())
 })
+
+// ProcessHostLabel returns this process's host label and the ladder rung that
+// answered (source "none" with an empty label when nothing did). fishhawkd's
+// interim dispatch hold (#5619) defaults its measured host to this label, so
+// the daemon and its /mcp route share ONE lazy, once-per-process resolution.
+// Calling it resolves the ladder, which may create the persisted host-id file
+// under the user's state directory.
+func ProcessHostLabel() (label, source string) {
+	res := processHostLabel()
+	return res.Label, res.Source
+}
 
 // defaultGroupKeyFor is the default local concurrency group the server files a
 // host-dispatched stage under for label: concurrency.DefaultGroupKey, mirrored.

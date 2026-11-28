@@ -1,0 +1,14 @@
+id: scenario:issue-5619/startup-log-names-hold-host
+statement: fishhawkd serve --enable-ops-monitor --ops-monitor-dispatch-hold --ops-monitor-deployment local --ops-monitor-host-label pinned-a starts, and its `ops monitor started` log line carries dispatch_hold:true and dispatch_hold_host pinned-a.
+verify_hint: 'CLI stderr (the JSON log stream): start the built fishhawkd binary with those flags plus --addr 127.0.0.1:0 and no database. Read the `ops monitor started` record, then stop the process.'
+steps: 'Posture B: using the fishhawkd built from the sanctioned checkout, ran env -i PATH=$PATH HOME=/tmp/fhacc5619b/home fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold --ops-monitor-deployment local --ops-monitor-host-label pinned-a in the background with no DB. After 5s I read the ''ops monitor started'' stderr record, then sent SIGTERM.'
+assertions:
+    expected: dispatch_hold:true and dispatch_hold_host pinned-a
+    observed_at_record: '''ops monitor started'' with deployment local, dispatch_hold:true, dispatch_hold_host:"pinned-a" (stderr sha256:4e7ecf64…)'
+    repro_handle: fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-dispatch-hold --ops-monitor-deployment local --ops-monitor-host-label pinned-a
+origin:
+    issue: 5619
+    pr: 5629
+    run_id: aceea4db-113a-4949-a73d-c70867037e8b
+    head_sha: 3d519e629768c0893a20e515e4d207e3233dc796
+    recorded_at: 2026-11-28T09:51:05Z

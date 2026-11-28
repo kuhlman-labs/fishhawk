@@ -1,0 +1,14 @@
+id: scenario:issue-5619/hold-stays-default-off
+statement: fishhawkd serve --enable-ops-monitor --ops-monitor-deployment local, without --ops-monitor-dispatch-hold, logs `ops monitor started` with dispatch_hold:false and no dispatch_hold_host, so no hold is built and the marker is unchanged.
+verify_hint: 'CLI stderr (the JSON log stream): start the built fishhawkd binary with those flags plus --addr 127.0.0.1:0 and read the `ops monitor started` record.'
+steps: 'Posture B: using the fishhawkd built from the sanctioned checkout, ran env -i PATH=$PATH HOME=/tmp/fhacc5619b/home fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-deployment local in the background. After 5s I read ''ops monitor started'', then sent SIGTERM.'
+assertions:
+    expected: dispatch_hold:false and no dispatch_hold_host
+    observed_at_record: dispatch_hold:false and no dispatch_hold_host key (stderr sha256:cec22775…)
+    repro_handle: fishhawkd serve --addr 127.0.0.1:0 --enable-ops-monitor --ops-monitor-deployment local
+origin:
+    issue: 5619
+    pr: 5629
+    run_id: aceea4db-113a-4949-a73d-c70867037e8b
+    head_sha: 3d519e629768c0893a20e515e4d207e3233dc796
+    recorded_at: 2026-11-28T09:51:05Z

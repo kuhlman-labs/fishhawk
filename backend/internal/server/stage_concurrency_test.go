@@ -1050,11 +1050,12 @@ func (f *scPG) slotGroup(id uuid.UUID) string {
 // position 4. The pass holds no implement slot: a later implement still sees
 // only the implement holder.
 //
-// The pass declares capacity 8: each queued implement reserves one slot of
-// host:h1:capacity (ADR-094 A2, the reservation formula), so at the default
-// capacity of 3 the holder plus three reservations would fill capacity and
-// queue the pass there. 1 holder + 3 reservations < 8 leaves the verify group
-// the only group in the path.
+// The pass declares capacity 8 as headroom. Under ADR-094 A4 the three
+// queued implements are blocked on local-implement:h1 and reserve no slot of
+// host:h1:capacity, so the default capacity 3 would admit the pass too (1
+// holder + 0 < 3). 8 keeps capacity out of the path even if every queued
+// implement were counted (1 + 3 < 8), leaving the verify group the only group
+// in the path.
 func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T) {
 	f := newSCPG(t, pgStore)
 	holder := f.impl()

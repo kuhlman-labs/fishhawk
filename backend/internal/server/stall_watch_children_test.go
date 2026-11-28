@@ -27,6 +27,8 @@ type childStallHold struct{ held bool }
 
 func (h *childStallHold) Held(time.Time) (bool, string) { return h.held, "memory pressure critical" }
 
+func (h *childStallHold) Host() string { return "" }
+
 // childStallConcurrency answers StatusForStages from a map; every other
 // concurrency.Store method panics through the nil embedded interface.
 type childStallConcurrency struct {
